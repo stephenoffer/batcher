@@ -75,7 +75,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `from_arrow` | `bt.from_arrow` | canonical |  |
 | `from_dict` | `bt.from_pydict` | alias |  |
 | `from_dicts` | `bt.from_pylist` | alias |  |
-| `from_epoch` | `bt.from_epoch` | mismatch | Differs: Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so from\_epoch('a', 'b') silently computes over the constants. Param: strings as column names (all-null result); Batcher also lacks time\_unit='d'. Wave W0. |
+| `from_epoch` | `bt.from_epoch` | mismatch | Differs: Polars time\_unit=d reads days since 1970; port that as bt.from\_unix\_date(column). Other units map to bt.from\_epoch(column, unit=time\_unit). Wave W0. |
 | `from_numpy` | `bt.from_numpy` | param | Missing: 2-D arrays with schema= and orient=. Wave W2. |
 | `from_pandas` | `bt.from_pandas` | canonical |  |
 | `from_records` | `bt.from_records` | mismatch | Differs: Polars takes schema= and orient= and can read a sequence of sequences as columns; Batcher reads rows with columns=. Wave W0. |

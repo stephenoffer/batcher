@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1475 Python modules across 216 packages and 289 Rust files across 15 crates.
+Covering 1475 Python modules across 216 packages and 291 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -289,7 +289,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 336 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1860 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `reader.py` | 1861 | The `bt.read` namespace — typed, per-format dataset readers. |
 | `writer.py` | 1992 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
@@ -577,7 +577,7 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 | `limits.py` | 266 | Client-side rate limiting for a hosted LLM endpoint. |
 | `openai.py` | 350 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
 | `parallelism.py` | 392 | How many GPUs one LLM engine replica needs, and what that choice costs. |
-| `sglang.py` | 349 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
+| `sglang.py` | 348 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
 | `vllm.py` | 500 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
 
@@ -933,7 +933,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 828 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3163 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3167 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 550 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 709 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1954,7 +1954,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
 | `routing.py` | 137 | Which SQL backend serves this call — the one router the read and the write share. |
-| `snowflake.py` | 326 | Snowflake source + sink — one query submission, N shippable result chunks. |
+| `snowflake.py` | 328 | Snowflake source + sink — one query submission, N shippable result chunks. |
 | `uri.py` | 708 | Connection-URI parsing — one industry-standard URI, routed to the right backend. |
 
 ### `batcher/io/formats/sql/adbc/` — 2 · neutral IO
@@ -2336,7 +2336,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 377 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 5966 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 5967 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 353 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 473 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -3105,14 +3105,16 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `analyze.rs` | 526 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 174 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 762 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/binary.rs` | 766 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/branch/case.rs` | 71 | `CASE`: the first branch whose condition holds supplies the row's value. |
 | `eval/branch/coalesce.rs` | 76 | `COALESCE`: the first argument with a value supplies the row's value. |
 | `eval/branch/literal_case.rs` | 181 | A `CASE` whose arms are all literals, built in one pass instead of one array per arm. |
 | `eval/branch/mod.rs` | 146 | Short-circuiting evaluation of the branch-selecting forms: `CASE` and `COALESCE`. |
 | `eval/cast.rs` | 612 | `cast` evaluation with DuckDB float→int rounding semantics. |
+| `eval/cmp/mod.rs` | 11 | Comparison kernels for a column against a one-value literal. |
+| `eval/cmp/string.rs` | 259 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
-| `eval/dispatch.rs` | 512 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 519 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 382 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/grid.rs` | 238 | The grid and reference-system functions, which take plain numbers rather than geometry. |
@@ -3152,7 +3154,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/media/video/mod.rs` | 299 | Video evaluation for `Expr::Video` (the `.video` namespace). |
 | `eval/media/video/sample.rs` | 602 | Turning a clip into pixels: `frames`, `thumbnail`, and `frame_at`. |
 | `eval/mime.rs` | 230 | What a payload is, decided from its bytes — the one magic-number table. |
-| `eval/mod.rs` | 52 | Evaluation bodies for the scalar `Expr` variants. |
+| `eval/mod.rs` | 53 | Evaluation bodies for the scalar `Expr` variants. |
 | `eval/security/crypto.rs` | 101 | Keyed cryptographic primitives: HMAC-SHA-256 pseudonymization and AES-256-GCM-SIV column encryption. |
 | `eval/security/keyref.rs` | 50 | Resolving a crypto key *reference* to the key material, at evaluation time. |
 | `eval/security/mask.rs` | 35 | Character masking — the redaction primitive behind partial-disclosure policies ("show only the last four digits"). |

@@ -23,7 +23,7 @@ The following table maps the 35 names on `Expression`, sorted alphabetically.
 | `date_trunc` | `Expr.dt.truncate` | param | Missing: multi-unit intervals ('15 minutes') and relative\_to= origin. Wave W6. |
 | `day` | `Expr.dt.day` | canonical |  |
 | `day_of_month` | `Expr.dt.day` | canonical |  |
-| `day_of_week` | `Expr.dt.dayofweek` | mismatch | Differs: Daft numbers Monday=0 through Sunday=6; Batcher dayofweek numbers Sunday=0 through Saturday=6 (and weekday is ISO Monday=1). Param: start='monday', base=0. Wave W0. |
+| `day_of_week` | `Expr.dt.dayofweek` | canonical |  |
 | `day_of_year` | `Expr.dt.dayofyear` | canonical |  |
 | `hour` | `Expr.dt.hour` | canonical |  |
 | `microsecond` | `Expr.dt.microsecond` | canonical |  |
@@ -31,7 +31,7 @@ The following table maps the 35 names on `Expression`, sorted alphabetically.
 | `minute` | `Expr.dt.minute` | canonical |  |
 | `month` | `Expr.dt.month` | canonical |  |
 | `nanosecond` | `Expr.dt.nanosecond` | canonical |  |
-| `partition_days` | `bt.partition_days` | mismatch | Differs: Daft partition\_days returns a Date column; Batcher returns Int64 days since epoch. Param: as\_date=True. Wave W0. |
+| `partition_days` | `bt.partition_days` | canonical |  |
 | `partition_hours` | `bt.partition_hours` | canonical |  |
 | `partition_months` | `bt.partition_months` | canonical |  |
 | `partition_years` | `bt.partition_years` | canonical |  |
@@ -42,7 +42,7 @@ The following table maps the 35 names on `Expression`, sorted alphabetically.
 | `time` | `Expr.dt.time_of_day` | mismatch | Differs: Daft time() returns a TIME value; Batcher time\_of\_day returns microseconds since midnight as Int64. Needs a TIME type. Wave W6. |
 | `to_date` | `Expr.str.to_date` | canonical |  |
 | `to_datetime` | `Expr.str.to_datetime` | param | Missing: timezone= for the parsed timestamp. Wave W6. |
-| `to_unix_epoch` | `Expr.dt.timestamp` | mismatch | Differs: Daft to\_unix\_epoch defaults to seconds; Batcher dt.timestamp defaults to microseconds. Param: unit='s'. Wave W0. |
+| `to_unix_epoch` | `Expr.dt.timestamp` | canonical |  |
 | `total_days` | n/a | gap | Not yet: Duration total\_days. Wave W6. |
 | `total_hours` | n/a | gap | Not yet: Duration total\_hours. Wave W6. |
 | `total_microseconds` | n/a | gap | Not yet: Duration total\_microseconds. Wave W6. |
@@ -68,17 +68,17 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | `current_timezone` | n/a | gap | Not yet: session timezone expression. Wave W6. |
 | `date` | `Expr.dt.date` | canonical |  |
 | `date_add` | `bt.date_add` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
-| `date_diff` | `Expr.dt.days_between` | mismatch | Differs: Batcher bug: dt.days\_between returns 0 on DATE columns (correct on timestamps; Daft returns 9 for 2024-01-10 minus 2024-01-01). Fix the kernel. Wave W0. |
+| `date_diff` | `Expr.dt.days_between` | canonical |  |
 | `date_format` | `Expr.dt.strftime` | param | Missing: optional format (Daft defaults to ISO 8601 with fractional seconds). Wave W2. |
 | `date_from_unix_date` | `bt.from_unix_date` | canonical |  |
 | `date_sub` | `bt.date_sub` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
 | `date_trunc` | `Expr.dt.truncate` | param | Missing: multi-unit intervals ('15 minutes') and relative\_to= origin. Wave W6. |
 | `dateadd` | `bt.date_add` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
-| `datediff` | `Expr.dt.days_between` | mismatch | Differs: Batcher bug: dt.days\_between returns 0 on DATE columns (correct on timestamps; Daft returns 9 for 2024-01-10 minus 2024-01-01). Fix the kernel. Wave W0. |
-| `datepart` | `bt.date_part` | mismatch | Differs: Daft datepart('dayofweek') numbers Monday=0 (a Sunday is 6); Batcher date\_part('dayofweek') numbers Sunday=0. Other parts (year, week, ...) agree. Param: week start for the dayofweek part. Wave W0. |
+| `datediff` | `Expr.dt.days_between` | canonical |  |
+| `datepart` | `bt.date_part` | mismatch | Differs: Daft datepart(dayofweek) numbers Monday=0; port it as col.dt.dayofweek(start=monday). Every other part agrees with bt.date\_part. Wave W0. |
 | `day` | `Expr.dt.day` | canonical |  |
 | `day_of_month` | `Expr.dt.day` | canonical |  |
-| `day_of_week` | `Expr.dt.dayofweek` | mismatch | Differs: Daft numbers Monday=0 through Sunday=6; Batcher dayofweek numbers Sunday=0 through Saturday=6 (and weekday is ISO Monday=1). Param: start='monday', base=0. Wave W0. |
+| `day_of_week` | `Expr.dt.dayofweek` | canonical |  |
 | `day_of_year` | `Expr.dt.dayofyear` | canonical |  |
 | `dayofmonth` | `Expr.dt.day` | canonical |  |
 | `dayofyear` | `Expr.dt.dayofyear` | canonical |  |
@@ -97,7 +97,7 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | `months_between` | n/a | gap | Not yet: months\_between (fractional months). Wave W6. |
 | `nanosecond` | `Expr.dt.nanosecond` | canonical |  |
 | `next_day` | n/a | gap | Not yet: next\_day(date, day\_of\_week). Wave W6. |
-| `partition_days` | `bt.partition_days` | mismatch | Differs: Daft partition\_days returns a Date column; Batcher returns Int64 days since epoch. Param: as\_date=True. Wave W0. |
+| `partition_days` | `bt.partition_days` | canonical |  |
 | `partition_hours` | `bt.partition_hours` | canonical |  |
 | `partition_months` | `bt.partition_months` | canonical |  |
 | `partition_years` | `bt.partition_years` | canonical |  |
@@ -111,7 +111,7 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | `timestamp_seconds` | `bt.from_epoch` | canonical |  |
 | `to_date` | `Expr.str.to_date` | canonical |  |
 | `to_datetime` | `Expr.str.to_datetime` | param | Missing: timezone= for the parsed timestamp. Wave W6. |
-| `to_unix_epoch` | `Expr.dt.timestamp` | mismatch | Differs: Daft to\_unix\_epoch defaults to seconds; Batcher dt.timestamp defaults to microseconds. Param: unit='s'. Wave W0. |
+| `to_unix_epoch` | `Expr.dt.timestamp` | canonical |  |
 | `to_utc_timestamp` | n/a | gap | Not yet: to\_utc\_timestamp over tz-aware timestamps. Wave W6. |
 | `total_days` | n/a | gap | Not yet: Duration total\_days. Wave W6. |
 | `total_hours` | n/a | gap | Not yet: Duration total\_hours. Wave W6. |

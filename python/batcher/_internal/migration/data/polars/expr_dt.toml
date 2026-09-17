@@ -14,7 +14,7 @@ datetime = { status = "gap", need = "Expr.dt.datetime (naive local datetime of a
 day = { status = "canonical", batcher = "Expr.dt.day" }
 days_in_month = { status = "canonical", batcher = "Expr.dt.days_in_month" }
 dst_offset = { status = "gap", need = "Expr.dt.dst_offset (a time-zone-aware Datetime type)", wave = "W6" }
-epoch = { status = "mismatch", batcher = "Expr.dt.epoch", note = "Polars epoch() defaults to time_unit='us' (microseconds); Batcher's epoch returns seconds. Param: time_unit=", wave = "W0" }
+epoch = { status = "mismatch", batcher = "Expr.dt.timestamp", note = "Polars epoch() defaults to microseconds. Port epoch(time_unit=U) as dt.timestamp(U) for s, ms, us and ns; time_unit=d is bt.partition_days(x), Int64 where Polars returns Int32. For an instant before 1970 with a sub-millisecond part, dt.timestamp(ms) truncates toward zero where Polars floors", wave = "W0" }
 hour = { status = "canonical", batcher = "Expr.dt.hour" }
 is_business_day = { status = "param", batcher = "Expr.dt.is_business_day", need = "week_mask=, holidays=", wave = "W2" }
 is_leap_year = { status = "canonical", batcher = "Expr.dt.is_leap_year" }
@@ -24,8 +24,8 @@ millennium = { status = "canonical", batcher = "Expr.dt.millennium" }
 millisecond = { status = "canonical", batcher = "Expr.dt.millisecond" }
 minute = { status = "canonical", batcher = "Expr.dt.minute" }
 month = { status = "canonical", batcher = "Expr.dt.month" }
-month_end = { status = "mismatch", batcher = "Expr.dt.last_day", note = "on a Datetime Polars keeps the time of day and returns Datetime; Batcher returns a Date", wave = "W0" }
-month_start = { status = "mismatch", batcher = "Expr.dt.month_start", note = "Polars keeps the input type and the time of day (Date stays Date); Batcher returns a midnight Timestamp", wave = "W0" }
+month_end = { status = "canonical", batcher = "Expr.dt.last_day", template = 'month_end() -> self.last_day(keep_time=True)' }
+month_start = { status = "canonical", batcher = "Expr.dt.month_start", template = 'month_start() -> self.month_start(keep_time=True)' }
 nanosecond = { status = "canonical", batcher = "Expr.dt.nanosecond" }
 offset_by = { status = "canonical", batcher = "Expr.dt.offset_by" }
 ordinal_day = { status = "alias", batcher = "Expr.dt.dayofyear" }
@@ -37,7 +37,7 @@ second = { status = "param", batcher = "Expr.dt.second", need = "fractional=", w
 strftime = { status = "canonical", batcher = "Expr.dt.strftime" }
 time = { status = "gap", need = "Expr.dt.time (needs a TIME type; time_of_day returns an integer)", wave = "W6" }
 timestamp = { status = "canonical", batcher = "Expr.dt.timestamp" }
-to_string = { status = "mismatch", batcher = "Expr.dt.strftime", note = "with no format Polars renders '2024-01-31 12:30:15.123456'; Batcher renders ISO '2024-01-31T12:30:15' without fractional seconds", wave = "W0" }
+to_string = { status = "mismatch", batcher = "Expr.dt.strftime", note = "with no format Polars renders by column type: a Datetime[us] is strftime(%Y-%m-%d %H:%M:%S%.6f) and a Date is strftime(%Y-%m-%d). Batcher needs the format stated, so a port of an unknown column type needs review", wave = "W0" }
 total_days = { status = "gap", need = "Duration total_days", wave = "W6" }
 total_hours = { status = "gap", need = "Duration total_hours", wave = "W6" }
 total_microseconds = { status = "gap", need = "Duration total_microseconds", wave = "W6" }
@@ -45,7 +45,7 @@ total_milliseconds = { status = "gap", need = "Duration total_milliseconds", wav
 total_minutes = { status = "gap", need = "Duration total_minutes", wave = "W6" }
 total_nanoseconds = { status = "gap", need = "Duration total_nanoseconds", wave = "W6" }
 total_seconds = { status = "gap", need = "Duration total_seconds", wave = "W6" }
-truncate = { status = "mismatch", batcher = "Expr.dt.truncate", note = "on a Date Polars returns a Date; Batcher returns a Timestamp. Polars also accepts multiples ('15m') and offset=, which Batcher refuses", wave = "W0" }
+truncate = { status = "param", batcher = "Expr.dt.truncate", need = "Polars duration strings (1mo, 15m) and offset=. For a single calendar unit port as truncate(unit, preserve_type=True), which keeps a Date a Date", wave = "W2" }
 week = { status = "canonical", batcher = "Expr.dt.week" }
 weekday = { status = "canonical", batcher = "Expr.dt.weekday" }
 with_time_unit = { status = "gap", need = "Expr.dt.with_time_unit", wave = "W6" }

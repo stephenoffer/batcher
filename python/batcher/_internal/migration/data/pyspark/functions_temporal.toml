@@ -11,22 +11,22 @@ current_time = { status = "gap", need = "TIME type and current_time(precision)",
 current_timestamp = { status = "canonical", batcher = "bt.current_timestamp" }
 current_timezone = { status = "gap", need = "session time zone configuration", wave = "W6" }
 date_add = { status = "param", batcher = "bt.date_add", need = "column-valued day amount", wave = "W2" }
-date_diff = { status = "mismatch", batcher = "Expr.dt.days_between", note = "Batcher bug: Expr.dt.days_between returns 0 on DATE columns (correct on timestamps). date_diff(end, start) is end.dt.days_between(start)", wave = "W0" }
+date_diff = { status = "canonical", batcher = "Expr.dt.days_between", template = 'date_diff(end, start) -> sem.column(end).dt.days_between(sem.column(start))' }
 date_format = { status = "mismatch", batcher = "Expr.dt.strftime", note = "Spark takes Java DateTimeFormatter patterns (yyyy-MM-dd) and renders in the session time zone; strftime takes %Y-%m-%d. Codemod translates the pattern", wave = "W0", template = 'date_format(date, format) -> sem.column(date).dt.strftime(sem.java_datetime(format))' }
 date_from_unix_date = { status = "canonical", batcher = "bt.from_unix_date" }
-date_part = { status = "mismatch", batcher = "bt.date_part", note = "Spark SECOND returns DECIMAL with the fraction and DAYOFWEEK/DOW count Sunday=1; bt.date_part follows DuckDB (integer seconds, dow Sunday=0)", wave = "W0" }
+date_part = { status = "mismatch", batcher = "bt.date_part", note = "Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK_ISO/DOW_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1_000_000, which is Float64); every other field agrees with bt.date_part", wave = "W0" }
 date_sub = { status = "param", batcher = "bt.date_sub", need = "column-valued day amount", wave = "W2" }
 date_trunc = { status = "canonical", batcher = "Expr.dt.truncate" }
 dateadd = { status = "param", batcher = "bt.date_add", need = "column-valued day amount", wave = "W2" }
-datediff = { status = "mismatch", batcher = "Expr.dt.days_between", note = "Batcher bug: Expr.dt.days_between returns 0 on DATE columns (correct on timestamps). datediff(end, start) is end.dt.days_between(start)", wave = "W0" }
-datepart = { status = "mismatch", batcher = "bt.date_part", note = "Spark SECOND returns DECIMAL with the fraction and DAYOFWEEK/DOW count Sunday=1; bt.date_part follows DuckDB (integer seconds, dow Sunday=0)", wave = "W0" }
+datediff = { status = "canonical", batcher = "Expr.dt.days_between", template = 'datediff(end, start) -> sem.column(end).dt.days_between(sem.column(start))' }
+datepart = { status = "mismatch", batcher = "bt.date_part", note = "Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK_ISO/DOW_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1_000_000, which is Float64); every other field agrees with bt.date_part", wave = "W0" }
 day = { status = "canonical", batcher = "Expr.dt.day" }
-dayname = { status = "mismatch", batcher = "Expr.dt.dayname", note = "Spark returns the three-letter abbreviation ('Wed'); Batcher returns the full name ('Wednesday')", wave = "W0" }
+dayname = { status = "canonical", batcher = "Expr.dt.dayname", template = 'dayname(col) -> sem.column(col).dt.dayname(abbreviated=True)' }
 dayofmonth = { status = "canonical", batcher = "Expr.dt.day" }
-dayofweek = { status = "mismatch", batcher = "Expr.dt.dayofweek", note = "Spark numbers Sunday=1 through Saturday=7; Batcher numbers Sunday=0 through Saturday=6", wave = "W0" }
+dayofweek = { status = "canonical", batcher = "Expr.dt.dayofweek", template = 'dayofweek(col) -> sem.column(col).dt.dayofweek(base=1)' }
 dayofyear = { status = "canonical", batcher = "Expr.dt.dayofyear" }
 days = { status = "canonical", batcher = "bt.partition_days" }
-extract = { status = "mismatch", batcher = "bt.date_part", note = "Spark SECOND returns DECIMAL with the fraction and DAYOFWEEK/DOW count Sunday=1; bt.date_part follows DuckDB (integer seconds, dow Sunday=0)", wave = "W0" }
+extract = { status = "mismatch", batcher = "bt.date_part", note = "Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK_ISO/DOW_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1_000_000, which is Float64); every other field agrees with bt.date_part", wave = "W0" }
 from_unixtime = { status = "mismatch", batcher = ["bt.from_epoch", "Expr.dt.strftime"], note = "Spark renders a string with a Java pattern in the session time zone; Batcher builds a UTC timestamp and formats it with strftime", wave = "W0" }
 from_utc_timestamp = { status = "canonical", batcher = "Expr.dt.convert_timezone" }
 hour = { status = "canonical", batcher = "Expr.dt.hour" }
@@ -43,7 +43,7 @@ make_timestamp_ntz = { status = "param", batcher = "bt.make_timestamp", need = "
 make_ym_interval = { status = "gap", need = "year-month interval constructor", wave = "W6" }
 minute = { status = "canonical", batcher = "Expr.dt.minute" }
 month = { status = "canonical", batcher = "Expr.dt.month" }
-monthname = { status = "mismatch", batcher = "Expr.dt.monthname", note = "Spark returns the three-letter abbreviation ('Feb'); Batcher returns the full name ('February')", wave = "W0" }
+monthname = { status = "canonical", batcher = "Expr.dt.monthname", template = 'monthname(col) -> sem.column(col).dt.monthname(abbreviated=True)' }
 months = { status = "canonical", batcher = "bt.partition_months" }
 months_between = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (months_between with roundOff)", wave = "W1" }
 next_day = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (next_day)", wave = "W1" }
@@ -72,7 +72,7 @@ to_timestamp_ltz = { status = "gap", need = "parse to a timestamp with local tim
 to_timestamp_ntz = { status = "gap", need = "parse to a timestamp without time zone using Java patterns", wave = "W6" }
 to_unix_timestamp = { status = "gap", need = "parse with a Java pattern in the session time zone to epoch seconds", wave = "W6" }
 to_utc_timestamp = { status = "canonical", batcher = "Expr.dt.convert_timezone" }
-trunc = { status = "mismatch", batcher = "Expr.dt.truncate", note = "Spark trunc(date, fmt) returns a DATE and only accepts year/quarter/month/week units (null otherwise); Expr.dt.truncate returns a timestamp", wave = "W0" }
+trunc = { status = "mismatch", batcher = "Expr.dt.truncate", note = "Spark trunc(date, fmt) returns a DATE. Port as col.dt.date().dt.truncate(unit, preserve_type=True), with year/yyyy/yy as year, month/mon/mm as month, and week and quarter as themselves; Spark returns null for any other format where Batcher raises", wave = "W0" }
 try_make_interval = { status = "gap", need = "interval constructor returning null on overflow", wave = "W6" }
 try_make_timestamp = { status = "gap", need = "timestamp constructor returning null on invalid input", wave = "W6" }
 try_make_timestamp_ltz = { status = "gap", need = "LTZ timestamp constructor returning null on invalid input", wave = "W6" }
@@ -85,7 +85,7 @@ unix_micros = { status = "canonical", batcher = "Expr.dt.epoch_us" }
 unix_millis = { status = "canonical", batcher = "Expr.dt.epoch_ms" }
 unix_seconds = { status = "canonical", batcher = "Expr.dt.epoch" }
 unix_timestamp = { status = "gap", need = "current or parsed epoch seconds with a Java pattern in the session time zone", wave = "W6" }
-weekday = { status = "mismatch", batcher = "Expr.dt.weekday", note = "Spark numbers Monday=0 through Sunday=6; Batcher returns ISO Monday=1 through Sunday=7", wave = "W0" }
+weekday = { status = "canonical", batcher = "Expr.dt.dayofweek", template = 'weekday(col) -> sem.column(col).dt.dayofweek(start="monday", base=0)' }
 weekofyear = { status = "canonical", batcher = "Expr.dt.week" }
 window = { status = "mismatch", batcher = "bt.window", note = "Spark window() yields a struct<start, end> and accepts startTime=; bt.window yields the window start timestamp", wave = "W0" }
 window_time = { status = "gap", need = "event time of a window struct (end - 1 microsecond)", wave = "W10" }

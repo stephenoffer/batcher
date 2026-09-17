@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Daft
 
-The following table maps 203 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
+The following table maps 206 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
 
 | Batcher | Daft |
 |---|---|
@@ -53,7 +53,7 @@ The following table maps 203 Batcher spellings to the Daft names that compute th
 | `bt.mean` | `functions.avg`, `functions.mean` |
 | `bt.median` | `functions.median` |
 | `bt.min` | `functions.min` |
-| `bt.partition_days` | `Expression.unix_date`, `functions.unix_date` |
+| `bt.partition_days` | `Expression.partition_days`, `Expression.unix_date`, `functions.partition_days`, `functions.unix_date` |
 | `bt.partition_hours` | `Expression.partition_hours`, `functions.partition_hours` |
 | `bt.partition_months` | `Expression.partition_months`, `functions.partition_months` |
 | `bt.partition_years` | `Expression.partition_years`, `functions.partition_years` |
@@ -130,7 +130,9 @@ The following table maps 203 Batcher spellings to the Daft names that compute th
 | `Expr.degrees` | `Expression.degrees`, `functions.degrees` |
 | `Expr.dt.date` | `Expression.date`, `functions.date` |
 | `Expr.dt.day` | `Expression.day_of_month`, `Expression.day`, `functions.day_of_month`, `functions.day`, `functions.dayofmonth` |
+| `Expr.dt.dayofweek` | `Expression.day_of_week`, `functions.day_of_week` |
 | `Expr.dt.dayofyear` | `Expression.day_of_year`, `functions.day_of_year`, `functions.dayofyear` |
+| `Expr.dt.days_between` | `functions.date_diff`, `functions.datediff` |
 | `Expr.dt.hour` | `Expression.hour`, `functions.hour` |
 | `Expr.dt.last_day` | `functions.last_day` |
 | `Expr.dt.microsecond` | `Expression.microsecond`, `functions.microsecond` |
@@ -140,6 +142,7 @@ The following table maps 203 Batcher spellings to the Daft names that compute th
 | `Expr.dt.nanosecond` | `Expression.nanosecond`, `functions.nanosecond` |
 | `Expr.dt.quarter` | `Expression.quarter`, `functions.quarter` |
 | `Expr.dt.second` | `Expression.second`, `functions.second` |
+| `Expr.dt.timestamp` | `Expression.to_unix_epoch`, `functions.to_unix_epoch` |
 | `Expr.dt.week` | `Expression.week_of_year`, `functions.week_of_year`, `functions.weekofyear` |
 | `Expr.dt.year` | `Expression.year`, `functions.year` |
 | `Expr.eq_missing` | `Expression.eq_null_safe`, `functions.eq_null_safe` |

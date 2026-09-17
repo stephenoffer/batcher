@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to PySpark
 
-The following table maps 251 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 255 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
@@ -167,7 +167,10 @@ The following table maps 251 Batcher spellings to the PySpark names that compute
 | `Expr.degrees` | `functions.degrees` |
 | `Expr.dt.convert_timezone` | `functions.from_utc_timestamp`, `functions.to_utc_timestamp` |
 | `Expr.dt.day` | `functions.day`, `functions.dayofmonth` |
+| `Expr.dt.dayname` | `functions.dayname` |
+| `Expr.dt.dayofweek` | `functions.dayofweek`, `functions.weekday` |
 | `Expr.dt.dayofyear` | `functions.dayofyear` |
+| `Expr.dt.days_between` | `functions.date_diff`, `functions.datediff` |
 | `Expr.dt.epoch_ms` | `functions.unix_millis` |
 | `Expr.dt.epoch_us` | `functions.unix_micros` |
 | `Expr.dt.epoch` | `functions.unix_seconds` |
@@ -175,6 +178,7 @@ The following table maps 251 Batcher spellings to the PySpark names that compute
 | `Expr.dt.last_day` | `functions.last_day` |
 | `Expr.dt.minute` | `functions.minute` |
 | `Expr.dt.month` | `functions.month` |
+| `Expr.dt.monthname` | `functions.monthname` |
 | `Expr.dt.quarter` | `functions.quarter` |
 | `Expr.dt.second` | `functions.second` |
 | `Expr.dt.truncate` | `functions.date_trunc` |

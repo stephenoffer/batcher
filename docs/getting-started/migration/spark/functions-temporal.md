@@ -26,22 +26,22 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `current_timestamp` | `bt.current_timestamp` | canonical |  |
 | `current_timezone` | n/a | gap | Not yet: session time zone configuration. Wave W6. |
 | `date_add` | `bt.date_add` | param | Missing: column-valued day amount. Wave W2. |
-| `date_diff` | `Expr.dt.days_between` | mismatch | Differs: Batcher bug: Expr.dt.days\_between returns 0 on DATE columns (correct on timestamps). date\_diff(end, start) is end.dt.days\_between(start). Wave W0. |
+| `date_diff` | `Expr.dt.days_between` | canonical |  |
 | `date_format` | `Expr.dt.strftime` | mismatch | Differs: Spark takes Java DateTimeFormatter patterns (yyyy-MM-dd) and renders in the session time zone; strftime takes %Y-%m-%d. Codemod translates the pattern. Wave W0. |
 | `date_from_unix_date` | `bt.from_unix_date` | canonical |  |
-| `date_part` | `bt.date_part` | mismatch | Differs: Spark SECOND returns DECIMAL with the fraction and DAYOFWEEK/DOW count Sunday=1; bt.date\_part follows DuckDB (integer seconds, dow Sunday=0). Wave W0. |
+| `date_part` | `bt.date_part` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
 | `date_sub` | `bt.date_sub` | param | Missing: column-valued day amount. Wave W2. |
 | `date_trunc` | `Expr.dt.truncate` | canonical |  |
 | `dateadd` | `bt.date_add` | param | Missing: column-valued day amount. Wave W2. |
-| `datediff` | `Expr.dt.days_between` | mismatch | Differs: Batcher bug: Expr.dt.days\_between returns 0 on DATE columns (correct on timestamps). datediff(end, start) is end.dt.days\_between(start). Wave W0. |
-| `datepart` | `bt.date_part` | mismatch | Differs: Spark SECOND returns DECIMAL with the fraction and DAYOFWEEK/DOW count Sunday=1; bt.date\_part follows DuckDB (integer seconds, dow Sunday=0). Wave W0. |
+| `datediff` | `Expr.dt.days_between` | canonical |  |
+| `datepart` | `bt.date_part` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
 | `day` | `Expr.dt.day` | canonical |  |
-| `dayname` | `Expr.dt.dayname` | mismatch | Differs: Spark returns the three-letter abbreviation ('Wed'); Batcher returns the full name ('Wednesday'). Wave W0. |
+| `dayname` | `Expr.dt.dayname` | canonical |  |
 | `dayofmonth` | `Expr.dt.day` | canonical |  |
-| `dayofweek` | `Expr.dt.dayofweek` | mismatch | Differs: Spark numbers Sunday=1 through Saturday=7; Batcher numbers Sunday=0 through Saturday=6. Wave W0. |
+| `dayofweek` | `Expr.dt.dayofweek` | canonical |  |
 | `dayofyear` | `Expr.dt.dayofyear` | canonical |  |
 | `days` | `bt.partition_days` | canonical |  |
-| `extract` | `bt.date_part` | mismatch | Differs: Spark SECOND returns DECIMAL with the fraction and DAYOFWEEK/DOW count Sunday=1; bt.date\_part follows DuckDB (integer seconds, dow Sunday=0). Wave W0. |
+| `extract` | `bt.date_part` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
 | `from_unixtime` | `bt.from_epoch` + `Expr.dt.strftime` | mismatch | Differs: Spark renders a string with a Java pattern in the session time zone; Batcher builds a UTC timestamp and formats it with strftime. Wave W0. |
 | `from_utc_timestamp` | `Expr.dt.convert_timezone` | canonical |  |
 | `hour` | `Expr.dt.hour` | canonical |  |
@@ -58,7 +58,7 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `make_ym_interval` | n/a | gap | Not yet: year-month interval constructor. Wave W6. |
 | `minute` | `Expr.dt.minute` | canonical |  |
 | `month` | `Expr.dt.month` | canonical |  |
-| `monthname` | `Expr.dt.monthname` | mismatch | Differs: Spark returns the three-letter abbreviation ('Feb'); Batcher returns the full name ('February'). Wave W0. |
+| `monthname` | `Expr.dt.monthname` | canonical |  |
 | `months` | `bt.partition_months` | canonical |  |
 | `months_between` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (months\_between with roundOff). Wave W1. |
 | `next_day` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (next\_day). Wave W1. |
@@ -87,7 +87,7 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `to_timestamp_ntz` | n/a | gap | Not yet: parse to a timestamp without time zone using Java patterns. Wave W6. |
 | `to_unix_timestamp` | n/a | gap | Not yet: parse with a Java pattern in the session time zone to epoch seconds. Wave W6. |
 | `to_utc_timestamp` | `Expr.dt.convert_timezone` | canonical |  |
-| `trunc` | `Expr.dt.truncate` | mismatch | Differs: Spark trunc(date, fmt) returns a DATE and only accepts year/quarter/month/week units (null otherwise); Expr.dt.truncate returns a timestamp. Wave W0. |
+| `trunc` | `Expr.dt.truncate` | mismatch | Differs: Spark trunc(date, fmt) returns a DATE. Port as col.dt.date().dt.truncate(unit, preserve\_type=True), with year/yyyy/yy as year, month/mon/mm as month, and week and quarter as themselves; Spark returns null for any other format where Batcher raises. Wave W0. |
 | `try_make_interval` | n/a | gap | Not yet: interval constructor returning null on overflow. Wave W6. |
 | `try_make_timestamp` | n/a | gap | Not yet: timestamp constructor returning null on invalid input. Wave W6. |
 | `try_make_timestamp_ltz` | n/a | gap | Not yet: LTZ timestamp constructor returning null on invalid input. Wave W6. |
@@ -100,7 +100,7 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `unix_millis` | `Expr.dt.epoch_ms` | canonical |  |
 | `unix_seconds` | `Expr.dt.epoch` | canonical |  |
 | `unix_timestamp` | n/a | gap | Not yet: current or parsed epoch seconds with a Java pattern in the session time zone. Wave W6. |
-| `weekday` | `Expr.dt.weekday` | mismatch | Differs: Spark numbers Monday=0 through Sunday=6; Batcher returns ISO Monday=1 through Sunday=7. Wave W0. |
+| `weekday` | `Expr.dt.dayofweek` | canonical |  |
 | `weekofyear` | `Expr.dt.week` | canonical |  |
 | `window` | `bt.window` | mismatch | Differs: Spark window() yields a struct\<start, end\> and accepts startTime=; bt.window yields the window start timestamp. Wave W0. |
 | `window_time` | n/a | gap | Not yet: event time of a window struct (end - 1 microsecond). Wave W10. |

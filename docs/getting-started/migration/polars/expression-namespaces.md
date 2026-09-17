@@ -85,7 +85,7 @@ The following table maps the 47 names on `Expr.dt`, sorted alphabetically.
 | `day` | `Expr.dt.day` | canonical |  |
 | `days_in_month` | `Expr.dt.days_in_month` | canonical |  |
 | `dst_offset` | n/a | gap | Not yet: Expr.dt.dst\_offset (a time-zone-aware Datetime type). Wave W6. |
-| `epoch` | `Expr.dt.epoch` | mismatch | Differs: Polars epoch() defaults to time\_unit='us' (microseconds); Batcher's epoch returns seconds. Param: time\_unit=. Wave W0. |
+| `epoch` | `Expr.dt.timestamp` | mismatch | Differs: Polars epoch() defaults to microseconds. Port epoch(time\_unit=U) as dt.timestamp(U) for s, ms, us and ns; time\_unit=d is bt.partition\_days(x), Int64 where Polars returns Int32. For an instant before 1970 with a sub-millisecond part, dt.timestamp(ms) truncates toward zero where Polars floors. Wave W0. |
 | `hour` | `Expr.dt.hour` | canonical |  |
 | `is_business_day` | `Expr.dt.is_business_day` | param | Missing: week\_mask=, holidays=. Wave W2. |
 | `is_leap_year` | `Expr.dt.is_leap_year` | canonical |  |
@@ -95,8 +95,8 @@ The following table maps the 47 names on `Expr.dt`, sorted alphabetically.
 | `millisecond` | `Expr.dt.millisecond` | canonical |  |
 | `minute` | `Expr.dt.minute` | canonical |  |
 | `month` | `Expr.dt.month` | canonical |  |
-| `month_end` | `Expr.dt.last_day` | mismatch | Differs: on a Datetime Polars keeps the time of day and returns Datetime; Batcher returns a Date. Wave W0. |
-| `month_start` | `Expr.dt.month_start` | mismatch | Differs: Polars keeps the input type and the time of day (Date stays Date); Batcher returns a midnight Timestamp. Wave W0. |
+| `month_end` | `Expr.dt.last_day` | canonical |  |
+| `month_start` | `Expr.dt.month_start` | canonical |  |
 | `nanosecond` | `Expr.dt.nanosecond` | canonical |  |
 | `offset_by` | `Expr.dt.offset_by` | canonical |  |
 | `ordinal_day` | `Expr.dt.dayofyear` | alias |  |
@@ -108,7 +108,7 @@ The following table maps the 47 names on `Expr.dt`, sorted alphabetically.
 | `strftime` | `Expr.dt.strftime` | canonical |  |
 | `time` | n/a | gap | Not yet: Expr.dt.time (needs a TIME type; time\_of\_day returns an integer). Wave W6. |
 | `timestamp` | `Expr.dt.timestamp` | canonical |  |
-| `to_string` | `Expr.dt.strftime` | mismatch | Differs: with no format Polars renders '2024-01-31 12:30:15.123456'; Batcher renders ISO '2024-01-31T12:30:15' without fractional seconds. Wave W0. |
+| `to_string` | `Expr.dt.strftime` | mismatch | Differs: with no format Polars renders by column type: a Datetime\[us\] is strftime(%Y-%m-%d %H:%M:%S%.6f) and a Date is strftime(%Y-%m-%d). Batcher needs the format stated, so a port of an unknown column type needs review. Wave W0. |
 | `total_days` | n/a | gap | Not yet: Duration total\_days. Wave W6. |
 | `total_hours` | n/a | gap | Not yet: Duration total\_hours. Wave W6. |
 | `total_microseconds` | n/a | gap | Not yet: Duration total\_microseconds. Wave W6. |
@@ -116,7 +116,7 @@ The following table maps the 47 names on `Expr.dt`, sorted alphabetically.
 | `total_minutes` | n/a | gap | Not yet: Duration total\_minutes. Wave W6. |
 | `total_nanoseconds` | n/a | gap | Not yet: Duration total\_nanoseconds. Wave W6. |
 | `total_seconds` | n/a | gap | Not yet: Duration total\_seconds. Wave W6. |
-| `truncate` | `Expr.dt.truncate` | mismatch | Differs: on a Date Polars returns a Date; Batcher returns a Timestamp. Polars also accepts multiples ('15m') and offset=, which Batcher refuses. Wave W0. |
+| `truncate` | `Expr.dt.truncate` | param | Missing: Polars duration strings (1mo, 15m) and offset=. For a single calendar unit port as truncate(unit, preserve\_type=True), which keeps a Date a Date. Wave W2. |
 | `week` | `Expr.dt.week` | canonical |  |
 | `weekday` | `Expr.dt.weekday` | canonical |  |
 | `with_time_unit` | n/a | gap | Not yet: Expr.dt.with\_time\_unit. Wave W6. |

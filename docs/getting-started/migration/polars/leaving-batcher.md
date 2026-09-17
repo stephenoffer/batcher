@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 220 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 222 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -148,10 +148,12 @@ The following table maps 220 Batcher spellings to the Polars names that compute 
 | `Expr.dt.hour` | `Expr.dt.hour` |
 | `Expr.dt.is_leap_year` | `Expr.dt.is_leap_year` |
 | `Expr.dt.iso_year` | `Expr.dt.iso_year` |
+| `Expr.dt.last_day` | `Expr.dt.month_end` |
 | `Expr.dt.microsecond` | `Expr.dt.microsecond` |
 | `Expr.dt.millennium` | `Expr.dt.millennium` |
 | `Expr.dt.millisecond` | `Expr.dt.millisecond` |
 | `Expr.dt.minute` | `Expr.dt.minute` |
+| `Expr.dt.month_start` | `Expr.dt.month_start` |
 | `Expr.dt.month` | `Expr.dt.month` |
 | `Expr.dt.nanosecond` | `Expr.dt.nanosecond` |
 | `Expr.dt.offset_by` | `Expr.dt.offset_by` |

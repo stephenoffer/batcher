@@ -7,7 +7,7 @@ date = { status = "canonical", batcher = "Expr.dt.date" }
 date_trunc = { status = "param", batcher = "Expr.dt.truncate", need = "multi-unit intervals ('15 minutes') and relative_to= origin", wave = "W6" }
 day = { status = "canonical", batcher = "Expr.dt.day" }
 day_of_month = { status = "canonical", batcher = "Expr.dt.day" }
-day_of_week = { status = "mismatch", batcher = "Expr.dt.dayofweek", note = "Daft numbers Monday=0 through Sunday=6; Batcher dayofweek numbers Sunday=0 through Saturday=6 (and weekday is ISO Monday=1). Param: start='monday', base=0", wave = "W0" }
+day_of_week = { status = "canonical", batcher = "Expr.dt.dayofweek", template = 'day_of_week() -> self.dt.dayofweek(start="monday")' }
 day_of_year = { status = "canonical", batcher = "Expr.dt.dayofyear" }
 hour = { status = "canonical", batcher = "Expr.dt.hour" }
 microsecond = { status = "canonical", batcher = "Expr.dt.microsecond" }
@@ -15,7 +15,7 @@ millisecond = { status = "canonical", batcher = "Expr.dt.millisecond" }
 minute = { status = "canonical", batcher = "Expr.dt.minute" }
 month = { status = "canonical", batcher = "Expr.dt.month" }
 nanosecond = { status = "canonical", batcher = "Expr.dt.nanosecond" }
-partition_days = { status = "mismatch", batcher = "bt.partition_days", note = "Daft partition_days returns a Date column; Batcher returns Int64 days since epoch. Param: as_date=True", wave = "W0" }
+partition_days = { status = "canonical", batcher = "bt.partition_days", template = 'partition_days() -> bt.partition_days(self, as_date=True)' }
 partition_hours = { status = "canonical", batcher = "bt.partition_hours" }
 partition_months = { status = "canonical", batcher = "bt.partition_months" }
 partition_years = { status = "canonical", batcher = "bt.partition_years" }
@@ -26,7 +26,7 @@ strftime = { status = "param", batcher = "Expr.dt.strftime", need = "optional fo
 time = { status = "mismatch", batcher = "Expr.dt.time_of_day", note = "Daft time() returns a TIME value; Batcher time_of_day returns microseconds since midnight as Int64. Needs a TIME type", wave = "W6" }
 to_date = { status = "canonical", batcher = "Expr.str.to_date" }
 to_datetime = { status = "param", batcher = "Expr.str.to_datetime", need = "timezone= for the parsed timestamp", wave = "W6" }
-to_unix_epoch = { status = "mismatch", batcher = "Expr.dt.timestamp", note = "Daft to_unix_epoch defaults to seconds; Batcher dt.timestamp defaults to microseconds. Param: unit='s'", wave = "W0" }
+to_unix_epoch = { status = "canonical", batcher = "Expr.dt.timestamp", template = 'to_unix_epoch(time_unit="s") -> self.dt.timestamp(time_unit)' }
 total_days = { status = "gap", need = "Duration total_days", wave = "W6" }
 total_hours = { status = "gap", need = "Duration total_hours", wave = "W6" }
 total_microseconds = { status = "gap", need = "Duration total_microseconds", wave = "W6" }
@@ -47,17 +47,17 @@ current_timestamp = { status = "mismatch", batcher = "bt.current_timestamp", not
 current_timezone = { status = "gap", need = "session timezone expression", wave = "W6" }
 date = { status = "canonical", batcher = "Expr.dt.date" }
 date_add = { status = "param", batcher = "bt.date_add", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days)", wave = "W2" }
-date_diff = { status = "mismatch", batcher = "Expr.dt.days_between", note = "Batcher bug: dt.days_between returns 0 on DATE columns (correct on timestamps; Daft returns 9 for 2024-01-10 minus 2024-01-01). Fix the kernel", wave = "W0" }
+date_diff = { status = "canonical", batcher = "Expr.dt.days_between", template = 'date_diff(end, start) -> sem.column(end).dt.days_between(sem.column(start))' }
 date_format = { status = "param", batcher = "Expr.dt.strftime", need = "optional format (Daft defaults to ISO 8601 with fractional seconds)", wave = "W2" }
 date_from_unix_date = { status = "canonical", batcher = "bt.from_unix_date" }
 date_sub = { status = "param", batcher = "bt.date_sub", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days)", wave = "W2" }
 date_trunc = { status = "param", batcher = "Expr.dt.truncate", need = "multi-unit intervals ('15 minutes') and relative_to= origin", wave = "W6" }
 dateadd = { status = "param", batcher = "bt.date_add", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days)", wave = "W2" }
-datediff = { status = "mismatch", batcher = "Expr.dt.days_between", note = "Batcher bug: dt.days_between returns 0 on DATE columns (correct on timestamps; Daft returns 9 for 2024-01-10 minus 2024-01-01). Fix the kernel", wave = "W0" }
-datepart = { status = "mismatch", batcher = "bt.date_part", note = "Daft datepart('dayofweek') numbers Monday=0 (a Sunday is 6); Batcher date_part('dayofweek') numbers Sunday=0. Other parts (year, week, ...) agree. Param: week start for the dayofweek part", wave = "W0" }
+datediff = { status = "canonical", batcher = "Expr.dt.days_between", template = 'datediff(end, start) -> sem.column(end).dt.days_between(sem.column(start))' }
+datepart = { status = "mismatch", batcher = "bt.date_part", note = "Daft datepart(dayofweek) numbers Monday=0; port it as col.dt.dayofweek(start=monday). Every other part agrees with bt.date_part", wave = "W0" }
 day = { status = "canonical", batcher = "Expr.dt.day" }
 day_of_month = { status = "canonical", batcher = "Expr.dt.day" }
-day_of_week = { status = "mismatch", batcher = "Expr.dt.dayofweek", note = "Daft numbers Monday=0 through Sunday=6; Batcher dayofweek numbers Sunday=0 through Saturday=6 (and weekday is ISO Monday=1). Param: start='monday', base=0", wave = "W0" }
+day_of_week = { status = "canonical", batcher = "Expr.dt.dayofweek", template = 'day_of_week(expr) -> sem.column(expr).dt.dayofweek(start="monday")' }
 day_of_year = { status = "canonical", batcher = "Expr.dt.dayofyear" }
 dayofmonth = { status = "canonical", batcher = "Expr.dt.day" }
 dayofyear = { status = "canonical", batcher = "Expr.dt.dayofyear" }
@@ -76,7 +76,7 @@ month = { status = "canonical", batcher = "Expr.dt.month" }
 months_between = { status = "gap", need = "months_between (fractional months)", wave = "W6" }
 nanosecond = { status = "canonical", batcher = "Expr.dt.nanosecond" }
 next_day = { status = "gap", need = "next_day(date, day_of_week)", wave = "W6" }
-partition_days = { status = "mismatch", batcher = "bt.partition_days", note = "Daft partition_days returns a Date column; Batcher returns Int64 days since epoch. Param: as_date=True", wave = "W0" }
+partition_days = { status = "canonical", batcher = "bt.partition_days", template = 'partition_days(expr) -> bt.partition_days(sem.column(expr), as_date=True)' }
 partition_hours = { status = "canonical", batcher = "bt.partition_hours" }
 partition_months = { status = "canonical", batcher = "bt.partition_months" }
 partition_years = { status = "canonical", batcher = "bt.partition_years" }
@@ -90,7 +90,7 @@ timestamp_millis = { status = "canonical", batcher = "bt.from_epoch" }
 timestamp_seconds = { status = "canonical", batcher = "bt.from_epoch" }
 to_date = { status = "canonical", batcher = "Expr.str.to_date" }
 to_datetime = { status = "param", batcher = "Expr.str.to_datetime", need = "timezone= for the parsed timestamp", wave = "W6" }
-to_unix_epoch = { status = "mismatch", batcher = "Expr.dt.timestamp", note = "Daft to_unix_epoch defaults to seconds; Batcher dt.timestamp defaults to microseconds. Param: unit='s'", wave = "W0" }
+to_unix_epoch = { status = "canonical", batcher = "Expr.dt.timestamp", template = 'to_unix_epoch(expr, time_unit="s") -> sem.column(expr).dt.timestamp(time_unit)' }
 to_utc_timestamp = { status = "gap", need = "to_utc_timestamp over tz-aware timestamps", wave = "W6" }
 total_days = { status = "gap", need = "Duration total_days", wave = "W6" }
 total_hours = { status = "gap", need = "Duration total_hours", wave = "W6" }
