@@ -214,7 +214,30 @@ def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table 
     return None if inferred is None else inferred.arrow.empty_table()
 
 
+#: `id(plan) -> (plan, carried)`, pinning the plan so a recycled id cannot answer for another.
+#: A re-issued query hands back the *same* plan object, and this analysis walks every node's
+#: schema and reruns Kyber's projection analysis: ~0.5 ms of a TPC-H q8 `collect()` whose whole
+#: control plane is a few milliseconds, recomputed for an immutable plan.
+_CARRIED_MEMO: dict[int, tuple[object, frozenset[str] | None]] = {}
+_CARRIED_MEMO_MAX = 256
+
+
 def carried_columns(plan) -> frozenset[str] | None:
+    """Column names that can actually flow through `plan`, memoized per plan instance.
+
+    See `_carried_columns` for what they are. A plan is immutable, so its answer cannot change.
+    """
+    hit = _CARRIED_MEMO.get(id(plan))
+    if hit is not None and hit[0] is plan:
+        return hit[1]
+    carried = _carried_columns(plan)
+    if len(_CARRIED_MEMO) >= _CARRIED_MEMO_MAX:
+        _CARRIED_MEMO.clear()
+    _CARRIED_MEMO[id(plan)] = (plan, carried)
+    return carried
+
+
+def _carried_columns(plan) -> frozenset[str] | None:
     """Column names that can actually flow through `plan`, or `None` when that is unknowable.
 
     Two kinds of column can reach a morsel, and the union of them is the answer:
