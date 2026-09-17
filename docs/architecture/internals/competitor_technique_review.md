@@ -3493,6 +3493,34 @@ Measured, the build with the route against the same build without it, alternatin
 rounds, every correctness check passing: per-query geomean **0.899**, b/duckdb **1.542 -> 1.379**,
 q12 0.61x, q3 0.66x, q10 0.69x, q6 0.70x, q1 0.79x.
 
+### 27k. arrow-rs 56 to 60 - **landed, TPC-H sf10 from Parquet 1.39x to 1.26x**
+
+With the read route in 27j, the rest of the scan gap is decode cost, and that code is arrow-rs's.
+Batcher pinned 56, four majors behind. A side-by-side benchmark decoding seven sf10 `lineitem`
+columns (zstd, dictionary-encoded) put `parquet` 60 at **1.2-1.6x faster decode** with metadata
+parsed once, and about 2x once footer parsing is included.
+
+Upgraded: `arrow`, `arrow-pyarrow`, `parquet`, `arrow-avro`, `arrow-flight` 56 -> 60; `pyo3` 0.25 ->
+0.29; `object_store` 0.12 -> 0.14; `tonic` 0.13 -> 0.14; `rust-version` 1.85 -> 1.88. API breaks
+were mechanical: the page-index types, `ArrowReaderOptions`' page-index policy, pyo3's
+`allow_threads`/`with_gil` renames, `ObjectStoreExt`. Three things were not:
+
+- **The new page-index accessors panic on an out-of-range page** where 56 returned `None`, so they
+  are bounds-checked to keep "cannot decide, keep the page".
+- **object_store 0.14 enables rustls' `aws-lc-rs` backend beside `ring`**, and rustls panics at the
+  first handshake with both present. The Flight shuffle installs `ring` once if nothing else has.
+- **`az://container/a/b.parquet` now addresses `a/b.parquet`.** object_store 0.12 took the host as
+  the container in its builder and *also* stripped the first path segment as a bucket, so it read
+  `b.parquet`, silently dropping a directory. This is a fix, and `store.rs`'s test records it.
+
+Measured: builds of the same commit on 56 and 60, alternating over two rounds of TPC-H sf10 read
+from Parquet, every correctness check passing: per-query geomean **0.905**, faster on 21 of 22
+queries, b/duckdb **1.389 -> 1.255** (each build's best time over DuckDB's best across all four
+runs). q21 is the one slower query, at 1.02x; q11 returns no rows at this scale, so its time was
+compared and its result was not. The box was shared during the run (load average 22-31), which
+widens each query's spread but not the direction. Rust: 2,476 tests passed, 0 failed. The
+differential, Parquet IO and Parquet unit suites gave identical results on both builds.
+
 ### What this pass did not do, and where the single-node gap now is
 
 The sf10 decomposition in `BENCHMARK_RESULTS.md` (2026-09-08) put the loss in the Parquet reader,
@@ -3501,8 +3529,9 @@ is the read's **total CPU**, not its occupancy: three `lineitem` columns decode 
 against DuckDB's 2.6 for decoding *and* summing them, at 34-43 cores busy. A prototype that folded
 each file into a partial aggregate concurrently, overlapping read and execute through the
 existing mergeable primitives, was **slower** on every shape (sum 40 to 82 ms, q1 about 400 to
-540 ms), and is not the lever on a box this wide. What remains is per-value decode cost in
-arrow-rs 56, which is a dependency question, and DuckDB's inline-prefix strings, item 2.
+540 ms), and is not the lever on a box this wide. What remained was per-value decode cost in
+arrow-rs 56, a dependency question that item 27k answered by moving to 60, and DuckDB's
+inline-prefix strings, item 2.
 
 ## Things Batcher already has, so do not "add" them
 

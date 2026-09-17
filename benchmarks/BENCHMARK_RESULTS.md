@@ -28897,3 +28897,19 @@ own round-to-round spread. Every run passed every correctness check.
 The oracle that motivated it forced a native unfiltered read for every predicated read with no
 pruning and no memory guard: 1.526 -> 1.356. The shipped route gives up nothing measurable
 against that oracle and keeps both protections.
+
+### arrow-rs 56 -> 60: the Parquet decode itself
+
+Same box and mirror. Two release builds of one commit, differing only in the arrow-rs, parquet,
+object_store and pyo3 versions (review item 27k), running TPC-H sf10 `--scan`, alternating 56, 60,
+56, 60, best-of-3 per run and the best of the two runs per build. The box was shared (load average
+22-31). DuckDB's time is its best across all four runs:
+
+| | b/duckdb, arrow 56 | b/duckdb, arrow 60 |
+|---|---:|---:|
+| TPC-H sf10 from Parquet | 1.389 | **1.255** |
+
+Per query, 60 against 56: geomean **0.905**; q5 0.83x, q6 0.86x, q14, q19 and q20 0.87x; q21
+1.02x is the only slower query. q11 returns zero rows at this scale and is reported DEGENERATE by
+the harness, so its time is counted and its result is not compared. Every other correctness check
+passed on both builds.
