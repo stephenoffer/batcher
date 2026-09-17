@@ -1202,7 +1202,7 @@ The Kyber optimizer entry point.
 | module | lines | what it is |
 |---|---|---|
 | `driver.py` | 522 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
-| `expr_dispatch.py` | 241 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
+| `expr_dispatch.py` | 255 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
 | `facade.py` | 593 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem

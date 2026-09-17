@@ -155,6 +155,11 @@ impl<'a> Needle<'a> {
         }
     }
 
+    /// This literal's [`short_key`] when it is at most eight bytes, else `None`.
+    fn short_key(&self) -> Option<u128> {
+        (self.bytes.len() <= 8).then(|| short_key(self.bytes, 0, self.bytes.len()))
+    }
+
     /// The row `values[start..end]`, whose prefix is `row_prefix`, ordered against this literal.
     #[inline(always)]
     fn order(&self, values: &[u8], start: usize, end: usize, row_prefix: u64) -> Ordering {
@@ -187,6 +192,17 @@ fn compare<O: OffsetSizeTrait>(
     op: BinaryOp,
 ) -> BooleanBuffer {
     let needle = Needle::new(lit);
+    if let Some(key) = needle.short_key() {
+        // Short literal: every row orders by one integer compare, with no branch on the data.
+        return match op {
+            BinaryOp::Eq => fill_short(strings, |row| row == key),
+            BinaryOp::Ne => fill_short(strings, |row| row != key),
+            BinaryOp::Lt => fill_short(strings, |row| row < key),
+            BinaryOp::Le => fill_short(strings, |row| row <= key),
+            BinaryOp::Gt => fill_short(strings, |row| row > key),
+            _ => fill_short(strings, |row| row >= key),
+        };
+    }
     let offsets = strings.value_offsets();
     let values = strings.values().as_slice();
     let ord = |i: usize| {
@@ -211,6 +227,16 @@ fn range<O: OffsetSizeTrait>(
     (hi_op, hi): (BinaryOp, &str),
 ) -> BooleanBuffer {
     let (lo, hi) = (Needle::new(lo), Needle::new(hi));
+    if let (Some(lo_key), Some(hi_key)) = (lo.short_key(), hi.short_key()) {
+        let strict_lo = matches!(lo_op, BinaryOp::Gt);
+        let strict_hi = matches!(hi_op, BinaryOp::Lt);
+        return match (strict_lo, strict_hi) {
+            (false, true) => fill_short(strings, |row| (row >= lo_key) & (row < hi_key)),
+            (false, false) => fill_short(strings, |row| (row >= lo_key) & (row <= hi_key)),
+            (true, true) => fill_short(strings, |row| (row > lo_key) & (row < hi_key)),
+            (true, false) => fill_short(strings, |row| (row > lo_key) & (row <= hi_key)),
+        };
+    }
     let offsets = strings.value_offsets();
     let values = strings.values().as_slice();
     let n = strings.len();
@@ -236,6 +262,39 @@ fn range<O: OffsetSizeTrait>(
         *word = bits;
     }
     BooleanBuffer::new(words.into(), 0, n)
+}
+
+/// One bit per row, `test` applied to each row's [`short_key`], filled a word at a time.
+#[inline(always)]
+fn fill_short<O: OffsetSizeTrait>(
+    strings: &GenericStringArray<O>,
+    test: impl Fn(u128) -> bool,
+) -> BooleanBuffer {
+    let offsets = strings.value_offsets();
+    let values = strings.values().as_slice();
+    let n = strings.len();
+    let mut words = vec![0u64; n.div_ceil(64)];
+    for (w, word) in words.iter_mut().enumerate() {
+        let base = w * 64;
+        let mut bits = 0u64;
+        for (bit, pair) in offsets[base..=(base + 64).min(n)].windows(2).enumerate() {
+            let (start, end) = (pair[0].as_usize(), pair[1].as_usize());
+            bits |= u64::from(test(short_key(values, start, end - start))) << bit;
+        }
+        *word = bits;
+    }
+    BooleanBuffer::new(words.into(), 0, n)
+}
+
+/// A row's order against any literal of at most eight bytes, as one integer: its prefix, then
+/// its length clamped to nine.
+///
+/// For such a literal, a row with a different prefix is ordered by the prefix, and a row with
+/// the same prefix is ordered by length — see the module note — and every row longer than
+/// eight bytes is longer than the literal, so lengths past eight need not be told apart.
+#[inline(always)]
+fn short_key(values: &[u8], start: usize, len: usize) -> u128 {
+    (u128::from(prefix(values, start, len)) << 8) | len.min(9) as u128
 }
 
 /// The first eight bytes of `bytes[start..start + len]` as a big-endian `u64`, zero past `len`.
