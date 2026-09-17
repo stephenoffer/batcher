@@ -29,6 +29,7 @@ mod build;
 mod dense;
 mod key_bits;
 mod key_filter;
+mod probe_par;
 mod radix;
 mod range;
 mod sort_merge;
@@ -153,6 +154,11 @@ impl IndexBuf {
         self.idx.len()
     }
 
+    /// The buffered indices, NULLs as the [`NULL_INDEX`] sentinel.
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        &self.idx
+    }
+
     /// Append another buffer's indices, preserving its NULL sentinels.
     ///
     /// Used to concatenate per-partition pieces **in partition order**, which is what makes
@@ -176,14 +182,45 @@ impl IndexBuf {
     }
 
     /// The Arrow column. No null buffer is built unless a NULL was actually pushed.
+    ///
+    /// With NULLs, the buffer is reused as the values and only a validity bitmap is built: one
+    /// pass for the bits, one to write `0` over each sentinel. That is the array the
+    /// `Option`-collecting form built — the same bits, `0` at every null slot — without a
+    /// per-element `Option` and a second allocation, which on an outer join of millions of rows
+    /// was a serial pass over the whole output.
     pub(crate) fn finish(self) -> UInt32Array {
         if !self.any_null {
             return UInt32Array::from(self.idx);
         }
-        self.idx
-            .into_iter()
-            .map(|v| (v != NULL_INDEX).then_some(v))
-            .collect()
+        let mut idx = self.idx;
+        let valid = arrow::buffer::BooleanBuffer::collect_bool(idx.len(), |i| idx[i] != NULL_INDEX);
+        for v in &mut idx {
+            if *v == NULL_INDEX {
+                *v = 0;
+            }
+        }
+        UInt32Array::new(idx.into(), Some(arrow::buffer::NullBuffer::new(valid)))
+    }
+
+    /// Several buffers concatenated in order into one, the copies running in parallel.
+    pub(crate) fn concat(parts: &[&IndexBuf]) -> IndexBuf {
+        let total: usize = parts.iter().map(|p| p.idx.len()).sum();
+        let mut idx = vec![0u32; total];
+        let mut slots: Vec<&mut [u32]> = Vec::with_capacity(parts.len());
+        let mut rest = idx.as_mut_slice();
+        for p in parts {
+            let (head, tail) = rest.split_at_mut(p.idx.len());
+            slots.push(head);
+            rest = tail;
+        }
+        slots
+            .into_par_iter()
+            .zip(parts.par_iter())
+            .for_each(|(dst, src)| dst.copy_from_slice(&src.idx));
+        IndexBuf {
+            idx,
+            any_null: parts.iter().any(|p| p.any_null),
+        }
     }
 }
 
@@ -1880,6 +1917,12 @@ fn build_probe_flat<K: JoinKeys + Sync>(
     bloom_fp_rate: f64,
 ) -> JoinIndices {
     let table = JoinTable::build(keys, right_rows, right_null, use_bloom, bloom_fp_rate);
+
+    // A large probe runs across cores in contiguous ranges, reassembled into exactly the order
+    // and relation the serial probe below emits. See `probe_par`.
+    if let Some(ranges) = probe_par::probe_ranges(left_rows) {
+        return probe_par::probe_in_order(&table, keys, &ranges, left_null, right_rows, join_type);
+    }
 
     // Probe with the left side. Pre-size outputs to the left row count — the lower
     // bound for inner/left; outer and duplicate-key cases grow from there.

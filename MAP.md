@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1495 Python modules across 218 packages and 294 Rust files across 15 crates.
+Covering 1495 Python modules across 218 packages and 296 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -315,7 +315,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1860 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `reader.py` | 1861 | The `bt.read` namespace — typed, per-format dataset readers. |
 | `writer.py` | 2242 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
@@ -604,7 +604,7 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 | `limits.py` | 266 | Client-side rate limiting for a hosted LLM endpoint. |
 | `openai.py` | 350 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
 | `parallelism.py` | 392 | How many GPUs one LLM engine replica needs, and what that choice costs. |
-| `sglang.py` | 349 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
+| `sglang.py` | 348 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
 | `vllm.py` | 500 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
 
@@ -961,7 +961,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 828 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3163 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3167 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 550 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 709 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1592,7 +1592,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | module | lines | what it is |
 |---|---|---|
 | `estimator.py` | 332 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
-| `kernel.py` | 463 | The kernel's own view of how close this process is to being OOM-killed. |
+| `kernel.py` | 466 | The kernel's own view of how close this process is to being OOM-killed. |
 | `learned.py` | 520 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 411 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 448 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
@@ -1982,7 +1982,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
 | `routing.py` | 137 | Which SQL backend serves this call — the one router the read and the write share. |
-| `snowflake.py` | 326 | Snowflake source + sink — one query submission, N shippable result chunks. |
+| `snowflake.py` | 328 | Snowflake source + sink — one query submission, N shippable result chunks. |
 | `uri.py` | 708 | Connection-URI parsing — one industry-standard URI, routed to the right backend. |
 
 ### `batcher/io/formats/sql/adbc/` — 2 · neutral IO
@@ -2364,7 +2364,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 487 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6795 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 6796 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -3072,7 +3072,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/dense.rs` | 335 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
 | `join/key_filter.rs` | 303 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 2091 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 2134 | Hash join — produces match index-pairs, built to distribute. |
+| `join/probe_par.rs` | 113 | The flat hash join's probe, across cores, emitting exactly what the serial probe emits. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 538 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
@@ -3155,6 +3156,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/geo/scalar.rs` | 367 | The scalar-returning geospatial functions: accessors, measures, predicates, codecs. |
 | `eval/hash/compat.rs` | 393 | Engine-compatible digests for `Expr::Hash` — Spark's `hash`, Iceberg's bucket hash, and Daft's default XXH3. |
 | `eval/hash/mod.rs` | 241 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
+| `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
 | `eval/in_list.rs` | 271 | `x IN (lit, lit, …)` — hash-set membership. |
 | `eval/list.rs` | 791 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 161 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
