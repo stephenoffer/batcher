@@ -289,6 +289,8 @@ def _nested_trunc(expr: Expr) -> tuple[DateTrunc, DateTrunc] | None:
     if not (isinstance(expr, DateTrunc) and isinstance(expr.input, DateTrunc)):
         return None
     inner = expr.input
+    if any(t.preserve_type or t.keep_time for t in (expr, inner)):
+        return None  # a clock-keeping or type-keeping truncation does not nest the same way
     if expr.unit not in _TRUNC_ORDER or inner.unit not in _TRUNC_ORDER:
         return None  # an unknown unit errors in the engine — do not "fix" it here
     return expr, inner

@@ -235,8 +235,24 @@ def _r_case(e: Any, d: int) -> str:
     return f"{parts}.otherwise({render_expr(e.otherwise, d + 1)})"
 
 
+def _r_date_trunc(e: Any, d: int) -> str:
+    """``.dt.truncate('month')``, with each Polars flag named only when it is set.
+
+    The flags default off and are keyword arguments on the methods that set them, so the
+    generic accessor form (``truncate('month', False, False)``) read like a call nobody
+    writes. `keep_time` is set only by ``month_start(keep_time=True)`` and the ``last_day``
+    built on it; it renders as the node's own flags, since the node is what ran.
+    """
+    base = render_expr(e.input, d + 1)
+    if e.keep_time:
+        return f"{base}.dt.truncate({e.unit!r}, preserve_type={e.preserve_type!r}, keep_time=True)"
+    flag = ", preserve_type=True" if e.preserve_type else ""
+    return f"{base}.dt.truncate({e.unit!r}{flag})"
+
+
 _RENDERERS = {
     "Col": _r_col,
+    "DateTrunc": _r_date_trunc,
     "Lit": _r_lit,
     "Binary": _r_binary,
     "Aliased": _r_aliased,

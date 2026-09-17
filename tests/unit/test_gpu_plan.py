@@ -644,3 +644,32 @@ def test_nan_comparison_follows_the_engine(be):
     table = pa.table({"v": pa.array([float("nan"), 1.0, 3.0], type=pa.float64())})
     got, exp = _run(lambda ds: ds.filter(col("v") > 2.0), table, be)
     _assert_matches(got, exp, be)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: col("d").dt.truncate("month", preserve_type=True),
+        lambda: col("d").dt.month_start(keep_time=True),
+    ],
+)
+def test_polars_date_trunc_flags_decline(be, build):
+    """The Polars `date_trunc` flags are not translated, so the stage declines to the CPU.
+
+    Translating them would change what the device computes, which needs a recorded
+    `gpu_shadow_verify` run on hardware. Until then a flagged truncation must never run as a
+    plain one, which would return the midnight Timestamp instead of a Date or the kept clock.
+    """
+    table = pa.table({"d": pa.array([dt.date(2024, 2, 15), None], type=pa.date32())})
+    spec = gpu_plan_ops(bt.from_arrow(table).select(r=build())._plan)
+    assert spec is not None, "the projection is eligible; the flag is what must decline"
+    with pytest.raises(Unsupported):
+        run_chain(table, spec[1], be)
+
+
+def test_plain_date_trunc_still_translates(be):
+    """Positive control for the decline above: the unflagged truncation runs on the device."""
+    table = pa.table({"d": pa.array([dt.date(2024, 2, 15), None], type=pa.date32())})
+    spec = gpu_plan_ops(bt.from_arrow(table).select(r=col("d").dt.truncate("month"))._plan)
+    assert spec is not None
+    run_chain(table, spec[1], be)

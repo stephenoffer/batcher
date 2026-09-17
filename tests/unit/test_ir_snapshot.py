@@ -178,6 +178,8 @@ def _representatives() -> dict[str, Any]:
         # --- date/time ----------------------------------------------------------
         "date_func": DateFunc("year", Col("d")),
         "date_trunc": DateTrunc(Col("d"), "month"),
+        # Polars readings: a Date kept a Date, the clock kept across the roll-back.
+        "date_trunc_flags": DateTrunc(Col("d"), "month", preserve_type=True, keep_time=True),
         "make_temporal": MakeTemporal("make_date", [Col("y"), Col("m"), Col("d")]),
         "convert_timezone": ConvertTimezone(Col("d"), "UTC", "America/New_York"),
         "date_offset_full": DateOffset(Col("d"), 1, 2, 3),

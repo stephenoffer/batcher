@@ -289,10 +289,62 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
 
 /// `date_trunc(unit, ts)` — truncate each timestamp to the start of `unit`,
 /// returning Timestamp(microsecond). Calendar-correct via chrono.
-pub(crate) fn eval_date_trunc(arr: &ArrayRef, unit: &str) -> Result<ArrayRef, ExprError> {
+///
+/// The default answers a Timestamp for a Date input too, because DuckDB does
+/// (`typeof(date_trunc('month', DATE '2024-02-15'))` is `TIMESTAMP`). Two flags restore
+/// Polars' reading without a second spelling:
+///
+/// * `preserve_type` answers a Date32 for a Date32 input (Polars `dt.truncate`). A
+///   Timestamp input is unaffected.
+/// * `keep_time` truncates only the calendar part and adds the input's time of day back
+///   (Polars `dt.month_start`, where 2024-02-15 13:45 rolls back to 2024-02-01 13:45). It
+///   is only meaningful for a unit of a day or coarser, and errors for a finer one rather
+///   than returning the input unchanged under a name that promised a truncation.
+pub(crate) fn eval_date_trunc(
+    arr: &ArrayRef,
+    unit: &str,
+    preserve_type: bool,
+    keep_time: bool,
+) -> Result<ArrayRef, ExprError> {
+    let out = truncate_to_timestamp(arr, unit, keep_time)?;
+    if preserve_type && matches!(arr.data_type(), DataType::Date32) {
+        // A Date32 has no time of day, so the truncated instant is always a midnight and
+        // the cast is exact.
+        return Ok(cast(&out, &DataType::Date32)?);
+    }
+    Ok(out)
+}
+
+/// The DuckDB `date_trunc` body: floor each instant to `unit` as Timestamp(µs), adding the
+/// time of day back when `keep_time` is set.
+fn truncate_to_timestamp(
+    arr: &ArrayRef,
+    unit: &str,
+    keep_time: bool,
+) -> Result<ArrayRef, ExprError> {
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{Int64Type, TimeUnit};
     use chrono::{DateTime, Datelike, NaiveDate, Timelike};
+
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    if keep_time
+        && matches!(
+            unit,
+            "hour"
+                | "minute"
+                | "second"
+                | "millisecond"
+                | "milliseconds"
+                | "microsecond"
+                | "microseconds"
+        )
+    {
+        return Err(ExprError::MissingArgument {
+            func: "date_trunc".into(),
+            arg: "a unit of a day or coarser (keep_time keeps the clock, so a sub-day unit \
+                  would truncate nothing)",
+        });
+    }
 
     let ts = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
     let micros = cast(&ts, &DataType::Int64)?;
@@ -376,9 +428,16 @@ pub(crate) fn eval_date_trunc(arr: &ArrayRef, unit: &str) -> Result<ArrayRef, Ex
     let out: Int64Array = (0..m.len())
         .map(|i| {
             if m.is_null(i) {
-                None
+                return None;
+            }
+            let us = m.value(i);
+            let floor = truncate(us)?;
+            if keep_time {
+                // The time of day is the floored remainder, so a pre-1970 instant keeps
+                // the clock it reads rather than a negative offset.
+                floor.checked_add(us - floor_div(us, MICROS_PER_DAY) * MICROS_PER_DAY)
             } else {
-                truncate(m.value(i))
+                Some(floor)
             }
         })
         .collect();
@@ -758,7 +817,7 @@ mod tests {
             ),
         ];
         for (unit, e0, e1) in cases {
-            let out = eval_date_trunc(&arr, unit).unwrap();
+            let out = eval_date_trunc(&arr, unit, false, false).unwrap();
             assert_eq!(
                 out.data_type(),
                 &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -770,7 +829,91 @@ mod tests {
         }
 
         // An unknown unit still errors cleanly (no silent null-out).
-        assert!(eval_date_trunc(&arr, "fortnight").is_err());
+        assert!(eval_date_trunc(&arr, "fortnight", false, false).is_err());
+    }
+
+    #[test]
+    fn date_trunc_answers_a_timestamp_for_a_date_unless_preserve_type() {
+        use arrow::datatypes::TimeUnit;
+        let arr: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(date(2024, 2, 29)), // leap day
+            Some(date(1969, 6, 15)), // pre-epoch
+            None,
+        ]));
+        // DuckDB: `date_trunc('month', DATE ...)` is a TIMESTAMP.
+        let plain = eval_date_trunc(&arr, "month", false, false).unwrap();
+        assert_eq!(
+            plain.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        // Polars: a Date stays a Date.
+        let kept = eval_date_trunc(&arr, "month", true, false).unwrap();
+        let d = kept.as_primitive::<Date32Type>();
+        assert_eq!(d.value(0), date(2024, 2, 1));
+        assert_eq!(d.value(1), date(1969, 6, 1));
+        assert!(d.is_null(2));
+        // A timestamp input is untouched by the flag.
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(0i64)]));
+        let out = eval_date_trunc(&ts, "month", true, false).unwrap();
+        assert_eq!(
+            out.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn date_trunc_flags_deserialize_from_the_python_wire_shape() {
+        // `tests/unit/data/ir_snapshot_golden.json::date_trunc` and `::date_trunc_flags`.
+        let plain: crate::Expr = serde_json::from_str(
+            r#"{"e": "date_trunc", "input": {"e": "col", "name": "d"}, "unit": "month"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            plain,
+            crate::Expr::DateTrunc {
+                preserve_type: false,
+                keep_time: false,
+                ..
+            }
+        ));
+        let flagged: crate::Expr = serde_json::from_str(
+            r#"{"e": "date_trunc", "input": {"e": "col", "name": "d"}, "keep_time": true,
+                "preserve_type": true, "unit": "month"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            flagged,
+            crate::Expr::DateTrunc {
+                preserve_type: true,
+                keep_time: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn date_trunc_keep_time_rolls_the_date_back_and_keeps_the_clock() {
+        use arrow::datatypes::TimestampMicrosecondType;
+        let at = |y, mo, d, h, mi, us: u32| -> i64 {
+            NaiveDate::from_ymd_opt(y, mo, d)
+                .unwrap()
+                .and_hms_micro_opt(h, mi, 0, us)
+                .unwrap()
+                .and_utc()
+                .timestamp_micros()
+        };
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(at(2024, 2, 15, 13, 45, 123_456)),
+            Some(at(1969, 12, 31, 23, 59, 500_000)),
+            None,
+        ]));
+        let out = eval_date_trunc(&arr, "month", false, true).unwrap();
+        let t = out.as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(t.value(0), at(2024, 2, 1, 13, 45, 123_456));
+        assert_eq!(t.value(1), at(1969, 12, 1, 23, 59, 500_000));
+        assert!(t.is_null(2));
+        // A sub-day unit would truncate nothing, so it is refused.
+        assert!(eval_date_trunc(&arr, "hour", false, true).is_err());
     }
 
     #[test]

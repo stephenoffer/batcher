@@ -218,6 +218,16 @@
     },
     "unit": "month"
   },
+  "date_trunc_flags": {
+    "e": "date_trunc",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "keep_time": true,
+    "preserve_type": true,
+    "unit": "month"
+  },
   "geo_binary": {
     "args": [
       {

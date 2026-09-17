@@ -108,17 +108,23 @@ def partition_months(expr: IntoExpr) -> Expr:
     return (value.dt.year() - _EPOCH_YEAR) * _MONTHS_PER_YEAR + (value.dt.month() - 1)
 
 
-def partition_days(expr: IntoExpr) -> Expr:
+def partition_days(expr: IntoExpr, as_date: bool = False) -> Expr:
     """Days since 1970-01-01 — the Iceberg ``days(ts)`` partition transform.
 
     Negative before 1970: 1969-06-01 is ``-214``. This is the same integer a ``date``
     column already holds, which is why the transform is a cast rather than a subtraction.
 
+    The default is the integer the Iceberg specification stores. Daft's
+    ``partition_days`` returns the same day as a Date column, so pass ``as_date=True``
+    for that form.
+
     Args:
         expr: A date or timestamp expression, or a column name.
+        as_date: Return the partition day as a Date instead of an Int64 day count.
 
     Returns:
-        A new Int64 expression: the whole days between the epoch and this value.
+        A new Int64 expression of the whole days between the epoch and this value, or a
+        Date expression when ``as_date`` is set.
 
     Examples:
         .. doctest::
@@ -128,8 +134,12 @@ def partition_days(expr: IntoExpr) -> Expr:
             >>> ds = bt.from_pydict({"t": [dt.date(2024, 3, 5), dt.date(1969, 6, 1)]})
             >>> ds.select(p=bt.partition_days("t")).to_pydict()
             {'p': [19787, -214]}
+
+            >>> ds.select(p=bt.partition_days("t", as_date=True)).to_pydict()
+            {'p': [datetime.date(2024, 3, 5), datetime.date(1969, 6, 1)]}
     """
-    return _col_or_expr(expr).cast("date").cast("int64")
+    day = _col_or_expr(expr).cast("date")
+    return day if as_date else day.cast("int64")
 
 
 def partition_hours(expr: IntoExpr) -> Expr:

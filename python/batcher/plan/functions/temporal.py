@@ -12,7 +12,7 @@ from __future__ import annotations
 import datetime as _dt
 
 from batcher._internal.errors import PlanError, require_int
-from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit, _wrap
+from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit, _col_or_expr, _wrap
 from batcher.plan.expr_ir.func_nodes import MakeTemporal, WindowBuckets, WindowStart
 from batcher.plan.expr_ir.namespaces.temporal import parse_offset
 from batcher.plan.ir_tags import MICROS_PER_DAY
@@ -367,9 +367,14 @@ def from_epoch(expr: IntoExpr, unit: str = "s") -> Expr:
     instant lands in the microsecond that contains it rather than one microsecond late.
     A value too large to scale into microseconds is null rather than a wrapped instant.
 
+    A bare string names a column, as it does in Polars: ``from_epoch("t")`` reads column
+    ``t``. It used to be a string literal, which is never an epoch count, so the call
+    answered an all-null column with no error.
+
     Args:
-        expr: An integer column of epoch counts.
-        unit: The unit of those counts: ``"s"``, ``"ms"``, ``"us"``, or ``"ns"``.
+        expr: An integer column of epoch counts, or its name.
+        unit: The unit of those counts: ``"s"``, ``"ms"``, ``"us"``, or ``"ns"``. For a
+            count of whole days use :func:`from_unix_date`, which returns a Date.
 
     Returns:
         A Timestamp expression at microsecond resolution.
@@ -391,7 +396,7 @@ def from_epoch(expr: IntoExpr, unit: str = "s") -> Expr:
     """
     if unit not in _EPOCH_UNITS:
         raise PlanError(f"from_epoch(): unit must be one of {sorted(_EPOCH_UNITS)}, got {unit!r}")
-    return MakeTemporal(_EPOCH_UNITS[unit], [_wrap(expr)])
+    return MakeTemporal(_EPOCH_UNITS[unit], [_col_or_expr(expr)])
 
 
 def from_unix_date(expr: IntoExpr) -> Expr:
@@ -400,8 +405,10 @@ def from_unix_date(expr: IntoExpr) -> Expr:
     The counterpart of :func:`from_epoch` for a column that counts whole days rather
     than sub-day units, which is how several warehouse exports encode a date.
 
+    A bare string names a column, as it does for :func:`from_epoch`.
+
     Args:
-        expr: An integer column of days since the Unix epoch.
+        expr: An integer column of days since the Unix epoch, or its name.
 
     Returns:
         A Date32 expression.
@@ -414,4 +421,4 @@ def from_unix_date(expr: IntoExpr) -> Expr:
             >>> ds.select(r=bt.from_unix_date(bt.col("d"))).to_pydict()
             {'r': [datetime.date(1970, 1, 1), datetime.date(2024, 2, 29)]}
     """
-    return MakeTemporal("from_unix_date", [_wrap(expr)])
+    return MakeTemporal("from_unix_date", [_col_or_expr(expr)])

@@ -62,7 +62,7 @@ def _rebuild_unary(call: Expr, value: Expr) -> Expr:
     if isinstance(call, DateFunc):
         return DateFunc(call.fn, value)
     if isinstance(call, DateTrunc):
-        return DateTrunc(value, call.unit)
+        return DateTrunc(value, call.unit, call.preserve_type, call.keep_time)
     if isinstance(call, Strftime):
         return Strftime(value, call.format)
     if isinstance(call, Strptime):

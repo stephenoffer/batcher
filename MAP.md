@@ -1318,7 +1318,7 @@ Extended Kyber rule families.
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 487 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
 | `temporal_date_cast.py` | 186 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
-| `temporal_extra.py` | 460 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
+| `temporal_extra.py` | 462 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
 | `temporal_folds.py` | 185 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
 | `temporal_sargable.py` | 279 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
 | `topn_limit.py` | 213 | LIMIT / OFFSET rewrites that the base limit rules don't already cover. |
@@ -1397,7 +1397,7 @@ NORMALIZE-phase whole-tree rewrites, grouped by family.
 | `disjunctions.py` | 174 | Disjunctions of equalities folded into an `IN` list, and the range they imply. |
 | `fold.py` | 280 | Constant folding — evaluate constant sub-expressions at plan time. |
 | `predicates.py` | 232 | Boolean-predicate normalizations in the NORMALIZE phase. |
-| `ranges.py` | 364 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
+| `ranges.py` | 373 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
 | `simplify.py` | 195 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
 
 ### `batcher/kyber/rules/nulls/` — 3 · subsystem
@@ -1665,7 +1665,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `exprs.py` | 439 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 384 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `pruning.py` | 417 | Narrow a plan tree to the columns it actually reads, at every level rather than at the leaves. |
-| `scalar_fns.py` | 411 | The named scalar-function families: math, two-argument math, and dates. |
+| `scalar_fns.py` | 415 | The named scalar-function families: math, two-argument math, and dates. |
 | `temporal.py` | 411 | The calendar half of the date vocabulary: `date_trunc`, `offset_by`, the year-derived |
 | `tree.py` | 212 | The whole-plan form of the translator: any tree of scans, joins and unions on the device. |
 | `windows.py` | 468 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
@@ -2338,11 +2338,11 @@ The scalar expression algebra.
 | `constructors.py` | 377 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 5966 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 353 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
-| `func_nodes.py` | 467 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
+| `func_nodes.py` | 473 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 411 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 529 | Leaf IR nodes the `Expr` base class does not construct. |
-| `render.py` | 257 | A readable ``repr`` for the scalar `Expr` tree. |
+| `render.py` | 273 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 379 | Structural traversals over the expression tree. |
 
@@ -2361,12 +2361,12 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | module | lines | what it is |
 |---|---|---|
 | `_bind.py` | 180 | Shared accessor-generation helper for the namespace families. |
-| `_descriptions.py` | 497 | The curated per-accessor docstrings, keyed by accessor name. |
+| `_descriptions.py` | 456 | The curated per-accessor docstrings, keyed by accessor name. |
 | `_temporal_units.py` | 137 | The truncation-unit vocabulary shared by `.dt.truncate`/`floor`/`ceil`/`round`. |
 | `collections.py` | 1620 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
 | `strings.py` | 4025 | The `.str` accessor namespace. |
-| `temporal.py` | 1165 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
+| `temporal.py` | 1326 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
 
@@ -2398,13 +2398,13 @@ The expression function library, grouped by family.
 | `aggregate.py` | 501 | Aggregate free functions that compose existing mergeable aggregates. |
 | `collection.py` | 170 | Collection-construction free functions (`struct`, `named_struct`, `map_from_arrays`, `sequence`). |
 | `horizontal.py` | 261 | Row-wise ("horizontal") reductions across several columns. |
-| `partitioning.py` | 194 | Lakehouse partition transforms — the derived value a partitioned table stores. |
+| `partitioning.py` | 204 | Lakehouse partition transforms — the derived value a partitioned table stores. |
 | `quantiles.py` | 192 | Quantile, cardinality, and histogram aggregate shorthands. |
 | `regression.py` | 263 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
 | `scalar.py` | 411 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
 | `security.py` | 285 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
 | `statistics.py` | 462 | Derived statistical aggregates built as expressions over mergeable primitives. |
-| `temporal.py` | 417 | Temporal free functions. |
+| `temporal.py` | 424 | Temporal free functions. |
 
 ### `batcher/plan/functions/analysis/` — 1 · contract
 
@@ -2605,7 +2605,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 |---|---|---|
 | `arithmetic.py` | 356 | Output types for the arithmetic families: binary operators and the math functions. |
 | `collections.py` | 204 | Output types for the container accessors: `list`, `struct` and `map`. |
-| `dispatch.py` | 301 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
+| `dispatch.py` | 307 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `geospatial.py` | 106 | Output types for the `st_*` geometry and `quat_*`/`se3_*` rigid-body functions. |
 | `scalars.py` | 234 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
 
@@ -3096,7 +3096,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/branch/mod.rs` | 146 | Short-circuiting evaluation of the branch-selecting forms: `CASE` and `COALESCE`. |
 | `eval/cast.rs` | 612 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
-| `eval/dispatch.rs` | 507 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 512 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 382 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/grid.rs` | 238 | The grid and reference-system functions, which take plain numbers rather than geometry. |
@@ -3169,12 +3169,12 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
 | `eval/temporal/civil.rs` | 193 | Calendar field extraction as integer arithmetic, for the date parts a query groups by. |
-| `eval/temporal/date.rs` | 630 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
+| `eval/temporal/date.rs` | 689 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 161 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 18 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/text.rs` | 215 | Text ↔ instant: `strftime` renders one, `strptime` reads one back. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 2467 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 2477 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 299 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 | `subset.rs` | 186 | Evaluating an expression over a *subset* of a batch's rows, and putting the answer back where it came from. |
 | `supertype.rs` | 207 | The common-supertype lattice over Arrow types — one answer for every tier. |

@@ -125,17 +125,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("d").dt.week()).to_pydict()\n'
         "        {'r': [7]}"
     ),
-    "dayofweek": (
-        "The day of week, Sunday = 0 through Saturday = 6.\n\n"
-        "For ISO numbering use ``isodow``; they differ only on Sunday, as the example is.\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 18, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.dayofweek()).to_pydict()  # a Sunday\n'
-        "        {'r': [0]}"
-    ),
     "dayofyear": (
         "The day of year, 1 through 366.\n\n"
         "Examples:\n"
@@ -171,26 +160,6 @@ _DESCRIPTIONS: dict[str, str] = {
         "        >>> # The finer-grained members keep it.\n"
         '        >>> pre.select(ms=bt.col("d").dt.epoch_ms()).to_pydict()\n'
         "        {'ms': [-750]}"
-    ),
-    "dayname": (
-        'The full English weekday name, e.g. "Monday" (→ Utf8).\n\n'
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.dayname()).to_pydict()\n'
-        "        {'r': ['Thursday']}"
-    ),
-    "monthname": (
-        'The full English month name, e.g. "January" (→ Utf8).\n\n'
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.monthname()).to_pydict()\n'
-        "        {'r': ['February']}"
     ),
     "weekday": (
         "The ISO day of week, Monday = 1 through Sunday = 7.\n\n"
@@ -232,16 +201,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
         '        >>> ds.select(r=bt.col("d").dt.millennium()).to_pydict()\n'
         "        {'r': [3]}"
-    ),
-    "last_day": (
-        "The last day of the instant's month (→ Date).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.last_day()).to_pydict()\n'
-        "        {'r': [datetime.date(2024, 2, 29)]}"
     ),
     # --- .list per-row reductions over each list value ----------------------
     # The reductions return null on an empty or null list; len/n_unique return 0

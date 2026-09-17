@@ -518,8 +518,18 @@ pub enum Expr {
     },
 
     /// `date_trunc(unit, ts)` — truncate a timestamp to the start of `unit`
-    /// (year/month/day/hour/minute/second). → Timestamp(us).
-    DateTrunc { input: Box<Expr>, unit: String },
+    /// (year/month/day/hour/minute/second). → Timestamp(us), as DuckDB, for either input
+    /// type. `preserve_type` keeps a Date32 input a Date32 (Polars `dt.truncate`);
+    /// `keep_time` truncates only the calendar part and carries the time of day across
+    /// (Polars `dt.month_start`). Both default off, so the wire shape is unchanged.
+    DateTrunc {
+        input: Box<Expr>,
+        unit: String,
+        #[serde(default)]
+        preserve_type: bool,
+        #[serde(default)]
+        keep_time: bool,
+    },
 
     /// `strftime(ts, format)` — format a Date/Timestamp with a chrono/strftime
     /// `format` string (e.g. `%Y-%m-%d`). Null instants format to null. → Utf8.

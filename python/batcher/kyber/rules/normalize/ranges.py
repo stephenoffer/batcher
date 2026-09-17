@@ -139,12 +139,21 @@ def date_trunc_to_range(plan: LogicalPlan) -> LogicalPlan:
 
 
 def _match_trunc_and_lit(a: Expr, b: Expr) -> tuple[DateTrunc, Lit] | tuple[None, None]:
-    """`(DateTrunc, Lit)` from a comparison's two sides in either order, else `(None, None)`."""
+    """`(DateTrunc, Lit)` from a comparison's two sides in either order, else `(None, None)`.
+
+    Only the plain DuckDB `date_trunc` matches. `keep_time` output is not a unit floor, so
+    `trunc = lit` is no longer one contiguous range; `preserve_type` changes the result's
+    type, which the range bounds are built against. Both are left for the engine.
+    """
     if isinstance(a, DateTrunc) and isinstance(b, Lit):
-        return a, b
-    if isinstance(b, DateTrunc) and isinstance(a, Lit):
-        return b, a
-    return None, None
+        trunc, lit = a, b
+    elif isinstance(b, DateTrunc) and isinstance(a, Lit):
+        trunc, lit = b, a
+    else:
+        return None, None
+    if trunc.preserve_type or trunc.keep_time:
+        return None, None
+    return trunc, lit
 
 
 def _rewrite_date_trunc_eq(expr: Expr) -> Expr:

@@ -378,6 +378,10 @@ _TRUNC_FREQ = {"second": "s", "minute": "min", "hour": "h", "day": "D"}
 def eval_date_trunc(ir, df, be, eval_expr):
     """`date_trunc(unit, ts)`, by flooring for the fixed-duration units and by calendar
     arithmetic for the rest."""
+    if ir.get("preserve_type") or ir.get("keep_time"):
+        # The Polars readings (a Date kept a Date, the clock kept across the roll-back) are
+        # not translated: declined, so the CPU engine answers rather than a midnight timestamp.
+        raise Unsupported("date_trunc preserve_type/keep_time")
     unit = ir.get("unit")
     freq = _TRUNC_FREQ.get(unit)
     x = be.column(eval_expr(ir["input"], df, be), df)

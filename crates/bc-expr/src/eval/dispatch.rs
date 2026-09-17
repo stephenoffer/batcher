@@ -414,9 +414,14 @@ impl Expr {
             // fails naming the function instead of panicking on a missing index.
             Expr::Geo { func, args } => eval_geo(*func, args, batch),
             Expr::Spatial { func, args } => eval_spatial(*func, args, batch),
-            Expr::DateTrunc { input, unit } => {
+            Expr::DateTrunc {
+                input,
+                unit,
+                preserve_type,
+                keep_time,
+            } => {
                 let arr = input.eval(batch)?;
-                eval_date_trunc(&arr, unit)
+                eval_date_trunc(&arr, unit, *preserve_type, *keep_time)
             }
             Expr::Strftime { input, format } => {
                 let arr = input.eval(batch)?;
