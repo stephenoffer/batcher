@@ -23,7 +23,7 @@ def main() -> None:
     orders = (
         tpch("orders")
         .select("o_orderkey", "o_totalprice", "o_orderstatus", "o_orderdate")
-        .head(1_000)
+        .limit(1_000)
     )
 
     packed = orders.select(
@@ -34,7 +34,7 @@ def main() -> None:
             day=col("o_orderdate"),
         ),
     )
-    print(packed.head(2).to_pydict())
+    print(packed.limit(2).to_pydict())
     assert packed.columns == ["o_orderkey", "detail"]
 
     # Reading one field back.

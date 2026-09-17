@@ -17,8 +17,8 @@ from batcher.plan.expr_ir.core import AggExpr, Expr
 from batcher.plan.functions.aggregate import _as_column
 
 __all__ = [
+    "approx_count_distinct",
     "approx_median",
-    "approx_n_unique",
     "approx_quantile",
     "histogram",
     "iqr",
@@ -28,12 +28,14 @@ __all__ = [
 ]
 
 
-def quantile(column: str | Expr, q: float) -> AggExpr:
+def quantile(column: str | Expr, q: float, interpolation: str = "linear") -> AggExpr:
     """Exact ``q``-quantile of a column (``q`` in ``[0, 1]``; ``0.5`` is the median).
 
     Args:
         column: The column to summarize, as a name or an expression.
         q: The quantile to compute, between 0 and 1.
+        interpolation: How a rank between two values resolves, as for
+            :meth:`Expr.quantile`; ``pl.quantile`` defaults to ``"nearest"``.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -46,7 +48,7 @@ def quantile(column: str | Expr, q: float) -> AggExpr:
             >>> ds.group_by("g").agg(q=bt.quantile("x", 0.5)).to_pydict()
             {'g': ['a'], 'q': [20.0]}
     """
-    return _as_column(column).quantile(q)
+    return _as_column(column).quantile(q, interpolation)
 
 
 def approx_quantile(column: str | Expr, q: float) -> AggExpr:
@@ -92,11 +94,13 @@ def approx_median(column: str | Expr) -> AggExpr:
     return _as_column(column).approx_median()
 
 
-def approx_n_unique(column: str | Expr) -> AggExpr:
+def approx_count_distinct(column: str | Expr, *, count_nulls: bool = False) -> AggExpr | Expr:
     """Approximate distinct count via a HyperLogLog sketch — bounded memory (~2% error).
 
     Args:
         column: The column to summarize, as a name or an expression.
+        count_nulls: Whether a null counts as one more value, as ``pl.approx_n_unique``
+            counts it.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -106,10 +110,10 @@ def approx_n_unique(column: str | Expr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [5, 5, 9]})
-            >>> ds.group_by("g").agg(n=bt.approx_n_unique("x")).sort("g").to_pydict()
+            >>> ds.group_by("g").agg(n=bt.approx_count_distinct("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'n': [1, 1]}
     """
-    return _as_column(column).approx_n_unique()
+    return _as_column(column).approx_count_distinct(count_nulls=count_nulls)
 
 
 def histogram(column: str | Expr) -> AggExpr:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 from batcher.carbonite.spill.scratch import make_store, scratch_dir
-from batcher.io.source import Source
+from batcher.io.source import Source, iter_source
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.types import logical_bytes, one_batch
 
@@ -73,7 +73,31 @@ def map_projection(plan: LogicalPlan, source_id: int) -> list[str] | None:
     return kyber.required_columns_per_source(plan).get(source_id)
 
 
-def _iter_spill_morsels(source: Source, projection: list[str] | None = None):
+def map_predicate(plan: LogicalPlan, source_id: int) -> dict | None:
+    """The predicate `source_id` may be read under for `plan` — Kyber's answer, for a spill phase.
+
+    The sibling of `map_projection`, and missing for the same reason it once was: every spill
+    phase read its source unfiltered, so `collect(spill=True)` over a Parquet table decoded
+    every row group a pushed predicate would have pruned, where `collect()` over the same plan
+    pruned them. Sound for the same reason pushdown is sound anywhere: the phase's map
+    sub-plan still carries the `Filter` directly above the scan and applies it to each morsel,
+    so a reader that returns a superset -- or ignores the predicate -- changes nothing.
+
+    Args:
+        plan: The breaker being spilled, rooted above the scan.
+        source_id: The scan whose predicate is wanted.
+
+    Returns:
+        The predicate IR for that source, or ``None`` when nothing may be pushed to it.
+    """
+    from batcher.kyber.rules.projections import required_predicates_per_source
+
+    return required_predicates_per_source(plan).get(source_id)
+
+
+def _iter_spill_morsels(
+    source: Source, projection: list[str] | None = None, predicate: dict | None = None
+):
     """Yield `source`'s batches normalized to ~``_SPILL_INPUT_CHUNK_BYTES``.
 
     Over-large batches are split into zero-copy `slice` views (bounded without a
@@ -100,7 +124,7 @@ def _iter_spill_morsels(source: Source, projection: list[str] | None = None):
         pending_bytes = 0
         return out
 
-    for batch in source.iter_batches(projection):
+    for batch in iter_source(source, projection, predicate):
         n = batch.num_rows
         if n == 0:
             continue

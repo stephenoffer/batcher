@@ -26,8 +26,8 @@ def main() -> None:
     assert ds.meta.any_match(col("status") == "bad")
     assert ds.meta.none_match(col("amount") < 0)
     assert ds.meta.all_match(col("amount") > 0)
-    assert not ds.meta.is_empty_where(col("status") == "bad")
-    assert ds.meta.is_empty_where(col("status") == "missing")
+    assert not ds.meta.none_match(col("status") == "bad")
+    assert ds.meta.none_match(col("status") == "missing")
 
     # When you do want the number.
     assert ds.meta.count_where(col("status") == "ok") == 4

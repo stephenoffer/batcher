@@ -279,12 +279,18 @@ def _collect(
         from batcher import core, kyber
         from batcher.api.orchestration import auto_num_partitions
         from batcher.api.orchestration.run import record_cardinality_outcome
+        from batcher.api.orchestration.topn_seeding import footer_seed
         from batcher.dist.spill import spill_collect
 
         hub = core.default_hub()
         partitions = num_partitions or auto_num_partitions(plan, sources, hub)
+        # A top-N bound proved from the source's footers holds on every scheduling, and this
+        # route never reaches `run_relational`, where `collect()` applies it.
+        seeded = footer_seed(plan, sources, hub)
         # Spill the optimized plan (COUNT(DISTINCT)→COUNT over DISTINCT; derived join keys).
-        opt_lp = kyber.optimize_logical(plan, sources=sources, hub=hub)
+        opt_lp = kyber.optimize_logical(
+            seeded.plan if seeded is not None else plan, sources=sources, hub=hub
+        )
         # `map_batches` runs in Python and deliberately does not lower to the engine IR, so
         # the disk-shuffle spill executor cannot run a plan carrying one. It did not *decline*
         # that plan, though — it entered the executor and raised `NotImplementedError:

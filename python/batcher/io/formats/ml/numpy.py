@@ -1,9 +1,12 @@
-"""NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns.
+"""NumPy ``.npy`` / ``.npz`` source and ``.npy`` sink — arrays as Arrow columns.
 
 A 1-D array becomes a single ``data`` column; an ``(n, dim)`` array becomes a
 ``FixedSizeList`` column (the Ray Data ``read_numpy`` convention); a higher-rank
 ``(n, *shape)`` array becomes a fixed-shape-tensor column that preserves the full
 per-row shape. ``.npz`` archives expose one column per stored array.
+
+`NumpySink` is the inverse for one column, which is Ray Data's ``write_numpy``: the column
+the reader would have produced is written back as the array it came from.
 """
 
 from __future__ import annotations
@@ -14,12 +17,13 @@ from typing import IO, Any
 
 import pyarrow as pa
 
+from batcher._internal.errors import SchemaError
 from batcher._internal.optional import require
-from batcher.io.base import FileSource
-from batcher.io.formats.base import SOURCES
+from batcher.io.base import FileSink, FileSource
+from batcher.io.formats.base import SINKS, SOURCES
 from batcher.plan.source_stats import SourceStatistics
 
-__all__ = ["NumpySource"]
+__all__ = ["NumpySink", "NumpySource"]
 
 # Bytes of array data a streamed chunk may hold. Bounds the read window; the batches
 # handed on are re-cut to the configured morsel by `FileSource._normalize`, so this is
@@ -231,3 +235,87 @@ class NumpySource(FileSource):
             return numpy_statistics(self._fs, self._files())
         except Exception:
             return None
+
+
+def _column_to_array(name: str, column: pa.Array) -> Any:
+    """One Arrow column as the ndarray `NumpySource` would read it back from.
+
+    The reader's rank rules, run backwards: a fixed-shape tensor becomes ``(n, *shape)``, a
+    fixed-size list of numbers ``(n, width)``, and a flat numeric, boolean or temporal
+    column a 1-D array. Anything else has no ``.npy`` layout that loads without pickle, and
+    a null has no representation at all, so both are refused by name rather than written as
+    an object array the reader cannot open or a NaN the source never held.
+    """
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    np = _np()
+    if column.null_count:
+        raise SchemaError(
+            f"write.numpy: column {name!r} holds {column.null_count} null(s), and a .npy "
+            "array has no null. Fill or drop them first (fill_null / drop_nulls)."
+        )
+    if is_tensor_column(column):
+        return column.to_numpy_ndarray()
+    dtype = column.type
+    if pa.types.is_fixed_size_list(dtype):
+        inner = dtype.value_type
+        if pa.types.is_integer(inner) or pa.types.is_floating(inner):
+            width = dtype.list_size
+            child = column.values.slice(column.offset * width, len(column) * width)
+            if child.null_count:
+                raise SchemaError(f"write.numpy: column {name!r} holds null list items")
+            return child.to_numpy(zero_copy_only=False).reshape(len(column), width)
+    elif (
+        pa.types.is_integer(dtype)
+        or pa.types.is_floating(dtype)
+        or pa.types.is_boolean(dtype)
+        or pa.types.is_timestamp(dtype)
+        or pa.types.is_duration(dtype)
+    ):
+        return np.asarray(column.to_numpy(zero_copy_only=False))
+    raise SchemaError(
+        f"write.numpy cannot write column {name!r} of type {dtype}: a .npy file holds a "
+        "numeric, boolean or temporal array, a fixed-size list of numbers, or a fixed-shape "
+        "tensor. Write this column with write.parquet or write.arrow instead."
+    )
+
+
+@SINKS.register("numpy")
+class NumpySink(FileSink):
+    """Write one column as a NumPy ``.npy`` array per output file.
+
+    The leading axis is the row axis, so a directory write produces one array per part
+    file and `NumpySource` reads the directory back as the same column. A ``.npy`` header
+    states the row count before the data, so each file is encoded whole; bound a large
+    write with ``max_rows_per_file``.
+
+    Args:
+        column: The column to write. May be omitted when the dataset has exactly one.
+    """
+
+    suffix = ".npy"
+    format_name = "numpy"
+
+    __slots__ = ("_column",)
+
+    def __init__(self, *, column: str | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)  # carries filesystem= / storage_options=
+        self._column = column
+
+    def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
+        name = self._column
+        if name is None:
+            if table.num_columns != 1:
+                raise SchemaError(
+                    "write.numpy writes one column and this dataset has "
+                    f"{table.num_columns} ({', '.join(table.column_names)}); name it with "
+                    "column=..."
+                )
+            name = table.column_names[0]
+        if name not in table.column_names:
+            from batcher._internal.errors import ColumnNotFoundError
+
+            raise ColumnNotFoundError.of(name, table.column_names)
+        column = table.column(name)
+        chunk = column.combine_chunks() if column.num_chunks != 1 else column.chunk(0)
+        _np().save(fh, _column_to_array(name, chunk), allow_pickle=False)

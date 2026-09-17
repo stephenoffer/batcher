@@ -274,6 +274,27 @@ print(out.to_pydict())
 # {'bucket': [1.0, 3.0, 4.0, 5.0]}
 ```
 
+A few Spark functions have no DuckDB twin and are top-level functions too. {py:obj}`bt.pmod(a, b) <batcher.pmod>` is the positive remainder, where `%` keeps the dividend's sign. {py:obj}`bt.bit_get(value, position) <batcher.bit_get>` reads one bit of an integer, counting from the least significant. {py:obj}`bt.elt(index, *values) <batcher.elt>` picks the `index`-th of its arguments on each row, and is null when the index is out of range. A string argument to these is a column name.
+
+```python
+nums = bt.from_pydict({"n": [-10, 7, 2], "flags": [5, 2, 3]})
+out = nums.select(
+    rem=bt.col("n") % 3,
+    pos=bt.pmod("n", 3),
+    low_bit=bt.bit_get("flags", 0),
+    label=bt.elt(bt.col("flags") - 1, bt.lit("low"), bt.lit("mid"), bt.lit("high")),
+)
+print(out.to_pydict())
+# {'rem': [-1, 1, 2], 'pos': [2, 1, 2], 'low_bit': [1, 0, 1], 'label': [None, 'low', 'mid']}
+```
+
+{py:obj}`bt.pi() <batcher.pi>` and {py:obj}`bt.e() <batcher.e>` are the two constants, folded to a literal when the plan is built.
+
+```python
+print(nums.select(tau=bt.pi() * 2, e=bt.e()).limit(1).to_pydict())
+# {'tau': [6.283185307179586], 'e': [2.718281828459045]}
+```
+
 ## Aggregate expressions
 
 Aggregate methods such as `.sum()`, `.mean()`, `.min()`, `.max()`, `.median()`,
@@ -288,6 +309,28 @@ out = ds.group_by().agg(
 )
 print(out.to_pydict())
 # {'total': [60.0], 'avg_qty': [2.0], 'rows': [3]}
+```
+
+## Inspecting an expression
+
+The `.meta` accessor answers questions about an expression's shape without running anything, which helps when a function receives expressions it did not build. {py:meth}`output_name <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.output_name>` is the column name the expression would take in a `select`, {py:meth}`root_names <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.root_names>` lists the columns it reads, {py:meth}`is_column <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.is_column>` tells a bare column from a computation, and {py:meth}`has_multiple_outputs <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.has_multiple_outputs>` is true for a selector that expands to several columns.
+
+```python
+revenue = (bt.col("price") * bt.col("qty")).alias("revenue")
+print(revenue.meta.output_name(), revenue.meta.root_names())
+# revenue ['price', 'qty']
+print(bt.col("price").meta.is_column(), bt.numeric().meta.has_multiple_outputs())
+# True True
+```
+
+{py:meth}`tree_format <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.tree_format>` draws the tree the engine is handed, one node per line.
+
+```python
+revenue.meta.tree_format()
+# alias(revenue)
+# └─ binary(mul)
+#    ├─ col(price)
+#    └─ col(qty)
 ```
 
 ## See also

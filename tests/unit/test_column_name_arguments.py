@@ -66,20 +66,19 @@ _CALLS = {
     "max": lambda d, c: d.max(c),
     "std": lambda d, c: d.std(c),
     "var": lambda d, c: d.var(c),
-    "n_unique": lambda d, c: d.n_unique(c),
-    "approx_n_unique": lambda d, c: d.approx_n_unique(c),
+    "count_distinct": lambda d, c: d.count_distinct(c),
+    "approx_count_distinct": lambda d, c: d.approx_count_distinct(c),
     "has_nulls": lambda d, c: d.has_nulls(c),
     "n_null": lambda d, c: d.n_null(c),
     "mode": lambda d, c: d.mode(c),
     "product": lambda d, c: d.product(c),
-    "skewness": lambda d, c: d.skewness(c),
+    "skew": lambda d, c: d.skew(c),
     "kurtosis": lambda d, c: d.kurtosis(c),
     "mad": lambda d, c: d.mad(c),
     "corr": lambda d, c: d.corr(c, "v"),
     "cov": lambda d, c: d.cov(c, "v"),
     "explode": lambda d, c: d.explode(c),
     "with_row_index": lambda d, c: d.with_row_index(c),
-    "with_row_count": lambda d, c: d.with_row_count(c),
     "with_watermark": lambda d, c: d.with_watermark(c, "1 second"),
     "session_window": lambda d, c: d.session_window(c, "5m", n=bt.col("v").sum()),
 }
@@ -97,8 +96,8 @@ def test_every_column_name_argument_refuses_an_expression_clearly(ds, api):
     assert api in message, f"{api} does not name itself in its own error"
 
 
-#: `with_row_index`/`with_row_count` name a *new* column, so "ts" would collide.
-_VALID_NAME = {"with_row_index": "idx", "with_row_count": "idx"}
+#: `with_row_index` names a *new* column, so "ts" would collide.
+_VALID_NAME = {"with_row_index": "idx"}
 
 
 @pytest.mark.unit

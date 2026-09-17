@@ -98,7 +98,7 @@ def test_group_by_multi_column_key():
 
 
 def test_count_distinct_distributed():
-    ds = _edge_ds().group_by("k").agg(cd=col("s").n_unique())
+    ds = _edge_ds().group_by("k").agg(cd=col("s").count_distinct())
     single, dist = _both(ds)
     assert_tables_equal(dist, single)
     import duckdb

@@ -33,7 +33,7 @@ def test_rule_registered():
 
 
 def test_rewrites_lone_count_distinct():
-    ds = _ds().group_by("g").agg(nd=col("v").n_unique())
+    ds = _ds().group_by("g").agg(nd=col("v").count_distinct())
     out = count_distinct_to_distinct_count(ds._plan, _ctx(ds))
     assert isinstance(out, Aggregate)
     # The distinct aggregate is gone — it is now a plain non-null COUNT…
@@ -47,13 +47,13 @@ def test_rewrites_lone_count_distinct():
 
 def test_no_fire_with_other_aggregates():
     # COUNT(DISTINCT v) alongside a row-level aggregate can't share one distinct.
-    ds = _ds().group_by("g").agg(nd=col("v").n_unique(), n=count())
+    ds = _ds().group_by("g").agg(nd=col("v").count_distinct(), n=count())
     assert count_distinct_to_distinct_count(ds._plan, _ctx(ds)) is None
 
 
 def test_no_fire_for_approx_count_distinct():
     # approx_count_distinct is the bounded-memory HLL path — must not be rewritten.
-    ds = _ds().group_by("g").agg(nd=col("v").approx_n_unique())
+    ds = _ds().group_by("g").agg(nd=col("v").approx_count_distinct())
     assert count_distinct_to_distinct_count(ds._plan, _ctx(ds)) is None
 
 
@@ -66,7 +66,7 @@ def test_gated_on_group_count_against_cores():
 
     from batcher.plan.resource import HardwareProfile
 
-    ds = _ds().group_by("g").agg(nd=col("v").n_unique())  # ~2 groups
+    ds = _ds().group_by("g").agg(nd=col("v").count_distinct())  # ~2 groups
 
     def _ctx_cores(n: int) -> OptimizerContext:
         est = StatsEstimator(ds._sources, learned={})
@@ -83,6 +83,6 @@ def test_gated_on_group_count_against_cores():
 
 def test_result_preserved_end_to_end():
     # The optimized query returns the same per-group distinct counts.
-    got = _ds().group_by("g").agg(nd=col("v").n_unique()).collect().to_pydict()
+    got = _ds().group_by("g").agg(nd=col("v").count_distinct()).collect().to_pydict()
     pairs = dict(zip(got["g"], got["nd"], strict=True))
     assert pairs == {"a": 1, "b": 2}

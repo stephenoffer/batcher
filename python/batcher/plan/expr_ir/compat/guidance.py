@@ -15,6 +15,8 @@ typo and a `Dataset` typo read identically.
 
 from __future__ import annotations
 
+import re
+
 from batcher._internal.errors import absent_error, public_members
 
 __all__ = ["EXPR_UNSUPPORTED", "expr_attribute_error"]
@@ -47,25 +49,28 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     ),
     "sort": "Sort rows at the Dataset level: ds.sort('x'). Inside a list use .list.sort().",
     "sort_by": "Sort rows at the Dataset level: ds.sort('x', descending=True).",
+    "rint": "Round half to even is bt.col('x').round(mode='half_to_even').",
     "explode": "Explode a list column at the Dataset level: ds.explode('x').",
     "value_counts": (
         "Value counts is a Dataset op: ds.value_counts('x'), or ds.group_by('x').len()."
     ),
     "unique": (
-        "Distinct values are ds.select('x').distinct(); count them with bt.col('x').n_unique()."
+        "Distinct values are ds.select('x').distinct(); count them with "
+        "bt.col('x').count_distinct()."
     ),
     "unique_counts": "Per-value counts are ds.value_counts('x').",
     "drop_nulls": (
         "Drop nulls at the Dataset level: ds.drop_nulls('x'), or filter bt.col('x').is_not_null()."
     ),
     "drop_nans": (
-        "Drop NaN with ds.filter(bt.col('x').is_not_nan()); .fill_nan(v) replaces them in place."
+        "Drop the rows holding NaN with ds.drop_nans('x'); .fill_nan(v) replaces them in place."
     ),
     "gather": (
-        "Positional gather is not an expression op. Use ds.slice(...) / ds.gather_every(...)."
+        "Positional gather is not an expression op. Use ds.limit(n, offset=o) / "
+        "ds.gather_every(...)."
     ),
-    "take": "Positional take is not an expression op. Use ds.slice(...) / ds.head(n).",
-    "head": "On a list use .list.head(n); at the Dataset level use ds.head(n).",
+    "take": "Positional take is not an expression op. Use ds.limit(n, offset=o).",
+    "head": "On a list use .list.head(n); at the Dataset level use ds.limit(n).",
     "tail": "On a list use .list.slice(-n, n); at the Dataset level use ds.tail(n).",
     "reverse": "On a list use .list.reverse(); at the Dataset level use ds.reverse().",
     "flatten": "Flatten a list column with .list.flatten(), or explode it with ds.explode('x').",
@@ -81,13 +86,19 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     "coalesce": "Spelled bt.coalesce(bt.col('a'), bt.col('b')) (a top-level function) here.",
     "combine_first": "Fill nulls from another column with bt.coalesce(bt.col('a'), bt.col('b')).",
     # --- argmax / positional stats ----------------------------------------------------
-    "argmax": "Spelled bt.col('x').arg_max() here.",
-    "argmin": "Spelled bt.col('x').arg_min() here.",
-    "idxmax": "The argmax index is bt.col('x').arg_max().",
-    "idxmin": "The argmin index is bt.col('x').arg_min().",
+    "argmax": (
+        "Spelled bt.col('x').arg_max(order_by=...) here (the value at another column's max "
+        "is max_by)."
+    ),
+    "argmin": (
+        "Spelled bt.col('x').arg_min(order_by=...) here (the value at another column's min "
+        "is min_by)."
+    ),
+    "idxmax": "The argmax index is bt.col('x').arg_max(order_by=...).",
+    "idxmin": "The argmin index is bt.col('x').arg_min(order_by=...).",
     # --- clipping / casting naming ----------------------------------------------------
-    "clip_lower": "Spelled bt.col('x').clip_min(lo) here.",
-    "clip_upper": "Spelled bt.col('x').clip_max(hi) here.",
+    "clip_lower": "Spelled bt.col('x').clip(lower=lo) here.",
+    "clip_upper": "Spelled bt.col('x').clip(upper=hi) here.",
     "to_physical": (
         "Reinterpret the storage type with bt.col('x').cast('int64') (or the target dtype)."
     ),
@@ -144,7 +155,7 @@ def expr_attribute_error(expr: object, name: str) -> AttributeError:
         An `AttributeError` that explains the absence and names the Batcher spelling,
         accessor, or Dataset method to use instead.
     """
-    return absent_error("Expr", name, EXPR_UNSUPPORTED, public_members(type(expr)))
+    return absent_error("Expr", name, EXPR_UNSUPPORTED, public_members(type(expr)), receiver="Expr")
 
 
 # --- typed-accessor migration tables -------------------------------------------------
@@ -161,14 +172,14 @@ STR_UNSUPPORTED: dict[str, str] = {
     "encode": "Byte encoding is not exposed; string columns are already UTF-8 text.",
     "extractall": "Spelled .str.extract_all(pattern) here.",
     "find": "The index of a substring is .str.position(sub).",
-    "findall": "All matches are .str.extract_all(pattern) or .str.regexp_extract_all(pattern).",
+    "findall": "All matches are .str.extract_all(pattern).",
     "fullmatch": (
         ".str.match(pattern) anchors the start only, as pandas .str.match does; "
         "anchor the end yourself with .str.regexp_matches('^(?:pattern)$')."
     ),
     "get": "The i-th character is .str.slice(i, 1).",
     "index": "The index of a substring is .str.position(sub).",
-    "isdecimal": "Spelled .str.isdigit() / .str.is_numeric() here.",
+    "isdecimal": "Spelled .str.is_numeric() here.",
     "islower": "Spelled .str.is_lower() here.",
     "isnumeric": "Spelled .str.is_numeric() here.",
     "istitle": "There is no is_title; compare against .str.to_titlecase().",
@@ -204,11 +215,12 @@ LIST_UNSUPPORTED: dict[str, str] = {
     # the same operation, so it redirects to `gather` rather than to the scalar accessors,
     # which index one position instead of taking a column of them.
     "take": "Positional take is .list.gather(indices), taking a column of positions per row.",
+    "sort_desc": "Sort descending with .list.sort(descending=True); the nulls stay last.",
     "count_matches": (
         "Count occurrences by filtering and .list.len(), or test with .list.contains(x)."
     ),
     "set_symmetric_difference": (
-        "Symmetric difference is .list.set_difference(a, b) both ways, then .list.union(...)."
+        "Symmetric difference is .list.difference(b) both ways, then .list.union(...)."
     ),
     "shift": "Shifting elements within a list is not built in; explode, window, and re-aggregate.",
     "sample": "Sampling within a list is not built in; explode then ds.sample(...).",
@@ -252,4 +264,6 @@ def accessor_attribute_error(
         An `AttributeError` naming the Batcher accessor method to use instead, or a
         `Did you mean ...?` against the accessor's real methods for a near miss.
     """
-    return absent_error(label, name, table, public_members(type(accessor)))
+    namespace = re.search(r"'\.(\w+)' accessor", label)
+    receiver = f"Expr.{namespace.group(1)}" if namespace else None
+    return absent_error(label, name, table, public_members(type(accessor)), receiver=receiver)

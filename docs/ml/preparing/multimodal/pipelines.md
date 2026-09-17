@@ -82,7 +82,7 @@ catalog = bt.read.parquet("s3://bucket/catalog.parquet")  # has a "url" column
 captioned = (
     catalog.ml.download("url", output_column="bytes")  # CPU: fetch
     .with_columns(image=bt.col("bytes").image.to_tensor(224, 224))  # engine: decode
-    .ml.map_batches(Captioner, batch_size=64, num_gpus=1, concurrency=2)  # GPU: model
+    .map_batches(Captioner, batch_size=64, num_gpus=1, concurrency=2)  # GPU: model
 )
 captioned.write.parquet("s3://bucket/captioned.parquet")
 ```

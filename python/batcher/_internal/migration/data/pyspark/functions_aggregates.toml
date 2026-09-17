@@ -1,0 +1,140 @@
+# PySpark 4.2.0 -> Batcher migration registry: pyspark.sql.functions, aggregates, window functions and sketches.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[functions]
+any_value = { status = "canonical", batcher = "Expr.any_value" }
+approx_count_distinct = { status = "param", batcher = "bt.approx_count_distinct", need = "rsd= relative standard deviation", wave = "W2" }
+approx_percentile = { status = "param", batcher = "Expr.approx_quantile", need = "a list of percentages, accuracy=, and returning an actual input value", wave = "W2" }
+array_agg = { status = "canonical", batcher = "bt.array_agg", template = 'array_agg(col) -> sem.column(col).array_agg(ignore_nulls=True)' }
+avg = { status = "canonical", batcher = "Expr.mean" }
+bit_and = { status = "canonical", batcher = "bt.bit_and" }
+bit_or = { status = "canonical", batcher = "bt.bit_or" }
+bit_xor = { status = "canonical", batcher = "bt.bit_xor" }
+bool_and = { status = "canonical", batcher = "bt.bool_and" }
+bool_or = { status = "canonical", batcher = "bt.bool_or" }
+collect_list = { status = "canonical", batcher = "Expr.array_agg", template = 'collect_list(col) -> sem.column(col).array_agg(ignore_nulls=True)' }
+collect_set = { status = "param", batcher = "Expr.array_agg", need = "distinct=True collection that skips nulls", wave = "W2" }
+corr = { status = "canonical", batcher = "bt.corr" }
+count = { status = "canonical", batcher = ["Expr.count", "bt.count"], template = 'count(col) -> sem.spark_count(col)' }
+count_distinct = { status = "param", batcher = "bt.count_distinct", need = "several columns counted as one distinct tuple", wave = "W2" }
+count_if = { status = "canonical", batcher = "bt.count_if" }
+covar_pop = { status = "canonical", batcher = "bt.covar_pop" }
+covar_samp = { status = "canonical", batcher = "bt.covar_samp" }
+cume_dist = { status = "canonical", batcher = "bt.cume_dist" }
+dense_rank = { status = "canonical", batcher = "bt.dense_rank" }
+every = { status = "canonical", batcher = "bt.bool_and" }
+first = { status = "mismatch", batcher = "bt.first", note = "Spark first takes whatever row arrives first and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.first(order_by, ignore_nulls=ignorenulls)", wave = "W0" }
+first_value = { status = "mismatch", batcher = "bt.first_value", note = "the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.first_value(x, ignore_nulls=...)", wave = "W0" }
+grouping = { status = "gap", need = "GROUPING() indicator inside cube/rollup/grouping sets aggregates", wave = "W8" }
+grouping_id = { status = "gap", need = "GROUPING_ID() bit vector inside cube/rollup/grouping sets aggregates", wave = "W8" }
+histogram_numeric = { status = "gap", need = "approximate numeric histogram with nBins", wave = "W14" }
+kurtosis = { status = "canonical", batcher = "bt.kurtosis", template = 'kurtosis(col) -> sem.column(col).kurtosis(bias=True)' }
+lag = { status = "param", batcher = "bt.lag", need = "default= value for rows before the partition start", wave = "W5" }
+last = { status = "mismatch", batcher = "bt.last", note = "Spark last takes whatever row arrives last and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.last(order_by, ignore_nulls=ignorenulls)", wave = "W0" }
+last_value = { status = "mismatch", batcher = "bt.last_value", note = "the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.last_value(x, ignore_nulls=...)", wave = "W0" }
+lead = { status = "param", batcher = "bt.lead", need = "default= value for rows past the partition end", wave = "W5" }
+listagg = { status = "canonical", batcher = "Expr.str.join" }
+listagg_distinct = { status = "param", batcher = "Expr.str.join", need = "distinct=True", wave = "W2" }
+max = { status = "canonical", batcher = "bt.max" }
+max_by = { status = "param", batcher = "bt.max_by", template = 'max_by(col, ord) -> sem.column(col).max_by(sem.column(ord), ignore_nulls=False)', need = "k= for the top-k values", wave = "W2" }
+mean = { status = "canonical", batcher = "bt.mean" }
+median = { status = "canonical", batcher = "bt.median" }
+min = { status = "canonical", batcher = "bt.min" }
+min_by = { status = "param", batcher = "bt.min_by", template = 'min_by(col, ord) -> sem.column(col).min_by(sem.column(ord), ignore_nulls=False)', need = "k= for the bottom-k values", wave = "W2" }
+mode = { status = "canonical", batcher = "bt.mode" }
+nth_value = { status = "mismatch", batcher = "bt.nth_value", note = "the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.nth_value(x, n, ignore_nulls=...)", wave = "W0" }
+ntile = { status = "canonical", batcher = "bt.ntile" }
+percent_rank = { status = "canonical", batcher = "bt.percent_rank" }
+percentile = { status = "param", batcher = "Expr.quantile", need = "a list of percentages and frequency= weights", wave = "W2" }
+percentile_approx = { status = "param", batcher = "Expr.approx_quantile", need = "a list of percentages, accuracy=, and returning an actual input value", wave = "W2" }
+product = { status = "canonical", batcher = "bt.product" }
+rank = { status = "canonical", batcher = "bt.rank" }
+regr_avgx = { status = "canonical", batcher = "bt.regr_avgx" }
+regr_avgy = { status = "canonical", batcher = "bt.regr_avgy" }
+regr_count = { status = "canonical", batcher = "bt.regr_count" }
+regr_intercept = { status = "canonical", batcher = "bt.regr_intercept" }
+regr_r2 = { status = "canonical", batcher = "bt.regr_r2" }
+regr_slope = { status = "canonical", batcher = "bt.regr_slope" }
+regr_sxx = { status = "canonical", batcher = "bt.regr_sxx" }
+regr_sxy = { status = "canonical", batcher = "bt.regr_sxy" }
+regr_syy = { status = "canonical", batcher = "bt.regr_syy" }
+row_number = { status = "canonical", batcher = "bt.row_number" }
+skewness = { status = "canonical", batcher = "bt.skew", template = 'skewness(col) -> sem.column(col).skew(bias=True)' }
+some = { status = "canonical", batcher = "bt.bool_or" }
+std = { status = "canonical", batcher = "bt.std" }
+stddev = { status = "canonical", batcher = "bt.std" }
+stddev_pop = { status = "canonical", batcher = "bt.stddev_pop" }
+stddev_samp = { status = "canonical", batcher = "bt.std" }
+string_agg = { status = "canonical", batcher = "Expr.str.join" }
+string_agg_distinct = { status = "param", batcher = "Expr.str.join", need = "distinct=True", wave = "W2" }
+sum = { status = "canonical", batcher = "bt.sum" }
+sum_distinct = { status = "param", batcher = "Expr.sum", need = "distinct=True", wave = "W2" }
+try_avg = { status = "gap", need = "average returning null on overflow", wave = "W3" }
+try_sum = { status = "gap", need = "sum returning null on overflow", wave = "W3" }
+var_pop = { status = "canonical", batcher = "bt.var_pop" }
+var_samp = { status = "canonical", batcher = "bt.var" }
+variance = { status = "canonical", batcher = "bt.var" }
+bitmap_and_agg = { status = "gap", need = "DataSketches-binary-compatible bitmap sketch function", wave = "W14" }
+bitmap_bit_position = { status = "gap", need = "DataSketches-binary-compatible bitmap sketch function", wave = "W14" }
+bitmap_bucket_number = { status = "gap", need = "DataSketches-binary-compatible bitmap sketch function", wave = "W14" }
+bitmap_construct_agg = { status = "gap", need = "DataSketches-binary-compatible bitmap sketch function", wave = "W14" }
+bitmap_count = { status = "gap", need = "DataSketches-binary-compatible bitmap sketch function", wave = "W14" }
+bitmap_or_agg = { status = "gap", need = "DataSketches-binary-compatible bitmap sketch function", wave = "W14" }
+count_min_sketch = { status = "gap", need = "DataSketches-binary-compatible count-min sketch function", wave = "W14" }
+hll_sketch_agg = { status = "gap", need = "DataSketches-binary-compatible HLL sketch function", wave = "W14" }
+hll_sketch_estimate = { status = "gap", need = "DataSketches-binary-compatible HLL sketch function", wave = "W14" }
+hll_union = { status = "gap", need = "DataSketches-binary-compatible HLL sketch function", wave = "W14" }
+hll_union_agg = { status = "gap", need = "DataSketches-binary-compatible HLL sketch function", wave = "W14" }
+kll_merge_agg_bigint = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_merge_agg_double = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_merge_agg_float = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_agg_bigint = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_agg_double = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_agg_float = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_n_bigint = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_n_double = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_n_float = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_quantile_bigint = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_quantile_double = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_quantile_float = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_rank_bigint = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_rank_double = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_get_rank_float = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_merge_bigint = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_merge_double = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_merge_float = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_to_string_bigint = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_to_string_double = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+kll_sketch_to_string_float = { status = "gap", need = "DataSketches-binary-compatible KLL sketch function", wave = "W14" }
+theta_difference = { status = "gap", need = "DataSketches-binary-compatible theta sketch function", wave = "W14" }
+theta_intersection = { status = "gap", need = "DataSketches-binary-compatible theta sketch function", wave = "W14" }
+theta_intersection_agg = { status = "gap", need = "DataSketches-binary-compatible theta sketch function", wave = "W14" }
+theta_sketch_agg = { status = "gap", need = "DataSketches-binary-compatible theta sketch function", wave = "W14" }
+theta_sketch_estimate = { status = "gap", need = "DataSketches-binary-compatible theta sketch function", wave = "W14" }
+theta_union = { status = "gap", need = "DataSketches-binary-compatible theta sketch function", wave = "W14" }
+theta_union_agg = { status = "gap", need = "DataSketches-binary-compatible theta sketch function", wave = "W14" }
+tuple_difference_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_difference_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_difference_theta_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_difference_theta_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_intersection_agg_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_intersection_agg_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_intersection_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_intersection_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_intersection_theta_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_intersection_theta_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_sketch_agg_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_sketch_agg_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_sketch_estimate_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_sketch_estimate_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_sketch_summary_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_sketch_summary_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_sketch_theta_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_sketch_theta_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_union_agg_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_union_agg_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_union_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_union_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_union_theta_double = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }
+tuple_union_theta_integer = { status = "gap", need = "DataSketches-binary-compatible tuple sketch function", wave = "W14" }

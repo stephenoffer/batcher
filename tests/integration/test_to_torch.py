@@ -1,4 +1,4 @@
-"""`Dataset.to_torch` / `to_torch_dataloader` — framework-export round trip.
+"""`ds.ml.iter_torch_batches` / `to_torch_dataloader` — framework-export round trip.
 
 Skipped when `torch` is not installed. Verifies tensor dicts, numeric-only column
 selection, re-iterability (multi-epoch), and the DataLoader wrapper.
@@ -26,8 +26,7 @@ def _ds():
 
 
 def test_to_torch_tensor_dicts_numeric_only():
-    td = _ds().to_torch()
-    batches = list(td)
+    batches = list(_ds().ml.iter_torch_batches(device="cpu"))
     assert batches, "expected at least one batch"
     for b in batches:
         assert set(b) == {"x", "y"}  # the string column is dropped
@@ -35,9 +34,9 @@ def test_to_torch_tensor_dicts_numeric_only():
 
 
 def test_to_torch_is_reiterable_across_epochs():
-    td = _ds().to_torch()
-    epoch1 = [{k: v.tolist() for k, v in b.items()} for b in td]
-    epoch2 = [{k: v.tolist() for k, v in b.items()} for b in td]
+    ds = _ds()
+    epoch1 = [{k: v.tolist() for k, v in b.items()} for b in ds.ml.iter_torch_batches(device="cpu")]
+    epoch2 = [{k: v.tolist() for k, v in b.items()} for b in ds.ml.iter_torch_batches(device="cpu")]
     assert epoch1 == epoch2
     # The values survive the round trip.
     merged_x = [x for b in epoch1 for x in b["x"]]
@@ -46,14 +45,13 @@ def test_to_torch_is_reiterable_across_epochs():
 
 def test_to_torch_tensors_are_writable():
     """Training mutates batches in place, so the buffer must be owned, not Arrow-backed."""
-    td = _ds().to_torch()
-    first = next(iter(td))
+    first = next(iter(_ds().ml.iter_torch_batches(device="cpu")))
     before = first["x"].tolist()
     first["x"] += 1
     assert first["x"].tolist() == [v + 1 for v in before]
 
 
 def test_to_torch_dataloader_iterates():
-    dl = _ds().to_torch_dataloader()
+    dl = _ds().ml.to_torch_dataloader()
     seen = sum(1 for _ in dl)
     assert seen >= 1

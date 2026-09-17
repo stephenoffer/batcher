@@ -56,7 +56,7 @@ def duck():
 def test_dropna_matches_duckdb_and_pandas(ds, duck):
     """The whole-row form and the subset form, which differ on this fixture."""
     pandas = pytest.importorskip("pandas")
-    whole = ds.dropna().to_pydict()
+    whole = ds.drop_nulls().to_pydict()
     want = duck.execute(
         "SELECT g, n, const, txt FROM t WHERE g IS NOT NULL AND n IS NOT NULL"
         " AND const IS NOT NULL AND txt IS NOT NULL ORDER BY g, n"
@@ -64,7 +64,7 @@ def test_dropna_matches_duckdb_and_pandas(ds, duck):
     got = sorted(zip(whole["g"], whole["n"], whole["const"], whole["txt"], strict=True))
     assert got == sorted(want)
 
-    subset = ds.dropna(subset=["txt"]).to_pydict()
+    subset = ds.drop_nulls(subset=["txt"]).to_pydict()
     assert None not in subset["txt"]
     assert len(subset["txt"]) == 5, "only the null text row goes; the null n row stays"
 
@@ -78,8 +78,8 @@ def test_drop_empty_removes_the_empty_string_as_well_as_the_null(ds):
     kept = ds.drop_empty("txt").to_pydict()["txt"]
     assert kept == ["hello world", "hi", "a much longer piece of text here", "mid"]
     assert "" not in kept and None not in kept
-    assert None not in ds.dropna(subset=["txt"]).to_pydict()["txt"]
-    assert "" in ds.dropna(subset=["txt"]).to_pydict()["txt"], (
+    assert None not in ds.drop_nulls(subset=["txt"]).to_pydict()["txt"]
+    assert "" in ds.drop_nulls(subset=["txt"]).to_pydict()["txt"], (
         "dropna keeps the empty string, which is what makes drop_empty a different verb"
     )
 
@@ -223,7 +223,7 @@ def test_the_split_refuses_fractions_that_leave_no_training_set():
 def test_to_csv_round_trips_through_the_reader(ds, tmp_path):
     """The CSV shorthand, checked by reading the file back rather than by eyeballing it."""
     target = tmp_path / "out.csv"
-    ds.to_csv(str(target))
+    ds.write.csv(str(target))
     written = sorted(tmp_path.glob("**/*.csv"))
     assert written, f"nothing was written under {tmp_path}"
     back = bt.read.csv(str(target)).to_pydict()
@@ -254,7 +254,7 @@ def test_glimpse_bounds_what_it_prints(capsys):
 def test_the_verbs_survive_an_empty_frame():
     """Each verb over zero rows must answer, not raise."""
     empty = bt.from_pydict({"g": [], "n": [], "txt": []})
-    assert empty.dropna().to_pydict() == {"g": [], "n": [], "txt": []}
+    assert empty.drop_nulls().to_pydict() == {"g": [], "n": [], "txt": []}
     assert empty.drop_empty("txt").to_pydict()["txt"] == []
     assert empty.filter_by_length("txt", min_chars=1).to_pydict()["txt"] == []
     assert empty.class_balance("g").to_pydict()["g"] == []

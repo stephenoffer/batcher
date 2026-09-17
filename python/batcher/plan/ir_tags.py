@@ -255,8 +255,16 @@ AGG_FNS: Final = frozenset(
         # Assembly contiguity. `n_length`/`l_count` carry their fraction in `param`, as
         # `quantile` does; `n50`/`n90`/`l50` are the public spellings over them.
         "n_length", "l_count", "aun",
+        # Parameter forms with a state of their own to finalize, each reached only through
+        # a parameter on the one public spelling: `min_by(by, ignore_nulls=False)`,
+        # `skew(bias=True)`, `mode(all_modes=True)`.
+        "arg_min_null", "arg_max_null", "skewness_pop", "modes",
     }
 )  # fmt: skip
+
+#: How `quantile` resolves a rank between two elements, mirroring the Rust
+#: `QuantileInterpolation` enum. `linear` is the default and is never written to the IR.
+QUANTILE_INTERPOLATIONS: Final = frozenset({"linear", "lower", "higher", "nearest", "midpoint"})
 
 #: The aggregates that *count* rather than measure, so their answer over no rows is `0` and
 #: never null. Every other aggregate over an empty group is null, and the distinction is the

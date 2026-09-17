@@ -14,7 +14,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_float
 from batcher.api._join_helpers import _as_key_expr
 from batcher.plan.expr_ir import Col, nullif, when
 from batcher.plan.expr_ir.selectors import Selector, expand_selectors
@@ -29,6 +29,7 @@ from batcher.plan.logical import (
     WindowFrame,
     WindowFuncSpec,
 )
+from batcher.plan.logical.window import sql_default_frame
 from batcher.plan.types import normalize_dtype_spec
 
 if TYPE_CHECKING:
@@ -124,6 +125,7 @@ def build_window(
                     f"{sorted(WINDOW_AGGREGATES & WINDOW_FRAMEABLE)}"
                 )
             fn_frame = wframe if func in WINDOW_FRAMEABLE else None
+            fn_frame = sql_default_frame(func, fn_frame, ordered=bool(order_specs))
             specs.append(WindowFuncSpec(func, _as_key_expr(column), alias, int(offset), fn_frame))
         else:
             raise PlanError(
@@ -464,7 +466,8 @@ def build_sample(
     if seed is None:
         seed = random.randrange(2**63)
     # The fraction field is required by the node; for count mode it is unused (1.0).
-    return ds._derive(Sample(ds._plan, 1.0 if n is not None else float(fraction), int(seed), n))
+    rate = 1.0 if n is not None else require_float(fraction, func="sample", arg="fraction")
+    return ds._derive(Sample(ds._plan, rate, int(seed), n))
 
 
 def build_unpivot(

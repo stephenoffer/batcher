@@ -45,7 +45,7 @@ def main() -> None:
     equivalent = (
         orders.with_columns(
             order_year=col("o_orderdate").dt.year(),
-            status=col("o_orderstatus").str.to_uppercase(),
+            status=col("o_orderstatus").str.upper(),
         )
         .group_by("order_year", "status")
         .agg(orders=bt.count(), avg_price=col("o_totalprice").mean().round(2))

@@ -7,8 +7,9 @@ description: Port a Daft workload to Batcher's public Python API — the relatio
 
 Daft and Batcher target the same shape of work: multimodal and ML-first pipelines
 over a native columnar engine, distributed with Ray. The port is mostly mechanical.
-Read `docs/getting-started/migration/transforming.md` and `docs/getting-started/migration/reading-and-writing.md`
-(the mapping tables and the `from_*`/`to_*` adapters)
+Read `docs/getting-started/migration/daft/index.md` (every Daft name, generated from the
+migration registry) and `docs/getting-started/migration/reading-and-writing.md` (the
+`from_*`/`to_*` adapters)
 and `docs/benchmarks/comparisons/vs-daft.md` (the scorecard) before promising a user a speedup.
 Batcher wins multimodal ingest and top-N and ties aggregation. The join-heavy TPC-H
 result is **hardware-dependent and has moved**: that page measures Daft ahead on a
@@ -32,27 +33,17 @@ Both engines are lazy: Daft builds a plan and runs on `collect()`/`show()`; Batc
 `Dataset` does the same on `collect()`, `to_arrow()`, `to_pydict()`, `count()`,
 `show()`, `iter_batches()`, or `write.*`. That model ports unchanged.
 
-| Daft | Batcher |
-|---|---|
-| `daft.read_parquet(p)` | `bt.read.parquet(p)` |
-| `daft.read_warc(p)` | `bt.read.warc(p)` — one row per crawl record; `.warc.gz` transparent |
-| `daft.read_huggingface("user/ds")` | `bt.from_huggingface(datasets.load_dataset("user/ds"))` — load first, then wrap |
-| `daft.from_pydict(d)` | `bt.from_pydict(d)` |
-| `daft.col("a")` | `bt.col("a")` |
-| `df.select("a", "b")` | `ds.select("a", "b")` |
-| `df.with_column("c", e)` | `ds.with_columns(c=e)` |
-| `df.where(pred)` | `ds.filter(pred)` |
-| `df.groupby("k").agg(...)` | `ds.group_by("k").agg(total=col("v").sum())` |
-| `df.groupby("k").map_groups(fn)` | `ds.group_by("k").map_groups(fn)` |
-| `df.join(o, on="k")` | `ds.join(o, on="k", how="inner")` |
-| `df.sort("a", desc=True)` | `ds.sort("a", descending=True)` |
-| `df.limit(n)` | `ds.limit(n)` |
-| `df.distinct()` | `ds.distinct()` |
-| `df.explode("c")` | `ds.explode("c")` |
-| `df.into_partitions(n)` | `ds.repartition(n)` |
-| `df.collect()` | `ds.collect()` (pyarrow `Table`) |
-| `df.to_arrow()` / `.to_pandas()` | `ds.to_arrow()` / `ds.to_pandas()` |
-| `df.explain()` | `ds.explain()` (plus `ds.stats()` for *measured* per-op cost) |
+Every Daft 0.7.25 public name has one row in the migration registry
+(`python/batcher/_internal/migration/data/daft/`), rendered into
+`docs/getting-started/migration/daft/`: `dataframe.md` (`DataFrame`, `GroupedDataFrame`,
+`Window`), `module.md` (the `daft` module: constructors, readers, session shortcuts, UDF
+decorators), `functions-numeric.md`, `functions-strings.md`, `functions-temporal.md`,
+`functions-nested.md` (on `Expression` and `daft.functions`), `udfs-ai-multimodal.md`,
+`session-and-catalog.md`, and `types.md`. Read each row's status before renaming a call. A
+`mismatch` returns a different answer under the Batcher spelling, such as `day_of_week`
+numbering, 0-based `find`, or `decode_image` yielding pixels in Daft and a header
+struct here. Fix a wrong row in the registry and run `just migration-docs`; don't restate it in
+this skill.
 
 ## Multimodal and ML translation
 
@@ -61,34 +52,12 @@ This is where the two engines actually differ. Daft puts media work on `.url` an
 pure per-value transforms and the **`ds.ml` pipeline** for anything that loads a
 model or does network IO.
 
-| Daft | Batcher |
-|---|---|
-| `col("url").url.download()` | `ds.ml.download("url", output_column="bytes")` |
-| `col("bytes").image.decode()` | `col("bytes").image.decode()` — a struct, not just dimensions |
-| `image_width(c)` / `image_height(c)` / `image_channel(c)` / `image_mode(c)` | one `col("c").image.decode()`, then `.struct.field("width" \| "height" \| "channels" \| "mode")`. Daft re-reads the header per call; Batcher reads it once |
-| `col("img").image.resize(w, h)` | `col("img").image.resize(w, h)` |
-| `crop(c, x, y, w, h)` | `col("c").image.crop(x, y, w, h)` — clips at the edge; `center_crop` is the padding one |
-| `encode_image(c, fmt)` | `col("c").image.encode(fmt)` — `png`/`jpeg`/`bmp`/`gif` |
-| `convert_image(c, mode)` | `col("c").image.convert(mode)` — `L`/`LA`/`RGB`/`RGBA` |
-| image → tensor for a model | `col("img").image.to_tensor()` |
-| audio decode / resample | `col("a").audio.decode()`, `.audio.resample(...)`, `.audio.to_waveform()` |
-| video decode | `col("v").video.decode()` |
-| `daft.read_parquet` over image paths | `bt.read.images(path, decode=True, size=(224, 224))`, `bt.read.video(...)`, `bt.read.point_cloud(...)` |
-| `col("j").json.query(...)` | `col("j").json.extract_string(p)` / `extract_int` / `extract_float` / `extract_bool` |
-| `json_array_length(c, p)` / `json_object_keys(c, p)` | `col("c").json.array_length(p)` / `.json.keys(p)` |
-| `json_tuple(c, *keys)` | `col("c").json.values(p)` then `explode`, or one `extract_*` per key |
-| — | `col("c").json.type_of(p)` and `.json.exists(p)`: route a field whose type varies, and tell an absent key from a JSON `null` |
-| `.struct.get("f")` / map access | `col("s").struct.field("f")`, `col("m").map.get(k)` / `.keys()` / `.values()` |
-| list/embedding ops | `col("e").list.cosine_distance(o)`, `.l2_distance`, `.dot`, `.normalize`, `.mean_pool` |
-| `df.with_column("emb", embed_text(col("t")))` | `ds.ml.embed(model, column="t", output_column="emb", num_gpus=1)` |
-| a model UDF over batches | `ds.ml.infer(model, column=..., num_gpus=..., concurrency=...)` |
-| LLM generation UDF | `ds.ml.generate(...)` / `batcher.ml.llm_generate(..., engine=vllm_engine("..."))` |
-| zero-shot labeling | `ds.ml.classify(engine, labels=[...])` |
-| — | `ds.ml.near_duplicates("text")` / `ds.ml.drop_near_duplicates(...)`, `ds.ml.similarity_join(other, left_on=...)` |
-| — | `ds.ml.stream_loader(batch_size=, world_size=, rank=)` — sharded, resumable training feed |
+`udfs-ai-multimodal.md` maps each image, video, audio, file and AI function. A URL fetch is
+`ds.ml.download(...)`, a Dataset-level stage rather than an expression, and a model call is
+`ds.ml.infer` / `ds.ml.embed` / `ds.ml.generate`.
 
 **Pass a class, not an instance**, to `ds.ml.infer` / `ds.ml.embed` /
-`ds.ml.map_batches`: the model is then constructed once per worker instead of being
+`ds.map_batches`: the model is then constructed once per worker instead of being
 pickled per batch. `num_gpus=` and `concurrency=` size the GPU actor pool; batch size
 adapts under a VRAM cap rather than being a number you tune.
 
@@ -106,43 +75,19 @@ frames.write.parquet("s3://bucket/labels/")
 
 ## Scalar-function translation
 
-The functions where Batcher's spelling differs and the capability does not. Everything
-absent from this table is either the same name or covered by the relational table above.
+The scalar functions are on the `functions-*.md` pages, one row per name on both `Expression`
+and `daft.functions`.
 
-| Daft | Batcher |
-|---|---|
-| `to_snake_case(c)`, `to_camel_case(c)`, `to_kebab_case(c)`, `to_title_case(c)`, `to_upper_*` | one `col("c").str.to_case(style)`; the styles add `sentence`, `dot`, `train` |
-| `compress(c, codec)` / `decompress(c, codec)` | `col("c").str.compress(codec)` / `.str.decompress(codec)`; adds zstd, brotli, lz4 |
-| `try_compress` / `try_decompress` | not needed — `decompress` is already lenient, so a bad frame is null |
-| `regexp_split(c, p)` | `col("c").str.regexp_split(p)` |
-| `great_circle_distance(a, b, c, d)` | `bt.great_circle_distance(a, b, c, d, unit="km")`; also `m`/`mi`/`nm` |
-| `make_date(y, m, d)` / `make_timestamp(...)` | `bt.make_date(...)` / `bt.make_timestamp(...)` |
-| `timestamp_seconds(c)` / `timestamp_millis(c)` / `timestamp_micros(c)` | `bt.from_epoch(c, "s" \| "ms" \| "us" \| "ns")` |
-| `date_from_unix_date(c)` | `bt.from_unix_date(c)` |
-| `length_bytes(c)` | `col("c").str.len_bytes()` |
-| `eq_null_safe(a, b)` | `a.eq_missing(b)` |
-| `is_inf(c)` / `not_null(c)` | `c.is_infinite()` / `c.is_not_null()` |
-| `columns_sum(...)` / `columns_max(...)` | `bt.sum_horizontal(...)` / `bt.max_horizontal(...)` |
-| `date_format(c, f)` / `datepart(p, c)` / `date_trunc(u, c)` | `col("c").dt.strftime(f)` / `bt.date_part(p, c)` / `col("c").dt.truncate(u)` |
-| `dot_product(a, b)` / `jaccard_similarity(a, b)` | `a.list.dot(b)` / `a.list.jaccard(b)` |
-| `list_sum(c)` / `list_max(c)` / … | `col("c").list.sum()` / `.list.max()` / … |
-| `monotonically_increasing_id()` | `ds.with_row_index()` — a `Dataset` method, not an expression |
-| `random_int(lo, hi)` | `ds.with_random()` (seeded, `[0, 1)`) scaled and cast |
-| `uuid()` | no equivalent, deliberately: a random value per row would make the sequential, parallel and distributed paths disagree, and those must be identical. Use `col("k").str.hash64()` for a surrogate key |
-
-**Do not reach for an epoch cast.** Daft's `timestamp_seconds` has no Batcher alias on
-purpose: `col("t").cast("timestamp")` compiles, runs, and is wrong, because Arrow reads a
+**Do not reach for an epoch cast.** Daft's `timestamp_seconds` maps to `bt.from_epoch`, not to a
+cast: `col("t").cast("timestamp")` compiles, runs, and is wrong, because Arrow reads a
 bare integer as *microseconds*. `bt.from_epoch(c, "s")` is the port.
 
 ## The UDF story
 
-| Daft | Batcher |
-|---|---|
-| `@daft.udf(return_dtype=...)` on a batch fn | `@bt.udf(output_columns=[...])`, applied to a `Dataset` |
-| stateful class UDF (`__init__` + `__call__`) | the same class handed to `ds.map_batches(Cls, ...)` / `ds.ml.map_batches` |
-| per-row UDF | `@bt.udf(per_row=True)`, or `ds.map`/`ds.flat_map` — avoid; see gotchas |
-| a Python row predicate | `ds.ml.filter(fn)` — the last resort; an `Expr` in `ds.filter` stays in Rust |
-| SQL-callable UDF | `bt.register_function(name, fn, result_type=...)` |
+`module.md` has the rows for `udf`, `cls`, `func`, and `method`. None of them is canonical:
+Daft's decorators produce expression-level UDFs, and Batcher's `@bt.udf` wraps a batch function
+applied to a whole `Dataset`, so a Daft UDF ports to `ds.map_batches(fn)` or, for a model,
+`ds.ml.infer`.
 
 `ds.map_batches(fn)` hands `fn` a pyarrow `RecordBatch` and expects one back —
 vectorized Arrow compute inside, never a row loop. Declare `input_columns` (what you
@@ -183,18 +128,24 @@ credit-based flow control**, bypassing the object store entirely. Practically:
 
 1. **Split the script into relational vs model stages.** The relational half ports
    verb-for-verb from the first table; the model half moves onto `ds.ml`.
-2. **Replace the readers.** `daft.read_*` → `bt.read.<fmt>`; for media, prefer the
+2. **Run the codemod first.** `python -m batcher.migrate --from daft --to batcher <paths>`
+   prints a diff and changes nothing until you add `--write`. The `daft` direction may not be
+   implemented yet: the command then raises `ConfigError` naming the directions that are, and
+   the `daft/index.md` page says the same. Port by hand from the generated pages in that case.
+   Either way, run `python -m batcher.migrate --from batcher --to batcher <paths>` over any
+   code that already calls Batcher, so no removed Batcher spelling survives the port.
+3. **Replace the readers.** `daft.read_*` → `bt.read.<fmt>`; for media, prefer the
    dedicated `bt.read.images` / `bt.read.video` / `bt.read.point_cloud` over a manual
    path scan plus download.
-3. **Convert URL fetch → decode → transform.** `.url.download()` becomes
+4. **Convert URL fetch → decode → transform.** `.url.download()` becomes
    `ds.ml.download(...)`; the decode/resize/tensor chain stays as `.image` /`.audio` /
    `.video` accessor expressions, which lower to Rust and stay vectorized.
-4. **Convert model UDFs to `ds.ml.infer` / `ds.ml.embed`**, passing the model *class*
+5. **Convert model UDFs to `ds.ml.infer` / `ds.ml.embed`**, passing the model *class*
    with `num_gpus=` and `concurrency=`. Only fall back to `ds.map_batches` when the
    stage is not a model call.
-5. **`select` down to the columns each opaque stage reads, before that stage.** The
+6. **`select` down to the columns each opaque stage reads, before that stage.** The
    optimizer cannot prune across a Python callback.
-6. **Verify** (below), then read `ds.explain()` and `ds.stats()` — `stats()` reports
+7. **Verify** (below), then read `ds.explain()` and `ds.stats()` — `stats()` reports
    measured rows/time/bytes/spill per operator and names the bottleneck.
 
 ### Verifying equivalence
@@ -235,6 +186,15 @@ Daft is the one that departs from SQL, both found by running it against DuckDB:
 The general move: when a ported result differs, run the same query through DuckDB before
 assuming the port is wrong.
 
+## Going back
+
+`docs/getting-started/migration/daft/leaving-batcher.md` maps Batcher spellings to Daft for the
+rows where both engines compute the same thing; anything else is on the forward pages with its
+difference. `python -m batcher.migrate --from batcher --to daft <paths>` is the reverse codemod,
+subject to the same implemented-directions check. Batcher has no Daft exporter or importer
+(`to_daft` and `from_daft` are registry gaps), so hand data back through Arrow, with
+`daft.from_arrow(ds.to_arrow())`, or through Parquet files.
+
 ## Gotchas / do-not
 
 - **Do not port a per-row Python UDF as a per-row Python UDF.** `ds.map` / `flat_map`
@@ -260,8 +220,9 @@ assuming the port is wrong.
 
 ## See also
 
-- `docs/getting-started/migration/transforming.md`, `docs/getting-started/migration/reading-and-writing.md` — the full
-  mapping tables and `from_*`/`to_*` adapters.
+- `docs/getting-started/migration/daft/index.md` — every Daft name, with its Batcher spelling,
+  status, and what differs; `docs/getting-started/migration/reading-and-writing.md` — the
+  `from_*`/`to_*` adapters.
 - `docs/benchmarks/comparisons/vs-daft.md`, `docs/benchmarks/results/multimodal-ingest.md` — the measured
   comparison and the image/point-cloud pipelines.
 - `docs/api/models/ml.md`, `docs/ml/` — the inference, embedding, and training-feed surface.

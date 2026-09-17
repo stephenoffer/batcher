@@ -1,0 +1,25 @@
+# Ray Data 2.58 `Datasource` and `Datasink` protocol methods and their Batcher io protocol equivalent.
+
+[Datasource]
+apply_predicate = { status = "gap", need = "predicate pushdown negotiation on a user source (apply_predicate/get_current_predicate/supports_predicate_pushdown); Batcher's Source protocol takes projection only", wave = "W11" }
+apply_projection = { status = "mismatch", batcher = "batcher.io.Source", note = "Ray negotiates projection by returning a new Datasource from apply_projection(map); Batcher passes projection= to Source.read/iter_batches.", wave = "W11" }
+create_reader = { status = "out_of_scope", reason = "deprecated Datasource v1 reader API (Ray says implement get_read_tasks instead)" }
+estimate_inmemory_data_size = { status = "param", batcher = "batcher.io.Source", need = "in-memory byte-size estimate hook (Source exposes row_count only)", wave = "W11" }
+get_current_predicate = { status = "gap", need = "predicate pushdown negotiation on a user source (apply_predicate/get_current_predicate/supports_predicate_pushdown); Batcher's Source protocol takes projection only", wave = "W11" }
+get_name = { status = "mismatch", batcher = "batcher.io.Source", note = "Ray get_name is a display name for read tasks; Batcher Source.identity() is a stable key for learned metadata, and file sources expose format_name.", wave = "W11" }
+get_projection_map = { status = "mismatch", batcher = "batcher.io.Source", note = "Ray keeps a projection/rename map on the datasource; Batcher passes a column list to read/iter_batches.", wave = "W11" }
+get_read_tasks = { status = "mismatch", batcher = "batcher.io.Source", note = "Ray get_read_tasks(parallelism) returns ReadTasks carrying metadata; Batcher Source.splits(target_size) returns Splits that the engine reads.", wave = "W11" }
+prepare_read = { status = "out_of_scope", reason = "deprecated Datasource v1 reader API (Ray says implement get_read_tasks instead)" }
+should_create_reader = { status = "out_of_scope", reason = "compatibility switch for the deprecated Datasource v1 reader API" }
+supports_distributed_reads = { status = "mismatch", batcher = "batcher.io.FileSource", note = "Ray's flag launches read tasks only on the driver node when False; Batcher expresses a node-bound source through FileSource.node_local.", wave = "W11" }
+supports_predicate_pushdown = { status = "gap", need = "predicate pushdown negotiation on a user source (apply_predicate/get_current_predicate/supports_predicate_pushdown); Batcher's Source protocol takes projection only", wave = "W11" }
+supports_projection_pushdown = { status = "mismatch", batcher = "batcher.io.Source", note = "Ray sources opt in to projection pushdown; every Batcher Source receives projection= and may ignore it.", wave = "W11" }
+
+[Datasink]
+get_name = { status = "mismatch", batcher = "batcher.io.FileSink", note = "Ray get_name is a display name for write tasks; Batcher sinks expose format_name.", wave = "W11" }
+min_rows_per_write = { status = "gap", need = "sink-declared minimum rows per write call (rebatch before write)", wave = "W11" }
+on_write_complete = { status = "mismatch", batcher = "batcher.io.Sink", note = "Ray on_write_complete(write_result) runs once after all tasks; Batcher Sink.commit(manifest, path) finalizes from the WriteManifest every shard contributed.", wave = "W11" }
+on_write_failed = { status = "gap", need = "sink callback on write failure for cleanup of staged output", wave = "W11" }
+on_write_start = { status = "gap", need = "sink callback before any write task starts (staging setup)", wave = "W11" }
+supports_distributed_writes = { status = "gap", need = "sink flag restricting write tasks to the driver node", wave = "W11" }
+write = { status = "mismatch", batcher = "batcher.io.Sink", note = "Ray Datasink.write(blocks, ctx) consumes a generator of blocks in one task; Batcher Sink.write(table, path) writes one Arrow table to one file (write_partitioned for directory shards).", wave = "W11" }

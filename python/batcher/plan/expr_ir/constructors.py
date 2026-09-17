@@ -1,13 +1,14 @@
 """Module-level expression constructors (the user-facing entry points).
 
-`col`, `lit`, `when`, `coalesce`, `nullif`, `atan2`, `greatest`, `least`, and
+`col`, `lit`, `when`, `coalesce`, `nullif`, `greatest`, `least`, and
 `count` build expression trees out of the node classes in `core`. These are the
 free functions users call directly (e.g. `col("x")`, `when(c).then(v)`).
 """
 
 from __future__ import annotations
 
-from typing import Final
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, Final
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import (
@@ -16,7 +17,7 @@ from batcher.plan.expr_ir.core import (
     Expr,
     IntoExpr,
     Lit,
-    Math2Expr,
+    _col_or_expr,
     _wrap,
 )
 from batcher.plan.expr_ir.nodes import (
@@ -29,19 +30,26 @@ from batcher.plan.expr_ir.nodes import (
     NullIf,
 )
 
+if TYPE_CHECKING:
+    import pyarrow as pa
+
 
 def when(cond: Expr) -> CaseBuilder:
     """Begin a CASE expression.
 
-    Returns a builder you chain with ``.then(value)`` and finish with
+    Returns a builder you chain with ``.then(value)`` and optionally finish with
     ``.otherwise(default)``; add further ``.when(...).then(...)`` pairs for more
     branches. The first matching condition wins, evaluated row by row.
+
+    Without ``.otherwise`` (or with ``.otherwise(None)``) a row no branch matches is
+    NULL, as SQL's ``CASE WHEN ... END`` is. The NULL takes the type of the first
+    non-null branch value.
 
     Args:
         cond: A boolean expression selecting the rows this branch applies to.
 
     Returns:
-        A `CaseBuilder`; call ``.then(...).otherwise(...)`` to produce the expression.
+        A `CaseBuilder`, usable as an expression once it has a ``.then(...)``.
 
     Examples:
         .. doctest::
@@ -51,6 +59,9 @@ def when(cond: Expr) -> CaseBuilder:
             >>> grade = bt.when(bt.col("x") > 0).then(bt.lit("pos")).otherwise(bt.lit("non-pos"))
             >>> ds.select(grade=grade).to_pydict()
             {'grade': ['non-pos', 'non-pos', 'pos']}
+
+            >>> ds.select(pos=bt.when(bt.col("x") > 0).then(bt.col("x"))).to_pydict()
+            {'pos': [None, None, 5]}
     """
     return CaseBuilder().when(cond)
 
@@ -104,8 +115,11 @@ def coalesce(*exprs: IntoExpr) -> Coalesce:
     or null if all are. The usual use is a fallback for a nullable column, e.g.
     ``coalesce(col("discount"), lit(0))`` to treat a missing discount as zero.
 
+    A bare string names a **column**, as it does in Polars. Spell a string constant
+    ``bt.lit("...")``.
+
     Args:
-        *exprs: One or more expressions, tested in order.
+        *exprs: One or more expressions or column names, tested in order.
 
     Returns:
         An expression equal to the first non-null argument.
@@ -120,7 +134,7 @@ def coalesce(*exprs: IntoExpr) -> Coalesce:
     """
     if not exprs:
         raise ValueError("coalesce() requires at least one argument")
-    return Coalesce([_wrap(e) for e in exprs])
+    return Coalesce([_col_or_expr(e) for e in exprs])
 
 
 def nullif(left: IntoExpr, right: IntoExpr) -> NullIf:
@@ -149,32 +163,7 @@ def nullif(left: IntoExpr, right: IntoExpr) -> NullIf:
     return NullIf(_wrap(left), _wrap(right))
 
 
-def atan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
-    """Two-argument arctangent of ``y / x`` (→ Float64).
-
-    Computes the angle of the point ``(x, y)`` from the positive x-axis, using the
-    signs of both arguments to place it in the correct quadrant, so the result
-    spans the full ``[-π, π]`` range (unlike single-argument ``atan``).
-
-    Args:
-        y: The ordinate (numerator).
-        x: The abscissa (denominator).
-
-    Returns:
-        A Float64 expression of the angle in radians.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"y": [0.0], "x": [1.0]})
-            >>> ds.select(r=bt.atan2(bt.col("y"), bt.col("x"))).to_pydict()
-            {'r': [0.0]}
-    """
-    return Math2Expr("atan2", _wrap(y), _wrap(x))
-
-
-def hash_rows(*exprs: IntoExpr, seed: int = 0) -> HashRows:
+def hash_rows(*exprs: IntoExpr, seed: int = 0, algorithm: str = "batcher") -> HashRows:
     """A deterministic 64-bit hash of the given values, per row → Int64.
 
     Typed rather than textual: an integer hashes its bits, a float its canonicalized
@@ -189,15 +178,30 @@ def hash_rows(*exprs: IntoExpr, seed: int = 0) -> HashRows:
     bucket. Two rows that compare equal always hash equally; two that differ may (very
     rarely) collide, as with any 64-bit hash.
 
+    `algorithm` reproduces another engine's digest bit for bit, for a ported job whose
+    stored keys or buckets must not move:
+
+    - ``"murmur3"`` is Spark ``hash(...)``: 32-bit Murmur3 chained across the inputs from
+      `seed` (Spark's is 42), a null input leaving the hash unchanged, the Int32 result
+      sign-extended. Spark hashes an ``int`` column as 4 bytes and a ``bigint`` as 8, so
+      cast to ``int32`` where the Spark column was an ``IntegerType``.
+    - ``"iceberg"`` is the Iceberg bucket-transform hash of one value (standard Murmur3,
+      integers and dates as 8-byte longs); a null stays null. See ``Expr.hash_bucket``.
+    - ``"xxhash3"`` is Daft's default ``hash``: XXH3-64 of one value with `seed`, read
+      back as signed. A null hashes like an empty input, as in Daft.
+
     Args:
         *exprs: The values to hash, in order. At least one is required.
         seed: Changes the digest; the same seed reproduces it.
+        algorithm: ``"batcher"`` (the default), ``"murmur3"``, ``"iceberg"`` or
+            ``"xxhash3"``.
 
     Returns:
         An Int64 expression — the row's digest.
 
     Raises:
-        PlanError: If no expressions are given.
+        PlanError: If no expressions are given, `algorithm` is unknown, or a
+            single-value algorithm gets more than one expression.
 
     Examples:
         .. doctest::
@@ -214,7 +218,18 @@ def hash_rows(*exprs: IntoExpr, seed: int = 0) -> HashRows:
     """
     if not exprs:
         raise PlanError("hash_rows() requires at least one expression")
-    return HashRows([_wrap(e) for e in exprs], int(seed))
+    if algorithm not in _HASH_ALGORITHMS:
+        raise PlanError(
+            f"hash_rows(): algorithm must be one of {sorted(_HASH_ALGORITHMS)}, got {algorithm!r}"
+        )
+    if algorithm in ("iceberg", "xxhash3") and len(exprs) != 1:
+        raise PlanError(f"hash_rows(algorithm={algorithm!r}) hashes exactly one expression")
+    wire = None if algorithm == "batcher" else algorithm
+    return HashRows([_wrap(e) for e in exprs], int(seed), wire)
+
+
+#: The digests `hash_rows` computes; mirrors `bc_expr::HashAlgorithm`.
+_HASH_ALGORITHMS: Final = frozenset({"batcher", "iceberg", "murmur3", "xxhash3"})
 
 
 def greatest(*exprs: IntoExpr) -> Greatest:
@@ -225,8 +240,11 @@ def greatest(*exprs: IntoExpr) -> Greatest:
     row-wise (horizontal) max across columns, not an aggregate down a column — for
     that, use ``col("x").max()`` inside ``agg``.
 
+    A bare string names a **column**, as it does in Polars. Spell a string constant
+    ``bt.lit("...")``.
+
     Args:
-        *exprs: One or more expressions to compare.
+        *exprs: One or more expressions or column names to compare.
 
     Returns:
         An expression equal to the per-row maximum.
@@ -241,7 +259,7 @@ def greatest(*exprs: IntoExpr) -> Greatest:
     """
     if not exprs:
         raise ValueError("greatest() requires at least one argument")
-    return Greatest([_wrap(e) for e in exprs])
+    return Greatest([_col_or_expr(e) for e in exprs])
 
 
 def least(*exprs: IntoExpr) -> Least:
@@ -250,8 +268,11 @@ def least(*exprs: IntoExpr) -> Least:
     The row-wise (horizontal) minimum across the given expressions, skipping nulls;
     an all-null row yields null. The counterpart to `greatest`.
 
+    A bare string names a **column**, as it does in Polars. Spell a string constant
+    ``bt.lit("...")``.
+
     Args:
-        *exprs: One or more expressions to compare.
+        *exprs: One or more expressions or column names to compare.
 
     Returns:
         An expression equal to the per-row minimum.
@@ -266,32 +287,95 @@ def least(*exprs: IntoExpr) -> Least:
     """
     if not exprs:
         raise ValueError("least() requires at least one argument")
-    return Least([_wrap(e) for e in exprs])
+    return Least([_col_or_expr(e) for e in exprs])
 
 
-def col(name: str) -> Col:
-    """Reference an input column by name.
+def col(name: str | pa.DataType | Iterable[str | pa.DataType], *more: str | pa.DataType) -> Expr:
+    """Reference an input column by name, or several columns at once.
 
     ``col`` is the starting point for almost every expression: it names a column in
     the dataset, and the operators (``+``, ``==``, ``&`` …) and methods (``.sum()``,
     ``.cast(...)``, ``.str.upper()`` …) on the result build the computation that
     runs in the Rust engine. It is lazy and does no work itself.
 
+    Given more than one name, a list of names, a regular expression wrapped in ``^...$``,
+    or an Arrow type (or several), it is a column selector, as Polars' ``col`` is: it
+    expands to one expression per matched column when a projection is built
+    (``select``, ``with_columns``, ``group_by().agg``), so ``col("a", "b") * 2`` doubles
+    both. Named columns expand in the order given and must all exist; a pattern or a type
+    matches in the dataset's column order. ``bt.matches`` and ``bt.by_dtype`` are the same
+    selectors under their own names.
+
     Args:
-        name: The name of an existing column.
+        name: A column name, a ``^...$`` pattern, an Arrow type, or a list of them.
+        *more: Further names, patterns or types, selecting several columns.
 
     Returns:
-        An expression that evaluates to that column's values.
+        A column expression, or a selector when several columns may match.
+
+    Raises:
+        PlanError: If names and Arrow types are mixed, or nothing is given.
 
     Examples:
         .. doctest::
 
             >>> import batcher as bt
-            >>> ds = bt.from_pydict({"price": [10, 20], "qty": [2, 3]})
+            >>> import pyarrow as pa
+            >>> ds = bt.from_pydict({"price": [10, 20], "qty": [2, 3], "sku": ["a", "b"]})
             >>> ds.select(total=bt.col("price") * bt.col("qty")).to_pydict()
             {'total': [20, 60]}
+            >>> ds.select(bt.col("qty", "price") * 10).to_pydict()
+            {'qty': [20, 30], 'price': [100, 200]}
+            >>> ds.select(bt.col("^p.*$")).columns, ds.select(bt.col(pa.string())).columns
+            (['price'], ['sku'])
     """
-    return Col(name)
+    items = [*_col_items(name), *(m for x in more for m in _col_items(x))]
+    if not items:
+        raise PlanError("col() requires a column name")
+    if len(items) == 1 and isinstance(items[0], str) and not _is_pattern(items[0]):
+        return Col(items[0])
+    return _col_selector(items)
+
+
+def _col_items(value: Any) -> list[Any]:
+    """One `col` argument as a flat list: a name, pattern or type, or a list of them."""
+    # A plain name is the overwhelmingly common call, and answering it before touching
+    # pyarrow keeps `bt.col` from importing pyarrow at all.
+    if isinstance(value, str):
+        return [value]
+    import pyarrow as pa
+
+    if isinstance(value, pa.DataType):
+        return [value]
+    if isinstance(value, Iterable):
+        return list(value)
+    raise PlanError(f"col() takes column names or Arrow types, got {type(value).__name__}")
+
+
+def _is_pattern(name: str) -> bool:
+    """Polars reads a name wrapped in ``^...$`` as a regular expression, and so does `col`."""
+    return len(name) >= 2 and name.startswith("^") and name.endswith("$")
+
+
+def _col_selector(items: list[Any]) -> Expr:
+    """The selector a multi-column `col` stands for."""
+    import pyarrow as pa
+
+    from batcher.plan.expr_ir.selectors import by_dtype, matches
+    from batcher.plan.expr_ir.selectors.core import _named_columns
+
+    types = [i for i in items if isinstance(i, pa.DataType)]
+    if types:
+        if len(types) != len(items):
+            raise PlanError("col() takes either column names or Arrow types, not both")
+        return by_dtype(*types)
+    if not any(_is_pattern(i) for i in items):
+        return _named_columns(tuple(items))
+    selector = None
+    for item in items:
+        part = matches(item) if _is_pattern(item) else _named_columns((item,))
+        selector = part if selector is None else selector | part
+    return selector
 
 
 def count() -> AggExpr:

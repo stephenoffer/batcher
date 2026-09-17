@@ -46,7 +46,7 @@ def main() -> None:
     assert many == per_order.filter(col("lines") >= 5).count()
 
     # `persist` is the explicit form for keeping a result across a longer stretch of work.
-    kept = per_order.persist()
+    kept = per_order.cache()
     assert kept.count() == per_order.count()
 
 

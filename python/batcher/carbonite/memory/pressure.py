@@ -286,9 +286,22 @@ class PressureMonitor:
         EWMA advances several steps per round, collapses toward the raw reading, and the
         anti-flap smoothing the design exists for is defeated.
         """
+        return max(self.accounted_level(), self.stall_floor())
+
+    def accounted_level(self) -> PressureLevel:
+        """The level the **byte accounting** alone reports, without the PSI stall floor.
+
+        `classify` is this raised by `stall_floor`. A caller that must know *which* signal
+        put the level where it is — a stall is a statement about the box, a full envelope a
+        statement about the engine, and the right response to each differs — reads both.
+        Like `classify`, it does not advance the hysteresis average.
+
+        Returns:
+            The level from pool utilization and the measured footprint.
+        """
         raw = self._engine_used_fraction()
         prev = self._ewma if self._ewma is not None else raw
-        return max(self._classify(max(raw, prev)), self.stall_floor())
+        return self._classify(max(raw, prev))
 
     def _classify(self, used: float) -> PressureLevel:
         """Bucket a used-fraction into a level. Pure.

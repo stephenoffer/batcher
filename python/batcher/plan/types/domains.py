@@ -84,6 +84,7 @@ _REAL: dict[str, str] = dict.fromkeys(
         "mad",
         "product",
         "skewness",
+        "skewness_pop",
         "kurtosis",
         "kurtosis_pop",
         "kahan_sum",

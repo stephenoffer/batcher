@@ -78,6 +78,10 @@ gcp-secrets = ["google-cloud-secret-manager>=2.16"]
 azure-secrets = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.7"]
 # ML / GPU data plane.
 torch = ["torch>=2.2"]
+# `python -m batcher.migrate`: the codemod that rewrites code onto Batcher's one spelling per
+# capability, and between Batcher and PySpark/Polars/Daft/Ray Data. It parses and rewrites
+# source with libcst and never imports the engine, so it installs without a build.
+migrate = ["libcst>=1.1"]
 # Live GPU telemetry (`_internal.hardware.nvml`): SM utilization, VRAM actually resident,
 # board power, thermal/ECC health. Ray reports a device *count* and nothing else, so this is
 # the only source for any of it, and three things the GPU path advertises are blind without
@@ -115,7 +119,7 @@ protobuf = ["protobuf>=4", "protarrow>=0.3"]
 msgpack = ["ormsgpack>=1"]
 hdf5 = ["h5py>=3.10"]
 zarr = ["zarr>=2.17"]
-tfrecord = ["tfr-reader>=0.1"]
+tfrecord = ["tfr-reader>=0.1", "google-crc32c>=1.5"]
 pdf = ["pypdf>=4"]
 # --- Lakehouse (ACID table formats + catalogs) ---
 delta = ["deltalake>=0.18"]
@@ -198,6 +202,8 @@ huggingface = ["datasets>=2.18"]
 # should have been pointing at all along.
 spark = ["pyspark>=3.5"]
 dask = ["dask[dataframe]>=2024.1"]
+# `bt.from_daft` and `Dataset.to_daft`.
+daft = ["daft>=0.3"]
 # --- Convenience bundles (self-referencing extras use the distribution name) ---
 lakehouse = ["batcher-engine[delta,iceberg,hudi,delta-sharing]"]
 warehouse = ["batcher-engine[sql,connectorx,snowflake,databricks,bigquery,clickhouse,odbc]"]
@@ -303,7 +309,7 @@ layers = [
     # one-way, which it is not (`ml` imports `api` 77 times, `api` imports `ml` 17). `:` is
     # import-linter's "these siblings may import each other" — the accurate statement.
     # Everything BELOW still may not reach up into any of them, which is the part that matters.
-    "api : ml : graph : _sql",
+    "api : ml : graph : _sql : migrate",
     "dist",
     "kyber | carbonite | core | governance",
     "interop",
@@ -468,6 +474,10 @@ exclude_also = [
 target-version = "py311"
 line-length = 100
 src = ["python", "tests", "benchmarks", "examples"]
+# The codemod's golden corpus is its input and output, byte for byte: `batcher.py`/`back.py` are
+# what `batcher.migrate` writes (marker comments, long chains and all), so reformatting them
+# would change the property under test. `tests/migrate/test_corpus.py` holds them exact instead.
+extend-exclude = ["tests/migrate/corpus"]
 
 [tool.ruff.lint]
 select = [

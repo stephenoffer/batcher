@@ -262,7 +262,7 @@ def test_agg_extra(table: pa.Table) -> None:
     out = ds.group_by("g").agg(
         n=count(),
         cg=col("g").count(),  # count_of_group_key → count(*)
-        ug=col("g").n_unique(),  # count_distinct_of_group_key → 1 per group
+        ug=col("g").count_distinct(),  # count_distinct_of_group_key → 1 per group
         sa=col("a").sum(),
     )
     _match(

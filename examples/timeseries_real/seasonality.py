@@ -24,7 +24,7 @@ def main() -> None:
     overall = orders.count() / 7.0
 
     by_weekday = (
-        orders.with_columns(day=col("o_orderdate").dt.day_name())
+        orders.with_columns(day=col("o_orderdate").dt.dayname())
         .group_by("day")
         .agg(orders=bt.count(), revenue=col("o_totalprice").sum())
         .with_columns(index=col("orders") / overall)

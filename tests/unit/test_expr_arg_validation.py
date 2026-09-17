@@ -145,12 +145,7 @@ _DATASET_CASES = [
     pytest.param("limit", ("offset",), {"n": 2, "offset": "1"}, id="limit-offset"),
     pytest.param("top_k", ("k",), {"k": "2", "by": "x"}, id="top_k"),
     pytest.param("bottom_k", ("k",), {"k": 2.5, "by": "x"}, id="bottom_k"),
-    pytest.param("nlargest", ("n",), {"n": "2", "columns": "x"}, id="nlargest"),
-    pytest.param("nsmallest", ("n",), {"n": "2", "columns": "x"}, id="nsmallest"),
-    pytest.param("slice", ("offset",), {"offset": "0"}, id="slice-offset"),
-    pytest.param("slice", ("length",), {"offset": 0, "length": "1"}, id="slice-length"),
     pytest.param("gather_every", ("n",), {"n": "2"}, id="gather_every"),
-    pytest.param("coalesce", ("n",), {"n": "4"}, id="coalesce"),
     pytest.param("repartition", ("num_files",), {"num_files": "4"}, id="repartition"),
     pytest.param("sample_per_group", ("n",), {"n": "1", "by": "s"}, id="sample_per_group"),
 ]
@@ -172,9 +167,9 @@ def test_the_dataset_verbs_still_do_their_job():
     ds = bt.from_pydict({"x": [3, 1, 2], "s": ["a", "b", "c"]})
     assert ds.limit(2).to_pydict() == {"x": [3, 1], "s": ["a", "b"]}
     assert ds.top_k(2, "x").to_pydict() == {"x": [3, 2], "s": ["a", "c"]}
-    assert ds.slice(1, 2).to_pydict() == {"x": [1, 2], "s": ["b", "c"]}
+    assert ds.limit(2, offset=1).to_pydict() == {"x": [1, 2], "s": ["b", "c"]}
     assert ds.gather_every(2).to_pydict() == {"x": [3, 2], "s": ["a", "c"]}
-    assert ds.nsmallest(2, "x").to_pydict() == {"x": [1, 2], "s": ["b", "c"]}
+    assert ds.bottom_k(2, "x").to_pydict() == {"x": [1, 2], "s": ["b", "c"]}
 
 
 # --- the float-typed parameters -----------------------------------------------------
@@ -192,9 +187,9 @@ def test_the_dataset_verbs_still_do_their_job():
         lambda ds: bt.col("x").approx_quantile("a"),
         lambda ds: ds.approx_quantile("x", "a"),
         lambda ds: ds.approx_percentile("x", "a"),
-        lambda ds: ds.sample_frac("abc"),
+        lambda ds: ds.sample("abc"),
     ],
-    ids=["quantile", "approx_quantile", "ds.approx_quantile", "approx_percentile", "sample_frac"],
+    ids=["quantile", "approx_quantile", "ds.approx_quantile", "approx_percentile", "sample"],
 )
 def test_a_non_number_float_parameter_is_rejected_as_a_plan_error(build):
     ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
@@ -203,7 +198,7 @@ def test_a_non_number_float_parameter_is_rejected_as_a_plan_error(build):
 
 
 def test_a_bool_probability_is_rejected_too():
-    """``sample_frac(True)`` would silently mean "keep everything"."""
+    """``quantile(True)`` would silently mean "keep everything"."""
     with pytest.raises(PlanError, match="must be a number"):
         bt.col("x").quantile(True)
 

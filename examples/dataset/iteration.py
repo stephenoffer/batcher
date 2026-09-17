@@ -35,10 +35,10 @@ def main() -> None:
     assert rows[0] == (0, 0)
 
     # Head/tail/limit for a peek.
-    assert ds.head(3).to_pydict()["id"] == [0, 1, 2]
+    assert ds.limit(3).to_pydict()["id"] == [0, 1, 2]
     assert ds.tail(2).to_pydict()["id"] == [8, 9]
     assert ds.limit(4).count() == 4
-    assert ds.slice(2, 3).to_pydict()["id"] == [2, 3, 4]
+    assert ds.limit(3, offset=2).to_pydict()["id"] == [2, 3, 4]
 
     # First and last row, returned as plain tuples rather than a Dataset.
     print("first row tuple:", ds.first(), "| last:", ds.last())
@@ -51,8 +51,8 @@ def main() -> None:
     # Top and bottom by a column, which beats sorting the whole table.
     assert ds.top_k(2, by="v").to_pydict()["id"] == [9, 8]
     assert ds.bottom_k(2, by="v").to_pydict()["id"] == [0, 1]
-    assert ds.nlargest(2, "v").to_pydict()["id"] == [9, 8]
-    assert ds.nsmallest(2, "v").to_pydict()["id"] == [0, 1]
+    assert ds.top_k(2, "v").to_pydict()["id"] == [9, 8]
+    assert ds.bottom_k(2, "v").to_pydict()["id"] == [0, 1]
 
     # Every nth row, and reversal.
     assert ds.gather_every(3).to_pydict()["id"] == [0, 3, 6, 9]
@@ -60,7 +60,7 @@ def main() -> None:
 
     # Python-native output, for small results only.
     assert ds.limit(2).to_pylist() == [{"id": 0, "v": 0}, {"id": 1, "v": 1}]
-    assert ds.limit(2).to_dicts()[1]["v"] == 1
+    assert ds.limit(2).to_pylist()[1]["v"] == 1
 
     # The point of all of the above: the aggregate below never leaves Rust, and is the
     # right answer whenever you were about to write a Python loop.

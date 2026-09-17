@@ -54,7 +54,7 @@ def test_arg_max_string_names_a_column(duck):
     """``arg_max(v, "k")`` orders by column ``k`` — not the constant string ``'k'``."""
     table = pa.table({"g": ["a", "a", "a"], "v": [10, 20, 30], "k": [1, 5, 2]})
     duck.register("t", table)
-    got = bt.from_arrow(table).group_by("g").agg(r=bt.col("v").arg_max("k")).collect()
+    got = bt.from_arrow(table).group_by("g").agg(r=bt.col("v").max_by("k")).collect()
     assert_same(got, duck.sql("SELECT g, arg_max(v, k) AS r FROM t GROUP BY g"))
 
 
@@ -62,7 +62,7 @@ def test_arg_min_string_names_a_column(duck):
     """``arg_min(v, "k")`` orders by column ``k``."""
     table = pa.table({"g": ["a", "a", "a"], "v": [10, 20, 30], "k": [1, 5, 2]})
     duck.register("t", table)
-    got = bt.from_arrow(table).group_by("g").agg(r=bt.col("v").arg_min("k")).collect()
+    got = bt.from_arrow(table).group_by("g").agg(r=bt.col("v").min_by("k")).collect()
     assert_same(got, duck.sql("SELECT g, arg_min(v, k) AS r FROM t GROUP BY g"))
 
 
@@ -70,8 +70,8 @@ def test_arg_max_string_equals_col_form():
     """The string spelling must equal the explicit ``col`` spelling."""
     table = pa.table({"g": ["a", "a", "a"], "v": [10, 20, 30], "k": [1, 5, 2]})
     ds = bt.from_arrow(table)
-    by_str = ds.group_by("g").agg(r=bt.col("v").arg_max("k")).collect().to_pydict()
-    by_col = ds.group_by("g").agg(r=bt.col("v").arg_max(bt.col("k"))).collect().to_pydict()
+    by_str = ds.group_by("g").agg(r=bt.col("v").max_by("k")).collect().to_pydict()
+    by_col = ds.group_by("g").agg(r=bt.col("v").max_by(bt.col("k"))).collect().to_pydict()
     assert by_str == by_col
 
 

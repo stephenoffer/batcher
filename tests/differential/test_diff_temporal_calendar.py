@@ -3,13 +3,13 @@
 ``test_diff_temporal.py`` covers extraction and arithmetic. This module covers the
 *calendar* half of the accessor -- the period boundaries (``month_start``,
 ``quarter_end``, ``year_start``, ...), the boundary predicates (``is_month_end``,
-``is_quarter_start``, ...), the names (``day_name``, ``month_name``) and the formatter --
+``is_quarter_start``, ...), the names (``dayname``, ``monthname``) and the formatter --
 none of which any test called.
 
 Every one of these has a DuckDB equivalent, so that is the oracle. Where DuckDB spells
-the same idea differently (``date_trunc('quarter')`` for ``quarter_start``, ``last_day``
-for ``month_end``) the SQL is written from the *definition* rather than from Batcher's
-output, which is what makes the comparison independent.
+the same idea differently (``date_trunc('quarter')`` for ``quarter_start``,
+``day(last_day(ts))`` for ``days_in_month``) the SQL is written from the *definition*
+rather than from Batcher's output, which is what makes the comparison independent.
 
 The fixture is chosen around the dates that separate a correct implementation from a
 plausible one: a leap day, the last instant of a year, a quarter end that is also a month
@@ -92,7 +92,6 @@ PREDICATES = [
     ),
     ("is_year_start", "month(ts) = 1 AND day(ts) = 1"),
     ("is_year_end", "month(ts) = 12 AND day(ts) = 31"),
-    ("is_weekday", "isodow(ts) <= 5"),
     ("is_business_day", "isodow(ts) <= 5"),
 ]
 
@@ -132,7 +131,7 @@ def test_the_predicates_agree_with_the_boundaries_they_name(ds):
 
 def test_day_and_month_names_match_duckdb(ds, duck):
     """The English names, which must be full words rather than abbreviations."""
-    got = ds.select(day=bt.col("t").dt.day_name(), month=bt.col("t").dt.month_name()).to_pydict()
+    got = ds.select(day=bt.col("t").dt.dayname(), month=bt.col("t").dt.monthname()).to_pydict()
     assert got["day"] == _duck_column(duck, "dayname(ts)")
     assert got["month"] == _duck_column(duck, "monthname(ts)")
 
@@ -140,7 +139,7 @@ def test_day_and_month_names_match_duckdb(ds, duck):
 def test_ordinal_day_and_days_in_month_match_duckdb(ds, duck):
     """Day of year and month length, both of which the leap day is the test for."""
     got = ds.select(
-        ordinal=bt.col("t").dt.ordinal_day(), length=bt.col("t").dt.daysinmonth()
+        ordinal=bt.col("t").dt.dayofyear(), length=bt.col("t").dt.days_in_month()
     ).to_pydict()
     assert got["ordinal"] == _duck_column(duck, "dayofyear(ts)")
     assert got["length"] == _duck_column(duck, "day(last_day(ts))")
@@ -167,8 +166,8 @@ def test_week_of_month_counts_from_the_first_of_the_month(ds):
 def test_to_string_matches_duckdbs_strftime(ds, duck):
     """The default ISO shape and an explicit format, both against ``strftime``."""
     got = ds.select(
-        iso=bt.col("t").dt.to_string(),
-        custom=bt.col("t").dt.to_string("%Y/%m/%d %H:%M"),
+        iso=bt.col("t").dt.strftime(format="%Y-%m-%dT%H:%M:%S"),
+        custom=bt.col("t").dt.strftime("%Y/%m/%d %H:%M"),
     ).to_pydict()
     assert got["iso"] == _duck_column(duck, "strftime(ts, '%Y-%m-%dT%H:%M:%S')")
     assert got["custom"] == _duck_column(duck, "strftime(ts, '%Y/%m/%d %H:%M')")
@@ -177,9 +176,9 @@ def test_to_string_matches_duckdbs_strftime(ds, duck):
 def test_every_calendar_accessor_nulls_on_a_null_input(ds):
     """One null row through the whole family, since a boundary rule can easily forget it."""
     accessors = [name for name, _ in BOUNDARIES] + [name for name, _ in PREDICATES]
-    accessors += ["day_name", "month_name", "ordinal_day", "daysinmonth", "week_of_month"]
+    accessors += ["dayname", "monthname", "dayofyear", "days_in_month", "week_of_month"]
     projections = {f"c{i}": getattr(bt.col("t").dt, name)() for i, name in enumerate(accessors)}
-    projections["fmt"] = bt.col("t").dt.to_string()
+    projections["fmt"] = bt.col("t").dt.strftime(format="%Y-%m-%dT%H:%M:%S")
     got = ds.select(**projections).to_pydict()
     null_row = len(STAMPS) - 1
     for key, values in got.items():
@@ -193,8 +192,8 @@ def test_the_calendar_accessors_work_on_a_date_column_too(duck):
         bt.from_pydict({"d": dates})
         .select(
             start=bt.col("d").dt.month_start(),
-            name=bt.col("d").dt.day_name(),
-            ordinal=bt.col("d").dt.ordinal_day(),
+            name=bt.col("d").dt.dayname(),
+            ordinal=bt.col("d").dt.dayofyear(),
             ends=bt.col("d").dt.is_month_end(),
         )
         .to_pydict()
@@ -220,7 +219,7 @@ def test_streaming_agrees_with_collect(ds):
     projected = ds.select(
         start=bt.col("t").dt.quarter_start(),
         ends=bt.col("t").dt.is_year_end(),
-        name=bt.col("t").dt.month_name(),
+        name=bt.col("t").dt.monthname(),
     )
     collected = projected.to_pydict()
     streamed: dict[str, list] = {"start": [], "ends": [], "name": []}

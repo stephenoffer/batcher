@@ -67,7 +67,7 @@ def _ds_and_node(**kw):
     import batcher as bt
 
     ds = bt.from_pydict({"x": [1]})
-    return ds, ds.ml.map_batches(lambda b: b, **kw)._plan
+    return ds, ds.map_batches(lambda b: b, **kw)._plan
 
 
 def _ctx(ds, hardware=None):

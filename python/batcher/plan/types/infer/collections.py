@@ -33,18 +33,30 @@ __all__ = [
 
 # `list` accessor (`ListFunc`) output types. `len`/`n_unique`/`arg_max`/`arg_min`
 # count or index -> Int64.
-_LIST_INT = frozenset({"len", "n_unique", "arg_max", "arg_min"})
+_LIST_INT = frozenset({"len", "n_unique", "n_unique_with_nulls", "arg_max", "arg_min"})
 # `sort_desc` is `sort`'s twin and preserves the element type just as it does (verified:
 # an Int list sorts to List<Int64>, a Float list to List<Float64>).
-_LIST_SAME = frozenset({"reverse", "sort", "sort_desc", "unique"})
+# The null-placing and null-keeping variants are the same kernels with one flag moved.
+_LIST_SAME = frozenset(
+    {
+        "reverse",
+        "sort",
+        "sort_desc",
+        "sort_nulls_first",
+        "sort_desc_nulls_first",
+        "unique",
+        "unique_with_nulls",
+    }
+)
 # Positions, not values: `arg_sort` returns the permutation that would sort the list, so
 # it is List<Int64> whatever the elements are (the plural of `arg_min`/`arg_max` above).
 _LIST_INT_LIST = frozenset({"arg_sort"})
 # Element-wise transforms the engine computes in floating point whatever the input's
-# element width (verified: an Int list's cum_sum/diff/softmax all come back List<Double>).
+# element width (verified: an Int list's cum_sum/softmax come back List<Double>).
 # `cum_sum` is float here even though the scalar `sum` is element-typed, because the
-# engine's running total is accumulated in f64.
-_LIST_FLOAT_LIST = frozenset({"cum_sum", "diff", "softmax"})
+# engine's running total is accumulated in f64. `diff` is not here: an integer list
+# differences exactly into List<Int64> (see `listfunc_type`).
+_LIST_FLOAT_LIST = frozenset({"cum_sum", "softmax"})
 # Genuinely float, whatever the element width (verified against the engine: an Int
 # list's mean/median/product/std/var/l2_norm all come back as `double`). `sum` is NOT
 # here: it preserves the element type (Int list -> Int64, like `min`/`max`), and
@@ -108,6 +120,14 @@ def listfunc_type(fn: str, input_t: pa.DataType | None) -> pa.DataType | None:
         return pa.list_(pa.int64()) if list_element_type(input_t) is not None else None
     if fn in _LIST_FLOAT_LIST:
         return pa.list_(pa.float64()) if list_element_type(input_t) is not None else None
+    if fn == "diff":
+        # `bc_expr`'s `list_reduce::diff` keeps an integer element (other than UInt64) in
+        # Int64 and computes every other numeric element in Float64.
+        element = list_element_type(input_t)
+        if element is None:
+            return None
+        exact = pa.types.is_integer(element) and not pa.types.is_uint64(element)
+        return pa.list_(pa.int64() if exact else pa.float64())
     if fn in _LIST_FLOAT_REDUCE:
         return pa.float64()  # always double, whatever the element width
     if fn in _LIST_ORDER_REDUCE:

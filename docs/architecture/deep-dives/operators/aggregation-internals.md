@@ -256,7 +256,7 @@ events = bt.from_pydict(
 # The state holds one entry per distinct page per user, not one per event.
 top = events.group_by("user").agg(
     favourite=bt.col("page").mode(),
-    top_two=bt.col("page").top_k(2),
+    top_two=bt.col("page").mode_top_k(2),
 )
 print(top.sort("user").to_pydict())
 ```

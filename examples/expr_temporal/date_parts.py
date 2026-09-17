@@ -19,7 +19,7 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderkey", "o_orderdate").head(1_000)
+    orders = tpch("orders").select("o_orderkey", "o_orderdate").limit(1_000)
 
     parts = orders.select(
         "o_orderdate",
@@ -28,12 +28,12 @@ def main() -> None:
         month=col("o_orderdate").dt.month(),
         day=col("o_orderdate").dt.day(),
         weekday=col("o_orderdate").dt.weekday(),
-        week=col("o_orderdate").dt.weekofyear(),
-        ordinal=col("o_orderdate").dt.ordinal_day(),
+        week=col("o_orderdate").dt.week(),
+        ordinal=col("o_orderdate").dt.dayofyear(),
         iso_year=col("o_orderdate").dt.iso_year(),
     )
 
-    result = parts.head(3).to_pydict()
+    result = parts.limit(3).to_pydict()
     print(result)
 
     # Every part sits in its natural range.

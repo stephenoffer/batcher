@@ -48,7 +48,11 @@ def fn(request, duck):
 
 def test_matches_duckdb_across_the_domain(fn, duck):
     """Each inverse over its whole domain, including where the old identity overflowed."""
-    got = bt.from_pydict({"x": DOMAINS[fn]}).select(r=getattr(bt.col("x"), fn)()).collect()
+    got = (
+        bt.from_pydict({"x": DOMAINS[fn]})
+        .select(r=getattr(bt.col("x"), "arc" + fn[1:])())
+        .collect()
+    )
     assert_same(got, duck.sql(f"select {fn}(x) as r from t"))
 
 
@@ -76,7 +80,11 @@ def test_out_of_range_agrees_with_numpy(fn, value, expected):
     is held to a relative tolerance, because NumPy's `arcsinh(1e300)` and libm's differ
     in the last bit and neither is the oracle here.
     """
-    got = bt.from_pydict({"x": [value]}).select(r=getattr(bt.col("x"), fn)()).to_pydict()["r"][0]
+    got = (
+        bt.from_pydict({"x": [value]})
+        .select(r=getattr(bt.col("x"), "arc" + fn[1:])())
+        .to_pydict()["r"][0]
+    )
     with np.errstate(invalid="ignore", divide="ignore"):
         ref = float(getattr(np, "arc" + fn[1:])(np.float64(value)))
     for want in (expected, ref):
@@ -94,8 +102,8 @@ def test_asinh_is_odd_and_acosh_inverts_cosh():
     d = (
         bt.from_pydict({"x": xs})
         .select(
-            odd=bt.col("x").asinh() + (-bt.col("x")).asinh(),
-            roundtrip=bt.col("x").sinh().asinh(),
+            odd=bt.col("x").arcsinh() + (-bt.col("x")).arcsinh(),
+            roundtrip=bt.col("x").sinh().arcsinh(),
         )
         .to_pydict()
     )

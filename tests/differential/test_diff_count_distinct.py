@@ -30,7 +30,7 @@ def test_count_distinct_grouped_vs_duckdb(duck, t):
     out = (
         bt.from_arrow(t)
         .group_by("g")
-        .agg(nv=col("v").n_unique(), ns=col("s").n_unique(), n=count())
+        .agg(nv=col("v").count_distinct(), ns=col("s").count_distinct(), n=count())
         .collect()
     )
     expected = duck.sql(
@@ -40,7 +40,7 @@ def test_count_distinct_grouped_vs_duckdb(duck, t):
 
 
 def test_count_distinct_global_vs_duckdb(duck, t):
-    out = bt.from_arrow(t).group_by().agg(nv=col("v").n_unique()).collect()
+    out = bt.from_arrow(t).group_by().agg(nv=col("v").count_distinct()).collect()
     expected = duck.sql("SELECT COUNT(DISTINCT v) nv FROM t")
     assert_same(out, expected)
 
@@ -58,7 +58,7 @@ def test_count_distinct_excludes_nulls_vs_duckdb(duck):
         }
     )
     duck.register("u", tbl)
-    out = bt.from_arrow(tbl).group_by("g").agg(nv=col("v").n_unique()).collect()
+    out = bt.from_arrow(tbl).group_by("g").agg(nv=col("v").count_distinct()).collect()
     assert_same(out, duck.sql("SELECT g, COUNT(DISTINCT v) nv FROM u GROUP BY g"))
 
 
@@ -90,7 +90,7 @@ def test_count_distinct_grouped_spilled(duck):
     tbl = _skewed_with_nulls()
     duck.register("s", tbl)
     with config_context(_tight_cap()):
-        out = bt.from_arrow(tbl).group_by("k").agg(nv=col("v").n_unique()).collect()
+        out = bt.from_arrow(tbl).group_by("k").agg(nv=col("v").count_distinct()).collect()
     assert_same(out, duck.sql("SELECT k, COUNT(DISTINCT v) nv FROM s GROUP BY k"))
 
 
@@ -100,7 +100,7 @@ def test_count_distinct_global_spilled(duck):
     tbl = _skewed_with_nulls()
     duck.register("s", tbl)
     with config_context(_tight_cap()):
-        out = bt.from_arrow(tbl).group_by().agg(nv=col("v").n_unique()).collect()
+        out = bt.from_arrow(tbl).group_by().agg(nv=col("v").count_distinct()).collect()
     assert_same(out, duck.sql("SELECT COUNT(DISTINCT v) nv FROM s"))
 
 
@@ -117,7 +117,7 @@ def test_count_distinct_strings_spilled(duck):
     tbl = pa.table({"k": k, "s": s})
     duck.register("ss", tbl)
     with config_context(_tight_cap()):
-        out = bt.from_arrow(tbl).group_by("k").agg(ns=col("s").n_unique()).collect()
+        out = bt.from_arrow(tbl).group_by("k").agg(ns=col("s").count_distinct()).collect()
     assert_same(out, duck.sql("SELECT k, COUNT(DISTINCT s) ns FROM ss GROUP BY k"))
 
 
@@ -132,7 +132,7 @@ def test_count_distinct_partition_independent():
     )
 
     def run(ds):
-        return ds.group_by("g").agg(nv=col("v").n_unique()).sort("g").collect().to_pylist()
+        return ds.group_by("g").agg(nv=col("v").count_distinct()).sort("g").collect().to_pylist()
 
     whole = run(bt.from_arrow(tbl))
     chunked = run(bt.from_arrow(tbl.to_batches(max_chunksize=37)))

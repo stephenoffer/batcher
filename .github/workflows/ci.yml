@@ -98,6 +98,10 @@ jobs:
       - name: Build engine into the environment
         run: just build
 
+      # After the build, because it introspects the live engine surface.
+      - name: One spelling per capability
+        run: just lint-aliases
+
       - name: Python tests + coverage gate
         run: just cov-gate
 

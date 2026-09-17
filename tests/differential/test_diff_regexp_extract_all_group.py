@@ -44,9 +44,7 @@ def t(duck):
 @pytest.mark.differential
 @pytest.mark.parametrize("group", [0, 1, 2])
 def test_capture_group_matches_duckdb(duck, t, group):
-    out = (
-        bt.from_arrow(t).select(r=col("s").str.regexp_extract_all(r"(\d+)-(\d+)", group)).collect()
-    )
+    out = bt.from_arrow(t).select(r=col("s").str.extract_all(r"(\d+)-(\d+)", group)).collect()
     expected = duck.sql(rf"SELECT regexp_extract_all(s, '(\d+)-(\d+)', {group}) r FROM t")
     assert_same(out, expected)
 
@@ -77,11 +75,11 @@ def test_a_group_that_did_not_participate_is_null_not_empty(duck, t):
 def test_a_group_the_pattern_does_not_have_is_rejected(t):
     """DuckDB errors rather than returning empty lists; so does the engine."""
     with pytest.raises(Exception, match="cannot access group"):
-        bt.from_arrow(t).select(r=col("s").str.regexp_extract_all(r"(\d+)", 5)).collect()
+        bt.from_arrow(t).select(r=col("s").str.extract_all(r"(\d+)", 5)).collect()
 
 
 @pytest.mark.differential
 def test_the_default_is_still_the_whole_match(duck, t):
     """Omitting the group must keep the pre-existing behaviour exactly."""
-    out = bt.from_arrow(t).select(r=col("s").str.regexp_extract_all(r"\d+")).collect()
+    out = bt.from_arrow(t).select(r=col("s").str.extract_all(r"\d+")).collect()
     assert_same(out, duck.sql(r"SELECT regexp_extract_all(s, '\d+') r FROM t"))

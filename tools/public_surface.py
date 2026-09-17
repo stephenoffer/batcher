@@ -68,6 +68,7 @@ def _subpackage_exports() -> list[tuple[str, Any]]:
 
 def _accessor_namespaces() -> list[type]:
     """The typed accessor classes reached as attributes of Expr/Dataset."""
+    from batcher.api.catalog import SessionCatalog
     from batcher.api.dataset.dq import ConstraintResult, DatasetDQ, ValidationReport
     from batcher.api.dataset.meta import (
         ApproxMeta,
@@ -91,6 +92,7 @@ def _accessor_namespaces() -> list[type]:
         _MapNamespace,
         _StructNamespace,
     )
+    from batcher.plan.expr_ir.namespaces.meta import _MetaNamespace
     from batcher.plan.expr_ir.namespaces.sequence import _SeqNamespace
     from batcher.plan.expr_ir.namespaces.strings import _StrNamespace
     from batcher.plan.expr_ir.namespaces.temporal import _DtNamespace
@@ -108,6 +110,7 @@ def _accessor_namespaces() -> list[type]:
         _AudioNamespace,
         _VideoNamespace,
         _SeqNamespace,
+        _MetaNamespace,
         _SelectorNameNamespace,
         Reader,
         Writer,
@@ -116,6 +119,8 @@ def _accessor_namespaces() -> list[type]:
         ValidationReport,
         ConstraintResult,
         DatasetSCD,
+        # `session.catalog` — the attached catalogs and where table names resolve.
+        SessionCatalog,
         # The `ds.meta` accessor tree — metadata shortcuts, reached as `ds.meta.col("x")`,
         # `ds.meta.col("x").check`, `ds.meta.schema`, `.nulls`, `.approx`, `.storage`,
         # and `ds.meta.against(other)`.
@@ -255,6 +260,7 @@ _EXPR_ACCESSORS = (
     ("image", "batcher.plan.expr_ir.image", "_ImageNamespace"),
     ("audio", "batcher.plan.expr_ir.audio", "_AudioNamespace"),
     ("video", "batcher.plan.expr_ir.video", "_VideoNamespace"),
+    ("meta", "batcher.plan.expr_ir.namespaces.meta", "_MetaNamespace"),
 )
 
 

@@ -1,0 +1,72 @@
+# PySpark 4.2.0 -> Batcher migration registry: pyspark.sql.functions, math and bitwise.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[functions]
+abs = { status = "canonical", batcher = "Expr.abs" }
+acos = { status = "canonical", batcher = "Expr.arccos" }
+acosh = { status = "canonical", batcher = "Expr.arccosh" }
+asin = { status = "canonical", batcher = "Expr.arcsin" }
+asinh = { status = "canonical", batcher = "Expr.arcsinh" }
+atan = { status = "canonical", batcher = "Expr.arctan" }
+atan2 = { status = "canonical", batcher = "bt.arctan2" }
+atanh = { status = "canonical", batcher = "Expr.arctanh" }
+bin = { status = "canonical", batcher = "Expr.to_base", template = 'bin(col) -> sem.column(col).to_base(2, twos_complement=True)' }
+bit_count = { status = "canonical", batcher = "Expr.bit_count" }
+bit_get = { status = "canonical", batcher = "bt.bit_get" }
+bitwise_not = { status = "gap", need = "integer bitwise NOT (~ on Expr is boolean-only and raises on integers)", wave = "W3" }
+bround = { status = "param", batcher = "Expr.round", template = 'bround(col, scale=0) -> sem.column(col).round(scale, mode="half_to_even")', need = "a column-valued scale", wave = "W2" }
+cbrt = { status = "canonical", batcher = "Expr.cbrt" }
+ceil = { status = "param", batcher = "Expr.ceil", need = "scale= digits, and a BIGINT result for scale-less input", wave = "W2" }
+ceiling = { status = "param", batcher = "Expr.ceil", need = "scale= digits, and a BIGINT result for scale-less input", wave = "W2" }
+conv = { status = "gap", need = "convert a number string between bases", wave = "W3" }
+cos = { status = "canonical", batcher = "Expr.cos" }
+cosh = { status = "canonical", batcher = "Expr.cosh" }
+cot = { status = "canonical", batcher = "Expr.cot" }
+csc = { status = "canonical", batcher = "Expr.csc" }
+degrees = { status = "canonical", batcher = "Expr.degrees" }
+e = { status = "canonical", batcher = "bt.e" }
+exp = { status = "canonical", batcher = "Expr.exp" }
+expm1 = { status = "canonical", batcher = "Expr.expm1" }
+factorial = { status = "mismatch", batcher = "Expr.factorial", note = "Batcher returns Int64 and raises outside 0..20; Spark returns null there. Port as bt.when(n.between(0, 20)).then(n.factorial())", wave = "W0" }
+floor = { status = "param", batcher = "Expr.floor", need = "scale= digits, and a BIGINT result for scale-less input", wave = "W2" }
+getbit = { status = "canonical", batcher = "bt.bit_get", template = 'getbit(col, pos) -> bt.bit_get(col, pos)' }
+greatest = { status = "canonical", batcher = "bt.greatest" }
+hypot = { status = "canonical", batcher = "bt.hypot" }
+least = { status = "canonical", batcher = "bt.least" }
+ln = { status = "canonical", batcher = "Expr.ln" }
+log = { status = "param", batcher = ["bt.log", "Expr.ln"], need = "one-argument natural-log form log(col)", wave = "W2" }
+log10 = { status = "canonical", batcher = "Expr.log10" }
+log1p = { status = "canonical", batcher = "Expr.log1p" }
+log2 = { status = "canonical", batcher = "Expr.log2" }
+nanvl = { status = "canonical", batcher = "bt.nanvl" }
+negate = { status = "canonical", batcher = "op:neg" }
+negative = { status = "canonical", batcher = "op:neg" }
+pi = { status = "canonical", batcher = "bt.pi" }
+pmod = { status = "canonical", batcher = "bt.pmod" }
+positive = { status = "canonical", batcher = "Expr", template = 'positive(col) -> sem.column(col)' }
+pow = { status = "canonical", batcher = "op:pow" }
+power = { status = "canonical", batcher = "op:pow" }
+radians = { status = "canonical", batcher = "Expr.radians" }
+rand = { status = "param", batcher = "Dataset.with_random", need = "expression form rand(seed) usable inside select/with_columns", wave = "W2" }
+randn = { status = "param", batcher = "Dataset.with_random", need = "expression form randn(seed) (normal=True) usable inside select/with_columns", wave = "W2" }
+rint = { status = "canonical", batcher = "Expr.round", template = 'rint(col) -> sem.column(col).round(0, mode="half_to_even")' }
+round = { status = "canonical", batcher = "Expr.round" }
+sec = { status = "canonical", batcher = "Expr.sec" }
+shiftleft = { status = "canonical", batcher = "op:lshift" }
+shiftright = { status = "canonical", batcher = "op:rshift" }
+shiftrightunsigned = { status = "gap", need = "unsigned (logical) right shift", wave = "W3" }
+sign = { status = "canonical", batcher = "Expr.sign" }
+signum = { status = "canonical", batcher = "Expr.sign" }
+sin = { status = "canonical", batcher = "Expr.sin" }
+sinh = { status = "canonical", batcher = "Expr.sinh" }
+sqrt = { status = "canonical", batcher = "Expr.sqrt" }
+tan = { status = "canonical", batcher = "Expr.tan" }
+tanh = { status = "canonical", batcher = "Expr.tanh" }
+try_add = { status = "gap", need = "addition returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
+try_divide = { status = "canonical", batcher = "Expr.safe_divide" }
+try_mod = { status = "canonical", batcher = "op:mod" }
+try_multiply = { status = "gap", need = "multiplication returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
+try_subtract = { status = "gap", need = "subtraction returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
+uniform = { status = "gap", need = "uniform random value in [min, max) with seed", wave = "W3" }
+width_bucket = { status = "canonical", batcher = "bt.width_bucket" }

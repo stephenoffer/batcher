@@ -81,10 +81,9 @@ def _agg_child_columns(node: Aggregate) -> set[str]:
     for key in node.group_keys:
         need |= referenced_columns(key.expr)
     for spec in node.aggregates:
-        if spec.agg.input is not None:
-            need |= referenced_columns(spec.agg.input)
-        if spec.agg.input2 is not None:  # arg_min/arg_max carry an ordering key
-            need |= referenced_columns(spec.agg.input2)
+        # The input, an arg_min/arg_max ordering key, and an ordered array_agg's keys.
+        for operand in spec.agg.operands():
+            need |= referenced_columns(operand)
     return need
 
 

@@ -165,7 +165,7 @@ def term_expr(
     """
     text = col(column).fill_null(lit(""))
     if lowercase:
-        text = text.str.to_lowercase()
+        text = text.str.lower()
     tokens = text.str.extract_all(token_pattern)
     if stop_words:
         tokens = tokens.list.filter(~element().is_in(list(stop_words)))

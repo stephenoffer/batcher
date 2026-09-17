@@ -39,15 +39,15 @@ def main() -> None:
 
     # A widened type still holds the values but breaks the contract, which is the case a
     # value-only check misses entirely.
-    widened = orders.astype({"o_orderkey": "float64"})
+    widened = orders.cast({"o_orderkey": "float64"})
     widened_types = dict(
         zip(widened.columns, [str(dtype) for dtype in widened.dtypes], strict=True)
     )
     assert widened_types["o_orderkey"] != expected["o_orderkey"]
     assert widened.count() == orders.count()
     # The values compare equal, which is exactly why the type check is needed.
-    assert widened.head(3).to_pydict()["o_orderkey"] == [
-        float(value) for value in orders.head(3).to_pydict()["o_orderkey"]
+    assert widened.limit(3).to_pydict()["o_orderkey"] == [
+        float(value) for value in orders.limit(3).to_pydict()["o_orderkey"]
     ]
 
     # A column added upstream is a different kind of change, and often a safe one.

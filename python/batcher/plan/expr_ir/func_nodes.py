@@ -216,11 +216,17 @@ class MakeTemporal(IRNode):
 
 @expr_node
 class DateTrunc(IRNode):
-    """`date_trunc(unit, ts)` — truncate to the start of a unit. → Timestamp."""
+    """`date_trunc(unit, ts)` — truncate to the start of a unit. → Timestamp.
+
+    `preserve_type` keeps a Date input a Date; `keep_time` truncates only the calendar
+    part and keeps the time of day. Both are omitted from the wire when off, so the
+    default shape is DuckDB's `date_trunc` byte for byte."""
 
     tag = ExprTag.DATE_TRUNC
     input: Expr = child()
     unit: str = scalar()
+    preserve_type: bool = scalar(omit_falsy=True, default=False)
+    keep_time: bool = scalar(omit_falsy=True, default=False)
 
 
 @expr_node
@@ -295,11 +301,14 @@ class Strftime(IRNode):
 class Strptime(IRNode):
     """`strptime(s, format)` — parse a string column into a Timestamp using a
     chrono/strftime format (e.g. ``%Y-%m-%d %H:%M:%S``). Values that do not match
-    become NULL (DuckDB ``try_strptime``). → Timestamp(us)."""
+    become NULL (DuckDB ``try_strptime``), or raise when ``strict`` (DuckDB ``strptime``,
+    Polars ``strict=True``). → Timestamp(us). ``strict`` is left out of the IR when false,
+    so a non-strict parse serializes exactly as it did before the field existed."""
 
     tag = ExprTag.STRPTIME
     input: Expr = child()
     format: str = scalar()
+    strict: bool = scalar(omit_falsy=True, default=False)
 
 
 @expr_node

@@ -1,0 +1,135 @@
+# PySpark 4.2.0 -> Batcher migration registry: DataFrame, na and stat functions.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[DataFrame]
+agg = { status = "param", batcher = "Dataset.agg", need = "dict {column: function-name} form, e.g. agg({'x': 'max'})", wave = "W2" }
+alias = { status = "gap", need = "DataFrame alias qualifiers for self-joins (df.alias('a') then col('a.x'))", wave = "W8" }
+approxQuantile = { status = "param", batcher = "Dataset.approx_quantile", need = "list of columns and list of probabilities in one call; relativeError=", wave = "W2" }
+asTable = { status = "gap", need = "table argument (TableArg with partitionBy/orderBy) for table-valued functions and UDTFs", wave = "W11" }
+cache = { status = "canonical", batcher = "Dataset.cache" }
+checkpoint = { status = "param", batcher = "Dataset.cache", need = "eager=True materialization that also truncates the logical plan", wave = "W8" }
+coalesce = { status = "canonical", batcher = "Dataset.repartition" }
+colRegex = { status = "canonical", batcher = "bt.matches" }
+collect = { status = "mismatch", batcher = "Dataset.collect", note = "Spark returns list[Row] eagerly; Batcher returns a pyarrow.Table. Port as: .to_pylist()", wave = "W0" }
+columns = { status = "canonical", batcher = "Dataset.columns" }
+corr = { status = "canonical", batcher = "Dataset.corr" }
+count = { status = "canonical", batcher = "Dataset.count" }
+cov = { status = "canonical", batcher = "Dataset.cov" }
+createGlobalTempView = { status = "param", batcher = "Session.register", need = "global_temp database scope, and raise when the view already exists", wave = "W9" }
+createOrReplaceGlobalTempView = { status = "param", batcher = "Session.register", need = "global_temp database scope shared across sessions", wave = "W9" }
+createOrReplaceTempView = { status = "canonical", batcher = "Session.register" }
+createTempView = { status = "canonical", batcher = "Session.register" }
+crossJoin = { status = "canonical", batcher = "Dataset.cross_join" }
+crosstab = { status = "mismatch", batcher = "Dataset.crosstab", note = "Spark names the first column '<col1>_<col2>' and fills absent pairs with 0; Batcher keeps the index column name and leaves absent pairs null. Needs fill_value= and a name parameter", wave = "W0" }
+cube = { status = "canonical", batcher = "Dataset.cube" }
+describe = { status = "mismatch", batcher = "Dataset.describe", note = "Spark returns a 'summary' column with count/mean/stddev/min/max rendered as strings; Batcher returns 'statistic' rows with null_count and quartiles as numbers", wave = "W0" }
+distinct = { status = "canonical", batcher = "Dataset.distinct" }
+drop = { status = "param", batcher = "Dataset.drop", need = "silently ignore unknown column names as Spark does (strict=False); Batcher raises", wave = "W2" }
+dropDuplicates = { status = "canonical", batcher = "Dataset.distinct" }
+dropDuplicatesWithinWatermark = { status = "param", batcher = "Dataset.drop_duplicates_within_watermark", need = "reuse the event time and delay declared by withWatermark instead of passing event_time=/lateness= again", wave = "W10" }
+drop_duplicates = { status = "canonical", batcher = "Dataset.distinct" }
+dropna = { status = "canonical", batcher = "Dataset.drop_nulls" }
+dtypes = { status = "mismatch", batcher = "Dataset.dtypes", note = "Spark returns [(name, 'bigint'), ...] pairs of DDL type strings; Batcher returns a list of pyarrow DataTypes without names", wave = "W0" }
+exceptAll = { status = "canonical", batcher = "Dataset.except_" }
+executionInfo = { status = "gap", need = "post-execution metrics object on the Dataset (Dataset.stats re-executes instead)", wave = "W8" }
+exists = { status = "param", batcher = "Dataset.join", need = "an outer reference in a correlated subquery; port as join(other, how=semi)", wave = "W8" }
+explain = { status = "mismatch", batcher = "Dataset.explain", note = "Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str", wave = "W0" }
+fillna = { status = "canonical", batcher = "Dataset.fill_null" }
+filter = { status = "canonical", batcher = "Dataset.filter", template = 'filter(condition) -> self.filter(sem.expression(condition))' }
+first = { status = "mismatch", batcher = "Dataset.first", note = "Spark returns a Row (or None); Batcher returns a tuple, or a dict with named=True", wave = "W0" }
+foreach = { status = "gap", need = "distributed per-row side-effect action on a batch Dataset (write.for_each is streaming only)", wave = "W11" }
+foreachPartition = { status = "gap", need = "distributed per-partition side-effect action on a batch Dataset", wave = "W11" }
+freqItems = { status = "param", batcher = "Dataset.value_counts", need = "approximate frequent items over several columns with a support= threshold, returning one row of arrays", wave = "W2" }
+groupBy = { status = "param", batcher = "Dataset.group_by", need = "Column-expression grouping keys (Batcher takes column names)", wave = "WF", template = 'groupBy(*cols) -> self.group_by(sem.column_names(cols))' }
+groupby = { status = "canonical", batcher = "Dataset.group_by", template = 'groupby(*cols) -> self.group_by(sem.column_names(cols))' }
+groupingSets = { status = "canonical", batcher = "Dataset.grouping_sets" }
+head = { status = "mismatch", batcher = ["Dataset.limit", "Dataset.to_pylist"], note = "Spark head(n) eagerly returns list[Row] (head() returns one Row); Batcher returns a lazy Dataset. Codemod: .limit(n).to_pylist()", wave = "W0", template = 'head(n) -> self.limit(n).to_pylist()' }
+hint = { status = "out_of_scope", reason = "no optimizer hint IR; Kyber chooses join strategies from measured statistics (revisit)" }
+inputFiles = { status = "param", batcher = "Dataset.meta", need = "port as [f.path for f in ds.meta.storage.files]", wave = "W8" }
+intersect = { status = "canonical", batcher = "Dataset.intersect" }
+intersectAll = { status = "canonical", batcher = "Dataset.intersect" }
+isEmpty = { status = "canonical", batcher = "Dataset.is_empty" }
+isLocal = { status = "out_of_scope", reason = "Spark driver-local execution flag; Batcher always runs in-process" }
+isStreaming = { status = "canonical", batcher = "Dataset.is_streaming" }
+join = { status = "param", batcher = "Dataset.join", need = "Spark how= spellings (left_outer, full_outer, leftsemi, left_anti, ...) as values; Column/non-equi on= conditions; full-outer key coalescing", wave = "W2", template = 'join(other, on=None, how=None) -> self.join(other, sem.join_keys(on), how=sem.join_how(how))' }
+lateralJoin = { status = "gap", need = "correlated lateral join (plan + _sql)", wave = "W8" }
+limit = { status = "canonical", batcher = "Dataset.limit" }
+localCheckpoint = { status = "param", batcher = "Dataset.cache", need = "eager=True materialization that truncates the logical plan", wave = "W8" }
+mapInArrow = { status = "mismatch", batcher = "Dataset.map_batches", note = "Spark passes an iterator of pyarrow.RecordBatch per partition and requires a schema; Batcher calls fn once per batch with no iterator protocol", wave = "W11" }
+mapInPandas = { status = "mismatch", batcher = "Dataset.map_batches", note = "Spark passes an iterator of pandas.DataFrame per partition and requires a schema; Batcher calls fn per batch (batch_format='pandas') with no iterator protocol", wave = "W11" }
+melt = { status = "canonical", batcher = "Dataset.unpivot" }
+mergeInto = { status = "param", batcher = "Dataset.write.merge_into", need = "target table name plus an arbitrary Column match condition (Batcher keys on on= columns)", wave = "W9" }
+metadataColumn = { status = "gap", need = "source metadata columns (_metadata.file_path etc.) selectable by name", wave = "W8" }
+na = { status = "canonical", batcher = ["Dataset.drop_nulls", "Dataset.fill_null"] }
+nearestByJoin = { status = "gap", need = "top-K nearest join ranked by an arbitrary expression (Dataset.ml.similarity_join is an LSH threshold join)", wave = "W8" }
+observe = { status = "gap", need = "named observed metrics collected while a query runs", wave = "W8" }
+offset = { status = "param", batcher = "Dataset.limit", need = "offset without a limit", wave = "W2" }
+orderBy = { status = "mismatch", batcher = "Dataset.sort", note = "Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls_first=True for ascending keys", wave = "W0", template = 'orderBy(*cols, **kwargs) -> self.sort(sem.spark_sort(cols, kwargs))' }
+pandas_api = { status = "out_of_scope", reason = "pandas-on-Spark API layer; migrate pandas code through the pandas guide instead" }
+persist = { status = "canonical", batcher = "Dataset.cache" }
+plot = { status = "out_of_scope", reason = "plotting accessor, not a data-engine capability" }
+printSchema = { status = "mismatch", batcher = "Dataset.schema", note = "Spark prints a tree; Batcher exposes a pyarrow.Schema to print", wave = "W0" }
+randomSplit = { status = "param", batcher = "Dataset.ml.random_split", need = "weights normalized when they do not sum to 1, and an unseeded random default", wave = "W2" }
+rdd = { status = "out_of_scope", reason = "no RDD or JVM context" }
+registerTempTable = { status = "canonical", batcher = "Session.register" }
+repartition = { status = "param", batcher = "Dataset.repartition", need = "hash co-location of rows by columns and a partition count; Batcher's by= lays out the output directory instead", wave = "W2" }
+repartitionById = { status = "param", batcher = "Dataset.repartition", need = "partitioning by an integer partition-id expression", wave = "W2" }
+repartitionByRange = { status = "param", batcher = "Dataset.repartition", need = "range partitioning by sort keys", wave = "W2" }
+replace = { status = "param", batcher = "Expr.replace", need = "Dataset-level replace(to_replace, value, subset) across columns", wave = "W2" }
+rollup = { status = "canonical", batcher = "Dataset.rollup" }
+sameSemantics = { status = "gap", need = "compare two logical plans for semantic equality", wave = "W8" }
+sample = { status = "param", batcher = "Dataset.sample", need = "withReplacement= (Poisson sampling)", wave = "W2" }
+sampleBy = { status = "param", batcher = "Dataset.sample", need = "stratified sampling with a per-stratum fractions dict", wave = "W2" }
+scalar = { status = "gap", need = "scalar subquery as a column", wave = "W8" }
+schema = { status = "mismatch", batcher = "Dataset.schema", note = "Spark returns a StructType; Batcher returns a pyarrow.Schema", wave = "W0" }
+select = { status = "canonical", batcher = "Dataset.select" }
+selectExpr = { status = "canonical", batcher = "Dataset.select", template = 'selectExpr(*expr) -> self.select(sem.spark_sql_exprs(expr))' }
+semanticHash = { status = "gap", need = "semantic hash of the logical plan", wave = "W8" }
+show = { status = "param", batcher = "Dataset.show", need = "truncate= and vertical= display options (Spark shows 20 rows by default)", wave = "W2" }
+sort = { status = "mismatch", batcher = "Dataset.sort", note = "Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls_first=True for ascending keys", wave = "W0", template = 'sort(*cols, **kwargs) -> self.sort(sem.spark_sort(cols, kwargs))' }
+sortWithinPartitions = { status = "gap", need = "sort rows within each partition without a global order", wave = "W8" }
+sparkSession = { status = "out_of_scope", reason = "handle to the owning SparkSession; Batcher datasets carry no session object" }
+stat = { status = "canonical", batcher = ["Dataset.corr", "Dataset.cov"] }
+storageLevel = { status = "gap", need = "read back the storage level a cached Dataset was persisted with", wave = "W8" }
+subtract = { status = "canonical", batcher = "Dataset.except_" }
+summary = { status = "param", batcher = "Dataset.describe", need = "choose statistics by name (count, mean, stddev, min, max, '75%') with string output", wave = "W2" }
+tail = { status = "mismatch", batcher = "Dataset.tail", note = "Spark tail(n) eagerly returns list[Row]; Batcher returns a lazy Dataset. Port as: .tail(n).to_pylist()", wave = "W0" }
+take = { status = "mismatch", batcher = "Dataset.limit", note = "Spark take(n) eagerly returns list[Row]; Batcher limit is lazy. Codemod: .limit(n).to_pylist()", wave = "W0", template = 'take(num) -> self.limit(num).to_pylist()' }
+to = { status = "param", batcher = "Dataset.cast", need = "reconcile to a target schema: reorder, project away and cast nested fields by name", wave = "W2" }
+toArrow = { status = "canonical", batcher = "Dataset.to_arrow" }
+toDF = { status = "param", batcher = "Dataset.rename", need = "rename every column positionally from a list of new names", wave = "W2" }
+toJSON = { status = "gap", need = "render each row as a JSON string", wave = "W7" }
+toLocalIterator = { status = "mismatch", batcher = "Dataset.iter_rows", note = "Spark yields Row objects partition by partition; Batcher yields tuples (or dicts with named=True)", wave = "W0" }
+toPandas = { status = "canonical", batcher = "Dataset.to_pandas" }
+transform = { status = "canonical", batcher = "Dataset.pipe" }
+transpose = { status = "param", batcher = "Dataset.transpose", need = "Spark's index column argument; port as transpose(column_names=idx, include_header=True, header_name=key)", wave = "W8" }
+union = { status = "mismatch", batcher = "Dataset.union", note = "Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by_name=False positional mode", wave = "W2" }
+unionAll = { status = "mismatch", batcher = "Dataset.union", note = "Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by_name=False positional mode", wave = "W2" }
+unionByName = { status = "param", batcher = "Dataset.union", need = "match columns by name in any order, and allowMissingColumns= filling absent columns with null", wave = "W2", template = 'unionByName(other, allowMissingColumns=False) -> self.union(other.select(*self.columns), sem.expect(allowMissingColumns, False))' }
+unpersist = { status = "canonical", batcher = "Dataset.uncache" }
+unpivot = { status = "canonical", batcher = "Dataset.unpivot" }
+where = { status = "canonical", batcher = "Dataset.filter", template = 'where(condition) -> self.filter(sem.expression(condition))' }
+withColumn = { status = "canonical", batcher = "Dataset.with_columns", template = 'withColumn(colName, col) -> self.with_columns(**{colName: col})' }
+withColumnRenamed = { status = "param", batcher = "Dataset.rename", need = "no-op when the column is absent (Batcher raises)", wave = "W2", template = 'withColumnRenamed(existing, new) -> self.rename({existing: new})' }
+withColumns = { status = "canonical", batcher = "Dataset.with_columns", template = 'withColumns(colsMap) -> self.with_columns(**colsMap)' }
+withColumnsRenamed = { status = "param", batcher = "Dataset.rename", need = "no-op for absent columns (Batcher raises)", wave = "W2" }
+withMetadata = { status = "gap", need = "per-field metadata on a column", wave = "W11" }
+withWatermark = { status = "canonical", batcher = "Dataset.with_watermark" }
+write = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly", wave = "W0" }
+writeStream = { status = "canonical", batcher = "Dataset.write" }
+writeTo = { status = "canonical", batcher = "Dataset.write.table" }
+zipWithIndex = { status = "mismatch", batcher = "Dataset.with_row_index", note = "Spark appends the index as the last column; Batcher inserts it first", wave = "W0" }
+
+[DataFrameNaFunctions]
+drop = { status = "mismatch", batcher = "Dataset.drop_nulls", note = "Dataset.drop removes columns; na.drop drops rows and maps to Dataset.drop_nulls, which lacks thresh=", wave = "W2" }
+fill = { status = "canonical", batcher = "Dataset.fill_null" }
+replace = { status = "param", batcher = "Expr.replace", need = "Dataset-level replace(to_replace, value, subset) across columns", wave = "W2" }
+
+[DataFrameStatFunctions]
+approxQuantile = { status = "param", batcher = "Dataset.approx_quantile", need = "list of columns and list of probabilities in one call; relativeError=", wave = "W2" }
+corr = { status = "canonical", batcher = "Dataset.corr" }
+cov = { status = "canonical", batcher = "Dataset.cov" }
+crosstab = { status = "mismatch", batcher = "Dataset.crosstab", note = "Spark names the first column '<col1>_<col2>' and fills absent pairs with 0; Batcher keeps the index column name and leaves absent pairs null. Needs fill_value= and a name parameter", wave = "W0" }
+freqItems = { status = "param", batcher = "Dataset.value_counts", need = "approximate frequent items over several columns with a support= threshold, returning one row of arrays", wave = "W2" }
+sampleBy = { status = "param", batcher = "Dataset.sample", need = "stratified sampling with a per-stratum fractions dict", wave = "W2" }

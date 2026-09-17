@@ -151,9 +151,13 @@ has no row axis at all, so give it one with `np.atleast_1d`.
 ### From other frameworks
 
 Adapters convert a frame from another library into a `Dataset`:
-{py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_dask <batcher.from_dask>`,
+{py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_daft <batcher.from_daft>`, {py:func}`from_dask <batcher.from_dask>`,
 {py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>`. They require the corresponding
 library to be installed.
+
+Three of them stream rather than collect, so the other engine's result never sits in memory as one table. A Polars `LazyFrame` runs under Polars' `collect_batches` and arrives chunk by chunk. A Daft `DataFrame` arrives through `to_arrow_iter`. A Spark `DataFrame` on PySpark 4.1 or later arrives one partition at a time through its Arrow stream, and on earlier releases it's collected through `toArrow` or `toPandas`. Each of these re-runs the other engine's query whenever the `Dataset` executes. Polars strings arrive as `large_string` rather than `string_view`, which Batcher has no kernels for.
+
+The return legs are {py:meth}`ds.to_polars() <batcher.Dataset.to_polars>`, {py:meth}`ds.to_daft() <batcher.Dataset.to_daft>`, and {py:meth}`ds.to_spark(spark) <batcher.Dataset.to_spark>`. `to_spark` takes the session explicitly. It hands a result of up to 64 MiB to `spark.createDataFrame` as one Arrow table, and stages a larger one as Parquet under `staging_path` for `spark.read.parquet`. On a cluster, point `staging_path` at storage every executor can read.
 
 ```python
 # docs: skip
@@ -161,6 +165,8 @@ import pandas as pd
 
 ds = bt.from_pandas(pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}))
 ```
+
+When you don't want to name the library, {py:func}`from_any <batcher.from_any>` dispatches on the object's type. It also accepts an object that exports only the DataFrame interchange protocol (`__dataframe__`), the one Polars' `from_dataframe` consumes, and converts it through `pyarrow.interchange`.
 
 {py:func}`from_torch <batcher.from_torch>` takes a tensor, a `{name: tensor}` mapping, a tuple of tensors, or a map-style
 `Dataset`, and applies the same rank rules as `from_numpy`. See {doc}`PyTorch </integrations/compute/pytorch>` for
@@ -216,6 +222,24 @@ format-specific options.
 ds = bt.read.delta("s3://lake/events")
 frames = bt.read.images("s3://bucket/photos/*.jpg")
 ```
+
+`read.arrow` reads both Arrow IPC layouts. A file with the IPC file footer splits by record
+batch, and a footer-less IPC stream, such as one from Polars' `write_ipc_stream`, is read front
+to back as one split.
+
+`read.binary` doubles as a file inventory. A scan that projects only `uri` and `size` answers
+from the file listing and never opens a file, which is the Batcher spelling of Daft's
+`from_glob_path`:
+
+```python
+# docs: skip
+inventory = bt.read.binary("s3://bucket/raw/*.jpg").select("uri", "size")
+large = inventory.filter(bt.col("size") > 10_000_000)
+```
+
+`read.text` keeps blank lines by default. `skip_blank_lines=True` drops lines that are empty
+or hold only whitespace, the way Daft's `read_text` does, and the kept rows keep their original
+`line_number`.
 
 ## Messy input
 

@@ -59,7 +59,7 @@ def test_sort_preserves_tensor_type():
 
 
 def test_limit_preserves_tensor_type():
-    assert _ttype(bt.from_arrow(_table()).head(2).collect()).startswith(_TENSOR)
+    assert _ttype(bt.from_arrow(_table()).limit(2).collect()).startswith(_TENSOR)
 
 
 def test_union_preserves_tensor_type():

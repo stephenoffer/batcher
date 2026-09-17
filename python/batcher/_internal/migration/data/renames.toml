@@ -1,0 +1,239 @@
+# Batcher's own second spellings, and the one spelling each collapses to.
+#
+# One table per receiver (the receiver spellings of tools/parity/batcher_targets.py); each key
+# is a spelling being removed. The choice follows the parity plan's naming rule: the spelling
+# shared by the most of Polars, Spark, Daft, Ray Data and DuckDB, with a tie going to Polars.
+#
+# A value is the kept attribute name, or an inline table when the replacement is not a plain
+# rename: `{ to = "write.csv" }` (a dotted path from the same receiver), `{ to = "count",
+# call = true }` (a property replaced by a call), `{ operator = "add" }` (an operator), or
+# `{ transform = "...", to = "..." }` (an argument reshaping). Any of them may add
+# `keys = ["<param>", ...]` (the call's positional arguments become those keywords, in order:
+# `clip_max(2)` is `clip(upper=2)`), or `fill = ["<param>@<position>=<python literal>"]`: when the removed call omits that argument,
+# the rewrite passes the removed spelling's default explicitly, because the kept one differs
+# (`head()` is `limit(5)`). The rule types and their
+# validation live in python/batcher/_internal/migration/renames.py.
+#
+# Three consumers read this: the `batcher.migrate` codemod rewrites the removed spelling in
+# existing code, the migration-error guidance names the replacement when the removed spelling
+# is typed, and tests/unit/test_migration_renames.py checks that every second spelling
+# `tools/lint_aliases.py` finds has a decision here. Where the kept spelling is today the
+# delegate and the removed one holds the implementation (`acos` -> `arccos`), the
+# implementation moves under the kept name as part of the removal.
+
+
+[Dataset]
+append = "union"
+approx_n_unique = "approx_count_distinct"
+assign = "with_columns"
+astype = "cast"
+coalesce = "repartition"
+copy = { transform = "identity", to = "self" }
+difference = "except_"
+drop_duplicates = "distinct"
+dropna = "drop_nulls"
+empty = { to = "is_empty", call = true }
+fillna = "fill_null"
+groupby = "group_by"
+head = { to = "limit", fill = ["n@0=5"] }
+height = { to = "count", call = true }
+lazy = { transform = "identity", to = "self" }
+melt = "unpivot"
+merge = "join"
+n_unique = "count_distinct"
+nlargest = "top_k"
+nsmallest = "bottom_k"
+persist = "cache"
+query = "filter"
+sample_frac = "sample"
+skewness = "skew"
+slice = { transform = "slice_to_limit", to = "limit" }
+sort_values = "sort"
+to_csv = { to = "write.csv" }
+to_dict = "to_pydict"
+to_dicts = "to_pylist"
+to_json = { to = "write.json" }
+to_parquet = { to = "write.parquet" }
+to_tf = { to = "ml.to_tf" }
+to_torch_dataloader = { to = "ml.to_torch_dataloader" }
+transform = "pipe"
+unique = "distinct"
+unpersist = "uncache"
+vstack = "union"
+with_column = { transform = "with_column", to = "with_columns" }
+with_row_count = "with_row_index"
+
+["Dataset.meta"]
+# `none_match` stays: it completes the `all_match`/`any_match` family a reader scans first.
+is_empty_where = "none_match"
+
+["Dataset.ml"]
+to_torch = "iter_torch_batches"
+
+[Expr]
+acos = "arccos"
+acosh = "arccosh"
+add = { operator = "add" }
+all = "bool_and"
+and_ = { operator = "and" }
+any = "bool_or"
+approx_n_unique = "approx_count_distinct"
+arg_max = { to = "max_by", args = 1 }
+arg_min = { to = "min_by", args = 1 }
+asin = "arcsin"
+asinh = "arcsinh"
+astype = "cast"
+atan = "arctan"
+atanh = "arctanh"
+clip_max = { to = "clip", keys = ["upper"] }
+clip_min = { to = "clip", keys = ["lower"] }
+cumcount = "cum_count"
+cummax = "cum_max"
+cummin = "cum_min"
+cumprod = "cum_prod"
+cumsum = "cum_sum"
+div = { operator = "truediv" }
+eq = { operator = "eq" }
+fillna = "fill_null"
+floordiv = { operator = "floordiv" }
+ge = { operator = "ge" }
+gt = { operator = "gt" }
+is_between = "between"
+isin = "is_in"
+isna = "is_null"
+isnull = "is_null"
+kurt = "kurtosis"
+kurtosis_pop = { to = "kurtosis", fill = ["bias@99=True"] }
+le = { operator = "le" }
+log = "ln"
+lt = { operator = "lt" }
+mod = { operator = "mod" }
+mul = { operator = "mul" }
+n_unique = "count_distinct"
+ne = { operator = "ne" }
+neg = { operator = "neg" }
+not_ = { operator = "invert" }
+notna = "is_not_null"
+notnull = "is_not_null"
+nunique = "count_distinct"
+or_ = { operator = "or" }
+pow = { operator = "pow" }
+prod = "product"
+rename = "alias"
+rint = { to = "round", fill = ["mode@1='half_to_even'"] }
+skewness = "skew"
+sub = { operator = "sub" }
+truediv = { operator = "truediv" }
+xor = { operator = "xor" }
+
+["Expr.dt"]
+day_name = "dayname"
+day_of_week = "dayofweek"
+day_of_year = "dayofyear"
+daysinmonth = "days_in_month"
+floor = "truncate"
+is_weekday = "is_business_day"
+isodow = "weekday"
+month_end = "last_day"
+month_name = "monthname"
+ordinal_day = "dayofyear"
+to_string = { to = "strftime", fill = ["format@0='%Y-%m-%dT%H:%M:%S'"] }
+week_of_year = "week"
+weekofyear = "week"
+
+["Expr.list"]
+argmax = "arg_max"
+argmin = "arg_min"
+dim = "len"
+element_at = "get"
+euclidean_distance = "l2_distance"
+lengths = "len"
+magnitude = "l2_norm"
+max_pool = "max"
+mean_pool = "mean"
+set_difference = "difference"
+set_intersection = "intersect"
+set_union = "union"
+sort_desc = { to = "sort", fill = ["descending@99=True"] }
+
+["Expr.str"]
+head = "left"
+initcap = "to_titlecase"
+isalnum = "is_alnum"
+isalpha = "is_alpha"
+isdigit = "is_numeric"
+isspace = "is_space"
+len = "len_chars"
+len_bytes = "octet_length"
+ljust = "rpad"
+lstrip = "strip_chars_start"
+pad_end = "rpad"
+pad_start = "lpad"
+regexp_escape = "escape_regex"
+regexp_extract = { to = "extract", fill = ["group@1=0"] }
+regexp_extract_all = "extract_all"
+regexp_replace_all = "replace_all"
+removeprefix = "strip_prefix"
+regexp_count = "count_matches"
+removesuffix = "strip_suffix"
+rjust = "lpad"
+rstrip = "strip_chars_end"
+startswith = "starts_with"
+endswith = "ends_with"
+strip = "trim"
+strip_chars = "trim"
+tail = "right"
+title = "to_titlecase"
+to_lowercase = "lower"
+to_uppercase = "upper"
+truncate_chars = "left"
+
+[GroupBy]
+skewness = "skew"
+nunique = "count_distinct"
+n_unique = "count_distinct"
+size = { to = "len", fill = ["name@0='size'"] }
+
+[StreamingQuery]
+awaitTermination = "await_termination"
+isActive = "is_active"
+lastProgress = "last_progress"
+processAllAvailable = "process_all_available"
+recentProgress = "recent_progress"
+runId = "run_id"
+
+[bt]
+approx_n_unique = "approx_count_distinct"
+arg_max = "max_by"
+arg_min = "min_by"
+atan2 = "arctan2"
+from_dict = "from_pydict"
+from_dicts = "from_pylist"
+max_horizontal = "greatest"
+min_horizontal = "least"
+n_unique = "count_distinct"
+read_avro = { to = "read.avro" }
+read_csv = { to = "read.csv" }
+read_database = { to = "read.sql", keys = ["query", "uri"] }
+read_delta = { to = "read.delta" }
+read_excel = { to = "read.excel" }
+read_iceberg = { to = "read.iceberg" }
+read_ipc = { to = "read.arrow" }
+read_json = { to = "read.json" }
+read_ndjson = { to = "read.json" }
+read_orc = { to = "read.orc" }
+read_parquet = { to = "read.parquet" }
+read_table = { to = "read.table" }
+skewness = "skew"
+
+[Trigger]
+AvailableNow = "available_now"
+Continuous = "continuous"
+Once = "once"
+ProcessingTime = "processing_time"
+
+# Hook methods a subclass defines, renamed on the class that inherits from it.
+[StreamingQueryListener]
+onQueryProgress = "on_query_progress"
+onQueryStarted = "on_query_started"
+onQueryTerminated = "on_query_terminated"

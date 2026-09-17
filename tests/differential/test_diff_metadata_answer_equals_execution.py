@@ -42,7 +42,7 @@ AGGREGATES = {
     "min": lambda c: bt.col(c).min(),
     "max": lambda c: bt.col(c).max(),
     "count": lambda c: bt.col(c).count(),
-    "count_distinct": lambda c: bt.col(c).n_unique(),
+    "count_distinct": lambda c: bt.col(c).count_distinct(),
 }
 
 

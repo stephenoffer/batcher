@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    comments = tpch("lineitem").select("l_orderkey", "l_comment").head(20_000)
+    comments = tpch("lineitem").select("l_orderkey", "l_comment").limit(20_000)
 
     # Exact duplicates: a group-by on the text itself.
     exact = (
@@ -32,14 +32,14 @@ def main() -> None:
     print("exactly duplicated comments:", exact.count())
 
     total = comments.count()
-    distinct = comments.n_unique("l_comment")
+    distinct = comments.count_distinct("l_comment")
     print(f"{distinct} distinct of {total}")
     assert distinct <= total
 
     # A content hash gives the same grouping in fixed width, which is what you store when
     # the text is large.
     hashed = comments.select("l_orderkey", fingerprint=col("l_comment").str.sha256())
-    assert hashed.n_unique("fingerprint") == distinct
+    assert hashed.count_distinct("fingerprint") == distinct
 
     # MinHash is the near-duplicate version: similar text, colliding signatures.
     similar = comments.select(
@@ -52,7 +52,7 @@ def main() -> None:
     print("minhash buckets with more than one member:", buckets.count())
 
     # A hash collision groups at least as aggressively as exact equality does.
-    assert similar.n_unique("sim") <= distinct
+    assert similar.count_distinct("sim") <= distinct
 
 
 if __name__ == "__main__":

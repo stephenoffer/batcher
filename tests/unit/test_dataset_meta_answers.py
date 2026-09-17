@@ -64,7 +64,7 @@ def test_column_summaries_agree_with_an_executed_aggregate(shape: str) -> None:
         hi=bt.col("a").max(),
         total=bt.col("a").sum(),
         avg=bt.col("a").mean(),
-        distinct=bt.col("a").n_unique(),
+        distinct=bt.col("a").count_distinct(),
     ).to_pydict()
 
     assert tuple(meta.bounds()) == (row["lo"][0], row["hi"][0])
@@ -177,7 +177,7 @@ def test_count_where_matches_an_executed_filter(shape: str, threshold: int) -> N
     executed = ds.filter(predicate).count()
 
     assert ds.meta.count_where(predicate) == executed
-    assert ds.meta.is_empty_where(predicate) is (executed == 0)
+    assert ds.meta.none_match(predicate) is (executed == 0)
 
 
 # --------------------------------------------------------------------------- #

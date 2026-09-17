@@ -1,4 +1,4 @@
-"""Python-level ergonomics of `Expr`: dunders, builtins, repr, and compat aliases.
+"""Python-level ergonomics of `Expr`: dunders, builtins, repr, and absent spellings.
 
 These are plan-build-time properties (no engine needed), so they live in `tests/unit`.
 Three families:
@@ -6,9 +6,8 @@ Three families:
 1. **Builtins refuse clearly.** ``len``/``in``/``hash``/``bool``/``iter`` on an
    expression are all mistakes, and each must name the fix rather than surface
    Python's default message.
-2. **Aliases are delegations, not reimplementations.** Every compat spelling must
-   produce an IR *identical* to the primary. Comparing `to_ir()` is what proves there
-   is one implementation rather than two that can drift.
+2. **One name per capability.** Ecosystem spellings that would be silently wrong
+   (1-based SQL positions, `islower` on uncased strings) stay absent.
 3. **`repr` round-trips visually.** The rendered form should read like the code that
    built the expression, including arguments.
 """
@@ -57,7 +56,7 @@ def test_hash_explains_why_equality_is_unusable():
 
 def test_iter_mentions_the_horizontal_helpers():
     """``min(expr)`` reaches `__iter__`, so that message must cover the min/max case."""
-    with pytest.raises(TypeError, match="min_horizontal"):
+    with pytest.raises(TypeError, match="least"):
         min(col("x"))
 
 
@@ -110,120 +109,7 @@ def test_expressions_survive_deepcopy():
     assert copy.deepcopy(e).to_ir() == e.to_ir()
 
 
-# --- 2. compat aliases are exact delegations -----------------------------------------
-@pytest.mark.parametrize(
-    ("alias", "primary"),
-    [
-        ("isna", "is_null"),
-        ("isnull", "is_null"),
-        ("notna", "is_not_null"),
-        ("notnull", "is_not_null"),
-    ],
-)
-def test_nullary_alias_matches_primary(alias, primary):
-    assert getattr(col("x"), alias)().to_ir() == getattr(col("x"), primary)().to_ir()
-
-
-@pytest.mark.parametrize(
-    ("alias", "primary"),
-    [
-        ("nunique", "n_unique"),
-        ("skew", "skewness"),
-        ("kurt", "kurtosis"),
-        ("cumsum", "cum_sum"),
-        ("cummax", "cum_max"),
-        ("cummin", "cum_min"),
-        ("cumcount", "cum_count"),
-        ("prod", "product"),
-        ("any", "bool_or"),
-        ("all", "bool_and"),
-        ("log", "ln"),
-    ],
-)
-def test_aggregate_alias_matches_primary(alias, primary):
-    """Aggregate/window nodes have no standalone `to_ir()`, so compare the built node.
-
-    They are only serializable once hoisted into an `Aggregate`/`Window` plan node,
-    so equality here is on the node's own rendered form.
-    """
-    assert repr(getattr(col("x"), alias)()) == repr(getattr(col("x"), primary)())
-
-
-@pytest.mark.parametrize(
-    ("alias", "primary", "arg"),
-    [
-        ("astype", "cast", "float64"),
-        ("fillna", "fill_null", 0),
-        ("isin", "is_in", [1, 2]),
-        ("rename", "alias", "y"),
-    ],
-)
-def test_unary_alias_matches_primary(alias, primary, arg):
-    assert getattr(col("x"), alias)(arg).to_ir() == getattr(col("x"), primary)(arg).to_ir()
-
-
-@pytest.mark.parametrize(
-    ("method", "op"),
-    [
-        ("add", lambda a, b: a + b),
-        ("sub", lambda a, b: a - b),
-        ("mul", lambda a, b: a * b),
-        ("truediv", lambda a, b: a / b),
-        ("div", lambda a, b: a / b),
-        ("floordiv", lambda a, b: a // b),
-        ("mod", lambda a, b: a % b),
-        ("eq", lambda a, b: a == b),
-        ("ne", lambda a, b: a != b),
-        ("lt", lambda a, b: a < b),
-        ("le", lambda a, b: a <= b),
-        ("gt", lambda a, b: a > b),
-        ("ge", lambda a, b: a >= b),
-        ("and_", lambda a, b: a & b),
-        ("or_", lambda a, b: a | b),
-        ("xor", lambda a, b: a ^ b),
-    ],
-)
-def test_operator_method_matches_the_operator(method, op):
-    assert getattr(col("x"), method)(col("y")).to_ir() == op(col("x"), col("y")).to_ir()
-
-
-def test_not_matches_the_invert_operator():
-    assert col("x").not_().to_ir() == (~col("x")).to_ir()
-
-
-@pytest.mark.parametrize(
-    ("accessor", "alias", "primary"),
-    [
-        ("str", "isdigit", "is_numeric"),
-        ("str", "isalpha", "is_alpha"),
-        ("str", "isalnum", "is_alnum"),
-        ("str", "isspace", "is_space"),
-        ("dt", "day_of_week", "dayofweek"),
-        ("dt", "day_of_year", "dayofyear"),
-        ("dt", "week_of_year", "weekofyear"),
-        ("list", "lengths", "len"),
-        ("list", "argmin", "arg_min"),
-        ("list", "argmax", "arg_max"),
-    ],
-)
-def test_namespace_alias_matches_primary(accessor, alias, primary):
-    ns = getattr(col("c"), accessor)
-    assert getattr(ns, alias)().to_ir() == getattr(ns, primary)().to_ir()
-
-
-@pytest.mark.parametrize(
-    ("accessor", "alias", "primary", "arg"),
-    [
-        ("str", "strip_prefix", "removeprefix", "ab"),
-        ("str", "strip_suffix", "removesuffix", "cd"),
-        ("list", "element_at", "get", 1),
-    ],
-)
-def test_namespace_alias_with_arg_matches_primary(accessor, alias, primary, arg):
-    ns = getattr(col("c"), accessor)
-    assert getattr(ns, alias)(arg).to_ir() == getattr(ns, primary)(arg).to_ir()
-
-
+# --- 2. no silently-wrong ecosystem spellings ---------------------------------------
 def test_aliases_that_would_be_semantically_wrong_are_absent():
     """Guard the deliberate omissions in `expr_ir.compat.namespaces`.
 
@@ -281,7 +167,7 @@ def test_a_truncation_unit_alias_is_canonicalized_on_the_node():
     """
     assert repr(col("t").dt.truncate("1d")) == "col('t').dt.truncate('day')"
     assert repr(col("t").dt.truncate("mo")) == "col('t').dt.truncate('month')"
-    assert repr(col("t").dt.floor("1h")) == "col('t').dt.truncate('hour')"
+    assert repr(col("t").dt.truncate("1h")) == "col('t').dt.truncate('hour')"
 
 
 def test_two_column_list_nodes_repr_without_raising():

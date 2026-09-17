@@ -137,6 +137,28 @@ gen-exports:
 map:
     python tools/gen_map.py
 
+# Regenerate the per-engine migration reference pages under docs/getting-started/migration/
+# (spark, polars, daft, ray-data) from the migration registry. Run it after changing a
+# registry row or the codemod's implemented directions;
+# tests/docs/test_migration_docs_fresh.py fails when the pages are stale.
+migration-docs:
+    python tools/gen_migration_docs.py
+
+# Re-enumerate every public name in the installed PySpark, Polars, Daft and Ray Data into
+# tools/parity/surfaces/. The migration registry must classify each one exactly once
+# (tests/unit/test_migration_registry.py), so this is how a competitor upgrade becomes a
+# reviewable diff of names instead of a silent change in what "full parity" means.
+parity-snapshot:
+    python tools/parity/surfaces.py
+
+# Second spellings on the public surface: two names bound to one function, a method that only
+# forwards its parameters to another public method, or two expression methods that build the
+# same IR. One spelling per capability; the removed ones live in the migration registry, and
+# `python -m batcher.migrate` rewrites code that still uses them. Imports the engine, so it
+# runs after `just build`.
+lint-aliases:
+    python tools/lint_aliases.py --check
+
 # Copy-paste detector. The subsystems cannot import each other, so copy-paste is the only
 # *wrong* way to share between them — this is what catches it.
 lint-duplication:

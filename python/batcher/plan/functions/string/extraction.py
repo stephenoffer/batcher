@@ -65,7 +65,7 @@ def extract_json(text: str | Expr) -> Expr:
             >>> ds.select(j=bt.extract_json("o")).to_pydict()["j"][0]
             '{"a": 1, "b": [2, 3]}'
     """
-    return _text(text).str.regexp_extract(r"\{[\s\S]*\}", 0)
+    return _text(text).str.extract(r"\{[\s\S]*\}", 0)
 
 
 def extract_json_array(text: str | Expr) -> Expr:
@@ -88,7 +88,7 @@ def extract_json_array(text: str | Expr) -> Expr:
             >>> ds.select(a=bt.extract_json_array("o")).to_pydict()["a"][0]
             '[1, 2, 3]'
     """
-    return _text(text).str.regexp_extract(r"\[[\s\S]*\]", 0)
+    return _text(text).str.extract(r"\[[\s\S]*\]", 0)
 
 
 def extract_code_block(text: str | Expr) -> Expr:
@@ -113,7 +113,7 @@ def extract_code_block(text: str | Expr) -> Expr:
             >>> ds.select(c=bt.extract_code_block("o")).to_pydict()["c"][0]
             'print(1)'
     """
-    return _text(text).str.regexp_extract(r"```(?:[a-zA-Z0-9_+-]*\n)?([\s\S]*?)```", 1)
+    return _text(text).str.extract(r"```(?:[a-zA-Z0-9_+-]*\n)?([\s\S]*?)```", 1)
 
 
 def extract_first_number(text: str | Expr) -> Expr:
@@ -138,7 +138,7 @@ def extract_first_number(text: str | Expr) -> Expr:
             >>> ds.select(n=bt.extract_first_number("o")).to_pydict()["n"]
             [8.0, None]
     """
-    return _text(text).str.regexp_extract(r"-?\d+\.?\d*", 0).try_cast("float64")
+    return _text(text).str.extract(r"-?\d+\.?\d*", 0).try_cast("float64")
 
 
 def extract_tag(text: str | Expr, tag: str) -> Expr:
@@ -164,7 +164,7 @@ def extract_tag(text: str | Expr, tag: str) -> Expr:
             'Paris'
     """
     name = re.escape(tag)
-    return _text(text).str.regexp_extract(rf"<{name}>([\s\S]*?)</{name}>", 1)
+    return _text(text).str.extract(rf"<{name}>([\s\S]*?)</{name}>", 1)
 
 
 def extract_reasoning(text: str | Expr) -> Expr:
@@ -188,7 +188,7 @@ def extract_reasoning(text: str | Expr) -> Expr:
             >>> ds.select(r=bt.extract_reasoning("o")).to_pydict()["r"][0]
             '2+2 is 4'
     """
-    return _text(text).str.regexp_extract(r"<think(?:ing)?>([\s\S]*?)</think(?:ing)?>", 1)
+    return _text(text).str.extract(r"<think(?:ing)?>([\s\S]*?)</think(?:ing)?>", 1)
 
 
 def strip_reasoning(text: str | Expr) -> Expr:
@@ -212,9 +212,7 @@ def strip_reasoning(text: str | Expr) -> Expr:
             >>> ds.select(a=bt.strip_reasoning("o")).to_pydict()["a"][0]
             'The answer is 4'
     """
-    return (
-        _text(text).str.regexp_replace(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>", "").str.strip()
-    )
+    return _text(text).str.regexp_replace(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>", "").str.trim()
 
 
 def extract_after(text: str | Expr, marker: str) -> Expr:
@@ -240,7 +238,7 @@ def extract_after(text: str | Expr, marker: str) -> Expr:
             >>> ds.select(a=bt.extract_after("o", "Answer:")).to_pydict()["a"][0]
             'Paris'
     """
-    return _text(text).str.regexp_extract(re.escape(marker) + r"\s*(.*)", 1).str.strip()
+    return _text(text).str.extract(re.escape(marker) + r"\s*(.*)", 1).str.trim()
 
 
 def extract_between(text: str | Expr, start: str, end: str) -> Expr:
@@ -267,7 +265,7 @@ def extract_between(text: str | Expr, start: str, end: str) -> Expr:
             >>> ds.select(v=bt.extract_between("o", "[[", "]]")).to_pydict()["v"][0]
             '42'
     """
-    return _text(text).str.regexp_extract(re.escape(start) + r"([\s\S]*?)" + re.escape(end), 1)
+    return _text(text).str.extract(re.escape(start) + r"([\s\S]*?)" + re.escape(end), 1)
 
 
 def is_refusal(text: str | Expr) -> Expr:
@@ -323,7 +321,7 @@ def extract_choice(text: str | Expr) -> Expr:
             >>> ds.select(c=bt.extract_choice("o")).to_pydict()["c"]
             ['B', 'C']
     """
-    return _text(text).str.regexp_extract(r"\b([A-H])\b", 1)
+    return _text(text).str.extract(r"\b([A-H])\b", 1)
 
 
 def extract_boxed(text: str | Expr) -> Expr:
@@ -381,7 +379,7 @@ def extract_last_number(text: str | Expr) -> Expr:
     """
     # Every match, then the last one: the engine's regex has no lookahead, and a "last
     # occurrence" pattern needs one. `regexp_extract_all` walks the string once either way.
-    numbers = _text(text).str.regexp_extract_all(r"-?\d+\.?\d*", 0)
+    numbers = _text(text).str.extract_all(r"-?\d+\.?\d*", 0)
     return numbers.list.last().try_cast("float64")
 
 
@@ -410,4 +408,4 @@ def extract_citations(text: str | Expr) -> Expr:
             >>> ds.select(c=bt.extract_citations("o")).to_pydict()["c"]
             [['1', '2', '1']]
     """
-    return _text(text).str.regexp_extract_all(r"\[(\d+)\]", 1)
+    return _text(text).str.extract_all(r"\[(\d+)\]", 1)

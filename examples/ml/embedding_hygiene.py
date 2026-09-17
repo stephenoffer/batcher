@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    documents = tpch("part").select("p_partkey", "p_name").head(3_000)
+    documents = tpch("part").select("p_partkey", "p_name").limit(3_000)
 
     embedded = documents.with_columns(
         vector=bt.array(
@@ -32,8 +32,8 @@ def main() -> None:
 
     health = embedded.select(
         "p_partkey",
-        dim=col("vector").list.dim(),
-        magnitude=col("vector").list.magnitude(),
+        dim=col("vector").list.len(),
+        magnitude=col("vector").list.l2_norm(),
         zero=col("vector").list.is_zero_vector(),
     )
 
@@ -41,7 +41,7 @@ def main() -> None:
         rows=bt.count(),
         zeros=bt.count_if(col("zero")),
         smallest=col("magnitude").min(),
-        dims=col("dim").n_unique(),
+        dims=col("dim").count_distinct(),
     ).to_pydict()
     print(summary)
 

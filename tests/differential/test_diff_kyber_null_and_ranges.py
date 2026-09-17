@@ -88,7 +88,7 @@ _STRICTNESS_CASES = [
     ("math_is_null", lambda: col("f").sin().is_null(), "sin(f) IS NULL"),
     ("math_is_not_null", lambda: col("f").abs().is_not_null(), "abs(f) IS NOT NULL"),
     ("str_is_null", lambda: col("s").str.upper().is_null(), "upper(s) IS NULL"),
-    ("str_is_not_null", lambda: col("s").str.len().is_not_null(), "length(s) IS NOT NULL"),
+    ("str_is_not_null", lambda: col("s").str.len_chars().is_not_null(), "length(s) IS NOT NULL"),
     ("date_is_null", lambda: col("ts").dt.year().is_null(), "year(ts) IS NULL"),
     (
         "date_trunc_is_not_null",

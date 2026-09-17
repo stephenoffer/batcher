@@ -41,7 +41,7 @@ def main() -> None:
     )
 
     print("same-day order pairs:", pairs.count())
-    result = pairs.head(5).to_pydict()
+    result = pairs.limit(5).to_pydict()
     print(result["o_orderkey"], result["other_key"])
 
     # No row is paired with itself, and each pair appears in one direction only.

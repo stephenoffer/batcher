@@ -69,7 +69,7 @@ def _table(name: str) -> pa.Table:
 def test_count_distinct_over_matches_duckdb(duck, name):
     """`COUNT(DISTINCT v) OVER (PARTITION BY k)` for every type family."""
     tbl = _table(name)
-    got = bt.from_arrow(tbl).with_columns(n=col("v").n_unique().over("k")).collect()
+    got = bt.from_arrow(tbl).with_columns(n=col("v").count_distinct().over("k")).collect()
 
     duck.register("t", tbl)
     assert_same(
@@ -79,24 +79,24 @@ def test_count_distinct_over_matches_duckdb(duck, name):
 
 
 @pytest.mark.differential
-@pytest.mark.parametrize("func", ["sum", "mean", "min", "max", "count", "n_unique"])
+@pytest.mark.parametrize("func", ["sum", "mean", "min", "max", "count", "count_distinct"])
 def test_every_aggregate_over_an_all_null_column_matches_duckdb(duck, func):
     """An all-null (`Null`-typed) column: the window form raised where `GROUP BY` answered."""
     tbl = _table("null")
     got = bt.from_arrow(tbl).with_columns(r=getattr(col("v"), func)().over("k")).collect()
 
-    sql = {"mean": "avg(v)", "n_unique": "count(distinct v)"}.get(func, f"{func}(v)")
+    sql = {"mean": "avg(v)", "count_distinct": "count(distinct v)"}.get(func, f"{func}(v)")
     duck.register("t", tbl)
     assert_same(got, duck.sql(f"select v, k, o, {sql} over (partition by k) as r from t"))
 
 
 @pytest.mark.differential
 @pytest.mark.parametrize("name", sorted(_COLUMNS))
-@pytest.mark.parametrize("func", ["min", "max", "count", "n_unique"])
+@pytest.mark.parametrize("func", ["min", "max", "count", "count_distinct"])
 def test_window_admits_exactly_what_group_by_admits(name, func):
     """The parity itself: same aggregate, same groups, therefore the same answer.
 
-    `min`/`max`/`count`/`n_unique` are the aggregates defined for every type here; `sum` and
+    `min`/`max`/`count`/`count_distinct` are the aggregates defined for every type here; `sum` and
     `mean` are numeric-only, so they are covered by the all-null case above instead.
     """
     tbl = _table(name)
@@ -109,7 +109,7 @@ def test_window_admits_exactly_what_group_by_admits(name, func):
 
 
 @pytest.mark.differential
-@pytest.mark.parametrize("func", ["count", "n_unique", "min", "max"])
+@pytest.mark.parametrize("func", ["count", "count_distinct", "min", "max"])
 def test_running_frame_over_an_all_null_column_matches_duckdb(duck, func):
     """The `ORDER BY` (running) frame is a different kernel and diverged separately.
 
@@ -123,7 +123,7 @@ def test_running_frame_over_an_all_null_column_matches_duckdb(duck, func):
         .collect()
     )
 
-    sql = {"n_unique": "count(distinct v)"}.get(func, f"{func}(v)")
+    sql = {"count_distinct": "count(distinct v)"}.get(func, f"{func}(v)")
     duck.register("t", tbl)
     assert_same(
         got,
@@ -136,7 +136,11 @@ def test_running_frame_over_an_all_null_column_matches_duckdb(duck, func):
 def test_running_count_distinct_matches_duckdb(duck, name):
     """`COUNT(DISTINCT v)` under a running frame, for every type family."""
     tbl = _table(name)
-    got = bt.from_arrow(tbl).with_columns(n=col("v").n_unique().over("k", order_by="o")).collect()
+    got = (
+        bt.from_arrow(tbl)
+        .with_columns(n=col("v").count_distinct().over("k", order_by="o"))
+        .collect()
+    )
     duck.register("t", tbl)
     assert_same(
         got,

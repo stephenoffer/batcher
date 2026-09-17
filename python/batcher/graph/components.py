@@ -90,7 +90,7 @@ def connected_components(g: Graph, *, max_iterations: int = 100) -> Dataset:
         return labels.join(offered, on=NODE, how="left").select(
             **{
                 NODE: bt.col(NODE),
-                "component": bt.min_horizontal(
+                "component": bt.least(
                     bt.col("component"), bt.coalesce(bt.col("_l"), bt.col("component"))
                 ),
             }
@@ -186,7 +186,7 @@ def is_connected(g: Graph, *, max_iterations: int = 100) -> bool:
             >>> is_connected(Graph.from_edges(bt.from_pydict({"src": [1], "dst": [2]})))
             True
     """
-    return connected_components(g, max_iterations=max_iterations).n_unique("component") <= 1
+    return connected_components(g, max_iterations=max_iterations).count_distinct("component") <= 1
 
 
 def k_core(g: Graph, k: int, *, max_iterations: int = 100) -> Graph:
@@ -269,9 +269,7 @@ def _propagate_max_label(edges: Dataset, labels: Dataset, rounds: int) -> Datase
             current.join(offered, on=NODE, how="left").select(
                 **{
                     NODE: bt.col(NODE),
-                    "_c": bt.max_horizontal(
-                        bt.col("_c"), bt.coalesce(bt.col("_offer"), bt.col("_c"))
-                    ),
+                    "_c": bt.greatest(bt.col("_c"), bt.coalesce(bt.col("_offer"), bt.col("_c"))),
                 }
             )
         )

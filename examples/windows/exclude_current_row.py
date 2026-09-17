@@ -20,7 +20,9 @@ from batcher import col
 
 
 def main() -> None:
-    lineitem = tpch("lineitem").select("l_orderkey", "l_linenumber", "l_extendedprice").head(30_000)
+    lineitem = (
+        tpch("lineitem").select("l_orderkey", "l_linenumber", "l_extendedprice").limit(30_000)
+    )
 
     compared = (
         lineitem.with_columns(
@@ -40,7 +42,7 @@ def main() -> None:
         )
     )
 
-    result = compared.sort("l_orderkey", "l_linenumber").head(6).to_pydict()
+    result = compared.sort("l_orderkey", "l_linenumber").limit(6).to_pydict()
     for row in zip(
         result["l_orderkey"], result["l_extendedprice"], result["others_mean"], strict=True
     ):

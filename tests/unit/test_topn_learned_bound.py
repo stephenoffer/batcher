@@ -225,3 +225,55 @@ def test_a_widening_type_change_still_seeds():
     )
     floats = _typed_plan([float(i) for i in range(1000)], pa.float64())
     assert seed_topn_bound(floats, hub) is not None
+
+
+# --- a bound must survive being stored ------------------------------------------------
+#
+# The hub persists JSON, and the k-th value of the most common top-N there is -- the latest
+# events, `ORDER BY ts DESC LIMIT k` -- is a `datetime`. Stored raw, `put_keyed_param` raised,
+# `record_topn_bound` swallowed it as a suppressed hint, and the bound never seeded anything:
+# measured on a 40M-row Parquet table, every warm run of a timestamp top-N re-read all 40M
+# rows while the identical integer top-N was answered from 35.
+
+
+@pytest.mark.parametrize(
+    "arrow_type, values",
+    [
+        (pa.timestamp("ms"), list(range(0, 1_000_000, 1000))),
+        (pa.timestamp("us", tz="UTC"), list(range(0, 1_000_000, 1000))),
+        (pa.date32(), list(range(1000))),
+        (pa.decimal128(12, 3), [f"{i}.125" for i in range(1000)]),
+    ],
+)
+def test_a_non_json_bound_is_stored_and_seeds_the_next_run(arrow_type, values):
+    import decimal
+
+    hub = _hub()
+    array = pa.array(
+        [decimal.Decimal(v) for v in values] if pa.types.is_decimal(arrow_type) else values,
+        pa.int64() if not pa.types.is_decimal(arrow_type) else arrow_type,
+    )
+    if not pa.types.is_decimal(arrow_type):
+        array = array.cast(pa.int32() if pa.types.is_date(arrow_type) else pa.int64()).cast(
+            arrow_type
+        )
+    table = pa.table({"x": array, "p": np.arange(len(array), dtype="int64")})
+    plan = bt.from_arrow(table).sort("x", descending=True).limit(10)._plan
+
+    record_topn_bound(hub, plan, table.slice(len(array) - 10))
+    seed = seed_topn_bound(plan, hub)
+
+    assert seed is not None, "a bound of this type was learned and then lost"
+    filtered = seed.plan.to_ir()["input"]["input"]
+    assert filtered["op"] == "filter"
+
+
+def test_a_bound_stored_before_the_encoding_change_still_reads_back():
+    """Bounds already in a persistent hub are bare JSON scalars, and must keep seeding."""
+    from batcher.kyber.learned_tuning.topn_bound import _TOPN_NAMESPACE, _bound_key, _topn_shape
+
+    hub = _hub()
+    plan = _plan()
+    sort, k = _topn_shape(plan)
+    hub.put_keyed_param(_TOPN_NAMESPACE, _bound_key(sort, "x", True, k), 990)
+    assert seed_topn_bound(plan, hub) is not None

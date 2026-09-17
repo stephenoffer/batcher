@@ -140,9 +140,23 @@ def discriminator(expr) -> str | None:
     expr_type = type(expr)
     attr = _DISCRIMINATOR_ATTR.get(expr_type, "")
     if attr == "":
-        attr = "op" if hasattr(expr, "op") else ("fn" if hasattr(expr, "fn") else None)
+        attr = "op" if _has_own(expr, "op") else ("fn" if _has_own(expr, "fn") else None)
         _DISCRIMINATOR_ATTR[expr_type] = attr
     return None if attr is None else getattr(expr, attr)
+
+
+def _has_own(expr, name: str) -> bool:
+    """Whether `expr` has `name` through ordinary lookup, never through `Expr.__getattr__`.
+
+    `hasattr` would fall through to `Expr.__getattr__` on a miss, which builds a migration
+    hint for the user by loading the whole migration registry. That cost about 0.7 s on the
+    first query of every process, spent on a message `hasattr` then discards.
+    """
+    try:
+        object.__getattribute__(expr, name)
+    except AttributeError:
+        return False
+    return True
 
 
 def apply_expr_leaves(

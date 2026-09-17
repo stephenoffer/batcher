@@ -18,7 +18,7 @@ def main() -> None:
 
     def shape(ds: bt.Dataset) -> dict[str, list[float]]:
         return ds.select(
-            skew=bt.skewness("x"),
+            skew=bt.skew("x"),
             bowley=bt.bowley_skew("x"),
             pearson_mode=bt.pearson_mode_skew("x"),
             kurtosis=bt.kurtosis("x"),

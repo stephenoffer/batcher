@@ -72,7 +72,7 @@ fold *down* a column). They mirror the Polars `*_horizontal` family.
 flags = bt.from_pydict({"a": [1, None, 3], "b": [10, 20, None]})
 out = flags.select(
     total=bt.sum_horizontal(bt.col("a"), bt.col("b")),
-    lo=bt.min_horizontal(bt.col("a"), bt.col("b")),
+    lo=bt.least(bt.col("a"), bt.col("b")),
     both_pos=bt.all_horizontal(bt.col("a") > 0, bt.col("b") > 0),
 )
 print(out.to_pydict())
@@ -153,8 +153,8 @@ print(out.to_pydict())
 {py:meth}`.asinh() <batcher.plan.expr_ir.core.Expr.asinh>` / {py:meth}`.acosh() <batcher.plan.expr_ir.core.Expr.acosh>` / {py:meth}`.atanh() <batcher.plan.expr_ir.core.Expr.atanh>` (→ Float64). The reciprocal trig pair
 {py:meth}`.sec() <batcher.plan.expr_ir.core.Expr.sec>` / {py:meth}`.csc() <batcher.plan.expr_ir.core.Expr.csc>`, the gamma function {py:meth}`.gamma() <batcher.plan.expr_ir.core.Expr.gamma>` and its log {py:meth}`.lgamma() <batcher.plan.expr_ir.core.Expr.lgamma>` (which stays
 finite where `.gamma()` overflows, above about 171), and two rounding modes that are not
-`.round()`: `.rint()` rounds half to *even*, `.even()` rounds *away from zero* to the
-nearest even integer. Integer bitwise
+`.round()`'s default: `.round(mode="half_to_even")` rounds half to *even* (DuckDB
+`round_even`, Spark `bround`), and `.even()` rounds *away from zero* to the nearest even integer. Integer bitwise
 ops (distinct from the boolean `&`/`|`): {py:meth}`.bitwise_and(o) <batcher.plan.expr_ir.core.Expr.bitwise_and>`, {py:meth}`.bitwise_or(o) <batcher.plan.expr_ir.core.Expr.bitwise_or>`,
 {py:meth}`.bitwise_xor(o) <batcher.plan.expr_ir.core.Expr.bitwise_xor>`, {py:meth}`.bitwise_left_shift(o) <batcher.plan.expr_ir.core.Expr.bitwise_left_shift>`, {py:meth}`.bitwise_right_shift(o) <batcher.plan.expr_ir.core.Expr.bitwise_right_shift>`, and
 {py:meth}`.bit_count() <batcher.plan.expr_ir.core.Expr.bit_count>` (the number of set bits, i.e. population count → Int64).
@@ -173,6 +173,7 @@ the accessor namespaces:
 | Method | Description |
 | --- | --- |
 | `.alias(name)` | bind an output name to a derived expression, for positional `select` |
+| {py:meth}`.pipe(fn, *args) <batcher.Expr.pipe>` | apply your own `fn(expr, *args)` and keep the chain fluent (Polars `pipe`, Spark `Column.transform`) |
 | {py:meth}`.neg() <batcher.plan.expr_ir.core.Expr.neg>` | arithmetic negation (the Polars spelling of the unary minus) |
 | `.chr()` | the character at this Unicode code point (DuckDB/Spark `chr`) |
 | {py:meth}`.to_base(radix) <batcher.plan.expr_ir.core.Expr.to_base>` | this integer written in base 2..36 (DuckDB {py:meth}`to_base <batcher.plan.expr_ir.core.Expr.to_base>`; `bin` is radix 2) |
@@ -191,11 +192,11 @@ Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
 `Map<value, count>` of each group's values, DuckDB `histogram`), `.count()`, `.n_unique()`
 (aliased `.count_distinct()`), `.mode()`, `.bool_and()`, `.bool_or()`,
 `.bit_and()` / `.bit_or()` / `.bit_xor()` (bitwise reduction of the non-null
-`Int64` values in each group), `.array_agg()` (collect each group's values into a
-`List`; SQL `array_agg` /
-Spark `collect_list`), `.arg_min(by=…)` / `.arg_max(by=…)` (the value at the
-row with the extreme `by` key), and `.first(order_by=…)` / `.last(order_by=…)`
-(the value at the first or last row in `order_by` order). `order_by` is required there, because an arrival-order first or last wouldn't be partition-independent. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
+`Int64` values in each group), `.array_agg(order_by=…)` (collect each group's values into a
+`List`; SQL `array_agg(x ORDER BY k)` /
+Spark `collect_list`), {py:meth}`.min_by(by) <batcher.plan.expr_ir.core.Expr.min_by>` / {py:meth}`.max_by(by) <batcher.plan.expr_ir.core.Expr.max_by>` (the value at the
+row with the extreme `by` key), {py:meth}`.arg_min(order_by=…) <batcher.plan.expr_ir.core.Expr.arg_min>` / {py:meth}`.arg_max(order_by=…) <batcher.plan.expr_ir.core.Expr.arg_max>` (the 0-based position of the group's extreme value along `order_by`, Polars `arg_min`/`arg_max`), and `.first(order_by=…)` / `.last(order_by=…)`
+(the value at the first or last row in `order_by` order). `order_by` is required for the positions, first and last, because an arrival-order position wouldn't be partition-independent. `array_agg` accepts no `order_by` too, and then returns each group's elements in an unspecified order: the same elements on every execution path, but not the same sequence. Rows that tie on every `order_by` key are ordered by their value, ascending with nulls last, so an ordered list is the same however the rows were partitioned. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
 
 The assembly-contiguity aggregates measure how a set of lengths is distributed *by base*
 rather than by item, the measure genome-assembly quality is judged on:
@@ -212,9 +213,10 @@ All four are mergeable, so a value computed over a shuffle equals the single-nod
 The distribution aggregates read a group's whole value list rather than a running
 total: `.entropy()` (base-2 Shannon entropy of the value distribution, DuckDB `entropy`),
 {py:meth}`.mad() <batcher.plan.expr_ir.core.Expr.mad>` (median absolute deviation, a spread measure a single outlier cannot move),
-`.kurtosis_pop()` (the population form of `.kurtosis()`), `.quantile_disc(q)` (the
-quantile *element*, where `.quantile(q)` interpolates between two of them), `.top_k(k)`
+`.kurtosis(bias=True)` (the population form of `.kurtosis()`), `.quantile_disc(q)` (the
+quantile *element*, where `.quantile(q)` interpolates between two of them), {py:meth}`.mode_top_k(k) <batcher.plan.expr_ir.core.Expr.mode_top_k>`
 (the `k` most frequent values as a list, DuckDB `approx_top_k`, computed exactly here),
+{py:meth}`.top_k(k) <batcher.plan.expr_ir.core.Expr.top_k>` (the `k` largest values as a list, Polars `top_k`),
 {py:meth}`.kahan_sum() <batcher.plan.expr_ir.core.Expr.kahan_sum>` (compensated summation, DuckDB `fsum` or {py:meth}`kahan_sum <batcher.plan.expr_ir.core.Expr.kahan_sum>`) gives the same answer as
 `.sum()` on a well-conditioned column and a materially better one when the addends differ
 wildly in magnitude), and {py:meth}`.any_value() <batcher.plan.expr_ir.core.Expr.any_value>` (one value from the group, DuckDB {py:meth}`any_value <batcher.plan.expr_ir.core.Expr.any_value>` / `arbitrary`; the
@@ -271,16 +273,31 @@ print(ranked.sort("g", "t").to_pydict()["prev"])
 # [None, 10, None]
 ```
 
+{py:meth}`.over(...) <batcher.plan.expr_ir.core.Expr.over>` works on any expression, not only on an aggregate or a window function. Every aggregate and window function inside the expression is bound to the partition and order, and an expression with neither is returned unchanged. `descending=` and `nulls_last=` set the direction of the `order_by` keys. Only `mapping_strategy="group_to_rows"` is supported. An `order_by` makes an aggregate inside the expression a running one, as in SQL, which is where Batcher and Polars differ: Polars ignores the order for an aggregate.
+
+```python
+share = (bt.col("v") / bt.col("v").sum()).over("g")
+prev = bt.col("v").shift(1).over("g", order_by="t", descending=True)
+print(w.with_columns(share=share, prev=prev).sort("g", "t").to_pydict()["prev"])
+# [20, None, None]
+```
+
 Cumulative and shift shorthands (Polars-style) build the same window expressions:
 `col("v").cum_sum()`, `.cum_min()`, `.cum_max()`, `.cum_count()` and
 {py:meth}`.cum_prod() <batcher.plan.expr_ir.core.Expr.cum_prod>` are running
-aggregates in row order (pass `partition_by=`/`order_by=` for a grouped/ordered
-running value), and `col("v").shift(n)` lags (positive `n`) or leads (negative `n`).
+aggregates, and `col("v").shift(n)` lags (positive `n`) or leads (negative `n`).
+
+Every order-dependent expression needs an explicit order. Batcher keeps no arrival order across a parallel or distributed scan, so `shift`, `diff`, `pct_change`, `cum_*`, `rolling_*`, `first`/`last`, the fills, `interpolate`, `rle_id`, the EWMs and `is_first_distinct`/`is_last_distinct` raise a `PlanError` without one. Pass `order_by=` where the method takes it, or bind any of them with `.over(order_by=...)`. When the data has no ordering column, number the rows right after reading with `.with_row_index("_row")` and order by `"_row"`; the index follows source order.
 
 ```python
-c = bt.from_pydict({"x": [1, 2, 3, 4]})
-print(c.with_columns(cs=bt.col("x").cum_sum(), prev=bt.col("x").shift(1)).to_pydict())
-# {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10], 'prev': [None, 1, 2, 3]}
+c = bt.from_pydict({"x": [1, 2, 3, 4]}).with_row_index("_row")
+print(
+    c.with_columns(
+        cs=bt.col("x").cum_sum(order_by="_row"),
+        prev=bt.col("x").shift(1).over(order_by="_row"),
+    ).to_pydict()
+)
+# {'_row': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10], 'prev': [None, 1, 2, 3]}
 ```
 
 `.cum_prod()` returns `Float64` even for an integer input, because a running product
@@ -289,8 +306,9 @@ answer for a compounding factor. Nulls are skipped, as they are for the rest of 
 
 ```python
 rates = bt.from_pydict({"fund": ["a", "a", "b", "b"], "r": [1.1, 1.2, 2.0, 0.5]})
-print(rates.with_columns(growth=bt.col("r").cum_prod(partition_by="fund")).to_pydict()["growth"])
-# [1.1, 1.32, 2.0, 1.0]
+growth = bt.col("r").cum_prod().over("fund", order_by="r", descending=True)
+print(rates.with_columns(growth=growth).sort("fund", "r").to_pydict()["growth"])
+# [1.32, 1.2, 1.0, 2.0]
 ```
 
 A window expression composes with ordinary arithmetic and other windows. The engine lifts it into a `Window` operator and rewrites the surrounding expression to read the result, as described in {doc}`window functions </user-guide/analyze/window-functions>`. The shapes that come up most have their own names:
@@ -316,19 +334,24 @@ partition aggregate a *partial* frame, as SQL does; pass `min_periods=k` to make
 those rows null instead (the Polars default).
 
 ```python
-r = bt.from_pydict({"x": [1, 2, 3, 4]})
+r = bt.from_pydict({"t": [0, 1, 2, 3], "x": [1, 2, 3, 4]})
 print(
     r.with_columns(
-        m=bt.col("x").rolling_mean(2), s=bt.col("x").rolling_sum(2, min_periods=2)
+        m=bt.col("x").rolling_mean(2, order_by="t"),
+        s=bt.col("x").rolling_sum(2, min_periods=2, order_by="t"),
     ).to_pydict()
 )
-# {'x': [1, 2, 3, 4], 'm': [1.0, 1.5, 2.5, 3.5], 's': [None, 3, 5, 7]}
+# {'t': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 'm': [1.0, 1.5, 2.5, 3.5], 's': [None, 3, 5, 7]}
 ```
 
 ```python
-d = bt.from_pydict({"x": [10, 15, 30]})
-print(d.with_columns(chg=bt.col("x").diff(), pct=bt.col("x").pct_change()).to_pydict())
-# {'x': [10, 15, 30], 'chg': [None, 5, 15], 'pct': [None, 0.5, 1.0]}
+d = bt.from_pydict({"t": [0, 1, 2], "x": [10, 15, 30]})
+print(
+    d.with_columns(
+        chg=bt.col("x").diff(order_by="t"), pct=bt.col("x").pct_change(order_by="t")
+    ).to_pydict()
+)
+# {'t': [0, 1, 2], 'x': [10, 15, 30], 'chg': [None, 5, 15], 'pct': [None, 0.5, 1.0]}
 ```
 
 ## Compatibility spellings
@@ -344,7 +367,7 @@ Trig / clip / range on `Expr`: {py:meth}`.arcsin() <batcher.plan.expr_ir.core.Ex
 On `.str`: `.to_lowercase()` / `.to_uppercase()` / `.to_titlecase()` (Polars, for
 `lower`/`upper`/`initcap`), `.pad_start(w, fill)` / `.pad_end(w, fill)` and pandas'
 `.ljust(w, fill)` / `.rjust(w, fill)` (for `lpad`/`rpad`), `.count_matches(pattern)`
-(for `regexp_count`), `.extract(pattern, group=1)` / `.extract_all(pattern)` /
+(for `count_matches`), `.extract(pattern, group=1)` / `.extract_all(pattern)` /
 {py:meth}`.replace_all(pattern, value) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.replace_all>` (for the `regexp_*` methods), {py:meth}`.len_chars() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.len_chars>` /
 `.len_bytes()` (for `len`/`octet_length`), `.strip_chars(chars=None)` /
 `.strip_chars_start(...)` / `.strip_chars_end(...)` (for `trim`/`lstrip`/`rstrip`), and
@@ -412,9 +435,9 @@ import batcher as bt
 ds = bt.from_pydict({"x": [1, None, 3], "y": [10, 20, 30]})
 print(
     ds.select(
-        filled=bt.col("x").fillna(0),
-        missing=bt.col("x").isna(),
-        total=bt.col("x").add(bt.col("y")),
+        filled=bt.col("x").fill_null(0),
+        missing=bt.col("x").is_null(),
+        total=(bt.col("x") + bt.col("y")),
     ).to_pydict()
 )
 # {'filled': [1, 0, 3], 'missing': [False, True, False], 'total': [11, None, 33]}
@@ -441,8 +464,20 @@ here and a silently-wrong alias is worse than a missing one:
 | `str.find`, `str.index` | `position` is 1-based and returns 0 when absent; pandas' `find` is 0-based and returns -1. |
 | `str.substring` | `substr` is 1-based SQL. Use the 0-based `str.slice(offset, length)`. |
 | `str.islower`, `str.isupper` | {py:meth}`is_lower <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_lower>`/{py:meth}`is_upper <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_upper>` are true for an uncased string such as `"123"`; Python's are false. |
-| `str.count` | pandas' `count` is a regex count. Use `str.regexp_count(pattern)`. |
+| `str.count` | pandas' `count` is a regex count. Use `str.count_matches(pattern)`. |
 | `str.casefold` | Python's casefold is not lowercase for non-ASCII (`"ß"` folds to `"ss"`). |
+
+## Introspection
+
+The {py:class}`.meta <batcher.plan.expr_ir.namespaces.meta._MetaNamespace>` accessor reads an expression's tree and never a row, so it needs no dataset:
+
+| Method | Returns |
+| --- | --- |
+| `.meta.output_name(raise_if_undetermined=True)` | the column name the expression takes in `select` |
+| `.meta.root_names()` | the input columns it reads, left to right, repeats kept |
+| `.meta.is_column()` | whether it is a bare column reference |
+| `.meta.has_multiple_outputs()` | whether it holds a selector that expands to several columns |
+| `.meta.tree_format(return_as_string=False)` | a drawing of the engine tree, printed or returned |
 
 ## Data science toolkit and evaluation metrics
 

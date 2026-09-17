@@ -359,6 +359,7 @@
   "fold_distinct_union_all@2",
   "push_filter_through_distinct@3",
   "prune_distinct_of_empty@2",
+  "set_membership_to_join@2",
   "merge_distinct_union_of_complementary_filters@2",
   "merge_distinct_union_of_filters_on_same_input@2",
   "absorb_subsumed_branch_in_distinct_union@2",

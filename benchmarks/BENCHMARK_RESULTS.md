@@ -1,5 +1,96 @@
 # Batcher CPU benchmark results
 
+## Ten landed changes, a full re-sweep, and what the new cases found (2026-09-16)
+
+A whole-board pass: every suite re-run against the full lineup, the losing cases profiled with
+`perf` and `py-spy`, and ten changes landed on what that found. Every A/B below was
+interleaved in one window, because the box was shared with up to eight other sessions and its
+load average ran from 11 to 285. **Read the board as best-of-passes on a busy box, not as the
+quiet-box figures of the 2026-09-13 entry below.**
+
+### What landed, and what each measured
+
+| commit | change | measured |
+|---|---|---|
+| `30ecce22` | exact key-range bitmap rejects absent probe keys before hashing (`join/key_bits.rs`) | 6M probe x 204-key build, 1 thread: inner 77-92 -> 19 ms CPU, semi 76 -> 20; q17 15.5 -> 9.6 ms |
+| `2d27444a` | DISTINCT INTERSECT/EXCEPT -> semi/anti join when NULLs cannot differ (`set_membership_to_join`) | `op-intersect` 49.3 -> 24.3 ms, `op-except` 46.9 -> 32.4 |
+| `045ab2bd` | string vs literal from an 8-byte prefix; `s >= a AND s < b` in one pass | `LIKE 'the%'` count, 1 thread: 77 -> 65 ms CPU |
+| `cacdae88` | `COUNT(*) ... WHERE p` counts `nullif(p, false)`, not a CASE mask | same query: 65 -> 59 ms CPU; parallel wall 9.1 -> 7.4 ms |
+| `26d2b2d6` | short-literal string order as one branchless `u128` compare | 50%-selective `o_orderstatus = 'F'` filter: 27.1 -> 17.7 ms CPU |
+| `b7f5de66` | a PSI stall alone no longer spills a plan under 2% of the budget | TPC-H sf1 q8 (3.5 MB peak) had 86% of its samples in the spill writer |
+| `ca76e72e` | eleven operator-mix cases for untimed public API | see below |
+| `a72d1dcb` | `carried_columns` memoized per plan instance | q8 17.5 -> 17.0 ms, q5 18.4 -> 17.9 |
+| `31ed3b84` | list-state aggregates scatter values directly | grouped MEDIAN 112 -> 82 ms, QUANTILE_CONT 97 -> 80 |
+| `0b88b6b0` | window partition bucket by multiply-shift, not `%` | top-3 per supplier 707 -> 650 ms CPU, H2O q8 1414 -> 1294 |
+
+### The board after them
+
+Best of 2-3 passes per engine per case, then the geomean of Batcher over each rival. `losses`
+counts cases where any rival was faster in its own best pass.
+
+| suite | b/duckdb | b/duckdb_arrow | b/polars | b/daft | losses |
+|---|---:|---:|---:|---:|---:|
+| TPC-H sf1 | 0.68 | 0.25 | 0.53 | 0.21 | 5 of 21 |
+| operator mix (58 cases) | 0.71 | 0.46 | 0.17 | 0.11 | 21 of 58 |
+| H2O groupby 1e7 | 0.95 | 0.75 | 0.47 | 0.33 | 6 of 10 |
+| H2O join 1e7 | 0.77 | 0.66 | 0.60 | 0.31 | 0 of 5 (q1 re-run in isolation: 0.58-0.78x) |
+| JSON | 0.34 | 0.32 | 0.01 | 0.04 | 0 of 5 |
+| ClickBench | 0.66 | 0.18 | 0.38 | 0.12 | 11 of 40 |
+| TPC-DS sf1 | 0.99-1.40 | - | - | - | 61 of 97 |
+
+TPC-DS ran on `batcher,duckdb,polars` only. Polars' SQL front end rejects the suite, so every
+Polars cell is `ERR`. The 29.6% spread across its two passes is the load, not the engine.
+**Daft was measured at a 58 GB resident set on q64 and SIGKILLed**, which took the whole runner
+with it in two sweeps; Batcher peaks at 4.2 GB on the same query and DuckDB at 5.6 GB. Daft is
+now run in its own pass with `--skip tpcds-q64`.
+
+Three operator-mix rows read 1.4-1.7 s against DuckDB's 50 ms (`op-sort-float`,
+`op-sort-multikey-narrow`, `op-sort-string-lowcard`). They are spill artifacts rather than
+losses: re-run at PSI zero the same sort takes 64 ms. A 6M-row sort is large enough that a
+kernel stall still spills it, which is the protective behaviour working on a thrashing cgroup.
+
+### What the new operator cases found
+
+The operator mix had no case for `COUNT(DISTINCT)`, `MEDIAN`, `QUANTILE_CONT`, `STDDEV_SAMP`,
+`HAVING`, `FULL OUTER JOIN`, a bounded `ROWS` frame, `ROW_NUMBER() <= k`, `REGEXP_MATCHES`,
+an IN-list filter or a date `BETWEEN`. First readings against the best rival: HAVING, stddev,
+grouped `COUNT(DISTINCT)` and regexp at or ahead; full outer join 78 ms against DuckDB's 29;
+window top-k 61 against 33; median and quantile 97 and 91 against 57 and 52 before `31ed3b84`.
+
+### What was tried and not landed
+
+- **Parallel Full join on the broadcast path.** Correct and tested, and no wall-clock change
+  on `op-join-full-outer`. The case runs at 8% CPU utilization because the streaming executor's
+  `materialized_join_from` serves every Full join with a single-threaded `ops::join_batches`,
+  deliberately. Its order must match the sequential oracle for a `LIMIT` above the join, and a
+  parallel join's order diverges past `RADIX_MIN_BUILD_ROWS_BROADCAST`, where this 3M-row build
+  sits. Reverted. The fix needs an order-preserving parallel join, not a parallel one.
+- **A cheaper superset for `push_semijoin_into_decorrelated_aggregate` on q21.** That rule
+  refuses q21 because re-evaluating the probe spine costs more than the aggregate. Restricting
+  by a superset instead (the lineitem filter plus the 411-supplier join, without `orders`)
+  fired, cut operator CPU to 225 ms and the aggregate to 6.8 ms, and ran **87 -> 275 ms**: the
+  plan now reads source 1 twice, which bars the streaming executor, and the materializing path
+  ran it at 23% CPU. Measured separately, the spine takes 19.7 ms and yields 72,110 keys, the
+  full aggregate 50.5 ms and the key-restricted one 10.1 ms, so the win is real but needs a
+  shared subplan in the executor.
+- **`CHUNK_MERGE_CEILING` raised from 0.25 to 1.0** for H2O q7: q7 72.7 -> 91.6 ms and q3
+  70 -> 93, only q5 improved. Reverted.
+- **Fixed-width copies in the repartition string gather** for H2O q7: the `memmove` calls left
+  the profile and the time did not, because the cost is the random read of the source strings.
+  Reverted.
+
+### Where the largest gaps now are
+
+- **TPC-DS ROLLUP queries** (q5, q18, q22, q70, q77, q80): q77's operators take 1.1 ms of a
+  315 ms query. `py-spy` puts 62% in `subplan_reuse._materialize` and 28% in `_optimize`.
+- **TPC-DS q72, 13x**: join order. Batcher joins `inventory` (11.7M rows) to its dimensions and
+  reaches 16.4M rows before the selective `catalog_sales` side reduces anything; a filter
+  estimated at 70,233 rows passes 16,425,000.
+- **Control-plane overhead** is 3-17 ms per TPC-H query with the plan cache warm, and the four
+  remaining TPC-H losses to Polars (q2, q5, q8, q17) are 3-5 ms each.
+- **TPC-H q21** (see the superset attempt above) and **H2O q8 / window top-k**, where the
+  per-bucket gathers remain after the bucketing fix.
+
 ## The board as it stands, on four engines (2026-09-13)
 
 A full sweep with `duckdb_arrow` in the lineup, which is what makes the rest of this file
@@ -28797,3 +28888,179 @@ Read with the caveats, which matter more than the numbers:
   4.3 s. A completed query against a dead one is worth recording and is not a ratio.
 - Daft failed every pipeline in this run with `No flotilla workers became available within
   120s`, which is a deployment failure on this fleet rather than a result about Daft.
+
+## 2026-09-16 (single-node) — the scan under a top-N, a spill and a float filter
+
+Machine: 48-core Xeon 8275CL (46 available), 92 GiB, release engine. Review:
+`docs/architecture/internals/competitor_technique_review.md` item 27.
+
+### `benchmarks/internals/operators/parquet_topn.py`, default arguments
+
+40M rows in 8 files, 500,000-row row groups, clustered on a millisecond timestamp. Load per core
+0.16 at start. Every top-N result was checked in order against DuckDB before it was timed.
+
+| `ORDER BY ts LIMIT 10` | batcher warm | duckdb | polars |
+|---|---:|---:|---:|
+| DESC | **45.3 ms** | 91.5 ms | 1,203.1 ms |
+| ASC | 46.6 ms | **33.4 ms** | 1,198.0 ms |
+
+Before this change the same warm query took 433 ms. A timestamp bound was never stored,
+because the hub rejected a `datetime` and the error was suppressed, so no warm run had a
+bound to start from.
+
+The script's `batcher cold` column (955 ms) is **not a top-N number**, and it is recorded
+separately for that reason. It is the first query of a fresh interpreter, and any first query
+costs that much: in three fresh processes, a point filter over the same files took 829-882 ms
+and the top-N run right after it took **134 ms**. So 134 ms is the first run of the top-N,
+proved from the footers with nothing learned, against 422 ms before. The ~850 ms per-process
+first-query cost is its own finding and is not addressed here.
+
+| `collect(spill=True)`, 5% clustered filter then `GROUP BY` | best of 5 |
+|---|---:|
+| predicate not pushed into the spill read (the old tap) | 1,189.1 ms |
+| predicate pushed | **95.2 ms (12.5x)** |
+
+### TPC-H sf10 on the Parquet scan path: no regression from the NaN fix
+
+`benchmarks/run.py --benchmark tpch --scale 10 --scan --source <local mirror> --engines
+batcher,duckdb`, over a local copy written by `tools/mirror_bench_data.py`. Two sandboxes built
+from the same working tree differ only in the NaN-aware float pruning and the float row filter,
+and ran alternately, two rounds each. Every run passed every correctness check.
+
+| | round 1 | round 2 |
+|---|---:|---:|
+| b/duckdb, before | 1.522 | 1.532 |
+| b/duckdb, after | 1.527 | 1.526 |
+
+Per query, best of the two rounds, after against before: **geomean 1.003**, range 0.89 (q9) to
+1.15 (q7), and both extremes sit inside the round-to-round spread of their own arm.
+
+**Read the 1.52x itself.** This board is usually quoted in memory, where sf10 was 0.93x on
+2026-08-26. Read from Parquet it is 1.52x, 21 of 22 queries lose, and q15 (0.11x, answered from
+a cached subplan) and q22 (0.79x) are the only wins. The single-node gap to DuckDB at sf10 is the
+scan, as the 2026-09-08 decomposition said, and on this 48-core box it is decode CPU rather than
+idle cores. Three `lineitem` columns cost 4.1 CPU-seconds to decode natively against 2.6 for
+DuckDB to decode *and* sum them.
+
+### The Parquet row filter's gate, recalibrated from 50 % to 8 %
+
+Same box, same local sf10 mirror. A filter plus an aggregate over `lineitem` (60M rows, one file,
+490 row groups), `l_partkey < k` for a scattered predicate at a chosen selectivity; the build with
+the new gate against the build with the old one, alternating, two rounds, best of 4 per query.
+
+| selected | narrow (`sum` of one column) | wide (four aggregates, two string columns) |
+|---|---:|---:|
+| 1 % | 0.99x | 1.01x |
+| 3 % | 1.01x | 1.00x |
+| 5 % | 1.01x | 1.02x |
+| 10 % | 0.87x | 0.95x |
+| 20 % | **0.69x** | **0.68x** |
+| 35 % | **0.68x** | **0.72x** |
+
+A read-only sweep (the native reader alone, filter on against off) put the crossover near 2 %, and
+a 2 % gate was built and measured first: it made the same queries **1.10-1.34x slower** at 3-5 %,
+because declining the filter leaves the caller an unfiltered read to re-filter, which the read-only
+sweep did not charge. Recorded so the next reader tunes against a whole query.
+
+TPC-H sf10 from Parquet, the two builds alternating over two rounds: geomean **1.008**, every
+correctness check passing. The largest single-query movements are q10 0.75x and q21 1.15x, whose
+own before-arm varied 970-1,137 ms between rounds.
+
+A date-literal pushdown into the native reader was built and measured on the same harness in the
+same session (0.994 overall; q6 0.63x, q3 1.35x, q7 1.31x) and reverted. Review item 27g has the
+decomposition.
+
+### A predicated Parquet read decodes its surviving row groups whole
+
+Same box and mirror. `ParquetSource.read` with a predicate now prunes row groups on the footers
+and returns the survivors whole for the engine's `Filter`, when they fit a quarter of the memory
+envelope (`io/formats/structured/parquet/routing.py`). TPC-H sf10 `--scan`, one build with the
+route switched on and off, alternating, two rounds, best of each:
+
+| | b/duckdb, route off | b/duckdb, route on |
+|---|---:|---:|
+| TPC-H sf10 from Parquet | 1.542 | **1.379** |
+
+Per query, on against off: geomean **0.899**; q12 0.61x, q3 0.66x, q10 0.69x, q6 0.70x, q1 0.79x,
+q2 0.81x, q8 0.83x; the slowest movements, q20 1.11x and q22 1.09x, sit inside those queries'
+own round-to-round spread. Every run passed every correctness check.
+
+The oracle that motivated it forced a native unfiltered read for every predicated read with no
+pruning and no memory guard: 1.526 -> 1.356. The shipped route gives up nothing measurable
+against that oracle and keeps both protections.
+
+### arrow-rs 56 -> 60: the Parquet decode itself
+
+Same box and mirror. Two release builds of one commit, differing only in the arrow-rs, parquet,
+object_store and pyo3 versions (review item 27k), running TPC-H sf10 `--scan`, alternating 56, 60,
+56, 60, best-of-3 per run and the best of the two runs per build. The box was shared (load average
+22-31). DuckDB's time is its best across all four runs:
+
+| | b/duckdb, arrow 56 | b/duckdb, arrow 60 |
+|---|---:|---:|
+| TPC-H sf10 from Parquet | 1.389 | **1.255** |
+
+Per query, 60 against 56: geomean **0.905**; q5 0.83x, q6 0.86x, q14, q19 and q20 0.87x; q21
+1.02x is the only slower query. q11 returns zero rows at this scale and is reported DEGENERATE by
+the harness, so its time is counted and its result is not compared. Every other correctness check
+passed on both builds.
+
+### A wide result's small batches now merge before they cross into Python
+
+Same box, TPC-H sf1 `lineitem` generated by DuckDB's `dbgen` and loaded with `bt.from_arrow`, a
+`filter(...).collect()` per shape, best of 9, two rounds, the committed build against the same
+commit with `bc-interp`'s `coalesce_small_batches` admitting ~24 KiB more per column past the
+first. Load average 22-37 on 48 cores. A result's batch count is shown because it is the thing
+that moved:
+
+| shape | before | after |
+|---|---:|---:|
+| 16 columns, 14 % selectivity | 50.2 / 51.8 ms, 408 batches | **33.8 / 39.1 ms**, 118 batches |
+| 8 `int64` columns, 14 % | 33.4 / 33.8 ms, 408 batches | **20.5 / 21.4 ms**, 71 batches |
+| 16 columns, 2 % | 19.4 / 17.8 ms, 21 batches | 16.5 / 17.2 ms, 20 batches |
+| 2 columns, 14 % | 15.2 / 15.6 ms, 404 batches | 15.9 / 15.6 ms, 271 batches |
+| 1 column, 32 % | 9.9 / 10.0 ms | 9.8 / 9.4 ms, unchanged batches |
+
+The pass-everything filters return the same 391 and 408 batches either way. The ceiling was
+first scaled together with the merge target, which merged the 14 % result into 9 batches and
+lost 16.5 -> 19 ms on the 2 % one, because 21 parallel 1 MiB copies became 2 serial 8 MB ones; the
+target is left as it was. Ordering-sensitive differential suites (operator matrix, sort, limit,
+top-N, window, filter, union, streaming; 4,843 tests) pass on the new build.
+
+This was found chasing a window: `SUM(l_quantity) OVER (PARTITION BY l_suppkey)` over the 14 %
+filter measured 189 ms against DuckDB's 46 and Polars' 41, and the window kernel over the same rows
+as one pre-materialized batch took 17 ms. A window that concatenates only the columns it reads was
+built and measured as well; it removed the concatenation and returned the 408 batches unmerged,
+costing more at the boundary than it saved, and was not kept.
+
+### A rank-limited window returns its survivors instead of ranking every row
+
+Same box, an in-memory 10M-row H2O-shaped table (`id6` over 100,000 values, `id4` over 100, a
+float `v3`) and TPC-H sf1 `lineitem`, SQL through `bt.sql`, best of 5 per case, four rounds with
+the build order alternated. Both builds are commit `dcd705bb`; the second adds
+`bc_runtime::window::window_with_rank_limit`. Load average 35-70 on 48 cores, so ranges, not
+points:
+
+| case | before | after |
+|---|---:|---:|
+| `row_number() ... <= 2` by `id6` (H2O q8's shape) | 121-252 ms | **63-68 ms** |
+| `row_number() ... <= 2` by `id4` | 126-143 ms | **50-88 ms** |
+| `row_number() ... <= 10` by `id6` | 142-182 ms | 84-158 ms |
+| `rank() ... <= 3` per `l_suppkey`, all 16 `lineitem` columns | 306-657 ms | 253-444 ms |
+| control: `row_number()` with no limit, summed | 530-858 ms | 431-576 ms |
+| control: `sum(v3) OVER (PARTITION BY id6)`, summed | 67-426 ms | 60-80 ms |
+
+The controls take no new code and moved only within the load's spread. `perf` on the q8 shape
+before the change put 21 % in `scatter_blocked`, writing a rank for all 10M rows back into input
+order so a mask could keep 200,000 of them; the new path keeps each bucket's survivors and orders
+those once. Rows, order and values are those of the mask by construction, and
+`rank_limited_equals_masking_the_full_window` holds the two forms equal across `row_number`,
+`rank` and `dense_rank` with ties, null keys, every `k`, both paths and the serial fallback.
+
+`test_diff_qualify_topn_parallel.py` (46 cases at 200,000 rows, above the parallel threshold)
+passes on both builds, as do the window, qualify, distinct, rank, limit and operator-matrix
+differential suites (4,878 tests) on the new one. Writing it found a DuckDB defect rather than a
+Batcher one: on DuckDB 1.5.5, `row_number() ... <= 2` over a float order key holding NaN returned
+wrong rows for ~25 of 5,000 partitions (for one, -26 and NaN where the two smallest values are -90
+and -77); Batcher's answer matched a ground truth computed in the test.
+

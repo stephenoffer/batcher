@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    lineitem = tpch("lineitem").head(20_000)
+    lineitem = tpch("lineitem").limit(20_000)
 
     per_order = (
         lineitem.group_by("l_orderkey")
@@ -30,7 +30,7 @@ def main() -> None:
             lines=bt.count(),
         )
         .sort("l_orderkey")
-        .head(5)
+        .limit(5)
         .to_pydict()
     )
     print(per_order["l_orderkey"], per_order["lines"])
@@ -49,14 +49,14 @@ def main() -> None:
         .agg(quantities=bt.array_agg(col("l_quantity")))
         .with_columns(total=col("quantities").list.sum())
         .sort("l_orderkey")
-        .head(5)
+        .limit(5)
         .to_pydict()
     )
     direct = (
         lineitem.group_by("l_orderkey")
         .agg(total=col("l_quantity").sum())
         .sort("l_orderkey")
-        .head(5)
+        .limit(5)
         .to_pydict()
     )
     assert rebuilt["total"] == direct["total"]

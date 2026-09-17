@@ -167,7 +167,7 @@ pub(crate) fn allocator_collect(py: Python<'_>, force: bool) -> u64 {
     let before = allocator_rss();
     // A forced collect walks every thread's heap and can take milliseconds; holding the GIL
     // across it would stall every other Python thread in the worker for no reason.
-    py.allow_threads(|| {
+    py.detach(|| {
         // SAFETY: `mi_collect` takes only a bool and is safe to call from any thread at any
         // point after the allocator is initialized, which it is — it served this frame.
         unsafe { libmimalloc_sys::mi_collect(force) }

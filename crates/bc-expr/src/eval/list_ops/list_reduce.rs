@@ -139,6 +139,34 @@ pub(crate) fn cum_sum(list: &GenericListArray<i32>) -> Result<ArrayRef, ExprErro
 /// First difference per row: element `i` is `xᵢ − xᵢ₋₁`, element 0 null. A null at
 /// either neighbor makes that difference null (Polars `list.diff`). Same length out.
 pub(crate) fn diff(list: &GenericListArray<i32>) -> Result<ArrayRef, ExprError> {
+    // An integer list differences in integers. Through Float64 every delta past 2^53 was
+    // rounded and the element type became a float where Polars (the function's source)
+    // keeps the integer; wrapping subtraction is the engine's scalar `-` convention.
+    // `UInt64` has no exact Int64 view, so it keeps the float path.
+    let child_type = list.values().data_type();
+    if child_type.is_integer() && !matches!(child_type, DataType::UInt64) {
+        let child = cast(list.values(), &DataType::Int64)?;
+        let v = child.as_primitive::<arrow::datatypes::Int64Type>();
+        let off = list.value_offsets();
+        let mut b = ListBuilder::new(Int64Builder::new());
+        for i in 0..list.len() {
+            if list.is_null(i) {
+                b.append_null();
+                continue;
+            }
+            let (s, e) = (off[i] as usize, off[i + 1] as usize);
+            let vb = b.values();
+            for k in s..e {
+                if k == s || !v.is_valid(k) || !v.is_valid(k - 1) {
+                    vb.append_null();
+                } else {
+                    vb.append_value(v.value(k).wrapping_sub(v.value(k - 1)));
+                }
+            }
+            b.append(true);
+        }
+        return Ok(Arc::new(b.finish()));
+    }
     let (child, off) = f64_child(list)?;
     let f = child.as_primitive::<Float64Type>();
     let mut b = ListBuilder::new(Float64Builder::new());

@@ -2,8 +2,9 @@
 
 `sort_elimination_from_ordering` removes a `Sort` whose ordering the input already
 satisfies. The estimator propagates a `sorted_by` ordering through order-preserving
-operators (a source that declares its sort, a `Sort` below, then `Filter`/`Limit`/
-`Window` on top all carry it), and this rule consumes it: if the requested sort
+operators (a source that declares its sort, a `Sort` below, then `Filter`/`Limit` on
+top carry it; a `Window` does not, because a spilled or distributed window emits rows
+in bucket order), and this rule consumes it: if the requested sort
 keys are a prefix of that known ordering, the sort is redundant and the input flows
 through unchanged. The classic win is re-sorting an already-sorted stream
 (time-series / pre-sorted lakehouse data) or sorting again by a coarser key.

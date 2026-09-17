@@ -35,7 +35,7 @@ def main() -> None:
             lines=bt.count(),
             qty=col("l_quantity").sum(),
             revenue=(col("l_extendedprice") * (1 - col("l_discount"))).sum(),
-            distinct_parts=bt.approx_n_unique(col("l_partkey")),
+            distinct_parts=bt.approx_count_distinct(col("l_partkey")),
         )
         .sort("l_returnflag", "l_linestatus")
     )
@@ -59,8 +59,7 @@ def main() -> None:
     # associative in exact arithmetic and IEEE addition is not, so the partition count
     # changes the summation order. Compensated summation bounds that to the last bits.
     assert all(
-        abs(a - b) <= abs(a) * 1e-12
-        for a, b in zip(left["revenue"], right["revenue"], strict=True)
+        abs(a - b) <= abs(a) * 1e-12 for a, b in zip(left["revenue"], right["revenue"], strict=True)
     )
 
     # A mergeable sketch combines across partitions to the same estimate.

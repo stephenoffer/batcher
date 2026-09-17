@@ -138,6 +138,6 @@ def jarque_bera(column: str | Expr) -> Expr:
     value = _as_column(column)
     n = value.count()
     # G1 = S·sqrt(n(n-1))/(n-2)  and  G2 = [(n+1)·K + 6]·(n-1)/((n-2)(n-3)), inverted.
-    skew = value.skewness() * (n - 2.0) / (n * (n - 1.0)).sqrt()
+    skew = value.skew() * (n - 2.0) / (n * (n - 1.0)).sqrt()
     excess = (value.kurtosis() * (n - 2.0) * (n - 3.0) / (n - 1.0) - 6.0) / (n + 1.0)
     return n / 6.0 * (skew * skew + excess * excess / 4.0)

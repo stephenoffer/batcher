@@ -270,9 +270,9 @@ def tweedie_deviance(y_true: IntoExpr, y_pred: IntoExpr, *, power: float = 1.5) 
         valid = (actual > lit(0.0)) & (predicted > lit(0.0))
     else:
         p = power
-        term1 = actual.pow(lit(2.0 - p)) / lit((1.0 - p) * (2.0 - p))
-        term2 = actual * predicted.pow(lit(1.0 - p)) / lit(1.0 - p)
-        term3 = predicted.pow(lit(2.0 - p)) / lit(2.0 - p)
+        term1 = actual ** lit(2.0 - p) / lit((1.0 - p) * (2.0 - p))
+        term2 = actual * predicted ** lit(1.0 - p) / lit(1.0 - p)
+        term3 = predicted ** lit(2.0 - p) / lit(2.0 - p)
         contribution = lit(2.0) * (term1 - term2 + term3)
         valid = (actual >= lit(0.0)) & (predicted > lit(0.0))
     # Mean over the valid rows only: an invalid row (a non-positive prediction) is dropped

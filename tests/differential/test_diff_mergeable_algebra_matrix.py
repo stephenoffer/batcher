@@ -54,16 +54,17 @@ def _aggregates():
     c = bt.col
     return {
         "sum": c("x").sum(), "mean": c("x").mean(), "min": c("x").min(), "max": c("x").max(),
-        "count": c("x").count(), "n_unique": c("x").n_unique(),
+        "count": c("x").count(), "count_distinct": c("x").count_distinct(),
         "std": c("x").std(), "var": c("x").var(),
         "median": c("x").median(), "quantile": c("x").quantile(0.9),
         "product": c("i").product(), "isum": c("i").sum(), "kahan_sum": c("x").kahan_sum(),
-        "skewness": c("x").skewness(), "kurtosis": c("x").kurtosis(), "mad": c("x").mad(),
+        "skew": c("x").skew(), "kurtosis": c("x").kurtosis(), "mad": c("x").mad(),
         "entropy": c("s").entropy(), "mode": c("s").mode(), "any_value": c("s").any_value(),
         "bool_and": c("b").bool_and(), "bool_or": c("b").bool_or(),
         "bit_and": c("i").bit_and(), "bit_or": c("i").bit_or(), "bit_xor": c("i").bit_xor(),
-        "arg_min": c("s").arg_min(c("x")), "arg_max": c("s").arg_max(c("x")),
-        "approx_n_unique": c("s").approx_n_unique(), "approx_median": c("x").approx_median(),
+        "arg_min": c("s").min_by(c("x")), "arg_max": c("s").max_by(c("x")),
+        "approx_count_distinct": c("s").approx_count_distinct(),
+        "approx_median": c("x").approx_median(),
     }  # fmt: skip
 
 

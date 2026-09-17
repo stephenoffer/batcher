@@ -107,7 +107,7 @@ def test_n_unique_column_shortcut_over_limit(duck):
     t = pa.table({"a": pa.array([1, 1, 2, 2, 3, 3, 4, 4], pa.int64())})
     duck.register("u", t)
     ds = bt.from_arrow(t).limit(3)  # first 3 rows: 1, 1, 2 → 2 distinct
-    got = ds.n_unique("a")
+    got = ds.count_distinct("a")
     want = duck.sql("SELECT count(DISTINCT a) FROM (SELECT a FROM u LIMIT 3)").fetchone()[0]
     assert got == want == 2
 

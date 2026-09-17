@@ -16,9 +16,8 @@ use std::sync::{Arc, OnceLock};
 
 use arrow::record_batch::RecordBatch;
 use futures::{StreamExt, TryStreamExt};
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -390,7 +389,7 @@ impl parquet::arrow::async_reader::AsyncFileReader for PrefetchedFooter {
         // the parquet crate asserts rather than re-fetching.
         let file_size = self.tail_start + self.tail.len() as u64;
         let prefetch = self.tail.len();
-        let page_index = options.map(|o| o.page_index()).unwrap_or(false);
+        let page_index = options.is_some_and(page_index::wanted);
         async move {
             let reader = parquet::file::metadata::ParquetMetaDataReader::new()
                 // `Optional`, never `Required`: a file written without a page index is
@@ -468,11 +467,7 @@ async fn load_metadata_cached(
     // The page index sits just below the footer, so it is normally inside the tail above and
     // costs nothing extra; when it is not, `PrefetchedFooter` fetches it and the file simply
     // takes the second request it would have taken anyway.
-    let amd = ArrowReaderMetadata::load_async(
-        &mut probe,
-        ArrowReaderOptions::new().with_page_index(true),
-    )
-    .await?;
+    let amd = ArrowReaderMetadata::load_async(&mut probe, page_index::required_options()).await?;
     meta_cache()
         .lock()
         .unwrap()
@@ -525,8 +520,8 @@ async fn read_parquet_async(
     //
     // A `RowFilter` is the only pruning step here that can *lose*: below `MAX_SELECTIVITY` it
     // saves decoding the non-predicate columns of every rejected row, and above it the
-    // fragmented row selection costs more than the decode it skips (measured 1.45x faster at
-    // ~2 % selected, 1.57x *slower* at ~95 %). Nothing in the footer can distinguish the two —
+    // fragmented row selection costs more than the decode it skips (see `MAX_SELECTIVITY`: end to end
+    // a win at 5 % selected, a loss by 10 %, and up to 1.47x slower by 20 %). Nothing in the footer can distinguish the two —
     // a scattered predicate leaves every row group's [min, max] spanning the domain whether it
     // selects 2 % or 95 % — so the only honest input is a measurement.
     //
@@ -582,9 +577,7 @@ async fn read_parquet_async(
             };
             if !permissive {
                 if let Some(cols) = row_filter::plan(pred, arrow_meta.schema()) {
-                    let reader =
-                        ParquetObjectReader::new(resolved.store.clone(), resolved.path.clone())
-                            .with_file_size(size);
+                    let reader = split_read::object_reader(&resolved.store, &resolved.path, size);
                     let mask = projection::exact_columns(
                         arrow_meta.parquet_schema(),
                         cols.iter().map(String::as_str),
@@ -636,7 +629,7 @@ async fn read_parquet_async(
         // Over the network a row group's contiguous column chunks coalesce into one enormous
         // GET, which one connection then serves at a fraction of the link — see `split_read`.
         // Local reads keep the plain reader: the page cache has no such limit.
-        let base = ParquetObjectReader::new(store.clone(), loc.clone()).with_file_size(size);
+        let base = split_read::object_reader(&store, &loc, size);
         let reader = split_read::maybe_split(base, &store, &loc, remote);
         let amd = arrow_meta.clone();
         let proj = projection.clone();
@@ -881,7 +874,7 @@ mod tests {
     fn write_parquet(path: &std::path::Path, batches: &[RecordBatch], rows_per_group: usize) {
         let file = std::fs::File::create(path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(rows_per_group)
+            .set_max_row_group_row_count(Some(rows_per_group))
             .build();
         let mut w = ArrowWriter::try_new(file, batches[0].schema(), Some(props)).unwrap();
         for b in batches {
@@ -1229,8 +1222,8 @@ mod tests {
         write_parquet(&p, &[batch], 25_000);
         let path = p.to_str().unwrap();
 
-        // `a < 10000` over 0..300000 selects 10,000 rows — 3.3 %, comfortably selective.
-        let pred = r#"{"node":"cmp","col":"a","op":"lt","lit":10000}"#;
+        // `a < 3000` over 0..300000 selects 3,000 rows — 1 %, under `MAX_SELECTIVITY`.
+        let pred = r#"{"node":"cmp","col":"a","op":"lt","lit":3000}"#;
         let out = read_parquet_filtered(path, &[], None, 8192, pred).unwrap();
         let mut got: Vec<i64> = out
             .iter()
@@ -1244,7 +1237,7 @@ mod tests {
             })
             .collect();
         got.sort_unstable(); // the file order is a permutation; compare as a set
-        let want: Vec<i64> = (0..10_000).collect();
+        let want: Vec<i64> = (0..3_000).collect();
         assert_eq!(
             got.len(),
             want.len(),
@@ -1253,7 +1246,7 @@ mod tests {
         assert_eq!(got, want, "values must be exactly the matching rows");
 
         // An AND of two ranges, to exercise the Kleene combination path.
-        let both = r#"{"node":"and","left":{"node":"cmp","col":"a","op":"ge","lit":100},"right":{"node":"cmp","col":"a","op":"lt","lit":5000}}"#;
+        let both = r#"{"node":"and","left":{"node":"cmp","col":"a","op":"ge","lit":100},"right":{"node":"cmp","col":"a","op":"lt","lit":1900}}"#;
         let out2 = read_parquet_filtered(path, &[], None, 8192, both).unwrap();
         let mut got2: Vec<i64> = out2
             .iter()
@@ -1267,7 +1260,7 @@ mod tests {
             })
             .collect();
         got2.sort_unstable();
-        assert_eq!(got2, (100..5000).collect::<Vec<i64>>());
+        assert_eq!(got2, (100..1900).collect::<Vec<i64>>());
 
         // A permissive predicate is declined by the selectivity gate, so it returns the
         // un-filtered superset — still correct, because the engine keeps its own `Filter`.
@@ -1301,9 +1294,9 @@ mod tests {
             row_filter::estimate(&pred, rg, &idx).unwrap()
         };
 
-        // 2 % of the [0, 9999] span sits below 200.
-        let selective = est(r#"{"node":"cmp","col":"a","op":"lt","lit":200}"#);
-        assert!(selective < 0.05, "expected ~0.02, got {selective}");
+        // 0.5 % of the [0, 9999] span sits below 50.
+        let selective = est(r#"{"node":"cmp","col":"a","op":"lt","lit":50}"#);
+        assert!(selective < 0.01, "expected ~0.005, got {selective}");
         assert!(row_filter::worth_it_frac(selective));
 
         // 95 % sits below 9500 — the case that must decline.
@@ -1372,7 +1365,7 @@ mod bloom_tests {
         .unwrap();
         let props = WriterProperties::builder()
             .set_bloom_filter_enabled(true)
-            .set_max_row_group_size(rows_per_group)
+            .set_max_row_group_row_count(Some(rows_per_group))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();

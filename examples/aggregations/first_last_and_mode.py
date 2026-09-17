@@ -32,7 +32,7 @@ def main() -> None:
             orders=bt.count(),
         )
         .sort("o_custkey")
-        .head(5)
+        .limit(5)
         .to_pydict()
     )
     print(per_customer)

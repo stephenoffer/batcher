@@ -78,7 +78,35 @@ pub(crate) fn eval_security(
                     .collect::<StringArray>(),
             ))
         }
+        StrFunc::MaskByClass => {
+            let classes = class_mask(pattern)?;
+            Ok(Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| mask::mask_by_class(v, classes)))
+                    .collect::<StringArray>(),
+            ))
+        }
         _ => unreachable!("eval_security called with the non-security StrFunc {func:?}"),
+    }
+}
+
+/// `mask_by_class`'s four replacements, read from exactly four characters in `pattern`
+/// (upper, lower, digit, other), where `\u{0}` keeps that class. Anything else is a plan
+/// the Python builder cannot produce, so it is rejected rather than guessed at.
+fn class_mask(pattern: Option<&str>) -> Result<mask::ClassMask, ExprError> {
+    let slot = |c: char| (c != '\0').then_some(c);
+    let chars: Vec<char> = pattern.unwrap_or_default().chars().collect();
+    match chars[..] {
+        [upper, lower, digit, other] => Ok(mask::ClassMask {
+            upper: slot(upper),
+            lower: slot(lower),
+            digit: slot(digit),
+            other: slot(other),
+        }),
+        _ => Err(ExprError::InvalidArgument {
+            func: "mask_by_class".to_string(),
+            reason: "expects four replacement characters (upper, lower, digit, other)".into(),
+        }),
     }
 }
 

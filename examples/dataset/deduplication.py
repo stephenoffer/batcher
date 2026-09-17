@@ -26,10 +26,10 @@ def main() -> None:
     assert events.distinct().count() == 5
     dupes = bt.from_pydict({"v": [1, 1, 2]})
     assert dupes.distinct().count() == 2
-    assert dupes.unique().count() == 2
+    assert dupes.distinct().count() == 2
 
     # Distinct on a subset of columns.
-    by_id = events.drop_duplicates(["id"]).to_pydict()
+    by_id = events.distinct(["id"]).to_pydict()
     print("one per id:", by_id)
     assert sorted(by_id["id"]) == [1, 2, 3]
 

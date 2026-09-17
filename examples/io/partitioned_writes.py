@@ -34,7 +34,7 @@ def main() -> None:
         # One directory per distinct ship mode.
         written = sorted(p.name for p in Path(root).iterdir() if p.is_dir())
         print(written)
-        assert len(written) == lineitem.n_unique("l_shipmode")
+        assert len(written) == lineitem.count_distinct("l_shipmode")
         assert all(name.startswith("l_shipmode=") for name in written)
 
         # The dataset reader reconstructs the partition column from the path.

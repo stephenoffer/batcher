@@ -60,7 +60,7 @@ def _upper():
 
 
 def _scored(declared: list[str] | None) -> bt.Dataset:
-    return bt.from_pydict(SOURCE).ml.map_batches(_upper(), output_columns=declared, concurrency=1)
+    return bt.from_pydict(SOURCE).map_batches(_upper(), output_columns=declared, concurrency=1)
 
 
 def _rows(result) -> list[tuple]:

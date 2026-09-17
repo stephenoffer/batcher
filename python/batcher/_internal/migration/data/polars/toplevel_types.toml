@@ -1,0 +1,42 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+[polars]
+Array = { status = "param", batcher = "Expr.cast", need = "cast target Array (fixed-size list)", wave = "W2" }
+BaseExtension = { status = "gap", need = "extension types", wave = "W11" }
+Binary = { status = "canonical", batcher = "Expr.cast" }
+Boolean = { status = "canonical", batcher = "Expr.cast" }
+Categorical = { status = "gap", need = "Categorical logical type (dictionary preserved end to end)", wave = "W11" }
+Categories = { status = "gap", need = "Categorical category sets", wave = "W11" }
+DataType = { status = "out_of_scope", reason = "Arrow is the only columnar contract: Batcher accepts and returns pyarrow type objects, so a Polars DataType class has no Batcher counterpart to build" }
+DataTypeExpr = { status = "gap", need = "dtype expressions (dtype_of/self_dtype)", wave = "W11" }
+Date = { status = "canonical", batcher = "Expr.cast" }
+Datetime = { status = "param", batcher = "Expr.cast", need = "cast target Datetime with time_unit ms/ns and time_zone", wave = "W2" }
+Decimal = { status = "canonical", batcher = "Expr.cast" }
+Duration = { status = "param", batcher = "Expr.cast", need = "cast target Duration", wave = "W2" }
+Enum = { status = "gap", need = "Enum logical type", wave = "W11" }
+Extension = { status = "gap", need = "extension types", wave = "W11" }
+Field = { status = "out_of_scope", reason = "Arrow is the only columnar contract: Batcher accepts and returns pyarrow type objects, so a Polars Field class has no Batcher counterpart to build" }
+Float16 = { status = "canonical", batcher = "Expr.cast" }
+Float32 = { status = "canonical", batcher = "Expr.cast" }
+Float64 = { status = "canonical", batcher = "Expr.cast" }
+Int128 = { status = "gap", need = "Int128 type", wave = "W11" }
+Int16 = { status = "canonical", batcher = "Expr.cast" }
+Int32 = { status = "canonical", batcher = "Expr.cast" }
+Int64 = { status = "canonical", batcher = "Expr.cast" }
+Int8 = { status = "canonical", batcher = "Expr.cast" }
+List = { status = "param", batcher = "Expr.cast", need = "cast target List", wave = "W2" }
+Null = { status = "param", batcher = "Expr.cast", need = "cast target Null", wave = "W2" }
+Object = { status = "out_of_scope", reason = "arbitrary Python objects in a column contradict Arrow as the only columnar contract" }
+Schema = { status = "out_of_scope", reason = "Arrow is the only columnar contract: Batcher accepts and returns pyarrow type objects, so a Polars Schema class has no Batcher counterpart to build" }
+String = { status = "canonical", batcher = "Expr.cast" }
+Struct = { status = "param", batcher = "Expr.cast", need = "cast target Struct", wave = "W2" }
+Time = { status = "gap", need = "TIME type", wave = "W6" }
+UInt128 = { status = "gap", need = "UInt128 type", wave = "W11" }
+UInt16 = { status = "canonical", batcher = "Expr.cast" }
+UInt32 = { status = "canonical", batcher = "Expr.cast" }
+UInt64 = { status = "mismatch", batcher = "Expr.cast", note = "a cast to uint64 keeps the type, but a UInt64 input above the Int64 range raises at the engine boundary rather than overflowing", wave = "W0" }
+UInt8 = { status = "canonical", batcher = "Expr.cast" }
+Unknown = { status = "out_of_scope", reason = "Polars-internal placeholder dtype for unresolved schemas" }
+Utf8 = { status = "canonical", batcher = "Expr.cast" }

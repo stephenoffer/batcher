@@ -124,8 +124,8 @@ def test_compression_shrinks_repetitive_data():
     sizes = (
         bt.from_arrow(t)
         .select(
-            raw=col("s").str.len_bytes(),
-            **{c: col("s").str.compress(c).str.len_bytes() for c in CODECS},
+            raw=col("s").str.octet_length(),
+            **{c: col("s").str.compress(c).str.octet_length() for c in CODECS},
         )
         .to_pydict()
     )

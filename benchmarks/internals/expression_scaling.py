@@ -99,9 +99,9 @@ def _cases() -> dict[str, Callable[[object], object]]:
         ),
         "case_str4": lambda d: d.select(
             o=bt.when(bt.col("i64") < 250_000)
-            .then(bt.col("s_hi").str.to_uppercase())
+            .then(bt.col("s_hi").str.upper())
             .when(bt.col("i64") < 500_000)
-            .then(bt.col("s_hi").str.to_lowercase())
+            .then(bt.col("s_hi").str.lower())
             .when(bt.col("i64") < 750_000)
             .then(bt.col("s_hi").str.reverse())
             .otherwise(bt.col("s_hi"))
@@ -110,7 +110,7 @@ def _cases() -> dict[str, Callable[[object], object]]:
             o=bt.coalesce(bt.col("nulls"), bt.col("f64") * 2.0, bt.col("g64") * 3.0, bt.lit(0.0))
         ),
         # --- interpreted kernels: strings and temporal ---
-        "str_upper": lambda d: d.select(o=bt.col("s_lo").str.to_uppercase()),
+        "str_upper": lambda d: d.select(o=bt.col("s_lo").str.upper()),
         "str_contains": lambda d: d.filter(bt.col("s_hi").str.contains("7")),
         "dt_extract": lambda d: d.select(o=bt.col("ts").dt.year() + bt.col("ts").dt.month()),
         # --- a repeated subexpression, which Kyber's CSE rule should evaluate once ---

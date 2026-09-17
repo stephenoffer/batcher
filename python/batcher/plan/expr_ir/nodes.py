@@ -9,11 +9,11 @@ way: `nodes` → `core`).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from batcher._internal.errors import PlanError, require_int
-from batcher.plan.expr_ir.core import Expr, FrameSpec, IntoExpr, _col_or_expr, _wrap
+from batcher.plan.expr_ir.core import Expr, FrameSpec, IntoExpr, Lit, _col_or_expr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
@@ -39,6 +39,9 @@ class HashRows(IRNode):
     tag = ExprTag.HASH
     inputs: list[Expr] = children()
     seed: int = scalar(omit_falsy=True, default=0)
+    # `None` is Batcher's own digest and stays off the wire, so an existing plan
+    # serializes byte-identically; the others name an engine-compatible digest.
+    algorithm: str | None = scalar(omit_none=True, default=None)
 
 
 @expr_node
@@ -59,29 +62,111 @@ class Case(IRNode):
 
 
 class CaseBuilder:
-    """Fluent builder for CASE: `when(c).then(v).when(c2).then(v2).otherwise(d)`."""
+    """Fluent CASE builder: ``when(c).then(v).when(c2).then(v2).otherwise(d)``.
 
-    __slots__ = ("_branches", "_pending")
+    A builder that has at least one ``then`` is already an expression, as Polars' ``Then``
+    is: used anywhere an expression is accepted it is the CASE with a NULL ``otherwise``,
+    SQL's ``CASE WHEN ... END``. ``otherwise(None)`` means the same. Every step returns a
+    new builder, so a shared prefix can be extended two ways without either seeing the
+    other's branches.
 
-    def __init__(self) -> None:
-        self._branches: list[tuple[Expr, Expr]] = []
-        self._pending: Expr | None = None
+    It is deliberately *not* an `Expr` subclass. The optimizer's traversals dispatch on
+    exact node types, and a builder reaching a plan as a node of its own would be a leaf
+    they cannot see into. So the builder finishes into a `Case` at every entry point
+    instead: `_wrap` finishes it, and every `Expr` method and operator called on it runs
+    on the finished `Case`.
 
-    def when(self, cond: Expr) -> CaseBuilder:
-        self._pending = cond
-        return self
+    The NULL has to be typed, because the IR has no untyped null and a CASE needs one
+    type across its branches. It takes the type of the first non-null branch value, as
+    ``nullif(v, v)`` -- the construction the SQL front-end uses for the same ``CASE``.
+    """
 
-    def then(self, value: IntoExpr) -> CaseBuilder:
+    __slots__ = ("_branches", "_otherwise", "_pending")
+
+    def __init__(
+        self,
+        branches: tuple[tuple[Expr, Any], ...] = (),
+        pending: Expr | None = None,
+        otherwise: Any = None,
+    ) -> None:
+        self._branches = branches
+        self._pending = pending
+        self._otherwise = otherwise
+
+    def __repr__(self) -> str:
+        """A source-like rendering of the chain."""
+        parts = [f"when({c!r}).then({v!r})" for c, v in self._branches]
+        if self._pending is not None:
+            parts.append(f"when({self._pending!r})")
+        return ".".join(parts)
+
+    def when(self, cond: IntoExpr) -> CaseBuilder:
+        """Open another branch; finish it with :meth:`then`."""
+        if self._pending is not None:
+            raise PlanError("when() must be followed by then() before another when()")
+        return CaseBuilder(self._branches, _wrap(cond))
+
+    def then(self, value: IntoExpr | None) -> CaseBuilder:
+        """Give the open branch its value; ``None`` is a NULL typed like the other branches."""
         if self._pending is None:
             raise PlanError("then() must follow when()")
-        self._branches.append((self._pending, _wrap(value)))
-        self._pending = None
-        return self
+        branch = (self._pending, None if value is None else _wrap(value))
+        return CaseBuilder((*self._branches, branch))
 
-    def otherwise(self, value: IntoExpr) -> Case:
+    def otherwise(self, value: IntoExpr | None) -> Case:
+        """Finish the CASE with the value for rows no branch matched (``None`` is NULL)."""
         if self._pending is not None:
             raise PlanError("dangling when() without then()")
-        return Case(self._branches, _wrap(value))
+        return CaseBuilder(self._branches, None, value)._finish()
+
+    def _finish(self) -> Case:
+        """The `Case` this builder stands for, with a typed NULL wherever no value was given."""
+        if self._pending is not None:
+            raise PlanError("dangling when() without then()")
+        if not self._branches:
+            raise PlanError("a CASE needs at least one when(...).then(...) branch")
+        otherwise = None if self._otherwise is None else _wrap(self._otherwise)
+        values = [v for _c, v in self._branches] + [otherwise]
+        witness = next((v for v in values if v is not None), None)
+        null = NullIf(witness, witness) if witness is not None else NullIf(Lit(1), Lit(1))
+        branches = [(c, null if v is None else v) for c, v in self._branches]
+        return Case(branches, null if otherwise is None else otherwise)
+
+    def to_ir(self) -> dict[str, Any]:
+        """The finished `Case`'s JSON IR."""
+        return self._finish().to_ir()
+
+    def __getattr__(self, name: str) -> Any:
+        """Every `Expr` method runs on the finished `Case` (``.alias``, ``.cast``, ``.str``)."""
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._finish(), name)
+
+
+def _forward_to_case(name: str) -> Callable[..., Any]:
+    def forward(self: CaseBuilder, *args: Any) -> Any:
+        return getattr(self._finish(), name)(*args)
+
+    forward.__name__ = name
+    forward.__doc__ = f"``{name}`` of the finished `Case`."
+    return forward
+
+
+# Operators are looked up on the type, never through `__getattr__`, so each one `Expr`
+# defines is forwarded explicitly -- otherwise ``when(c).then(1) + 1`` would be a
+# `TypeError` while ``when(c).then(1).alias("x")`` worked.
+_NOT_FORWARDED = frozenset(
+    {"__init__", "__getattr__", "__repr__", "__init_subclass__", "__new__", "__class_getitem__"}
+)
+for _dunder, _impl in list(vars(Expr).items()):
+    if (
+        _dunder.startswith("__")
+        and _dunder.endswith("__")
+        and callable(_impl)
+        and _dunder not in _NOT_FORWARDED
+    ):
+        setattr(CaseBuilder, _dunder, _forward_to_case(_dunder))
+del _dunder, _impl
 
 
 @expr_node
@@ -196,6 +281,7 @@ class WindowExpr(Expr):
         "frame",
         "func",
         "half_life",
+        "ignore_nulls",
         "input",
         "offset",
         "order_by",
@@ -212,6 +298,7 @@ class WindowExpr(Expr):
         offset: int = 1,
         alpha: float | None = None,
         half_life: float | None = None,
+        ignore_nulls: bool = False,
     ) -> None:
         self.func = func
         self.input = input
@@ -221,6 +308,8 @@ class WindowExpr(Expr):
         self.offset = offset
         self.alpha = alpha
         self.half_life = half_life
+        # `IGNORE NULLS`, for `first_value`/`last_value`/`nth_value` only.
+        self.ignore_nulls = ignore_nulls
 
     def to_ir(self) -> dict[str, Any]:
         """Always raises: a window has no scalar IR — it must be hoisted to a `Window` node."""
@@ -242,6 +331,7 @@ class WindowExpr(Expr):
             self.offset,
             self.alpha,
             self.half_life,
+            self.ignore_nulls,
         )
 
     def over(
@@ -249,24 +339,30 @@ class WindowExpr(Expr):
         partition_by: Iterable[Any] | None = (),
         order_by: Iterable[Any] | None = (),
         frame: FrameSpec | None = None,
+        *,
+        descending: bool | Iterable[bool] = False,
+        nulls_last: bool = True,
+        mapping_strategy: str = "group_to_rows",
     ) -> WindowExpr:
         """Bind this window function to a partition/order (and optional frame).
 
         Lets a value-function constructor read fluently:
         ``lag(col("x"), 2).over(partition_by=["g"], order_by=["t"])``. Either key list
-        may be ``None``, meaning none — SQL's unpartitioned ``OVER (ORDER BY t)``.
-        Returns a new `WindowExpr`; the original is unchanged."""
-        from batcher.plan.expr_ir.core import normalize_key_list
+        may be ``None``, meaning none — SQL's unpartitioned ``OVER (ORDER BY t)``. A
+        partition the window already carries is kept and this one added; an `order_by`
+        given here replaces the window's own, and ``ignore_nulls`` is carried through. See
+        :meth:`Expr.over` for the parameters. Returns a new `WindowExpr`; the original is
+        unchanged."""
+        from batcher.plan.expr_rewrite.over import bind_over
 
-        return WindowExpr(
-            self.func,
-            self.input,
-            normalize_key_list(partition_by),
-            normalize_key_list(order_by),
-            frame if frame is not None else self.frame,
-            self.offset,
-            self.alpha,
-            self.half_life,
+        return bind_over(
+            self,
+            partition_by,
+            order_by,
+            frame,
+            descending=descending,
+            nulls_last=nulls_last,
+            mapping_strategy=mapping_strategy,
         )
 
 
@@ -316,18 +412,22 @@ def lead(expr: IntoExpr, n: int = 1) -> WindowExpr:
     return WindowExpr("lead", _col_or_expr(expr), [], [], None, int(n))
 
 
-def first_value(expr: IntoExpr) -> WindowExpr:
+def first_value(expr: IntoExpr, *, ignore_nulls: bool = False) -> WindowExpr:
     """The first value of the ordered partition (SQL ``FIRST_VALUE``).
 
-    Reads the **whole partition** (``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
-    FOLLOWING``), not the running frame, so every row of a partition gets the same
-    value. Bind with ``.over(partition_by=…, order_by=…)``.
+    Bind with ``.over(partition_by=…, order_by=…)``. Every frame SQL defaults to starts at
+    the partition's first row, so every row of a partition gets the same value unless an
+    explicit ``frame`` moves the start.
+
+    ``ignore_nulls=True`` is SQL's ``IGNORE NULLS`` (Spark's ``ignoreNulls``): the first
+    *non-null* value in the frame.
 
     Args:
         expr: The column (or expression) to read the first value of.
+        ignore_nulls: Whether to skip null values.
 
     Returns:
-        A window expression yielding the partition's first value for every row.
+        A window expression yielding the frame's first value for every row.
 
     Examples:
         .. doctest::
@@ -337,23 +437,32 @@ def first_value(expr: IntoExpr) -> WindowExpr:
             >>> w = bt.first_value(bt.col("x")).over(order_by=["x"])
             >>> ds.with_columns(r=w).select("r").to_pydict()
             {'r': [10, 10, 10]}
+
+            >>> gaps = bt.from_pydict({"t": [1, 2, 3], "x": [None, 20, 30]})
+            >>> w = bt.first_value("x", ignore_nulls=True).over(order_by=["t"])
+            >>> gaps.with_columns(r=w).sort("t").select("r").to_pydict()
+            {'r': [None, 20, 20]}
     """
-    return WindowExpr("first_value", _col_or_expr(expr), [], [], None)
+    return WindowExpr("first_value", _col_or_expr(expr), [], [], None, ignore_nulls=ignore_nulls)
 
 
-def last_value(expr: IntoExpr) -> WindowExpr:
-    """The last value of the ordered partition (SQL ``LAST_VALUE``).
+def last_value(expr: IntoExpr, *, ignore_nulls: bool = False) -> WindowExpr:
+    """The last value of the window frame (SQL ``LAST_VALUE``).
 
-    Reads the **whole partition** (``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
-    FOLLOWING``), not the running frame — so this is the partition's final value, the
-    same for every row, not a running "last seen so far". Bind with
-    ``.over(partition_by=…, order_by=…)``.
+    Bind with ``.over(partition_by=…, order_by=…)``. With an ``order_by`` and no explicit
+    ``frame`` the frame is SQL's default, ``RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+    ROW``, so this is the running "last value so far", taken from the end of the current
+    row's peer group, as in DuckDB, Spark and Batcher SQL. Pass ``frame=(None, None)`` for the
+    partition's final value on every row, which is also the answer without an ``order_by``.
+
+    ``ignore_nulls=True`` is SQL's ``IGNORE NULLS``: the last *non-null* value in the frame.
 
     Args:
         expr: The column (or expression) to read the last value of.
+        ignore_nulls: Whether to skip null values.
 
     Returns:
-        A window expression yielding the partition's last value for every row.
+        A window expression yielding the frame's last value for every row.
 
     Examples:
         .. doctest::
@@ -361,27 +470,32 @@ def last_value(expr: IntoExpr) -> WindowExpr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [10, 20, 30]})
             >>> w = bt.last_value(bt.col("x")).over(order_by=["x"])
-            >>> ds.with_columns(r=w).select("r").to_pydict()
+            >>> ds.with_columns(r=w).sort("x").select("r").to_pydict()
+            {'r': [10, 20, 30]}
+            >>> whole = bt.last_value(bt.col("x")).over(order_by=["x"], frame=(None, None))
+            >>> ds.with_columns(r=whole).select("r").to_pydict()
             {'r': [30, 30, 30]}
     """
-    return WindowExpr("last_value", _col_or_expr(expr), [], [], None)
+    return WindowExpr("last_value", _col_or_expr(expr), [], [], None, ignore_nulls=ignore_nulls)
 
 
-def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
-    """The value of the ``n``-th row (1-based) of the ordered partition.
+def nth_value(expr: IntoExpr, n: int, *, ignore_nulls: bool = False) -> WindowExpr:
+    """The value of the ``n``-th row (1-based) of the window frame.
 
-    Backs SQL ``NTH_VALUE``; null if the partition has fewer than ``n`` rows. Like
-    :func:`first_value`/:func:`last_value`, this reads the **whole partition**
-    (equivalent to ``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING``), not
-    the running frame — so the ``n``-th value is the same for every row of a partition.
-    Bind with ``.over(partition_by=…, order_by=…)``.
+    Backs SQL ``NTH_VALUE``; null while the frame has fewer than ``n`` rows. As for
+    :func:`last_value`, an ``order_by`` without an explicit ``frame`` uses SQL's default
+    running frame, so rows before the ``n``-th peer group are null. Pass
+    ``frame=(None, None)`` for the partition's ``n``-th value on every row.
+
+    ``ignore_nulls=True`` counts only the non-null values, as SQL's ``IGNORE NULLS``.
 
     Args:
         expr: The column (or expression) to read.
-        n: The 1-based position within the partition to return.
+        n: The 1-based position within the frame to return.
+        ignore_nulls: Whether to count only non-null values.
 
     Returns:
-        A window expression yielding the partition's ``n``-th value for every row.
+        A window expression yielding the frame's ``n``-th value for every row.
 
     Raises:
         PlanError: If ``n`` is less than 1.
@@ -392,11 +506,11 @@ def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [10, 20, 30]})
             >>> w = bt.nth_value(bt.col("x"), 2).over(order_by=["x"])
-            >>> ds.with_columns(r=w).select("r").to_pydict()
-            {'r': [20, 20, 20]}
+            >>> ds.with_columns(r=w).sort("x").select("r").to_pydict()
+            {'r': [None, 20, 20]}
     """
     n = require_int(n, func="nth_value", arg="n", minimum=1)
-    return WindowExpr("nth_value", _col_or_expr(expr), [], [], None, n)
+    return WindowExpr("nth_value", _col_or_expr(expr), [], [], None, n, ignore_nulls=ignore_nulls)
 
 
 def row_number() -> WindowExpr:

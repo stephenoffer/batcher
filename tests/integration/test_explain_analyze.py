@@ -62,7 +62,7 @@ def test_stats_measures_map_batches_without_an_estimate():
     guess. So the stage carries real rows and time, and `est_rows` stays absent."""
     import math
 
-    ds = bt.from_arrow(pa.table({"x": [1, 2, 3]})).ml.map_batches(lambda b: b, output_columns=["x"])
+    ds = bt.from_arrow(pa.table({"x": [1, 2, 3]})).map_batches(lambda b: b, output_columns=["x"])
     st = ds.stats()
     stage = next(o for o in st.ops if o.kind == "MapBatches")
     assert stage.rows_out == 3

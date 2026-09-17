@@ -25,8 +25,8 @@ from batcher import col
 
 def main() -> None:
     supplier = tpch("supplier").select("s_suppkey", "s_name", "s_acctbal")
-    first = supplier.head(100)
-    second = supplier.slice(100, 100)
+    first = supplier.limit(100)
+    second = supplier.limit(100, offset=100)
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

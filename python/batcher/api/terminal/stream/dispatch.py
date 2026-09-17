@@ -33,7 +33,12 @@ from collections.abc import Iterator
 import pyarrow as pa
 
 from batcher.api.terminal.stream.bounded import asof_lookup_driver, bounded_driver
-from batcher.api.terminal.stream.pipeline import _apply_peeled, _iter_streaming, _pushdown
+from batcher.api.terminal.stream.pipeline import (
+    _apply_peeled,
+    _iter_streaming,
+    _pushdown,
+    _stream_topn,
+)
 from batcher.api.terminal.stream.rebatch import _rebatch_exact, _take
 from batcher.api.terminal.stream.static_join import (
     refuse_reason as static_join_refusal,
@@ -360,11 +365,7 @@ def _iter_batches(
             and is_streamable(plan.input.input)
             and not core.has_map_batches(plan.input.input)
         ):
-            from batcher.core.streaming import stream_topn
-
-            yield from stream_topn(
-                plan.input, plan.n, sources[0], batch_size, projection=_pushdown(plan)
-            )
+            yield from _stream_topn(plan, sources, batch_size)
             return
         # A plain `Limit` over a breaker-free pipeline streams and stops early.
         if (

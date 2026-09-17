@@ -126,7 +126,7 @@ def test_gff_keeps_attributes_as_text_so_either_dialect_reads(tmp_path):
     ds = bt.read.gff(_write(tmp_path, "a.gtf", gtf))
     assert ds.schema.field("attributes").type == pa.string()
     # The engine's own string vocabulary pulls a key out of either encoding.
-    got = ds.select(g=bt.col("attributes").str.regexp_extract(r'gene_id "([^"]+)"', 1))
+    got = ds.select(g=bt.col("attributes").str.extract(r'gene_id "([^"]+)"', 1))
     assert got.to_pydict()["g"] == ["g1"]
 
 
@@ -178,9 +178,9 @@ def test_vcf_reads_dot_as_null_and_keeps_a_multiallelic_alt_intact(tmp_path):
 
 def test_vcf_info_is_queryable_with_the_string_vocabulary(tmp_path):
     ds = bt.read.vcf(_write(tmp_path, "z.vcf", _VCF))
-    af = ds.select(
-        af=bt.col("info").str.regexp_extract(r"AF=([0-9.]+)", 1).cast("float64")
-    ).to_pydict()["af"]
+    af = ds.select(af=bt.col("info").str.extract(r"AF=([0-9.]+)", 1).cast("float64")).to_pydict()[
+        "af"
+    ]
     assert af == [0.25, 0.01]
 
 

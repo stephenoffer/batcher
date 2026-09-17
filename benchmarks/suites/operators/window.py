@@ -87,3 +87,42 @@ def window_sum_partition(ctx: Context):
         ctx,
         "SELECT l_orderkey, sum(l_extendedprice) OVER (PARTITION BY l_orderkey) AS s FROM lineitem",
     )
+
+
+@window.case("op-window-rolling")
+def window_rolling(ctx: Context):
+    """A four-row moving average within each supplier (a bounded `ROWS` frame, not a running one).
+
+    The frame slides, so each row's aggregate drops the value leaving the window as well as
+    adding the one entering — the shape a running sum never exercises. Ordered on
+    `(l_orderkey, l_linenumber)`, which is unique, so every row's frame is one defined set.
+    """
+    return cannot_run(
+        sql_fanout(
+            ctx,
+            "SELECT SUM(r) AS s, COUNT(r) AS n FROM (SELECT AVG(l_extendedprice) OVER ("
+            "PARTITION BY l_suppkey ORDER BY l_orderkey, l_linenumber "
+            "ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS r FROM lineitem) t",
+        ),
+        "daft",
+        _DAFT_ORDERED_WINDOW_OOM,
+    )
+
+
+@window.case("op-window-topk")
+def window_topk(ctx: Context):
+    """The three priciest lines per supplier via `ROW_NUMBER() <= 3` — top-k per group.
+
+    Which of several equally-priced lines takes rank 3 is undefined, so the case reports the
+    count and the price total, which ties cannot change.
+    """
+    return cannot_run(
+        sql_fanout(
+            ctx,
+            "SELECT COUNT(*) AS n, SUM(l_extendedprice) AS s FROM (SELECT l_extendedprice, "
+            "ROW_NUMBER() OVER (PARTITION BY l_suppkey ORDER BY l_extendedprice DESC) AS rn "
+            "FROM lineitem) t WHERE rn <= 3",
+        ),
+        "daft",
+        _DAFT_ORDERED_WINDOW_OOM,
+    )

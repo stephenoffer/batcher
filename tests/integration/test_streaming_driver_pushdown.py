@@ -82,7 +82,7 @@ def test_a_streaming_distinct_reads_only_its_key_columns():
 
 def test_a_streaming_top_n_reads_only_its_sort_and_output_columns():
     source = _WideStream()
-    ds = _ds(source).select("k", "c2").sort("c2", descending=True).head(3)
+    ds = _ds(source).select("k", "c2").sort("c2", descending=True).limit(3)
     assert sum(b.num_rows for b in ds.iter_batches()) == 3
     assert _read_columns(source) == {"k", "c2"}
 

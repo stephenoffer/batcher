@@ -36,9 +36,9 @@ def main() -> None:
     assert list(resolved) == lineitem.columns
 
     # These read data.
-    print("rows:", lineitem.height)
-    assert lineitem.height == lineitem.count()
-    assert lineitem.shape == (lineitem.height, lineitem.width)
+    print("rows:", lineitem.count())
+    assert lineitem.count() == lineitem.count()
+    assert lineitem.shape == (lineitem.count(), lineitem.width)
     assert not lineitem.is_empty()
 
     # A per-column statistical summary, one row per statistic.

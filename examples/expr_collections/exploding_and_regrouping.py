@@ -22,7 +22,7 @@ from batcher import col
 def main() -> None:
     per_order = (
         tpch("lineitem")
-        .head(20_000)
+        .limit(20_000)
         .group_by("l_orderkey")
         .agg(parts=bt.array_agg(col("l_partkey")))
         .sort("l_orderkey")
@@ -50,7 +50,7 @@ def main() -> None:
     assert counts["n"] == before["n"]
 
     # The per-element work really happened.
-    sample = after.head(1).to_pydict()
+    sample = after.limit(1).to_pydict()
     assert all(
         bucket == part % 10
         for part, bucket in zip(sample["parts"][0], sample["buckets"][0], strict=True)

@@ -19,7 +19,7 @@ from batcher import col
 
 
 def main() -> None:
-    customer = tpch("customer").select("c_custkey", "c_name").head(100)
+    customer = tpch("customer").select("c_custkey", "c_name").limit(100)
 
     encoded = customer.select(
         "c_name",
@@ -32,7 +32,7 @@ def main() -> None:
         from_url=col("url").str.url_decode(),
     )
 
-    result = encoded.head(2).to_pydict()
+    result = encoded.limit(2).to_pydict()
     print(result["hexed"][0][:40], "...")
 
     full = encoded.to_pydict()

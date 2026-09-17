@@ -149,7 +149,7 @@ def _ops() -> dict[str, callable]:
         "global_sum": lambda ds: ds.group_by().agg(s=col("v").sum(), n=count()),
         "global_median": lambda ds: ds.group_by().agg(m=col("v").median()),
         "groupby_median": lambda ds: ds.group_by("k").agg(m=col("v").median()),
-        "groupby_nunique": lambda ds: ds.group_by("k").agg(d=col("s").n_unique()),
+        "groupby_nunique": lambda ds: ds.group_by("k").agg(d=col("s").count_distinct()),
         "distinct_k": lambda ds: ds.select("k").distinct(),
         "sort_v": lambda ds: ds.sort("v"),
         "topn": lambda ds: ds.sort("v", descending=True).limit(17),
@@ -164,7 +164,7 @@ def _ops() -> dict[str, callable]:
         ),
         "union_all": lambda ds: ds.union(ds),
         "union_distinct": lambda ds: ds.select("k").union(ds.select("k"), distinct=True),
-        "map_batches_auto": lambda ds: ds.ml.map_batches(_AddOne),
+        "map_batches_auto": lambda ds: ds.map_batches(_AddOne),
     }
 
 
@@ -273,7 +273,7 @@ _SPECIAL = {
             "filter": lambda ds: ds.filter(col("k") >= 0),
             "select": lambda ds: ds.select("k"),
             "distinct": lambda ds: ds.select("k").distinct(),
-            "map_batches": lambda ds: ds.ml.map_batches(_PassThrough),
+            "map_batches": lambda ds: ds.map_batches(_PassThrough),
         },
     ),
     "wide_600col": (

@@ -23,9 +23,9 @@ def main() -> None:
     lineitem = tpch("lineitem")
 
     shape = lineitem.agg(
-        qty_skew=bt.skewness(col("l_quantity")),
+        qty_skew=bt.skew(col("l_quantity")),
         qty_kurtosis=bt.kurtosis(col("l_quantity")),
-        price_skew=bt.skewness(col("l_extendedprice")),
+        price_skew=bt.skew(col("l_extendedprice")),
         price_kurtosis=bt.kurtosis(col("l_extendedprice")),
         qty_mean=col("l_quantity").mean(),
         qty_median=bt.median(col("l_quantity")),

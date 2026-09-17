@@ -101,7 +101,7 @@ def test_an_accelerator_stage_reserves_no_cpu():
     (`DEFAULT_ACTOR_CREATION_CPU_SPECIFIED = 1`), and naming `num_gpus` is naming one. The
     shuffle fleet takes its workers in a placement group sized to the cluster's whole CPU
     capacity, so on any pipeline that shuffles before it infers — a `group_by`/`join`/`sort`
-    feeding `ds.ml.map_batches`, which is the heterogeneous CPU+GPU shape the API documents —
+    feeding `ds.map_batches`, which is the heterogeneous CPU+GPU shape the API documents —
     that core never comes free. The pool never places, every device sits idle, and
     `ray status` reports a fully reserved cluster, so it reads as busy rather than stuck.
 
@@ -160,19 +160,19 @@ def test_a_resources_only_stage_forces_distribution():
     import batcher as bt
     from batcher.api.terminal.routing import _plan_has_gpu_stage
 
-    tpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b, resources={"TPU": 4})
+    tpu = bt.from_pydict({"x": [1]}).map_batches(lambda b: b, resources={"TPU": 4})
     assert _plan_has_gpu_stage(tpu._plan) is True
     # The GPU and plain-CPU verdicts are unchanged.
-    gpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b, num_gpus=1)
+    gpu = bt.from_pydict({"x": [1]}).map_batches(lambda b: b, num_gpus=1)
     assert _plan_has_gpu_stage(gpu._plan) is True
-    cpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b)
+    cpu = bt.from_pydict({"x": [1]}).map_batches(lambda b: b)
     assert _plan_has_gpu_stage(cpu._plan) is False
 
 
 def test_public_api_threads_resources_to_the_plan():
     import batcher as bt
 
-    ds = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(lambda b: b, resources={"TPU": 4})
+    ds = bt.from_pydict({"x": [1, 2, 3]}).map_batches(lambda b: b, resources={"TPU": 4})
     assert ds._plan.resources == (("TPU", 4),)
 
 
@@ -183,8 +183,8 @@ def test_stacked_stages_take_the_max_per_resource():
     from batcher.dist.executors.map import _map_resources
 
     ds = bt.from_pydict({"x": [1]})
-    ds = ds.ml.map_batches(lambda b: b, resources={"TPU": 2})
-    ds = ds.ml.map_batches(lambda b: b, resources={"TPU": 4})
+    ds = ds.map_batches(lambda b: b, resources={"TPU": 2})
+    ds = ds.map_batches(lambda b: b, resources={"TPU": 4})
     assert _map_resources(ds._plan)[4] == {"TPU": 4}
 
 
@@ -265,9 +265,9 @@ def test_a_non_gpu_accelerator_stage_is_costed_as_inference():
 
     base = bt.from_pydict({"x": list(range(100))})
     model = CostModel(CardinalityEstimator(base._sources))
-    plain = base.ml.map_batches(lambda b: b)._plan
-    tpu = base.ml.map_batches(lambda b: b, resources={"TPU": 4}, model_memory_gb=8.0)._plan
-    gpu = base.ml.map_batches(lambda b: b, num_gpus=1, model_memory_gb=8.0)._plan
+    plain = base.map_batches(lambda b: b)._plan
+    tpu = base.map_batches(lambda b: b, resources={"TPU": 4}, model_memory_gb=8.0)._plan
+    gpu = base.map_batches(lambda b: b, num_gpus=1, model_memory_gb=8.0)._plan
 
     assert model.op_cost(tpu).cpu > model.op_cost(plain).cpu
     # And it is costed the same as the equivalent GPU stage — the device differs, not the work.

@@ -65,7 +65,7 @@ def main() -> None:
 
     # The grouped form is the one that collapses early; the windowed form carries every
     # row to the end and then deduplicates, which is why it is the wrong default.
-    assert grouped().count() == lineitem.n_unique("l_shipmode")
+    assert grouped().count() == lineitem.count_distinct("l_shipmode")
     assert lineitem.count() > grouped().count()
     print(f"{lineitem.count()} rows collapse to {grouped().count()} groups")
     assert bt is not None

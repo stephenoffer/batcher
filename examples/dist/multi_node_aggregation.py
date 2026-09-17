@@ -29,18 +29,14 @@ def main() -> None:
         "min": col("l_extendedprice").min(),
         "max": col("l_extendedprice").max(),
         "mean": col("l_quantity").mean(),
-        "n_unique": col("l_partkey").n_unique(),
-        "approx_n_unique": bt.approx_n_unique(col("l_partkey")),
+        "n_unique": col("l_partkey").count_distinct(),
+        "approx_n_unique": bt.approx_count_distinct(col("l_partkey")),
         "bool_or": bt.bool_or(col("l_quantity") > 40),
         "bit_or": bt.bit_or(col("l_linenumber")),
     }
 
     for name, aggregate in aggregates.items():
-        query = (
-            lineitem.group_by("l_shipmode")
-            .agg(**{name: aggregate})
-            .sort("l_shipmode")
-        )
+        query = lineitem.group_by("l_shipmode").agg(**{name: aggregate}).sort("l_shipmode")
         single = query.collect(distributed=False, num_partitions=1).to_pydict()
         many = query.collect(distributed=distributed, num_partitions=8).to_pydict()
 
@@ -48,8 +44,7 @@ def main() -> None:
         left, right = single[name], many[name]
         if left and isinstance(left[0], float):
             assert all(
-                abs(a - b) <= max(abs(a), 1.0) * 1e-12
-                for a, b in zip(left, right, strict=True)
+                abs(a - b) <= max(abs(a), 1.0) * 1e-12 for a, b in zip(left, right, strict=True)
             ), name
         else:
             assert left == right, name

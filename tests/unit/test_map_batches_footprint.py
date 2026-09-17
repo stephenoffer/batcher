@@ -45,7 +45,7 @@ def test_a_passthrough_stage_is_priced_at_its_input_width():
     # pricing the same assumption is not a new guess, it is the existing one costed.
     ds = _images()
     est = CardinalityEstimator(ds._sources)
-    staged = ds.ml.map_batches(lambda b: b)
+    staged = ds.map_batches(lambda b: b)
     assert est.row_width(staged._plan, 64.0) == pytest.approx(_IMAGE_BYTES)
 
 
@@ -55,7 +55,7 @@ def test_a_declared_output_schema_keeps_the_flat_default():
     # be a fabricated number rather than a costed contract.
     ds = _images()
     est = CardinalityEstimator(ds._sources)
-    staged = ds.ml.map_batches(lambda b: b, output_columns=("score",))
+    staged = ds.map_batches(lambda b: b, output_columns=("score",))
     assert est.row_width(staged._plan, 64.0) == 64.0
 
 
@@ -63,7 +63,7 @@ def test_the_width_is_not_asserted_as_a_schema():
     # Deliberately *not* fixed by giving `MapBatches` an `available_schema`: that method
     # feeds type inference and expression validation, where claiming the input's types
     # survive a UDF that may rewrite them turns an estimate into a wrong answer.
-    staged = _images().ml.map_batches(lambda b: b)
+    staged = _images().map_batches(lambda b: b)
     assert staged._plan.available_schema() is None
 
 
@@ -82,7 +82,7 @@ def test_an_explicit_batch_size_is_what_the_stage_holds():
     # decoded image already clear the morsel byte budget several times over, which is the
     # property under test.
     ds = _images(rows=8)
-    ops, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=8))
+    ops, _ = _annotate(ds.map_batches(lambda b: b, batch_size=8))
     stage = next(o for o in ops if o.kind == "MapBatches")
     assert stage.bounds.m_max_bytes == pytest.approx(8 * _IMAGE_BYTES, rel=0.01)
     assert stage.bounds.m_max_bytes > active_config().execution.morsel_bytes
@@ -92,26 +92,26 @@ def test_a_stage_with_no_batch_size_is_still_one_morsel():
     # The safety property: without an explicit batch size the stage really does stream a
     # morsel at a time, and its budget must not move.
     ds = _images()
-    ops, _ = _annotate(ds.ml.map_batches(lambda b: b))
+    ops, _ = _annotate(ds.map_batches(lambda b: b))
     stage = next(o for o in ops if o.kind == "MapBatches")
     assert stage.bounds.m_max_bytes <= active_config().execution.morsel_bytes
 
 
 def test_a_narrow_stage_is_unchanged_by_either_fix():
     narrow = bt.from_pydict({"x": list(range(64))})
-    ops, est = _annotate(narrow.ml.map_batches(lambda b: b))
+    ops, est = _annotate(narrow.map_batches(lambda b: b))
     stage = next(o for o in ops if o.kind == "MapBatches")
     assert stage.bounds.m_max_bytes <= active_config().execution.morsel_bytes
     # And the width is the input's real (narrow) width, not an inflated one.
-    assert est.row_width(narrow.ml.map_batches(lambda b: b)._plan, 64.0) <= 64.0
+    assert est.row_width(narrow.map_batches(lambda b: b)._plan, 64.0) <= 64.0
 
 
 def test_the_batch_size_budget_scales_with_the_batch():
     # Both batch sizes stay at or under the relation's row count, so the batch is what binds
     # in each case and the ratio is the batch ratio rather than the row cap's.
     ds = _images(rows=8)
-    small, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=2))
-    large, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=8))
+    small, _ = _annotate(ds.map_batches(lambda b: b, batch_size=2))
+    large, _ = _annotate(ds.map_batches(lambda b: b, batch_size=8))
 
     def mem(ops):
         return next(o for o in ops if o.kind == "MapBatches").bounds.m_max_bytes

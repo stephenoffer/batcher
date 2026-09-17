@@ -98,12 +98,17 @@ def test_next_after_matches_duckdb(duck, nums):
 
 @pytest.mark.differential
 @pytest.mark.parametrize(
-    "method",
-    ["url_encode", "url_decode", "regexp_escape", "to_binary"],
+    ("method", "sql_name"),
+    [
+        ("url_encode", "url_encode"),
+        ("url_decode", "url_decode"),
+        ("escape_regex", "regexp_escape"),
+        ("to_binary", "to_binary"),
+    ],
 )
-def test_new_string_functions_match_duckdb(duck, texts, method):
+def test_new_string_functions_match_duckdb(duck, texts, method, sql_name):
     out = bt.from_arrow(texts).select(r=getattr(col("s").str, method)()).collect()
-    assert_same(out, duck.sql(f"SELECT {method}(s) r FROM texts"))
+    assert_same(out, duck.sql(f"SELECT {sql_name}(s) r FROM texts"))
 
 
 @pytest.mark.differential
@@ -150,7 +155,7 @@ def test_regexp_escape_output_is_usable_as_a_pattern(texts):
     RE2's rule escapes more than the engine's own matcher needs (a space, a `/`), so this
     also pins that the matcher accepts the wider escaping rather than rejecting it.
     """
-    escaped = bt.from_arrow(texts).select(e=col("s").str.regexp_escape()).to_pydict()["e"]
+    escaped = bt.from_arrow(texts).select(e=col("s").str.escape_regex()).to_pydict()["e"]
     for value, pattern in zip(texts.column("s").to_pylist(), escaped, strict=True):
         if value is None:
             continue

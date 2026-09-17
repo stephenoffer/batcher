@@ -165,7 +165,7 @@ Batcher instead: {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Read
 (`benchmarks/BENCHMARK_RESULTS.md`), because files decode concurrently in-process with no per-file
 task scheduling and no object-store hop.
 
-The inference idiom carries over unchanged. {py:meth}`ds.ml.map_batches <batcher.api.dataset.ml.DatasetML.map_batches>` takes a class, loads the model once
+The inference idiom carries over unchanged. {py:meth}`ds.map_batches <batcher.Dataset.map_batches>` takes a class, loads the model once
 per worker, and runs the batches through an actor pool, so a ported pipeline keeps its shape while
 picking up warm pools and stage overlap. See {doc}`/ml/inference/inference`.
 

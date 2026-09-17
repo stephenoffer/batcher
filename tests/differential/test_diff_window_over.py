@@ -116,10 +116,10 @@ def test_grouped_cum_sum_matches_duckdb(duck):
 
 
 def test_shift_matches_duckdb_lag_lead(duck):
-    # The rows are already in `ord` order, so positional shift == LAG/LEAD over ord.
+    # A shift needs an order; binding it to `ord` makes it LAG/LEAD over ord.
     out = bt.from_arrow(_ordered()).with_columns(
-        s1=col("v").shift(1),
-        sm1=col("v").shift(-1),
+        s1=col("v").shift(1).over(order_by="ord"),
+        sm1=col("v").shift(-1).over(order_by="ord"),
     )
     duck.register("t", _ordered())
     assert_same(

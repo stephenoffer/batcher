@@ -46,7 +46,7 @@ def main() -> None:
     assert types["int_divided"] == "double"
     assert types["int_floor_divided"] == "int64"
 
-    values = mixed.head(3).to_pydict()
+    values = mixed.limit(3).to_pydict()
     assert all(value == 1.0 for value in values["int_divided"])
     assert all(value == 1 for value in values["int_floor_divided"])
 

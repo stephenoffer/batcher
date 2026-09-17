@@ -25,7 +25,7 @@ def main() -> None:
         orders.group_by("o_orderdate")
         .agg(revenue=col("o_totalprice").sum())
         .sort("o_orderdate")
-        .head(30)
+        .limit(30)
     )
 
     cumulative = daily.with_columns(

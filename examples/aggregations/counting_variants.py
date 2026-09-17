@@ -35,8 +35,8 @@ def main() -> None:
         rows=bt.count(),
         non_null=col("l_extendedprice").count(),
         matching=bt.count_if(col("o_orderstatus") == "F"),
-        distinct_clerks=bt.n_unique(col("o_clerk")),
-        approx_clerks=bt.approx_n_unique(col("o_clerk")),
+        distinct_clerks=bt.count_distinct(col("o_clerk")),
+        approx_clerks=bt.approx_count_distinct(col("o_clerk")),
         null_share=bt.null_rate(col("l_extendedprice")),
         present_share=bt.non_null_rate(col("l_extendedprice")),
     ).to_pydict()

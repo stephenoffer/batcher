@@ -150,8 +150,8 @@ _CURATED_CALLS: dict[tuple[str, str], tuple[str, str]] = {
     ("list", "unique"): ("list_distinct(l)", "unique()"),
     # DuckDB's bounds are inclusive and 1-based; the accessor's are an offset and a length.
     ("list", "slice"): ("list_slice(l, 2, 3)", "slice(1, 2)"),
-    # `strlen` is DuckDB's byte length, so `.str.len` keeps the ANSI spelling.
-    ("str", "len"): ("length(c)", "len()"),
+    # `strlen` is DuckDB's byte length, so `.str.len_chars` keeps the ANSI spelling.
+    ("str", "len_chars"): ("length(c)", "len_chars()"),
     ("str", "split"): ("string_split(c, ' ')", "split(' ')"),
     # The rest are curated under exactly their own name, and are here so "reachable" means
     # "reaches this operation" rather than "some handler answers to the name".
@@ -211,10 +211,11 @@ def test_the_sql_spelling_lowers_to_the_accessor_call(namespace: str, method: st
 
     The written spelling keeps its underscores. The vocabulary is *keyed* without them, so
     that ``ST_AsText`` and ``st_as_text`` agree, but the key is a lookup form and not a
-    name to hand a reader: ``strlen`` (the key for `.str.len`) is DuckDB's own byte-length
-    function, which an earlier handler rightly claims, while ``str_len`` reaches the
-    accessor. Writing the query from the key rather than from the name is how this test
-    first reported that collision as a defect in the dispatch.
+    name to hand a reader: ``strlen`` (the key `.str.len` had, before it was named
+    `.str.len_chars`) is DuckDB's own byte-length function, which an earlier handler
+    rightly claims, while ``str_len`` reached the accessor. Writing the query from the
+    key rather than from the name is how this test first reported that collision as a
+    defect in the dispatch.
 
     An argument the method rejects (a string where it wants a date, a size it validates)
     makes *both* sides raise, which is still agreement -- and is why the comparison is on

@@ -119,7 +119,7 @@ def score(batch):  # batch is a {column: ndarray} dict
     return batch
 
 
-out = ds.ml.map_batches(
+out = ds.map_batches(
     score, batch_format="numpy", output_columns=["recency", "frequency", "score"]
 )
 print(out.to_pydict()["score"])
@@ -305,7 +305,7 @@ class Threshold:
         return batch.append_column("label", label)
 
 
-print(ds.ml.map_batches(Threshold(0.5)).to_pydict())
+print(ds.map_batches(Threshold(0.5)).to_pydict())
 # {'score': [0.2, 0.8, 0.5, 0.9], 'label': [False, True, True, True]}
 ```
 

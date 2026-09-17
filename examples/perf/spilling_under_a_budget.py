@@ -48,7 +48,7 @@ def main() -> None:
 
     # A sort spills too, and a sorted result compared order-independently would prove
     # nothing — so this compares position by position.
-    top = lineitem.sort("l_extendedprice", descending=True).head(20)
+    top = lineitem.sort("l_extendedprice", descending=True).limit(20)
     assert (
         top.collect(spill=True).to_pydict()["l_extendedprice"]
         == top.collect().to_pydict()["l_extendedprice"]

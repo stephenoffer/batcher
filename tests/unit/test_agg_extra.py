@@ -135,7 +135,12 @@ def test_min_of_non_key_negative():
 
 
 def test_count_distinct_of_group_key_fires():
-    agg = bt.from_pydict({"g": [1, 2], "x": [1, 2]}).group_by("g").agg(n=col("g").n_unique())._plan
+    agg = (
+        bt.from_pydict({"g": [1, 2], "x": [1, 2]})
+        .group_by("g")
+        .agg(n=col("g").count_distinct())
+        ._plan
+    )
     out = m.count_distinct_of_group_key(agg, None)
     assert isinstance(out, Project)
     assert out.input.aggregates == ()  # the distinct count is gone
@@ -146,7 +151,7 @@ def test_count_distinct_of_group_key_idempotent():
     agg = (
         bt.from_pydict({"g": [1, 2], "x": [1, 2]})
         .group_by("g")
-        .agg(n=col("g").n_unique(), s=col("x").sum())
+        .agg(n=col("g").count_distinct(), s=col("x").sum())
         ._plan
     )
     out = m.count_distinct_of_group_key(agg, None)
@@ -154,7 +159,12 @@ def test_count_distinct_of_group_key_idempotent():
 
 
 def test_count_distinct_of_non_key_negative():
-    agg = bt.from_pydict({"g": [1, 2], "x": [1, 2]}).group_by("g").agg(n=col("x").n_unique())._plan
+    agg = (
+        bt.from_pydict({"g": [1, 2], "x": [1, 2]})
+        .group_by("g")
+        .agg(n=col("x").count_distinct())
+        ._plan
+    )
     assert m.count_distinct_of_group_key(agg, None) is None
 
 
@@ -242,7 +252,7 @@ def test_fold_constant_min_and_count_distinct_fire():
     agg = (
         bt.from_pydict({"g": [1, 2], "x": [1, 2]})
         .group_by("g")
-        .agg(mn=bt.lit(7).min(), n=bt.lit(3).n_unique(), s=col("x").sum())
+        .agg(mn=bt.lit(7).min(), n=bt.lit(3).count_distinct(), s=col("x").sum())
         ._plan
     )
     out = m.fold_constant_grouped_aggregate(agg, None)

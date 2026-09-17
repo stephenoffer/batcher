@@ -23,7 +23,7 @@ def main() -> None:
     # A real bipartite graph: customers linked to the nations they belong to.
     edges = (
         tpch("customer")
-        .head(2_000)
+        .limit(2_000)
         .select(
             src=bt.col("c_custkey").cast("string"),
             dst=bt.col("c_nationkey").cast("string"),

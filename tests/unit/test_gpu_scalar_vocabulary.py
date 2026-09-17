@@ -24,6 +24,7 @@ import batcher as bt
 from batcher import col
 from batcher.core.gpu_plan import DfBackend, gpu_plan_ops
 from batcher.core.gpu_plan.execute import run_chain
+from batcher.plan.expr_ir.core import MathExpr
 
 pytestmark = pytest.mark.unit
 
@@ -192,14 +193,14 @@ def test_date_trunc_to_a_month_groups_on_the_device(be):
 @pytest.mark.parametrize(
     "build",
     [
-        lambda e: e.dt.isodow(),
+        lambda e: e.dt.weekday(),
         lambda e: e.dt.century(),
         lambda e: e.dt.decade(),
         lambda e: e.dt.millennium(),
         lambda e: e.dt.iso_year(),
         lambda e: e.dt.last_day(),
     ],
-    ids=["isodow", "century", "decade", "millennium", "iso_year", "last_day"],
+    ids=["weekday", "century", "decade", "millennium", "iso_year", "last_day"],
 )
 def test_date_field_matches_the_engine(build, be):
     table = _timestamps()
@@ -249,7 +250,7 @@ def test_epoch_reads_a_date_column_rather_than_declining_it(be):
         lambda e: e.cot(),
         lambda e: e.sec(),
         lambda e: e.csc(),
-        lambda e: e.rint(),
+        lambda e: MathExpr("rint", e),
         lambda e: e.even(),
     ],
     ids=["cot", "sec", "csc", "rint", "even"],
@@ -268,7 +269,7 @@ def test_rint_and_round_disagree_on_a_half_and_both_are_right(be):
     ties-to-even sends both to `2.0` and `-2.0`, ties-away sends them to `2.0` and `-3.0`.
     """
     table = _numbers()
-    ds = bt.from_arrow(table).select(a=col("x").rint(), b=col("x").round())
+    ds = bt.from_arrow(table).select(a=MathExpr("rint", col("x")), b=col("x").round())
     _assert_matches_engine(ds, table, be)
     got = _translated(ds, table, be).to_pydict()
     assert (got["a"][1], got["b"][1]) == (-2.0, -3.0)
@@ -277,11 +278,11 @@ def test_rint_and_round_disagree_on_a_half_and_both_are_right(be):
 @pytest.mark.parametrize(
     "build",
     [
-        bt.atan2,
+        bt.arctan2,
         bt.hypot,
         bt.next_after,
     ],
-    ids=["atan2", "hypot", "next_after"],
+    ids=["arctan2", "hypot", "next_after"],
 )
 def test_binary_math_matches_the_engine(build, be):
     table = _numbers()

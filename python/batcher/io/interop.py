@@ -2,7 +2,7 @@
 
 Ray-Data-style ``from_*`` constructors that adapt an in-memory object from a
 neighboring framework (Arrow, pandas, Polars, NumPy, HuggingFace, PyTorch,
-TensorFlow, Spark, Dask) into a Batcher `Source`. Every adapter normalizes to
+TensorFlow, Spark, Daft, Dask) into a Batcher `Source`. Every adapter normalizes to
 Arrow and returns an `InMemorySource` (eager, materialized) or an
 `IteratorSource` (lazy, streaming) — it never builds a `Dataset` (the session
 layer wraps these Sources), so importing this module pulls in no optional
@@ -28,6 +28,7 @@ the one actionable thing in the message was a command that fails; both are now d
 
 from __future__ import annotations
 
+import io
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "from_arrow",
+    "from_daft",
     "from_dask",
     "from_huggingface",
     "from_items",
@@ -171,9 +173,58 @@ def from_pandas(df: Any) -> Source:
 
 
 def from_polars(df: Any) -> Source:
-    """Build a `Source` from a Polars `DataFrame` via its zero-copy Arrow export."""
-    require("polars", feature="Polars interop", provides="polars", extra="polars")
-    return _source_from_table(df.to_arrow())
+    """Build a `Source` from a Polars `DataFrame`, or stream one from a `LazyFrame`.
+
+    A `DataFrame` goes through its Arrow export. A `LazyFrame` stays lazy: its query runs
+    under ``collect_batches`` each time the source is read, and the chunks stream into the
+    engine one at a time, so the whole result is never held at once. A Polars release
+    without ``collect_batches`` collects the `LazyFrame` instead.
+
+    Both paths export at Polars' *oldest* Arrow compatibility level. Polars stores strings
+    as views, and at its newest level it exports ``string_view``/``binary_view``, which
+    Batcher has no kernels for. The oldest level exports ``large_string``/``large_binary``,
+    so the view layouts never reach the engine from this door.
+    """
+    pl = require("polars", feature="Polars interop", provides="polars", extra="polars")
+    if isinstance(df, pl.LazyFrame):
+        return _polars_lazy_source(df, pl)
+    return _source_from_table(_polars_to_arrow(df, pl))
+
+
+def _polars_to_arrow(frame: Any, pl: Any) -> pa.Table:
+    """`frame` as Arrow with no view layouts, on a Polars that has compatibility levels.
+
+    Polars 1.40's direct export is wrong for a *sliced* frame whose struct column has a null
+    row at the slice's start: the struct's children keep the unsliced length, and pyarrow's
+    validation rejects the batch (``Struct child array #0 has length smaller than
+    expected``). Every chunk ``collect_batches`` yields is such a slice. Polars' IPC writer
+    lays the same frame out correctly, so a batch the direct export cannot build goes
+    through an in-memory IPC buffer instead: one bulk copy, never a per-row conversion.
+    """
+    level = getattr(pl, "CompatLevel", None)
+    options = {} if level is None else {"compat_level": level.oldest()}
+    try:
+        return frame.to_arrow(**options)
+    except pa.ArrowInvalid:
+        sink = io.BytesIO()
+        frame.write_ipc(sink, **options)
+        return pa.ipc.open_file(pa.py_buffer(sink.getbuffer())).read_all()
+
+
+def _polars_lazy_source(lf: Any, pl: Any) -> Source:
+    """A streaming source over a `LazyFrame`, re-running its query on every read."""
+    if not callable(getattr(lf, "collect_batches", None)):
+        return _source_from_table(_polars_to_arrow(lf.collect(), pl))
+    # An empty frame of the resolved schema exports the Arrow schema without running the
+    # query, and at the same compatibility level every chunk uses.
+    schema = _polars_to_arrow(pl.DataFrame(schema=lf.collect_schema()), pl).schema
+
+    def _factory() -> Iterator[pa.RecordBatch]:
+        for chunk in lf.collect_batches():
+            table = _polars_to_arrow(chunk, pl)
+            yield from (table if table.schema.equals(schema) else table.cast(schema)).to_batches()
+
+    return IteratorSource(_factory, schema)
 
 
 def from_huggingface(hf_dataset: Any) -> Source:
@@ -285,13 +336,26 @@ def from_tf(tf_dataset: Any) -> Source:
 
 
 def from_spark(spark_df: Any) -> Source:
-    """Build a `Source` from a Spark `DataFrame` via Arrow collection.
+    """Build a `Source` from a Spark `DataFrame`, streaming it where Spark allows.
 
-    Uses ``DataFrame.toArrow()`` (Spark 4+) when available, else the classic
-    ``_collect_as_arrow``/``toPandas`` Arrow bridge. The collect is eager —
-    Spark drives its own distributed read up to this boundary.
+    A DataFrame exporting ``__arrow_c_stream__`` (PySpark 4.1 and later) streams: Spark
+    converts each partition to Arrow with ``mapInArrow`` and hands the partitions to the
+    driver one at a time through ``toLocalIterator``, so the driver holds one partition
+    rather than the whole frame. Each read of the source re-runs the Spark job.
+
+    Older releases have no streaming export, so the frame is collected eagerly: through
+    ``DataFrame.toArrow()`` on PySpark 4.0, else the ``toPandas`` Arrow bridge.
     """
     require("pyspark", feature="Spark interop", provides="PySpark", extra="spark")
+    if callable(getattr(spark_df, "__arrow_c_stream__", None)):
+        # Opening the reader resolves the schema from Spark's plan without starting the
+        # job: the partitions are pulled only when a batch is.
+        schema = pa.RecordBatchReader.from_stream(spark_df).schema
+
+        def _factory() -> Iterator[pa.RecordBatch]:
+            yield from pa.RecordBatchReader.from_stream(spark_df)
+
+        return IteratorSource(_factory, schema)
     to_arrow = getattr(spark_df, "toArrow", None)
     if callable(to_arrow):
         return _source_from_table(to_arrow())
@@ -311,6 +375,33 @@ def from_dask(ddf: Any) -> Source:
         for part in ddf.to_delayed():
             table = pa.Table.from_pandas(part.compute(), schema=schema)
             yield from table.to_batches()
+
+    return IteratorSource(_factory, schema)
+
+
+def from_daft(daft_df: Any) -> Source:
+    """Build a streaming `Source` from a Daft `DataFrame`, one Arrow batch at a time.
+
+    The schema comes from Daft's plan, and the batches from ``to_arrow_iter``, which runs
+    the Daft query and yields its result incrementally. The frame is never collected to a
+    single table, and each read of the source re-runs the Daft query.
+    """
+    require("daft", feature="Daft interop", provides="daft", extra="daft")
+    daft_schema = daft_df.schema()
+    opaque = [field.name for field in daft_schema if field.dtype.is_python()]
+    if opaque:
+        # Daft holds these as pickled Python objects behind an Arrow extension type, which
+        # has no column type in the engine. Daft also stores a dictionary-encoded Arrow
+        # column this way, so the case is reached without ever writing a Python object.
+        raise PlanError(
+            f"from_daft(): column(s) {opaque} have Daft's Python dtype, which holds opaque "
+            "Python objects rather than Arrow values. Cast them in Daft first, e.g. "
+            "`df.with_column(name, df[name].cast(daft.DataType.string()))`."
+        )
+    schema = daft_schema.to_pyarrow_schema()
+
+    def _factory() -> Iterator[pa.RecordBatch]:
+        yield from daft_df.to_arrow_iter()
 
     return IteratorSource(_factory, schema)
 

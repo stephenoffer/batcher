@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    corpus = tpch("part").select("p_partkey", "p_name", "p_retailprice").head(2_000)
+    corpus = tpch("part").select("p_partkey", "p_name", "p_retailprice").limit(2_000)
     term = "spring"
 
     # Lexical: position of the term, lower is better.

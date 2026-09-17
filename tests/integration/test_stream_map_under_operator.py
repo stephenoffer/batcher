@@ -111,10 +111,10 @@ def test_the_first_n_scored_rows_can_be_taken_and_written():
     model against live data. `core.streaming.stream_limit` cannot take a UDF pipeline -- it
     asks Kyber to lower the plan -- so the router answered "the plan must materialize",
     which a limit does not, naming a breaker the caller had not written."""
-    rows = _rows_from(_scored().head(2))
+    rows = _rows_from(_scored().limit(2))
     assert [r["v"] for r in rows] == [2, 4]
 
-    query = _scored().head(2).write.memory("map_limit", trigger=bt.Trigger.available_now())
+    query = _scored().limit(2).write.memory("map_limit", trigger=bt.Trigger.available_now())
     assert query.await_termination(timeout=60) is True
     assert bt.read_memory("map_limit").to_pydict()["v"] == [2, 4]
 
@@ -123,5 +123,5 @@ def test_the_first_n_scored_rows_can_be_taken_and_written():
 def test_an_offset_and_an_over_long_limit_behave_on_a_scored_stream():
     """`slice` is the same node with an offset set, and a limit past the end of a finite
     feed takes what there is rather than waiting for rows that never come."""
-    assert [r["v"] for r in _rows_from(_scored().slice(1, 2))] == [4, 6]
-    assert [r["v"] for r in _rows_from(_scored().head(100))] == [2, 4, 6, 8]
+    assert [r["v"] for r in _rows_from(_scored().limit(2, offset=1))] == [4, 6]
+    assert [r["v"] for r in _rows_from(_scored().limit(100))] == [2, 4, 6, 8]

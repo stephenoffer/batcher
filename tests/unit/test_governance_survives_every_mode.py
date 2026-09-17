@@ -177,8 +177,6 @@ def _rendered(fn, ds) -> str:
 _EXPORTS = {
     "to_pydict": lambda ds: ds.to_pydict(),
     "to_pylist": lambda ds: ds.to_pylist(),
-    "to_dicts": lambda ds: ds.to_dicts(),
-    "to_dict": lambda ds: ds.to_dict(),
     "to_arrow": lambda ds: ds.to_arrow(),
     "to_pandas": lambda ds: ds.to_pandas(),
     "to_polars": lambda ds: ds.to_polars(),
@@ -192,11 +190,9 @@ _EXPORTS = {
 }
 
 _WRITES = {
-    "to_parquet": lambda ds, path: ds.to_parquet(path),
-    "to_csv": lambda ds, path: ds.to_csv(path),
-    "to_json": lambda ds, path: ds.to_json(path),
     "write.parquet": lambda ds, path: ds.write.parquet(path),
     "write.csv": lambda ds, path: ds.write.csv(path),
+    "write.json": lambda ds, path: ds.write.json(path),
 }
 
 

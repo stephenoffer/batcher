@@ -145,14 +145,26 @@ impl DenseHeads {
     /// can never be found by a probe — the same NULL semantics the hash build enforces.
     /// Returns the map alongside `unique` (no key repeated) and the `next` chain links, so
     /// the caller assembles exactly the state the hash path produces.
+    #[cfg(test)]
     pub(super) fn build(keys: &[i64], rows: usize, null: &[bool]) -> Option<DenseBuild> {
+        Self::build_within(keys, rows, null, key_bounds(keys, rows, null)?)
+    }
+
+    /// [`Self::build`] over bounds the caller already holds, so a caller that falls back to
+    /// another structure over the same range (the probe bitmap) does not rescan the keys.
+    pub(super) fn build_within(
+        keys: &[i64],
+        rows: usize,
+        null: &[bool],
+        bounds: KeyBounds,
+    ) -> Option<DenseBuild> {
         // A slot holds `row + 1`, so the last representable build row is `u32::MAX - 2`. Every
         // caller is already u32-indexed far below that; refusing here keeps the encoding total
         // rather than relying on that.
         if rows >= u32::MAX as usize - 1 {
             return None;
         }
-        let (lo, span) = span_of(keys, rows, null)?;
+        let (lo, span) = dense_admits(bounds)?;
         // `fill_parallel` carries each row's slot as a `u32` through the partition pass, so a
         // span past `u32::MAX` would truncate it and send rows to the wrong map range — a
         // silently wrong join, not a crash. Refuse it here rather than in one of the two fills,
@@ -191,7 +203,7 @@ impl DenseHeads {
             if null[i] {
                 continue;
             }
-            // `span_of` proved every non-null key lies in `lo..lo + span`, so the index is
+            // `key_bounds` proved every non-null key lies in `lo..lo + span`, so the index is
             // in bounds for exactly the rows this loop visits.
             let slot = &mut map[(keys[i] - lo) as usize];
             if *slot != EMPTY {
@@ -311,13 +323,34 @@ fn chunk_len_for(span: usize, parts: usize) -> usize {
     span.div_ceil(parts).max(1).next_power_of_two()
 }
 
+/// The non-null build keys' range: the smallest key, the slot count `max - min + 1`, and how
+/// many non-null keys there are.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct KeyBounds {
+    pub(super) lo: i64,
+    pub(super) span: usize,
+    seen: usize,
+}
+
 /// `(lo, span)` for the non-null keys when the range is worth direct-mapping, else `None`.
+#[cfg(test)]
+fn span_of(keys: &[i64], rows: usize, null: &[bool]) -> Option<(i64, usize)> {
+    dense_admits(key_bounds(keys, rows, null)?)
+}
+
+/// `(lo, span)` when bounds this tight are worth direct-mapping, else `None`.
+fn dense_admits(b: KeyBounds) -> Option<(i64, usize)> {
+    let budget = b.seen.saturating_mul(MAX_SPAN_PER_ROW).max(MIN_SPAN);
+    (b.span <= budget).then_some((b.lo, b.span))
+}
+
+/// The bounds of the non-null keys, or `None` when there are none or the range overflows.
 ///
 /// One linear min/max pass, which is cheap next to the per-row hashing it replaces — but
 /// "cheap per row" over a 15,000,000-row build is still milliseconds on one core, ahead of a
 /// fill that now uses all of them, so it reduces across cores too. `(min, max, count)` is a
 /// commutative monoid, so the split is invisible in the result.
-fn span_of(keys: &[i64], rows: usize, null: &[bool]) -> Option<(i64, usize)> {
+pub(super) fn key_bounds(keys: &[i64], rows: usize, null: &[bool]) -> Option<KeyBounds> {
     const CHUNK: usize = 1 << 16;
     let bounds = |r: std::ops::Range<usize>| {
         let mut lo = i64::MAX;
@@ -351,8 +384,7 @@ fn span_of(keys: &[i64], rows: usize, null: &[bool]) -> Option<(i64, usize)> {
     }
     // `hi - lo` can overflow i64 for extreme keys; a checked span refuses those outright.
     let span = usize::try_from(hi.checked_sub(lo)?.checked_add(1)?).ok()?;
-    let budget = seen.saturating_mul(MAX_SPAN_PER_ROW).max(MIN_SPAN);
-    (span <= budget).then_some((lo, span))
+    Some(KeyBounds { lo, span, seen })
 }
 
 #[cfg(test)]

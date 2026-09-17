@@ -139,7 +139,7 @@ def test_async_per_row_map():
 
     out = (
         bt.from_pydict({"x": list(range(8))})
-        .ml.map(enrich, output_columns=["x", "y"], max_concurrency=8)
+        .map(enrich, output_columns=["x", "y"], max_concurrency=8)
         .to_pydict()
     )
     assert out["y"] == [v * 10 for v in range(8)]  # order preserved
@@ -150,7 +150,7 @@ def test_async_per_row_flat_map():
         await asyncio.sleep(0.001)
         return [{"x": row["x"]}, {"x": row["x"]}]
 
-    out = bt.from_pydict({"x": [1, 2, 3]}).ml.flat_map(dup, output_columns=["x"]).to_pydict()
+    out = bt.from_pydict({"x": [1, 2, 3]}).flat_map(dup, output_columns=["x"]).to_pydict()
     assert out == {"x": [1, 1, 2, 2, 3, 3]}
 
 
@@ -168,7 +168,7 @@ def test_async_udf_inside_a_running_event_loop():
 
     async def driver() -> tuple[dict, dict]:
         a = bt.from_pydict({"x": [1, 2, 3]}).map_batches(enrich).to_pydict()
-        b = bt.from_pydict({"x": [1, 2]}).ml.map(per_row, output_columns=["x"]).to_pydict()
+        b = bt.from_pydict({"x": [1, 2]}).map(per_row, output_columns=["x"]).to_pydict()
         return a, b
 
     batch_out, row_out = asyncio.run(driver())
@@ -190,7 +190,7 @@ def test_async_class_with_constructor_kwargs():
 
     out = (
         bt.from_pydict({"x": [1, 2]})
-        .ml.map_batches(AsyncModel, fn_constructor_kwargs={"bias": 100})
+        .map_batches(AsyncModel, fn_constructor_kwargs={"bias": 100})
         .to_pydict()
     )
     assert out == {"x": [101, 102]}
@@ -200,7 +200,7 @@ def test_async_fn_with_kwargs():
     async def af(batch: pa.RecordBatch, k: int = 1) -> pa.RecordBatch:
         return _add(batch, k)
 
-    out = bt.from_pydict({"x": [1, 2]}).ml.map_batches(af, fn_kwargs={"k": 50}).to_pydict()
+    out = bt.from_pydict({"x": [1, 2]}).map_batches(af, fn_kwargs={"k": 50}).to_pydict()
     assert out == {"x": [51, 52]}
 
 
@@ -244,7 +244,7 @@ def test_async_per_row_bounds_concurrency_within_a_batch():
         state["cur"] -= 1
         return {"x": row["x"]}
 
-    bt.from_pydict({"x": list(range(30))}).ml.map(
+    bt.from_pydict({"x": list(range(30))}).map(
         track, output_columns=["x"], batch_size=30, max_concurrency=5
     ).collect()
     assert state["max"] <= 5

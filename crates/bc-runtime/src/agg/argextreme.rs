@@ -8,6 +8,11 @@
 //! Ties on the key are broken by the **smallest value** (values are encoded into
 //! arrow's order-preserving row format, so any value type is comparable), making
 //! the result deterministic and partition-independent regardless of merge order.
+//!
+//! The same kernel serves the null-keeping forms (`arg_min_null`/`arg_max_null`), which
+//! differ in one predicate: a row whose value is null still competes on its key. The state
+//! stays sound because a real winner always has a non-null key, so a null key in a partial
+//! still means "no winner" while a null value there means "the winner's value is null".
 
 use std::cmp::Ordering;
 
@@ -19,15 +24,17 @@ use crate::error::RuntimeError;
 
 /// Pick, per group, the `(key, value)` pair at the extreme key — the shared core of
 /// the partial step (over input columns) and the merge step (over partial winners).
-/// Returns two columns: `[winning_key, winning_value]`. Rows where **either** the key
-/// or the value is null are ignored (matching DuckDB `arg_max`/`arg_min`, which skip a
-/// row with a null in either argument); an all-ignored group yields a null pair.
+/// Returns two columns: `[winning_key, winning_value]`. A row with a null key is always
+/// ignored. With `skip_null_values` a row with a null *value* is ignored too (DuckDB
+/// `arg_max`/`arg_min`); without it that row competes and can win with its null value
+/// (DuckDB `arg_max_null`, Spark and Polars `max_by`). An all-ignored group yields a null pair.
 pub(crate) fn arg_extreme_pick(
     keys: &ArrayRef,
     values: &ArrayRef,
     group_ids: &[u32],
     num_groups: usize,
     is_max: bool,
+    skip_null_values: bool,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
     // Rank on the engine's float identity, not arrow's raw-bit row order: a *negative*
     // NaN key must rank greatest (not below -inf) so `arg_max(v, -NaN)` can win, and the
@@ -48,8 +55,10 @@ pub(crate) fn arg_extreme_pick(
     // two virtual calls per row. Resolved once here; `None` means "no nulls", which the
     // closure then answers without touching memory at all.
     let (knulls, vnulls) = (keys.nulls(), values.nulls());
-    let live =
-        |i: usize| knulls.is_none_or(|n| n.is_valid(i)) && vnulls.is_none_or(|n| n.is_valid(i));
+    let live = |i: usize| {
+        knulls.is_none_or(|n| n.is_valid(i))
+            && (!skip_null_values || vnulls.is_none_or(|n| n.is_valid(i)))
+    };
     for (i, &g) in group_ids.iter().enumerate() {
         // A null key can't be an extreme, and a null value can't be selected — DuckDB
         // ignores the whole row if either is null, so `arg_max(v, k)` returns the value
@@ -85,8 +94,16 @@ pub(crate) fn arg_extreme_state(
     group_ids: &[u32],
     num_groups: usize,
     is_max: bool,
+    skip_null_values: bool,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
-    arg_extreme_pick(keys, values, group_ids, num_groups, is_max)
+    arg_extreme_pick(
+        keys,
+        values,
+        group_ids,
+        num_groups,
+        is_max,
+        skip_null_values,
+    )
 }
 
 /// Merge arg_min/arg_max state across partitions: keep the extreme-key pair among
@@ -97,8 +114,16 @@ pub(crate) fn merge_arg_extreme(
     group_ids: &[u32],
     num_groups: usize,
     is_max: bool,
+    skip_null_values: bool,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
-    arg_extreme_pick(&state[0], &state[1], group_ids, num_groups, is_max)
+    arg_extreme_pick(
+        &state[0],
+        &state[1],
+        group_ids,
+        num_groups,
+        is_max,
+        skip_null_values,
+    )
 }
 
 #[cfg(test)]
@@ -116,11 +141,11 @@ mod tests {
         let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 3, 2, 5, 4]));
         let gids = [0u32, 0, 0, 1, 1];
 
-        let amax = arg_extreme_pick(&keys, &vals, &gids, 2, true).unwrap();
+        let amax = arg_extreme_pick(&keys, &vals, &gids, 2, true, true).unwrap();
         let amax_v = amax[1].as_primitive::<Int64Type>();
         assert_eq!((amax_v.value(0), amax_v.value(1)), (20, 40));
 
-        let amin = arg_extreme_pick(&keys, &vals, &gids, 2, false).unwrap();
+        let amin = arg_extreme_pick(&keys, &vals, &gids, 2, false, true).unwrap();
         let amin_v = amin[1].as_primitive::<Int64Type>();
         assert_eq!((amin_v.value(0), amin_v.value(1)), (10, 50));
     }
@@ -134,15 +159,15 @@ mod tests {
         let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 9, 5]));
         let gids = [0u32, 0, 0];
 
-        let amax = arg_extreme_pick(&keys, &vals, &gids, 1, true).unwrap();
+        let amax = arg_extreme_pick(&keys, &vals, &gids, 1, true, true).unwrap();
         assert_eq!(amax[1].as_primitive::<Int64Type>().value(0), 30);
-        let amin = arg_extreme_pick(&keys, &vals, &gids, 1, false).unwrap();
+        let amin = arg_extreme_pick(&keys, &vals, &gids, 1, false, true).unwrap();
         assert_eq!(amin[1].as_primitive::<Int64Type>().value(0), 10);
 
         // A group whose only rows have null values yields a null pair.
         let v2: ArrayRef = Arc::new(Int64Array::from(vec![None, None]));
         let k2: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
-        let r = arg_extreme_pick(&k2, &v2, &[0u32, 0], 1, true).unwrap();
+        let r = arg_extreme_pick(&k2, &v2, &[0u32, 0], 1, true, true).unwrap();
         assert!(r[1].is_null(0), "all-null-value group must yield null");
     }
 
@@ -159,13 +184,13 @@ mod tests {
         let keys: ArrayRef = Arc::new(Float64Array::from(vec![1.0, neg_nan, 2.0]));
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
         let gids = [0u32, 0, 0];
-        let amax = arg_extreme_pick(&keys, &vals, &gids, 1, true).unwrap();
+        let amax = arg_extreme_pick(&keys, &vals, &gids, 1, true, true).unwrap();
         assert_eq!(
             amax[1].as_primitive::<Int64Type>().value(0),
             20,
             "arg_max must select the -NaN-keyed row (NaN ranks greatest)"
         );
-        let amin = arg_extreme_pick(&keys, &vals, &gids, 1, false).unwrap();
+        let amin = arg_extreme_pick(&keys, &vals, &gids, 1, false, true).unwrap();
         assert_eq!(
             amin[1].as_primitive::<Int64Type>().value(0),
             10,
@@ -176,7 +201,7 @@ mod tests {
         // smaller-value tiebreak treats them as equal and is stable, not a spurious split.
         let keys2: ArrayRef = Arc::new(Int64Array::from(vec![7, 7]));
         let vals2: ArrayRef = Arc::new(Float64Array::from(vec![-0.0, 0.0]));
-        let r = arg_extreme_pick(&keys2, &vals2, &[0u32, 0], 1, true).unwrap();
+        let r = arg_extreme_pick(&keys2, &vals2, &[0u32, 0], 1, true, true).unwrap();
         let picked = r[1].as_primitive::<Float64Type>().value(0);
         assert_eq!(picked, 0.0, "signed zeros are one value on the tie-break");
     }
@@ -209,7 +234,7 @@ mod tests {
         let full_g = [0u32, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
 
         for is_max in [true, false] {
-            let single = arg_extreme_state(&full_v, &full_k, &full_g, 2, is_max).unwrap();
+            let single = arg_extreme_state(&full_v, &full_k, &full_g, 2, is_max, true).unwrap();
 
             // Split each group's rows across two partitions (first 3 rows of each group in p1,
             // last 3 in p2), so a group's non-null winner and its null rows can land apart.
@@ -233,12 +258,13 @@ mod tests {
             let p2_k: ArrayRef = Arc::new(Int64Array::from(vec![8, 3, 2, 6, 2, 5]));
             let split_g = [0u32, 0, 0, 1, 1, 1];
 
-            let s1 = arg_extreme_state(&p1_v, &p1_k, &split_g, 2, is_max).unwrap();
-            let s2 = arg_extreme_state(&p2_v, &p2_k, &split_g, 2, is_max).unwrap();
+            let s1 = arg_extreme_state(&p1_v, &p1_k, &split_g, 2, is_max, true).unwrap();
+            let s2 = arg_extreme_state(&p2_v, &p2_k, &split_g, 2, is_max, true).unwrap();
             // Shuffle brings both partials of each group together: rows [g0,g1,g0,g1].
             let kcat: ArrayRef = arrow::compute::concat(&[s1[0].as_ref(), s2[0].as_ref()]).unwrap();
             let vcat: ArrayRef = arrow::compute::concat(&[s1[1].as_ref(), s2[1].as_ref()]).unwrap();
-            let merged = merge_arg_extreme(&[kcat, vcat], &[0u32, 1, 0, 1], 2, is_max).unwrap();
+            let merged =
+                merge_arg_extreme(&[kcat, vcat], &[0u32, 1, 0, 1], 2, is_max, true).unwrap();
 
             let sv = single[1].as_primitive::<Int64Type>();
             let mv = merged[1].as_primitive::<Int64Type>();
@@ -258,12 +284,70 @@ mod tests {
         let k1: ArrayRef = Arc::new(Int64Array::from(vec![1, 3]));
         let v2: ArrayRef = Arc::new(Int64Array::from(vec![30, 40]));
         let k2: ArrayRef = Arc::new(Int64Array::from(vec![2, 9]));
-        let p1 = arg_extreme_pick(&k1, &v1, &[0u32, 0], 1, true).unwrap(); // key3→20
-        let p2 = arg_extreme_pick(&k2, &v2, &[0u32, 0], 1, true).unwrap(); // key9→40
-                                                                           // Merge the two partial winners (each one row): global max key 9 → val 40.
+        let p1 = arg_extreme_pick(&k1, &v1, &[0u32, 0], 1, true, true).unwrap(); // key3→20
+        let p2 = arg_extreme_pick(&k2, &v2, &[0u32, 0], 1, true, true).unwrap(); // key9→40
+                                                                                 // Merge the two partial winners (each one row): global max key 9 → val 40.
         let kcat: ArrayRef = arrow::compute::concat(&[p1[0].as_ref(), p2[0].as_ref()]).unwrap();
         let vcat: ArrayRef = arrow::compute::concat(&[p1[1].as_ref(), p2[1].as_ref()]).unwrap();
-        let merged = merge_arg_extreme(&[kcat, vcat], &[0u32, 0], 1, true).unwrap();
+        let merged = merge_arg_extreme(&[kcat, vcat], &[0u32, 0], 1, true, true).unwrap();
         assert_eq!(merged[1].as_primitive::<Int64Type>().value(0), 40);
+    }
+
+    #[test]
+    fn arg_extreme_null_keeping_form_can_win_with_a_null_value() {
+        // DuckDB `arg_max_null(x, k)` over x=[1, NULL, 3], k=[1, 5, 2] is NULL: the row at
+        // the largest key has a null value and still wins. `arg_min_null` is 1 (key 1).
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 5, 2]));
+        let gids = [0u32, 0, 0];
+        let amax = arg_extreme_pick(&keys, &vals, &gids, 1, true, false).unwrap();
+        assert!(amax[1].is_null(0), "the null value at the max key wins");
+        assert!(
+            amax[0].is_valid(0),
+            "the winning key is recorded even for a null value"
+        );
+        let amin = arg_extreme_pick(&keys, &vals, &gids, 1, false, false).unwrap();
+        assert_eq!(amin[1].as_primitive::<Int64Type>().value(0), 1);
+
+        // A null *key* still removes the row: x=[1, 2, 3], k=[NULL, 5, NULL] -> 2 both ways.
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(5), None]));
+        for is_max in [true, false] {
+            let r = arg_extreme_pick(&keys, &vals, &gids, 1, is_max, false).unwrap();
+            assert_eq!(r[1].as_primitive::<Int64Type>().value(0), 2);
+        }
+    }
+
+    #[test]
+    fn arg_extreme_null_keeping_merge_equals_single_node_in_any_order() {
+        // group 0: v=[NULL, 4, 7, NULL] k=[9, 3, 8, 1]: max key 9 -> NULL, min key 1 -> NULL.
+        // group 1: v=[5, NULL, 6, 2]    k=[2, 7, 7, 4]: max key 7 ties NULL vs 6.
+        let v: ArrayRef = Arc::new(Int64Array::from(vec![
+            None,
+            Some(5),
+            Some(4),
+            None,
+            Some(7),
+            Some(6),
+            None,
+            Some(2),
+        ]));
+        let k: ArrayRef = Arc::new(Int64Array::from(vec![9, 2, 3, 7, 8, 7, 1, 4]));
+        let g = [0u32, 1, 0, 1, 0, 1, 0, 1];
+        for is_max in [true, false] {
+            let single = arg_extreme_state(&v, &k, &g, 2, is_max, false).unwrap();
+            let s1 = arg_extreme_state(&v.slice(0, 4), &k.slice(0, 4), &g[..4], 2, is_max, false)
+                .unwrap();
+            let s2 = arg_extreme_state(&v.slice(4, 4), &k.slice(4, 4), &g[4..], 2, is_max, false)
+                .unwrap();
+            for (a, b) in [(&s1, &s2), (&s2, &s1)] {
+                let kc = arrow::compute::concat(&[a[0].as_ref(), b[0].as_ref()]).unwrap();
+                let vc = arrow::compute::concat(&[a[1].as_ref(), b[1].as_ref()]).unwrap();
+                let merged =
+                    merge_arg_extreme(&[kc, vc], &[0u32, 1, 0, 1], 2, is_max, false).unwrap();
+                assert_eq!(merged[1].as_ref(), single[1].as_ref(), "is_max={is_max}");
+                assert_eq!(merged[0].as_ref(), single[0].as_ref(), "is_max={is_max}");
+            }
+        }
     }
 }

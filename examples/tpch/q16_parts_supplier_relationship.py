@@ -37,7 +37,7 @@ def main() -> None:
         partsupp.join(complaining, left_on="ps_suppkey", right_on="s_suppkey", how="anti")
         .join(wanted_parts, left_on="ps_partkey", right_on="p_partkey")
         .group_by("p_brand", "p_type", "p_size")
-        .agg(supplier_cnt=col("ps_suppkey").n_unique())
+        .agg(supplier_cnt=col("ps_suppkey").count_distinct())
         .sort("supplier_cnt", "p_brand", "p_type", "p_size", descending=[True, False, False, False])
         .limit(20)
         .to_pydict()

@@ -198,29 +198,33 @@ print(ds.select(tok=bt.col("text").str.split(",")).explode("tok").to_pydict())
 
 ### A Python predicate
 
-{py:meth}`ds.ml.filter <batcher.api.dataset.ml.DatasetML.filter>` keeps the rows for which
-`fn(row_dict)` is true. Reach for it when the condition genuinely cannot be written as an
-expression, such as a call into a library or a model's verdict. {py:meth}`ds.filter
-<batcher.Dataset.filter>` stays vectorized in Rust and is the right answer everywhere else.
+{py:meth}`ds.filter <batcher.Dataset.filter>` takes a callable as well as an expression or a
+SQL predicate string. The callable is batch-level: it receives a whole batch in `batch_format`
+and returns one boolean per row. Reach for it when the condition genuinely cannot be written as
+an expression, such as a call into a library or a model's verdict. The expression form stays
+vectorized in Rust and is the right answer everywhere else.
 
 ```python
-print(ds.ml.filter(lambda row: row["text"].count(",") > 0).to_pydict())
+import pyarrow.compute as pc
+
+print(ds.filter(lambda batch: pc.greater(pc.count_substring(batch["text"], ","), 0)).to_pydict())
 # {'text': ['a,b', 'd,e,f'], 'price': [10.0, 30.0], 'qty': [1, 3]}
 ```
 
-The predicate's answers become one Arrow boolean mask, so the surviving rows keep their exact
-types and no value makes the round trip back through Python. Dropping rows also changes no
-column, which the stage declares, so a cheap expression filter written after it is still
-pushed underneath and runs first.
+The answer is applied as one Arrow boolean mask, so the surviving rows keep their exact types
+and no value makes the round trip back through the callback's format. Dropping rows also
+changes no column, which the stage declares, so a cheap expression filter written after it is
+still pushed underneath and runs first. A class predicate is built once per worker, and the
+stage takes the same `fn_constructor_args`, `num_gpus` and `concurrency` options as
+`map_batches`.
 
-Declare `input_columns` here. Building a Python dict per row is the entire cost of a row
-predicate, and declaring what it reads narrows that dict to those columns: on a ten-column
-table reading one column, that measured 12x end to end. Every column still comes out, because
-the output is the input masked. Reading a column you did not declare raises rather than
-working by accident.
+Declare `input_columns` here. Converting the batch into the callback's format is most of what
+the stage costs beyond the predicate itself, and declaring what it reads narrows the batch to
+those columns. Every column still comes out, because the output is the input masked. Reading a
+column you did not declare raises rather than working by accident.
 
 ```python
-print(ds.ml.filter(lambda row: "," in row["text"], input_columns=["text"]).to_pydict())
+print(ds.filter(lambda batch: batch["text"].str.contains(","), batch_format="pandas", input_columns=["text"]).to_pydict())
 # {'text': ['a,b', 'd,e,f'], 'price': [10.0, 30.0], 'qty': [1, 3]}
 ```
 
@@ -292,7 +296,7 @@ print(bt.from_pydict({"text": ["ab", "cd"]}).map_batches(explode_chars).to_pydic
 # {'ch': ['a', 'b', 'c', 'd']}
 ```
 
-Returning a list of *row* dicts is rejected, because that is {py:meth}`ds.ml.flat_map <batcher.api.dataset.ml.DatasetML.flat_map>`, which
+Returning a list of *row* dicts is rejected, because that is {py:meth}`ds.flat_map <batcher.Dataset.flat_map>`, which
 declares the row-at-a-time cost rather than hiding it.
 
 ## Keep the output schema stable across batches

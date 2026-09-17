@@ -168,7 +168,7 @@ def shortest_path_lengths(
             dist.join(relaxed, on=NODE, how="outer").select(
                 **{
                     NODE: bt.col(NODE),
-                    "distance": bt.min_horizontal(
+                    "distance": bt.least(
                         bt.coalesce(bt.col("distance"), bt.col("_c")),
                         bt.coalesce(bt.col("_c"), bt.col("distance")),
                     ),

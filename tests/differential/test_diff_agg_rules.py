@@ -160,19 +160,19 @@ def test_group_by_duplicate_keys_is_untouched(duck, t):
 
 
 def test_count_distinct_of_unique_key(duck):
-    ds = _keyed(_DATA).group_by("g").agg(n=col("id").n_unique())
+    ds = _keyed(_DATA).group_by("g").agg(n=col("id").count_distinct())
     assert "count_distinct" not in _aggs(ds)
     assert_same(ds.collect(), duck.sql("SELECT g, count(DISTINCT id) AS n FROM t GROUP BY g"))
 
 
 def test_count_distinct_of_unique_key_global(duck):
-    ds = _keyed(_DATA).group_by().agg(n=col("id").n_unique())
+    ds = _keyed(_DATA).group_by().agg(n=col("id").count_distinct())
     assert "count_distinct" not in _aggs(ds)
     assert_same(ds.collect(), duck.sql("SELECT count(DISTINCT id) AS n FROM t"))
 
 
 def test_count_distinct_of_duplicate_column_is_untouched(duck, t):
-    ds = t.group_by("g").agg(n=col("k").n_unique())  # `k` repeats — the distinct count stands
+    ds = t.group_by("g").agg(n=col("k").count_distinct())  # `k` repeats — the distinct count stands
     assert_same(ds.collect(), duck.sql("SELECT g, count(DISTINCT k) AS n FROM t GROUP BY g"))
 
 
@@ -367,13 +367,13 @@ def test_regroup_by_a_subset_of_keys_is_untouched(duck, t):
 
 
 def test_unread_aggregate_output_is_dropped(duck, t):
-    ds = t.group_by("g").agg(s=col("x").sum(), dead=col("x").n_unique()).select("g", "s")
+    ds = t.group_by("g").agg(s=col("x").sum(), dead=col("x").count_distinct()).select("g", "s")
     assert "count_distinct" not in _aggs(ds)
     assert_same(ds.collect(), duck.sql("SELECT g, sum(x) AS s FROM t GROUP BY g"))
 
 
 def test_read_aggregate_outputs_are_kept(duck, t):
-    ds = t.group_by("g").agg(s=col("x").sum(), d=col("x").n_unique())
+    ds = t.group_by("g").agg(s=col("x").sum(), d=col("x").count_distinct())
     assert "count_distinct" in _aggs(ds)
     assert_same(
         ds.collect(), duck.sql("SELECT g, sum(x) AS s, count(DISTINCT x) AS d FROM t GROUP BY g")

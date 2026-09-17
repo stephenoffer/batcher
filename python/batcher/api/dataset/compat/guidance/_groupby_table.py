@@ -117,10 +117,8 @@ GROUPBY_UNSUPPORTED: dict[str, str] = {
     "cov": "Aggregate covariance with .agg(c=bt.covar_samp(bt.col('a'), bt.col('b'))).",
     "corr": "Aggregate correlation with .agg(r=bt.corr(bt.col('a'), bt.col('b'))).",
     "sem": "Aggregate standard error with .agg(s=bt.sem(bt.col('x'))).",
-    "skew": "Aggregate skewness with .agg(s=bt.col('x').skew()).",
-    "all": "Aggregate a boolean per group with .agg(ok=bt.col('flag').all()).",
-    "any": "Aggregate a boolean per group with .agg(hit=bt.col('flag').any()).",
-    "count_distinct": "Distinct count per group is .n_unique() or .agg(n=bt.col('x').n_unique()).",
+    "all": "Aggregate a boolean per group with .agg(ok=bt.col('flag').bool_and()).",
+    "any": "Aggregate a boolean per group with .agg(hit=bt.col('flag').bool_or()).",
     "aggregate": "Spelled .agg(...) here.",
     # --- Spark GroupedData naming -----------------------------------------------------
     "pivot": (

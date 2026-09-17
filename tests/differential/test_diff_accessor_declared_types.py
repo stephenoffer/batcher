@@ -43,6 +43,7 @@ import pytest
 
 import batcher as bt
 from batcher import col
+from batcher._internal.errors import PlanError
 
 pytestmark = pytest.mark.differential
 
@@ -130,6 +131,18 @@ def _attempts(namespace: str, name: str, receivers):
                 yield method, (col(other), window)
 
 
+def _built(dataset, expr):
+    """`select(v=expr)`, or -- for an order-dependent expression, which is refused without an
+    order -- the same expression bound to the fixture's row order with ``.over(order_by=...)``.
+    """
+    try:
+        return dataset.select(v=expr)
+    except PlanError as err:
+        if "requires order_by" not in str(err):
+            raise
+        return dataset.select(v=expr.over(order_by="i"))
+
+
 def _sweep(namespace: str, receivers) -> tuple[list[str], list[str]]:
     """`(reached, divergences)` over every method of `namespace`."""
     dataset = bt.from_arrow(_ROWS)
@@ -137,7 +150,7 @@ def _sweep(namespace: str, receivers) -> tuple[list[str], list[str]]:
     for name in _methods(namespace):
         for method, args in _attempts(namespace, name, receivers):
             try:
-                built = dataset.select(v=method(*args))
+                built = _built(dataset, method(*args))
                 declared = built.schema.field("v").type
                 actual = built.collect().schema.field("v").type
             except Exception:

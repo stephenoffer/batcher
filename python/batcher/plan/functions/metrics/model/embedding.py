@@ -85,7 +85,7 @@ def mean_euclidean_distance(left: IntoExpr, right: IntoExpr) -> Expr:
             >>> ds.agg(m=bt.mean_euclidean_distance("a", "b")).to_pydict()["m"][0]
             2.5
     """
-    return _as_column(left).list.euclidean_distance(_as_column(right)).mean()
+    return _as_column(left).list.l2_distance(_as_column(right)).mean()
 
 
 def mean_dot_product(left: IntoExpr, right: IntoExpr) -> Expr:

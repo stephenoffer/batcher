@@ -1,0 +1,106 @@
+# Daft 0.7.25 -> Batcher: Date, time and timestamp functions, on Expression and daft.functions.
+# Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
+
+[Expression]
+convert_time_zone = { status = "mismatch", batcher = "Expr.dt.convert_timezone", note = "Daft returns a timezone-aware timestamp in the target zone; Batcher convert_timezone(from_tz, to_tz) rewrites a naive wall-clock and returns a naive timestamp. Needs tz-aware timestamps", wave = "W6" }
+date = { status = "canonical", batcher = "Expr.dt.date" }
+date_trunc = { status = "param", batcher = "Expr.dt.truncate", need = "multi-unit intervals ('15 minutes') and relative_to= origin", wave = "W6" }
+day = { status = "canonical", batcher = "Expr.dt.day" }
+day_of_month = { status = "canonical", batcher = "Expr.dt.day" }
+day_of_week = { status = "canonical", batcher = "Expr.dt.dayofweek", template = 'day_of_week() -> self.dt.dayofweek(start="monday")' }
+day_of_year = { status = "canonical", batcher = "Expr.dt.dayofyear" }
+hour = { status = "canonical", batcher = "Expr.dt.hour" }
+microsecond = { status = "canonical", batcher = "Expr.dt.microsecond" }
+millisecond = { status = "canonical", batcher = "Expr.dt.millisecond" }
+minute = { status = "canonical", batcher = "Expr.dt.minute" }
+month = { status = "canonical", batcher = "Expr.dt.month" }
+nanosecond = { status = "canonical", batcher = "Expr.dt.nanosecond" }
+partition_days = { status = "canonical", batcher = "bt.partition_days", template = 'partition_days() -> bt.partition_days(self, as_date=True)' }
+partition_hours = { status = "canonical", batcher = "bt.partition_hours" }
+partition_months = { status = "canonical", batcher = "bt.partition_months" }
+partition_years = { status = "canonical", batcher = "bt.partition_years" }
+quarter = { status = "canonical", batcher = "Expr.dt.quarter" }
+replace_time_zone = { status = "gap", need = "replace_time_zone (attach a zone keeping the local time)", wave = "W6" }
+second = { status = "canonical", batcher = "Expr.dt.second" }
+strftime = { status = "param", batcher = "Expr.dt.strftime", need = "optional format (Daft defaults to ISO 8601 with fractional seconds)", wave = "W2" }
+time = { status = "mismatch", batcher = "Expr.dt.time_of_day", note = "Daft time() returns a TIME value; Batcher time_of_day returns microseconds since midnight as Int64. Needs a TIME type", wave = "W6" }
+to_date = { status = "canonical", batcher = "Expr.str.to_date" }
+to_datetime = { status = "param", batcher = "Expr.str.to_datetime", need = "timezone= for the parsed timestamp", wave = "W6" }
+to_unix_epoch = { status = "canonical", batcher = "Expr.dt.timestamp", template = 'to_unix_epoch(time_unit="s") -> self.dt.timestamp(time_unit)' }
+total_days = { status = "gap", need = "Duration total_days", wave = "W6" }
+total_hours = { status = "gap", need = "Duration total_hours", wave = "W6" }
+total_microseconds = { status = "gap", need = "Duration total_microseconds", wave = "W6" }
+total_milliseconds = { status = "gap", need = "Duration total_milliseconds", wave = "W6" }
+total_minutes = { status = "gap", need = "Duration total_minutes", wave = "W6" }
+total_nanoseconds = { status = "gap", need = "Duration total_nanoseconds", wave = "W6" }
+total_seconds = { status = "gap", need = "Duration total_seconds", wave = "W6" }
+unix_date = { status = "canonical", batcher = "bt.partition_days" }
+week_of_year = { status = "canonical", batcher = "Expr.dt.week" }
+year = { status = "canonical", batcher = "Expr.dt.year" }
+
+[functions]
+add_months = { status = "param", batcher = "Expr.dt.offset_by", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (months; offset_by takes a literal '1mo' string)", wave = "W2" }
+convert_time_zone = { status = "mismatch", batcher = "Expr.dt.convert_timezone", note = "Daft returns a timezone-aware timestamp in the target zone; Batcher convert_timezone(from_tz, to_tz) rewrites a naive wall-clock and returns a naive timestamp. Needs tz-aware timestamps", wave = "W6" }
+convert_timezone = { status = "mismatch", batcher = "Expr.dt.convert_timezone", note = "Daft returns a timezone-aware timestamp in the target zone; Batcher convert_timezone(from_tz, to_tz) rewrites a naive wall-clock and returns a naive timestamp. Needs tz-aware timestamps", wave = "W6" }
+current_date = { status = "mismatch", batcher = "bt.current_date", note = "Daft current_date is the UTC date; Batcher current_date is the local date bound at plan build, so they differ across midnight in non-UTC zones. Param: tz='UTC'", wave = "W6" }
+current_timestamp = { status = "mismatch", batcher = "bt.current_timestamp", note = "Daft current_timestamp is UTC; Batcher current_timestamp is a naive local wall clock bound at plan build (22:06 vs 15:06 on a UTC-7 host). Param: tz='UTC'", wave = "W6" }
+current_timezone = { status = "gap", need = "session timezone expression", wave = "W6" }
+date = { status = "canonical", batcher = "Expr.dt.date" }
+date_add = { status = "param", batcher = "bt.date_add", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days)", wave = "W2" }
+date_diff = { status = "canonical", batcher = "Expr.dt.days_between", template = 'date_diff(end, start) -> sem.column(end).dt.days_between(sem.column(start))' }
+date_format = { status = "param", batcher = "Expr.dt.strftime", need = "optional format (Daft defaults to ISO 8601 with fractional seconds)", wave = "W2" }
+date_from_unix_date = { status = "canonical", batcher = "bt.from_unix_date" }
+date_sub = { status = "param", batcher = "bt.date_sub", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days)", wave = "W2" }
+date_trunc = { status = "param", batcher = "Expr.dt.truncate", need = "multi-unit intervals ('15 minutes') and relative_to= origin", wave = "W6" }
+dateadd = { status = "param", batcher = "bt.date_add", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days)", wave = "W2" }
+datediff = { status = "canonical", batcher = "Expr.dt.days_between", template = 'datediff(end, start) -> sem.column(end).dt.days_between(sem.column(start))' }
+datepart = { status = "mismatch", batcher = "bt.date_part", note = "Daft datepart(dayofweek) numbers Monday=0; port it as col.dt.dayofweek(start=monday). Every other part agrees with bt.date_part", wave = "W0" }
+day = { status = "canonical", batcher = "Expr.dt.day" }
+day_of_month = { status = "canonical", batcher = "Expr.dt.day" }
+day_of_week = { status = "canonical", batcher = "Expr.dt.dayofweek", template = 'day_of_week(expr) -> sem.column(expr).dt.dayofweek(start="monday")' }
+day_of_year = { status = "canonical", batcher = "Expr.dt.dayofyear" }
+dayofmonth = { status = "canonical", batcher = "Expr.dt.day" }
+dayofyear = { status = "canonical", batcher = "Expr.dt.dayofyear" }
+from_unixtime = { status = "canonical", batcher = ["bt.from_epoch", "Expr.dt.strftime"] }
+from_utc_timestamp = { status = "gap", need = "from_utc_timestamp over tz-aware timestamps", wave = "W6" }
+great_circle_distance = { status = "mismatch", batcher = "bt.great_circle_distance", note = "Daft returns meters; Batcher defaults to kilometers (157249.4 vs 157.25 for (0,0)-(1,1)), and its docstring wrongly says degrees. Param: unit='m'", wave = "W0" }
+hour = { status = "canonical", batcher = "Expr.dt.hour" }
+last_day = { status = "canonical", batcher = "Expr.dt.last_day" }
+make_date = { status = "canonical", batcher = "bt.make_date" }
+make_timestamp = { status = "param", batcher = "bt.make_timestamp", need = "timezone= argument", wave = "W6" }
+make_timestamp_ltz = { status = "gap", need = "make_timestamp_ltz (UTC instant from a zoned wall clock)", wave = "W6" }
+microsecond = { status = "canonical", batcher = "Expr.dt.microsecond" }
+millisecond = { status = "canonical", batcher = "Expr.dt.millisecond" }
+minute = { status = "canonical", batcher = "Expr.dt.minute" }
+month = { status = "canonical", batcher = "Expr.dt.month" }
+months_between = { status = "gap", need = "months_between (fractional months)", wave = "W6" }
+nanosecond = { status = "canonical", batcher = "Expr.dt.nanosecond" }
+next_day = { status = "gap", need = "next_day(date, day_of_week)", wave = "W6" }
+partition_days = { status = "canonical", batcher = "bt.partition_days", template = 'partition_days(expr) -> bt.partition_days(sem.column(expr), as_date=True)' }
+partition_hours = { status = "canonical", batcher = "bt.partition_hours" }
+partition_months = { status = "canonical", batcher = "bt.partition_months" }
+partition_years = { status = "canonical", batcher = "bt.partition_years" }
+quarter = { status = "canonical", batcher = "Expr.dt.quarter" }
+replace_time_zone = { status = "gap", need = "replace_time_zone (attach a zone keeping the local time)", wave = "W6" }
+second = { status = "canonical", batcher = "Expr.dt.second" }
+strftime = { status = "param", batcher = "Expr.dt.strftime", need = "optional format (Daft defaults to ISO 8601 with fractional seconds)", wave = "W2" }
+time = { status = "mismatch", batcher = "Expr.dt.time_of_day", note = "Daft time() returns a TIME value; Batcher time_of_day returns microseconds since midnight as Int64. Needs a TIME type", wave = "W6" }
+timestamp_micros = { status = "canonical", batcher = "bt.from_epoch" }
+timestamp_millis = { status = "canonical", batcher = "bt.from_epoch" }
+timestamp_seconds = { status = "canonical", batcher = "bt.from_epoch" }
+to_date = { status = "canonical", batcher = "Expr.str.to_date" }
+to_datetime = { status = "param", batcher = "Expr.str.to_datetime", need = "timezone= for the parsed timestamp", wave = "W6" }
+to_unix_epoch = { status = "canonical", batcher = "Expr.dt.timestamp", template = 'to_unix_epoch(expr, time_unit="s") -> sem.column(expr).dt.timestamp(time_unit)' }
+to_utc_timestamp = { status = "gap", need = "to_utc_timestamp over tz-aware timestamps", wave = "W6" }
+total_days = { status = "gap", need = "Duration total_days", wave = "W6" }
+total_hours = { status = "gap", need = "Duration total_hours", wave = "W6" }
+total_microseconds = { status = "gap", need = "Duration total_microseconds", wave = "W6" }
+total_milliseconds = { status = "gap", need = "Duration total_milliseconds", wave = "W6" }
+total_minutes = { status = "gap", need = "Duration total_minutes", wave = "W6" }
+total_nanoseconds = { status = "gap", need = "Duration total_nanoseconds", wave = "W6" }
+total_seconds = { status = "gap", need = "Duration total_seconds", wave = "W6" }
+trunc = { status = "param", batcher = "Expr.dt.truncate", need = "multi-unit intervals ('15 minutes') and relative_to= origin", wave = "W6" }
+unix_date = { status = "canonical", batcher = "bt.partition_days" }
+week_of_year = { status = "canonical", batcher = "Expr.dt.week" }
+weekofyear = { status = "canonical", batcher = "Expr.dt.week" }
+year = { status = "canonical", batcher = "Expr.dt.year" }

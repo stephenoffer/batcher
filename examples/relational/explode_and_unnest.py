@@ -20,14 +20,14 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").head(500)
+    orders = tpch("orders").limit(500)
 
     # Build a list column from real data: the words of each order's clerk field.
     with_parts = orders.select(
         "o_orderkey",
         parts=col("o_clerk").str.split("#"),
     )
-    print(with_parts.head(2).to_pydict())
+    print(with_parts.limit(2).to_pydict())
 
     exploded = with_parts.explode("parts")
     # Every clerk id is "Clerk#000000xxx", so each row becomes exactly two.
@@ -41,13 +41,13 @@ def main() -> None:
         detail=bt.struct(price=col("o_totalprice"), status=col("o_orderstatus")),
     )
     flat = packed.unnest("detail")
-    print(flat.head(2).to_pydict())
+    print(flat.limit(2).to_pydict())
     assert flat.count() == packed.count()
     assert {"price", "status"} <= set(flat.columns)
 
     # Reading a field without flattening.
-    field = packed.select(price=col("detail").struct.field("price")).head(3).to_pydict()
-    assert field["price"] == orders.select("o_totalprice").head(3).to_pydict()["o_totalprice"]
+    field = packed.select(price=col("detail").struct.field("price")).limit(3).to_pydict()
+    assert field["price"] == orders.select("o_totalprice").limit(3).to_pydict()["o_totalprice"]
 
 
 if __name__ == "__main__":

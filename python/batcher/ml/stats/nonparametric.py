@@ -331,7 +331,7 @@ def friedman_test(ds: Dataset, value: str, block: str, treatment: str) -> TestRe
     ranked = present.with_columns(__bt_rank=within_rank, __bt_tie=tie_size)
     per_treatment = ranked.group_by(treatment).agg(__bt_r=sum_(col("__bt_rank"))).collect()
     sizes = ranked.agg(
-        __bt_blocks=col(block).n_unique(),
+        __bt_blocks=col(block).count_distinct(),
         __bt_tie=sum_(col("__bt_tie") * col("__bt_tie") - lit(1.0)),
     ).collect()
     n = int(sizes.column("__bt_blocks")[0].as_py())

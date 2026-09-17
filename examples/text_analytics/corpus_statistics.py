@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    corpus = tpch("part").select("p_partkey", "p_name").head(20_000)
+    corpus = tpch("part").select("p_partkey", "p_name").limit(20_000)
 
     lengths = corpus.select(
         characters=col("p_name").str.len_chars(),
@@ -41,13 +41,15 @@ def main() -> None:
     assert summary["p50_chars"][0] <= summary["p95_chars"][0] <= summary["max_chars"][0]
 
     # Duplication: how much of the corpus is the same text twice.
-    distinct = corpus.n_unique("p_name")
+    distinct = corpus.count_distinct("p_name")
     duplication = 1.0 - distinct / corpus.count()
     print(f"{distinct} distinct of {corpus.count()} ({duplication:.2%} duplicated)")
     assert 0.0 <= duplication < 1.0
 
     # Vocabulary, from the exploded tokens.
-    vocabulary = corpus.select(word=col("p_name").str.split(" ")).explode("word").n_unique("word")
+    vocabulary = (
+        corpus.select(word=col("p_name").str.split(" ")).explode("word").count_distinct("word")
+    )
     print("vocabulary:", vocabulary)
     assert 0 < vocabulary < summary["total_tokens"][0]
 

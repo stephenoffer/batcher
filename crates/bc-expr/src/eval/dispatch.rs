@@ -83,6 +83,13 @@ impl Expr {
                 if let Some(out) = try_dict_compare(*op, left, right, batch)? {
                     return Ok(out);
                 }
+                // Fast path: a string range (`s >= 'a' AND s < 'b'`, what a sargable
+                // `LIKE 'a%'` becomes) walks the column once for both bounds.
+                if matches!(op, BinaryOp::And) {
+                    if let Some(out) = crate::eval::cmp::try_string_range(left, right, batch)? {
+                        return Ok(out);
+                    }
+                }
                 // Fast path: a numeric literal operand broadcasts as a scalar instead
                 // of materializing a full N-length array (bit-identical result).
                 if let Some(out) = try_scalar_binary(*op, left, right, batch)? {
@@ -321,12 +328,16 @@ impl Expr {
                     .collect::<Result<_, _>>()?;
                 eval_make_temporal(*func, &evaluated)
             }
-            Expr::Hash { inputs, seed } => {
+            Expr::Hash {
+                inputs,
+                seed,
+                algorithm,
+            } => {
                 let args: Vec<_> = inputs
                     .iter()
                     .map(|e| e.eval(batch))
                     .collect::<Result<_, _>>()?;
-                crate::eval::hash::eval_hash(&args, *seed, batch.num_rows())
+                crate::eval::hash::eval_hash_with(&args, *seed, *algorithm, batch.num_rows())
             }
             Expr::Sequence { start, stop, step } => {
                 let (s, e, d) = (start.eval(batch)?, stop.eval(batch)?, step.eval(batch)?);
@@ -414,9 +425,14 @@ impl Expr {
             // fails naming the function instead of panicking on a missing index.
             Expr::Geo { func, args } => eval_geo(*func, args, batch),
             Expr::Spatial { func, args } => eval_spatial(*func, args, batch),
-            Expr::DateTrunc { input, unit } => {
+            Expr::DateTrunc {
+                input,
+                unit,
+                preserve_type,
+                keep_time,
+            } => {
                 let arr = input.eval(batch)?;
-                eval_date_trunc(&arr, unit)
+                eval_date_trunc(&arr, unit, *preserve_type, *keep_time)
             }
             Expr::Strftime { input, format } => {
                 let arr = input.eval(batch)?;
@@ -430,9 +446,13 @@ impl Expr {
                 let arr = input.eval(batch)?;
                 eval_convert_timezone(&arr, from_tz, to_tz)
             }
-            Expr::Strptime { input, format } => {
+            Expr::Strptime {
+                input,
+                format,
+                strict,
+            } => {
                 let arr = input.eval(batch)?;
-                eval_strptime(&arr, format)
+                eval_strptime(&arr, format, *strict)
             }
             Expr::DateOffset {
                 input,

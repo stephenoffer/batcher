@@ -50,7 +50,7 @@ def main() -> None:
     assert equivalent["orders"] == rows["orders"]
 
     # And the result composes with the DataFrame API, because it is a Dataset.
-    biggest = result.filter(col("orders") > 1_000).sort("value", descending=True).head(1)
+    biggest = result.filter(col("orders") > 1_000).sort("value", descending=True).limit(1)
     print(biggest.to_pydict())
     assert biggest.count() <= 1
 

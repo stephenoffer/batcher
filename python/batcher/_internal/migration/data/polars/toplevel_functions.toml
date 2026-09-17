@@ -1,0 +1,131 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+[polars]
+Catalog = { status = "mismatch", batcher = "bt.Catalog", note = "pl.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend", wave = "W9" }
+Config = { status = "mismatch", batcher = "bt.Config", note = "Polars Config holds display/formatting settings; Batcher's Config is the engine configuration (memory, optimizer, distribution)", wave = "W11" }
+DataFrame = { status = "canonical", batcher = "bt.Dataset", template = 'DataFrame(data) -> sem.frame(data)' }
+Expr = { status = "canonical", batcher = "bt.Expr" }
+GPUEngine = { status = "param", batcher = "Dataset.collect", need = "a GPU engine options object (device, memory resource, raise_on_fail); backend='gpu' exists", wave = "W2" }
+LazyFrame = { status = "canonical", batcher = "bt.Dataset", template = 'LazyFrame(data) -> sem.frame(data)' }
+QueryOptFlags = { status = "param", batcher = "bt.OptimizerConfig", need = "per-collect optimization toggles (predicate/projection pushdown, CSE, slice pushdown)", wave = "W2" }
+SQLContext = { status = "canonical", batcher = "bt.Session" }
+Series = { status = "out_of_scope", reason = "Batcher has no Series type (user decision); a column is an Expr or a one-column Dataset" }
+StringCache = { status = "out_of_scope", reason = "no global Categorical string cache: Arrow dictionaries are per batch" }
+align_frames = { status = "gap", need = "align_frames (outer-join frames on a key and sort)", wave = "W8" }
+all = { status = "mismatch", batcher = ["bt.all", "bt.bool_and"], note = "pl.all() with no names is the all-columns selector bt.all(); pl.all(name) is col(name).bool_and(empty_value=True)", wave = "W0" }
+all_horizontal = { status = "param", batcher = "bt.all_horizontal", need = "bare string arguments as column names (read as string literals and rejected today)", wave = "W2" }
+any = { status = "mismatch", batcher = "bt.bool_or", note = "pl.any(names) ignores nulls and is false for an empty column: col(name).bool_or(empty_value=False) per name", wave = "W0" }
+any_horizontal = { status = "param", batcher = "bt.any_horizontal", need = "bare string arguments as column names (read as string literals and rejected today)", wave = "W2" }
+api = { status = "mismatch", batcher = "bt.api", note = "polars.api registers user namespaces; batcher.api is Batcher's internal conductor package. Namespace registration is the gap", wave = "W11" }
+approx_n_unique = { status = "mismatch", batcher = "bt.approx_count_distinct", note = "pl.approx_n_unique(name) counts null as a distinct value: col(name).approx_count_distinct(count_nulls=True)", wave = "W0" }
+arange = { status = "gap", need = "arange expression (int range)", wave = "W6" }
+arctan2 = { status = "canonical", batcher = "bt.arctan2" }
+arctan2d = { status = "gap", need = "arctan2d (degrees)", wave = "W3" }
+arg_sort_by = { status = "gap", need = "arg_sort_by", wave = "W8" }
+arg_where = { status = "gap", need = "arg_where", wave = "W8" }
+build_info = { status = "canonical", batcher = "bt.versions" }
+business_day_count = { status = "gap", need = "business_day_count", wave = "W6" }
+coalesce = { status = "canonical", batcher = "bt.coalesce" }
+col = { status = "canonical", batcher = "bt.col", template = 'col(name) <-> bt.col(name)' }
+collect_all = { status = "gap", need = "collect_all (execute several plans with shared subplans)", wave = "W8" }
+collect_all_async = { status = "gap", need = "collect_all_async", wave = "W8" }
+concat = { status = "param", batcher = "bt.concat", need = "how='diagonal_relaxed', 'align', 'horizontal' and relaxed supertype unification", wave = "W2" }
+concat_arr = { status = "gap", need = "concat_arr (fixed-size array concatenation)", wave = "W3" }
+concat_list = { status = "param", batcher = "Expr.list.concat", need = "variadic form that promotes scalar columns to one-element lists", wave = "W2" }
+concat_str = { status = "mismatch", batcher = "bt.concat_str", note = "Polars returns null when any input is null (ignore_nulls=False) and takes separator=; Batcher skips null inputs and has no separator (bt.concat_ws). Params: ignore_nulls=False, separator=", wave = "W0" }
+corr = { status = "param", batcher = "bt.corr", need = "method='spearman', propagate_nans=", wave = "W2" }
+count = { status = "param", batcher = "bt.count", need = "count('a', 'b') per-column non-null counts (Batcher's count() is COUNT(*))", wave = "W2" }
+cov = { status = "canonical", batcher = "bt.covar_samp" }
+cum_count = { status = "canonical", batcher = ["bt.col", "Expr.cum_count"] }
+cum_fold = { status = "gap", need = "cum_fold", wave = "W3" }
+cum_reduce = { status = "gap", need = "cum_reduce", wave = "W3" }
+cum_sum = { status = "mismatch", batcher = ["bt.col", "Expr.cum_sum"], note = "Polars leaves a null row null; Batcher carries the running value through it. Param: skip_nulls=False", wave = "W0" }
+cum_sum_horizontal = { status = "gap", need = "cum_sum_horizontal", wave = "W3" }
+date = { status = "canonical", batcher = "bt.make_date" }
+date_range = { status = "mismatch", batcher = "bt.date_range", note = "Polars date_range is an expression (or eager Series); Batcher's returns a one-column Dataset", wave = "W6" }
+date_ranges = { status = "gap", need = "date_ranges (per-row list of dates)", wave = "W6" }
+datetime = { status = "param", batcher = "bt.make_timestamp", need = "microsecond=, time_unit=, time_zone=, ambiguous=", wave = "W2" }
+datetime_range = { status = "mismatch", batcher = "bt.date_range", note = "Polars datetime_range is an expression; Batcher's date_range returns a one-column Dataset", wave = "W6" }
+datetime_ranges = { status = "gap", need = "datetime_ranges (per-row list of datetimes)", wave = "W6" }
+defer = { status = "param", batcher = "bt.from_batches", need = "port as bt.from_batches(factory, schema)", wave = "W8" }
+disable_string_cache = { status = "out_of_scope", reason = "no global Categorical string cache: Arrow dictionaries are per batch" }
+dtype_of = { status = "gap", need = "dtype_of (dtype expression)", wave = "W11" }
+duration = { status = "gap", need = "duration expression (needs a Duration kernel family)", wave = "W6" }
+element = { status = "canonical", batcher = "bt.element" }
+enable_string_cache = { status = "out_of_scope", reason = "no global Categorical string cache: Arrow dictionaries are per batch" }
+escape_regex = { status = "gap", need = "escape_regex helper for a Python string", wave = "W3" }
+exceptions = { status = "canonical", batcher = "bt.BatcherError" }
+exclude = { status = "canonical", batcher = "bt.exclude" }
+explain_all = { status = "gap", need = "explain_all (plans of several frames)", wave = "W8" }
+field = { status = "gap", need = "field (struct field reference inside struct.with_fields)", wave = "W3" }
+first = { status = "param", batcher = "bt.first", need = "pl.first() with no argument as the first-column selector", wave = "WF" }
+fold = { status = "canonical", batcher = "bt.fold_horizontal" }
+format = { status = "mismatch", batcher = "bt.format_string", note = "Polars format returns null when any input is null; Batcher renders a null as an empty string", wave = "W0" }
+from_arrow = { status = "canonical", batcher = "bt.from_arrow" }
+from_dict = { status = "canonical", batcher = "bt.from_pydict" }
+from_dicts = { status = "canonical", batcher = "bt.from_pylist" }
+from_epoch = { status = "mismatch", batcher = "bt.from_epoch", note = "Polars time_unit=d reads days since 1970; port that as bt.from_unix_date(column). Other units map to bt.from_epoch(column, unit=time_unit)", wave = "W0" }
+from_numpy = { status = "param", batcher = "bt.from_numpy", need = "2-D arrays with schema= and orient=", wave = "W2" }
+from_pandas = { status = "canonical", batcher = "bt.from_pandas" }
+from_records = { status = "mismatch", batcher = "bt.from_records", note = "Polars takes schema= and orient= and can read a sequence of sequences as columns; Batcher reads rows with columns=", wave = "W0" }
+from_repr = { status = "out_of_scope", reason = "parsing a printed table repr is a notebook convenience, not engine surface" }
+from_torch = { status = "canonical", batcher = "bt.from_torch" }
+get_extension_type = { status = "gap", need = "extension type registry", wave = "W11" }
+get_index_type = { status = "out_of_scope", reason = "Polars-internal row-index width; Batcher's row index is always Int64" }
+groups = { status = "gap", need = "groups (group row indices expression)", wave = "W8" }
+head = { status = "gap", need = "head expression (first n values)", wave = "W8" }
+implode = { status = "mismatch", batcher = "bt.array_agg", note = "Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array_agg(order_by=_row) after with_row_index(_row)", wave = "W0" }
+int_range = { status = "gap", need = "int_range expression", wave = "W6" }
+int_ranges = { status = "mismatch", batcher = "bt.sequence", note = "Polars int_ranges excludes the end; Batcher's sequence includes it (int_ranges(0, n) is sequence(0, n - 1))", wave = "W0" }
+last = { status = "param", batcher = "bt.last", need = "pl.last() with no argument as the last-column selector", wave = "WF" }
+len = { status = "canonical", batcher = "bt.count" }
+linear_space = { status = "gap", need = "linear_space", wave = "W6" }
+linear_spaces = { status = "gap", need = "linear_spaces", wave = "W6" }
+lit = { status = "param", batcher = "bt.lit", need = "list and ndarray literals, Polars dtype objects, allow_object=", wave = "W2", template = 'lit(value) <-> bt.lit(value)' }
+map_batches = { status = "gap", need = "map_batches over several expressions (vectorized UDF)", wave = "W11" }
+map_groups = { status = "gap", need = "map_groups over several expressions (UDF per group)", wave = "W11" }
+max = { status = "mismatch", batcher = "bt.max", note = "pl.max(names) ignores NaN: col(name).max(nan_policy=ignore) per name", wave = "W0" }
+max_horizontal = { status = "mismatch", batcher = "bt.greatest", note = "Polars reads a bare string as a column name and skips NaN; port as bt.greatest(bt.col(a), bt.col(b)), which reads a bare string as a literal", wave = "W0" }
+mean = { status = "canonical", batcher = "bt.mean" }
+mean_horizontal = { status = "param", batcher = "bt.mean_horizontal", need = "bare string arguments as column names (rejected today)", wave = "W2" }
+median = { status = "canonical", batcher = "bt.median" }
+merge_sorted = { status = "param", batcher = "Dataset.union", need = "a list of frames; port as union of each then sort(key)", wave = "W8" }
+min = { status = "canonical", batcher = "bt.min" }
+min_horizontal = { status = "mismatch", batcher = "bt.least", note = "Polars reads a bare string as a column name and skips NaN; port as bt.least(bt.col(a), bt.col(b)), which reads a bare string as a literal", wave = "W0" }
+n_unique = { status = "mismatch", batcher = "bt.count_distinct", note = "pl.n_unique(name) counts null as a distinct value: col(name).count_distinct(count_nulls=True)", wave = "W0" }
+nth = { status = "gap", need = "nth (column by position)", wave = "W8" }
+ones = { status = "gap", need = "ones expression", wave = "W8" }
+plugins = { status = "gap", need = "Rust plugin ABI (register_plugin_function)", wave = "W11" }
+quantile = { status = "canonical", batcher = "bt.quantile", template = 'quantile(column, quantile, interpolation="nearest") -> sem.column(column).quantile(quantile, interpolation)' }
+reduce = { status = "canonical", batcher = "bt.reduce_horizontal" }
+register_extension_type = { status = "gap", need = "extension type registry", wave = "W11" }
+repeat = { status = "gap", need = "repeat expression", wave = "W8" }
+rolling_corr = { status = "gap", need = "rolling_corr", wave = "W5" }
+rolling_cov = { status = "gap", need = "rolling_cov", wave = "W5" }
+row_index = { status = "param", batcher = "Dataset.with_row_index", need = "row_index() as an expression usable inside select/with_columns", wave = "W8" }
+select = { status = "gap", need = "top-level select (evaluate expressions without a frame)", wave = "W8" }
+selectors = { status = "param", batcher = "bt.Selector", need = "a selectors module (bt.cs) holding the full selector family", wave = "W11" }
+self_dtype = { status = "gap", need = "self_dtype (dtype expression)", wave = "W11" }
+set_random_seed = { status = "gap", need = "set_random_seed (global seed for sample/shuffle)", wave = "W8" }
+show_versions = { status = "canonical", batcher = "bt.show_versions" }
+sql = { status = "param", batcher = "bt.sql", need = "discover frames from the caller's globals, eager= flag", wave = "W2" }
+sql_expr = { status = "canonical", batcher = "bt.sql_expr" }
+std = { status = "param", batcher = "bt.std", need = "ddof=", wave = "W2" }
+struct = { status = "param", batcher = "bt.struct", need = "positional expressions (names inferred) and schema=", wave = "W2" }
+struct_with_fields = { status = "gap", need = "struct_with_fields", wave = "W3" }
+sum = { status = "mismatch", batcher = "bt.sum", note = "pl.sum(names) sums an empty or all-null column to 0: col(name).sum(empty_value=0) per name", wave = "W0" }
+sum_horizontal = { status = "param", batcher = "bt.sum_horizontal", need = "bare string arguments as column names (rejected today)", wave = "W2" }
+tail = { status = "gap", need = "tail expression (last n values)", wave = "W8" }
+thread_pool_size = { status = "param", batcher = "batcher.config.get_option", need = "the effective worker-thread count (execution.parallelism is the configured value and may be unset)", wave = "W2" }
+threadpool_size = { status = "param", batcher = "batcher.config.get_option", need = "the effective worker-thread count (execution.parallelism is the configured value and may be unset)", wave = "W2" }
+time = { status = "gap", need = "time constructor (needs a TIME type)", wave = "W6" }
+time_range = { status = "gap", need = "time_range (needs a TIME type)", wave = "W6" }
+time_ranges = { status = "gap", need = "time_ranges (needs a TIME type)", wave = "W6" }
+union = { status = "canonical", batcher = "bt.concat" }
+unregister_extension_type = { status = "gap", need = "extension type registry", wave = "W11" }
+using_string_cache = { status = "out_of_scope", reason = "no global Categorical string cache: Arrow dictionaries are per batch" }
+var = { status = "param", batcher = "bt.var", need = "ddof=", wave = "W2" }
+when = { status = "param", batcher = "bt.when", template = 'when(predicate) -> bt.when(predicate)', need = "several conditions and **constraints in one when()", wave = "WF" }
+zeros = { status = "gap", need = "zeros expression", wave = "W8" }

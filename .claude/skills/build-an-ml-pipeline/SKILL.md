@@ -11,7 +11,7 @@ the optimizer prunes columns and pushes filters *through* your model stage. Two 
 everything below:
 
 1. **UDFs take whole Arrow batches, never rows.** Python must not touch a tuple in the hot
-   path. `ds.ml.map_batches(fn)` hands `fn` a `pyarrow.RecordBatch` and expects one back.
+   path. `ds.map_batches(fn)` hands `fn` a `pyarrow.RecordBatch` and expects one back.
    `ds.map` exists and is per-row Python — it is the slow path.
 2. **Pass a class, not a function**, whenever a model is involved. The engine instantiates the
    class **once per worker**; `__call__` runs per batch. A plain function with `num_gpus > 0`
@@ -63,7 +63,7 @@ class Classifier:
 labeled = (
     bt.read.parquet("s3://bucket/features.parquet")
     .filter(bt.col("active"))  # pushed below the model stage
-    .ml.map_batches(
+    .map_batches(
         Classifier,
         batch_size=1024,
         num_gpus=1.0,
@@ -98,7 +98,7 @@ in-flight requests pipelined, and releases the model with the worker:
 udf = bt.ml.onnx_predictor(
     "resnet50.onnx", input_columns=["pixel_values"], output_columns=["logits"], providers=["cuda"]
 )
-scored = images.ml.map_batches(udf, num_gpus=1, concurrency=8)
+scored = images.map_batches(udf, num_gpus=1, concurrency=8)
 ```
 
 `providers=["tensorrt", "cuda"]` is how TensorRT is reached (an ONNX Runtime execution
@@ -209,8 +209,8 @@ for batch in train_x.select("clicks", "spend", "label").ml.iter_torch_batches(
   seed=0, shuffle=True, drop_last=True, columns=None, global_consumed=0)` — resumable
   (`global_consumed` restarts mid-epoch); `batcher.ml.streaming_split(dataset, world_size,
   *, rank=None, queue_depth=2)` splits one dataset across ranks.
-- `Dataset.to_torch / to_tf / to_torch_dataloader(*, columns=None, batch_size=None)` are the
-  materializing conveniences for data that fits.
+- `ds.ml.to_torch_dataloader(...)` wraps the same stream in a `torch.utils.data.DataLoader`,
+  and `ds.ml.to_tf(...)` is the TensorFlow loader. There is no `Dataset.to_torch`.
 - Preprocessors are the next section — `StandardScaler` above is one of fifteen.
 
 ## Preprocessors
@@ -308,7 +308,7 @@ Gemini or Vertex AI. All the hosted ones take `requests_per_minute` / `tokens_pe
 ## Errors, laziness, and output
 
 - **Errors** — exactly two real options, both narrow.
-  `ds.ml.map_batches(..., max_errored_rows=N)` bisects a batch whose `fn` raises, drops the
+  `ds.map_batches(..., max_errored_rows=N)` bisects a batch whose `fn` raises, drops the
   offending rows, and gives up past the budget (default `0` = strict); it exists **only** on
   `map_batches`, not on `infer`/`embed`/`generate`. `ds.ml.download(..., on_error="null")`
   turns a failed fetch into a null (`"raise"` or `"null"` only). There is no per-row error

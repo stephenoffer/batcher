@@ -87,8 +87,8 @@ def test_auto_workers_is_result_invariant():
         return b.append_column("y", pa.array([v.as_py() * 2 for v in b.column("x")]))
 
     t = pa.table({"x": list(range(2000))})
-    auto = bt.from_arrow(t).ml.map_batches(add).to_pydict()
-    one = bt.from_arrow(t).ml.map_batches(add, num_workers=1).to_pydict()
+    auto = bt.from_arrow(t).map_batches(add).to_pydict()
+    one = bt.from_arrow(t).map_batches(add, num_workers=1).to_pydict()
     assert auto == one
 
 
@@ -100,8 +100,8 @@ def test_autobatch_engages_for_class_fn_and_is_result_invariant():
             return b.append_column("y", pa.array([v.as_py() * 3 for v in b.column("x")]))
 
     t = pa.table({"x": list(range(4000))})
-    auto = bt.from_arrow(t).ml.map_batches(Scale).to_pydict()
-    fixed = bt.from_arrow(t).ml.map_batches(Scale, batch_size=512).to_pydict()
+    auto = bt.from_arrow(t).map_batches(Scale).to_pydict()
+    fixed = bt.from_arrow(t).map_batches(Scale, batch_size=512).to_pydict()
     assert auto == fixed
 
 
@@ -112,8 +112,8 @@ def test_autobatch_handles_row_multiplying_fn():
             return pa.Table.from_batches([b, b]).combine_chunks().to_batches()[0]
 
     t = pa.table({"x": list(range(3000))})
-    auto = sorted(bt.from_arrow(t).ml.map_batches(Dup).to_pydict()["x"])
-    fixed = sorted(bt.from_arrow(t).ml.map_batches(Dup, batch_size=777).to_pydict()["x"])
+    auto = sorted(bt.from_arrow(t).map_batches(Dup).to_pydict()["x"])
+    fixed = sorted(bt.from_arrow(t).map_batches(Dup, batch_size=777).to_pydict()["x"])
     assert auto == fixed and len(auto) == 6000
 
 
@@ -121,7 +121,7 @@ def test_plain_function_not_autobatched_but_correct():
     # A plain (non-class, CPU) fn keeps the engine morsel path — no autobatch warm-up —
     # and is still correct.
     t = pa.table({"x": list(range(2000))})
-    out = bt.from_arrow(t).ml.map_batches(lambda b: b).to_pydict()
+    out = bt.from_arrow(t).map_batches(lambda b: b).to_pydict()
     assert out["x"] == list(range(2000))
 
 

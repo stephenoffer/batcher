@@ -37,7 +37,7 @@ def main() -> None:
         model.bias.copy_(torch.tensor([0.5]))
     model = model.to(device).eval()
 
-    lineitem = tpch("lineitem").select("l_quantity", "l_discount").head(50_000)
+    lineitem = tpch("lineitem").select("l_quantity", "l_discount").limit(50_000)
 
     def score(batch: pa.RecordBatch) -> pa.RecordBatch:
         """Score one Arrow batch. Batch-first: never one row at a time."""
@@ -54,7 +54,7 @@ def main() -> None:
         )
 
     scored = lineitem.map_batches(score)
-    result = scored.head(5).to_pydict()
+    result = scored.limit(5).to_pydict()
     print(result)
 
     # The new column exists in the *result*. `Dataset.columns` still reports the

@@ -14,7 +14,7 @@ example runs as written. The real-model parts are shown rather than executed.
 
 ## The shape of a batch function
 
-{py:meth}`ds.ml.map_batches(fn) <batcher.api.dataset.ml.DatasetML.map_batches>` applies `fn` to each Arrow `RecordBatch` and expects a
+{py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` applies `fn` to each Arrow `RecordBatch` and expects a
 `RecordBatch` back. Here a trivial function scores each row by a column, standing in
 for a model's forward pass.
 
@@ -36,7 +36,7 @@ def score(batch: pa.RecordBatch) -> pa.RecordBatch:
     return batch.append_column("score", pa.array(preds))
 
 
-scored = ds.ml.map_batches(score)
+scored = ds.map_batches(score)
 print(scored.to_pydict())
 # {'id': [1, 2, 3, 4], 'feature': [0.5, 1.5, 2.5, 3.5], 'score': [1.0, 3.0, 5.0, 7.0]}
 ```
@@ -81,7 +81,7 @@ class Classifier:
 
 
 ds = bt.read.parquet("s3://bucket/features.parquet")
-labeled = ds.ml.map_batches(
+labeled = ds.map_batches(
     Classifier,
     batch_size=1024,
     num_gpus=1.0,

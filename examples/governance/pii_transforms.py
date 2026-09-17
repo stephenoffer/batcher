@@ -35,7 +35,7 @@ def main() -> None:
         # Keyed, so the same value hashes differently in another system.
         keyed=bt.hmac_sha256(col("email"), key="env:DEMO_HMAC_KEY"),
         # Card numbers: keep the last four, the industry convention.
-        last4=col("card").str.tail(4),
+        last4=col("card").str.right(4),
     ).to_pydict()
 
     print({k: v[0] for k, v in protected.items()})

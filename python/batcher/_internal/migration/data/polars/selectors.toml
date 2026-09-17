@@ -1,0 +1,42 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+[selectors]
+Selector = { status = "canonical", batcher = "bt.Selector" }
+all = { status = "canonical", batcher = "bt.all" }
+alpha = { status = "gap", need = "cs.alpha (column names by character class)", wave = "W11" }
+alphanumeric = { status = "gap", need = "cs.alphanumeric", wave = "W11" }
+array = { status = "gap", need = "cs.array (fixed-size list columns)", wave = "W11" }
+binary = { status = "gap", need = "cs.binary", wave = "W11" }
+boolean = { status = "canonical", batcher = "bt.boolean" }
+by_dtype = { status = "param", batcher = "bt.by_dtype", need = "Python types and Polars dtype objects (Batcher takes pyarrow types)", wave = "W2" }
+by_index = { status = "gap", need = "cs.by_index", wave = "W11" }
+by_name = { status = "gap", need = "cs.by_name (require_all=)", wave = "W11" }
+categorical = { status = "gap", need = "cs.categorical", wave = "W11" }
+contains = { status = "canonical", batcher = "bt.contains" }
+date = { status = "gap", need = "cs.date", wave = "W11" }
+datetime = { status = "gap", need = "cs.datetime (time_unit=, time_zone=)", wave = "W11" }
+decimal = { status = "gap", need = "cs.decimal", wave = "W11" }
+digit = { status = "gap", need = "cs.digit", wave = "W11" }
+duration = { status = "gap", need = "cs.duration", wave = "W11" }
+ends_with = { status = "canonical", batcher = "bt.ends_with" }
+enum = { status = "gap", need = "cs.enum", wave = "W11" }
+exclude = { status = "param", batcher = "bt.exclude", need = "exclude by dtype and by selector as well as by name", wave = "W2" }
+expand_selector = { status = "gap", need = "cs.expand_selector (resolve against a schema)", wave = "W11" }
+first = { status = "gap", need = "cs.first (first column; bt.first is an aggregate)", wave = "W11" }
+float = { status = "canonical", batcher = "bt.floating" }
+integer = { status = "canonical", batcher = "bt.integer" }
+is_selector = { status = "gap", need = "cs.is_selector", wave = "W11" }
+last = { status = "gap", need = "cs.last (last column; bt.last is an aggregate)", wave = "W11" }
+list = { status = "gap", need = "cs.list", wave = "W11" }
+matches = { status = "canonical", batcher = "bt.matches" }
+nested = { status = "gap", need = "cs.nested", wave = "W11" }
+numeric = { status = "canonical", batcher = "bt.numeric" }
+signed_integer = { status = "gap", need = "cs.signed_integer", wave = "W11" }
+starts_with = { status = "canonical", batcher = "bt.starts_with" }
+string = { status = "param", batcher = "bt.string", need = "include_categorical=", wave = "W2" }
+struct = { status = "gap", need = "cs.struct (bt.struct is a constructor)", wave = "W11" }
+temporal = { status = "canonical", batcher = "bt.temporal" }
+time = { status = "gap", need = "cs.time", wave = "W11" }
+unsigned_integer = { status = "gap", need = "cs.unsigned_integer", wave = "W11" }

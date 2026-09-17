@@ -31,7 +31,7 @@ def main() -> None:
     # The first order for each customer has no gap.
     firsts = spaced.filter(col("previous_order").is_null()).count()
     print("customers with a first order:", firsts)
-    assert firsts == orders.n_unique("o_custkey")
+    assert firsts == orders.count_distinct("o_custkey")
 
     gaps = spaced.filter(col("gap_days").is_not_null())
     stats = gaps.agg(
@@ -46,7 +46,7 @@ def main() -> None:
     # Customers who went quiet for more than a year between orders.
     quiet = gaps.filter(col("gap_days") > 365).select("o_custkey").distinct()
     print("customers with a year-long gap:", quiet.count())
-    assert quiet.count() < orders.n_unique("o_custkey")
+    assert quiet.count() < orders.count_distinct("o_custkey")
 
     # Every gap is non-negative, because the window is ordered by the same column it
     # measures — which is the invariant that catches an unordered window.

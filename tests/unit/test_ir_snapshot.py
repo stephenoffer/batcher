@@ -149,6 +149,7 @@ def _representatives() -> dict[str, Any]:
             ],
         ),
         "math2": Math2Expr("pow", _X, Lit(2)),
+        "math2_round_even": Math2Expr("round_even", _X, Lit(2)),
         "coalesce": Coalesce([_X, Lit(0)]),
         # --- nodes.py leaves ----------------------------------------------------
         "case": Case([(_PRED, Lit(1))], Lit(0)),
@@ -158,6 +159,8 @@ def _representatives() -> dict[str, Any]:
         "array": Array([Lit(1), Lit(2)]),
         "hash": HashRows([_X, _Y], 7),
         "hash_default_seed": HashRows([_X], 0),
+        # An engine-compatible digest names itself; Batcher's own stays off the wire.
+        "hash_algorithm": HashRows([_X, _Y], 42, "murmur3"),
         "sequence": Sequence(Lit(1), Lit(10), Lit(2)),
         "make_struct": MakeStruct([("a", _X), ("b", Lit(1))]),
         "make_map": MakeMap(_X, Lit(1)),
@@ -169,6 +172,13 @@ def _representatives() -> dict[str, Any]:
         "str_contains": StrFunc("contains", Col("s"), pattern="x"),
         "str_substr": StrFunc("substr", Col("s"), start=1, length=3),
         "str_replace": StrFunc("replace", Col("s"), pattern="a", replacement="b"),
+        # Another engine's semantics rides a tag or an existing slot, never a new field.
+        "str_regexp_replace_dollar": StrFunc(
+            "regexp_replace_all_dollar", Col("s"), pattern="(a)", replacement="$1"
+        ),
+        "str_xxhash64_seed": StrFunc("xxhash64", Col("s"), start=42),
+        "str_regexp_split_limit": StrFunc("regexp_split", Col("s"), pattern="-", length=2),
+        "str_mask_by_class": StrFunc("mask_by_class", Col("s"), pattern="Xxn\x00"),
         # The per-row-parameter form: each parameter is a child, and an absent one is
         # omitted rather than emitted as null.
         "str_dyn_full": StrFuncDyn(
@@ -178,18 +188,24 @@ def _representatives() -> dict[str, Any]:
         # --- date/time ----------------------------------------------------------
         "date_func": DateFunc("year", Col("d")),
         "date_trunc": DateTrunc(Col("d"), "month"),
+        # Polars readings: a Date kept a Date, the clock kept across the roll-back.
+        "date_trunc_flags": DateTrunc(Col("d"), "month", preserve_type=True, keep_time=True),
         "make_temporal": MakeTemporal("make_date", [Col("y"), Col("m"), Col("d")]),
         "convert_timezone": ConvertTimezone(Col("d"), "UTC", "America/New_York"),
         "date_offset_full": DateOffset(Col("d"), 1, 2, 3),
         "date_offset_partial": DateOffset(Col("d"), 0, 5, 0),  # omit zero months/micros
         "strftime": Strftime(Col("d"), "%Y-%m-%d"),
         "strptime": Strptime(Col("s"), "%Y-%m-%d"),
+        "strptime_strict": Strptime(Col("s"), "%Y-%m-%d", strict=True),
         "window_start_min": WindowStart(Col("d"), 1000),
         "window_start_origin": WindowStart(Col("d"), 1000, 500),
         "window_buckets": WindowBuckets(Col("d"), 1000, 500),
         # --- list / collection --------------------------------------------------
         "list_func": ListFunc("sum", Col("a")),
+        "list_func_nulls_first": ListFunc("sort_desc_nulls_first", Col("a")),
+        "list_func_with_nulls": ListFunc("unique_with_nulls", Col("a")),
         "list_binary": ListBinary("dot", Col("a"), Col("b")),
+        "list_binary_jaccard_nonzero": ListBinary("jaccard_nonzero", Col("a"), Col("b")),
         "list_set": ListSet("array_intersect", Col("a"), Col("b")),
         "list_zip": ListZip("list_add", Col("a"), Col("b")),
         "list_transform": ListTransform(Col("a"), _ELEM),
@@ -253,7 +269,17 @@ def _representatives() -> dict[str, Any]:
     # AggExpr is not an Expr: its to_ir takes an output alias.
     out["agg_unary"] = AggExpr("sum", _X).to_ir("total")
     out["agg_param"] = AggExpr("quantile", _X, param=0.5).to_ir("p50")
+    # The one W0 aggregate field: present only off its default, so `agg_param` above proves
+    # a linear quantile still serializes without it.
+    out["agg_interpolation"] = AggExpr("quantile", _X, param=0.25, interpolation="nearest").to_ir(
+        "q25"
+    )
     out["agg_binary"] = AggExpr("corr", _X, input2=_Y).to_ir("r")
+    # An ordered array_agg: `order_by` present only with keys, so `agg_unary` above proves an
+    # aggregate without them still serializes without the field.
+    out["agg_ordered_list"] = AggExpr(
+        "list_agg", _X, order_by=[(_Y, True, False), (_X, False, True)]
+    ).to_ir("xs")
     return out
 
 

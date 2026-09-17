@@ -125,17 +125,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("d").dt.week()).to_pydict()\n'
         "        {'r': [7]}"
     ),
-    "dayofweek": (
-        "The day of week, Sunday = 0 through Saturday = 6.\n\n"
-        "For ISO numbering use ``isodow``; they differ only on Sunday, as the example is.\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 18, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.dayofweek()).to_pydict()  # a Sunday\n'
-        "        {'r': [0]}"
-    ),
     "dayofyear": (
         "The day of year, 1 through 366.\n\n"
         "Examples:\n"
@@ -172,27 +161,7 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> pre.select(ms=bt.col("d").dt.epoch_ms()).to_pydict()\n'
         "        {'ms': [-750]}"
     ),
-    "dayname": (
-        'The full English weekday name, e.g. "Monday" (→ Utf8).\n\n'
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.dayname()).to_pydict()\n'
-        "        {'r': ['Thursday']}"
-    ),
-    "monthname": (
-        'The full English month name, e.g. "January" (→ Utf8).\n\n'
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.monthname()).to_pydict()\n'
-        "        {'r': ['February']}"
-    ),
-    "isodow": (
+    "weekday": (
         "The ISO day of week, Monday = 1 through Sunday = 7.\n\n"
         "For the DuckDB numbering (Sunday = 0 through Saturday = 6) use ``dayofweek``.\n\n"
         "Examples:\n"
@@ -200,7 +169,7 @@ _DESCRIPTIONS: dict[str, str] = {
         "        >>> import batcher as bt\n"
         "        >>> import datetime as dt\n"
         '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 18, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.isodow()).to_pydict()  # a Sunday\n'
+        '        >>> ds.select(r=bt.col("d").dt.weekday()).to_pydict()  # a Sunday\n'
         "        {'r': [7]}"
     ),
     "century": (
@@ -233,16 +202,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("d").dt.millennium()).to_pydict()\n'
         "        {'r': [3]}"
     ),
-    "last_day": (
-        "The last day of the instant's month (→ Date).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        "        >>> import datetime as dt\n"
-        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.last_day()).to_pydict()\n'
-        "        {'r': [datetime.date(2024, 2, 29)]}"
-    ),
     # --- .list per-row reductions over each list value ----------------------
     # The reductions return null on an empty or null list; len/n_unique return 0
     # for an empty list and null for a null list.
@@ -254,15 +213,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.len()).to_pydict()\n'
         "        {'r': [3]}"
-    ),
-    "sum": (
-        "The sum of the elements of each list.\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.sum()).to_pydict()\n'
-        "        {'r': [6]}"
     ),
     "min": (
         "The smallest element of each list.\n\n"
@@ -291,35 +241,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("xs").list.mean()).to_pydict()\n'
         "        {'r': [2.0]}"
     ),
-    "n_unique": (
-        "The count of distinct elements in each list (→ Int64).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.n_unique()).to_pydict()\n'
-        "        {'r': [3]}"
-    ),
-    "sort": (
-        "Each list sorted ascending (→ list).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.sort()).to_pydict()\n'
-        "        {'r': [[1, 2, 3]]}"
-    ),
-    "sort_desc": (
-        "Each list sorted descending, nulls last (\u2192 list).\n\n"
-        "Not the reverse of :meth:`sort`: ascending puts nulls last, so reversing would\n"
-        "move them to the front. DuckDB's ``list_reverse_sort`` leaves them at the back.\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[3, 1, None, 2]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.sort_desc()).to_pydict()\n'
-        "        {'r': [[3, 2, 1, None]]}"
-    ),
     "product": (
         "The product of the elements of each list.\n\n"
         "Examples:\n"
@@ -346,15 +267,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.var()).to_pydict()\n'
         "        {'r': [1.0]}"
-    ),
-    "unique": (
-        "The distinct elements of each list, first-seen order preserved (→ list).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.unique()).to_pydict()\n'
-        "        {'r': [[1, 2, 3]]}"
     ),
     "median": (
         "The median of the elements of each list (→ Float64).\n\n"

@@ -15,7 +15,7 @@ from __future__ import annotations
 from batcher._internal.errors import PlanError
 from batcher.api.dataset.dq.constraints import AggregateConstraint
 from batcher.plan.expr_ir import Col, count
-from batcher.plan.functions.aggregate import median, n_unique, std
+from batcher.plan.functions.aggregate import count_distinct, median, std
 from batcher.plan.functions.quantiles import quantile
 from batcher.plan.functions.statistics import null_rate, nunique_ratio
 
@@ -189,7 +189,7 @@ def distinct_count_between(
     """
     _bounds(f"distinct_count_between({column!r})", low, high)
     return AggregateConstraint(
-        f"distinct_count_between({column}, {low}, {high})", n_unique(Col(column)), low, high
+        f"distinct_count_between({column}, {low}, {high})", count_distinct(Col(column)), low, high
     )
 
 

@@ -19,7 +19,7 @@ from batcher.api.io_namespace._discovery import (
     unknown_attribute,
 )
 from batcher.api.session import read as _read
-from batcher.api.session import read_table as _read_table
+from batcher.api.session.read import _read_table
 from batcher.io.formats.sql.routing import read_backend
 
 if TYPE_CHECKING:

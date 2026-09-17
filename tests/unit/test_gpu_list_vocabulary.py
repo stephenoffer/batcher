@@ -108,10 +108,9 @@ def test_a_list_reduction_matches_the_engine(be, fn, table):
     _assert_matches_engine(ds, table, be)
 
 
-@pytest.mark.parametrize("fn", ["magnitude", "mean_pool", "max_pool", "is_unit_norm",
-                                "is_zero_vector", "sum_squares", "dim"])  # fmt: skip
+@pytest.mark.parametrize("fn", ["is_unit_norm", "is_zero_vector", "sum_squares"])
 def test_the_vector_spellings_reach_the_device(be, fn):
-    """The `.list` namespace's vector-shaped aliases lower onto the same reductions."""
+    """The `.list` namespace's vector-shaped predicates and measures lower onto reductions."""
     ds = bt.from_arrow(FLOATS).select(out=getattr(col("v").list, fn)())
     _assert_matches_engine(ds, FLOATS, be)
 
@@ -181,7 +180,7 @@ def test_the_end_elements(be, fn):
 
 
 def test_element_at_is_one_based(be):
-    ds = bt.from_arrow(FLOATS).select(out=col("v").list.element_at(1))
+    ds = bt.from_arrow(FLOATS).select(out=col("v").list.get(1))
     _assert_matches_engine(ds, FLOATS, be)
 
 
@@ -201,7 +200,7 @@ def test_membership_and_position(be, value):
 @pytest.mark.parametrize(
     "fn",
     ["dot", "cosine_similarity", "cosine_distance", "l1_distance", "l2_distance",
-     "euclidean_distance", "angular_distance", "hamming_distance"],
+     "angular_distance", "hamming_distance"],
 )  # fmt: skip
 def test_a_vector_function_matches_the_engine(be, fn):
     ds = bt.from_arrow(PAIRS).select(out=getattr(col("a").list, fn)(col("b")))

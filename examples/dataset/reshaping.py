@@ -39,7 +39,7 @@ def main() -> None:
     assert b["quarter"] == ["q1", "q2", "q1", "q2"]
 
     # `melt` is the pandas spelling of unpivot.
-    melted = wide.melt(id_vars=["region"], value_vars=["q1", "q2"]).to_pydict()
+    melted = wide.unpivot(index=["region"], on=["q1", "q2"]).to_pydict()
     assert len(melted[next(iter(melted))]) == 4
 
     # Explode a list column into one row per element.

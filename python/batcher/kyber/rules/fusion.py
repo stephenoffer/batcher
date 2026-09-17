@@ -192,16 +192,20 @@ def count_over_filter_to_count_if(node: Aggregate, _ctx: OptimizerContext) -> Lo
     report as 0), and a non-count aggregate over the filtered rows is not a plain mask
     count. Returns None otherwise, so the rule is a no-op on everything else.
     """
-    from batcher.plan.expr_ir import AggExpr, Lit, nullif, when
+    from batcher.plan.expr_ir import AggExpr, Lit, nullif
 
     if node.group_keys or not isinstance(node.input, Filter):
         return None
     if not node.aggregates or any(s.agg.func != "count_star" for s in node.aggregates):
         return None
     predicate = node.input.predicate
-    # `nullif(1, 1)` is an Int64 NULL: a null (or false) predicate yields null, which
-    # `count` skips — matching `WHERE p`, where a null predicate drops the row.
-    mask = when(predicate).then(Lit(1)).otherwise(nullif(Lit(1), Lit(1)))
+    # `nullif(p, false)` is TRUE where `p` holds and NULL where it is false or null, and
+    # `count` skips nulls — matching `WHERE p`, where a null predicate drops the row. It is
+    # the predicate itself with its falses masked, so the engine evaluates `p` and a bitmap
+    # operation. The `p ? 1 : nullif(1, 1)` it replaces built two Int64 literal columns, a
+    # third to compare them, and a zip, per morsel: 18% of a `LIKE 'the%'` count over TPC-H
+    # `lineitem`, whose predicate was the rest.
+    mask = nullif(predicate, Lit(False))
     new_aggs = tuple(
         AggregateSpec(alias=s.alias, agg=AggExpr("count", mask)) for s in node.aggregates
     )

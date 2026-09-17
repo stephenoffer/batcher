@@ -43,7 +43,7 @@ def main() -> None:
     # Anonymous access needs no credentials configured, which is what makes this corpus
     # usable as a fixture.
     named = inferred.select(nationkey=col("column0"), name=col("column1")).sort("nationkey")
-    result = named.head(3).to_pydict()
+    result = named.limit(3).to_pydict()
     print(result)
     assert result["name"][0] == "ALGERIA"
 

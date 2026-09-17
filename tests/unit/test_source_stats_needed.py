@@ -83,7 +83,7 @@ def test_only_the_aggregates_that_read_column_statistics_name_their_input():
     assert column_bounds_needed(_ds().agg(n=col("x").count())._plan) == {"x"}
     # No rule reads the input column's statistics for these, so neither does the collector.
     assert column_bounds_needed(_ds().agg(q=col("x").quantile(0.5))._plan) == set()
-    assert column_bounds_needed(_ds().agg(d=col("x").n_unique())._plan) == set()
+    assert column_bounds_needed(_ds().agg(d=col("x").count_distinct())._plan) == set()
 
 
 def test_sort_keys_are_named_as_needed():

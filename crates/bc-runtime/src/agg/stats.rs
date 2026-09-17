@@ -391,6 +391,22 @@ pub(crate) fn finalize_skewness(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeE
     })
 }
 
+/// `skewness_pop` — the **population** (biased) skewness `g1 = m3 / m2^1.5`, where
+/// [`finalize_skewness`] applies the sample correction `sqrt(n(n-1))/(n-2)`. It is the value
+/// Spark's `skewness`, Polars' `skew()` and Daft's `skew` return by default.
+///
+/// Null for an empty group and for one with no variance, the same conditions
+/// [`finalize_kurtosis_pop`] (and DuckDB's `kurtosis_pop`) use. Spark agrees on both; Polars
+/// answers `NaN` for the zero-variance case, which the null here does not reproduce.
+pub(crate) fn finalize_skewness_pop(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
+    moment_finalize(state, |n, m2, m3, _m4| {
+        if n < 1.0 || m2 <= 0.0 {
+            return None;
+        }
+        Some(m3 / (m2 * m2.sqrt()))
+    })
+}
+
 /// Sample excess kurtosis (matching DuckDB): the bias-corrected fourth standardized
 /// moment, `0` for a normal distribution. Null when n < 4 or the variance is zero.
 pub(crate) fn finalize_kurtosis(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
@@ -448,6 +464,56 @@ fn moment_finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skewness_pop_matches_spark_and_polars_and_merges() {
+        // Spark's documented `skewness` of [1, 1, 2] is 0.7071067811865...
+        // (python/pyspark/sql/functions/builtin.py), and Polars' `skew()` of
+        // [1, 2, 10, 4] is 0.8483206969390205.
+        let pick = |x: &[f64]| {
+            let g = vec![0u32; x.len()];
+            let st = moment_state(&f64s(x), &g, 1, AggFunc::SkewnessPop).unwrap();
+            let out = finalize_skewness_pop(&st).unwrap();
+            let a = out.as_primitive::<Float64Type>();
+            a.is_valid(0).then(|| a.value(0))
+        };
+        let spark = pick(&[1.0, 1.0, 2.0]).unwrap();
+        assert!(
+            (spark - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12,
+            "{spark}"
+        );
+        let polars = pick(&[1.0, 2.0, 10.0, 4.0]).unwrap();
+        assert!((polars - 0.848_320_696_939_020_5).abs() < 1e-12, "{polars}");
+        // Defined from one row up, unlike the sample form's three: [1, 2] is symmetric.
+        assert_eq!(pick(&[1.0, 2.0]), Some(0.0));
+        // No variance (and so one row) and an empty group are null.
+        assert_eq!(pick(&[3.0, 3.0]), None);
+        assert_eq!(pick(&[3.0]), None);
+        assert_eq!(pick(&[]), None);
+
+        // Mergeable: two partials combined in either order finalize to the whole input.
+        let x = [1.0, 2.0, 10.0, 4.0, 7.5, -3.0];
+        let whole = finalize_skewness_pop(
+            &moment_state(&f64s(&x), &[0u32; 6], 1, AggFunc::SkewnessPop).unwrap(),
+        )
+        .unwrap();
+        let p1 = moment_state(&f64s(&x[..2]), &[0u32; 2], 1, AggFunc::SkewnessPop).unwrap();
+        let p2 = moment_state(&f64s(&x[2..]), &[0u32; 4], 1, AggFunc::SkewnessPop).unwrap();
+        for (a, b) in [(&p1, &p2), (&p2, &p1)] {
+            let cat: Vec<ArrayRef> = a
+                .iter()
+                .zip(b.iter())
+                .map(|(l, r)| arrow::compute::concat(&[l.as_ref(), r.as_ref()]).unwrap())
+                .collect();
+            let merged =
+                finalize_skewness_pop(&merge_moments(&cat, &[0u32, 0], 1).unwrap()).unwrap();
+            let (w, m) = (
+                whole.as_primitive::<Float64Type>().value(0),
+                merged.as_primitive::<Float64Type>().value(0),
+            );
+            assert!((w - m).abs() < 1e-12, "{w} vs {m}");
+        }
+    }
 
     fn f64s(v: &[f64]) -> ArrayRef {
         Arc::new(Float64Array::from(v.to_vec()))

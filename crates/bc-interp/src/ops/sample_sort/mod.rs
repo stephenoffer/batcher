@@ -54,11 +54,12 @@ use crate::error::InterpError;
 /// `i64` orders it — a month is not a fixed number of days, so two intervals are not even
 /// totally ordered by duration.
 ///
-/// `Time32` *is* one integer, and arrow simply will not cast it: `can_cast_types(Time32, Int64)`
-/// is false in arrow-rs, and arrow C++ refuses `date32 -> int64` as well, so this is a gap the
-/// two implementations already answer differently rather than a hypothetical. Admitting it would
-/// turn `ORDER BY <a time column>` from a working serial sort into a **raise**. The routing
-/// below declines on a failed cast for the same reason, so this list being wrong costs a missed
+/// `Time32` *is* one integer. Through arrow-rs 56 `can_cast_types(Time32, Int64)` was false, and
+/// admitting it then would have turned `ORDER BY <a time column>` from a working serial sort into
+/// a **raise**. arrow-rs 60 casts it, so admitting it is now possible — but it is a routing
+/// change (serial -> parallel sort for time columns) that wants its own differential and
+/// benchmark run, not a ride-along on a dependency upgrade, so it stays out for now. The routing
+/// below declines on a failed cast regardless, so this list being wrong costs a missed
 /// optimization and never an error.
 fn is_integer_ordered_temporal(dt: &DataType) -> bool {
     matches!(
@@ -1207,15 +1208,17 @@ mod tests {
                 "{dt:?} is admitted but arrow cannot cast it to Int64"
             );
         }
-        // Arrow cannot widen `Time32`, so it must stay out of the routing and keep the serial
-        // sort — which is correct, only sequential.
+        // Arrow 60 widens `Time32` (arrow 56 did not), but admitting it is a routing change
+        // deferred to its own measured change (see `is_integer_ordered_temporal`); until then it
+        // keeps the serial sort — which is correct, only sequential. The cast assertion records
+        // the arrow fact, so a future arrow that stops casting it is noticed too.
         for dt in [
             DataType::Time32(TimeUnit::Second),
             DataType::Time32(TimeUnit::Millisecond),
         ] {
             assert!(
-                !can_cast_types(&dt, &DataType::Int64),
-                "{dt:?} now casts — admit it"
+                can_cast_types(&dt, &DataType::Int64),
+                "{dt:?} no longer casts to Int64 under this arrow"
             );
             assert!(
                 !is_integer_ordered_temporal(&dt),

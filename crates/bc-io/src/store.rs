@@ -754,7 +754,11 @@ mod tests {
             ("s3a://bucket/a/b.parquet", "a/b.parquet"),
             ("gs://bucket/a/b.parquet", "a/b.parquet"),
             ("abfss://fs@acct.dfs.core.windows.net/a/b", "a/b"),
-            ("az://container/a/b.parquet", "b.parquet"), // container is stripped
+            // The container is the *host*, so the whole URL path is the object. object_store
+            // 0.12 also dropped the first path segment here (`b.parquet`), which addressed a
+            // different object than the fsspec/adlfs fallback reads for the same URI; 0.14
+            // parses `az://` like `abfs://`, and this pins the corrected answer.
+            ("az://container/a/b.parquet", "a/b.parquet"),
             ("http://host/a/b.parquet", "a/b.parquet"),
             ("https://host.example/a/b.parquet", "a/b.parquet"),
             // Path-style S3 over HTTPS: the leading segment is the bucket.

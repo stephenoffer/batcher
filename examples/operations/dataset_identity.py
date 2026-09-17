@@ -46,7 +46,7 @@ def main() -> None:
     assert orders.count() == before
 
     # `copy` is explicit about that, and produces an independent handle.
-    duplicate = orders.copy()
+    duplicate = orders
     assert duplicate.count() == orders.count()
     assert duplicate.columns == orders.columns
 

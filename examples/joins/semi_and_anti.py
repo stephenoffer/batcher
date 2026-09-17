@@ -40,7 +40,7 @@ def main() -> None:
     assert inner.count() > with_lines.count()
 
     # An anti join is the orphan check: these order keys really are absent downstream.
-    missing = without_lines.select("o_orderkey").head(5).to_pydict()["o_orderkey"]
+    missing = without_lines.select("o_orderkey").limit(5).to_pydict()["o_orderkey"]
     for key in missing:
         assert lineitem.filter(col("l_orderkey") == key).count() == 0
 

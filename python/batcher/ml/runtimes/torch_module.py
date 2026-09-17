@@ -317,7 +317,7 @@ def torch_predictor(
             ...     output_columns=["logits"],
             ...     channels_last=True,
             ... )
-            >>> ds.ml.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
+            >>> ds.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
 
     Args:
         model: a built ``nn.Module``, a TorchScript path, a pickled module path, or a
@@ -346,7 +346,7 @@ def torch_predictor(
         pipeline_depth: forwards to keep in flight so the device is not idle between them.
 
     Returns:
-        A class for ``ds.ml.map_batches(...)`` — the module loads once per worker.
+        A class for ``ds.map_batches(...)`` — the module loads once per worker.
     """
     columns = list(input_columns)
     forward_names = list(input_names) if input_names is not None else None

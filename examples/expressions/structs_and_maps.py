@@ -42,7 +42,7 @@ def main() -> None:
 
     # Compose: a struct field feeds any other expression.
     initials = people.select(
-        initials=col("who").struct.field("first").str.head(1).str.to_uppercase()
+        initials=col("who").struct.field("first").str.left(1).str.upper()
     ).to_pydict()
     assert initials["initials"] == ["A", "A"]
 

@@ -349,14 +349,53 @@ fn eval_partial_with(
             None => None,
         };
         evaluated[i] = values.clone();
-        // The ordering key for arg_min/arg_max (the aggregate's second input).
-        let key = match &item.input2 {
-            Some(expr) => Some(eval_input2(i, expr)?),
-            None => None,
+        // The ordering key for arg_min/arg_max (the aggregate's second input), or an ordered
+        // `list_agg`'s encoded order keys.
+        let key = if !item.order_by.is_empty() {
+            Some(encode_agg_order_keys(batch, item)?)
+        } else {
+            match &item.input2 {
+                Some(expr) => Some(eval_input2(i, expr)?),
+                None => None,
+            }
         };
         calls.push(AggCall::with_key(map_agg_func(item), values, key));
     }
     Ok(agg::partial(&group_arrays, &calls, batch.num_rows())?)
+}
+
+/// An ordered `list_agg`'s `ORDER BY` keys for `batch`, row-encoded into one sortable column.
+///
+/// Evaluated on the interpreter in both the interpreted and the JIT partial: the keys only feed
+/// an encoding, and one evaluation path is what keeps the two partials identical by
+/// construction. Each key is normalized the way every sort in the engine normalizes it
+/// ([`normalize_sort_key`]), so an ordered aggregate ranks `-0.0`, NaN and an all-null key
+/// exactly as `ORDER BY` does. Any other aggregate carrying keys is refused rather than
+/// silently computed unordered.
+fn encode_agg_order_keys(
+    batch: &RecordBatch,
+    item: &AggregateItem,
+) -> Result<ArrayRef, InterpError> {
+    if !matches!(item.func, AggFunc::ListAgg) {
+        return Err(bc_runtime::RuntimeError::OrderByNotSupported {
+            func: map_agg_func(item).name().to_string(),
+        }
+        .into());
+    }
+    let keys = item
+        .order_by
+        .iter()
+        .map(|k| {
+            Ok((
+                normalize_sort_key(k.expr.eval(batch)?),
+                SortOptions {
+                    descending: k.descending,
+                    nulls_first: k.nulls_first,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, InterpError>>()?;
+    Ok(agg::encode_order_keys(&keys)?)
 }
 
 pub(crate) fn eval_partial(
@@ -644,16 +683,20 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
         AggFunc::Var => agg::AggFunc::Var,
         AggFunc::Stddev => agg::AggFunc::Stddev,
         AggFunc::Median => agg::AggFunc::Median,
-        // Quantile in [0,1] → permille (median is the 0.5 default).
-        AggFunc::Quantile => {
-            agg::AggFunc::Quantile((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
-        }
+        // The fraction rides at full precision (median is the 0.5 default); a permille here
+        // once turned `quantile(x, 0.1234)` into the 0.123 quantile.
+        AggFunc::Quantile => agg::AggFunc::Quantile(
+            agg::Fraction::new(item.param.unwrap_or(0.5)),
+            item.interpolation.unwrap_or_default(),
+        ),
+        // The keys are what make the list ordered; without them it is the arrival-order form.
+        AggFunc::ListAgg if !item.order_by.is_empty() => agg::AggFunc::ListAggOrdered,
         AggFunc::ListAgg => agg::AggFunc::ListAgg,
         AggFunc::BoolAnd => agg::AggFunc::BoolAnd,
         AggFunc::BoolOr => agg::AggFunc::BoolOr,
         AggFunc::ApproxCountDistinct => agg::AggFunc::ApproxCountDistinct,
         AggFunc::ApproxQuantile => {
-            agg::AggFunc::ApproxQuantile((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
+            agg::AggFunc::ApproxQuantile(agg::Fraction::new(item.param.unwrap_or(0.5)))
         }
         AggFunc::Mode => agg::AggFunc::Mode,
         // The contiguity fraction rides `param`, exactly as the quantile does; the default
@@ -680,15 +723,18 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
         AggFunc::AnyValue => agg::AggFunc::AnyValue,
         AggFunc::Entropy => agg::AggFunc::Entropy,
         AggFunc::Mad => agg::AggFunc::Mad,
-        // Same permille encoding as `Quantile`: the param is a fraction on the wire and
-        // an integer permille in the runtime, so the two cannot drift apart.
+        // The same full-precision fraction as `Quantile`.
         AggFunc::QuantileDisc => {
-            agg::AggFunc::QuantileDisc((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
+            agg::AggFunc::QuantileDisc(agg::Fraction::new(item.param.unwrap_or(0.5)))
         }
         // `k` is a count, not a fraction, so it rides `param` unscaled.
         AggFunc::ApproxTopK => agg::AggFunc::ApproxTopK(item.param.unwrap_or(1.0).round() as u16),
         AggFunc::KurtosisPop => agg::AggFunc::KurtosisPop,
         AggFunc::KahanSum => agg::AggFunc::KahanSum,
+        AggFunc::ArgMinNull => agg::AggFunc::ArgMinNull,
+        AggFunc::ArgMaxNull => agg::AggFunc::ArgMaxNull,
+        AggFunc::SkewnessPop => agg::AggFunc::SkewnessPop,
+        AggFunc::Modes => agg::AggFunc::Modes,
     }
 }
 
@@ -1549,13 +1595,27 @@ pub(crate) fn window_batch_with(
             frame: map_frame(f.frame)?,
             alpha: f.alpha,
             half_life: f.half_life,
+            ignore_nulls: f.ignore_nulls,
         });
     }
 
-    // `rank_limit` goes *down* to the per-bucket kernel rather than being applied here: the
-    // bounded top-N it enables must inherit `window_with`'s parallelism, not replace it. The
-    // mask below still runs — the bounded path marks a non-survivor `k + 1` — so this is a
-    // pure short-circuit and the filter stays the one place the bound is enforced.
+    // A fused `QUALIFY <rank> <= k` asks only for the rows it keeps, so gather those rather
+    // than computing every row's result and masking all but `k` per partition away. The
+    // survivors come back in input order, so this is the same batch the mask produced.
+    if let Some(k) = rank_limit {
+        let kept = window::window_with_rank_limit(
+            &part_arrays,
+            &order_arrays,
+            &calls,
+            num_rows,
+            parallel_row_threshold,
+            k,
+        )?;
+        let rows = arrow::array::UInt32Array::from(kept.rows);
+        let taken = arrow::compute::take_record_batch(batch, &rows)?;
+        return append_window_columns(&taken, functions, &kept.columns);
+    }
+
     let cols = window::window_with(
         &part_arrays,
         &order_arrays,
@@ -1565,52 +1625,30 @@ pub(crate) fn window_batch_with(
         rank_limit,
     )?;
 
-    // input columns + one appended column per function alias.
-    let in_schema = batch.schema();
-    let mut fields: Vec<Field> = in_schema
+    append_window_columns(batch, functions, &cols)
+}
+
+/// `batch` with one column appended per window function, named by its alias.
+fn append_window_columns(
+    batch: &RecordBatch,
+    functions: &[WindowFunc],
+    cols: &[ArrayRef],
+) -> Result<RecordBatch, InterpError> {
+    let mut fields: Vec<Field> = batch
+        .schema()
         .fields()
         .iter()
         .map(|f| f.as_ref().clone())
         .collect();
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    for (f, col) in functions.iter().zip(&cols) {
+    for (f, col) in functions.iter().zip(cols) {
         fields.push(Field::new(&f.alias, col.data_type().clone(), true));
         columns.push(col.clone());
     }
-    let out = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-    // Fused `QUALIFY <rank> <= k`: keep only rows whose ranking value is within the
-    // limit. The optimizer sets `rank_limit` only for a single ranking function, so
-    // the bound applies to the first appended column (`cols[0]`). This is exactly
-    // `Filter(Window, rank <= k)` — but fused, so the full windowed batch is never
-    // emitted downstream and the separate filter is gone.
-    match (rank_limit, cols.first()) {
-        (Some(k), Some(rank_col)) => Ok(filter_by_rank_limit(&out, rank_col, k)?),
-        _ => Ok(out),
-    }
-}
-
-/// Keep rows of `batch` whose `rank_col` value is `<= limit` (a fused per-partition
-/// top-N). `rank_col` is a ranking output (`row_number`/`rank`/`dense_rank`), whose
-/// per-partition values start at 1, so a global `<= limit` mask selects the top rows
-/// of every partition at once.
-fn filter_by_rank_limit(
-    batch: &RecordBatch,
-    rank_col: &ArrayRef,
-    limit: usize,
-) -> Result<RecordBatch, InterpError> {
-    use arrow::array::Int64Array;
-    use arrow::compute::filter_record_batch;
-
-    let ranks = rank_col
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("ranking window functions (row_number/rank/dense_rank) produce Int64 output");
-    let limit = limit as i64;
-    let mask: BooleanArray = ranks
-        .iter()
-        .map(|v| Some(v.is_some_and(|r| r <= limit)))
-        .collect();
-    Ok(filter_record_batch(batch, &mask)?)
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 fn map_window_func(f: WindowFn) -> window::WindowFn {
@@ -1729,8 +1767,10 @@ mod input_alias_tests {
             func,
             input,
             input2,
+            order_by: Vec::new(),
             alias: "a".into(),
             param: None,
+            interpolation: None,
         }
     }
 

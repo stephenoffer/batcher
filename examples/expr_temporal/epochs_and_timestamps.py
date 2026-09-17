@@ -19,7 +19,7 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderdate").head(200)
+    orders = tpch("orders").select("o_orderdate").limit(200)
 
     converted = orders.select(
         "o_orderdate",
@@ -30,7 +30,7 @@ def main() -> None:
         nanos=col("stamp").dt.epoch_ns(),
     )
 
-    result = converted.head(2).to_pydict()
+    result = converted.limit(2).to_pydict()
     print(result)
 
     full = converted.to_pydict()

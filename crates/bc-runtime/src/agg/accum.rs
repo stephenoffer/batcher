@@ -10,7 +10,9 @@ use arrow::array::{
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Decimal128Type, Float64Type, Int64Type};
 
-use super::{accumulate, arg_extreme_state, covar_state, AggCall, AggFunc, Partial};
+use super::{
+    accumulate, arg_extreme_state, covar_state, ordered_list_state, AggCall, AggFunc, Partial,
+};
 use crate::error::RuntimeError;
 
 /// Produce the partial-state columns for one aggregate call. The two-input functions
@@ -22,12 +24,21 @@ pub(super) fn accumulate_call(
     num_groups: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
     match call.func {
-        AggFunc::ArgMin | AggFunc::ArgMax => arg_extreme_state(
+        AggFunc::ArgMin | AggFunc::ArgMax | AggFunc::ArgMinNull | AggFunc::ArgMaxNull => {
+            arg_extreme_state(
+                require(call.values.as_ref(), call.func)?,
+                require(call.key.as_ref(), call.func)?,
+                group_ids,
+                num_groups,
+                matches!(call.func, AggFunc::ArgMax | AggFunc::ArgMaxNull),
+                matches!(call.func, AggFunc::ArgMin | AggFunc::ArgMax),
+            )
+        }
+        AggFunc::ListAggOrdered => ordered_list_state(
             require(call.values.as_ref(), call.func)?,
             require(call.key.as_ref(), call.func)?,
             group_ids,
             num_groups,
-            matches!(call.func, AggFunc::ArgMax),
         ),
         AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => covar_state(
             require(call.values.as_ref(), call.func)?,
@@ -1208,12 +1219,20 @@ mod global_partial_tests {
             AggFunc::Var,
             AggFunc::Stddev,
             AggFunc::Median,
-            AggFunc::Quantile(250),
-            AggFunc::QuantileDisc(250),
-            AggFunc::ApproxQuantile(500),
+            AggFunc::Quantile(
+                crate::agg::Fraction::new(0.25),
+                crate::agg::QuantileInterpolation::Linear,
+            ),
+            AggFunc::QuantileDisc(crate::agg::Fraction::new(0.25)),
+            AggFunc::ApproxQuantile(crate::agg::Fraction::new(0.5)),
             AggFunc::ApproxCountDistinct,
+            AggFunc::Quantile(
+                crate::agg::Fraction::new(0.3),
+                crate::agg::QuantileInterpolation::Nearest,
+            ),
             AggFunc::ListAgg,
             AggFunc::Mode,
+            AggFunc::Modes,
             // The contiguity statistics ride `Median`'s state, so they must agree with the
             // scatter path exactly as it does — this list is what says so if they stop.
             AggFunc::NLength(500),
@@ -1227,6 +1246,7 @@ mod global_partial_tests {
             AggFunc::KahanSum,
             AggFunc::ApproxTopK(2),
             AggFunc::Skewness,
+            AggFunc::SkewnessPop,
             AggFunc::Kurtosis,
             AggFunc::KurtosisPop,
             AggFunc::BitAnd,
@@ -1245,6 +1265,8 @@ mod global_partial_tests {
         for func in [
             AggFunc::ArgMin,
             AggFunc::ArgMax,
+            AggFunc::ArgMinNull,
+            AggFunc::ArgMaxNull,
             AggFunc::CovarPop,
             AggFunc::CovarSamp,
             AggFunc::Corr,

@@ -41,7 +41,9 @@ fn luma_square(data: &[u8], side: u32) -> Option<Vec<f64>> {
         return None;
     }
     Some(
-        rgb.chunks_exact(3)
+        rgb.as_chunks::<3>()
+            .0
+            .iter()
             .map(|p| f64::from(rec601([p[0], p[1], p[2]])))
             .collect(),
     )

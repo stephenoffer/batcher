@@ -1,19 +1,13 @@
-"""Ecosystem-compatible spellings bound onto `Expr`.
+"""Migration-error guidance for `Expr` and its typed accessors.
 
-Batcher keeps one canonical name per capability (the SQL/Polars spelling). This
-package adds the pandas names for the same operations, so a ported script runs
-without a find-and-replace pass. Every alias is a thin delegation to the primary —
-one implementation, one plan, no second semantics.
-
-The aliases live here rather than in `core.py` so the fluent builder stays the
-one-`Expr` hierarchy instead of carrying a parallel copy of its own surface;
-`bind_compat_methods` attaches them at import time, the same way the typed
-accessors are bound in `namespaces/_bind.py`.
+Batcher keeps one spelling per capability. When a migrant types a name `Expr` does not
+carry, `Expr.__getattr__` and the accessor hooks raise an `AttributeError` that names the
+Batcher spelling: from the curated tables in `guidance` first, then from the migration
+registry (`batcher._internal.migration`), which also knows every spelling Batcher removed.
 """
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir.compat.binder import bind_compat_methods
 from batcher.plan.expr_ir.compat.guidance import (
     DT_UNSUPPORTED,
     LIST_UNSUPPORTED,
@@ -27,6 +21,5 @@ __all__ = [
     "LIST_UNSUPPORTED",
     "STR_UNSUPPORTED",
     "accessor_attribute_error",
-    "bind_compat_methods",
     "expr_attribute_error",
 ]

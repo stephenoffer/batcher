@@ -83,7 +83,7 @@ SCALAR = [
     # against Polars in its own test below.
     (
         "clip_max",
-        lambda: bt.col("x").clip_max(2.0),
+        lambda: bt.col("x").clip(upper=2.0),
         "CASE WHEN x IS NULL THEN NULL ELSE least(x, 2.0) END",
     ),
     ("is_even", lambda: bt.col("i").is_even(), "i % 2 = 0"),
@@ -113,7 +113,7 @@ def test_clip_max_leaves_a_missing_value_missing(duck):
     here because the SQL spelling is the obvious oracle and it is the wrong one.
     """
     polars = pytest.importorskip("polars")
-    ours = bt.from_pydict({"x": ROWS["x"]}).select(v=bt.col("x").clip_max(2.0)).to_pydict()["v"]
+    ours = bt.from_pydict({"x": ROWS["x"]}).select(v=bt.col("x").clip(upper=2.0)).to_pydict()["v"]
     theirs = (
         polars.DataFrame({"x": ROWS["x"]})
         .select(polars.col("x").clip(upper_bound=2.0))

@@ -1,25 +1,84 @@
-"""The default SQL catalog: `bt.sql`, `bt.register_function` and `bt.register_model`.
+"""The default session: `bt.sql`, `bt.register_function`, `bt.register_model` and its accessors.
 
 A process-global `Session` backs all three, so ``CREATE TABLE AS`` in one call is
-visible to the next. `bt.Session` is the public handle for an isolated catalog.
+visible to the next, and `ds.write.table` resolves table names against it when no session
+is passed. `bt.current_session` returns it and `bt.set_session` replaces it; `bt.Session`
+builds an isolated one.
+
+`bt.sql_expr` and `bt.call_function` sit beside them: they reach the same SQL function
+table for a single expression, read in the default session's dialect unless told otherwise.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
 from batcher.api.sql_session import Session
 
-__all__ = ["register_function", "register_model", "sql"]
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir import Expr
 
-# The process-global default SQL session, backing the module-level `sql` /
-# `register_function` below. It is intentionally private: `bt.sql(...)` is the one
-# obvious entry point for the default catalog, and `bt.Session` is the public handle
-# for an isolated one.
-_catalog = Session()
+__all__ = [
+    "call_function",
+    "current_session",
+    "register_function",
+    "register_model",
+    "set_session",
+    "sql",
+    "sql_expr",
+]
+
+# The process-global default session, backing the module-level `sql` / `register_function`
+# below. A one-slot list so `set_session` can replace it without a `global` statement.
+_default: list[Session] = [Session()]
+
+
+def current_session() -> Session:
+    """The process-default `Session` that `bt.sql` and `ds.write.table` use.
+
+    Spark's ``SparkSession.active()`` and Daft's ``current_session()``. Tables created with
+    ``bt.sql("CREATE TABLE ...")`` and catalogs attached to it are visible to every later
+    `bt.sql` call in the process.
+
+    Returns:
+        The default session.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.current_session().catalog.current_catalog()
+            'memory'
+    """
+    return _default[0]
+
+
+def set_session(session: Session) -> None:
+    """Make `session` the process default that `bt.sql` and `ds.write.table` use.
+
+    Args:
+        session: The session to install.
+
+    Raises:
+        PlanError: `session` is not a `bt.Session`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> previous = bt.current_session()
+            >>> s = bt.Session()
+            >>> bt.set_session(s)
+            >>> bt.current_session() is s
+            True
+            >>> bt.set_session(previous)
+    """
+    if not isinstance(session, Session):
+        raise PlanError(f"set_session() takes a bt.Session, got {type(session).__name__}")
+    _default[0] = session
 
 
 def _bind(tables: Mapping[str, Any]) -> dict[str, Any]:
@@ -107,8 +166,86 @@ def sql(
             )
         bound.update(tables)
     bound.update(kwargs)
-    session = _catalog if dialect is None else _catalog._with_dialect(dialect)
+    default = current_session()
+    session = default if dialect is None else default._with_dialect(dialect)
     return session._run(query, _bind(bound))
+
+
+def sql_expr(text: str, *, dialect: str | None = None) -> Expr:
+    """Parse one SQL expression into an `Expr` (Polars and Daft ``sql_expr``, Spark ``expr``).
+
+    The text is translated by the same function table `bt.sql` uses, so a function spelled
+    in SQL has the meaning it has in a query. A trailing ``AS name`` becomes an alias, which
+    makes ``ds.select(bt.sql_expr("a + 1 AS b"))`` the spelling of Spark's ``selectExpr``.
+    Column references stay names, resolved when the expression is used. An aggregate call
+    becomes an aggregate expression for `agg`.
+
+    Window functions (``OVER``) and functions registered with `bt.register_function` need a
+    relation and are refused; use `bt.sql` for those.
+
+    Args:
+        text: One SQL expression, optionally ending in ``AS name``.
+        dialect: The sqlglot read dialect, such as ``"spark"``; the default catalog's
+            dialect (``duckdb``) when omitted.
+
+    Returns:
+        The expression, aliased when the text carries ``AS name``.
+
+    Raises:
+        PlanError: If `text` is not valid SQL, is a query or statement rather than an
+            expression, or uses a construct an expression cannot carry.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2], "s": ["a", "b"]})
+            >>> ds.select(bt.sql_expr("x + 1 AS y"), bt.sql_expr("upper(s)").alias("u")).to_pydict()
+            {'y': [2, 3], 'u': ['A', 'B']}
+
+            >>> ds.agg(bt.sql_expr("sum(x) AS total")).to_pydict()
+            {'total': [3]}
+    """
+    from batcher._sql.expression import parse_sql_expression
+
+    return parse_sql_expression(text, dialect=dialect or _default[0]._dialect)
+
+
+def call_function(name: str, *args: Any, dialect: str | None = None) -> Expr:
+    """Call a SQL function by name on expression arguments (Spark ``call_function``).
+
+    The name is looked up in the SQL function table, the one `bt.sql` and `bt.sql_expr`
+    read, so any function a query can call is reachable without its own Python constructor.
+    A string argument is a column name, as in Spark. A Python number, or a ``bt.lit``
+    constant, is passed as a SQL literal, which the functions that need a constant argument
+    require.
+
+    Args:
+        name: The SQL function name, such as ``"pmod"`` or ``"find_in_set"``.
+        *args: The arguments: expressions, column names, or constants.
+        dialect: The sqlglot read dialect whose function names apply; the default
+            catalog's dialect (``duckdb``) when omitted.
+
+    Returns:
+        The expression the call translates to.
+
+    Raises:
+        PlanError: If `name` is not a function name or the call does not translate.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [-10, 7], "csv": ["a,b", "b,c"]})
+            >>> ds.select(
+            ...     m=bt.call_function("pmod", "a", 3, dialect="spark"),
+            ...     p=bt.call_function("find_in_set", bt.lit("b"), "csv", dialect="spark"),
+            ... ).to_pydict()
+            {'m': [2, 1], 'p': [2, 1]}
+    """
+    from batcher._sql.expression import call_sql_function
+
+    return call_sql_function(name, args, dialect=dialect or _default[0]._dialect)
 
 
 def register_function(name: str, fn: Callable, **options: Any) -> None:
@@ -133,7 +270,7 @@ def register_function(name: str, fn: Callable, **options: Any) -> None:
             >>> bt.sql("SELECT dbl(x) AS y FROM t", t=t).to_pydict()
             {'y': [2, 4, 6]}
     """
-    _catalog.register_function(name, fn, **options)
+    current_session().register_function(name, fn, **options)
 
 
 def register_model(name: str, model: Any) -> None:
@@ -162,4 +299,4 @@ def register_model(name: str, model: Any) -> None:
             >>> [round(v, 6) for v in scored.to_pydict()["prediction"]]
             [10.0]
     """
-    _catalog.register_model(name, model)
+    current_session().register_model(name, model)

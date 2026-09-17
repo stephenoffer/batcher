@@ -24,7 +24,6 @@ def ds() -> bt.Dataset:
     [
         pytest.param(lambda d: d.ml.to_numpy_batches(columns=["nope"]), id="to_numpy_batches"),
         pytest.param(lambda d: d.ml.iter_torch_batches(columns=["nope"]), id="iter_torch_batches"),
-        pytest.param(lambda d: d.ml.to_torch(columns=["nope"]), id="to_torch"),
         pytest.param(lambda d: d.ml.to_tf(columns=["nope"]), id="to_tf"),
         pytest.param(
             lambda d: d.ml.to_torch_dataloader(columns=["nope"]), id="to_torch_dataloader"

@@ -58,7 +58,7 @@ def _mapped(path: str):
     the schema rather than only on row order. `output_columns` declares that column to the
     planner, which a UDF's opaque output otherwise cannot state.
     """
-    return bt.read_parquet(path).map_batches(
+    return bt.read.parquet(path).map_batches(
         lambda b: b.append_column("d", pa.array([v * 2 for v in b.column("v").to_pylist()])),
         output_columns=["k", "v", "g", "w", "d"],
     )
@@ -68,7 +68,7 @@ def test_the_source_really_splits(parquet_path):
     """Without this the file is vacuous: a non-splittable source hides every missing route."""
     from batcher.dist.executor import _is_splittable_source
 
-    assert _is_splittable_source(bt.read_parquet(parquet_path)._sources[0])
+    assert _is_splittable_source(bt.read.parquet(parquet_path)._sources[0])
 
 
 def test_map_then_sort_matches_single_node(parquet_path):
@@ -83,14 +83,14 @@ def test_map_then_sort_matches_single_node(parquet_path):
 
 
 def test_map_then_distinct_matches_duckdb(duck, parquet_path):
-    duck.register("t", bt.read_parquet(parquet_path).collect())
+    duck.register("t", bt.read.parquet(parquet_path).collect())
     ds = _mapped(parquet_path).select("k").distinct()
     got = ds.collect(distributed=True, num_workers=_W)
     assert_same(got, duck.sql("SELECT DISTINCT k FROM t"))
 
 
 def test_map_then_window_matches_duckdb(duck, parquet_path):
-    duck.register("t", bt.read_parquet(parquet_path).collect())
+    duck.register("t", bt.read.parquet(parquet_path).collect())
     ds = (
         _mapped(parquet_path)
         .with_columns(s=bt.col("v").sum().over(partition_by="g"))

@@ -44,8 +44,8 @@ def test_trim_strips_only_space_separators(duck):
         bt.from_arrow(tbl)
         .select(
             tr=col("s").str.trim(),
-            lt=col("s").str.lstrip(),
-            rt=col("s").str.rstrip(),
+            lt=col("s").str.strip_chars_start(),
+            rt=col("s").str.strip_chars_end(),
         )
         .collect()
     )

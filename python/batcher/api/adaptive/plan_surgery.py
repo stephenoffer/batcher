@@ -18,15 +18,33 @@ from batcher.plan.logical import (
     Join,
     Limit,
     LogicalPlan,
+    RowId,
     Sort,
     Union,
     Window,
     is_streamable,
 )
 
-__all__ = ["BREAKERS", "children", "joins", "lowest_breaker", "replace", "walk"]
+__all__ = [
+    "BREAKERS",
+    "STRUCTURAL_BREAKERS",
+    "children",
+    "joins",
+    "lowest_breaker",
+    "replace",
+    "walk",
+]
 
 BREAKERS = (Aggregate, Sort, Distinct, Window, Limit, Join, Union)
+
+#: The cut points when distribution *forces* staging. A row index is not a pipeline breaker,
+#: but it numbers the whole input in one global order, and the distributed dispatcher can
+#: compute that only as the top of a stage (a source-ordered map, numbered on the driver). So
+#: a breaker above one, such as the aggregate `group_by(maintain_order=True)` lowers to, has
+#: no one-shot path, and cutting at the row index is what lets it run at all. Only the
+#: structural path uses this; single-node staging keeps `BREAKERS`, so its gate and cut
+#: count are unchanged.
+STRUCTURAL_BREAKERS = (*BREAKERS, RowId)
 
 
 def children(node: LogicalPlan) -> list[LogicalPlan]:
@@ -59,7 +77,7 @@ def joins(node: LogicalPlan) -> list[Join]:
     return out
 
 
-def lowest_breaker(node: LogicalPlan, accept=None):
+def lowest_breaker(node: LogicalPlan, accept=None, breakers: tuple[type, ...] = BREAKERS):
     """A breaker whose inputs are all breaker-free (so it can run now).
 
     `accept`, when given, filters *which* runnable breaker qualifies. A rejected
@@ -67,13 +85,13 @@ def lowest_breaker(node: LogicalPlan, accept=None):
     inside whatever larger subplan is staged above it, which is the point. Staging a
     breaker costs a materialization and buys a measurement, so a breaker whose size is
     already known exactly is worth executing inline, fused with its neighbours, rather
-    than on its own.
+    than on its own. `breakers` names the node types that count as a cut point.
     """
     for child in children(node):
-        found = lowest_breaker(child, accept)
+        found = lowest_breaker(child, accept, breakers)
         if found is not None:
             return found
-    runnable = isinstance(node, BREAKERS) and all(is_streamable(c) for c in children(node))
+    runnable = isinstance(node, breakers) and all(is_streamable(c) for c in children(node))
     if runnable and (accept is None or accept(node)):
         return node
     return None

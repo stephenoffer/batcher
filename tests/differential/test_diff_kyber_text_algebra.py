@@ -123,9 +123,9 @@ _CASES = [
         lambda: StrFunc("reverse", col("s")) != lit("cba"),
         "reverse(s) <> 'cba'",
     ),
-    ("length_positive", lambda: col("s").str.len() > lit(0), "length(s) > 0"),
-    ("length_le_zero", lambda: col("s").str.len() <= lit(0), "length(s) <= 0"),
-    ("length_ne_zero", lambda: col("s").str.len() != lit(0), "length(s) <> 0"),
+    ("length_positive", lambda: col("s").str.len_chars() > lit(0), "length(s) > 0"),
+    ("length_le_zero", lambda: col("s").str.len_chars() <= lit(0), "length(s) <= 0"),
+    ("length_ne_zero", lambda: col("s").str.len_chars() != lit(0), "length(s) <> 0"),
     (
         "octet_length_zero",
         lambda: StrFunc("octet_length", col("s")) == lit(0),

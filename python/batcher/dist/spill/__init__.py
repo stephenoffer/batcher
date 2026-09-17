@@ -45,12 +45,13 @@ from batcher.dist.spill.scratch import _fd_safe as _fd_safe
 from batcher.dist.spill.scratch import _iter_spill_morsels as _iter_spill_morsels
 from batcher.dist.spill.scratch import _make_store as _make_store
 from batcher.dist.spill.scratch import _work_dir as _work_dir
-from batcher.dist.spill.scratch import map_projection
+from batcher.dist.spill.scratch import map_predicate, map_projection
 from batcher.dist.spill.staging import peel_to_breaker, stage_breaker_inputs
 
 __all__ = [
     "BucketWriters",
     "execute_spilling_aggregate",
+    "map_predicate",
     "map_projection",
     "narrow_to_stage",
     "peel_to_breaker",

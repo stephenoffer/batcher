@@ -48,7 +48,7 @@ def _ds():
 
 def test_expensive_repeated_subexpression_is_bound_once():
     e = col("url").str.regexp_replace("-", "+")
-    ds = _ds().select(a=e, b=e.str.upper(), c=e.str.len())
+    ds = _ds().select(a=e, b=e.str.upper(), c=e.str.len_chars())
     bound = _bound_columns(_optimized(ds))
     assert len(bound) == 1, f"expected one binding, got {bound}"
 
@@ -74,7 +74,7 @@ def test_single_output_column_is_never_rewritten():
 
 def test_rewrite_preserves_output_schema_and_values():
     e = col("url").str.regexp_replace("-", "+")
-    ds = _ds().select(a=e, b=e.str.upper(), c=e.str.len())
+    ds = _ds().select(a=e, b=e.str.upper(), c=e.str.len_chars())
     out = ds.collect()
     assert out.column_names == ["a", "b", "c"]  # order and names unchanged
     assert out.to_pydict() == {
@@ -94,17 +94,17 @@ def test_nested_repeats_share_rather_than_recompute():
     """`f(url)` inside `f(url)||x` — the inner bind is reused by the outer, not redone."""
     inner = col("url").str.regexp_replace("-", "+")
     outer = inner.str.regexp_replace("a", "z")
-    ds = _ds().select(a=inner, b=inner.str.upper(), c=outer, d=outer.str.len())
+    ds = _ds().select(a=inner, b=inner.str.upper(), c=outer, d=outer.str.len_chars())
     plan = _optimized(ds)
     bound = _bound_columns(plan)
     assert len(bound) == 2, f"expected both repeats bound, got {bound}"
-    assert _ds().select(a=inner, b=inner.str.upper(), c=outer, d=outer.str.len()).collect()
+    assert _ds().select(a=inner, b=inner.str.upper(), c=outer, d=outer.str.len_chars()).collect()
 
 
 def test_the_rewrite_reaches_a_fixpoint(caplog):
     """The rule adds a `Project`; a non-confluent rule would spin and warn."""
     e = col("url").str.regexp_replace("-", "+")
-    ds = _ds().select(a=e, b=e.str.upper(), c=e.str.len())
+    ds = _ds().select(a=e, b=e.str.upper(), c=e.str.len_chars())
     with caplog.at_level(logging.WARNING, logger="batcher.kyber"):
         _optimized(ds)
     assert "fixpoint" not in caplog.text.lower()

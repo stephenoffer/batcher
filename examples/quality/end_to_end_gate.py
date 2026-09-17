@@ -33,7 +33,7 @@ def main() -> None:
 
     # 2. Primary key: unique and non-null.
     checks["primary key"] = (
-        orders.n_unique("o_orderkey") == orders.count()
+        orders.count_distinct("o_orderkey") == orders.count()
         and orders.filter(col("o_orderkey").is_null()).count() == 0
     )
 

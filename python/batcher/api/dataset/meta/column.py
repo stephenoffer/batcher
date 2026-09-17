@@ -199,7 +199,7 @@ class ColumnMeta(MetaBase):
                 3
         """
         value = self.ask(distinct.n_unique, self._column, ndv=(self._column,))
-        return answer(value, lambda: self._ds.n_unique(self._column))
+        return answer(value, lambda: self._ds.count_distinct(self._column))
 
     def is_unique(self) -> bool:
         """Whether every non-null value occurs exactly once.

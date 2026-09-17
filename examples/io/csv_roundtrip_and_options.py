@@ -23,7 +23,7 @@ def main() -> None:
     orders = (
         tpch("orders")
         .select("o_orderkey", "o_orderdate", "o_totalprice", "o_orderpriority")
-        .head(1_000)
+        .limit(1_000)
     )
 
     with tempfile.TemporaryDirectory() as directory:

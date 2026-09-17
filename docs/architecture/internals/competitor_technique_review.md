@@ -150,6 +150,8 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | 8 | A range-join algorithm (IEJoin, or a binned rewrite) | DuckDB | **Landed**, and since re-tuned | **Largest single gap found**: 12–32x, and OOMs where DuckDB runs |
 | 26 | Composite integer keys hashed **column at a time**, and that table presized | DuckDB, Polars | **Landed** (`hash_columns_i64` + `GroupGrowth` in `assign_groups_int64_multi`) | 1.4x-6.2x on a multi-key integer `GROUP BY` with many groups; 1.07x-1.12x at low cardinality. Generalizing either half to the *other* group paths loses — see item 26 |
 | 11 | Compressed materialization — narrow a key to its *measured* range | DuckDB | **Landed for the multi-key sort** (`packed_multi_sort_indices`); **measured and reverted** for the composite group key | 1.5-3.0x on a multi-key `ORDER BY`; 0.86x-1.04x on grouping, so not taken there — see 11 |
+| 27a | A top-N bound proved from row-group statistics | DuckDB `RowGroupPruner` | **Landed** (`kyber/learned_tuning/topn_footer.py` + `api/orchestration/topn_seeding.py`) | `ORDER BY ts DESC LIMIT 10` on 40M clustered rows: first run 422 -> 134 ms, warm 433 -> 45 ms, DuckDB 92 |
+| 27d | Float bounds that cannot see NaN | DuckDB `can_have_nan` | **Fixed** — a wrong answer at four layers, invisible to the DuckDB oracle at its default | Correctness: NaN rows returned by every terminal |
 
 **Status correction, 2026-07-29.** Items 3, 4 and 8 were recorded as absent or open and are
 landed; item 6 was recorded as partially closed and is in fact *inert on the live path*. Three
@@ -2007,6 +2009,19 @@ their ranks must agree, not the intermediate column.
 Keep it in proportion: Batcher already led this shape by 10-20x over DuckDB and 2.5-10x over
 Polars, so this makes a win larger rather than closing a gap.
 
+**Update, 2026-09-16: the mask is gone as well.** The heap bounded each bucket's *ordering*, but
+the parallel window still scattered a rank for every input row back into input order so that
+`filter_by_rank_limit` could keep `k` per partition; `perf` put 21 % of H2O q8's shape (10M rows,
+100,000 partitions, `k = 2`) in that scatter. `bc_runtime::window::window_with_rank_limit` now
+keeps each bucket's survivors, named by input row, and orders them once, and the interpreter's
+window gathers only those rows; `filter_by_rank_limit` was deleted. The subtlety above is moot:
+the keep is `rank <= k` on both paths, so there is no unmasked column to compare against. Four
+alternating rounds on one commit took q8's shape from 121-252 ms to **63-68 ms**
+(`BENCHMARK_RESULTS.md`), and `rank_limited_equals_masking_the_full_window` holds the survivors
+equal to masking the full window. The differential test written for it,
+`test_diff_qualify_topn_parallel.py`, found a DuckDB 1.5.5 defect on the way: `row_number() <= 2`
+over a float order key holding NaN returns wrong rows for ~25 of 5,000 partitions.
+
 ### The measured census: 96 queries, four suites, ranked by what they actually cost
 
 The inventory says almost nothing is missing, so the bottlenecks have to be found by
@@ -3308,6 +3323,308 @@ is the interleaved A/B above; this row exists so the shape has a number in the s
 so the next session has something to A/B a build against. It belongs in
 `benchmarks/BENCHMARK_RESULTS.md` and is recorded here instead only because that file was being
 rewritten by another session at the time.
+
+## 27. The scan under a top-N, a spill and a float filter — four gaps, one of them a wrong answer (2026-09-16)
+
+A pass started from the operator suite at `HEAD` (46 cases, **0.75x DuckDB and 0.16x Polars** by
+geomean, every correctness gate passing) and found the operator surface is not where the
+remaining single-node losses are. The largest remaining single-case losses were one string
+kernel against DuckDB's inline string prefix (`LIKE 'the%'`, 2.63x) and DuckDB's anti-join for
+`EXCEPT` (1.58x), both a few milliseconds. So it read the scan side instead, where DuckDB's
+optimizer has a pass Batcher did not.
+
+### 27a. A top-N bound proved from row-group statistics — **landed**
+
+DuckDB's `RowGroupPruner` (`src/optimizer/row_group_pruner.cpp`) orders a table's row groups by
+the sort key's zone map for `ORDER BY k LIMIT n`, and prunes the ones that cannot reach the
+answer. Batcher had half of this: `kyber/learned_tuning/topn_bound.py` remembers the k-th value
+from the *previous* run, so every first run read the whole relation.
+`kyber/learned_tuning/topn_footer.py` computes the bound from the footers instead. For a
+descending sort it walks the row groups from the largest `min`, summing non-null row counts, and
+stops at the group that brings the sum to `k`. Its `min` is a value `k` rows provably reach, so
+`key >= min` removes only rows strictly worse than the k-th, and predicate pushdown skips every
+row group whose `max` is below it. The conductor applies it in
+`api/orchestration/topn_seeding.py`, and on `collect(spill=True)` and `iter_batches()` too,
+because a proved bound needs no row count to check.
+
+Measured on a 40M-row, 8-file event table clustered on its timestamp, `ORDER BY ts DESC LIMIT 10`:
+the first run went from **422 ms to 134 ms** with nothing learned, and the warm run from 433 to
+**45 ms**, against DuckDB's 92 ms and Polars' 1,203 ms. The ascending warm run is 47 ms against
+DuckDB's 33. A fresh interpreter's *first* query of any kind costs another ~850 ms, which is not
+this bound's and is recorded as its own finding. It declines floats, strings, nanosecond timestamps, nulls-first
+orderings, anything but a renaming `Project` between the sort and the scan, and any bound that
+would leave more than half the rows. The recorded run is in `BENCHMARK_RESULTS.md`, produced by
+`benchmarks/internals/operators/parquet_topn.py`.
+
+### 27b. The learned bound had never worked on a temporal key
+
+Found while measuring 27a. The hub stores JSON, `record_topn_bound` stored the k-th value raw,
+and for a `datetime` that raised inside a `try` that recorded the error as a suppressed hint.
+So the *most common* top-N shape, the latest events, never seeded: every warm run of the
+timestamp query read all 40M rows, 433 ms, while the identical integer query was answered from
+35 rows. Non-JSON bounds are now stored as a one-element Arrow IPC stream. Warm: **433 to 39 ms**.
+It is recorded here because it is the pattern this document keeps finding: a feature measured
+at 19x on the shape it was built on, silently inert on the shape users write.
+
+### 27c. A spilled query never pushed a predicate
+
+Every out-of-core phase reads through `dist/spill/scratch.py::_iter_spill_morsels`, which took a
+projection and no predicate. So `collect(spill=True)` decoded every row group that `collect()`
+pruned, on exactly the queries that spill because their inputs are large. `map_predicate` now
+sits beside `map_projection` for aggregate, join, sort and window. A 5%-selective clustered
+filter under a spilled group-by: **1,189 to 95 ms (12.5x)**.
+
+### 27d. A float filter over Parquet dropped NaN rows — **a wrong answer at every layer**
+
+The engine ranks NaN above every number (`bc_arrow::canon_float_array`), so `x > 0.9` is true
+for a NaN row. Parquet, Delta and Iceberg keep NaN out of a float column's recorded min/max. Four
+separate layers pruned `x > v` on that max: the native reader's row-group and page pruning
+(`bc-io/src/predicate.rs`), the pyarrow filter the Parquet source re-applies, manifest file
+skipping, and Kyber's zone-map rules via `SourceStatistics.to_relstats`. Over a row group of
+`[0.1, 0.5, NaN]`, `collect()`, `count()`, `is_empty()`, `iter_batches()` and `collect(spill=True)`
+all answered no rows where the same filter over the same table in memory keeps one.
+
+**Every differential test passed through this, and the reason is the lesson.** DuckDB has the
+identical behaviour by default: its Parquet reader trusts the float max unless you pass
+`can_have_nan=true` (`extension/parquet/parquet_statistics.cpp`). The oracle agreed with the bug.
+The fix follows DuckDB's `can_have_nan=true` semantics everywhere: a float max cannot prove `>`,
+`>=` or `!=` empty, and the pyarrow translation Or-s `is_nan` into `>` and `>=`, which makes it
+exact under negation too. `<`, `<=` and `=` keep their pruning, because no NaN satisfies them.
+The tests compare against DuckDB **with** `can_have_nan=true` and against Batcher's own in-memory
+answer.
+
+What it costs: no row group or file is skipped on a float column's max for `>`, `>=` or `!=`.
+Those predicates prune well only on a float column clustered across files, which analytic
+tables rarely have. The integer, date and timestamp paths are untouched. Measured on TPC-H sf10
+read from Parquet, alternating builds with and without it: per-query geomean **1.003**, every
+correctness check passing (`BENCHMARK_RESULTS.md`, 2026-09-16).
+
+### 27e. Float predicates now filter inside the Parquet decode
+
+`bc-io`'s row filter decodes the predicate columns first and the rest only for surviving rows,
+and it refused floats outright because its comparison order differs from the engine's. It now
+admits them as a **superset**: every row the two orders could disagree on, NaN and a zero against
+a zero literal, is kept, and the engine's `Filter` above the scan decides. Pinned against the
+engine's own canonicalization in `row_filter::tests::a_float_mask_keeps_every_row_the_engine_keeps`.
+An interleaved A/B at sf10 put a selective filter on `l_extendedprice` at **163-169 ms before and
+101-108 ms after**. q6 did not move (186-199 against 181-214 ms), because its payload is one
+column and the saving is the payload's decode.
+
+### 27f. `EXCEPT` as a distinct anti-join — built as a prototype, measured, not taken
+
+`op-except` is 1.58x DuckDB while `op-intersect` is at parity, and DuckDB plans `EXCEPT` as an
+anti-join. Batcher lowers both to one membership group-by (`Dataset._set_membership`), so the
+obvious move is `left.distinct()` anti-joined to the right side on NULL-safe keys. At the
+benchmark's shape (1.5M distinct left keys, 6M right rows over 1.5M keys, in memory): the
+membership group-by took **57 ms**, the anti-join **141 ms**, DuckDB **39 ms**. The semi-join form
+of `INTERSECT` took 49 ms against the group-by's 55 and DuckDB's 67, which is not worth a second
+lowering. The anti-join builds on the 6M-row side; the group-by aggregates both sides once. Do not
+rebuild this without a right-side distinct in front of it, and measure that first.
+
+And the float row filter in 27e is not free on a permissive read: q6's filtered read, isolated,
+costs 294 ms and 6.3 CPU-seconds with the filter against 144 ms and 3.3 without, because
+decoding through a fragmented 12.5% selection costs more than the one payload column it skips.
+The end-to-end query does not move, because the filter hands the engine 7.5M rows instead of 60M.
+A width-aware admission rule (payload columns against predicate columns) is the open refinement.
+
+### 27g. Date predicates in the native Parquet reader — built a third time, reverted a third time, and why
+
+TPC-H at sf10 read from Parquet is **1.52x DuckDB** (item 27d's A/B), 21 of 22 queries lose, and
+its worst ratios all filter on a date. `to_native_predicate` refuses temporal literals, so every
+such read falls to pyarrow's per-file filtered scan. The 2026-09-08 attempt at pushing dates was
+reverted because that box could not measure it (q3 was bimodal). This box can: two sandboxes,
+alternating, two rounds, and the spread between rounds sits inside a few percent.
+
+Built: a tagged `{"date": days}` literal, compared only against a column the file declares a
+Parquet `DATE`, in row-group pruning, page-index pruning and the row filter, with Rust tests that a
+plain `INT32` column holding the same day numbers is never pruned by it.
+
+Measured on TPC-H sf10: **0.994 overall**, q6 **0.63x**, q14 0.82x, q21 0.83x, and q3 **1.35x**,
+q7 **1.31x** slower. Decomposed, the loss is not the read that got the date. q3's `lineitem` read
+cost 183 ms natively against 169 ms through pyarrow. It is the *other* reads and the batch shape.
+Pushing dates made the native reader take reads that pyarrow's scanner serves better: a
+date that keeps a third to a half of `lineitem` is decoded whole by the native reader and then
+re-filtered once in Python, where pyarrow decodes and filters in one parallel pass and returns
+fewer, larger batches. q7's engine execute time rose from 60 ms to 103 ms on the same rows.
+
+Two follow-ups were built and measured on the way, and both lost. Filtering decoded batches
+inside each row group's task, in parallel, made q7's `lineitem` read **455-470 ms** against the
+native 322 ms: the filtered batches then come back small and are copied again by the coalescing
+step and again by the Python re-filter. And lowering the row filter's gate to the read-only
+crossover (2 %) turned q6's 0.63x back into 0.94x.
+
+**What would make date pushdown pay is a routing decision, not a literal.** The native reader wins
+when row groups prune or the row filter admits the predicate, and pyarrow's scanner wins on a
+permissive predicate over a wide read. Choosing between them per read from footer statistics is
+the open item, and it is a cost model in the conductor rather than anything in `bc-io`. Do not
+re-add the literal without it.
+
+### 27h. The row filter's selectivity gate was set at half, and the cliff is below a tenth — **landed**
+
+Found while chasing 27g's q3. `bc-io`'s row filter was admitted for any predicate measured under
+50 % selective, from two points on sf1. Across the range on sf10 `lineitem` (60M rows, a scattered
+integer predicate, filter plus aggregate, two builds alternating), the filter is a win at 5 % and a
+loss by 10 %, and at 20-35 % the query ran **1.44-1.47x slower** with it than without. The gate is
+now 8 %: unchanged within 2 % at 1-5 %, and **0.68-0.95x** at 10-35 %. The per-point table is on
+`MAX_SELECTIVITY`, together with the read-only measurement that pointed at 2 % and the end-to-end
+one that overruled it: declining the filter leaves the caller an unfiltered read to re-filter,
+which a read-only benchmark does not charge.
+
+### 27i. A fresh process pays ~850 ms before its first query does any work
+
+Recorded, not addressed. In a fresh interpreter any first query costs 830-880 ms, where DuckDB
+imports and answers `SELECT 1` in 57 ms. `import batcher` is lazy (1 ms), but resolving `bt.read`
+loads **492 Batcher modules** in about 460 ms, and the first `collect()` imports another ~450 ms,
+most of it `pyarrow.dataset` and, through pyarrow's own pandas shim, pandas (~200 ms; any pyarrow
+array built from a Python list imports it, so this part is pyarrow's). No benchmark here sees it,
+because every suite reports a warm best-of-N. It decides every short script, notebook cell and CLI
+run, and it is a lazy-import refactor across the reader namespace and the orchestration imports
+rather than an engine change.
+
+One part of the first `collect()` was Batcher's own and was not an import. The optimizer asked
+each expression type `hasattr(expr, "op")`, and a miss falls through to `Expr.__getattr__`, which
+builds the user-facing migration hint by loading the whole migration registry, 42 files. That cost
+114-186 ms of CPU per process, measured on a loaded box, for a message `hasattr` discards. The
+probe now uses `object.__getattribute__`, which never reaches `__getattr__`, and
+`tests/unit/test_expr_dispatch_probe.py` fails on the old probe.
+
+pandas itself is pyarrow's, and not avoidable from here: `pa.array`, `pa.scalar` and `pa.table`
+import it even from a numpy array. An unfiltered Parquet read never touches those, and a filtered
+one did only because row-group pruning builds its manifest and literals with them (27j). A read
+of one morsel or less, 16,384 rows, now skips pruning, since the decode it could save is a
+fraction of the 244-272 ms import, and a filtered first query over a small file no longer loads
+pandas. `test_diff_parquet_pruned_whole_read.py` checks those reads against DuckDB and pins that
+pruning still runs one row above the threshold.
+
+### 27j. A predicated Parquet read decodes its surviving row groups whole — **landed, TPC-H sf10 1.54x to 1.38x**
+
+27g ended on "a routing decision, not a literal", and the oracle for that decision came out
+one-sided. Forcing every predicated read to the native reader *unfiltered*, with the engine's
+`Filter` doing all row selection, took TPC-H sf10 from Parquet from 1.526x DuckDB to 1.356x
+with no query meaningfully slower. The mechanism is CPU, not cores: pyarrow's filtered read of
+q1's `lineitem` columns spends 10.6 CPU-seconds where the native decode spends 5.2, and the
+engine's filter is a SIMD comparison over morsels already in parallel. So the 2026-09-08 entry's
+"native batched + engine filter: three of four slower" does not reproduce on a quiet box, and that
+entry had itself withdrawn its per-query numbers as bimodal.
+
+What makes this a routing decision rather than "never filter in the reader" is memory and
+clustering, and `io/formats/structured/parquet/routing.py` handles both:
+
+- **Row groups are still pruned first**, from the footers, through the same NaN-aware rules
+  `io.stats.file_skipping` applies to lakehouse manifests. A clustered table reads only the
+  groups that can match, so 27a's top-N bound keeps its 10x.
+- **Only while the survivors fit a quarter of the memory envelope.** A scattered predicate can
+  leave every row group alive, and a whole file is up to 100x what its matching rows occupy.
+  Past the guard the filtered readers run exactly as before.
+
+Measured, the build with the route against the same build without it, alternating over two
+rounds, every correctness check passing: per-query geomean **0.899**, b/duckdb **1.542 -> 1.379**,
+q12 0.61x, q3 0.66x, q10 0.69x, q6 0.70x, q1 0.79x.
+
+### 27k. arrow-rs 56 to 60 - **landed, TPC-H sf10 from Parquet 1.39x to 1.26x**
+
+With the read route in 27j, the rest of the scan gap is decode cost, and that code is arrow-rs's.
+Batcher pinned 56, four majors behind. A side-by-side benchmark decoding seven sf10 `lineitem`
+columns (zstd, dictionary-encoded) put `parquet` 60 at **1.2-1.6x faster decode** with metadata
+parsed once, and about 2x once footer parsing is included.
+
+Upgraded: `arrow`, `arrow-pyarrow`, `parquet`, `arrow-avro`, `arrow-flight` 56 -> 60; `pyo3` 0.25 ->
+0.29; `object_store` 0.12 -> 0.14; `tonic` 0.13 -> 0.14; `rust-version` 1.85 -> 1.88. API breaks
+were mechanical: the page-index types, `ArrowReaderOptions`' page-index policy, pyo3's
+`allow_threads`/`with_gil` renames, `ObjectStoreExt`. Three things were not:
+
+- **The new page-index accessors panic on an out-of-range page** where 56 returned `None`, so they
+  are bounds-checked to keep "cannot decide, keep the page".
+- **object_store 0.14 enables rustls' `aws-lc-rs` backend beside `ring`**, and rustls panics at the
+  first handshake with both present. The Flight shuffle installs `ring` once if nothing else has.
+- **`az://container/a/b.parquet` now addresses `a/b.parquet`.** object_store 0.12 took the host as
+  the container in its builder and *also* stripped the first path segment as a bucket, so it read
+  `b.parquet`, silently dropping a directory. This is a fix, and `store.rs`'s test records it.
+
+Measured: builds of the same commit on 56 and 60, alternating over two rounds of TPC-H sf10 read
+from Parquet, every correctness check passing: per-query geomean **0.905**, faster on 21 of 22
+queries, b/duckdb **1.389 -> 1.255** (each build's best time over DuckDB's best across all four
+runs). q21 is the one slower query, at 1.02x; q11 returns no rows at this scale, so its time was
+compared and its result was not. The box was shared during the run (load average 22-31), which
+widens each query's spread but not the direction. Rust: 2,476 tests passed, 0 failed. The
+differential, Parquet IO and Parquet unit suites gave identical results on both builds.
+
+### 27l. Filtering on dictionary codes inside the Parquet decoder — **reviewed and measured, not built**
+
+What is left of the TPC-H-from-Parquet gap after 27j and 27k is decode, and both engines that
+beat Batcher there evaluate a filter *inside* their decoder rather than after it. Read from the
+sources in `/mnt/shared_storage/ref`:
+
+- **DuckDB** (`extension/parquet/parquet_reader.cpp`, `column_reader.cpp`) scans in 2,048-row
+  vectors. `EvaluateFilters` decodes each filter column in an order an adaptive filter keeps
+  re-ranking by measured selectivity (`adaptive_filter.GetPermutation`), narrowing one selection
+  vector; `DecodeRemainingColumns` then reads the other columns through it, and
+  `DirectSelect`/`PlainSelect` decode a plain-encoded page for the selected rows only. For a
+  dictionary page, `DirectFilter` hands the filter to `dictionary_decoder.Filter`, which tests it
+  once per dictionary value, and `PageIsFilteredOut` skips a page whose dictionary holds no match
+  (`HasFilteredOutAllValues`) or whose page statistics rule it out.
+- **Polars** (`crates/polars-parquet/src/arrow/read/deserialize/dictionary_encoded/predicate.rs`)
+  evaluates the predicate over the dictionary into a bitmap, then walks the page's
+  RLE/bit-packed codes straight into a keep-mask: an RLE run costs one `extend_constant`, and
+  bit-packed codes are unpacked 32 at a time and compared as a word. No value is materialized
+  for a row the predicate rejects, and the mask becomes `Filter::Mask` for the other columns.
+
+The other three engines in `/mnt/shared_storage/ref` do not filter while decoding by default,
+and the two built on arrow-rs are why that is not an accident:
+
+- **DataFusion** decodes through the same arrow-rs `ParquetRecordBatchStream` Batcher does, and
+  its late materialization is that crate's `RowFilter` (`datasource-parquet/src/row_filter.rs`).
+  It ships **off**: `pushdown_filters: bool, default = false` in `common/src/config.rs`.
+- **Daft** decodes through arrow-rs as well (`daft-parquet/src/read.rs`), and nothing in
+  `daft-parquet` builds a `RowFilter`, so it decodes and filters afterwards, as Batcher's 27j
+  route does.
+- **Spark**'s record-level Parquet filter, `spark.sql.parquet.recordLevelFilter.enabled`, is
+  `false` by default and applies only when the vectorized reader is *disabled* (`SQLConf.scala`).
+
+So the split is by who owns the decoder: the two engines with their own (DuckDB, Polars) filter
+inside it, and the ones on a shared decoder decode first. Batcher's measured default in 27h and
+27j agrees with DataFusion's and Daft's.
+
+Why it matters on TPC-H: every low-cardinality `lineitem` column is dictionary-encoded in the
+sf10 mirror (`l_shipmode`, `l_returnflag`, `l_shipinstruct`, and the three dates, all
+`PLAIN_DICTIONARY`), and they are exactly the filter and group columns of q1, q12, q19 and q21.
+Materializing `l_shipmode` as strings costs **5.3x** reading it as a dictionary in pyarrow (235
+against 44 ms, sf10, one file).
+
+**The obvious route through arrow-rs is a dead end, measured.** Asking parquet 60's reader for a
+`Dictionary(Int32, Utf8)` in place of `Utf8` makes the read *slower*, single-threaded, best of
+three over sf10 `lineitem`: `l_shipmode` 572 -> 852 ms, `l_returnflag` 421 -> 708,
+`l_shipinstruct` 838 -> 1,059. Each of the 490 row groups carries its own dictionary, and the
+reader does not hand codes through. So item 6's planner decision would not recover this cost
+either: a preserved dictionary has to be produced by a decoder that owns the pages.
+
+Two measurements from the same session rule out the cheaper levers. Forcing predicated reads back
+through arrow-rs's `RowFilter` (27h's path) with the threshold raised lost on q1, q3, q6, q12,
+q14 and q19 in both rounds taken (q12 269 ms against 497-997 ms). And the per-vector selection
+is the part `RowFilter` cannot imitate: its `RowSelection` is a run list whose cost grows with
+fragmentation, which is the cliff 27h measured.
+
+What building it takes, for whoever picks it up. A page-level reader in `bc-io` for
+dictionary-encoded flat columns: read the dictionary page, evaluate the pushed `bc-io`
+predicate on it once, decode the data pages' RLE/bit-packed codes into a keep-mask as Polars
+does, and skip any page the dictionary rules out as DuckDB does. The other columns then decode
+through that mask. `parquet::encodings` is public only under parquet's `experimental` feature,
+so either that feature is taken on or the hybrid RLE decoder is written here, about 200 lines in
+Polars. The mask has to stay a superset, as every pushed filter does here, and the engine's
+`Filter` stays above it. The benchmark behind the arrow-rs numbers was a throwaway example
+against `ParquetRecordBatchReaderBuilder`; it is not committed.
+
+### What this pass did not do, and where the single-node gap now is
+
+The sf10 decomposition in `BENCHMARK_RESULTS.md` (2026-09-08) put the loss in the Parquet reader,
+on a 16-core box, as a read and an execute that do not overlap. Re-measured here on 48 cores it
+is the read's **total CPU**, not its occupancy: three `lineitem` columns decode in 4.1 CPU-seconds
+against DuckDB's 2.6 for decoding *and* summing them, at 34-43 cores busy. A prototype that folded
+each file into a partial aggregate concurrently, overlapping read and execute through the
+existing mergeable primitives, was **slower** on every shape (sum 40 to 82 ms, q1 about 400 to
+540 ms), and is not the lever on a box this wide. What remained was per-value decode cost in
+arrow-rs 56, a dependency question that item 27k answered by moving to 60, and DuckDB's
+inline-prefix strings, item 2.
 
 ## Things Batcher already has, so do not "add" them
 

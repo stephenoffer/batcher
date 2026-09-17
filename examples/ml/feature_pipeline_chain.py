@@ -40,7 +40,7 @@ def main() -> None:
     # One-hot expanded the segment into indicator columns.
     indicators = [name for name in transformed.columns if name.startswith("c_mktsegment")]
     print("indicator columns:", indicators)
-    assert len(indicators) == train.n_unique("c_mktsegment")
+    assert len(indicators) == train.count_distinct("c_mktsegment")
 
     # The same fitted chain applies to unseen rows, and does *not* re-fit: the holdout
     # mean is near zero but not exactly zero, which is the proof it used the training

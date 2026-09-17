@@ -81,7 +81,7 @@ def cross_encoder_rerank_udf(
             >>> udf = cross_encoder_rerank_udf(
             ...     scorer, query_column="question", document_column="passages", k=1
             ... )
-            >>> ds.ml.map_batches(udf).to_pydict()["passages"]
+            >>> ds.map_batches(udf).to_pydict()["passages"]
             [['everest is 8849 m']]
 
     Args:
@@ -105,7 +105,7 @@ def cross_encoder_rerank_udf(
             keeps the raw logits, whose *order* is identical either way.
 
     Returns:
-        A class for ``ds.ml.map_batches(...)`` — the cross-encoder loads once per worker.
+        A class for ``ds.map_batches(...)`` — the cross-encoder loads once per worker.
 
     Raises:
         PlanError: if `k` is given and below 1.

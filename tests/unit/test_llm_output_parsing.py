@@ -155,7 +155,7 @@ def test_a_citation_can_be_checked_against_what_was_retrieved() -> None:
     """The use the extractor exists for: a marker pointing at a passage never retrieved."""
     answered = bt.from_pydict({"answer": ["backed by [1] and [9]"], "retrieved": [["1", "2"]]})
     got = answered.select(
-        fabricated=bt.extract_citations("answer").list.set_difference(bt.col("retrieved"))
+        fabricated=bt.extract_citations("answer").list.difference(bt.col("retrieved"))
     )
     assert got.to_pydict()["fabricated"] == [["9"]]
 

@@ -61,7 +61,7 @@ def token_ngrams(text: Expr, n: int) -> Expr:
 
 def char_ngrams(text: Expr, n: int) -> Expr:
     """The character n-grams of a case-folded, space-collapsed text column, as a list."""
-    normalized = text.str.lower().str.normalize_whitespace().str.strip()
+    normalized = text.str.lower().str.normalize_whitespace().str.trim()
     return normalized.str.chunk(n, overlap=n - 1)
 
 

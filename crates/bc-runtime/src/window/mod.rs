@@ -219,6 +219,9 @@ pub struct WindowCall {
     /// Set instead of `alpha` to decay by *elapsed key value* rather than by row position;
     /// only `ewm_mean` accepts it.
     pub half_life: Option<f64>,
+    /// `IGNORE NULLS` for `first_value`/`last_value`/`nth_value`: select among the non-null
+    /// values of the partition or frame. `false` is SQL's `RESPECT NULLS`.
+    pub ignore_nulls: bool,
 }
 
 /// Compute every window function over the partitioned/ordered input, returning
@@ -299,6 +302,33 @@ pub fn window_with(
     let canon_order = crate::keys::canonicalize_float_order_keys(order_keys);
     let order_keys: &[(ArrayRef, SortOptions)] = canon_order.as_deref().unwrap_or(order_keys);
 
+    match parallel_buckets(
+        partition_keys,
+        order_keys,
+        funcs,
+        num_rows,
+        parallel_row_threshold,
+    ) {
+        Some(nbuckets) => crate::window::parallel::window_parallel(
+            partition_keys,
+            order_keys,
+            funcs,
+            num_rows,
+            nbuckets,
+            rank_limit,
+        ),
+        None => window_serial(partition_keys, order_keys, funcs, num_rows, rank_limit),
+    }
+}
+
+/// How many hash buckets [`window_with`] spreads this window over, or `None` to run it serially.
+fn parallel_buckets(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+    parallel_row_threshold: usize,
+) -> Option<usize> {
     let nthreads = rayon::current_num_threads();
     let frameless_agg = order_keys.is_empty()
         && funcs
@@ -308,17 +338,98 @@ pub fn window_with(
         && (!order_keys.is_empty() || frameless_agg)
         && num_rows >= parallel_row_threshold
         && nthreads > 1;
-    if !worth_parallel {
-        return window_serial(partition_keys, order_keys, funcs, num_rows, rank_limit);
-    }
-    crate::window::parallel::window_parallel(
+    worth_parallel.then_some(nthreads)
+}
+
+/// The rows a window with a fused `rank <= k` keeps, and each function's value at them.
+///
+/// [`window_with`] answers the same question for every row, and its caller then masks all but
+/// the survivors away. Where `k` rows of each partition survive out of many, that is most of the
+/// work: on the H2O `groupby` q8 shape (10M rows, 100,000 partitions, `k = 2`) the parallel path
+/// scattered a rank for all 10M rows back into input order so a mask could keep 200,000 of them.
+/// This keeps only the survivors of each bucket and orders them by their input row once.
+///
+/// `rows` is ascending, so a gather by it yields exactly the rows, and the order, that masking
+/// [`window_with`]'s output by `rank <= k` does; `columns[f]` holds function `f`'s values at those
+/// rows. The bound applies to the first function, as it does for that mask.
+pub fn window_with_rank_limit(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+    parallel_row_threshold: usize,
+    rank_limit: usize,
+) -> Result<RankLimited, RuntimeError> {
+    // The same key canonicalization `window_with` applies, for the same reasons given there.
+    let canon = crate::keys::canonicalize_float_keys(partition_keys);
+    let partition_keys: &[ArrayRef] = canon.as_deref().unwrap_or(partition_keys);
+    let canon_order = crate::keys::canonicalize_float_order_keys(order_keys);
+    let order_keys: &[(ArrayRef, SortOptions)] = canon_order.as_deref().unwrap_or(order_keys);
+    match parallel_buckets(
         partition_keys,
         order_keys,
         funcs,
         num_rows,
-        nthreads,
-        rank_limit,
-    )
+        parallel_row_threshold,
+    ) {
+        Some(nbuckets) => crate::window::parallel::window_parallel_rank_limited(
+            partition_keys,
+            order_keys,
+            funcs,
+            num_rows,
+            nbuckets,
+            rank_limit,
+        ),
+        None => {
+            let columns = window_serial(
+                partition_keys,
+                order_keys,
+                funcs,
+                num_rows,
+                Some(rank_limit),
+            )?;
+            RankLimited::keep(columns, rank_limit, |i| i)
+        }
+    }
+}
+
+/// The survivors of a rank-limited window: see [`window_with_rank_limit`].
+pub struct RankLimited {
+    /// Input row of each survivor, ascending.
+    pub rows: Vec<u32>,
+    /// Each window function's value at `rows`.
+    pub columns: Vec<ArrayRef>,
+}
+
+impl RankLimited {
+    /// Keep the rows of `columns` whose first column is `<= limit`, naming each by `row_of`.
+    pub(crate) fn keep(
+        columns: Vec<ArrayRef>,
+        limit: usize,
+        row_of: impl Fn(u32) -> u32,
+    ) -> Result<Self, RuntimeError> {
+        let Some(rank) = columns.first() else {
+            return Ok(Self {
+                rows: Vec::new(),
+                columns,
+            });
+        };
+        let rank = rank.as_primitive::<Int64Type>();
+        let limit = limit as i64;
+        let positions: Vec<u32> = (0..rank.len())
+            .filter(|&i| rank.is_valid(i) && rank.value(i) <= limit)
+            .map(|i| i as u32)
+            .collect();
+        let idx = UInt32Array::from(positions);
+        let kept = columns
+            .iter()
+            .map(|c| take(c.as_ref(), &idx, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            rows: idx.values().iter().map(|&p| row_of(p)).collect(),
+            columns: kept,
+        })
+    }
 }
 
 pub(crate) fn window_serial(
@@ -470,6 +581,7 @@ pub(crate) fn window_serial(
                 &ordered,
                 require(call.values.as_ref(), f)?,
                 call.offset,
+                call.ignore_nulls,
                 num_rows,
             )?,
             // first_value/last_value/nth_value over an explicit frame — the frame's
@@ -482,6 +594,7 @@ pub(crate) fn window_serial(
                 &ordered,
                 require(call.values.as_ref(), f)?,
                 call.offset,
+                call.ignore_nulls,
                 call.frame.expect("frame present"),
                 order_rows.as_ref(),
                 range_order.as_ref(),
@@ -567,11 +680,15 @@ fn series_window(
 /// output row selects another row's value by position within its ordered
 /// partition, so the result is type-generic: we build a per-row source-index map
 /// (with nulls for out-of-range) and `take` from the input column.
+///
+/// `ignore_nulls` (`first_value`/`last_value`/`nth_value` only) selects among the partition's
+/// non-null values instead of its rows; `lag`/`lead` never carry it.
 fn value_window(
     func: WindowFn,
     ordered: &[Vec<usize>],
     values: &ArrayRef,
     offset: i64,
+    ignore_nulls: bool,
     num_rows: usize,
 ) -> Result<ArrayRef, RuntimeError> {
     if func.is_fill() {
@@ -580,6 +697,20 @@ fn value_window(
     let mut src: Vec<Option<u32>> = vec![None; num_rows];
     for part in ordered {
         let len = part.len();
+        if ignore_nulls
+            && matches!(
+                func,
+                WindowFn::FirstValue | WindowFn::LastValue | WindowFn::NthValue
+            )
+        {
+            // One whole-partition answer shared by every row.
+            let nn = crate::window::frame::NonNullRanks::new(part, values);
+            let pick = nn.pick(func, offset, 0, len).map(|p| part[p] as u32);
+            for &row in part {
+                src[row] = pick;
+            }
+            continue;
+        }
         for (pos, &row) in part.iter().enumerate() {
             let pos = pos as i64;
             let take_pos: Option<usize> = match func {
@@ -1604,6 +1735,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         // Both the serial kernel (huge threshold) and the bucket-parallel path (threshold 1).
         for threshold in [1usize, 1 << 20] {
@@ -1654,6 +1786,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         for threshold in [1usize, 1 << 20] {
             let out = window_with(
@@ -1701,6 +1834,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::RowNumber,
@@ -1709,6 +1843,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Sum,
@@ -1717,6 +1852,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Lag,
@@ -1725,6 +1861,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         // Null-aware read (Lag yields nulls at each partition's first row; the raw
@@ -1766,6 +1903,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             }];
             // threshold 1 forces the parallel bucket path; usize::MAX keeps the oracle.
             let par = window_with(std::slice::from_ref(&part), &[], &funcs, n, 1, None).unwrap();
@@ -1799,6 +1937,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order.clone())], &f, 4).unwrap();
         assert_eq!(opt_ints(&out[0]), vec![Some(20), Some(30), Some(40), None]);
@@ -1810,6 +1949,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &f, 4).unwrap();
         assert_eq!(opt_ints(&out[0]), vec![None, Some(10), Some(20), Some(30)]);
@@ -1826,6 +1966,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &funcs, 3).unwrap();
         // sorted order: idx1(10)=1, idx2(20)=2, idx0(30)=3
@@ -1850,6 +1991,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -1858,6 +2000,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -1885,6 +2028,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -1893,6 +2037,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::RowNumber,
@@ -1901,6 +2046,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -1934,6 +2080,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::CumeDist,
@@ -1942,6 +2089,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -1959,6 +2107,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &funcs, 1).unwrap();
         assert_eq!(floats(&out[0]), vec![0.0]);
@@ -1975,6 +2124,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &funcs, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![1, 1, 1, 2, 2]);
@@ -1991,6 +2141,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &funcs, 2).unwrap();
         assert_eq!(ints(&out[0]), vec![1, 2]);
@@ -2005,6 +2156,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         assert!(window(&[], &[], &funcs, 3).is_err());
     }
@@ -2023,6 +2175,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -2031,6 +2184,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[part], &[asc(order)], &funcs, 4).unwrap();
@@ -2051,6 +2205,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[part], &[], &funcs, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![9, 6, 9, 6, 9]);
@@ -2067,6 +2222,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Min,
@@ -2075,6 +2231,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2083,6 +2240,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Count,
@@ -2091,6 +2249,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Avg,
@@ -2099,6 +2258,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[], &[], &funcs, 4).unwrap();
@@ -2129,6 +2289,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2137,6 +2298,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         // Whole-partition (no ORDER BY).
@@ -2171,6 +2333,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2179,6 +2342,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[part], &[], &funcs, 3).unwrap();
@@ -2200,6 +2364,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         assert!(window(&[], &[], &funcs, 3).is_err());
     }
@@ -2215,6 +2380,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[part], &[], &funcs, 3).unwrap();
         assert_eq!(floats(&out[0]), vec![1.5, 1.5, 10.0]);
@@ -2240,6 +2406,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(part, &[asc(ord)], &funcs, n).unwrap();
         opt_ints(&out[0])
@@ -2333,6 +2500,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(ord)], &funcs, 3).unwrap();
         let s = out[0].as_any().downcast_ref::<StringArray>().unwrap();
@@ -2367,6 +2535,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             }];
             let order = [asc(ord.clone())];
             let serial = window_with(
@@ -2406,6 +2575,7 @@ mod tests {
             frame: Some(range_running),
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(ord.clone())], &framed, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![2, 2, 4, 4, 5]);
@@ -2418,6 +2588,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out2 = window(&[], &[asc(ord)], &frameless, 5).unwrap();
         assert_eq!(ints(&out2[0]), vec![5, 5, 5, 5, 5]);

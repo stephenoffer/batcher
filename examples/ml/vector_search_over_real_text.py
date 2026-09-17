@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    documents = tpch("part").select("p_partkey", "p_name").head(2_000)
+    documents = tpch("part").select("p_partkey", "p_name").limit(2_000)
 
     # A cheap, deterministic three-dimensional "embedding" of the text: three character
     # ratios. A real pipeline swaps this one expression for a model call.
@@ -31,10 +31,10 @@ def main() -> None:
             col("p_name").str.count_char("o") / 10.0,
         )
     )
-    print(embedded.head(2).to_pydict())
+    print(embedded.limit(2).to_pydict())
 
     # The query side is one row, cross-joined onto the corpus.
-    query = embedded.head(1).select(col("vector").alias("query"), col("p_name").alias("q_name"))
+    query = embedded.limit(1).select(col("vector").alias("query"), col("p_name").alias("q_name"))
 
     ranked = (
         embedded.cross_join(query)

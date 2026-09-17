@@ -151,6 +151,6 @@ def test_the_aggregates_with_no_sliding_form_still_refuse_a_frame():
     exists to avoid.
     """
     ds = bt.from_pydict({"g": ["a", "a"], "o": [1, 2], "x": [1.0, 2.0]})
-    for build in (lambda: col("x").n_unique(), lambda: col("x").median()):
+    for build in (lambda: col("x").count_distinct(), lambda: col("x").median()):
         with pytest.raises(Exception, match="frame"):
             ds.select(r=build().over("g", order_by="o", frame=(-1, 0))).collect()

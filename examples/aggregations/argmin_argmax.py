@@ -1,7 +1,7 @@
 """Finding the row that holds an extreme, not just the extreme value.
 
-`max` tells you the largest price. `arg_max` tells you which order it belongs to. Doing
-that with a sort and a limit works, but costs a full ordering; `arg_max` is a single pass
+`max` tells you the largest price. `max_by` tells you which order it belongs to. Doing
+that with a sort and a limit works, but costs a full ordering; `max_by` is a single pass
 and composes inside a group-by.
 
     python examples/aggregations/argmin_argmax.py
@@ -24,14 +24,14 @@ def main() -> None:
 
     extremes = lineitem.agg(
         dearest_price=col("l_extendedprice").max(),
-        dearest_order=bt.arg_max(col("l_orderkey"), col("l_extendedprice")),
+        dearest_order=bt.max_by(col("l_orderkey"), col("l_extendedprice")),
         cheapest_price=col("l_extendedprice").min(),
-        cheapest_order=bt.arg_min(col("l_orderkey"), col("l_extendedprice")),
+        cheapest_order=bt.min_by(col("l_orderkey"), col("l_extendedprice")),
     ).to_pydict()
     print(extremes)
 
     # Cross-check against the sort-and-take-one version.
-    by_sort = lineitem.sort("l_extendedprice", descending=True).head(1).to_pydict()
+    by_sort = lineitem.sort("l_extendedprice", descending=True).limit(1).to_pydict()
     assert extremes["dearest_price"][0] == by_sort["l_extendedprice"][0]
     assert extremes["dearest_order"][0] == by_sort["l_orderkey"][0]
 
@@ -40,13 +40,13 @@ def main() -> None:
         lineitem.group_by("l_shipmode")
         .agg(
             top_price=col("l_extendedprice").max(),
-            top_order=bt.arg_max(col("l_orderkey"), col("l_extendedprice")),
+            top_order=bt.max_by(col("l_orderkey"), col("l_extendedprice")),
         )
         .sort("l_shipmode")
         .to_pydict()
     )
     print(per_mode)
-    assert len(per_mode["l_shipmode"]) == lineitem.n_unique("l_shipmode")
+    assert len(per_mode["l_shipmode"]) == lineitem.count_distinct("l_shipmode")
     assert max(per_mode["top_price"]) == extremes["dearest_price"][0]
 
 

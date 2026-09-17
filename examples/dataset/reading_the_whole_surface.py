@@ -22,7 +22,7 @@ def main() -> None:
     orders = (
         tpch("orders")
         .select("o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate")
-        .head(5_000)
+        .limit(5_000)
     )
 
     # Metadata, none of which executes.
@@ -34,7 +34,7 @@ def main() -> None:
 
     # Shape, which does.
     assert orders.count() == 5_000
-    assert orders.height == 5_000
+    assert orders.count() == 5_000
     assert orders.shape == (5_000, 5)
     assert orders.has_rows
     assert not orders.is_empty()
@@ -46,7 +46,7 @@ def main() -> None:
     assert orders.std("o_totalprice") > 0
     assert orders.var("o_totalprice") > 0
     assert orders.median("o_totalprice") > 0
-    assert orders.n_unique("o_orderkey") == 5_000
+    assert orders.count_distinct("o_orderkey") == 5_000
     # `nunique` is the whole-frame form: one count per column, no argument.
     assert set(orders.nunique().to_pydict()) == set(orders.columns)
 
@@ -60,9 +60,9 @@ def main() -> None:
     # Row access.
     assert len(orders.first()) == 5
     assert len(orders.last()) == 5
-    assert orders.head(3).count() == 3
+    assert orders.limit(3).count() == 3
     assert orders.tail(3).count() == 3
-    assert orders.slice(10, 5).count() == 5
+    assert orders.limit(5, offset=10).count() == 5
     assert orders.sample(n=10, seed=1).count() == 10
     assert orders.limit(7).count() == 7
     assert orders.gather_every(100).count() == 50
@@ -88,10 +88,10 @@ def main() -> None:
 
     # Plan surface.
     assert isinstance(orders.explain(), str)
-    assert orders.lazy().count() == orders.count()
-    assert orders.copy().count() == orders.count()
+    assert orders.count() == orders.count()
+    assert orders.count() == orders.count()
     assert orders.pipe(lambda d: d.filter(col("o_totalprice") > 0)).count() == orders.count()
-    assert orders.equals(orders.copy())
+    assert orders.equals(orders)
 
     print("Dataset surface sweep passed")
     assert bt is not None

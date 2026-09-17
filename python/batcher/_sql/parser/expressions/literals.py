@@ -69,21 +69,20 @@ _UNARY_MATH = {
     # The remaining DuckDB math builtins sqlglot promotes to typed nodes. Each has an
     # identically-named `Expr` method, so the only thing that was missing was the row
     # in this table — `SELECT cot(x)` raised "unsupported SQL expression: Cot".
-    "Atan": "atan",
-    "Asin": "asin",
-    "Acos": "acos",
+    "Atan": "arctan",
+    "Asin": "arcsin",
+    "Acos": "arccos",
     "Sinh": "sinh",
     "Cosh": "cosh",
     "Tanh": "tanh",
-    "Asinh": "asinh",
-    "Acosh": "acosh",
-    "Atanh": "atanh",
+    "Asinh": "arcsinh",
+    "Acosh": "arccosh",
+    "Atanh": "arctanh",
     "Cot": "cot",
     "Factorial": "factorial",
     # Spark spellings sqlglot gives a typed node; each is an existing `Expr` method.
     "Sec": "sec",
     "Csc": "csc",
-    "Rint": "rint",
     "BitwiseCount": "bit_count",
     # Not math *functions*, but the same shape: a method on the value expression.
     "IsNan": "is_nan",
@@ -92,7 +91,7 @@ _UNARY_MATH = {
 _UNARY_STR = {
     "Upper": "upper",
     "Lower": "lower",
-    "Length": "len",
+    "Length": "len_chars",
     "Reverse": "reverse",
     "Ascii": "ascii",
     # `unicode(s)` is DuckDB's spelling of `ascii(s)` — the first character's codepoint.
@@ -105,7 +104,7 @@ _UNARY_STR = {
     # (this table is consulted first) made `sha2(s, 512)` silently return sha256.
     # `functions._scalar_function` handles it and rejects any width but 256.
     "BitLength": "bit_length",
-    "Initcap": "initcap",
+    "Initcap": "to_titlecase",
     "Soundex": "soundex",
     "ToBase64": "base64",
     "FromBase64": "from_base64",
@@ -129,8 +128,8 @@ _DATE_PART = {
     "Dayname": "dayname",
     "Monthname": "monthname",
     "LastDay": "last_day",
-    "WeekOfYear": "weekofyear",
-    "DayOfWeekIso": "isodow",
+    "WeekOfYear": "week",
+    "DayOfWeekIso": "weekday",
 }
 # EXTRACT(<part> FROM ts) field name (lowercased) → `.dt` method.
 _EXTRACT_PART = {
@@ -153,9 +152,9 @@ _EXTRACT_PART = {
     # checked against DuckDB's answer for the same instant, not assumed equivalent by name:
     # `isodow` counts Monday as 1 where `dow` counts Sunday as 0, and `isoyear` is the year
     # the ISO *week* belongs to, which differs from `year` around New Year.
-    "isodow": "isodow",
+    "isodow": "weekday",
     "isoyear": "iso_year",
-    "weekofyear": "week_of_year",
+    "weekofyear": "week",
     "dayofmonth": "day",
     "century": "century",
     "millennium": "millennium",
@@ -179,7 +178,7 @@ _EXTRACT_COMPOSITE = {
     # The ISO year and week as one number, `yyyyww` — and the year has to be the *ISO*
     # one, which differs from the calendar year in the days around New Year that are the
     # only reason anybody asks for this.
-    "yearweek": lambda dt: dt.iso_year() * 100 + dt.week_of_year(),
+    "yearweek": lambda dt: dt.iso_year() * 100 + dt.week(),
     # 1 in the Common Era, 0 before it. Built from a comparison rather than a branch so a
     # null date stays null instead of being reported as BCE.
     "era": lambda dt: (dt.year() > 0).cast("int64"),

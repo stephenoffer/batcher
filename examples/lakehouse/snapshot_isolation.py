@@ -26,15 +26,15 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "orders")
 
-        orders.head(2_000).write.delta(table)
+        orders.limit(2_000).write.delta(table)
         snapshot = bt.read.delta(table, version=0)
         snapshot_count = snapshot.count()
         snapshot_total = snapshot.agg(t=col("o_totalprice").sum()).to_pydict()["t"][0]
         print(f"version 0: {snapshot_count} rows")
 
         # A writer lands two more commits.
-        orders.slice(2_000, 1_000).write.delta(table, mode="append")
-        orders.slice(3_000, 1_000).write.delta(table, mode="append")
+        orders.limit(1_000, offset=2_000).write.delta(table, mode="append")
+        orders.limit(1_000, offset=3_000).write.delta(table, mode="append")
 
         latest = bt.read.delta(table)
         print(f"latest: {latest.count()} rows")

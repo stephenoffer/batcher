@@ -3,9 +3,9 @@
 What is left after the coverage sweep, grouped by why it was missed rather than by what it
 does:
 
-* **``ds.to_torch`` / ``to_torch_dataloader`` / ``to_tf`` / ``to_jax``** -- the training-loop
-  exits. They are the last mile of an ML pipeline and the place where a shape or a dtype
-  error costs a training run rather than a query.
+* **``ds.ml.iter_torch_batches`` / ``to_torch_dataloader`` / ``to_tf`` / ``to_jax``** -- the
+  training-loop exits. They are the last mile of an ML pipeline and the place where a shape
+  or a dtype error costs a training run rather than a query.
 * **``Config.from_file`` / ``from_toml`` / ``from_yaml``** -- how a deployment configures the
   engine without touching code. A loader that silently ignored a section would leave a
   cluster running defaults while its config file said otherwise.
@@ -40,7 +40,7 @@ def ds():
 def test_to_torch_yields_tensors_holding_the_dataset_rows(ds):
     """Batched tensors, in order, with the values the dataset holds."""
     pytest.importorskip("torch")
-    batches = list(ds.to_torch(batch_size=2))
+    batches = list(ds.ml.iter_torch_batches(batch_size=2, device="cpu"))
     assert len(batches) == 2, f"four rows at batch_size=2 is two batches, got {len(batches)}"
     seen: dict[str, list[float]] = {"a": [], "b": []}
     for batch in batches:
@@ -55,7 +55,7 @@ def test_to_torch_yields_tensors_holding_the_dataset_rows(ds):
 def test_to_torch_selects_only_the_requested_columns(ds):
     """``columns=`` must narrow the tensors, or a wide table pays for every column."""
     pytest.importorskip("torch")
-    batch = next(iter(ds.to_torch(columns=["a"], batch_size=4)))
+    batch = next(iter(ds.ml.iter_torch_batches(columns=["a"], batch_size=4, device="cpu")))
     assert set(batch) == {"a"}, f"columns were {sorted(batch)}"
     assert [float(v) for v in batch["a"]] == ROWS["a"]
 
@@ -63,7 +63,7 @@ def test_to_torch_selects_only_the_requested_columns(ds):
 def test_to_torch_dataloader_is_a_real_dataloader_over_the_same_rows(ds):
     """The ``DataLoader`` wrapper, checked by iterating it rather than by its type alone."""
     torch = pytest.importorskip("torch")
-    loader = ds.to_torch_dataloader(batch_size=2)
+    loader = ds.ml.to_torch_dataloader(batch_size=2)
     assert isinstance(loader, torch.utils.data.DataLoader)
     collected: dict[str, list[float]] = {"a": [], "b": []}
     for batch in loader:
@@ -76,7 +76,7 @@ def test_to_torch_dataloader_is_a_real_dataloader_over_the_same_rows(ds):
 def test_to_tf_yields_batches_holding_the_dataset_rows(ds):
     """The TensorFlow exit, same contract as the torch one."""
     pytest.importorskip("tensorflow")
-    exported = ds.to_tf(batch_size=2)
+    exported = ds.ml.to_tf(batch_size=2)
     seen: list[float] = []
     for batch in exported:
         assert set(batch) == {"a", "b"}
@@ -106,7 +106,7 @@ def test_the_framework_exports_agree_with_each_other_on_the_values(ds):
     """
     pytest.importorskip("torch")
     from_torch: list[float] = []
-    for batch in ds.to_torch(batch_size=3):
+    for batch in ds.ml.iter_torch_batches(batch_size=3, device="cpu"):
         from_torch.extend(float(v) for v in batch["a"])
     assert from_torch == ROWS["a"]
     assert from_torch == ds.to_pydict()["a"], "the tensor and the frame must agree"

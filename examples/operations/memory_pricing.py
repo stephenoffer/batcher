@@ -50,7 +50,7 @@ def main() -> None:
     assert first == second
 
     # `persist` is the longer-lived form.
-    kept = summary.persist()
+    kept = summary.cache()
     assert kept.to_pydict() == summary.to_pydict()
 
 

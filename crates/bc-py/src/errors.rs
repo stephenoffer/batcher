@@ -36,7 +36,7 @@ const ERRORS_MODULE: &str = "batcher._internal.errors";
 /// the extension without the Python package must still get a usable error rather than an
 /// import failure masquerading as one.
 fn typed(class: &str, msg: String) -> PyErr {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let built = py
             .import(ERRORS_MODULE)
             .and_then(|module| module.getattr(class))

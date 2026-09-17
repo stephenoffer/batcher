@@ -816,7 +816,7 @@ fn sample_bytes(key_col: &ArrayRef) -> Result<Vec<Vec<u8>>, RuntimeError> {
         if keys.is_null(i) {
             continue;
         }
-        if seen % stride == 0 {
+        if seen.is_multiple_of(stride) {
             sample.push(keys.key(i).to_vec());
         }
         seen += 1;

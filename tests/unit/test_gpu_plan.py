@@ -288,13 +288,13 @@ def test_sort_emits_exactly_the_engines_columns(build, be):
         lambda: col("v").floor(),
         lambda: col("v").ceil(),
         lambda: col("v").round(1),
-        lambda: col("v").pow(2.0),
+        lambda: col("v") ** 2.0,
         lambda: col("v").sign(),
         lambda: col("v").exp(),
         lambda: col("v").log10(),
         col("s").str.upper,
         col("s").str.lower,
-        col("s").str.len,
+        col("s").str.len_chars,
         lambda: col("s").str.contains("a"),
         lambda: col("s").str.starts_with("a"),
         lambda: col("s").str.ends_with("c"),
@@ -335,9 +335,9 @@ def test_signed_arithmetic_matches_cpu_engine(expr, be):
 @pytest.mark.parametrize(
     "build",
     [
-        lambda ds: ds.select(r=col("s").str.strip()),
+        lambda ds: ds.select(r=col("s").str.trim()),
         lambda ds: ds.select(r=col("s").str.upper()),
-        lambda ds: ds.select(r=col("s").str.len()),
+        lambda ds: ds.select(r=col("s").str.len_chars()),
         # SQL `substring` is 1-based and inclusive; a 0-based slice returns a shifted window
         lambda ds: ds.select(r=col("s").str.substr(1, 3)),
         lambda ds: ds.select(r=col("s").str.substr(2, 2)),
@@ -384,7 +384,7 @@ def test_string_operations_match_cpu_engine(build, be):
         # SQL `position` is 1-based and reports 0 for "not found"; `find` is 0-based and -1
         lambda: col("s").str.position("o"),
         lambda: col("s").str.right(2),
-        col("s").str.initcap,
+        col("s").str.to_titlecase,
         # the fixed-duration truncations, which are a floor
         lambda: col("t").dt.truncate("day"),
         lambda: col("t").dt.truncate("hour"),
@@ -460,11 +460,19 @@ def test_ranking_window_matches_cpu_engine(function, be):
         lambda ds: ds.window(
             partition_by=["x"], order_by=[("y", False)], functions={"r": ("first_value", "y")}
         ),
+        # `last_value`/`nth_value` over the whole partition. Without the explicit frame an
+        # ORDER BY gives them SQL's running frame, which the translator declines.
         lambda ds: ds.window(
-            partition_by=["x"], order_by=[("y", False)], functions={"r": ("last_value", "y")}
+            partition_by=["x"],
+            order_by=[("y", False)],
+            functions={"r": ("last_value", "y")},
+            frame=(None, None),
         ),
         lambda ds: ds.window(
-            partition_by=["x"], order_by=[("y", False)], functions={"r": ("nth_value", "y")}
+            partition_by=["x"],
+            order_by=[("y", False)],
+            functions={"r": ("nth_value", "y")},
+            frame=(None, None),
         ),
         lambda ds: ds.window(
             partition_by=["x"], order_by=[("y", False)], functions={"r": ("lag", "y")}
@@ -644,3 +652,142 @@ def test_nan_comparison_follows_the_engine(be):
     table = pa.table({"v": pa.array([float("nan"), 1.0, 3.0], type=pa.float64())})
     got, exp = _run(lambda ds: ds.filter(col("v") > 2.0), table, be)
     _assert_matches(got, exp, be)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: col("d").dt.truncate("month", preserve_type=True),
+        lambda: col("d").dt.month_start(keep_time=True),
+    ],
+)
+def test_polars_date_trunc_flags_decline(be, build):
+    """The Polars `date_trunc` flags are not translated, so the stage declines to the CPU.
+
+    Translating them would change what the device computes, which needs a recorded
+    `gpu_shadow_verify` run on hardware. Until then a flagged truncation must never run as a
+    plain one, which would return the midnight Timestamp instead of a Date or the kept clock.
+    """
+    table = pa.table({"d": pa.array([dt.date(2024, 2, 15), None], type=pa.date32())})
+    spec = gpu_plan_ops(bt.from_arrow(table).select(r=build())._plan)
+    assert spec is not None, "the projection is eligible; the flag is what must decline"
+    with pytest.raises(Unsupported):
+        run_chain(table, spec[1], be)
+
+
+def test_plain_date_trunc_still_translates(be):
+    """Positive control for the decline above: the unflagged truncation runs on the device."""
+    table = pa.table({"d": pa.array([dt.date(2024, 2, 15), None], type=pa.date32())})
+    spec = gpu_plan_ops(bt.from_arrow(table).select(r=col("d").dt.truncate("month"))._plan)
+    assert spec is not None
+    run_chain(table, spec[1], be)
+
+
+@pytest.mark.parametrize(
+    ("label", "agg"),
+    [
+        ("interpolation", lambda: col("y").quantile(0.5, "nearest")),
+        ("arg_max_null", lambda: col("y").max_by("z", ignore_nulls=False)),
+        ("skewness_pop", lambda: col("y").skew(bias=True)),
+        ("modes", lambda: col("y").mode(all_modes=True)),
+    ],
+)
+def test_w0_aggregate_parameters_decline(label, agg):
+    """The W0 aggregate parameters with engine state are not translated, so the node declines.
+
+    Each would change what the device computes (a different rank, a kept null, the biased
+    moment, a list), which needs a recorded `gpu_shadow_verify` run before it may translate.
+    """
+    ds = bt.from_arrow(_table())
+    assert gpu_plan_ops(ds.group_by("x").agg(r=agg())._plan) is None, label
+    # Positive control: the default forms of the same aggregates still translate.
+    plain = ds.group_by("x").agg(r=col("y").quantile(0.5))
+    assert gpu_plan_ops(plain._plan) is not None
+
+
+def test_an_ordered_array_agg_declines():
+    """`order_by` on an aggregate is declined by the field, not only because `list_agg` is.
+
+    The node-level check is what a later `list_agg` translation would lean on, so it is pinned
+    on the IR directly: the same `sum` item translates without the field and declines with it.
+    The plan-level case then shows an ordered `array_agg` query falls back as a whole.
+    """
+    from batcher.core.gpu_plan.aggs import supported_aggregate
+
+    item = {"func": "sum", "alias": "s", "input": {"e": "col", "name": "y"}}
+    keyed = {**item, "order_by": [{"expr": {"e": "col", "name": "z"}, "descending": False}]}
+    assert supported_aggregate({"aggregates": [item]})
+    assert not supported_aggregate({"aggregates": [keyed]})
+
+    ds = bt.from_arrow(_table())
+    ordered = ds.group_by("x").agg(r=col("y").array_agg(order_by="z"))
+    assert gpu_plan_ops(ordered._plan) is None
+    # Positive control: the same grouping with a translatable aggregate is taken.
+    assert gpu_plan_ops(ds.group_by("x").agg(r=col("y").sum())._plan) is not None
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        lambda: bt.first_value("y", ignore_nulls=True).over(partition_by="x", order_by="y"),
+        lambda: bt.last_value("y").over(partition_by="x", order_by="y"),
+        lambda: bt.nth_value("y", 2).over(partition_by="x", order_by="y"),
+    ],
+)
+def test_framed_or_null_skipping_value_window_declines(be, window):
+    """A value window over a running frame, or skipping nulls, is not the whole-partition pick
+    the translator computes, so the stage declines rather than answering the partition's value.
+    """
+    table = _table()
+    spec = gpu_plan_ops(bt.from_arrow(table).with_columns(r=window())._plan)
+    if spec is not None:
+        with pytest.raises(Unsupported):
+            run_chain(table, spec[1], be)
+    whole = bt.last_value("y").over(partition_by="x", order_by="y", frame=(None, None))
+    got, exp = _run(lambda ds: ds.with_columns(r=whole), table, be)
+    _assert_matches(got, exp, be)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: col("a") ^ col("b"),
+        lambda: col("x").round(1, mode="half_to_even"),
+        lambda: col("l").list.sort(nulls_last=False),
+        lambda: col("l").list.unique(drop_nulls=False),
+        lambda: col("l").list.n_unique(count_nulls=True),
+        lambda: col("x").hash(algorithm="murmur3"),
+    ],
+    ids=["bool_xor", "round_even", "sort_nulls_first", "unique_nulls", "n_unique_nulls", "murmur3"],
+)
+def test_scalar_and_list_parameter_forms_decline(be, build):
+    """The forms the scalar and list parameters put on the wire are not translated.
+
+    Boolean `^` answers a boolean in the engine where the device's bit path answers an
+    integer; `round_even`, the null-keeping list kernels and the engine-compatible hashes
+    have no translation. None may run as its default form, which would be a wrong answer
+    rather than a fallback; translating any of them needs a recorded `gpu_shadow_verify` run.
+    """
+    table = pa.table(
+        {
+            "a": pa.array([True, None]),
+            "b": pa.array([False, True]),
+            "x": pa.array([2.25, None], type=pa.float64()),
+            "l": pa.array([[1, None, 1], None], type=pa.list_(pa.int64())),
+        }
+    )
+    spec = gpu_plan_ops(bt.from_arrow(table).select(r=build())._plan)
+    assert spec is not None, "the projection is eligible; the form is what must decline"
+    with pytest.raises(Unsupported):
+        run_chain(table, spec[1], be)
+
+
+def test_integer_bit_xor_still_translates(be):
+    """Positive control: an integer `^`, and a boolean `^` against an integer, still run."""
+    table = pa.table(
+        {"a": pa.array([6, 3]), "b": pa.array([3, None]), "f": pa.array([True, False])}
+    )
+    for expr in (col("a") ^ col("b"), col("f") ^ col("a")):
+        spec = gpu_plan_ops(bt.from_arrow(table).select(r=expr)._plan)
+        assert spec is not None
+        run_chain(table, spec[1], be)

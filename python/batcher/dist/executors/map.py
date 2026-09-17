@@ -2122,7 +2122,7 @@ def _gpu_options(
     inference pool that named only its devices still queued behind a core — and the shuffle
     fleet takes its workers in a placement group holding the cluster's whole CPU capacity, so
     on any pipeline that shuffles before it infers (a `group_by`/`join`/`sort` feeding
-    `ds.ml.map_batches`, the documented heterogeneous CPU+GPU shape) that core never comes
+    `ds.map_batches`, the documented heterogeneous CPU+GPU shape) that core never comes
     free. It does not fail: the pool never places, every device sits idle, and `ray status`
     reports a fully reserved cluster, which reads as busy rather than stuck. This is the same
     deadlock `bc`'s GPU *relational* path fixed in `gpu_task_options`, on the *inference* path.

@@ -23,14 +23,14 @@ from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
 from batcher.plan.functions.aggregate import _as_column, covar_pop
 
 __all__ = [
-    "arg_max",
-    "arg_min",
     "cv",
     "first",
     "geometric_mean",
     "harmonic_mean",
     "last",
+    "max_by",
     "midrange",
+    "min_by",
     "non_null_rate",
     "null_rate",
     "nunique_ratio",
@@ -285,16 +285,23 @@ def midrange(column: str | Expr) -> Expr:
     return (col.max() + col.min()) / Lit(2)
 
 
-def first(column: str | Expr, order_by: IntoExpr) -> AggExpr:
+def first(
+    column: str | Expr, order_by: IntoExpr | None = None, *, ignore_nulls: bool = True
+) -> AggExpr:
     """The value of `column` at the first row in `order_by` order (SQL ``FIRST``).
 
     A partition-independent first: it picks the row that sorts first by `order_by`, so
     the result is identical single-node and distributed (an arrival-order first would
-    not be). Ties break arbitrarily.
+    not be). Ties on `order_by` break to the smallest value.
+
+    Rows whose value is null are skipped. ``ignore_nulls=False`` takes the first row's value
+    even when it is null, which is SQL's ``FIRST`` and Spark's ``first(col)``.
 
     Args:
         column: The column (or expression) whose value to return.
         order_by: The column (or expression) whose ascending order defines "first".
+            Required, here or through an enclosing ``.over(order_by=...)``.
+        ignore_nulls: Whether to skip rows whose value is null.
 
     Returns:
         An aggregate expression of the first value per group.
@@ -307,17 +314,22 @@ def first(column: str | Expr, order_by: IntoExpr) -> AggExpr:
             >>> ds.group_by("g").agg(f=bt.first("x", order_by="t")).to_pydict()
             {'g': ['a'], 'f': [20]}
     """
-    return _as_column(column).first(order_by)
+    return _as_column(column).first(order_by, ignore_nulls=ignore_nulls)
 
 
-def last(column: str | Expr, order_by: IntoExpr) -> AggExpr:
+def last(
+    column: str | Expr, order_by: IntoExpr | None = None, *, ignore_nulls: bool = True
+) -> AggExpr:
     """The value of `column` at the last row in `order_by` order (SQL ``LAST``).
 
-    The `order_by` companion to :func:`first`; partition-independent for the same reason.
+    The `order_by` companion to :func:`first`; partition-independent for the same reason,
+    and null handling is the same.
 
     Args:
         column: The column (or expression) whose value to return.
         order_by: The column (or expression) whose ascending order defines "last".
+            Required, here or through an enclosing ``.over(order_by=...)``.
+        ignore_nulls: Whether to skip rows whose value is null.
 
     Returns:
         An aggregate expression of the last value per group.
@@ -330,15 +342,17 @@ def last(column: str | Expr, order_by: IntoExpr) -> AggExpr:
             >>> ds.group_by("g").agg(v=bt.last("x", order_by="t")).to_pydict()
             {'g': ['a'], 'v': [10]}
     """
-    return _as_column(column).last(order_by)
+    return _as_column(column).last(order_by, ignore_nulls=ignore_nulls)
 
 
-def arg_min(value: str | Expr, by: IntoExpr) -> AggExpr:
-    """The `value` at the row where `by` is smallest (SQL ``ARG_MIN`` / ``MIN_BY``).
+def min_by(value: str | Expr, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+    """The `value` at the row where `by` is smallest (SQL ``MIN_BY`` / ``ARG_MIN``).
 
     Args:
         value: The column (or expression) whose value to return.
         by: The column (or expression) minimized to select the row.
+        ignore_nulls: Whether to skip rows whose value is null; ``False`` is Spark's
+            ``min_by`` and DuckDB's ``arg_min_null``.
 
     Returns:
         An aggregate expression of the `value` at the minimizing row per group.
@@ -348,18 +362,20 @@ def arg_min(value: str | Expr, by: IntoExpr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"g": ["a", "a"], "x": [10, 20], "t": [3, 1]})
-            >>> ds.group_by("g").agg(v=bt.arg_min("x", "t")).to_pydict()
+            >>> ds.group_by("g").agg(v=bt.min_by("x", "t")).to_pydict()
             {'g': ['a'], 'v': [20]}
     """
-    return _as_column(value).arg_min(by)
+    return _as_column(value).min_by(by, ignore_nulls=ignore_nulls)
 
 
-def arg_max(value: str | Expr, by: IntoExpr) -> AggExpr:
-    """The `value` at the row where `by` is largest (SQL ``ARG_MAX`` / ``MAX_BY``).
+def max_by(value: str | Expr, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+    """The `value` at the row where `by` is largest (SQL ``MAX_BY`` / ``ARG_MAX``).
 
     Args:
         value: The column (or expression) whose value to return.
         by: The column (or expression) maximized to select the row.
+        ignore_nulls: Whether to skip rows whose value is null; ``False`` is Spark's
+            ``max_by`` and DuckDB's ``arg_max_null``.
 
     Returns:
         An aggregate expression of the `value` at the maximizing row per group.
@@ -369,10 +385,10 @@ def arg_max(value: str | Expr, by: IntoExpr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"g": ["a", "a"], "x": [10, 20], "t": [3, 1]})
-            >>> ds.group_by("g").agg(v=bt.arg_max("x", "t")).to_pydict()
+            >>> ds.group_by("g").agg(v=bt.max_by("x", "t")).to_pydict()
             {'g': ['a'], 'v': [10]}
     """
-    return _as_column(value).arg_max(by)
+    return _as_column(value).max_by(by, ignore_nulls=ignore_nulls)
 
 
 def value_range(column: str | Expr) -> Expr:
@@ -459,4 +475,4 @@ def nunique_ratio(column: str | Expr) -> Expr:
             >>> ds.agg(v=bt.nunique_ratio("x")).to_pydict()
             {'v': [0.5]}
     """
-    return _as_column(column).n_unique() / count()
+    return _as_column(column).count_distinct() / count()

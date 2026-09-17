@@ -25,7 +25,7 @@ def main() -> None:
     assert "bytes" in pictures.columns
 
     # The payload is real: JPEG files start with FF D8 FF.
-    sample = pictures.select("bytes").head(1).to_pydict()["bytes"][0]
+    sample = pictures.select("bytes").limit(1).to_pydict()["bytes"][0]
     assert sample[:3] == b"\xff\xd8\xff"
 
     # Metadata-only work needs none of it.

@@ -97,7 +97,11 @@ def _resolve_frame(win) -> tuple | None:
     `nth_value` the *running* value (the current peer's / null-until-the-nth-peer)
     rather than the whole-partition value. `first_value` is the same either way, so it
     stays frameless. Ranking / LAG / LEAD ignore frames (as SQL does)."""
-    name = type(win.this).__name__.lower()
+    fn = win.this
+    if type(fn).__name__.lower() == "ignorenulls":
+        # `x IGNORE NULLS` wraps the value function; its frame is the function's own.
+        fn = fn.this
+    name = type(fn).__name__.lower()
     explicit = _window_frame(win)
     if _is_agg_window(win):
         return explicit

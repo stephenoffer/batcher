@@ -49,8 +49,8 @@ def main() -> None:
     chosen = (
         lineitem.grouping_sets(["l_returnflag"], ["l_linestatus"]).agg(lines=bt.count()).to_pydict()
     )
-    flags = lineitem.n_unique("l_returnflag")
-    statuses = lineitem.n_unique("l_linestatus")
+    flags = lineitem.count_distinct("l_returnflag")
+    statuses = lineitem.count_distinct("l_linestatus")
     assert len(chosen["lines"]) == flags + statuses
 
 

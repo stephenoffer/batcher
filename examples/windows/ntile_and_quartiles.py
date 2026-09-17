@@ -45,7 +45,7 @@ def main() -> None:
     )
 
     # Ten deciles over the same order.
-    assert bucketed.n_unique("decile") == 10
+    assert bucketed.count_distinct("decile") == 10
 
 
 if __name__ == "__main__":

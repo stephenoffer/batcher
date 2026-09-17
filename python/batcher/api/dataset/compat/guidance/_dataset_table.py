@@ -48,7 +48,7 @@ _NO_INDEX: dict[str, str] = {
         "and pick columns with ds.select('a', 'b') or ds[['a', 'b']]."
     ),
     "iloc": (
-        "Batcher has no positional indexer. Use ds.slice(offset, length), ds.head(n), "
+        "Batcher has no positional indexer. Use ds.limit(n, offset=offset) "
         "or ds[0:10] for rows, and ds.select(...) for columns."
     ),
     "at": "Batcher has no scalar indexer. Use ds.filter(...).item() for a single value.",
@@ -76,14 +76,8 @@ _NO_INDEX: dict[str, str] = {
 # --- transposition needs a bounded, homogeneous, materialized frame ------------------
 _NO_TRANSPOSE: dict[str, str] = {
     "T": (
-        "Transposing needs a fully materialized, single-typed frame, which a lazy "
-        "(possibly unbounded) relation is not. Collect first: ds.to_pandas().T. "
-        "To reshape relationally use ds.unpivot() / ds.pivot()."
-    ),
-    "transpose": (
-        "Transposing needs a fully materialized, single-typed frame, which a lazy "
-        "(possibly unbounded) relation is not. Collect first: ds.to_pandas().T. "
-        "To reshape relationally use ds.unpivot() / ds.pivot()."
+        "Spelled ds.transpose(column_names='<column>') here, or "
+        "ds.transpose(order_by='<column>') to name the columns by row position."
     ),
     "stack": "Reshaping wide-to-long is ds.unpivot(index=[...], on=[...]).",
     "unstack": "Reshaping long-to-wide is ds.pivot(index=[...], on=..., values=...).",
@@ -135,13 +129,9 @@ _IMMUTABLE: dict[str, str] = {
     "drop_in_place": (
         "A Dataset is immutable. Use ds.drop('col') to get a Dataset without a column."
     ),
-    "update": (
-        "A Dataset is immutable. Derive a new one with ds.with_columns(...) or "
-        "join the replacement values in with ds.join(other, on=...)."
-    ),
     "extend": "A Dataset is immutable. Stack rows with ds.union(other) (a new Dataset).",
     "clear": "A Dataset is immutable. For an empty, same-schema Dataset use ds.limit(0).",
-    "clone": "A Dataset is already immutable; ds.copy() (an identity) is here if you want it.",
+    "clone": "A Dataset is already immutable: use the same `ds`; there is nothing to copy.",
     "insert_at_idx": "A Dataset is immutable. Add a column with ds.with_columns(name=expr).",
 }
 
@@ -243,28 +233,28 @@ _NEEDS_ORDER: dict[str, str] = {
     "tz_localize": "Attach a timezone with bt.col('t').dt.convert_timezone('UTC').",
     "truncate": (
         "Trim rows by a boundary column with ds.filter(...), or by position with "
-        "ds.slice(offset, length)."
+        "ds.limit(n, offset=offset)."
     ),
     "idxmax": (
         "There is no row index. For the row itself use ds.sort('x', descending=True).head(1); "
-        "for the argmax within a group use bt.col('x').arg_max()."
+        "for the argmax within a group use bt.col('x').arg_max(order_by=...)."
     ),
     "idxmin": (
         "There is no row index. For the row itself use ds.sort('x').head(1); "
-        "for the argmin within a group use bt.col('x').arg_min()."
+        "for the argmin within a group use bt.col('x').arg_min(order_by=...)."
     ),
 }
 
 # --- reductions that exist per-expression, reached through .agg(...) at frame level ---
 _AGG_REDUCTIONS: dict[str, str] = {
     "prod": "Spelled ds.product('x') here (or bt.col('x').product() inside ds.agg(...)).",
-    "skew": "Spelled ds.skewness('x') here (or bt.col('x').skewness() inside ds.agg(...)).",
     "kurt": "Spelled ds.kurtosis('x') here (or bt.col('x').kurtosis() inside ds.agg(...)).",
     "sem": "Standard error of the mean is bt.sem(bt.col('x')) inside ds.agg(...).",
     "corrwith": "Pairwise correlation is ds.corr('a', 'b'); the full matrix is ds.corr_matrix().",
     "dot": "A matrix product is not a relational op. Use ds.to_numpy() then NumPy.",
     "nunique_approx": (
-        "Approximate distinct count is bt.col('x').approx_n_unique(), or ds.approx_n_unique."
+        "Approximate distinct count is bt.col('x').approx_count_distinct(), or "
+        "ds.approx_count_distinct('x')."
     ),
 }
 
@@ -303,9 +293,6 @@ _PREDICATES: dict[str, str] = {
     "fill_nan": (
         "Replace NaN (distinct from null) with bt.col('x').fill_nan(0) inside ds.with_columns(...)."
     ),
-    "drop_nans": (
-        "ds.drop_nulls() drops nulls, not NaN. Drop NaN with ds.filter(bt.col('x').is_not_nan())."
-    ),
     "is_duplicated": (
         "Flag duplicate rows with bt.col('key').is_duplicated() in ds.with_columns(...)."
     ),
@@ -332,10 +319,10 @@ _RESHAPE: dict[str, str] = {
         "Reduce across columns with bt.fold_horizontal(fn, [bt.col('a'), bt.col('b')]) in a select."
     ),
     "max_horizontal": (
-        "Row-wise max across columns is bt.max_horizontal('a', 'b') in ds.select(...)."
+        "Row-wise max across columns is bt.greatest(bt.col('a'), bt.col('b')) in ds.select(...)."
     ),
     "min_horizontal": (
-        "Row-wise min across columns is bt.min_horizontal('a', 'b') in ds.select(...)."
+        "Row-wise min across columns is bt.least(bt.col('a'), bt.col('b')) in ds.select(...)."
     ),
     "sum_horizontal": (
         "Row-wise sum across columns is bt.sum_horizontal('a', 'b') in ds.select(...)."
@@ -344,10 +331,6 @@ _RESHAPE: dict[str, str] = {
         "Row-wise mean across columns is bt.mean_horizontal('a', 'b') in ds.select(...)."
     ),
     "hash_rows": "A per-row hash column is bt.hash_rows(...) in ds.with_columns(...).",
-    "partition_by": (
-        "For output layout use ds.write.parquet(partition_by=[...]); to process per group "
-        "use ds.group_by(...).agg(...) or a window."
-    ),
     "explode_multiple": "Explode a list column with ds.explode('col').",
 }
 
@@ -369,7 +352,7 @@ _MANAGED: dict[str, str] = {
     "localCheckpoint": "Materialize and reuse a result with ds.cache().",
     "storageLevel": (
         "Not a property to read: pass the level in, as ds.cache('disk_only') or "
-        "ds.persist('memory_only'). bt.cache_stats() reports what the cache holds."
+        "ds.cache('memory_only'). bt.cache_stats() reports what the cache holds."
     ),
     "hint": (
         "The optimizer (Kyber) chooses join strategy and build side; inspect it with ds.explain()."

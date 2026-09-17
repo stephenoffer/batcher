@@ -344,7 +344,7 @@ def feature_profile(ds: Dataset, columns: list[str] | None = None) -> Dataset:
     aggregates: dict[str, Any] = {}
     for index, name in enumerate(names):
         aggregates[f"__bt_n_{index}"] = bt.null_rate(col(name))
-        aggregates[f"__bt_s_{index}"] = bt.skewness(col(name))
+        aggregates[f"__bt_s_{index}"] = bt.skew(col(name))
         aggregates[f"__bt_k_{index}"] = bt.kurtosis(col(name))
         aggregates[f"__bt_c_{index}"] = bt.robust_cv(col(name))
     row = ds.agg(**aggregates).collect()

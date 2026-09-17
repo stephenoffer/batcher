@@ -84,7 +84,7 @@ Breadth lives on **accessor namespaces**, not on `Expr` itself:
 ds = bt.from_pydict({"name": [" Ann ", "bob"], "tags": [["a", "b"], ["c"]]})
 
 ds = ds.with_columns(
-    clean=bt.col("name").str.strip().str.to_lowercase(),
+    clean=bt.col("name").str.trim().str.lower(),
     n_tags=bt.col("tags").list.len(),
     tier=bt.when(bt.col("name").str.len_chars() > 3).then("long").otherwise("short"),
 )
@@ -92,7 +92,7 @@ ds = ds.with_columns(
 
 Chain with `& | ~` (parenthesize each side — `&` binds tighter than a comparison).
 Conditionals are `bt.when(cond).then(a).otherwise(b)` (or `bt.iff(c, a, b)`). Horizontal
-folds across columns: `bt.sum_horizontal`, `bt.max_horizontal`, `bt.coalesce`,
+folds across columns: `bt.sum_horizontal`, `bt.greatest`, `bt.coalesce`,
 `bt.all_horizontal`. Column *sets* come from selectors: `bt.numeric()`, `bt.string()`,
 `bt.by_dtype(...)`, `bt.exclude(...)`.
 
@@ -141,7 +141,7 @@ and `group_by()` with no keys aggregates globally. Shorthand reducers on the `Gr
 (`.sum()`, `.mean()`, `.len()`, …) reduce every remaining column the same way.
 **Aggregates cannot be nested**, but expressions over them are fine
 (`avg_price=bt.col("price").sum() / bt.count()`). For huge cardinality prefer the sketch
-aggregates — `bt.approx_n_unique`, `bt.approx_quantile`, `bt.approx_median`.
+aggregates — `bt.approx_count_distinct`, `bt.approx_quantile`, `bt.approx_median`.
 
 ## Window functions
 
@@ -201,7 +201,8 @@ columnar operator, not a row loop.
   `bt.register_function(name, fn)` makes one callable from `bt.sql`.
 - `Dataset.map` / `flat_map` are **per-row Python** — the slow path. `ds.select(tok=
   bt.col("text").str.split(",")).explode("tok")` beats a `flat_map` by roughly 10x.
-- `ds.ml.filter(fn)` is the row-predicate escape hatch for a condition no `Expr` can say.
+- `ds.filter(fn)` is the escape hatch for a condition no `Expr` can say: `fn(batch)` returns
+  one boolean per row. `ds.filter("x > 1")` takes a SQL predicate string.
   It declares that it changes no column, so a vectorized `ds.filter` written after it is
   still pushed underneath and runs first — keep the cheap predicate in the chain.
 - A preempted worker **recomputes** its partition, so `fn` must be idempotent — move side

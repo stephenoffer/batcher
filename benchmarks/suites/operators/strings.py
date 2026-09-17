@@ -126,3 +126,15 @@ def replace_length(ctx: Context):
         return pa.table({"s": pa.array([pc.sum(pc.utf8_length(rep)).as_py()])})
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow)
+
+
+@strings.case("op-str-regexp")
+def regexp(ctx: Context):
+    """COUNT WHERE l_comment matches `^[a-z]+ ly` -- a real regex automaton, not a LIKE."""
+    sql = "SELECT COUNT(*) AS n FROM lineitem WHERE REGEXP_MATCHES(l_comment, '^[a-z]+ ly')"
+
+    def pyarrow(t: pa.Table) -> pa.Table:
+        n = pc.sum(pc.match_substring_regex(t["l_comment"], "^[a-z]+ ly")).as_py()
+        return pa.table({"n": pa.array([n], type=pa.int64())})
+
+    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow)

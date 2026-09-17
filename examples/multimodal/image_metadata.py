@@ -36,7 +36,7 @@ def main() -> None:
     ).to_pydict()
     print({name: round(value[0], 1) for name, value in summary.items()})
 
-    rows = described.head(3).to_pydict()
+    rows = described.limit(3).to_pydict()
     print(rows["mime"], rows["width"], rows["height"])
     assert all(value == "image/jpeg" for value in described.to_pydict()["mime"])
     assert summary["smallest"][0] > 0

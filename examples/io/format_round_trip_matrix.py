@@ -23,7 +23,7 @@ def main() -> None:
     source = (
         tpch("orders")
         .select("o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate")
-        .head(2_000)
+        .limit(2_000)
     )
     expected = source.sort("o_orderkey").to_pydict()
     expected_types = dict(zip(source.columns, [str(dtype) for dtype in source.dtypes], strict=True))

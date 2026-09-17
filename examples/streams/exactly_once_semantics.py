@@ -26,7 +26,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "sink")
 
-        batch = source.head(5_000)
+        batch = source.limit(5_000)
 
         # At-least-once: an append replayed twice duplicates its rows.
         batch.write.delta(table)

@@ -25,7 +25,7 @@ def test_sort_below_aggregate_is_removed():
 
 def test_topn_sort_below_aggregate_is_kept():
     # Sort with a limit changes which rows are aggregated -> must not be removed.
-    plan = _t().sort("v").head(2).group_by("k").agg(total=col("v").sum())._plan
+    plan = _t().sort("v").limit(2).group_by("k").agg(total=col("v").sum())._plan
     # plan is Aggregate(Limit(Sort)); the rule matches Aggregate-over-Sort only.
     assert eliminate_sort_before_aggregate(plan, None) is None
 

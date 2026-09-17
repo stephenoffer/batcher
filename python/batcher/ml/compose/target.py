@@ -34,6 +34,10 @@ TRANSFORMS = ("log1p", "log", "sqrt")
 
 _INVERSE = {"log1p": "expm1", "log": "exp", "sqrt": "square"}
 
+# The `Expr` method each transform name applies. The names are this estimator's own vocabulary
+# (scikit-learn's), not `Expr` spellings, so "log" is the natural log whatever `Expr` calls it.
+_FORWARD = {"log1p": "log1p", "log": "ln", "sqrt": "sqrt"}
+
 
 class TransformedTargetRegressor:
     """Fit a regressor on a transformed target and invert its predictions automatically.
@@ -100,7 +104,7 @@ class TransformedTargetRegressor:
 
     def _forward(self, ds: Dataset) -> Dataset:
         """Replace the target column with its transform."""
-        expression = getattr(col(self.target).cast("float64"), self.transform)()
+        expression = getattr(col(self.target).cast("float64"), _FORWARD[self.transform])()
         return ds.with_columns(**{self.target: expression})
 
     def fit(self, ds: Dataset) -> TransformedTargetRegressor:

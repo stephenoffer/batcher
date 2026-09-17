@@ -219,7 +219,11 @@ def test_edge_null_heavy_join_keys():
 
 
 def test_type_very_long_strings():
-    out = bt.from_pydict({"s": ["x" * 500_000] * 200}).with_columns(n=col("s").str.len()).collect()
+    out = (
+        bt.from_pydict({"s": ["x" * 500_000] * 200})
+        .with_columns(n=col("s").str.len_chars())
+        .collect()
+    )
     assert out.num_rows == 200
     assert out.to_pydict()["n"][0] == 500_000
 

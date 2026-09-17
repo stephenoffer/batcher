@@ -11,6 +11,42 @@
       "name": "y"
     }
   },
+  "agg_interpolation": {
+    "alias": "q25",
+    "func": "quantile",
+    "input": {
+      "e": "col",
+      "name": "x"
+    },
+    "interpolation": "nearest",
+    "param": 0.25
+  },
+  "agg_ordered_list": {
+    "alias": "xs",
+    "func": "list_agg",
+    "input": {
+      "e": "col",
+      "name": "x"
+    },
+    "order_by": [
+      {
+        "descending": true,
+        "expr": {
+          "e": "col",
+          "name": "y"
+        },
+        "nulls_first": false
+      },
+      {
+        "descending": false,
+        "expr": {
+          "e": "col",
+          "name": "x"
+        },
+        "nulls_first": true
+      }
+    ]
+  },
   "agg_param": {
     "alias": "p50",
     "func": "quantile",
@@ -218,6 +254,16 @@
     },
     "unit": "month"
   },
+  "date_trunc_flags": {
+    "e": "date_trunc",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "keep_time": true,
+    "preserve_type": true,
+    "unit": "month"
+  },
   "geo_binary": {
     "args": [
       {
@@ -292,6 +338,21 @@
       }
     ],
     "seed": 7
+  },
+  "hash_algorithm": {
+    "algorithm": "murmur3",
+    "e": "hash",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "col",
+        "name": "y"
+      }
+    ],
+    "seed": 42
   },
   "hash_default_seed": {
     "e": "hash",
@@ -441,6 +502,18 @@
       "name": "b"
     }
   },
+  "list_binary_jaccard_nonzero": {
+    "e": "list_binary",
+    "fn": "jaccard_nonzero",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
   "list_contains": {
     "e": "list_contains",
     "input": {
@@ -475,6 +548,22 @@
   "list_func": {
     "e": "list",
     "fn": "sum",
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "list_func_nulls_first": {
+    "e": "list",
+    "fn": "sort_desc_nulls_first",
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "list_func_with_nulls": {
+    "e": "list",
+    "fn": "unique_with_nulls",
     "input": {
       "e": "col",
       "name": "a"
@@ -725,6 +814,20 @@
       }
     }
   },
+  "math2_round_even": {
+    "e": "math2",
+    "fn": "round_even",
+    "left": {
+      "e": "col",
+      "name": "x"
+    },
+    "right": {
+      "e": "lit",
+      "value": {
+        "int": 2
+      }
+    }
+  },
   "not": {
     "e": "not",
     "input": {
@@ -923,6 +1026,35 @@
       "name": "p"
     }
   },
+  "str_mask_by_class": {
+    "e": "str",
+    "fn": "mask_by_class",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "pattern": "Xxn\u0000"
+  },
+  "str_regexp_replace_dollar": {
+    "e": "str",
+    "fn": "regexp_replace_all_dollar",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "pattern": "(a)",
+    "replacement": "$1"
+  },
+  "str_regexp_split_limit": {
+    "e": "str",
+    "fn": "regexp_split",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "length": 2,
+    "pattern": "-"
+  },
   "str_replace": {
     "e": "str",
     "fn": "replace",
@@ -951,6 +1083,15 @@
     "length": 3,
     "start": 1
   },
+  "str_xxhash64_seed": {
+    "e": "str",
+    "fn": "xxhash64",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "start": 42
+  },
   "strftime": {
     "e": "strftime",
     "format": "%Y-%m-%d",
@@ -966,6 +1107,15 @@
       "e": "col",
       "name": "s"
     }
+  },
+  "strptime_strict": {
+    "e": "strptime",
+    "format": "%Y-%m-%d",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "strict": true
   },
   "struct_field": {
     "e": "struct_field",

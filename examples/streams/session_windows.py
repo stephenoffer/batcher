@@ -59,7 +59,7 @@ def main() -> None:
         .sort("o_custkey", "session")
     )
     result = summary.to_pydict()
-    print(f"{summary.count()} sessions across {orders.n_unique('o_custkey')} customers")
+    print(f"{summary.count()} sessions across {orders.count_distinct('o_custkey')} customers")
 
     # Every order belongs to exactly one session.
     assert sum(result["orders"]) == orders.count()
@@ -71,7 +71,7 @@ def main() -> None:
     assert all(first <= last for first, last in zip(result["first"], result["last"], strict=True))
 
     # There are at least as many sessions as customers, because everyone has one.
-    assert summary.count() >= orders.n_unique("o_custkey")
+    assert summary.count() >= orders.count_distinct("o_custkey")
 
 
 if __name__ == "__main__":

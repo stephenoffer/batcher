@@ -34,8 +34,8 @@ def main() -> None:
     assert not ds.all_null("amount")
 
     # Cardinality.
-    assert ds.n_unique("grade") == 2
-    assert ds.approx_n_unique("id") >= 1
+    assert ds.count_distinct("grade") == 2
+    assert ds.approx_count_distinct("id") >= 1
 
     # Distribution, exact and approximate.
     print("median:", ds.median("amount"), "p90:", ds.quantile("amount", 0.9))

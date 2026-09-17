@@ -62,8 +62,8 @@ CASES: dict[str, object] = {
     "cast_unwrap": lambda ds: ds.filter(col("i").cast("float64") >= lit(3.0)),
     "cast_folds": lambda ds: ds.select(r=col("i").cast("int64").cast("int64")),
     "like_family": lambda ds: ds.filter(col("s").str.contains("b")),
-    "string_folds": lambda ds: ds.select(r=lit("aB").str.upper(), n=lit("abc").str.len()),
-    "string_lengths": lambda ds: ds.filter(col("s").str.len() > lit(0)),
+    "string_folds": lambda ds: ds.select(r=lit("aB").str.upper(), n=lit("abc").str.len_chars()),
+    "string_lengths": lambda ds: ds.filter(col("s").str.len_chars() > lit(0)),
     "temporal_parts": lambda ds: ds.filter(col("t").dt.year() == lit(2021)),
     "temporal_trunc": lambda ds: ds.filter(col("t").dt.truncate("day") < lit(dt.date(2022, 1, 1))),
     "temporal_date": lambda ds: ds.filter(col("d").dt.month() != lit(6)),
@@ -89,7 +89,7 @@ CASES: dict[str, object] = {
     "greatest_least": lambda ds: ds.select(r=bt.greatest(col("i"), col("j"), col("i"))),
     "mixed_wide": lambda ds: ds.filter(
         (col("i").abs() < lit(50))
-        & (col("s").str.len() > lit(0))
+        & (col("s").str.len_chars() > lit(0))
         & col("t").dt.year().is_not_null()
     ).select(a=col("i").abs().floor(), b=col("s").str.upper(), c=col("t").dt.month()),
 }

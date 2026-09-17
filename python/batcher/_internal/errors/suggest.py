@@ -291,6 +291,8 @@ def absent_error(
     name: str,
     table: dict[str, str],
     members: Iterable[str],
+    *,
+    receiver: str | None = None,
 ) -> AttributeError:
     """The `AttributeError` for a failed attribute lookup, with migration guidance.
 
@@ -307,6 +309,10 @@ def absent_error(
         table: The known-absent ecosystem APIs, mapping the name a migrant types to the
             guidance half of the message.
         members: The object's real public attribute names, for the did-you-mean fallback.
+        receiver: The migration-registry receiver key (``"Dataset"``, ``"Expr.str"``,
+            ``"bt"``). When given, a name the curated table does not know is looked up in
+            the registry: a removed Batcher spelling, or a PySpark/Polars/Daft/Ray Data
+            spelling typed on the object a user of that engine would reach for.
 
     Returns:
         An `AttributeError`. For a name in `table`, the curated guidance; otherwise the
@@ -325,6 +331,12 @@ def absent_error(
     """
     if name in table:
         return AttributeError(f"{label} has no attribute {name!r}. {table[name]}")
+    if receiver is not None and not name.startswith("_"):
+        from batcher._internal.migration.hints import migration_hint
+
+        hint = migration_hint(receiver, name)
+        if hint is not None:
+            return AttributeError(f"{label} has no attribute {name!r}. {hint}")
     return AttributeError(_Guidance(label, name, tuple(members)))
 
 

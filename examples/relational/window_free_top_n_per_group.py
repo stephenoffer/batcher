@@ -53,7 +53,7 @@ def main() -> None:
     print(f"{len(left['l_orderkey'])} orders, one top line each")
 
     # One row per order, both ways.
-    assert len(left["l_orderkey"]) == lineitem.n_unique("l_orderkey")
+    assert len(left["l_orderkey"]) == lineitem.count_distinct("l_orderkey")
     assert left["l_orderkey"] == right["l_orderkey"]
 
     # And the same prices, because both pick the maximum.

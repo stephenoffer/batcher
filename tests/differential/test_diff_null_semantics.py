@@ -56,7 +56,7 @@ def test_null_median_and_count_distinct(duck, nulls):
     out = (
         bt.from_arrow(nulls)
         .group_by("k")
-        .agg(m=col("v").median(), nd=col("v").n_unique())
+        .agg(m=col("v").median(), nd=col("v").count_distinct())
         .collect()
     )
     assert_same(out, duck.sql("SELECT k, median(v) m, COUNT(DISTINCT v) nd FROM t GROUP BY k"))

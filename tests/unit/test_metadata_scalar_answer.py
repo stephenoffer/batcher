@@ -88,7 +88,7 @@ def test_exact_ndv_required_for_n_unique(pq_path):
     # Parquet footers carry no EXACT distinct count → no metadata answer (execute).
     ds = _ds(pq_path)
     assert metadata_n_unique(ds._plan, ds._sources, "x") is None
-    assert ds.n_unique("x") == 4  # but execution is correct
+    assert ds.count_distinct("x") == 4  # but execution is correct
 
 
 def test_in_memory_scalars_answered_from_learned_bounds():
@@ -99,7 +99,7 @@ def test_in_memory_scalars_answered_from_learned_bounds():
     assert metadata_min(ds._plan, ds._sources, "x") == 1
     assert ds.min("x") == 1
     assert ds.n_null("x") == 1
-    assert ds.n_unique("x") == 2
+    assert ds.count_distinct("x") == 2
     assert ds.all_null("x") is False
 
 

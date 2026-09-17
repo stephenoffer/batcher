@@ -20,7 +20,9 @@ from batcher import col, ml
 
 def main() -> None:
     features = (
-        tpch("lineitem").select("l_quantity", "l_extendedprice", "l_discount", "l_tax").head(20_000)
+        tpch("lineitem")
+        .select("l_quantity", "l_extendedprice", "l_discount", "l_tax")
+        .limit(20_000)
     )
     columns = features.columns
 

@@ -47,7 +47,7 @@ def main() -> None:
 
     # An order-sensitive result needs the sort to be part of the query, not an accident
     # of the partitioning — this is the case that silently breaks at scale.
-    top = lineitem.sort("l_extendedprice", descending=True).head(10)
+    top = lineitem.sort("l_extendedprice", descending=True).limit(10)
     assert (
         top.collect(num_partitions=1).to_pydict()["l_extendedprice"]
         == top.collect(num_partitions=8).to_pydict()["l_extendedprice"]

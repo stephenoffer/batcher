@@ -1,4 +1,4 @@
-"""WebDataset format — `.tar` shard reader via stdlib `tarfile` (core, no extra).
+"""WebDataset format — `.tar` shard reader and writer via stdlib `tarfile` (core, no extra).
 
 WebDataset stores training samples as plain POSIX tar archives: files sharing a
 basename form one sample, and the file extension names the field. ``a/b.jpg`` and
@@ -7,10 +7,15 @@ basename form one sample, and the file extension names the field. ``a/b.jpg`` an
 grouping members by key into Arrow rows whose value columns are ``binary``. One
 tar shard is one `Split`, and each shard streams a morsel at a time rather than becoming
 resident whole.
+
+`WebDatasetSink` writes the same layout back: one tar member per non-null cell, named
+``<__key__>.<column>``, with a sample's members adjacent as the format requires. It streams
+too, appending each batch's members to an open tar.
 """
 
 from __future__ import annotations
 
+import io
 import os
 import tarfile
 from collections.abc import Iterator
@@ -18,11 +23,12 @@ from typing import IO, Any
 
 import pyarrow as pa
 
+from batcher._internal.errors import SchemaError
 from batcher.config import active_config
-from batcher.io.base import FileSource
-from batcher.io.formats.base import SOURCES
+from batcher.io.base import FileSink, FileSource
+from batcher.io.formats.base import SINKS, SOURCES
 
-__all__ = ["WebDatasetSource"]
+__all__ = ["WebDatasetSink", "WebDatasetSource"]
 
 # Payload bytes a batch may accumulate before it is flushed, *in addition* to the row-count
 # morsel. Both bounds are needed and the byte one is the load-bearing half: a WebDataset row
@@ -221,3 +227,107 @@ class WebDatasetSource(FileSource):
         rows = active_config().execution.morsel_rows
         for batch in _iter_shard_batches(fh, schema, rows, path):
             yield batch.select(projection) if projection is not None else batch
+
+
+def _member_payloads(name: str, column: pa.Array) -> list[bytes | None]:
+    """One column's cells as tar member payloads, None where the member is omitted.
+
+    Bytes are written as they are and text as UTF-8. A number or a boolean is written as
+    its decimal text, which is the WebDataset convention for a ``.cls`` label and what its
+    decoders parse back. Nothing else has a byte form a reader of the format would agree
+    on, so a nested or temporal column is refused rather than serialized one way here and
+    decoded another way there.
+    """
+    dtype = column.type
+    if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
+        return column.to_pylist()
+    if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+        return column.cast(pa.large_binary()).to_pylist()
+    if pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_boolean(dtype):
+        text = column.cast(pa.int8()) if pa.types.is_boolean(dtype) else column
+        return text.cast(pa.large_string()).cast(pa.large_binary()).to_pylist()
+    raise SchemaError(
+        f"write.webdataset cannot write column {name!r} of type {dtype}: a sample member is "
+        "bytes, text, or a number. Encode it first, for example with .json.encode() for a "
+        "struct or list."
+    )
+
+
+@SINKS.register("webdataset")
+class WebDatasetSink(FileSink):
+    """Write rows as WebDataset samples in a POSIX ``.tar`` shard.
+
+    Every row needs a ``__key__`` string, which names the sample; every other column is an
+    extension, so a row ``{__key__: "a", jpg: b"...", cls: 3}`` becomes the members
+    ``a.jpg`` and ``a.cls``. A null cell writes no member, which is how a WebDataset sample
+    leaves a field out, and reads back as null. The key must not contain a ``.`` in its last
+    path segment, because a reader takes the first dot there as the start of the extension.
+
+    Member modification times are fixed at zero, so the same rows produce the same bytes.
+    """
+
+    suffix = ".tar"
+    format_name = "webdataset"
+
+    __slots__ = ()
+
+    @staticmethod
+    def _check_schema(schema: pa.Schema) -> None:
+        if "__key__" not in schema.names:
+            raise SchemaError(
+                "write.webdataset needs a string __key__ column naming each sample; derive "
+                "one from a row index cast to string first"
+            )
+        for name in schema.names:
+            if name != "__key__" and ("/" in name or not name):
+                raise SchemaError(f"write.webdataset: column {name!r} is not a usable extension")
+
+    def _append(self, tar: tarfile.TarFile, batch: pa.RecordBatch) -> None:
+        keys = batch.column("__key__").to_pylist()
+        names = [n for n in batch.schema.names if n != "__key__"]
+        payloads = [_member_payloads(n, batch.column(n)) for n in names]
+        # A repeated key is refused rather than written: two adjacent samples with one key
+        # read back as a single row holding the second sample's members, which loses the
+        # first without an error. Checked within the batch, and against the key that ended
+        # the previous batch, which is the one other place two samples can be adjacent.
+        previous = getattr(tar, "_batcher_last_key", None)
+        if len(set(keys)) != len(keys) or (keys and keys[0] == previous):
+            raise SchemaError(
+                "write.webdataset: __key__ repeats, and a reader would merge or reject the "
+                "samples that share a key. Make the keys unique first."
+            )
+        for row, key in enumerate(keys):
+            if not isinstance(key, str) or not key or "." in key.rsplit("/", 1)[-1]:
+                raise SchemaError(
+                    f"write.webdataset: sample key {key!r} is not a non-empty string without "
+                    "a '.' in its last path segment, so a reader would not get it back"
+                )
+            for name, column in zip(names, payloads, strict=True):
+                data = column[row]
+                if data is None:
+                    continue
+                info = tarfile.TarInfo(f"{key}.{name}")
+                info.size = len(data)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
+        if keys:
+            tar._batcher_last_key = keys[-1]  # type: ignore[attr-defined]
+        # `TarFile` keeps a `TarInfo` for every member it writes, which only a reader needs.
+        # Dropping them per batch keeps a large shard's write at one batch of memory.
+        tar.members.clear()
+
+    def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
+        self._check_schema(table.schema)
+        with tarfile.open(fileobj=fh, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+            for batch in table.to_batches():
+                self._append(tar, batch)
+
+    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
+        self._check_schema(schema)
+        return tarfile.open(fileobj=fh, mode="w|", format=tarfile.PAX_FORMAT)
+
+    def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
+        self._append(writer, batch)
+
+    def _close_stream_writer(self, writer: Any) -> None:
+        writer.close()  # writes the end-of-archive blocks; the handle stays open

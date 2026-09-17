@@ -1,6 +1,6 @@
 """The SQuAD normalization kernel against the composition it replaced.
 
-`normalize` was five expressions — `lower`, three `regexp_replace_all` passes, two trims — and
+`normalize` was five expressions — `lower`, three `replace_all` passes, two trims — and
 is now one engine kernel. Every word-level metric in the package tokenizes through it, so a
 drift here silently changes `token_set_f1`, `answer_groundedness`, BLEU, ROUGE, and the
 diversity monitors all at once, in a direction no test would name.
@@ -25,10 +25,10 @@ def _composition(expr):
     """The five-expression chain the kernel replaced, as the oracle."""
     return (
         expr.str.lower()
-        .str.regexp_replace_all(r"\b(a|an|the)\b", " ")
+        .str.replace_all(r"\b(a|an|the)\b", " ")
         .str.remove_punctuation()
         .str.normalize_whitespace()
-        .str.strip()
+        .str.trim()
     )
 
 

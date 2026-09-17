@@ -34,7 +34,7 @@ def _endless():
 
 @pytest.mark.integration
 def test_head_materializes_a_bounded_peek():
-    assert _endless().head(3).to_pydict() == {"v": [0, 1, 2]}
+    assert _endless().limit(3).to_pydict() == {"v": [0, 1, 2]}
 
 
 @pytest.mark.integration
@@ -42,17 +42,17 @@ def test_the_peek_can_be_counted_too():
     """Without this, `head(10)` could be materialized but not counted -- `count()` wraps the
     plan in an aggregate, and an aggregate over an endless source is exactly what the guard
     refuses. An inconsistency nobody could have explained."""
-    assert _endless().head(3).count() == 3
+    assert _endless().limit(3).count() == 3
 
 
 @pytest.mark.integration
 def test_an_offset_is_respected():
-    assert _endless().slice(2, 3).to_pydict() == {"v": [2, 3, 4]}
+    assert _endless().limit(3, offset=2).to_pydict() == {"v": [2, 3, 4]}
 
 
 @pytest.mark.integration
 def test_a_filter_beneath_the_peek_still_streams():
-    assert _endless().filter(col("v") > 1).head(2).to_pydict() == {"v": [2, 3]}
+    assert _endless().filter(col("v") > 1).limit(2).to_pydict() == {"v": [2, 3]}
 
 
 @pytest.mark.integration
@@ -65,21 +65,21 @@ def test_show_prints_the_first_rows_of_a_stream(capsys):
 def test_show_on_an_existing_peek_does_not_wrap_a_limit_in_a_limit(capsys):
     """A limit over a limit is correct and unstreamable: the router recognizes a limit over
     a *breaker-free* pipeline, and a limit is not one. Folding the two keeps it one node."""
-    _endless().head(2).show()
+    _endless().limit(2).show()
     printed = capsys.readouterr().out
     assert "0" in printed and "1" in printed
 
 
 @pytest.mark.integration
 def test_to_pylist_and_the_other_materializing_terminals_follow():
-    assert _endless().head(2).to_pylist() == [{"v": 0}, {"v": 1}]
+    assert _endless().limit(2).to_pylist() == [{"v": 0}, {"v": 1}]
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
     ("label", "build"),
     [
-        ("top_n", lambda: _endless().sort("v").head(3)),
+        ("top_n", lambda: _endless().sort("v").limit(3)),
         ("whole_stream", _endless),
         ("aggregate", lambda: _endless().agg(total=col("v").sum())),
     ],

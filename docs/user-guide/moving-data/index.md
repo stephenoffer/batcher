@@ -23,6 +23,12 @@ SQL, NoSQL, warehouses, scientific formats.
 Files, lakehouse tables, sinks.
 :::
 
+:::{grid-item-card} {octicon}`database;1.1em` Catalogs and tables
+:link: /user-guide/moving-data/catalogs-and-tables
+:link-type: doc
+Named tables, save modes, attached catalogs.
+:::
+
 :::{grid-item-card} {octicon}`plug;1.1em` Custom connectors
 :link: /user-guide/moving-data/custom-connectors
 :link-type: doc
@@ -72,6 +78,7 @@ Progress, state, late rows, listeners.
 reading-data
 reading-databases
 writing-data
+catalogs-and-tables
 custom-connectors
 cloud-storage
 lakehouse

@@ -82,7 +82,7 @@ def test_global_aggregate_min_max_matches_execution(pq_path):
 
 def test_count_distinct_executes_without_exact_ndv(pq_path):
     # Parquet footers don't give an exact distinct count → must execute, correctly.
-    ds = _ds(pq_path).agg(n=col("g").n_unique())
+    ds = _ds(pq_path).agg(n=col("g").count_distinct())
     assert ds.to_pydict() == {"n": [7]}
 
 
@@ -195,7 +195,7 @@ def test_in_memory_global_aggregate_matches_arrow(name, agg):
     build, oracle = {
         "sum_a": (lambda d: d.agg(v=col("a").sum()), pc.sum),
         "mean_a": (lambda d: d.agg(v=col("a").mean()), pc.mean),
-        "nunique_i": (lambda d: d.agg(v=col("i").n_unique()), pc.count_distinct),
+        "nunique_i": (lambda d: d.agg(v=col("i").count_distinct()), pc.count_distinct),
         "sum_i": (lambda d: d.agg(v=col("i").sum()), pc.sum),
         "min_a": (lambda d: d.agg(v=col("a").min()), pc.min),
         "count_a": (lambda d: d.agg(v=col("a").count()), lambda c: pc.count(c, mode="only_valid")),
@@ -216,7 +216,7 @@ def test_the_moment_facets_are_actually_answered_from_metadata():
     for build in (
         lambda d: d.agg(v=col("a").sum()),
         lambda d: d.agg(v=col("a").mean()),
-        lambda d: d.agg(v=col("i").n_unique()),
+        lambda d: d.agg(v=col("i").count_distinct()),
         lambda d: d.agg(v=col("i").sum()),
     ):
         q = build(ds)
@@ -245,7 +245,7 @@ def test_a_filtered_sum_is_never_answered_from_the_whole_relation_total():
         (lambda d: d.select(a=col("b") * 2).agg(v=col("a").sum()), 120.0),
         (lambda d: d.select(a=col("b")).agg(v=col("a").sum()), 60.0),
         (lambda d: d.select(a=col("b")).agg(v=col("a").mean()), 20.0),
-        (lambda d: d.select(a=col("b")).agg(v=col("a").n_unique()), 3),
+        (lambda d: d.select(a=col("b")).agg(v=col("a").count_distinct()), 3),
         (lambda d: d.select(a=col("a") * 10).agg(v=col("a").sum()), 60.0),
     ],
 )

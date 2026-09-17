@@ -35,7 +35,7 @@ def main() -> None:
     )
 
     print("customers:", latest.count())
-    assert latest.count() == orders.n_unique("o_custkey")
+    assert latest.count() == orders.count_distinct("o_custkey")
     keys = latest.to_pydict()["o_custkey"]
     assert len(set(keys)) == len(keys)
 
@@ -46,7 +46,7 @@ def main() -> None:
     assert kept["o_orderdate"][0] == max(theirs["o_orderdate"])
 
     # `drop_duplicates` gives one row per key too, but not necessarily that one.
-    arbitrary = orders.drop_duplicates(subset=["o_custkey"])
+    arbitrary = orders.distinct(subset=["o_custkey"])
     assert arbitrary.count() == latest.count()
 
     # Running the ranked version twice gives an identical answer.

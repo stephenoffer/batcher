@@ -10,7 +10,7 @@ once per batch is the single most common reason an inference pipeline is slow.
 1. {doc}`Getting started </getting-started/index>`: install and run a first query.
 1. {doc}`Your first pipeline </getting-started/tutorials/foundations/first-pipeline>`: the data flow a model
    plugs into.
-1. {doc}`Batch inference </getting-started/tutorials/ml/batch-inference>`: the `.ml.map_batches`
+1. {doc}`Batch inference </getting-started/tutorials/ml/batch-inference>`: the `.map_batches`
    pattern.
 1. {doc}`Feature engineering </getting-started/tutorials/ml/feature-engineering>`: build a model-ready
    feature matrix with fit/transform preprocessors.
@@ -35,7 +35,7 @@ def score(batch: pa.RecordBatch) -> pa.RecordBatch:
     return batch.append_column("score", pa.array(preds))
 
 
-print(ds.ml.map_batches(score).to_pydict())
+print(ds.map_batches(score).to_pydict())
 # {'id': [1, 2, 3, 4], 'feature': [0.5, 1.5, 2.5, 3.5], 'score': [1.0, 3.0, 5.0, 7.0]}
 ```
 
@@ -63,14 +63,14 @@ class Embedder:
 
 (
     bt.read.parquet("s3://bucket/docs.parquet")
-    .ml.map_batches(Embedder, batch_size=512, num_gpus=1.0, concurrency=4)
+    .map_batches(Embedder, batch_size=512, num_gpus=1.0, concurrency=4)
     .write.parquet("output/embeddings.parquet")
 )
 ```
 
 ## Runnable examples
 
-- `ml_inference.py` is a batch-inference pipeline built on {py:meth}`ds.ml.map_batches <batcher.api.dataset.ml.DatasetML.map_batches>`, and it
+- `ml_inference.py` is a batch-inference pipeline built on {py:meth}`ds.map_batches <batcher.Dataset.map_batches>`, and it
   runs as written.
 - `feature_engineering.py` prepares model-ready features.
 - `preprocessors.py` builds the same features from fit/transform preprocessor objects

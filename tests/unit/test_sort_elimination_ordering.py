@@ -140,3 +140,71 @@ def test_a_top_n_over_a_sorted_input_still_collapses_to_a_limit():
     plan = _t().sort("x", descending=True).sort("x", descending=True).limit(2)._plan
     ir = Optimizer().optimize(plan).ir
     assert _num_sorts(ir) == 1
+
+
+# --- a window delivers no ordering ------------------------------------------------------------
+#
+# The estimator used to pass a window's input ordering through, so `with_row_index` below a
+# window let this rule delete a `sort("_row")` above it. Only the in-memory kernel keeps input
+# positions; a spilled window emits grace buckets (partitioned) or `ORDER BY` range buckets
+# (global), and Carbonite decides to spill after Kyber has planned. The `with_row_index` case
+# without a window is the positive control: the same sort over an order-preserving operator is
+# still removed, so a surviving sort above a window is the window's doing.
+
+
+def _indexed(n: int = 6):
+    data = {"x": [(i * 7) % 11 for i in range(n)], "g": [i % 4 for i in range(n)]}
+    return bt.from_pydict(data).with_row_index("_row")
+
+
+def _windowed_by_partition(n: int = 6):
+    return _indexed(n).with_columns(s=bt.col("x").sum().over(partition_by=["g"], order_by=["_row"]))
+
+
+def _windowed_globally():
+    return _indexed().with_columns(p=bt.col("x").shift(1).over(order_by=["_row"]))
+
+
+def test_positive_control_a_sort_over_the_row_index_is_eliminated():
+    ir = Optimizer().optimize(_indexed().filter(bt.col("g") > 0).sort("_row")._plan).ir
+    assert _num_sorts(ir) == 0
+
+
+def test_a_window_delivers_no_ordering_to_the_estimator():
+    ctx = _ctx()
+    assert ctx.estimator.estimate(_indexed()._plan).sorted_by, "positive control"
+    assert ctx.estimator.estimate(_windowed_by_partition()._plan).sorted_by == ()
+    assert ctx.estimator.estimate(_windowed_globally()._plan).sorted_by == ()
+
+
+def test_a_sort_above_a_partitioned_window_survives():
+    ir = Optimizer().optimize(_windowed_by_partition().sort("_row")._plan).ir
+    assert _num_sorts(ir) == 1
+    assert ir["op"] == "sort"
+
+
+def test_a_sort_above_a_global_window_survives():
+    ir = Optimizer().optimize(_windowed_globally().sort("_row")._plan).ir
+    assert _num_sorts(ir) == 1
+
+
+def test_a_sort_above_a_first_distinct_marker_survives():
+    """The reported shape: `is_first_distinct` lowers to a window partitioned by the value."""
+    ds = _indexed().with_columns(f=bt.col("x").is_first_distinct(bt.col("_row")))
+    assert _num_sorts(Optimizer().optimize(ds.sort("_row")._plan).ir) == 1
+
+
+def test_the_optimized_plan_keeps_the_rows_and_their_order_when_spilled():
+    """Semantics: the optimized plan, run through the spilling window, still orders by `_row`.
+
+    40 rows over four partitions is enough for the grace-partitioned window to emit its buckets
+    out of row order, which is what made the eliminated sort visible.
+    """
+    from batcher.api.dataset.frame import Dataset
+
+    ds = _windowed_by_partition(40).sort("_row")
+    _physical, logical, _decisions = Optimizer().optimize_full(ds._plan)
+    optimized = Dataset(logical, ds._sources)
+    expected = ds.collect().to_pydict()
+    assert expected["_row"] == list(range(40))
+    assert optimized.collect(spill=True).to_pydict() == expected

@@ -1105,7 +1105,7 @@ mod tests {
                 // Every worker takes the same number of buckets, so the split has no
                 // straggler round — the property that replaced "round to a power of two".
                 assert!(
-                    w % threads == 0 || w == MAX_PARTITIONS,
+                    w.is_multiple_of(threads) || w == MAX_PARTITIONS,
                     "width {w} is not a multiple of {threads} workers"
                 );
                 assert!((threads..=MAX_PARTITIONS).contains(&w) || w >= threads);
@@ -1179,8 +1179,10 @@ mod tests {
             func: AggFunc::Sum,
             input: Some(Expr::Col { name: "v".into() }),
             input2: None,
+            order_by: Vec::new(),
             alias: "s".into(),
             param: None,
+            interpolation: None,
         }]
     }
 

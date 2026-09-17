@@ -10,7 +10,7 @@ Most of those cannot have a DuckDB oracle -- image, audio, ML and text-quality f
 Batcher capabilities rather than SQL semantics, and a differential test of `mime_type` would
 be comparing against nothing. This file covers the part that *can*: functions with a real SQL
 equivalent under a different spelling, which is why a name-matching sweep missed them.
-`cumsum` is `SUM(...) OVER`, `is_between` is `BETWEEN`, `sec` is `1/cos`, `is_alpha` is a
+`cum_sum` is `SUM(...) OVER`, `between` is `BETWEEN`, `sec` is `1/cos`, `is_alpha` is a
 POSIX class match. None of them was under the oracle before.
 
 All of them agree today. This adds no fix; it puts a surface that happened to be right under
@@ -67,13 +67,13 @@ def strings(duck):
 
 #: `Expr` methods with a SQL equivalent, as (name, batcher expression, SQL, table).
 _NUMERIC_CASES = [
-    ("cumsum", lambda c: c("a").cumsum(), "SUM(a) OVER (ORDER BY rowid)"),
-    ("cummax", lambda c: c("a").cummax(), "MAX(a) OVER (ORDER BY rowid)"),
-    ("cummin", lambda c: c("a").cummin(), "MIN(a) OVER (ORDER BY rowid)"),
-    ("cumcount", lambda c: c("a").cumcount(), "COUNT(a) OVER (ORDER BY rowid)"),
-    ("is_between", lambda c: c("a").is_between(-7, 5), "a BETWEEN -7 AND 5"),
-    ("isnull", lambda c: c("a").isnull(), "a IS NULL"),
-    ("notnull", lambda c: c("a").notnull(), "a IS NOT NULL"),
+    ("cum_sum", lambda c: c("a").cum_sum(order_by="rowid"), "SUM(a) OVER (ORDER BY rowid)"),
+    ("cum_max", lambda c: c("a").cum_max(order_by="rowid"), "MAX(a) OVER (ORDER BY rowid)"),
+    ("cum_min", lambda c: c("a").cum_min(order_by="rowid"), "MIN(a) OVER (ORDER BY rowid)"),
+    ("cum_count", lambda c: c("a").cum_count(order_by="rowid"), "COUNT(a) OVER (ORDER BY rowid)"),
+    ("between", lambda c: c("a").between(-7, 5), "a BETWEEN -7 AND 5"),
+    ("is_null", lambda c: c("a").is_null(), "a IS NULL"),
+    ("is_not_null", lambda c: c("a").is_not_null(), "a IS NOT NULL"),
     ("sec", lambda c: c("b").cast("double").sec(), "1/cos(b::DOUBLE)"),
     ("csc", lambda c: c("b").cast("double").csc(), "1/sin(b::DOUBLE)"),
 ]
@@ -95,8 +95,8 @@ _STRING_CASES = [
     ),
     ("space_count", lambda c: c("s").str.space_count(), "length(s)-length(replace(s,' ',''))"),
     (
-        "removesuffix",
-        lambda c: c("s").str.removesuffix("c"),
+        "strip_suffix",
+        lambda c: c("s").str.strip_suffix("c"),
         "CASE WHEN s LIKE '%c' THEN left(s, length(s)-1) ELSE s END",
     ),
     ("line_count", lambda c: c("s").str.line_count(), "length(s)-length(replace(s,chr(10),''))+1"),
@@ -110,7 +110,9 @@ def test_a_numeric_expression_matches_duckdb(name, build, sql, numbers, duck):
     """Ordered, not `assert_same`. These are per-row expressions, so a result that is right
     as a multiset and wrong per row is exactly the defect worth catching, and the
     order-independent helper cannot see it."""
-    got = numbers.select(r=build(bt.col)).to_arrow()
+    # `rowid` numbers the rows in source order, the same column DuckDB's running cases order
+    # by; the running ones need it, because an order-dependent expression requires an order.
+    got = numbers.with_row_index("rowid").select(r=build(bt.col)).to_arrow()
     assert_same_ordered(got, duck.sql(f"SELECT {sql} AS r FROM n"))
 
 
@@ -125,7 +127,7 @@ class TestTheTwoDeliberateDivergences:
 
     def test_expr_floordiv_floors_where_sql_truncates(self, numbers, duck):
         """`Expr.floordiv` is Python/Polars: toward negative infinity."""
-        got = numbers.select(r=bt.col("a").floordiv(bt.col("b"))).to_pydict()["r"]
+        got = numbers.select(r=(bt.col("a") // bt.col("b"))).to_pydict()["r"]
         assert got == [3, -4, -4, 3, 0, 5, None, 0]
         sql = [row[0] for row in duck.execute("SELECT a // b FROM n").fetchall()]
         assert sql == [3, -3, -3, 3, 0, 5, None, 0]

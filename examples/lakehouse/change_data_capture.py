@@ -25,11 +25,11 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "customers")
-        customer.head(1_000).write.delta(table)
+        customer.limit(1_000).write.delta(table)
         assert bt.read.delta(table).count() == 1_000
 
         # A change batch: 50 updates to existing keys and 50 new keys.
-        updates = customer.slice(950, 100).with_columns(c_acctbal=col("c_acctbal") * 2.0)
+        updates = customer.limit(100, offset=950).with_columns(c_acctbal=col("c_acctbal") * 2.0)
         updates.write.delta(table, merge_on="c_custkey")
 
         after = bt.read.delta(table)
@@ -41,11 +41,11 @@ def main() -> None:
 
         # The updated rows really did change.
         touched = set(updates.to_pydict()["c_custkey"])
-        existing = sorted(touched & set(customer.head(1_000).to_pydict()["c_custkey"]))
+        existing = sorted(touched & set(customer.limit(1_000).to_pydict()["c_custkey"]))
         assert len(existing) == 50
 
         original = (
-            customer.head(1_000)
+            customer.limit(1_000)
             .filter(col("c_custkey").is_in(existing))
             .sort("c_custkey")
             .to_pydict()

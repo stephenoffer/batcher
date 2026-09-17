@@ -25,7 +25,7 @@ class RegisteredFunction:
     relation in, relation out) when true, else a scalar function ``SELECT f(x)``
     hoisted into a column-materializing `map_batches`. `vectorized` (scalar form)
     chooses whether `fn` receives whole Arrow arrays or one row at a time; `per_row`
-    is the table-form analogue (``ds.ml.map`` vs ``ds.ml.map_batches``).
+    is the table-form analogue (``ds.map`` vs ``ds.map_batches``).
     """
 
     name: str

@@ -8,7 +8,7 @@ import pytest
 
 import batcher as bt
 from _harness import assert_same
-from batcher import atan2, col
+from batcher import arctan2, col
 
 
 @pytest.fixture
@@ -41,10 +41,10 @@ def test_pow_round_atan2_vs_duckdb(duck, n):
     out = (
         bt.from_arrow(n)
         .select(
-            pw=col("x").pow(col("y")),
+            pw=(col("x") ** col("y")),
             po=col("x") ** 2,
             rd=col("x").round(2),
-            atn=atan2(col("y"), col("p")),
+            atn=arctan2(col("y"), col("p")),
         )
         .collect()
     )

@@ -19,7 +19,7 @@ from batcher import col
 
 
 def main() -> None:
-    lineitem = tpch("lineitem").head(20_000)
+    lineitem = tpch("lineitem").limit(20_000)
 
     shares = lineitem.select(
         "l_orderkey",
@@ -28,7 +28,7 @@ def main() -> None:
         order_total=col("l_extendedprice").sum().over(partition_by=["l_orderkey"]),
     ).with_columns(share=col("l_extendedprice") / col("order_total"))
 
-    result = shares.sort("l_orderkey", "l_linenumber").head(8).to_pydict()
+    result = shares.sort("l_orderkey", "l_linenumber").limit(8).to_pydict()
     print([round(value, 4) for value in result["share"]])
 
     # Every share is a proportion.
@@ -43,7 +43,7 @@ def main() -> None:
         lineitem.group_by("l_orderkey").agg(order_total=col("l_extendedprice").sum()),
         on="l_orderkey",
     ).with_columns(share=col("l_extendedprice") / col("order_total"))
-    joined = by_join.sort("l_orderkey", "l_linenumber").head(8).to_pydict()
+    joined = by_join.sort("l_orderkey", "l_linenumber").limit(8).to_pydict()
     assert [round(value, 9) for value in joined["share"]] == [
         round(value, 9) for value in result["share"]
     ]

@@ -166,6 +166,50 @@ print(trades.join_asof(quotes, on="t", by="sym", direction="nearest").sort("sym"
 Both `tolerance` and `"nearest"` have to subtract two keys, so they need a numeric or
 temporal `on` column. A string key still orders fine for a plain backward or forward search.
 
+## Joins on predicates
+
+An equi-join matches equal keys. {py:meth}`join_where <batcher.Dataset.join_where>` matches on any predicates over both sides instead, such as an event falling inside an interval. It keeps every pair of rows for which all the predicates are true, which is an inner join.
+
+```python
+events = bt.from_pydict({"t": [3, 12, 25], "reading": [0.4, 0.9, 0.7]})
+shifts = bt.from_pydict({"start": [0, 10, 20], "end": [10, 20, 30], "crew": ["x", "y", "z"]})
+inside = events.join_where(shifts, bt.col("t") >= bt.col("start"), bt.col("t") < bt.col("end"))
+print(inside.select("t", "crew").sort("t").to_pydict())
+# {'t': [3, 12, 25], 'crew': ['x', 'y', 'z']}
+```
+
+A predicate names right columns by name. A right column whose name the left side already has takes the `suffix`, `_right` by default, so `bt.col("v_right")` is the right side's `v`. One or two inequalities between the sides run as a range join rather than as a filtered cartesian product, and an equality runs as a hash join.
+
+## Update values from another dataset
+
+{py:meth}`update <batcher.Dataset.update>` overwrites values with another dataset's where the keys match. Every column the two share, other than the key, takes the other side's value on a matched row, and a null there leaves the value alone.
+
+```python
+fixes = bt.from_pydict({"id": [2, 4], "amount": [25, None]})
+print(orders.update(fixes, on="id").sort("id").to_pydict())
+# {'id': [1, 2, 3, 4, 5], 'category': ['a', 'b', 'a', 'b', 'a'], 'amount': [10, 25, 30, 40, 50]}
+```
+
+Pass `include_nulls=True` when a null is itself the new value, and `how="inner"` or `how="full"` to keep only the matched rows or to add the other side's unmatched ones.
+
+```python
+print(orders.update(fixes, on="id", include_nulls=True).sort("id").select("id", "amount").to_pydict())
+# {'id': [1, 2, 3, 4, 5], 'amount': [10, 25, 30, None, 50]}
+```
+
+## Pair rows by position
+
+{py:meth}`zip <batcher.Dataset.zip>` puts datasets side by side, pairing the first row of each with the first row of the others. A dataset has no row order of its own, so `order_by` names the column that defines position. Number the rows where you read them with `with_row_index` when the data carries no such column.
+
+```python
+features = bt.from_pydict({"row": [0, 1, 2], "x": [0.1, 0.2, 0.3]})
+labels = bt.from_pydict({"row": [0, 1, 2], "label": [1, 0, 1]})
+print(features.zip(labels, order_by="row").to_pydict())
+# {'row': [0, 1, 2], 'x': [0.1, 0.2, 0.3], 'row_1': [0, 1, 2], 'label': [1, 0, 1]}
+```
+
+The datasets must hold the same number of rows. `zip` counts them before it builds the plan and raises when they differ. When the rows share a key, `join` on that key says the same thing without depending on position.
+
 ## Lookup joins against a key-value store
 
 Every join above reads its right side as a dataset, which means reading all of it. That is
@@ -243,6 +287,6 @@ the same result.
 
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: summarize joined results.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: per-row computations over partitions.
-- {doc}`Dataset API </api/relational/dataset>`: the `join`, `join_asof` and `lookup_join` reference.
+- {doc}`Dataset API </api/relational/dataset>`: the `join`, `join_asof`, `join_where`, `update`, `zip` and `lookup_join` reference.
 - {doc}`Caching results </user-guide/operate/tuning/caching>`: the other place a key-value store speeds a query up, by holding whole results.
 - {doc}`/cookbook/dataset/verbs/joins`: join types, key spellings, and the as-of join, as a script.

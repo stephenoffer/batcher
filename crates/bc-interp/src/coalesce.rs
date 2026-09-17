@@ -53,6 +53,28 @@ const TARGET_BYTES: usize = 1 << 20;
 /// buys 1.18x on one shape and loses 1.4x on another is the wrong threshold.
 const MERGE_MAX_BYTES: usize = 64 << 10;
 
+/// What each column past the first adds to [`MERGE_MAX_BYTES`].
+///
+/// A conversion is paid per *array*, not per batch, so a wide batch buys more copying than a
+/// narrow one: measured on the pyarrow C data interface, 408 batches of TPC-H `lineitem`'s 16
+/// columns cost 17 ms to export and import, about 2.6 us per array against the 7.7 us a
+/// one-column batch costs whole. A flat ceiling therefore never merged a wide result, and a
+/// 16-column, 14 %-selectivity filter over sf1 `lineitem` returned all 408 of its ~350 KB
+/// batches. Admitting ~24 KiB per extra column merges them, best of 9 over two rounds against
+/// the unchanged build: **50-52 ms -> 34-39 ms**, and 8 `int64` columns at the same selectivity
+/// **33-34 ms -> 20-21 ms**; one- and two-column results are untouched by construction.
+///
+/// [`TARGET_BYTES`] deliberately does *not* scale with the columns. Scaling it too merged the
+/// same result into 9 batches rather than 118, which measured no better, and it turned a 2 %
+/// filter's 21 parallel 1 MiB copies into 2 serial 8 MB ones, costing **16.5 -> 19 ms**: the
+/// target sets how finely the copy fans out across the pool, not how many conversions remain.
+const MERGE_BYTES_PER_EXTRA_COLUMN: usize = 24 << 10;
+
+/// The largest batch of `columns` columns worth copying into a merge.
+fn merge_max_bytes(columns: usize) -> usize {
+    MERGE_MAX_BYTES + MERGE_BYTES_PER_EXTRA_COLUMN * columns.saturating_sub(1)
+}
+
 /// Total merge bytes below which the concatenation runs on this thread.
 ///
 /// The pool is not free to enter. A `LIMIT 10` over a sharded scan returns one short batch per
@@ -125,7 +147,8 @@ fn group_by_target(batches: Vec<RecordBatch>) -> (Vec<Vec<RecordBatch>>, usize) 
     let mut merge_bytes = 0usize;
     for batch in batches {
         let bytes = sliced_batch_bytes(&batch);
-        if bytes >= MERGE_MAX_BYTES {
+        let columns = batch.num_columns().max(1);
+        if bytes >= merge_max_bytes(columns) {
             if !current.is_empty() {
                 groups.push(std::mem::take(&mut current));
                 current_bytes = 0;
@@ -171,6 +194,46 @@ mod tests {
                     .to_vec()
             })
             .collect()
+    }
+
+    fn wide_batch(columns: usize, rows: usize) -> RecordBatch {
+        let fields: Vec<Field> = (0..columns)
+            .map(|c| Field::new(format!("c{c}"), DataType::Int64, false))
+            .collect();
+        let arrays = (0..columns)
+            .map(|c| {
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows as i64).map(|r| r * 7 + c as i64),
+                )) as _
+            })
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+    }
+
+    #[test]
+    fn the_merge_ceiling_grows_with_the_columns_a_conversion_pays_for() {
+        // 1,500 rows of 8 `int64` columns is 96 KB: over the one-column ceiling, under the
+        // eight-column one, so it merges; the same bytes in one column do not.
+        let wide: Vec<RecordBatch> = (0..4).map(|_| wide_batch(8, 1_500)).collect();
+        assert!(sliced_batch_bytes(&wide[0]) > MERGE_MAX_BYTES);
+        let merged = coalesce_small_batches(wide.clone());
+        assert_eq!(
+            merged.len(),
+            1,
+            "four 96 KB eight-column batches should merge"
+        );
+        assert_eq!(
+            merged[0],
+            arrow::compute::concat_batches(&wide[0].schema(), &wide).unwrap()
+        );
+
+        let narrow: Vec<RecordBatch> = (0..4).map(|_| wide_batch(1, 12_000)).collect();
+        assert!(sliced_batch_bytes(&narrow[0]) > merge_max_bytes(1));
+        assert_eq!(
+            coalesce_small_batches(narrow).len(),
+            4,
+            "a 96 KB one-column batch is not copied"
+        );
     }
 
     #[test]

@@ -174,4 +174,4 @@ def build_map_groups(
     # The reframing happens per group inside the adapter, so the outer stage stays Arrow.
     adapter = GroupApply(fn, keys, columns, options.pop("batch_format", "pyarrow"))
     collected = source.group_by(*keys).agg(**{name: Col(name).array_agg() for name in columns})
-    return collected.ml.map_batches(adapter, **options)
+    return collected.map_batches(adapter, **options)

@@ -203,7 +203,7 @@ def openvino_predictor(
             ...     output_columns=["score"],
             ...     cache_dir="/tmp/ov-cache",
             ... )
-            >>> ds.ml.map_batches(udf, concurrency=8).collect()  # doctest: +SKIP
+            >>> ds.map_batches(udf, concurrency=8).collect()  # doctest: +SKIP
 
     Args:
         model_path: an OpenVINO IR ``.xml``, an ``.onnx`` graph, or a saved model directory.
@@ -223,7 +223,7 @@ def openvino_predictor(
             on this worker's array conversion.
 
     Returns:
-        A class for ``ds.ml.map_batches(...)`` — the model compiles once per worker.
+        A class for ``ds.map_batches(...)`` — the model compiles once per worker.
     """
     columns = list(input_columns)
     model_inputs = list(input_names) if input_names is not None else None

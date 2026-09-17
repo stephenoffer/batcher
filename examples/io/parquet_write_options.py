@@ -45,10 +45,10 @@ def main() -> None:
         assert metadata.num_row_groups >= 1
 
         # Values survive the round trip exactly, whichever codec wrote them.
-        original = lineitem.sort("l_orderkey").head(100).to_pydict()
+        original = lineitem.sort("l_orderkey").limit(100).to_pydict()
         for codec in ("snappy", "zstd", "gzip"):
             back = bt.read.parquet(str(Path(directory) / f"{codec}.parquet"))
-            assert back.sort("l_orderkey").head(100).to_pydict() == original
+            assert back.sort("l_orderkey").limit(100).to_pydict() == original
 
 
 if __name__ == "__main__":

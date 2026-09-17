@@ -117,7 +117,7 @@ def test_top_k_matches_duckdb_on_every_path(duck, shape, k):
     table = SHAPES[shape]
     duck.register("t", table)
     oracle = duck.sql(f"SELECT g, approx_top_k(x, {k}) AS r FROM t GROUP BY g")
-    ds = bt.from_arrow(table).group_by("g").agg(r=bt.col("x").top_k(k))
+    ds = bt.from_arrow(table).group_by("g").agg(r=bt.col("x").mode_top_k(k))
     for _name, got in _paths(ds):
         assert_same(got, oracle)
 
@@ -131,7 +131,7 @@ def test_global_mode_and_top_k_match_duckdb(duck):
         duck.sql("SELECT mode(x) AS r FROM t"),
     )
     assert_same(
-        bt.from_arrow(table).agg(r=bt.col("x").top_k(3)).collect(),
+        bt.from_arrow(table).agg(r=bt.col("x").mode_top_k(3)).collect(),
         duck.sql("SELECT approx_top_k(x, 3) AS r FROM t"),
     )
 
@@ -195,7 +195,7 @@ def test_an_all_null_group_yields_an_empty_list_not_null(duck):
     """
     t = pa.table({"g": ["a", "a", "b"], "x": pa.array([1, 1, None], pa.int64())})
     duck.register("an", t)
-    got = bt.from_arrow(t).group_by("g").agg(r=bt.col("x").top_k(2)).collect()
+    got = bt.from_arrow(t).group_by("g").agg(r=bt.col("x").mode_top_k(2)).collect()
     by_group = dict(zip(got.column("g").to_pylist(), got.column("r").to_pylist(), strict=True))
     assert by_group["a"] == [1]
     assert by_group["b"] == [], "Batcher yields an empty list for an all-null group"
@@ -212,7 +212,7 @@ def test_a_fully_tied_group_ranks_by_value():
     aggregate mergeable: the winner must not depend on which partition saw which row first.
     """
     table = pa.table({"g": ["a"] * 6, "x": pa.array([5, 3, 9, 1, 7, 2], pa.int64())})
-    ds = bt.from_arrow(table).group_by("g").agg(r=bt.col("x").top_k(3))
+    ds = bt.from_arrow(table).group_by("g").agg(r=bt.col("x").mode_top_k(3))
     for name, got in _paths(ds):
         assert got.column("r").to_pylist() == [[1, 2, 3]], f"tie ranking wrong on {name}"
 
@@ -224,7 +224,7 @@ def test_top_k_is_ordered_most_frequent_first():
     came back in any order at all -- exactly how an ordering bug stays invisible.
     """
     table = pa.table({"x": pa.array([7, 7, 7, 7, 5, 5, 5, 9, 9, 1], pa.int64())})
-    got = bt.from_arrow(table).agg(r=bt.col("x").top_k(3)).collect()
+    got = bt.from_arrow(table).agg(r=bt.col("x").mode_top_k(3)).collect()
     assert got.column("r").to_pylist() == [[7, 5, 9]]
 
 
@@ -262,7 +262,7 @@ def test_a_hot_group_at_scale_still_answers_correctly(duck):
     duck.register("hot", table)
 
     assert_same(
-        bt.from_arrow(table).agg(r=bt.col("x").top_k(3)).collect(),
+        bt.from_arrow(table).agg(r=bt.col("x").mode_top_k(3)).collect(),
         duck.sql("SELECT approx_top_k(x, 3) AS r FROM hot"),
     )
     assert_same(

@@ -45,7 +45,7 @@ def main() -> None:
     # Nothing ran: `explain` is a plan operation.
     result = query.to_pydict()
     print("priorities:", result["o_orderpriority"])
-    assert len(result["o_orderpriority"]) == orders.n_unique("o_orderpriority")
+    assert len(result["o_orderpriority"]) == orders.count_distinct("o_orderpriority")
 
     # `profile` is the executed counterpart, and it needs the query to run.
     report = query.profile()

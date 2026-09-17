@@ -151,11 +151,11 @@ def test_uncache_on_an_uncached_dataset_is_a_no_op():
 def test_unpersist_is_the_spark_spelling_of_uncache():
     from batcher.carbonite.cache import current_result_cache
 
-    ds = bt.from_pydict({"v": [1, 2]}).persist("memory_only")
+    ds = bt.from_pydict({"v": [1, 2]}).cache("memory_only")
     ds.collect()
     cache = current_result_cache()
     assert cache is not None and len(cache) == 1
-    ds.unpersist()
+    ds.uncache()
     assert len(cache) == 0
 
 

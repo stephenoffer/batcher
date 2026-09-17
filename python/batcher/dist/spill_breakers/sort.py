@@ -18,6 +18,7 @@ from batcher.dist.executors.plan_analysis import _single_source
 from batcher.dist.spill import (
     _fd_safe,
     _iter_spill_morsels,
+    map_predicate,
     map_projection,
 )
 from batcher.dist.spill.buckets import (
@@ -249,7 +250,16 @@ def _range_regrace(store, handle, key_name, nulls_first, descending, depth):
 
 
 def stage_and_partition(
-    source, map_ir, key_name, nulls_first, descending, n_buckets, store, cfg_json, projection=None
+    source,
+    map_ir,
+    key_name,
+    nulls_first,
+    descending,
+    n_buckets,
+    store,
+    cfg_json,
+    projection=None,
+    predicate=None,
 ):
     """Map `source` through `map_ir`, sample the key, and range-partition the mapped output
     into `n_buckets` ordered disk buckets (key-ascending; `None` where a bucket got no rows).
@@ -274,7 +284,7 @@ def stage_and_partition(
     # re-reads locally, not re-mapping a possibly-remote source), and sketch the key.
     grids: list[tuple[list[float], int]] = []
     stage = store.writer("stage")
-    for batch in _iter_spill_morsels(source, projection):
+    for batch in _iter_spill_morsels(source, projection, predicate):
         for rb in nat.execute_plan(map_ir, [[batch]], cfg_json):
             if not rb.num_rows:
                 continue
@@ -339,6 +349,7 @@ def stream_spilling_sort(
             store,
             cfg_json,
             map_projection(sort, sid),
+            map_predicate(sort, sid),
         )
         # Sort each bucket, yield in key order (reversed for descending). The count comes
         # from `handles`, not from `n_buckets`: staging measures the input and sizes the

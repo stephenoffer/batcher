@@ -28,7 +28,7 @@ def main() -> None:
 
         # Ten small commits, as an incremental writer leaves them.
         for index in range(10):
-            orders.slice(index * 500, 500).write.delta(
+            orders.limit(500, offset=index * 500).write.delta(
                 table, mode="overwrite" if index == 0 else "append"
             )
 

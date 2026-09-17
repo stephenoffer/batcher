@@ -19,7 +19,7 @@ from sqlglot import expressions as exp
 
 from batcher._sql.parser.expressions.literals import _const_int_arg, _const_str_arg
 from batcher._sql.parser.expressions.maps import map_subscript
-from batcher.plan.expr_ir import Expr, array, lit, nullif, when
+from batcher.plan.expr_ir import Expr, array, lit, nullif
 from batcher.plan.functions.collection import element, sequence
 
 __all__ = ["collection_function", "list_function"]
@@ -46,11 +46,11 @@ def collection_function(tr, node) -> Expr | None:
     if isinstance(node, exp.GenerateSeries):
         return _generate_series(tr, node)
     if isinstance(node, exp.ArrayAppend):
-        return tr._scalar(node.this).list.concat(array(tr._scalar(node.expression)))
+        return tr._scalar(node.this).list.append(tr._scalar(node.expression))
     if isinstance(node, exp.ArrayPrepend):
         # sqlglot keeps Spark's argument order (`array_prepend(xs, elem)`), so the
-        # element is `expression` here even though it lands on the left of the concat.
-        return array(tr._scalar(node.expression)).list.concat(tr._scalar(node.this))
+        # element is `expression` here even though it lands on the left.
+        return tr._scalar(node.this).list.prepend(tr._scalar(node.expression))
     if isinstance(node, exp.ArrayInsert):
         return _array_insert(tr, node)
     if isinstance(node, exp.ArrayCompact):
@@ -58,11 +58,7 @@ def collection_function(tr, node) -> Expr | None:
     if isinstance(node, exp.ArrayExcept):
         return tr._scalar(node.this).list.difference(tr._scalar(node.expression))
     if isinstance(node, exp.ArrayRemove):
-        # The null guard is load-bearing: `element() != v` is *null* for a null element,
-        # which the filter drops, so `array_remove(array(1, null), 1)` lost the null that
-        # Spark keeps.
-        value = tr._scalar(node.expression)
-        return tr._scalar(node.this).list.filter(element().is_null() | (element() != value))
+        return tr._scalar(node.this).list.remove(_raw_value(node.expression))
     if isinstance(node, exp.Transform):
         body = _lambda_body(tr, node.expression)
         return None if body is None else tr._scalar(node.this).list.transform(body)
@@ -107,7 +103,8 @@ def collection_function(tr, node) -> Expr | None:
         value = tr._scalar(args[0])
         return array(*([value] * count)) if count > 0 else None
     if name == "arrays_overlap" and len(args) == 2:
-        return _arrays_overlap(tr._scalar(args[0]), tr._scalar(args[1]))
+        # Spark's three-valued overlap: a null element might have been the shared one.
+        return tr._scalar(args[0]).list.has_any(tr._scalar(args[1]), propagate_nulls=True)
     if name in _VECTOR_PAIR and len(args) == 2:
         method = _VECTOR_PAIR[name]
         return getattr(tr._scalar(args[0]).list, method)(tr._scalar(args[1]))
@@ -140,23 +137,6 @@ def _lambda_body(tr, lam) -> Expr | None:
         if ref.name == param and ref.parent is not None:
             ref.replace(placeholder.copy())
     return tr._scalar(body)
-
-
-def _arrays_overlap(left: Expr, right: Expr) -> Expr:
-    """Spark `arrays_overlap`: true on a shared element, null when only nulls could hide one.
-
-    The three-valued rule is the whole difficulty. True wins outright; otherwise, if
-    either side contains a null, the answer is unknown rather than false, because the
-    null *might* have been the shared element. Composed from the set intersection and a
-    null count so each branch is exact rather than approximated by `has_any`, whose null
-    rule is a different one (it is null when a whole *list* is null).
-    """
-    shared = left.list.intersect(right).list.len() > lit(0)
-    has_null = (left.list.filter(element().is_null()).list.len() > lit(0)) | (
-        right.list.filter(element().is_null()).list.len() > lit(0)
-    )
-    unknown = nullif(lit(True), lit(True))
-    return when(shared).then(lit(True)).when(has_null).then(unknown).otherwise(lit(False))
 
 
 def _vector_norm(tr, args) -> Expr | None:
@@ -442,7 +422,7 @@ def list_function(tr, node):
         # nulls last, so reversing lands them at the *front*, where DuckDB keeps them at
         # the back — `list_reverse_sort([4, NULL, 6])` is `[6, 4, NULL]`, not
         # `[NULL, 6, 4]`.
-        return value.list.sort_desc() if descending else value.list.sort()
+        return value.list.sort(descending=descending)
     # sqlglot promotes a few vector functions to typed nodes (two args in `this`/`expression`)
     # rather than `Anonymous`; dispatch them to the same binary `.list` methods.
     typed_binary = _LIST_TYPED_BINARY.get(type(node).__name__)

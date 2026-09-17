@@ -189,10 +189,14 @@ is in the window. That is Polars' `closed="both"`, and the SQL
 
 Value specs are `(func, column)` for `"first_value"` and `"last_value"`,
 `(func, column, offset)` for `"lag"` and `"lead"`, and `(func, column, n)` for
-`"nth_value"`, which reads the `n`-th row of the ordered partition. {py:func}`nth_value <batcher.nth_value>` is SQL
+`"nth_value"`, which reads the `n`-th row of the frame. {py:func}`nth_value <batcher.nth_value>` is SQL
 `NTH_VALUE`, and {py:func}`first_value <batcher.first_value>` is its special case `n = 1`. Use `nth_value` when the
 reference point is a fixed rank, such as "each product's price relative to its category's
-second-cheapest".
+second-cheapest". With an `order_by` and no `frame`, `last_value` and `nth_value` use SQL's
+default frame, which ends at the current row, so `nth_value` stays null until the partition
+reaches its `n`-th row. Pass `frame=(None, None)` to read the whole partition on every row.
+The `first_value`, `last_value` and `nth_value` constructors also take `ignore_nulls=True`,
+which is SQL's `IGNORE NULLS`.
 
 ```python
 shifted = ds.window(
@@ -207,7 +211,7 @@ shifted = ds.window(
 print(shifted.to_pydict())
 # {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['y', 'z', 'x', 'q', 'p'],
 #  'price': [10, 20, 30, 15, 40], 'prev': [None, 10, 20, None, 15],
-#  'top': [10, 10, 10, 15, 15], 'second': [20, 20, 20, 40, 40]}
+#  'top': [10, 10, 10, 15, 15], 'second': [None, 20, 20, None, 40]}
 ```
 
 ## Top-N per partition
@@ -265,16 +269,18 @@ then reference the resulting column.
 Common window shapes have named methods on `Expr`, so you rarely spell the window
 out. They all accept `partition_by` / `order_by` and lower to the windows above.
 
+The ones that depend on row order, such as `diff`, `pct_change`, `shift` and `cum_sum`, require an order. Batcher keeps no arrival order across a parallel scan, so it raises a `PlanError` rather than guess one. Pass `order_by=`, or bind the expression with `.over(order_by=...)`. When the data has no ordering column, add `.with_row_index("_row")` right after reading and order by `"_row"`.
+
 ```python
-ts = bt.from_pydict({"price": [10, 15, 30]})
+ts = bt.from_pydict({"day": [1, 2, 3], "price": [10, 15, 30]})
 print(
     ts.with_columns(
-        change=bt.col("price").diff(),  # price - lag(price)
-        growth=bt.col("price").pct_change(),  # price / lag(price) - 1
+        change=bt.col("price").diff(order_by="day"),  # price - lag(price)
+        growth=bt.col("price").pct_change(order_by="day"),  # price / lag(price) - 1
         rnk=bt.col("price").rank(),  # RANK() OVER (ORDER BY price)
     ).to_pydict()
 )
-# {'price': [10, 15, 30], 'change': [None, 5, 15],
+# {'day': [1, 2, 3], 'price': [10, 15, 30], 'change': [None, 5, 15],
 #  'growth': [None, 0.5, 1.0], 'rnk': [1, 2, 3]}
 ```
 

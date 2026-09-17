@@ -216,7 +216,7 @@ def st_as_binary(geom: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({'g': ['POINT(2 2)']})
-            >>> got = bt.st_as_binary(bt.col("g")).str.len()
+            >>> got = bt.st_as_binary(bt.col("g")).str.len_chars()
             >>> ds.select(v=got).to_pydict()
             {'v': [21]}
     """
@@ -241,7 +241,7 @@ def st_as_ewkb(geom: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({'g': ['POINT(2 2)']})
-            >>> got = bt.st_as_ewkb(bt.st_set_srid(bt.col("g"), 4326)).str.len()
+            >>> got = bt.st_as_ewkb(bt.st_set_srid(bt.col("g"), 4326)).str.len_chars()
             >>> ds.select(v=got).to_pydict()
             {'v': [None]}
     """

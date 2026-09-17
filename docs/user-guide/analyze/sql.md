@@ -135,6 +135,28 @@ Every method on the expression accessors is callable from SQL too, under the nam
 namespace and the method: `col("s").str.slugify()` is `str_slugify(s)`. See
 {doc}`/api/relational/expression-accessors` for the naming rules and the full surface.
 
+The other direction works at the level of one expression. {py:func}`bt.sql_expr <batcher.sql_expr>` parses a SQL expression into an `Expr` you can pass to any DataFrame method, and a trailing `AS name` becomes its alias, so a `select` over `sql_expr` strings is Spark's `selectExpr`. {py:func}`bt.call_function <batcher.call_function>` calls a SQL function by name. A string argument is a column name and a number is a literal, which reaches a function that has no Python constructor of its own.
+
+```python
+out = ds.select(
+    bt.sql_expr("upper(category) AS cat"),
+    bt.sql_expr("price / 10 AS tens"),
+    rem=bt.call_function("pmod", "price", 25.0, dialect="spark"),
+)
+print(out.to_pydict())
+# {'cat': ['A', 'B', 'A', 'B', 'A', 'C'], 'tens': [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 'rem': [10.0, 20.0, 5.0, 15.0, 0.0, 10.0]}
+```
+
+An aggregate call becomes an aggregate expression, so `sql_expr` also works inside `agg`:
+
+```python
+top = ds.group_by("category").agg(bt.sql_expr("max(price) AS top")).sort("category")
+print(top.to_pydict())
+# {'category': ['a', 'b', 'c'], 'top': [50.0, 40.0, 60.0]}
+```
+
+`sql_expr` refuses a whole query, a subquery and a window function, all of which need a relation. Use `bt.sql` for those.
+
 (sessions-tables-and-python-functions)=
 
 ## Sessions, tables, and Python functions
@@ -367,7 +389,7 @@ does give a `TIMESTAMP`. This matches Spark and keeps a date column usable as a 
 cast explicitly if you need DuckDB's type. The row values are identical either way.
 
 Descending list sorts agree with DuckDB, NULLs included. `list_reverse_sort` lowers to
-`.list.sort_desc()`, a kernel of its own rather than `sort().reverse()`. Ascending puts NULLs
+`.list.sort(descending=True)`, a kernel of its own rather than `sort().reverse()`. Ascending puts NULLs
 last, so reversing would lift them to the front, where DuckDB keeps them at the back. Both
 spellings return `[2, 1, NULL]` for `[1, NULL, 2]`.
 

@@ -80,7 +80,7 @@ def test_envelope_honors_declared_gpus_without_detectable_vram(monkeypatch):
 
 
 def test_envelope_no_gpu_no_memory_budget():
-    ds = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(lambda b: b)
+    ds = bt.from_pydict({"x": [1, 2, 3]}).map_batches(lambda b: b)
     env = _map_scheduling_envelope(ds._plan, 2, None)
     assert env.num_gpus == 0.0
     assert env.memory_bytes == 0

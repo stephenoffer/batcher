@@ -63,7 +63,7 @@ def main() -> None:
     # Lazy: the scorer runs only when the terminal to_pydict() executes. A real
     # model adds num_gpus=/concurrency= here to place it on a GPU actor pool.
     # output_columns declares the schema the stage adds, so later ops can name them.
-    scored = features.ml.map_batches(
+    scored = features.map_batches(
         scorer,
         batch_format="numpy",
         output_columns=["id", "recency", "frequency", "score", "label"],

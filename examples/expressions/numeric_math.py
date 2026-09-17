@@ -27,7 +27,7 @@ def main() -> None:
         # `sqrt`/`log` are undefined outside their domain and yield null or NaN there.
         root=col("x").abs().sqrt(),
         exponent=col("x").exp(),
-        squared=col("x").pow(2),
+        squared=(col("x") ** 2),
         # Bound a column without a branch.
         clipped=col("x").clip(-1.0, 5.0),
     ).to_pydict()
@@ -45,8 +45,8 @@ def main() -> None:
     # Division and modulo.
     div = nums.select(
         true_div=col("n") / 2,
-        floor_div=col("n").floordiv(2),
-        remainder=col("n").mod(2),
+        floor_div=(col("n") // 2),
+        remainder=(col("n") % 2),
     ).to_pydict()
     print(div)
     assert div["true_div"][0] == 3.5

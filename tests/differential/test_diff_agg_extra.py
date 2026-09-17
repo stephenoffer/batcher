@@ -72,7 +72,7 @@ def test_min_max_of_group_key_with_null_group(duck):
 def test_count_distinct_of_group_key_null_group(duck):
     _reg(duck)
     # The NULL group must yield COUNT(DISTINCT g) = 0.
-    out = bt.from_arrow(_DATA).group_by("g").agg(n=col("g").n_unique()).collect()
+    out = bt.from_arrow(_DATA).group_by("g").agg(n=col("g").count_distinct()).collect()
     expected = duck.sql("SELECT g, count(DISTINCT g) AS n FROM t GROUP BY g")
     assert_same(out, expected)
 
@@ -124,7 +124,7 @@ def test_fold_constant_grouped(duck):
     out = (
         bt.from_arrow(_DATA)
         .group_by("g")
-        .agg(mn=bt.lit(7).min(), mx=bt.lit(7).max(), n=bt.lit(3).n_unique())
+        .agg(mn=bt.lit(7).min(), mx=bt.lit(7).max(), n=bt.lit(3).count_distinct())
         .collect()
     )
     expected = duck.sql(
@@ -142,7 +142,7 @@ def test_drop_distinct_before_agg(duck):
         bt.from_arrow(_DATA)
         .distinct()
         .group_by("g")
-        .agg(lo=col("x").min(), hi=col("x").max(), nd=col("x").n_unique())
+        .agg(lo=col("x").min(), hi=col("x").max(), nd=col("x").count_distinct())
         .collect()
     )
     expected = duck.sql(

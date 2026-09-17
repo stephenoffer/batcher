@@ -7,7 +7,7 @@ only referenced for typing here.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import pyarrow as pa
@@ -15,14 +15,28 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher.api._varargs import flatten_varargs
 from batcher.api.dataset.compat.guidance import groupby_attribute_error
-from batcher.plan.expr_ir import AggExpr, Col, Expr
-from batcher.plan.expr_ir.selectors import Selector
-from batcher.plan.logical import Aggregate, AggregateSpec, Project, Projection
+from batcher.plan.expr_ir import AggExpr, Aliased, Col, Expr, IntoExpr
+from batcher.plan.expr_ir.selectors import Selector, expand_selectors, has_selector
+from batcher.plan.expr_rewrite.naming import output_name
+from batcher.plan.logical import (
+    Aggregate,
+    AggregateSpec,
+    Filter,
+    LogicalPlan,
+    Project,
+    Projection,
+    RowId,
+    Sort,
+    SortKeySpec,
+)
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["GroupBy"]
+
+#: The hidden column `maintain_order` numbers input rows into and keeps the minimum of.
+_FIRST_ROW = "__bc_group_first_row"
 
 
 def _numeric_columns(schema: pa.Schema) -> set[str]:
@@ -60,15 +74,23 @@ class GroupBy:
             {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
-    __slots__ = ("_keys", "_named", "_source")
+    __slots__ = ("_having", "_keys", "_maintain_order", "_named", "_source")
 
     def __init__(
-        self, source: Dataset, keys: tuple[str, ...], named: dict[str, Expr] | None = None
+        self,
+        source: Dataset,
+        keys: tuple[str, ...],
+        named: dict[str, Expr] | None = None,
+        *,
+        maintain_order: bool = False,
+        having: tuple[Expr, ...] = (),
     ) -> None:
         """Hold the source dataset and grouping keys until `agg` finishes the aggregation."""
         self._source = source
         self._keys = keys
         self._named = named or {}
+        self._maintain_order = maintain_order
+        self._having = having
 
     def __repr__(self) -> str:
         """Show the grouping keys, e.g. ``GroupBy(keys=['region', 'day'])``."""
@@ -140,6 +162,53 @@ class GroupBy:
         """
         return [*self._keys, *self._named]
 
+    def having(self, *predicates: Expr) -> GroupBy:
+        """Keep only the groups for which every predicate over aggregates holds (SQL ``HAVING``).
+
+        Each predicate is a boolean expression over the group's aggregates, such as
+        ``bt.count() > 1`` or ``bt.col("v").sum() >= 100``. It filters whichever reduction
+        finishes the grouping (`agg`, `sum`, `len`, ...), and its aggregates run in the same
+        mergeable pass as the outputs, so it adds no second scan and is identical single-node
+        and distributed. A predicate that is null for a group drops the group, as in SQL.
+        Calling `having` again adds predicates, all of which must hold.
+
+        Args:
+            *predicates: Boolean expressions over aggregates. A list of them is accepted too.
+
+        Returns:
+            A `GroupBy` over the same keys that drops the failing groups.
+
+        Raises:
+            PlanError: If no predicate is given, or one does not contain an aggregate.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [1, 2, 3]})
+                >>> ds.group_by("g").having(bt.count() > 1).agg(s=bt.col("v").sum()).to_pydict()
+                {'g': ['a'], 's': [3]}
+        """
+        from batcher.plan.expr_ir.walk import contains_aggregate
+
+        flat = flatten_varargs(predicates)
+        if not flat:
+            raise PlanError("having() requires at least one predicate, e.g. bt.count() > 1")
+        for p in flat:
+            if not isinstance(p, (Expr, AggExpr)) or not contains_aggregate(p):
+                raise PlanError(
+                    "having() predicates must be expressions over aggregates, such as "
+                    f"bt.col('v').sum() > 10; got {p!r}. Filter rows before grouping with "
+                    "ds.filter(...)"
+                )
+        return GroupBy(
+            self._source,
+            self._keys,
+            self._named,
+            maintain_order=self._maintain_order,
+            having=(*self._having, *flat),
+        )
+
     def agg(self, *aggs: AggExpr | dict[str, Any], **named: AggExpr | Expr) -> Dataset:
         """Compute aggregates per group, returning a new `Dataset`.
 
@@ -149,10 +218,11 @@ class GroupBy:
         (``salary_min``, ``salary_max``), as pandas does when it flattens.
 
         Keyword args bind an output name to an aggregate (`col("x").sum()`,
-        `count()`, ...). A positional arg is a bare single-column aggregate
-        (``col("x").sum()``) that keeps its source column's name — use a keyword when
-        you want a different output name. The result columns are the group keys
-        followed by the aggregates, in the order given.
+        `count()`, ...). A positional arg is named the way Polars names it: by its
+        ``.alias(...)``, else its leftmost column, so ``col("x").sum()`` keeps ``x`` and
+        ``(col("x").sum() / col("y").sum())`` is ``x``; ``count()`` is ``count``. Use a
+        keyword when you want a different output name. The result columns are the group
+        keys followed by the aggregates, in the order given.
 
         A keyword value may also be a whole **expression over aggregates** —
         ``col("x").sum() / col("y").sum()``, ``col("v").max() - col("v").min()`` — not
@@ -182,10 +252,11 @@ class GroupBy:
                 {'dept': ['eng', 'sales'], 'avg': [110.0, 90.0]}
 
         Args:
-            *aggs: Bare single-column aggregates (``col(name).<agg>()``) that keep
-                ``name`` as the output column, aggregates named by ``.alias(...)``, or a
-                single pandas-style ``{column: reducer}`` / ``{column: [reducers]}``
-                dict. A list of aggregates is accepted in place of separate arguments.
+            *aggs: Aggregates or expressions over aggregates, named by their alias or
+                leftmost column (an aggregate over ``col("a", "b")`` expands to one per
+                column), or a single pandas-style ``{column: reducer}`` /
+                ``{column: [reducers]}`` dict. A list of aggregates is accepted in place
+                of separate arguments.
             **named: Output column name to an aggregate, or an expression over aggregates.
 
         Returns:
@@ -198,7 +269,14 @@ class GroupBy:
         if len(aggs) == 1 and isinstance(aggs[0], dict):
             return self.agg(**{**self._spec_to_aggs(aggs[0]), **named})
         aggs = flatten_varargs(aggs)
-        resolved = {**self._named_aggs(aggs), **named}
+        positional = self._named_aggs(aggs)
+        clashing = sorted(positional.keys() & named.keys())
+        if clashing:
+            raise PlanError(
+                f"agg() got output column(s) {clashing} both positionally and as a keyword; "
+                "give each output column exactly one definition"
+            )
+        resolved = {**positional, **named}
         if not resolved:
             raise PlanError("agg() requires at least one aggregate")
         return self._source._derive(self._lower_aggregates(resolved))
@@ -252,6 +330,8 @@ class GroupBy:
         """
         from batcher.api.group_apply import build_map_groups
 
+        self._refuse_maintain_order("map_groups")
+        self._refuse_having("map_groups")
         if self._named:
             raise PlanError(
                 "map_groups needs plain column keys; group_by was given a derived key "
@@ -278,7 +358,7 @@ class GroupBy:
                 if reducer is None or not callable(reducer):
                     raise PlanError(
                         f"agg(): {fn!r} is not an aggregate; try 'sum', 'mean', 'min', "
-                        "'max', 'count', 'median', 'std', 'var', or 'n_unique'"
+                        "'max', 'count', 'median', 'std', 'var', or 'count_distinct'"
                     )
                 out[column if len(names) == 1 else f"{column}_{fn}"] = reducer()
         return out
@@ -297,6 +377,8 @@ class GroupBy:
         scalar expression re-evaluated in a following `Project`. When every output is a
         bare aggregate the projection is skipped — the plan shape is exactly as before.
         """
+        if self._having:
+            return self._lower_with_having(resolved)
         from batcher.plan.expr_ir.walk import (
             AggregateLeafRegistry,
             contains_aggregate,
@@ -322,16 +404,16 @@ class GroupBy:
                 )
 
         group_keys = self._group_key_projections()
-        watermark = self._source._watermark
         if not has_composite:
-            return Aggregate(self._source._plan, group_keys, tuple(pure_specs), watermark=watermark)
+            return self._aggregate(tuple(pure_specs))
 
         hidden = tuple(AggregateSpec(name, agg) for name, agg in registry.leaves())
-        agg_plan = Aggregate(
-            self._source._plan, group_keys, tuple(pure_specs) + hidden, watermark=watermark
-        )
+        agg_plan = self._aggregate(tuple(pure_specs) + hidden, ordered=False)
         passthrough = tuple(Projection(k.alias, Col(k.alias)) for k in group_keys)
-        return Project(agg_plan, passthrough + tuple(project_items))
+        order = (Projection(_FIRST_ROW, Col(_FIRST_ROW)),) if self._maintain_order else ()
+        return self._in_first_row_order(
+            Project(agg_plan, passthrough + tuple(project_items) + order)
+        )
 
     def len(self, name: str = "len") -> Dataset:
         """Count the rows in each group.
@@ -363,6 +445,10 @@ class GroupBy:
         non-null entries of each value column (SQL ``COUNT(col)``, like pandas
         ``groupby().count()``). Name columns or pass a selector to count a subset.
 
+        This is **not** the ``count`` of Spark, Polars or Ray Data, which all count *rows*
+        into one column. Their ``group_by(k).count()`` is ``group_by(k).len(name="count")``
+        here (``name="count()"`` for Ray Data's column name).
+
         Args:
             *columns: Columns (names or selectors) to count; defaults to every
                 non-key column.
@@ -380,13 +466,18 @@ class GroupBy:
         """
         return self._reduce("count", columns)
 
-    def quantile(self, q: float, *columns: str | Selector) -> Dataset:
+    def quantile(
+        self, q: float, *columns: str | Selector, interpolation: str = "linear"
+    ) -> Dataset:
         """The `q`-quantile of each column per group (every non-key numeric column by default).
+
+        `interpolation` is as for :meth:`Expr.quantile`; Polars' default is ``"nearest"``.
 
         Args:
             q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median).
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            interpolation: How to resolve a rank that falls between two values.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group quantiles.
@@ -407,18 +498,20 @@ class GroupBy:
                 "group_by().quantile() has no numeric value columns to reduce — "
                 "name the columns to reduce explicitly"
             )
-        specs = tuple(AggregateSpec(c, Col(c).quantile(q)) for c in targets)
+        specs = tuple(AggregateSpec(c, Col(c).quantile(q, interpolation)) for c in targets)
         return self._finish(specs)
 
-    def sum(self, *columns: str | Selector) -> Dataset:
+    def sum(self, *columns: str | Selector, empty_value: int | float | None = None) -> Dataset:
         """Sum each value column per group (every non-key numeric column by default).
 
         Like pandas' ``numeric_only``, the no-argument form reduces only numeric
-        columns; name a non-numeric column explicitly to attempt to sum it.
+        columns; name a non-numeric column explicitly to attempt to sum it. A group whose
+        values are all null sums to null; ``empty_value=0`` answers ``0``, as Polars does.
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            empty_value: The sum of a group with no non-null value; ``None`` keeps null.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group sums, each
@@ -432,7 +525,7 @@ class GroupBy:
                 >>> ds.group_by("g").sum().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [3, 3], 'y': [30, 30]}
         """
-        return self._reduce("sum", columns)
+        return self._reduce("sum", columns, empty_value=empty_value)
 
     def mean(self, *columns: str | Selector) -> Dataset:
         """Average each value column per group (every non-key numeric column by default).
@@ -474,12 +567,16 @@ class GroupBy:
         """
         return self._reduce("min", columns)
 
-    def max(self, *columns: str | Selector) -> Dataset:
+    def max(self, *columns: str | Selector, nan_policy: str = "propagate") -> Dataset:
         """Maximum of each value column per group (all non-key columns by default).
+
+        A NaN is the greatest float, so it is a group's maximum; ``nan_policy="ignore"``
+        skips it unless nothing else is left, as Polars does (see :meth:`Expr.max`).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key column.
+            nan_policy: ``"propagate"`` or ``"ignore"``.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group maxima.
@@ -492,7 +589,7 @@ class GroupBy:
                 >>> ds.group_by("g").max().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [3, 2]}
         """
-        return self._reduce("max", columns)
+        return self._reduce("max", columns, nan_policy=nan_policy)
 
     def median(self, *columns: str | Selector) -> Dataset:
         """Median of each value column per group (every non-key numeric column by default).
@@ -514,12 +611,16 @@ class GroupBy:
         """
         return self._reduce("median", columns)
 
-    def n_unique(self, *columns: str | Selector) -> Dataset:
+    def count_distinct(self, *columns: str | Selector, count_nulls: bool = False) -> Dataset:
         """Count distinct values of each column per group (all non-key columns by default).
 
+        Nulls are not counted; ``count_nulls=True`` counts a null as one more value, as
+        Polars' ``n_unique`` does.
+
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key column.
+            count_nulls: Whether a null counts as a distinct value.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group distinct counts.
@@ -529,51 +630,14 @@ class GroupBy:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 1, 5]})
-                >>> ds.group_by("g").n_unique().sort("g").to_pydict()
+                >>> ds.group_by("g").count_distinct().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [1, 1]}
         """
-        return self._reduce("n_unique", columns)
+        return self._reduce("count_distinct", columns, count_nulls=count_nulls)
 
-    def nunique(self, *columns: str | Selector) -> Dataset:
-        """Count distinct values per group — the pandas ``nunique`` spelling of :meth:`n_unique`.
-
-        Args:
-            *columns: Columns (names or selectors) to reduce; defaults to every
-                non-key column.
-
-        Returns:
-            A new `Dataset` of the group keys followed by the per-group distinct counts.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 1, 5]})
-                >>> ds.group_by("g").nunique().sort("g").to_pydict()
-                {'g': ['a', 'b'], 'x': [1, 1]}
-        """
-        return self._reduce("n_unique", columns)
-
-    def size(self, name: str = "size") -> Dataset:
-        """Count the rows in each group — the pandas ``size`` spelling of :meth:`len`.
-
-        Args:
-            name: Name of the output count column.
-
-        Returns:
-            A new `Dataset` of the group keys followed by the per-group row count.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"g": ["a", "a", "b"]})
-                >>> ds.group_by("g").size().sort("g").to_pydict()
-                {'g': ['a', 'b'], 'size': [2, 1]}
-        """
-        return self.len(name)
-
-    def first(self, *columns: str | Selector, order_by: str | Expr) -> Dataset:
+    def first(
+        self, *columns: str | Selector, order_by: str | Expr, ignore_nulls: bool = True
+    ) -> Dataset:
         """The first value of each column per group, along an explicit `order_by`.
 
         `order_by` is required, and deliberately so: a relation has no inherent row
@@ -585,6 +649,8 @@ class GroupBy:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key column.
             order_by: The column or expression defining "first" within each group.
+            ignore_nulls: Whether to skip null values; ``False`` takes the first row's value
+                even when it is null, as Spark's and Polars' ``first`` do.
 
         Returns:
             A new `Dataset` of the group keys followed by each column's first value.
@@ -597,9 +663,11 @@ class GroupBy:
                 >>> ds.group_by("g").first("v", order_by="t").to_pydict()
                 {'g': ['a'], 'v': [10]}
         """
-        return self._ordered_reduce("first", columns, order_by)
+        return self._ordered_reduce("first", columns, order_by, ignore_nulls)
 
-    def last(self, *columns: str | Selector, order_by: str | Expr) -> Dataset:
+    def last(
+        self, *columns: str | Selector, order_by: str | Expr, ignore_nulls: bool = True
+    ) -> Dataset:
         """The last value of each column per group, along an explicit `order_by`.
 
         `order_by` is required for the same reason as in :meth:`first`: without a
@@ -609,6 +677,8 @@ class GroupBy:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key column.
             order_by: The column or expression defining "last" within each group.
+            ignore_nulls: Whether to skip null values; ``False`` takes the last row's value
+                even when it is null.
 
         Returns:
             A new `Dataset` of the group keys followed by each column's last value.
@@ -621,7 +691,7 @@ class GroupBy:
                 >>> ds.group_by("g").last("v", order_by="t").to_pydict()
                 {'g': ['a'], 'v': [20]}
         """
-        return self._ordered_reduce("last", columns, order_by)
+        return self._ordered_reduce("last", columns, order_by, ignore_nulls)
 
     def head(self, n: int = 5, *, order_by: str | Expr) -> Dataset:
         """The first `n` rows of each group along `order_by`, keeping every column.
@@ -684,6 +754,8 @@ class GroupBy:
         """Keep the `n` lowest- (or highest-) ranked rows per group, via `row_number`."""
         if n < 1:
             raise PlanError(f"group_by().head()/tail(): n must be >= 1, got {n}")
+        self._refuse_maintain_order("head/tail")
+        self._refuse_having("head/tail")
         if self._named:
             raise PlanError(
                 "group_by().head()/tail() needs plain column keys — a derived key "
@@ -699,7 +771,7 @@ class GroupBy:
         return ranked.filter(Col(rank) <= n).drop(rank)
 
     def _ordered_reduce(
-        self, fn: str, columns: tuple[str | Selector, ...], order_by: str | Expr
+        self, fn: str, columns: tuple[str | Selector, ...], order_by: str | Expr, ignore_nulls: bool
     ) -> Dataset:
         """Reduce with an order-dependent aggregate (`first`/`last`) along `order_by`."""
         targets = self._resolve_columns(columns, numeric_only=False)
@@ -708,15 +780,18 @@ class GroupBy:
                 f"group_by().{fn}() has no value columns to reduce; name them explicitly"
             )
         key = Col(order_by) if isinstance(order_by, str) else order_by
-        specs = tuple(AggregateSpec(c, getattr(Col(c), fn)(key)) for c in targets)
+        specs = tuple(
+            AggregateSpec(c, getattr(Col(c), fn)(key, ignore_nulls=ignore_nulls)) for c in targets
+        )
         return self._finish(specs)
 
-    def std(self, *columns: str | Selector) -> Dataset:
+    def std(self, *columns: str | Selector, ddof: int = 1) -> Dataset:
         """Sample standard deviation per group (every non-key numeric column by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            ddof: Delta degrees of freedom; ``0`` is the population standard deviation.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group standard deviations.
@@ -729,14 +804,15 @@ class GroupBy:
                 >>> ds.group_by("g").std().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [1.4142135623730951, 0.0]}
         """
-        return self._reduce("std", columns)
+        return self._reduce("std", columns, ddof=ddof)
 
-    def var(self, *columns: str | Selector) -> Dataset:
+    def var(self, *columns: str | Selector, ddof: int = 1) -> Dataset:
         """Sample variance of each column per group (every non-key numeric column by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            ddof: Delta degrees of freedom; ``0`` is the population variance.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group variances.
@@ -749,14 +825,15 @@ class GroupBy:
                 >>> ds.group_by("g").var().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [2.0, 0.0]}
         """
-        return self._reduce("var", columns)
+        return self._reduce("var", columns, ddof=ddof)
 
-    def product(self, *columns: str | Selector) -> Dataset:
+    def product(self, *columns: str | Selector, empty_value: float | None = None) -> Dataset:
         """Product of each value column per group (every non-key numeric column by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            empty_value: The product of a group with no non-null value; ``None`` keeps null.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group products.
@@ -769,18 +846,33 @@ class GroupBy:
                 >>> ds.group_by("g").product().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [6.0, 5.0]}
         """
-        return self._reduce("product", columns)
+        return self._reduce("product", columns, empty_value=empty_value)
 
-    def array_agg(self, *columns: str | Selector) -> Dataset:
+    def array_agg(
+        self,
+        *columns: str | Selector,
+        order_by: IntoExpr | Iterable[IntoExpr] | None = None,
+        descending: bool | Sequence[bool] = False,
+        nulls_last: bool | Sequence[bool] = True,
+        ignore_nulls: bool = False,
+    ) -> Dataset:
         """Collect each value column's values into a list per group (all non-key by default).
 
         The group-wise ``array_agg`` / ``list`` aggregate — gather each group's values into a
-        `List` column, e.g. to build a per-entity sequence of features for a model. Values
-        appear in input order.
+        `List` column, e.g. to build a per-entity sequence of features for a model. Every
+        list is ordered by `order_by`, so the lists line up element for element; without it
+        the element order is unspecified, as for :meth:`Expr.array_agg
+        <batcher.Expr.array_agg>`.
 
         Args:
             *columns: Columns (names or selectors) to collect; defaults to every non-key
                 column.
+            order_by: The key or keys that order each list's elements.
+            descending: Order from the largest key, for every key or per key.
+            nulls_last: Place elements whose key is null after the others, for every key or
+                per key.
+            ignore_nulls: Whether to leave nulls out of the lists, as Spark's
+                ``collect_list`` does.
 
         Returns:
             A new `Dataset` of the group keys followed by a `List` column per collected column.
@@ -789,17 +881,25 @@ class GroupBy:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3]})
-                >>> ds.group_by("g").array_agg().sort("g").to_pydict()
-                {'g': ['a', 'b'], 'x': [[1, 2], [3]]}
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3], "t": [1, 0, 0]})
+                >>> ds.group_by("g").array_agg("x", order_by="t").sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [[2, 1], [3]]}
         """
-        return self._reduce("array_agg", columns)
+        return self._reduce(
+            "array_agg",
+            columns,
+            order_by=order_by,
+            descending=descending,
+            nulls_last=nulls_last,
+            ignore_nulls=ignore_nulls,
+        )
 
-    def mode(self, *columns: str | Selector) -> Dataset:
+    def mode(self, *columns: str | Selector, all_modes: bool = False) -> Dataset:
         """The most frequent value of each column per group (all non-key columns by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every non-key column.
+            all_modes: Whether to return every tied value as an ascending list.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group modes.
@@ -812,14 +912,15 @@ class GroupBy:
                 >>> ds.group_by("g").mode().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [5, 9]}
         """
-        return self._reduce("mode", columns)
+        return self._reduce("mode", columns, all_modes=all_modes)
 
-    def skewness(self, *columns: str | Selector) -> Dataset:
+    def skew(self, *columns: str | Selector, bias: bool = False) -> Dataset:
         """Sample skewness of each column per group (every non-key numeric column by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every non-key
                 numeric column.
+            bias: Whether to return the population skewness, as Daft, Spark and Polars do.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group skewness.
@@ -829,17 +930,21 @@ class GroupBy:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a", "a", "a"], "x": [1.0, 2.0, 3.0]})
-                >>> ds.group_by("g").skewness().to_pydict()
+                >>> ds.group_by("g").skew().to_pydict()
                 {'g': ['a'], 'x': [0.0]}
         """
-        return self._reduce("skewness", columns)
+        return self._reduce("skew", columns, bias=bias)
 
-    def kurtosis(self, *columns: str | Selector) -> Dataset:
+    def kurtosis(
+        self, *columns: str | Selector, bias: bool = False, fisher: bool = True
+    ) -> Dataset:
         """Sample excess kurtosis of each column per group (numeric columns by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every non-key
                 numeric column.
+            bias: Whether to return the population estimate, as Spark and Polars do.
+            fisher: Whether to subtract 3, so a normal distribution scores 0.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group kurtosis.
@@ -852,13 +957,13 @@ class GroupBy:
                 >>> round(ds.group_by("g").kurtosis().to_pydict()["x"][0], 2)
                 -1.2
         """
-        return self._reduce("kurtosis", columns)
+        return self._reduce("kurtosis", columns, bias=bias, fisher=fisher)
 
     # Reductions whose default (all non-key columns) is restricted to numeric columns,
     # mirroring pandas' `numeric_only`: averaging or summing a string column is an error,
     # so an explicit-columns call is required to attempt it.
     _NUMERIC_ONLY = frozenset(
-        {"sum", "mean", "median", "std", "var", "product", "skewness", "kurtosis"}
+        {"sum", "mean", "median", "std", "var", "product", "skew", "kurtosis"}
     )
 
     def _value_columns(self, numeric_only: bool) -> list[str]:
@@ -897,7 +1002,7 @@ class GroupBy:
                 out.append(c)
         return out
 
-    def _reduce(self, fn: str, columns: tuple[str | Selector, ...]) -> Dataset:
+    def _reduce(self, fn: str, columns: tuple[str | Selector, ...], **options: Any) -> Dataset:
         targets = self._resolve_columns(columns, numeric_only=fn in self._NUMERIC_ONLY)
         if not targets:
             hint = (
@@ -906,45 +1011,144 @@ class GroupBy:
                 else "no value columns to reduce; every column is a group key"
             )
             raise PlanError(f"group_by().{fn}() has {hint} — name the columns to reduce explicitly")
-        specs = tuple(AggregateSpec(c, getattr(Col(c), fn)()) for c in targets)
-        return self._finish(specs)
+        values = {c: getattr(Col(c), fn)(**options) for c in targets}
+        if all(isinstance(v, AggExpr) for v in values.values()):
+            return self._finish(tuple(AggregateSpec(c, v) for c, v in values.items()))
+        # A parameter that composes over the aggregate (`sum(empty_value=0)`) is an
+        # expression over aggregates, which only the `agg()` lowering knows how to plan.
+        return self._source._derive(self._lower_aggregates(values))
 
-    def _named_aggs(self, aggs: tuple[AggExpr, ...]) -> dict[str, AggExpr]:
-        """Resolve bare positional aggregates to an ordered {source_column: agg} map."""
-        out: dict[str, AggExpr] = {}
+    def _named_aggs(self, aggs: tuple[AggExpr | Expr, ...]) -> dict[str, AggExpr | Expr]:
+        """Resolve positional aggregates to an ordered {output_name: agg} map.
+
+        Each is named as a positional `select` output is (`output_name`): an explicit
+        ``.alias(...)`` wins, else the leftmost column, so ``col("x").sum()`` keeps ``x``
+        and ``count()`` is ``count``. An aggregate over a multi-column selector
+        (``col("a", "b").sum()``) expands to one aggregate per matched column. Two outputs
+        landing on one name are refused, never silently overwritten.
+        """
+        pairs: list[tuple[str, AggExpr | Expr]] = []
         for a in aggs:
-            # An explicit `.alias(...)` names the output directly, which is what lets a
-            # positional `count()` (no input column to be named after) and two aggregates
-            # over one column both be spelled positionally, as Polars spells them.
-            name = a.name if isinstance(a, AggExpr) else None
-            if name is None and isinstance(a, AggExpr) and isinstance(a.input, Col):
-                name = a.input.name
-            if name is None:
+            if isinstance(a, AggExpr) and a.name is None and has_selector(a.input):
+                pairs.extend(self._expand_selector_agg(a))
+            elif isinstance(a, (AggExpr, Expr)):
+                pairs.append((output_name(a), a.inner if isinstance(a, Aliased) else a))
+            else:
                 raise PlanError(
-                    "a positional agg() argument must be a single-column aggregate that "
-                    "names its output, e.g. col('x').sum(); for a custom name or a "
-                    "count()/multi-column aggregate use .alias('name') or a keyword "
-                    "(agg(total=...))"
+                    f"a positional agg() argument must be an aggregate expression such as "
+                    f"col('x').sum(), got {type(a).__name__}"
                 )
+        out: dict[str, AggExpr | Expr] = {}
+        for name, agg in pairs:
             if name in out:
-                if a.name is None:
+                if isinstance(agg, AggExpr) and agg.name is not None:
                     raise PlanError(
-                        f"agg() got two positional aggregates over column {name!r}, which "
-                        "would both be named after it; give one a name, e.g. "
-                        "agg(col('x').sum().alias('total'), col('x').mean().alias('avg'))"
+                        f"agg() got two positional aggregates aliased {name!r}; each "
+                        ".alias(...) must name a distinct output column"
                     )
                 raise PlanError(
-                    f"agg() got two positional aggregates aliased {name!r}; each "
-                    ".alias(...) must name a distinct output column"
+                    f"agg() got two positional aggregates over column {name!r}, which would "
+                    "both be named after it; give one a name, e.g. "
+                    "agg(col('x').sum().alias('total'), col('x').mean())"
                 )
-            out[name] = a
+            out[name] = agg
         return out
 
-    def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:
-        plan = Aggregate(
-            self._source._plan,
-            self._group_key_projections(),
-            specs,
-            watermark=self._source._watermark,
+    def _expand_selector_agg(self, agg: AggExpr) -> list[tuple[str, AggExpr]]:
+        """One aggregate per column a selector-valued aggregate input matches."""
+        source = self._source
+        expanded = expand_selectors(
+            agg.input, source._plan.available_columns(), source._plan.available_schema()
         )
-        return self._source._derive(plan)
+        return [
+            (
+                name,
+                AggExpr(
+                    agg.func,
+                    expr,
+                    input2=agg.input2,
+                    param=agg.param,
+                    interpolation=agg.interpolation,
+                    order_by=agg.order_by,
+                ),
+            )
+            for name, expr in expanded
+        ]
+
+    def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:
+        if self._having:
+            return self._source._derive(self._lower_aggregates({s.alias: s.agg for s in specs}))
+        return self._source._derive(self._aggregate(specs))
+
+    def _lower_with_having(self, resolved: dict[str, AggExpr | Expr]) -> LogicalPlan:
+        """The aggregation with each `having` predicate as a hidden output, filtered and dropped.
+
+        The predicates ride in the same aggregate pass as the outputs; a `Filter` then keeps
+        the groups where all of them are true and a `Project` removes them again.
+        """
+        from batcher.plan.expr_rewrite import combine_conjuncts
+
+        taken = set(resolved) | set(self.keys)
+        hidden: dict[str, AggExpr | Expr] = {}
+        for i, predicate in enumerate(self._having):
+            name = f"__bc_having_{i}"
+            while name in taken:
+                name += "_"
+            hidden[name] = predicate
+        plain = GroupBy(self._source, self._keys, self._named, maintain_order=self._maintain_order)
+        plan = plain._lower_aggregates({**resolved, **hidden})
+        kept = Filter(plan, combine_conjuncts([Col(h) for h in hidden]))
+        visible = [c for c in plan.available_columns() if c not in hidden]
+        return Project(kept, tuple(Projection(c, Col(c)) for c in visible))
+
+    def _refuse_having(self, method: str) -> None:
+        """`having` filters the groups a reduction emits; row methods emit no groups."""
+        if self._having:
+            raise PlanError(
+                f"group_by().having(...).{method}() is not supported: having filters the groups "
+                "an aggregation emits, and this method returns rows. Compute the group predicate "
+                "with a window and filter on it instead."
+            )
+
+    def _aggregate(self, specs: tuple[AggregateSpec, ...], *, ordered: bool = True) -> LogicalPlan:
+        """The `Aggregate` over the group keys, rewritten for `maintain_order` when it is set.
+
+        The rewrite is plan-only and needs nothing from the engine: `RowId` numbers the input
+        rows, the aggregate keeps each group's smallest number beside the user's aggregates,
+        and (when `ordered`) a `Sort` on it restores first-appearance order before a `Project`
+        drops it. Each piece already means the same thing single-node, spilled and
+        distributed, so the order does too. `ordered=False` leaves the sort to a caller that
+        projects first.
+        """
+        source = self._source
+        if not self._maintain_order:
+            return Aggregate(
+                source._plan, self._group_key_projections(), specs, watermark=source._watermark
+            )
+        if source._watermark is not None:
+            raise PlanError(
+                "group_by(maintain_order=True) needs a bounded input: an unbounded stream "
+                "has no first appearance to sort its windows by. Sort the result instead."
+            )
+        first = AggregateSpec(_FIRST_ROW, Col(_FIRST_ROW).min())
+        plan = Aggregate(
+            RowId(source._plan, _FIRST_ROW), self._group_key_projections(), (*specs, first)
+        )
+        return self._in_first_row_order(plan) if ordered else plan
+
+    def _in_first_row_order(self, plan: LogicalPlan) -> LogicalPlan:
+        """`plan` sorted on the hidden first-row column, which is then dropped."""
+        if not self._maintain_order:
+            return plan
+        ordered = Sort(plan, (SortKeySpec(Col(_FIRST_ROW)),))
+        kept = [name for name in plan.available_columns() if name != _FIRST_ROW]
+        return Project(ordered, tuple(Projection(name, Col(name)) for name in kept))
+
+    def _refuse_maintain_order(self, method: str) -> None:
+        """`maintain_order` orders the groups an aggregation emits; row methods have none."""
+        if self._maintain_order:
+            raise PlanError(
+                f"group_by(maintain_order=True).{method}() is not supported: it orders the "
+                "groups an aggregation emits, and this method returns rows. Sort the result "
+                "instead."
+            )

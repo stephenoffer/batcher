@@ -6,7 +6,7 @@ ML work attaches to a `Dataset` through the `.ml` accessor:
 
 | Method | Use |
 | --- | --- |
-| {py:meth}`ds.ml.map_batches(fn, ...) <batcher.api.dataset.ml.DatasetML.map_batches>` | Apply an arbitrary function to each Arrow batch. |
+| {py:meth}`ds.map_batches(fn, ...) <batcher.Dataset.map_batches>` | Apply an arbitrary function to each Arrow batch. |
 | {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` | Run batch inference from a model id plus `column`, or from a model callable. |
 | {py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>` | Generate embeddings from a model id plus `column`, or from a model callable. |
 | {py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` | Offline LLM text generation, appending the response column. |
@@ -42,7 +42,7 @@ def add_sum(batch):
     return batch.append_column("sum", total)
 
 
-print(ds.ml.map_batches(add_sum).to_pydict())
+print(ds.map_batches(add_sum).to_pydict())
 # {'x': [1, 2, 3, 4], 'y': [10, 20, 30, 40], 'sum': [11, 22, 33, 44]}
 ```
 
@@ -66,7 +66,7 @@ class Scale:
         return batch.set_column(0, "x", scaled)
 
 
-print(ds.ml.map_batches(Scale(10)).to_pydict())
+print(ds.map_batches(Scale(10)).to_pydict())
 # {'x': [10, 20, 30, 40], 'y': [10, 20, 30, 40]}
 ```
 
@@ -90,7 +90,7 @@ class Classifier:
         return batch.append_column("prediction", pa.array(preds))
 
 
-labelled = ds.ml.map_batches(Classifier, num_gpus=1, concurrency=4)
+labelled = ds.map_batches(Classifier, num_gpus=1, concurrency=4)
 ```
 
 ## Common arguments

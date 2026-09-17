@@ -21,7 +21,7 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderkey", "o_orderdate", "o_totalprice").head(3_000)
+    orders = tpch("orders").select("o_orderkey", "o_orderdate", "o_totalprice").limit(3_000)
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -30,13 +30,13 @@ def main() -> None:
         # reading one with `read.parquet` drops the partition column (with a
         # warning). Partitioned reads are `read.parquet_dataset`, in their own
         # example; this one is only about how far a glob reaches.
-        for index, part in enumerate([orders.head(1000), orders.slice(1000, 1000)]):
+        for index, part in enumerate([orders.limit(1000), orders.limit(1000, offset=1000)]):
             target = root / "batch-a" / f"part-{index}.parquet"
             target.parent.mkdir(parents=True, exist_ok=True)
             part.write.parquet(str(target))
         tail = root / "batch-b" / "part-0.parquet"
         tail.parent.mkdir(parents=True, exist_ok=True)
-        orders.slice(2000, 1000).write.parquet(str(tail))
+        orders.limit(1000, offset=2000).write.parquet(str(tail))
 
         # One segment: only the first directory.
         one_year = bt.read.parquet(str(root / "batch-a" / "*.parquet"))

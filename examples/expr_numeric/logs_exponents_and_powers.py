@@ -20,19 +20,19 @@ from batcher import col
 
 
 def main() -> None:
-    lineitem = tpch("lineitem").select("l_quantity", "l_extendedprice").head(5_000)
+    lineitem = tpch("lineitem").select("l_quantity", "l_extendedprice").limit(5_000)
 
     transformed = lineitem.select(
         "l_quantity",
-        natural=col("l_quantity").log(),
+        natural=col("l_quantity").ln(),
         base10=col("l_quantity").log10(),
         base2=col("l_quantity").log2(),
         squared=col("l_quantity") ** 2,
         root=col("l_quantity").sqrt(),
-        exponent=col("l_quantity").log().exp(),
+        exponent=col("l_quantity").ln().exp(),
     )
 
-    sample = transformed.head(3).to_pydict()
+    sample = transformed.limit(3).to_pydict()
     print({name: [round(value, 4) for value in column] for name, column in sample.items()})
 
     full = transformed.to_pydict()

@@ -20,7 +20,7 @@ from batcher.io.formats.semistructured.json import JSONSink, JSONSource
 from batcher.io.formats.semistructured.logs import LogSource
 from batcher.io.formats.semistructured.msgpack import MsgpackSink, MsgpackSource
 from batcher.io.formats.semistructured.protobuf import ProtobufSource
-from batcher.io.formats.semistructured.xml import XMLSource
+from batcher.io.formats.semistructured.xml import XMLSink, XMLSource
 
 __all__ = [
     "JSONSink",
@@ -29,5 +29,6 @@ __all__ = [
     "MsgpackSink",
     "MsgpackSource",
     "ProtobufSource",
+    "XMLSink",
     "XMLSource",
 ]

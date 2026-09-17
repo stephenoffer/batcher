@@ -73,7 +73,7 @@ def test_task_options_accelerator_type():
 
 def test_map_batches_stores_autoscale_and_accelerator():
     ds = bt.from_pydict({"x": [1, 2, 3]})
-    plan = ds.ml.map_batches(lambda b: b, concurrency=(2, 8), accelerator_type="NVIDIA_A100")._plan
+    plan = ds.map_batches(lambda b: b, concurrency=(2, 8), accelerator_type="NVIDIA_A100")._plan
     assert plan.concurrency == (2, 8)
     assert plan.accelerator_type == "NVIDIA_A100"
 
@@ -82,7 +82,7 @@ def test_map_batches_stores_autoscale_and_accelerator():
 def test_invalid_concurrency_rejected(bad):
     ds = bt.from_pydict({"x": [1, 2, 3]})
     with pytest.raises(PlanError, match="concurrency"):
-        ds.ml.map_batches(lambda b: b, concurrency=bad)
+        ds.map_batches(lambda b: b, concurrency=bad)
 
 
 def test_warm_inference_pools_default_on():

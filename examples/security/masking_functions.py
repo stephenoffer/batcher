@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    customer = tpch("customer").select("c_custkey", "c_phone").head(500)
+    customer = tpch("customer").select("c_custkey", "c_phone").limit(500)
 
     masked = customer.select(
         "c_phone",
@@ -29,7 +29,7 @@ def main() -> None:
         fully=bt.mask(col("c_phone")),
         hashed=col("c_phone").str.sha256(),
     )
-    result = masked.head(3).to_pydict()
+    result = masked.limit(3).to_pydict()
     for key in ("c_phone", "last_four", "first_two", "fully", "hashed"):
         print(f"  {key:<10} {result[key][0][:40]}")
 

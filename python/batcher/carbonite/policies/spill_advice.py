@@ -48,6 +48,12 @@ if TYPE_CHECKING:
 
 __all__ = ["SpillAdvisor"]
 
+#: The share of the hard budget a sized plan's peak must reach before a stall-only pressure
+#: reading sends it out of core. Two percent is a working set whose eviction the kernel would
+#: feel — 18 MB of a 1 GiB worker, 540 MB of a 27 GB envelope — and below which a spill buys
+#: I/O and nothing else. See `SpillAdvisor._too_small_to_relieve_a_stall`.
+_STALL_SPILL_MIN_SHARE_OF_BUDGET = 0.02
+
 
 class SpillAdvisor:
     """The out-of-core decisions for one query, all sized off one peak and one budget."""
@@ -126,9 +132,31 @@ class SpillAdvisor:
         if estimated > 0 and estimated > budget:
             return f"estimated peak {estimated} B exceeds the {budget} B memory budget"
         level = self._pressure.classify()
-        if level >= PressureLevel.SPILL:
+        if level >= PressureLevel.SPILL and not self._too_small_to_relieve_a_stall(
+            estimated, budget
+        ):
             return f"live memory pressure is {level.name}"
         return self._oom_history_reason(estimated)
+
+    def _too_small_to_relieve_a_stall(self, estimated: int, budget: int) -> bool:
+        """Whether a spill ordered **only** by the kernel's stall reading would relieve nothing.
+
+        The stall floor raises the level to SPILL when PSI says the cgroup is thrashing, and
+        on a node whose memory other tenants are exhausting that reading stays high for as
+        long as they do. Taken as an order for every query, it sent plans with a few
+        megabytes of state to disk: on a shared 92 GiB box at PSI `full` 49%, a TPC-H sf1
+        join estimated at 3.5 MB spilled into two partitions and ran ~10x slower. Spilling
+        cannot shrink a working set that was never large, and its writes add page cache and
+        I/O to the very reclaim the stall measures.
+
+        So a stall alone spills only a plan whose peak is a real share of the budget. The
+        byte-accounting level is untouched: if the engine's own envelope or footprint is in
+        the spill band, every plan spills exactly as before, and so does every un-sized plan,
+        whose `0` estimate says nothing about its size.
+        """
+        if estimated <= 0 or estimated >= budget * _STALL_SPILL_MIN_SHARE_OF_BUDGET:
+            return False
+        return self._pressure.accounted_level() < PressureLevel.SPILL
 
     def _oom_history_reason(self, estimated: int) -> str | None:
         """Spill an **un-sized** plan in a cgroup that has already been OOM-killed.

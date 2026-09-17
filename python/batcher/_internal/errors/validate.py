@@ -22,7 +22,52 @@ from typing import Any
 
 from batcher._internal.errors.hierarchy import PlanError
 
-__all__ = ["require_float", "require_int"]
+__all__ = ["require_bool", "require_choice", "require_float", "require_int"]
+
+
+def require_bool(value: Any, *, func: str, arg: str) -> bool:
+    """Return `value` if it is a `bool`, or raise `PlanError`.
+
+    A flag that selects between two meanings of a function (``literal=``, ``truncate=``)
+    must be a real boolean. A truthy string or a ``1`` would otherwise pick a meaning
+    silently, and ``"false"`` is truthy.
+
+    Args:
+        value: The argument as the caller passed it.
+        func: Dotted method name for the message, such as ``"str.contains"``.
+        arg: Parameter name for the message.
+
+    Returns:
+        `value`, unchanged.
+
+    Raises:
+        PlanError: If `value` is not a `bool`.
+    """
+    if not isinstance(value, bool):
+        got = f"{type(value).__name__} {value!r}"
+        raise PlanError(f"{func}(): {arg} must be True or False, got {got}")
+    return value
+
+
+def require_choice(value: Any, *, func: str, arg: str, choices: tuple[str, ...]) -> str:
+    """Return `value` if it is one of `choices`, or raise `PlanError` listing them.
+
+    Args:
+        value: The argument as the caller passed it.
+        func: Dotted method name for the message, such as ``"str.trim"``.
+        arg: Parameter name for the message.
+        choices: The accepted spellings, in the order the message lists them.
+
+    Returns:
+        `value`, unchanged.
+
+    Raises:
+        PlanError: If `value` is not one of `choices`.
+    """
+    if not isinstance(value, str) or value not in choices:
+        listed = ", ".join(repr(c) for c in choices)
+        raise PlanError(f"{func}(): {arg} must be one of {listed}, got {value!r}")
+    return value
 
 
 def require_int(value: Any, *, func: str, arg: str, minimum: int | None = None) -> int:

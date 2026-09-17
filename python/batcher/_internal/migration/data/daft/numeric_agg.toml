@@ -1,0 +1,166 @@
+# Daft 0.7.25 -> Batcher: Math, aggregate and window functions, on Expression and daft.functions.
+# Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
+
+[Expression]
+abs = { status = "canonical", batcher = "Expr.abs" }
+any_value = { status = "param", batcher = "Expr.any_value", need = "ignore_nulls=False (Batcher any_value always skips nulls)", wave = "W2" }
+approx_count_distinct = { status = "canonical", batcher = "Expr.approx_count_distinct" }
+approx_percentiles = { status = "param", batcher = "Expr.approx_quantile", need = "a list of percentiles in one call (returns a list)", wave = "W2" }
+arccos = { status = "canonical", batcher = "Expr.arccos" }
+arccosh = { status = "canonical", batcher = "Expr.arccosh" }
+arcsin = { status = "canonical", batcher = "Expr.arcsin" }
+arcsinh = { status = "canonical", batcher = "Expr.arcsinh" }
+arctan = { status = "canonical", batcher = "Expr.arctan" }
+arctan2 = { status = "canonical", batcher = "bt.arctan2" }
+arctanh = { status = "canonical", batcher = "Expr.arctanh" }
+avg = { status = "canonical", batcher = "Expr.mean" }
+bitwise_and = { status = "canonical", batcher = "Expr.bitwise_and" }
+bitwise_or = { status = "canonical", batcher = "Expr.bitwise_or" }
+bitwise_xor = { status = "canonical", batcher = "Expr.bitwise_xor" }
+bool_and = { status = "canonical", batcher = "Expr.bool_and" }
+bool_or = { status = "canonical", batcher = "Expr.bool_or" }
+cbrt = { status = "canonical", batcher = "Expr.cbrt" }
+ceil = { status = "canonical", batcher = "Expr.ceil" }
+clip = { status = "canonical", batcher = "Expr.clip" }
+cos = { status = "canonical", batcher = "Expr.cos" }
+cosh = { status = "canonical", batcher = "Expr.cosh" }
+cot = { status = "canonical", batcher = "Expr.cot" }
+count = { status = "param", batcher = "Expr.count", need = "mode= ('all' counts nulls too, 'null' counts only nulls; Batcher counts non-null only)", wave = "W2" }
+count_distinct = { status = "canonical", batcher = "Expr.count_distinct" }
+csc = { status = "canonical", batcher = "Expr.csc" }
+degrees = { status = "canonical", batcher = "Expr.degrees" }
+exp = { status = "canonical", batcher = "Expr.exp" }
+expm1 = { status = "canonical", batcher = "Expr.expm1" }
+fill_nan = { status = "canonical", batcher = "Expr.fill_nan" }
+first_value = { status = "param", batcher = "bt.first_value", need = "ignore_nulls=", wave = "W5" }
+floor = { status = "canonical", batcher = "Expr.floor" }
+is_inf = { status = "canonical", batcher = "Expr.is_infinite" }
+is_nan = { status = "canonical", batcher = "Expr.is_nan" }
+lag = { status = "param", batcher = "bt.lag", need = "default= fill value for rows with no predecessor", wave = "W5" }
+last_value = { status = "param", batcher = "bt.last_value", need = "ignore_nulls=", wave = "W5" }
+lead = { status = "param", batcher = "bt.lead", need = "default= fill value for rows with no successor", wave = "W5" }
+list_agg = { status = "canonical", batcher = "Expr.array_agg" }
+list_agg_distinct = { status = "param", batcher = "Expr.array_agg", need = "distinct=True (distinct values, nulls dropped)", wave = "W2" }
+ln = { status = "canonical", batcher = "Expr.ln" }
+log = { status = "canonical", batcher = "Expr.ln", need = "base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e)", wave = "W2" }
+log10 = { status = "canonical", batcher = "Expr.log10" }
+log1p = { status = "canonical", batcher = "Expr.log1p" }
+log2 = { status = "canonical", batcher = "Expr.log2" }
+max = { status = "canonical", batcher = "Expr.max" }
+mean = { status = "canonical", batcher = "Expr.mean" }
+median = { status = "canonical", batcher = "Expr.median" }
+min = { status = "canonical", batcher = "Expr.min" }
+negate = { status = "canonical", batcher = "op:neg" }
+not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
+over = { status = "param", batcher = ["Expr.over"], need = "a Window spec object", wave = "WF" }
+percentile = { status = "canonical", batcher = "Expr.quantile" }
+pow = { status = "canonical", batcher = "op:pow" }
+power = { status = "canonical", batcher = "op:pow" }
+product = { status = "canonical", batcher = "Expr.product" }
+radians = { status = "canonical", batcher = "Expr.radians" }
+round = { status = "canonical", batcher = "Expr.round" }
+sec = { status = "canonical", batcher = "Expr.sec" }
+shift_left = { status = "canonical", batcher = "op:lshift" }
+shift_right = { status = "canonical", batcher = "op:rshift" }
+sign = { status = "canonical", batcher = "Expr.sign" }
+sin = { status = "canonical", batcher = "Expr.sin" }
+sinh = { status = "canonical", batcher = "Expr.sinh" }
+skew = { status = "canonical", batcher = "Expr.skew", template = 'skew() -> self.skew(bias=True)' }
+sqrt = { status = "canonical", batcher = "Expr.sqrt" }
+stddev = { status = "param", batcher = "Expr.std", need = "ddof= (Batcher std is always the sample, ddof=1)", wave = "W2" }
+string_agg = { status = "canonical", batcher = "Expr.str.join" }
+sum = { status = "canonical", batcher = "Expr.sum" }
+tan = { status = "canonical", batcher = "Expr.tan" }
+tanh = { status = "canonical", batcher = "Expr.tanh" }
+var = { status = "param", batcher = "Expr.var", need = "ddof= (Batcher var is always the sample, ddof=1)", wave = "W2" }
+
+[functions]
+abs = { status = "canonical", batcher = "Expr.abs" }
+any_value = { status = "param", batcher = "Expr.any_value", need = "ignore_nulls=False (Batcher any_value always skips nulls)", wave = "W2" }
+approx_count_distinct = { status = "canonical", batcher = "bt.approx_count_distinct" }
+approx_percentiles = { status = "param", batcher = "Expr.approx_quantile", need = "a list of percentiles in one call (returns a list)", wave = "W2" }
+arccos = { status = "canonical", batcher = "Expr.arccos" }
+arccosh = { status = "canonical", batcher = "Expr.arccosh" }
+arcsin = { status = "canonical", batcher = "Expr.arcsin" }
+arcsinh = { status = "canonical", batcher = "Expr.arcsinh" }
+arctan = { status = "canonical", batcher = "Expr.arctan" }
+arctan2 = { status = "canonical", batcher = "bt.arctan2" }
+arctanh = { status = "canonical", batcher = "Expr.arctanh" }
+avg = { status = "canonical", batcher = "bt.mean" }
+bin = { status = "canonical", batcher = "Expr.to_base", template = 'bin(expr) -> sem.column(expr).to_base(2, twos_complement=True)' }
+bitwise_and = { status = "canonical", batcher = "Expr.bitwise_and" }
+bitwise_or = { status = "canonical", batcher = "Expr.bitwise_or" }
+bitwise_xor = { status = "canonical", batcher = "Expr.bitwise_xor" }
+bool_and = { status = "canonical", batcher = "bt.bool_and" }
+bool_or = { status = "canonical", batcher = "bt.bool_or" }
+cbrt = { status = "canonical", batcher = "Expr.cbrt" }
+ceil = { status = "canonical", batcher = "Expr.ceil" }
+clip = { status = "canonical", batcher = "Expr.clip" }
+columns_avg = { status = "canonical", batcher = "bt.mean_horizontal" }
+columns_max = { status = "canonical", batcher = "bt.greatest" }
+columns_mean = { status = "canonical", batcher = "bt.mean_horizontal" }
+columns_min = { status = "canonical", batcher = "bt.least" }
+columns_sum = { status = "canonical", batcher = "bt.sum_horizontal" }
+conv = { status = "gap", need = "base conversion between arbitrary radixes 2-36 on string input", wave = "W3" }
+cos = { status = "canonical", batcher = "Expr.cos" }
+cosh = { status = "canonical", batcher = "Expr.cosh" }
+cot = { status = "canonical", batcher = "Expr.cot" }
+count = { status = "mismatch", batcher = "bt.count", note = "Daft count(expr) counts non-null values of expr, which is col.count(); bt.count() counts rows", wave = "W0" }
+count_distinct = { status = "canonical", batcher = "bt.count_distinct" }
+csc = { status = "canonical", batcher = "Expr.csc" }
+degrees = { status = "canonical", batcher = "Expr.degrees" }
+dense_rank = { status = "canonical", batcher = "bt.dense_rank" }
+e = { status = "canonical", batcher = "bt.e" }
+exp = { status = "canonical", batcher = "Expr.exp" }
+expm1 = { status = "canonical", batcher = "Expr.expm1" }
+factorial = { status = "canonical", batcher = "Expr.factorial" }
+fill_nan = { status = "canonical", batcher = "Expr.fill_nan" }
+first_value = { status = "param", batcher = "bt.first_value", need = "ignore_nulls=", wave = "W5" }
+floor = { status = "canonical", batcher = "Expr.floor" }
+hypot = { status = "canonical", batcher = "bt.hypot" }
+is_inf = { status = "canonical", batcher = "Expr.is_infinite" }
+is_nan = { status = "canonical", batcher = "Expr.is_nan" }
+lag = { status = "param", batcher = "bt.lag", need = "default= fill value for rows with no predecessor", wave = "W5" }
+last_value = { status = "param", batcher = "bt.last_value", need = "ignore_nulls=", wave = "W5" }
+lead = { status = "param", batcher = "bt.lead", need = "default= fill value for rows with no successor", wave = "W5" }
+list_agg = { status = "canonical", batcher = "Expr.array_agg" }
+list_agg_distinct = { status = "param", batcher = "Expr.array_agg", need = "distinct=True (distinct values, nulls dropped)", wave = "W2" }
+ln = { status = "canonical", batcher = "Expr.ln" }
+log = { status = "param", batcher = "bt.log", need = "expr-first argument order with a default base e (bt.log takes (base, value) and has no default)", wave = "W2" }
+log10 = { status = "canonical", batcher = "Expr.log10" }
+log1p = { status = "canonical", batcher = "Expr.log1p" }
+log2 = { status = "canonical", batcher = "Expr.log2" }
+max = { status = "canonical", batcher = "bt.max" }
+mean = { status = "canonical", batcher = "bt.mean" }
+median = { status = "canonical", batcher = "bt.median" }
+min = { status = "canonical", batcher = "bt.min" }
+monotonically_increasing_id = { status = "param", batcher = "Dataset.with_row_index", need = "an Expression form usable inside select/with_columns", wave = "W8" }
+negate = { status = "canonical", batcher = "op:neg" }
+not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
+over = { status = "param", batcher = ["Expr.over"], need = "a Window spec object", wave = "WF" }
+percentile = { status = "canonical", batcher = "Expr.quantile" }
+pi = { status = "canonical", batcher = "bt.pi" }
+pmod = { status = "canonical", batcher = "bt.pmod" }
+pow = { status = "canonical", batcher = "op:pow" }
+power = { status = "canonical", batcher = "op:pow" }
+product = { status = "canonical", batcher = "bt.product" }
+radians = { status = "canonical", batcher = "Expr.radians" }
+random_int = { status = "gap", need = "seeded per-row random integer expression", wave = "W3" }
+rank = { status = "canonical", batcher = "bt.rank" }
+round = { status = "canonical", batcher = "Expr.round" }
+row_number = { status = "canonical", batcher = "bt.row_number" }
+sec = { status = "canonical", batcher = "Expr.sec" }
+shift_left = { status = "canonical", batcher = "op:lshift" }
+shift_right = { status = "canonical", batcher = "op:rshift" }
+sign = { status = "canonical", batcher = "Expr.sign" }
+sin = { status = "canonical", batcher = "Expr.sin" }
+sinh = { status = "canonical", batcher = "Expr.sinh" }
+skew = { status = "canonical", batcher = "bt.skew", template = 'skew(expr) -> sem.column(expr).skew(bias=True)' }
+sqrt = { status = "canonical", batcher = "Expr.sqrt" }
+stddev = { status = "param", batcher = "bt.std", need = "ddof= (Batcher std is always the sample, ddof=1)", wave = "W2" }
+string_agg = { status = "canonical", batcher = "Expr.str.join" }
+sum = { status = "canonical", batcher = "bt.sum" }
+tan = { status = "canonical", batcher = "Expr.tan" }
+tanh = { status = "canonical", batcher = "Expr.tanh" }
+try_divide = { status = "canonical", batcher = "Expr.safe_divide" }
+var = { status = "param", batcher = "bt.var", need = "ddof= (Batcher var is always the sample, ddof=1)", wave = "W2" }

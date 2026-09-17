@@ -204,7 +204,7 @@ def llm_score_udf(
             >>> judge = lambda: (lambda prompts: ["4"] * len(prompts))
             >>> udf = llm_score_udf(judge, template="Rate 1-5: {answer}")
             >>> ds = bt.from_pydict({"answer": ["a fine answer"]})
-            >>> ds.ml.map_batches(udf).to_pydict()["score"]
+            >>> ds.map_batches(udf).to_pydict()["score"]
             [4.0]
     """
     _validate_scale(low, high)
@@ -288,7 +288,7 @@ def llm_pairwise_udf(
             ...     b_column="right",
             ... )
             >>> ds = bt.from_pydict({"left": ["one"], "right": ["two"]})
-            >>> ds.ml.map_batches(udf).to_pydict()["winner"]
+            >>> ds.map_batches(udf).to_pydict()["winner"]
             ['TIE']
     """
     if a_column == b_column:
@@ -361,7 +361,7 @@ def llm_verify_udf(
             >>> judge = lambda: (lambda prompts: ["YES"] * len(prompts))
             >>> udf = llm_verify_udf(judge, template="Is {answer} grounded in {context}?")
             >>> ds = bt.from_pydict({"answer": ["Paris"], "context": ["Paris is the capital."]})
-            >>> ds.ml.map_batches(udf).to_pydict()["passed"]
+            >>> ds.map_batches(udf).to_pydict()["passed"]
             [True]
     """
     suffix = "\n\n" + _VERIFY_INSTRUCTION

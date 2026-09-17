@@ -180,6 +180,10 @@ def test_unsized_plan_spills_when_memory_pressure_is_measured(monkeypatch):
     with config_context(cfg):
         rm = ResourceManager()
         monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.SPILL)
+        # The pressure described above is the *measured footprint*, which is the byte
+        # accounting — not a PSI stall alone, which spills only a plan large enough to relieve
+        # it (`tests/unit/test_stall_spill_small_plans.py`).
+        monkeypatch.setattr(rm._pressure, "accounted_level", lambda: PressureLevel.SPILL)
         assert rm.should_spill(_plan_with_peak(0)) is True
         # And it holds for a plan whose estimate says it comfortably fits.
         assert rm.should_spill(_plan_with_peak(1000)) is True

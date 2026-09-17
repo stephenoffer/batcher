@@ -1,6 +1,6 @@
 """Which operations carry an event-time watermark, and what happens where one is dropped.
 
-`with_watermark` is what makes a downstream `groupby().agg()` *bounded*: the aggregate emits
+`with_watermark` is what makes a downstream `group_by().agg()` *bounded*: the aggregate emits
 and evicts each group as the watermark passes it (`core/streaming/folds.py` reads
 ``agg.watermark.time_col`` to build that fold). An aggregate with ``watermark=None`` is not an
 error -- it is a valid, **unbounded** aggregate whose state is never evicted.
@@ -107,8 +107,8 @@ def test_the_repair_the_warning_names_actually_works(name, build):
         warnings.simplefilter("ignore")
         joined = build(_watermarked(), _right())
         repaired = joined.with_watermark("ts", "5 minutes")
-        lost = joined.groupby("k").agg(s=bt.col("x").sum())._plan
-        kept = repaired.groupby("k").agg(s=bt.col("x").sum())._plan
+        lost = joined.group_by("k").agg(s=bt.col("x").sum())._plan
+        kept = repaired.group_by("k").agg(s=bt.col("x").sum())._plan
     assert lost.watermark is None
     assert kept.watermark is not None
     assert kept.watermark.time_col == "ts"

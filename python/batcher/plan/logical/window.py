@@ -17,7 +17,6 @@ from batcher.plan.ir_tags import (
     FRAME_UNITS,
     WINDOW_AGGREGATES,
     WINDOW_EWM,
-    WINDOW_FILL,
     WINDOW_FRAMEABLE,
     WINDOW_FUNCS,
     WINDOW_RANKING,
@@ -34,7 +33,13 @@ from batcher.plan.logical.base import (
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type, widen
 
-__all__ = ["Window", "WindowFrame", "WindowFuncSpec"]
+__all__ = [
+    "Window",
+    "WindowFrame",
+    "WindowFuncSpec",
+    "depends_on_row_order",
+    "missing_order_message",
+]
 
 
 def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataType | None:
@@ -182,6 +187,39 @@ def _bound_ir(offset: int | None, *, preceding: bool) -> dict[str, Any]:
     return {"kind": "following", "n": offset}
 
 
+#: The value functions that take `IGNORE NULLS`.
+_IGNORE_NULLS_FUNCS = frozenset({"first_value", "last_value", "nth_value"})
+
+
+def sql_default_frame(
+    func: str, frame: WindowFrame | None, ordered: bool, ignore_nulls: bool = False
+) -> WindowFrame | None:
+    """The frame a positional value function runs over when none is given explicitly.
+
+    SQL's default frame with an ORDER BY is ``RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+    ROW``, which makes `last_value` the running value of the current peer group and
+    `nth_value` null until the frame reaches the n-th row. The engine's frameless form reads
+    the whole partition instead, so the builders resolve SQL's default here. `first_value`
+    is the same under either frame and stays frameless, as the SQL front-end leaves it --
+    except under `IGNORE NULLS`, where the first non-null value so far is null until one
+    arrives, which only the running frame answers.
+
+    Args:
+        func: The window function's tag.
+        frame: The explicit frame, or None.
+        ordered: Whether the window has an ORDER BY.
+        ignore_nulls: Whether the function skips nulls.
+
+    Returns:
+        `frame` when given; SQL's default running frame for an ordered `last_value` or
+        `nth_value`, or an ordered `first_value` that ignores nulls; otherwise None.
+    """
+    framed = {"last_value", "nth_value"} | ({"first_value"} if ignore_nulls else set())
+    if frame is None and ordered and func in framed:
+        return WindowFrame(None, 0, "range")
+    return frame
+
+
 @dataclass(frozen=True, slots=True)
 class WindowFuncSpec:
     """One window function: a function name, optional input expression, and alias.
@@ -206,6 +244,9 @@ class WindowFuncSpec:
     #: EWM half-life in the ORDER BY key's units (microseconds for a temporal key). Set
     #: instead of `alpha` to decay by elapsed key value; only `ewm_mean` takes it.
     half_life: float | None = None
+    #: `IGNORE NULLS`: pick among non-null values. Only the positional value functions
+    #: `first_value`/`last_value`/`nth_value` take it; omitted from the IR when false.
+    ignore_nulls: bool = False
 
     def __post_init__(self) -> None:
         if self.func not in WINDOW_FUNCS:
@@ -247,6 +288,11 @@ class WindowFuncSpec:
                 )
         elif self.alpha is not None or self.half_life is not None:
             raise PlanError(f"window function {self.func!r} does not take a smoothing factor")
+        if self.ignore_nulls and self.func not in _IGNORE_NULLS_FUNCS:
+            raise PlanError(
+                f"window function {self.func!r} does not take ignore_nulls; only "
+                f"{sorted(_IGNORE_NULLS_FUNCS)} do"
+            )
 
     def to_ir(self) -> dict[str, Any]:
         item: dict[str, Any] = {"func": self.func, "alias": self.alias, "offset": self.offset}
@@ -258,7 +304,94 @@ class WindowFuncSpec:
             item["alpha"] = self.alpha
         if self.half_life is not None:
             item["half_life"] = self.half_life
+        if self.ignore_nulls:
+            item["ignore_nulls"] = True
         return item
+
+
+def depends_on_row_order(fn: WindowFuncSpec) -> bool:
+    """Whether `fn`'s answer depends on the order of the rows within a partition.
+
+    The ranking, positional (`lag`/`lead`/`first_value`/...), fill and series functions
+    all read a row's neighbours. An aggregate does only when a ``rows`` frame bounds it --
+    ``cum_sum`` is ``sum`` over ``(None, 0)`` -- because a whole-partition aggregate, or a
+    ``range``/``groups`` frame over rows that are all peers, sees the same rows in any order.
+
+    Args:
+        fn: The window function to classify.
+
+    Returns:
+        True when the function needs ``order_by`` keys to have a defined answer.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.plan.logical.window import WindowFuncSpec, WindowFrame
+            >>> from batcher.plan.logical.window import depends_on_row_order
+            >>> from batcher.plan.expr_ir import col
+            >>> depends_on_row_order(WindowFuncSpec("sum", col("x"), "s"))
+            False
+            >>> running = WindowFuncSpec("sum", col("x"), "s", frame=WindowFrame(None, 0))
+            >>> depends_on_row_order(running)
+            True
+    """
+    if fn.func in (WINDOW_RANKING | WINDOW_VALUE | WINDOW_SERIES):
+        return True
+    frame = fn.frame
+    return (
+        frame is not None
+        and frame.units == "rows"
+        and not (frame.start is None and frame.end is None)
+    )
+
+
+#: The user-facing methods an engine window function is reached through, for the refusal.
+_METHODS_BY_FUNC = {
+    "lag": "shift/diff/pct_change (lag)",
+    "lead": "shift (lead)",
+    "row_number": "row_number/is_first_distinct/is_last_distinct",
+}
+
+
+def _order_dependent_label(fn: WindowFuncSpec) -> str:
+    """How a refusal names `fn`: by the method a user wrote rather than the engine tag."""
+    if fn.func in WINDOW_AGGREGATES and fn.frame is not None:
+        return f"running/rolling {fn.func} (cum_*/rolling_*)"
+    return _METHODS_BY_FUNC.get(fn.func, fn.func)
+
+
+def missing_order_message(func: str, *, over: bool = True) -> str:
+    """The refusal every order-dependent expression gives when it has no ``order_by``.
+
+    Args:
+        func: The function or method name to name in the message.
+        over: Whether the expression also takes its order from ``.over(order_by=...)``, so
+            the message offers that spelling too. The positional aggregates (``arg_min``)
+            have no window form and take ``order_by=`` only.
+
+    Returns:
+        The error message, naming ``order_by=`` and the ``with_row_index`` fix.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.plan.logical.window import missing_order_message
+            >>> "with_row_index" in missing_order_message("shift")
+            True
+            >>> ".over" in missing_order_message("arg_min", over=False)
+            False
+    """
+    spelling = (
+        "pass order_by=... or bind it with .over(order_by=...)"
+        if over
+        else "pass the keys as order_by=<keys>"
+    )
+    return (
+        f"{func} depends on row order and requires order_by keys: {spelling}. Batcher keeps "
+        "no arrival order across a parallel or distributed scan, so if the data has no "
+        "ordering column, number the rows right after reading with "
+        '.with_row_index("_row") and order by "_row".'
+    )
 
 
 def _key_label(expr: Expr) -> str:
@@ -323,33 +456,16 @@ class Window(LogicalPlan):
             operation="over(order_by=...)",
         )
         for fn in self.functions:
-            if fn.func in WINDOW_RANKING and not self.order_keys:
+            if not self.order_keys and depends_on_row_order(fn):
                 # Spark rejects this too (WINDOW_FUNCTION_FRAME_NOT_ORDERED), for the reason
-                # that applies here: without an order there is no "first" row, so the answer
-                # would depend on arrival order, which a morselized or distributed scan does
-                # not fix. DuckDB and Polars accept it because a single-node engine can
-                # define arrival order cheaply; an engine whose contract is
-                # single-node == distributed cannot.
-                #
-                # `row_number()` over the whole relation is the one that ports, because the
-                # thing a migrant wants from it — a positional column, any order — is a
-                # capability Batcher has under another name. Naming it here is what turns a
-                # refusal into a fix. The suggestion is withheld when `partition_by` is set:
-                # `with_row_index` numbers the relation, not each group, so offering it there
-                # would trade a clear refusal for a wrong answer.
-                hint = (
-                    " — for a plain positional column with no ordering, use ds.with_row_index('n')"
-                    if fn.func == "row_number" and not self.partition_keys
-                    else ""
-                )
-                raise PlanError(f"window ranking function {fn.func!r} requires order_by keys{hint}")
-            if fn.func in (WINDOW_FILL | WINDOW_SERIES) and not self.order_keys:
-                # Without an order there is no "previous" row: the result would depend on
-                # arrival order, which a morselized/distributed scan does not fix.
-                raise PlanError(
-                    f"window function {fn.func!r} requires order_by keys — it carries "
-                    "values along a defined row order, and an unordered relation has none"
-                )
+                # that applies here: without an order there is no "first" or "previous" row,
+                # so the answer would depend on arrival order, which a morselized or
+                # distributed scan does not fix. DuckDB and Polars accept it because a
+                # single-node engine can define arrival order cheaply; an engine whose
+                # contract is single-node == distributed cannot. The refusal names the fix
+                # for data with no ordering column: number the rows at the source, which
+                # `with_row_index` does in source order.
+                raise PlanError(missing_order_message(_order_dependent_label(fn)))
             if fn.input is not None:
                 _validate_refs(fn.input, available, what=f"window function {fn.alias!r}")
         _validate_window_input_types(self.input, self.functions)

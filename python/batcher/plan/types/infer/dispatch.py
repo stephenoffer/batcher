@@ -177,7 +177,13 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return pa.string()  # formats a Date/Timestamp into text
     if isinstance(expr, DateTrunc):
         # `date_trunc` returns a microsecond Timestamp for both date and timestamp
-        # inputs (verified against the engine).
+        # inputs (verified against the engine), unless `preserve_type` keeps a date a date.
+        if expr.preserve_type:
+            source = infer_type(expr.input, schema)
+            if source is None:
+                return None  # the engine answers the input's type, which is unknown here
+            if pa.types.is_date32(source):
+                return pa.date32()
         return pa.timestamp("us")
     if isinstance(expr, (DateOffset, ConvertTimezone)):
         return infer_type(expr.input, schema)  # type-preserving (shift/tz-convert)

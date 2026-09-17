@@ -145,35 +145,52 @@ pub(crate) fn eval_strftime(arr: &ArrayRef, format: &str) -> Result<ArrayRef, Ex
 /// NULL rather than erroring — DuckDB `try_strptime` semantics, the safe-ingest
 /// behavior for dirty source columns. A date-only format (no time fields) parses at
 /// midnight, matching DuckDB (`strptime` always returns a TIMESTAMP).
-pub(crate) fn eval_strptime(arr: &ArrayRef, format: &str) -> Result<ArrayRef, ExprError> {
+///
+/// With `strict`, a non-null value that does not parse is an error naming the value and
+/// the format (DuckDB `strptime`, Polars `strict=True`). A null stays null: it is a
+/// missing value, not a malformed one.
+pub(crate) fn eval_strptime(
+    arr: &ArrayRef,
+    format: &str,
+    strict: bool,
+) -> Result<ArrayRef, ExprError> {
     use arrow::array::{Array, AsArray};
     use chrono::NaiveDateTime;
 
-    let format = strptime_format_for_chrono(format);
-    let format = format.as_str();
+    let chrono_format = strptime_format_for_chrono(format);
+    let chrono_format = chrono_format.as_str();
     let strings = cast(arr, &DataType::Utf8)?;
     let s = strings.as_string::<i32>();
-    let out: TimestampMicrosecondArray = (0..s.len())
-        .map(|i| {
-            if s.is_null(i) {
-                return None;
+    let mut out: Vec<Option<i64>> = Vec::with_capacity(s.len());
+    for i in 0..s.len() {
+        if s.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let v = s.value(i);
+        // Try a full datetime first, then fill in whatever the format left unnamed.
+        //
+        // The second step used to be `NaiveDate::parse_from_str` at midnight, which is
+        // both narrower and *wrong for the formats it did match*: chrono's date parser
+        // ignores time fields, so `'2024-03-05 13'` with `%Y-%m-%d %H` parsed as the
+        // date and threw the hour away, answering midnight. `parse_partial` subsumes
+        // it — a date-only format defaults to midnight through the same path — and
+        // keeps the hour.
+        let parsed = NaiveDateTime::parse_from_str(v, chrono_format)
+            .ok()
+            .or_else(|| parse_partial(v, chrono_format));
+        match parsed {
+            Some(d) => out.push(Some(d.and_utc().timestamp_micros())),
+            None if strict => {
+                return Err(ExprError::InvalidArgument {
+                    func: "strptime".to_string(),
+                    reason: format!("{v:?} does not match the format {format:?}"),
+                })
             }
-            let v = s.value(i);
-            // Try a full datetime first, then fill in whatever the format left unnamed.
-            //
-            // The second step used to be `NaiveDate::parse_from_str` at midnight, which is
-            // both narrower and *wrong for the formats it did match*: chrono's date parser
-            // ignores time fields, so `'2024-03-05 13'` with `%Y-%m-%d %H` parsed as the
-            // date and threw the hour away, answering midnight. `parse_partial` subsumes
-            // it — a date-only format defaults to midnight through the same path — and
-            // keeps the hour.
-            let dt = NaiveDateTime::parse_from_str(v, format)
-                .ok()
-                .or_else(|| parse_partial(v, format));
-            dt.map(|d| d.and_utc().timestamp_micros())
-        })
-        .collect();
-    Ok(Arc::new(out))
+            None => out.push(None),
+        }
+    }
+    Ok(Arc::new(TimestampMicrosecondArray::from(out)))
 }
 
 /// Parse a format that names only *some* of a timestamp's fields, defaulting the rest.
@@ -244,7 +261,7 @@ mod tests {
             Some("not a date"),
             None,
         ]));
-        let out = eval_strptime(&arr, "%Y-%m-%d %H:%M:%S").unwrap();
+        let out = eval_strptime(&arr, "%Y-%m-%d %H:%M:%S", false).unwrap();
         let ts = out.as_primitive::<TimestampMicrosecondType>();
         let expected = NaiveDate::from_ymd_opt(2024, 2, 15)
             .unwrap()
@@ -288,7 +305,7 @@ mod tests {
             Some("2024-02-15 13:45:30.5"),
             Some("2024-02-15 13:45:30.123"),
         ]));
-        let out = eval_strptime(&arr, "%Y-%m-%d %H:%M:%S.%f").unwrap();
+        let out = eval_strptime(&arr, "%Y-%m-%d %H:%M:%S.%f", false).unwrap();
         let ts = out.as_primitive::<TimestampMicrosecondType>();
         let frac = |i: usize| ts.value(i).rem_euclid(1_000_000);
         assert_eq!(frac(0), 123_456);
@@ -303,7 +320,7 @@ mod tests {
         use chrono::NaiveDate;
 
         let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("2024-02-15")]));
-        let out = eval_strptime(&arr, "%Y-%m-%d").unwrap();
+        let out = eval_strptime(&arr, "%Y-%m-%d", false).unwrap();
         let ts = out.as_primitive::<TimestampMicrosecondType>();
         let expected = NaiveDate::from_ymd_opt(2024, 2, 15)
             .unwrap()
@@ -342,7 +359,7 @@ mod tests {
         ];
         for (value, format, want) in cases {
             let arr: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![Some(value), None]));
-            let out = eval_strptime(&arr, format).unwrap();
+            let out = eval_strptime(&arr, format, false).unwrap();
             let o = out
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
@@ -363,7 +380,7 @@ mod tests {
             Some("2024-13-05"), // an impossible month, not a partial format
             Some("2024-03-05 extra"),
         ]));
-        let out = eval_strptime(&arr, "%Y-%m-%d").unwrap();
+        let out = eval_strptime(&arr, "%Y-%m-%d", false).unwrap();
         let o = out
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -387,7 +404,7 @@ mod tests {
     #[test]
     fn strptime_refuses_a_format_with_no_year() {
         let arr: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![Some("12:30")]));
-        let out = eval_strptime(&arr, "%H:%M").unwrap();
+        let out = eval_strptime(&arr, "%H:%M", false).unwrap();
         assert!(out
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()

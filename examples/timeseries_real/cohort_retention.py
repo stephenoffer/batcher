@@ -31,7 +31,7 @@ def main() -> None:
 
     table = (
         with_cohort.group_by("cohort", "period")
-        .agg(customers=col("o_custkey").n_unique(), orders=bt.count())
+        .agg(customers=col("o_custkey").count_distinct(), orders=bt.count())
         .sort("cohort", "period")
     )
     result = table.to_pydict()
@@ -56,7 +56,7 @@ def main() -> None:
         )
         if cohort == period
     ]
-    assert sum(first_period) == orders.n_unique("o_custkey")
+    assert sum(first_period) == orders.count_distinct("o_custkey")
 
 
 if __name__ == "__main__":

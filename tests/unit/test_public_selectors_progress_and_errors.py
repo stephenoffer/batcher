@@ -8,8 +8,8 @@ way that hides a real failure:
   projection actually does, the preview would be a lie.
 * ``SourceProgress`` / ``SinkProgress`` are the per-micro-batch records a streaming
   listener reads. They exist for Spark parity, so their field names are the contract.
-* ``StreamingQueryListener.onQueryStarted`` / ``onQueryTerminated`` are the camelCase
-  aliases that same parity requires, and an alias that does not forward is invisible.
+* ``StreamingQueryListener`` dispatches only its snake_case hooks, so a listener ported from
+  PySpark with ``onQueryStarted`` must be refused at class creation or it never fires.
 * ``CompileError``, ``OptimizationError`` and ``TransportError`` are public exception
   types; what matters about them is where they sit in the hierarchy, because that is what
   decides whether a user's ``except`` clause catches them.
@@ -126,24 +126,22 @@ def test_progress_records_default_to_an_empty_batch():
     assert dataclasses.is_dataclass(source) and dataclasses.is_dataclass(sink)
 
 
-def test_either_spelling_of_a_listener_callback_is_dispatched():
-    """A listener ported from PySpark overrides ``onQueryStarted`` and must still be called.
+def test_only_the_snake_case_callbacks_are_dispatched_and_spark_ones_are_refused():
+    """A listener ported from PySpark keeps ``onQueryStarted``; that name is never dispatched.
 
-    The two spellings are not aliases that forward into each other -- both are no-op hooks
-    on the base class and the dispatcher calls both, so overriding either one works. That
-    is a deliberate design and it is invisible from the class alone: the property only
-    holds because of what ``_fire`` does, so this test goes through the dispatcher.
+    So it is refused when the class is defined, naming the hook to rename it to, rather than
+    registering fine and silently receiving nothing. This goes through the dispatcher for the
+    snake_case side, because that half of the property only holds because of what ``_fire`` does.
     """
     from batcher.plan.streaming.listener import notify_query_started, notify_query_terminated
 
+    with pytest.raises(bt.PlanError, match="on_query_started"):
+
+        class SparkStyle(bt.StreamingQueryListener):
+            def onQueryStarted(self, event):
+                pass
+
     seen: list[str] = []
-
-    class SparkStyle(bt.StreamingQueryListener):
-        def onQueryStarted(self, event):
-            seen.append("spark-start")
-
-        def onQueryTerminated(self, event):
-            seen.append("spark-stop")
 
     class PythonStyle(bt.StreamingQueryListener):
         def on_query_started(self, event):
@@ -152,19 +150,14 @@ def test_either_spelling_of_a_listener_callback_is_dispatched():
         def on_query_terminated(self, event):
             seen.append("python-stop")
 
-    ported, native = SparkStyle(), PythonStyle()
-    bt.add_streaming_listener(ported)
+    native = PythonStyle()
     bt.add_streaming_listener(native)
     try:
         notify_query_started("q", 0.0)
         notify_query_terminated("q", None)
     finally:
-        bt.remove_streaming_listener(ported)
         bt.remove_streaming_listener(native)
-
-    assert "spark-start" in seen, "the PySpark spelling was never called"
-    assert "python-start" in seen, "the Python spelling was never called"
-    assert "spark-stop" in seen and "python-stop" in seen
+    assert seen == ["python-start", "python-stop"]
 
 
 def test_a_listener_that_raises_does_not_break_the_query():
@@ -195,8 +188,8 @@ def test_a_listener_that_raises_does_not_break_the_query():
 def test_the_default_listener_callbacks_do_nothing_rather_than_raise():
     """Documented: a listener overriding one callback must not be broken by the others."""
     listener = bt.StreamingQueryListener()
-    assert listener.onQueryStarted(object()) is None
-    assert listener.onQueryTerminated(object()) is None
+    assert listener.on_query_started(object()) is None
+    assert listener.on_query_terminated(object()) is None
     assert listener.on_query_progress(object()) is None
 
 

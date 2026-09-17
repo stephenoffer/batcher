@@ -57,6 +57,13 @@ sha1 = "0.10"
 sha2 = "0.10"
 crc32fast = "1"
 twox-hash = "1"
+# XXH3-64 for `hash(algorithm="xxhash3")`, Daft's default hash. The 1.x line above has an
+# `xxh3` module too, but it disagrees with the reference (it hashes an empty input to 0,
+# and `1i64` to a different digest than Daft and the xxHash reference implementation); 2.x
+# matches Daft 0.7.25 bit for bit. Already in the lock file through the Parquet stack.
+twox-hash-2 = { package = "twox-hash", version = "2.1", default-features = false, features = [
+    "xxhash3_64",
+] }
 # Data-protection functions (`hmac_sha256`, `aes_encrypt`, `aes_decrypt`). Pure-Rust
 # RustCrypto. AES-GCM-**SIV** is chosen over plain GCM because the engine needs a
 # deterministic ciphertext (the interpreter is the oracle; a random nonce would make the

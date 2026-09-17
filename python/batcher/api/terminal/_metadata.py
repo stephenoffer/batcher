@@ -356,10 +356,15 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
     from batcher import core, kyber
 
     try:
+        verdict = _seed_verdict_key(hub, sources, kyber.learning.generation())
+        hit = _NOTHING_TO_SEED.get(id(plan))
+        if hit is not None and hit[0] is plan and hit[1] == verdict:
+            return
         wanted = ndv_columns(plan) if plan is not None else None
         learned = kyber.load_learned_stats(hub)
         max_cells = active_config().optimizer.ndv_sketch_max_cells
         measured: list[kyber.MeasuredColumns] = []
+        fully_known = True
         for src in sources:
             if not getattr(src, "resident", False) or getattr(src, "ephemeral", False):
                 continue
@@ -372,6 +377,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
             cols = [
                 c for c in src.schema().names if c not in known and (wanted is None or c in wanted)
             ]
+            fully_known = fully_known and not cols
             rows = src.row_count() or 0
             if not cols or rows * len(cols) > max_cells:
                 continue
@@ -413,8 +419,37 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
                 # count. `record_column_stats_batch` lands them all in one write per table.
                 measured.append(kyber.MeasuredColumns(source_key, ndv, {}, {}, mcv))
         kyber.record_column_stats_batch(hub, measured)
+        if fully_known and plan is not None:
+            if len(_NOTHING_TO_SEED) >= _NOTHING_TO_SEED_MAX:
+                _NOTHING_TO_SEED.clear()
+            _NOTHING_TO_SEED[id(plan)] = (plan, verdict)
     except Exception as exc:  # pragma: no cover - learning must never break execution
         note_suppressed("api", "learn column NDV", exc)
+
+
+#: `id(plan) -> (plan, verdict key)` for a plan whose every wanted column was already measured
+#: on every resident source, pinning the plan against id reuse. Reaching that verdict walks the
+#: plan for its ndv columns and diffs each source's whole schema against the learned store,
+#: which on a re-issued query is the same work concluding the same "nothing to seed" every time:
+#: half of `_optimize` on a warm ClickBench query over the 105-column `hits`.
+#:
+#: The verdict is keyed on the learned **generation**, which every plan-relevant write advances
+#: (`kyber.learning.bump_generation`), plus the hub, the sources by identity, and the tenant. A
+#: store that learns more can only shrink what needs seeding, and one that learns something
+#: plan-relevant misses the memo and is re-read. Only the post-run learner and this function
+#: write column sketches, and skipping a seed changes an estimate, never a result.
+_NOTHING_TO_SEED: dict[int, tuple[LogicalPlan, tuple[object, ...]]] = {}
+_NOTHING_TO_SEED_MAX = 256
+
+
+def _seed_verdict_key(hub, sources: list[Source], generation: int) -> tuple[object, ...]:
+    """What a memoized "nothing to seed" verdict is conditional on, besides the plan itself.
+
+    The tenant is part of it because learned statistics are namespaced per tenant
+    (`source_stats_key`), so a column measured under one tenant is unmeasured under another.
+    """
+    tenant = active_config().tenant.tenant_id
+    return (id(hub), tuple(id(s) for s in sources), generation, tenant)
 
 
 def _learn_row_bytes(hub, resolved, sources) -> None:

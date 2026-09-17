@@ -37,7 +37,7 @@ def main() -> None:
 
     # A share is a proportion, and the mean share is one over the mean lines per order.
     assert 0.0 < summary["mean_share"][0] <= 1.0
-    orders = lineitem.n_unique("l_orderkey")
+    orders = lineitem.count_distinct("l_orderkey")
     expected = orders / summary["lines"][0]
     print(f"mean share {summary['mean_share'][0]:.6f}, 1/(lines per order) {expected:.6f}")
     assert abs(summary["mean_share"][0] - expected) < 0.05
@@ -48,7 +48,7 @@ def main() -> None:
         .agg(top_share=col("share").max(), lines=bt.count())
         .sort("top_share", descending=True)
     )
-    result = concentration.head(5).to_pydict()
+    result = concentration.limit(5).to_pydict()
     print(result["top_share"])
     assert all(0.0 < value <= 1.0 + 1e-9 for value in result["top_share"])
 

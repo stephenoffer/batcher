@@ -657,7 +657,9 @@ mod fold_unit_tests {
                 func: AggFunc::Sum,
                 input: Some(bc_expr::Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 param: None,
+                interpolation: None,
             }],
         }
     }

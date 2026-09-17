@@ -16,7 +16,7 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
 
-__all__ = ["Selector", "_Match", "_SelectorNameNamespace", "_by_name"]
+__all__ = ["Selector", "_Match", "_SelectorNameNamespace", "_by_name", "_named_columns"]
 
 # A selector's match test: given a column's name and its Arrow dtype (None when the
 # plan cannot resolve a schema), decide whether the column is in the selection.
@@ -169,7 +169,7 @@ class Selector(Expr):
             {'a': [1.2], 'b': [5.7], 's': ['x']}
     """
 
-    __slots__ = ("_desc", "_match", "_needs_dtype", "_rename")
+    __slots__ = ("_desc", "_match", "_names", "_needs_dtype", "_rename")
 
     def __init__(
         self,
@@ -178,12 +178,16 @@ class Selector(Expr):
         *,
         needs_dtype: bool = False,
         rename: Callable[[str], str] | None = None,
+        names: tuple[str, ...] | None = None,
     ) -> None:
         """Build a selector from a match test; prefer the module-level constructors."""
         self._match = match
         self._desc = desc
         self._needs_dtype = needs_dtype
         self._rename = rename
+        # Set only by `col("a", "b")`: the columns in the order they were named, each of
+        # which must exist -- the one selector whose order is the caller's, not the input's.
+        self._names = names
 
     def __repr__(self) -> str:
         """Render the selector's construction, e.g. ``numeric() - matches('^_')``."""
@@ -238,7 +242,11 @@ class Selector(Expr):
 
     def _with_rename(self, fn: Callable[[str], str], what: str) -> Selector:
         return Selector(
-            self._match, f"{self._desc}.{what}", needs_dtype=self._needs_dtype, rename=fn
+            self._match,
+            f"{self._desc}.{what}",
+            needs_dtype=self._needs_dtype,
+            rename=fn,
+            names=self._names,
         )
 
     def _combine(self, other: Selector, op: Callable[[bool, bool], bool], sym: str) -> Selector:
@@ -307,6 +315,15 @@ class Selector(Expr):
                 >>> bt.matches("^x").matched_columns(["xa", "b", "xc"], None)
                 ['xa', 'xc']
         """
+        if self._names is not None:
+            missing = [n for n in self._names if n not in columns]
+            if missing:
+                from batcher._internal.errors import ColumnNotFoundError
+
+                raise ColumnNotFoundError(
+                    f"{self._desc} names unknown column(s) {missing}; available: {columns}"
+                )
+            return list(self._names)
         if self._needs_dtype and schema is None:
             raise PlanError(
                 f"the dtype-based selector {self._desc} needs the input schema, which is "
@@ -343,3 +360,11 @@ class Selector(Expr):
 def _by_name(names: tuple[str, ...]) -> Selector:
     wanted = frozenset(names)
     return Selector(lambda n, _d: n in wanted, f"by_name({', '.join(map(repr, names))})")
+
+
+def _named_columns(names: tuple[str, ...]) -> Selector:
+    """The selector `col("a", "b")` builds: exactly these columns, in this order."""
+    wanted = frozenset(names)
+    return Selector(
+        lambda n, _d: n in wanted, f"col({', '.join(map(repr, names))})", names=tuple(names)
+    )

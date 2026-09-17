@@ -397,7 +397,35 @@ pub struct AggregateItem {
     /// Function parameter (the quantile in [0,1] for `Quantile`); ignored otherwise.
     #[serde(default)]
     pub param: Option<f64>,
+    /// How `quantile` picks a value when its rank falls between two elements. `None` is
+    /// `Linear`, DuckDB's `quantile_cont`; the others restore Polars' `interpolation=`.
+    /// Read by `quantile` alone. `#[serde(default)]` keeps every older plan, and the Python
+    /// side omits the field at its default, so a linear quantile serializes as it always did.
+    #[serde(default)]
+    pub interpolation: Option<QuantileInterpolation>,
+    /// The order `list_agg` collects a group's elements in, as `ORDER BY` keys evaluated
+    /// against the aggregate's input rows. Read by `list_agg` alone; the engine refuses it on
+    /// any other aggregate. Empty is `list_agg`'s unordered form, whose element order is
+    /// unspecified. Ties on every key break by the element's own value, ascending with nulls
+    /// last, so an ordered list is a property of the group's rows and not of how they were
+    /// partitioned. `#[serde(default)]` keeps every older plan, and the Python side omits the
+    /// field when there are no keys.
+    #[serde(default)]
+    pub order_by: Vec<SortKey>,
     pub alias: String,
+}
+
+/// Where a continuous quantile lands between the two elements that bracket rank
+/// `q · (n - 1)`. The names and rules are Polars' (`nearest` rounds half away from zero).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantileInterpolation {
+    #[default]
+    Linear,
+    Lower,
+    Higher,
+    Nearest,
+    Midpoint,
 }
 
 /// Aggregate function tags. The wire names are the contract with the engine.
@@ -503,6 +531,17 @@ pub enum AggFunc {
     /// short or well-conditioned column, and a materially better one for a long float
     /// column whose addends differ wildly in magnitude.
     KahanSum,
+    /// `arg_min_null`/`arg_max_null` — DuckDB's null-keeping forms of `arg_min`/`arg_max`:
+    /// a row whose *value* is null still competes on its key, so the answer can be null.
+    /// Only a null key removes a row. Same 2-column `(key, value)` state.
+    ArgMinNull,
+    ArgMaxNull,
+    /// `skewness_pop` — the population (biased) skewness `m3/m2^1.5`, where `Skewness`
+    /// applies the sample correction. Same 5-column moment state.
+    SkewnessPop,
+    /// `modes` — every most-frequent value of a group as a `List`, ascending, where `Mode`
+    /// returns one of them. Same counted `(values, counts)` state as `Mode`.
+    Modes,
 }
 
 /// One window function in a `Window`: a function over an optional input
@@ -534,6 +573,10 @@ pub struct WindowFunc {
     /// hour's silence must not cost the same weight as a second's. Only `ewm_mean` takes it.
     #[serde(default)]
     pub half_life: Option<f64>,
+    /// `IGNORE NULLS` for `first_value`/`last_value`/`nth_value`: pick among the frame's
+    /// non-null values rather than its rows. Absent (the SQL default) is `RESPECT NULLS`.
+    #[serde(default)]
+    pub ignore_nulls: bool,
     pub alias: String,
 }
 
@@ -940,6 +983,92 @@ mod tests {
         assert_eq!(keys, vec!["k".to_string()]);
         assert_eq!(order.len(), 1);
         assert!(order[0].descending && !order[0].nulls_first);
+    }
+
+    /// The W0 aggregate parameters on the wire, in exactly the shape Python's `to_ir()` emits
+    /// (`tests/unit/data/ir_snapshot_golden.json::agg_interpolation`). The field is absent at
+    /// its default, so an older plan must still read as a linear quantile, and the parameter
+    /// forms with a state of their own arrive as their own tags.
+    #[test]
+    fn aggregate_parameters_round_trip() {
+        let plan = |aggs: &str| {
+            RelOp::from_json(&format!(
+                r#"{{"op":"aggregate","input":{{"op":"scan","source_id":0}},
+                    "group_keys":[],"aggregates":[{aggs}]}}"#
+            ))
+        };
+        let RelOp::Aggregate { aggregates, .. } = plan(
+            r#"{"func":"quantile","alias":"q25","input":{"e":"col","name":"x"},
+                "interpolation":"nearest","param":0.25},
+               {"func":"quantile","alias":"p50","input":{"e":"col","name":"x"},"param":0.5},
+               {"func":"arg_max_null","alias":"a","input":{"e":"col","name":"x"},
+                "input2":{"e":"col","name":"k"}},
+               {"func":"skewness_pop","alias":"s","input":{"e":"col","name":"x"}},
+               {"func":"modes","alias":"m","input":{"e":"col","name":"x"}}"#,
+        )
+        .expect("every W0 aggregate form deserializes") else {
+            panic!("expected an Aggregate")
+        };
+        assert_eq!(
+            aggregates[0].interpolation,
+            Some(QuantileInterpolation::Nearest)
+        );
+        assert_eq!(aggregates[1].interpolation, None);
+        assert!(matches!(aggregates[2].func, AggFunc::ArgMaxNull));
+        assert!(matches!(aggregates[3].func, AggFunc::SkewnessPop));
+        assert!(matches!(aggregates[4].func, AggFunc::Modes));
+        assert!(
+            plan(r#"{"func":"quantile","alias":"q","param":0.5,"interpolation":"banker"}"#)
+                .is_err(),
+            "an interpolation the engine does not have must be rejected, not defaulted"
+        );
+    }
+
+    /// An ordered `list_agg` on the wire, in the shape Python's `to_ir()` emits
+    /// (`tests/unit/data/ir_snapshot_golden.json::agg_ordered_list`): `order_by` is a list of
+    /// sort keys, and it is absent on every other aggregate, which must still read as empty.
+    #[test]
+    fn aggregate_order_by_round_trips() {
+        let RelOp::Aggregate { aggregates, .. } = RelOp::from_json(
+            r#"{"op":"aggregate","input":{"op":"scan","source_id":0},"group_keys":[],
+                "aggregates":[
+                  {"func":"list_agg","alias":"xs","input":{"e":"col","name":"x"},
+                   "order_by":[{"expr":{"e":"col","name":"t"},"descending":true,
+                                "nulls_first":false},
+                               {"expr":{"e":"col","name":"u"},"descending":false,
+                                "nulls_first":true}]},
+                  {"func":"list_agg","alias":"ys","input":{"e":"col","name":"x"}}]}"#,
+        )
+        .expect("an ordered list_agg deserializes") else {
+            panic!("expected an Aggregate")
+        };
+        let keys = &aggregates[0].order_by;
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].descending && !keys[0].nulls_first);
+        assert!(!keys[1].descending && keys[1].nulls_first);
+        assert!(aggregates[1].order_by.is_empty());
+    }
+
+    /// `ignore_nulls` on a value window: present when set, absent (RESPECT NULLS) otherwise.
+    #[test]
+    fn window_ignore_nulls_round_trips() {
+        let plan = |extra: &str| {
+            RelOp::from_json(&format!(
+                r#"{{"op":"window","input":{{"op":"scan","source_id":0}},"partition_keys":[],
+                    "order_keys":[{{"expr":{{"e":"col","name":"k"}},"descending":false}}],
+                    "functions":[{{"func":"last_value","alias":"r","offset":1,
+                                   "input":{{"e":"col","name":"x"}}{extra}}}]}}"#
+            ))
+            .expect("a value window deserializes")
+        };
+        let RelOp::Window { functions, .. } = plan(r#","ignore_nulls":true"#) else {
+            panic!("expected a Window")
+        };
+        assert!(functions[0].ignore_nulls);
+        let RelOp::Window { functions, .. } = plan("") else {
+            panic!("expected a Window")
+        };
+        assert!(!functions[0].ignore_nulls);
     }
 
     /// The guard reaches `Expr` (the other half of the wire contract) too: an unknown

@@ -73,18 +73,17 @@ TEMPORAL_REFERENCE: dict[str, Callable[[dtm.datetime], object]] = {
     "hour": lambda d: d.hour,
     "minute": lambda d: d.minute,
     "second": lambda d: d.second,
-    "day_of_year": lambda d: d.timetuple().tm_yday,
+    "dayofyear": lambda d: d.timetuple().tm_yday,
     "quarter": lambda d: (d.month - 1) // 3 + 1,
     "is_leap_year": lambda d: calendar.isleap(d.year),
     "days_in_month": lambda d: calendar.monthrange(d.year, d.month)[1],
-    "week_of_year": lambda d: d.isocalendar()[1],
+    "week": lambda d: d.isocalendar()[1],
     "iso_year": lambda d: d.isocalendar()[0],
     "date": lambda d: d.date(),
 }
 
 LIST_REFERENCE: dict[str, Callable[[list], object]] = {
     "len": len,
-    "lengths": len,
     # SQL, not Python: `list_sum([])` is null in DuckDB and 0 in Python.
     "sum": _empty_is_null(sum),
     "mean": _empty_is_null(lambda values: sum(values) / len(values)),

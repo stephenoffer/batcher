@@ -320,7 +320,7 @@ import batcher as bt
 from batcher.ml import llm_score_udf
 
 judge = lambda: lambda prompts: ["4"] * len(prompts)
-graded = bt.from_pydict({"answer": ["Paris is the capital of France."]}).ml.map_batches(
+graded = bt.from_pydict({"answer": ["Paris is the capital of France."]}).map_batches(
     llm_score_udf(judge, template="Rate this answer 1-5 for accuracy:\n{answer}"),
     output_columns=["answer", "score"],
 )
@@ -343,7 +343,7 @@ between a win rate and a measurement of the judge.
 from batcher.ml import llm_pairwise_udf
 
 biased = lambda: lambda prompts: ["A"] * len(prompts)  # always prefers the first
-compared = bt.from_pydict({"base": ["one"], "tuned": ["two"]}).ml.map_batches(
+compared = bt.from_pydict({"base": ["one"], "tuned": ["two"]}).map_batches(
     llm_pairwise_udf(
         biased,
         template="Which answer is better?\nFirst: {base}\nSecond: {tuned}",

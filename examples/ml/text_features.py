@@ -69,7 +69,7 @@ def main() -> None:
     # Normalize the text before any of this, so casing does not leak into the features
     # you did not intend it to.
     normalized = docs.select(
-        clean=col("body").str.to_lowercase().str.remove_punctuation().str.normalize_whitespace()
+        clean=col("body").str.lower().str.remove_punctuation().str.normalize_whitespace()
     ).to_pydict()
     print(normalized["clean"][1])
     assert "!" not in normalized["clean"][1]

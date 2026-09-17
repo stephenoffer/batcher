@@ -19,7 +19,7 @@ from batcher import col
 
 
 def main() -> None:
-    comments = tpch("customer").select("c_custkey", "c_comment").head(1_000)
+    comments = tpch("customer").select("c_custkey", "c_comment").limit(1_000)
 
     shaped = comments.select(
         "c_custkey",
@@ -31,7 +31,7 @@ def main() -> None:
         avg_word=col("c_comment").str.avg_word_length(),
     )
 
-    result = shaped.head(3).to_pydict()
+    result = shaped.limit(3).to_pydict()
     print(result)
 
     # A comment is one line of prose, so line count is 1 and words exceed sentences.

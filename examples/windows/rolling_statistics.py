@@ -25,7 +25,7 @@ def main() -> None:
         .group_by("o_orderdate")
         .agg(revenue=col("o_totalprice").sum())
         .sort("o_orderdate")
-        .head(60)
+        .limit(60)
     )
 
     frame = (-9, 0)

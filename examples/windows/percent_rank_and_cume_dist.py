@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    customer = tpch("customer").select("c_custkey", "c_acctbal").head(1_000)
+    customer = tpch("customer").select("c_custkey", "c_acctbal").limit(1_000)
 
     placed = customer.with_columns(
         pct=bt.percent_rank().over(order_by=[("c_acctbal", False)]),

@@ -33,7 +33,7 @@ def _rerank(data, **kwargs):
         rerank_columns=kwargs.pop("rerank_columns", ("docs", "scores")),
         **kwargs,
     )
-    return bt.from_pydict(data).ml.map_batches(udf).to_pydict()
+    return bt.from_pydict(data).map_batches(udf).to_pydict()
 
 
 def test_pure_relevance_returns_the_ranking_it_was_given():
@@ -140,7 +140,7 @@ def test_an_invalid_setting_is_rejected_when_the_udf_is_built(kwargs):
 def test_a_missing_column_names_the_ones_that_exist():
     udf = mmr_rerank_udf(embedding_column="absent", k=2)
     with pytest.raises(ColumnNotFoundError):
-        bt.from_pydict({"vecs": [[[1.0]]]}).ml.map_batches(udf).to_pydict()
+        bt.from_pydict({"vecs": [[[1.0]]]}).map_batches(udf).to_pydict()
 
 
 def test_ungrouped_candidates_are_rejected_by_name():
@@ -157,14 +157,14 @@ def test_ungrouped_candidates_are_rejected_by_name():
     )
     udf = mmr_rerank_udf(embedding_column="emb", score_column="score", k=2)
     with pytest.raises(PlanError, match="candidate set"):
-        flat.ml.map_batches(udf).collect()
+        flat.map_batches(udf).collect()
 
 
 def test_a_non_list_embedding_column_is_rejected():
     scalar = bt.from_pydict({"emb": [1.0, 2.0], "score": [1.0, 2.0]})
     udf = mmr_rerank_udf(embedding_column="emb", score_column="score", k=2)
     with pytest.raises(PlanError, match="as a list"):
-        scalar.ml.map_batches(udf).collect()
+        scalar.map_batches(udf).collect()
 
 
 def test_mismatched_per_candidate_lists_are_named_rather_than_broadcast() -> None:

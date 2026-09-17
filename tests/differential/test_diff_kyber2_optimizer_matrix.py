@@ -188,7 +188,7 @@ def test_aggregate_over_join_matches_duckdb(how: str, agg: str, seed: int) -> No
         "max": col(mc).max(),
         "sum": col(mc).sum(),
         "count": count(),
-        "nunique": col(mc).n_unique(),
+        "nunique": col(mc).count_distinct(),
     }[agg]
     ds = (
         bt.from_arrow(L.to_batches() or L)

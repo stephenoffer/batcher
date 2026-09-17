@@ -109,8 +109,8 @@ assert abs(sum(values) - 2.0) < 1e-9  # the shares within each region sum to one
 
 Two behaviours differ from SQL and are worth knowing. `order_by` takes `(column, descending)`
 pairs, so the ranking direction is part of the window rather than a separate argument. And
-the default frame is the whole partition, so `last_value` returns the partition's last value
-rather than the current row.
+with an `order_by` the default frame ends at the current row, as in SQL, so `last_value`
+returns the current row's value unless you pass `frame=(None, None)` for the whole partition.
 
 ## SQL
 

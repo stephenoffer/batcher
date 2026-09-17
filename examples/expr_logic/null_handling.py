@@ -42,7 +42,7 @@ def main() -> None:
     print("rows with no matching line:", nulls)
     assert nulls > 0
 
-    sample = flags.filter(col("missing")).head(3).to_pydict()
+    sample = flags.filter(col("missing")).limit(3).to_pydict()
     print(sample)
     assert all(value is None for value in sample["sum_with_null"])
     assert all(value == 0.0 for value in sample["filled"])

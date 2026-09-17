@@ -43,7 +43,7 @@ _STATEFUL = {
         .with_watermark("ts", "1h")
         .drop_duplicates_within_watermark(["k"], event_time="ts", lateness="1h")
     ),
-    "limit": lambda: _stream().head(1),
+    "limit": lambda: _stream().limit(1),
     "interval_join": lambda: _stream().join_stream(
         _stream(), on="k", left_time="ts", right_time="ts", within="5m"
     ),

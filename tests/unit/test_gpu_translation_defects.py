@@ -5,7 +5,7 @@ translator and comparing against the engine, and every one of them passed the ex
 while being wrong. They are grouped by how they failed, because the three failure modes need
 different things from a reader:
 
-* a **wrong answer** — `strip_chars` ignored the characters it was given and stripped
+* a **wrong answer** — `trim` ignored the characters it was given and stripped
   whitespace instead, so a value with no leading space came back untouched;
 * a **wrong column** — `is_leap_year` and the bit operators over a boolean returned the right
   values in the wrong type. That is not cosmetic here: a fan-out concatenates its shards, and a
@@ -91,9 +91,9 @@ def _assert_matches_engine(ds, table: pa.Table, be) -> None:
 # --- a wrong answer: the strip functions ignored their character set ------------------
 
 
-@pytest.mark.parametrize("fn", ["strip_chars", "strip_chars_start", "strip_chars_end"])
+@pytest.mark.parametrize("fn", ["trim", "strip_chars_start", "strip_chars_end"])
 def test_stripping_a_character_set_strips_those_characters(be, fn):
-    """`strip_chars("ax")` removes `a` and `x`, not whitespace.
+    """`trim("ax")` removes `a` and `x`, not whitespace.
 
     The pattern was dropped on the way through, so the translation stripped whitespace — which
     is the same answer on a value that happens to start with a space, and a silently different
@@ -105,7 +105,7 @@ def test_stripping_a_character_set_strips_those_characters(be, fn):
 
 def test_stripping_nothing_still_means_whitespace(be):
     """`strip()` with no character set is the whitespace default on both sides."""
-    ds = bt.from_arrow(TEXT).select(out=col("s").str.strip())
+    ds = bt.from_arrow(TEXT).select(out=col("s").str.trim())
     _assert_matches_engine(ds, TEXT, be)
 
 
@@ -131,11 +131,14 @@ def test_capitalize_reaches_the_device(be):
 # --- a wrong column: booleans through the bit operators --------------------------------
 
 
-@pytest.mark.parametrize("fn", ["bitwise_and", "bitwise_or", "bitwise_xor", "xor"])
+@pytest.mark.parametrize("fn", ["bitwise_and", "bitwise_or"])
 def test_a_bit_operator_over_booleans_answers_in_an_integer(be, fn):
-    """The engine (and DuckDB) return an integer; both libraries return a boolean.
+    """The engine returns an integer for `&`/`|` bit ops over booleans; both libraries a boolean.
 
-    The values agree and the column does not, which a fan-out cannot concatenate.
+    The values agree and the column does not, which a fan-out cannot concatenate. `bit_xor`
+    over two booleans is a boolean in the engine (the exclusive-or of the predicates), and
+    that form declines on the device (see
+    `test_gpu_plan.py::test_scalar_and_list_parameter_forms_decline`).
     """
     ds = bt.from_arrow(NUMBERS).select(out=getattr(col("b"), fn)(col("b")))
     _assert_matches_engine(ds, NUMBERS, be)

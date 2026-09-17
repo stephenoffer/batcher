@@ -1,17 +1,10 @@
 # Reading, writing, and interop
 
-This page maps the reader, writer, constructor, and exporter you already use in pandas,
-Polars, or PySpark onto the Batcher equivalent. Start here when the first thing a ported
-script does is load a file or hand a frame to Batcher.
-
-Every reader is lazy. {py:meth}`bt.read.parquet(p) <batcher.api.io_namespace.reader.Reader.parquet>` returns a plan and does no I/O until a
-terminal operation, so there is no eager/lazy pair to choose between.
+This page covers Batcher's readers, writers, constructors, and exporters, and where the reader and writer you already use in another engine maps onto them. Start here when the first thing a ported script does is load a file or hand a frame to Batcher.
 
 ## Reading and writing
 
-Batcher gives you one callable namespace per direction. {py:obj}`bt.read(path) <batcher.read>` infers the
-format, and the typed methods such as {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` and {py:meth}`bt.read.delta <batcher.api.io_namespace.reader.Reader.delta>` are
-explicit and discoverable. {py:obj}`ds.write <batcher.Dataset.write>` mirrors it.
+Batcher gives you one callable namespace per direction. {py:obj}`bt.read(path) <batcher.read>` infers the format, and typed methods such as {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` and {py:meth}`bt.read.delta <batcher.api.io_namespace.reader.Reader.delta>` name it explicitly. {py:obj}`ds.write <batcher.Dataset.write>` mirrors it.
 
 ```python
 import batcher as bt
@@ -23,52 +16,36 @@ print(sorted(back.to_pydict()["amount"]))
 # [10, 20, 30]
 ```
 
-The reader and writer spellings map across as follows.
+Every reader and writer in PySpark, Polars, Daft, and Ray Data has a row in the generated reference, with its Batcher spelling and what differs, such as a default save mode. PySpark's readers and writers are on {doc}`spark/io`. The Polars, Daft, and Ray Data readers are module functions, on {doc}`polars/io`, {doc}`daft/module`, and {doc}`ray-data/io`. Their writers are frame methods, on {doc}`polars/dataframe`, {doc}`daft/dataframe`, and {doc}`ray-data/dataset`.
 
-| Task | pandas | Polars | PySpark | Batcher |
-|------|--------|--------|---------|---------|
-| Read Parquet | `pd.read_parquet(p)` | `pl.read_parquet(p)` | `spark.read.parquet(p)` | `bt.read.parquet(p)` |
-| Scan Parquet (lazy) | n/a | `pl.scan_parquet(p)` | n/a | `bt.read.parquet(p)` |
-| Read CSV | `pd.read_csv(p)` | `pl.read_csv(p)` | `spark.read.csv(p)` | {py:meth}`bt.read.csv(p) <batcher.api.io_namespace.reader.Reader.csv>` |
-| Read Delta | n/a | `pl.read_delta(p)` | `spark.read.format("delta").load(p)` | `bt.read.delta(p)` |
-| Autodetect | n/a | n/a | `spark.read.load(p)` | `bt.read(p)` |
-| Write Parquet | `df.to_parquet(p)` | `df.write_parquet(p)` | `df.write.parquet(p)` | {py:meth}`ds.write.parquet(p) <batcher.api.io_namespace.writer.Writer.parquet>` |
-| Write Delta | n/a | `df.write_delta(p)` | `df.write.format("delta").save(p)` | {py:meth}`ds.write.delta(p) <batcher.api.io_namespace.writer.Writer.delta>` |
+Polars splits reading into eager `read_*` and lazy `scan_*`. Batcher doesn't need the split. Every `bt.read.*` returns a {py:class}`Dataset <batcher.Dataset>` plan and does no I/O until a terminal operation, with the projection and predicate pushdown `scan_*` gives you. There's one spelling per format, and it's the lazy one.
 
-Polars splits reading into eager `read_*` and lazy `scan_*`. Batcher doesn't need the
-split, because every `bt.read.*` is already lazy. It returns a {py:class}`Dataset <batcher.Dataset>` plan and does
-no I/O until a terminal op, with the projection and predicate pushdown `scan_*` gives
-you. There is one spelling per format, and it's the lazy one.
+If your fingers already type `pd.read_csv` or `pl.read_parquet`, the Batcher spelling moves the format behind a dot. There is no top-level `bt.read_csv`, and every common format has one typed reader:
 
-If your fingers already type `pd.read_csv`, keep typing it. Every common format also
-has a top-level shorthand under the ecosystem-standard name, and each one is the same
-lazy reader as its `bt.read.*` twin:
+| Reads | Batcher |
+|-------|---------|
+| CSV files, directories, globs | {py:meth}`bt.read.csv(p) <batcher.api.io_namespace.reader.Reader.csv>` |
+| Parquet | {py:meth}`bt.read.parquet(p) <batcher.api.io_namespace.reader.Reader.parquet>` |
+| newline-delimited JSON | {py:meth}`bt.read.json(p) <batcher.api.io_namespace.reader.Reader.json>` |
+| Arrow IPC / Feather | {py:meth}`bt.read.arrow(p) <batcher.api.io_namespace.reader.Reader.arrow>` |
+| ORC | {py:meth}`bt.read.orc(p) <batcher.api.io_namespace.reader.Reader.orc>` |
+| Avro | {py:meth}`bt.read.avro(p) <batcher.api.io_namespace.reader.Reader.avro>` |
+| Excel workbooks | {py:meth}`bt.read.excel(p) <batcher.api.io_namespace.reader.Reader.excel>` |
+| Delta Lake tables | {py:meth}`bt.read.delta(p) <batcher.api.io_namespace.reader.Reader.delta>` |
+| Iceberg tables | {py:meth}`bt.read.iceberg(t) <batcher.api.io_namespace.reader.Reader.iceberg>` |
+| any SQL database | {py:meth}`bt.read.sql(q, uri=...) <batcher.api.io_namespace.reader.Reader.sql>` |
 
-| Shorthand | Same as | Reads |
-|-----------|---------|-------|
-| {py:func}`bt.read_csv(p) <batcher.read_csv>` | {py:meth}`bt.read.csv(p) <batcher.api.io_namespace.reader.Reader.csv>` | CSV files, directories, globs |
-| {py:func}`bt.read_parquet(p) <batcher.read_parquet>` | {py:meth}`bt.read.parquet(p) <batcher.api.io_namespace.reader.Reader.parquet>` | Parquet |
-| {py:func}`bt.read_json(p) <batcher.read_json>` / {py:func}`bt.read_ndjson(p) <batcher.read_ndjson>` | {py:meth}`bt.read.json(p) <batcher.api.io_namespace.reader.Reader.json>` | newline-delimited JSON |
-| {py:func}`bt.read_ipc(p) <batcher.read_ipc>` | {py:meth}`bt.read.arrow(p) <batcher.api.io_namespace.reader.Reader.arrow>` | Arrow IPC / Feather |
-| {py:func}`bt.read_orc(p) <batcher.read_orc>` | {py:meth}`bt.read.orc(p) <batcher.api.io_namespace.reader.Reader.orc>` | ORC |
-| {py:func}`bt.read_avro(p) <batcher.read_avro>` | {py:meth}`bt.read.avro(p) <batcher.api.io_namespace.reader.Reader.avro>` | Avro |
-| {py:func}`bt.read_excel(p) <batcher.read_excel>` | {py:meth}`bt.read.excel(p) <batcher.api.io_namespace.reader.Reader.excel>` | Excel workbooks |
-| {py:func}`bt.read_delta(p) <batcher.read_delta>` | {py:meth}`bt.read.delta(p) <batcher.api.io_namespace.reader.Reader.delta>` | Delta Lake tables |
-| {py:func}`bt.read_iceberg(t) <batcher.read_iceberg>` | {py:meth}`bt.read.iceberg(t) <batcher.api.io_namespace.reader.Reader.iceberg>` | Iceberg tables |
-| {py:func}`bt.read_database(q, uri=...) <batcher.read_database>` | {py:meth}`bt.read.sql(q, uri=...) <batcher.api.io_namespace.reader.Reader.sql>` | any SQL database |
-
-For a source that isn't a file at all, {py:func}`bt.read_table(name, ...) <batcher.read_table>` constructs any
-registered connector by name, which is the escape hatch behind all of the above.
+For a source that isn't a file at all, {py:meth}`bt.read.table(name, ...) <batcher.api.io_namespace.reader.Reader.table>` constructs any
+registered connector by name, which is the escape hatch behind the typed readers.
 
 ## Getting data in from another library
 
-Whatever object you're holding, there's a constructor for it. The names follow pandas
-and Polars, so {py:func}`from_dict <batcher.from_dict>` and {py:func}`from_dicts <batcher.from_dicts>` mean what they mean there:
+Whatever object you're holding, there's a constructor for it:
 
 | You have | Call |
 |----------|------|
-| A `{column: values}` dict | {py:func}`bt.from_pydict(d) <batcher.from_pydict>`, or {py:func}`bt.from_dict(d) <batcher.from_dict>` |
-| A list of row dicts | {py:func}`bt.from_pylist(rows) <batcher.from_pylist>`, or {py:func}`bt.from_dicts(rows) <batcher.from_dicts>` |
+| A `{column: values}` dict | {py:func}`bt.from_pydict(d) <batcher.from_pydict>` |
+| A list of row dicts | {py:func}`bt.from_pylist(rows) <batcher.from_pylist>` |
 | A list of row tuples | {py:func}`bt.from_records(rows, columns=[...]) <batcher.from_records>` |
 | A generator or any iterable | {py:func}`bt.from_iter(gen) <batcher.from_iter>` |
 | A pandas or Polars frame | {py:func}`bt.from_pandas(df) <batcher.from_pandas>` / {py:func}`bt.from_polars(df) <batcher.from_polars>` |
@@ -76,10 +53,7 @@ and Polars, so {py:func}`from_dict <batcher.from_dict>` and {py:func}`from_dicts
 | An Arrow table, or anything Arrow-exporting | {py:func}`bt.from_arrow(t) <batcher.from_arrow>` |
 | Something whose type you don't know | {py:func}`bt.from_any(obj) <batcher.from_any>` |
 
-`bt.from_any` is the one to reach for in migration code and glue: it dispatches on the
-type and routes to the right constructor, so a script that accepts "a frame" from a
-caller doesn't have to branch. {py:func}`bt.sql <batcher.sql>` uses it for every bound table, which is why
-you can pass a pandas frame or a plain dict straight into a query:
+Reach for `bt.from_any` in migration code and glue. It dispatches on the type and routes to the right constructor, so a script that accepts "a frame" from a caller doesn't have to branch. {py:func}`bt.sql <batcher.sql>` uses it for every bound table, which is why you can pass a pandas frame or a plain dict straight into a query:
 
 ```python
 import batcher as bt
@@ -132,8 +106,7 @@ Pass `end=` or `periods=`, the stride as `interval=` (Polars) or `freq=` (pandas
 
 ## Moving data in and out
 
-Every `from_*` constructor has a symmetric `to_*` exporter, so Batcher slots into an
-existing pipeline without a copy where the framework's Arrow bridge allows it.
+Most `from_*` constructors have a matching `to_*` exporter, so Batcher slots into an existing pipeline without a copy where the framework's Arrow bridge allows it.
 
 ```python
 # docs: skip
@@ -154,19 +127,21 @@ Each row pairs a source system with its constructor and, where one exists, its e
 | Python dict / rows | {py:func}`bt.from_pydict(d) <batcher.from_pydict>` / {py:func}`bt.from_pylist(rows) <batcher.from_pylist>` | {py:meth}`ds.to_pydict() <batcher.Dataset.to_pydict>` / {py:meth}`ds.to_pylist() <batcher.Dataset.to_pylist>` |
 | pandas | {py:func}`bt.from_pandas(df) <batcher.from_pandas>` | {py:meth}`ds.to_pandas() <batcher.Dataset.to_pandas>` |
 | Polars | {py:func}`bt.from_polars(df) <batcher.from_polars>` | {py:meth}`ds.to_polars() <batcher.Dataset.to_polars>` |
-| NumPy | {py:func}`bt.from_numpy(arr) <batcher.from_numpy>` | n/a |
+| NumPy | {py:func}`bt.from_numpy(arr) <batcher.from_numpy>` | {py:meth}`ds.to_numpy() <batcher.Dataset.to_numpy>` |
 | Ray Data | {py:func}`bt.from_ray_dataset(ds) <batcher.from_ray_dataset>` | {py:meth}`ds.to_ray_dataset() <batcher.Dataset.to_ray_dataset>` |
-| Spark | {py:func}`bt.from_spark(df) <batcher.from_spark>` | n/a |
+| Spark | {py:func}`bt.from_spark(df) <batcher.from_spark>` | {py:meth}`ds.to_spark(spark) <batcher.Dataset.to_spark>` |
+| Daft | {py:func}`bt.from_daft(df) <batcher.from_daft>` | {py:meth}`ds.to_daft() <batcher.Dataset.to_daft>` |
 | Dask | {py:func}`bt.from_dask(ddf) <batcher.from_dask>` | n/a |
 | HuggingFace | {py:func}`bt.from_huggingface(ds) <batcher.from_huggingface>` | n/a |
-| PyTorch | {py:func}`bt.from_torch(ds) <batcher.from_torch>` | {py:meth}`ds.to_torch() <batcher.Dataset.to_torch>` / {py:meth}`ds.to_torch_dataloader() <batcher.Dataset.to_torch_dataloader>` |
-| TensorFlow | {py:func}`bt.from_tf(ds) <batcher.from_tf>` | {py:meth}`ds.to_tf() <batcher.Dataset.to_tf>` |
+| PyTorch | {py:func}`bt.from_torch(ds) <batcher.from_torch>` | {py:meth}`ds.ml.iter_torch_batches() <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` / {py:meth}`ds.ml.to_torch_dataloader() <batcher.api.dataset.ml.DatasetML.to_torch_dataloader>` |
+| TensorFlow | {py:func}`bt.from_tf(ds) <batcher.from_tf>` | {py:meth}`ds.ml.to_tf() <batcher.api.dataset.ml.DatasetML.to_tf>` |
 
-The `to_torch` and `to_tf` exporters yield a re-iterable dataset of per-batch tensor
-dicts, so a multi-epoch training loop streams the query in bounded memory.
+The `ml.iter_torch_batches` and `ml.to_tf` loaders stream per-batch tensor dicts, and each
+pass runs the query again, so a multi-epoch training loop streams in bounded memory.
 
 ## See also
 
 - {doc}`/getting-started/migration/transforming`: the verbs that run between the read and the write.
 - {doc}`/user-guide/moving-data/reading-data`: the full reader reference, with cloud paths and globs.
 - {doc}`/user-guide/moving-data/writing-data`: save modes, partitioning, and atomic writes.
+- {doc}`/getting-started/migration/differences`: the exporters that don't exist, and how to verify a port.

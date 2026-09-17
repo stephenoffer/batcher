@@ -36,6 +36,15 @@ TOP_LEVEL_UNSUPPORTED: dict[str, str] = {
     ),
     "Index": "Batcher relations have no row index (they are unordered multisets, like SQL).",
     "Column": "A column reference is bt.col('x'); build derived columns with expressions.",
+    # --- renamed meanings -------------------------------------------------------------
+    "arg_max": (
+        "The value at the row where another column is largest is bt.max_by(value, by); "
+        "the position of a column's maximum is bt.col('x').arg_max(order_by='_row')."
+    ),
+    "arg_min": (
+        "The value at the row where another column is smallest is bt.min_by(value, by); "
+        "the position of a column's minimum is bt.col('x').arg_min(order_by='_row')."
+    ),
     "Categorical": (
         "There is no categorical constructor; store the values as a string column, and "
         "bt.col('x').label_encode() when you need integer codes."
@@ -71,15 +80,11 @@ TOP_LEVEL_UNSUPPORTED: dict[str, str] = {
     "scan_ipc": "Every reader is already lazy: bt.read.arrow(path) (no scan_/read_ split).",
     "scan_delta": "Every reader is already lazy: bt.read.delta(path).",
     # --- SQL / database readers -------------------------------------------------------
-    "read_sql": (
-        "Read a query with bt.read_database(query, uri=...) or bt.read.sql(query, uri=...)."
-    ),
-    "read_sql_query": "Read a query with bt.read_database(query, uri=...).",
-    "read_sql_table": (
-        "Read a table with bt.read_database('SELECT * FROM t', uri=...) or bt.read.sql(...)."
-    ),
+    "read_sql": ("Read a query with bt.read.sql(query, uri=...)."),
+    "read_sql_query": "Read a query with bt.read.sql(query, uri=...).",
+    "read_sql_table": ("Read a table with bt.read.sql('SELECT * FROM t', uri=...)."),
     # --- foreign-format readers with no native path -----------------------------------
-    "read_feather": "Arrow/Feather is bt.read_ipc(path) or bt.read.arrow(path).",
+    "read_feather": "Arrow/Feather is bt.read.arrow(path).",
     "read_html": (
         "No native HTML reader; load with pandas then bt.from_pandas(pd.read_html(url)[0])."
     ),
@@ -141,4 +146,4 @@ def top_level_attribute_error(name: str, members: Iterable[str]) -> AttributeErr
     Returns:
         An `AttributeError` that names the Batcher spelling to use instead.
     """
-    return absent_error("batcher", name, TOP_LEVEL_UNSUPPORTED, members)
+    return absent_error("batcher", name, TOP_LEVEL_UNSUPPORTED, members, receiver="bt")

@@ -102,15 +102,6 @@ def test_concat_str_is_the_explicit_string_form():
 
 
 # --- constructors -----------------------------------------------------------
-def test_from_dict_and_from_pydict_agree():
-    assert bt.from_dict({"x": [1, 2]}).to_pydict() == bt.from_pydict({"x": [1, 2]}).to_pydict()
-
-
-def test_from_dicts_and_from_pylist_agree():
-    rows = [{"a": 1}, {"a": 2}]
-    assert bt.from_dicts(rows).to_pydict() == bt.from_pylist(rows).to_pydict()
-
-
 def test_from_records_names_tuple_rows():
     ds = bt.from_records([(1, "a"), (2, "b")], columns=["n", "s"])
     assert ds.to_pydict() == {"n": [1, 2], "s": ["a", "b"]}
@@ -298,27 +289,6 @@ def test_versions_reports_the_engine_build_profile():
 def test_show_versions_prints_a_report(capsys):
     bt.show_versions()
     assert "batcher" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "read_csv",
-        "read_parquet",
-        "read_json",
-        "read_ndjson",
-        "read_ipc",
-        "read_orc",
-        "read_avro",
-        "read_excel",
-        "read_delta",
-        "read_iceberg",
-        "read_database",
-        "read_table",
-    ],
-)
-def test_toplevel_reader_shorthands_exist(name):
-    assert callable(getattr(bt, name))
 
 
 @pytest.mark.parametrize(

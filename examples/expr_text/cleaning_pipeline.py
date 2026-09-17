@@ -37,7 +37,7 @@ def main() -> None:
         .str.remove_urls()
         .str.remove_emails()
         .str.normalize_whitespace()
-        .str.strip(),
+        .str.trim(),
     )
 
     result = cleaned.to_pydict()

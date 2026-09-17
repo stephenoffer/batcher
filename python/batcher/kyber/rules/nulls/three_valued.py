@@ -94,8 +94,9 @@ def never_null(expr: Expr) -> bool:
         # holding nulls — verified against the engine for an all-null argument list.
         return True
     if isinstance(expr, HashRows):
-        # A row hash is defined for every input, nulls included.
-        return True
+        # A row hash is defined for every input, nulls included -- except the Iceberg
+        # bucket hash, which keeps a null input null.
+        return expr.algorithm != "iceberg"
     if isinstance(expr, (Coalesce, Greatest, Least)):
         # All three answer with the first/extreme non-null argument, so one never-null
         # argument anywhere in the list is enough.

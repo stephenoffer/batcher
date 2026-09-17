@@ -176,11 +176,11 @@ def test_a_custom_check_is_never_discharged_from_metadata(ds):
     which that filter drops. So a custom check must not take the shortcut. Here the predicate
     is null exactly where `note` is, and those rows must be counted as violations.
     """
-    contract = ds.dq.check(bt.col("note").str.len() > 0, name="note_nonempty")
+    contract = ds.dq.check(bt.col("note").str.len_chars() > 0, name="note_nonempty")
     assert (
         contract.validate().violations
         == _forced(ds)
-        .dq.check(bt.col("note").str.len() > 0, name="note_nonempty")
+        .dq.check(bt.col("note").str.len_chars() > 0, name="note_nonempty")
         .validate()
         .violations
     )
@@ -257,9 +257,9 @@ def test_a_partial_scan_never_teaches_a_source_level_distinct_count(tmp_path):
 
     The learning loop records a scanned column's ndv under the *source's* identity, so a query
     that scanned only part of the source (a pushed filter, a limit) would file a partial distinct
-    count as the source's — and `approx_n_unique`, which reads exactly that record, would return
-    it for the whole table. Reproduced directly: `filter(id < 100).collect()` scanned 100 of
-    2,000 rows, and `approx_n_unique("id")` then answered ~100.
+    count as the source's — and `approx_count_distinct`, which reads exactly that record, would
+    return it for the whole table. Reproduced directly: `filter(id < 100).collect()` scanned 100 of
+    2,000 rows, and `approx_count_distinct("id")` then answered ~100.
     """
     path = str(tmp_path / "u.parquet")
     n = 2_000
@@ -267,11 +267,11 @@ def test_a_partial_scan_never_teaches_a_source_level_distinct_count(tmp_path):
 
     poisoned = bt.read.parquet(path)
     poisoned.filter(bt.col("id") < 100).collect()  # a partial scan — must teach nothing
-    after_partial = poisoned.approx_n_unique("id")
+    after_partial = poisoned.approx_count_distinct("id")
     # Either nothing was learned (fell back to a real sketch) or it is near the truth — never 100.
     assert after_partial is None or after_partial > n * 0.5
 
     whole = bt.read.parquet(path)
     whole.collect()  # a whole scan — may learn
-    learned = whole.approx_n_unique("id")
+    learned = whole.approx_count_distinct("id")
     assert learned is None or abs(learned - n) / n < 0.1  # within HLL tolerance of the truth

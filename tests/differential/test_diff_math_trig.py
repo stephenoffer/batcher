@@ -27,7 +27,7 @@ def t(duck):
 def test_inverse_trig_vs_duckdb(duck, t):
     out = (
         bt.from_arrow(t)
-        .select(asn=col("u").asin(), acs=col("u").acos(), atn=col("y").atan())
+        .select(asn=col("u").arcsin(), acs=col("u").arccos(), atn=col("y").arctan())
         .collect()
     )
     assert_same(out, duck.sql("SELECT asin(u) asn, acos(u) acs, atan(y) atn FROM t"))

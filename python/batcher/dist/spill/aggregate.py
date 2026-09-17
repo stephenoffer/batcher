@@ -47,13 +47,13 @@ from batcher.dist.spill.buckets import (
 from batcher.dist.spill.scratch import (
     _fd_safe,
     _iter_spill_morsels,
+    map_predicate,
     map_projection,
 )
 from batcher.dist.spill.staging import peel_to_breaker, stage_breaker_inputs
 from batcher.io.source import Source
 from batcher.plan.expr_ir import col
 from batcher.plan.ir_specs import agg_spec_json
-from batcher.plan.types import logical_bytes
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -69,6 +69,7 @@ from batcher.plan.logical import (
     hoist_sort_key,
     hoist_window_keys,
 )
+from batcher.plan.types import logical_bytes
 
 __all__ = [
     "execute_spilling_aggregate",
@@ -450,7 +451,9 @@ def execute_spilling_aggregate(
         held: list[pa.RecordBatch] = []
         held_bytes = 0
         bucketing = False
-        for batch in _iter_spill_morsels(source, map_projection(agg, source_id)):
+        for batch in _iter_spill_morsels(
+            source, map_projection(agg, source_id), map_predicate(agg, source_id)
+        ):
             mapped = nat.execute_plan(map_ir, [[batch]], cfg_json)
             if not mapped:
                 continue

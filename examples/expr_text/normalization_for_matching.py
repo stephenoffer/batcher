@@ -28,10 +28,10 @@ def main() -> None:
 
     normalized = names.with_columns(
         key=col("raw")
-        .str.to_lowercase()
+        .str.lower()
         .str.remove_punctuation()
         .str.normalize_whitespace()
-        .str.strip_chars(" \t\n")
+        .str.trim(" \t\n")
     )
     result = normalized.to_pydict()
     for raw, key in zip(result["raw"], result["key"], strict=True):

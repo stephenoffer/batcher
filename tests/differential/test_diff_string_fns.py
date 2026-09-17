@@ -35,7 +35,7 @@ def test_levenshtein_matches_duckdb(duck):
 
 def test_regexp_extract_all_matches_duckdb(duck):
     duck.register("t", _strs())
-    out = bt.from_arrow(_strs()).select(r=col("s").str.regexp_extract_all("[a-z]")).collect()
+    out = bt.from_arrow(_strs()).select(r=col("s").str.extract_all("[a-z]")).collect()
     assert_same(out, duck.sql("SELECT regexp_extract_all(s, '[a-z]') AS r FROM t"))
 
 
@@ -45,7 +45,7 @@ def test_spark_only_string_fns_fixtures():
         .select(
             si=col("s").str.substring_index(".", 2),
             ov=col("s").str.overlay("XY", 2, 1),
-            rc=col("s").str.regexp_count("[a-z]"),
+            rc=col("s").str.count_matches("[a-z]"),
             sx=col("s").str.soundex(),
         )
         .collect()

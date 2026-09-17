@@ -110,7 +110,7 @@ FAMILIES = {
     "round_to_digits": lambda: col("f").round(2),
     "cast_round_trip": lambda: col("i").cast("float64").cast("int64"),
     "string_case_and_trim": col("s").str.upper().str.trim,
-    "string_length": col("s").str.len,
+    "string_length": col("s").str.len_chars,
     "string_slice": lambda: col("s").str.substr(1, 2),
     "date_part": col("t").dt.year,
     "date_truncation": lambda: col("t").dt.truncate("day"),

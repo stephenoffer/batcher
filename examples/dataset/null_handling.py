@@ -52,8 +52,8 @@ def main() -> None:
     assert per_column["note"] == ["a", "b", "unknown", "unknown"]
 
     # The pandas spellings do the same thing.
-    assert ds.dropna(["amount"]).count() == 2
-    assert None not in ds.fillna(0).to_pydict()["amount"]
+    assert ds.drop_nulls(["amount"]).count() == 2
+    assert None not in ds.fill_null(0).to_pydict()["amount"]
 
     # Null-aware predicates, as boolean columns.
     flags = ds.select(

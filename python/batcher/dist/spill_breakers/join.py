@@ -32,6 +32,7 @@ from batcher.dist.executors.plan_analysis import _single_source
 from batcher.dist.spill import (
     _fd_safe,
     _iter_spill_morsels,
+    map_predicate,
     map_projection,
 )
 from batcher.dist.spill.buckets import (
@@ -166,6 +167,7 @@ def stream_spilling_join(
             "L",
             cfg_json,
             map_projection(join, left_sid),
+            map_predicate(join, left_sid),
         )
         right_handles = _spill_side(
             nat,
@@ -177,6 +179,7 @@ def stream_spilling_join(
             "R",
             cfg_json,
             map_projection(join, right_sid),
+            map_predicate(join, right_sid),
         )
 
         key_idx = (
@@ -341,7 +344,16 @@ def _empty_batch(schema: pa.Schema) -> pa.RecordBatch:
 
 
 def _spill_side(
-    nat, sub_ir, key_names, source, n_buckets, store, tag, engine_config, projection=None
+    nat,
+    sub_ir,
+    key_names,
+    source,
+    n_buckets,
+    store,
+    tag,
+    engine_config,
+    projection=None,
+    predicate=None,
 ):
     """Stream a source through its sub-plan, hash-partition by key, spill by tier.
     Returns a list of per-bucket `SpillHandle`s (None where a bucket received no
@@ -349,7 +361,7 @@ def _spill_side(
     writers = BucketWriters(store, f"{tag}_bucket")
     key_idx: list[int] | None = None
 
-    for batch in _iter_spill_morsels(source, projection):
+    for batch in _iter_spill_morsels(source, projection, predicate):
         rows = nat.execute_plan(sub_ir, [[batch]], engine_config)
         if not rows:
             continue

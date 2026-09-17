@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     from batcher.api.dataset import Dataset
     from batcher.api.merge import MergeBuilder
+    from batcher.api.sql_session import Session
     from batcher.api.streaming import StreamingQuery
     from batcher.io.manifest import WriteManifest
     from batcher.plan.streaming import Trigger
@@ -683,6 +684,14 @@ class Writer:
         sink_kwargs = dict(opts)
         if dml_mode:
             sink_kwargs["mode"] = mode
+        elif fmt in _DATABASE_SINKS and mode in ("error", "ignore"):
+            # The existence gate above asks the filesystem, which cannot see a table, and
+            # the sink only takes append/overwrite. Mapping `error` to overwrite replaced
+            # the very table the caller asked to protect, so refuse instead.
+            raise PlanError(
+                f"write(): mode={mode!r} is not supported for the {fmt!r} sink, which cannot "
+                "check whether its table exists; pass mode='append' or mode='overwrite'"
+            )
         elif fmt in _MODE_AWARE_SINKS:
             sink_kwargs["mode"] = mode if mode in ("append", "overwrite") else "overwrite"
 
@@ -1484,6 +1493,219 @@ class Writer:
         """
         return self(path, "msgpack", **opts)
 
+    def text(self, path: PathLike, *, line_sep: str = "\n", **opts: Any) -> WriteManifest:
+        r"""Write a single string column as plain text, one value per line.
+
+        The dataset must hold exactly one string column. A null is written as an empty
+        line, so it reads back as ``""``: a text file cannot say "no value".
+
+        Args:
+            path: Output path/URI (file or directory) to write to.
+            line_sep: The terminator written after every value.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> out = os.path.join(tempfile.mkdtemp(), "lines.txt")
+                >>> _ = bt.from_pydict({"value": ["hello", "world"]}).write.text(out)
+                >>> open(out).read()
+                'hello\nworld\n'
+        """
+        return self(path, "text", line_sep=line_sep, **opts)
+
+    def xml(
+        self, path: PathLike, *, row_tag: str = "ROW", root_tag: str = "ROWS", **opts: Any
+    ) -> WriteManifest:
+        """Write rows as XML elements under one root element, in Spark's XML layout.
+
+        Each row is a `row_tag` element with one child per column, all inside a single
+        `root_tag` element. A null field is omitted, a list repeats its element, a struct
+        nests, and a field named with the ``"_"`` attribute prefix becomes an attribute.
+        ``attribute_prefix``, ``value_tag``, ``null_value`` and ``declaration`` are accepted
+        as `opts`.
+
+        Args:
+            path: Output path/URI (file or directory) to write to.
+            row_tag: The element each row is written as.
+            root_tag: The element wrapping every row.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> out = os.path.join(tempfile.mkdtemp(), "books.xml")
+                >>> ds = bt.from_pydict({"_id": ["b1"], "title": ["Dune"]})
+                >>> _ = ds.write.xml(out, row_tag="book", root_tag="books", declaration="")
+                >>> print(open(out).read().strip())
+                <books>
+                <book id="b1"><title>Dune</title></book>
+                </books>
+        """
+        return self(path, "xml", row_tag=row_tag, root_tag=root_tag, **opts)
+
+    def numpy(self, path: PathLike, *, column: str | None = None, **opts: Any) -> WriteManifest:
+        """Write one column as NumPy ``.npy`` arrays, the inverse of `bt.read.numpy`.
+
+        A numeric, boolean or temporal column is written as a 1-D array, a fixed-size list
+        of numbers as ``(rows, width)``, and a fixed-shape tensor column as
+        ``(rows, *shape)``. A null is refused, because a ``.npy`` array cannot hold one.
+
+        Args:
+            path: Output path/URI (file or directory) to write to.
+            column: The column to write; may be omitted when the dataset has one column.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> import numpy as np
+                >>> out = os.path.join(tempfile.mkdtemp(), "x.npy")
+                >>> _ = bt.from_pydict({"id": [1, 2], "x": [0.5, 1.5]}).write.numpy(out, column="x")
+                >>> np.load(out)
+                array([0.5, 1.5])
+        """
+        return self(path, "numpy", column=column, **opts)
+
+    def webdataset(self, path: PathLike, **opts: Any) -> WriteManifest:
+        """Write rows as WebDataset ``.tar`` shards, the inverse of `bt.read.webdataset`.
+
+        Each row needs a string ``__key__`` column naming the sample, and every other
+        column becomes one tar member per row, named ``<key>.<column>``. Bytes are written
+        as they are, text as UTF-8 and numbers as decimal text. A null cell writes no
+        member. Cap a shard's size with ``max_rows_per_file``.
+
+        Args:
+            path: Output path/URI (file or directory) to write to.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile, tarfile
+                >>> out = os.path.join(tempfile.mkdtemp(), "shard.tar")
+                >>> ds = bt.from_pydict({"__key__": ["s0"], "txt": ["hi"], "cls": [3]})
+                >>> _ = ds.write.webdataset(out)
+                >>> tarfile.open(out).getnames()
+                ['s0.txt', 's0.cls']
+        """
+        return self(path, "webdataset", **opts)
+
+    def tfrecord(
+        self, path: PathLike, *, record_format: str = "example", **opts: Any
+    ) -> WriteManifest:
+        """Write rows as TFRecord files, one ``tf.train.Example`` per row by default.
+
+        Integer and boolean columns become ``Int64List`` features, float columns
+        ``FloatList`` (float32), string and binary columns ``BytesList``, and list columns
+        the same kinds with one value per item. A null becomes an empty feature list.
+        ``record_format="raw"`` writes a single binary column's values as the record
+        payloads instead, which is what `bt.read.tfrecord` reads back as ``record``.
+        Needs ``google-crc32c`` for the record checksums.
+
+        Args:
+            path: Output path/URI (file or directory) to write to.
+            record_format: ``"example"`` or ``"raw"``.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> out = os.path.join(tempfile.mkdtemp(), "train.tfrecord")
+                >>> ds = bt.from_pydict({"label": [0, 1], "text": ["no", "yes"]})
+                >>> ds.write.tfrecord(out).files[0].rows  # doctest: +SKIP
+                2
+        """
+        return self(path, "tfrecord", record_format=record_format, **opts)
+
+    # --- Catalog tables ----------------------------------------------------
+    def table(
+        self,
+        name: str,
+        *,
+        mode: str = "error",
+        by_name: bool = True,
+        partition_by: list[str] | None = None,
+        properties: dict[str, str] | None = None,
+        replace_where: Any = None,
+        session: Session | None = None,
+    ) -> WriteManifest:
+        """Write the result to a catalog table by name, creating it unless `mode` forbids.
+
+        The one spelling for Spark's ``saveAsTable``/``insertInto``/``writeTo``, and Daft's
+        and Polars' ``write_table``. `name` resolves through the session's catalogs the way
+        `Session.table` does. `mode` says what to do about the table existing:
+
+        * ``"error"`` (default) creates the table, and raises if it exists.
+        * ``"ignore"`` creates it, or does nothing if it exists.
+        * ``"append"`` adds rows, creating the table if it is missing.
+        * ``"overwrite"`` replaces rows and schema, creating the table if missing. With
+          `replace_where`, only the rows matching the predicate are replaced.
+        * ``"replace"`` replaces rows and schema of a table that must exist.
+        * ``"overwrite_partitions"`` replaces only the partitions the incoming rows have
+          values in, and keeps every other partition.
+
+        ``by_name=False`` matches columns to an existing table by position, as SQL
+        ``INSERT`` and Spark ``insertInto`` do.
+
+        Args:
+            name: The table name, qualified as far as needed (``"t"``, ``"ns.t"``,
+                ``"catalog.ns.t"``).
+            mode: The save mode above.
+            by_name: Match columns to an existing table by name (unlisted ones become
+                NULL), or by position when False.
+            partition_by: Partition columns for a created table, or the partitions an
+                ``"overwrite_partitions"`` write scopes to.
+            properties: Table properties, applied when the write creates or replaces it.
+            replace_where: A predicate scoping ``mode="overwrite"`` to matching rows.
+            session: The session whose catalogs resolve `name`; the current session when
+                omitted.
+
+        Returns:
+            A `WriteManifest` for the rows written (empty when nothing was).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = bt.from_pydict({"id": [1, 2]}).write.table("orders", session=s)
+                >>> _ = bt.from_pydict({"id": [3]}).write.table("orders", mode="append", session=s)
+                >>> s.table("orders").count()
+                3
+        """
+        from batcher.api.catalog.modes import write_to_table
+
+        return write_to_table(
+            self._ds,
+            name,
+            session=session,
+            mode=mode,
+            by_name=by_name,
+            partition_by=partition_by,
+            properties=properties,
+            replace_where=replace_where,
+        )
+
     # --- Upserts / MERGE INTO ----------------------------------------------
     def merge(
         self,
@@ -1826,6 +2048,34 @@ class Writer:
                 ... )
         """
         return self(table, "snowflake", **opts)
+
+    def clickhouse(self, table: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
+        """Insert into an existing ClickHouse table over the Arrow insert interface.
+
+        The table must already exist. ``mode="overwrite"`` truncates it before inserting,
+        and is refused on a distributed write, where every shard would truncate the rows
+        of the shards before it. Needs ``batcher-engine[clickhouse]``.
+
+        Args:
+            table: Destination table, optionally qualified as ``database.table``.
+            mode: ``"append"`` (default) or ``"overwrite"``.
+            opts: Connection details: ``host``, ``port``, ``username``, ``password``
+                (plain or an ``env:``/``file:`` reference), ``database`` and
+                ``client_kwargs``.
+
+        Returns:
+            A `WriteManifest` describing the inserted rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                >>> ds.write.clickhouse(  # doctest: +SKIP
+                ...     "analytics.orders", host="localhost", password="env:CH_PASSWORD"
+                ... )
+        """
+        return self(table, "clickhouse", mode=mode, **opts)
 
     def mongo(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write to a MongoDB collection — upsert, append, overwrite, or delete.

@@ -1,0 +1,6 @@
+{
+ "daft": 25,
+ "polars": 33,
+ "pyspark": 21,
+ "ray_data": 160
+}

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from batcher.io.formats.sql.adbc import ADBCSink, ADBCSource
 from batcher.io.formats.sql.bigquery import BigQuerySource
-from batcher.io.formats.sql.clickhouse import ClickHouseSource
+from batcher.io.formats.sql.clickhouse import ClickHouseSink, ClickHouseSource
 from batcher.io.formats.sql.connectorx import ConnectorXSource
 from batcher.io.formats.sql.databricks import DatabricksSource
 from batcher.io.formats.sql.dbapi import DBAPISource
@@ -41,6 +41,7 @@ __all__ = [
     "ADBCSink",
     "ADBCSource",
     "BigQuerySource",
+    "ClickHouseSink",
     "ClickHouseSource",
     "ConnectorXSource",
     "DBAPISource",

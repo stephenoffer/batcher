@@ -5,9 +5,10 @@ description: Port an existing pandas or Polars script to Batcher's public Python
 
 # Migrate from Polars or pandas
 
-`docs/getting-started/migration/transforming.md` is the user-facing mapping table and the source of truth.
-Read it first; this skill is the agent-side procedure around it, and must never
-contradict it. Everything below is verified against the live surface — if you need a
+Every Polars 1.40.0 name has a row in the migration registry, rendered into
+`docs/getting-started/migration/polars/`; `docs/getting-started/migration/transforming.md` holds
+the pandas tables. Read those first; this skill is the agent-side procedure around them, and
+must never contradict them. Everything below is verified against the live surface — if you need a
 name this skill doesn't list, check it with
 `python -c "import batcher as bt; print(bt.<name>)"` rather than guessing.
 
@@ -35,40 +36,47 @@ Work happens only at a terminal op: `collect()`, `to_arrow()`, `to_pydict()`,
   is already lazy and already does projection/predicate pushdown. One spelling per
   format, and it is the lazy one.
 
-## Translation table
+## Where the name mappings live
 
-Extends the tables in `docs/getting-started/migration/transforming.md`; consult that page for the full
-pandas/Polars/PySpark grid, including IO, terminal ops, and the `from_*`/`to_*`
-round-trips.
+**Polars.** `docs/getting-started/migration/polars/` has one row per public name:
+`dataframe.md` (`LazyFrame`, `DataFrame`, group-by objects), `expressions.md` (`Expr`),
+`expression-namespaces.md` (`.str`, `.dt`, `.list`, `.arr`, `.struct`, `.cat`, `.bin`, `.name`,
+`.meta`), `functions.md` (top-level functions and `polars.selectors`), `io.md`, `types.md`, and
+`session-and-sql.md` (`SQLContext`, `Config`). Read each row's status before renaming a call:
+a `mismatch` means the Batcher spelling returns a different answer, such as `round` rounding
+half to even in Polars and half away from zero here, or `write_delta` raising on an existing
+table in Polars and appending here. Fix a wrong row in
+`python/batcher/_internal/migration/data/polars/` and run `just migration-docs`; don't restate
+it here.
 
-| pandas | Polars | Batcher |
-|---|---|---|
-| `pd.read_parquet(p)` | `pl.scan_parquet(p)` | `bt.read.parquet(p)` (lazy) |
-| `pd.read_csv(p, on_bad_lines="skip")` | `pl.read_csv(p, ignore_errors=True)` | `bt.read.csv(p, on_bad_lines="skip")` — same three values as pandas |
-| `pd.DataFrame(d)` | `pl.DataFrame(d)` | `bt.from_pydict(d)` |
-| `df[["a","b"]]` | `df.select("a","b")` | `ds.select("a", "b")` |
-| `df.assign(c=...)` | `df.with_columns(c=...)` | `ds.with_columns(c=...)` |
-| `df[df.a > 1]` | `df.filter(pl.col("a") > 1)` | `ds.filter(col("a") > 1)` |
-| `df.groupby("k").agg(...)` | `df.group_by("k").agg(...)` | `ds.group_by("k").agg(total=col("v").sum())` |
-| `df.groupby("k").apply(fn)` | `df.group_by("k").map_groups(fn)` | `ds.group_by("k").map_groups(fn)` — `fn` gets one whole group; add `batch_format="pandas"` for a frame |
-| `df.merge(o, on="k")` | `df.join(o, on="k")` | `ds.join(o, on="k", how="inner")` |
-| `df.sort_values("a", ascending=False)` | `df.sort("a", descending=True)` | `ds.sort("a", descending=True)` |
-| `df.drop_duplicates()` | `df.unique()` | `ds.distinct()` |
-| `df.head(n)` | `df.head(n)` | `ds.limit(n)` / `ds.head(n)` |
-| `df.explode("c")` | `df.explode("c")` | `ds.explode("c")` |
-| `df.melt(...)` | `df.unpivot(...)` | `ds.unpivot(index=..., on=...)` |
-| `df.pivot_table(...)` | `df.pivot(...)` | `ds.pivot(index=..., on=..., values=...)` |
-| `df.fillna(0)` | `df.fill_null(0)` | `ds.fill_null(0)` |
-| `np.where(c, a, b)` | `pl.when(c).then(a).otherwise(b)` | `bt.when(c).then(a).otherwise(b)` |
-| `s.str.contains(p)` | `pl.col("s").str.contains(p)` | `col("s").str.contains(p)` |
-| `s.dt.year` | `pl.col("t").dt.year()` | `col("t").dt.year()` |
-| `df.select_dtypes("number")` | `pl.col(pl.NUMERIC_DTYPES)` | `ds.select(bt.numeric())` |
-| `g.transform("sum")` | `pl.col("v").sum().over("k")` | `col("v").sum().over(partition_by=["k"])` |
-| (eager) | `df.collect()` | `ds.collect()` (pyarrow `Table`) |
+**pandas** has no registry. These are the common spellings:
 
-pandas-familiar aliases exist and are real (`ds.assign`, `ds.merge`, `ds.groupby`,
-`ds.sort_values`, `ds.astype`, `ds.fillna`, `ds.dropna`, `ds.nlargest`), but prefer the
-canonical spelling above — one obvious way per operation.
+| pandas | Batcher |
+|---|---|
+| `pd.read_parquet(p)` | `bt.read.parquet(p)` (lazy) |
+| `pd.read_csv(p, on_bad_lines="skip")` | `bt.read.csv(p, on_bad_lines="skip")` — same three values as pandas |
+| `pd.DataFrame(d)` | `bt.from_pydict(d)` |
+| `df[["a","b"]]` | `ds.select("a", "b")` |
+| `df.assign(c=...)` | `ds.with_columns(c=...)` |
+| `df[df.a > 1]` | `ds.filter(col("a") > 1)` |
+| `df.groupby("k").agg(...)` | `ds.group_by("k").agg(total=col("v").sum())` |
+| `df.groupby("k").apply(fn)` | `ds.group_by("k").map_groups(fn)` — `fn` gets one whole group |
+| `df.merge(o, on="k")` | `ds.join(o, on="k", how="inner")` |
+| `df.sort_values("a", ascending=False)` | `ds.sort("a", descending=True)` |
+| `df.drop_duplicates()` | `ds.distinct()` |
+| `df.head(n)` | `ds.limit(n)` |
+| `df.explode("c")` | `ds.explode("c")` |
+| `df.melt(...)` | `ds.unpivot(index=..., on=...)` |
+| `df.pivot_table(...)` | `ds.pivot(index=..., on=..., values=...)` |
+| `df.fillna(0)` | `ds.fill_null(0)` |
+| `np.where(c, a, b)` | `bt.when(c).then(a).otherwise(b)` |
+| `s.str.contains(p)` | `col("s").str.contains(p)` |
+| `s.dt.year` | `col("t").dt.year()` |
+| `df.select_dtypes("number")` | `ds.select(bt.numeric())` |
+| `g.transform("sum")` | `col("v").sum().over(partition_by=["k"])` |
+
+There are no pandas-spelled aliases: `ds.merge`, `ds.groupby`, `ds.sort_values`, `ds.astype`,
+`ds.fillna` and the rest raise an `AttributeError` that names the Batcher spelling.
 
 ## Conceptual shifts that bite
 
@@ -127,17 +135,24 @@ Worth saying out loud when a user asks "why port at all":
 1. **Inventory the terminal ops.** Find every place the original script reads a value
    (prints, `len()`, `.iloc`, an `if` on a cell). Each becomes an explicit Batcher
    terminal call — or, better, gets deleted because it was only there to inspect.
-2. **Replace the readers.** `pd.read_*` / `pl.read_*` / `pl.scan_*` → `bt.read.<fmt>`.
+2. **Run the codemod first.** `python -m batcher.migrate --from polars --to batcher <paths>`
+   prints a diff and changes nothing until you add `--write`. The `polars` direction may not be
+   implemented yet: the command then raises `ConfigError` naming the directions that are, and
+   the `polars/index.md` page says the same. Port by hand from the generated pages in that case.
+   Either way, run `python -m batcher.migrate --from batcher --to batcher <paths>` over any
+   code that already calls Batcher, so no removed Batcher spelling survives the port.
+   pandas has no codemod direction, so a pandas script is ported by hand.
+3. **Replace the readers.** `pd.read_*` / `pl.read_*` / `pl.scan_*` → `bt.read.<fmt>`.
    Drop any manual `scan_` vs `read_` decision.
-3. **Translate verbs top-down** using the table. Keep the chain in one expression; do
+4. **Translate verbs top-down** using the generated Polars pages or the pandas table. Keep the chain in one expression; do
    not insert `.collect()` between stages — that defeats the optimizer.
-4. **Move per-row Python into expressions.** `df.apply(...)` / a Python loop becomes an
+5. **Move per-row Python into expressions.** `df.apply(...)` / a Python loop becomes an
    `Expr`. Only if the expression language genuinely has no answer, fall back to
    `ds.map_batches(fn)` over Arrow batches (see `docs/user-guide/transform/columns/udfs.md`), declaring
    `input_columns` and `output_columns`.
-5. **Fix the tail.** `ds.write.parquet(path)` / `ds.to_pandas()` at the boundary where
+6. **Fix the tail.** `ds.write.parquet(path)` / `ds.to_pandas()` at the boundary where
    downstream code still expects a DataFrame.
-6. **Verify** (below), then `ds.explain()` and `ds.stats()` to confirm the plan is what
+7. **Verify** (below), then `ds.explain()` and `ds.stats()` to confirm the plan is what
    you expect and nothing degenerated into a per-batch Python stage.
 
 ### Verifying equivalence
@@ -169,6 +184,15 @@ assert sorted(map(tuple, old.rows())) == sorted(tuple(r.values()) for r in new.t
 
 For a sorted query, compare `new.to_pylist()` against the oracle **in order**.
 
+## Going back
+
+`docs/getting-started/migration/polars/leaving-batcher.md` maps Batcher spellings to Polars for
+the rows where both engines compute the same thing; anything else is on the forward pages with
+its difference. `python -m batcher.migrate --from batcher --to polars <paths>` is the reverse
+codemod, subject to the same implemented-directions check. Data goes back without a file:
+`ds.to_polars()` and `ds.to_pandas()` return a frame, so a pipeline can also move one stage at a
+time and hand the rest back.
+
 ## Gotchas / do-not
 
 - **Do not touch a tuple in Python.** No `for row in ...`, no `.apply`, no
@@ -188,7 +212,8 @@ For a sorted query, compare `new.to_pylist()` against the oracle **in order**.
 
 ## See also
 
-- `docs/getting-started/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
+- `docs/getting-started/migration/polars/index.md` — every Polars name, with its Batcher spelling, status, and what differs.
+- `docs/getting-started/migration/transforming.md` — the pandas tables and the familiar names Batcher keeps.
 - `docs/user-guide/transform/columns/expressions.md`, `docs/user-guide/transform/columns/expression-accessors.md`,
   `docs/api/relational/expressions.md` — the expression surface
   and every accessor namespace.

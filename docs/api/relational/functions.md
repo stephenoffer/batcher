@@ -33,6 +33,11 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    nanvl
    next_after
    width_bucket
+   pi
+   e
+   pmod
+   bit_get
+   elt
    concat
    concat_str
    concat_ws
@@ -59,6 +64,19 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    date_range
    sequence
    hash_rows
+```
+
+## SQL expressions and functions by name
+
+A SQL expression string, or a call to any SQL function by its name, becomes an `Expr` through the same function table `bt.sql` reads. `sql_expr("a + 1 AS b")` covers Spark's `expr` and `selectExpr`, and `call_function("pmod", "a", 3)` reaches a function that has no Python constructor.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   sql_expr
+   call_function
 ```
 
 ## Text extraction and LLM output parsing
@@ -228,8 +246,8 @@ value functions are window-only: bind them with `.over(partition_by=…, order_b
    nunique_ratio
    first
    last
-   arg_min
-   arg_max
+   min_by
+   max_by
    row_number
    rank
    dense_rank

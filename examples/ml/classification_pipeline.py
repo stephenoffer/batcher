@@ -19,7 +19,7 @@ from batcher import col, ml
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_totalprice", "o_orderstatus", "o_orderpriority").head(20_000)
+    orders = tpch("orders").select("o_totalprice", "o_orderstatus", "o_orderpriority").limit(20_000)
 
     train, test = orders.ml.train_test_split(test_size=0.25, seed=3)
 

@@ -93,7 +93,7 @@ def test_arg_min_max_grouped_matches_duckdb(duck):
     out = (
         bt.from_arrow(t)
         .group_by("g")
-        .agg(hi=col("val").arg_max(by=col("key")), lo=col("val").arg_min(by=col("key")))
+        .agg(hi=col("val").max_by(by=col("key")), lo=col("val").min_by(by=col("key")))
         .collect()
     )
     assert_same(

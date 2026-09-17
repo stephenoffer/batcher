@@ -88,7 +88,10 @@ _CASES = [
     ("i_le_under", lambda: bt.col("i") <= 0, "i <= 0", True),
     ("i_eq_absent", lambda: bt.col("i") == 999, "i = 999", True),
     ("i_rev_gt", lambda: bt.lit(100) < bt.col("i"), "100 < i", True),
-    ("f_gt_max", lambda: bt.col("f") > 9.0, "f > 9.0", True),
+    # A float column's footer max leaves NaN out, and the engine ranks NaN above 9.0, so the
+    # footer cannot prove this empty; `test_a_float_max_does_not_prove_a_nan_away` is the case
+    # where answering it would be wrong. It still falls back to an executed count.
+    ("f_gt_max", lambda: bt.col("f") > 9.0, "f > 9.0", False),
     ("k_ne_const", lambda: bt.col("k") != 7, "k <> 7", True),
     # Tautology — every row survives.
     (
@@ -126,6 +129,29 @@ def test_filter_count_matches_duckdb(pq_path, duck, name, pred, where, fires):
     assert mem.count() == expected
     mem_answer = _count(mem)
     assert mem_answer in (None, expected)
+
+
+def test_a_float_max_does_not_prove_a_nan_away(tmp_path, duck):
+    """The footer records `max = 4.0` for this column and the NaN row satisfies `f > 9.0`."""
+    table = pa.table({"f": pa.array([1.5, float("nan"), 4.0], type=pa.float64())})
+    path = str(tmp_path / "nan.parquet")
+    pq.write_table(table, path)
+    assert pq.ParquetFile(path).metadata.row_group(0).column(0).statistics.max == 4.0
+    # DuckDB's own Parquet reader with `can_have_nan=true`: its default trusts the float max, and
+    # a registered Arrow table pushes the filter into pyarrow's IEEE comparison. Both say 0.
+    expected = duck.execute(
+        f"select count(*) from read_parquet('{path}', can_have_nan=true) where f > 9.0"
+    ).fetchone()[0]
+    assert expected == 1
+
+    ds = bt.read.parquet(path).filter(bt.col("f") > 9.0)
+    assert _count(ds) in (None, expected)
+    assert answer_filter_is_empty(ds._plan, ds._sources, _stats(ds), core.default_hub()) in (
+        None,
+        False,
+    )
+    assert ds.count() == expected
+    assert ds.is_empty() is False
 
 
 def test_is_empty_and_any_match_duckdb(pq_path, duck):

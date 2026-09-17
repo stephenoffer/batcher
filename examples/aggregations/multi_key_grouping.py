@@ -43,7 +43,7 @@ def main() -> None:
         .to_pydict()
     )
     years = len(by_year["year"])
-    statuses = orders.n_unique("o_orderstatus")
+    statuses = orders.count_distinct("o_orderstatus")
     print(f"{len(by_year_and_status['orders'])} pairs, at most {years * statuses}")
     assert len(by_year_and_status["orders"]) <= years * statuses
     assert sum(by_year_and_status["orders"]) == orders.count()

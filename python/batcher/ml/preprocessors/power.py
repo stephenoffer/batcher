@@ -168,11 +168,11 @@ def yeo_johnson(value: Expr, lam: float) -> Expr:
     if lam == 0.0:
         upper = (value + lit(1.0)).ln()
     else:
-        upper = ((value + lit(1.0)).pow(lit(lam)) - lit(1.0)) / lit(lam)
+        upper = (((value + lit(1.0)) ** lit(lam)) - lit(1.0)) / lit(lam)
     if lam == 2.0:
         lower = -(lit(1.0) - value).ln()
     else:
-        lower = -((lit(1.0) - value).pow(lit(2.0 - lam)) - lit(1.0)) / lit(2.0 - lam)
+        lower = -(((lit(1.0) - value) ** lit(2.0 - lam)) - lit(1.0)) / lit(2.0 - lam)
     return when(positive).then(upper).otherwise(lower)
 
 
@@ -288,7 +288,7 @@ def box_cox(value: Expr, lam: float) -> Expr:
     """
     if lam == 0.0:
         return value.ln()
-    return (value.pow(lit(lam)) - lit(1.0)) / lit(lam)
+    return ((value ** lit(lam)) - lit(1.0)) / lit(lam)
 
 
 class BoxCoxTransformer(_GridPowerTransformer):

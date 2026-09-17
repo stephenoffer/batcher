@@ -211,7 +211,7 @@ def test_the_device_a_stage_is_sized_for_is_the_one_it_is_pinned_to() -> None:
         accelerator_type="NVIDIA_H100",
     )
     ds = bt.from_pydict({"x": [1, 2, 3]})
-    node = ds.ml.map_batches(lambda b: b, model_memory_gb=6.0, accelerator_type="NVIDIA_L40S")._plan
+    node = ds.map_batches(lambda b: b, model_memory_gb=6.0, accelerator_type="NVIDIA_L40S")._plan
     ctx = OptimizerContext(
         config=active_config(),
         sources=ds._sources,

@@ -70,7 +70,7 @@ def llm_udf(
             >>> from batcher.ml import llm_udf, vllm_engine  # doctest: +SKIP
             >>> engine = vllm_engine("meta-llama/Llama-3-8B")  # doctest: +SKIP
             >>> udf = llm_udf(engine, prompt_column="question")  # doctest: +SKIP
-            >>> ds.ml.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
+            >>> ds.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
 
     Args:
         engine_factory: zero-arg callable returning an `Engine`; called once per worker.

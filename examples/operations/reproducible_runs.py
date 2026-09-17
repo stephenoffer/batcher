@@ -43,13 +43,13 @@ def main() -> None:
     print("a seeded sample is reproducible; a different seed is not the same rows")
 
     # A shuffle needs a seed too.
-    shuffled = lineitem.select("l_orderkey").shuffle(seed=7).head(20).to_pydict()
-    reshuffled = lineitem.select("l_orderkey").shuffle(seed=7).head(20).to_pydict()
+    shuffled = lineitem.select("l_orderkey").shuffle(seed=7).limit(20).to_pydict()
+    reshuffled = lineitem.select("l_orderkey").shuffle(seed=7).limit(20).to_pydict()
     assert shuffled == reshuffled
 
     # An unsorted head is not a defined result, so it needs an ordering to be compared.
-    ordered = lineitem.sort("l_orderkey", "l_quantity", "l_shipmode").head(20).to_pydict()
-    ordered_again = lineitem.sort("l_orderkey", "l_quantity", "l_shipmode").head(20).to_pydict()
+    ordered = lineitem.sort("l_orderkey", "l_quantity", "l_shipmode").limit(20).to_pydict()
+    ordered_again = lineitem.sort("l_orderkey", "l_quantity", "l_shipmode").limit(20).to_pydict()
     assert ordered == ordered_again
     print("a totally ordered head is reproducible")
 

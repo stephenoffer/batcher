@@ -139,7 +139,7 @@ def test_kurtosis_pop_is_the_population_form(ds):
     """
     values = [1.0, 2.0, 3.0, 4.0, 10.0]
     frame = bt.from_pydict({"v": values})
-    population = frame.agg(k=bt.col("v").kurtosis_pop()).to_pydict()["k"][0]
+    population = frame.agg(k=bt.col("v").kurtosis(bias=True)).to_pydict()["k"][0]
     sample = frame.agg(k=bt.col("v").kurtosis()).to_pydict()["k"][0]
     assert population is not None
     mean = sum(values) / len(values)
@@ -169,7 +169,7 @@ def test_quantile_disc_returns_a_value_that_is_in_the_column():
 def test_top_k_returns_the_most_frequent_values(ds):
     """``top_k`` is a frequency aggregate, not an ordering one -- the easy misreading."""
     values = ["a", "b", "a", "c", "a", "b"]
-    got = bt.from_pydict({"v": values}).agg(t=bt.col("v").top_k(2)).to_pydict()["t"][0]
+    got = bt.from_pydict({"v": values}).agg(t=bt.col("v").mode_top_k(2)).to_pydict()["t"][0]
     assert got[0] == "a", f"'a' occurs three times and must lead, got {got}"
     assert set(got) == {"a", "b"}, f"the two most frequent are a and b, got {got}"
     assert len(got) == 2
@@ -181,7 +181,7 @@ GROUP_SHORTHANDS = [
     ("mode", lambda: bt.col("n").mode()),
     ("product", lambda: bt.col("n").product()),
     ("kurtosis", lambda: bt.col("n").kurtosis()),
-    ("skewness", lambda: bt.col("n").skewness()),
+    ("skew", lambda: bt.col("n").skew()),
 ]
 
 
@@ -275,7 +275,7 @@ def test_ml_to_torch_and_dataloader_carry_the_rows(ds):
     frame = bt.from_pydict({"a": [1.0, 2.0, 3.0, 4.0]})
 
     seen: list[float] = []
-    for batch in frame.ml.to_torch(batch_size=2, columns=["a"]):
+    for batch in frame.ml.iter_torch_batches(batch_size=2, columns=["a"]):
         seen.extend(float(v) for v in batch["a"].reshape(-1))
     assert seen == [1.0, 2.0, 3.0, 4.0]
 

@@ -5,7 +5,7 @@ registered with `Session.register_function` lowers to a `MapBatches` stage inste
 of an `Expr`. Two forms:
 
 * table function — ``SELECT * FROM f(t)`` — resolved in `from_clause._table` via
-  `_apply_table_function`: the whole relation flows through `ds.ml.map_batches`.
+  `_apply_table_function`: the whole relation flows through `ds.map_batches`.
 * scalar function — ``SELECT f(x)`` / ``WHERE f(x)`` — resolved by `_hoist_udfs`,
   a pre-pass that materializes each call into a synthetic column (a `map_batches`
   that appends one column) and rewrites the call to reference that column, so the
@@ -166,7 +166,7 @@ def _hoist_one(tr, ds, call):
     # The parser already resolved exactly which columns the UDF reads (`arg_cols`), so hand
     # them to the plan instead of throwing them away — otherwise `SELECT a FROM t WHERE
     # my_udf(b) > 0` scans every column of `t` because the UDF looks opaque.
-    ds = ds.ml.map_batches(
+    ds = ds.map_batches(
         adapter,
         input_columns=[name for _, name in arg_cols],
         output_columns=[*ds.columns, out_col],
@@ -192,6 +192,6 @@ def _apply_table_function(tr, anon, rf):
     if rf.per_row:
         # The per-row form used to drop `rf.config` on the floor, so a `batch_size` or
         # `num_workers` given at registration was accepted and never applied. Registration
-        # now validates the keys against `ml.map`, so forwarding them is safe.
-        return src.ml.map(rf.fn, output_columns=out_cols, **rf.config)
-    return src.ml.map_batches(rf.fn, output_columns=out_cols, **rf.config)
+        # now validates the keys against `Dataset.map`, so forwarding them is safe.
+        return src.map(rf.fn, output_columns=out_cols, **rf.config)
+    return src.map_batches(rf.fn, output_columns=out_cols, **rf.config)

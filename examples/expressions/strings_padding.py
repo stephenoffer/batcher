@@ -27,14 +27,14 @@ def main() -> None:
         # The general forms: pad on either side with any fill character.
         left_pad=col("raw_id").str.lpad(5, "0"),
         right_pad=col("raw_id").str.rpad(5, "."),
-        pad_start=col("raw_id").str.pad_start(4, "*"),
-        pad_end=col("raw_id").str.pad_end(4, "*"),
+        pad_start=col("raw_id").str.lpad(4, "*"),
+        pad_end=col("raw_id").str.rpad(4, "*"),
         # Trim from both ends, or just one. Pass the character set explicitly when the
         # input may hold tabs or newlines: the no-argument form follows SQL `TRIM` and
         # removes spaces only, so `strip_chars(" \t\n")` is the portable spelling.
-        trimmed=col("messy").str.strip_chars(" "),
+        trimmed=col("messy").str.trim(" "),
         # Trim specific characters instead of whitespace.
-        undashed=col("messy").str.strip_chars("-"),
+        undashed=col("messy").str.trim("-"),
         lead_only=col("messy").str.strip_chars_start(" "),
         trail_only=col("messy").str.strip_chars_end(" "),
     )

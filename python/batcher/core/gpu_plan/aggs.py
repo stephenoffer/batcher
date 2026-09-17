@@ -90,7 +90,16 @@ def supported_aggregate(ir: dict) -> bool:
     Returns:
         True when every group key and every reduction in the node is translatable.
     """
-    return all(a.get("func") in _SUPPORTED for a in ir["aggregates"])
+    # A non-linear `interpolation` is declined: the backends' `quantile` is only verified
+    # against the engine's linear form, and no GPU run has recorded the others. `order_by`
+    # (an ordered `array_agg`) is declined for the same reason and one more: the element
+    # order is the engine's key-then-value rule, which no dataframe `groupby` reproduces, and
+    # a list aggregate is not translated at all yet. Checked here rather than left to
+    # `_SUPPORTED`, so translating `list_agg` later cannot silently drop the order.
+    return all(
+        a.get("func") in _SUPPORTED and a.get("interpolation") is None and not a.get("order_by")
+        for a in ir["aggregates"]
+    )
 
 
 def _key_columns(df, ir: dict, be: DfBackend) -> tuple[list[str], list[str], dict[str, str]]:

@@ -1,11 +1,13 @@
-"""Row-callback adapters and the ``@udf`` decorator for the callback transforms.
+"""Callback adapters and the ``@udf`` decorator for the callback transforms.
 
 `map`/`flat_map` let a user write a per-row Python function; these adapters run that
 function **inside the worker** over each Arrow batch's rows (the data plane), so the
 control-plane driver still only ever ships whole batches — the hot-path invariant
-holds. They are module-level classes (not closures) so Ray can pickle them across
-the cluster. `udf` bundles a function with its `map_batches` config so it reads as a
-reusable, configured transform (Ray Data / Daft ``@udf``).
+holds. A callable `filter` is batch-level: its adapter hands the predicate a whole batch
+and applies the boolean mask it returns as Arrow. The per-row adapters are module-level
+classes (not closures) so Ray can pickle them across the cluster. `udf` bundles a function
+with its `map_batches` config so it reads as a reusable, configured transform (Ray Data /
+Daft ``@udf``).
 """
 
 from __future__ import annotations
@@ -75,6 +77,51 @@ def _to_table(
     return pa.Table.from_batches([template.slice(0, 0)])
 
 
+def _row_dicts(batch: pa.RecordBatch, fmt: str, writable: bool) -> list[dict[str, Any]]:
+    """A batch's rows as ``{column: value}`` dicts, in the row format a callback asked for.
+
+    ``"pyarrow"`` rows hold Python values (``to_pylist``). ``"numpy"`` rows hold NumPy values
+    the way Ray Data's rows do, so a tensor column arrives as an ``ndarray`` per row rather than
+    a nested list; `writable` copies a read-only column first, so a callback may mutate what it
+    is handed.
+    """
+    if fmt == "pyarrow":
+        return batch.to_pylist()
+    from batcher.interop.formats import to_format
+
+    arrays = to_format(batch, "numpy")
+    if writable:
+        arrays = writable_batch(arrays, "numpy")
+    return [{name: col[i] for name, col in arrays.items()} for i in range(batch.num_rows)]
+
+
+#: The batch formats a callback can mutate in place once copied. Arrow, Polars and JAX data is
+#: immutable in every engine, so a writable request has nothing to copy there.
+WRITABLE_FORMATS = ("numpy", "pandas", "torch")
+
+
+def _writable_array(arr: Any) -> Any:
+    """`arr`, or a copy of it when NumPy marks it read-only."""
+    flags = getattr(arr, "flags", None)
+    return arr if flags is None or flags.writeable else arr.copy()
+
+
+def writable_batch(batch: Any, fmt: str) -> Any:
+    """`batch` with every read-only buffer copied, for ``zero_copy_batch=False``.
+
+    The zero-copy conversions hand a callback views over Arrow memory, which NumPy marks
+    read-only; a callback that writes into one raises. Ray Data copies by default so the write
+    succeeds, and this is that copy, paid only when it was asked for.
+    """
+    if fmt == "numpy":
+        return {name: _writable_array(arr) for name, arr in batch.items()}
+    if fmt == "pandas":
+        return batch.copy(deep=True)
+    if fmt == "torch":
+        return {name: tensor.clone() for name, tensor in batch.items()}
+    return batch
+
+
 def _fn_label(fn: Callable) -> str:
     """A readable name for a row callback, for an error message."""
     return getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None) or repr(fn)
@@ -85,7 +132,7 @@ def _check_row_result(value: Any, fn: Callable) -> None:
 
     Anything else reached `Table.from_pylist` and came back as
     ``AttributeError: 'int' object has no attribute 'keys'`` — raised inside pyarrow, naming
-    neither `ds.ml.map` nor the callback nor the shape that was wanted. Checked on the first
+    neither `ds.map` nor the callback nor the shape that was wanted. Checked on the first
     row of each batch only: it is `O(1)` per batch, and a callback that changes its return
     shape partway through a batch is not the mistake this is for.
     """
@@ -94,37 +141,10 @@ def _check_row_result(value: Any, fn: Callable) -> None:
     from batcher._internal.errors import PlanError
 
     raise PlanError(
-        f"the ds.ml.map callback {_fn_label(fn)!r} returned {type(value).__name__}, but a "
+        f"the ds.map callback {_fn_label(fn)!r} returned {type(value).__name__}, but a "
         f"per-row callback must return one {{column: value}} dict per row. Return "
-        f"`{{**row, 'new': ...}}` to add a column, or use `ds.ml.flat_map` if one row "
+        f"`{{**row, 'new': ...}}` to add a column, or use `ds.flat_map` if one row "
         f"produces several."
-    )
-
-
-#: Results a row predicate can return that are truthy for a reason the user did not mean.
-#: A container or a string is *always* truthy when non-empty, so `ds.ml.filter` would keep
-#: every row and report nothing — the worst failure a filter has, because the query still
-#: succeeds. A number and `None` are left alone: ``lambda r: r["n"]`` is a legitimate, if
-#: terse, predicate, and a missing `return` yielding `None` correctly drops every row.
-_NOT_A_PREDICATE = (dict, list, tuple, set, str, bytes)
-
-
-def _check_predicate_result(value: Any, fn: Callable) -> None:
-    """Reject a `ds.ml.filter` predicate that returned a container rather than a truth value.
-
-    Checked on the first row of each batch, like the `map`/`flat_map` shape checks: it is
-    `O(1)` per batch, and a predicate that changes its return shape partway through a batch
-    is not the mistake this is for.
-    """
-    if not isinstance(value, _NOT_A_PREDICATE):
-        return
-    from batcher._internal.errors import PlanError
-
-    raise PlanError(
-        f"the ds.ml.filter predicate {_fn_label(fn)!r} returned {type(value).__name__}, but "
-        f"it must return True or False for each row. A non-empty {type(value).__name__} is "
-        f"always truthy, so every row would be kept. Return a comparison such as "
-        f"`row['x'] > 0`, or use `ds.ml.map` if you meant to transform the row."
     )
 
 
@@ -141,19 +161,19 @@ def _check_flat_row_result(value: Any, fn: Callable) -> None:
 
     if isinstance(value, dict):
         raise PlanError(
-            f"the ds.ml.flat_map callback {_fn_label(fn)!r} returned a single dict. A "
+            f"the ds.flat_map callback {_fn_label(fn)!r} returned a single dict. A "
             f"flat_map callback returns an *iterable* of row dicts — wrap it in a list "
-            f"(`[{{...}}]`), or use `ds.ml.map` for one row in, one row out."
+            f"(`[{{...}}]`), or use `ds.map` for one row in, one row out."
         )
     if value is None or isinstance(value, str | bytes):
         raise PlanError(
-            f"the ds.ml.flat_map callback {_fn_label(fn)!r} returned "
+            f"the ds.flat_map callback {_fn_label(fn)!r} returned "
             f"{type(value).__name__}, but it must return an iterable of {{column: value}} "
             f"row dicts (an empty list to drop the row)."
         )
     if isinstance(value, list | tuple) and value and not isinstance(value[0], dict):
         raise PlanError(
-            f"the ds.ml.flat_map callback {_fn_label(fn)!r} returned a "
+            f"the ds.flat_map callback {_fn_label(fn)!r} returned a "
             f"{type(value).__name__} of {type(value[0]).__name__}, but each element must be "
             f"a {{column: value}} row dict."
         )
@@ -175,7 +195,7 @@ def _carry_identity(adapter: object, fn: Callable) -> None:
 
     The defining line rides along under a private attribute because a *locally* defined
     callback has no unique qualname: every lambda in one enclosing function is
-    ``mod.outer.<locals>.<lambda>``, so ``ds.ml.map(lambda r: ...)`` twice in one function
+    ``mod.outer.<locals>.<lambda>``, so ``ds.map(lambda r: ...)`` twice in one function
     would share one cost measurement and one error allowance. `strategy._fn_probe_key` reads
     the line off `__code__` when it can; an adapter has no code object, so it is handed one.
     """
@@ -201,13 +221,17 @@ class _RowMap:
         self,
         fn: Callable[[dict[str, Any]], dict[str, Any]],
         out_columns: tuple[str, ...] | None = None,
+        fmt: str = "pyarrow",
+        writable: bool = False,
     ) -> None:
         self.fn = fn
         self.out_columns = out_columns
+        self.fmt = fmt
+        self.writable = writable
         _carry_identity(self, fn)
 
     def __call__(self, batch: pa.RecordBatch) -> pa.Table:
-        rows = [self.fn(row) for row in batch.to_pylist()]
+        rows = [self.fn(row) for row in _row_dicts(batch, self.fmt, self.writable)]
         if rows:
             _check_row_result(rows[0], self.fn)
         return _to_table(rows, batch, self.out_columns)
@@ -226,14 +250,18 @@ class _RowFlatMap:
         self,
         fn: Callable[[dict[str, Any]], Iterable[dict[str, Any]]],
         out_columns: tuple[str, ...] | None = None,
+        fmt: str = "pyarrow",
+        writable: bool = False,
     ) -> None:
         self.fn = fn
         self.out_columns = out_columns
+        self.fmt = fmt
+        self.writable = writable
         _carry_identity(self, fn)
 
     def __call__(self, batch: pa.RecordBatch) -> pa.Table:
         out: list[dict[str, Any]] = []
-        for index, row in enumerate(batch.to_pylist()):
+        for index, row in enumerate(_row_dicts(batch, self.fmt, self.writable)):
             produced = self.fn(row)
             if index == 0:
                 _check_flat_row_result(produced, self.fn)
@@ -260,14 +288,18 @@ class _AsyncRowMap:
         fn: Callable[[dict[str, Any]], Any],
         out_columns: tuple[str, ...] | None = None,
         limit: int = _DEFAULT_ROW_CONCURRENCY,
+        fmt: str = "pyarrow",
+        writable: bool = False,
     ) -> None:
         self.fn = fn
         self.out_columns = out_columns
         self.limit = limit
+        self.fmt = fmt
+        self.writable = writable
         _carry_identity(self, fn)
 
     def __call__(self, batch: pa.RecordBatch) -> pa.Table:
-        rows = _gather_rows(self.fn, batch.to_pylist(), self.limit)
+        rows = _gather_rows(self.fn, _row_dicts(batch, self.fmt, self.writable), self.limit)
         if rows:
             _check_row_result(rows[0], self.fn)
         return _to_table(rows, batch, self.out_columns)
@@ -287,14 +319,18 @@ class _AsyncRowFlatMap:
         fn: Callable[[dict[str, Any]], Iterable[dict[str, Any]]],
         out_columns: tuple[str, ...] | None = None,
         limit: int = _DEFAULT_ROW_CONCURRENCY,
+        fmt: str = "pyarrow",
+        writable: bool = False,
     ) -> None:
         self.fn = fn
         self.out_columns = out_columns
         self.limit = limit
+        self.fmt = fmt
+        self.writable = writable
         _carry_identity(self, fn)
 
     def __call__(self, batch: pa.RecordBatch) -> pa.Table:
-        per_row = _gather_rows(self.fn, batch.to_pylist(), self.limit)
+        per_row = _gather_rows(self.fn, _row_dicts(batch, self.fmt, self.writable), self.limit)
         if per_row:
             _check_flat_row_result(per_row[0], self.fn)
         out: list[dict[str, Any]] = []
@@ -303,95 +339,195 @@ class _AsyncRowFlatMap:
         return _to_table(out, batch, self.out_columns)
 
 
-class _RowFilter:
-    """Keep the rows for which a per-row ``fn(row_dict)`` is truthy.
+def _as_mask(result: Any, num_rows: int, fn: Callable) -> pa.Array:
+    """A filter callback's answer as one Arrow boolean array, or a `PlanError` naming `fn`.
 
-    The predicate's answers become one Arrow boolean mask and the batch is filtered with it,
-    so **every column keeps its exact type** and no value makes the round trip back through
-    Python. That is the whole reason this is its own adapter rather than a `flat_map` that
-    returns ``[row]`` or ``[]``: rebuilding a table from row dicts re-infers the schema from
-    the values, which turns a `float32` into a double, an all-null batch into a null column,
-    and a large-string column into a string one. Filtering a mask cannot do any of that.
-
-    `read` narrows the dict the predicate is handed to the columns it declared, which is
-    worth far more than it looks: boxing one column of a ten-column batch into Python
-    measured **14x** faster than boxing all ten, and boxing is the whole cost of the row
-    path. It is safe here in a way it would not be for `map`, because the *output* is the
-    original batch masked — no column can go missing from the result by narrowing what the
-    predicate saw.
-    """
-
-    #: Marks this as the per-row adapter, so a profile can tell a row stage from a
-    #: `map_batches` one — see `_RowMap`.
-    batcher_row_adapter = True
-
-    def __init__(
-        self,
-        fn: Callable[[dict[str, Any]], Any],
-        read: tuple[str, ...] | None = None,
-    ) -> None:
-        self.fn = fn
-        self.read = read
-        _carry_identity(self, fn)
-
-    def _rows(self, batch: pa.RecordBatch) -> list[dict[str, Any]]:
-        """The row dicts to evaluate, narrowed to the declared columns when there are any."""
-        if not self.read:
-            return batch.to_pylist()
-        names = [name for name in self.read if name in batch.schema.names]
-        return batch.select(names).to_pylist()
-
-    def _mask(self, batch: pa.RecordBatch, keep: list) -> pa.RecordBatch:
-        if keep:
-            _check_predicate_result(keep[0], self.fn)
-        return batch.filter(pa.array([bool(k) for k in keep], type=pa.bool_()))
-
-    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
-        rows = self._rows(batch)
-        try:
-            keep = [self.fn(row) for row in rows]
-        except KeyError as exc:
-            _raise_undeclared_column(exc, self.fn, self.read)
-        return self._mask(batch, keep)
-
-
-class _AsyncRowFilter(_RowFilter):
-    """`_RowFilter` for an ``async def`` predicate, awaiting a batch's rows concurrently."""
-
-    def __init__(
-        self,
-        fn: Callable[[dict[str, Any]], Any],
-        read: tuple[str, ...] | None = None,
-        limit: int = _DEFAULT_ROW_CONCURRENCY,
-    ) -> None:
-        super().__init__(fn, read)
-        self.limit = limit
-
-    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
-        try:
-            keep = _gather_rows(self.fn, self._rows(batch), self.limit)
-        except KeyError as exc:
-            _raise_undeclared_column(exc, self.fn, self.read)
-        return self._mask(batch, keep)
-
-
-def _raise_undeclared_column(exc: KeyError, fn: Callable, read: tuple[str, ...] | None) -> None:
-    """Explain a `KeyError` from a predicate that read a column it did not declare.
-
-    Without this the failure is a bare ``KeyError: 'y'`` from inside the user's own lambda,
-    which points at the lambda rather than at the declaration that removed the column — and
-    the declaration is several lines away and looks like a performance hint.
+    The answer may be anything that converts to a boolean column: an Arrow array, a NumPy or
+    torch boolean array, a pandas or Polars Series, or a list. A null keeps nothing, as a null
+    predicate does in SQL. A non-boolean answer is refused rather than coerced, because a
+    truthy integer or string column would keep rows for a reason nobody wrote.
     """
     from batcher._internal.errors import PlanError
 
-    if not read:
-        raise exc
-    raise PlanError(
-        f"the ds.ml.filter predicate {_fn_label(fn)!r} read column {exc.args[0]!r}, which is "
-        f"not in its declared input_columns={list(read)}. A declared predicate is handed only "
-        f"the columns it declared, so add the column to input_columns (or drop the "
-        f"declaration to receive every column)."
-    ) from exc
+    if hasattr(result, "detach"):  # a torch tensor, possibly on a device
+        result = result.detach().cpu().numpy()
+    if not isinstance(result, pa.Array | pa.ChunkedArray):
+        try:
+            result = pa.array(result, from_pandas=True)
+        except (TypeError, ValueError, pa.ArrowException) as exc:
+            raise PlanError(
+                f"the ds.filter callback {_fn_label(fn)!r} returned {type(result).__name__}, "
+                "which is not a boolean column. Return one True/False per row of the batch."
+            ) from exc
+    if isinstance(result, pa.ChunkedArray):
+        result = result.combine_chunks()
+    if pa.types.is_null(result.type):  # an empty list, or all None: no value to keep a row
+        result = result.cast(pa.bool_())
+    if not pa.types.is_boolean(result.type):
+        raise PlanError(
+            f"the ds.filter callback {_fn_label(fn)!r} returned a {result.type} column, but it "
+            "must return a boolean mask with one value per row. Return a comparison such as "
+            "`pc.greater(batch['x'], 0)` or `batch['x'] > 0`."
+        )
+    if len(result) != num_rows:
+        raise PlanError(
+            f"the ds.filter callback {_fn_label(fn)!r} returned {len(result)} values for a "
+            f"batch of {num_rows} rows; the mask needs exactly one value per row."
+        )
+    return result
+
+
+class _BatchFilter:
+    """Keep the rows of each batch for which ``fn(batch)`` returns True.
+
+    `fn` sees the whole batch in `fmt` and returns one boolean per row, so no Python runs per
+    row. The batch is then filtered with that mask as Arrow, so **every column keeps its exact
+    type** and no value round-trips through the callback's format: a mask cannot widen a
+    `float32` or re-infer a column from its values.
+
+    `read` narrows what `fn` is handed to the columns it declared. That is safe here in a way
+    it would not be for a transform, because the output is the original batch masked, so no
+    column can go missing from the result by narrowing what the predicate saw.
+    """
+
+    def __init__(
+        self, fn: Callable, fmt: str = "pyarrow", read: tuple[str, ...] | None = None
+    ) -> None:
+        self.fn = fn
+        self.fmt = fmt
+        self.read = read
+        _carry_identity(self, fn)
+
+    def _view(self, batch: pa.RecordBatch) -> Any:
+        """What `fn` is handed: the declared columns, in the requested format."""
+        if self.read:
+            batch = batch.select([name for name in self.read if name in batch.schema.names])
+        if self.fmt == "pyarrow":
+            return batch
+        from batcher.interop.formats import to_format
+
+        return to_format(batch, self.fmt)
+
+    def _undeclared(self, exc: KeyError) -> Exception:
+        """Explain a `KeyError` from a predicate that read a column it did not declare.
+
+        Without this the failure is a bare ``KeyError: 'y'`` from inside the user's own
+        lambda, which points at the lambda rather than at the declaration that removed the
+        column, several lines away and easily mistaken for a performance hint.
+        """
+        from batcher._internal.errors import PlanError
+
+        if not self.read:
+            return exc
+        return PlanError(
+            f"the ds.filter callback {_fn_label(self.fn)!r} read column {exc.args[0]!r}, which "
+            f"is not in its declared input_columns={list(self.read)}. A declared predicate is "
+            "handed only the columns it declared, so add the column to input_columns."
+        )
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        try:
+            answer = self.fn(self._view(batch))
+        except KeyError as exc:
+            raise self._undeclared(exc) from exc
+        return batch.filter(_as_mask(answer, batch.num_rows, self.fn))
+
+
+class _AsyncBatchFilter(_BatchFilter):
+    """`_BatchFilter` for an ``async def`` predicate, awaited on the async batch path."""
+
+    async def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:  # type: ignore[override]
+        try:
+            answer = await self.fn(self._view(batch))
+        except KeyError as exc:
+            raise self._undeclared(exc) from exc
+        return batch.filter(_as_mask(answer, batch.num_rows, self.fn))
+
+
+def filter_adapter(bound: Callable | type, fmt: str, read: tuple[str, ...] | None) -> Any:
+    """The `MapBatches` callable for a batch predicate: an instance, or a class for a class `fn`.
+
+    A class `fn` stays a class, so the engine still builds it once per worker; its instance is
+    wrapped in the mask adapter at construction.
+    """
+    from batcher.core.udf.async_udf import is_async_udf
+
+    adapter = _AsyncBatchFilter if is_async_udf(bound) else _BatchFilter
+    if not isinstance(bound, type):
+        return adapter(bound, fmt, read)
+
+    class _FilterModel:
+        def __init__(self) -> None:
+            self._filter = adapter(bound(), fmt, read)
+
+        def close(self) -> None:
+            close = getattr(self._filter.fn, "close", None)
+            if callable(close):
+                close()
+
+    if adapter is _AsyncBatchFilter:
+
+        class _Model(_FilterModel):
+            async def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+                return await self._filter(batch)
+
+    else:
+
+        class _Model(_FilterModel):  # type: ignore[no-redef]
+            def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+                return self._filter(batch)
+
+    _Model.__name__ = _Model.__qualname__ = f"Filter{bound.__name__}"
+    return _Model
+
+
+def row_adapter(
+    bound: Callable | type,
+    cols: tuple[str, ...] | None,
+    limit: int,
+    *,
+    flat: bool,
+    fmt: str,
+    writable: bool,
+) -> Any:
+    """The `MapBatches` callable for a per-row `map`/`flat_map`, async-aware and class-aware.
+
+    An ``async def`` row `fn` gets the adapter that awaits a batch's rows concurrently, up to
+    `limit`. A class `fn` stays a class, built once per worker with its instance wrapped.
+    """
+    from batcher.core.udf.async_udf import is_async_udf
+
+    if is_async_udf(bound):
+        adapter: Any = _AsyncRowFlatMap if flat else _AsyncRowMap
+
+        def build(fn: Callable) -> Any:
+            return adapter(fn, cols, limit, fmt, writable)
+
+    else:
+        adapter = _RowFlatMap if flat else _RowMap
+
+        def build(fn: Callable) -> Any:
+            return adapter(fn, cols, fmt, writable)
+
+    if not isinstance(bound, type):
+        return build(bound)
+
+    class _RowModel:
+        batcher_row_adapter = True
+
+        def __init__(self) -> None:
+            self._rows = build(bound())
+
+        def __call__(self, batch: pa.RecordBatch) -> pa.Table:
+            return self._rows(batch)
+
+        def close(self) -> None:
+            close = getattr(self._rows.fn, "close", None)
+            if callable(close):
+                close()
+
+    _RowModel.__name__ = _RowModel.__qualname__ = f"Rows{bound.__name__}"
+    return _RowModel
 
 
 class _BoundBatchFn:
@@ -401,17 +537,26 @@ class _BoundBatchFn:
     binds positionals to the FRONT — ahead of the batch — so it cannot express `fn_args` at
     all. A module-level class can, and (unlike a closure) it pickles, so the process pool and
     a distributed actor still accept a `fn` carrying arguments.
+
+    `writable` names the batch format to copy read-only buffers out of before the call
+    (``zero_copy_batch=False``), or is `None` to hand the batch over as converted.
     """
 
-    __slots__ = ("args", "fn", "kwargs")
+    __slots__ = ("args", "fn", "kwargs", "writable")
 
-    def __init__(self, fn: Callable, args: tuple, kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self, fn: Callable, args: tuple, kwargs: dict[str, Any], writable: str | None = None
+    ) -> None:
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        self.writable = writable
+
+    def _prepare(self, batch: Any) -> Any:
+        return batch if self.writable is None else writable_batch(batch, self.writable)
 
     def __call__(self, batch: Any) -> Any:
-        return self.fn(batch, *self.args, **self.kwargs)
+        return self.fn(self._prepare(batch), *self.args, **self.kwargs)
 
 
 class _AsyncBoundBatchFn(_BoundBatchFn):
@@ -426,7 +571,7 @@ class _AsyncBoundBatchFn(_BoundBatchFn):
     __slots__ = ()
 
     async def __call__(self, batch: Any) -> Any:
-        return await self.fn(batch, *self.args, **self.kwargs)
+        return await self.fn(self._prepare(batch), *self.args, **self.kwargs)
 
 
 class Udf:
@@ -479,11 +624,25 @@ class Udf:
         return Udf(self.fn, per_row=self.per_row, config={**self.config, **config})
 
     def __call__(self, target: Any) -> Any:
-        if not hasattr(target, "ml"):  # a batch (or a row), not a Dataset — run the fn itself
+        from batcher._internal.errors import PlanError
+        from batcher.api.dataset.frame import Dataset
+        from batcher.plan.expr_ir.core import AggExpr, Expr
+
+        if isinstance(target, (Expr, AggExpr)):
+            # Spark's `udf(f)(col)` shape. Running `fn` on the expression evaluated it once, at
+            # plan time, on the expression object: `lambda s: s + 1` quietly built a plain
+            # expression and `lambda s: s.upper()` raised an unrelated AttributeError.
+            raise PlanError(
+                "a @udf applies to a Dataset (or a batch), not to a column expression: "
+                "write `my_udf(ds)`, or `ds.map_batches(fn)` for a batch function. A "
+                "per-row column function is `ds.map(fn)`; most column logic is an "
+                "expression (`bt.col(...)...`) and needs no UDF."
+            )
+        if not isinstance(target, Dataset):  # a batch or a row, not a Dataset: run the fn
             return self.fn(target)
         if self.per_row:
-            return target.ml.map(self.fn, **self.config)
-        return target.ml.map_batches(self.fn, **self.config)
+            return target.map(self.fn, **self.config)
+        return target.map_batches(self.fn, **self.config)
 
 
 def udf(fn: Callable | None = None, *, per_row: bool = False, **config: Any) -> Any:
@@ -528,7 +687,7 @@ def udf(fn: Callable | None = None, *, per_row: bool = False, **config: Any) -> 
     """
     # Checked at decoration, not at application. `**config` reaches `map_batches` only when
     # the `Udf` is finally called on a dataset, so a misspelled option used to surface as a
-    # `TypeError` naming `DatasetML.map_batches()` — a method the user never wrote — at
+    # `TypeError` naming `Dataset.map_batches()` — a method the user never wrote — at
     # whatever line applied the transform, arbitrarily far from the decorator.
     from batcher.api.dataset._options import validate_map_options
 

@@ -17,7 +17,8 @@ use super::assign::assign_groups;
 use super::hash::hash_partial_keys;
 use crate::agg::{
     accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_counted,
-    merge_covar, merge_distinct, merge_median, merge_moments, merge_welford, AggFunc, Partial,
+    merge_covar, merge_distinct, merge_median, merge_moments, merge_ordered_list, merge_welford,
+    AggFunc, Partial,
 };
 use crate::error::RuntimeError;
 
@@ -343,7 +344,7 @@ pub(crate) fn merge_state(
         // Distinct sets merge by unioning the per-group value lists (dedup again).
         AggFunc::CountDistinct => vec![merge_distinct(&state[0], group_ids, num_groups)?],
         AggFunc::Median
-        | AggFunc::Quantile(_)
+        | AggFunc::Quantile(..)
         | AggFunc::ListAgg
         // The contiguity statistics carry `Median`'s value list, so they merge by the same
         // concatenation. This arm *is* their mergeability.
@@ -356,9 +357,13 @@ pub(crate) fn merge_state(
         | AggFunc::QuantileDisc(_) => {
             vec![merge_median(&state[0], group_ids, num_groups)?]
         }
+        // Two aligned lists, concatenated under the same group ids so they stay aligned.
+        AggFunc::ListAggOrdered => merge_ordered_list(state, group_ids, num_groups)?,
         // Counted states merge by summing the counts of equal values (see `agg::counted`);
         // addition is associative and commutative, which is this pair's mergeability.
-        AggFunc::Mode | AggFunc::ApproxTopK(_) => merge_counted(state, group_ids, num_groups)?,
+        AggFunc::Mode | AggFunc::Modes | AggFunc::ApproxTopK(_) => {
+            merge_counted(state, group_ids, num_groups)?
+        }
         // `any_value` merges with the same min reducer that built its partial.
         // Compensated states merge by compensated-adding the sums and summing the
         // compensations — the same fold the partial performs, so `combine([p]) == p`.
@@ -384,12 +389,15 @@ pub(crate) fn merge_state(
             vec![merge_approx_quantile(&state[0], group_ids, num_groups)?]
         }
         // 2-column (key, value) state: keep the extreme-key pair per group.
-        AggFunc::ArgMin | AggFunc::ArgMax => merge_arg_extreme(
-            state,
-            group_ids,
-            num_groups,
-            matches!(func, AggFunc::ArgMax),
-        )?,
+        AggFunc::ArgMin | AggFunc::ArgMax | AggFunc::ArgMinNull | AggFunc::ArgMaxNull => {
+            merge_arg_extreme(
+                state,
+                group_ids,
+                num_groups,
+                matches!(func, AggFunc::ArgMax | AggFunc::ArgMaxNull),
+                matches!(func, AggFunc::ArgMin | AggFunc::ArgMax),
+            )?
+        }
         AggFunc::Mean => vec![
             accumulate(AggFunc::Sum, Some(&state[0]), group_ids, num_groups)?
                 .into_iter()
@@ -409,7 +417,7 @@ pub(crate) fn merge_state(
         // formulas — summing them would be wrong (mean/M2/M3/M4 and the co-moment are not
         // additive across partitions), and the old sum-of-powers form catastrophically
         // cancelled at a large offset.
-        AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => {
+        AggFunc::Skewness | AggFunc::SkewnessPop | AggFunc::Kurtosis | AggFunc::KurtosisPop => {
             merge_moments(state, group_ids, num_groups)?
         }
         AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => {

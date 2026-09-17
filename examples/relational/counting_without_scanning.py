@@ -29,7 +29,7 @@ def main() -> None:
     # Row count: reads the data.
     rows = lineitem.count()
     print("rows:", rows)
-    assert rows == lineitem.height
+    assert rows == lineitem.count()
     assert lineitem.shape == (rows, 16)
 
     # "Are there any rows" needs one row, not all of them.
@@ -39,14 +39,14 @@ def main() -> None:
     assert lineitem.filter(col("l_quantity") > 10_000).is_empty()
 
     # A distinct count over one column reads one column.
-    exact = lineitem.n_unique("l_shipmode")
-    approx = lineitem.agg(n=bt.approx_n_unique(col("l_shipmode"))).to_pydict()["n"][0]
+    exact = lineitem.count_distinct("l_shipmode")
+    approx = lineitem.agg(n=bt.approx_count_distinct(col("l_shipmode"))).to_pydict()["n"][0]
     print(f"ship modes: exact {exact}, approx {approx}")
     assert exact == approx  # low cardinality, so the sketch is exact here
 
     # On a high-cardinality column the sketch is close, not exact — and much cheaper.
-    exact_parts = lineitem.n_unique("l_partkey")
-    approx_parts = lineitem.agg(n=bt.approx_n_unique(col("l_partkey"))).to_pydict()["n"][0]
+    exact_parts = lineitem.count_distinct("l_partkey")
+    approx_parts = lineitem.agg(n=bt.approx_count_distinct(col("l_partkey"))).to_pydict()["n"][0]
     error = abs(approx_parts - exact_parts) / exact_parts
     print(f"parts: exact {exact_parts}, approx {approx_parts}, error {error:.4%}")
     assert error < 0.05

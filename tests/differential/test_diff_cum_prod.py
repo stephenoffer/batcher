@@ -19,11 +19,12 @@ import pytest
 
 import batcher as bt
 from _harness import assert_same
+from batcher._internal.errors import PlanError
 
 _ORDERED = (
     "product(v) OVER (PARTITION BY g ORDER BY o ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
 )
-_ROWS = "product(v) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+_ROWS = "product(v) OVER (ORDER BY o ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
 
 
 def _tbl(rows):
@@ -63,11 +64,17 @@ def test_cum_prod_partitioned_matches_duckdb(rows, duck):
 
 @pytest.mark.differential
 def test_cum_prod_over_row_order_matches_duckdb(duck):
-    """With no partition or order key the accumulation follows row order, as DuckDB's does."""
+    """Unpartitioned, the accumulation follows the order bound with ``over``, as DuckDB's does.
+
+    Without one it is refused: Batcher keeps no arrival order to accumulate along.
+    """
     table = _tbl([("a", 1, 2.0), ("b", 2, 3.0), ("a", 3, 4.0), ("b", 4, 0.5)])
     duck.register("t", table)
-    got = bt.from_arrow(table).with_columns(cp=bt.col("v").cum_prod()).collect()
+    ds = bt.from_arrow(table)
+    got = ds.with_columns(cp=bt.col("v").cum_prod().over(order_by="o")).collect()
     assert_same(got, duck.sql(f"SELECT g, o, v, {_ROWS} AS cp FROM t"))
+    with pytest.raises(PlanError, match="requires order_by"):
+        ds.with_columns(cp=bt.col("v").cum_prod())
 
 
 @pytest.mark.differential
@@ -92,8 +99,8 @@ def test_cumprod_alias_is_the_same_expression(duck):
     table = _tbl([("a", 1, 2.0), ("a", 2, 3.0)])
     ds = bt.from_arrow(table)
     assert (
-        ds.with_columns(cp=bt.col("v").cumprod()).explain()
-        == ds.with_columns(cp=bt.col("v").cum_prod()).explain()
+        ds.with_columns(cp=bt.col("v").cum_prod(order_by="o")).explain()
+        == ds.with_columns(cp=bt.col("v").cum_prod().over(order_by="o")).explain()
     )
 
 
@@ -101,5 +108,5 @@ def test_cumprod_alias_is_the_same_expression(duck):
 def test_cum_prod_on_an_empty_relation(duck):
     """An empty input produces an empty result rather than raising."""
     table = _tbl([]).slice(0, 0)
-    got = bt.from_arrow(table).with_columns(cp=bt.col("v").cum_prod()).collect()
+    got = bt.from_arrow(table).with_columns(cp=bt.col("v").cum_prod(order_by="o")).collect()
     assert got.num_rows == 0

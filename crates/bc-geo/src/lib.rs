@@ -72,7 +72,10 @@ pub fn from_text(text: &str) -> GeoResult<Geom> {
         .strip_prefix("0x")
         .or_else(|| t.strip_prefix("0X"))
         .unwrap_or(t);
-    if !body.is_empty() && body.len() % 2 == 0 && body.bytes().all(|c| c.is_ascii_hexdigit()) {
+    if !body.is_empty()
+        && body.len().is_multiple_of(2)
+        && body.bytes().all(|c| c.is_ascii_hexdigit())
+    {
         return codec::wkb::read_hex_wkb(t);
     }
     codec::wkt::read_wkt(text)

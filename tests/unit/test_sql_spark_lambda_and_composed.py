@@ -251,13 +251,17 @@ def test_a_chrono_pattern_works_in_the_duckdb_dialect():
     assert got["r"] == ["2016/04"]
 
 
-def test_the_three_argument_parse_url_is_declined():
-    # Reading one query parameter needs the key escaped into the pattern; approximating
-    # it would return a neighbouring parameter's value.
-    with pytest.raises(NotImplementedError):
-        bt.sql(
-            "SELECT parse_url('http://a.com/p?q=1&qq=2', 'QUERY', 'q') AS r", dialect="spark"
-        ).collect()
+def test_the_three_argument_parse_url_reads_exactly_the_named_parameter():
+    # Reading one query parameter needs the key escaped into the pattern and anchored at
+    # a `&` or the start, or `q` would return its neighbour `qq`'s value. This used to be
+    # declined for that reason; `.str.parse_url(part, key)` now owns the escaped pattern.
+    url = "'http://a.com/p?qq=2&q=1'"
+    got = bt.sql(
+        f"SELECT parse_url({url}, 'QUERY', 'q') AS q, parse_url({url}, 'QUERY', 'qq') AS qq, "
+        f"parse_url({url}, 'QUERY', 'z') AS z",
+        dialect="spark",
+    ).to_pydict()
+    assert got == {"q": ["1"], "qq": ["2"], "z": [None]}
 
 
 # --- the fourth batch: the "now" family and an array splice ----------------------------

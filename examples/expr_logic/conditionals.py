@@ -1,8 +1,7 @@
 """Branching in an expression: when/then/otherwise, and its shorthands.
 
-A CASE builder needs a terminating `otherwise` — an unfinished one is an error rather than
-an implicit null, which catches the most common way these go wrong. Chain `when` calls for
-more than two branches.
+A CASE builder without `otherwise` is SQL's `CASE WHEN ... END`: rows no branch matches
+are null, typed like the branch values. Chain `when` calls for more than two branches.
 
     python examples/expr_logic/conditionals.py
 """
@@ -20,7 +19,7 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderkey", "o_totalprice").head(5_000)
+    orders = tpch("orders").select("o_orderkey", "o_totalprice").limit(5_000)
 
     banded = orders.with_columns(
         band=bt.when(col("o_totalprice") < 50_000)
@@ -55,13 +54,14 @@ def main() -> None:
     )
     assert checked.count() == 0
 
-    # An unfinished builder is an error, not an implicit null.
-    try:
-        orders.select(x=bt.when(col("o_totalprice") > 1).then(bt.lit(1)))
-    except Exception as error:
-        print("unfinished CASE refused:", str(error)[:70])
-    else:
-        raise AssertionError("expected an error for an unterminated CASE")
+    # Without `otherwise`, an unmatched row is null -- the same as `otherwise(None)`.
+    open_ended = orders.select(
+        big=bt.when(col("o_totalprice") > 100_000).then(bt.lit("big")),
+        explicit=bt.when(col("o_totalprice") > 100_000).then(bt.lit("big")).otherwise(None),
+    ).to_pydict()
+    print("rows with no matching branch:", open_ended["big"].count(None))
+    assert open_ended["big"] == open_ended["explicit"]
+    assert None in open_ended["big"] and "big" in open_ended["big"]
 
 
 if __name__ == "__main__":

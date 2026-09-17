@@ -84,6 +84,6 @@ def test_filter_pushed_through_sort():
 def test_filter_not_pushed_through_topn_sort():
     # Sort carrying a limit (top-N): filtering first would change which rows
     # survive the limit, so the filter must stay above.
-    plan = _t().sort("sal").head(2).filter(col("sal") > 15)._plan
+    plan = _t().sort("sal").limit(2).filter(col("sal") > 15)._plan
     # The plan is Filter(Limit(Sort)); the rule only matches Filter-over-Sort.
     assert push_filter_through_sort(plan, None) is None

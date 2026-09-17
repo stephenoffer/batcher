@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    comments = tpch("orders").select("o_orderkey", "o_comment").head(5_000)
+    comments = tpch("orders").select("o_orderkey", "o_comment").limit(5_000)
 
     signals = comments.select(
         "o_orderkey",

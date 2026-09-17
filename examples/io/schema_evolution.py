@@ -35,9 +35,11 @@ def main() -> None:
         new_file = root / "part-01.parquet"
 
         # The old generation: two columns.
-        orders.head(500).write.parquet(str(old_file))
+        orders.limit(500).write.parquet(str(old_file))
         # The new generation: a third column was added upstream.
-        orders.slice(500, 500).with_columns(o_channel=bt.lit("web")).write.parquet(str(new_file))
+        orders.limit(500, offset=500).with_columns(o_channel=bt.lit("web")).write.parquet(
+            str(new_file)
+        )
 
         # Reading both at once keeps every row and silently drops the new column.
         combined = bt.read.parquet(str(root / "*.parquet"))

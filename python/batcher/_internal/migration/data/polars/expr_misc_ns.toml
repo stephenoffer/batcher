@@ -1,0 +1,62 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+["Expr.struct"]
+field = { status = "param", batcher = "Expr.struct.field", need = "several names and the '*' wildcard in one call", wave = "W2" }
+json_encode = { status = "gap", need = "struct.json_encode", wave = "W3" }
+rename_fields = { status = "gap", need = "struct.rename_fields", wave = "W3" }
+unnest = { status = "param", batcher = "Dataset.unnest", need = "expression-level unnest (struct fields as separate output columns inside select)", wave = "W2" }
+with_fields = { status = "gap", need = "struct.with_fields", wave = "W3" }
+
+["Expr.cat"]
+ends_with = { status = "canonical", batcher = "Expr.str.ends_with" }
+get_categories = { status = "gap", need = "cat.get_categories (needs a Categorical type)", wave = "W3" }
+len_bytes = { status = "canonical", batcher = "Expr.str.octet_length" }
+len_chars = { status = "canonical", batcher = "Expr.str.len_chars" }
+slice = { status = "canonical", batcher = "Expr.str.slice" }
+starts_with = { status = "canonical", batcher = "Expr.str.starts_with" }
+
+["Expr.bin"]
+contains = { status = "canonical", batcher = "Expr.str.contains" }
+decode = { status = "mismatch", batcher = ["Expr.str.unhex", "Expr.str.from_base64"], note = "Polars decode returns Binary; Batcher's unhex/from_base64 return Utf8", wave = "W0" }
+encode = { status = "mismatch", batcher = ["Expr.str.hex", "Expr.str.base64"], note = "Polars encode('hex') is lowercase; Batcher's hex is uppercase (base64 agrees)", wave = "W0" }
+ends_with = { status = "canonical", batcher = "Expr.str.ends_with" }
+get = { status = "gap", need = "bin.get (byte at index)", wave = "W3" }
+head = { status = "mismatch", batcher = "Expr.str.left", note = "on a Binary column Batcher returns Utf8 where Polars returns Binary. Batcher bug", wave = "W0" }
+reinterpret = { status = "gap", need = "bin.reinterpret (bytes to a numeric dtype)", wave = "W3" }
+size = { status = "canonical", batcher = "Expr.str.octet_length" }
+slice = { status = "mismatch", batcher = "Expr.str.slice", note = "on a Binary column Batcher returns Utf8 where Polars returns Binary. Batcher bug", wave = "W0" }
+starts_with = { status = "canonical", batcher = "Expr.str.starts_with" }
+tail = { status = "mismatch", batcher = "Expr.str.right", note = "on a Binary column Batcher returns Utf8 where Polars returns Binary. Batcher bug", wave = "W0" }
+
+["Expr.name"]
+keep = { status = "param", batcher = "Selector.name", need = "the .name accessor on every Expr (today only on selectors)", wave = "W2" }
+map = { status = "param", batcher = "Selector.name", need = "the .name accessor on every Expr (today only on selectors)", wave = "W2" }
+map_fields = { status = "gap", need = "name.map_fields (rename struct fields)", wave = "W3" }
+prefix = { status = "param", batcher = "Selector.name", need = "the .name accessor on every Expr (today only on selectors)", wave = "W2" }
+prefix_fields = { status = "gap", need = "name.prefix_fields", wave = "W3" }
+replace = { status = "gap", need = "name.replace (regex rename)", wave = "W3" }
+suffix = { status = "param", batcher = "Selector.name", need = "the .name accessor on every Expr (today only on selectors)", wave = "W2" }
+suffix_fields = { status = "gap", need = "name.suffix_fields", wave = "W3" }
+to_lowercase = { status = "param", batcher = "Selector.name", need = "the .name accessor on every Expr (today only on selectors)", wave = "W2" }
+to_uppercase = { status = "param", batcher = "Selector.name", need = "the .name accessor on every Expr (today only on selectors)", wave = "W2" }
+
+["Expr.meta"]
+as_expression = { status = "gap", need = "meta.as_expression expression introspection", wave = "W8" }
+as_selector = { status = "gap", need = "meta.as_selector expression introspection", wave = "W8" }
+eq = { status = "gap", need = "meta.eq expression introspection", wave = "W8" }
+has_multiple_outputs = { status = "canonical", batcher = "Expr.meta.has_multiple_outputs" }
+is_column = { status = "canonical", batcher = "Expr.meta.is_column" }
+is_column_selection = { status = "gap", need = "meta.is_column_selection expression introspection", wave = "W8" }
+is_literal = { status = "gap", need = "meta.is_literal expression introspection", wave = "W8" }
+is_regex_projection = { status = "gap", need = "meta.is_regex_projection expression introspection", wave = "W8" }
+ne = { status = "gap", need = "meta.ne expression introspection", wave = "W8" }
+output_name = { status = "canonical", batcher = "Expr.meta.output_name" }
+pop = { status = "gap", need = "meta.pop expression introspection", wave = "W8" }
+root_names = { status = "canonical", batcher = "Expr.meta.root_names" }
+serialize = { status = "param", batcher = "Expr.to_ir", need = "a stable serialized form (bytes/JSON string) that round-trips through deserialize", wave = "W8" }
+show_graph = { status = "gap", need = "meta.show_graph expression introspection", wave = "W8" }
+tree_format = { status = "canonical", batcher = "Expr.meta.tree_format" }
+undo_aliases = { status = "gap", need = "meta.undo_aliases expression introspection", wave = "W8" }
+write_json = { status = "param", batcher = "Expr.to_ir", need = "JSON string output of the expression IR", wave = "W8" }

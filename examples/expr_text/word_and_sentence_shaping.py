@@ -32,7 +32,7 @@ def main() -> None:
 
     shaped = documents.select(
         "id",
-        by_chars=col("body").str.truncate_chars(30),
+        by_chars=col("body").str.left(30),
         by_words=col("body").str.truncate_words(5),
         by_sentences=col("body").str.truncate_sentences(1),
         first_sentence=col("body").str.first_sentence(),

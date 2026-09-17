@@ -28,10 +28,10 @@ def test_str_transforms_vs_duckdb(duck, t):
             up=col("s").str.upper(),
             lo=col("s").str.lower(),
             tr=col("s").str.trim(),
-            lt=col("s").str.lstrip(),
-            rt=col("s").str.rstrip(),
+            lt=col("s").str.strip_chars_start(),
+            rt=col("s").str.strip_chars_end(),
             rev=col("s").str.reverse(),
-            n=col("s").str.len(),
+            n=col("s").str.len_chars(),
         )
         .collect()
     )

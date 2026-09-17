@@ -35,7 +35,7 @@ def _heavy_marker(b: pa.RecordBatch) -> pa.RecordBatch:
 def _op_for(fn) -> object:
     """A real `MapBatches` node for `fn` (built via the public API)."""
     t = pa.table({"x": list(range(300_000))})
-    return bt.from_arrow(t).ml.map_batches(fn)._plan
+    return bt.from_arrow(t).map_batches(fn)._plan
 
 
 def _clear_caches() -> None:
@@ -133,16 +133,16 @@ def test_learned_row_cost_is_persisted_after_measuring():
 
 def test_batch_size_policy_is_result_invariant():
     t = pa.table({"x": list(range(300_000))})
-    op = bt.from_arrow(t).ml.map_batches(_double)._plan
+    op = bt.from_arrow(t).map_batches(_double)._plan
     key = strat._fn_probe_key(op.fn)
 
     _clear_caches()
     _seed_row_cost(key, 1.0)  # heavy -> fine batches
-    heavy = bt.from_arrow(t).ml.map_batches(_double).to_pydict()
+    heavy = bt.from_arrow(t).map_batches(_double).to_pydict()
 
     _clear_caches()
     _seed_row_cost(key, 1e-12)  # light -> coarse
-    light = bt.from_arrow(t).ml.map_batches(_double).to_pydict()
+    light = bt.from_arrow(t).map_batches(_double).to_pydict()
 
     assert heavy == light  # batch size only shards — byte-identical result
 

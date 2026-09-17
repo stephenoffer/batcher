@@ -28,7 +28,7 @@ def main() -> None:
 
         # Twelve small commits, the way an hourly job would leave them.
         for index in range(12):
-            orders.slice(index * 200, 200).write.delta(
+            orders.limit(200, offset=index * 200).write.delta(
                 table, mode="overwrite" if index == 0 else "append"
             )
 

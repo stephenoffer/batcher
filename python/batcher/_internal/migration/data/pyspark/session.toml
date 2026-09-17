@@ -1,0 +1,118 @@
+# PySpark 4.2.0 -> Batcher migration registry: SparkSession, Catalog, config, UDF registration and streaming queries.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[SparkSession]
+Builder = { status = "canonical", batcher = ["bt.Session", "bt.set_config"] }
+active = { status = "canonical", batcher = "bt.current_session" }
+addArtifact = { status = "out_of_scope", reason = "Spark Connect artifact upload to a remote server" }
+addArtifacts = { status = "out_of_scope", reason = "Spark Connect artifact upload to a remote server" }
+addTag = { status = "gap", need = "session operation tags", wave = "W9" }
+builder = { status = "canonical", batcher = ["bt.Session", "bt.set_config"] }
+catalog = { status = "canonical", batcher = "Session.catalog" }
+clearProgressHandlers = { status = "gap", need = "query progress handler registry for batch queries", wave = "W10" }
+clearTags = { status = "gap", need = "session operation tags", wave = "W9" }
+client = { status = "out_of_scope", reason = "Spark Connect client handle" }
+conf = { status = "canonical", batcher = ["batcher.config.get_option", "batcher.config.set_option"] }
+copyFromLocalToFs = { status = "out_of_scope", reason = "Spark Connect local-to-server file copy" }
+createDataFrame = { status = "param", batcher = ["bt.from_pylist", "bt.from_pandas", "bt.from_arrow"], need = "one constructor taking rows/tuples/pandas/Arrow with schema= as StructType, DDL string or column-name list", wave = "W2", template = 'createDataFrame(data, schema=None) -> sem.spark_rows(data, schema)' }
+dataSource = { status = "param", batcher = "batcher.io.SOURCES", need = "register a Python DataSource class by name (dataSource.register)", wave = "W11" }
+emptyDataFrame = { status = "param", batcher = "bt.from_pydict", need = "an empty Dataset from a Spark StructType schema; bt.from_pydict({}, schema=...) takes a pyarrow.Schema", wave = "W2" }
+getActiveSession = { status = "canonical", batcher = "bt.current_session" }
+getTags = { status = "gap", need = "session operation tags", wave = "W9" }
+interruptAll = { status = "canonical", batcher = ["bt.running_queries", "bt.cancel_query"] }
+interruptOperation = { status = "canonical", batcher = "bt.cancel_query" }
+interruptTag = { status = "gap", need = "cancel operations by session tag", wave = "W9" }
+newSession = { status = "canonical", batcher = "bt.Session" }
+profile = { status = "gap", need = "UDF performance and memory profiler results", wave = "W11" }
+range = { status = "canonical", batcher = "bt.range", template = 'range(start, end=None, step=1, numPartitions=None) -> bt.range(start, end, step, name="id")' }
+read = { status = "canonical", batcher = "bt.read" }
+readStream = { status = "canonical", batcher = "bt.read" }
+registerProgressHandler = { status = "gap", need = "query progress handler registry for batch queries", wave = "W10" }
+removeProgressHandler = { status = "gap", need = "query progress handler registry for batch queries", wave = "W10" }
+removeTag = { status = "gap", need = "session operation tags", wave = "W9" }
+sparkContext = { status = "out_of_scope", reason = "no RDD or JVM context" }
+sql = { status = "param", batcher = "Session.sql", need = "args= parameter markers (named :param and positional ?)", wave = "W2" }
+stop = { status = "canonical", batcher = "bt.release_cluster" }
+streams = { status = "canonical", batcher = ["bt.streams", "bt.await_any_termination"] }
+table = { status = "canonical", batcher = "Session.table" }
+tvf = { status = "gap", need = "table-valued function namespace (range, explode, inline, ...)", wave = "W11" }
+udf = { status = "canonical", batcher = "bt.register_function" }
+udtf = { status = "param", batcher = "Session.register_function", need = "UDTF class protocol (eval/terminate/analyze) registered with table=True", wave = "W11" }
+version = { status = "canonical", batcher = "bt.engine_version" }
+
+[Catalog]
+analyzeTable = { status = "gap", need = "catalog API: compute table statistics", wave = "W9" }
+cacheTable = { status = "param", batcher = "Session.table", need = "port as session.table(name).cache()", wave = "W9" }
+clearCache = { status = "canonical", batcher = "bt.clear_cache" }
+createDatabase = { status = "canonical", batcher = "Session.catalog.create_namespace" }
+createExternalTable = { status = "param", batcher = "Session.register", need = "a table over a path is registered as a view of bt.read(path)", wave = "W9" }
+createTable = { status = "param", batcher = "Session.catalog.create_table", need = "Spark's path= and source= for an external table", wave = "W9" }
+currentCatalog = { status = "canonical", batcher = "Session.catalog.current_catalog" }
+currentDatabase = { status = "canonical", batcher = "Session.catalog.current_namespace" }
+databaseExists = { status = "canonical", batcher = "Session.catalog.has_namespace" }
+dropDatabase = { status = "canonical", batcher = "Session.catalog.drop_namespace" }
+dropGlobalTempView = { status = "param", batcher = "Session.drop", need = "global_temp database scope", wave = "W9" }
+dropTable = { status = "canonical", batcher = "Session.catalog.drop_table" }
+dropTempView = { status = "canonical", batcher = "Session.drop" }
+dropView = { status = "canonical", batcher = "Session.drop" }
+functionExists = { status = "canonical", batcher = "Session.has_function" }
+getCreateTableString = { status = "gap", need = "catalog API: SHOW CREATE TABLE text", wave = "W9" }
+getDatabase = { status = "gap", need = "catalog API: database object", wave = "W9" }
+getFunction = { status = "gap", need = "catalog API: function object", wave = "W9" }
+getTable = { status = "canonical", batcher = "Session.catalog.get_table" }
+getTableProperties = { status = "canonical", batcher = "Table.properties" }
+isCached = { status = "gap", need = "catalog API: whether a table is cached", wave = "W9" }
+listCatalogs = { status = "canonical", batcher = "Session.catalog.list_catalogs" }
+listColumns = { status = "param", batcher = "Table.schema", need = "Column objects rather than an Arrow schema", wave = "W9" }
+listDatabases = { status = "canonical", batcher = "Session.catalog.list_namespaces" }
+listFunctions = { status = "param", batcher = "Session.list_functions", need = "Function objects rather than names", wave = "W9" }
+listPartitions = { status = "gap", need = "catalog API: list a table's partitions", wave = "W9" }
+listTables = { status = "param", batcher = "Session.catalog.list_tables", need = "Table objects rather than names", wave = "W9" }
+listViews = { status = "canonical", batcher = "Session.list" }
+recoverPartitions = { status = "gap", need = "catalog API: recover partitions from storage", wave = "W9" }
+refreshByPath = { status = "gap", need = "catalog API: invalidate cached data under a path", wave = "W9" }
+refreshTable = { status = "gap", need = "catalog API: invalidate a table's cached metadata", wave = "W9" }
+registerFunction = { status = "canonical", batcher = "bt.register_function" }
+setCurrentCatalog = { status = "canonical", batcher = "Session.catalog.use" }
+setCurrentDatabase = { status = "canonical", batcher = "Session.catalog.use" }
+tableExists = { status = "canonical", batcher = "Session.catalog.has_table" }
+truncateTable = { status = "canonical", batcher = "Session.catalog.truncate_table" }
+uncacheTable = { status = "param", batcher = "Session.table", need = "port as session.table(name).uncache()", wave = "W9" }
+
+[RuntimeConfig]
+get = { status = "canonical", batcher = "batcher.config.get_option" }
+getAll = { status = "canonical", batcher = ["batcher.config.option_names", "batcher.config.get_option"] }
+isModifiable = { status = "gap", need = "report whether a config key can be changed at runtime", wave = "W9" }
+set = { status = "canonical", batcher = "batcher.config.set_option" }
+unset = { status = "canonical", batcher = "batcher.config.reset_option" }
+
+[UDFRegistration]
+register = { status = "canonical", batcher = "bt.register_function" }
+registerJavaFunction = { status = "out_of_scope", reason = "JVM UDF registration; no JVM" }
+registerJavaUDAF = { status = "out_of_scope", reason = "JVM UDAF registration; no JVM" }
+
+[UDTFRegistration]
+register = { status = "param", batcher = "bt.register_function", need = "UDTF class protocol (eval/terminate/analyze) registered with table=True", wave = "W11" }
+
+[StreamingQuery]
+awaitTermination = { status = "canonical", batcher = "StreamingQuery.await_termination" }
+exception = { status = "canonical", batcher = "StreamingQuery.exception" }
+explain = { status = "mismatch", batcher = "StreamingQuery.explain", note = "Spark prints the plan and returns None; Batcher returns the plan as a str", wave = "W0" }
+id = { status = "canonical", batcher = "StreamingQuery.id" }
+isActive = { status = "canonical", batcher = "StreamingQuery.is_active" }
+lastProgress = { status = "canonical", batcher = "StreamingQuery.last_progress" }
+name = { status = "canonical", batcher = "StreamingQuery.name" }
+processAllAvailable = { status = "canonical", batcher = "StreamingQuery.process_all_available" }
+recentProgress = { status = "canonical", batcher = "StreamingQuery.recent_progress" }
+runId = { status = "canonical", batcher = "StreamingQuery.run_id" }
+status = { status = "canonical", batcher = "StreamingQuery.status" }
+stop = { status = "canonical", batcher = "StreamingQuery.stop" }
+
+[StreamingQueryManager]
+active = { status = "canonical", batcher = "bt.streams" }
+addListener = { status = "canonical", batcher = "bt.add_streaming_listener" }
+awaitAnyTermination = { status = "canonical", batcher = "bt.await_any_termination" }
+get = { status = "gap", need = "look up an active streaming query by id", wave = "W10" }
+removeListener = { status = "canonical", batcher = "bt.remove_streaming_listener" }
+resetTerminated = { status = "canonical", batcher = "bt.reset_terminated" }

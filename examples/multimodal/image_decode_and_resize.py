@@ -52,14 +52,14 @@ def main() -> None:
     assert all(value != 32 for value in source_shape["width"])
 
     # The tensor itself is flat: 32 * 32 * 3 channels.
-    tensor = resized.select("image").head(1).to_pydict()["image"][0]
+    tensor = resized.select("image").limit(1).to_pydict()["image"][0]
     print("decoded tensor length:", len(tensor))
     assert len(tensor) == 32 * 32 * 3
 
     # A larger target gives a proportionally larger tensor, which is the check that the
     # `size` argument is doing the resizing rather than being ignored.
     bigger = bt.read.images(glob, decode=True, size=(64, 64))
-    assert len(bigger.select("image").head(1).to_pydict()["image"][0]) == 64 * 64 * 3
+    assert len(bigger.select("image").limit(1).to_pydict()["image"][0]) == 64 * 64 * 3
 
     # Metadata survives the decode, so a filter still works downstream.
     assert resized.filter(col("width") > 0).count() == 10

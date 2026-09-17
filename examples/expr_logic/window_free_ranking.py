@@ -23,8 +23,8 @@ def main() -> None:
     orders = tpch("orders").select("o_orderkey", "o_totalprice")
 
     by_top_k = orders.top_k(10, by="o_totalprice").to_pydict()
-    by_sort = orders.sort("o_totalprice", descending=True).head(10).to_pydict()
-    by_nlargest = orders.nlargest(10, "o_totalprice").to_pydict()
+    by_sort = orders.sort("o_totalprice", descending=True).limit(10).to_pydict()
+    by_nlargest = orders.top_k(10, "o_totalprice").to_pydict()
 
     print("top prices:", [round(value) for value in by_top_k["o_totalprice"][:5]])
 
@@ -35,7 +35,7 @@ def main() -> None:
 
     # The other end.
     smallest = orders.bottom_k(10, by="o_totalprice").to_pydict()
-    by_nsmallest = orders.nsmallest(10, "o_totalprice").to_pydict()
+    by_nsmallest = orders.bottom_k(10, "o_totalprice").to_pydict()
     assert smallest["o_totalprice"] == by_nsmallest["o_totalprice"]
     assert smallest["o_totalprice"] == sorted(smallest["o_totalprice"])
 

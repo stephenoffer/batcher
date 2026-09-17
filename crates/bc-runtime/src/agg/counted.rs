@@ -213,6 +213,42 @@ pub(crate) fn finalize_top_k(state: &[ArrayRef], k: usize) -> Result<ArrayRef, R
     bucket_values_into_list(&groups, &taken, num_groups)
 }
 
+/// `modes`: **every** most-frequent value of each group, ascending, as a `List` — the
+/// untruncated `mode`, and what Polars' `mode()` returns. An empty group is NULL, as for
+/// `mode`. The ranking already orders a tie by ascending value, so the answer is the leading
+/// run of equal counts, which keeps it independent of how the counts were merged.
+pub(crate) fn finalize_modes(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
+    let (ranked_idx, vchild) = ranked(state)?;
+    let counts = state[1]
+        .as_list::<i32>()
+        .values()
+        .as_primitive::<Int64Type>()
+        .clone();
+    let mut keep: Vec<u32> = Vec::new();
+    let mut elem_groups: Vec<i64> = Vec::new();
+    let mut valid: Vec<bool> = Vec::with_capacity(ranked_idx.len());
+    for (g, idx) in ranked_idx.iter().enumerate() {
+        valid.push(!idx.is_empty());
+        let Some(&first) = idx.first() else { continue };
+        let top = counts.value(first as usize);
+        for &e in idx.iter().take_while(|&&e| counts.value(e as usize) == top) {
+            keep.push(e);
+            elem_groups.push(g as i64);
+        }
+    }
+    let num_groups = ranked_idx.len();
+    let taken = arrow::compute::take(vchild.as_ref(), &UInt32Array::from(keep), None)?;
+    let list = bucket_values_into_list(&Int64Array::from(elem_groups), &taken, num_groups)?;
+    let list = list.as_list::<i32>();
+    let (field, offsets, values, _) = list.clone().into_parts();
+    Ok(Arc::new(arrow::array::ListArray::try_new(
+        field,
+        offsets,
+        values,
+        Some(arrow::buffer::NullBuffer::from(valid)),
+    )?))
+}
+
 /// `mode`: each group's most frequent value, ties to the smallest; an empty group is NULL.
 pub(crate) fn finalize_mode(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
     let (ranked_idx, vchild) = ranked(state)?;
@@ -244,6 +280,39 @@ mod tests {
         let m = modes.as_primitive::<Int64Type>();
         assert_eq!(m.value(0), 5);
         assert_eq!(m.value(1), 3); // tie broken to the smaller value -> deterministic
+    }
+
+    #[test]
+    fn modes_returns_every_tied_value_ascending_and_merges() {
+        // group 0: [3, 3, 2, 2, 5] -> [2, 3]; group 1: [4] -> [4]; group 2: all null -> NULL.
+        let values = vec![Some(3), Some(3), Some(4), Some(2), None, Some(2), Some(5)];
+        let groups = [0u32, 0, 1, 0, 2, 0, 0];
+        let whole = finalize_modes(&state(values.clone(), &groups, 3)).unwrap();
+        let list = whole.as_list::<i32>();
+        let got = |l: &arrow::array::ListArray, g: usize| -> Option<Vec<i64>> {
+            l.is_valid(g)
+                .then(|| l.value(g).as_primitive::<Int64Type>().values().to_vec())
+        };
+        assert_eq!(got(list, 0), Some(vec![2, 3]));
+        assert_eq!(got(list, 1), Some(vec![4]));
+        assert_eq!(got(list, 2), None);
+
+        // Split so each partial alone sees a different leader; the merge must still tie 2 and 3.
+        let p1 = state(values[..3].to_vec(), &groups[..3], 3);
+        let p2 = state(values[3..].to_vec(), &groups[3..], 3);
+        for (a, b) in [(&p1, &p2), (&p2, &p1)] {
+            let cat: Vec<ArrayRef> = a
+                .iter()
+                .zip(b.iter())
+                .map(|(l, r)| arrow::compute::concat(&[l.as_ref(), r.as_ref()]).unwrap())
+                .collect();
+            let merged = merge_counted(&cat, &[0u32, 1, 2, 0, 1, 2], 3).unwrap();
+            let out = finalize_modes(&merged).unwrap();
+            let out = out.as_list::<i32>();
+            for g in 0..3 {
+                assert_eq!(got(out, g), got(list, g), "group {g}");
+            }
+        }
     }
 
     #[test]

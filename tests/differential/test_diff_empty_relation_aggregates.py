@@ -11,7 +11,7 @@ something: an engine whose aggregates returned NULL unconditionally would pass e
 empty-relation assertion in this file.
 
 `first` is the one that differs, and in Batcher's favour. `Expr.first` *requires* an
-`order_by`, so `first(v)` does not compile at all, where DuckDB's `first(v)` returns whichever
+`order_by`, so `agg(first(v))` is refused as a plan, where DuckDB's `first(v)` returns whichever
 row it happened to see. Refusing an aggregate whose answer the query does not determine is
 the same discipline `.claude/rules/python-control-plane.md` applies to `row_number` ties and
 to `LIMIT` over an unordered relation. Given the ordering it asks for, it agrees.
@@ -24,6 +24,7 @@ import pytest
 
 import batcher as bt
 from _harness import assert_same_ordered
+from batcher._internal.errors import PlanError
 
 pytestmark = pytest.mark.differential
 
@@ -63,10 +64,10 @@ _AGGREGATES = [
     ("median", lambda c: c("v").median(), "median(v)"),
     ("std", lambda c: c("v").std(), "stddev(v)"),
     ("var", lambda c: c("v").var(), "var_samp(v)"),
-    ("n_unique", lambda c: c("a").n_unique(), "count(DISTINCT a)"),
+    ("count_distinct", lambda c: c("a").count_distinct(), "count(DISTINCT a)"),
     ("quantile", lambda c: c("v").quantile(0.5), "quantile_cont(v, 0.5)"),
-    ("any", lambda c: (c("v") > 0).any(), "bool_or(v>0)"),
-    ("all", lambda c: (c("v") > 0).all(), "bool_and(v>0)"),
+    ("bool_or", lambda c: (c("v") > 0).bool_or(), "bool_or(v>0)"),
+    ("bool_and", lambda c: (c("v") > 0).bool_and(), "bool_and(v>0)"),
 ]
 
 _IDS = [case[0] for case in _AGGREGATES]
@@ -95,9 +96,9 @@ def test_the_answers_are_not_all_the_same(empty):
         label: empty.agg(r=build(bt.col)).to_pydict()["r"][0] for label, build, _ in _AGGREGATES
     }
     assert answers["count"] == 0
-    assert answers["n_unique"] == 0
+    assert answers["count_distinct"] == 0
     assert answers["sum"] is None
-    assert answers["all"] is None, "bool_and over no rows is NULL, not vacuous truth"
+    assert answers["bool_and"] is None, "bool_and over no rows is NULL, not vacuous truth"
 
 
 def test_the_oracle_column_is_a_double_not_a_decimal(full, duck):
@@ -114,9 +115,11 @@ def test_the_oracle_column_is_a_double_not_a_decimal(full, duck):
 class TestFirstRequiresAnOrdering:
     """Batcher is stricter than DuckDB here, deliberately."""
 
-    def test_first_without_an_ordering_does_not_compile(self):
-        with pytest.raises(TypeError, match="order_by"):
-            bt.col("v").first()
+    def test_first_without_an_ordering_does_not_compile(self, empty):
+        # The order may arrive later through `.over(order_by=...)`, so the refusal is at the
+        # point the aggregate is bound to a plan rather than where it is built.
+        with pytest.raises(PlanError, match="order_by"):
+            empty.agg(r=bt.col("v").first())
 
     @pytest.mark.parametrize("relation", ["empty", "full"])
     def test_ordered_first_matches_duckdb(self, relation, request, duck):

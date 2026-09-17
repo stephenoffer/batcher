@@ -26,7 +26,7 @@ keywords to name the output, or positionally to keep the source column's name.
 {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; the column aggregates are methods
 on an expression (`.sum()`, `.mean()`, and so on) or the top-level shorthands
 {py:obj}`bt.sum("x") <batcher.sum>`, {py:func}`bt.mean <batcher.mean>`, {py:func}`bt.min <batcher.min>`, {py:func}`bt.max <batcher.max>`, {py:func}`bt.median <batcher.median>`,
-{py:func}`bt.std <batcher.std>`, {py:func}`bt.var <batcher.var>`, {py:func}`bt.n_unique <batcher.n_unique>`. `bt.sum("x")` reads as `col("x").sum()`, the
+{py:func}`bt.std <batcher.std>`, {py:func}`bt.var <batcher.var>`, {py:func}`bt.count_distinct <batcher.count_distinct>`. `bt.sum("x")` reads as `col("x").sum()`, the
 Polars `pl.sum` convention.
 
 ```python
@@ -51,7 +51,7 @@ print(out.to_pydict())
 
 When you reduce *every* value column the same way, a shortcut method is shorter
 than spelling out `agg`. The set is `sum`, `mean`, `min`, `max`, `median`,
-`quantile(q)`, `n_unique`, `std`, `var`, `count` (non-null values per column), and
+`quantile(q)`, `count_distinct`, `std`, `var`, `count` (non-null values per column), and
 `len` (the per-group row count). With no arguments they reduce every non-key
 column, keeping its name. Pass column names or a
 {doc}`selector </user-guide/transform/rows/transformations>` to reduce a subset. The arithmetic reductions
@@ -77,8 +77,8 @@ two-column statistic.
 ## Aggregate functions
 
 The aggregate methods available inside `agg` are `sum`, `min`, `max`, `mean`,
-`var`, `std`, `median`, `quantile(q)`, `count`, and `n_unique` (also spelled
-{py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>`). {py:obj}`bt.count() <batcher.count>` counts rows. Each of these
+`var`, `std`, `median`, `quantile(q)`, `count`, and
+{py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>`. {py:obj}`bt.count() <batcher.count>` counts rows. Each of these
 builds an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that `agg(...)`
 consumes and that {py:meth}`.over(...) <batcher.AggExpr.over>` lifts into a {doc}`window function </user-guide/analyze/window-functions>`.
 You rarely name it directly.
@@ -93,7 +93,7 @@ stats = (
         hi=bt.col("price").max(),
         med=bt.col("price").median(),
         p90=bt.col("price").quantile(0.9),
-        distinct_qty=bt.col("qty").n_unique(),
+        distinct_qty=bt.col("qty").count_distinct(),
     )
     .sort("category")
 )
@@ -104,8 +104,10 @@ print(stats.to_pydict())
 
 ## Advanced aggregates
 
-Beyond the basics, `agg` supports `mode`, `first`/`last`, `arg_min`/`arg_max` (the
-value of one column at the row that minimizes/maximizes another), the boolean
+Beyond the basics, `agg` supports `mode`, `first`/`last`, `min_by`/`max_by` (the
+value of one column at the row that minimizes/maximizes another), `arg_min`/`arg_max` (the
+position of a column's own extreme), `top_k` and `mode_top_k` (a group's largest and most
+frequent values as a list), the boolean
 reductions `bool_and`/`bool_or`, and `array_agg` (collect a group's values into a
 list).
 
@@ -115,7 +117,7 @@ adv = (
     .agg(
         any_big=(bt.col("price") > 35).bool_or(),
         all_big=(bt.col("price") > 35).bool_and(),
-        costliest=bt.col("price").arg_max(bt.col("price")),
+        costliest=bt.col("price").max_by(bt.col("price")),
     )
     .sort("category")
 )
@@ -127,7 +129,7 @@ print(adv.to_pydict())
 Each of these also has a top-level SQL-style spelling that reads `bt.<agg>("col")`,
 the same shorthand `bt.sum("x")` is for `col("x").sum()`:
 {py:obj}`bt.product(x) <batcher.product>`, {py:obj}`bt.mode(x) <batcher.mode>`,
-{py:obj}`bt.skewness(x) <batcher.skewness>` / {py:obj}`bt.kurtosis(x) <batcher.kurtosis>`,
+{py:obj}`bt.skew(x) <batcher.skew>` / {py:obj}`bt.kurtosis(x) <batcher.kurtosis>`,
 {py:obj}`bt.bool_and(x) <batcher.bool_and>` / {py:obj}`bt.bool_or(x) <batcher.bool_or>`,
 {py:obj}`bt.bit_and(x) <batcher.bit_and>` / {py:obj}`bt.bit_or(x) <batcher.bit_or>` /
 {py:obj}`bt.bit_xor(x) <batcher.bit_xor>`, and
@@ -276,11 +278,11 @@ print(stats.to_pydict())
 
 Exact distinct counts and quantiles get expensive on large inputs. The
 sketch-backed aggregates trade a little accuracy for bounded memory and
-mergeability: `approx_n_unique` (HyperLogLog), `approx_quantile(q)` and
+mergeability: `approx_count_distinct` (HyperLogLog), `approx_quantile(q)` and
 `approx_median` (KLL). They merge exactly across partitions, so the estimate is
 identical single-node or distributed. On small inputs it typically matches the
 exact count. Each also has a top-level spelling:
-{py:obj}`bt.approx_n_unique(x) <batcher.approx_n_unique>`,
+{py:obj}`bt.approx_count_distinct(x) <batcher.approx_count_distinct>`,
 {py:obj}`bt.approx_quantile(x, q) <batcher.approx_quantile>`, and
 {py:obj}`bt.approx_median(x) <batcher.approx_median>`. They sit alongside the exact
 {py:obj}`bt.quantile(x, q) <batcher.quantile>` and the value-tally
@@ -290,8 +292,8 @@ exact count. Each also has a top-level spelling:
 approx = (
     ds.group_by("category")
     .agg(
-        exact=bt.col("qty").n_unique(),
-        approx=bt.col("qty").approx_n_unique(),
+        exact=bt.col("qty").count_distinct(),
+        approx=bt.col("qty").approx_count_distinct(),
     )
     .sort("category")
 )
@@ -339,6 +341,30 @@ print(buckets.to_pydict())
 # {'tier': ['high', 'low'], 'n': [3, 2], 'revenue': [120.0, 30.0]}
 ```
 
+## Filtering groups
+
+{py:meth}`having <batcher.GroupBy.having>` keeps only the groups for which a predicate over their aggregates holds, which is SQL's `HAVING`. It goes between `group_by` and the reduction that finishes it, and the predicate's aggregates run in the same pass as the outputs.
+
+```python
+big = ds.group_by("category").having(bt.col("price").sum() > 70).agg(n=bt.count())
+print(big.to_pydict())
+# {'category': ['a'], 'n': [3]}
+```
+
+A filter before `group_by` removes rows, and `having` removes whole groups after they are summarized. A group whose predicate is null is dropped, as in SQL.
+
+## Group order
+
+A grouped result has no defined row order, which is why the examples above end in `sort`. Pass `maintain_order=True` to `group_by` to get the groups in the order each one first appears in the input, as Polars does. The order is computed rather than observed: Batcher numbers the input rows, keeps each group's smallest number, and sorts on it, so the order is the same under `collect`, spilling, `iter_batches` and `distributed=True`. The price is one sort over the groups.
+
+```python
+visits = bt.from_pydict({"city": ["oslo", "lima", "oslo", "baku"], "n": [1, 2, 3, 4]})
+print(visits.group_by("city", maintain_order=True).agg(total=bt.col("n").sum()).to_pydict())
+# {'city': ['oslo', 'lima', 'baku'], 'total': [4, 2, 4]}
+```
+
+It orders the groups an aggregation emits, so `head`, `tail` and `map_groups`, which return rows, raise rather than ignore it. A streaming input has no first appearance to sort by and raises too.
+
 ## Global aggregates
 
 Call `group_by()` with no keys to aggregate the whole dataset into one row.
@@ -358,13 +384,13 @@ print(ds.count())
 
 Each single-column reduction also has a **scalar terminal** that skips the one-row frame and
 hands back the value itself. `min`, `max`, `sum`, `mean`, `median`, `quantile`, `std`, `var`
-and `n_unique` are joined by the distribution's shape and by the boolean reductions:
+and `count_distinct` are joined by the distribution's shape and by the boolean reductions:
 
 ```python
 print(ds.product("price"), ds.mode("category"))
 # 12000000.0 a
 
-print(ds.skewness("price"), ds.kurtosis("price"), ds.mad("price"))
+print(ds.skew("price"), ds.kurtosis("price"), ds.mad("price"))
 # 0.0 -1.2000000000000004 10.0
 ```
 

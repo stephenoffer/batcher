@@ -27,7 +27,7 @@ from batcher import graph as bg
 def main() -> None:
     # Two orders are connected when the same part appears in both. The edge table is a
     # self-join on the part key.
-    lines = tpch("lineitem").select("l_orderkey", "l_partkey").head(4_000)
+    lines = tpch("lineitem").select("l_orderkey", "l_partkey").limit(4_000)
 
     right = lines.select(
         col("l_orderkey").alias("other_order"), col("l_partkey").alias("other_part")

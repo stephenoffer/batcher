@@ -38,7 +38,13 @@ def nth_value_at_one_to_first_value(node: Window, _ctx: OptimizerContext) -> Log
     for spec in node.functions:
         if spec.func == "nth_value" and spec.offset == 1:
             rewritten.append(
-                WindowFuncSpec("first_value", spec.input, spec.alias, frame=spec.frame)
+                WindowFuncSpec(
+                    "first_value",
+                    spec.input,
+                    spec.alias,
+                    frame=spec.frame,
+                    ignore_nulls=spec.ignore_nulls,
+                )
             )
         else:
             rewritten.append(spec)

@@ -10,7 +10,7 @@ mistake away from the line that made it. The failures that motivated these tests
 * a misspelled `result_typ` was accepted and dropped, leaving the required option unset;
 * a `map_batches` option on the scalar form was accepted and never read;
 * `@udf(output_column=...)` failed at *apply* time with a `TypeError` naming
-  `DatasetML.map_batches()`, a method the user never called;
+  `Dataset.map_batches()`, a method the user never called;
 * `bt.tenant(..., typo=1)` and `Config.replace(typo=1)` failed with a `TypeError` naming a
   dataclass `__init__` and listing nothing.
 """
@@ -142,7 +142,7 @@ def test_the_udf_decorator_rejects_an_unknown_option_where_it_was_written():
 
 def test_the_decorator_checks_the_per_row_target_instead():
     with pytest.raises(PlanError, match="per-row callback"):
-        bt.udf(per_row=True, batch_format="numpy")
+        bt.udf(per_row=True, preserves_columns=["x"])
 
 
 def test_a_valid_decorator_option_still_works():

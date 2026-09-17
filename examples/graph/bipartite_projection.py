@@ -21,7 +21,7 @@ from batcher import col
 
 def main() -> None:
     # A small slice, because the projection is quadratic in the group size.
-    customers = tpch("customer").select("c_custkey", "c_nationkey").head(200)
+    customers = tpch("customer").select("c_custkey", "c_nationkey").limit(200)
 
     per_nation = customers.group_by("c_nationkey").agg(members=bt.count()).sort("c_nationkey")
     print("nations:", per_nation.count())
@@ -42,7 +42,7 @@ def main() -> None:
     assert pairs.count() == expected
 
     # Every pair really shares a nation, and no customer is paired with itself.
-    sample = pairs.select("c_custkey", "other", "c_nationkey").head(5).to_pydict()
+    sample = pairs.select("c_custkey", "other", "c_nationkey").limit(5).to_pydict()
     print(sample)
     assert all(
         left != right_key

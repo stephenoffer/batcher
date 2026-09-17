@@ -1,0 +1,83 @@
+# PySpark 4.2.0 -> Batcher migration registry: readers and writers, batch and streaming.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[DataFrameReader]
+changes = { status = "param", batcher = "bt.read.read_change_feed", need = "change feeds from non-Delta tables and Spark's startingVersion/endingVersion option names", wave = "W13" }
+csv = { status = "mismatch", batcher = "bt.read.csv", note = "Spark defaults to header=false and inferSchema=false (string columns named _c0, _c1, ...); Batcher reads the header and infers types. Codemod passes the header and inference options explicitly", wave = "W0", template = 'csv(path, header=None, inferSchema=None) -> sem.spark_read_csv(self, path, header, inferSchema)' }
+format = { status = "canonical", batcher = "bt.read" }
+jdbc = { status = "param", batcher = "bt.read.sql", need = "url + table + properties form, and column/lowerBound/upperBound/numPartitions or predicates partitioning", wave = "W13" }
+json = { status = "canonical", batcher = "bt.read.json" }
+load = { status = "canonical", batcher = "bt.read" }
+option = { status = "canonical", batcher = "bt.read" }
+options = { status = "canonical", batcher = "bt.read" }
+orc = { status = "canonical", batcher = "bt.read.orc" }
+parquet = { status = "canonical", batcher = "bt.read.parquet" }
+schema = { status = "param", batcher = "bt.read", need = "schema as a DDL string or StructType (Batcher takes a pyarrow.Schema)", wave = "W11" }
+table = { status = "mismatch", batcher = "Session.table", note = "bt.read.table constructs a registered connector by name; Spark's reader reads a catalog table, which is session.table(name)", wave = "W9" }
+text = { status = "mismatch", batcher = "bt.read.text", note = "Spark returns a single 'value' column; Batcher returns path, line_number and text columns", wave = "W0" }
+xml = { status = "param", batcher = "bt.read.xml", need = "rowTag= and Spark's XML option names", wave = "W13" }
+
+[DataStreamReader]
+changes = { status = "param", batcher = "bt.read.read_change_feed", need = "streaming change feed from non-Delta tables", wave = "W10" }
+csv = { status = "mismatch", batcher = "bt.read.csv", note = "DataStreamReader.csv is an incremental streaming file source; bt.read.csv is a bounded batch read. Use bt.read.files_incremental(path, 'csv')", wave = "W10" }
+format = { status = "param", batcher = "bt.read", need = "select a streaming source by format name through one builder", wave = "W10" }
+json = { status = "mismatch", batcher = "bt.read.json", note = "DataStreamReader.json is an incremental streaming file source; bt.read.json is a bounded batch read. Use bt.read.files_incremental(path, 'json')", wave = "W10" }
+load = { status = "param", batcher = "bt.read.files_incremental", need = "one load() for every streaming source format", wave = "W10" }
+name = { status = "gap", need = "stable source name for streaming source evolution", wave = "W10" }
+option = { status = "canonical", batcher = "bt.read" }
+options = { status = "canonical", batcher = "bt.read" }
+orc = { status = "mismatch", batcher = "bt.read.orc", note = "DataStreamReader.orc is an incremental streaming file source; bt.read.orc is a bounded batch read. Use bt.read.files_incremental(path, 'orc')", wave = "W10" }
+parquet = { status = "mismatch", batcher = "bt.read.parquet", note = "DataStreamReader.parquet is an incremental streaming file source; bt.read.parquet is a bounded batch read. Use bt.read.files_incremental(path, 'parquet')", wave = "W10" }
+schema = { status = "param", batcher = "bt.read", need = "schema as a DDL string or StructType (Batcher takes a pyarrow.Schema)", wave = "W11" }
+table = { status = "mismatch", batcher = "bt.read.table", note = "Spark streams from a catalog table; bt.read.table reads a registered non-file source format", wave = "W10" }
+text = { status = "mismatch", batcher = "bt.read.text", note = "DataStreamReader.text is an incremental streaming file source; bt.read.text is a bounded batch read. Use bt.read.files_incremental(path, 'text')", wave = "W10" }
+xml = { status = "mismatch", batcher = "bt.read.xml", note = "DataStreamReader.xml is an incremental streaming file source; bt.read.xml is a bounded batch read. Use bt.read.files_incremental(path, 'xml')", wave = "W10" }
+
+[DataFrameWriter]
+bucketBy = { status = "gap", need = "bucketed table writes (bucketBy with sortBy)", wave = "W13" }
+clusterBy = { status = "param", batcher = "Dataset.write", need = "record clustering columns in table metadata", wave = "W13" }
+csv = { status = "mismatch", batcher = "Dataset.write.csv", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly", wave = "W0" }
+format = { status = "canonical", batcher = "Dataset.write" }
+insertInto = { status = "canonical", batcher = "Dataset.write.table" }
+jdbc = { status = "param", batcher = "Dataset.write.sql", need = "url + table + properties connection form", wave = "W13" }
+json = { status = "mismatch", batcher = "Dataset.write.json", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0", template = 'json(path, mode=None) -> sem.spark_write(self, "json", path, mode, None)' }
+mode = { status = "canonical", batcher = "Dataset.write" }
+option = { status = "canonical", batcher = "Dataset.write" }
+options = { status = "canonical", batcher = "Dataset.write" }
+orc = { status = "mismatch", batcher = "Dataset.write.orc", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0", template = 'orc(path, mode=None, partitionBy=None) -> sem.spark_write(self, "orc", path, mode, partitionBy)' }
+parquet = { status = "mismatch", batcher = "Dataset.write.parquet", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0", template = 'parquet(path, mode=None, partitionBy=None) -> sem.spark_write(self, "parquet", path, mode, partitionBy)' }
+partitionBy = { status = "canonical", batcher = "Dataset.write" }
+save = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly", wave = "W0" }
+saveAsTable = { status = "canonical", batcher = "Dataset.write.table" }
+sortBy = { status = "param", batcher = "Dataset.write", need = "sort within buckets, paired with bucketBy", wave = "W13" }
+text = { status = "canonical", batcher = "Dataset.write.text" }
+xml = { status = "canonical", batcher = "Dataset.write.xml" }
+
+[DataFrameWriterV2]
+append = { status = "mismatch", batcher = "Dataset.write.table", note = "write.table(name, mode=append) creates a missing table, where the V2 append raises", wave = "W9" }
+clusterBy = { status = "gap", need = "clustering columns on a V2 table", wave = "W9" }
+create = { status = "canonical", batcher = "Dataset.write.table" }
+createOrReplace = { status = "canonical", batcher = "Dataset.write.table" }
+option = { status = "param", batcher = "Dataset.write.iceberg", need = "DataFrameWriterV2 chain against a catalog table identifier: write options", wave = "W9" }
+options = { status = "param", batcher = "Dataset.write.iceberg", need = "DataFrameWriterV2 chain against a catalog table identifier: write options", wave = "W9" }
+overwrite = { status = "canonical", batcher = "Dataset.write.table" }
+overwritePartitions = { status = "canonical", batcher = "Dataset.write.table" }
+partitionedBy = { status = "canonical", batcher = "Dataset.write.table" }
+replace = { status = "canonical", batcher = "Dataset.write.table" }
+tableProperty = { status = "canonical", batcher = "Dataset.write.table" }
+using = { status = "gap", need = "choose the table provider for a V2 create", wave = "W9" }
+
+[DataStreamWriter]
+clusterBy = { status = "gap", need = "clustering columns for a streaming table write", wave = "W10" }
+foreach = { status = "canonical", batcher = "Dataset.write.for_each" }
+foreachBatch = { status = "mismatch", batcher = "Dataset.write.for_each_batch", note = "Spark passes each micro-batch as a DataFrame; Batcher passes a pyarrow.Table", wave = "W10" }
+format = { status = "canonical", batcher = "Dataset.write" }
+option = { status = "canonical", batcher = "Dataset.write" }
+options = { status = "canonical", batcher = "Dataset.write" }
+outputMode = { status = "canonical", batcher = "Dataset.write" }
+partitionBy = { status = "canonical", batcher = "Dataset.write" }
+queryName = { status = "canonical", batcher = "Dataset.write" }
+start = { status = "canonical", batcher = "Dataset.write" }
+toTable = { status = "param", batcher = "Dataset.write", need = "start a streaming write into a catalog table", wave = "W10" }
+trigger = { status = "canonical", batcher = ["Dataset.write", "bt.Trigger"] }

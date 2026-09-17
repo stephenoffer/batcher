@@ -1,0 +1,89 @@
+# Daft 0.7.25 -> Batcher: Session, Catalog and Table.
+# Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
+
+[Session]
+attach = { status = "param", batcher = "Session.catalog.attach", need = "a DataFrame argument is Session.register instead", wave = "W9" }
+attach_catalog = { status = "canonical", batcher = "Session.catalog.attach" }
+attach_function = { status = "canonical", batcher = "Session.register_function" }
+attach_provider = { status = "param", batcher = "Session.register_engine", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
+attach_table = { status = "canonical", batcher = "Session.register" }
+attach_view = { status = "canonical", batcher = "Session.register" }
+create_namespace = { status = "canonical", batcher = "Session.catalog.create_namespace" }
+create_namespace_if_not_exists = { status = "param", batcher = "Session.catalog.create_namespace", need = "port as the base method with if_not_exists=True", wave = "W9" }
+create_table = { status = "canonical", batcher = "Session.catalog.create_table" }
+create_table_if_not_exists = { status = "param", batcher = "Session.catalog.create_table", need = "port as the base method with if_not_exists=True", wave = "W9" }
+create_temp_table = { status = "param", batcher = "Session.register", need = "Batcher binds the lazy plan rather than materializing it", wave = "W9" }
+create_temp_view = { status = "canonical", batcher = "Session.register" }
+current_catalog = { status = "canonical", batcher = "Session.catalog.current_catalog" }
+current_model = { status = "param", batcher = "Session.list_models", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
+current_namespace = { status = "canonical", batcher = "Session.catalog.current_namespace" }
+current_provider = { status = "param", batcher = "Session.list_engines", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
+detach_catalog = { status = "canonical", batcher = "Session.catalog.detach" }
+detach_function = { status = "canonical", batcher = "Session.drop_function" }
+detach_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
+detach_table = { status = "param", batcher = "Session.drop", need = "Session.drop is silent when the name is absent", wave = "W9" }
+drop_namespace = { status = "canonical", batcher = "Session.catalog.drop_namespace" }
+drop_table = { status = "canonical", batcher = "Session.catalog.drop_table" }
+get_aggregate_function = { status = "gap", need = "look up a registered aggregate function as an Expression", wave = "W9" }
+get_catalog = { status = "canonical", batcher = "Session.catalog.get_catalog" }
+get_function = { status = "gap", need = "look up a registered function as an Expression", wave = "W9" }
+get_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
+get_table = { status = "canonical", batcher = "Session.catalog.get_table" }
+has_catalog = { status = "canonical", batcher = "Session.catalog.has_catalog" }
+has_namespace = { status = "canonical", batcher = "Session.catalog.has_namespace" }
+has_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
+has_table = { status = "canonical", batcher = "Session.catalog.has_table" }
+list_catalogs = { status = "canonical", batcher = "Session.catalog.list_catalogs" }
+list_namespaces = { status = "canonical", batcher = "Session.catalog.list_namespaces" }
+list_tables = { status = "canonical", batcher = "Session.catalog.list_tables" }
+load_extension = { status = "out_of_scope", reason = "loads a Daft native extension library; Batcher extends through Python registries, not dynamic native loading" }
+read_table = { status = "canonical", batcher = "Session.table" }
+set_catalog = { status = "canonical", batcher = "Session.catalog.use" }
+set_model = { status = "param", batcher = "Session.register_model", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
+set_namespace = { status = "canonical", batcher = "Session.catalog.use" }
+set_provider = { status = "param", batcher = "Session.register_engine", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
+sql = { status = "canonical", batcher = "Session.sql" }
+use = { status = "canonical", batcher = "Session.catalog.use" }
+write_table = { status = "canonical", batcher = "Dataset.write.table" }
+
+[Catalog]
+create_function = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+create_namespace = { status = "canonical", batcher = "Catalog.create_namespace" }
+create_namespace_if_not_exists = { status = "canonical", batcher = "Catalog.create_namespace", template = 'create_namespace_if_not_exists(identifier) -> self.create_namespace(identifier, if_not_exists=True)' }
+create_table = { status = "canonical", batcher = "Catalog.create_table" }
+create_table_if_not_exists = { status = "param", batcher = "Catalog.create_table", need = "port as create_table(name, source, if_not_exists=True)", wave = "W9" }
+drop_namespace = { status = "canonical", batcher = "Catalog.drop_namespace" }
+drop_table = { status = "canonical", batcher = "Catalog.drop_table" }
+from_glue = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+from_gravitino = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+from_iceberg = { status = "canonical", batcher = "Catalog.from_iceberg" }
+from_paimon = { status = "gap", need = "Apache Paimon catalog backend", wave = "W9" }
+from_postgres = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+from_pydict = { status = "canonical", batcher = "Catalog.from_pydict" }
+from_s3tables = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+from_unity = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+get_function = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+get_table = { status = "canonical", batcher = "Catalog.get_table" }
+has_namespace = { status = "canonical", batcher = "Catalog.has_namespace" }
+has_table = { status = "canonical", batcher = "Catalog.has_table" }
+list_namespaces = { status = "canonical", batcher = "Catalog.list_namespaces" }
+list_tables = { status = "canonical", batcher = "Catalog.list_tables" }
+name = { status = "canonical", batcher = "Catalog.name" }
+read_table = { status = "canonical", batcher = "Table.read" }
+write_table = { status = "canonical", batcher = "Dataset.write.table" }
+
+[Table]
+append = { status = "param", batcher = "Dataset.write.table", need = "port as ds.write.table(table.name, mode=...); Table has no write methods", wave = "W9" }
+from_df = { status = "canonical", batcher = "Session.register" }
+from_gravitino = { status = "gap", need = "Gravitino table handle", wave = "W9" }
+from_iceberg = { status = "param", batcher = "Catalog.from_iceberg", need = "port as Catalog.from_iceberg(spec).get_table(name)", wave = "W9" }
+from_paimon = { status = "gap", need = "Paimon table handle", wave = "W9" }
+from_pydict = { status = "canonical", batcher = "Catalog.from_pydict" }
+from_unity = { status = "gap", need = "Unity Catalog table handle", wave = "W9" }
+name = { status = "canonical", batcher = "Table.name" }
+overwrite = { status = "param", batcher = "Dataset.write.table", need = "port as ds.write.table(table.name, mode=...); Table has no write methods", wave = "W9" }
+read = { status = "canonical", batcher = "Table.read" }
+schema = { status = "canonical", batcher = "Table.schema" }
+select = { status = "param", batcher = "Table.read", need = "port as table.read().select(...)", wave = "W9" }
+show = { status = "param", batcher = "Table.read", need = "port as table.read().show()", wave = "W9" }
+write = { status = "param", batcher = "Dataset.write.table", need = "port as ds.write.table(table.name, mode=...); Table has no write methods", wave = "W9" }

@@ -112,7 +112,7 @@ def test_group_by_accepts_a_list(ds):
 
 @pytest.mark.unit
 def test_groupby_pandas_spelling_accepts_a_list(ds):
-    got = ds.groupby(["g"]).agg(s=bt.col("x").sum()).sort("g").to_pydict()
+    got = ds.group_by(["g"]).agg(s=bt.col("x").sum()).sort("g").to_pydict()
     assert got == {"g": ["a", "b"], "s": [3, 3]}
 
 

@@ -161,23 +161,30 @@ so `batch_size` is the throughput knob that matters here.
 1. **Inventory the extract.** List every connection string, every query, and every place
    the old code set a fetch size, a partition column, or a thread count. Note which
    queries are full-table reads (those become `table=`) and which are real SQL.
-2. **Port the connection first, unpartitioned.** Turn the JDBC URL or SQLAlchemy URL into
+2. **Run the codemod first, on the Python around the extract.** The codemod has no JDBC,
+   SQLAlchemy, or DB-API direction, because the connection and the partitioning are the port.
+   If the job is PySpark beyond the extract, run
+   `python -m batcher.migrate --from pyspark --to batcher <paths>` as `migrate-from-spark`
+   describes. If it already calls Batcher, run
+   `python -m batcher.migrate --from batcher --to batcher <paths>`, which rewrites removed
+   Batcher spellings.
+3. **Port the connection first, unpartitioned.** Turn the JDBC URL or SQLAlchemy URL into
    a `uri=`, drop any `jdbc:` prefix and `+driver` suffix concerns, and move the password
    to `password="env:…"`. Run one small query and confirm it returns rows before anything
    else.
-3. **Port the query text verbatim.** It executes on the warehouse, so dialect-specific SQL
+4. **Port the query text verbatim.** It executes on the warehouse, so dialect-specific SQL
    is fine here — this is the opposite of `migrate-from-duckdb-sql`. Keep it byte-identical
    to the original so the two extracts are comparable.
-4. **Check the schema.** `print(ds.schema)`. On the DB-API path a driver may report types
+5. **Check the schema.** `print(ds.schema)`. On the DB-API path a driver may report types
    too coarsely to resolve (PEP 249's `NUMBER` covers int, float, and decimal alike); pass
    `schema_override=` rather than letting inference guess.
-5. **Add partitioning last, and only if the extract is slow.** Map `partitionColumn` /
+6. **Add partitioning last, and only if the extract is slow.** Map `partitionColumn` /
    `lowerBound` / `upperBound` / `numPartitions` straight across. Approximate bounds are
-   fine — they cut, they don't filter. Verify the row count is unchanged from step 2.
-6. **Move the filtering into the plan.** Delete post-extract pandas filtering and
+   fine — they cut, they don't filter. Verify the row count is unchanged from step 3.
+7. **Move the filtering into the plan.** Delete post-extract pandas filtering and
    `df = df[df.amount > 100]` lines; write them as `.filter(...)` so they push into the
    SQL. Confirm with `print(ds.explain())`.
-7. **Port the sink.** `.write.jdbc(url, table, mode)` becomes
+8. **Port the sink.** `.write.jdbc(url, table, mode)` becomes
    `ds.write.sql(table, uri=..., mode=...)`. A plain append goes through ADBC and ingests
    Arrow in bulk; MySQL, Oracle and SQL Server, which have no ADBC driver, go through the
    scheme's PEP 249 driver, so a `jdbc:mysql:` sink ports without changing anything but the
@@ -185,7 +192,7 @@ so `batch_size` is the throughput knob that matters here.
    `foreachPartition` over a hand-written upsert, which is what Spark forces — collapse
    both into `mode="upsert", key_columns=[...]`, and pass `key_columns=` on the write that
    creates the table so it has the key the upsert conflicts on.
-8. **Verify the ported extract returns the same rows.** Run the original extract and the
+9. **Verify the ported extract returns the same rows.** Run the original extract and the
    ported one against the same database and compare **order-independently** — a SQL result
    has no order without an `ORDER BY`, and this is where ports quietly differ:
 
@@ -202,10 +209,19 @@ so `batch_size` is the throughput knob that matters here.
    query ends in an explicit `ORDER BY`. Import both from `_harness` rather than from
    `conftest`, which re-exports them but resolves ambiguously across test directories.
 
-9. **Prove the partitioning did not change the answer.** Re-run step 8 with
+10. **Prove the partitioning did not change the answer.** Re-run step 9 with
    `num_partitions=1` and with your chosen count, and assert both match. The disjoint-and-
    exhaustive invariant is tested in-repo, but a wrong `partition_on` column (non-numeric,
    or one the database silently coerces) is your bug to catch.
+
+## Going back
+
+The query text never changed, because it runs on the warehouse, so going back is only the
+connection and the parallelism. The Spark JDBC option table above reads right to left:
+`uri=` becomes the JDBC `url`, and `partition_on` / `lower_bound` / `upper_bound` /
+`num_partitions` become `partitionColumn` / `lowerBound` / `upperBound` / `numPartitions`. A
+write through `ds.write.sql(..., mode="upsert", key_columns=[...])` has no single JDBC
+equivalent, so it goes back to a staging-table write followed by a `MERGE` on the warehouse.
 
 ## Known gaps — state these plainly
 

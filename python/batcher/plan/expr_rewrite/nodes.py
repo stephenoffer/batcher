@@ -10,7 +10,7 @@ import dataclasses
 from collections.abc import Callable
 from typing import TypeVar
 
-from batcher.plan.expr_ir import AggExpr, Expr
+from batcher.plan.expr_ir import Expr
 from batcher.plan.expr_rewrite.traverse import ExprRule
 from batcher.plan.logical import (
     Aggregate,
@@ -116,16 +116,10 @@ def _map_sort_key(key: SortKeySpec, rule: ExprRule) -> SortKeySpec:
 
 
 def _map_agg(spec: AggregateSpec, rule: ExprRule) -> AggregateSpec:
-    # AggExpr is not a dataclass (custom __slots__ class), so rebuild it directly.
-    if spec.agg.input is None:
-        return spec
-    # Carry the second input (arg_min/arg_max ordering key) through the rewrite too.
-    input1 = rule(spec.agg.input)
-    input2 = rule(spec.agg.input2) if spec.agg.input2 is not None else None
-    if input1 is spec.agg.input and input2 is spec.agg.input2:
-        return spec
-    rebuilt = AggExpr(spec.agg.func, input1, param=spec.agg.param, input2=input2)
-    return dataclasses.replace(spec, agg=rebuilt)
+    # Every operand -- the input, arg_min/arg_max's ordering key, an ordered array_agg's
+    # keys -- goes through the rule, and every other field is carried by `map_operands`.
+    rebuilt = spec.agg.map_operands(rule)
+    return spec if rebuilt is spec.agg else dataclasses.replace(spec, agg=rebuilt)
 
 
 def _map_window_fn(fn: WindowFuncSpec, rule: ExprRule) -> WindowFuncSpec:

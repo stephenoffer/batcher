@@ -21,11 +21,11 @@ from batcher import col
 
 
 def main() -> None:
-    customer = tpch("customer").select("c_custkey", "c_mktsegment").head(500)
+    customer = tpch("customer").select("c_custkey", "c_mktsegment").limit(500)
 
     # The dimension as it stood, and a later snapshot where some segments changed.
     first = customer.with_columns(effective=bt.lit(dt.date(2024, 1, 1)))
-    changed = customer.head(100).with_columns(
+    changed = customer.limit(100).with_columns(
         c_mktsegment=bt.lit("HOUSEHOLD"),
         effective=bt.lit(dt.date(2024, 6, 1)),
     )
@@ -40,12 +40,12 @@ def main() -> None:
     ).with_columns(is_current=col("valid_to").is_null())
 
     result = versioned.to_pydict()
-    print(versioned.head(4).to_pydict())
+    print(versioned.limit(4).to_pydict())
 
     # Exactly one current row per customer.
     current = versioned.filter(col("is_current"))
     assert current.count() == customer.count()
-    assert current.n_unique("c_custkey") == customer.count()
+    assert current.count_distinct("c_custkey") == customer.count()
 
     # The changed customers have two versions, the rest one.
     counts = versioned.group_by("c_custkey").agg(versions=bt.count()).to_pydict()

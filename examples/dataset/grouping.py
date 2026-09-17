@@ -33,7 +33,7 @@ def main() -> None:
             average=col("amount").mean(),
             biggest=col("amount").max(),
             n=bt.count(),
-            distinct_products=col("product").n_unique(),
+            distinct_products=col("product").count_distinct(),
         )
         .sort("region")
         .to_pydict()
@@ -54,7 +54,7 @@ def main() -> None:
 
     # A derived key, computed inline.
     by_initial = (
-        sales.group_by(initial=col("region").str.head(1))
+        sales.group_by(initial=col("region").str.left(1))
         .agg(total=col("amount").sum())
         .sort("initial")
         .to_pydict()

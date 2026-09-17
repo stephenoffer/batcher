@@ -47,7 +47,7 @@ DOUBLE_IN_BOTH = [
     ("log10", lambda: col("n").abs().log10(), "log10(abs(n))"),
     ("sin", lambda: col("n").sin(), "sin(n)"),
     ("cos", lambda: col("n").cos(), "cos(n)"),
-    ("atan", lambda: col("n").atan(), "atan(n)"),
+    ("atan", lambda: col("n").arctan(), "atan(n)"),
     ("tanh", lambda: col("n").tanh(), "tanh(n)"),
 ]
 

@@ -76,7 +76,7 @@ def answer_groundedness(answer: IntoExpr, context: IntoExpr) -> Expr:
             0.5
     """
     ans, ctx = tokens(_as_column(answer)), tokens(_as_column(context))
-    intersection = ans.list.set_intersection(ctx).list.len()
+    intersection = ans.list.intersect(ctx).list.len()
     return mean_ratio(intersection, ans.list.n_unique())
 
 
@@ -105,7 +105,7 @@ def context_utilization(answer: IntoExpr, context: IntoExpr) -> Expr:
             0.5
     """
     ans, ctx = tokens(_as_column(answer)), tokens(_as_column(context))
-    intersection = ans.list.set_intersection(ctx).list.len()
+    intersection = ans.list.intersect(ctx).list.len()
     return mean_ratio(intersection, ctx.list.n_unique())
 
 
@@ -135,7 +135,7 @@ def unsupported_token_rate(answer: IntoExpr, context: IntoExpr) -> Expr:
             0.6667
     """
     ans, ctx = tokens(_as_column(answer)), tokens(_as_column(context))
-    unsupported = ans.list.set_difference(ctx).list.len()
+    unsupported = ans.list.difference(ctx).list.len()
     return mean_ratio(unsupported, ans.list.n_unique())
 
 
@@ -169,7 +169,7 @@ def fully_grounded_rate(answer: IntoExpr, context: IntoExpr) -> Expr:
             0.5
     """
     ans, ctx = tokens(_as_column(answer)), tokens(_as_column(context))
-    unsupported = ans.list.set_difference(ctx).list.len()
+    unsupported = ans.list.difference(ctx).list.len()
     non_empty = ans.list.len() > lit(0)
     grounded = (unsupported == lit(0)) & non_empty
     return count_if(grounded) / count_if(lit(True))

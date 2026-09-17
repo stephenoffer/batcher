@@ -138,7 +138,7 @@ def test_setops_empty_operands(duck):
 def test_count_distinct_float_folding(duck):
     a = _fa()
     duck.register("a", a)
-    got = bt.from_arrow(a).group_by().agg(n=col("x").n_unique()).collect()
+    got = bt.from_arrow(a).group_by().agg(n=col("x").count_distinct()).collect()
     assert_same(got, duck.sql("SELECT count(DISTINCT x) AS n FROM a"))
 
 

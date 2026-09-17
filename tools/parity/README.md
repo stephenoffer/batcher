@@ -1,6 +1,6 @@
 # Parity censuses: run the competitor, not just read it
 
-Three harnesses that execute a reference engine and Batcher side by side over the
+Four harnesses that execute a reference engine and Batcher side by side over the
 reference's **whole function surface**, then sort every result into three buckets:
 
 | Bucket | Meaning |
@@ -25,6 +25,7 @@ built (`just build`) and take a few minutes each, mostly in process startup per 
 python tools/parity/duckdb_census.py > /tmp/duckdb.json   # needs `duckdb` (a test dep)
 python tools/parity/spark_census.py  > /tmp/spark.json    # needs the Spark source, no JVM
 python tools/parity/polars_census.py > /tmp/polars.json   # needs `polars` (a test dep)
+python tools/parity/daft_census.py   > /tmp/daft.json     # needs `daft`
 ```
 
 To check a change for regressions, run one before and after and diff the `match` sets. The
@@ -42,7 +43,7 @@ nested LIST) does not report the whole function as a gap.
 Spark annotates every builtin with an `@ExpressionDescription` holding
 `> SELECT _FUNC_(args);` and the expected output, and `FunctionRegistry.scala` maps each
 expression class to its SQL name. Together they are an executable oracle a text reader can
-use. Point `SPARK` at a Spark checkout.
+use. Point `SPARK_SOURCE` at a Spark checkout (default `/mnt/shared_storage/ref/spark`).
 
 Remember what `dialect="spark"` means when reading its output: it selects a **parser**, not
 a semantics. Where Spark and DuckDB genuinely disagree on what a function means the engine
@@ -66,3 +67,21 @@ Three classes of "mismatch" are not defects, and each will appear:
   half-to-even in Polars. Each is recorded in the ledger with its reasoning.
 
 A mismatch that is none of those three is a bug. That is the whole point of the column.
+
+**`daft_census.py`** resolves every `daft.Expression` method by *name* against Batcher's
+surface and runs nothing, so it has no mismatch column. Treat its match count as an upper
+bound: a name that resolves to a same-named Batcher method with different semantics counts as
+a match. Several of its `ALIASES` entries are known to be wrong for exactly that reason
+(`value_counts`, `explode`, `not_nan`, `lag`).
+
+## The denominator: surface snapshots and the migration registry
+
+The censuses above answer "does Batcher return the same thing?" for the names they can call.
+They do not say which names exist. `surfaces.py` (`just parity-snapshot`) enumerates every
+public name on every surface a user of PySpark, Polars, Daft and Ray Data types, and commits
+it as `surfaces/<engine>.json`. The migration registry in
+`python/batcher/_internal/migration/data/` classifies each of those names exactly once
+(canonical, alias, param, gap, mismatch, out of scope), and
+`tests/unit/test_migration_registry.py` fails on a name nobody classified, a Batcher target
+that does not resolve, or a competitor spelling that silently resolves as a second Batcher
+spelling. `batcher_targets.py` is the resolver both use.

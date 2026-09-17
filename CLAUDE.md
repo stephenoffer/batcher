@@ -172,10 +172,10 @@ it routes to the rest) ·
 `read-and-write-data` · `manage-a-lakehouse-table` · `validate-data-quality` ·
 `apply-governance-and-security`
 
-**Migrating onto it:** `migrate-from-spark` · `migrate-from-polars-or-pandas` ·
-`migrate-from-duckdb-sql` · `migrate-from-daft`
+**Migrating:** `migrate-from-spark` · `migrate-from-polars-or-pandas` ·
+`migrate-from-duckdb-sql` · `migrate-from-daft` · `migrate-from-ray-data`
 
-Catalog: `docs/agents.md` (`tests/docs/test_skill_coverage.py` fails on an unlisted skill).
+Catalog: `docs/agents.md`, gated by `tests/docs/test_skill_coverage.py`.
 
 ## Source of truth
 

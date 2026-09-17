@@ -223,6 +223,7 @@ pub fn framed_value(
     ordered: &[Vec<usize>],
     values: &ArrayRef,
     nth: i64,
+    ignore_nulls: bool,
     frame: Frame,
     order_rows: Option<&Rows>,
     range_order: Option<&RangeOrder>,
@@ -239,12 +240,15 @@ pub fn framed_value(
     for part in ordered {
         let len = part.len();
         let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let non_null = ignore_nulls.then(|| NonNullRanks::new(part, values));
         let mut prev_bounds = (0usize, 0usize);
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
             debug_check_monotone(&mut prev_bounds, a, b);
             let take_pos: Option<usize> = if a >= b {
                 None // empty frame → null
+            } else if let Some(nn) = &non_null {
+                nn.pick(func, nth, a, b)
             } else {
                 match func {
                     WindowFn::FirstValue => Some(a),
@@ -270,6 +274,52 @@ pub fn framed_value(
         }
     }
     Ok(take(values.as_ref(), &UInt32Array::from(src), None)?)
+}
+
+/// The ordered positions of one partition's non-null values, so an `IGNORE NULLS` value
+/// function can find the first, last or `nth` non-null row of any `[a, b)` range in O(1).
+///
+/// `prefix[i]` counts the non-null values among the first `i` ordered rows, and
+/// `positions[k]` is the ordered position of the `k`-th of them. A frame `[a, b)` therefore
+/// holds `prefix[b] - prefix[a]` non-null values, starting at `positions[prefix[a]]`.
+pub(crate) struct NonNullRanks {
+    prefix: Vec<usize>,
+    positions: Vec<usize>,
+}
+
+impl NonNullRanks {
+    /// Index the non-null values of the partition whose ordered row ids are `part`.
+    pub(crate) fn new(part: &[usize], values: &ArrayRef) -> Self {
+        let mut prefix = Vec::with_capacity(part.len() + 1);
+        let mut positions = Vec::new();
+        prefix.push(0);
+        for (pos, &row) in part.iter().enumerate() {
+            if values.is_valid(row) {
+                positions.push(pos);
+            }
+            prefix.push(positions.len());
+        }
+        Self { prefix, positions }
+    }
+
+    /// The ordered position `func` selects among the non-null values of `[a, b)`, or `None`
+    /// when the range holds too few. `nth` is 1-based and read by `nth_value` alone; a
+    /// non-positive or oversized `nth` selects nothing rather than overflowing.
+    pub(crate) fn pick(&self, func: WindowFn, nth: i64, a: usize, b: usize) -> Option<usize> {
+        let (lo, hi) = (self.prefix[a], self.prefix[b]);
+        if lo >= hi {
+            return None;
+        }
+        let k = match func {
+            WindowFn::FirstValue => lo,
+            WindowFn::LastValue => hi - 1,
+            _ => {
+                let offset = usize::try_from(nth).ok()?.checked_sub(1)?;
+                (offset < hi - lo).then(|| lo + offset)?
+            }
+        };
+        Some(self.positions[k])
+    }
 }
 
 /// `count` over the frame: number of non-null values (0 for an empty frame),
@@ -698,6 +748,72 @@ fn framed_bool_minmax(
 }
 
 #[cfg(test)]
+mod ignore_nulls_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+
+    /// `IGNORE NULLS` against DuckDB over the default running frame
+    /// (`RANGE UNBOUNDED PRECEDING TO CURRENT ROW`), with ties on the order key:
+    /// x=[NULL, 2, NULL, 4], k=[1, 2, 3, 4] ->
+    /// first_value [NULL, 2, 2, 2], last_value [NULL, 2, 2, 4], nth_value(2) [NULL, NULL, NULL, 4].
+    #[test]
+    fn ignore_nulls_matches_duckdb_on_the_running_frame() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(2), None, Some(4)]));
+        let ordered = vec![vec![0usize, 1, 2, 3]];
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
+        };
+        let run = |func, nth| {
+            let out =
+                framed_value(func, &ordered, &values, nth, true, frame, None, None, 4).unwrap();
+            let a = out.as_primitive::<Int64Type>();
+            (0..4)
+                .map(|i| a.is_valid(i).then(|| a.value(i)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run(WindowFn::FirstValue, 1),
+            vec![None, Some(2), Some(2), Some(2)]
+        );
+        assert_eq!(
+            run(WindowFn::LastValue, 1),
+            vec![None, Some(2), Some(2), Some(4)]
+        );
+        assert_eq!(run(WindowFn::NthValue, 2), vec![None, None, None, Some(4)]);
+        // An absurd `nth` selects nothing instead of overflowing.
+        assert_eq!(run(WindowFn::NthValue, i64::MAX), vec![None; 4]);
+        assert_eq!(run(WindowFn::NthValue, 0), vec![None; 4]);
+    }
+
+    /// The ranks index is exact on every `[a, b)` against a brute-force scan.
+    #[test]
+    fn non_null_ranks_agree_with_a_scan() {
+        let raw = [None, Some(1), None, None, Some(4), Some(5), None, Some(7)];
+        let values: ArrayRef = Arc::new(Int64Array::from(raw.to_vec()));
+        let part: Vec<usize> = (0..raw.len()).rev().collect(); // a non-identity order
+        let nn = NonNullRanks::new(&part, &values);
+        for a in 0..=part.len() {
+            for b in a..=part.len() {
+                let live: Vec<usize> = (a..b).filter(|&p| raw[part[p]].is_some()).collect();
+                assert_eq!(
+                    nn.pick(WindowFn::FirstValue, 1, a, b),
+                    live.first().copied()
+                );
+                assert_eq!(nn.pick(WindowFn::LastValue, 1, a, b), live.last().copied());
+                for nth in 1..4 {
+                    assert_eq!(
+                        nn.pick(WindowFn::NthValue, nth, a, b),
+                        live.get(nth as usize - 1).copied()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use bounds::frame_half_open;
 
@@ -952,6 +1068,7 @@ mod tests {
             &ordered,
             &values,
             1,
+            false,
             frame,
             Some(&rows),
             None,
@@ -965,6 +1082,7 @@ mod tests {
             &ordered,
             &values,
             1,
+            false,
             frame,
             Some(&rows),
             None,
@@ -978,6 +1096,7 @@ mod tests {
             &ordered,
             &values,
             2,
+            false,
             frame,
             Some(&rows),
             None,
@@ -999,6 +1118,7 @@ mod tests {
             &ordered,
             &values,
             3,
+            false,
             frame,
             Some(&rows),
             None,
@@ -1028,6 +1148,7 @@ mod tests {
             &ordered,
             &values,
             1,
+            false,
             frame,
             None,
             None,
@@ -1043,6 +1164,7 @@ mod tests {
             &ordered,
             &values,
             1,
+            false,
             frame,
             None,
             None,
@@ -1082,6 +1204,7 @@ mod tests {
                 &ordered,
                 &values,
                 nth,
+                false,
                 frame,
                 None,
                 None,

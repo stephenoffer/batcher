@@ -197,7 +197,7 @@ def test_the_to_torch_loader_round_trips_back_through_from_torch():
     """What the loader yields is what the constructor takes. It was not, and nothing said so."""
     pytest.importorskip("torch")
     source = bt.from_pydict({"x": [1, 2, 3, 4]})
-    batch = next(iter(source.ml.to_torch(batch_size=4)))
+    batch = next(iter(source.ml.iter_torch_batches(batch_size=4)))
     assert bt.from_torch(batch).to_pydict()["x"] == [1, 2, 3, 4]
 
 

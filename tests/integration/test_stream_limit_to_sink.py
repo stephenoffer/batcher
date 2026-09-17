@@ -28,15 +28,15 @@ def _stream(n: int = 6):
 
 @pytest.mark.integration
 def test_the_first_n_rows_reach_a_sink_and_the_query_stops():
-    query = _stream().head(3).write.memory("limit_sink", trigger=bt.Trigger.available_now())
+    query = _stream().limit(3).write.memory("limit_sink", trigger=bt.Trigger.available_now())
     assert query.await_termination(timeout=60) is True
     assert bt.read_memory("limit_sink").to_pydict() == {"v": [0, 1, 2]}
 
 
 @pytest.mark.integration
 def test_the_sink_gets_exactly_what_iter_batches_yields():
-    streamed = [row for batch in _stream().head(3).iter_batches() for row in batch.to_pylist()]
-    query = _stream().head(3).write.memory("limit_parity", trigger=bt.Trigger.available_now())
+    streamed = [row for batch in _stream().limit(3).iter_batches() for row in batch.to_pylist()]
+    query = _stream().limit(3).write.memory("limit_parity", trigger=bt.Trigger.available_now())
     assert query.await_termination(timeout=60) is True
     assert bt.read_memory("limit_parity").to_pylist() == streamed
 
@@ -44,14 +44,18 @@ def test_the_sink_gets_exactly_what_iter_batches_yields():
 @pytest.mark.integration
 def test_an_offset_is_respected_too():
     """`head` is a `Limit` with offset 0; `slice` is the same node with one set."""
-    query = _stream().slice(2, 2).write.memory("limit_offset", trigger=bt.Trigger.available_now())
+    query = (
+        _stream()
+        .limit(2, offset=2)
+        .write.memory("limit_offset", trigger=bt.Trigger.available_now())
+    )
     assert query.await_termination(timeout=60) is True
     assert bt.read_memory("limit_offset").to_pydict() == {"v": [2, 3]}
 
 
 @pytest.mark.integration
 def test_a_limit_larger_than_the_stream_takes_what_there_is():
-    query = _stream(2).head(100).write.memory("limit_short", trigger=bt.Trigger.available_now())
+    query = _stream(2).limit(100).write.memory("limit_short", trigger=bt.Trigger.available_now())
     assert query.await_termination(timeout=60) is True
     assert bt.read_memory("limit_short").to_pydict() == {"v": [0, 1]}
 
@@ -61,6 +65,6 @@ def test_a_checkpoint_is_refused_rather_than_accepted_and_ignored():
     """How many rows have already gone out is not a source offset, so a restart would
     resume with the count at zero while the offset log claimed the rows were done."""
     with pytest.raises(PlanError, match="how many rows have gone out"):
-        _stream().head(3).write.memory(
+        _stream().limit(3).write.memory(
             "limit_ckpt", trigger=bt.Trigger.available_now(), checkpoint="/tmp/nope"
         )

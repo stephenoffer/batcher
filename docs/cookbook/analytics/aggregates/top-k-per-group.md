@@ -156,16 +156,16 @@ Three functions, three different questions:
 ## k = 1 does not need a window
 
 :::{tip}
-If you only want the single best row per group, `arg_max` gets it as a plain aggregate.
+If you only want the single best row per group, `max_by` gets it as a plain aggregate.
 Being an aggregate makes it mergeable, so it runs in bounded memory and merges across
 partitions without ever materializing a group. A window has to hold each partition to sort
-it, while `arg_max` holds one row.
+it, while `max_by` holds one row.
 :::
 
 ```python
 best = (
     sales.group_by("category")
-    .agg(product=col("product").arg_max(col("revenue")), revenue=col("revenue").max())
+    .agg(product=col("product").max_by(col("revenue")), revenue=col("revenue").max())
     .sort("category")
 )
 print(best.to_pydict())
@@ -173,7 +173,7 @@ print(best.to_pydict())
 #  'revenue': [500.0, 700.0, 900.0]}
 ```
 
-Reach for the window when k > 1. Reach for `arg_max` when k = 1 and the groups are large.
+Reach for the window when k > 1. Reach for `max_by` when k = 1 and the groups are large.
 
 ## See also
 
@@ -185,4 +185,4 @@ Reach for the window when k > 1. Reach for `arg_max` when k = 1 and the groups a
 - {doc}`Window internals </architecture/deep-dives/operators/window-internals>`: why the partitioned sort beats
   the global one.
 - {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>`: the heap that `top_k` fuses into.
-- {doc}`Expressions API </api/relational/expressions>`: `row_number`, `rank`, `dense_rank`, `arg_max`.
+- {doc}`Expressions API </api/relational/expressions>`: `row_number`, `rank`, `dense_rank`, `max_by`.

@@ -33,6 +33,29 @@ predicate. That single rule is what makes pushdown safe to reason about:
 So a predicate that fails to push is a performance question, never a correctness one. You
 never need to check whether a filter "worked".
 
+### Floating-point columns and NaN
+
+Batcher sorts `NaN` above every number, so `NaN > 0.9` is true, the same as in `ORDER BY`. Parquet, Delta, and Iceberg leave `NaN` out of a float column's recorded minimum and maximum, so a file's recorded maximum can sit below a `NaN` it holds. Batcher therefore never skips a row group or a file on a float column's maximum for `>`, `>=`, or `!=`, and a filter over Parquet keeps exactly the `NaN` rows the same filter keeps in memory:
+
+```python
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+import batcher as bt
+
+floats = pa.table({"reading": [0.1, 0.5, float("nan")]})
+pq.write_table(floats, "readings.parquet")
+
+high = bt.read.parquet("readings.parquet").filter(bt.col("reading") > 0.9)
+print(high.count())
+```
+
+```text
+1
+```
+
+A filter using `<`, `<=`, or `=` still skips on the recorded bounds, because no `NaN` satisfies it. DuckDB behaves the same way when you read with `can_have_nan=true`. Its default trusts the recorded maximum and can skip `NaN` rows.
+
 ## What pushes
 
 Batcher translates this subset of a predicate:
@@ -46,6 +69,11 @@ Batcher translates this subset of a predicate:
 | String prefix, suffix, and substring | `col("s").str.starts_with("US")` |
 | A constant | `col("a").is_in([])`, which folds to a constant false |
 | `AND` and `OR` of any of the above | `col("a") > 5 & col("b").is_in([1, 2])` |
+
+A spilled query takes the same predicate. `collect(spill=True)` reads its input through the
+out-of-core aggregate, join, sort, and window executors, and each of them offers the source
+the filter above its scan, so a selective filter over a large Parquet table prunes its row
+groups whether or not the query spills.
 
 Anything else stays with the engine. The common cases that don't push are a comparison
 between two columns (`col("a") > col("b")`), arithmetic on the filtered column
@@ -202,6 +230,56 @@ the ordering nor the cap, and the read is unordered and uncapped exactly as befo
 Two things still block a sorted cap: a filter between the sort and the read, since the
 server's top *n* of the unfiltered relation is not the top *n* of the filtered one, and a
 sort on a computed key, which the server cannot name.
+
+### Sorted limits over Parquet row groups
+
+A Parquet file can't take an `ORDER BY`, but its footer records the minimum and maximum of
+every column in every row group. That is enough to prove where the top *n* rows can't be.
+For `sort("ts", descending=True).limit(n)`, Batcher walks the row groups from the largest
+minimum down and adds up their non-null row counts. The group that brings the total to *n*
+fixes a value that at least *n* rows are known to reach. Every row below that value is
+strictly worse than the *n*th best row, so Batcher filters the read to `ts >= value`, and
+the reader skips every row group whose maximum falls short of it.
+
+```python
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+events = pa.table(
+    {
+        "ts": pa.array(range(0, 60_000), pa.int64()).cast(pa.timestamp("ms")),
+        "user": pa.array([i % 97 for i in range(60_000)], pa.int64()),
+    }
+)
+pq.write_table(events, "events.parquet", row_group_size=10_000)
+
+latest = bt.read.parquet("events.parquet").sort("ts", descending=True).limit(3)
+print(latest.collect().to_pydict()["user"])
+```
+
+```text
+[53, 52, 51]
+```
+
+The bound is derived on the query's first run, from the files being read, so it can't be
+stale. It applies to `collect()`, `collect(spill=True)`, and `iter_batches()` alike. On a
+table whose sort key is clustered across row groups, such as an event log written in time
+order, the read shrinks to the few groups that hold the answer. A table whose row groups all
+span the same range has nothing to skip, and Batcher then reads it as it would without the
+bound.
+
+The bound is offered only when all of the following hold:
+
+1. The sort key is a column read directly from the file, optionally renamed by a `select`, with no filter, join, or aggregation between the sort and the read.
+1. The key is an integer, a date, or a timestamp with millisecond or microsecond precision. Floating-point footers omit `NaN`, and string footers may be truncated, so neither proves a bound.
+1. Nulls sort last, which is the default. A nulls-first sort wants the rows the bound would remove.
+1. The limit is at most 10,000 rows and has no offset.
+1. The source holds at least 1,000,000 rows across two or more row groups.
+1. The row groups the bound can't skip hold at most half the table's rows.
+
+When the same top *n* runs again, Batcher also remembers the *n*th value it returned and
+starts from that. It checks the result's row count and re-runs the query as written if the
+data has moved, so a remembered bound costs a wasted scan at worst, never a wrong answer.
 
 ## Counting without reading
 

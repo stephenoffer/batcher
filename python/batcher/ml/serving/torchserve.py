@@ -42,7 +42,7 @@ def torchserve_client(
             ...     input_columns=["image"],
             ...     output_columns=["class"],
             ... )
-            >>> ds.ml.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
+            >>> ds.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
 
     Args:
         base_url: the TorchServe inference base (e.g. ``http://host:8080``).
@@ -63,7 +63,7 @@ def torchserve_client(
             while this worker encodes and decodes. Results stay in input order.
 
     Returns:
-        A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
+        A class for ``ds.map_batches(...)`` — the client connects once per worker.
     """
     url = f"{base_url.rstrip('/')}/predictions/{model}"
     return http_client(

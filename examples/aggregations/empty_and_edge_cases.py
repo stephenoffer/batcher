@@ -32,7 +32,7 @@ def main() -> None:
         total=col("l_quantity").sum(),
         average=col("l_quantity").mean(),
         smallest=col("l_quantity").min(),
-        distinct=bt.n_unique(col("l_quantity")),
+        distinct=bt.count_distinct(col("l_quantity")),
     ).to_pydict()
     print(result)
 
@@ -44,7 +44,7 @@ def main() -> None:
     assert result["distinct"][0] == 0
 
     # A single row is the other edge: variance needs two.
-    single = lineitem.head(1)
+    single = lineitem.limit(1)
     edge = single.agg(
         sample_var=bt.var(col("l_quantity")),
         population_var=bt.var_pop(col("l_quantity")),

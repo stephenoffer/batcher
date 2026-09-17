@@ -45,7 +45,7 @@ DECLARED = ["id", "body", "resp"]
 
 
 def _scored():
-    return bt.from_pydict({"id": [1, 2], "body": ["a", "b"]}).ml.map_batches(
+    return bt.from_pydict({"id": [1, 2], "body": ["a", "b"]}).map_batches(
         Upper, output_columns=DECLARED
     )
 
@@ -102,4 +102,4 @@ def test_reparent_copies_every_other_field() -> None:
 def test_skipping_validation_does_not_disable_it_where_it_belongs() -> None:
     """The check still runs when the user builds the plan, which is the input that can answer it."""
     with pytest.raises(ColumnNotFoundError, match="resp"):
-        bt.from_pydict({"id": [1], "body": ["a"]}).ml.map_batches(Upper).select("id", "resp")
+        bt.from_pydict({"id": [1], "body": ["a"]}).map_batches(Upper).select("id", "resp")

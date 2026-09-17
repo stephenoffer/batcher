@@ -91,7 +91,7 @@ and the generic `write(path, format=...)` reaches them all, each returning a
 | Writer | Writes | Needs |
 | --- | --- | --- |
 | `write.orc(path)` | ORC files | nothing extra |
-| `write.arrow(path)` | Arrow/Feather IPC files | nothing extra |
+| `write.arrow(path)` | Arrow/Feather IPC files, or IPC streams with `ipc_format="stream"` | nothing extra |
 | `write.avro(path)` | Avro files | `[avro]` |
 | `write.fasta(path)` | FASTA, one record per row, wrapped at 60 | nothing extra |
 | `write.fastq(path)` | Four-line FASTQ, one read per row | nothing extra |
@@ -99,8 +99,14 @@ and the generic `write(path, format=...)` reaches them all, each returning a
 | `write.gff(path)` | GFF3 annotations, all nine columns | nothing extra |
 | `write.lance(path)` | A Lance dataset (columnar ML format) | `[lance]` |
 | `write.msgpack(path)` | MessagePack files | `[msgpack]` |
+| `write.text(path)` | One string column, one value per line | nothing extra |
+| `write.xml(path, row_tag=..., root_tag=...)` | XML in Spark's row-element layout | nothing extra |
+| `write.numpy(path, column=...)` | One column as `.npy` arrays | nothing extra |
+| `write.webdataset(path)` | WebDataset `.tar` shards keyed by `__key__` | nothing extra |
+| `write.tfrecord(path)` | TFRecord, one `tf.train.Example` per row | `google-crc32c` |
 | `write.sql(table, uri=..., mode=...)` | A SQL table: append, or upsert/update/delete by key | a driver + reachable DB |
 | `write.snowflake(table, connection_kwargs=...)` | A Snowflake table | Snowflake account |
+| `write.clickhouse(table, host=...)` | An existing ClickHouse table, via `insert_arrow` | `[clickhouse]` + a server |
 | `write.mongo(collection, uri=..., mode=...)` | A MongoDB collection | a running MongoDB |
 | `write.dynamodb(table, region_name=...)` | A DynamoDB table via `BatchWriteItem` | AWS DynamoDB |
 | `write.cassandra(table, contact_points=..., keyspace=...)` | A Cassandra / Scylla table | a running Cassandra |
@@ -134,7 +140,72 @@ ds.write.snowflake(
     "ORDERS",
     connection_kwargs={"account": "acct", "warehouse": "WH", "database": "DB"},
 )
+ds.write.clickhouse("analytics.orders", host="localhost", password="env:CH_PASSWORD")
+ds.write.tfrecord("output/train.tfrecord")
 ```
+
+`write.clickhouse` inserts into a table that already exists and never creates one, because a
+ClickHouse table needs an engine and a sort key that the data does not determine. Its `mode`
+defaults to `append`, and `overwrite` truncates the table first.
+
+## Text, XML, and training-data formats
+
+The text and XML writers are Spark's `DataFrameWriter.text` and `.xml`. `write.text` takes
+exactly one string column and writes a null as an empty line, because a text file has no way
+to say "no value". `write.xml` writes one `row_tag` element per row inside a `root_tag`
+element, omits a null field, repeats a list's element once per item, and turns a field named
+with a leading `_` into an attribute:
+
+```python
+books = bt.from_pydict({"_id": ["b1", "b2"], "title": ["Dune", None]})
+xml_path = os.path.join(out_dir, "books.xml")
+books.write.xml(xml_path, row_tag="book", root_tag="books", declaration="")
+print(open(xml_path).read())
+# <books>
+# <book id="b1"><title>Dune</title></book>
+# <book id="b2"></book>
+# </books>
+
+lines_path = os.path.join(out_dir, "titles.txt")
+books.select("title").write.text(lines_path)
+print(bt.read.text(lines_path).to_pydict()["text"])
+# ['Dune', '']
+```
+
+The NumPy, WebDataset, and TFRecord writers are the inverses of `read.numpy`,
+`read.webdataset`, and `read.tfrecord`, in the layouts Ray Data writes. `write.numpy` writes
+one column, so name it with `column=` when there is more than one, and it refuses nulls
+because a `.npy` array cannot hold them. `write.webdataset` needs a string `__key__` column
+and writes every other column as one tar member per row. Bytes are written as they are, text
+as UTF-8, and numbers as decimal text:
+
+```python
+import tarfile
+
+samples = bt.from_pydict({"__key__": ["s0", "s1"], "txt": ["cat", "dog"], "cls": [0, 1]})
+shard = os.path.join(out_dir, "shard.tar")
+samples.write.webdataset(shard)
+print(tarfile.open(shard).getnames())
+# ['s0.txt', 's0.cls', 's1.txt', 's1.cls']
+print(bt.read.webdataset(shard).to_pydict()["cls"])
+# [b'0', b'1']
+
+npy_path = os.path.join(out_dir, "labels.npy")
+samples.write.numpy(npy_path, column="cls")
+print(bt.read.numpy(npy_path).to_pydict())
+# {'data': [0, 1]}
+```
+
+`write.tfrecord` encodes each row as a `tf.train.Example`. Integer and boolean columns become
+`Int64List` features, float columns `FloatList`, which is float32 by definition, and string
+and binary columns `BytesList`. `record_format="raw"` writes one binary column's values as the
+record payloads instead, which is what `read.tfrecord` returns. Every record carries the
+checksum TensorFlow verifies, so the writer needs `google-crc32c` installed.
+
+The text, XML, WebDataset, TFRecord, and IPC stream writers encode one batch at a time, so a
+streaming write of a large result holds a single batch. A `.npy` header states its row count
+before the data, so `write.numpy` encodes each file whole. Bound a large NumPy write with
+`max_rows_per_file`.
 
 ## Partitioned output
 

@@ -41,7 +41,7 @@ def main() -> None:
             quarter=col("o_orderdate").dt.quarter(),
             is_weekend=col("o_orderdate").dt.is_weekend(),
             # A log transform for the skewed magnitude.
-            log_total=col("o_totalprice").log(),
+            log_total=col("o_totalprice").ln(),
             # A boolean feature as an integer, which every model can consume.
             urgent=col("o_orderpriority").is_in(["1-URGENT", "2-HIGH"]).cast("int64"),
         )
@@ -57,7 +57,7 @@ def main() -> None:
         )
     )
 
-    print(features.head(3).to_pydict())
+    print(features.limit(3).to_pydict())
     assert features.count() > 0
     assert features.width == 8
 

@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    lineitem = tpch("lineitem").head(5_000)
+    lineitem = tpch("lineitem").limit(5_000)
 
     ranked = lineitem.select(
         "l_orderkey",
@@ -31,7 +31,7 @@ def main() -> None:
         dense=bt.dense_rank().over(partition_by=["l_orderkey"], order_by=[("l_quantity", True)]),
     )
 
-    sample_key = lineitem.head(1).to_pydict()["l_orderkey"][0]
+    sample_key = lineitem.limit(1).to_pydict()["l_orderkey"][0]
     rows = ranked.filter(col("l_orderkey") == sample_key).sort("row").to_pydict()
     print(rows)
 
@@ -43,7 +43,7 @@ def main() -> None:
 
     # Across the whole table: each partition restarts at 1.
     firsts = ranked.filter(col("row") == 1).count()
-    assert firsts == lineitem.n_unique("l_orderkey")
+    assert firsts == lineitem.count_distinct("l_orderkey")
 
 
 if __name__ == "__main__":

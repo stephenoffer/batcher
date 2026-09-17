@@ -184,7 +184,7 @@ def _to_pa(
         col, value, flipped = parsed
         effective = COMPARISON_FLIP[op] if flipped else op
         field = ds.field(col)
-        return {
+        expr = {
             "eq": field == value,
             "ne": field != value,
             "lt": field < value,
@@ -192,4 +192,32 @@ def _to_pa(
             "gt": field > value,
             "ge": field >= value,
         }[effective]
+        if effective in ("gt", "ge") and _may_hold_nan(schema, col, ir):
+            return expr | _compute_module().is_nan(field)
+        return expr
     return None
+
+
+def _may_hold_nan(schema: Any | None, column: str, ir: dict[str, Any]) -> bool:
+    """Whether `column` can hold a NaN, which the engine ranks above every number.
+
+    Arrow's float comparisons are IEEE, so `NaN > 0.9` is false there and true in the engine
+    (`bc_arrow::canon_float_array` orders NaN greatest, as `ORDER BY` does). That makes `>` and
+    `>=` the two comparisons where a pushed filter kept *fewer* rows than the engine's own
+    `Filter` would: `bt.read.parquet(p).filter(col("x") > 0.9)` dropped every NaN row that
+    the identical filter over the same data in memory returned. Or-ing `is_nan` makes the two
+    agree exactly, so it holds under a `NOT` too. `<`, `<=`, `=` and `!=` already agree: no
+    NaN satisfies the first three in either order, and IEEE `NaN != x` is true.
+
+    A column of unknown type is treated as float when the literal is one, which is the case
+    that can reach a float column; `is_nan` of an integer is simply false.
+    """
+    col_type = _field_type(schema, column)
+    if col_type is not None:
+        if pa.types.is_dictionary(col_type):
+            col_type = col_type.value_type
+        return pa.types.is_floating(col_type)
+    return any(
+        side.get("e") == "lit" and "float" in (side.get("value") or {})
+        for side in (ir["left"], ir["right"])
+    )

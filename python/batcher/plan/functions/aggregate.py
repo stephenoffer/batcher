@@ -7,6 +7,8 @@ single-node and distributed with no new engine state.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
+
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr
 
 __all__ = [
@@ -17,6 +19,7 @@ __all__ = [
     "bool_and",
     "bool_or",
     "corr",
+    "count_distinct",
     "count_if",
     "covar_pop",
     "covar_samp",
@@ -26,9 +29,8 @@ __all__ = [
     "median",
     "min",
     "mode",
-    "n_unique",
     "product",
-    "skewness",
+    "skew",
     "std",
     "sum",
     "var",
@@ -141,11 +143,13 @@ def _as_column(value: str | Expr) -> Expr:
     return col(value) if isinstance(value, str) else value
 
 
-def sum(column: str | Expr) -> AggExpr:
+def sum(column: str | Expr, *, empty_value: int | float | None = None) -> AggExpr | Expr:
     """Sum a column — the ``pl.sum('x')`` shorthand for ``col('x').sum()``.
 
     Args:
         column: The column to sum, as a name or an expression.
+        empty_value: The sum of a group with no non-null value (Polars answers ``0``);
+            ``None`` keeps SQL's null.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -158,7 +162,7 @@ def sum(column: str | Expr) -> AggExpr:
             >>> ds.group_by("g").agg(bt.sum("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'x': [3, 3]}
     """
-    return _as_column(column).sum()
+    return _as_column(column).sum(empty_value=empty_value)
 
 
 def mean(column: str | Expr) -> AggExpr:
@@ -201,11 +205,14 @@ def min(column: str | Expr) -> AggExpr:
     return _as_column(column).min()
 
 
-def max(column: str | Expr) -> AggExpr:
+def max(column: str | Expr, *, nan_policy: str = "propagate") -> AggExpr | Expr:
     """Maximum of a column — the ``pl.max('x')`` shorthand for ``col('x').max()``.
+
+    ``pl.max`` skips NaN; that is ``nan_policy="ignore"`` here (see :meth:`Expr.max`).
 
     Args:
         column: The column to reduce, as a name or an expression.
+        nan_policy: ``"propagate"`` (NaN is the greatest value) or ``"ignore"``.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -218,7 +225,7 @@ def max(column: str | Expr) -> AggExpr:
             >>> ds.group_by("g").agg(bt.max("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'x': [3, 2]}
     """
-    return _as_column(column).max()
+    return _as_column(column).max(nan_policy=nan_policy)
 
 
 def median(column: str | Expr) -> AggExpr:
@@ -241,11 +248,12 @@ def median(column: str | Expr) -> AggExpr:
     return _as_column(column).median()
 
 
-def std(column: str | Expr) -> AggExpr:
+def std(column: str | Expr, *, ddof: int = 1) -> AggExpr | Expr:
     """Sample standard deviation of a column — ``pl.std('x')`` for ``col('x').std()``.
 
     Args:
         column: The column to reduce, as a name or an expression.
+        ddof: Delta degrees of freedom; ``0`` is the population standard deviation.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -258,14 +266,15 @@ def std(column: str | Expr) -> AggExpr:
             >>> ds.group_by("g").agg(bt.std("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'x': [1.4142135623730951, 0.0]}
     """
-    return _as_column(column).std()
+    return _as_column(column).std(ddof=ddof)
 
 
-def var(column: str | Expr) -> AggExpr:
+def var(column: str | Expr, *, ddof: int = 1) -> AggExpr | Expr:
     """Sample variance of a column — the ``pl.var('x')`` shorthand for ``col('x').var()``.
 
     Args:
         column: The column to reduce, as a name or an expression.
+        ddof: Delta degrees of freedom; ``0`` is the population variance.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -278,14 +287,17 @@ def var(column: str | Expr) -> AggExpr:
             >>> ds.group_by("g").agg(bt.var("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'x': [2.0, 0.0]}
     """
-    return _as_column(column).var()
+    return _as_column(column).var(ddof=ddof)
 
 
-def n_unique(column: str | Expr) -> AggExpr:
-    """Count distinct values of a column — ``pl.n_unique('x')`` for ``col('x').n_unique()``.
+def count_distinct(column: str | Expr, *, count_nulls: bool = False) -> AggExpr | Expr:
+    """Count distinct values of a column — ``pl.n_unique('x')`` for ``col('x').count_distinct()``.
+
+    ``pl.n_unique`` counts null as a value, which is ``count_nulls=True`` here.
 
     Args:
         column: The column to reduce, as a name or an expression.
+        count_nulls: Whether a null counts as a distinct value.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -295,17 +307,19 @@ def n_unique(column: str | Expr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 1, 5]})
-            >>> ds.group_by("g").agg(bt.n_unique("x")).sort("g").to_pydict()
+            >>> ds.group_by("g").agg(bt.count_distinct("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'x': [1, 1]}
     """
-    return _as_column(column).n_unique()
+    return _as_column(column).count_distinct(count_nulls=count_nulls)
 
 
-def product(column: str | Expr) -> AggExpr:
+def product(column: str | Expr, *, empty_value: float | None = None) -> AggExpr | Expr:
     """Multiply a column's values — the ``pl.product('x')`` shorthand for ``col('x').product()``.
 
     Args:
         column: The column to multiply, as a name or an expression.
+        empty_value: The product of a group with no non-null value (Polars answers ``1``);
+            ``None`` keeps SQL's null.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -318,14 +332,15 @@ def product(column: str | Expr) -> AggExpr:
             >>> ds.group_by("g").agg(p=bt.product("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'p': [6.0, 4.0]}
     """
-    return _as_column(column).product()
+    return _as_column(column).product(empty_value=empty_value)
 
 
-def mode(column: str | Expr) -> AggExpr:
+def mode(column: str | Expr, *, all_modes: bool = False) -> AggExpr:
     """Most frequent value of a column (SQL ``MODE`` / DuckDB ``mode``; ties break low).
 
     Args:
         column: The column to summarize, as a name or an expression.
+        all_modes: Whether to return every tied value as an ascending list, as Polars does.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -338,14 +353,15 @@ def mode(column: str | Expr) -> AggExpr:
             >>> ds.group_by("g").agg(m=bt.mode("x")).to_pydict()
             {'g': ['a'], 'm': [5]}
     """
-    return _as_column(column).mode()
+    return _as_column(column).mode(all_modes=all_modes)
 
 
-def skewness(column: str | Expr) -> AggExpr:
+def skew(column: str | Expr, *, bias: bool = False) -> AggExpr:
     """Sample skewness — the third standardized moment (DuckDB ``skewness``).
 
     Args:
         column: The column to summarize, as a name or an expression.
+        bias: Whether to return the population skewness, as Spark, Polars and Daft do.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -355,17 +371,19 @@ def skewness(column: str | Expr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 100.0]})
-            >>> ds.agg(s=bt.skewness("x").round(4)).to_pydict()
+            >>> ds.agg(s=bt.skew("x").round(4)).to_pydict()
             {'s': [2.2324]}
     """
-    return _as_column(column).skewness()
+    return _as_column(column).skew(bias=bias)
 
 
-def kurtosis(column: str | Expr) -> AggExpr:
+def kurtosis(column: str | Expr, *, bias: bool = False, fisher: bool = True) -> AggExpr | Expr:
     """Sample excess kurtosis — the fourth standardized moment (DuckDB ``kurtosis``).
 
     Args:
         column: The column to summarize, as a name or an expression.
+        bias: Whether to return the population estimate, as Spark and Polars do.
+        fisher: Whether to subtract 3, so a normal distribution scores 0.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -378,14 +396,16 @@ def kurtosis(column: str | Expr) -> AggExpr:
             >>> ds.agg(k=bt.kurtosis("x").round(4)).to_pydict()
             {'k': [4.9869]}
     """
-    return _as_column(column).kurtosis()
+    return _as_column(column).kurtosis(bias=bias, fisher=fisher)
 
 
-def bool_and(column: str | Expr) -> AggExpr:
+def bool_and(column: str | Expr, *, empty_value: bool | None = None) -> AggExpr | Expr:
     """True when every non-null value is true (SQL ``BOOL_AND`` / ``EVERY``).
 
     Args:
         column: The boolean column to reduce, as a name or an expression.
+        empty_value: The result for a group with no non-null value (Polars' ``all``
+            answers ``True``); ``None`` keeps SQL's null.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -398,14 +418,16 @@ def bool_and(column: str | Expr) -> AggExpr:
             >>> ds.group_by("g").agg(a=bt.bool_and("ok")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'a': [False, True]}
     """
-    return _as_column(column).bool_and()
+    return _as_column(column).bool_and(empty_value=empty_value)
 
 
-def bool_or(column: str | Expr) -> AggExpr:
+def bool_or(column: str | Expr, *, empty_value: bool | None = None) -> AggExpr | Expr:
     """True when any non-null value is true (SQL ``BOOL_OR`` / ``SOME``).
 
     Args:
         column: The boolean column to reduce, as a name or an expression.
+        empty_value: The result for a group with no non-null value (Polars' ``any``
+            answers ``False``); ``None`` keeps SQL's null.
 
     Returns:
         An aggregate expression; pass it to ``agg(...)``.
@@ -418,7 +440,7 @@ def bool_or(column: str | Expr) -> AggExpr:
             >>> ds.group_by("g").agg(o=bt.bool_or("ok")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'o': [True, False]}
     """
-    return _as_column(column).bool_or()
+    return _as_column(column).bool_or(empty_value=empty_value)
 
 
 def bit_and(column: str | Expr) -> AggExpr:
@@ -481,11 +503,27 @@ def bit_xor(column: str | Expr) -> AggExpr:
     return _as_column(column).bit_xor()
 
 
-def array_agg(column: str | Expr) -> AggExpr:
+def array_agg(
+    column: str | Expr,
+    *,
+    order_by: IntoExpr | Iterable[IntoExpr] | None = None,
+    descending: bool | Sequence[bool] = False,
+    nulls_last: bool | Sequence[bool] = True,
+    ignore_nulls: bool = False,
+) -> AggExpr | Expr:
     """Collect each group's values into a list (SQL ``ARRAY_AGG`` / Spark ``collect_list``).
+
+    The element order is unspecified unless `order_by` fixes it; see
+    :meth:`Expr.array_agg <batcher.Expr.array_agg>` for the ordering and tie rules.
 
     Args:
         column: The column to collect, as a name or an expression.
+        order_by: The key or keys that order each list's elements.
+        descending: Order from the largest key, for every key or per key.
+        nulls_last: Place elements whose key is null after the others, for every key or
+            per key.
+        ignore_nulls: Whether to leave nulls out of each list, as Spark's ``collect_list``
+            and ``array_agg`` do; SQL and DuckDB keep them.
 
     Returns:
         An aggregate expression producing a `List` column; pass it to ``agg(...)``.
@@ -494,8 +532,10 @@ def array_agg(column: str | Expr) -> AggExpr:
         .. doctest::
 
             >>> import batcher as bt
-            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [2, 3, 4]})
-            >>> ds.group_by("g").agg(xs=bt.array_agg("x")).sort("g").to_pydict()
-            {'g': ['a', 'b'], 'xs': [[2, 3], [4]]}
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [2, 3, 4], "t": [1, 0, 0]})
+            >>> ds.group_by("g").agg(xs=bt.array_agg("x", order_by="t")).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'xs': [[3, 2], [4]]}
     """
-    return _as_column(column).array_agg()
+    return _as_column(column).array_agg(
+        order_by=order_by, descending=descending, nulls_last=nulls_last, ignore_nulls=ignore_nulls
+    )

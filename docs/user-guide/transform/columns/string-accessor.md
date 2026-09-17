@@ -25,7 +25,7 @@ case-sensitive. Use `ilike` when they should not be.
 ```python
 out = ds.select(
     upper=bt.col("name").str.upper(),
-    length=bt.col("name").str.len(),
+    length=bt.col("name").str.len_chars(),
     has_a=bt.col("name").str.ilike("%a%"),
     first_two=bt.col("name").str.left(2),
 )
@@ -154,8 +154,8 @@ Kafka record, a zstd-framed blob in a warehouse table. {py:meth}`compress(codec)
 ```python
 blobs = bt.from_pydict({"body": ["a payload worth compressing " * 10]})
 out = blobs.select(
-    packed=bt.col("body").str.compress("gzip").str.len_bytes(),
-    raw=bt.col("body").str.len_bytes(),
+    packed=bt.col("body").str.compress("gzip").str.octet_length(),
+    raw=bt.col("body").str.octet_length(),
 )
 print(out.to_pydict())
 # {'packed': [51], 'raw': [280]}
@@ -184,16 +184,16 @@ the same algorithm in a frame that can be validated.
 ## Regex
 
 Alongside the single-match {py:meth}`regexp_matches <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_matches>`, {py:meth}`regexp_replace <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_replace>`, and {py:meth}`regexp_extract <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_extract>`,
-three methods work over *every* match in a string: {py:meth}`regexp_count <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_count>` tallies the
+three methods work over *every* match in a string: {py:meth}`count_matches <batcher.plan.expr_ir.namespaces.strings._StrNamespace.count_matches>` tallies the
 matches, {py:meth}`regexp_extract_all <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_extract_all>` gathers them into a list, and
 {py:meth}`regexp_replace_all(pattern, replacement) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_replace_all>` substitutes them all.
 
 ```python
 codes = bt.from_pydict({"s": ["a1b2c3", "xyz", "p4q5"]})
 out = codes.select(
-    digits=bt.col("s").str.regexp_count("[0-9]"),
-    found=bt.col("s").str.regexp_extract_all("[0-9]"),
-    masked=bt.col("s").str.regexp_replace_all("[0-9]", "#"),
+    digits=bt.col("s").str.count_matches("[0-9]"),
+    found=bt.col("s").str.extract_all("[0-9]"),
+    masked=bt.col("s").str.replace_all("[0-9]", "#"),
 )
 print(out.to_pydict())
 # {'digits': [3, 0, 2], 'found': [['1', '2', '3'], [], ['4', '5']], 'masked': ['a#b#c#', 'xyz', 'p#q#']}

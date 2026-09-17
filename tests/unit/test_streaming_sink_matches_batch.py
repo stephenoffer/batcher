@@ -213,8 +213,8 @@ def test_distinct_head_is_a_bounded_peek_like_filter_head():
 
 def test_distinct_head_over_a_stream_returns_what_batch_returns():
     """The peek must be the batch answer's prefix, not merely n rows of something."""
-    streamed = _stream().distinct().head(2).to_pydict()
-    assert streamed == _bounded().distinct().head(2).to_pydict()
+    streamed = _stream().distinct().limit(2).to_pydict()
+    assert streamed == _bounded().distinct().limit(2).to_pydict()
 
 
 def test_a_keyed_distinct_head_is_not_a_bounded_peek():

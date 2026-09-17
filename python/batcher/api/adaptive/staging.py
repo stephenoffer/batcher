@@ -20,7 +20,12 @@ import pyarrow as pa
 
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.api.adaptive.gating import _estimate_accurate, _estimate_rows
-from batcher.api.adaptive.plan_surgery import lowest_breaker, replace
+from batcher.api.adaptive.plan_surgery import (
+    BREAKERS,
+    STRUCTURAL_BREAKERS,
+    lowest_breaker,
+    replace,
+)
 from batcher.io.source import InMemorySource, Source
 from batcher.plan.logical import LogicalPlan, Scan, empty_result_schema
 from batcher.plan.schema import SchemaRef
@@ -331,7 +336,7 @@ def _staged_loop(
             # reading one already-merged source, so the fusion never happens.
             fused = fused_union_ids(plan) if distributed else set()
             accept = _stage_filter(fused, None if structural else _worth_staging(srcs, hub))
-            target = lowest_breaker(plan, accept)
+            target = lowest_breaker(plan, accept, STRUCTURAL_BREAKERS if structural else BREAKERS)
             if target is None:
                 break
             final = target is plan

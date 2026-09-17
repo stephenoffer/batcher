@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
+
+from batcher._internal.errors import PlanError
 
 if TYPE_CHECKING:
     from batcher.plan.streaming.progress import StreamingQueryProgress
@@ -130,6 +132,25 @@ class StreamingQueryListener:
             True
     """
 
+    # The PySpark hook spellings are deliberately not dispatched: one spelling per hook. A
+    # listener ported from PySpark that still defines `onQueryProgress` would otherwise never
+    # be called, and nothing would say so, so defining one is refused at class creation.
+    _SPARK_HOOKS: ClassVar[dict[str, str]] = {
+        "onQueryStarted": "on_query_started",
+        "onQueryProgress": "on_query_progress",
+        "onQueryTerminated": "on_query_terminated",
+    }
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Refuse a PySpark-spelled hook, which would silently never be called."""
+        super().__init_subclass__(**kwargs)
+        for spark, hook in cls._SPARK_HOOKS.items():
+            if spark in vars(cls):
+                raise PlanError(
+                    f"{cls.__name__}.{spark} would never be called: the hook is spelled "
+                    f"{hook} here. Rename the method; `python -m batcher.migrate` does it."
+                )
+
     def on_query_started(self, event: QueryStartedEvent) -> None:
         """Called once when a query starts.
 
@@ -174,53 +195,6 @@ class StreamingQueryListener:
 
         Args:
             event: The termination event, carrying the failure when there was one.
-        """
-
-    # Spark spellings, so a listener ported from a PySpark job keeps working. Thin
-    # aliases: a subclass may override either spelling and both are dispatched.
-    def onQueryStarted(self, event: QueryStartedEvent) -> None:
-        """Spark spelling of `on_query_started`.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> class Ported(bt.StreamingQueryListener):
-                ...     def onQueryStarted(self, event):
-                ...         pass
-
-        Args:
-            event: The start event.
-        """
-
-    def onQueryProgress(self, event: QueryProgressEvent) -> None:
-        """Spark spelling of `on_query_progress`.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> class Ported(bt.StreamingQueryListener):
-                ...     def onQueryProgress(self, event):
-                ...         pass
-
-        Args:
-            event: The progress event.
-        """
-
-    def onQueryTerminated(self, event: QueryTerminatedEvent) -> None:
-        """Spark spelling of `on_query_terminated`.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> class Ported(bt.StreamingQueryListener):
-                ...     def onQueryTerminated(self, event):
-                ...         pass
-
-        Args:
-            event: The termination event.
         """
 
 
@@ -298,28 +272,23 @@ def streaming_listeners() -> list[StreamingQueryListener]:
     return list(_LISTENERS)
 
 
-def _fire(method: str, spark_method: str, event: object) -> None:
-    """Deliver `event` to every listener, never letting one break the query.
-
-    Both spellings are dispatched so a subclass may override either. A listener that
-    overrides neither gets two no-op calls, which is free.
-    """
+def _fire(method: str, event: object) -> None:
+    """Deliver `event` to every listener, never letting one break the query."""
     listeners = _LISTENERS
     if not listeners:
         return
     for listener in listeners:
-        for name in (method, spark_method):
-            try:
-                getattr(listener, name)(event)
-            except Exception:
-                from batcher._internal.logging import get_logger
+        try:
+            getattr(listener, method)(event)
+        except Exception:
+            from batcher._internal.logging import get_logger
 
-                get_logger("streaming").warning(
-                    "streaming listener %s.%s raised; the query is unaffected",
-                    type(listener).__name__,
-                    name,
-                    exc_info=True,
-                )
+            get_logger("streaming").warning(
+                "streaming listener %s.%s raised; the query is unaffected",
+                type(listener).__name__,
+                method,
+                exc_info=True,
+            )
 
 
 def notify_query_started(name: str, timestamp: float) -> None:
@@ -329,7 +298,7 @@ def notify_query_started(name: str, timestamp: float) -> None:
         name: The query's name.
         timestamp: Unix wall-clock seconds at which it started.
     """
-    _fire("on_query_started", "onQueryStarted", QueryStartedEvent(name, name, timestamp))
+    _fire("on_query_started", QueryStartedEvent(name, name, timestamp))
 
 
 def notify_query_progress(name: str, progress: StreamingQueryProgress) -> None:
@@ -339,7 +308,7 @@ def notify_query_progress(name: str, progress: StreamingQueryProgress) -> None:
         name: The query's name.
         progress: The completed micro-batch's metrics.
     """
-    _fire("on_query_progress", "onQueryProgress", QueryProgressEvent(name, progress))
+    _fire("on_query_progress", QueryProgressEvent(name, progress))
     _publish_progress(name, progress)
 
 
@@ -385,8 +354,4 @@ def notify_query_terminated(name: str, exception: BaseException | None) -> None:
         exception: The failure that ended it, or None for a clean stop.
     """
     detail = None if exception is None else f"{type(exception).__name__}: {exception}"
-    _fire(
-        "on_query_terminated",
-        "onQueryTerminated",
-        QueryTerminatedEvent(name, name, detail),
-    )
+    _fire("on_query_terminated", QueryTerminatedEvent(name, name, detail))

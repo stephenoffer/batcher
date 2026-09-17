@@ -41,8 +41,7 @@ another column, because the target is lowered into the plan and compiled once.
 
 ## Conditionals and nulls
 
-A CASE builder needs a terminating `otherwise`. An unfinished one raises rather than
-implying a null, which catches the most common way these go wrong.
+A CASE builder without `otherwise` is SQL's `CASE WHEN ... END`: a row no branch matches is null, typed like the branch values. `otherwise(None)` says the same thing explicitly.
 
 ```python
 orders = bt.from_pydict({"total": [10_000.0, 90_000.0, 400_000.0]})
@@ -52,13 +51,14 @@ banded = orders.with_columns(
     .then(bt.lit("small"))
     .when(col("total") < 150_000)
     .then(bt.lit("medium"))
-    .otherwise(bt.lit("large"))
+    .otherwise(bt.lit("large")),
+    big=bt.when(col("total") > 100_000).then(bt.lit("big")),
 )
 assert banded.to_pydict()["band"] == ["small", "medium", "large"]
+assert banded.to_pydict()["big"] == [None, None, "big"]
 ```
 
-There is no null literal. `bt.nullif(a, b)` produces one, returning null where the two sides
-are equal, and `bt.coalesce` consumes nulls by supplying a fallback chain.
+`bt.lit(None, dtype=...)` is a typed null literal, `bt.nullif(a, b)` returns null where the two sides are equal, and `bt.coalesce` consumes nulls by supplying a fallback chain.
 
 ## Selectors and horizontal folds
 

@@ -8,10 +8,19 @@ display or foreign-format concern. Merged back in `_dataset_table.DATASET_UNSUPP
 
 from __future__ import annotations
 
-__all__ = ["DATASET_EXPORTERS", "DATASET_NAMING", "DATASET_RAY_DATA"]
+__all__ = ["DATASET_EXPORTERS", "DATASET_ML_MOVED", "DATASET_NAMING", "DATASET_RAY_DATA"]
 
 
 DATASET_NAMING: dict[str, str] = {
+    # Batcher's own removed second spellings.
+    "query": (
+        'Removed: filter takes the SQL predicate string itself, ds.filter("x > 1"), as well '
+        "as an expression or a callable batch predicate."
+    ),
+    "to_torch": (
+        "Removed: stream {column: tensor} batches with ds.ml.iter_torch_batches(batch_size=...), "
+        "or build a DataLoader with ds.ml.to_torch_dataloader(...)."
+    ),
     "toPandas": "Spelled ds.to_pandas() here (PEP 8 naming throughout).",
     "toArrow": "Spelled ds.to_arrow() here (PEP 8 naming throughout).",
     "toJSON": "Write JSON with ds.write.json(path), or materialize rows with ds.to_pylist().",
@@ -25,7 +34,7 @@ DATASET_NAMING: dict[str, str] = {
     "withMetadata": (
         "Column metadata is not exposed. Rename or cast with ds.rename(...) / ds.cast(...)."
     ),
-    "selectExpr": "Use ds.sql('SELECT ... FROM self') or ds.select(<expressions>).",
+    "selectExpr": "Use ds.select(bt.sql_expr('a + 1 AS b'), ...), one bt.sql_expr per SQL string.",
     "groupBy": "Spelled ds.group_by(...) here (PEP 8 naming throughout).",
     "orderBy": "Spelled ds.sort(...) here.",
     "sortWithinPartitions": "Spelled ds.sort(...) here; ordering is global.",
@@ -37,7 +46,7 @@ DATASET_NAMING: dict[str, str] = {
     "intersectAll": "Spelled ds.intersect(other) here.",
     "subtract": "Spelled ds.except_(other) here (set difference).",
     "crossJoin": "Spelled ds.cross_join(other) here.",
-    "dropDuplicates": "Spelled ds.distinct() (or ds.drop_duplicates()) here.",
+    "dropDuplicates": "Spelled ds.distinct() here; ds.distinct(subset) for dropDuplicates(cols).",
     "where": "Spelled ds.filter(bt.col('x') > 0) here (Spark's `where` alias).",
     "approxQuantile": "Spelled ds.approx_quantile(column, [0.5]) here.",
     "sampleBy": (
@@ -130,16 +139,7 @@ DATASET_RAY_DATA: dict[str, str] = {
     "add_column": "Spelled ds.with_columns(name=bt.col('x') * 2) here.",
     "aggregate": "Spelled ds.agg(...) here, or ds.group_by('k').agg(...) for a grouped one.",
     "mix": "Spelled bt.concat([a, b]) here (or ds.union(other) for two).",
-    "zip": (
-        "There is no positional column-wise zip: a relation is an unordered multiset, so "
-        "pairing rows by position is only defined once you name the order. Add the position "
-        "and join on it: a.with_row_index('i').join(b.with_row_index('i'), on='i')."
-    ),
     # Splitting and sampling.
-    "split": (
-        "Split by position with ds.split_at_indices([2, 5]), or by fraction with "
-        "ds.split_proportionately([0.2, 0.5]). Both stay lazy and materialize nothing."
-    ),
     "streaming_split": (
         "Batcher's loaders stream without a split step: ds.ml.stream_loader(...) feeds one "
         "worker, and ds.split_proportionately([...]) gives disjoint shards that stay lazy."
@@ -149,7 +149,7 @@ DATASET_RAY_DATA: dict[str, str] = {
         "Spelled ds.shuffle(seed=0) here. Batcher shuffles rows rather than reordering "
         "blocks, so there is no weaker block-level variant to choose."
     ),
-    "random_sample": "Spelled ds.sample_frac(0.1, seed=0) here, or ds.sample(n) for a row count.",
+    "random_sample": "Spelled ds.sample(0.1, seed=0) here, or ds.sample(n=10) for a row count.",
     "train_test_split": "Spelled ds.ml.train_test_split(0.2, seed=0) here.",
     "streaming_train_test_split": (
         "Spelled ds.ml.train_test_split(0.2, seed=0) here; it is already lazy, so both "
@@ -161,8 +161,8 @@ DATASET_RAY_DATA: dict[str, str] = {
     "take_batch": "Spelled ds.limit(n).to_arrow() here.",
     "materialize": (
         "Spelled ds.cache() here: it pins the computed result so downstream branches reuse "
-        "it instead of recomputing. ds.persist() is the Spark spelling of the same marker; "
-        "ds.cache('disk_only') keeps it off the memory budget entirely."
+        "it instead of recomputing; ds.cache('disk_only') keeps it off the memory budget "
+        "entirely."
     ),
     "iterator": "Spelled ds.iter_batches() here; ds.iter_rows() yields dicts.",
     "iter_torch_batches": "Spelled ds.ml.iter_torch_batches(...) here.",
@@ -200,8 +200,6 @@ DATASET_RAY_DATA: dict[str, str] = {
         "ds.write.for_each_batch(fn)."
     ),
     # Foreign frameworks.
-    "to_spark": "No Spark bridge. Hand over a file: ds.write.parquet(path), then read it in Spark.",
-    "to_daft": "No Daft bridge. Both speak Arrow: daft.from_arrow(ds.to_arrow()).",
     "to_dask": (
         "No Dask bridge. Collect first: ds.to_pandas(), or hand over ds.write.parquet(path)."
     ),
@@ -243,4 +241,26 @@ DATASET_RAY_DATA: dict[str, str] = {
     ),
     "deserialize_lineage": "No lineage pickling; a Dataset is already a lazy plan.",
     "has_serializable_lineage": "No lineage pickling; a Dataset is already a lazy plan.",
+}
+
+
+#: What `ds.ml` answers for the UDF verbs that moved onto `Dataset`, where they take Ray Data's
+#: whole resource parameter set. The actor-pool and GPU inference path they dispatched to is
+#: unchanged; only the spelling moved.
+DATASET_ML_MOVED: dict[str, str] = {
+    "map_batches": (
+        "Moved: spelled ds.map_batches(fn, ...) with the same options, including num_gpus, "
+        "concurrency, fn_constructor_args and batch_format."
+    ),
+    "map": "Moved: spelled ds.map(fn, ...) with the same options.",
+    "flat_map": "Moved: spelled ds.flat_map(fn, ...) with the same options.",
+    "filter": (
+        "Moved: spelled ds.filter(fn, ...). The callable is batch-level: it receives a whole "
+        "batch and returns one boolean per row, so a per-row predicate becomes "
+        "lambda batch: [pred(row) for row in batch.to_pylist()]."
+    ),
+    "to_torch": (
+        "Spelled ds.ml.iter_torch_batches(...) here, or ds.ml.to_torch_dataloader(...) for a "
+        "DataLoader."
+    ),
 }

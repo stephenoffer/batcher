@@ -65,19 +65,19 @@ def test_a_prefix_whose_last_character_cannot_be_incremented_is_left_alone():
 
 
 def test_len_zero_unwraps_the_column():
-    plan = _plan(DS.filter(col("s").str.len() == 0))
+    plan = _plan(DS.filter(col("s").str.len_chars() == 0))
     assert '"fn": "len"' not in plan
     assert '{"str": ""}' in plan
 
 
 def test_len_not_zero_unwraps_too():
-    plan = _plan(DS.filter(col("s").str.len() != 0))
+    plan = _plan(DS.filter(col("s").str.len_chars() != 0))
     assert '"fn": "len"' not in plan
 
 
 def test_a_non_zero_length_comparison_is_left_alone():
     """`len(s) = 3` is not an equality on `s`; only the zero case has a string form."""
-    plan = _plan(DS.filter(col("s").str.len() == 3))
+    plan = _plan(DS.filter(col("s").str.len_chars() == 3))
     assert '"fn": "len"' in plan
 
 

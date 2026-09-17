@@ -1,0 +1,98 @@
+# PySpark 4.2.0 -> Batcher migration registry: pyspark.sql.functions, strings, binary and hashing.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[functions]
+aes_decrypt = { status = "mismatch", batcher = "bt.aes_decrypt", note = "Spark defaults to AES-GCM over a 16/24/32-byte key with mode=/padding=/aad= and returns BINARY; bt.aes_decrypt reads base64 AES-256-GCM-SIV. Ciphertexts do not interoperate", wave = "W2" }
+aes_encrypt = { status = "mismatch", batcher = "bt.aes_encrypt", note = "Spark defaults to AES-GCM over a 16/24/32-byte key with mode=/padding=/iv=/aad= and returns BINARY; bt.aes_encrypt writes base64 AES-256-GCM-SIV. Ciphertexts do not interoperate", wave = "W2" }
+ascii = { status = "canonical", batcher = "Expr.str.ascii" }
+base64 = { status = "canonical", batcher = "Expr.str.base64" }
+bit_length = { status = "canonical", batcher = "Expr.str.bit_length" }
+btrim = { status = "canonical", batcher = "Expr.str.trim" }
+char = { status = "mismatch", batcher = "Expr.chr", note = "Spark char(n) is chr(n % 256) and empty for a negative n: bt.when(n < 0).then(bt.lit()).otherwise((n % 256).chr())", wave = "W0" }
+char_length = { status = "canonical", batcher = "Expr.str.len_chars" }
+character_length = { status = "canonical", batcher = "Expr.str.len_chars" }
+collate = { status = "gap", need = "collation-aware string comparison (collate(col, name))", wave = "W14" }
+collation = { status = "gap", need = "report a column's collation", wave = "W14" }
+concat = { status = "mismatch", batcher = ["bt.concat", "bt.concat_str"], note = "Spark concat returns null when any argument is null: bt.concat_str(*cols, ignore_nulls=False). Array arguments are list concatenation", wave = "W0" }
+concat_ws = { status = "canonical", batcher = "bt.concat_ws" }
+contains = { status = "mismatch", batcher = "Expr.str.contains", note = "bt.contains is a column-name selector, not a string predicate; F.contains(left, right) is Expr.str.contains", wave = "W0" }
+crc32 = { status = "canonical", batcher = "Expr.str.crc32" }
+decode = { status = "gap", need = "decode BINARY to STRING with a named charset", wave = "W3" }
+elt = { status = "canonical", batcher = "bt.elt" }
+encode = { status = "gap", need = "encode STRING to BINARY with a named charset", wave = "W3" }
+endswith = { status = "canonical", batcher = "Expr.str.ends_with" }
+find_in_set = { status = "param", batcher = "Expr.str.find_in_set", template = 'find_in_set(str, str_array) -> sem.column(str_array).str.find_in_set(str)', need = "a column-valued needle", wave = "W2" }
+format_number = { status = "gap", need = "format a number with grouping separators to d decimal places", wave = "W3" }
+format_string = { status = "mismatch", batcher = "bt.format_string", note = "Spark uses printf-style placeholders (%s, %d, %.2f); bt.format_string uses {} placeholders", wave = "W0" }
+hash = { status = "mismatch", batcher = "Expr.hash", note = "port as bt.hash_rows(*cols, seed=42, algorithm=murmur3), cast to int32 where Spark's result is IntegerType", wave = "W0" }
+hex = { status = "canonical", batcher = "Expr.str.hex" }
+ilike = { status = "param", batcher = "Expr.str.ilike", need = "escapeChar= and a column-valued pattern", wave = "W2" }
+initcap = { status = "canonical", batcher = "Expr.str.to_titlecase", template = 'initcap(col) -> sem.column(col).str.to_titlecase(boundary="space")' }
+instr = { status = "canonical", batcher = "Expr.str.position" }
+is_valid_utf8 = { status = "canonical", batcher = "Expr.is_not_null", template = 'is_valid_utf8(str) -> bt.when(sem.column(str).is_not_null()).then(True)' }
+lcase = { status = "canonical", batcher = "Expr.str.lower" }
+left = { status = "mismatch", batcher = "Expr.str.left", note = "Spark left(n) returns '' when n <= 0; Batcher left(-k) drops k characters from the end", wave = "W0" }
+length = { status = "canonical", batcher = "Expr.str.len_chars" }
+levenshtein = { status = "param", batcher = "Expr.str.levenshtein", need = "column-valued right operand and threshold= (returns -1 beyond it)", wave = "W2" }
+like = { status = "param", batcher = "Expr.str.like", need = "escapeChar= and a column-valued pattern", wave = "W2" }
+locate = { status = "param", batcher = "Expr.str.position", need = "pos= start position", wave = "W2" }
+lower = { status = "canonical", batcher = "Expr.str.lower" }
+lpad = { status = "canonical", batcher = "Expr.str.lpad" }
+ltrim = { status = "canonical", batcher = "Expr.str.strip_chars_start" }
+make_valid_utf8 = { status = "canonical", batcher = "Expr.cast", template = 'make_valid_utf8(str) -> sem.column(str)' }
+mask = { status = "canonical", batcher = "bt.mask", template = 'mask(col, upperChar="X", lowerChar="x", digitChar="n", otherChar=None) -> bt.mask(sem.column(col), upper=upperChar, lower=lowerChar, digit=digitChar, other=otherChar)' }
+md5 = { status = "canonical", batcher = "Expr.str.md5" }
+octet_length = { status = "canonical", batcher = "Expr.str.octet_length" }
+overlay = { status = "canonical", batcher = "Expr.str.overlay" }
+parse_url = { status = "canonical", batcher = "Expr.str.parse_url", template = 'parse_url(url, partToExtract, key=None) -> sem.column(url).str.parse_url(partToExtract, key)' }
+position = { status = "param", batcher = "Expr.str.position", need = "start= position", wave = "W2" }
+printf = { status = "mismatch", batcher = "bt.format_string", note = "Spark uses printf-style placeholders (%s, %d, %.2f); bt.format_string uses {} placeholders", wave = "W0" }
+quote = { status = "gap", need = "quote a string as a SQL literal", wave = "W3" }
+randstr = { status = "gap", need = "random string of a given length", wave = "W3" }
+regexp = { status = "canonical", batcher = "Expr.str.regexp_matches" }
+regexp_count = { status = "canonical", batcher = "Expr.str.count_matches" }
+regexp_extract = { status = "canonical", batcher = "Expr.str.extract" }
+regexp_extract_all = { status = "canonical", batcher = "Expr.str.extract_all", template = 'regexp_extract_all(str, regexp, idx=1) -> sem.column(str).str.extract_all(regexp, idx, missing="empty")' }
+regexp_instr = { status = "gap", need = "position of the first regex match", wave = "W3" }
+regexp_like = { status = "canonical", batcher = "Expr.str.regexp_matches" }
+regexp_replace = { status = "mismatch", batcher = "Expr.str.replace_all", template = 'regexp_replace(string, pattern, replacement) -> sem.column(string).str.replace_all(pattern, replacement, backrefs="dollar")', note = "Spark reads $1 back-references and Java regex syntax; replace_all(backrefs=dollar) reads $1. Java-only constructs (lookaround, the \\$ escape) and column-valued patterns need a manual port", wave = "W0" }
+regexp_substr = { status = "canonical", batcher = "Expr.str.extract", template = 'regexp_substr(str, regexp) -> sem.column(str).str.extract(regexp, 0, missing="null")' }
+repeat = { status = "canonical", batcher = "Expr.str.repeat" }
+replace = { status = "canonical", batcher = "Expr.str.replace" }
+reverse = { status = "canonical", batcher = ["Expr.str.reverse", "Expr.list.reverse"] }
+right = { status = "mismatch", batcher = "Expr.str.right", note = "Spark right(n) returns '' when n <= 0; Batcher right(-k) drops k characters from the start", wave = "W0" }
+rlike = { status = "canonical", batcher = "Expr.str.regexp_matches" }
+rpad = { status = "canonical", batcher = "Expr.str.rpad" }
+rtrim = { status = "canonical", batcher = "Expr.str.strip_chars_end" }
+sentences = { status = "gap", need = "split text into sentences of words (locale-aware)", wave = "W3" }
+sha = { status = "canonical", batcher = "Expr.str.sha1" }
+sha1 = { status = "canonical", batcher = "Expr.str.sha1" }
+sha2 = { status = "param", batcher = "Expr.str.sha256", need = "numBits= 224/384/512 (only SHA-256 today)", wave = "W2" }
+soundex = { status = "canonical", batcher = "Expr.str.soundex" }
+split = { status = "mismatch", batcher = "Expr.str.split", note = "Spark split(str, pattern, limit) with limit > 0 is str.regexp_split(pattern, limit=limit); limit <= 0 means no limit. Java-only regex syntax needs a manual port", wave = "W0" }
+split_part = { status = "canonical", batcher = "Expr.str.split_part" }
+startswith = { status = "canonical", batcher = "Expr.str.starts_with" }
+substr = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substr('hello', 0, 2) is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0" }
+substring = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substring('hello', 0, 2) is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0", template = 'substring(str, pos, len) -> sem.column(str).str.substr(sem.spark_position(pos), len)' }
+substring_index = { status = "canonical", batcher = "Expr.str.substring_index" }
+to_binary = { status = "mismatch", batcher = "Expr.str.to_binary", note = "Spark to_binary encodes to BINARY by format (hex, utf-8, base64); Expr.str.to_binary renders the bytes as '0'/'1' text", wave = "W0" }
+to_char = { status = "gap", need = "format numbers and dates with a format string", wave = "W3" }
+to_number = { status = "gap", need = "parse a string to a number with a format string", wave = "W3" }
+to_varchar = { status = "gap", need = "format numbers and dates with a format string", wave = "W3" }
+translate = { status = "canonical", batcher = "Expr.str.translate" }
+trim = { status = "canonical", batcher = "Expr.str.trim" }
+try_aes_decrypt = { status = "gap", need = "Spark-compatible AES decrypt returning null on failure (modes GCM/CBC/ECB)", wave = "W3" }
+try_parse_url = { status = "gap", need = "parse_url returning null on malformed URLs", wave = "W3" }
+try_to_binary = { status = "gap", need = "to_binary returning null on invalid input", wave = "W3" }
+try_to_number = { status = "gap", need = "to_number returning null on invalid input", wave = "W3" }
+try_url_decode = { status = "canonical", batcher = "Expr.str.url_decode", template = 'try_url_decode(str) -> sem.column(str).str.url_decode(form=True, malformed="null")' }
+try_validate_utf8 = { status = "canonical", batcher = "Expr.cast", template = 'try_validate_utf8(str) -> sem.column(str)' }
+ucase = { status = "canonical", batcher = "Expr.str.upper" }
+unbase64 = { status = "canonical", batcher = "Expr.str.from_base64", template = 'unbase64(col) -> sem.column(col).str.from_base64(as_binary=True)' }
+unhex = { status = "canonical", batcher = "Expr.str.unhex", template = 'unhex(col) -> sem.column(col).str.unhex(as_binary=True)' }
+upper = { status = "canonical", batcher = "Expr.str.upper" }
+url_decode = { status = "mismatch", batcher = "Expr.str.url_decode", template = 'url_decode(str) -> sem.column(str).str.url_decode(form=True)', note = "with form=True the decode matches Spark; a malformed escape stays as written where Spark raises", wave = "W0" }
+url_encode = { status = "canonical", batcher = "Expr.str.url_encode", template = 'url_encode(str) -> sem.column(str).str.url_encode(form=True)' }
+validate_utf8 = { status = "canonical", batcher = "Expr.cast", template = 'validate_utf8(str) -> sem.column(str)' }
+xxhash64 = { status = "mismatch", batcher = "Expr.str.xxhash64", note = "for one string or binary column, xxhash64(col) is col.str.xxhash64(seed=42). Several columns or other types chain the seed in Spark and need a manual port", wave = "W0" }

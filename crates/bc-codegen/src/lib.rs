@@ -726,7 +726,7 @@ pub(crate) fn libm_unary_symbol(func: bc_expr::MathFunc) -> Option<&'static str>
 /// not a single libm call (`Round`, which takes a digit count, stays on the
 /// interpreter).
 pub(crate) fn libm_binary_symbol(func: bc_expr::Math2Func) -> Option<&'static str> {
-    use bc_expr::Math2Func::{Atan2, Gcd, Hypot, Lcm, NextAfter, Pow, Round};
+    use bc_expr::Math2Func::{Atan2, Gcd, Hypot, Lcm, NextAfter, Pow, Round, RoundEven};
     Some(match func {
         Pow => "pow",
         Atan2 => "atan2",
@@ -737,7 +737,7 @@ pub(crate) fn libm_binary_symbol(func: bc_expr::Math2Func) -> Option<&'static st
         // interpreter computes it by stepping the bit pattern, which a libm `nextafter`
         // libcall need not reproduce for the subnormal and sign-crossing cases. The JIT
         // must be bit-for-bit identical to the oracle or fall back; it falls back.
-        Round | Gcd | Lcm | Hypot | NextAfter => return None,
+        Round | RoundEven | Gcd | Lcm | Hypot | NextAfter => return None,
     })
 }
 
@@ -2054,7 +2054,7 @@ mod tests {
         /// Generate a numeric-valued expression of depth at most `depth`.
         fn gen_num(rng: &mut Rng, depth: u32) -> Expr {
             // Leaf: a column or a literal.
-            if depth == 0 || rng.next_u64() % 3 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
                 return match rng.next_u64() % 5 {
                     0 => col("a"),
                     1 => col("b"),
@@ -2117,7 +2117,7 @@ mod tests {
         /// Generate a boolean-valued expression of depth at most `depth`.
         fn gen_bool(rng: &mut Rng, depth: u32) -> Expr {
             // Leaf (or forced at depth 0): a comparison of two numeric children.
-            if depth == 0 || rng.next_u64() % 3 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
                 let op = match rng.next_u64() % 6 {
                     0 => BinaryOp::Eq,
                     1 => BinaryOp::Ne,
@@ -2171,7 +2171,7 @@ mod tests {
         for it in 0..ITERS {
             let seed = master.next_u64();
             let mut rng = Rng(seed | 1); // never seed xorshift with 0
-            let kind = if rng.next_u64() % 2 == 0 {
+            let kind = if rng.next_u64().is_multiple_of(2) {
                 Kind::Num
             } else {
                 Kind::Bool
@@ -2199,9 +2199,9 @@ mod tests {
             let mut c = Vec::with_capacity(n);
             for _ in 0..n {
                 // ~1 in 4 values null, independently per column.
-                a.push((rng.next_u64() % 4 != 0).then(|| rng.i64_small()));
-                b.push((rng.next_u64() % 4 != 0).then(|| rng.i64_small()));
-                c.push((rng.next_u64() % 4 != 0).then(|| rng.f64_small()));
+                a.push((!rng.next_u64().is_multiple_of(4)).then(|| rng.i64_small()));
+                b.push((!rng.next_u64().is_multiple_of(4)).then(|| rng.i64_small()));
+                c.push((!rng.next_u64().is_multiple_of(4)).then(|| rng.f64_small()));
             }
             let schema = Schema::new(vec![
                 Field::new("a", DataType::Int64, true),
@@ -2219,7 +2219,7 @@ mod tests {
             .unwrap()
         }
         fn gen_num(rng: &mut Rng, depth: u32) -> Expr {
-            if depth == 0 || rng.next_u64() % 3 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
                 return match rng.next_u64() % 5 {
                     0 => col("a"),
                     1 => col("b"),
@@ -2236,7 +2236,7 @@ mod tests {
             bin(op, gen_num(rng, depth - 1), gen_num(rng, depth - 1))
         }
         fn gen_bool(rng: &mut Rng, depth: u32) -> Expr {
-            if depth == 0 || rng.next_u64() % 3 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
                 let op = match rng.next_u64() % 6 {
                     0 => BinaryOp::Eq,
                     1 => BinaryOp::Ne,
@@ -2311,14 +2311,14 @@ mod tests {
         fn make_c(n: usize, seed: u64) -> RecordBatch {
             let mut rng = Rng(seed);
             let c: Vec<Option<f64>> = (0..n)
-                .map(|_| (rng.next_u64() % 4 != 0).then(|| rng.f64_small()))
+                .map(|_| (!rng.next_u64().is_multiple_of(4)).then(|| rng.f64_small()))
                 .collect();
             let schema = Schema::new(vec![Field::new("c", DataType::Float64, true)]);
             RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Float64Array::from(c))]).unwrap()
         }
         fn gen(rng: &mut Rng, depth: u32) -> Expr {
-            if depth == 0 || rng.next_u64() % 3 == 0 {
-                return if rng.next_u64() % 2 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
+                return if rng.next_u64().is_multiple_of(2) {
                     col("c")
                 } else {
                     lit_f(rng.f64_small())
@@ -2386,7 +2386,7 @@ mod tests {
         /// which introduce a float, so the whole tree stays Int64-typed. This
         /// lets all-integer Case branches share one matched type.
         fn gen_int(rng: &mut Rng, depth: u32) -> Expr {
-            if depth == 0 || rng.next_u64() % 3 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
                 return match rng.next_u64() % 3 {
                     0 => col("a"),
                     1 => col("b"),
@@ -2410,7 +2410,7 @@ mod tests {
         /// Mirrors the base fuzzer's `gen_num` safeguards and additionally may
         /// emit `Cast`/`Case` nodes so those paths get nested exercise too.
         fn gen_num(rng: &mut Rng, depth: u32) -> Expr {
-            if depth == 0 || rng.next_u64() % 3 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
                 return match rng.next_u64() % 5 {
                     0 => col("a"),
                     1 => col("b"),
@@ -2465,7 +2465,7 @@ mod tests {
         /// `gen_bool`); then/otherwise are all the same numeric type.
         fn gen_case(rng: &mut Rng, depth: u32) -> Expr {
             let n_branches = 1 + (rng.next_u64() % 3) as usize; // 1..=3
-            let float_case = rng.next_u64() % 2 == 0;
+            let float_case = rng.next_u64().is_multiple_of(2);
             // Per-branch then/otherwise generators, uniformly typed.
             let then_of = |rng: &mut Rng| {
                 if float_case {
@@ -2491,7 +2491,7 @@ mod tests {
         /// And/Or/Not combinators). Identical in spirit to the base fuzzer's
         /// `gen_bool`; defined locally so the extended fuzzer is self-contained.
         fn gen_bool(rng: &mut Rng, depth: u32) -> Expr {
-            if depth == 0 || rng.next_u64() % 3 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
                 let op = match rng.next_u64() % 6 {
                     0 => BinaryOp::Eq,
                     1 => BinaryOp::Ne,
@@ -2544,11 +2544,11 @@ mod tests {
             let mut rng = Rng(seed | 1); // never seed xorshift with 0
                                          // Always root in a Cast or Case so every iteration exercises
                                          // at least one of the newer nodes; nested gen_num may add more.
-            let expr = if rng.next_u64() % 2 == 0 {
+            let expr = if rng.next_u64().is_multiple_of(2) {
                 gen_case(&mut rng, 3)
             } else {
                 // Root cast: float64 of any subtree, or an int64 no-op cast.
-                if rng.next_u64() % 2 == 0 {
+                if rng.next_u64().is_multiple_of(2) {
                     cast_f(gen_num(&mut rng, 3))
                 } else {
                     cast(gen_int(&mut rng, 3), "int64")
@@ -2705,13 +2705,13 @@ mod tests {
         fn make_nullable(n: usize, seed: u64) -> RecordBatch {
             let mut rng = Rng(seed);
             let a: Vec<Option<i64>> = (0..n)
-                .map(|_| (rng.next_u64() % 4 != 0).then(|| rng.i64_small()))
+                .map(|_| (!rng.next_u64().is_multiple_of(4)).then(|| rng.i64_small()))
                 .collect();
             let b: Vec<Option<i64>> = (0..n)
-                .map(|_| (rng.next_u64() % 4 != 0).then(|| rng.i64_small()))
+                .map(|_| (!rng.next_u64().is_multiple_of(4)).then(|| rng.i64_small()))
                 .collect();
             let c: Vec<Option<f64>> = (0..n)
-                .map(|_| (rng.next_u64() % 4 != 0).then(|| rng.f64_small()))
+                .map(|_| (!rng.next_u64().is_multiple_of(4)).then(|| rng.f64_small()))
                 .collect();
             let schema = Schema::new(vec![
                 Field::new("a", DataType::Int64, true),
@@ -2731,7 +2731,7 @@ mod tests {
         // Numeric subtree: columns/literals + Add/Sub/Mul (no Div/Mod -> no inf/NaN
         // from division, so `assert_eq!` never spuriously differs).
         fn gen_num(rng: &mut Rng, depth: u32) -> Expr {
-            if depth == 0 || rng.next_u64() % 3 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(3) {
                 return match rng.next_u64() % 5 {
                     0 => col("a"),
                     1 => col("b"),
@@ -2749,7 +2749,7 @@ mod tests {
         }
         // Boolean subtree: comparisons + Not (NO And/Or, to stay vectorizable).
         fn gen_bool(rng: &mut Rng, depth: u32) -> Expr {
-            if depth == 0 || rng.next_u64() % 2 == 0 {
+            if depth == 0 || rng.next_u64().is_multiple_of(2) {
                 let op = match rng.next_u64() % 6 {
                     0 => BinaryOp::Eq,
                     1 => BinaryOp::Ne,
@@ -2775,7 +2775,7 @@ mod tests {
         for it in 0..2000 {
             let mut rng = Rng(master.next_u64() | 1);
             // Half boolean trees (comparison/Not), half numeric arithmetic.
-            let expr = if rng.next_u64() % 2 == 0 {
+            let expr = if rng.next_u64().is_multiple_of(2) {
                 gen_bool(&mut rng, 4)
             } else {
                 gen_num(&mut rng, 4)

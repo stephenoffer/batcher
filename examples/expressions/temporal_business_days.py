@@ -30,14 +30,14 @@ def main() -> None:
     )
 
     marked = week.with_columns(
-        day_name=col("ts").dt.day_name(),
+        day_name=col("ts").dt.dayname(),
         weekend=col("ts").dt.is_weekend(),
-        weekday=col("ts").dt.is_weekday(),
+        weekday=col("ts").dt.is_business_day(),
         business=col("ts").dt.is_business_day(),
         # Formatting: `strftime` takes a format string, `to_string` defaults to ISO 8601.
         stamp=col("ts").dt.strftime("%Y-%m-%d"),
         pretty=col("ts").dt.strftime("%a %d %b %Y"),
-        iso=col("ts").dt.to_string(),
+        iso=col("ts").dt.strftime(format="%Y-%m-%dT%H:%M:%S"),
     )
 
     result = marked.to_pydict()
@@ -54,8 +54,8 @@ def main() -> None:
 
     # The report this exists for: weekday traffic only.
     weekdays = (
-        week.filter(col("ts").dt.is_weekday())
-        .select(day=col("ts").dt.day_name(), hits=col("hits"))
+        week.filter(col("ts").dt.is_business_day())
+        .select(day=col("ts").dt.dayname(), hits=col("hits"))
         .to_pydict()
     )
     print(weekdays)

@@ -160,7 +160,7 @@ def test_top_level_getattr_leaves_dunders_plain() -> None:
         ("dataset", "unionAll", "ds.union"),
         ("dataset", "to_sql", "ds.write.sql"),
         ("expr", "map_elements", "map_batches"),
-        ("expr", "clip_lower", "clip_min"),
+        ("expr", "clip_lower", "clip(lower="),
         ("expr", "value_counts", "ds.value_counts"),
         ("expr", "argmax", "arg_max"),
         ("groupby", "transform", "ds.window"),

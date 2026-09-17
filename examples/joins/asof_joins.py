@@ -25,7 +25,7 @@ def main() -> None:
         tpch("orders")
         .select("o_orderkey", "o_orderdate", "o_totalprice")
         .sort("o_orderdate")
-        .head(4_000)
+        .limit(4_000)
     )
 
     # A rate table with far fewer rows than the event stream.

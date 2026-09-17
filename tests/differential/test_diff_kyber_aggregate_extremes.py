@@ -74,17 +74,17 @@ def test_quantile_over_an_integer_column_is_untouched_and_still_matches(duck, t)
 
 
 def test_self_ordered_arg_min_matches_duckdb(duck, t):
-    out = bt.from_arrow(t).group_by("g").agg(r=col("f").arg_min(col("f"))).collect()
+    out = bt.from_arrow(t).group_by("g").agg(r=col("f").min_by(col("f"))).collect()
     assert_same(out, duck.sql("SELECT g, min_by(f, f) AS r FROM t GROUP BY g"))
 
 
 def test_self_ordered_arg_max_matches_duckdb(duck, t):
-    out = bt.from_arrow(t).group_by("g").agg(r=col("f").arg_max(col("f"))).collect()
+    out = bt.from_arrow(t).group_by("g").agg(r=col("f").max_by(col("f"))).collect()
     assert_same(out, duck.sql("SELECT g, max_by(f, f) AS r FROM t GROUP BY g"))
 
 
 def test_arg_min_ordered_by_another_column_is_untouched_and_still_matches(duck, t):
-    out = bt.from_arrow(t).group_by("g").agg(r=col("f").arg_min(col("i"))).collect()
+    out = bt.from_arrow(t).group_by("g").agg(r=col("f").min_by(col("i"))).collect()
     assert_same(out, duck.sql("SELECT g, min_by(f, i) AS r FROM t GROUP BY g"))
 
 
@@ -92,7 +92,7 @@ def test_extremes_over_an_empty_input_match_duckdb(duck, empty):
     out = (
         bt.from_arrow(empty)
         .group_by("g")
-        .agg(a=col("f").quantile(0.0), b=col("f").arg_max(col("f")))
+        .agg(a=col("f").quantile(0.0), b=col("f").max_by(col("f")))
         .collect()
     )
     assert_same(

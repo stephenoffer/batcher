@@ -61,7 +61,7 @@ def test_multiset_overlap_differs_from_the_set_intersection_on_repeats():
     ds = bt.from_pydict({"a": [["x", "x", "x"]], "b": [["x", "x"]]})
     out = ds.select(
         clipped=bt.col("a").list.multiset_overlap(bt.col("b")),
-        as_set=bt.col("a").list.set_intersection(bt.col("b")).list.len(),
+        as_set=bt.col("a").list.intersect(bt.col("b")).list.len(),
     ).to_pydict()
     assert out["clipped"] == [2.0]
     assert out["as_set"] == [1]

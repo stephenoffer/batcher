@@ -1,20 +1,14 @@
 # Migrating to Batcher
 
-This section maps the operations you know from pandas, Polars, PySpark, DuckDB, Daft, and
-Ray Data onto their Batcher equivalents, and shows how to prove the port is correct.
+You don't have to relearn data engineering to move onto Batcher. This section maps the operations you know from pandas, Polars, PySpark, DuckDB, Daft, and Ray Data onto their Batcher spellings, and each page ends by showing how to prove the port returns the same rows.
 
-Batcher's surface is deliberately close to the libraries you already know, so most of
-your vocabulary carries over. Absorb one concept before anything else: a {py:class}`Dataset <batcher.Dataset>` is
-*lazy*. Transformations such as `select`, `filter`, `group_by().agg()`, and `join`
-build a plan and return a new `Dataset`, and nothing runs until a terminal operation
-such as `collect`, `to_arrow`, `to_pandas`, `write`, `count`, or `iter_batches`. This
-is the Polars `LazyFrame` model rather than the eager pandas one.
+Batcher keeps one spelling for each operation, so some of your vocabulary changes: `groupby`, `merge`, `fillna` and `drop_duplicates` are `group_by`, `join`, `fill_null` and `distinct` here. You don't have to memorize the difference. A familiar name Batcher spells differently raises an error that names its replacement.
+
+One concept matters before anything else. A {py:class}`Dataset <batcher.Dataset>` is *lazy*. Transformations such as `select`, `filter`, `group_by().agg()`, and `join` build a plan and return a new `Dataset`. Nothing runs until a terminal operation such as `collect`, `to_arrow`, `to_pandas`, `write`, `count`, or `iter_batches`. If you know the Polars `LazyFrame`, you already know this model.
 
 ## Coming from
 
-Each card names the single shift that matters most from that system, and links to the
-page to read first. The translation tables below are shared across all six, because they
-are organized by what you are porting rather than by where it came from.
+Each card names the one shift that matters most from that system and links to the page to read first.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -67,7 +61,7 @@ distribution is an argument to `collect` rather than a property of the dataset.
 
 ## The translation tables
 
-Each of the four pages below is one sitting.
+The tables are shared across all six source systems, because they're organized by what you're porting rather than where it came from. Each page is short enough to read in one sitting.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -97,10 +91,41 @@ What Batcher deliberately does not have, and how to prove the port matches.
 :::
 ::::
 
+## Name-by-name reference
+
+For PySpark, Polars, Daft, and Ray Data, a generated reference lists every public name with its Batcher spelling, whether the two engines compute the same thing, and what is missing or different when they don't. Each row reads in both directions, and each section ends with a page that maps Batcher spellings back to the other engine. The pages are rendered from the same migration registry the `AttributeError` guidance reads, so the tables and the error messages agree.
+
+::::{grid} 1 2 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`server;1.1em` PySpark
+:link: /getting-started/migration/spark/index
+:link-type: doc
+`DataFrame`, `Column`, `pyspark.sql.functions`, readers and writers, the session, and the catalog.
+:::
+
+:::{grid-item-card} {octicon}`code;1.1em` Polars
+:link: /getting-started/migration/polars/index
+:link-type: doc
+`LazyFrame`, `DataFrame`, expressions and their namespaces, selectors, and readers.
+:::
+
+:::{grid-item-card} {octicon}`file-media;1.1em` Daft
+:link: /getting-started/migration/daft/index
+:link-type: doc
+`DataFrame`, `Expression`, `daft.functions`, multimodal and AI functions, and the session.
+:::
+
+:::{grid-item-card} {octicon}`stack;1.1em` Ray Data
+:link: /getting-started/migration/ray-data/index
+:link-type: doc
+`Dataset`, expressions and aggregations, readers, preprocessors, and the execution context.
+:::
+::::
+
 ## A first port, end to end
 
-The shape of nearly every ported script is the same: read lazily, chain verbs, collect
-once at the end.
+Nearly every ported script has the same shape. Read lazily, chain verbs, and collect once at the end.
 
 ```python
 import batcher as bt
@@ -117,8 +142,7 @@ print(out.sort("city").to_pydict())
 # {'city': ['LA', 'NYC'], 'total': [20, 30], 'n': [1, 1]}
 ```
 
-Then check it against the original with `equals`, which compares results rather than
-plans and ignores row order by default:
+Then check it against the original with {py:meth}`equals <batcher.Dataset.equals>`. It compares results rather than plans, and ignores row order by default:
 
 ```python
 original = ds.filter(col("amount") > 10).select("city", "amount")
@@ -127,13 +151,33 @@ print(ported.equals(original))
 # True
 ```
 
+## Rewrite a script with the codemod
+
+`python -m batcher.migrate` rewrites a PySpark, Polars, Daft, or Ray Data script onto Batcher, and a Batcher script back onto any of the four. It reads the same migration registry these pages are built from, needs the `migrate` extra (`pip install "batcher-engine[migrate]"`), and doesn't need the compiled engine, so it runs anywhere Python does.
+
+To translate a Polars project and see the result before anything changes, run the following:
+
+```bash
+python -m batcher.migrate src/ --from polars --to batcher
+python -m batcher.migrate src/ --from polars --to batcher --write --report migrate.json
+```
+
+The first command prints a unified diff and leaves the files alone. The second rewrites them in place and writes every call it looked at to `migrate.json`, with a count of what it rewrote and what it left. `--check` exits with status 1 when any file would change, which is how you keep a converted tree converted in CI. The reverse direction is `--from batcher --to polars`, and exactly one side of every direction is `batcher`.
+
+The codemod only rewrites what it can prove means the same thing. When a name has a different meaning in Batcher, has no Batcher equivalent yet, or sits on an object it can't identify, the call stays as written and the line before it gets a comment that says why:
+
+```text
+# batcher-migrate: Polars `Expr.top_k` differs in Batcher (`Expr.top_k`): Polars top_k(k) returns the k largest values; Batcher's Expr.top_k returns the k most frequent values (to be renamed so top_k means largest)
+largest = df.select(pl.col("v").top_k(2))
+```
+
+Where the difference is a default, it writes the default out. A Polars `sort` gains `nulls_first=True`, a Ray Data `map_batches` gains `batch_format="numpy"`, and a PySpark write gains `mode="error"`. Search the rewritten tree for `batcher-migrate:` to find everything left for you to port by hand. The foreign directions rewrite `.py` files only.
+
 ## Porting with a coding agent
 
 Each source system has an agent skill that turns these tables into a procedure:
-`migrate-from-spark`, `migrate-from-polars-or-pandas`, `migrate-from-duckdb-sql`, and
-`migrate-from-daft`. Beyond the mappings, each carries the concept shifts that silently
-produce wrong or slow results, and a recipe that finishes by proving the ported script
-returns the same rows as the original. See {doc}`/agents`.
+`migrate-from-spark`, `migrate-from-polars-or-pandas`, `migrate-from-duckdb-sql`,
+`migrate-from-daft`, `migrate-from-ray-data`, and `migrate-from-a-sql-warehouse`. Beyond the mappings, each skill carries the concept shifts that silently produce wrong or slow results. Each one finishes by proving the ported script returns the same rows as the original. See {doc}`/agents`.
 
 ## Reporting a problem
 
@@ -146,6 +190,7 @@ same information as a dict.
 - {doc}`/agents`: the migration skills, with the failure modes and the
   verification procedure.
 - {doc}`/user-guide/index`: the task-oriented guides for the API these pages map onto.
+- {doc}`/getting-started/concepts/lazy`: the lazy, immutable `Dataset` model in one page.
 - {doc}`/architecture/overview`: why a `Dataset` is lazy, and what runs where.
 
 ```{toctree}
@@ -156,4 +201,8 @@ transforming
 ray-data
 ml-pipelines
 differences
+spark/index
+polars/index
+daft/index
+ray-data/index
 ```

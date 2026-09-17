@@ -34,7 +34,7 @@ def main() -> None:
         years = sorted(p.name for p in Path(root).iterdir() if p.is_dir())
         print(years[:4], "...")
         assert all(name.startswith("year=") for name in years)
-        assert len(years) == report.n_unique("year")
+        assert len(years) == report.count_distinct("year")
 
         # The dataset reader recovers the partition column.
         back = bt.read.parquet_dataset(root)

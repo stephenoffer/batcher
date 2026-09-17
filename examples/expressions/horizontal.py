@@ -26,8 +26,8 @@ def main() -> None:
     rolled = checks.with_columns(
         # Numeric reductions across the three quarter columns.
         total=bt.sum_horizontal(col("q1"), col("q2"), col("q3")),
-        best=bt.max_horizontal(col("q1"), col("q2"), col("q3")),
-        worst=bt.min_horizontal(col("q1"), col("q2"), col("q3")),
+        best=bt.greatest(col("q1"), col("q2"), col("q3")),
+        worst=bt.least(col("q1"), col("q2"), col("q3")),
         average=bt.mean_horizontal(col("q1"), col("q2"), col("q3")),
         # How many of the listed columns are non-null on this row.
         present=bt.count_horizontal(col("q1"), col("q2"), col("q3")),

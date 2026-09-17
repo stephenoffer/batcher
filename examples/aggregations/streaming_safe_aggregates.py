@@ -21,7 +21,7 @@ from batcher import col
 
 def main() -> None:
     lineitem = tpch("lineitem").select("l_shipmode", "l_quantity", "l_partkey")
-    shards = [lineitem.slice(start, 50_000) for start in range(0, 200_000, 50_000)]
+    shards = [lineitem.limit(50_000, offset=start) for start in range(0, 200_000, 50_000)]
 
     # Bounded state: these fold.
     partials = [
@@ -30,7 +30,7 @@ def main() -> None:
             total=col("l_quantity").sum(),
             low=col("l_quantity").min(),
             high=col("l_quantity").max(),
-            sketch=bt.approx_n_unique(col("l_partkey")),
+            sketch=bt.approx_count_distinct(col("l_partkey")),
         )
         for shard in shards
     ]

@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     from batcher._internal.errors import ResourceError as ResourceError
     from batcher._internal.errors import SchemaError as SchemaError
     from batcher._internal.errors import TransportError as TransportError
+    from batcher.api.catalog import Catalog as Catalog
+    from batcher.api.catalog import Table as Table
     from batcher.api.dataset import Dataset as Dataset
     from batcher.api.dataset import GroupBy as GroupBy
     from batcher.api.functions import *  # noqa: F403

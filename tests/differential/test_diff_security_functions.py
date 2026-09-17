@@ -70,7 +70,7 @@ def test_mask_show_first_matches_duckdb_composition(duck):
 def test_mask_preserves_character_length(duck):
     """A masked value is the same length as its input — the property a UI depends on."""
     ds = _cards(duck)
-    got = ds.select(n=bt.mask(col("card")).str.len()).to_arrow()
+    got = ds.select(n=bt.mask(col("card")).str.len_chars()).to_arrow()
     assert_same(got, duck.sql("SELECT length(card) AS n FROM cards"))
 
 
@@ -105,7 +105,7 @@ def test_aes_decrypt_under_a_wrong_key_is_null_not_an_error(duck):
 def test_aes_encrypt_preserves_distinctness(duck):
     """Encryption is injective: it neither merges nor splits distinct plaintexts."""
     ds = _cards(duck)
-    got = ds.select(c=bt.aes_encrypt(col("card"), KEY)).agg(n=col("c").n_unique()).to_arrow()
+    got = ds.select(c=bt.aes_encrypt(col("card"), KEY)).agg(n=col("c").count_distinct()).to_arrow()
     assert_same(got, duck.sql("SELECT COUNT(DISTINCT card) AS n FROM cards"))
 
 
@@ -127,7 +127,9 @@ def test_hmac_preserves_the_grouping_of_the_plaintext(duck):
 def test_hmac_is_a_64_character_hex_digest(duck):
     t = pa.table({"email": ["a@x.com", None]})
     duck.register("users", t)
-    got = bt.from_arrow(t).select(n=bt.hmac_sha256(col("email"), key="k").str.len()).to_arrow()
+    got = (
+        bt.from_arrow(t).select(n=bt.hmac_sha256(col("email"), key="k").str.len_chars()).to_arrow()
+    )
     assert_same(
         got, duck.sql("SELECT CASE WHEN email IS NULL THEN NULL ELSE 64 END AS n FROM users")
     )

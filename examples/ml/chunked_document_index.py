@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    documents = tpch("orders").select("o_orderkey", "o_comment").head(2_000)
+    documents = tpch("orders").select("o_orderkey", "o_comment").limit(2_000)
 
     chunked = (
         documents.select(
@@ -34,8 +34,8 @@ def main() -> None:
     assert chunked.count() >= documents.count()
 
     # Every chunk knows its document, and every document has at least one chunk.
-    assert chunked.n_unique("document") == documents.count()
-    assert chunked.n_unique("chunk_id") == chunked.count()
+    assert chunked.count_distinct("document") == documents.count()
+    assert chunked.count_distinct("chunk_id") == chunked.count()
 
     per_document = chunked.group_by("document").agg(chunks=bt.count())
     assert min(per_document.to_pydict()["chunks"]) >= 1
@@ -55,7 +55,7 @@ def main() -> None:
     )
     print("document hits:", best.count())
     assert best.count() <= hits.count()
-    assert best.n_unique("document") == best.count()
+    assert best.count_distinct("document") == best.count()
 
     # Every returned document really contains the term somewhere.
     documents_hit = set(best.to_pydict()["document"])

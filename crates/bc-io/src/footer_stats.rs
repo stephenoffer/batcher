@@ -577,7 +577,7 @@ mod tests {
         let path = dir.join(name);
         let file = std::fs::File::create(&path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(rg)
+            .set_max_row_group_row_count(Some(rg))
             .build();
         let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
         w.write(batch).unwrap();
@@ -748,13 +748,17 @@ mod tests {
     /// which routes the caller to the real proof rather than to a claim.
     #[test]
     fn reports_a_sort_declaration_when_the_writer_records_one() {
-        use parquet::format::SortingColumn;
+        use parquet::file::metadata::SortingColumn;
         let d = tmpdir();
         let path = d.join("sorted.parquet");
         let batch = int_batch((0..50).collect());
         let props = WriterProperties::builder()
-            .set_max_row_group_size(10)
-            .set_sorting_columns(Some(vec![SortingColumn::new(0, false, false)]))
+            .set_max_row_group_row_count(Some(10))
+            .set_sorting_columns(Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: false,
+                nulls_first: false,
+            }]))
             .build();
         let file = std::fs::File::create(&path).unwrap();
         let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
@@ -769,13 +773,17 @@ mod tests {
     /// the direction so nothing is reinterpreted.
     #[test]
     fn reports_a_descending_sort_declaration() {
-        use parquet::format::SortingColumn;
+        use parquet::file::metadata::SortingColumn;
         let d = tmpdir();
         let path = d.join("desc.parquet");
         let batch = int_batch((0..50).rev().collect());
         let props = WriterProperties::builder()
-            .set_max_row_group_size(10)
-            .set_sorting_columns(Some(vec![SortingColumn::new(0, true, false)]))
+            .set_max_row_group_row_count(Some(10))
+            .set_sorting_columns(Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: true,
+                nulls_first: false,
+            }]))
             .build();
         let file = std::fs::File::create(&path).unwrap();
         let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
@@ -789,7 +797,7 @@ mod tests {
     /// so no claim is even possible and the caller takes the cheap path.
     #[test]
     fn refuses_files_disagreeing_about_sort_direction() {
-        use parquet::format::SortingColumn;
+        use parquet::file::metadata::SortingColumn;
         let d = tmpdir();
         let mut paths = Vec::new();
         for (name, descending, rows) in [
@@ -799,8 +807,12 @@ mod tests {
             let path = d.join(name);
             let batch = int_batch(rows);
             let props = WriterProperties::builder()
-                .set_max_row_group_size(10)
-                .set_sorting_columns(Some(vec![SortingColumn::new(0, descending, false)]))
+                .set_max_row_group_row_count(Some(10))
+                .set_sorting_columns(Some(vec![SortingColumn {
+                    column_idx: 0,
+                    descending,
+                    nulls_first: false,
+                }]))
                 .build();
             let file = std::fs::File::create(&path).unwrap();
             let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();

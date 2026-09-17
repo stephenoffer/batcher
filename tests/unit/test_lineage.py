@@ -54,7 +54,7 @@ def test_a_scan_column_originates_in_itself():
 
 
 def test_a_derived_column_carries_every_column_it_reads():
-    plan = Project(Scan(0, _LEFT), (Projection("both", Col("ssn").str.len() + Col("age")),))
+    plan = Project(Scan(0, _LEFT), (Projection("both", Col("ssn").str.len_chars() + Col("age")),))
     assert _lin(plan)["both"] == frozenset({(T, "ssn"), (T, "age")})
 
 

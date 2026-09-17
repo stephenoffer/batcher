@@ -2633,6 +2633,7 @@ fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
                 | AggFunc::Quantile
                 | AggFunc::CountDistinct
                 | AggFunc::Mode
+                | AggFunc::Modes
                 // The contiguity statistics hold a per-group value list exactly as `Median`
                 // does, so they need the same partitioning to stay bounded. Omitting them
                 // here compiles and passes every small test, and lets a grouped `n50` over a
@@ -3572,8 +3573,10 @@ mod tests {
                 func: AggFunc::Sum,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         };
         let norm = |bs: &[RecordBatch]| -> Vec<(Option<i64>, Option<i64>)> {
@@ -3773,8 +3776,10 @@ mod tests {
                     func: AggFunc::Sum,
                     input: Some(Expr::Col { name: "v".into() }),
                     input2: None,
+                    order_by: Vec::new(),
                     alias: "s".into(),
                     param: None,
+                    interpolation: None,
                 }],
             };
             // 4 groups; the filter keeps every row so the fold materializes the whole input.
@@ -3842,8 +3847,10 @@ mod tests {
                     func: AggFunc::Sum,
                     input: Some(Expr::Col { name: "v".into() }),
                     input2: None,
+                    order_by: Vec::new(),
                     alias: "s".into(),
                     param: None,
+                    interpolation: None,
                 }],
             };
             // 20k distinct keys → a large hash state; a 1 KiB budget forces the grace spill.
@@ -3932,6 +3939,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "s".into(),
                 }],
                 rank_limit: None,
@@ -4501,8 +4509,10 @@ mod tests {
                 func: AggFunc::Sum,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         };
         // Same data, split two different ways.
@@ -4556,7 +4566,9 @@ mod tests {
                 func,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 param,
+                interpolation: None,
                 alias: "m".into(),
             }],
         }
@@ -4672,7 +4684,9 @@ mod tests {
             func,
             input: Some(Expr::Col { name: "v".into() }),
             input2: None,
+            order_by: Vec::new(),
             param: None,
+            interpolation: None,
             alias: alias.into(),
         };
         let plan = RelOp::Aggregate {
@@ -4734,7 +4748,9 @@ mod tests {
                 func,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 param: None,
+                interpolation: None,
                 alias: format!("a{i}"),
             })
             .collect();
@@ -4788,7 +4804,7 @@ mod tests {
                 let mut vs: Vec<Option<i64>> = Vec::with_capacity(n);
                 for _ in 0..n {
                     ks.push((xs(&mut s) % kmod as u64) as i64);
-                    vs.push(if xs(&mut s) % 10 == 0 {
+                    vs.push(if xs(&mut s).is_multiple_of(10) {
                         None // ~10% nulls (incl. occasional all-null groups)
                     } else {
                         Some((xs(&mut s) % vmod as u64) as i64)
@@ -4837,7 +4853,9 @@ mod tests {
             func: f,
             input: Some(Expr::Col { name: "v".into() }),
             input2: None,
+            order_by: Vec::new(),
             param: None,
+            interpolation: None,
             alias: a.into(),
         };
 
@@ -4887,7 +4905,9 @@ mod tests {
                 func: AggFunc::CountDistinct,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 param: None,
+                interpolation: None,
                 alias: "nd".into(),
             }],
         };
@@ -4962,7 +4982,9 @@ mod tests {
                 func: AggFunc::Mode,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 param: None,
+                interpolation: None,
                 alias: "mo".into(),
             }],
         };
@@ -5044,7 +5066,9 @@ mod tests {
                 func: AggFunc::Histogram,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 param: None,
+                interpolation: None,
                 alias: "h".into(),
             }],
         };
@@ -5378,6 +5402,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -5387,6 +5412,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "s".into(),
                 },
             ],
@@ -5435,6 +5461,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -5444,6 +5471,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "s".into(),
                 },
             ],
@@ -5503,6 +5531,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
                 alias: "rn".into(),
             }],
             rank_limit: Some(2),
@@ -5542,8 +5571,10 @@ mod tests {
                 func: AggFunc::Sum,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         };
         let data = vec![
@@ -6259,8 +6290,10 @@ mod tests {
                 func: AggFunc::Sum,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         };
         let data = vec![batch(&[1, 2, 1, 3, 2, 1], &[10, 20, 30, 40, 50, 60])];
@@ -6638,8 +6671,10 @@ mod tests {
                 func: AggFunc::Sum,
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
+                order_by: Vec::new(),
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         }
     }
@@ -6722,6 +6757,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
                 alias: "s".into(),
             }],
             rank_limit: None,

@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    lineitem = tpch("lineitem").select("l_quantity", "l_extendedprice").head(20_000)
+    lineitem = tpch("lineitem").select("l_quantity", "l_extendedprice").limit(20_000)
 
     # A monotonic but curved relationship: price against the square of quantity.
     curved = lineitem.with_columns(curved=col("l_quantity") ** 3)

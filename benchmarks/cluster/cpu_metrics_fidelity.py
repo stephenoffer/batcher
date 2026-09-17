@@ -99,7 +99,7 @@ def main() -> int:
     )
 
     dataset = (
-        bt.read_parquet(SOURCE)
+        bt.read.parquet(SOURCE)
         .group_by(k=col("a") % 200_000)
         .agg(s=col("b").sum(), n=col("a").count())
     )

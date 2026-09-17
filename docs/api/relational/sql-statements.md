@@ -15,7 +15,7 @@ s.register("events", bt.from_pydict({"id": [1, 2, 3], "amount": [30.0, 40.0, 5.0
 
 ## Defining tables and views with SQL
 
-`CREATE TABLE/VIEW ... AS` and `DROP TABLE` register and unregister a lazy dataset in the session catalog. Nothing is materialized until a terminal operation runs it:
+`CREATE TABLE/VIEW ... AS` and `DROP TABLE` register and unregister a lazy dataset as a session view. Nothing is materialized until a terminal operation runs it. A *qualified* name, such as `CREATE TABLE sales.orders AS ...`, creates a stored table in the session's catalog instead, and `CREATE SCHEMA`, `USE`, `INSERT INTO sales.orders` and `SHOW DATABASES` work against it. {doc}`/user-guide/moving-data/catalogs-and-tables` covers those statements:
 
 ```python
 s.sql("CREATE VIEW big_events AS SELECT id, amount FROM events WHERE amount > 25")

@@ -122,7 +122,7 @@ def test_chunk_explode_embed_distributes(docs):
     rag = (
         docs.with_columns(chunk=bt.col("doc").str.chunk(10, overlap=2))
         .explode("chunk")
-        .ml.map_batches(_identity)
+        .map_batches(_identity)
     )
     assert _is_linear_map_pipeline(rag._plan)
     assert is_streamable(rag._plan)

@@ -304,9 +304,9 @@ def test_measured_function_costs_are_ranked_correctly():
     assert f(s.str.sha256()) > 4 * f(s.str.regexp_matches("a.*b"))
     assert f(s.str.levenshtein("abc")) > 3 * f(s.str.regexp_matches("a.*b"))
     # Even `length` is expensive: decoding string offsets dominates the operation.
-    assert f(s.str.len()) > 20 * f(bt.col("x") > 5)
+    assert f(s.str.len_chars()) > 20 * f(bt.col("x") > 5)
     # Numeric math stays cheap next to any string work.
-    assert f(bt.col("y").sqrt()) < f(s.str.len())
+    assert f(bt.col("y").sqrt()) < f(s.str.len_chars())
 
 
 @pytest.mark.unit

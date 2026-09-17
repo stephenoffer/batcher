@@ -27,7 +27,9 @@ def main() -> None:
         root = Path(directory) / "supplier"
         root.mkdir()
         for index in range(4):
-            supplier.slice(index * 500, 500).write.parquet(str(root / f"part-{index}.parquet"))
+            supplier.limit(500, offset=index * 500).write.parquet(
+                str(root / f"part-{index}.parquet")
+            )
 
         # A glob naming the extension.
         by_glob = bt.read.parquet(str(root / "*.parquet"))
@@ -40,7 +42,7 @@ def main() -> None:
 
         # Aggregates span the files, because they are one relation.
         total = by_glob.agg(t=col("s_acctbal").sum()).to_pydict()["t"][0]
-        expected = supplier.head(2_000).agg(t=col("s_acctbal").sum()).to_pydict()["t"][0]
+        expected = supplier.limit(2_000).agg(t=col("s_acctbal").sum()).to_pydict()["t"][0]
         assert abs(total - expected) < 1e-6
 
         # A narrower glob reads a subset.

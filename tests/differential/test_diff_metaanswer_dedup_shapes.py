@@ -88,7 +88,7 @@ def test_distinct_subset_scalar_declines_and_matches_duckdb(pq_path, duck, keep)
         assert d.min("x") == dmin
         assert d.max("x") == dmax
         assert d.n_null("x") == dnull
-        assert d.n_unique("x") == dnun
+        assert d.count_distinct("x") == dnun
 
 
 def test_distinct_subset_keep_any_scalar_declines(pq_path):
@@ -145,7 +145,7 @@ def test_union_all_null_count_still_answers(pq_path):
 
 
 def test_union_distinct_min_still_answers(pq_path):
-    """Dedup preserves the value *set*, so min/max/n_unique over `UNION` stay answerable."""
+    """Dedup preserves the value *set*, so min/max/count_distinct over `UNION` stay answerable."""
     for ds in _sources(pq_path).values():
         u = ds.union(ds, distinct=True)
         assert metadata_min(u._plan, u._sources, "x") == 1  # fired, no scan

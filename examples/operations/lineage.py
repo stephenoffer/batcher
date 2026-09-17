@@ -40,7 +40,7 @@ def main() -> None:
 
     # The result is unchanged by asking for its lineage.
     result = pipeline.sort("o_orderpriority").to_pydict()
-    assert len(result["o_orderpriority"]) == orders.n_unique("o_orderpriority")
+    assert len(result["o_orderpriority"]) == orders.count_distinct("o_orderpriority")
     assert sum(result["lines"]) > 0
 
 

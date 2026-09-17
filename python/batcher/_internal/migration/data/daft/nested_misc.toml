@@ -1,0 +1,163 @@
+# Daft 0.7.25 -> Batcher: List, map, struct, JSON, embedding, null, cast and hash functions.
+# Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
+
+[Expression]
+alias = { status = "canonical", batcher = "Expr.alias" }
+apply = { status = "gap", need = "Expression-level per-value Python function (apply) with return_dtype", wave = "W11" }
+as_binary = { status = "canonical", batcher = "Expr.cast" }
+as_bool = { status = "canonical", batcher = "Expr.cast" }
+as_date = { status = "canonical", batcher = "Expr.cast" }
+as_decimal128 = { status = "canonical", batcher = "Expr.cast" }
+as_duration = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_embedding = { status = "gap", need = "Embedding logical type (fixed-size numeric vector)", wave = "W12" }
+as_extension = { status = "gap", need = "extension types", wave = "W11" }
+as_file = { status = "gap", need = "File logical type", wave = "W12" }
+as_fixed_size_binary = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_fixed_size_list = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_float16 = { status = "canonical", batcher = "Expr.cast" }
+as_float32 = { status = "canonical", batcher = "Expr.cast" }
+as_float64 = { status = "canonical", batcher = "Expr.cast" }
+as_image = { status = "gap", need = "Image logical type", wave = "W12" }
+as_int16 = { status = "canonical", batcher = "Expr.cast" }
+as_int32 = { status = "canonical", batcher = "Expr.cast" }
+as_int64 = { status = "canonical", batcher = "Expr.cast" }
+as_int8 = { status = "canonical", batcher = "Expr.cast" }
+as_interval = { status = "gap", need = "interval (month-day-nano) type; Batcher's 'interval' cast yields duration[us]", wave = "W6" }
+as_list = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_map = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_null = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_py = { status = "out_of_scope", reason = "Expression-object introspection (literal to Python value), not a data operation" }
+as_python = { status = "out_of_scope", reason = "Python object dtype: per-row Python objects cannot cross the Arrow data plane" }
+as_sparse_tensor = { status = "gap", need = "SparseTensor logical type", wave = "W12" }
+as_string = { status = "canonical", batcher = "Expr.cast" }
+as_struct = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_tensor = { status = "gap", need = "Tensor logical type", wave = "W12" }
+as_time = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_timestamp = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+as_uint16 = { status = "canonical", batcher = "Expr.cast" }
+as_uint32 = { status = "canonical", batcher = "Expr.cast" }
+as_uint64 = { status = "canonical", batcher = "Expr.cast" }
+as_uint8 = { status = "canonical", batcher = "Expr.cast" }
+as_union = { status = "gap", need = "union type", wave = "W11" }
+as_uuid = { status = "gap", need = "UUID logical type", wave = "W11" }
+between = { status = "canonical", batcher = "Expr.between" }
+cast = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+chunk = { status = "gap", need = "list chunking into fixed-size sublists", wave = "W4" }
+coalesce = { status = "canonical", batcher = "bt.coalesce" }
+column_name = { status = "out_of_scope", reason = "Expression-object introspection, not a data operation" }
+cosine_distance = { status = "canonical", batcher = "Expr.list.cosine_distance" }
+cosine_similarity = { status = "canonical", batcher = "Expr.list.cosine_similarity" }
+deserialize = { status = "gap", need = "typed JSON decode (json_decode with a dtype)", wave = "W7" }
+dot_product = { status = "canonical", batcher = "Expr.list.dot" }
+eq_null_safe = { status = "canonical", batcher = "Expr.eq_missing" }
+euclidean_distance = { status = "canonical", batcher = "Expr.list.l2_distance" }
+explode = { status = "mismatch", batcher = "Dataset.explode", note = "Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form)", wave = "W8" }
+fill_null = { status = "canonical", batcher = "Expr.fill_null" }
+get = { status = "param", batcher = ["Expr.list.get", "Expr.struct.field"], need = "default= for a missing index/field, and one get over list, struct and map", wave = "W4" }
+hamming_distance = { status = "canonical", batcher = ["op:xor", "Expr.bit_count"] }
+hash = { status = "mismatch", batcher = "Expr.hash", note = "Daft's default xxhash is col.hash(seed, algorithm=xxhash3), with the UInt64 bits read as Int64; murmurhash3 and sha1 have no Batcher algorithm", wave = "W0" }
+is_column = { status = "out_of_scope", reason = "Expression-object introspection, not a data operation" }
+is_in = { status = "canonical", batcher = "Expr.is_in" }
+is_literal = { status = "out_of_scope", reason = "Expression-object introspection, not a data operation" }
+is_null = { status = "canonical", batcher = "Expr.is_null" }
+jaccard_similarity = { status = "canonical", batcher = "Expr.list.jaccard", template = 'jaccard_similarity(other) -> self.list.jaccard(other, mode="nonzero")' }
+jq = { status = "gap", need = "jq filter language over JSON strings (Batcher has JSONPath extract_* only)", wave = "W7" }
+list_append = { status = "canonical", batcher = ["Expr.list.concat", "bt.array"] }
+list_bool_and = { status = "canonical", batcher = "Expr.list.min" }
+list_bool_or = { status = "canonical", batcher = "Expr.list.max" }
+list_contains = { status = "param", batcher = "Expr.list.contains", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (item)", wave = "W4" }
+list_count = { status = "param", batcher = "Expr.list.len", need = "mode= (Daft defaults to counting non-null elements; list.len counts all)", wave = "W4" }
+list_distinct = { status = "canonical", batcher = "Expr.list.unique" }
+list_filter = { status = "canonical", batcher = "Expr.list.filter" }
+list_flatten = { status = "canonical", batcher = "Expr.list.flatten" }
+list_join = { status = "canonical", batcher = "Expr.list.join", template = 'list_join(delimiter) -> self.list.join(delimiter, null_replacement="")' }
+list_map = { status = "canonical", batcher = "Expr.list.transform" }
+list_max = { status = "canonical", batcher = "Expr.list.max" }
+list_mean = { status = "canonical", batcher = "Expr.list.mean" }
+list_min = { status = "canonical", batcher = "Expr.list.min" }
+list_sort = { status = "param", batcher = "Expr.list.sort", need = "descending= and nulls_first= (Daft sorts descending with nulls first; Batcher has only sort/sort_desc with nulls last)", wave = "W2" }
+list_sum = { status = "canonical", batcher = "Expr.list.sum" }
+map_get = { status = "param", batcher = "Expr.map.get", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (map key)", wave = "W4" }
+map_keys = { status = "canonical", batcher = "Expr.map.keys" }
+minhash = { status = "mismatch", batcher = "Expr.str.minhash", note = "Daft minhash(num_hashes, ngram_size, seed, hash_function='murmurhash3') and Batcher str.minhash(num_perm, ngram) use different shingling and hashing, so signatures differ for the same text. Param: hash_function=, seed=", wave = "W0" }
+name = { status = "out_of_scope", reason = "Expression-object introspection, not a data operation" }
+not_null = { status = "canonical", batcher = "Expr.is_not_null" }
+partition_iceberg_bucket = { status = "gap", need = "Iceberg murmur3_32 bucket transform (Batcher hash_bucket uses a different hash)", wave = "W3" }
+partition_iceberg_truncate = { status = "param", batcher = "bt.partition_truncate", need = "string and binary inputs (Batcher raises on Utf8)", wave = "W2" }
+pearson_correlation = { status = "gap", need = "Pearson correlation between two vectors per row", wave = "W3" }
+serialize = { status = "gap", need = "to_json/serialize of any value to a JSON string", wave = "W7" }
+simhash = { status = "gap", need = "text SimHash fingerprint (Batcher's list.simhash is a random-hyperplane embedding signature)", wave = "W3" }
+slice = { status = "mismatch", batcher = "Expr.list.slice", note = "Daft slice(start, end) takes an exclusive end index; Batcher list.slice(offset, length) takes a length ([1,2,3,4] slice(1,3) is [2,3] vs [2,3,4]). Param: end=", wave = "W0" }
+to_arrow_expr = { status = "out_of_scope", reason = "Expression-object introspection (pyarrow.compute bridge), not a data operation" }
+tokenize_decode = { status = "gap", need = "BPE tokenizer decode from a tokens file", wave = "W3" }
+tokenize_encode = { status = "gap", need = "BPE tokenizer encode from a tokens file", wave = "W3" }
+try_cast = { status = "param", batcher = "Expr.try_cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+try_deserialize = { status = "gap", need = "typed JSON decode that nulls on failure", wave = "W7" }
+udf = { status = "out_of_scope", reason = "internal Expression constructor used by the Daft UDF machinery, not a user entry point" }
+unnest = { status = "param", batcher = "Dataset.unnest", need = "an Expression-level unnest usable inside select", wave = "W8" }
+value_counts = { status = "gap", need = "per-list value counts as a list of (value, count) structs", wave = "W4" }
+
+[functions]
+between = { status = "canonical", batcher = "Expr.between" }
+cast = { status = "param", batcher = "Expr.cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+chunk = { status = "gap", need = "list chunking into fixed-size sublists", wave = "W4" }
+coalesce = { status = "canonical", batcher = "bt.coalesce" }
+cosine_distance = { status = "canonical", batcher = "Expr.list.cosine_distance" }
+cosine_similarity = { status = "canonical", batcher = "Expr.list.cosine_similarity" }
+deserialize = { status = "gap", need = "typed JSON decode (json_decode with a dtype)", wave = "W7" }
+dot_product = { status = "canonical", batcher = "Expr.list.dot" }
+eq_null_safe = { status = "canonical", batcher = "Expr.eq_missing" }
+euclidean_distance = { status = "canonical", batcher = "Expr.list.l2_distance" }
+explode = { status = "mismatch", batcher = "Dataset.explode", note = "Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form)", wave = "W8" }
+extract_day_uuid7 = { status = "gap", need = "UUIDv7 days-since-epoch extraction", wave = "W3" }
+extract_hour_uuid7 = { status = "gap", need = "UUIDv7 hours-since-epoch extraction", wave = "W3" }
+extract_minute_uuid7 = { status = "gap", need = "UUIDv7 minutes-since-epoch extraction", wave = "W3" }
+extract_month_uuid7 = { status = "gap", need = "UUIDv7 months-since-epoch extraction", wave = "W3" }
+fill_null = { status = "canonical", batcher = "Expr.fill_null" }
+get = { status = "param", batcher = ["Expr.list.get", "Expr.struct.field"], need = "default= for a missing index/field, and one get over list, struct and map", wave = "W4" }
+hamming_distance = { status = "canonical", batcher = ["op:xor", "Expr.bit_count"] }
+hash = { status = "mismatch", batcher = "bt.hash_rows", note = "Daft hashes with xxhash (or murmurhash3/sha1 via hash_function=); Batcher hash_rows uses a different function, so values differ. Param: hash_function='xxhash'", wave = "W0" }
+is_in = { status = "canonical", batcher = "Expr.is_in" }
+is_null = { status = "canonical", batcher = "Expr.is_null" }
+jaccard_similarity = { status = "canonical", batcher = "Expr.list.jaccard", template = 'jaccard_similarity(left, right) -> sem.column(left).list.jaccard(right, mode="nonzero")' }
+jq = { status = "gap", need = "jq filter language over JSON strings (Batcher has JSONPath extract_* only)", wave = "W7" }
+json_array_length = { status = "canonical", batcher = "Expr.json.array_length" }
+json_object_keys = { status = "mismatch", batcher = "Expr.json.keys", note = "Daft does not return keys in source order (keys b, a come back as a, b) and returns null for a non-object; Batcher returns source order and an empty list. Param: null for non-objects, key order", wave = "W7" }
+json_tuple = { status = "gap", need = "json_tuple(expr, *fields) returning a struct of top-level values", wave = "W7" }
+list_append = { status = "canonical", batcher = ["Expr.list.concat", "bt.array"] }
+list_bool_and = { status = "canonical", batcher = "Expr.list.min" }
+list_bool_or = { status = "canonical", batcher = "Expr.list.max" }
+list_contains = { status = "param", batcher = "Expr.list.contains", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (item)", wave = "W4" }
+list_count = { status = "param", batcher = "Expr.list.len", need = "mode= (Daft defaults to counting non-null elements; list.len counts all)", wave = "W4" }
+list_distinct = { status = "canonical", batcher = "Expr.list.unique" }
+list_filter = { status = "canonical", batcher = "Expr.list.filter" }
+list_flatten = { status = "canonical", batcher = "Expr.list.flatten" }
+list_join = { status = "canonical", batcher = "Expr.list.join", template = 'list_join(list_expr, delimiter) -> sem.column(list_expr).list.join(delimiter, null_replacement="")' }
+list_map = { status = "canonical", batcher = "Expr.list.transform" }
+list_max = { status = "canonical", batcher = "Expr.list.max" }
+list_mean = { status = "canonical", batcher = "Expr.list.mean" }
+list_min = { status = "canonical", batcher = "Expr.list.min" }
+list_sort = { status = "param", batcher = "Expr.list.sort", need = "descending= and nulls_first= (Daft sorts descending with nulls first; Batcher has only sort/sort_desc with nulls last)", wave = "W2" }
+list_sum = { status = "canonical", batcher = "Expr.list.sum" }
+map_get = { status = "param", batcher = "Expr.map.get", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (map key)", wave = "W4" }
+map_keys = { status = "canonical", batcher = "Expr.map.keys" }
+minhash = { status = "mismatch", batcher = "Expr.str.minhash", note = "Daft minhash(num_hashes, ngram_size, seed, hash_function='murmurhash3') and Batcher str.minhash(num_perm, ngram) use different shingling and hashing, so signatures differ for the same text. Param: hash_function=, seed=", wave = "W0" }
+not_null = { status = "canonical", batcher = "Expr.is_not_null" }
+partition_iceberg_bucket = { status = "gap", need = "Iceberg murmur3_32 bucket transform (Batcher hash_bucket uses a different hash)", wave = "W3" }
+partition_iceberg_truncate = { status = "param", batcher = "bt.partition_truncate", need = "string and binary inputs (Batcher raises on Utf8)", wave = "W2" }
+pearson_correlation = { status = "gap", need = "Pearson correlation between two vectors per row", wave = "W3" }
+run_process = { status = "out_of_scope", reason = "spawns an external process per row: a per-row side effect outside the data plane" }
+seq = { status = "mismatch", batcher = "bt.sequence", note = "Daft seq(n) is [0, n); Batcher sequence(start, stop) includes stop. Rewrite: sequence(0, n - 1)", wave = "W1" }
+serialize = { status = "gap", need = "to_json/serialize of any value to a JSON string", wave = "W7" }
+simhash = { status = "gap", need = "text SimHash fingerprint (Batcher's list.simhash is a random-hyperplane embedding signature)", wave = "W3" }
+slice = { status = "mismatch", batcher = "Expr.list.slice", note = "Daft slice(start, end) takes an exclusive end index; Batcher list.slice(offset, length) takes a length ([1,2,3,4] slice(1,3) is [2,3] vs [2,3,4]). Param: end=", wave = "W0" }
+to_list = { status = "canonical", batcher = "bt.array" }
+to_struct = { status = "param", batcher = "bt.struct", need = "positional fields named after their columns (bt.struct takes keywords only)", wave = "W2" }
+tokenize_decode = { status = "gap", need = "BPE tokenizer decode from a tokens file", wave = "W3" }
+tokenize_encode = { status = "gap", need = "BPE tokenizer encode from a tokens file", wave = "W3" }
+try_cast = { status = "param", batcher = "Expr.try_cast", need = "cast grammar for timestamp units/timezones, duration, list, struct, map, fixed_size_list, fixed_size_binary, time and null (Batcher's cast accepts primitive and decimal names only)", wave = "W2" }
+try_deserialize = { status = "gap", need = "typed JSON decode that nulls on failure", wave = "W7" }
+unnest = { status = "param", batcher = "Dataset.unnest", need = "an Expression-level unnest usable inside select", wave = "W8" }
+uuid = { status = "gap", need = "UUID v4/v7 generator expression (needs a determinism story across seq/par/dist)", wave = "W3" }
+value_counts = { status = "gap", need = "per-list value counts as a list of (value, count) structs", wave = "W4" }
+when = { status = "param", batcher = "bt.when", need = "the two-argument when(cond, then) form", wave = "WF" }

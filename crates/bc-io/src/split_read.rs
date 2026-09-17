@@ -16,7 +16,7 @@
 //!
 //! So this wrapper does the opposite of coalescing, *after* it: a range wider than
 //! [`SPLIT_THRESHOLD`] is cut into pieces and the pieces are fetched concurrently. The pieces
-//! are issued as separate [`ObjectStore::get_range`] calls rather than one `get_ranges`,
+//! are issued as separate [`ObjectStoreExt::get_range`] calls rather than one `get_ranges`,
 //! because `get_ranges` would merge these perfectly-adjacent pieces straight back into the
 //! single request they were cut from.
 //!
@@ -33,11 +33,27 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
-use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::ParquetMetaData;
+
+/// The plain object-store Parquet reader every row-group read starts from.
+///
+/// parquet 59.2 deprecated `ParquetObjectReader` in favour of each caller implementing
+/// `AsyncFileReader` directly (apache/arrow-rs#10308). parquet 60 still ships it, and it is the
+/// reader every measurement in this module and in `lib.rs` was taken with, so it is kept and
+/// named once here behind a single `allow`: an Arrow upgrade whose contract is "behaviour
+/// unchanged" is the wrong change to swap the I/O path in. Replacing it is its own change.
+#[allow(deprecated)]
+pub(crate) type ObjectReader = parquet::arrow::async_reader::ParquetObjectReader;
+
+/// An [`ObjectReader`] over `path` whose size is already known, so no read has to guess it.
+#[allow(deprecated)]
+pub(crate) fn object_reader(store: &Arc<dyn ObjectStore>, path: &Path, size: u64) -> ObjectReader {
+    ObjectReader::new(store.clone(), path.clone()).with_file_size(size)
+}
 
 /// Byte span above which one read is cut into concurrent pieces.
 ///
@@ -169,10 +185,10 @@ fn join(parts: Vec<Bytes>) -> Bytes {
 /// it behind a vtable on every fetch.
 pub(crate) enum MaybeSplitReader {
     /// Local: the page cache has no per-request bandwidth limit, so read as-is.
-    Plain(ParquetObjectReader),
+    Plain(ObjectReader),
     /// Remote: cut oversized reads into concurrent range GETs.
     Split {
-        inner: ParquetObjectReader,
+        inner: ObjectReader,
         store: Arc<dyn ObjectStore>,
         path: Path,
     },
@@ -180,7 +196,7 @@ pub(crate) enum MaybeSplitReader {
 
 /// Wrap `inner` in the splitting reader when reads go over the network, else hand it back.
 pub(crate) fn maybe_split(
-    inner: ParquetObjectReader,
+    inner: ObjectReader,
     store: &Arc<dyn ObjectStore>,
     path: &Path,
     remote: bool,

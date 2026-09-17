@@ -18,8 +18,8 @@ robotics log means metres and radians. They are not the geodesic functions: a
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir import atan2
 from batcher.plan.expr_ir.core import Expr
+from batcher.plan.functions.scalar import arctan2
 from batcher.plan.functions.spatial._build import Numeric, Point, value
 
 __all__ = ["azimuth_3d", "distance_3d", "elevation_3d", "norm_3d", "voxel_index"]
@@ -111,7 +111,7 @@ def azimuth_3d(point: Point) -> Expr:
             {'a': [0.0]}
     """
     x, y, _ = (value(c) for c in point)
-    return atan2(y, x)
+    return arctan2(y, x)
 
 
 def elevation_3d(point: Point) -> Expr:
@@ -136,7 +136,7 @@ def elevation_3d(point: Point) -> Expr:
             {'e': [0.0]}
     """
     x, y, z = (value(c) for c in point)
-    return atan2(z, (x * x + y * y).sqrt())
+    return arctan2(z, (x * x + y * y).sqrt())
 
 
 def voxel_index(point: Point, size: Numeric, *, prefix: str = "") -> dict[str, Expr]:

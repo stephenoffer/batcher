@@ -115,3 +115,25 @@ def expr_cast_chain(ctx: Context):
         "SUM(CAST(FLOOR(l_extendedprice) AS BIGINT)) AS p FROM lineitem"
     )
     return sql_fanout(ctx, sql)
+
+
+@expressions.case("op-filter-in-list")
+def filter_in_list(ctx: Context):
+    """Two IN lists, a string one and an integer one, ANDed -- the membership test a
+    dashboard filter emits."""
+    sql = (
+        "SELECT COUNT(*) AS n, SUM(l_quantity) AS q FROM lineitem "
+        "WHERE l_shipmode IN ('MAIL', 'SHIP', 'AIR') "
+        "AND l_suppkey IN (1, 7, 42, 99, 123, 256, 512, 1024, 2048, 4096, 8192)"
+    )
+    return sql_fanout(ctx, sql)
+
+
+@expressions.case("op-filter-between-date")
+def filter_between_date(ctx: Context):
+    """A one-quarter date BETWEEN -- the range predicate zone maps and sorted data exist for."""
+    sql = (
+        "SELECT COUNT(*) AS n, SUM(l_extendedprice) AS s FROM lineitem "
+        "WHERE l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1995-03-31'"
+    )
+    return sql_fanout(ctx, sql)

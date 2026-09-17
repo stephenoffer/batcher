@@ -24,7 +24,7 @@ from batcher._sql.parser.translator import _Translator
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import Expr, col, lit, nullif, when
 
-__all__ = ["apply_dml"]
+__all__ = ["align_insert", "apply_dml"]
 
 _Registry = dict[str, Dataset]
 
@@ -98,11 +98,11 @@ def _insert(node: Any, registry: _Registry, functions: dict[str, Any]) -> tuple[
     if body is None:
         raise PlanError("INSERT requires a VALUES or SELECT body")
     new_rows = translate_ast(body, functions=functions, **registry)
-    aligned = _align_insert(name, current, new_rows, columns)
+    aligned = align_insert(name, current, new_rows, columns)
     return name, current.union(aligned, distinct=False)
 
 
-def _align_insert(
+def align_insert(
     name: str, current: Dataset, new_rows: Dataset, columns: list[str] | None
 ) -> Dataset:
     """Reshape `new_rows` to the target schema (order, subset, and column types).

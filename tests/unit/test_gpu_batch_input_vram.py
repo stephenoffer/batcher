@@ -100,7 +100,7 @@ def test_the_rule_reads_the_width_from_the_plan():
     )
 
     def width_of(ds):
-        staged = ds.ml.map_batches(lambda b: b, num_gpus=1, model_memory_gb=1.0)
+        staged = ds.map_batches(lambda b: b, num_gpus=1, model_memory_gb=1.0)
         ctx = OptimizerContext(
             config=active_config(),
             sources=staged._sources,

@@ -38,7 +38,7 @@ def main() -> None:
         lateness=col("l_receiptdate") - col("l_commitdate"),
     )
 
-    sample = gaps.head(5).to_pydict()
+    sample = gaps.limit(5).to_pydict()
     print(sample)
 
     full = gaps.to_pydict()

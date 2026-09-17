@@ -1,18 +1,14 @@
 """Window `IGNORE NULLS` vs DuckDB.
 
-`IGNORE NULLS` makes a value function skip nulls when picking its answer. Two shapes are
-exactly the engine's existing fill primitives, so they map onto them rather than needing a
-new operator:
+`IGNORE NULLS` makes a value function skip nulls when picking its answer. `first_value`,
+`last_value` and `nth_value` carry it to the engine as the window function's `ignore_nulls`
+flag, which picks among the non-null values of any frame. They used to lower two shapes onto
+the fill primitives (`last_value` over the default frame as a forward fill, `first_value`
+over ``CURRENT ROW AND UNBOUNDED FOLLOWING`` as a backward fill); both still hold, and the
+peer-group test below is what the fills got wrong.
 
-* ``last_value(x IGNORE NULLS)`` over the default frame — the most recent non-null so far,
-  i.e. a **forward fill**;
-* ``first_value(x IGNORE NULLS)`` over ``CURRENT ROW AND UNBOUNDED FOLLOWING`` — the next
-  non-null from here, i.e. a **backward fill**.
-
-Everything else (`lag`/`lead`/`nth_value` with IGNORE NULLS, or a value function over some
-other frame) needs per-row null skipping the runtime does not have. Those must raise: the
-null-*respecting* answer is a different, wrong result, not merely a slower one — which is
-what the last two tests pin.
+`lag`/`lead` with IGNORE NULLS need a per-row search the runtime does not have. Those must
+raise: the null-*respecting* answer is a different, wrong result, not merely a slower one.
 """
 
 from __future__ import annotations
@@ -87,12 +83,41 @@ def test_all_null_column_ignore_nulls(duck):
     assert_same(bt.sql(query, allnull=table).collect(), duck.sql(query))
 
 
+@pytest.mark.differential
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "last_value(v IGNORE NULLS) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        "nth_value(v, 2 IGNORE NULLS) OVER (PARTITION BY k ORDER BY i)",
+        "first_value(v IGNORE NULLS) OVER (PARTITION BY k ORDER BY i)",
+        "last_value(v IGNORE NULLS) OVER (PARTITION BY k ORDER BY i ROWS BETWEEN UNBOUNDED "
+        "PRECEDING AND UNBOUNDED FOLLOWING)",
+    ],
+)
+def test_framed_ignore_nulls_shapes_match_duckdb(duck, gaps, expr):
+    """Every frame takes IGNORE NULLS once the runtime picks among non-null values itself."""
+    query = f"SELECT i, k, {expr} AS x FROM gaps"
+    assert_same(bt.sql(query, gaps=gaps).collect(), duck.sql(query))
+
+
+@pytest.mark.differential
+def test_ignore_nulls_reads_the_whole_peer_group(duck):
+    """A tie on the ORDER BY key is one peer group, whatever order its rows arrive in.
+
+    The fills this used to lower to walked rows physically, so the NULL row tied with the 5
+    read 1 when it arrived first. DuckDB's running frame includes the whole peer group.
+    """
+    table = pa.table({"k": [1, 2, 2, 3], "x": pa.array([1, None, 5, None], pa.int64())})
+    duck.register("ties", table)
+    query = "SELECT k, x, last_value(x IGNORE NULLS) OVER (ORDER BY k) AS r FROM ties"
+    assert_same(bt.sql(query, ties=table).collect(), duck.sql(query))
+
+
 @pytest.mark.parametrize(
     "expr",
     [
         "lag(v) IGNORE NULLS OVER (ORDER BY i)",
         "lead(v) IGNORE NULLS OVER (ORDER BY i)",
-        "last_value(v IGNORE NULLS) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
     ],
 )
 def test_unsupported_ignore_nulls_shapes_reject(gaps, expr):

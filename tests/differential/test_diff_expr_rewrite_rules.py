@@ -294,16 +294,16 @@ _STRING_FOLDS = [
     ("crc32", lambda e: e.str.crc32()),
     ("hex", lambda e: e.str.hex()),
     ("ascii", lambda e: e.str.ascii()),
-    ("initcap", lambda e: e.str.initcap()),
+    ("initcap", lambda e: e.str.to_titlecase()),
     ("reverse", lambda e: e.str.reverse()),
     ("bit_length", lambda e: e.str.bit_length()),
     ("octet_length", lambda e: e.str.octet_length()),
-    ("trim", lambda e: e.str.strip_chars()),
+    ("trim", lambda e: e.str.trim()),
     ("ltrim", lambda e: e.str.strip_chars_start()),
     ("rtrim", lambda e: e.str.strip_chars_end()),
     ("repeat", lambda e: e.str.repeat(2)),
-    ("lpad", lambda e: e.str.pad_start(10)),
-    ("rpad", lambda e: e.str.pad_end(10)),
+    ("lpad", lambda e: e.str.lpad(10)),
+    ("rpad", lambda e: e.str.rpad(10)),
 ]
 
 
@@ -340,15 +340,14 @@ def test_hex_folds_to_uppercase_like_the_engine(duck, value):
 
 
 @pytest.mark.parametrize("width", [1, 5, 10, 11, 20])
-@pytest.mark.parametrize("method", ["pad_start", "pad_end"])
+@pytest.mark.parametrize("method", ["lpad", "rpad"])
 def test_a_pad_fold_truncates_an_over_long_literal(duck, width, method):
     """SQL pads *to* a width, so an input already wider than it is cut down, not left alone."""
     value = "Hello World"
     ds = bt.from_arrow(pa.table({"s": pa.array([value])}))
     folded = ds.select(r=getattr(bt.lit(value).str, method)(width)).collect()
     duck.register("t", pa.table({"s": pa.array([value])}))
-    fn = "lpad" if method == "pad_start" else "rpad"
-    assert_same(folded, duck.sql(f"SELECT {fn}(s, {width}, ' ') AS r FROM t"))
+    assert_same(folded, duck.sql(f"SELECT {method}(s, {width}, ' ') AS r FROM t"))
 
 
 # --------------------------------------------------------------------------- #
@@ -414,7 +413,7 @@ def test_folding_a_string_to_number_cast_matches_the_engine(duck, value):
 
 
 @pytest.mark.parametrize("value", ["hello", "", "Straße", "ÄÖÜ", "MiXeD", "İstanbul"])
-@pytest.mark.parametrize("method", ["to_uppercase", "to_lowercase", "len"])
+@pytest.mark.parametrize("method", ["upper", "lower", "len_chars"])
 def test_folding_a_case_or_length_function_matches_the_column_path(value, method):
     """Unicode case mapping is where two implementations most plausibly diverge."""
     ds = bt.from_arrow(pa.table({"c": pa.array([value], pa.string())}))

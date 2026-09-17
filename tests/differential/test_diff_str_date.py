@@ -34,7 +34,7 @@ def t(duck):
     [
         (col("s").str.upper(), "upper(s)"),
         (col("s").str.lower(), "lower(s)"),
-        (col("s").str.len(), "length(s)"),
+        (col("s").str.len_chars(), "length(s)"),
         (col("s").str.contains("o"), "contains(s, 'o')"),
         (col("s").str.starts_with("a"), "starts_with(s, 'a')"),
         (col("s").str.ends_with("f"), "ends_with(s, 'f')"),
@@ -54,7 +54,7 @@ def test_str_in_filter_and_projection(duck, t):
     out = (
         bt.from_arrow(t)
         .filter(col("s").str.contains("o"))
-        .select(up=col("s").str.upper(), n=col("s").str.len())
+        .select(up=col("s").str.upper(), n=col("s").str.len_chars())
         .collect()
     )
     expected = duck.sql("SELECT upper(s) AS up, length(s) AS n FROM t WHERE contains(s, 'o')")

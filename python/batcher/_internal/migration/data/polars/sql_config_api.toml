@@ -1,0 +1,54 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+[SQLContext]
+execute = { status = "canonical", batcher = "Session.sql" }
+execute_global = { status = "param", batcher = "bt.sql", need = "discover frames from the caller's globals/locals", wave = "W2" }
+register = { status = "canonical", batcher = "Session.register" }
+register_globals = { status = "gap", need = "Session.register_globals", wave = "W8" }
+register_many = { status = "gap", need = "Session.register_many", wave = "W8" }
+tables = { status = "canonical", batcher = "Session.list" }
+unregister = { status = "canonical", batcher = "Session.drop" }
+
+[Config]
+load = { status = "canonical", batcher = "Config.from_dict" }
+load_from_file = { status = "canonical", batcher = "Config.from_file" }
+reload_env_vars = { status = "canonical", batcher = "Config.from_env" }
+restore_defaults = { status = "canonical", batcher = "batcher.config.reset_option" }
+save = { status = "canonical", batcher = "Config.to_dict" }
+save_to_file = { status = "gap", need = "Config.save_to_file (write the active config to a file)", wave = "W11" }
+set_ascii_tables = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_auto_structify = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_decimal_separator = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_default_credential_provider = { status = "gap", need = "process-wide default credential provider", wave = "W13" }
+set_engine_affinity = { status = "param", batcher = "batcher.config.set_option", need = "engine affinity (streaming/in-memory/GPU) as a process-wide option", wave = "W2" }
+set_expr_depth_warning = { status = "out_of_scope", reason = "Polars-internal recursion-depth warning for deep expression trees" }
+set_float_precision = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_fmt_float = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_fmt_str_lengths = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_fmt_table_cell_list_len = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_streaming_chunk_size = { status = "canonical", batcher = "batcher.config.set_option" }
+set_tbl_cell_alignment = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_cell_numeric_alignment = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_cols = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_column_data_type_inline = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_dataframe_shape_below = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_formatting = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_hide_column_data_types = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_hide_column_names = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_hide_dataframe_shape = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_hide_dtype_separator = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_rows = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_tbl_width_chars = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_thousands_separator = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_trim_decimal_zeros = { status = "gap", need = "display/formatting option for printed tables", wave = "W11" }
+set_verbose = { status = "canonical", batcher = "batcher.config.set_verbosity" }
+state = { status = "canonical", batcher = "Config.non_defaults" }
+warn_unstable = { status = "out_of_scope", reason = "Polars-internal toggle for unstable-API warnings" }
+
+[api]
+register_dataframe_namespace = { status = "gap", need = "user namespace registration on Dataset", wave = "W11" }
+register_expr_namespace = { status = "gap", need = "user namespace registration on Expr", wave = "W11" }
+register_lazyframe_namespace = { status = "gap", need = "user namespace registration on Dataset", wave = "W11" }
+register_series_namespace = { status = "out_of_scope", reason = "Batcher has no Series type (user decision)" }

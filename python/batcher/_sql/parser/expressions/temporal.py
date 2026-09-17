@@ -20,10 +20,10 @@ from sqlglot import expressions as exp
 from batcher._sql.parser.expressions.lowering.buckets import time_bucket
 from batcher.plan.expr_ir import Binary, Cast, Expr, lit
 from batcher.plan.expr_ir.func_nodes import DateOffset
+from batcher.plan.functions.partitioning import partition_days
 from batcher.plan.functions.temporal import (
     current_timestamp,
     from_epoch,
-    from_unix_date,
     make_timestamp,
 )
 from batcher.plan.ir_tags import MICROS_PER_DAY
@@ -196,9 +196,15 @@ def _spark_temporal(tr, node) -> Expr | None:
         # the only answer that is true of them.
         return lit("UTC")
     if isinstance(node, exp.NextDay):
-        return _next_day(tr, node)
+        weekday = _const_str_arg(node.expression, "next_day()", "day of week")
+        return Cast(tr._scalar(node.this), "date").dt.next_day(weekday)
     if isinstance(node, exp.MonthsBetween):
-        return _months_between(tr, node)
+        round_off = node.args.get("roundoff")
+        exact = isinstance(round_off, exp.Boolean) and not round_off.this
+        left = Cast(tr._scalar(node.this), "timestamp")
+        return left.dt.months_between(
+            Cast(tr._scalar(node.expression), "timestamp"), round_off=not exact
+        )
     if isinstance(node, exp.AddMonths):
         months = _const_int_arg(node.expression, "add_months(): months")
         return DateOffset(Cast(tr._scalar(node.this), "date"), months, 0, 0)
@@ -206,9 +212,8 @@ def _spark_temporal(tr, node) -> Expr | None:
         days = _const_int_arg(node.expression, "date_add(): days")
         return DateOffset(Cast(tr._scalar(node.this), "date"), 0, days, 0)
     if isinstance(node, exp.UnixDate):
-        # Whole days since the epoch. `epoch` is seconds, and a DATE is midnight, so the
-        # division is exact.
-        return Cast(tr._scalar(node.this), "timestamp").dt.epoch() // lit(86_400)
+        # Spark `unix_date` is the Iceberg day transform: whole days since the epoch.
+        return partition_days(tr._scalar(node.this))
     if isinstance(node, (exp.UnixSeconds, exp.UnixMillis, exp.UnixMicros)):
         method = {
             "UnixSeconds": "epoch",
@@ -259,77 +264,6 @@ def _spark_temporal(tr, node) -> Expr | None:
         )
         return stamp.dt.convert_timezone(from_zone, target)
     return None
-
-
-# `next_day(d, 'TU')` — Spark's day-of-week abbreviations, as ISO day numbers (Mon = 1).
-_NEXT_DAY = {
-    "MO": 1,
-    "MON": 1,
-    "MONDAY": 1,
-    "TU": 2,
-    "TUE": 2,
-    "TUESDAY": 2,
-    "WE": 3,
-    "WED": 3,
-    "WEDNESDAY": 3,
-    "TH": 4,
-    "THU": 4,
-    "THURSDAY": 4,
-    "FR": 5,
-    "FRI": 5,
-    "FRIDAY": 5,
-    "SA": 6,
-    "SAT": 6,
-    "SATURDAY": 6,
-    "SU": 7,
-    "SUN": 7,
-    "SUNDAY": 7,
-}
-
-
-def _next_day(tr, node) -> Expr | None:
-    """`next_day(d, 'TU')` — the first date *strictly after* `d` with that weekday.
-
-    Composed from the ISO day number rather than a kernel: the shift is
-    ``((target - today + 6) mod 7) + 1`` days, which is 7 when the two coincide (the
-    "strictly after" rule) and never 0.
-    """
-    from batcher._sql.parser.expressions.literals import _const_str_arg
-
-    name = _const_str_arg(node.expression, "next_day()", "day of week").strip().upper()
-    target = _NEXT_DAY.get(name)
-    if target is None:
-        return None
-    date = Cast(tr._scalar(node.this), "date")
-    shift = ((lit(target) - date.dt.isodow() + lit(6)) % lit(7)) + lit(1)
-    # `offset_by` takes a constant duration, and this shift is per row, so the arithmetic
-    # runs on the day count and is read back as a date.
-    return from_unix_date(Cast(date, "timestamp").dt.epoch() // lit(86_400) + shift)
-
-
-def _seconds_of_day(ts: Expr) -> Expr:
-    """The instant's time of day in whole seconds — the fractional part of a month."""
-    return ts.dt.hour() * lit(3600) + ts.dt.minute() * lit(60) + ts.dt.second()
-
-
-def _months_between(tr, node) -> Expr:
-    """`months_between(a, b)` — Spark's fractional month difference.
-
-    Spark's definition, exactly: whole months from the calendar fields, plus the
-    leftover days and time-of-day divided by 31 (a fixed divisor, not the month's
-    length). Composed here because the parts are all field extractions the engine has.
-    """
-    left = Cast(tr._scalar(node.this), "timestamp")
-    right = Cast(tr._scalar(node.expression), "timestamp")
-    months = (left.dt.year() - right.dt.year()) * lit(12) + (left.dt.month() - right.dt.month())
-    day_part = (left.dt.day() - right.dt.day()) + (
-        (_seconds_of_day(left) - _seconds_of_day(right)) / lit(86400.0)
-    )
-    # Spark rounds the result to 8 decimal places unless the third argument says not to.
-    total = months + day_part / lit(31.0)
-    round_off = node.args.get("roundoff")
-    exact = isinstance(round_off, exp.Boolean) and not round_off.this
-    return total if exact else total.round(8)
 
 
 def datetime_pattern(fmt: str) -> str | None:

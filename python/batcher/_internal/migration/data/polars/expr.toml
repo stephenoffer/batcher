@@ -1,0 +1,223 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+[Expr]
+abs = { status = "canonical", batcher = "Expr.abs" }
+add = { status = "canonical", batcher = "op:add" }
+agg_groups = { status = "gap", need = "agg_groups (group row indices as a list)", wave = "W8" }
+alias = { status = "canonical", batcher = "Expr.alias" }
+all = { status = "canonical", batcher = "Expr.bool_and", template = 'all(*, ignore_nulls=True) -> self.bool_and(empty_value=True)' }
+and_ = { status = "canonical", batcher = "op:and" }
+any = { status = "canonical", batcher = "Expr.bool_or", template = 'any(*, ignore_nulls=True) -> self.bool_or(empty_value=False)' }
+append = { status = "gap", need = "Expr.append (length-changing concatenation of two expressions)", wave = "W8" }
+approx_n_unique = { status = "canonical", batcher = "Expr.approx_count_distinct", template = 'approx_n_unique() -> self.approx_count_distinct(count_nulls=True)' }
+arccos = { status = "canonical", batcher = "Expr.arccos" }
+arccosh = { status = "canonical", batcher = "Expr.arccosh" }
+arcsin = { status = "canonical", batcher = "Expr.arcsin" }
+arcsinh = { status = "canonical", batcher = "Expr.arcsinh" }
+arctan = { status = "canonical", batcher = "Expr.arctan" }
+arctanh = { status = "canonical", batcher = "Expr.arctanh" }
+arg_max = { status = "mismatch", batcher = "Expr.arg_max", note = "Polars reads the position in frame order; Batcher needs the order stated: col.arg_max(order_by=_row) after with_row_index(_row)", wave = "W0" }
+arg_min = { status = "mismatch", batcher = "Expr.arg_min", note = "Polars reads the position in frame order; Batcher needs the order stated: col.arg_min(order_by=_row) after with_row_index(_row)", wave = "W0" }
+arg_sort = { status = "gap", need = "Expr.arg_sort (sort permutation indices)", wave = "W8" }
+arg_true = { status = "gap", need = "Expr.arg_true (indices of true values)", wave = "W8" }
+arg_unique = { status = "gap", need = "Expr.arg_unique (index of first occurrence of each value)", wave = "W8" }
+arr = { status = "canonical", batcher = "Expr.list" }
+backward_fill = { status = "param", batcher = "Expr.backward_fill", need = "limit=; Batcher requires an explicit order_by (explicit-order policy), Polars uses implicit row order", wave = "WF" }
+bin = { status = "param", batcher = "Expr.str", need = "binary accessor whose slicing and encoding functions return Binary rather than Utf8", wave = "W3" }
+bitwise_and = { status = "mismatch", batcher = "Expr.bit_and", template = 'bitwise_and() -> self.bit_and()', note = "Batcher's bitwise_and is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit_and", wave = "W0" }
+bitwise_count_ones = { status = "canonical", batcher = "Expr.bit_count" }
+bitwise_count_zeros = { status = "gap", need = "bitwise_count_zeros", wave = "W3" }
+bitwise_leading_ones = { status = "gap", need = "bitwise_leading_ones", wave = "W3" }
+bitwise_leading_zeros = { status = "gap", need = "bitwise_leading_zeros", wave = "W3" }
+bitwise_or = { status = "mismatch", batcher = "Expr.bit_or", template = 'bitwise_or() -> self.bit_or()', note = "Batcher's bitwise_or is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit_or", wave = "W0" }
+bitwise_trailing_ones = { status = "gap", need = "bitwise_trailing_ones", wave = "W3" }
+bitwise_trailing_zeros = { status = "gap", need = "bitwise_trailing_zeros", wave = "W3" }
+bitwise_xor = { status = "mismatch", batcher = "Expr.bit_xor", template = 'bitwise_xor() -> self.bit_xor()', note = "Batcher's bitwise_xor is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit_xor", wave = "W0" }
+bottom_k = { status = "gap", need = "Expr.bottom_k (k smallest values, length-changing)", wave = "W8" }
+bottom_k_by = { status = "gap", need = "Expr.bottom_k_by", wave = "W8" }
+cast = { status = "param", batcher = "Expr.cast", need = "strict=, wrap_numerical=, Polars dtype objects as targets", wave = "W2" }
+cat = { status = "param", batcher = "Expr.str", need = "Categorical dtype; the string functions apply to a decoded column", wave = "W11" }
+cbrt = { status = "canonical", batcher = "Expr.cbrt" }
+ceil = { status = "canonical", batcher = "Expr.ceil" }
+clip = { status = "canonical", batcher = "Expr.clip" }
+cos = { status = "canonical", batcher = "Expr.cos" }
+cosh = { status = "canonical", batcher = "Expr.cosh" }
+cot = { status = "canonical", batcher = "Expr.cot" }
+count = { status = "canonical", batcher = "Expr.count" }
+cum_count = { status = "param", batcher = "Expr.cum_count", need = "reverse=", wave = "W2" }
+cum_max = { status = "canonical", batcher = "Expr.cum_max", template = 'cum_max(*, reverse=False) -> self.cum_max(reverse=reverse, propagate_nulls=True)' }
+cum_min = { status = "canonical", batcher = "Expr.cum_min", template = 'cum_min(*, reverse=False) -> self.cum_min(reverse=reverse, propagate_nulls=True)' }
+cum_prod = { status = "mismatch", batcher = "Expr.cum_prod", template = 'cum_prod(*, reverse=False) -> self.cum_prod(reverse=reverse, propagate_nulls=True)', note = "Batcher's running product is Float64 (DuckDB product) where Polars keeps an integer type; cast to int64 for values below 2**53", wave = "W0" }
+cum_sum = { status = "canonical", batcher = "Expr.cum_sum", template = 'cum_sum(*, reverse=False) -> self.cum_sum(reverse=reverse, propagate_nulls=True)' }
+cumulative_eval = { status = "gap", need = "Expr.cumulative_eval (expanding-window expression evaluation)", wave = "W8" }
+cut = { status = "param", batcher = "Expr.cut", need = "include_breaks=, left_closed=", wave = "W2" }
+degrees = { status = "canonical", batcher = "Expr.degrees" }
+deserialize = { status = "gap", need = "Expr.deserialize (expression from serialized IR)", wave = "W8" }
+diff = { status = "param", batcher = "Expr.diff", need = "null_behavior= ('ignore'/'drop')", wave = "W2" }
+dot = { status = "canonical", batcher = ["op:mul", "Expr.sum"] }
+drop_nans = { status = "gap", need = "Expr.drop_nans (length-changing)", wave = "W8" }
+drop_nulls = { status = "gap", need = "Expr.drop_nulls (length-changing)", wave = "W8" }
+dt = { status = "canonical", batcher = "Expr.dt" }
+entropy = { status = "mismatch", batcher = "Expr.entropy", template = 'entropy(base=2.718281828459045, *, normalize=True) -> self.entropy(base, of="values", normalize=normalize)', note = "Polars entropy reads the values as a distribution in natural log; the template passes of=values and base e. Polars counts a null as a value", wave = "W0" }
+eq = { status = "canonical", batcher = "op:eq" }
+eq_missing = { status = "canonical", batcher = "Expr.eq_missing" }
+ewm_mean = { status = "param", batcher = "Expr.ewm_mean", need = "adjust=, bias=, min_samples=, ignore_nulls=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
+ewm_mean_by = { status = "param", batcher = "Expr.ewm_mean_by", need = "half_life as a duration string over a temporal by column", wave = "W2" }
+ewm_std = { status = "param", batcher = "Expr.ewm_std", need = "adjust=, bias=, min_samples=, ignore_nulls=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
+ewm_var = { status = "param", batcher = "Expr.ewm_var", need = "adjust=, bias=, min_samples=, ignore_nulls=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
+exclude = { status = "canonical", batcher = "Selector.exclude" }
+exp = { status = "canonical", batcher = "Expr.exp" }
+explode = { status = "gap", need = "Expr.explode (length-changing)", wave = "W8" }
+ext = { status = "gap", need = "extension-type namespace on Expr", wave = "W11" }
+extend_constant = { status = "gap", need = "Expr.extend_constant (length-changing)", wave = "W8" }
+fill_nan = { status = "canonical", batcher = "Expr.fill_nan" }
+fill_null = { status = "param", batcher = "Expr.fill_null", need = "strategy= ('forward','backward','min','max','mean','zero','one') and limit=", wave = "W2" }
+filter = { status = "gap", need = "Expr.filter inside aggregation context (length-changing)", wave = "W8" }
+first = { status = "mismatch", batcher = "Expr.first", note = "Polars first takes the first row in frame order, nulls included; Batcher needs an explicit order: col.first(order_by, ignore_nulls=False) after with_row_index", wave = "W0" }
+flatten = { status = "gap", need = "Expr.flatten (length-changing)", wave = "W8" }
+floor = { status = "canonical", batcher = "Expr.floor" }
+floordiv = { status = "canonical", batcher = "op:floordiv" }
+forward_fill = { status = "param", batcher = "Expr.forward_fill", need = "limit=; Batcher requires an explicit order_by (explicit-order policy), Polars uses implicit row order", wave = "WF" }
+from_json = { status = "gap", need = "Expr.from_json (deserialize an expression from JSON)", wave = "W8" }
+gather = { status = "gap", need = "Expr.gather (take by index, length-changing)", wave = "W8" }
+gather_every = { status = "gap", need = "Expr.gather_every (length-changing)", wave = "W8" }
+ge = { status = "canonical", batcher = "op:ge" }
+get = { status = "gap", need = "Expr.get (single element by index)", wave = "W8" }
+gt = { status = "canonical", batcher = "op:gt" }
+has_nulls = { status = "gap", need = "Expr.has_nulls aggregate", wave = "W8" }
+hash = { status = "mismatch", batcher = "Expr.hash", note = "Polars documents its hash as unstable across versions, so no Batcher algorithm reproduces it; recompute hashes on both sides", wave = "W0" }
+head = { status = "gap", need = "Expr.head (length-changing)", wave = "W8" }
+hist = { status = "gap", need = "Expr.hist (binned counts)", wave = "W8" }
+implode = { status = "mismatch", batcher = "Expr.array_agg", note = "Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array_agg(order_by=_row) after with_row_index(_row)", wave = "W0" }
+index_of = { status = "gap", need = "Expr.index_of", wave = "W8" }
+inspect = { status = "gap", need = "Expr.inspect (print intermediate value)", wave = "W8" }
+interpolate = { status = "param", batcher = "Expr.interpolate", need = "method= ('linear','nearest'); Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
+interpolate_by = { status = "gap", need = "Expr.interpolate_by", wave = "W5" }
+is_between = { status = "canonical", batcher = "Expr.between" }
+is_close = { status = "gap", need = "Expr.is_close (abs_tol/rel_tol/nans_equal)", wave = "W3" }
+is_duplicated = { status = "canonical", batcher = "Expr.is_duplicated" }
+is_finite = { status = "canonical", batcher = "Expr.is_finite" }
+is_first_distinct = { status = "param", batcher = "Expr.is_first_distinct", need = "implicit row order: Batcher needs order_by, here or through over(order_by=...)", wave = "W2" }
+is_in = { status = "canonical", batcher = "Expr.is_in", template = 'is_in(other, *, nulls_equal=False) -> self.is_in(other, nulls_equal=nulls_equal)' }
+is_infinite = { status = "canonical", batcher = "Expr.is_infinite" }
+is_last_distinct = { status = "param", batcher = "Expr.is_last_distinct", need = "implicit row order: Batcher needs order_by, here or through over(order_by=...)", wave = "W2" }
+is_nan = { status = "canonical", batcher = "Expr.is_nan" }
+is_not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
+is_not_null = { status = "canonical", batcher = "Expr.is_not_null" }
+is_null = { status = "canonical", batcher = "Expr.is_null" }
+is_unique = { status = "canonical", batcher = "Expr.is_unique" }
+item = { status = "gap", need = "Expr.item (assert a single value)", wave = "W8" }
+kurtosis = { status = "canonical", batcher = "Expr.kurtosis", template = 'kurtosis(*, fisher=True, bias=True) -> self.kurtosis(bias=bias, fisher=fisher)' }
+last = { status = "mismatch", batcher = "Expr.last", note = "Polars last takes the last row in frame order, nulls included; Batcher needs an explicit order: col.last(order_by, ignore_nulls=False) after with_row_index", wave = "W0" }
+le = { status = "canonical", batcher = "op:le" }
+len = { status = "canonical", batcher = "bt.count" }
+limit = { status = "gap", need = "Expr.limit (length-changing)", wave = "W8" }
+list = { status = "canonical", batcher = "Expr.list" }
+log = { status = "canonical", batcher = "Expr.ln", need = "base= argument (Polars log(base=e)); Batcher's log is a second spelling of ln and is removed, then returns as log(base)", wave = "W2" }
+log10 = { status = "canonical", batcher = "Expr.log10" }
+log1p = { status = "canonical", batcher = "Expr.log1p" }
+lower_bound = { status = "gap", need = "Expr.lower_bound (dtype minimum)", wave = "W3" }
+lt = { status = "canonical", batcher = "op:lt" }
+map_batches = { status = "gap", need = "Expr.map_batches (vectorized Python UDF as an expression)", wave = "W11" }
+map_elements = { status = "gap", need = "Expr.map_elements, only as a batch-vectorized wrapper (per-row Python stays refused)", wave = "W11" }
+max = { status = "canonical", batcher = "Expr.max", template = 'max() -> self.max(nan_policy="ignore")' }
+max_by = { status = "canonical", batcher = "Expr.max_by", template = 'max_by(by) -> self.max_by(by, ignore_nulls=False)' }
+mean = { status = "canonical", batcher = "Expr.mean" }
+median = { status = "canonical", batcher = "Expr.median" }
+meta = { status = "canonical", batcher = "Expr.meta" }
+min = { status = "canonical", batcher = "Expr.min" }
+min_by = { status = "canonical", batcher = "Expr.min_by", template = 'min_by(by) -> self.min_by(by, ignore_nulls=False)' }
+mod = { status = "mismatch", batcher = "op:mod", template = 'mod(other) -> self - (self // other) * other', note = "Polars % takes the sign of the divisor (floored); Batcher % truncates like SQL and DuckDB", wave = "W0" }
+mode = { status = "mismatch", batcher = "Expr.mode", template = 'mode(*, maintain_order=False) -> self.mode(all_modes=True)', note = "with all_modes=True every tied value is returned as Polars does; Polars also counts null as a mode candidate, Batcher does not", wave = "W0" }
+mul = { status = "canonical", batcher = "op:mul" }
+n_unique = { status = "canonical", batcher = "Expr.count_distinct", template = 'n_unique() -> self.count_distinct(count_nulls=True)' }
+name = { status = "param", batcher = "Selector.name", need = ".name accessor (keep/prefix/suffix/map/case) on every Expr, not only on selectors", wave = "W2" }
+nan_max = { status = "gap", need = "Expr.nan_max (NaN-propagating max)", wave = "W3" }
+nan_min = { status = "gap", need = "Expr.nan_min (NaN-propagating min)", wave = "W3" }
+ne = { status = "canonical", batcher = "op:ne" }
+ne_missing = { status = "gap", need = "Expr.ne_missing (null-aware inequality)", wave = "W3" }
+neg = { status = "canonical", batcher = "op:neg" }
+not_ = { status = "canonical", batcher = "op:invert" }
+null_count = { status = "gap", need = "Expr.null_count aggregate", wave = "W8" }
+or_ = { status = "canonical", batcher = "op:or" }
+over = { status = "param", batcher = ["Expr.over"], template = 'over(partition_by=None, *more_exprs, order_by=None, descending=False, nulls_last=False, mapping_strategy="group_to_rows") -> sem.polars_over(self, partition_by, more_exprs, order_by, descending, nulls_last, mapping_strategy)', need = "mapping_strategy= join and explode", wave = "WF" }
+pct_change = { status = "canonical", batcher = "Expr.pct_change" }
+peak_max = { status = "canonical", batcher = "Expr.peak_max", template = 'peak_max() -> self.peak_max(edges=True, propagate_nulls=True)' }
+peak_min = { status = "canonical", batcher = "Expr.peak_min", template = 'peak_min() -> self.peak_min(propagate_nulls=True)' }
+pipe = { status = "canonical", batcher = "Expr.pipe" }
+pow = { status = "canonical", batcher = "op:pow" }
+product = { status = "canonical", batcher = "Expr.product", template = 'product() -> self.product(empty_value=1)' }
+qcut = { status = "gap", need = "Expr.qcut (quantile binning)", wave = "W3" }
+quantile = { status = "canonical", batcher = "Expr.quantile", template = 'quantile(quantile, interpolation="nearest") -> self.quantile(quantile, interpolation)' }
+radians = { status = "canonical", batcher = "Expr.radians" }
+rank = { status = "canonical", batcher = "Expr.rank", template = 'rank(method="average", *, descending=False, seed=None) -> self.rank(method, descending=descending, propagate_nulls=True)' }
+rechunk = { status = "out_of_scope", reason = "memory layout is engine-owned (morsels), not user-visible" }
+register_plugin = { status = "gap", need = "Rust expression plugin ABI", wave = "W11" }
+reinterpret = { status = "gap", need = "Expr.reinterpret (signed/unsigned bit reinterpretation)", wave = "W3" }
+repeat_by = { status = "gap", need = "Expr.repeat_by (length-changing)", wave = "W8" }
+replace = { status = "param", batcher = "Expr.replace", need = "old/new as parallel lists or scalars (Batcher takes a mapping), return_dtype=", wave = "W2" }
+replace_strict = { status = "param", batcher = "Expr.replace", need = "strict variant: default=, return_dtype=, raise on an unmapped value", wave = "W2" }
+reshape = { status = "gap", need = "Expr.reshape (to Array dims)", wave = "W8" }
+reverse = { status = "gap", need = "Expr.reverse (length-preserving reorder)", wave = "W8" }
+rle = { status = "gap", need = "Expr.rle (run-length encoding to struct)", wave = "W8" }
+rle_id = { status = "param", batcher = "Expr.rle_id", need = "Batcher requires an explicit order_by (explicit-order policy), Polars uses implicit row order", wave = "WF" }
+rolling = { status = "gap", need = "Expr.rolling(index_column, period) dynamic window", wave = "W5" }
+rolling_kurtosis = { status = "gap", need = "rolling_kurtosis", wave = "W5" }
+rolling_map = { status = "gap", need = "rolling_map (Python function over a window)", wave = "W5" }
+rolling_max = { status = "mismatch", batcher = "Expr.rolling_max", note = "Polars min_samples defaults to the window size, so a partial window is null; port as rolling_max(n, min_periods=n)", wave = "W0" }
+rolling_max_by = { status = "param", batcher = "Expr.rolling_max_by", need = "closed=, min_samples=", wave = "W2" }
+rolling_mean = { status = "mismatch", batcher = "Expr.rolling_mean", note = "Polars defaults min_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min_samples=", wave = "W0" }
+rolling_mean_by = { status = "param", batcher = "Expr.rolling_mean_by", need = "closed=, min_samples=", wave = "W2" }
+rolling_median = { status = "gap", need = "rolling_median", wave = "W5" }
+rolling_median_by = { status = "gap", need = "rolling_median_by", wave = "W5" }
+rolling_min = { status = "mismatch", batcher = "Expr.rolling_min", note = "Polars defaults min_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min_samples=", wave = "W0" }
+rolling_min_by = { status = "param", batcher = "Expr.rolling_min_by", need = "closed=, min_samples=", wave = "W2" }
+rolling_quantile = { status = "gap", need = "rolling_quantile", wave = "W5" }
+rolling_quantile_by = { status = "gap", need = "rolling_quantile_by", wave = "W5" }
+rolling_rank = { status = "gap", need = "rolling_rank", wave = "W5" }
+rolling_rank_by = { status = "gap", need = "rolling_rank_by", wave = "W5" }
+rolling_skew = { status = "gap", need = "rolling_skew", wave = "W5" }
+rolling_std = { status = "mismatch", batcher = "Expr.rolling_std", note = "Polars defaults min_samples to the window size and returns null until the window fills; Batcher emits partial windows, and returned NaN for every row of a column holding one NaN. Param: min_samples=", wave = "W0" }
+rolling_std_by = { status = "gap", need = "rolling_std_by", wave = "W5" }
+rolling_sum = { status = "mismatch", batcher = "Expr.rolling_sum", note = "Polars defaults min_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min_samples=", wave = "W0" }
+rolling_sum_by = { status = "param", batcher = "Expr.rolling_sum_by", need = "closed=, min_samples=", wave = "W2" }
+rolling_var = { status = "mismatch", batcher = "Expr.rolling_var", note = "Polars defaults min_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min_samples=", wave = "W0" }
+rolling_var_by = { status = "gap", need = "rolling_var_by", wave = "W5" }
+round = { status = "canonical", batcher = "Expr.round", template = 'round(decimals=0, mode="half_to_even") -> self.round(decimals, mode=mode)' }
+round_sig_figs = { status = "gap", need = "Expr.round_sig_figs", wave = "W3" }
+sample = { status = "gap", need = "Expr.sample (length-changing)", wave = "W8" }
+search_sorted = { status = "gap", need = "Expr.search_sorted", wave = "W8" }
+set_sorted = { status = "out_of_scope", reason = "sortedness flags are engine-owned metadata (Dataset.meta.sorted_by), not a user assertion" }
+shift = { status = "param", batcher = "Expr.shift", need = "fill_value=", wave = "W2" }
+shrink_dtype = { status = "out_of_scope", reason = "contradicts the FFI boundary's narrow-int normalization to Int64/Float64" }
+shuffle = { status = "gap", need = "Expr.shuffle (permute values)", wave = "W8" }
+sign = { status = "mismatch", batcher = "Expr.sign", template = 'sign() -> bt.when(self.is_nan()).then(self).otherwise(self.sign())', note = "Polars sign(NaN) is NaN; Batcher (DuckDB) returns 0", wave = "W0" }
+sin = { status = "canonical", batcher = "Expr.sin" }
+sinh = { status = "canonical", batcher = "Expr.sinh" }
+skew = { status = "canonical", batcher = "Expr.skew", template = 'skew(*, bias=True) -> self.skew(bias=bias)' }
+slice = { status = "gap", need = "Expr.slice (length-changing)", wave = "W8" }
+sort = { status = "gap", need = "Expr.sort (reorder within an expression)", wave = "W8" }
+sort_by = { status = "gap", need = "Expr.sort_by", wave = "W8" }
+sqrt = { status = "canonical", batcher = "Expr.sqrt" }
+std = { status = "param", batcher = "Expr.std", need = "ddof=", wave = "W2" }
+str = { status = "canonical", batcher = "Expr.str" }
+struct = { status = "canonical", batcher = "Expr.struct" }
+sub = { status = "canonical", batcher = "op:sub" }
+sum = { status = "canonical", batcher = "Expr.sum", template = 'sum() -> self.sum(empty_value=0)' }
+tail = { status = "gap", need = "Expr.tail (length-changing)", wave = "W8" }
+tan = { status = "canonical", batcher = "Expr.tan" }
+tanh = { status = "canonical", batcher = "Expr.tanh" }
+to_physical = { status = "gap", need = "Expr.to_physical", wave = "W3" }
+top_k = { status = "mismatch", batcher = "Expr.top_k", note = "Polars pads a group with fewer than k non-null values with its nulls; Batcher returns the values it has (DuckDB max(x, k))", wave = "W0" }
+top_k_by = { status = "gap", need = "Expr.top_k_by", wave = "W8" }
+truediv = { status = "canonical", batcher = "op:truediv" }
+truncate = { status = "param", batcher = "Expr.trunc", need = "decimals= argument", wave = "W2" }
+unique = { status = "gap", need = "Expr.unique (length-changing)", wave = "W8" }
+unique_counts = { status = "gap", need = "Expr.unique_counts", wave = "W8" }
+upper_bound = { status = "gap", need = "Expr.upper_bound (dtype maximum)", wave = "W3" }
+value_counts = { status = "gap", need = "Expr.value_counts (struct of value and count)", wave = "W8" }
+var = { status = "param", batcher = "Expr.var", need = "ddof=", wave = "W2" }
+where = { status = "gap", need = "Expr.where (alias of filter, length-changing)", wave = "W8" }
+xor = { status = "canonical", batcher = "op:xor" }

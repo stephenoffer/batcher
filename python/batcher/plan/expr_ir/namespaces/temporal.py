@@ -19,9 +19,10 @@ from batcher.plan.expr_ir.func_nodes import (
     DateFunc,
     DateOffset,
     DateTrunc,
+    MakeTemporal,
     Strftime,
 )
-from batcher.plan.expr_ir.namespaces._bind import _bind_accessors, _bind_aliases
+from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 from batcher.plan.expr_ir.namespaces._temporal_units import trunc_unit
 from batcher.plan.ir_tags import MICROS_PER_DAY
 
@@ -37,6 +38,15 @@ _OFFSET_UNITS = {
     "s": (0, 0, 1_000_000),
 }
 _OFFSET_RE = re.compile(r"(-?\d+)(mo|[ymwdhs])")
+
+# `dt.next_day`: Spark's weekday spellings (full, three- and two-letter) as ISO day numbers.
+_WEEKDAYS = {
+    spelling: number
+    for number, name in enumerate(
+        ("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"), start=1
+    )
+    for spelling in (name, name[:3], name[:2])
+}
 
 
 def parse_offset(by: str) -> tuple[int, int, int]:
@@ -189,12 +199,15 @@ class _DtNamespace:
             raise AttributeError(name)
         raise accessor_attribute_error(self, "'.dt' accessor", name, DT_UNSUPPORTED)
 
-    def truncate(self, unit: str) -> DateTrunc:
-        """Truncate each timestamp down to the start of ``unit``.
+    def truncate(self, unit: str, preserve_type: bool = False) -> DateTrunc:
+        """Truncate each date or timestamp down to the start of ``unit``.
 
         Zeroes out every field finer than ``unit`` (the floor toward the epoch), e.g.
         truncating to ``"month"`` gives the first of the month at midnight.
-        Type-preserving.
+
+        The result is a Timestamp for a Date input too, as DuckDB's ``date_trunc`` is.
+        Pass ``preserve_type=True`` for Polars' ``dt.truncate``, where a Date stays a
+        Date. A timestamp input is a timestamp either way.
 
         Args:
             unit: One of ``millennium``/``century``/``decade``/``year``/``quarter``/
@@ -202,9 +215,11 @@ class _DtNamespace:
                 ``millisecond``/``microsecond``. The duration spellings ``offset_by``
                 takes are accepted too (``"1mo"``/``"mo"``, ``"1d"``/``"d"``, ...),
                 where ``mo`` is months and ``m`` is minutes.
+            preserve_type: Return a Date for a Date input instead of a midnight Timestamp.
 
         Returns:
-            A new Timestamp expression floored to ``unit``.
+            A new expression floored to ``unit``: a Timestamp, or a Date for a Date input
+            when ``preserve_type`` is set.
 
         Examples:
             .. doctest::
@@ -217,8 +232,12 @@ class _DtNamespace:
 
                 >>> ds.select(bt.col("d").dt.truncate("1mo").alias("r")).to_pydict()
                 {'r': [datetime.datetime(2024, 2, 1, 0, 0)]}
+
+                >>> days = bt.from_pydict({"d": [dt.date(2024, 2, 15)]})
+                >>> days.select(r=bt.col("d").dt.truncate("month", preserve_type=True)).to_pydict()
+                {'r': [datetime.date(2024, 2, 1)]}
         """
-        return DateTrunc(self._e, trunc_unit(unit, "truncate"))
+        return DateTrunc(self._e, trunc_unit(unit, "truncate"), preserve_type=bool(preserve_type))
 
     def is_leap_year(self) -> DateFunc:
         """Test whether each row's year is a leap year (→ Bool).
@@ -315,6 +334,26 @@ class _DtNamespace:
         """
         return self._e.cast("timestamp").cast("int64")
 
+    def epoch_us(self) -> Expr:
+        """Microseconds since the Unix epoch as an integer (DuckDB ``epoch_us``, → Int64).
+
+        The microsecond-resolution epoch: the timestamp's own underlying value. A ``Date``
+        input reads as its midnight instant.
+
+        Returns:
+            A new Int64 expression of microseconds since 1970-01-01 UTC.
+
+        Examples:
+            .. doctest::
+
+                >>> import datetime as dt
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2021, 1, 1)]})
+                >>> ds.select(r=bt.col("d").dt.epoch_us()).to_pydict()
+                {'r': [1609459200000000]}
+        """
+        return self._micros()
+
     def epoch_ms(self) -> Expr:
         """Milliseconds since the Unix epoch as an integer (DuckDB ``epoch_ms``, → Int64).
 
@@ -380,6 +419,23 @@ class _DtNamespace:
         micros = self._micros()
         return (micros % 1_000_000 + 1_000_000) % 1_000_000
 
+    def microsecond(self) -> Expr:
+        """The microsecond-of-second component, 0-999999 (Polars ``dt.microsecond``, → Int64).
+
+        Returns:
+            A new Int64 expression of the microseconds past the whole second.
+
+        Examples:
+            .. doctest::
+
+                >>> import datetime as dt
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]})
+                >>> ds.select(r=bt.col("d").dt.microsecond()).to_pydict()
+                {'r': [123456]}
+        """
+        return self._subsecond_micros()
+
     def millisecond(self) -> Expr:
         """The millisecond-of-second component, 0-999 (Polars ``dt.millisecond``, → Int64).
 
@@ -418,30 +474,6 @@ class _DtNamespace:
 
     # --- Polars-compatible spellings (delegate to the SQL-named accessors) ----------
 
-    def to_string(self, format: str = "%Y-%m-%dT%H:%M:%S") -> Expr:
-        """Format as text — the Polars ``dt.to_string`` spelling of :meth:`strftime`.
-
-        The default is the ISO-8601 datetime form. A Date column has no time of day, so
-        pass ``"%Y-%m-%d"`` for one rather than reading back a midnight that is not in
-        the data.
-
-        Args:
-            format: A strftime pattern, e.g. ``"%Y-%m-%d"``; ISO-8601 by default.
-
-        Returns:
-            A new Utf8 expression: the formatted text.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> import datetime as dt
-                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
-                >>> ds.select(r=bt.col("d").dt.to_string("%Y-%m-%d")).to_pydict()
-                {'r': ['2024-02-15']}
-        """
-        return self.strftime(format)
-
     def date(self) -> Expr:
         """Extract the calendar date — the Polars ``dt.date`` spelling of ``CAST(ts AS DATE)``.
 
@@ -466,11 +498,19 @@ class _DtNamespace:
         """
         return self._e.cast("date")
 
-    def month_start(self) -> Expr:
-        """First day of the month at midnight — ``truncate('month')`` (Polars ``month_start``).
+    def month_start(self, keep_time: bool = False) -> Expr:
+        """First day of the month at midnight, which is ``truncate('month')``.
+
+        By default the result is a midnight Timestamp for either input type, the DuckDB
+        ``date_trunc('month', x)``. Pass ``keep_time=True`` for Polars' ``month_start``,
+        which rolls only the date back: the input's type is kept (a Date stays a Date)
+        and a timestamp keeps its time of day.
+
+        Args:
+            keep_time: Keep the input's type and time of day instead of a midnight Timestamp.
 
         Returns:
-            A new Timestamp expression at the start of the month.
+            A new expression at the start of the month.
 
         Examples:
             .. doctest::
@@ -480,8 +520,139 @@ class _DtNamespace:
                 >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
                 >>> ds.select(r=bt.col("d").dt.month_start()).to_pydict()
                 {'r': [datetime.datetime(2024, 2, 1, 0, 0)]}
+
+                >>> ds.select(r=bt.col("d").dt.month_start(keep_time=True)).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 1, 13, 45)]}
         """
+        if keep_time:
+            return DateTrunc(self._e, "month", preserve_type=True, keep_time=True)
         return self.truncate("month")
+
+    def last_day(self, keep_time: bool = False) -> Expr:
+        """The last day of the month, as a Date (DuckDB and Spark ``last_day``).
+
+        By default the result is a Date for either input type. Pass ``keep_time=True``
+        for Polars' ``month_end``, which keeps the input's type and a timestamp's time of
+        day. That form rolls to the start of the month, forward one month and back one
+        day, so it is calendar-exact across leap years.
+
+        Args:
+            keep_time: Keep the input's type and time of day instead of returning a Date.
+
+        Returns:
+            A new expression holding the month's last day.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})
+                >>> ds.select(r=bt.col("d").dt.last_day()).to_pydict()
+                {'r': [datetime.date(2024, 2, 29)]}
+
+                >>> ds.select(r=bt.col("d").dt.last_day(keep_time=True)).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 29, 13, 45, 30)]}
+        """
+        if keep_time:
+            return self.month_start(keep_time=True).dt.offset_by("1mo").dt.offset_by("-1d")
+        return DateFunc("last_day", self._e)
+
+    def dayofweek(self, start: str = "sunday", base: int = 0) -> Expr:
+        """The day of week as an integer, Sunday = 0 through Saturday = 6 by default.
+
+        The default is DuckDB's ``dayofweek``. `start` names the first day of the week and
+        `base` the number it gets, which covers every other convention in use:
+
+        * ``start="sunday", base=1`` is Spark ``dayofweek`` and SQL ``DAYOFWEEK``.
+        * ``start="monday", base=0`` is Spark ``weekday``, Daft ``day_of_week`` and
+          pandas ``dayofweek``.
+        * ``start="monday", base=1`` is ISO, the same as :meth:`weekday`.
+
+        Args:
+            start: The first day of the week, ``"sunday"`` or ``"monday"``.
+            base: The number the first day gets, ``0`` or ``1``.
+
+        Returns:
+            A new Int64 expression of the day of week.
+
+        Raises:
+            PlanError: If `start` or `base` is not one of the accepted values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.date(2024, 2, 18)]})  # a Sunday
+                >>> ds.select(
+                ...     duckdb=bt.col("d").dt.dayofweek(),
+                ...     spark=bt.col("d").dt.dayofweek(base=1),
+                ...     daft=bt.col("d").dt.dayofweek(start="monday"),
+                ... ).to_pydict()
+                {'duckdb': [0], 'spark': [1], 'daft': [6]}
+        """
+        if start not in ("sunday", "monday"):
+            raise PlanError(f"dt.dayofweek(): start must be 'sunday' or 'monday', got {start!r}")
+        if isinstance(base, bool) or base not in (0, 1):
+            raise PlanError(f"dt.dayofweek(): base must be 0 or 1, got {base!r}")
+        if start == "sunday":
+            sunday0 = DateFunc("day_of_week", self._e)
+            return sunday0 if base == 0 else sunday0 + 1
+        iso = self.weekday()  # Monday = 1 ... Sunday = 7
+        return iso if base == 1 else iso - 1
+
+    def dayname(self, abbreviated: bool = False) -> Expr:
+        """The English weekday name, e.g. ``"Monday"`` (→ Utf8).
+
+        The full name is DuckDB's ``dayname``. Pass ``abbreviated=True`` for the
+        three-letter form Spark's ``dayname`` returns, e.g. ``"Mon"``.
+
+        Args:
+            abbreviated: Return the three-letter abbreviation instead of the full name.
+
+        Returns:
+            A new Utf8 expression of the weekday name.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})
+                >>> ds.select(
+                ...     full=bt.col("d").dt.dayname(),
+                ...     short=bt.col("d").dt.dayname(abbreviated=True),
+                ... ).to_pydict()
+                {'full': ['Thursday'], 'short': ['Thu']}
+        """
+        return Strftime(self._e, "%a") if abbreviated else DateFunc("dayname", self._e)
+
+    def monthname(self, abbreviated: bool = False) -> Expr:
+        """The English month name, e.g. ``"January"`` (→ Utf8).
+
+        The full name is DuckDB's ``monthname``. Pass ``abbreviated=True`` for the
+        three-letter form Spark's ``monthname`` returns, e.g. ``"Jan"``.
+
+        Args:
+            abbreviated: Return the three-letter abbreviation instead of the full name.
+
+        Returns:
+            A new Utf8 expression of the month name.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})
+                >>> ds.select(
+                ...     full=bt.col("d").dt.monthname(),
+                ...     short=bt.col("d").dt.monthname(abbreviated=True),
+                ... ).to_pydict()
+                {'full': ['February'], 'short': ['Feb']}
+        """
+        return Strftime(self._e, "%b") if abbreviated else DateFunc("monthname", self._e)
 
     # --- time deltas between two timestamps -----------------------------------------
 
@@ -497,9 +668,14 @@ class _DtNamespace:
         returned 2: the operation was not antisymmetric, and an SLA computed in the other
         direction silently gained a whole day. Dividing the magnitude and reapplying the sign
         keeps `a.days_between(b) == -b.days_between(a)` for every input.
+
+        Both sides go through `_micros`. Casting straight to Int64 read a Date32's *day*
+        count as microseconds, so ``date(2024, 1, 10).days_between(date(2024, 1, 1))``
+        answered 0 where DuckDB's ``date_diff('day', ...)`` answers 9: nine microseconds
+        is no whole day.
         """
         other = _wrap_temporal(other)
-        delta = self._e.cast("int64") - other.cast("int64")
+        delta = self._micros() - other.dt._micros()
         magnitude = delta.abs() // micros_per_unit
         return (delta.sign().cast("int64") * magnitude).cast("int64")
 
@@ -570,13 +746,15 @@ class _DtNamespace:
         return self._delta_units(other, 3_600_000_000)
 
     def days_between(self, other: Expr) -> Expr:
-        """Whole days from `other` to this timestamp — the elapsed-time feature.
+        """Whole days from `other` to this date or timestamp — the elapsed-time feature.
 
         Counts fixed 24-hour days, so it is unaffected by calendar irregularities; a
-        partial day truncates toward zero.
+        partial day truncates toward zero. On two Date columns it is the day count
+        DuckDB's ``date_diff('day', other, self)`` and Spark's ``datediff(self, other)``
+        return.
 
         Args:
-            other: The earlier timestamp expression to measure from.
+            other: The earlier date or timestamp expression to measure from.
 
         Returns:
             An Int64 expression of the elapsed whole days.
@@ -591,6 +769,10 @@ class _DtNamespace:
                 ... )
                 >>> ds.select(r=bt.col("a").dt.days_between(bt.col("b"))).to_pydict()
                 {'r': [2]}
+
+                >>> days = bt.from_pydict({"a": [dt.date(2024, 1, 10)], "b": [dt.date(2024, 1, 1)]})
+                >>> days.select(r=bt.col("a").dt.days_between("b")).to_pydict()
+                {'r': [9]}
         """
         return self._delta_units(other, MICROS_PER_DAY)
 
@@ -615,6 +797,88 @@ class _DtNamespace:
                 {'r': [6]}
         """
         return self._delta_units(other, 7 * MICROS_PER_DAY)
+
+    def months_between(self, other: Expr | str, *, round_off: bool = True) -> Expr:
+        """Fractional months from `other` to this date or timestamp (Spark ``months_between``).
+
+        Spark's definition. The whole-month count comes from the calendar fields. When both
+        values fall on the same day of the month, or both on the last day of their months,
+        the answer is that whole count. Otherwise the leftover days and time of day are
+        added as a fraction of a fixed 31-day month, not of the month's real length.
+        `round_off` rounds the result to 8 decimal places, as Spark does by default.
+        Timestamps are read as naive wall-clock values, with no session time zone.
+
+        DuckDB has no fractional form. Its ``date_diff('month', b, a)`` counts month
+        boundaries crossed and answers an integer.
+
+        Args:
+            other: The earlier date or timestamp, as an expression or a column name.
+            round_off: Round to 8 decimal places; ``False`` keeps full precision.
+
+        Returns:
+            A Float64 expression, negative when `other` is later.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [dt.datetime(1997, 2, 28, 10, 30)], "b": [dt.datetime(1996, 10, 30)]}
+                ... )
+                >>> ds.select(r=bt.col("a").dt.months_between("b")).to_pydict()
+                {'r': [3.94959677]}
+        """
+        other = _wrap_temporal(other)
+        right = other.dt
+        months = (self.year() - right.year()) * 12 + (self.month() - right.month())
+        same_day = self.day() == right.day()
+        both_month_ends = (self.day() == self.days_in_month()) & (
+            right.day() == right.days_in_month()
+        )
+        micros = (self.day() - right.day()) * MICROS_PER_DAY + (
+            self.time_of_day() - right.time_of_day()
+        )
+        fraction = months + micros.cast("float64") / lit(float(31 * MICROS_PER_DAY))
+        exact = fraction.round(8) if round_off else fraction
+        whole = months.cast("float64")
+        return when(same_day | both_month_ends).then(whole).otherwise(exact)
+
+    def next_day(self, day_of_week: str) -> Expr:
+        """The first date strictly after this one that falls on `day_of_week` (→ Date).
+
+        Spark ``next_day``. `day_of_week` is a day name, its three-letter abbreviation or
+        its two-letter one (``"Sunday"``, ``"Sun"``, ``"SU"``), in any case. A date already
+        on that weekday moves a full week ahead. A timestamp is read as its date.
+
+        Args:
+            day_of_week: The weekday to advance to.
+
+        Returns:
+            A Date expression.
+
+        Raises:
+            PlanError: If `day_of_week` does not name a weekday.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.date(2015, 7, 27)]})
+                >>> ds.select(r=bt.col("d").dt.next_day("Sun")).to_pydict()
+                {'r': [datetime.date(2015, 8, 2)]}
+        """
+        target = (
+            _WEEKDAYS.get(day_of_week.strip().upper()) if isinstance(day_of_week, str) else None
+        )
+        if target is None:
+            raise PlanError(f"dt.next_day(): {day_of_week!r} does not name a weekday such as 'Mon'")
+        # ((target - today + 6) mod 7) + 1 is 7 when the two coincide and never 0. The shift
+        # is per row and `offset_by` takes a constant, so it runs on the day count, which is
+        # what a Date holds.
+        shift = ((lit(target) - self.weekday() + 6) % 7) + 1
+        return MakeTemporal("from_unix_date", [self._e.cast("date").cast("int64") + shift])
 
     def quarter_end(self) -> Expr:
         """Last day of the calendar quarter at midnight — the close of the quarter.
@@ -852,36 +1116,20 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.is_weekend()).to_pydict()
                 {'r': [True, False]}
         """
-        return self.isodow() >= 6
-
-    def is_weekday(self) -> Expr:
-        """True Monday through Friday — the complement of :meth:`is_weekend`.
-
-        Returns:
-            A Boolean expression, true on weekdays.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> import datetime as dt
-                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]})
-                >>> ds.select(r=bt.col("d").dt.is_weekday()).to_pydict()
-                {'r': [False, True]}
-        """
-        return self.isodow() <= 5
+        return self.weekday() >= 6
 
     def timestamp(self, unit: str = "us") -> Expr:
         """Epoch count at `unit` — the Polars ``dt.timestamp`` spelling (→ Int64).
 
         Args:
-            unit: ``"s"``, ``"ms"`` or ``"us"`` (the default, as in Polars).
+            unit: ``"s"``, ``"ms"``, ``"us"`` (the default, as in Polars) or ``"ns"``.
+                Daft's ``to_unix_epoch`` defaults to seconds, so it is ``unit="s"``.
 
         Returns:
             A new Int64 expression: the epoch count at that resolution.
 
         Raises:
-            PlanError: If `unit` is not one of the three.
+            PlanError: If `unit` is not one of the four.
 
         Examples:
             .. doctest::
@@ -892,7 +1140,12 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.timestamp("ms")).to_pydict()
                 {'r': [1000]}
         """
-        readers = {"s": self.epoch, "ms": self.epoch_ms, "us": self.epoch_us}
+        readers = {
+            "s": self.epoch,
+            "ms": self.epoch_ms,
+            "us": self.epoch_us,
+            "ns": self.epoch_ns,
+        }
         reader = readers.get(unit)
         if reader is None:
             raise PlanError(f"dt.timestamp(): unit must be one of {sorted(readers)}, got {unit!r}")
@@ -1127,10 +1380,28 @@ class _DtNamespace:
         """
         return ConvertTimezone(self._e, from_tz, to_tz)
 
+    def is_business_day(self) -> Expr:
+        """True Monday through Friday — the complement of :meth:`is_weekend`.
+
+        Returns:
+            A Boolean expression, true on weekdays.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]})
+                >>> ds.select(r=bt.col("d").dt.is_business_day()).to_pydict()
+                {'r': [False, True]}
+        """
+        return self.weekday() <= 5
+
 
 # Python accessor name → engine `DateFunc` wire tag (serde snake_case). Each maps
 # to one Arrow `DatePart` and matches the same-named DuckDB function.
 _DT_FIELDS = {
+    "weekday": "isodow",  # ISO day of week: Monday = 1 … Sunday = 7 (→ Int64)
     "year": "year",
     "month": "month",
     "day": "day",
@@ -1139,16 +1410,11 @@ _DT_FIELDS = {
     "second": "second",
     "quarter": "quarter",
     "week": "week",  # ISO week 1–53
-    "dayofweek": "day_of_week",  # Sunday = 0
     "dayofyear": "day_of_year",  # 1–366
     "epoch": "epoch",  # seconds since the Unix epoch (→ Int64)
-    "dayname": "dayname",  # full weekday name e.g. "Monday" (→ Utf8)
-    "monthname": "monthname",  # full month name e.g. "January" (→ Utf8)
-    "isodow": "isodow",  # ISO day of week: Monday = 1 … Sunday = 7 (→ Int64)
     "century": "century",  # the century, e.g. 2021 → 21 (→ Int64)
     "decade": "decade",  # the decade, e.g. 2021 → 202 (→ Int64)
     "millennium": "millennium",  # the millennium, e.g. 2021 → 3 (→ Int64)
-    "last_day": "last_day",  # the month's last day (→ Date32, as in DuckDB/Spark)
 }
 
 
@@ -1159,108 +1425,3 @@ _bind_accessors(
     lambda n: f"Extract the {n} field of a date/time column (→ Int64).",
     "A new :class:`~batcher.Expr` carrying the extracted field.",
 )
-
-
-# The Polars/pandas/DuckDB compat vocabulary for `.dt` -- a second spelling of a method
-# this namespace already has. Rows are (target, summary, example data, example
-# expression, expected output[, extra note]); the signature and the `Args:`/`Returns:`
-# sections come from the target, so an alias cannot drift from what it forwards to.
-# Only exact passthroughs live here: the spellings that bind a literal argument
-# (`month_start` -> `truncate("month")`, `days_between` -> `_delta_units(...)`) stay
-# written out, because the constant they choose is the whole content of the method.
-_DT_ALIASES: dict[str, tuple[str, ...]] = {
-    "epoch_us": (
-        "_micros",
-        "Microseconds since the Unix epoch as an integer (DuckDB ``epoch_us``, → Int64).",
-        '{"d": [dt.datetime(2021, 1, 1)]}',
-        'bt.col("d").dt.epoch_us()',
-        "{'r': [1609459200000000]}",
-        "The microsecond-resolution epoch — the timestamp's own underlying value.",
-    ),
-    "microsecond": (
-        "_subsecond_micros",
-        "The microsecond-of-second component, 0-999999 (Polars ``dt.microsecond``, → Int64).",
-        '{"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]}',
-        'bt.col("d").dt.microsecond()',
-        "{'r': [123456]}",
-    ),
-    "weekday": (
-        "isodow",
-        "ISO weekday, Monday=1 … Sunday=7 — the Polars ``weekday`` spelling of ``isodow``.",
-        '{"d": [dt.datetime(2024, 2, 18)]}',
-        'bt.col("d").dt.weekday()',
-        "{'r': [7]}",
-        "Not to be confused with ``dayofweek`` / ``day_of_week``, which use the DuckDB\n"
-        "numbering (Sunday=0 … Saturday=6). The two agree on Monday through Saturday and\n"
-        "differ only on Sunday, so the example below is a Sunday.",
-    ),
-    "ordinal_day": (
-        "dayofyear",
-        "Day-of-year, 1-366 — the Polars ``ordinal_day`` spelling of ``dayofyear``.",
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.ordinal_day()',
-        "{'r': [46]}",
-    ),
-    "month_end": (
-        "last_day",
-        "Last day of the month, as a DATE — the ``month_end`` spelling of ``last_day``.",
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.month_end()',
-        "{'r': [datetime.date(2024, 2, 29)]}",
-        "Two things this does *not* share with the name it borrows. Polars'\n"
-        "``dt.month_end`` returns the input's own type and keeps its time of day; this is\n"
-        "``last_day``, so it returns a ``date32`` and the time is gone. And it is the one\n"
-        "member of the period-boundary family that is not a timestamp at midnight --\n"
-        "``month_start``, ``quarter_start``, ``quarter_end``, ``year_start`` and\n"
-        "``year_end`` all are. For a September timestamp ``month_end`` and ``quarter_end``\n"
-        "name the same instant in two different column types. Use ``quarter_end``'s\n"
-        "spelling, ``truncate('month').dt.offset_by('1mo').dt.offset_by('-1d')``, if you\n"
-        "want the timestamp.",
-    ),
-    "day_name": (
-        "dayname",
-        'Full weekday name, e.g. ``"Monday"`` — the pandas ``dt.day_name``.',
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.day_name()',
-        "{'r': ['Thursday']}",
-    ),
-    "month_name": (
-        "monthname",
-        'Full month name, e.g. ``"February"`` — the pandas ``dt.month_name``.',
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.month_name()',
-        "{'r': ['February']}",
-    ),
-    "daysinmonth": (
-        "days_in_month",
-        "Days in this date's month — the pandas ``dt.daysinmonth`` spelling.",
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.daysinmonth()',
-        "{'r': [29]}",
-    ),
-    "weekofyear": (
-        "week",
-        "ISO week number, 1-53 — the pandas ``dt.weekofyear`` spelling of ``week``.",
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.weekofyear()',
-        "{'r': [7]}",
-    ),
-    "floor": (
-        "truncate",
-        "Round down to the start of `unit` — the pandas ``dt.floor`` spelling of ``truncate``.",
-        '{"d": [dt.datetime(2024, 2, 15, 13, 45)]}',
-        'bt.col("d").dt.floor("hour")',
-        "{'r': [datetime.datetime(2024, 2, 15, 13, 0)]}",
-    ),
-    "is_business_day": (
-        "is_weekday",
-        "True Monday through Friday — the Polars ``is_business_day`` spelling.",
-        '{"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]}',
-        'bt.col("d").dt.is_business_day()',
-        "{'r': [False, True]}",
-        "Holidays are not modelled: this is the weekday test, which is what the name\n"
-        "means everywhere it appears without a calendar argument.",
-    ),
-}
-
-_bind_aliases(_DtNamespace, _DT_ALIASES, preamble=("import datetime as dt",))

@@ -26,9 +26,9 @@ def main() -> None:
         lineitem.group_by("l_shipmode")
         .agg(
             lines=bt.count(),
-            parts=col("l_partkey").n_unique(),
-            approx_parts=bt.approx_n_unique(col("l_partkey")),
-            suppliers=col("l_suppkey").n_unique(),
+            parts=col("l_partkey").count_distinct(),
+            approx_parts=bt.approx_count_distinct(col("l_partkey")),
+            suppliers=col("l_suppkey").count_distinct(),
         )
         .sort("l_shipmode")
         .to_pydict()
@@ -56,7 +56,7 @@ def main() -> None:
 
     # Distinct counts do not add up across groups: the same part can ship by several
     # modes, so summing the per-group counts overstates the global one.
-    global_parts = lineitem.n_unique("l_partkey")
+    global_parts = lineitem.count_distinct("l_partkey")
     summed = sum(per_mode["parts"])
     print(f"global distinct parts {global_parts}, sum of per-group {summed}")
     assert summed > global_parts

@@ -93,5 +93,5 @@ def test_str_join_over_the_whole_frame(duck, t):
 
 
 def test_neg_is_the_unary_minus(duck, t):
-    got = bt.from_arrow(t).select(r=bt.col("x").neg())
+    got = bt.from_arrow(t).select(r=(-bt.col("x")))
     assert_same(got.collect(), duck.sql("SELECT -x AS r FROM t"))
