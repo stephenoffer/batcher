@@ -76,7 +76,7 @@ get_extension_type = { status = "gap", need = "extension type registry", wave = 
 get_index_type = { status = "out_of_scope", reason = "Polars-internal row-index width; Batcher's row index is always Int64" }
 groups = { status = "gap", need = "groups (group row indices expression)", wave = "W8" }
 head = { status = "gap", need = "head expression (first n values)", wave = "W8" }
-implode = { status = "canonical", batcher = "bt.array_agg" }
+implode = { status = "mismatch", batcher = "bt.array_agg", note = "Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array_agg(order_by=_row) after with_row_index(_row)", wave = "W0" }
 int_range = { status = "gap", need = "int_range expression", wave = "W6" }
 int_ranges = { status = "mismatch", batcher = "bt.sequence", note = "Polars int_ranges excludes the end; Batcher's sequence includes it (int_ranges(0, n) is sequence(0, n - 1))", wave = "W0" }
 last = { status = "param", batcher = "bt.last", need = "pl.last() with no argument as the last-column selector", wave = "WF" }

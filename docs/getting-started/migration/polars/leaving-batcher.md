@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 267 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 263 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -39,7 +39,6 @@ The following table maps 267 Batcher spellings to the Polars names that compute 
 | `batcher.config.set_verbosity` | `Config.set_verbose` |
 | `bt.all` | `selectors.all` |
 | `bt.arctan2` | `polars.arctan2` |
-| `bt.array_agg` | `polars.implode` |
 | `bt.BatcherError` | `polars.exceptions` |
 | `bt.boolean` | `selectors.boolean` |
 | `bt.coalesce` | `polars.coalesce` |
@@ -139,9 +138,6 @@ The following table maps 267 Batcher spellings to the Polars names that compute 
 | `Expr.arcsinh` | `Expr.arcsinh` |
 | `Expr.arctan` | `Expr.arctan` |
 | `Expr.arctanh` | `Expr.arctanh` |
-| `Expr.arg_max` | `Expr.arg_max` |
-| `Expr.arg_min` | `Expr.arg_min` |
-| `Expr.array_agg` | `Expr.implode` |
 | `Expr.between` | `Expr.is_between` |
 | `Expr.bit_count` | `Expr.bitwise_count_ones` |
 | `Expr.bool_and` | `Expr.all` |

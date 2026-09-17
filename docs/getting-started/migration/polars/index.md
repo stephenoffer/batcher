@@ -39,7 +39,7 @@ The following table lists the waves that hold Polars rows, in delivery order:
 | Wave | Scope | Rows |
 |---|---|---|
 | WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 9 |
-| W0 | Silent mismatches: parameters that restore the other engine's semantics | 93 |
+| W0 | Silent mismatches: parameters that restore the other engine's semantics | 97 |
 | W2 | Missing parameters across all four engines | 147 |
 | W3 | Scalar functions | 41 |
 | W5 | Window functions, including rolling and dynamic group-by | 36 |
@@ -57,9 +57,9 @@ The following table lists the pages in this section with the number of names eac
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
 | {doc}`dataframe` | 265 | 83 | 68 | 50 | 50 | 14 |
-| {doc}`expressions` | 218 | 92 | 29 | 18 | 76 | 3 |
+| {doc}`expressions` | 218 | 89 | 29 | 21 | 76 | 3 |
 | {doc}`expression-namespaces` | 219 | 99 | 33 | 15 | 72 | 0 |
-| {doc}`functions` | 163 | 41 | 27 | 19 | 69 | 7 |
+| {doc}`functions` | 163 | 40 | 27 | 20 | 69 | 7 |
 | {doc}`io` | 38 | 11 | 19 | 3 | 4 | 1 |
 | {doc}`types` | 37 | 16 | 6 | 1 | 9 | 5 |
 | {doc}`session-and-sql` | 45 | 12 | 2 | 0 | 28 | 3 |

@@ -19,6 +19,7 @@
 "log10" = "Expr"
 "log1p" = "Expr"
 "log2" = "Expr"
+"map_operands" = "AggExpr"
 "over" = "WindowExpr"
 "round" = "Expr"
 "sign" = "Expr"

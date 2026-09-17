@@ -86,7 +86,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `GPUEngine` | `Dataset.collect` | param | Missing: a GPU engine options object (device, memory resource, raise\_on\_fail); backend='gpu' exists. Wave W2. |
 | `groups` | n/a | gap | Not yet: groups (group row indices expression). Wave W8. |
 | `head` | n/a | gap | Not yet: head expression (first n values). Wave W8. |
-| `implode` | `bt.array_agg` | canonical |  |
+| `implode` | `bt.array_agg` | mismatch | Differs: Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array\_agg(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
 | `int_range` | n/a | gap | Not yet: int\_range expression. Wave W6. |
 | `int_ranges` | `bt.sequence` | mismatch | Differs: Polars int\_ranges excludes the end; Batcher's sequence includes it (int\_ranges(0, n) is sequence(0, n - 1)). Wave W0. |
 | `last` | `bt.last` | param | Missing: pl.last() with no argument as the last-column selector. Wave WF. |

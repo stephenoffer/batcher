@@ -70,9 +70,10 @@ fn hash_long(v: i64, seed: u32) -> u32 {
 /// The aligned 4-byte blocks of `bytes`, folded from `seed`.
 #[inline]
 fn hash_blocks(bytes: &[u8], seed: u32) -> u32 {
-    bytes.chunks_exact(4).fold(seed, |h, w| {
-        mix_h1(h, mix_k1(u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
-    })
+    let (blocks, _) = bytes.as_chunks::<4>();
+    blocks
+        .iter()
+        .fold(seed, |h, w| mix_h1(h, mix_k1(u32::from_le_bytes(*w))))
 }
 
 /// Spark's `hashUnsafeBytes`: each byte past the last aligned block is sign-extended and

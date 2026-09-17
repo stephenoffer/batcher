@@ -33,8 +33,8 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `arcsinh` | `Expr.arcsinh` | canonical |  |
 | `arctan` | `Expr.arctan` | canonical |  |
 | `arctanh` | `Expr.arctanh` | canonical |  |
-| `arg_max` | `Expr.arg_max` | canonical |  |
-| `arg_min` | `Expr.arg_min` | canonical |  |
+| `arg_max` | `Expr.arg_max` | mismatch | Differs: Polars reads the position in frame order; Batcher needs the order stated: col.arg\_max(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
+| `arg_min` | `Expr.arg_min` | mismatch | Differs: Polars reads the position in frame order; Batcher needs the order stated: col.arg\_min(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
 | `arg_sort` | n/a | gap | Not yet: Expr.arg\_sort (sort permutation indices). Wave W8. |
 | `arg_true` | n/a | gap | Not yet: Expr.arg\_true (indices of true values). Wave W8. |
 | `arg_unique` | n/a | gap | Not yet: Expr.arg\_unique (index of first occurrence of each value). Wave W8. |
@@ -105,7 +105,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `hash` | `Expr.hash` | mismatch | Differs: Polars documents its hash as unstable across versions, so no Batcher algorithm reproduces it; recompute hashes on both sides. Wave W0. |
 | `head` | n/a | gap | Not yet: Expr.head (length-changing). Wave W8. |
 | `hist` | n/a | gap | Not yet: Expr.hist (binned counts). Wave W8. |
-| `implode` | `Expr.array_agg` | canonical |  |
+| `implode` | `Expr.array_agg` | mismatch | Differs: Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array\_agg(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
 | `index_of` | n/a | gap | Not yet: Expr.index\_of. Wave W8. |
 | `inspect` | n/a | gap | Not yet: Expr.inspect (print intermediate value). Wave W8. |
 | `interpolate` | `Expr.interpolate` | param | Missing: method= ('linear','nearest'); Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |

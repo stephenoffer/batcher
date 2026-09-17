@@ -18,8 +18,8 @@ arcsin = { status = "canonical", batcher = "Expr.arcsin" }
 arcsinh = { status = "canonical", batcher = "Expr.arcsinh" }
 arctan = { status = "canonical", batcher = "Expr.arctan" }
 arctanh = { status = "canonical", batcher = "Expr.arctanh" }
-arg_max = { status = "canonical", batcher = "Expr.arg_max" }
-arg_min = { status = "canonical", batcher = "Expr.arg_min" }
+arg_max = { status = "mismatch", batcher = "Expr.arg_max", note = "Polars reads the position in frame order; Batcher needs the order stated: col.arg_max(order_by=_row) after with_row_index(_row)", wave = "W0" }
+arg_min = { status = "mismatch", batcher = "Expr.arg_min", note = "Polars reads the position in frame order; Batcher needs the order stated: col.arg_min(order_by=_row) after with_row_index(_row)", wave = "W0" }
 arg_sort = { status = "gap", need = "Expr.arg_sort (sort permutation indices)", wave = "W8" }
 arg_true = { status = "gap", need = "Expr.arg_true (indices of true values)", wave = "W8" }
 arg_unique = { status = "gap", need = "Expr.arg_unique (index of first occurrence of each value)", wave = "W8" }
@@ -90,7 +90,7 @@ has_nulls = { status = "gap", need = "Expr.has_nulls aggregate", wave = "W8" }
 hash = { status = "mismatch", batcher = "Expr.hash", note = "Polars documents its hash as unstable across versions, so no Batcher algorithm reproduces it; recompute hashes on both sides", wave = "W0" }
 head = { status = "gap", need = "Expr.head (length-changing)", wave = "W8" }
 hist = { status = "gap", need = "Expr.hist (binned counts)", wave = "W8" }
-implode = { status = "canonical", batcher = "Expr.array_agg" }
+implode = { status = "mismatch", batcher = "Expr.array_agg", note = "Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array_agg(order_by=_row) after with_row_index(_row)", wave = "W0" }
 index_of = { status = "gap", need = "Expr.index_of", wave = "W8" }
 inspect = { status = "gap", need = "Expr.inspect (print intermediate value)", wave = "W8" }
 interpolate = { status = "param", batcher = "Expr.interpolate", need = "method= ('linear','nearest'); Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
