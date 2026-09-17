@@ -246,7 +246,9 @@ class ParquetSource(FileSource):
         bounds = routing.row_group_bounds_cached(self._fs, files, columns)
         if not bounds:
             return None
-        survivors = routing.surviving_row_groups(bounds, predicate, columns)
+        survivors = routing.survivors_worth_pruning(
+            bounds, predicate, columns, active_config().execution.morsel_rows
+        )
         budget = active_config().memory.max_memory_bytes or machine_memory_bytes()
         rows = sum(rg.num_rows for rg in survivors)
         if routing.decoded_bytes(schema, projection, rows) > budget * routing.MEMORY_FRACTION:

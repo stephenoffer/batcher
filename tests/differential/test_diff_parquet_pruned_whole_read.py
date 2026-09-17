@@ -24,6 +24,7 @@ import pytest
 
 import batcher as bt
 from _harness import assert_same
+from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.structured.parquet import routing
 from batcher.io.formats.structured.parquet.source import ParquetSource
 
@@ -118,3 +119,51 @@ def test_a_clustered_predicate_reads_only_its_row_groups(path, monkeypatch):
     got = bt.read.parquet(path).filter(bt.col("id") >= 38_000).select("id").collect()
     assert got.num_rows == 2_000
     assert read["rows"] == 2_000, "pruning should leave exactly the one matching row group"
+
+
+@pytest.fixture(scope="module")
+def small_path(tmp_path_factory):
+    """Four row groups holding one morsel between them, with NaN floats and nulls."""
+    n = 4_000
+    floats = np.linspace(0.0, 1.0, n)
+    floats[::97] = np.nan
+    table = pa.table(
+        {
+            "id": pa.array(range(n), pa.int64()),
+            "f": pa.array(floats),
+            "name": pa.array([None if i % 13 == 0 else f"k{i % 37:02d}" for i in range(n)]),
+        }
+    )
+    out = tmp_path_factory.mktemp("pruned_small") / "small.parquet"
+    pq.write_table(table, out, row_group_size=1_000)
+    return str(out)
+
+
+_SMALL_PREDICATES = [
+    ("id >= 3500", lambda: bt.col("id") >= 3_500),
+    ("id < 0", lambda: bt.col("id") < 0),
+    ("f > 0.9", lambda: bt.col("f") > 0.9),
+    ("name = 'k05'", lambda: bt.col("name") == "k05"),
+    ("name IS NULL", lambda: bt.col("name").is_null()),
+]
+
+
+@pytest.mark.parametrize(
+    "sql_pred, expr", _SMALL_PREDICATES, ids=[sql for sql, _ in _SMALL_PREDICATES]
+)
+def test_a_one_morsel_read_skips_pruning_and_matches_duckdb(duck, small_path, sql_pred, expr):
+    got = bt.read.parquet(small_path).filter(expr()).select("id", "name").collect()
+    sql = f"SELECT id, name FROM read_parquet('{small_path}', can_have_nan=true) WHERE {sql_pred}"
+    assert_same(got, duck.sql(sql))
+
+
+def test_pruning_is_skipped_only_at_or_below_one_morsel(small_path):
+    """Below the threshold every row group is kept; above it the footers still prune."""
+    columns = ["id"]
+    predicate = (bt.col("id") >= 3_500).to_ir()
+    bounds = routing.row_group_bounds_cached(resolve_filesystem(small_path), [small_path], columns)
+    assert len(bounds) == 4
+    kept = routing.survivors_worth_pruning(bounds, predicate, columns, morsel_rows=4_000)
+    assert len(kept) == 4
+    pruned = routing.survivors_worth_pruning(bounds, predicate, columns, morsel_rows=3_999)
+    assert [rg.row_group for rg in pruned] == [3]

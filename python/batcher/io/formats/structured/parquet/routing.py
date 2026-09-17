@@ -32,7 +32,13 @@ import pyarrow as pa
 from batcher.io.stats import RowGroupBounds
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 
-__all__ = ["decoded_bytes", "predicate_columns", "row_group_bounds_cached", "surviving_row_groups"]
+__all__ = [
+    "decoded_bytes",
+    "predicate_columns",
+    "row_group_bounds_cached",
+    "surviving_row_groups",
+    "survivors_worth_pruning",
+]
 
 #: The share of the memory envelope an unfiltered read of the surviving row groups may occupy.
 #: Kept well below the spill limit because it is a decoded *input*, and the operators above
@@ -111,6 +117,24 @@ def surviving_row_groups(
     if mask is None:
         return list(bounds)
     return [rg for rg, keep in zip(bounds, mask.to_pylist(), strict=True) if keep]
+
+
+def survivors_worth_pruning(
+    bounds: Sequence[RowGroupBounds],
+    predicate: dict[str, Any],
+    columns: list[str],
+    morsel_rows: int,
+) -> list[RowGroupBounds]:
+    """`surviving_row_groups`, unless every row group together is no more than one morsel.
+
+    Pruning evaluates the predicate over a pyarrow manifest, and building its literals imports
+    pandas through pyarrow's own shim, measured at about 250 ms once per process. A read no
+    larger than one morsel decodes in a small fraction of that, and the engine's `Filter`
+    removes the same rows either way, so on such a read pruning costs more than it could save.
+    """
+    if sum(rg.num_rows for rg in bounds) <= morsel_rows:
+        return list(bounds)
+    return surviving_row_groups(bounds, predicate, columns)
 
 
 def decoded_bytes(schema: pa.Schema, projection: list[str] | None, rows: int) -> float:

@@ -3475,6 +3475,14 @@ builds the user-facing migration hint by loading the whole migration registry, 4
 probe now uses `object.__getattribute__`, which never reaches `__getattr__`, and
 `tests/unit/test_expr_dispatch_probe.py` fails on the old probe.
 
+pandas itself is pyarrow's, and not avoidable from here: `pa.array`, `pa.scalar` and `pa.table`
+import it even from a numpy array. An unfiltered Parquet read never touches those, and a filtered
+one did only because row-group pruning builds its manifest and literals with them (27j). A read
+of one morsel or less, 16,384 rows, now skips pruning, since the decode it could save is a
+fraction of the 244-272 ms import, and a filtered first query over a small file no longer loads
+pandas. `test_diff_parquet_pruned_whole_read.py` checks those reads against DuckDB and pins that
+pruning still runs one row above the threshold.
+
 ### 27j. A predicated Parquet read decodes its surviving row groups whole — **landed, TPC-H sf10 1.54x to 1.38x**
 
 27g ended on "a routing decision, not a literal", and the oracle for that decision came out
