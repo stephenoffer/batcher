@@ -1313,7 +1313,7 @@ Extended Kyber rule families.
 | `projection_scan.py` | 364 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 470 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
 | `sargable.py` | 351 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
-| `setops.py` | 378 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
+| `setops.py` | 388 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 487 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |

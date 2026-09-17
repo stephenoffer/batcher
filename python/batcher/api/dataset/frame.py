@@ -2688,7 +2688,9 @@ class Dataset:
         join cannot give (it drops NULL keys). `bool_or` records presence on each side
         per group; keep groups in both (INTERSECT) or only the left (EXCEPT). One row
         per distinct combination, so the result is DISTINCT by construction, and the
-        whole thing is mergeable aggregation, so it distributes.
+        whole thing is mergeable aggregation, so it distributes. Where NULLs provably
+        cannot tell the two semantics apart, Kyber's `set_membership_to_join` swaps this
+        shape for a semi or anti join, which costs a probe instead of an aggregate.
 
         The ALL forms (`distinct=False`) need multiplicity, which a membership flag
         cannot carry. Number each row within its run of identical rows first, and the
@@ -2701,6 +2703,12 @@ class Dataset:
         """
         from batcher.plan.expr_ir import col, lit
         from batcher.plan.expr_ir.nodes import row_number
+        from batcher.plan.logical._setops import (
+            MEMBERSHIP_IN_LEFT,
+            MEMBERSHIP_IN_RIGHT,
+            MEMBERSHIP_LEFT_TAG,
+            MEMBERSHIP_RIGHT_TAG,
+        )
 
         keys = list(cols)
         left, right = self.select(*cols), other.select(*cols)
@@ -2709,14 +2717,20 @@ class Dataset:
             left = left.with_columns(__bc_n__=ordinal)
             right = right.with_columns(__bc_n__=ordinal)
             keys = [*cols, "__bc_n__"]
-        left = left.with_columns(__bc_l__=lit(True), __bc_r__=lit(False))
-        right = right.with_columns(__bc_l__=lit(False), __bc_r__=lit(True))
+        tag_l, tag_r = MEMBERSHIP_LEFT_TAG, MEMBERSHIP_RIGHT_TAG
+        left = left.with_columns(**{tag_l: lit(True), tag_r: lit(False)})
+        right = right.with_columns(**{tag_l: lit(False), tag_r: lit(True)})
         grouped = (
             left.union(right)
             .group_by(*keys)
-            .agg(__bc_in_l__=col("__bc_l__").bool_or(), __bc_in_r__=col("__bc_r__").bool_or())
+            .agg(
+                **{
+                    MEMBERSHIP_IN_LEFT: col(tag_l).bool_or(),
+                    MEMBERSHIP_IN_RIGHT: col(tag_r).bool_or(),
+                }
+            )
         )
-        in_l, in_r = col("__bc_in_l__"), col("__bc_in_r__")
+        in_l, in_r = col(MEMBERSHIP_IN_LEFT), col(MEMBERSHIP_IN_RIGHT)
         keep = (in_l & in_r) if both else (in_l & ~in_r)
         return grouped.filter(keep).select(*cols)
 

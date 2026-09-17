@@ -13,7 +13,23 @@ from batcher._internal.errors import PlanError
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import promote
 
-__all__ = ["validate_branch_types"]
+__all__ = [
+    "MEMBERSHIP_IN_LEFT",
+    "MEMBERSHIP_IN_RIGHT",
+    "MEMBERSHIP_LEFT_TAG",
+    "MEMBERSHIP_RIGHT_TAG",
+    "validate_branch_types",
+]
+
+# The columns `Dataset.intersect`/`Dataset.except_` lower INTERSECT and EXCEPT through: each
+# branch is tagged with which side it came from, and a group-by `bool_or` over the tags records
+# each distinct row's membership. Kyber recognizes that exact shape to replace it with a semi or
+# anti join where NULLs cannot make the two disagree, so the names live here, where both the
+# emitter and the rule read them, rather than as a string literal each could drift from.
+MEMBERSHIP_LEFT_TAG = "__bc_l__"
+MEMBERSHIP_RIGHT_TAG = "__bc_r__"
+MEMBERSHIP_IN_LEFT = "__bc_in_l__"
+MEMBERSHIP_IN_RIGHT = "__bc_in_r__"
 
 
 def _is_nested(dt: pa.DataType) -> bool:

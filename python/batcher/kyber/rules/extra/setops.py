@@ -16,6 +16,8 @@ SQL `INTERSECT` / `EXCEPT` are **pre-lowered** by the front end (`Dataset.inters
 `Dataset.except_` in `api`) into a tagged `Union` + group-by-`bool_or` + `Filter`
 shape — there is no `Intersect`/`Except` logical node — so the classic empty-operand /
 identical-operand set-op rewrites do not apply to a dedicated node here and are omitted.
+The one rule that does read that shape, `set_membership_to_join`, swaps it for a semi or
+anti join where statistics prove NULLs cannot make the two disagree.
 """
 
 from __future__ import annotations
@@ -25,13 +27,24 @@ import json
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.plan.expr_ir import Binary, Col, Lit, Not
 from batcher.plan.logical import (
+    Aggregate,
     Distinct,
     Filter,
+    Join,
+    JoinOutputCol,
     Limit,
     LogicalPlan,
     Project,
+    Projection,
     Union,
+)
+from batcher.plan.logical._setops import (
+    MEMBERSHIP_IN_LEFT,
+    MEMBERSHIP_IN_RIGHT,
+    MEMBERSHIP_LEFT_TAG,
+    MEMBERSHIP_RIGHT_TAG,
 )
 
 __all__ = [
@@ -43,6 +56,7 @@ __all__ = [
     "prune_empty_union_branch",
     "push_filter_through_distinct",
     "push_project_through_union",
+    "set_membership_to_join",
     "simplify_singleton_union",
 ]
 
@@ -260,3 +274,115 @@ def prune_distinct_of_empty(node: Distinct, _ctx: OptimizerContext) -> LogicalPl
     if isinstance(inner, Limit) and inner.n == 0:
         return inner
     return None
+
+
+def _membership_branch(
+    branch: LogicalPlan, cols: tuple[str, ...], left: bool
+) -> LogicalPlan | None:
+    """The untagged relation under one tagged union branch, or `None` if it is not one.
+
+    A branch is `Project(x, cols..., tag_l=<left>, tag_r=<not left>)`, exactly as
+    `Dataset._set_membership` builds it. Returned as `Project(x, cols...)`, so whatever rules
+    have since done to `x` is kept and only the two tag literals are dropped.
+    """
+    if not isinstance(branch, Project):
+        return None
+    items = {p.alias: p.expr for p in branch.items}
+    want_tags = {MEMBERSHIP_LEFT_TAG: left, MEMBERSHIP_RIGHT_TAG: not left}
+    if len(branch.items) != len(cols) + 2 or set(items) != {*cols, *want_tags}:
+        return None
+    for tag, value in want_tags.items():
+        lit = items[tag]
+        if not (isinstance(lit, Lit) and lit.value is value):
+            return None
+    return Project(branch.input, tuple(p for p in branch.items if p.alias in cols))
+
+
+def _membership_kind(predicate: object) -> str | None:
+    """``"semi"`` for the INTERSECT filter `in_l AND in_r`, ``"anti"`` for EXCEPT's
+    `in_l AND NOT in_r`, else `None`."""
+    if not (
+        isinstance(predicate, Binary)
+        and predicate.op == "and"
+        and isinstance(predicate.left, Col)
+        and predicate.left.name == MEMBERSHIP_IN_LEFT
+    ):
+        return None
+    right = predicate.right
+    if isinstance(right, Col) and right.name == MEMBERSHIP_IN_RIGHT:
+        return "semi"
+    if (
+        isinstance(right, Not)
+        and isinstance(right.input, Col)
+        and right.input.name == MEMBERSHIP_IN_RIGHT
+    ):
+        return "anti"
+    return None
+
+
+@rule(name="set_membership_to_join", phase=Phase.REWRITE, matches=(Project,))
+def set_membership_to_join(node: Project, ctx: OptimizerContext) -> LogicalPlan | None:
+    """DISTINCT `INTERSECT`/`EXCEPT` → `Distinct(semi/anti Join)` when NULLs cannot differ.
+
+    `Dataset._set_membership` lowers both through a tagged union and a group-by over every
+    column, because grouping treats NULL as equal to NULL — SQL set semantics — and a join
+    does not. That aggregate hashes *both* inputs whole. A semi or anti join builds only the
+    right side and probes the left, which measured 24 ms against 52 ms for TPC-H
+    `orders EXCEPT lineitem` on the order key.
+
+    The two agree exactly when **every column is proven null-free on at least one side**,
+    from an exact null count. A NULL can only matter where both rows hold it in the same
+    column — only then does grouping pair two rows a join would not — and that needs a NULL
+    on both sides of that column. Under the condition, a left row carrying a NULL has no equal
+    row on the right under either semantics, so the join keeps it out of an INTERSECT and in
+    an EXCEPT exactly as the aggregate does. `Distinct` then restores the set semantics the
+    aggregate gave by construction; applying it after the join is exact for both kinds, since
+    membership is a property of the row value, not of which duplicate carried it.
+
+    The branch column types must also be identical, or the union's type widening and the
+    join's key typing would disagree on the output schema. Only the DISTINCT forms are
+    matched: the ALL forms group by an extra ordinal, so their group keys differ from the
+    projected columns and the pattern does not fire.
+    """
+    cols = tuple(p.alias for p in node.items)
+    if not all(isinstance(p.expr, Col) and p.expr.name == p.alias for p in node.items):
+        return None
+    filt = node.input
+    if not isinstance(filt, Filter):
+        return None
+    kind = _membership_kind(filt.predicate)
+    agg = filt.input
+    if kind is None or not isinstance(agg, Aggregate) or agg.watermark is not None:
+        return None
+    if tuple(g.alias for g in agg.group_keys) != cols or not all(
+        isinstance(g.expr, Col) and g.expr.name == g.alias for g in agg.group_keys
+    ):
+        return None
+    tags = {(a.alias, a.agg.func, getattr(a.agg.input, "name", None)) for a in agg.aggregates}
+    if tags != {
+        (MEMBERSHIP_IN_LEFT, "bool_or", MEMBERSHIP_LEFT_TAG),
+        (MEMBERSHIP_IN_RIGHT, "bool_or", MEMBERSHIP_RIGHT_TAG),
+    }:
+        return None
+    union = agg.input
+    if not isinstance(union, Union) or union.distinct or len(union.inputs) != 2:
+        return None
+    left = _membership_branch(union.inputs[0], cols, left=True)
+    right = _membership_branch(union.inputs[1], cols, left=False)
+    if left is None or right is None:
+        return None
+    # The union widens differing branch types to a common supertype (`int32` with `int64`
+    # yields `int64`), where a join keeps its left side's type or refuses the pair outright.
+    # Identical types make the two agree on the output schema as well as on the rows.
+    left_schema, right_schema = left.available_schema(), right.available_schema()
+    if left_schema is None or right_schema is None:
+        return None
+    if any(left_schema.field(c).type != right_schema.field(c).type for c in cols):
+        return None
+    left_nn = ctx.estimator.estimate(left).non_null_columns()
+    right_nn = ctx.estimator.estimate(right).non_null_columns()
+    if not all(c in left_nn or c in right_nn for c in cols):
+        return None
+    output = tuple(JoinOutputCol("left", c, c) for c in cols)
+    join = Join(left, right, cols, cols, kind, output)
+    return Project(Distinct(join), tuple(Projection(c, Col(c)) for c in cols))
