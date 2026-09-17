@@ -45,9 +45,9 @@ diagnosing a query that misbehaves.
 
 ## Migrating to Batcher
 
-One skill per source system. Each carries a verb-by-verb translation table, the concept
-shifts that actually bite, and a porting recipe that ends by proving the ported script
-returns the same rows as the original.
+One skill per source system. Each carries the concept shifts that actually bite, a porting
+recipe that starts with the codemod and ends by proving the ported script returns the same
+rows as the original, and a section on going back.
 
 | Skill | Source |
 |---|---|
@@ -55,10 +55,12 @@ returns the same rows as the original.
 | `migrate-from-polars-or-pandas` | Polars, pandas, and DataFrame-style code generally |
 | `migrate-from-duckdb-sql` | DuckDB and SQL. Also covers *writing* new SQL against Batcher |
 | `migrate-from-daft` | Daft, especially multimodal and batch-inference workloads |
+| `migrate-from-ray-data` | Ray Data pipelines: ETL, batch inference, and training feeds |
 | `migrate-from-a-sql-warehouse` | A SQL warehouse or JDBC extract: Spark JDBC, pandas `read_sql`, SQLAlchemy, DB-API |
 
-The narrative version of these tables is {doc}`/getting-started/migration/index`; the skills add the
-failure modes and the verification procedure.
+The narrative version of these tables is {doc}`/getting-started/migration/index`, and the name-by-name
+reference for PySpark, Polars, Daft, and Ray Data is generated from the migration registry beside it. The
+skills add the failure modes, the codemod step, the way back, and the verification procedure.
 
 ## Extending the engine
 

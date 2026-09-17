@@ -7,46 +7,36 @@ description: Port a PySpark job to Batcher's public Python API — the DataFrame
 
 Use this when you have working PySpark and want it running on Batcher. The DataFrame
 vocabulary carries over almost verbatim; what changes is the *runtime model*, and that
-is where ports go wrong. Read `docs/getting-started/migration/transforming.md` (the canonical mapping tables)
-before extending anything here — this skill is the porting procedure, that page is the
-reference.
+is where ports go wrong. The name-by-name reference is generated from the migration registry
+into `docs/getting-started/migration/spark/`; this skill is the porting procedure around it.
 
-## Translation table
+## Where the name mappings live
+
+Every PySpark 4.2.0 public name has one row in the migration registry
+(`python/batcher/_internal/migration/data/pyspark/`), rendered into
+`docs/getting-started/migration/spark/`:
+
+- `dataframe.md`: `DataFrame`, its `na`/`stat` helpers, `GroupedData`, `Window`, `WindowSpec`.
+- `expressions.md`: `Column`.
+- `functions-aggregates.md`, `functions-collections.md`, `functions-math-and-misc.md`,
+  `functions-strings.md`, `functions-temporal.md`: `pyspark.sql.functions` by family.
+- `io.md`: `DataFrameReader`/`Writer`/`WriterV2`, `DataStreamReader`/`Writer`.
+- `session-and-sql.md`: `SparkSession`, `Catalog`, `RuntimeConfig`, UDF registration,
+  `StreamingQuery`.
+- `types-and-data-sources.md`: `pyspark.sql.types` and the Python data source API.
+
+Each row has a status (`index.md` defines them). **Read the status before renaming a call.**
+A `mismatch` row is the dangerous one: the Batcher spelling exists and returns a different
+answer, such as `orderBy` putting nulls first in Spark and last here, or `DataFrame.write`
+raising on an existing target in Spark and overwriting here. `param` means a Spark option has
+no Batcher counterpart yet, and `gap` means nothing does. Do not restate a mapping in this
+skill: fix the registry row and run `just migration-docs`.
+
+Three idioms span several names and so have no single row:
 
 | PySpark | Batcher | Note |
 |---|---|---|
 | `SparkSession.builder.getOrCreate()` | *(nothing)* | `import batcher as bt`; the engine is in-process |
-| `spark.read.parquet(p)` | `bt.read.parquet(p)` | already lazy — no `scan_*`/`read_*` split |
-| `spark.read.load(p)` | `bt.read(p)` | format inferred from the path |
-| `spark.read.format("delta").load(p)` | `bt.read.delta(p)` | also `.iceberg`, `.csv`, `.json`, `.orc`, `.avro` |
-| `spark.createDataFrame(rows)` | `bt.from_pylist(rows)` / `bt.from_pydict(d)` | |
-| existing `DataFrame` | `bt.from_spark(sdf)` | on-ramp only — collects through Spark's Arrow bridge |
-| `df.select(...)` | `ds.select(...)` | |
-| `df.withColumn("c", e)` | `ds.with_columns(c=e)` | plural, kwargs; adds/replaces |
-| `df.withColumnRenamed(a, b)` | `ds.rename({a: b})` | |
-| `df.drop("c")` | `ds.drop("c")` | |
-| `df.filter(...)` / `.where(...)` | `ds.filter(bt.col(...) > 1)` | one spelling |
-| `df.groupBy("k").agg(...)` | `ds.group_by("k").agg(total=bt.col("v").sum())` | named kwargs become output columns |
-| `F.avg("v")` | `bt.col("v").mean()` | `mean` is canonical; `avg` accepted |
-| `F.collect_list("v")` | `bt.col("v").array_agg()` | |
-| `F.countDistinct("v")` | `bt.col("v").count_distinct()` | `bt.approx_count_distinct` for the sketch |
-| `df.orderBy("a")` / `.sort` | `ds.sort("a", descending=False)` | `nulls_first=` is explicit |
-| `df.join(o, "k", "left")` | `ds.join(o, on="k", how="left")` | also `left_on=`/`right_on=` |
-| `df.distinct()` | `ds.distinct()` | |
-| `df.limit(n)` | `ds.limit(n)` | |
-| `F.when(c, a).otherwise(b)` | `bt.when(c).then(a).otherwise(b)` | |
-| `F.lit(x)` | `bt.lit(x)` | |
-| `F.rank().over(Window.partitionBy(..).orderBy(..))` | `bt.rank().over(partition_by=.., order_by=..)` | no `Window` object |
-| `df.unionByName(o)` | `ds.union(o)` | `ds.intersect`, `ds.except_` too |
-| `df.repartition(n)` | `ds.repartition(n)` | file/partition count, not a forced shuffle |
-| `spark.sql(q)` | `bt.sql(q, t=ds)` / `ds.sql(q)` | tables bound as kwargs |
-| `spark.udf.register(...)` | `bt.register_function(name, fn)` | callable from `bt.sql` |
-| `F.pandas_udf` | `@bt.udf` + `ds.map_batches(fn)` | Arrow batch in, Arrow batch out |
-| `df.explain()` | `ds.explain()` (`analyze=True` to run it) | returns a `str` |
-| `df.collect()` | `ds.collect()` (Arrow table) / `ds.to_pylist()` | |
-| `df.count()` / `.show()` | `ds.count()` / `ds.show()` | |
-| `df.toLocalIterator()` | `ds.iter_batches()` | streams Arrow batches |
-| `df.write.mode("append").parquet(p)` | `ds.write(p, mode="append")` | Spark `SaveMode` parity |
 | `spark.read.option("mode", "DROPMALFORMED")` | `bt.read.csv(p, on_bad_lines="skip")` | also on `read.json`; `FAILFAST` is the default |
 | `MERGE INTO` | `ds.write.delta(uri, merge_on=["id"])` | one transactional call |
 
@@ -101,23 +91,29 @@ reference.
 1. **Inventory the script.** List every source, every action, and every UDF. Anything
    touching the JVM directly (`sc.parallelize`, RDD ops, `df.rdd`) has no port — rewrite
    it as a DataFrame/expression pipeline first, in Spark, so you can diff against it.
-2. **Delete the session.** Replace the builder with `import batcher as bt`, drop
+2. **Run the codemod first.** `python -m batcher.migrate --from pyspark --to batcher <paths>`
+   prints a diff and changes nothing until you add `--write`. The `pyspark` direction may not be
+   implemented yet: the command then raises `ConfigError` naming the directions that are, and
+   the `spark/index.md` page says the same. Port by hand from the generated pages in that case.
+   Either way, run `python -m batcher.migrate --from batcher --to batcher <paths>` over any
+   code that already calls Batcher, so no removed Batcher spelling survives the port.
+3. **Delete the session.** Replace the builder with `import batcher as bt`, drop
    `spark.conf` calls, and keep a note of any that were load-bearing (shuffle partitions,
    broadcast thresholds — these become non-goals, not settings).
-3. **Port sources.** `spark.read.X` → `bt.read.X`. Keep the paths identical so the two
+4. **Port sources.** `spark.read.X` → `bt.read.X`. Keep the paths identical so the two
    scripts read the same bytes.
-4. **Port transforms top-down**, one verb at a time using the table above. Fold
+5. **Port transforms top-down**, one verb at a time using the generated pages. Fold
    `withColumn` chains into single `with_columns` calls. Replace `Window.partitionBy(...)`
    with `.over(partition_by=..., order_by=...)`.
-5. **Port UDFs last.** Each `pandas_udf`/`udf` becomes a `map_batches` function over a
+6. **Port UDFs last.** Each `pandas_udf`/`udf` becomes a `map_batches` function over a
    `pyarrow.RecordBatch`. Pass `input_columns=[...]` naming *every* column the function
    reads — projection pushdown prunes the scan to that list, so an omission is a
    correctness bug, not a perf nit. When unsure what a ported UDF touches, leave
    `input_columns=None` (the default), which keeps every column alive. If the UDF is
    pure column arithmetic, delete it and write an `Expr`.
-6. **Port the sink.** `df.write.mode(m).format(f).save(p)` → `ds.write(p, mode=m)` or the
+7. **Port the sink.** `df.write.mode(m).format(f).save(p)` → `ds.write(p, mode=m)` or the
    typed `ds.write.parquet/delta/iceberg(...)`.
-7. **Verify equivalence.** Run both scripts on the same input, dump each to Arrow, and
+8. **Verify equivalence.** Run both scripts on the same input, dump each to Arrow, and
    compare **order-independently** unless the query ends in an explicit `sort`. The
    in-repo pattern is `tests/differential/conftest.py::assert_same` (multiset comparison,
    tolerant of int↔float and float rounding); `assert_same_ordered` is the version to use
@@ -131,7 +127,7 @@ reference.
    assert batcher_rows == spark_rows
    ```
 
-8. **Check the plan, then the clock.** `print(ported.explain())` to confirm the pushdowns
+9. **Check the plan, then the clock.** `print(ported.explain())` to confirm the pushdowns
    landed, then `ported.stats()` for the measured per-operator profile.
 
 ## Gotchas / do-not
@@ -154,6 +150,18 @@ reference.
 - **Do not hand-tune GPU/batch-size knobs first.** `ds.ml.infer` / `ds.ml.map_batches`
   adapt batch size and `num_gpus` from measurements; set them only when a measurement
   says to.
+
+## Going back
+
+`docs/getting-started/migration/spark/leaving-batcher.md` maps Batcher spellings to PySpark for
+the rows where both engines compute the same thing. A Batcher call whose PySpark counterpart is
+a `mismatch` is not listed there, so look it up on the forward pages before porting it back.
+`python -m batcher.migrate --from batcher --to pyspark <paths>` is the reverse codemod, subject
+to the same implemented-directions check as the forward one.
+
+Batcher has `bt.from_spark` but no Spark exporter, so hand data back as files: write Parquet or
+Delta with `ds.write.parquet(p)` / `ds.write.delta(uri)` and read it with `spark.read`. Pass
+`mode=` explicitly on both sides, because the two engines' default save modes differ.
 
 ## `bt.sql(dialect="spark")` gives you Spark's *syntax*, not Spark's semantics
 
@@ -183,7 +191,8 @@ counts and a checksum against the original job's output, not the eyeball.
 
 ## See also
 
-- `docs/getting-started/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
+- `docs/getting-started/migration/spark/index.md` — every PySpark name, with its Batcher spelling, status, and what differs.
+- `docs/getting-started/migration/differences.md` — laziness, write-mode defaults, integer overflow.
 - `docs/user-guide/analyze/sql.md`, `docs/user-guide/transform/columns/udfs.md`, `docs/user-guide/analyze/window-functions.md`, `docs/user-guide/moving-data/writing-data.md`, `docs/user-guide/operate/tuning/explain-plans.md`.
 - `docs/integrations/compute/ray.md` — how distribution actually works (scheduling only).
 - Skills: `run-quality-gate` (if the port changes repo code).

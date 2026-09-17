@@ -1,8 +1,8 @@
 # Migrating from Ray Data
 
-This page maps Ray Data's `Dataset` onto Batcher's, and explains the one architectural difference that changes how you tune a job. Most of the vocabulary carries over, because both libraries are lazy Python APIs over Arrow batches that scale from a laptop to a Ray cluster.
+This page maps Ray Data's `Dataset` onto Batcher's and explains the one architectural difference that changes how you tune a job. Most of the vocabulary carries over, because both libraries are lazy Python APIs over Arrow batches that scale from a laptop to a Ray cluster.
 
-## The one shift: bulk data leaves the object store
+## Bulk data leaves the object store
 
 In Ray Data, a `Dataset` is a collection of blocks held as Ray objects, and every shuffle, split, and repartition moves those blocks through the Ray object store. That is why object store memory is the number you end up tuning, and why spilling shows up as the dominant cost on a large job.
 
@@ -29,22 +29,7 @@ out.collect(distributed=True, num_workers=8)
 
 ## Relational verbs
 
-Batcher uses SQL names where Ray Data uses its own. The mapping is mechanical.
-
-| Ray Data | Batcher | Note |
-|---|---|---|
-| `ds.select_columns(["a", "b"])` | `ds.select("a", "b")` | |
-| `ds.drop_columns(["a"])` | `ds.drop("a")` | |
-| `ds.rename_columns({"a": "b"})` | `ds.rename({"a": "b"})` | |
-| `ds.add_column("c", fn)` | `ds.with_columns(c=col("a") * 2)` | An expression, not a callback |
-| `ds.filter(fn)` | `ds.filter(col("a") > 0)` | An expression, so it reaches the scan |
-| `ds.groupby("k").count()` | `ds.group_by("k").agg(n=bt.count())` | |
-| `ds.aggregate(...)` | `ds.agg(...)` | |
-| `ds.sort("k")` | `ds.sort("k")` | Unchanged |
-| `ds.limit(n)` | `ds.limit(n)` | Unchanged |
-| `ds.union(other)` | `ds.union(other)` | Unchanged |
-| `ds.random_shuffle()` | `ds.shuffle(seed=0)` | |
-| `ds.repartition(n)` | `ds.repartition(n)` | Unchanged |
+Most Ray Data verbs have a Batcher spelling, and the column verbs take SQL names: `select_columns` is `select`, `drop_columns` is `drop`, and `groupby` is `group_by`. {doc}`ray-data/dataset` lists every `Dataset` method with its Batcher spelling and status. Read the status before renaming a call, because several verbs share a name and differ in behavior. `write_parquet` appends by default in Ray Data and overwrites by default here, and `random_shuffle` draws a new permutation on every execution where `ds.shuffle(seed=0)` returns the same one every run.
 
 Prefer an expression over a callback wherever Ray Data accepts either. `ds.filter(col("amount") > 10)` lowers into the engine and is pushed down to the scan, where `ds.filter(lambda r: r["amount"] > 10)` cannot be. This is the single largest performance difference in a ported script.
 
@@ -64,9 +49,9 @@ print([a.count(), b.count(), c.count()])
 # [2, 5, 3]
 ```
 
-They differ in one way, and it is in your favor: Ray Data materializes the dataset to split it, and Batcher does not. Each part is a lazy plan, so a pipeline that consumes one part never computes the others. The trade is that collecting every part reads the input once per part, so call `ds.cache()` first when the source is expensive and you want all of them.
+They differ in one way, and it works in your favor. Ray Data materializes the dataset to split it, and Batcher does not. Each part is a lazy plan, so a pipeline that consumes one part never computes the others. The trade is that collecting every part reads the input once per part, so call `ds.cache()` first when the source is expensive and you want all of them.
 
-`ds.split(n)` has no direct equivalent, because "n approximately equal parts" is `split_proportionately` with explicit fractions. `streaming_split` is not needed either: the parts are already lazy, so they stream without a separate streaming variant.
+`ds.split(n)` becomes `split_proportionately` with explicit fractions, `[1/n] * (n - 1)` for a contiguous n-way split, and Ray Data's `equal=` has no equivalent. `streaming_split` becomes `batcher.ml.streaming_split(dataset, world_size, rank=)`, which yields per-rank torch batches rather than n iterators. {doc}`ray-data/dataset` lists both differences.
 
 For train and test sets, prefer {py:meth}`ds.ml.train_test_split(...) <batcher.api.dataset.ml.DatasetML.train_test_split>`. It assigns each row by a hash of its own values rather than by position, which keeps the split identical however the data is partitioned.
 
@@ -94,34 +79,15 @@ A Ray Data class-based UDF, which exists so the model loads once per actor rathe
 ds.map_batches(Classifier, concurrency=4, num_gpus=1, batch_size=64)
 ```
 
-For a model rather than arbitrary code, {py:meth}`ds.ml.infer(...) <batcher.api.dataset.ml.DatasetML.infer>` is the shorter path and reuses a session-warm actor pool, so the model loads once per session instead of once per execution.
+For a model rather than arbitrary code, {py:meth}`ds.ml.infer(...) <batcher.api.dataset.ml.DatasetML.infer>` is the shorter path. On a cluster, the actor pool stays warm for the session, so the same model loads once rather than once per execution.
 
 ## Reading and writing
 
-Readers live on `bt.read` and writers on `ds.write`, rather than being module-level and method-level functions.
-
-| Ray Data | Batcher |
-|---|---|
-| `ray.data.read_parquet(path)` | `bt.read.parquet(path)` |
-| `ray.data.read_csv(path)` | `bt.read.csv(path)` |
-| `ray.data.read_json(path)` | `bt.read.json(path)` |
-| `ray.data.read_images(path)` | `bt.read.images(path)` |
-| `ds.write_parquet(path)` | `ds.write.parquet(path)` |
-| `ds.write_csv(path)` | `ds.write.csv(path)` |
+Readers live on `bt.read` and writers on `ds.write`, rather than being module-level and method-level functions, so `ray.data.read_parquet(path)` becomes `bt.read.parquet(path)` and `ds.write_parquet(path)` becomes `ds.write.parquet(path)`. The defaults are not all the same. {doc}`ray-data/io` lists every reader with what differs, such as `read_images` decoding by default in Ray Data and not here, and {doc}`ray-data/dataset` lists the writers.
 
 ## Consuming results
 
-Ray Data distinguishes eager `take*` methods from lazy ones. Batcher stays lazy until a terminal call, so the eager names become a `limit` plus a terminal.
-
-| Ray Data | Batcher |
-|---|---|
-| `ds.take(n)` | `ds.limit(n).to_pylist()` |
-| `ds.take_all()` | `ds.to_pylist()` |
-| `ds.take_batch(n)` | `ds.limit(n).to_arrow()` |
-| `ds.iter_batches()` | `ds.iter_batches()` |
-| `ds.iter_torch_batches()` | `ds.ml.iter_torch_batches()` |
-| `ds.materialize()` | `ds.cache()` |
-| `ds.count()` | `ds.count()` |
+Ray Data distinguishes eager `take*` methods from lazy ones. Batcher stays lazy until a terminal call, so an eager name becomes a `limit` plus a terminal, such as `ds.take(n)` becoming `ds.limit(n).to_pylist()`. The iterators port too, with different defaults: Ray Data's `iter_batches` yields dicts of NumPy arrays, 256 rows at a time, where Batcher's yields Arrow record batches of the engine's size. {doc}`ray-data/dataset` gives the Batcher spelling and the difference for each of `take`, `take_all`, `take_batch`, `iter_batches`, `iter_rows`, `iter_torch_batches`, and `materialize`.
 
 ```python
 print(ds.select("city", "amount").limit(2).to_pylist())
@@ -164,6 +130,7 @@ assert ported.collect(distributed=True).equals(ported.collect())
 
 ## See also
 
+- {doc}`ray-data/index`: every Ray Data name, with its Batcher spelling, its status, and what differs.
 - {doc}`Running on Ray </integrations/compute/ray>`: cluster setup, worker counts, and the Flight shuffle.
 - {doc}`Sampling and splitting </user-guide/transform/rows/sampling>`: the positional and hash-based splits side by side.
 - {doc}`Batch inference and ML </getting-started/migration/ml-pipelines>`: models over batches, GPU pools, and the training feed.

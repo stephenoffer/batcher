@@ -158,17 +158,21 @@ rather than returning a wrong answer.
 
 1. **Inventory the SQL.** List every statement, every source table, and every construct
    in the "not supported" table above. Those are the only ones needing a rewrite.
-2. **Replace file scans with readers.** Every `read_parquet('...')` / `FROM 'x.csv'`
+2. **Run the codemod first, on the Python around the SQL.** The codemod has no DuckDB or
+   SQL direction, because the query text mostly runs unchanged. If the script already calls
+   Batcher, run `python -m batcher.migrate --from batcher --to batcher <paths>`: it prints a
+   diff of every removed Batcher spelling it can rewrite, and `--write` applies it.
+3. **Replace file scans with readers.** Every `read_parquet('...')` / `FROM 'x.csv'`
    becomes a `bt.read.*` call bound as a keyword or registered in a `Session`. Keep the
    paths byte-identical to the DuckDB script so both read the same input.
-3. **Paste the query in.** `bt.sql(sql_text, **tables)`. Run it. Most queries work here
-   and step 4 is empty.
-4. **Rewrite what raised.** Use the translation table. The error messages are specific —
+4. **Paste the query in.** `bt.sql(sql_text, **tables)`. Run it. Most queries work here
+   and step 5 is empty.
+5. **Rewrite what raised.** Use the translation table. The error messages are specific —
    they name the construct and usually name the replacement method.
-5. **Keep it as SQL, or lower it deliberately.** SQL and DataFrame lower to the same plan,
+6. **Keep it as SQL, or lower it deliberately.** SQL and DataFrame lower to the same plan,
    so there is no performance reason to convert a working query. Convert only where the
    DataFrame form is *clearer* — or where a construct forces it.
-6. **Verify against DuckDB.** Run both on the same input and compare **order-independently**
+7. **Verify against DuckDB.** Run both on the same input and compare **order-independently**
    unless the query ends in `ORDER BY`:
 
    ```python
@@ -183,8 +187,16 @@ rather than returning a wrong answer.
    In-repo, mirror `tests/differential/conftest.py::assert_same` — a multiset comparison
    tolerant of int↔float, Decimal→float, and float rounding. Use `assert_same_ordered`
    when order is part of the contract.
-7. **Check the plan, then the clock.** `print(ported.explain())` to confirm predicates and
+8. **Check the plan, then the clock.** `print(ported.explain())` to confirm predicates and
    projections pushed into the scan, then `ported.stats()` for the measured profile.
+
+## Going back
+
+SQL you run through `bt.sql` is DuckDB syntax by default, so a query ports back to DuckDB as
+text. What does not port by itself is anything registered on the Batcher side: a function
+registered with `bt.register_function` or a table bound as a keyword has to be registered
+again in DuckDB. Hand data back through Arrow: `ds.to_arrow()` returns a `pyarrow.Table`, which
+DuckDB queries directly, and `bt.from_duckdb(rel)` is the way in.
 
 ## Gotchas / do-not
 
