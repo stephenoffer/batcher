@@ -3549,6 +3549,55 @@ compared and its result was not. The box was shared during the run (load average
 widens each query's spread but not the direction. Rust: 2,476 tests passed, 0 failed. The
 differential, Parquet IO and Parquet unit suites gave identical results on both builds.
 
+### 27l. Filtering on dictionary codes inside the Parquet decoder — **reviewed and measured, not built**
+
+What is left of the TPC-H-from-Parquet gap after 27j and 27k is decode, and both engines that
+beat Batcher there evaluate a filter *inside* their decoder rather than after it. Read from the
+sources in `/mnt/shared_storage/ref`:
+
+- **DuckDB** (`extension/parquet/parquet_reader.cpp`, `column_reader.cpp`) scans in 2,048-row
+  vectors. `EvaluateFilters` decodes each filter column in an order an adaptive filter keeps
+  re-ranking by measured selectivity (`adaptive_filter.GetPermutation`), narrowing one selection
+  vector; `DecodeRemainingColumns` then reads the other columns through it, and
+  `DirectSelect`/`PlainSelect` decode a plain-encoded page for the selected rows only. For a
+  dictionary page, `DirectFilter` hands the filter to `dictionary_decoder.Filter`, which tests it
+  once per dictionary value, and `PageIsFilteredOut` skips a page whose dictionary holds no match
+  (`HasFilteredOutAllValues`) or whose page statistics rule it out.
+- **Polars** (`crates/polars-parquet/src/arrow/read/deserialize/dictionary_encoded/predicate.rs`)
+  evaluates the predicate over the dictionary into a bitmap, then walks the page's
+  RLE/bit-packed codes straight into a keep-mask: an RLE run costs one `extend_constant`, and
+  bit-packed codes are unpacked 32 at a time and compared as a word. No value is materialized
+  for a row the predicate rejects, and the mask becomes `Filter::Mask` for the other columns.
+
+Why it matters on TPC-H: every low-cardinality `lineitem` column is dictionary-encoded in the
+sf10 mirror (`l_shipmode`, `l_returnflag`, `l_shipinstruct`, and the three dates, all
+`PLAIN_DICTIONARY`), and they are exactly the filter and group columns of q1, q12, q19 and q21.
+Materializing `l_shipmode` as strings costs **5.3x** reading it as a dictionary in pyarrow (235
+against 44 ms, sf10, one file).
+
+**The obvious route through arrow-rs is a dead end, measured.** Asking parquet 60's reader for a
+`Dictionary(Int32, Utf8)` in place of `Utf8` makes the read *slower*, single-threaded, best of
+three over sf10 `lineitem`: `l_shipmode` 572 -> 852 ms, `l_returnflag` 421 -> 708,
+`l_shipinstruct` 838 -> 1,059. Each of the 490 row groups carries its own dictionary, and the
+reader does not hand codes through. So item 6's planner decision would not recover this cost
+either: a preserved dictionary has to be produced by a decoder that owns the pages.
+
+Two measurements from the same session rule out the cheaper levers. Forcing predicated reads back
+through arrow-rs's `RowFilter` (27h's path) with the threshold raised lost on q1, q3, q6, q12,
+q14 and q19 in both rounds taken (q12 269 ms against 497-997 ms). And the per-vector selection
+is the part `RowFilter` cannot imitate: its `RowSelection` is a run list whose cost grows with
+fragmentation, which is the cliff 27h measured.
+
+What building it takes, for whoever picks it up. A page-level reader in `bc-io` for
+dictionary-encoded flat columns: read the dictionary page, evaluate the pushed `bc-io`
+predicate on it once, decode the data pages' RLE/bit-packed codes into a keep-mask as Polars
+does, and skip any page the dictionary rules out as DuckDB does. The other columns then decode
+through that mask. `parquet::encodings` is public only under parquet's `experimental` feature,
+so either that feature is taken on or the hybrid RLE decoder is written here, about 200 lines in
+Polars. The mask has to stay a superset, as every pushed filter does here, and the engine's
+`Filter` stays above it. The benchmark behind the arrow-rs numbers was a throwaway example
+against `ParquetRecordBatchReaderBuilder`; it is not committed.
+
 ### What this pass did not do, and where the single-node gap now is
 
 The sf10 decomposition in `BENCHMARK_RESULTS.md` (2026-09-08) put the loss in the Parquet reader,
