@@ -33,14 +33,14 @@ The following table maps the 37 names on the `polars` module, sorted alphabetica
 | `Enum` | n/a | gap | Not yet: Enum logical type. Wave W11. |
 | `Extension` | n/a | gap | Not yet: extension types. Wave W11. |
 | `Field` | n/a | out of scope | Declined: Arrow is the only columnar contract: Batcher accepts and returns pyarrow type objects, so a Polars Field class has no Batcher counterpart to build. |
-| `Float16` | `Expr.cast` | mismatch | Differs: Batcher normalizes narrow types to Int64/Float64 at the FFI boundary, so a cast to Float16 comes back as Float64. Param: preserve narrow types. Wave W0. |
-| `Float32` | `Expr.cast` | mismatch | Differs: Batcher normalizes narrow types to Int64/Float64 at the FFI boundary, so a cast to Float32 comes back as Float64. Param: preserve narrow types. Wave W0. |
+| `Float16` | `Expr.cast` | canonical |  |
+| `Float32` | `Expr.cast` | canonical |  |
 | `Float64` | `Expr.cast` | canonical |  |
 | `Int128` | n/a | gap | Not yet: Int128 type. Wave W11. |
-| `Int16` | `Expr.cast` | mismatch | Differs: Batcher normalizes narrow types to Int64/Float64 at the FFI boundary, so a cast to Int16 comes back as Int64. Param: preserve narrow types. Wave W0. |
-| `Int32` | `Expr.cast` | mismatch | Differs: Batcher normalizes narrow types to Int64/Float64 at the FFI boundary, so a cast to Int32 comes back as Int64. Param: preserve narrow types. Wave W0. |
+| `Int16` | `Expr.cast` | canonical |  |
+| `Int32` | `Expr.cast` | canonical |  |
 | `Int64` | `Expr.cast` | canonical |  |
-| `Int8` | `Expr.cast` | mismatch | Differs: Batcher normalizes narrow types to Int64/Float64 at the FFI boundary, so a cast to Int8 comes back as Int64. Param: preserve narrow types. Wave W0. |
+| `Int8` | `Expr.cast` | canonical |  |
 | `List` | `Expr.cast` | param | Missing: cast target List. Wave W2. |
 | `Null` | `Expr.cast` | param | Missing: cast target Null. Wave W2. |
 | `Object` | n/a | out of scope | Declined: arbitrary Python objects in a column contradict Arrow as the only columnar contract. |
@@ -49,9 +49,9 @@ The following table maps the 37 names on the `polars` module, sorted alphabetica
 | `Struct` | `Expr.cast` | param | Missing: cast target Struct. Wave W2. |
 | `Time` | n/a | gap | Not yet: TIME type. Wave W6. |
 | `UInt128` | n/a | gap | Not yet: UInt128 type. Wave W11. |
-| `UInt16` | `Expr.cast` | mismatch | Differs: Batcher normalizes narrow types to Int64/Float64 at the FFI boundary, so a cast to UInt16 comes back as Int64. Param: preserve narrow types. Wave W0. |
-| `UInt32` | `Expr.cast` | mismatch | Differs: Batcher normalizes narrow types to Int64/Float64 at the FFI boundary, so a cast to UInt32 comes back as Int64. Param: preserve narrow types. Wave W0. |
-| `UInt64` | `Expr.cast` | mismatch | Differs: Batcher normalizes UInt64 to Int64 at the FFI boundary, so values above 2\*\*63-1 overflow. Param: preserve unsigned types. Wave W0. |
-| `UInt8` | `Expr.cast` | mismatch | Differs: Batcher normalizes narrow types to Int64/Float64 at the FFI boundary, so a cast to UInt8 comes back as Int64. Param: preserve narrow types. Wave W0. |
+| `UInt16` | `Expr.cast` | canonical |  |
+| `UInt32` | `Expr.cast` | canonical |  |
+| `UInt64` | `Expr.cast` | mismatch | Differs: a cast to uint64 keeps the type, but a UInt64 input above the Int64 range raises at the engine boundary rather than overflowing. Wave W0. |
+| `UInt8` | `Expr.cast` | canonical |  |
 | `Unknown` | n/a | out of scope | Declined: Polars-internal placeholder dtype for unresolved schemas. |
 | `Utf8` | `Expr.cast` | canonical |  |

@@ -55,12 +55,12 @@ explode = { status = "mismatch", batcher = "Dataset.explode", note = "Daft explo
 fill_null = { status = "canonical", batcher = "Expr.fill_null" }
 get = { status = "param", batcher = ["Expr.list.get", "Expr.struct.field"], need = "default= for a missing index/field, and one get over list, struct and map", wave = "W4" }
 hamming_distance = { status = "canonical", batcher = ["op:xor", "Expr.bit_count"] }
-hash = { status = "mismatch", batcher = "Expr.hash", note = "Daft hashes with xxhash (or murmurhash3/sha1 via hash_function=) and a seed; Batcher's 64-bit hash uses a different function, so values differ. Param: hash_function='xxhash'", wave = "W0" }
+hash = { status = "mismatch", batcher = "Expr.hash", note = "Daft's default xxhash is col.hash(seed, algorithm=xxhash3), with the UInt64 bits read as Int64; murmurhash3 and sha1 have no Batcher algorithm", wave = "W0" }
 is_column = { status = "out_of_scope", reason = "Expression-object introspection, not a data operation" }
 is_in = { status = "canonical", batcher = "Expr.is_in" }
 is_literal = { status = "out_of_scope", reason = "Expression-object introspection, not a data operation" }
 is_null = { status = "canonical", batcher = "Expr.is_null" }
-jaccard_similarity = { status = "mismatch", batcher = "Expr.list.jaccard", note = "Daft jaccard_similarity compares the sets of non-zero positions of two embeddings; Batcher list.jaccard is the fraction of positions holding equal values ([1,2,3] vs [3,1,5]: 1.0 vs 0.0). Param: mode='nonzero'", wave = "W0" }
+jaccard_similarity = { status = "canonical", batcher = "Expr.list.jaccard", template = 'jaccard_similarity(other) -> self.list.jaccard(other, mode="nonzero")' }
 jq = { status = "gap", need = "jq filter language over JSON strings (Batcher has JSONPath extract_* only)", wave = "W7" }
 list_append = { status = "canonical", batcher = ["Expr.list.concat", "bt.array"] }
 list_bool_and = { status = "canonical", batcher = "Expr.list.min" }
@@ -70,7 +70,7 @@ list_count = { status = "param", batcher = "Expr.list.len", need = "mode= (Daft 
 list_distinct = { status = "canonical", batcher = "Expr.list.unique" }
 list_filter = { status = "canonical", batcher = "Expr.list.filter" }
 list_flatten = { status = "canonical", batcher = "Expr.list.flatten" }
-list_join = { status = "mismatch", batcher = "Expr.list.join", note = "Daft list_join turns a null element into an empty field ('a--b'); Batcher skips nulls ('a-b'). Param: null_replacement=''", wave = "W0" }
+list_join = { status = "canonical", batcher = "Expr.list.join", template = 'list_join(delimiter) -> self.list.join(delimiter, null_replacement="")' }
 list_map = { status = "canonical", batcher = "Expr.list.transform" }
 list_max = { status = "canonical", batcher = "Expr.list.max" }
 list_mean = { status = "canonical", batcher = "Expr.list.mean" }
@@ -119,7 +119,7 @@ hamming_distance = { status = "canonical", batcher = ["op:xor", "Expr.bit_count"
 hash = { status = "mismatch", batcher = "bt.hash_rows", note = "Daft hashes with xxhash (or murmurhash3/sha1 via hash_function=); Batcher hash_rows uses a different function, so values differ. Param: hash_function='xxhash'", wave = "W0" }
 is_in = { status = "canonical", batcher = "Expr.is_in" }
 is_null = { status = "canonical", batcher = "Expr.is_null" }
-jaccard_similarity = { status = "mismatch", batcher = "Expr.list.jaccard", note = "Daft jaccard_similarity compares the sets of non-zero positions of two embeddings; Batcher list.jaccard is the fraction of positions holding equal values ([1,2,3] vs [3,1,5]: 1.0 vs 0.0). Param: mode='nonzero'", wave = "W0" }
+jaccard_similarity = { status = "canonical", batcher = "Expr.list.jaccard", template = 'jaccard_similarity(left, right) -> sem.column(left).list.jaccard(right, mode="nonzero")' }
 jq = { status = "gap", need = "jq filter language over JSON strings (Batcher has JSONPath extract_* only)", wave = "W7" }
 json_array_length = { status = "canonical", batcher = "Expr.json.array_length" }
 json_object_keys = { status = "mismatch", batcher = "Expr.json.keys", note = "Daft does not return keys in source order (keys b, a come back as a, b) and returns null for a non-object; Batcher returns source order and an empty list. Param: null for non-objects, key order", wave = "W7" }
@@ -132,7 +132,7 @@ list_count = { status = "param", batcher = "Expr.list.len", need = "mode= (Daft 
 list_distinct = { status = "canonical", batcher = "Expr.list.unique" }
 list_filter = { status = "canonical", batcher = "Expr.list.filter" }
 list_flatten = { status = "canonical", batcher = "Expr.list.flatten" }
-list_join = { status = "mismatch", batcher = "Expr.list.join", note = "Daft list_join turns a null element into an empty field ('a--b'); Batcher skips nulls ('a-b'). Param: null_replacement=''", wave = "W0" }
+list_join = { status = "canonical", batcher = "Expr.list.join", template = 'list_join(list_expr, delimiter) -> sem.column(list_expr).list.join(delimiter, null_replacement="")' }
 list_map = { status = "canonical", batcher = "Expr.list.transform" }
 list_max = { status = "canonical", batcher = "Expr.list.max" }
 list_mean = { status = "canonical", batcher = "Expr.list.mean" }

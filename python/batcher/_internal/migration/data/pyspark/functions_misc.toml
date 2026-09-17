@@ -20,7 +20,7 @@ asc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
 asc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
 assert_true = { status = "gap", need = "raise when a condition is false", wave = "W3" }
 broadcast = { status = "out_of_scope", reason = "no join-hint IR; Kyber picks the build side from measured cardinalities (revisit)" }
-bucket = { status = "mismatch", batcher = "Expr.hash_bucket", note = "Spark bucket is the Iceberg partition transform (Murmur3 hash mod N, null stays null); Expr.hash_bucket uses a different hash and maps null to a bucket", wave = "W0" }
+bucket = { status = "canonical", batcher = "Expr.hash_bucket", template = 'bucket(numBuckets, col) -> sem.column(col).hash_bucket(numBuckets, algorithm="iceberg")' }
 call_function = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (call_function by name)", wave = "W1" }
 call_udf = { status = "gap", need = "call a registered UDF by name from the DataFrame API", wave = "W11" }
 coalesce = { status = "canonical", batcher = "bt.coalesce" }
@@ -40,7 +40,7 @@ ifnull = { status = "canonical", batcher = "Expr.fill_null" }
 input_file_block_length = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }
 input_file_block_start = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }
 input_file_name = { status = "gap", need = "input-file metadata column", wave = "W8" }
-isnan = { status = "mismatch", batcher = "Expr.is_nan", note = "Spark isnan(null) is false; Expr.is_nan(null) is null", wave = "W0" }
+isnan = { status = "mismatch", batcher = "Expr.is_nan", template = 'isnan(col) -> sem.column(col).is_nan().fill_null(False)', note = "Spark isnan(null) is false; Batcher (DuckDB) returns null", wave = "W0" }
 isnotnull = { status = "canonical", batcher = "Expr.is_not_null" }
 isnull = { status = "canonical", batcher = "Expr.is_null" }
 java_method = { status = "out_of_scope", reason = "JVM reflection; no JVM" }
@@ -62,7 +62,7 @@ st_setsrid = { status = "canonical", batcher = "bt.st_set_srid" }
 st_srid = { status = "canonical", batcher = "bt.st_srid" }
 try_reflect = { status = "out_of_scope", reason = "JVM reflection; no JVM" }
 typeof = { status = "gap", need = "DDL type name of an expression's type", wave = "W11" }
-udf = { status = "mismatch", batcher = "bt.udf", note = "Spark udf(f, returnType) returns a function applied to columns that yields a Column; bt.udf wraps a batch function applied to a whole Dataset (fn(ds))", wave = "W0" }
+udf = { status = "mismatch", batcher = "bt.udf", note = "bt.udf(fn)(col) raises instead of evaluating at plan time; port a row UDF as ds.map_batches over Arrow batches, or as an expression", wave = "W0" }
 udtf = { status = "gap", need = "Python UDTF protocol: @udtf class decorator with eval/terminate", wave = "W11" }
 unwrap_udt = { status = "out_of_scope", reason = "JVM user-defined types; no JVM" }
 user = { status = "gap", need = "current user name", wave = "W9" }

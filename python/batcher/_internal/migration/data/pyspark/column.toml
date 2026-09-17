@@ -23,7 +23,7 @@ eqNullSafe = { status = "canonical", batcher = "Expr.eq_missing" }
 getField = { status = "canonical", batcher = "Expr.struct.field" }
 getItem = { status = "mismatch", batcher = ["Expr.list.get", "Expr.map.get"], note = "Spark getItem(-1) on an array is out of bounds (an error under ANSI, the 4.x default; null otherwise); Expr.list.get(-1) returns the last element. Map keys go through Expr.map.get", wave = "W0" }
 ilike = { status = "canonical", batcher = "Expr.str.ilike" }
-isNaN = { status = "mismatch", batcher = "Expr.is_nan", note = "Spark isNaN(null) is false; Expr.is_nan(null) is null", wave = "W0" }
+isNaN = { status = "mismatch", batcher = "Expr.is_nan", template = 'isNaN() -> self.is_nan().fill_null(False)', note = "Spark isnan(null) is false; Batcher (DuckDB) returns null", wave = "W0" }
 isNotNull = { status = "canonical", batcher = "Expr.is_not_null" }
 isNull = { status = "canonical", batcher = "Expr.is_null" }
 isin = { status = "alias", batcher = "Expr.is_in" }

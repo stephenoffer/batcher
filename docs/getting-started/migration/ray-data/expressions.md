@@ -32,7 +32,7 @@ The following table maps the 37 names on `Expr`, sorted alphabetically.
 | `floor` | `Expr.floor` | canonical |  |
 | `get_type` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `is_idempotent` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
-| `is_in` | `Expr.is_in` | mismatch | Differs: Ray is\_in is null-safe: a null input returns False, and a None in the list matches a null input. Batcher follows SQL three-valued logic: a null input returns null, and a None in the list makes every non-match null. Port as: col.is\_in(vals).fill\_null(False), OR col.is\_null() when vals holds None. Wave W0. |
+| `is_in` | `Expr.is_in` | canonical |  |
 | `is_not_null` | `Expr.is_not_null` | canonical |  |
 | `is_null` | `Expr.is_null` | canonical |  |
 | `list` | `Expr.list` | canonical |  |
@@ -42,10 +42,10 @@ The following table maps the 37 names on `Expr`, sorted alphabetically.
 | `map` | `Expr.map` | canonical |  |
 | `name` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `negate` | `-` operator | canonical |  |
-| `not_in` | `Expr.is_in` + `~` operator | mismatch | Differs: Ray not\_in is null-safe (a null input returns True unless None is listed); Batcher \~col.is\_in(vals) returns null for a null input under SQL three-valued logic. Port as: (\~col.is\_in(vals)).fill\_null(True). Wave W0. |
+| `not_in` | `Expr.is_in` | canonical |  |
 | `nullable` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `power` | `**` operator | canonical |  |
-| `round` | `Expr.round` | mismatch | Differs: Ray round() rounds half to even (2.5 -\> 2.0, 0.5 -\> 0.0); Batcher rounds half away from zero (2.5 -\> 3.0). The restoring mode='half\_even' parameter does not exist yet. Wave W0. |
+| `round` | `Expr.round` | canonical |  |
 | `sign` | `Expr.sign` | canonical |  |
 | `sin` | `Expr.sin` | canonical |  |
 | `str` | `Expr.str` | canonical |  |
@@ -176,7 +176,7 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `AggregateFnV2` | n/a | gap | Not yet: user-defined vectorized aggregate over block columns (aggregate\_block/combine/finalize). Wave W11. |
 | `Any` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `ApproximateQuantile` | `Expr.approx_quantile` | param | Missing: a list of quantiles in one aggregate returning a list, quantile\_precision=. Wave W2. |
-| `ApproximateTopK` | `Expr.top_k` | mismatch | Differs: Ray ApproximateTopK(on, k) returns \[\{column: value, 'count': n\}\] records; Batcher Expr.top\_k returns the values only (exactly, most frequent first) and its most-frequent meaning is being renamed so top\_k means largest. Wave W0. |
+| `ApproximateTopK` | `Expr.mode_top_k` | mismatch | Differs: Ray ApproximateTopK(on, k) returns \[\{column: value, count: n\}\] records; Batcher mode\_top\_k returns the values only, exactly, most frequent first. Wave W0. |
 | `ArrowAggSpec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `AsList` | `Expr.array_agg` | canonical |  |
 | `Block` | n/a | out of scope | Declined: Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime). |

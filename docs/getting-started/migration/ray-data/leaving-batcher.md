@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Ray Data
 
-The following table maps 107 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
+The following table maps 110 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
 
 | Batcher | Ray Data |
 |---|---|
@@ -32,6 +32,7 @@ The following table maps 107 Batcher spellings to the Ray Data names that comput
 | `bt.from_numpy` | `ray.data.from_numpy` |
 | `bt.from_spark` | `ray.data.from_spark` |
 | `bt.lit` | `expressions.lit` |
+| `bt.range` | `ray.data.range` |
 | `bt.read.avro` | `ray.data.read_avro` |
 | `bt.read.csv` | `ray.data.read_csv` |
 | `bt.read.delta_sharing` | `ray.data.read_delta_sharing_tables` |
@@ -77,6 +78,7 @@ The following table maps 107 Batcher spellings to the Ray Data names that comput
 | `Expr.dt` | `Expr.dt` |
 | `Expr.exp` | `Expr.exp` |
 | `Expr.floor` | `Expr.floor` |
+| `Expr.is_in` | `Expr.is_in`, `Expr.not_in` |
 | `Expr.is_not_null` | `Expr.is_not_null` |
 | `Expr.is_null` | `Expr.is_null` |
 | `Expr.list.flatten` | `Expr.list.flatten` |
@@ -93,6 +95,7 @@ The following table maps 107 Batcher spellings to the Ray Data names that comput
 | `Expr.mean` | `aggregate.Mean` |
 | `Expr.min` | `aggregate.Min` |
 | `Expr.quantile` | `aggregate.Quantile` |
+| `Expr.round` | `Expr.round` |
 | `Expr.sign` | `Expr.sign` |
 | `Expr.sin` | `Expr.sin` |
 | `Expr.str.capitalize` | `Expr.str.capitalize` |

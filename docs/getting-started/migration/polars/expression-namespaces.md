@@ -133,10 +133,10 @@ The following table maps the 43 names on `Expr.list`, sorted alphabetically.
 | `any` | n/a | gap | Not yet: list.any (boolean OR over each list). Wave W8. |
 | `arg_max` | `Expr.list.arg_max` | canonical |  |
 | `arg_min` | `Expr.list.arg_min` | canonical |  |
-| `concat` | `Expr.list.concat` | mismatch | Differs: a null list concatenated in Polars gives null; Batcher treats it as empty and returns the other side. Wave W0. |
+| `concat` | `Expr.list.concat` | canonical |  |
 | `contains` | `Expr.list.contains` | param | Missing: an Expr item and nulls\_equal= (a null item raises today). Wave W2. |
 | `count_matches` | n/a | gap | Not yet: list.count\_matches. Wave W8. |
-| `diff` | `Expr.list.diff` | mismatch | Differs: Polars keeps the integer element type; Batcher returns Float64 elements. Wave W0. |
+| `diff` | `Expr.list.diff` | canonical |  |
 | `drop_nulls` | `Expr.list.drop_nulls` | canonical |  |
 | `eval` | `Expr.list.transform` | param | Missing: eval with window and aggregation expressions over the element context. Wave W2. |
 | `explode` | n/a | gap | Not yet: list.explode (length-changing). Wave W8. |
@@ -154,7 +154,7 @@ The following table maps the 43 names on `Expr.list`, sorted alphabetically.
 | `mean` | `Expr.list.mean` | canonical |  |
 | `median` | `Expr.list.median` | canonical |  |
 | `min` | `Expr.list.min` | canonical |  |
-| `n_unique` | `Expr.list.n_unique` | mismatch | Differs: Polars counts null as a distinct element; Batcher skips it. Param: count\_nulls=True. Wave W0. |
+| `n_unique` | `Expr.list.n_unique` | canonical |  |
 | `reverse` | `Expr.list.reverse` | canonical |  |
 | `sample` | n/a | gap | Not yet: list.sample. Wave W8. |
 | `set_difference` | `Expr.list.difference` | alias |  |
@@ -163,13 +163,13 @@ The following table maps the 43 names on `Expr.list`, sorted alphabetically.
 | `set_union` | `Expr.list.union` | alias |  |
 | `shift` | n/a | gap | Not yet: list.shift. Wave W8. |
 | `slice` | `Expr.list.slice` | canonical |  |
-| `sort` | `Expr.list.sort` | mismatch | Differs: Polars places nulls first (nulls\_last=False); Batcher places them last, and Batcher's sort takes no descending= (sort\_desc instead). Params: descending=, nulls\_last=. Wave W0. |
+| `sort` | `Expr.list.sort` | canonical |  |
 | `std` | `Expr.list.std` | param | Missing: ddof=. Wave W2. |
-| `sum` | `Expr.list.sum` | mismatch | Differs: Polars sums an empty list to 0; Batcher returns null. Wave W0. |
+| `sum` | `Expr.list.sum` | canonical |  |
 | `tail` | `Expr.list.slice` | canonical |  |
 | `to_array` | n/a | gap | Not yet: list.to\_array (fixed-size list). Wave W8. |
 | `to_struct` | n/a | gap | Not yet: list.to\_struct. Wave W8. |
-| `unique` | `Expr.list.unique` | mismatch | Differs: Polars keeps null as a distinct element; Batcher drops it. Param: drop\_nulls=False (and maintain\_order=). Wave W0. |
+| `unique` | `Expr.list.unique` | canonical |  |
 | `var` | `Expr.list.var` | param | Missing: ddof=. Wave W2. |
 
 ## `Expr.arr`
@@ -197,17 +197,17 @@ The following table maps the 31 names on `Expr.arr`, sorted alphabetically.
 | `mean` | `Expr.list.mean` | canonical |  |
 | `median` | `Expr.list.median` | canonical |  |
 | `min` | `Expr.list.min` | canonical |  |
-| `n_unique` | `Expr.list.n_unique` | mismatch | Differs: Polars counts null as a distinct element; Batcher skips it. Param: count\_nulls=True. Wave W0. |
+| `n_unique` | `Expr.list.n_unique` | canonical |  |
 | `reverse` | `Expr.list.reverse` | canonical |  |
 | `shift` | n/a | gap | Not yet: list.shift. Wave W8. |
-| `slice` | `Expr.list.slice` | mismatch | Differs: on a fixed\_size\_list column Batcher's slice returns a null-typed column. Batcher bug. Wave W0. |
-| `sort` | `Expr.list.sort` | mismatch | Differs: Polars places nulls first (nulls\_last=False); Batcher places them last, and Batcher's sort takes no descending= (sort\_desc instead). Params: descending=, nulls\_last=. Wave W0. |
+| `slice` | `Expr.list.slice` | canonical |  |
+| `sort` | `Expr.list.sort` | canonical |  |
 | `std` | `Expr.list.std` | param | Missing: ddof=. Wave W2. |
 | `sum` | `Expr.list.sum` | canonical |  |
 | `tail` | `Expr.list.slice` | param | Missing: as\_array= (keep the fixed-size Array type). Wave W2. |
 | `to_list` | n/a | gap | Not yet: arr.to\_list (fixed-size to variable list cast). Wave W8. |
 | `to_struct` | n/a | gap | Not yet: list.to\_struct. Wave W8. |
-| `unique` | `Expr.list.unique` | mismatch | Differs: Polars keeps null as a distinct element; Batcher drops it. Param: drop\_nulls=False (and maintain\_order=). Wave W0. |
+| `unique` | `Expr.list.unique` | canonical |  |
 | `var` | `Expr.list.var` | param | Missing: ddof=. Wave W2. |
 
 ## `Expr.struct`

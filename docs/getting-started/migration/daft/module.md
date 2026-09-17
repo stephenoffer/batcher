@@ -101,7 +101,7 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `metrics` | n/a | gap | Not yet: custom counters incremented from inside UDFs. Wave W11. |
 | `open_file` | n/a | gap | Not yet: open a (remote) URL as a file object through the engine's IO layer. Wave W13. |
 | `planning_config_ctx` | `bt.config_context` | param | Missing: planning knobs (default\_io\_config, strict filter pushdown) as Config fields. Wave W9. |
-| `range` | `bt.range` | mismatch | Differs: Daft range names its column 'id' and takes partitions=; Batcher range names it 'value'. Param: name='id'. Wave W0. |
+| `range` | `bt.range` | mismatch | Differs: Daft partitions= has no Batcher counterpart; the column is named id. Wave W0. |
 | `read_blob` | `bt.read.binary` | mismatch | Differs: Daft read\_blob yields columns (path, size, content) with on\_error=; Batcher read.binary yields (uri, bytes, size, mime). Wave W13. |
 | `read_csv` | `bt.read.csv` | alias |  |
 | `read_deltalake` | `bt.read.delta` | canonical |  |

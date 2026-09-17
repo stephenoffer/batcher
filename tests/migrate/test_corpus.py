@@ -69,7 +69,7 @@ def test_an_executed_case_leaves_nothing_foreign_behind(engine: str, case: str) 
         ("pyspark", "mismatches", "functions.concat` differs in Batcher"),
         ("pyspark", "udfs", "functions.udf` differs in Batcher"),
         ("pyspark", "dates", "needs a manual rewrite"),
-        ("polars", "mismatches", "Expr.top_k` differs in Batcher"),
+        ("polars", "mismatches", "Expr.n_unique` differs in Batcher"),
         ("polars", "udfs", "Expr.map_elements` has no Batcher equivalent yet"),
         ("daft", "udfs", "daft.func` has no Batcher equivalent yet"),
         ("ray_data", "mismatches", "Dataset.random_shuffle` differs in Batcher"),

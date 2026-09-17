@@ -94,7 +94,7 @@ method = { status = "gap", need = "@daft.method on @daft.cls UDF classes", wave 
 metrics = { status = "gap", need = "custom counters incremented from inside UDFs", wave = "W11" }
 open_file = { status = "gap", need = "open a (remote) URL as a file object through the engine's IO layer", wave = "W13" }
 planning_config_ctx = { status = "param", batcher = "bt.config_context", need = "planning knobs (default_io_config, strict filter pushdown) as Config fields", wave = "W9" }
-range = { status = "mismatch", batcher = "bt.range", note = "Daft range names its column 'id' and takes partitions=; Batcher range names it 'value'. Param: name='id'", wave = "W0" }
+range = { status = "mismatch", batcher = "bt.range", template = 'range(start, end=None, step=1, partitions=None) -> bt.range(start, end, step, name="id")', note = "Daft partitions= has no Batcher counterpart; the column is named id", wave = "W0" }
 read_blob = { status = "mismatch", batcher = "bt.read.binary", note = "Daft read_blob yields columns (path, size, content) with on_error=; Batcher read.binary yields (uri, bytes, size, mime)", wave = "W13" }
 read_csv = { status = "alias", batcher = "bt.read.csv" }
 read_deltalake = { status = "canonical", batcher = "bt.read.delta" }

@@ -9,7 +9,7 @@ ascii = { status = "canonical", batcher = "Expr.str.ascii" }
 base64 = { status = "canonical", batcher = "Expr.str.base64" }
 bit_length = { status = "canonical", batcher = "Expr.str.bit_length" }
 btrim = { status = "canonical", batcher = "Expr.str.trim" }
-char = { status = "mismatch", batcher = "Expr.chr", note = "Spark char(n) returns the character for n mod 256 (char(321) is 'A'); Expr.chr returns the Unicode code point (chr(321) is 'Ł')", wave = "W0" }
+char = { status = "mismatch", batcher = "Expr.chr", note = "Spark char(n) is chr(n % 256) and empty for a negative n: bt.when(n < 0).then(bt.lit()).otherwise((n % 256).chr())", wave = "W0" }
 char_length = { status = "canonical", batcher = "Expr.str.len_chars" }
 character_length = { status = "canonical", batcher = "Expr.str.len_chars" }
 collate = { status = "gap", need = "collation-aware string comparison (collate(col, name))", wave = "W14" }
@@ -25,7 +25,7 @@ endswith = { status = "canonical", batcher = "Expr.str.ends_with" }
 find_in_set = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (find_in_set)", wave = "W1" }
 format_number = { status = "gap", need = "format a number with grouping separators to d decimal places", wave = "W3" }
 format_string = { status = "mismatch", batcher = "bt.format_string", note = "Spark uses printf-style placeholders (%s, %d, %.2f); bt.format_string uses {} placeholders", wave = "W0" }
-hash = { status = "mismatch", batcher = "Expr.hash", note = "Spark hash is 32-bit Murmur3 with seed 42 over one or more columns ('ABC' -> -757602832); Expr.hash is a different 64-bit hash of one value", wave = "W0" }
+hash = { status = "mismatch", batcher = "Expr.hash", note = "port as bt.hash_rows(*cols, seed=42, algorithm=murmur3), cast to int32 where Spark's result is IntegerType", wave = "W0" }
 hex = { status = "canonical", batcher = "Expr.str.hex" }
 ilike = { status = "param", batcher = "Expr.str.ilike", need = "escapeChar= and a column-valued pattern", wave = "W2" }
 initcap = { status = "canonical", batcher = "Expr.str.to_titlecase", template = 'initcap(col) -> sem.column(col).str.to_titlecase(boundary="space")' }

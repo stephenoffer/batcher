@@ -56,7 +56,7 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 | `NodeIdStr` | n/a | out of scope | Declined: type alias for a Ray node id string used by locality\_hints; Batcher placement is not addressed by node id. |
 | `Preprocessor` | `batcher.ml.Preprocessor` | canonical |  |
 | `RandomSeedConfig` | `Dataset.shuffle` | param | Missing: RandomSeedConfig(seed, reseed\_after\_execution=True): a new permutation per epoch from one base seed. Wave W2. |
-| `range` | `bt.range` | mismatch | Differs: Ray range(n) names its column 'id'; Batcher bt.range names it 'value'. Codemod: bt.range(n, name='id'). Wave W0. |
+| `range` | `bt.range` | canonical |  |
 | `range_tensor` | n/a | gap | Not yet: range of fixed-shape tensor rows (range\_tensor(n, shape=)). Wave W11. |
 | `read_audio` | `bt.read.audio` | mismatch | Differs: Ray decodes by default into 'amplitude' and 'sample\_rate' columns; Batcher read.audio defaults decode=False. Pass decode=True; verify output column names. Wave W12. |
 | `read_avro` | `bt.read.avro` | alias |  |

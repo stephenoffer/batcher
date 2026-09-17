@@ -71,12 +71,12 @@ The following table maps the 94 names on `Expression`, sorted alphabetically.
 | `fill_null` | `Expr.fill_null` | canonical |  |
 | `get` | `Expr.list.get` + `Expr.struct.field` | param | Missing: default= for a missing index/field, and one get over list, struct and map. Wave W4. |
 | `hamming_distance` | `^` operator + `Expr.bit_count` | canonical |  |
-| `hash` | `Expr.hash` | mismatch | Differs: Daft hashes with xxhash (or murmurhash3/sha1 via hash\_function=) and a seed; Batcher's 64-bit hash uses a different function, so values differ. Param: hash\_function='xxhash'. Wave W0. |
+| `hash` | `Expr.hash` | mismatch | Differs: Daft's default xxhash is col.hash(seed, algorithm=xxhash3), with the UInt64 bits read as Int64; murmurhash3 and sha1 have no Batcher algorithm. Wave W0. |
 | `is_column` | n/a | out of scope | Declined: Expression-object introspection, not a data operation. |
 | `is_in` | `Expr.is_in` | canonical |  |
 | `is_literal` | n/a | out of scope | Declined: Expression-object introspection, not a data operation. |
 | `is_null` | `Expr.is_null` | canonical |  |
-| `jaccard_similarity` | `Expr.list.jaccard` | mismatch | Differs: Daft jaccard\_similarity compares the sets of non-zero positions of two embeddings; Batcher list.jaccard is the fraction of positions holding equal values (\[1,2,3\] vs \[3,1,5\]: 1.0 vs 0.0). Param: mode='nonzero'. Wave W0. |
+| `jaccard_similarity` | `Expr.list.jaccard` | canonical |  |
 | `jq` | n/a | gap | Not yet: jq filter language over JSON strings (Batcher has JSONPath extract\_\* only). Wave W7. |
 | `list_append` | `Expr.list.concat` + `bt.array` | canonical |  |
 | `list_bool_and` | `Expr.list.min` | canonical |  |
@@ -86,7 +86,7 @@ The following table maps the 94 names on `Expression`, sorted alphabetically.
 | `list_distinct` | `Expr.list.unique` | canonical |  |
 | `list_filter` | `Expr.list.filter` | canonical |  |
 | `list_flatten` | `Expr.list.flatten` | canonical |  |
-| `list_join` | `Expr.list.join` | mismatch | Differs: Daft list\_join turns a null element into an empty field ('a--b'); Batcher skips nulls ('a-b'). Param: null\_replacement=''. Wave W0. |
+| `list_join` | `Expr.list.join` | canonical |  |
 | `list_map` | `Expr.list.transform` | canonical |  |
 | `list_max` | `Expr.list.max` | canonical |  |
 | `list_mean` | `Expr.list.mean` | canonical |  |
@@ -140,7 +140,7 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `hash` | `bt.hash_rows` | mismatch | Differs: Daft hashes with xxhash (or murmurhash3/sha1 via hash\_function=); Batcher hash\_rows uses a different function, so values differ. Param: hash\_function='xxhash'. Wave W0. |
 | `is_in` | `Expr.is_in` | canonical |  |
 | `is_null` | `Expr.is_null` | canonical |  |
-| `jaccard_similarity` | `Expr.list.jaccard` | mismatch | Differs: Daft jaccard\_similarity compares the sets of non-zero positions of two embeddings; Batcher list.jaccard is the fraction of positions holding equal values (\[1,2,3\] vs \[3,1,5\]: 1.0 vs 0.0). Param: mode='nonzero'. Wave W0. |
+| `jaccard_similarity` | `Expr.list.jaccard` | canonical |  |
 | `jq` | n/a | gap | Not yet: jq filter language over JSON strings (Batcher has JSONPath extract\_\* only). Wave W7. |
 | `json_array_length` | `Expr.json.array_length` | canonical |  |
 | `json_object_keys` | `Expr.json.keys` | mismatch | Differs: Daft does not return keys in source order (keys b, a come back as a, b) and returns null for a non-object; Batcher returns source order and an empty list. Param: null for non-objects, key order. Wave W7. |
@@ -153,7 +153,7 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `list_distinct` | `Expr.list.unique` | canonical |  |
 | `list_filter` | `Expr.list.filter` | canonical |  |
 | `list_flatten` | `Expr.list.flatten` | canonical |  |
-| `list_join` | `Expr.list.join` | mismatch | Differs: Daft list\_join turns a null element into an empty field ('a--b'); Batcher skips nulls ('a-b'). Param: null\_replacement=''. Wave W0. |
+| `list_join` | `Expr.list.join` | canonical |  |
 | `list_map` | `Expr.list.transform` | canonical |  |
 | `list_max` | `Expr.list.max` | canonical |  |
 | `list_mean` | `Expr.list.mean` | canonical |  |

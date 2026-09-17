@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Daft
 
-The following table maps 214 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
+The following table maps 217 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
 
 | Batcher | Daft |
 |---|---|
@@ -167,6 +167,8 @@ The following table maps 214 Batcher spellings to the Daft names that compute th
 | `Expr.list.dot` | `Expression.dot_product`, `functions.dot_product` |
 | `Expr.list.filter` | `Expression.list_filter`, `functions.list_filter` |
 | `Expr.list.flatten` | `Expression.list_flatten`, `functions.list_flatten` |
+| `Expr.list.jaccard` | `Expression.jaccard_similarity`, `functions.jaccard_similarity` |
+| `Expr.list.join` | `Expression.list_join`, `functions.list_join` |
 | `Expr.list.l2_distance` | `Expression.euclidean_distance`, `functions.euclidean_distance` |
 | `Expr.list.max` | `Expression.list_bool_or`, `Expression.list_max`, `functions.list_bool_or`, `functions.list_max` |
 | `Expr.list.mean` | `Expression.list_mean`, `functions.list_mean` |
@@ -216,6 +218,7 @@ The following table maps 214 Batcher spellings to the Daft names that compute th
 | `Expr.sum` | `Expression.sum` |
 | `Expr.tan` | `Expression.tan`, `functions.tan` |
 | `Expr.tanh` | `Expression.tanh`, `functions.tanh` |
+| `Expr.to_base` | `functions.bin` |
 | `GroupBy.agg` | `GroupedDataFrame.agg` |
 | `GroupBy.agg` + `Expr.any_value` | `GroupedDataFrame.any_value` |
 | `GroupBy.agg` + `Expr.str.join` | `GroupedDataFrame.string_agg` |

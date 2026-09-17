@@ -108,7 +108,7 @@ The following table maps the 89 names on the `daft.functions` module, sorted alp
 | `arctan2` | `bt.arctan2` | canonical |  |
 | `arctanh` | `Expr.arctanh` | canonical |  |
 | `avg` | `bt.mean` | canonical |  |
-| `bin` | `Expr.to_base` | mismatch | Differs: Daft bin renders negatives as 64-bit two's complement; Batcher to\_base(2) writes '-1'. Param: twos\_complement=True. Wave W0. |
+| `bin` | `Expr.to_base` | canonical |  |
 | `bitwise_and` | `Expr.bitwise_and` | canonical |  |
 | `bitwise_or` | `Expr.bitwise_or` | canonical |  |
 | `bitwise_xor` | `Expr.bitwise_xor` | canonical |  |

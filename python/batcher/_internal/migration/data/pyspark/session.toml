@@ -25,7 +25,7 @@ interruptOperation = { status = "canonical", batcher = "bt.cancel_query" }
 interruptTag = { status = "gap", need = "cancel operations by session tag", wave = "W9" }
 newSession = { status = "canonical", batcher = "bt.Session" }
 profile = { status = "gap", need = "UDF performance and memory profiler results", wave = "W11" }
-range = { status = "mismatch", batcher = "bt.range", note = "Spark names the column 'id'; bt.range names it 'value'. Codemod passes name='id'", wave = "W0", template = 'range(start, end=None, step=1) -> bt.range(start, end, step, name="id")' }
+range = { status = "canonical", batcher = "bt.range", template = 'range(start, end=None, step=1, numPartitions=None) -> bt.range(start, end, step, name="id")' }
 read = { status = "canonical", batcher = "bt.read" }
 readStream = { status = "canonical", batcher = "bt.read" }
 registerProgressHandler = { status = "gap", need = "query progress handler registry for batch queries", wave = "W10" }

@@ -40,7 +40,7 @@ The following table maps the 37 names on `SparkSession`, sorted alphabetically.
 | `interruptTag` | n/a | gap | Not yet: cancel operations by session tag. Wave W9. |
 | `newSession` | `bt.Session` | canonical |  |
 | `profile` | n/a | gap | Not yet: UDF performance and memory profiler results. Wave W11. |
-| `range` | `bt.range` | mismatch | Differs: Spark names the column 'id'; bt.range names it 'value'. Codemod passes name='id'. Wave W0. |
+| `range` | `bt.range` | canonical |  |
 | `read` | `bt.read` | canonical |  |
 | `readStream` | `bt.read` | canonical |  |
 | `registerProgressHandler` | n/a | gap | Not yet: query progress handler registry for batch queries. Wave W10. |

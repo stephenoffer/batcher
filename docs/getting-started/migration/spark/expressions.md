@@ -39,7 +39,7 @@ The following table maps the 36 names on `Column`, sorted alphabetically.
 | `getItem` | `Expr.list.get` + `Expr.map.get` | mismatch | Differs: Spark getItem(-1) on an array is out of bounds (an error under ANSI, the 4.x default; null otherwise); Expr.list.get(-1) returns the last element. Map keys go through Expr.map.get. Wave W0. |
 | `ilike` | `Expr.str.ilike` | canonical |  |
 | `isin` | `Expr.is_in` | alias |  |
-| `isNaN` | `Expr.is_nan` | mismatch | Differs: Spark isNaN(null) is false; Expr.is\_nan(null) is null. Wave W0. |
+| `isNaN` | `Expr.is_nan` | mismatch | Differs: Spark isnan(null) is false; Batcher (DuckDB) returns null. Wave W0. |
 | `isNotNull` | `Expr.is_not_null` | canonical |  |
 | `isNull` | `Expr.is_null` | canonical |  |
 | `like` | `Expr.str.like` | canonical |  |

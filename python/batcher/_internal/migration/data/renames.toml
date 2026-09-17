@@ -117,6 +117,7 @@ or_ = { operator = "or" }
 pow = { operator = "pow" }
 prod = "product"
 rename = "alias"
+rint = { to = "round", fill = ["mode@1='half_to_even'"] }
 skewness = "skew"
 sub = { operator = "sub" }
 truediv = { operator = "truediv" }
@@ -150,6 +151,7 @@ mean_pool = "mean"
 set_difference = "difference"
 set_intersection = "intersect"
 set_union = "union"
+sort_desc = { to = "sort", fill = ["descending@99=True"] }
 
 ["Expr.str"]
 head = "left"
@@ -198,14 +200,15 @@ recentProgress = "recent_progress"
 runId = "run_id"
 
 [bt]
-skewness = "skew"
-n_unique = "count_distinct"
 approx_n_unique = "approx_count_distinct"
+arg_max = "max_by"
+arg_min = "min_by"
 atan2 = "arctan2"
 from_dict = "from_pydict"
 from_dicts = "from_pylist"
 max_horizontal = "greatest"
 min_horizontal = "least"
+n_unique = "count_distinct"
 read_avro = { to = "read.avro" }
 read_csv = { to = "read.csv" }
 read_database = { to = "read.sql", keys = ["query", "uri"] }
@@ -218,6 +221,7 @@ read_ndjson = { to = "read.json" }
 read_orc = { to = "read.orc" }
 read_parquet = { to = "read.parquet" }
 read_table = { to = "read.table" }
+skewness = "skew"
 
 [Trigger]
 AvailableNow = "available_now"

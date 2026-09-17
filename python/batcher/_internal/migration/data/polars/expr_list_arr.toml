@@ -8,10 +8,10 @@ all = { status = "gap", need = "list.all (boolean AND over each list)", wave = "
 any = { status = "gap", need = "list.any (boolean OR over each list)", wave = "W8" }
 arg_max = { status = "canonical", batcher = "Expr.list.arg_max" }
 arg_min = { status = "canonical", batcher = "Expr.list.arg_min" }
-concat = { status = "mismatch", batcher = "Expr.list.concat", note = "a null list concatenated in Polars gives null; Batcher treats it as empty and returns the other side", wave = "W0" }
+concat = { status = "canonical", batcher = "Expr.list.concat", template = 'concat(other) -> self.concat(other, propagate_nulls=True)' }
 contains = { status = "param", batcher = "Expr.list.contains", need = "an Expr item and nulls_equal= (a null item raises today)", wave = "W2" }
 count_matches = { status = "gap", need = "list.count_matches", wave = "W8" }
-diff = { status = "mismatch", batcher = "Expr.list.diff", note = "Polars keeps the integer element type; Batcher returns Float64 elements", wave = "W0" }
+diff = { status = "canonical", batcher = "Expr.list.diff" }
 drop_nulls = { status = "canonical", batcher = "Expr.list.drop_nulls" }
 eval = { status = "param", batcher = "Expr.list.transform", need = "eval with window and aggregation expressions over the element context", wave = "W2" }
 explode = { status = "gap", need = "list.explode (length-changing)", wave = "W8" }
@@ -29,7 +29,7 @@ max = { status = "canonical", batcher = "Expr.list.max" }
 mean = { status = "canonical", batcher = "Expr.list.mean" }
 median = { status = "canonical", batcher = "Expr.list.median" }
 min = { status = "canonical", batcher = "Expr.list.min" }
-n_unique = { status = "mismatch", batcher = "Expr.list.n_unique", note = "Polars counts null as a distinct element; Batcher skips it. Param: count_nulls=True", wave = "W0" }
+n_unique = { status = "canonical", batcher = "Expr.list.n_unique", template = 'n_unique() -> self.n_unique(count_nulls=True)' }
 reverse = { status = "canonical", batcher = "Expr.list.reverse" }
 sample = { status = "gap", need = "list.sample", wave = "W8" }
 set_difference = { status = "alias", batcher = "Expr.list.difference" }
@@ -38,13 +38,13 @@ set_symmetric_difference = { status = "gap", need = "list.set_symmetric_differen
 set_union = { status = "alias", batcher = "Expr.list.union" }
 shift = { status = "gap", need = "list.shift", wave = "W8" }
 slice = { status = "canonical", batcher = "Expr.list.slice" }
-sort = { status = "mismatch", batcher = "Expr.list.sort", note = "Polars places nulls first (nulls_last=False); Batcher places them last, and Batcher's sort takes no descending= (sort_desc instead). Params: descending=, nulls_last=", wave = "W0" }
+sort = { status = "canonical", batcher = "Expr.list.sort", template = 'sort(*, descending=False, nulls_last=False) -> self.sort(descending=descending, nulls_last=nulls_last)' }
 std = { status = "param", batcher = "Expr.list.std", need = "ddof=", wave = "W2" }
-sum = { status = "mismatch", batcher = "Expr.list.sum", note = "Polars sums an empty list to 0; Batcher returns null", wave = "W0" }
+sum = { status = "canonical", batcher = "Expr.list.sum", template = 'sum() -> self.sum(empty_as_zero=True)' }
 tail = { status = "canonical", batcher = "Expr.list.slice" }
 to_array = { status = "gap", need = "list.to_array (fixed-size list)", wave = "W8" }
 to_struct = { status = "gap", need = "list.to_struct", wave = "W8" }
-unique = { status = "mismatch", batcher = "Expr.list.unique", note = "Polars keeps null as a distinct element; Batcher drops it. Param: drop_nulls=False (and maintain_order=)", wave = "W0" }
+unique = { status = "canonical", batcher = "Expr.list.unique", template = 'unique(*, maintain_order=False) -> self.unique(drop_nulls=False)' }
 var = { status = "param", batcher = "Expr.list.var", need = "ddof=", wave = "W2" }
 
 ["Expr.arr"]
@@ -67,15 +67,15 @@ max = { status = "canonical", batcher = "Expr.list.max" }
 mean = { status = "canonical", batcher = "Expr.list.mean" }
 median = { status = "canonical", batcher = "Expr.list.median" }
 min = { status = "canonical", batcher = "Expr.list.min" }
-n_unique = { status = "mismatch", batcher = "Expr.list.n_unique", note = "Polars counts null as a distinct element; Batcher skips it. Param: count_nulls=True", wave = "W0" }
+n_unique = { status = "canonical", batcher = "Expr.list.n_unique", template = 'n_unique() -> self.n_unique(count_nulls=True)' }
 reverse = { status = "canonical", batcher = "Expr.list.reverse" }
 shift = { status = "gap", need = "list.shift", wave = "W8" }
-slice = { status = "mismatch", batcher = "Expr.list.slice", note = "on a fixed_size_list column Batcher's slice returns a null-typed column. Batcher bug", wave = "W0" }
-sort = { status = "mismatch", batcher = "Expr.list.sort", note = "Polars places nulls first (nulls_last=False); Batcher places them last, and Batcher's sort takes no descending= (sort_desc instead). Params: descending=, nulls_last=", wave = "W0" }
+slice = { status = "canonical", batcher = "Expr.list.slice" }
+sort = { status = "canonical", batcher = "Expr.list.sort", template = 'sort(*, descending=False, nulls_last=False) -> self.sort(descending=descending, nulls_last=nulls_last)' }
 std = { status = "param", batcher = "Expr.list.std", need = "ddof=", wave = "W2" }
 sum = { status = "canonical", batcher = "Expr.list.sum" }
 tail = { status = "param", batcher = "Expr.list.slice", need = "as_array= (keep the fixed-size Array type)", wave = "W2" }
 to_list = { status = "gap", need = "arr.to_list (fixed-size to variable list cast)", wave = "W8" }
 to_struct = { status = "gap", need = "list.to_struct", wave = "W8" }
-unique = { status = "mismatch", batcher = "Expr.list.unique", note = "Polars keeps null as a distinct element; Batcher drops it. Param: drop_nulls=False (and maintain_order=)", wave = "W0" }
+unique = { status = "canonical", batcher = "Expr.list.unique", template = 'unique(*, maintain_order=False) -> self.unique(drop_nulls=False)' }
 var = { status = "param", batcher = "Expr.list.var", need = "ddof=", wave = "W2" }

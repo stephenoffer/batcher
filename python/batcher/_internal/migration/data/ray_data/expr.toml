@@ -15,7 +15,7 @@ exp = { status = "canonical", batcher = "Expr.exp" }
 floor = { status = "canonical", batcher = "Expr.floor" }
 get_type = { status = "out_of_scope", reason = "Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection" }
 is_idempotent = { status = "out_of_scope", reason = "Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection" }
-is_in = { status = "mismatch", batcher = "Expr.is_in", note = "Ray is_in is null-safe: a null input returns False, and a None in the list matches a null input. Batcher follows SQL three-valued logic: a null input returns null, and a None in the list makes every non-match null. Port as: col.is_in(vals).fill_null(False), OR col.is_null() when vals holds None.", wave = "W0" }
+is_in = { status = "canonical", batcher = "Expr.is_in", template = 'is_in(values) -> self.is_in(values, nulls_equal=True)' }
 is_not_null = { status = "canonical", batcher = "Expr.is_not_null" }
 is_null = { status = "canonical", batcher = "Expr.is_null" }
 list = { status = "canonical", batcher = "Expr.list" }
@@ -25,10 +25,10 @@ log2 = { status = "canonical", batcher = "Expr.log2" }
 map = { status = "canonical", batcher = "Expr.map" }
 name = { status = "out_of_scope", reason = "Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection" }
 negate = { status = "canonical", batcher = "op:neg" }
-not_in = { status = "mismatch", batcher = ["Expr.is_in", "op:invert"], note = "Ray not_in is null-safe (a null input returns True unless None is listed); Batcher ~col.is_in(vals) returns null for a null input under SQL three-valued logic. Port as: (~col.is_in(vals)).fill_null(True).", wave = "W0" }
+not_in = { status = "canonical", batcher = "Expr.is_in", template = 'not_in(values) -> ~self.is_in(values, nulls_equal=True)' }
 nullable = { status = "out_of_scope", reason = "Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection" }
 power = { status = "canonical", batcher = "op:pow" }
-round = { status = "mismatch", batcher = "Expr.round", note = "Ray round() rounds half to even (2.5 -> 2.0, 0.5 -> 0.0); Batcher rounds half away from zero (2.5 -> 3.0). The restoring mode='half_even' parameter does not exist yet.", wave = "W0" }
+round = { status = "canonical", batcher = "Expr.round", template = 'round() -> self.round(mode="half_to_even")' }
 sign = { status = "canonical", batcher = "Expr.sign" }
 sin = { status = "canonical", batcher = "Expr.sin" }
 str = { status = "canonical", batcher = "Expr.str" }

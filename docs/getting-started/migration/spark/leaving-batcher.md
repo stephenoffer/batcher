@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to PySpark
 
-The following table maps 266 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 272 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
@@ -77,6 +77,7 @@ The following table maps 266 Batcher spellings to the PySpark names that compute
 | `bt.partition_years` | `functions.years` |
 | `bt.percent_rank` | `functions.percent_rank` |
 | `bt.product` | `functions.product` |
+| `bt.range` | `SparkSession.range` |
 | `bt.rank` | `functions.rank` |
 | `bt.read.json` | `DataFrameReader.json` |
 | `bt.read.orc` | `DataFrameReader.orc` |
@@ -193,20 +194,25 @@ The following table maps 266 Batcher spellings to the PySpark names that compute
 | `Expr.exp` | `functions.exp` |
 | `Expr.expm1` | `functions.expm1` |
 | `Expr.fill_null` | `functions.ifnull`, `functions.nvl`, `functions.zeroifnull` |
+| `Expr.hash_bucket` | `functions.bucket` |
 | `Expr.is_in` | `Column.isin` |
 | `Expr.is_not_null` | `Column.isNotNull`, `functions.isnotnull` |
 | `Expr.is_null` | `Column.isNull`, `functions.isnull` |
 | `Expr.json.array_length` | `functions.json_array_length` |
 | `Expr.json.extract_string` | `functions.get_json_object` |
 | `Expr.json.keys` | `functions.json_object_keys` |
+| `Expr.list.contains` | `functions.array_contains` |
 | `Expr.list.difference` | `functions.array_except` |
 | `Expr.list.drop_nulls` | `functions.array_compact` |
+| `Expr.list.flatten` | `functions.flatten` |
 | `Expr.list.intersect` | `functions.array_intersect` |
 | `Expr.list.len` | `functions.array_size` |
 | `Expr.list.len` + `Expr.map.len` | `functions.cardinality`, `functions.size` |
 | `Expr.list.max` | `functions.array_max` |
 | `Expr.list.min` | `functions.array_min` |
+| `Expr.list.position` | `functions.array_position` |
 | `Expr.list.union` | `functions.array_union` |
+| `Expr.list.unique` | `functions.array_distinct` |
 | `Expr.ln` | `functions.ln` |
 | `Expr.log10` | `functions.log10` |
 | `Expr.log1p` | `functions.log1p` |
@@ -217,8 +223,7 @@ The following table maps 266 Batcher spellings to the PySpark names that compute
 | `Expr.map.values` | `functions.map_values` |
 | `Expr.mean` | `functions.avg` |
 | `Expr.radians` | `functions.radians` |
-| `Expr.rint` | `functions.rint` |
-| `Expr.round` | `functions.round` |
+| `Expr.round` | `functions.rint`, `functions.round` |
 | `Expr.safe_divide` | `functions.try_divide` |
 | `Expr.sec` | `functions.sec` |
 | `Expr.sign` | `functions.sign`, `functions.signum` |
@@ -267,6 +272,7 @@ The following table maps 266 Batcher spellings to the PySpark names that compute
 | `Expr.struct.field` | `Column.getField` |
 | `Expr.tan` | `functions.tan` |
 | `Expr.tanh` | `functions.tanh` |
+| `Expr.to_base` | `functions.bin` |
 | `Expr.try_cast` | `Column.try_cast` |
 | `GroupBy.agg` | `GroupedData.agg` |
 | `lshift` operator | `functions.shiftleft` |

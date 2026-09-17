@@ -26,7 +26,7 @@ def test_a_foreign_direction_rewrites_in_place_and_reports(tmp_path, capsys) -> 
     entry = json.loads(report.read_text())[str(script)]
     assert entry["counts"]["marked"] >= 3
     assert {s["action"] for s in entry["sites"]} >= {"rewritten", "marked"}
-    assert "left `Expr.top_k` as written" in capsys.readouterr().err
+    assert "left `Expr.n_unique` as written" in capsys.readouterr().err
 
 
 def test_check_fails_when_a_file_would_change_in_either_direction(tmp_path) -> None:

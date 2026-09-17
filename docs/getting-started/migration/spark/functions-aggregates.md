@@ -84,11 +84,11 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `listagg` | `Expr.str.join` | canonical |  |
 | `listagg_distinct` | `Expr.str.join` | param | Missing: distinct=True. Wave W2. |
 | `max` | `bt.max` | canonical |  |
-| `max_by` | `Expr.arg_max` | param | Missing: renaming the value-by Expr.arg\_max(by) to max\_by, and k= for the top-k values. Wave W0. |
+| `max_by` | `bt.max_by` | param | Missing: k= for the top-k values. Wave W2. |
 | `mean` | `bt.mean` | canonical |  |
 | `median` | `bt.median` | canonical |  |
 | `min` | `bt.min` | canonical |  |
-| `min_by` | `Expr.arg_min` | param | Missing: renaming the value-by Expr.arg\_min(by) to min\_by, and k= for the bottom-k values. Wave W0. |
+| `min_by` | `bt.min_by` | param | Missing: k= for the bottom-k values. Wave W2. |
 | `mode` | `bt.mode` | canonical |  |
 | `nth_value` | `bt.nth_value` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.nth\_value(x, n, ignore\_nulls=...). Wave W0. |
 | `ntile` | `bt.ntile` | canonical |  |

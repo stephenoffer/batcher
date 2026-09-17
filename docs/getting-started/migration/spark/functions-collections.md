@@ -22,15 +22,15 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `array` | `bt.array` | canonical |  |
 | `array_append` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (array\_append). Wave W1. |
 | `array_compact` | `Expr.list.drop_nulls` | canonical |  |
-| `array_contains` | `Expr.list.contains` | mismatch | Differs: Spark returns null when the value is absent and the array holds a null; Expr.list.contains returns false. Spark also accepts a column-valued value. Wave W0. |
-| `array_distinct` | `Expr.list.unique` | mismatch | Differs: Spark keeps one null element; Expr.list.unique drops nulls. Wave W0. |
+| `array_contains` | `Expr.list.contains` | canonical |  |
+| `array_distinct` | `Expr.list.unique` | canonical |  |
 | `array_except` | `Expr.list.difference` | canonical |  |
 | `array_insert` | n/a | gap | Not yet: insert an element at a 1-based (negative from end) position. Wave W3. |
 | `array_intersect` | `Expr.list.intersect` | canonical |  |
 | `array_join` | `Expr.list.join` | param | Missing: null\_replacement= (nulls are skipped today, as in Spark's default). Wave W2. |
 | `array_max` | `Expr.list.max` | canonical |  |
 | `array_min` | `Expr.list.min` | canonical |  |
-| `array_position` | `Expr.list.position` | mismatch | Differs: Spark returns 0 when the value is absent; Expr.list.position returns null. Wave W0. |
+| `array_position` | `Expr.list.position` | canonical |  |
 | `array_prepend` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (array\_prepend). Wave W1. |
 | `array_remove` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (array\_remove). Wave W1. |
 | `array_repeat` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (array\_repeat). Wave W1. |
@@ -46,7 +46,7 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `explode` | `Dataset.explode` | param | Missing: generator usable inside select, and map input producing key/value columns. Wave W8. |
 | `explode_outer` | `Dataset.explode` | param | Missing: generator usable inside select, and map input producing key/value columns. Wave W8. |
 | `filter` | `Expr.list.filter` | param | Missing: Python lambda form, including the (x, i) index form (bt.element() today). Wave W4. |
-| `flatten` | `Expr.list.flatten` | mismatch | Differs: Spark returns null when any inner array is null; Expr.list.flatten skips the null inner array. Wave W0. |
+| `flatten` | `Expr.list.flatten` | canonical |  |
 | `forall` | n/a | gap | Not yet: higher-order function with a Python lambda over array elements (every element matches). Wave W4. |
 | `from_csv` | n/a | gap | Not yet: parse a CSV string column into a struct with a schema. Wave W7. |
 | `from_json` | n/a | gap | Not yet: parse a JSON string column into a typed struct/array/map with a schema. Wave W7. |

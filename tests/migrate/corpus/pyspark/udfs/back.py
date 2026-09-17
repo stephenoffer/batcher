@@ -6,7 +6,7 @@ import batcher as bt
 # batcher-migrate: PySpark `bt.from_pylist` has no exact PySpark spelling; left as written
 df = bt.from_pylist([{"x": 1}, {"x": 2}])
 # batcher-migrate: PySpark `types.IntegerType` is `Expr.cast` in Batcher, but this call does not carry over 1:1
-# batcher-migrate: PySpark `functions.udf` differs in Batcher (`bt.udf`): Spark udf(f, returnType) returns a function applied to columns that yields a Column; bt.udf wraps a batch function applied to a whole Dataset (fn(ds))
+# batcher-migrate: PySpark `functions.udf` differs in Batcher (`bt.udf`): bt.udf(fn)(col) raises instead of evaluating at plan time; port a row UDF as ds.map_batches over Arrow batches, or as an expression
 plus_one = F.udf(lambda v: v + 1, IntegerType())
 
 

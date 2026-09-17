@@ -21,13 +21,13 @@ any_horizontal = { status = "param", batcher = "bt.any_horizontal", need = "bare
 api = { status = "mismatch", batcher = "bt.api", note = "polars.api registers user namespaces; batcher.api is Batcher's internal conductor package. Namespace registration is the gap", wave = "W11" }
 approx_n_unique = { status = "mismatch", batcher = "bt.approx_count_distinct", note = "pl.approx_n_unique(name) counts null as a distinct value: col(name).approx_count_distinct(count_nulls=True)", wave = "W0" }
 arange = { status = "gap", need = "arange expression (int range)", wave = "W6" }
-arctan2 = { status = "mismatch", batcher = "bt.arctan2", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so arctan2('a', 'b') silently computes over the constants. Param: strings as column names (all-null result)", wave = "W0" }
+arctan2 = { status = "canonical", batcher = "bt.arctan2" }
 arctan2d = { status = "gap", need = "arctan2d (degrees)", wave = "W3" }
 arg_sort_by = { status = "gap", need = "arg_sort_by", wave = "W8" }
 arg_where = { status = "gap", need = "arg_where", wave = "W8" }
 build_info = { status = "canonical", batcher = "bt.versions" }
 business_day_count = { status = "gap", need = "business_day_count", wave = "W6" }
-coalesce = { status = "mismatch", batcher = "bt.coalesce", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so coalesce('a', 'b') silently computes over the constants. Param: strings as column names", wave = "W0" }
+coalesce = { status = "canonical", batcher = "bt.coalesce" }
 col = { status = "param", batcher = "bt.col", need = "several names, regex patterns ('^a.*$') and dtypes in one col()", wave = "WF", template = 'col(name) <-> bt.col(name)' }
 collect_all = { status = "gap", need = "collect_all (execute several plans with shared subplans)", wave = "W8" }
 collect_all_async = { status = "gap", need = "collect_all_async", wave = "W8" }

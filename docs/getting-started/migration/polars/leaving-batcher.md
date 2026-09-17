@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 235 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 253 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -33,13 +33,16 @@ The following table maps 235 Batcher spellings to the Polars names that compute 
 | `>=` operator | `Expr.ge` |
 | `>` operator | `Expr.gt` |
 | `\|` operator | `Expr.or_` |
+| `^` operator | `Expr.xor` |
 | `batcher.config.reset_option` | `Config.restore_defaults` |
 | `batcher.config.set_option` | `Config.set_streaming_chunk_size` |
 | `batcher.config.set_verbosity` | `Config.set_verbose` |
 | `bt.all` | `selectors.all` |
+| `bt.arctan2` | `polars.arctan2` |
 | `bt.array_agg` | `polars.implode` |
 | `bt.BatcherError` | `polars.exceptions` |
 | `bt.boolean` | `selectors.boolean` |
+| `bt.coalesce` | `polars.coalesce` |
 | `bt.col` + `Expr.cum_count` | `polars.cum_count` |
 | `bt.concat` | `polars.union` |
 | `bt.contains` | `selectors.contains` |
@@ -129,10 +132,12 @@ The following table maps 235 Batcher spellings to the Polars names that compute 
 | `Expr.arcsinh` | `Expr.arcsinh` |
 | `Expr.arctan` | `Expr.arctan` |
 | `Expr.arctanh` | `Expr.arctanh` |
+| `Expr.arg_max` | `Expr.arg_max` |
+| `Expr.arg_min` | `Expr.arg_min` |
 | `Expr.array_agg` | `Expr.implode` |
 | `Expr.between` | `Expr.is_between` |
 | `Expr.bit_count` | `Expr.bitwise_count_ones` |
-| `Expr.cast` | `polars.Binary`, `polars.Boolean`, `polars.Date`, `polars.Decimal`, `polars.Float64`, `polars.Int64`, `polars.String`, `polars.Utf8` |
+| `Expr.cast` | `polars.Binary`, `polars.Boolean`, `polars.Date`, `polars.Decimal`, `polars.Float16`, `polars.Float32`, `polars.Float64`, `polars.Int16`, `polars.Int32`, `polars.Int64`, `polars.Int8`, `polars.String`, `polars.UInt16`, `polars.UInt32`, `polars.UInt8`, `polars.Utf8` |
 | `Expr.cbrt` | `Expr.cbrt` |
 | `Expr.ceil` | `Expr.ceil` |
 | `Expr.clip` | `Expr.clip` |
@@ -140,6 +145,9 @@ The following table maps 235 Batcher spellings to the Polars names that compute 
 | `Expr.cosh` | `Expr.cosh` |
 | `Expr.cot` | `Expr.cot` |
 | `Expr.count` | `Expr.count` |
+| `Expr.cum_max` | `Expr.cum_max` |
+| `Expr.cum_min` | `Expr.cum_min` |
+| `Expr.cum_sum` | `Expr.cum_sum` |
 | `Expr.degrees` | `Expr.degrees` |
 | `Expr.dt.century` | `Expr.dt.century` |
 | `Expr.dt.date` | `Expr.dt.date` |
@@ -171,6 +179,7 @@ The following table maps 235 Batcher spellings to the Polars names that compute 
 | `Expr.floor` | `Expr.floor` |
 | `Expr.is_duplicated` | `Expr.is_duplicated` |
 | `Expr.is_finite` | `Expr.is_finite` |
+| `Expr.is_in` | `Expr.is_in` |
 | `Expr.is_infinite` | `Expr.is_infinite` |
 | `Expr.is_nan` | `Expr.is_nan` |
 | `Expr.is_not_nan` | `Expr.is_not_nan` |
@@ -180,6 +189,8 @@ The following table maps 235 Batcher spellings to the Polars names that compute 
 | `Expr.kurtosis` | `Expr.kurtosis` |
 | `Expr.list.arg_max` | `Expr.arr.arg_max`, `Expr.list.arg_max` |
 | `Expr.list.arg_min` | `Expr.arr.arg_min`, `Expr.list.arg_min` |
+| `Expr.list.concat` | `Expr.list.concat` |
+| `Expr.list.diff` | `Expr.list.diff` |
 | `Expr.list.difference` | `Expr.list.set_difference` |
 | `Expr.list.drop_nulls` | `Expr.list.drop_nulls` |
 | `Expr.list.filter` | `Expr.list.filter` |
@@ -194,22 +205,29 @@ The following table maps 235 Batcher spellings to the Polars names that compute 
 | `Expr.list.mean` | `Expr.arr.mean`, `Expr.list.mean` |
 | `Expr.list.median` | `Expr.arr.median`, `Expr.list.median` |
 | `Expr.list.min` | `Expr.arr.min`, `Expr.list.min` |
+| `Expr.list.n_unique` | `Expr.arr.n_unique`, `Expr.list.n_unique` |
 | `Expr.list.reverse` | `Expr.arr.reverse`, `Expr.list.reverse` |
-| `Expr.list.slice` | `Expr.list.slice`, `Expr.list.tail` |
-| `Expr.list.sum` | `Expr.arr.sum` |
+| `Expr.list.slice` | `Expr.arr.slice`, `Expr.list.slice`, `Expr.list.tail` |
+| `Expr.list.sort` | `Expr.arr.sort`, `Expr.list.sort` |
+| `Expr.list.sum` | `Expr.arr.sum`, `Expr.list.sum` |
 | `Expr.list.union` | `Expr.list.set_union` |
+| `Expr.list.unique` | `Expr.arr.unique`, `Expr.list.unique` |
 | `Expr.list` | `Expr.arr`, `Expr.list` |
 | `Expr.ln` | `Expr.log` |
 | `Expr.log10` | `Expr.log10` |
 | `Expr.log1p` | `Expr.log1p` |
+| `Expr.max_by` | `Expr.max_by` |
 | `Expr.mean` | `Expr.mean` |
 | `Expr.median` | `Expr.median` |
+| `Expr.min_by` | `Expr.min_by` |
 | `Expr.min` | `Expr.min` |
 | `Expr.pct_change` | `Expr.pct_change` |
 | `Expr.peak_max` | `Expr.peak_max` |
 | `Expr.peak_min` | `Expr.peak_min` |
 | `Expr.quantile` | `Expr.quantile` |
 | `Expr.radians` | `Expr.radians` |
+| `Expr.rank` | `Expr.rank` |
+| `Expr.round` | `Expr.round` |
 | `Expr.sin` | `Expr.sin` |
 | `Expr.sinh` | `Expr.sinh` |
 | `Expr.skew` | `Expr.skew` |

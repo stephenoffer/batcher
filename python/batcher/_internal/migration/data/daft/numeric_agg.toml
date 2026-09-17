@@ -87,7 +87,7 @@ arctan = { status = "canonical", batcher = "Expr.arctan" }
 arctan2 = { status = "canonical", batcher = "bt.arctan2" }
 arctanh = { status = "canonical", batcher = "Expr.arctanh" }
 avg = { status = "canonical", batcher = "bt.mean" }
-bin = { status = "mismatch", batcher = "Expr.to_base", note = "Daft bin renders negatives as 64-bit two's complement; Batcher to_base(2) writes '-1'. Param: twos_complement=True", wave = "W0" }
+bin = { status = "canonical", batcher = "Expr.to_base", template = 'bin(expr) -> sem.column(expr).to_base(2, twos_complement=True)' }
 bitwise_and = { status = "canonical", batcher = "Expr.bitwise_and" }
 bitwise_or = { status = "canonical", batcher = "Expr.bitwise_or" }
 bitwise_xor = { status = "canonical", batcher = "Expr.bitwise_xor" }

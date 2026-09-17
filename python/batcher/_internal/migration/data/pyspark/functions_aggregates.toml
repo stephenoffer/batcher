@@ -37,11 +37,11 @@ lead = { status = "param", batcher = "bt.lead", need = "default= value for rows 
 listagg = { status = "canonical", batcher = "Expr.str.join" }
 listagg_distinct = { status = "param", batcher = "Expr.str.join", need = "distinct=True", wave = "W2" }
 max = { status = "canonical", batcher = "bt.max" }
-max_by = { status = "param", batcher = "Expr.arg_max", need = "renaming the value-by Expr.arg_max(by) to max_by, and k= for the top-k values", wave = "W0" }
+max_by = { status = "param", batcher = "bt.max_by", template = 'max_by(col, ord) -> sem.column(col).max_by(sem.column(ord), ignore_nulls=False)', need = "k= for the top-k values", wave = "W2" }
 mean = { status = "canonical", batcher = "bt.mean" }
 median = { status = "canonical", batcher = "bt.median" }
 min = { status = "canonical", batcher = "bt.min" }
-min_by = { status = "param", batcher = "Expr.arg_min", need = "renaming the value-by Expr.arg_min(by) to min_by, and k= for the bottom-k values", wave = "W0" }
+min_by = { status = "param", batcher = "bt.min_by", template = 'min_by(col, ord) -> sem.column(col).min_by(sem.column(ord), ignore_nulls=False)', need = "k= for the bottom-k values", wave = "W2" }
 mode = { status = "canonical", batcher = "bt.mode" }
 nth_value = { status = "mismatch", batcher = "bt.nth_value", note = "the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.nth_value(x, n, ignore_nulls=...)", wave = "W0" }
 ntile = { status = "canonical", batcher = "bt.ntile" }

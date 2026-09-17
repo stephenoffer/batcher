@@ -24,7 +24,7 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `base64` | `Expr.str.base64` | canonical |  |
 | `bit_length` | `Expr.str.bit_length` | canonical |  |
 | `btrim` | `Expr.str.trim` | canonical |  |
-| `char` | `Expr.chr` | mismatch | Differs: Spark char(n) returns the character for n mod 256 (char(321) is 'A'); Expr.chr returns the Unicode code point (chr(321) is 'Ł'). Wave W0. |
+| `char` | `Expr.chr` | mismatch | Differs: Spark char(n) is chr(n % 256) and empty for a negative n: bt.when(n \< 0).then(bt.lit()).otherwise((n % 256).chr()). Wave W0. |
 | `char_length` | `Expr.str.len_chars` | canonical |  |
 | `character_length` | `Expr.str.len_chars` | canonical |  |
 | `collate` | n/a | gap | Not yet: collation-aware string comparison (collate(col, name)). Wave W14. |
@@ -40,7 +40,7 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `find_in_set` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (find\_in\_set). Wave W1. |
 | `format_number` | n/a | gap | Not yet: format a number with grouping separators to d decimal places. Wave W3. |
 | `format_string` | `bt.format_string` | mismatch | Differs: Spark uses printf-style placeholders (%s, %d, %.2f); bt.format\_string uses \{\} placeholders. Wave W0. |
-| `hash` | `Expr.hash` | mismatch | Differs: Spark hash is 32-bit Murmur3 with seed 42 over one or more columns ('ABC' -\> -757602832); Expr.hash is a different 64-bit hash of one value. Wave W0. |
+| `hash` | `Expr.hash` | mismatch | Differs: port as bt.hash\_rows(\*cols, seed=42, algorithm=murmur3), cast to int32 where Spark's result is IntegerType. Wave W0. |
 | `hex` | `Expr.str.hex` | canonical |  |
 | `ilike` | `Expr.str.ilike` | param | Missing: escapeChar= and a column-valued pattern. Wave W2. |
 | `initcap` | `Expr.str.to_titlecase` | canonical |  |
