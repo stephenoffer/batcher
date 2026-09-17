@@ -525,8 +525,8 @@ async fn read_parquet_async(
     //
     // A `RowFilter` is the only pruning step here that can *lose*: below `MAX_SELECTIVITY` it
     // saves decoding the non-predicate columns of every rejected row, and above it the
-    // fragmented row selection costs more than the decode it skips (measured 1.45x faster at
-    // ~2 % selected, 1.57x *slower* at ~95 %). Nothing in the footer can distinguish the two —
+    // fragmented row selection costs more than the decode it skips (see `MAX_SELECTIVITY`: end to end
+    // a win at 5 % selected, a loss by 10 %, and up to 1.47x slower by 20 %). Nothing in the footer can distinguish the two —
     // a scattered predicate leaves every row group's [min, max] spanning the domain whether it
     // selects 2 % or 95 % — so the only honest input is a measurement.
     //
@@ -1229,8 +1229,8 @@ mod tests {
         write_parquet(&p, &[batch], 25_000);
         let path = p.to_str().unwrap();
 
-        // `a < 10000` over 0..300000 selects 10,000 rows — 3.3 %, comfortably selective.
-        let pred = r#"{"node":"cmp","col":"a","op":"lt","lit":10000}"#;
+        // `a < 3000` over 0..300000 selects 3,000 rows — 1 %, under `MAX_SELECTIVITY`.
+        let pred = r#"{"node":"cmp","col":"a","op":"lt","lit":3000}"#;
         let out = read_parquet_filtered(path, &[], None, 8192, pred).unwrap();
         let mut got: Vec<i64> = out
             .iter()
@@ -1244,7 +1244,7 @@ mod tests {
             })
             .collect();
         got.sort_unstable(); // the file order is a permutation; compare as a set
-        let want: Vec<i64> = (0..10_000).collect();
+        let want: Vec<i64> = (0..3_000).collect();
         assert_eq!(
             got.len(),
             want.len(),
@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(got, want, "values must be exactly the matching rows");
 
         // An AND of two ranges, to exercise the Kleene combination path.
-        let both = r#"{"node":"and","left":{"node":"cmp","col":"a","op":"ge","lit":100},"right":{"node":"cmp","col":"a","op":"lt","lit":5000}}"#;
+        let both = r#"{"node":"and","left":{"node":"cmp","col":"a","op":"ge","lit":100},"right":{"node":"cmp","col":"a","op":"lt","lit":1900}}"#;
         let out2 = read_parquet_filtered(path, &[], None, 8192, both).unwrap();
         let mut got2: Vec<i64> = out2
             .iter()
@@ -1267,7 +1267,7 @@ mod tests {
             })
             .collect();
         got2.sort_unstable();
-        assert_eq!(got2, (100..5000).collect::<Vec<i64>>());
+        assert_eq!(got2, (100..1900).collect::<Vec<i64>>());
 
         // A permissive predicate is declined by the selectivity gate, so it returns the
         // un-filtered superset — still correct, because the engine keeps its own `Filter`.
@@ -1301,9 +1301,9 @@ mod tests {
             row_filter::estimate(&pred, rg, &idx).unwrap()
         };
 
-        // 2 % of the [0, 9999] span sits below 200.
-        let selective = est(r#"{"node":"cmp","col":"a","op":"lt","lit":200}"#);
-        assert!(selective < 0.05, "expected ~0.02, got {selective}");
+        // 0.5 % of the [0, 9999] span sits below 50.
+        let selective = est(r#"{"node":"cmp","col":"a","op":"lt","lit":50}"#);
+        assert!(selective < 0.01, "expected ~0.005, got {selective}");
         assert!(row_filter::worth_it_frac(selective));
 
         // 95 % sits below 9500 — the case that must decline.

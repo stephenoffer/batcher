@@ -3414,6 +3414,60 @@ decoding through a fragmented 12.5% selection costs more than the one payload co
 The end-to-end query does not move, because the filter hands the engine 7.5M rows instead of 60M.
 A width-aware admission rule (payload columns against predicate columns) is the open refinement.
 
+### 27g. Date predicates in the native Parquet reader — built a third time, reverted a third time, and why
+
+TPC-H at sf10 read from Parquet is **1.52x DuckDB** (item 27d's A/B), 21 of 22 queries lose, and
+its worst ratios all filter on a date. `to_native_predicate` refuses temporal literals, so every
+such read falls to pyarrow's per-file filtered scan. The 2026-09-08 attempt at pushing dates was
+reverted because that box could not measure it (q3 was bimodal). This box can: two sandboxes,
+alternating, two rounds, and the spread between rounds sits inside a few percent.
+
+Built: a tagged `{"date": days}` literal, compared only against a column the file declares a
+Parquet `DATE`, in row-group pruning, page-index pruning and the row filter, with Rust tests that a
+plain `INT32` column holding the same day numbers is never pruned by it.
+
+Measured on TPC-H sf10: **0.994 overall**, q6 **0.63x**, q14 0.82x, q21 0.83x, and q3 **1.35x**,
+q7 **1.31x** slower. Decomposed, the loss is not the read that got the date. q3's `lineitem` read
+cost 183 ms natively against 169 ms through pyarrow. It is the *other* reads and the batch shape.
+Pushing dates made the native reader take reads that pyarrow's scanner serves better: a
+date that keeps a third to a half of `lineitem` is decoded whole by the native reader and then
+re-filtered once in Python, where pyarrow decodes and filters in one parallel pass and returns
+fewer, larger batches. q7's engine execute time rose from 60 ms to 103 ms on the same rows.
+
+Two follow-ups were built and measured on the way, and both lost. Filtering decoded batches
+inside each row group's task, in parallel, made q7's `lineitem` read **455-470 ms** against the
+native 322 ms: the filtered batches then come back small and are copied again by the coalescing
+step and again by the Python re-filter. And lowering the row filter's gate to the read-only
+crossover (2 %) turned q6's 0.63x back into 0.94x.
+
+**What would make date pushdown pay is a routing decision, not a literal.** The native reader wins
+when row groups prune or the row filter admits the predicate, and pyarrow's scanner wins on a
+permissive predicate over a wide read. Choosing between them per read from footer statistics is
+the open item, and it is a cost model in the conductor rather than anything in `bc-io`. Do not
+re-add the literal without it.
+
+### 27h. The row filter's selectivity gate was set at half, and the cliff is below a tenth — **landed**
+
+Found while chasing 27g's q3. `bc-io`'s row filter was admitted for any predicate measured under
+50 % selective, from two points on sf1. Across the range on sf10 `lineitem` (60M rows, a scattered
+integer predicate, filter plus aggregate, two builds alternating), the filter is a win at 5 % and a
+loss by 10 %, and at 20-35 % the query ran **1.44-1.47x slower** with it than without. The gate is
+now 8 %: unchanged within 2 % at 1-5 %, and **0.68-0.95x** at 10-35 %. The per-point table is on
+`MAX_SELECTIVITY`, together with the read-only measurement that pointed at 2 % and the end-to-end
+one that overruled it: declining the filter leaves the caller an unfiltered read to re-filter,
+which a read-only benchmark does not charge.
+
+### 27i. A fresh process pays ~850 ms before its first query does any work
+
+Recorded, not addressed. In a fresh interpreter any first query costs 830-880 ms, where DuckDB
+imports and answers `SELECT 1` in 57 ms. `import batcher` is lazy (1 ms), but resolving `bt.read`
+loads **492 Batcher modules** in about 460 ms, and the first `collect()` imports another ~450 ms,
+most of it `pyarrow.dataset` and, through pyarrow's own pandas shim, pandas (~200 ms; any pyarrow
+array built from a Python list imports it, so this part is pyarrow's). No benchmark here sees it,
+because every suite reports a warm best-of-N. It decides every short script, notebook cell and CLI
+run, and it is a lazy-import refactor across the reader namespace and the orchestration imports
+rather than an engine change.
+
 ### What this pass did not do, and where the single-node gap now is
 
 The sf10 decomposition in `BENCHMARK_RESULTS.md` (2026-09-08) put the loss in the Parquet reader,

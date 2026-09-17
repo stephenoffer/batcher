@@ -271,11 +271,30 @@ pub(crate) fn mask_of(pred: &Pred, batch: &RecordBatch) -> BooleanArray {
 /// runs, and decoding through that is markedly slower than decoding straight through while
 /// saving almost nothing, because almost nothing is skipped.
 ///
-/// Measured on TPC-H sf1 `lineitem` (6M rows, 16 columns, 49 row groups), scattered `l_suppkey`
-/// predicate, full projection: at ~2 % selected the filter runs **127.6 ms → 88.0 ms**; at
-/// ~95 % selected it runs **179.3 ms → 282.1 ms**. The crossover is broad and flat, so this
-/// sits well clear of it on the safe side.
-const MAX_SELECTIVITY: f64 = 0.5;
+/// **The cliff is below a tenth, not at half.** This was 0.5, set from two points on sf1
+/// `lineitem` (2 % faster, 95 % slower) on the reading that the crossover between them was
+/// "broad and flat". Measured across it on sf10 `lineitem` (60M rows, 490 row groups, one file,
+/// a scattered `l_partkey < k` predicate), it is neither. Two measurements, because they
+/// disagree and the second is the one that decides:
+///
+/// * **The read alone**, filter on against off on one binary: the filter is already 1.1x slower
+///   at 3 % on a narrow payload and 1.4-1.9x slower at 10 %. Taken alone that puts the cliff
+///   near 2 %.
+/// * **The whole query**, two builds alternating over two rounds, a filter plus an aggregate.
+///   Declining the filter hands the caller an unfiltered read to re-filter, which the read-only
+///   figure does not charge, and that moves the crossover up. With 0.02 the query was 1.10-1.34x
+///   slower at 3-5 %, so the gate belongs above that; with this value, against the old 0.5:
+///
+/// | selected | narrow payload | wide payload |
+/// |---|---|---|
+/// | 1-5 % | 0.99-1.01x | 1.00-1.02x |
+/// | 10 % | 0.87x | 0.95x |
+/// | 20 % | 0.69x | 0.68x |
+/// | 35 % | 0.68x | 0.72x |
+///
+/// Unchanged where the filter pays, and up to 1.47x faster where it did not. The old value's cost
+/// reached TPC-H: q3 at sf10 installed the filter on a ~20 % predicate over `customer`.
+const MAX_SELECTIVITY: f64 = 0.08;
 
 /// Whether a measured selected-fraction is low enough for the filter to pay.
 pub(crate) fn worth_it(selected: usize, total: usize) -> bool {

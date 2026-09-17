@@ -28850,3 +28850,31 @@ a cached subplan) and q22 (0.79x) are the only wins. The single-node gap to Duck
 scan, as the 2026-09-08 decomposition said, and on this 48-core box it is decode CPU rather than
 idle cores. Three `lineitem` columns cost 4.1 CPU-seconds to decode natively against 2.6 for
 DuckDB to decode *and* sum them.
+
+### The Parquet row filter's gate, recalibrated from 50 % to 8 %
+
+Same box, same local sf10 mirror. A filter plus an aggregate over `lineitem` (60M rows, one file,
+490 row groups), `l_partkey < k` for a scattered predicate at a chosen selectivity; the build with
+the new gate against the build with the old one, alternating, two rounds, best of 4 per query.
+
+| selected | narrow (`sum` of one column) | wide (four aggregates, two string columns) |
+|---|---:|---:|
+| 1 % | 0.99x | 1.01x |
+| 3 % | 1.01x | 1.00x |
+| 5 % | 1.01x | 1.02x |
+| 10 % | 0.87x | 0.95x |
+| 20 % | **0.69x** | **0.68x** |
+| 35 % | **0.68x** | **0.72x** |
+
+A read-only sweep (the native reader alone, filter on against off) put the crossover near 2 %, and
+a 2 % gate was built and measured first: it made the same queries **1.10-1.34x slower** at 3-5 %,
+because declining the filter leaves the caller an unfiltered read to re-filter, which the read-only
+sweep did not charge. Recorded so the next reader tunes against a whole query.
+
+TPC-H sf10 from Parquet, the two builds alternating over two rounds: geomean **1.008**, every
+correctness check passing. The largest single-query movements are q10 0.75x and q21 1.15x, whose
+own before-arm varied 970-1,137 ms between rounds.
+
+A date-literal pushdown into the native reader was built and measured on the same harness in the
+same session (0.994 overall; q6 0.63x, q3 1.35x, q7 1.31x) and reverted. Review item 27g has the
+decomposition.
