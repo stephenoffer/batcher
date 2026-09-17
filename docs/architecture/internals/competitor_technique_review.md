@@ -3569,6 +3569,22 @@ sources in `/mnt/shared_storage/ref`:
   bit-packed codes are unpacked 32 at a time and compared as a word. No value is materialized
   for a row the predicate rejects, and the mask becomes `Filter::Mask` for the other columns.
 
+The other three engines in `/mnt/shared_storage/ref` do not filter while decoding by default,
+and the two built on arrow-rs are why that is not an accident:
+
+- **DataFusion** decodes through the same arrow-rs `ParquetRecordBatchStream` Batcher does, and
+  its late materialization is that crate's `RowFilter` (`datasource-parquet/src/row_filter.rs`).
+  It ships **off**: `pushdown_filters: bool, default = false` in `common/src/config.rs`.
+- **Daft** decodes through arrow-rs as well (`daft-parquet/src/read.rs`), and nothing in
+  `daft-parquet` builds a `RowFilter`, so it decodes and filters afterwards, as Batcher's 27j
+  route does.
+- **Spark**'s record-level Parquet filter, `spark.sql.parquet.recordLevelFilter.enabled`, is
+  `false` by default and applies only when the vectorized reader is *disabled* (`SQLConf.scala`).
+
+So the split is by who owns the decoder: the two engines with their own (DuckDB, Polars) filter
+inside it, and the ones on a shared decoder decode first. Batcher's measured default in 27h and
+27j agrees with DataFusion's and Daft's.
+
 Why it matters on TPC-H: every low-cardinality `lineitem` column is dictionary-encoded in the
 sf10 mirror (`l_shipmode`, `l_returnflag`, `l_shipinstruct`, and the three dates, all
 `PLAIN_DICTIONARY`), and they are exactly the filter and group columns of q1, q12, q19 and q21.
