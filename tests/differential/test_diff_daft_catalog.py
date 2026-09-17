@@ -7,6 +7,10 @@ compares what each engine reports. It checks the *shape* of the API — which na
 what they list — and the rows, not Daft's identifier objects: Daft returns `Identifier`,
 Batcher a dotted string, and the comparison is on the strings.
 
+Daft is the oracle here, not DuckDB: DuckDB has no Python catalog object to hold these calls
+against. The SQL spelling of the same operations is checked against DuckDB in
+`test_diff_sql_catalog_tables.py`.
+
 One naming difference is visible here by design. Daft's session lists tables fully
 qualified (``mem.ns.t``); `SessionCatalog.list_tables` lists them relative to the current
 catalog (``ns.t``), as `Catalog.list_tables` does in both engines.

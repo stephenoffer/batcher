@@ -60,10 +60,38 @@ session holds is control-plane metadata, so registering a table executes nothing
 .. autoclass:: batcher.Session
    :members:
    :member-order: groupwise
+
+.. autofunction:: batcher.current_session
+
+.. autofunction:: batcher.set_session
+```
+
+## Catalogs and tables
+
+A {py:class}`Catalog <batcher.Catalog>` holds namespaces of tables over one storage backend:
+in memory, a directory of Delta tables, or a pyiceberg catalog. A session reaches the catalogs
+it has attached through `session.catalog`, a {py:class}`SessionCatalog
+<batcher.api.catalog.SessionCatalog>` that also tracks the current catalog and namespace.
+{py:class}`Table <batcher.Table>` is a handle on one table, and a write to it is
+{py:meth}`ds.write.table <batcher.api.io_namespace.writer.Writer.table>`.
+{doc}`/user-guide/moving-data/catalogs-and-tables` is the worked introduction.
+
+```{eval-rst}
+.. autoclass:: batcher.Catalog
+   :members:
+   :member-order: groupwise
+
+.. autoclass:: batcher.api.catalog.SessionCatalog
+   :members:
+   :member-order: groupwise
+
+.. autoclass:: batcher.Table
+   :members:
 ```
 
 ## See also
 
 - {doc}`/api/operations/governance`: the same types with the enforcement model explained, plus residency and the verifiers.
 - {doc}`/api/relational/sql`: what a `Session` runs once you've registered a table on it.
+- {doc}`/user-guide/moving-data/catalogs-and-tables`: catalogs, namespaces and table writes, worked through.
 - {doc}`/user-guide/trust/governance`: the worked introduction, from a first policy to an audit trail.

@@ -135,6 +135,7 @@ These commit through the table's transaction log rather than writing loose files
 | {py:meth}`ds.write.iceberg(table, mode="append") <batcher.api.io_namespace.writer.Writer.iceberg>` | an Iceberg table (`append` / `overwrite`) | |
 | {py:meth}`ds.write.hudi(path, mode="append") <batcher.api.io_namespace.writer.Writer.hudi>` | an Apache Hudi table | |
 | {py:meth}`ds.write.lance(path) <batcher.api.io_namespace.writer.Writer.lance>` | a Lance dataset | `lance` |
+| {py:meth}`ds.write.table(name, mode="error") <batcher.api.io_namespace.writer.Writer.table>` | a catalog table by name, with a save mode (see {doc}`/user-guide/moving-data/catalogs-and-tables`) | |
 | {py:meth}`ds.write.merge(target, on=) <batcher.api.io_namespace.writer.Writer.merge>` | upsert (`MERGE INTO`) this dataset into an existing `target`, keyed on `on` | |
 | {py:meth}`ds.write.merge_into(target, on=) <batcher.api.io_namespace.writer.Writer.merge_into>` | the full `MERGE INTO`: ordered `WHEN` clauses, each writing its own columns | |
 
