@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 263 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 272 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -98,6 +98,7 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `Dataset.columns` | `DataFrame.columns`, `LazyFrame.columns` |
 | `Dataset.count` | `DataFrame.height` |
 | `Dataset.distinct` | `DataFrame.unique`, `LazyFrame.unique` |
+| `Dataset.drop_nans` | `DataFrame.drop_nans`, `LazyFrame.drop_nans` |
 | `Dataset.drop_nulls` | `DataFrame.drop_nulls`, `LazyFrame.drop_nulls` |
 | `Dataset.dtypes` | `DataFrame.dtypes`, `LazyFrame.dtypes` |
 | `Dataset.filter` | `DataFrame.filter`, `LazyFrame.filter` |
@@ -106,6 +107,7 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `Dataset.is_empty` | `DataFrame.is_empty` |
 | `Dataset.iter_batches` | `LazyFrame.sink_batches` |
 | `Dataset.iter_rows` | `DataFrame.iter_rows`, `DataFrame.rows` |
+| `Dataset.join_where` | `DataFrame.join_where`, `LazyFrame.join_where` |
 | `Dataset.limit` | `DataFrame.head`, `DataFrame.limit`, `DataFrame.slice`, `LazyFrame.head`, `LazyFrame.limit`, `LazyFrame.slice` |
 | `Dataset.null_count` | `DataFrame.null_count`, `LazyFrame.null_count` |
 | `Dataset.pipe` | `DataFrame.pipe`, `LazyFrame.pipe` |
@@ -119,7 +121,7 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `Dataset.to_pandas` | `DataFrame.to_pandas` |
 | `Dataset.to_pylist` | `DataFrame.to_dicts` |
 | `Dataset.top_k` | `DataFrame.top_k`, `LazyFrame.top_k` |
-| `Dataset.union` | `DataFrame.extend`, `DataFrame.vstack` |
+| `Dataset.union` | `DataFrame.extend`, `DataFrame.merge_sorted`, `DataFrame.vstack`, `LazyFrame.merge_sorted` |
 | `Dataset.unpivot` | `DataFrame.melt`, `DataFrame.unpivot`, `LazyFrame.melt`, `LazyFrame.unpivot` |
 | `Dataset.width` | `DataFrame.width`, `LazyFrame.width` |
 | `Dataset.with_columns` | `DataFrame.with_columns`, `LazyFrame.with_columns` |
@@ -226,6 +228,12 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `Expr.max` | `Expr.max` |
 | `Expr.mean` | `Expr.mean` |
 | `Expr.median` | `Expr.median` |
+| `Expr.meta.has_multiple_outputs` | `Expr.meta.has_multiple_outputs` |
+| `Expr.meta.is_column` | `Expr.meta.is_column` |
+| `Expr.meta.output_name` | `Expr.meta.output_name` |
+| `Expr.meta.root_names` | `Expr.meta.root_names` |
+| `Expr.meta.tree_format` | `Expr.meta.tree_format` |
+| `Expr.meta` | `Expr.meta` |
 | `Expr.min_by` | `Expr.min_by` |
 | `Expr.min` | `Expr.min` |
 | `Expr.pct_change` | `Expr.pct_change` |
@@ -271,6 +279,7 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `Expr.tanh` | `Expr.tanh` |
 | `GroupBy.agg` | `GroupBy.agg`, `LazyGroupBy.agg` |
 | `GroupBy.array_agg` | `GroupBy.all`, `LazyGroupBy.all` |
+| `GroupBy.having` | `GroupBy.having`, `LazyGroupBy.having` |
 | `GroupBy.len` | `GroupBy.len`, `LazyGroupBy.len` |
 | `GroupBy.mean` | `GroupBy.mean`, `LazyGroupBy.mean` |
 | `GroupBy.median` | `GroupBy.median`, `LazyGroupBy.median` |

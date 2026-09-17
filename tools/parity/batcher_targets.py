@@ -93,7 +93,19 @@ def receivers() -> dict[str, Any]:
         "StreamingQueryListener": bt.StreamingQueryListener,
         "Config": bt.Config,
     }
-    for ns in ("str", "dt", "list", "struct", "json", "map", "image", "audio", "video", "seq"):
+    for ns in (
+        "str",
+        "dt",
+        "list",
+        "struct",
+        "json",
+        "map",
+        "meta",
+        "image",
+        "audio",
+        "video",
+        "seq",
+    ):
         out[f"Expr.{ns}"] = type(getattr(col, ns))
     for mod in _SUBPACKAGES:
         out[mod] = importlib.import_module(mod)

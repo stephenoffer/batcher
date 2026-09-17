@@ -57,7 +57,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `datetime` | `bt.make_timestamp` | param | Missing: microsecond=, time\_unit=, time\_zone=, ambiguous=. Wave W2. |
 | `datetime_range` | `bt.date_range` | mismatch | Differs: Polars datetime\_range is an expression; Batcher's date\_range returns a one-column Dataset. Wave W6. |
 | `datetime_ranges` | n/a | gap | Not yet: datetime\_ranges (per-row list of datetimes). Wave W6. |
-| `defer` | n/a | gap | Not yet: defer (lazy frame from a Python callable with a schema). Wave W8. |
+| `defer` | `bt.from_batches` | param | Missing: port as bt.from\_batches(factory, schema). Wave W8. |
 | `disable_string_cache` | n/a | out of scope | Declined: no global Categorical string cache: Arrow dictionaries are per batch. |
 | `dtype_of` | n/a | gap | Not yet: dtype\_of (dtype expression). Wave W11. |
 | `duration` | n/a | gap | Not yet: duration expression (needs a Duration kernel family). Wave W6. |
@@ -102,7 +102,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `mean` | `bt.mean` | canonical |  |
 | `mean_horizontal` | `bt.mean_horizontal` | param | Missing: bare string arguments as column names (rejected today). Wave W2. |
 | `median` | `bt.median` | canonical |  |
-| `merge_sorted` | n/a | gap | Not yet: merge\_sorted. Wave W8. |
+| `merge_sorted` | `Dataset.union` | param | Missing: a list of frames; port as union of each then sort(key). Wave W8. |
 | `min` | `bt.min` | canonical |  |
 | `min_horizontal` | `bt.least` | mismatch | Differs: Polars reads a bare string as a column name and skips NaN; port as bt.least(bt.col(a), bt.col(b)), which reads a bare string as a literal. Wave W0. |
 | `n_unique` | `bt.count_distinct` | mismatch | Differs: pl.n\_unique(name) counts null as a distinct value: col(name).count\_distinct(count\_nulls=True). Wave W0. |

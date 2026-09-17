@@ -55,6 +55,7 @@ SURFACE_RECEIVERS: dict[tuple[str, str], str] = {
     ("polars", "Expr.dt"): "Expr.dt",
     ("polars", "Expr.list"): "Expr.list",
     ("polars", "Expr.struct"): "Expr.struct",
+    ("polars", "Expr.meta"): "Expr.meta",
     ("polars", "polars"): "bt",
     ("polars", "SQLContext"): "Session",
     ("daft", "DataFrame"): "Dataset",

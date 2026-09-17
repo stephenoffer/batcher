@@ -48,7 +48,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `dtypes` | `Dataset.dtypes` | mismatch | Differs: Spark returns \[(name, 'bigint'), ...\] pairs of DDL type strings; Batcher returns a list of pyarrow DataTypes without names. Wave W0. |
 | `exceptAll` | `Dataset.except_` | canonical |  |
 | `executionInfo` | n/a | gap | Not yet: post-execution metrics object on the Dataset (Dataset.stats re-executes instead). Wave W8. |
-| `exists` | n/a | gap | Not yet: EXISTS subquery as a boolean column. Wave W8. |
+| `exists` | `Dataset.join` | param | Missing: an outer reference in a correlated subquery; port as join(other, how=semi). Wave W8. |
 | `explain` | `Dataset.explain` | mismatch | Differs: Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str. Wave W0. |
 | `fillna` | `Dataset.fill_null` | canonical |  |
 | `filter` | `Dataset.filter` | canonical |  |
@@ -61,7 +61,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `groupingSets` | `Dataset.grouping_sets` | canonical |  |
 | `head` | `Dataset.limit` + `Dataset.to_pylist` | mismatch | Differs: Spark head(n) eagerly returns list\[Row\] (head() returns one Row); Batcher returns a lazy Dataset. Codemod: .limit(n).to\_pylist(). Wave W0. |
 | `hint` | n/a | out of scope | Declined: no optimizer hint IR; Kyber chooses join strategies from measured statistics (revisit). |
-| `inputFiles` | n/a | gap | Not yet: list the files backing a Dataset. Wave W8. |
+| `inputFiles` | `Dataset.meta` | param | Missing: port as \[f.path for f in ds.meta.storage.files\]. Wave W8. |
 | `intersect` | `Dataset.intersect` | canonical |  |
 | `intersectAll` | `Dataset.intersect` | canonical |  |
 | `isEmpty` | `Dataset.is_empty` | canonical |  |
@@ -118,7 +118,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `toLocalIterator` | `Dataset.iter_rows` | mismatch | Differs: Spark yields Row objects partition by partition; Batcher yields tuples (or dicts with named=True). Wave W0. |
 | `toPandas` | `Dataset.to_pandas` | canonical |  |
 | `transform` | `Dataset.pipe` | canonical |  |
-| `transpose` | n/a | gap | Not yet: transpose rows into columns keyed by an index column. Wave W8. |
+| `transpose` | `Dataset.transpose` | param | Missing: Spark's index column argument; port as transpose(column\_names=idx, include\_header=True, header\_name=key). Wave W8. |
 | `union` | `Dataset.union` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
 | `unionAll` | `Dataset.union` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
 | `unionByName` | `Dataset.union` | param | Missing: match columns by name in any order, and allowMissingColumns= filling absent columns with null. Wave W2. |

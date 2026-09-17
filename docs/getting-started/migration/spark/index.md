@@ -60,7 +60,7 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 152 | 56 | 44 | 26 | 20 | 6 |
+| {doc}`dataframe` | 152 | 56 | 47 | 26 | 17 | 6 |
 | {doc}`expressions` | 36 | 27 | 2 | 4 | 3 | 0 |
 | {doc}`functions-aggregates` | 135 | 49 | 13 | 5 | 68 | 0 |
 | {doc}`functions-collections` | 90 | 26 | 13 | 5 | 46 | 0 |

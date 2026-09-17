@@ -33,7 +33,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `describe` | `Dataset.describe` | mismatch | Differs: Daft describe() returns the schema as a DataFrame (column\_name, type); Batcher describe() returns summary statistics. Rewrite: Dataset.schema. Wave W0. |
 | `distinct` | `Dataset.distinct` | canonical |  |
 | `drop_duplicates` | `Dataset.distinct` | canonical |  |
-| `drop_nan` | n/a | gap | Not yet: drop rows holding NaN in any (or the given) float columns. Wave W8. |
+| `drop_nan` | `Dataset.drop_nans` | canonical |  |
 | `drop_null` | `Dataset.drop_nulls` | canonical |  |
 | `except_all` | `Dataset.except_` | canonical |  |
 | `except_distinct` | `Dataset.except_` | canonical |  |

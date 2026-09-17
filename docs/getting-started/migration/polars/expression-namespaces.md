@@ -279,17 +279,17 @@ The following table maps the 17 names on `Expr.meta`, sorted alphabetically.
 | `as_expression` | n/a | gap | Not yet: meta.as\_expression expression introspection. Wave W8. |
 | `as_selector` | n/a | gap | Not yet: meta.as\_selector expression introspection. Wave W8. |
 | `eq` | n/a | gap | Not yet: meta.eq expression introspection. Wave W8. |
-| `has_multiple_outputs` | n/a | gap | Not yet: meta.has\_multiple\_outputs expression introspection. Wave W8. |
-| `is_column` | n/a | gap | Not yet: meta.is\_column expression introspection. Wave W8. |
+| `has_multiple_outputs` | `Expr.meta.has_multiple_outputs` | canonical |  |
+| `is_column` | `Expr.meta.is_column` | canonical |  |
 | `is_column_selection` | n/a | gap | Not yet: meta.is\_column\_selection expression introspection. Wave W8. |
 | `is_literal` | n/a | gap | Not yet: meta.is\_literal expression introspection. Wave W8. |
 | `is_regex_projection` | n/a | gap | Not yet: meta.is\_regex\_projection expression introspection. Wave W8. |
 | `ne` | n/a | gap | Not yet: meta.ne expression introspection. Wave W8. |
-| `output_name` | n/a | gap | Not yet: meta.output\_name expression introspection. Wave W8. |
+| `output_name` | `Expr.meta.output_name` | canonical |  |
 | `pop` | n/a | gap | Not yet: meta.pop expression introspection. Wave W8. |
-| `root_names` | n/a | gap | Not yet: meta.root\_names expression introspection. Wave W8. |
+| `root_names` | `Expr.meta.root_names` | canonical |  |
 | `serialize` | `Expr.to_ir` | param | Missing: a stable serialized form (bytes/JSON string) that round-trips through deserialize. Wave W8. |
 | `show_graph` | n/a | gap | Not yet: meta.show\_graph expression introspection. Wave W8. |
-| `tree_format` | n/a | gap | Not yet: meta.tree\_format expression introspection. Wave W8. |
+| `tree_format` | `Expr.meta.tree_format` | canonical |  |
 | `undo_aliases` | n/a | gap | Not yet: meta.undo\_aliases expression introspection. Wave W8. |
 | `write_json` | `Expr.to_ir` | param | Missing: JSON string output of the expression IR. Wave W8. |

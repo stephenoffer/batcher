@@ -49,7 +49,7 @@ date_ranges = { status = "gap", need = "date_ranges (per-row list of dates)", wa
 datetime = { status = "param", batcher = "bt.make_timestamp", need = "microsecond=, time_unit=, time_zone=, ambiguous=", wave = "W2" }
 datetime_range = { status = "mismatch", batcher = "bt.date_range", note = "Polars datetime_range is an expression; Batcher's date_range returns a one-column Dataset", wave = "W6" }
 datetime_ranges = { status = "gap", need = "datetime_ranges (per-row list of datetimes)", wave = "W6" }
-defer = { status = "gap", need = "defer (lazy frame from a Python callable with a schema)", wave = "W8" }
+defer = { status = "param", batcher = "bt.from_batches", need = "port as bt.from_batches(factory, schema)", wave = "W8" }
 disable_string_cache = { status = "out_of_scope", reason = "no global Categorical string cache: Arrow dictionaries are per batch" }
 dtype_of = { status = "gap", need = "dtype_of (dtype expression)", wave = "W11" }
 duration = { status = "gap", need = "duration expression (needs a Duration kernel family)", wave = "W6" }
@@ -91,7 +91,7 @@ max_horizontal = { status = "mismatch", batcher = "bt.greatest", note = "Polars 
 mean = { status = "canonical", batcher = "bt.mean" }
 mean_horizontal = { status = "param", batcher = "bt.mean_horizontal", need = "bare string arguments as column names (rejected today)", wave = "W2" }
 median = { status = "canonical", batcher = "bt.median" }
-merge_sorted = { status = "gap", need = "merge_sorted", wave = "W8" }
+merge_sorted = { status = "param", batcher = "Dataset.union", need = "a list of frames; port as union of each then sort(key)", wave = "W8" }
 min = { status = "canonical", batcher = "bt.min" }
 min_horizontal = { status = "mismatch", batcher = "bt.least", note = "Polars reads a bare string as a column name and skips NaN; port as bt.least(bt.col(a), bt.col(b)), which reads a bare string as a literal", wave = "W0" }
 n_unique = { status = "mismatch", batcher = "bt.count_distinct", note = "pl.n_unique(name) counts null as a distinct value: col(name).count_distinct(count_nulls=True)", wave = "W0" }

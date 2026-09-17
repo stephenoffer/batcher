@@ -7,7 +7,7 @@ approx_n_unique = { status = "mismatch", batcher = "Dataset.approx_count_distinc
 bottom_k = { status = "canonical", batcher = "Dataset.bottom_k" }
 cache = { status = "canonical", batcher = "Dataset.cache" }
 cast = { status = "canonical", batcher = "Dataset.cast" }
-clear = { status = "param", batcher = "Dataset.limit", need = "clear(n) returning n all-null rows with the same schema (limit(0) covers n=0)", wave = "W8" }
+clear = { status = "param", batcher = "Dataset.limit", need = "clear(n) with n > 0 null rows; clear() is limit(0)", wave = "W8" }
 clone = { status = "out_of_scope", reason = "a Dataset is an immutable plan handle, so a copy is the same object" }
 collect = { status = "mismatch", batcher = "Dataset.collect", note = "Polars returns a DataFrame; Batcher returns a pyarrow.Table (wrap with pl.from_arrow)", wave = "W0", template = 'collect() -> self.cache()' }
 collect_async = { status = "gap", need = "Dataset.collect_async", wave = "W8" }
@@ -18,7 +18,7 @@ count = { status = "mismatch", batcher = "Dataset.count", note = "Polars count()
 describe = { status = "param", batcher = "Dataset.describe", need = "interpolation= for the percentile rows", wave = "W2" }
 deserialize = { status = "gap", need = "Dataset.deserialize (plan from serialized bytes/JSON)", wave = "W8" }
 drop = { status = "param", batcher = "Dataset.drop", need = "strict= (raise on a missing column)", wave = "W2" }
-drop_nans = { status = "gap", need = "Dataset.drop_nans (drop rows holding NaN)", wave = "W5" }
+drop_nans = { status = "canonical", batcher = "Dataset.drop_nans" }
 drop_nulls = { status = "canonical", batcher = "Dataset.drop_nulls" }
 dtypes = { status = "canonical", batcher = "Dataset.dtypes" }
 explain = { status = "param", batcher = "Dataset.explain", need = "optimized=, tree_format= (format= exists)", wave = "W2" }
@@ -36,26 +36,26 @@ inspect = { status = "gap", need = "Dataset.inspect (print the frame mid-plan)",
 interpolate = { status = "gap", need = "Dataset.interpolate (every numeric column)", wave = "W5" }
 join = { status = "mismatch", batcher = "Dataset.join", note = "on how='full' Polars keeps both key columns (key, key_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=", wave = "W0", template = 'join(other, on=None, how="inner", *, left_on=None, right_on=None, suffix="_right", coalesce=None) -> self.join(other, sem.join_keys(on), how=sem.polars_how(how, coalesce), left_on=left_on, right_on=right_on, suffix=suffix)' }
 join_asof = { status = "param", batcher = "Dataset.join_asof", need = "strategy= ('backward'/'forward'/'nearest'), coalesce=, check_sortedness=", wave = "W2" }
-join_where = { status = "gap", need = "Dataset.join_where (inequality join over the existing range-join runtime)", wave = "W5" }
+join_where = { status = "canonical", batcher = "Dataset.join_where" }
 last = { status = "mismatch", batcher = "Dataset.last", note = "Polars LazyFrame.last() is a one-row LazyFrame; Batcher's last() executes and returns a tuple", wave = "W0" }
 lazy = { status = "canonical", batcher = "Dataset", template = 'lazy() -> self' }
 limit = { status = "canonical", batcher = "Dataset.limit" }
 map_batches = { status = "mismatch", batcher = "Dataset.map_batches", note = "Polars passes the whole DataFrame to fn once; Batcher calls fn per Arrow batch", wave = "W0" }
-match_to_schema = { status = "gap", need = "Dataset.match_to_schema", wave = "W8" }
+match_to_schema = { status = "param", batcher = "Dataset.match_to_schema", need = "struct field options and integer_cast/float_cast", wave = "W8" }
 max = { status = "param", batcher = "Dataset.max", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 mean = { status = "param", batcher = "Dataset.mean", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 median = { status = "param", batcher = "Dataset.median", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 melt = { status = "canonical", batcher = "Dataset.unpivot" }
-merge_sorted = { status = "gap", need = "Dataset.merge_sorted", wave = "W8" }
+merge_sorted = { status = "canonical", batcher = "Dataset.union", template = 'merge_sorted(other, key) -> self.union(other).sort(key)' }
 min = { status = "param", batcher = "Dataset.min", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 null_count = { status = "canonical", batcher = "Dataset.null_count" }
 pipe = { status = "canonical", batcher = "Dataset.pipe" }
-pipe_with_schema = { status = "gap", need = "Dataset.pipe_with_schema", wave = "W8" }
+pipe_with_schema = { status = "param", batcher = "Dataset.pipe", need = "the schema argument: Batcher's pipe passes only the Dataset; read ds.schema inside the function", wave = "W8" }
 pivot = { status = "param", batcher = "Dataset.pivot", need = "positional on=, several on columns, on_columns=, separator=, an expression aggregate_function=", wave = "W2" }
 profile = { status = "mismatch", batcher = "Dataset.profile", note = "Polars profile() returns (result, per-node timings); Batcher's profile() is a per-column data-quality profile. Timings are Dataset.explain(analyze=True)", wave = "W0" }
 quantile = { status = "mismatch", batcher = "Dataset.quantile", note = "Polars returns a one-row frame over every column and defaults to interpolation='nearest'; Batcher takes one column and interpolates linearly. Params: all-columns form, interpolation=", wave = "W0" }
 remote = { status = "out_of_scope", reason = "Polars Cloud remote execution" }
-remove = { status = "gap", need = "Dataset.remove (inverse filter with null-as-keep semantics)", wave = "W8" }
+remove = { status = "param", batcher = "Dataset.filter", need = "several predicates and **constraints in one call; port as filter(~bt.coalesce(pred, bt.lit(False)))", wave = "W8" }
 rename = { status = "param", batcher = "Dataset.rename", need = "strict= (raise on a missing column)", wave = "W2" }
 reverse = { status = "canonical", batcher = "Dataset.reverse" }
 rolling = { status = "gap", need = "Dataset.rolling (frame-level rolling group-by)", wave = "W5" }
@@ -84,7 +84,7 @@ top_k = { status = "canonical", batcher = "Dataset.top_k" }
 unique = { status = "canonical", batcher = "Dataset.distinct" }
 unnest = { status = "param", batcher = "Dataset.unnest", need = "separator= (prefix the field names)", wave = "W2" }
 unpivot = { status = "canonical", batcher = "Dataset.unpivot" }
-update = { status = "gap", need = "Dataset.update (overwrite values from another frame by key)", wave = "W8" }
+update = { status = "param", batcher = "Dataset.update", need = "the key-less positional form: Batcher's update needs on=", wave = "W8" }
 var = { status = "param", batcher = "Dataset.var", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=", wave = "W2" }
 width = { status = "canonical", batcher = "Dataset.width" }
 with_columns = { status = "canonical", batcher = "Dataset.with_columns", template = 'with_columns(*exprs, **named_exprs) -> self.with_columns(sem.named(exprs), **named_exprs)' }
@@ -97,7 +97,7 @@ with_row_index = { status = "canonical", batcher = "Dataset.with_row_index" }
 approx_n_unique = { status = "mismatch", batcher = "Dataset.approx_count_distinct", note = "Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count_nulls=True", wave = "W0" }
 bottom_k = { status = "canonical", batcher = "Dataset.bottom_k" }
 cast = { status = "canonical", batcher = "Dataset.cast" }
-clear = { status = "param", batcher = "Dataset.limit", need = "clear(n) returning n all-null rows with the same schema (limit(0) covers n=0)", wave = "W8" }
+clear = { status = "param", batcher = "Dataset.limit", need = "clear(n) with n > 0 null rows; clear() is limit(0)", wave = "W8" }
 clone = { status = "out_of_scope", reason = "a Dataset is an immutable plan handle, so a copy is the same object" }
 collect_schema = { status = "canonical", batcher = "Dataset.collect_schema" }
 columns = { status = "canonical", batcher = "Dataset.columns" }
@@ -107,7 +107,7 @@ describe = { status = "param", batcher = "Dataset.describe", need = "interpolati
 deserialize = { status = "gap", need = "Dataset.deserialize (plan from serialized bytes/JSON)", wave = "W8" }
 drop = { status = "param", batcher = "Dataset.drop", need = "strict= (raise on a missing column)", wave = "W2" }
 drop_in_place = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port; the frame is not mutated", wave = "W8" }
-drop_nans = { status = "gap", need = "Dataset.drop_nans (drop rows holding NaN)", wave = "W5" }
+drop_nans = { status = "canonical", batcher = "Dataset.drop_nans" }
 drop_nulls = { status = "canonical", batcher = "Dataset.drop_nulls" }
 dtypes = { status = "canonical", batcher = "Dataset.dtypes" }
 equals = { status = "param", batcher = "Dataset.equals", need = "null_equal=", wave = "W2" }
@@ -121,7 +121,7 @@ flags = { status = "out_of_scope", reason = "sortedness flags are engine-owned m
 fold = { status = "gap", need = "DataFrame.fold (row-wise Python reduction over columns)", wave = "W11" }
 gather_every = { status = "canonical", batcher = "Dataset.gather_every" }
 get_column = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port", wave = "W8" }
-get_column_index = { status = "gap", need = "Dataset.get_column_index", wave = "W8" }
+get_column_index = { status = "param", batcher = "Dataset.columns", need = "port as ds.columns.index(name)", wave = "W8" }
 get_columns = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port", wave = "W8" }
 glimpse = { status = "canonical", batcher = "Dataset.glimpse" }
 group_by = { status = "param", batcher = "Dataset.group_by", template = 'group_by(*by, maintain_order=False) -> self.group_by(sem.column_names(by), maintain_order=maintain_order)', need = "expression keys", wave = "WF" }
@@ -129,7 +129,7 @@ group_by_dynamic = { status = "param", batcher = "bt.window", need = "frame-leve
 hash_rows = { status = "mismatch", batcher = "bt.hash_rows", note = "different hash function: values never agree with Polars. Param: seed= and algorithm choice", wave = "W0" }
 head = { status = "canonical", batcher = "Dataset.limit", template = 'head(n=5) -> self.limit(n)' }
 height = { status = "canonical", batcher = "Dataset.count" }
-hstack = { status = "gap", need = "Dataset.hstack (horizontal concatenation by position)", wave = "W8" }
+hstack = { status = "param", batcher = "Dataset.zip", need = "implicit row order: port as zip(other, order_by=...)", wave = "W8" }
 insert_column = { status = "canonical", batcher = ["Dataset.with_columns", "Dataset.select"] }
 interpolate = { status = "gap", need = "Dataset.interpolate (every numeric column)", wave = "W5" }
 is_duplicated = { status = "param", batcher = "Expr.is_duplicated", need = "whole-row form over several columns", wave = "W2" }
@@ -141,34 +141,34 @@ iter_rows = { status = "canonical", batcher = "Dataset.iter_rows" }
 iter_slices = { status = "mismatch", batcher = "Dataset.iter_slices", note = "yields pyarrow RecordBatch rather than a DataFrame", wave = "W0" }
 join = { status = "mismatch", batcher = "Dataset.join", note = "on how='full' Polars keeps both key columns (key, key_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=", wave = "W0", template = 'join(other, on=None, how="inner", *, left_on=None, right_on=None, suffix="_right", coalesce=None) -> self.join(other, sem.join_keys(on), how=sem.polars_how(how, coalesce), left_on=left_on, right_on=right_on, suffix=suffix)' }
 join_asof = { status = "param", batcher = "Dataset.join_asof", need = "strategy= ('backward'/'forward'/'nearest'), coalesce=, check_sortedness=", wave = "W2" }
-join_where = { status = "gap", need = "Dataset.join_where (inequality join over the existing range-join runtime)", wave = "W5" }
+join_where = { status = "canonical", batcher = "Dataset.join_where" }
 lazy = { status = "canonical", batcher = "Dataset", template = 'lazy() -> self' }
 limit = { status = "canonical", batcher = "Dataset.limit" }
 map_columns = { status = "gap", need = "DataFrame.map_columns", wave = "W8" }
 map_rows = { status = "gap", need = "DataFrame.map_rows (per-row Python function), only as a batch-vectorized wrapper", wave = "W11" }
-match_to_schema = { status = "gap", need = "Dataset.match_to_schema", wave = "W8" }
+match_to_schema = { status = "param", batcher = "Dataset.match_to_schema", need = "struct field options and integer_cast/float_cast", wave = "W8" }
 max = { status = "param", batcher = "Dataset.max", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 max_horizontal = { status = "param", batcher = "bt.greatest", need = "frame-level form over every column", wave = "W8" }
 mean = { status = "param", batcher = "Dataset.mean", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 mean_horizontal = { status = "param", batcher = "bt.mean_horizontal", need = "frame-level form over every column", wave = "W8" }
 median = { status = "param", batcher = "Dataset.median", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 melt = { status = "canonical", batcher = "Dataset.unpivot" }
-merge_sorted = { status = "gap", need = "Dataset.merge_sorted", wave = "W8" }
+merge_sorted = { status = "canonical", batcher = "Dataset.union", template = 'merge_sorted(other, key) -> self.union(other).sort(key)' }
 min = { status = "param", batcher = "Dataset.min", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 min_horizontal = { status = "param", batcher = "bt.least", need = "frame-level form over every column", wave = "W8" }
 n_chunks = { status = "out_of_scope", reason = "memory layout is engine-owned (morsels), not user-visible" }
 n_unique = { status = "mismatch", batcher = "Dataset.count_distinct", note = "Polars df.n_unique(subset) counts unique rows; Batcher's n_unique(column) counts distinct non-null values of one column", wave = "W0" }
 null_count = { status = "canonical", batcher = "Dataset.null_count" }
-partition_by = { status = "gap", need = "Dataset.partition_by (split into a dict/list of frames)", wave = "W8" }
+partition_by = { status = "mismatch", batcher = "Dataset.partition_by", note = "Batcher returns a dict keyed by the group tuple in key order; Polars returns a list in arrival order unless as_dict=True", wave = "W8" }
 pipe = { status = "canonical", batcher = "Dataset.pipe" }
 pivot = { status = "param", batcher = "Dataset.pivot", need = "positional on=, several on columns, on_columns=, separator=, an expression aggregate_function=", wave = "W2" }
 plot = { status = "out_of_scope", reason = "plotting is outside a data engine; export with to_pandas/to_polars" }
 product = { status = "mismatch", batcher = "Dataset.product", note = "Polars returns a one-row frame over every column and returns 1 for an all-null or empty column; Batcher takes one column and returns null there. Params: all-columns form, empty_value=1", wave = "W0" }
 quantile = { status = "mismatch", batcher = "Dataset.quantile", note = "Polars returns a one-row frame over every column and defaults to interpolation='nearest'; Batcher takes one column and interpolates linearly. Params: all-columns form, interpolation=", wave = "W0" }
 rechunk = { status = "out_of_scope", reason = "memory layout is engine-owned (morsels), not user-visible" }
-remove = { status = "gap", need = "Dataset.remove (inverse filter with null-as-keep semantics)", wave = "W8" }
+remove = { status = "param", batcher = "Dataset.filter", need = "several predicates and **constraints in one call; port as filter(~bt.coalesce(pred, bt.lit(False)))", wave = "W8" }
 rename = { status = "param", batcher = "Dataset.rename", need = "strict= (raise on a missing column)", wave = "W2" }
-replace_column = { status = "gap", need = "Dataset.replace_column (by position)", wave = "W8" }
+replace_column = { status = "param", batcher = "Dataset.with_columns", need = "a positional index: port as with_columns(**{ds.columns[i]: expr})", wave = "W8" }
 reverse = { status = "canonical", batcher = "Dataset.reverse" }
 rolling = { status = "gap", need = "Dataset.rolling (frame-level rolling group-by)", wave = "W5" }
 row = { status = "gap", need = "Dataset.row(index | by_predicate)", wave = "W8" }
@@ -201,15 +201,15 @@ to_jax = { status = "mismatch", batcher = "Dataset.to_jax", note = "Polars defau
 to_numpy = { status = "mismatch", batcher = "Dataset.to_numpy", note = "Polars returns one 2-D ndarray; Batcher returns a dict of per-column arrays", wave = "W0" }
 to_pandas = { status = "canonical", batcher = "Dataset.to_pandas" }
 to_series = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port", wave = "W8" }
-to_struct = { status = "gap", need = "Dataset.to_struct (whole row as one struct column)", wave = "W8" }
+to_struct = { status = "param", batcher = "Dataset.select", need = "port as select(bt.struct(*ds.columns).alias(name))", wave = "W8" }
 to_torch = { status = "mismatch", batcher = "Dataset.ml.iter_torch_batches", note = "Polars returns a tensor, dict of tensors, or TensorDataset; Batcher yields per-batch tensor dicts", wave = "W0" }
 top_k = { status = "canonical", batcher = "Dataset.top_k" }
-transpose = { status = "gap", need = "Dataset.transpose", wave = "W8" }
+transpose = { status = "param", batcher = "Dataset.transpose", need = "implicit row order: positional column names need order_by", wave = "W8" }
 unique = { status = "canonical", batcher = "Dataset.distinct" }
 unnest = { status = "param", batcher = "Dataset.unnest", need = "separator= (prefix the field names)", wave = "W2" }
 unpivot = { status = "canonical", batcher = "Dataset.unpivot" }
 unstack = { status = "gap", need = "Dataset.unstack", wave = "W8" }
-update = { status = "gap", need = "Dataset.update (overwrite values from another frame by key)", wave = "W8" }
+update = { status = "param", batcher = "Dataset.update", need = "the key-less positional form: Batcher's update needs on=", wave = "W8" }
 upsample = { status = "gap", need = "Dataset.upsample (fill a regular time grid)", wave = "W5" }
 var = { status = "param", batcher = "Dataset.var", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=", wave = "W2" }
 vstack = { status = "canonical", batcher = "Dataset.union" }

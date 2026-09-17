@@ -17,7 +17,7 @@ get_internal_block_refs = { status = "out_of_scope", reason = "Ray object-store 
 get_stats_summary = { status = "mismatch", batcher = "Dataset.stats", note = "Ray returns a DatasetStatsSummary of a previous execution; Batcher stats() executes the query and returns measured per-operator RunStats.", wave = "W0" }
 groupby = { status = "canonical", batcher = "Dataset.group_by", template = 'groupby(key) -> self.group_by(sem.column_names(key))' }
 has_serializable_lineage = { status = "out_of_scope", reason = "lineage serialization of object-store block refs for Ray fault tolerance; a Batcher plan is rebuilt from its JSON IR and sources" }
-input_files = { status = "gap", need = "list the source files a Dataset reads", wave = "W8" }
+input_files = { status = "param", batcher = "Dataset.meta", need = "port as [f.path for f in ds.meta.storage.files]", wave = "W8" }
 iter_batches = { status = "mismatch", batcher = ["Dataset.iter_batches", "Dataset.ml.to_numpy_batches"], note = "Ray iter_batches defaults to batch_format='default' ({col: ndarray}, nulls become NaN) and batch_size=256; Batcher yields pyarrow RecordBatches of engine size. Port as iter_batches(256, batch_format='numpy')", wave = "W2" }
 iter_internal_ref_bundles = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
 iter_jax_batches = { status = "gap", need = "streaming iterator of JAX array batches (Batcher has only eager Dataset.to_jax)", wave = "W8" }
@@ -49,7 +49,7 @@ set_name = { status = "out_of_scope", reason = "user-facing Dataset display name
 show = { status = "mismatch", batcher = "Dataset.show", note = "Ray show(limit=20) prints one dict per row; Batcher show(limit=10) prints a table. Pass limit=20.", wave = "W0" }
 size_bytes = { status = "mismatch", batcher = "Dataset.memory_usage", note = "Ray size_bytes() returns the total in-memory bytes from block metadata; Batcher memory_usage() returns a per-column dict of estimated bytes. Port as: sum(ds.memory_usage().values()).", wave = "W0" }
 sort = { status = "param", batcher = "Dataset.sort", need = "boundaries= (explicit range-partition boundaries)", wave = "W2", template = 'sort(key, descending=False, boundaries=None) -> self.sort(sem.column_names(key), sem.expect(boundaries, None), descending=descending)' }
-split = { status = "mismatch", batcher = "Dataset.split_proportionately", note = "Ray split(n) eagerly materializes n contiguous MaterializedDatasets, and equal=True drops the remainder; Batcher parts are lazy and each re-executes the input. split_proportionately([1/n]*(n-1)) gives the contiguous n-way split; equal= and locality_hints have no equivalent.", wave = "W8" }
+split = { status = "param", batcher = "Dataset.split", need = "implicit row order: Batcher's split needs order_by", wave = "W8" }
 split_at_indices = { status = "mismatch", batcher = "Dataset.split_at_indices", note = "Ray materializes once and returns MaterializedDatasets; Batcher parts are lazy row-index filters that each re-execute the input (cache() first). Rows per part are the same for a fixed input order.", wave = "W0" }
 split_proportionately = { status = "mismatch", batcher = "Dataset.split_proportionately", note = "Ray materializes once and returns MaterializedDatasets; Batcher parts are lazy and each re-execute the input (cache() first). Rows per part are the same for a fixed input order.", wave = "W0" }
 stats = { status = "mismatch", batcher = "Dataset.stats", note = "Ray stats() returns a timing string for the last execution; Batcher stats() executes the query and returns a RunStats object.", wave = "W0" }
@@ -96,4 +96,4 @@ write_sql = { status = "mismatch", batcher = "Dataset.write.sql", note = "Ray wr
 write_tfrecords = { status = "param", batcher = "Dataset.write.tfrecord", need = "tf_schema=", wave = "W13" }
 write_turbopuffer = { status = "gap", need = "Turbopuffer vector-namespace writer", wave = "W13" }
 write_webdataset = { status = "mismatch", batcher = "Dataset.write.webdataset", note = "cells are written as raw bytes, UTF-8 text or decimal numbers rather than through Ray's encoders; a repeated __key__ is refused", wave = "W13" }
-zip = { status = "gap", need = "column-wise zip of datasets by row position with a row-count check", wave = "W8" }
+zip = { status = "param", batcher = "Dataset.zip", need = "implicit row order: Batcher's zip needs order_by", wave = "W8" }

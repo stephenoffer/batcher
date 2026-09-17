@@ -46,17 +46,17 @@ to_uppercase = { status = "param", batcher = "Selector.name", need = "the .name 
 as_expression = { status = "gap", need = "meta.as_expression expression introspection", wave = "W8" }
 as_selector = { status = "gap", need = "meta.as_selector expression introspection", wave = "W8" }
 eq = { status = "gap", need = "meta.eq expression introspection", wave = "W8" }
-has_multiple_outputs = { status = "gap", need = "meta.has_multiple_outputs expression introspection", wave = "W8" }
-is_column = { status = "gap", need = "meta.is_column expression introspection", wave = "W8" }
+has_multiple_outputs = { status = "canonical", batcher = "Expr.meta.has_multiple_outputs" }
+is_column = { status = "canonical", batcher = "Expr.meta.is_column" }
 is_column_selection = { status = "gap", need = "meta.is_column_selection expression introspection", wave = "W8" }
 is_literal = { status = "gap", need = "meta.is_literal expression introspection", wave = "W8" }
 is_regex_projection = { status = "gap", need = "meta.is_regex_projection expression introspection", wave = "W8" }
 ne = { status = "gap", need = "meta.ne expression introspection", wave = "W8" }
-output_name = { status = "gap", need = "meta.output_name expression introspection", wave = "W8" }
+output_name = { status = "canonical", batcher = "Expr.meta.output_name" }
 pop = { status = "gap", need = "meta.pop expression introspection", wave = "W8" }
-root_names = { status = "gap", need = "meta.root_names expression introspection", wave = "W8" }
+root_names = { status = "canonical", batcher = "Expr.meta.root_names" }
 serialize = { status = "param", batcher = "Expr.to_ir", need = "a stable serialized form (bytes/JSON string) that round-trips through deserialize", wave = "W8" }
 show_graph = { status = "gap", need = "meta.show_graph expression introspection", wave = "W8" }
-tree_format = { status = "gap", need = "meta.tree_format expression introspection", wave = "W8" }
+tree_format = { status = "canonical", batcher = "Expr.meta.tree_format" }
 undo_aliases = { status = "gap", need = "meta.undo_aliases expression introspection", wave = "W8" }
 write_json = { status = "param", batcher = "Expr.to_ir", need = "JSON string output of the expression IR", wave = "W8" }

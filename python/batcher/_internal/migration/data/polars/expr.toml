@@ -126,7 +126,7 @@ max = { status = "canonical", batcher = "Expr.max", template = 'max() -> self.ma
 max_by = { status = "canonical", batcher = "Expr.max_by", template = 'max_by(by) -> self.max_by(by, ignore_nulls=False)' }
 mean = { status = "canonical", batcher = "Expr.mean" }
 median = { status = "canonical", batcher = "Expr.median" }
-meta = { status = "gap", need = "Expr.meta introspection namespace", wave = "W8" }
+meta = { status = "canonical", batcher = "Expr.meta" }
 min = { status = "canonical", batcher = "Expr.min" }
 min_by = { status = "canonical", batcher = "Expr.min_by", template = 'min_by(by) -> self.min_by(by, ignore_nulls=False)' }
 mod = { status = "mismatch", batcher = "op:mod", template = 'mod(other) -> self - (self // other) * other', note = "Polars % takes the sign of the divisor (floored); Batcher % truncates like SQL and DuckDB", wave = "W0" }

@@ -34,7 +34,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `get_stats_summary` | `Dataset.stats` | mismatch | Differs: Ray returns a DatasetStatsSummary of a previous execution; Batcher stats() executes the query and returns measured per-operator RunStats. Wave W0. |
 | `groupby` | `Dataset.group_by` | canonical |  |
 | `has_serializable_lineage` | n/a | out of scope | Declined: lineage serialization of object-store block refs for Ray fault tolerance; a Batcher plan is rebuilt from its JSON IR and sources. |
-| `input_files` | n/a | gap | Not yet: list the source files a Dataset reads. Wave W8. |
+| `input_files` | `Dataset.meta` | param | Missing: port as \[f.path for f in ds.meta.storage.files\]. Wave W8. |
 | `iter_batches` | `Dataset.iter_batches` + `Dataset.ml.to_numpy_batches` | mismatch | Differs: Ray iter\_batches defaults to batch\_format='default' (\{col: ndarray\}, nulls become NaN) and batch\_size=256; Batcher yields pyarrow RecordBatches of engine size. Port as iter\_batches(256, batch\_format='numpy'). Wave W2. |
 | `iter_internal_ref_bundles` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
 | `iter_jax_batches` | n/a | gap | Not yet: streaming iterator of JAX array batches (Batcher has only eager Dataset.to\_jax). Wave W8. |
@@ -66,7 +66,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `show` | `Dataset.show` | mismatch | Differs: Ray show(limit=20) prints one dict per row; Batcher show(limit=10) prints a table. Pass limit=20. Wave W0. |
 | `size_bytes` | `Dataset.memory_usage` | mismatch | Differs: Ray size\_bytes() returns the total in-memory bytes from block metadata; Batcher memory\_usage() returns a per-column dict of estimated bytes. Port as: sum(ds.memory\_usage().values()). Wave W0. |
 | `sort` | `Dataset.sort` | param | Missing: boundaries= (explicit range-partition boundaries). Wave W2. |
-| `split` | `Dataset.split_proportionately` | mismatch | Differs: Ray split(n) eagerly materializes n contiguous MaterializedDatasets, and equal=True drops the remainder; Batcher parts are lazy and each re-executes the input. split\_proportionately(\[1/n\]\*(n-1)) gives the contiguous n-way split; equal= and locality\_hints have no equivalent. Wave W8. |
+| `split` | `Dataset.split` | param | Missing: implicit row order: Batcher's split needs order\_by. Wave W8. |
 | `split_at_indices` | `Dataset.split_at_indices` | mismatch | Differs: Ray materializes once and returns MaterializedDatasets; Batcher parts are lazy row-index filters that each re-execute the input (cache() first). Rows per part are the same for a fixed input order. Wave W0. |
 | `split_proportionately` | `Dataset.split_proportionately` | mismatch | Differs: Ray materializes once and returns MaterializedDatasets; Batcher parts are lazy and each re-execute the input (cache() first). Rows per part are the same for a fixed input order. Wave W0. |
 | `stats` | `Dataset.stats` | mismatch | Differs: Ray stats() returns a timing string for the last execution; Batcher stats() executes the query and returns a RunStats object. Wave W0. |
@@ -113,7 +113,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `write_tfrecords` | `Dataset.write.tfrecord` | param | Missing: tf\_schema=. Wave W13. |
 | `write_turbopuffer` | n/a | gap | Not yet: Turbopuffer vector-namespace writer. Wave W13. |
 | `write_webdataset` | `Dataset.write.webdataset` | mismatch | Differs: cells are written as raw bytes, UTF-8 text or decimal numbers rather than through Ray's encoders; a repeated \_\_key\_\_ is refused. Wave W13. |
-| `zip` | n/a | gap | Not yet: column-wise zip of datasets by row position with a row-count check. Wave W8. |
+| `zip` | `Dataset.zip` | param | Missing: implicit row order: Batcher's zip needs order\_by. Wave W8. |
 
 ## `GroupedData`
 

@@ -2866,7 +2866,7 @@ The migration registry: every PySpark, Polars, Daft and Ray Data name, and its B
 
 | module | lines | what it is |
 |---|---|---|
-| `hints.py` | 148 | The migration half of an `AttributeError`: what a removed or foreign spelling is called here. |
+| `hints.py` | 149 | The migration half of an `AttributeError`: what a removed or foreign spelling is called here. |
 | `loader.py` | 158 | Load the migration registry from its TOML files. |
 | `renames.py` | 250 | The rename decisions for Batcher's own second spellings, as typed rules the codemod can apply. |
 | `schema.py` | 278 | The shape of one migration-registry row: a competitor's name and what it becomes here. |

@@ -47,7 +47,7 @@ The following table lists the waves that hold Daft rows, in delivery order:
 | W5 | Window functions, including rolling and dynamic group-by | 10 |
 | W6 | Temporal types: `TIME`, intervals, and a session time zone | 38 |
 | W7 | Semi-structured data: JSON, CSV, and XML functions | 10 |
-| W8 | Relational `DataFrame` gaps | 11 |
+| W8 | Relational `DataFrame` gaps | 10 |
 | W9 | Catalogs and tables | 42 |
 | W11 | UDFs | 81 |
 | W12 | AI and multimodal | 102 |
@@ -59,7 +59,7 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 115 | 57 | 18 | 28 | 10 | 2 |
+| {doc}`dataframe` | 115 | 58 | 18 | 28 | 9 | 2 |
 | {doc}`module` | 130 | 48 | 27 | 10 | 33 | 12 |
 | {doc}`functions-numeric` | 160 | 134 | 23 | 1 | 2 | 0 |
 | {doc}`functions-strings` | 121 | 52 | 46 | 18 | 5 | 0 |

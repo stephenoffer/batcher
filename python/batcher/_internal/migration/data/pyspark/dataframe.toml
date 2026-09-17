@@ -33,7 +33,7 @@ dropna = { status = "canonical", batcher = "Dataset.drop_nulls" }
 dtypes = { status = "mismatch", batcher = "Dataset.dtypes", note = "Spark returns [(name, 'bigint'), ...] pairs of DDL type strings; Batcher returns a list of pyarrow DataTypes without names", wave = "W0" }
 exceptAll = { status = "canonical", batcher = "Dataset.except_" }
 executionInfo = { status = "gap", need = "post-execution metrics object on the Dataset (Dataset.stats re-executes instead)", wave = "W8" }
-exists = { status = "gap", need = "EXISTS subquery as a boolean column", wave = "W8" }
+exists = { status = "param", batcher = "Dataset.join", need = "an outer reference in a correlated subquery; port as join(other, how=semi)", wave = "W8" }
 explain = { status = "mismatch", batcher = "Dataset.explain", note = "Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str", wave = "W0" }
 fillna = { status = "canonical", batcher = "Dataset.fill_null" }
 filter = { status = "canonical", batcher = "Dataset.filter", template = 'filter(condition) -> self.filter(sem.expression(condition))' }
@@ -46,7 +46,7 @@ groupby = { status = "canonical", batcher = "Dataset.group_by", template = 'grou
 groupingSets = { status = "canonical", batcher = "Dataset.grouping_sets" }
 head = { status = "mismatch", batcher = ["Dataset.limit", "Dataset.to_pylist"], note = "Spark head(n) eagerly returns list[Row] (head() returns one Row); Batcher returns a lazy Dataset. Codemod: .limit(n).to_pylist()", wave = "W0", template = 'head(n) -> self.limit(n).to_pylist()' }
 hint = { status = "out_of_scope", reason = "no optimizer hint IR; Kyber chooses join strategies from measured statistics (revisit)" }
-inputFiles = { status = "gap", need = "list the files backing a Dataset", wave = "W8" }
+inputFiles = { status = "param", batcher = "Dataset.meta", need = "port as [f.path for f in ds.meta.storage.files]", wave = "W8" }
 intersect = { status = "canonical", batcher = "Dataset.intersect" }
 intersectAll = { status = "canonical", batcher = "Dataset.intersect" }
 isEmpty = { status = "canonical", batcher = "Dataset.is_empty" }
@@ -103,7 +103,7 @@ toJSON = { status = "gap", need = "render each row as a JSON string", wave = "W7
 toLocalIterator = { status = "mismatch", batcher = "Dataset.iter_rows", note = "Spark yields Row objects partition by partition; Batcher yields tuples (or dicts with named=True)", wave = "W0" }
 toPandas = { status = "canonical", batcher = "Dataset.to_pandas" }
 transform = { status = "canonical", batcher = "Dataset.pipe" }
-transpose = { status = "gap", need = "transpose rows into columns keyed by an index column", wave = "W8" }
+transpose = { status = "param", batcher = "Dataset.transpose", need = "Spark's index column argument; port as transpose(column_names=idx, include_header=True, header_name=key)", wave = "W8" }
 union = { status = "mismatch", batcher = "Dataset.union", note = "Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by_name=False positional mode", wave = "W2" }
 unionAll = { status = "mismatch", batcher = "Dataset.union", note = "Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by_name=False positional mode", wave = "W2" }
 unionByName = { status = "param", batcher = "Dataset.union", need = "match columns by name in any order, and allowMissingColumns= filling absent columns with null", wave = "W2", template = 'unionByName(other, allowMissingColumns=False) -> self.union(other.select(*self.columns), sem.expect(allowMissingColumns, False))' }

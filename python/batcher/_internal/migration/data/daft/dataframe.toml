@@ -17,7 +17,7 @@ count_rows = { status = "canonical", batcher = "Dataset.count" }
 describe = { status = "mismatch", batcher = "Dataset.describe", note = "Daft describe() returns the schema as a DataFrame (column_name, type); Batcher describe() returns summary statistics. Rewrite: Dataset.schema", wave = "W0" }
 distinct = { status = "canonical", batcher = "Dataset.distinct" }
 drop_duplicates = { status = "canonical", batcher = "Dataset.distinct" }
-drop_nan = { status = "gap", need = "drop rows holding NaN in any (or the given) float columns", wave = "W8" }
+drop_nan = { status = "canonical", batcher = "Dataset.drop_nans" }
 drop_null = { status = "canonical", batcher = "Dataset.drop_nulls" }
 except_all = { status = "canonical", batcher = "Dataset.except_" }
 except_distinct = { status = "canonical", batcher = "Dataset.except_" }

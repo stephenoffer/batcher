@@ -141,7 +141,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `max_by` | `Expr.max_by` | canonical |  |
 | `mean` | `Expr.mean` | canonical |  |
 | `median` | `Expr.median` | canonical |  |
-| `meta` | n/a | gap | Not yet: Expr.meta introspection namespace. Wave W8. |
+| `meta` | `Expr.meta` | canonical |  |
 | `min` | `Expr.min` | canonical |  |
 | `min_by` | `Expr.min_by` | canonical |  |
 | `mod` | `%` operator | mismatch | Differs: Polars % takes the sign of the divisor (floored); Batcher % truncates like SQL and DuckDB. Wave W0. |
