@@ -1,6 +1,8 @@
 # Joins
 
-The join type decides what happens to rows with no match, which is where most join bugs live. An inner join drops them without a word. A left join keeps them with nulls. Decide which you meant before you write it, then assert the row count.
+The join type decides what happens to a row with no match, and that is where most join bugs live. An inner join drops it without a word. A left join keeps it with nulls.
+
+The script runs one orders table against one customers table through six `how=` values: inner, left, right, outer, semi, and anti, the last being the orphan check. It then covers differently named keys, a cross join, and `join_asof` for the "what was the price when this trade happened" question. It ends on the guard worth copying into a real pipeline: count both sides and assert how many rows the join dropped.
 
 The whole script, executed on every test run:
 

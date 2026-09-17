@@ -1,6 +1,8 @@
 # Quantiles and histograms
 
-Exact quantiles need the whole column ordered. Sketch-backed ones need bounded memory and answer within a known error, which is what makes them usable on a column that does not fit in memory. Know which one you are getting.
+Exact quantiles need the whole column ordered. Sketch-backed ones, `approx_quantile` and `approx_median`, answer within a bounded error from a fixed amount of memory, which makes them usable on a column that doesn't fit in memory. Know which one you are getting.
+
+The script compares the two on 1,000 latency values, computes p50 and p95 per route in one `group_by`, and builds a histogram by grouping on a bucket expression.
 
 The whole script, executed on every test run:
 

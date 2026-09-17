@@ -1,12 +1,10 @@
 # Expressions
 
-This page covers the scripts that exercise the expression language: the operators, the
-accessor namespaces, and the type rules that decide what an expression returns.
+This page covers the scripts that exercise the expression language: the operators, the accessor namespaces, and the type rules that decide what an expression returns.
 
 ## The accessor namespaces
 
-Breadth lives on accessors rather than on `Expr` itself, which keeps the fluent builder thin.
-`.str`, `.dt`, `.list`, `.struct`, `.map` and `.json` each carry their own family.
+Breadth lives on accessors rather than on `Expr` itself, which keeps the fluent builder thin. `.str`, `.dt`, `.list`, `.struct`, `.map` and `.json` each carry their own family.
 
 ```python
 import batcher as bt
@@ -33,11 +31,7 @@ assert result["status"] == [200, 500]
 assert result["anonymized"][0] == "GET /users/<id> 200 13ms"
 ```
 
-Two spellings in the string family behave differently from their Python counterparts, and
-both have their own script. `strip` removes spaces rather than all whitespace, so a leading
-tab survives it; pass the character set to `strip_chars` when you mean all of it. And
-`levenshtein` and the other comparison functions take a plan-time constant rather than
-another column, because the target is lowered into the plan and compiled once.
+Two spellings in the string family behave differently from their Python counterparts, and both have their own script. `trim` removes spaces rather than all whitespace, so a leading tab survives it; pass the character set to `trim` when you mean all of it. And `levenshtein` and the other comparison functions take a plan-time constant rather than another column, because the target is lowered into the plan and compiled once.
 
 ## Conditionals and nulls
 
@@ -62,9 +56,7 @@ assert banded.to_pydict()["big"] == [None, None, "big"]
 
 ## Selectors and horizontal folds
 
-A selector resolves against the schema at plan time, which is what makes a generic cleanup
-step possible without reflection in Python. The `*_horizontal` family is the row-wise
-counterpart to an aggregate, for when a value is spread across columns rather than rows.
+A selector resolves against the schema at plan time, which is what makes a generic cleanup step possible without reflection in Python. The `*_horizontal` family is the row-wise counterpart to an aggregate, for when a value is spread across columns rather than rows.
 
 ```python
 readings = bt.from_pydict({"sensor": ["a", "b"], "morning": [1.0, 3.0], "evening": [2.0, 4.0]})
@@ -72,7 +64,7 @@ readings = bt.from_pydict({"sensor": ["a", "b"], "morning": [1.0, 3.0], "evening
 folded = readings.select(
     "sensor",
     total=bt.sum_horizontal(col("morning"), col("evening")),
-    peak=bt.max_horizontal(col("morning"), col("evening")),
+    peak=bt.greatest(col("morning"), col("evening")),
 )
 assert folded.to_pydict()["total"] == [3.0, 7.0]
 assert folded.to_pydict()["peak"] == [2.0, 4.0]
@@ -81,13 +73,11 @@ numeric = readings.select(bt.numeric())
 assert numeric.columns == ["morning", "evening"]
 ```
 
-`count_horizontal` counts non-null arguments rather than true ones, mirroring
-`col(x).count()`. To count satisfied predicates, cast them to integers and sum.
+`count_horizontal` counts non-null arguments rather than true ones, mirroring `col(x).count()`. To count satisfied predicates, cast them to integers and sum.
 
 ## Types
 
-Mixed arithmetic widens to the type that can hold both. True division always widens; floor
-division does not. That difference turns a count into a fraction without anyone noticing.
+Mixed arithmetic widens to the type that can hold both. True division always widens; floor division does not. That difference turns a count into a fraction without anyone noticing.
 
 ```python
 counts = bt.from_pydict({"hits": [10, 5], "total": [10, 20]})
@@ -101,9 +91,7 @@ assert types["exact"] == "double"
 assert types["floored"] == "int64"
 ```
 
-A cast to an integer rounds to nearest rather than truncating, which is the opposite of both
-C-style casting and Python's `int()`. Call `floor()` before the cast when you mean to
-truncate.
+A cast to an integer rounds to nearest rather than truncating, which is the opposite of both C-style casting and Python's `int()`. Call `floor()` before the cast when you mean to truncate.
 
 ## Every script on this page
 
@@ -214,3 +202,10 @@ The table below lists the expression scripts in path order.
 | `examples/expr_vectors/distance_measures.py` | Distances between embedding vectors held in a list column |
 | `examples/expr_vectors/normalization_and_pooling.py` | Vector shape: magnitudes, unit norm, and pooling many vectors into one |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/cookbook/expressions/index`: one recipe per expression family.
+- {doc}`/user-guide/transform/columns/expressions`: the expression guide.
+- {doc}`/user-guide/transform/columns/type-system`: how types widen, cast, and normalize.
+- {doc}`/api/relational/expressions`: every `Expr` method and accessor.

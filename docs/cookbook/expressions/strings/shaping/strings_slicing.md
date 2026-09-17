@@ -1,6 +1,8 @@
 # String slicing
 
-`head`/`tail` take from the ends, `slice`/`substr` take from an offset, and `split_part` takes the nth field of a delimited value. Check the base before you trust an index. `slice` is 0-based, the Polars spelling; `substr` and `split_part` are 1-based like SQL. All of them are safe on values shorter than the requested window, so you get what is there rather than an error.
+Codes, prefixes, and delimited identifiers all need a fixed piece of every value. `left` and `right` take from the ends, `slice` and `substr` take from an offset, and `split_part` takes the nth field of a delimited value.
+
+Check the base before you trust an index. `slice` is 0-based, the Polars spelling. `substr` and `split_part` are 1-based like SQL. The script exercises each one, and every one of them is safe on a value shorter than the requested window: you get what is there rather than an error.
 
 The whole script, executed on every test run:
 

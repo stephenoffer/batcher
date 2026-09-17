@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 470" role="img" width="980" height="470"><defs><style>
+  .surface { fill: #ffffff; stroke: #cbd5e1; }
+  .band-blue { fill: #eff6ff; stroke: #3b82f6; }
+  .band-amber { fill: #fffbeb; stroke: #f59e0b; }
+  .band-grey { fill: #f8fafc; stroke: #cbd5e1; }
+  .t-title { fill: #1e293b; }
+  .t-sub { fill: #5b6675; }
+  .t-arrow { fill: #475569; }
+  .t-code { fill: #1e40af; }
+  .code-bg { fill: #f1f5f9; stroke: #e2e8f0; }
+  .pill-blue { fill: #dbeafe; } .pill-amber { fill: #fef3c7; } .pill-grey { fill: #e2e8f0; }
+  .pt-blue { fill: #1d4ed8; } .pt-amber { fill: #b45309; } .pt-grey { fill: #334155; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1e293b; stroke: #334155; }
+    .band-blue { fill: #172554; stroke: #3b82f6; }
+    .band-amber { fill: #2c1f06; stroke: #f59e0b; }
+    .band-grey { fill: #131c31; stroke: #334155; }
+    .t-title { fill: #e2e8f0; }
+    .t-sub { fill: #94a3b8; }
+    .t-arrow { fill: #cbd5e1; }
+    .t-code { fill: #93c5fd; }
+    .code-bg { fill: #0f172a; stroke: #334155; }
+    .pill-blue { fill: #1e3a8a; } .pill-amber { fill: #78350f; } .pill-grey { fill: #334155; }
+    .pt-blue { fill: #bfdbfe; } .pt-amber { fill: #fde68a; } .pt-grey { fill: #e2e8f0; }
+    #tintBlue stop[offset="0"] { stop-color: #16233d; }
+    #tintBlue stop[offset="1"] { stop-color: #1e3a8a; }
+    #tintAmber stop[offset="0"] { stop-color: #2a1e07; }
+    #tintAmber stop[offset="1"] { stop-color: #78350f; }
+  }
+</style>
+<filter id="sh" x="-20%" y="-30%" width="140%" height="180%">
+  <feDropShadow dx="0" dy="2.5" stdDeviation="4.5" flood-color="#0f172a" flood-opacity="0.18"/>
+</filter>
+<filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+  <feDropShadow dx="0" dy="4" stdDeviation="9" flood-color="#2563eb" flood-opacity="0.35"/>
+</filter>
+<linearGradient id="hero" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="0.5" stop-color="#2563eb"/><stop offset="1" stop-color="#4f46e5"/></linearGradient>
+<linearGradient id="heroAmber" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+<linearGradient id="tintBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="tintAmber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="ribbonBlue" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#93c5fd"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+<linearGradient id="ribbonAmber" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+<marker id="arB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/></marker>
+<marker id="arA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#d97706"/></marker>
+<marker id="arG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/></marker>
+</defs><rect x="20" y="20" width="940" height="186" rx="16" class="band-blue" stroke-width="1.5"/><text x="38" y="44" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="1.5" fill="#3b82f6">MEDALLION LAYERS</text><g filter="url(#sh)"><rect x="44" y="72" width="236" height="104" rx="10" class="surface" stroke-width="1.2"/></g><text x="162.0" y="124.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Bronze</text><text x="162.0" y="143.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">raw Parquet, no cleaning</text><g filter="url(#glow)"><rect x="380" y="68" width="220" height="112" rx="16" fill="url(#hero)"/></g><text x="490.0" y="122.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="19" font-weight="800" fill="#ffffff">Silver</text><text x="490.0" y="144.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#ffffff" fill-opacity="0.88">Delta table, by day</text><g filter="url(#sh)"><rect x="700" y="72" width="236" height="104" rx="10" class="surface" stroke-width="1.2"/></g><text x="818.0" y="124.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Gold</text><text x="818.0" y="143.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">a plain query over silver</text><path d="M 280 124.0 L 378 124.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="330.0" y="112.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">overwrite</text><text x="330.0" y="146.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">paid rows</text><path d="M 600 124.0 L 698 124.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="650.0" y="112.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">group_by</text><text x="650.0" y="146.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">sum by day</text><rect x="20" y="230" width="940" height="220" rx="16" class="band-amber" stroke-width="1.5"/><text x="38" y="254" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="1.5" fill="#f59e0b">AFTER THE FIRST LOAD</text><g filter="url(#sh)"><rect x="44" y="322" width="256" height="84" rx="10" class="surface" stroke-width="1.2"/></g><text x="172.0" y="364.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">merge_on="order_id"</text><text x="172.0" y="383.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">upsert, one commit</text><path d="M 260 322 L 410 184" fill="none" stroke="#d97706" stroke-width="2.4" marker-end="url(#arA)"/><text x="284" y="296" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">commit</text><g filter="url(#sh)"><rect x="362" y="322" width="256" height="84" rx="10" class="surface" stroke-width="1.2"/></g><text x="490.0" y="364.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">version=0</text><text x="490.0" y="383.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">the table before the merge</text><path d="M 490 180 L 490 318" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="502" y="296" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">read</text><g filter="url(#sh)"><rect x="680" y="322" width="256" height="84" rx="10" class="surface" stroke-width="1.2"/></g><text x="808.0" y="364.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">replace_where=pred</text><text x="808.0" y="383.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">backfill, safe to re-run</text><path d="M 720 322 L 570 184" fill="none" stroke="#d97706" stroke-width="2.4" marker-end="url(#arA)"/><text x="696" y="296" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">commit</text><text x="490" y="434" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Every commit is a version. Pruning reads each file's bounds from the log.</text></svg>

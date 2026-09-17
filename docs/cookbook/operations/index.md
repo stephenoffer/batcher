@@ -1,6 +1,8 @@
 # Operations cookbook
 
-Seven runnable recipes for operating the engine, ordered the way you meet them: configure it, watch it, then deal with what it tells you.
+These seven recipes cover what you need once a pipeline runs somewhere that matters: scoping configuration to a block, reporting the environment, reading a plan, turning up logging for one query, bounding memory, catching the right exception, and running the same operators incrementally.
+
+They follow the order you meet them in: configure the engine, watch it, then act on what it tells you.
 
 Every page embeds a complete, self-contained script from the [`examples/operations/`](https://github.com/stephenoffer/batcher/tree/main/examples/operations) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 

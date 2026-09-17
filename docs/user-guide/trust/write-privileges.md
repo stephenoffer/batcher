@@ -84,7 +84,8 @@ from the format:
 | `mode="upsert"` | `INSERT`, `UPDATE` |
 | `mode="update"` | `UPDATE` |
 | `mode="delete"` | `DELETE` |
-| `ds.merge(...)` | whatever its `WHEN` clauses do |
+| `mode="delete_insert"` | `INSERT`, `DELETE` |
+| `ds.write.merge_into(...)` | whatever its `WHEN` clauses do |
 | A streaming write | `INSERT`, checked once before the query starts |
 
 A `MERGE` asks only for what its clauses actually do, so an insert-only upsert needs
@@ -96,8 +97,7 @@ streaming write is authorized before the query starts rather than at the first m
 because a stream refused after its first batch has already written.
 
 ```{important}
-**One grant governs the whole table.** A table nobody has granted anything on is open, as
-before. Once any grant names it, every privilege on it is deny-by-default. So a catalog
+**One grant governs the whole table.** A table nobody has granted anything on is open. Once any grant names it, every privilege on it is deny-by-default. So a catalog
 that grants `SELECT` and nothing else makes that table readable by the granted roles and
 writable by nobody. If a pipeline reads and rewrites the same governed table, grant it the
 write privileges explicitly.
@@ -129,7 +129,7 @@ except AccessDeniedError as exc:
 Run maintenance outside the block, with the engine's own authority over the table, which is
 how a warehouse runs `OPTIMIZE` anyway.
 
-The second is a copy-on-write {py:meth}`ds.merge() <batcher.Dataset.merge>`, which reads the
+The second is a copy-on-write {py:meth}`ds.write.merge() <batcher.api.io_namespace.writer.Writer.merge>`, which reads the
 files it will rewrite, composes the clauses over them, and writes the result back. Every row
 the clauses do *not* match is carried through the principal's view and rewritten that way, so
 a governed copy-on-write merge is refused too. A merge into Delta or Iceberg is not: the
@@ -142,6 +142,13 @@ the one thing a governed context cannot obtain without the bypass the refusal ex
 avoid.
 
 {py:func}`bt.vacuum() <batcher.vacuum>` is different: it deletes files no live version
-references, so it never writes a view back. A real vacuum needs `DELETE`. A dry run needs
+references, so it never writes a view back. A real vacuum needs `DELETE`. A dry run, which is the default, needs
 nothing, because it deletes nothing and it is the check you run *before* deciding whether
 the deletion is safe.
+
+## See also
+
+- {doc}`Governance and security </user-guide/trust/governance>`: grants, masks, row filters, and the audit event these decisions share.
+- {doc}`How a table is named </user-guide/trust/table-names>`: the name a write grant is matched against.
+- {doc}`Writing data </user-guide/moving-data/writing-data>`: the save modes in the table above.
+- {doc}`Hardening a deployment </user-guide/trust/hardening>`: `governance.audit_path` and strict mode.

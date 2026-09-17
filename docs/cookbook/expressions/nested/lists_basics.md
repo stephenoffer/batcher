@@ -2,6 +2,8 @@
 
 A list column holds a variable-length array per row. Indexing and slicing stay columnar, so `.list.get(0)` over a million rows is one operator rather than a million Python subscripts. `explode` is the escape hatch when you want one row per element instead.
 
+The script covers `get`, `first`, `last`, and `len`, the `slice` and `head` windows that are safe on short lists, `join` to collapse a list to a string, and `contains` and `position` for membership. The `explode` at the end carries a warning worth reading: a row with an empty list contributes no rows, so that key drops out of the result entirely.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/lists_basics.py

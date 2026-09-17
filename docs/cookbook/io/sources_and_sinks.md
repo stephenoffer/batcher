@@ -1,6 +1,8 @@
 # Source and sink registries
 
-`bt.read.parquet(...)` is a façade over a registry of `SourceFormat` implementations. Reading the registry is how you discover what is supported in *this* build, rather than trusting a docs page that may predate an extra you have not installed.
+`bt.read.parquet(...)` and `ds.write.parquet(...)` are thin wrappers over two registries, `SOURCES` and `SINKS` in `batcher.io`. Listing them tells you what *this* build can read and write, including the formats an optional extra adds.
+
+The script lists both registries and looks up the `ParquetSource` and `ParquetSink` classes behind the readers. Those classes are the contract to study when you write a connector of your own.
 
 The whole script, executed on every test run:
 

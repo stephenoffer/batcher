@@ -20,29 +20,29 @@
 
 <div class="bt-stats">
   <div class="bt-stat">
-    <span class="bt-stat-value">26&times;</span>
-    <span class="bt-stat-label">faster than DuckDB on semi-structured JSON</span>
-    <span class="bt-stat-src">5 of 5 queries won, same Arrow input</span>
-  </div>
-  <div class="bt-stat">
-    <span class="bt-stat-value">3.9&times;</span>
+    <span class="bt-stat-value">4.0&times;</span>
     <span class="bt-stat-label">faster than DuckDB on the same Arrow</span>
-    <span class="bt-stat-src">TPC-H sf1, 96 cores, 22 of 22 queries won</span>
+    <span class="bt-stat-src">TPC-H sf1, 22 queries, 48 cores</span>
   </div>
   <div class="bt-stat">
-    <span class="bt-stat-value">43 / 43</span>
-    <span class="bt-stat-label">ClickBench queries won</span>
-    <span class="bt-stat-src">vs DuckDB on the same Arrow, 43 of 43 correct</span>
+    <span class="bt-stat-value">6.3&times;</span>
+    <span class="bt-stat-label">faster than DuckDB on the same Arrow</span>
+    <span class="bt-stat-src">ClickBench, 43 queries, 48 cores</span>
+  </div>
+  <div class="bt-stat">
+    <span class="bt-stat-value">6 / 6</span>
+    <span class="bt-stat-label">benchmark suites faster than Polars</span>
+    <span class="bt-stat-src">TPC-H, ClickBench, H2O, JSON, operators</span>
+  </div>
+  <div class="bt-stat">
+    <span class="bt-stat-value">2.4&times;</span>
+    <span class="bt-stat-label">faster than Ray Data on GPU inference</span>
+    <span class="bt-stat-src">100,000 images, six T4 nodes, same checksum</span>
   </div>
   <div class="bt-stat">
     <span class="bt-stat-value">81%</span>
     <span class="bt-stat-label">sustained GPU utilization</span>
     <span class="bt-stat-src">ResNet-50 batch inference, 8&times;T4, 2,504 img/s</span>
-  </div>
-  <div class="bt-stat">
-    <span class="bt-stat-value">0.05 ms</span>
-    <span class="bt-stat-label">to answer <code>count()</code> after a transform chain</span>
-    <span class="bt-stat-src">read from footer statistics, no scan</span>
   </div>
 </div>
 ```
@@ -61,7 +61,7 @@ a Rust data plane on Apache Arrow.
 ![One engine: any source, whether Parquet, media, Kafka, or a lakehouse table, flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.svg)
 
 One decision buys most of that. Every stateful operator exists once, as a mergeable
-`partial → combine → finalize` triple in Rust over Arrow. One core, ninety-six cores, and a
+`partial -> combine -> finalize` triple in Rust over Arrow. One core, ninety-six cores, and a
 cluster differ only in how that triple is scheduled, so scaling out is a scheduling decision
 rather than a port. The same triple is the incremental form, so batch is the bounded case of
 streaming rather than a second execution model. Because the operator is identical everywhere,
@@ -70,43 +70,39 @@ evidence instead of vendor constants. And decode, embedding, vector search, and 
 expressions in that same algebra, so a predicate pushes beneath a JPEG decode and a tensor
 never leaves the engine.
 
-## The numbers
+## Start from your job
 
-Every figure below is correctness-gated, and DuckDB is measured two ways. **Same Arrow** is
-DuckDB executing over the identical zero-copy input Batcher runs on, which isolates the two
-execution engines against one input. **Native store** is DuckDB over its own compressed,
-dictionary-encoded, zone-mapped format, ingested before the clock starts: a storage engine
-*plus* an execution engine, against Batcher's execution engine alone.
+Pick the path that matches the work in front of you. Each one is an ordered reading list through the tutorials and guides.
 
-Suite geometric means, scale factor 1, 96 cores / 184 GiB, 2026-08-15. These are
-speedups, so bigger is better: 3.9x means Batcher finishes in a bit over a quarter of
-DuckDB's time. Every table under {doc}`benchmarks/index` reports the inverse, a
-`batcher / duckdb` time ratio where lower is better.
+::::{grid} 1 2 2 4
+:gutter: 3
 
-| Suite | vs DuckDB, same Arrow | vs DuckDB, native store |
-|---|---|---|
-| Semi-structured JSON, 5 queries | **26x**, won 5 of 5 | **4.1x**, won 5 of 5 |
-| ClickBench, 43 queries | **14x**, won 43 of 43 | **1.6x**, won 28 of 43 |
-| Operator mix, 19 kernels | **2.8x**, won 15 of 19 | **1.5x**, won 11 of 19 |
-| TPC-H sf1, 22 queries | **3.9x**, won 22 of 22 | **1.3x**, won 16 of 22 |
-| H2O.ai `join`, 5 queries | **4.1x**, won 5 of 5 | **1.1x**, won 3 of 5 |
-| TPC-DS sf1, 98 of 99 queries timed | — | **1.04x**, won 38 of 98 |
+:::{grid-item-card} {octicon}`database;1.1em` Data engineer
+:link: /getting-started/tutorials/paths/data-engineer
+:link-type: doc
+Read, reshape, join, and write: pipelines, lakehouse tables, and data quality.
+:::
 
-Read the first column before the second. On the **same Arrow input**, the comparison that
-isolates execution from storage, Batcher wins every suite that comparison can run.
+:::{grid-item-card} {octicon}`graph;1.1em` Data scientist
+:link: /getting-started/tutorials/paths/data-scientist
+:link-type: doc
+Expressions, aggregations, SQL, and window functions over a dataset.
+:::
 
-| Other workloads | Result |
-|---|---|
-| Image decode to tensor | **5,693 img/s**, 2.4x Daft |
-| ResNet-50 batch inference, 8xT4 | **2,504 img/s** at 81% GPU utilization |
-| Text embeddings, MiniLM, 8xT4 | **33,611 text/s** |
-| TPC-H sf10 q6, cluster against cluster | **2.4x** Daft on equal hardware, and Daft's answer is wrong |
+:::{grid-item-card} {octicon}`cpu;1.1em` ML engineer
+:link: /getting-started/tutorials/paths/ml-engineer
+:link-type: doc
+Batch inference, embeddings, and GPUs through `.ml`.
+:::
 
-![Bar chart of the TPC-H scale-factor-10 suite ratio. Batcher is 1.89x faster than DuckDB reading the same Arrow, winning 21 of 22 queries, and 2.26x faster than Polars, winning 17 of 22.](_static/diagrams/tpch_sf10.svg)
+:::{grid-item-card} {octicon}`server;1.1em` Platform engineer
+:link: /getting-started/tutorials/paths/platform-engineer
+:link-type: doc
+Configuration, environment defaults, memory limits, and object storage.
+:::
+::::
 
-Those rows were not all measured on the same machine, because the workload families were
-not. A figure is meaningful within its row. {doc}`benchmarks/index` carries the full grid,
-the hardware per family, and the reproduction commands.
+Coming from another engine? {doc}`The migration guides </getting-started/migration/index>` translate Spark, pandas, Polars, DuckDB, Ray Data, and Daft code into Batcher.
 
 ## Write it your way
 
@@ -158,7 +154,7 @@ import batcher as bt
 clicks = bt.read.kafka(topic="clicks")
 counts = clicks.group_by("page").agg(n=bt.count())
 
-# batch (default) → micro-batch → continuous: change one argument
+# batch (default), micro-batch, or continuous: change one argument
 counts.write.parquet("out/", trigger=bt.Trigger.processing_time("10s"))
 ```
 :::
@@ -247,6 +243,37 @@ more often you run it.
 ![The loop that outlives one query. In run N, Kyber plans on whatever it knows and Core executes and measures. Core writes measured cardinalities, operator wall times, column sketches, fitted cost coefficients and bandit arm rewards to the MetadataHub, keyed by plan signature and, for anything in machine units, by hardware fingerprint. Run N plus one reads that before planning, then measures and records again. The query ends and the hub does not, which is the difference from Spark AQE.](_static/diagrams/cross_run_learning.svg)
 
 {doc}`architecture/differentiators` covers both halves, and where each one stops.
+
+## The numbers
+
+Every figure below is correctness-gated, and DuckDB is measured two ways. *Same Arrow* is DuckDB executing over the identical zero-copy input Batcher runs on, which isolates the two execution engines. *Native store* is DuckDB over its own compressed, dictionary-encoded, zone-mapped format, ingested before the clock starts: a storage engine plus an execution engine, against Batcher's execution engine alone.
+
+The suite results come from one sweep on a 48-core box on 2026-09-13, best of five, one process per case. They're speedups, so bigger is better: 4.0x means Batcher finishes in a quarter of the other engine's time. The tables under {doc}`benchmarks/index` report the inverse, a `batcher / other` time ratio where lower is better.
+
+| Suite | vs DuckDB, same Arrow | vs DuckDB, native store | vs Polars | Cases where Batcher is fastest |
+|---|---|---|---|---|
+| TPC-H sf1, 22 queries | **4.0x** | **1.4x** | **1.9x** | 16 of 22 |
+| ClickBench, 43 queries | **6.3x** | **1.5x** | **2.7x** | 28 of 43 |
+| Semi-structured JSON, 5 queries | **3.1x** | **2.9x** | **over 60x** | 5 of 5 |
+| H2O.ai `join`, 5 queries | **1.7x** | **1.6x** | **2.0x** | 5 of 5 |
+| Operator mix, 46 kernels | **2.1x** | **1.3x** | **6.3x** | 33 of 46 |
+| H2O.ai `groupby`, 10 queries | **1.2x** | 0.95x | **1.9x** | 4 of 10 |
+
+Batcher is faster than Polars and than DuckDB on the same Arrow in all six suites, and faster than DuckDB's native store in five. The last column counts a case only when Batcher beats every engine in the sweep. Nearly half of the remaining cases are storage wins for DuckDB's compressed format rather than execution gaps.
+
+| Other workloads | Result |
+|---|---|
+| GPU batch inference, 100,000 images on six T4 nodes | **2.4x** Ray Data and **5.4x** Daft, identical checksums |
+| ResNet-50 batch inference, 8xT4 | **2,504 img/s** at 81% GPU utilization |
+| Text embeddings, MiniLM, 8xT4 | **33,611 text/s** |
+| Image decode to tensor, one 96-core node | **5,693 img/s**, 2.4x Daft |
+| TPC-H sf10 q6, cluster against cluster | **2.4x** Daft on equal hardware, and Daft's answer is wrong |
+
+![Bar chart of the TPC-H scale-factor-10 suite on the same Arrow input, from the 2026-08-28 sweep on 92 cores. Batcher is 3.03x faster than DuckDB reading the same Arrow and 2.86x faster than Polars.](_static/diagrams/tpch_sf10.svg)
+
+Those rows were not all measured on the same machine, because the workload families were
+not. A figure is meaningful within its row. {doc}`benchmarks/index` carries the full grid,
+the hardware per family, and the reproduction commands.
 
 ## How it compares
 

@@ -1,16 +1,17 @@
 # Model serving patterns
 
-A model's predictions reach a pipeline one of two ways. You load the weights into the worker,
-or you call a service that already has them loaded. Loading is faster, with no network, no
-serialization, and no shared queue, and it is what a batch job should do. Call a service when
-the model does not belong to you: another team owns it, it runs on hardware you cannot
-schedule, or the same endpoint has to serve an online path that must not be starved by your
-backfill.
+This page covers the ways a model's predictions reach a Batcher pipeline, and how to pick
+between loading the model in the worker and calling a service that already has it loaded.
+
+Load the model in the worker when you can. There's no network, no serialization, and no shared
+queue, and it's what a batch job should do. Call a service when the model doesn't belong to you:
+another team owns it, it runs on hardware you can't schedule, or the same endpoint serves an
+online path that your backfill must not starve.
 
 :::{warning}
-The mistake is picking the second because it is architecturally tidier. A 10-million-row
-backfill through an HTTP endpoint is 10 million round trips, and it will be slower than
-the model by an order of magnitude.
+Don't pick the service because it's architecturally tidier. A 10-million-row backfill through an
+HTTP endpoint pays a network round trip and a serialization per request, on top of the forward
+pass the in-process path runs anyway.
 :::
 
 ## The two shapes
@@ -18,23 +19,23 @@ the model by an order of magnitude.
 ::::{tab-set}
 :::{tab-item} In-process (the default)
 
-Load the model in the worker. A class is constructed once per worker and called per
-batch, so the weights land once and the forward pass is a local call.
+Load the model in the worker. A class is constructed once per worker and called per batch, so
+the weights land once and the forward pass is a local call.
 
 ```python
 # docs: skip
 scored = ds.ml.infer(Classifier, output_columns=[...], num_gpus=1, concurrency=4)
 ```
 
-That is {doc}`batch scoring </ml/inference/batch-scoring>`, and it is the right answer for anything you
-can schedule yourself.
+That's {doc}`batch scoring </ml/inference/batch-scoring>`, and it's the right answer for anything
+you can schedule yourself.
 
 :::
 
 :::{tab-item} A served model
 
-An adapter turns the endpoint into a UDF, a class you drop into `map_batches`, which
-connects once per worker rather than once per row.
+An adapter turns the endpoint into a UDF, a class you drop into `map_batches`, which connects
+once per worker rather than once per row.
 
 ```python
 # docs: skip
@@ -57,39 +58,39 @@ scored = bt.read.parquet("s3://bucket/rows.parquet").map_batches(Score, batch_si
 
 ## Calling a served model
 
-When the model lives elsewhere, pick the adapter for the backend that holds it.
+When the model lives elsewhere, pick the adapter for the backend that holds it:
 
 | Adapter | Backend |
 | --- | --- |
 | `http_client(url, input_columns=, output_columns=)` | Any JSON HTTP endpoint |
 | `triton_client(...)` | NVIDIA Triton |
 | `torchserve_client(...)` | TorchServe |
-| `serve_deployment(...)` | A Ray Serve deployment |
 | `serving_udf(connect, ...)` | Your own {py:class}`ServingClient <batcher.ml.ServingClient>` |
 
-The adapter sends a **batch** per request, not a row. That is the whole reason the
-pattern is viable. Ten million rows at `batch_size=64` is 156,000 requests instead of ten
-million.
+The adapter sends a *batch* per request, not a row, and that's what makes the pattern viable.
+Ten million rows at `batch_size=64` is 156,250 requests instead of ten million.
 
 :::{important}
-Tune `batch_size` against what the endpoint will accept. Most serving stacks have a max
-payload, and a batch that exceeds it does not degrade. It fails every request.
+Most serving stacks cap the rows or bytes in one request, and a request over the cap doesn't
+degrade: it fails. Set `max_batch_size` on the adapter to the window the endpoint was built for,
+and each engine batch is split into requests it can hold. {doc}`Serving </ml/training/serving>`
+covers how each adapter finds that number.
 :::
 
-`retries` handles the transient failure. A request that keeps failing raises, so if the
-endpoint is flaky enough that you would rather lose rows than the job, pair `retries` with
-`max_errored_rows`.
+`retries` handles the transient failure. A request that keeps failing raises, so if the endpoint
+is flaky enough that you'd rather lose rows than the job, pair `retries` with `max_errored_rows`
+on `map_batches`.
 
 To write your own adapter, implement `ServingClient` and hand `serving_udf` a `connect`
-callable. Same shape, so the connection is made once per worker.
+callable. The connection is still made once per worker.
 
 ## Overlapping stages with run_pipeline
 
 A single map stage doing decode-then-forward makes both halves wait on each other: the CPU
 decodes batch *n+1* only after the GPU finishes batch *n*. `run_pipeline` chains
-{py:class}`Stage <batcher.ml.Stage>`s with credit-based backpressure instead, so each stage
-runs while the next one is still working. No stage can run ahead far enough to blow up memory.
-Credits bound the queue between them.
+{py:class}`Stage <batcher.ml.Stage>`s with credit-based backpressure instead, so each stage runs
+while the next one is still working, and the credits bound the queue between them so no stage
+runs far enough ahead to blow up memory.
 
 ```python
 import pyarrow as pa
@@ -125,18 +126,21 @@ print(out[0].to_pydict())
 # {'x': [2.0, 4.0, 6.0, 8.0], 'label': [False, False, True, True]}
 ```
 
-`credits` is how many batches may sit queued ahead of a stage. One credit is one batch
-slot, and the producer blocks at zero. Two is a sane default, enough to overlap without
-buffering a pipeline's worth of decoded images in RAM. This is the same credit-based flow
-control the engine's shuffle uses.
+`credits` is how many finished batches may sit queued between a stage and the next. One credit
+is one batch slot, and the producer blocks at zero. The default of two overlaps the stages
+without buffering a pipeline's worth of decoded images in RAM. The engine's shuffle uses the
+same credit-based flow control.
+
+`num_gpus` on a `Stage` is recorded but not yet used for placement. Single-node execution ignores
+it, so don't rely on it to put a stage on a device.
 
 ## Adaptive batching with InferencePool
 
-{py:class}`InferencePool <batcher.ml.InferencePool>` sits underneath the `infer` path. Reach for it directly when you are
-driving the stream yourself, in a serving process or a custom loop. It keeps workers alive, so
-the factory runs once per worker and the model loads once, and it *rebatches* the incoming
-stream to a target size rather than feeding the GPU whatever size the reader happened to
-produce.
+{py:class}`InferencePool <batcher.ml.InferencePool>` sits underneath the `infer` path. Use it
+directly when you drive the stream yourself, in a serving process or a custom loop. It keeps
+workers alive, so the factory runs once per worker and the model loads once. It also *rebatches*
+the incoming stream to a target size rather than feeding the GPU whatever size the reader
+produced.
 
 ```python
 import pyarrow.compute as pc
@@ -156,20 +160,19 @@ print([b.to_pydict() for b in pool.run(ds.iter_batches())])
 # [{'x': [2, 4]}, {'x': [6, 8]}, {'x': [10, 12]}]
 ```
 
-Results come back **in input order**, whichever worker produced them, so a downstream
-join on row position stays valid. `target_latency_ms` with `objective="latency"` shrinks
-the batch to hold a latency target instead of maximizing throughput, which is the
-online-serving trade. `min_batch_rows` and `max_batch_rows` bound the adaptation.
+Results come back in input order, whichever worker produced them, so a downstream join on row
+position stays valid. Setting `target_latency_ms` retunes the batch size online toward that
+per-batch latency instead of maximizing throughput, which is the online-serving trade.
+`min_batch_rows` and `max_batch_rows` bound the adaptation.
 
 ## Batch and online, one model
 
 :::{tip}
-The pattern that keeps a team honest is to run the same worker class in the offline
-pipeline and inside the serving process. Offline it is handed to `map_batches`. Online it
-is handed to `InferencePool` and fed by request handlers. One implementation, so a preprocessing
-step cannot drift between training-time scoring and serving-time scoring. That drift is
-the most common source of training/serving skew and the hardest to find, because both
-halves look correct in isolation.
+Run the same worker class in the offline pipeline and inside the serving process. Offline it's
+handed to `map_batches`, and online to `InferencePool`, fed by request handlers. With one
+implementation, a preprocessing step can't drift between training-time and serving-time scoring.
+That drift is the most common source of training/serving skew and the hardest to find, because
+both halves look correct in isolation.
 :::
 
 ```python
@@ -183,31 +186,31 @@ for result in pool.run(request_batches()):
     respond(result)
 ```
 
+To put a model behind an endpoint of your own instead, `serve_deployment` wraps a load-once
+factory as a Ray Serve deployment. {doc}`Serving </ml/training/serving>` covers it.
+
 ## Choosing
 
-The pattern to use follows from who owns the model and where it runs, not from how large
-it is. Find your situation below:
+The pattern follows from who owns the model and where it runs, not from how large it is. Find
+your situation in the table:
 
 | Situation | Reach for |
 | --- | --- |
-| A batch job, model you can schedule | {py:meth}`ds.ml.infer(ModelClass, num_gpus=…) <batcher.api.dataset.ml.DatasetML.infer>` |
-| Model owned by another team or another cluster | `http_client`, `triton_client`, or `serve_deployment` |
+| A batch job, model you can schedule | {py:meth}`ds.ml.infer(ModelClass, num_gpus=...) <batcher.api.dataset.ml.DatasetML.infer>` |
+| Model owned by another team or another cluster | `http_client`, `triton_client`, or `torchserve_client` |
 | CPU preprocessing starving a GPU stage | `run_pipeline` with `Stage` credits |
-| You are driving the stream, and want adaptive batching | `InferencePool` |
+| You're driving the stream, and want adaptive batching | `InferencePool` |
+| A model you validated in batch that must also answer online requests | `serve_deployment` |
 | An LLM behind an OpenAI-compatible endpoint | `http_engine`, covered in {doc}`LLM inference </ml/retrieval/llm/index>` |
 
 ## See also
 
-- {doc}`Serving </ml/training/serving>`: the adapters and the `ServingClient` contract in full.
+- {doc}`Serving </ml/training/serving>`: the adapters, request sizing, retries, and `serve_deployment` in full.
 - {doc}`Batch scoring </ml/inference/batch-scoring>`: the offline job end to end.
 - {doc}`Inference </ml/inference/inference>`: the load-once-per-worker contract.
 - {doc}`GPU scheduling </ml/inference/gpu>`: sizing actors and packing models onto devices.
-- {doc}`Credit flow control </architecture/deep-dives/distribution/credit-flow-control>`: the credits `Stage` hands
-  out, and the same mechanism in the engine's shuffle.
-- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: why a CPU stage starves a GPU stage,
-  and what overlapping them buys.
-- {doc}`Streaming inference </cookbook/streaming/streaming-inference>`: the online half,
-  as a runnable recipe.
-- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: in-process against the served
-  path, measured.
+- {doc}`Credit flow control </architecture/deep-dives/distribution/credit-flow-control>`: the mechanism behind `Stage` credits and the engine's shuffle.
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: why a CPU stage starves a GPU stage.
+- {doc}`Streaming inference </cookbook/streaming/streaming-inference>`: the online half, as a runnable recipe.
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: measured in-process model throughput.
 - {doc}`ML API </api/models/ml>`: the `InferencePool`, `Stage`, and `run_pipeline` reference.

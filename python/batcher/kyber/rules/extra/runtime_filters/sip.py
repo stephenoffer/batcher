@@ -99,6 +99,7 @@ def push_is_not_null_from_join_key(node: Join, ctx: OptimizerContext) -> Logical
         if (
             "left" in sides
             and _scan_rooted(node.left)
+            and not _resident_scan(node.left, ctx)
             and _may_hold_null(left_stats.column(lk))
             and not _provably_true_at_source(node.left, lk, IsNotNull(Col(lk)), ctx)
         ):
@@ -106,6 +107,7 @@ def push_is_not_null_from_join_key(node: Join, ctx: OptimizerContext) -> Logical
         if (
             "right" in sides
             and _scan_rooted(node.right)
+            and not _resident_scan(node.right, ctx)
             and _may_hold_null(right_stats.column(rk))
             and not _provably_true_at_source(node.right, rk, IsNotNull(Col(rk)), ctx)
         ):
@@ -135,6 +137,29 @@ def _scan_rooted(side: LogicalPlan) -> bool:
     while isinstance(node, Filter | Project | Limit):
         node = node.input
     return isinstance(node, Scan)
+
+
+def _resident_scan(side: LogicalPlan, ctx: OptimizerContext) -> bool:
+    """Whether scan-rooted `side` reads a *resident* source — Arrow already in memory.
+
+    `key IS NOT NULL` earns its place by sinking into a scan that answers it from null counts and
+    skips row groups. A resident source can do neither, so the predicate is evaluated row by row
+    above it and every surviving row copied, all to remove rows the join drops anyway. On TPC-DS
+    sf1 that was the hottest operator of q60 — `ss_sold_date_sk IS NOT NULL` over 2.88M
+    `store_sales` rows keeping 2.75M, 48 ms of the query's 146 ms of CPU, feeding a join that
+    keeps 2% of them. Declining it on resident sources measured q61 25 -> 19 ms, q25 24 -> 20,
+    q33 20.4 -> 17.8, q29 29 -> 26 and q60 21 -> 19, with no case slower.
+
+    Only this rule asks. The `IN`-list and bloom pushes beside it remove rows a join *keeps
+    probing* until they are gone, which pays on resident data too.
+    """
+    node = side
+    while isinstance(node, Filter | Project | Limit):
+        node = node.input
+    sources = ctx.sources or []
+    if not isinstance(node, Scan) or node.source_id >= len(sources):
+        return False
+    return bool(getattr(sources[node.source_id], "resident", False))
 
 
 @rule(name="push_in_list_across_join_keys", matches=(Join,), **SIP)

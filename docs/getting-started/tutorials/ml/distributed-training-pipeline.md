@@ -14,6 +14,10 @@ and marked.
 | The DDP training loop | No | GPUs, NCCL, `torch.distributed` |
 | Sharded corpus, distributed preprocessing | No | A cluster and object storage |
 
+The engine side of this page is one flow, from shaped features to one stream per rank:
+
+![The featured dataset is split by a hash of its key into train, 44 rows in the example, and test, 20 rows held out. The scaler is fitted on train only, so its statistics come from train. Those statistics transform train into train_x and also transform test into test_x, so both parts are scaled with train's statistics. train_x then feeds stream_loader, where rank 0 and rank 1 each read a disjoint slice. Split before you fit, because a fit on test rows raises no error and still leaks.](/_static/diagrams/training_data_flow.svg)
+
 ## 1. Shape the features in the engine
 
 Feature work belongs in the engine, not in the training loop. Expressions run in Rust across
@@ -61,13 +65,13 @@ print(train.count(), test.count())
 # 44 20
 ```
 
-Sizes are binomial around `test_size × n` rather than exact, which is what a hash-keyed split
+Sizes are binomial around `test_size * n` rather than exact, which is what a hash-keyed split
 buys you: no shuffle, no materialization, and the same assignment on every node.
 
 ## 3. Fit the preprocessor on train, transform both
 
 A {py:class}`StandardScaler <batcher.ml.preprocessors.StandardScaler>` is a fit/transform pair, and the fit is one mergeable pass over the data,
-the same `partial → combine → finalize` algebra the aggregates use, so it runs on one core or
+the same partial, combine, and finalize algebra the aggregates use, so it runs on one core or
 a cluster with the same result. The transform stays inside the engine.
 
 ```python
@@ -88,7 +92,7 @@ The statistics come from `train` only. `test_x` is transformed with them, never 
 
 {py:meth}`ds.ml.iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` yields `{column: tensor}` dicts. It consumes the stream
 incrementally, so memory stays bounded and the loop starts before the whole dataset is read,
-and it overlaps the host→device copy of one batch with the host work of the next.
+and it overlaps the host-to-device copy of one batch with the host work of the next.
 
 ```python
 loader = train_x.select("clicks", "spend", "spend_per_click", "label").ml.iter_torch_batches(
@@ -102,20 +106,21 @@ print(tuple(batches[0]["clicks"].shape))
 # (16,)
 ```
 
-In real training, leave `device="auto"` (it picks CUDA, ROCm, XPU, or MPS and falls back to
-CPU) and set `pin_memory=True` so the copies are async. `local_shuffle_buffer_size=` gives a
+In real training, leave `device="auto"`, which picks CUDA, ROCm, XPU, or MPS and falls back
+to CPU, and set `pin_memory=True` so the copies are async. `local_shuffle_buffer_size=` gives a
 streaming approximation of a shuffle without materializing the dataset.
 
-On the benchmark this loader streams **1.06 M rows/s**, because it is zero-copy through
-DLPack rather than a per-batch Arrow-to-tensor conversion.
+The {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>` records this loader at
+1.06 M rows/s, streaming through zero-copy DLPack with background prefetch rather than a
+per-batch Arrow-to-tensor conversion.
 
 ## 5. The sample order, before you trust it
 
-For data-parallel training you need four things from the loader, and it is worth checking
-them rather than assuming them: the ranks must be **balanced** (nobody stalls at the
-all-reduce barrier), the order must be **deterministic** (so a resume is exact), it must be
-**elastic** (the same seed and epoch give the same global order at *any* `world_size`), and
-the ranks must be **independent** (no central coordinator).
+Data-parallel training needs four things from the loader, and they're worth checking rather
+than assuming. The ranks must be *balanced*, so nobody stalls at the all-reduce barrier. The
+order must be *deterministic*, so a resume is exact. It must be *elastic*: the same seed and
+epoch give the same global order at any `world_size`. And the ranks must be *independent*,
+with no central coordinator.
 
 The ordering functions are usable on their own, which is the easiest way to see what a resumed
 epoch will actually read:
@@ -243,10 +248,9 @@ Shards on object storage, with a bounded shard cache instead of a resident datas
 
 ```python
 # docs: skip
-from batcher.io.formats.ml import write_shards
 from batcher.ml import shard_stream_loader
 
-write_shards(train_x, "s3://corpus/train/", rows_per_shard=100_000)
+train_x.ml.write_shards("s3://corpus/train/", rows_per_shard=100_000)
 
 stream = shard_stream_loader(
     "s3://corpus/train/",
@@ -267,8 +271,8 @@ consumed concurrently with backpressure.
 ## 9. Preprocessing on the cluster
 
 When the corpus lives in object storage and the features are expensive, run the shaping
-distributed. It is the same plan; only the scheduling changes, and the result is the same rows,
-column names, and column types as the single-node one. A floating-point reduction is identical
+distributed. It's the same plan, and only the scheduling changes. The result has the same rows,
+column names, and column types as the single-node run. A floating-point reduction is identical
 up to reassociation, since the partition count sets the summation order.
 
 ```python

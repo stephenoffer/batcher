@@ -13,6 +13,7 @@ Result-correctness vs DuckDB lives in `tests/differential/test_diff_runtime_filt
 from __future__ import annotations
 
 import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -148,6 +149,27 @@ def _dim():
     return bt.from_pydict({"k": [1, 2, 9], "w": [5, 6, 7]})
 
 
+class _Stored:
+    """A source read as if file-backed: everything delegates, but it is not resident."""
+
+    resident = False
+
+    def __init__(self, source) -> None:
+        self._source = source
+
+    def __getattr__(self, name):
+        return getattr(self._source, name)
+
+
+def _stored(ds):
+    """`ds`'s plan over non-resident stand-ins for its sources, ready for `_rewrite`.
+
+    `push_is_not_null_from_join_key` declines on resident Arrow, which cannot use the predicate
+    to skip anything, so the cases about what it inserts are asked of a source that can.
+    """
+    return SimpleNamespace(_plan=ds._plan, _sources=[_Stored(s) for s in ds._sources])
+
+
 def _kstat(rows: int = 3, **kw) -> SourceStatistics:
     return SourceStatistics(row_count=rows, columns={"k": ColumnStat(**kw)})
 
@@ -224,9 +246,17 @@ def test_no_rule_ever_reduces_a_side_the_join_preserves(how, rule_name):
     ],
 )
 def test_is_not_null_respects_filterable_sides(how, on_fact, on_dim):
-    join = _join(_rewrite(_fact().join(_dim(), on="k", how=how)))
+    join = _join(_rewrite(_stored(_fact().join(_dim(), on="k", how=how))))
     assert _has_not_null(_side(join, "v"), "k") is on_fact
     assert _has_not_null(_side(join, "w"), "k") is on_dim
+
+
+def test_is_not_null_declines_on_resident_sources():
+    # The positive control is the `inner` case above: the same join, stored, gains the filter on
+    # both sides. Resident, it gains it on neither.
+    join = _join(_rewrite(_fact().join(_dim(), on="k")))
+    assert not _has_not_null(_side(join, "v"), "k")
+    assert not _has_not_null(_side(join, "w"), "k")
 
 
 def test_is_not_null_skipped_when_null_count_proven_zero():
@@ -260,7 +290,7 @@ def test_is_not_null_skipped_when_a_filter_hides_the_proven_zero():
 def test_is_not_null_on_every_key_of_a_composite_join():
     left = bt.from_pydict({"a": [1], "b": [2], "v": [3]})
     right = bt.from_pydict({"a": [1], "b": [2], "w": [4]})
-    plan = _rewrite(left.join(right, on=["a", "b"]))
+    plan = _rewrite(_stored(left.join(right, on=["a", "b"])))
     assert _has_not_null(plan, "a") and _has_not_null(plan, "b")
 
 
@@ -274,7 +304,7 @@ def test_runtime_filter_reaches_the_scan(shape):
         if shape == "project"
         else _fact().group_by("k").agg(total=col("v").sum())
     )
-    plan = _rewrite(side.join(_dim(), on="k"))
+    plan = _rewrite(_stored(side.join(_dim(), on="k")))
     at_scan = [f for f in _filters(plan) if isinstance(f.input, Scan) and _has_not_null(f, "k")]
     assert at_scan, "the runtime filter never reached a scan"
 
@@ -285,7 +315,8 @@ def test_runtime_filter_is_added_exactly_once_under_a_fixpoint_phase(marker):
     # guard that only checked the *adjacent* filter chain would stop seeing it there and re-add it
     # on every iteration. Counted per side: both sides' keys are named `k`, so one `IS NOT NULL`
     # on each is correct, not a duplicate.
-    join = _join(_rewrite(_fact().select(k=col("k"), v2=col("v") * 2).join(_dim(), on="k")))
+    ds = _stored(_fact().select(k=col("k"), v2=col("v") * 2).join(_dim(), on="k"))
+    join = _join(_rewrite(ds))
     per_side = [c for c in _conjuncts(_side(join, marker)) if isinstance(c, IsNotNull)]
     assert len(per_side) == 1, f"{len(per_side)} copies of IS NOT NULL on the {marker} side"
 

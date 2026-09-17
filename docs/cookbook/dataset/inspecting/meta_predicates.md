@@ -1,6 +1,8 @@
 # Cheap data checks
 
-These short-circuit. `any_match` stops at the first matching row rather than counting them all, which makes "does this table contain any bad rows?" much cheaper than "how many bad rows does it contain?".
+"Does this table contain any bad rows?" is a cheaper question than "how many bad rows does it contain?", and these accessors ask the cheap one. `any_match` and its siblings answer from metadata when the answer is provable and otherwise probe for a single row rather than counting them all.
+
+The script asks existence questions with `any_match`, `all_match`, and `none_match`, uses `count_where` when the number matters, and reads the `check` shorthands as sentences such as "all amounts are between 1 and 100". It shows that sort order is tracked on the plan, and it ends with the gate these exist for: refuse to proceed when a contract is violated.
 
 The whole script, executed on every test run:
 

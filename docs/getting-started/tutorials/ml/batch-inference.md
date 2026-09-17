@@ -42,22 +42,27 @@ print(scored.to_pydict())
 ```
 
 :::{warning}
-The {py:meth}`.to_pylist() <batcher.Dataset.to_pylist>` here turns one batch's column into Python values for the toy computation.
-Do not copy that into a real pipeline. It materializes every element as a Python object,
-which is exactly the per-row cost the batch interface exists to avoid. A real model consumes
-the Arrow buffers directly ({py:meth}`to_numpy <batcher.Dataset.to_numpy>`, or DLPack into torch) and no per-row Python work
-happens at all.
+The pyarrow `.to_pylist()` here turns one batch's column into Python values for the toy computation.
+Don't copy that into a real pipeline. It materializes every element as a Python object,
+which is exactly the per-row cost the batch interface exists to avoid. A real model reads
+the Arrow buffers directly, through the column's `to_numpy()` or DLPack into torch, and no
+per-row Python work happens at all.
 :::
 
 ## Loading a model once per worker
 
 :::{tip}
-Pass the **class**, not an instance, and not a closure over a loaded model. When `fn` is a
-class, it is constructed once per worker and reused across batches, so an expensive model
-load is amortized across every batch that worker sees. A model loaded per batch is the
-single most common reason an inference pipeline is slow, and on the benchmark the warm pool
-is what turns a 7-second gpt2 load from the dominant cost into a rounding error.
+Pass the class, not an instance and not a closure over a loaded model. When `fn` is a
+class, Batcher constructs it once per worker and reuses it across batches, so an expensive
+model load is paid once for every batch that worker sees. A model loaded per batch is the
+most common reason an inference pipeline is slow. On the {doc}`AI and GPU benchmark
+</benchmarks/results/ai-and-gpu>`, a gpt2 load takes about 7 seconds against roughly 1 second
+of generation, so loading once is most of the win.
 :::
+
+The difference is where the load sits relative to the batches:
+
+![On the left, a plain function such as def score(batch) is used as-is on every batch, so a function that loads its model pays the load on batch 1, again on batch 2, and again on batch 3. On the right, a class such as Classifier is built once per worker, its constructor loads the model a single time, and that one instance's call method scores batch 1, batch 2, and batch 3 with the model it already holds. A gpt2 load takes about 7 seconds against about 1 second of generation, so the load is most of the cost.](/_static/diagrams/model_load_once.svg)
 
 The class is callable: its `__call__` takes a batch and returns a batch.
 
@@ -95,10 +100,14 @@ labeled.write.parquet("output/labeled.parquet")
 `map_batches` accepts any of the following arguments to tune throughput and placement:
 
 - `batch_size`: rows per batch handed to `fn`.
-- `output_columns`: declares the columns `fn` adds, when the engine should know the
-  output schema ahead of time.
+- `output_columns`: the columns `fn` returns, when the engine should know the output
+  schema ahead of time.
 - `num_gpus`: fractional GPUs reserved per worker.
-- `concurrency`: number of parallel workers.
+- `concurrency`: the size of the distributed actor pool, as an int or a `(min, max)` range.
+- `fn_constructor_args` and `fn_constructor_kwargs`: arguments for a class's `__init__`,
+  such as a model path.
+- `max_retries` and `max_errored_rows`: how many times a failing batch is retried, and how
+  many per-row errors the job tolerates before it fails.
 
 The same accessor also offers {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` and
 {py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>` for the common inference and embedding cases. See the
@@ -108,13 +117,13 @@ The same accessor also offers {py:meth}`ds.ml.infer(model, ...) <batcher.api.dat
 Leave `batch_size` unset unless you have measured a reason to set it. Adaptive batch sizing
 picks a VRAM-safe default and halves the batch on a CUDA OOM, which is why
 {py:meth}`ds.map_batches(Model, num_gpus=1) <batcher.Dataset.map_batches>` with no knobs runs at 2,451 img/s and 82% GPU
-utilization on the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>`, within 2% of the
-hand-tuned batch size.
+utilization over 131k images on 8xT4 in the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>`,
+within 2% of the hand-tuned `batch_size=128` run.
 :::
 
 ## Where to go next
 
-Where this pattern goes:
+The same batch contract carries every model workload that follows:
 
 ::::{grid} 1 3 3 3
 :gutter: 3

@@ -24,7 +24,7 @@ Batcher raises typed exceptions, so a failure names what went wrong and what to 
 .. autoexception:: TransportError
 ```
 
-{py:exc}`BatcherError <batcher.BatcherError>` is the root every other Batcher error subclasses, so catching it covers them all. Several also subclass a builtin so existing handlers keep working: {py:exc}`PlanError <batcher.PlanError>`, {py:exc}`ConfigError <batcher.ConfigError>`, and {py:exc}`DataQualityError <batcher.DataQualityError>` are each a `ValueError`; {py:exc}`ColumnNotFoundError <batcher.ColumnNotFoundError>` is a `KeyError` and carries the missing `.column`; {py:exc}`MissingDependencyError <batcher.MissingDependencyError>` is an `ImportError` and carries the `.install` hint for the extra to install; {py:exc}`AccessDeniedError <batcher.AccessDeniedError>` is a `PermissionError`.
+{py:exc}`BatcherError <batcher.BatcherError>` is the root every other Batcher error subclasses, so catching it covers them all. Several also subclass a builtin so existing handlers keep working: {py:exc}`PlanError <batcher.PlanError>`, {py:exc}`ConfigError <batcher.ConfigError>`, and {py:exc}`DataQualityError <batcher.DataQualityError>` are each a `ValueError`. {py:exc}`ColumnNotFoundError <batcher.ColumnNotFoundError>` is a `KeyError` and carries the missing `.column`. {py:exc}`MissingDependencyError <batcher.MissingDependencyError>` is an `ImportError` and carries the `.install` hint for the extra to install. {py:exc}`AccessDeniedError <batcher.AccessDeniedError>` is a `PermissionError`.
 
 In practice you handle them with `try` and `except`, usually catching the base type.
 
@@ -43,7 +43,7 @@ except Exception as exc:
 
 ## The error types you may see
 
-Each row below names a type, then the part of the engine that raises it.
+The table maps each type to the failure that raises it.
 
 | Error | Raised when |
 | --- | --- |

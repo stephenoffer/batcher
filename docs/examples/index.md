@@ -1,12 +1,8 @@
 # Example library
 
-This page indexes the 512 runnable example scripts under `examples/`. Every one of them
-executes end to end against the built engine, asserts on its own output, and exits non-zero
-if anything is wrong. Running the directory is a release check, not a documentation exercise.
+Batcher ships 512 runnable example scripts under `examples/`, covering every part of the engine from the relational core to GPU inference. Every one executes end to end against the built engine, asserts on its own output, and exits non-zero if anything is wrong, so running the whole directory doubles as a release check. When you need a starting point for a pipeline, one of these is usually close.
 
-The tables on these pages are generated from the scripts themselves by
-`python tools/example_library.py`, so the library cannot drift from the tree. The prose
-around them is written by hand.
+The tables on these pages are generated from the scripts themselves by `python tools/example_library.py`, so the library cannot drift from the tree. The prose around them is written by hand.
 
 ```bash
 python examples/quickstart.py
@@ -16,18 +12,11 @@ python -m pytest tests/docs/test_examples.py -q
 
 ## What the scripts read
 
-Anything needing more than a handful of literal rows reads the public TPC-H mirror in
-`s3://ray-benchmark-data`, plus a corpus of small JPEGs for the multimodal scripts. Nothing
-is synthetic while the network is up.
+Anything needing more than a handful of literal rows reads the public TPC-H mirror in `s3://ray-benchmark-data`, plus a corpus of small JPEGs for the multimodal scripts. Nothing is synthetic while the network is up.
 
-The shared helper in `examples/_common/` restores the canonical TPC-H column names, which
-the mirror does not carry, caches a bounded slice of each table locally so five hundred
-scripts do not each re-read S3, and falls back to a schema-identical stand-in with a notice on stderr
-when there is no network. Point the cache elsewhere with `BATCHER_EXAMPLES_CACHE`, or take
-more rows with `BATCHER_EXAMPLES_ROWS`.
+The shared helper in `examples/_common/` restores the canonical TPC-H column names, which the mirror does not carry, caches a bounded slice of each table locally so five hundred scripts do not each re-read S3, and falls back to a schema-identical stand-in with a notice on stderr when there is no network. Point the cache elsewhere with `BATCHER_EXAMPLES_CACHE`, or take more rows with `BATCHER_EXAMPLES_ROWS`.
 
-Scripts reach the helper with a two-line bootstrap that works both under the test runner and
-when you run the file directly:
+Scripts reach the helper with a two-line bootstrap that works both under the test runner and when you run the file directly:
 
 ```python
 # docs: skip
@@ -43,37 +32,24 @@ orders = tpch("orders")
 
 ## Hardware is optional
 
-Two families would otherwise need hardware that CI does not have. Both take a flag and
-degrade rather than skip, because a check that skips itself checks nothing.
+Two families would otherwise need hardware that CI does not have. Both take a flag and degrade rather than skip, because a check that skips itself checks nothing.
 
 | Family | Default | Opt in |
 | --- | --- | --- |
 | `examples/gpu/` and the ML device paths | Auto: use an accelerator when the engine sees one, the CPU engine otherwise | `--device gpu`, `--device cpu`, or `BATCHER_EXAMPLES_DEVICE` |
 | `examples/dist/` | Single node, still asserting mergeable equivalence across partitions | `--distributed` or `BATCHER_EXAMPLES_DISTRIBUTED=1` |
 
-Asking for `--device gpu` on a machine with no accelerator is an error rather than a silent
-downgrade. The one time you type it deliberately is the time you need to know it did not
-happen.
+Asking for `--device gpu` on a machine with no accelerator is an error rather than a silent downgrade. The one time you type it deliberately is the time you need to know it did not happen.
 
 ## Start at the root
 
-The scripts at the root of `examples/` are tours of one topic rather than focused
-demonstrations, so they are where to start on an unfamiliar area before dropping into the
-per-API scripts.
+The scripts at the root of `examples/` are tours of one topic rather than focused demonstrations, so they are where to start on an unfamiliar area before dropping into the per-API scripts.
 
-`quickstart.py` is the headline pipeline: read, filter, group, aggregate, sort. If you run one
-script, run that one.
+`quickstart.py` is the headline pipeline: read, filter, group, aggregate, sort. If you run one script, run that one.
 
-Two of these need setup and are marked `# examples: skip`, so the test runner collects them
-without executing. `distributed.py` needs the optional `[ray]` extra and spins up a local
-cluster; `streaming_pipeline.py` needs a Kafka broker and a Delta sink. Both still show the
-real API shape, and running `distributed.py` directly is the fastest way to see single-node
-and distributed produce identical results.
+Two of these need setup and are marked `# examples: skip`, so the test runner collects them without executing. `distributed.py` needs the optional `[ray]` extra and spins up a local cluster; `streaming_pipeline.py` needs a Kafka broker and a Delta sink. Both still show the real API shape, and running `distributed.py` directly is the fastest way to see single-node and distributed produce identical results.
 
-For a single script that touches every subsystem at once, use
-`examples/operations/release_check.py` instead. It checks the S3 read path, the scan, the
-plan surface, each relational operator, SQL, expressions, data quality, backend parity,
-partition parity, spill parity and the write path, and reports which one failed.
+For a single script that touches every subsystem at once, use `examples/operations/release_check.py` instead. It checks the S3 read path, the scan, the plan surface, each relational operator, SQL, expressions, data quality, backend parity, partition parity, spill parity and the write path, and reports which one failed.
 
 <!-- library-table: . -->
 | Script | Shows |
@@ -98,9 +74,9 @@ partition parity, spill parity and the write path, and reports which one failed.
 
 ## The sections
 
-Each page below indexes one part of the library and shows code lifted from the scripts it
-covers. Blocks that need the S3 corpus are marked `# docs: skip` and are shown rather than
-executed; the rest run as part of the documentation build.
+Each page below indexes one part of the library and shows code lifted from the scripts it covers. Blocks that need the S3 corpus are marked `# docs: skip` and are shown rather than executed; the rest run as part of the documentation build.
+
+![A bar chart of the 512 example scripts by section, sorted largest first. Relational operations has 115, expressions 101, machine learning 57, reading and writing 47, statistics, time series, geospatial and graph 46, operating the engine 40, TPC-H 30, data quality and governance 23, distributed and streaming 18, the root tour scripts 16, multimodal and text 11, and accelerators 8. The relational core and the expression language together hold 216 of the 512.](/_static/diagrams/example_library_map.svg)
 
 | Page | Scripts | Covers |
 | --- | --- | --- |
@@ -115,6 +91,12 @@ executed; the rest run as part of the documentation build.
 | {doc}`data-quality` | 23 | Contracts, profiling, drift, governance, security |
 | {doc}`operations` | 40 | Plans, profiling, configuration, errors, performance |
 | {doc}`analytics` | 46 | Statistics, time series, geospatial, graph |
+
+## See also
+
+- {doc}`/cookbook/index`: recipes that embed a script and explain it, grouped by domain.
+- {doc}`/getting-started/tutorials/index`: one pipeline built step by step.
+- {doc}`/getting-started/quickstart`: the shortest path to a first query.
 
 ```{toctree}
 :hidden:

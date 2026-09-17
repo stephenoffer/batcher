@@ -22,7 +22,13 @@ variables and the config file, and which setting wins when they disagree.
 ```
 
 ```{eval-rst}
-.. autofunction:: batcher.config.active_config
+.. currentmodule:: batcher.config
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   active_config
 ```
 
 ### Options by name
@@ -31,12 +37,18 @@ Address any tunable by its dotted path, the way `pandas.set_option` and `spark.c
 do. {doc}`/configuration/options` lists every path with its default and its unit.
 
 ```{eval-rst}
-.. autofunction:: batcher.config.get_option
-.. autofunction:: batcher.config.set_option
-.. autofunction:: batcher.config.reset_option
-.. autofunction:: batcher.config.option_context
-.. autofunction:: batcher.config.option_names
-.. autofunction:: batcher.config.describe_options
+.. currentmodule:: batcher.config
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   get_option
+   set_option
+   reset_option
+   option_context
+   option_names
+   describe_options
 ```
 
 ### Serialization
@@ -45,8 +57,14 @@ Turn the active configuration into plain data, or find out what environment vari
 spells a given field.
 
 ```{eval-rst}
-.. autofunction:: batcher.config.config_to_dict
-.. autofunction:: batcher.config.env_var_names
+.. currentmodule:: batcher.config
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   config_to_dict
+   env_var_names
 ```
 
 ### Logging and verbosity
@@ -55,12 +73,18 @@ One-line switches over {py:class}`ObservabilityConfig <batcher.config.config.Obs
 {doc}`observability </user-guide/operate/running/observability>`.
 
 ```{eval-rst}
-.. autofunction:: batcher.config.set_log_level
-.. autofunction:: batcher.config.enable_logging
-.. autofunction:: batcher.config.disable_logging
-.. autofunction:: batcher.config.set_verbosity
-.. autofunction:: batcher.config.set_progress
-.. autofunction:: batcher.config.get_logger
+.. currentmodule:: batcher.config
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   set_log_level
+   enable_logging
+   disable_logging
+   set_verbosity
+   set_progress
+   get_logger
 ```
 
 ### Metrics export
@@ -68,10 +92,16 @@ One-line switches over {py:class}`ObservabilityConfig <batcher.config.config.Obs
 Process-wide counters as plain data, ready for Prometheus, OpenTelemetry, or a log line.
 
 ```{eval-rst}
-.. autofunction:: batcher.observe.metrics_snapshot
-.. autofunction:: batcher.observe.prometheus_text
-.. autofunction:: batcher.observe.start_metrics
-.. autofunction:: batcher.observe.reset_metrics
+.. currentmodule:: batcher.observe
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   metrics_snapshot
+   prometheus_text
+   start_metrics
+   reset_metrics
 ```
 
 ## Result cache
@@ -87,12 +117,7 @@ Whole-cache control and measurement, for the results {py:meth}`Dataset.cache <ba
 
    cache_stats
    clear_cache
-```
-
-```{eval-rst}
-.. autoclass:: batcher.StorageLevel
-   :members:
-   :undoc-members:
+   StorageLevel
 ```
 
 ## Configuration classes
@@ -100,76 +125,56 @@ Whole-cache control and measurement, for the results {py:meth}`Dataset.cache <ba
 The tunables themselves, one dataclass per subsystem. All of them are frozen, so changing a
 setting means deriving a new config rather than mutating the live one.
 {doc}`/api/operations/configuration` works that pattern through and says how the layers
-combine; {doc}`/configuration/options` gives every field a default and a unit.
+combine. {doc}`/configuration/options` gives every field a default and a unit.
 
 ```{eval-rst}
-.. autoclass:: batcher.Config
-   :members:
+.. currentmodule:: batcher
 
-.. autoclass:: batcher.ExecutionConfig
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: batcher.MemoryConfig
-   :members:
+   Config
+   ExecutionConfig
+   MemoryConfig
+   FlowControlConfig
+   StreamingConfig
+   OptimizerConfig
+   PIDConfig
+   MetadataConfig
+   GovernanceConfig
+   TenantConfig
+   tenant
+```
 
-.. autoclass:: batcher.FlowControlConfig
-   :members:
+```{eval-rst}
+.. currentmodule:: batcher.config.config
 
-.. autoclass:: batcher.StreamingConfig
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: batcher.OptimizerConfig
-   :members:
+   CardinalityConfig
+   CostWeights
+   CostCoefficients
+   DistributedConfig
+   ObservabilityConfig
+   ShuffleTlsConfig
+```
 
-.. autoclass:: batcher.config.config.CardinalityConfig
-   :members:
+```{eval-rst}
+.. currentmodule:: batcher.config
 
-.. autoclass:: batcher.config.config.CostWeights
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: batcher.config.config.CostCoefficients
-   :members:
-
-.. autoclass:: batcher.config.config.DistributedConfig
-   :members:
-
-.. autoclass:: batcher.PIDConfig
-   :members:
-
-.. autoclass:: batcher.MetadataConfig
-   :members:
-
-.. autoclass:: batcher.config.AcceleratorConfig
-   :members:
-
-.. autoclass:: batcher.config.EnergyConfig
-   :members:
-
-.. autoclass:: batcher.config.DeviceHealthConfig
-   :members:
-
-.. autoclass:: batcher.config.DeviceMemoryConfig
-   :members:
-
-.. autoclass:: batcher.config.FaultToleranceConfig
-   :members:
-
-.. autoclass:: batcher.config.QuarantineConfig
-   :members:
-
-.. autoclass:: batcher.GovernanceConfig
-   :members:
-
-.. autoclass:: batcher.TenantConfig
-   :members:
-
-.. autofunction:: batcher.tenant
-
-.. autoclass:: batcher.config.config.ObservabilityConfig
-   :members:
-
-.. autoclass:: batcher.config.config.ShuffleTlsConfig
-   :members:
+   AcceleratorConfig
+   EnergyConfig
+   DeviceHealthConfig
+   DeviceMemoryConfig
+   FaultToleranceConfig
+   QuarantineConfig
 ```
 
 ## See also

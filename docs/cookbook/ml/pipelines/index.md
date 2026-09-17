@@ -1,18 +1,11 @@
 # Complete pipelines
 
-Turning a table, or a folder of media, into something a model can consume. Then running the
-model over it without wasting the GPU you are paying for.
+Turning a table, or a folder of media, into something a model can consume. Then running the model over it without wasting the GPU you are paying for.
 
-The data half of an ML pipeline is where the time actually goes, and it is where most of the
-throughput gets lost. A model that reloads on every batch. A GPU that sits idle through a CPU
-decode. One corrupt JPEG that kills a six-hour job at hour five. These recipes are mostly
-about not doing that.
+The data half of an ML pipeline is where the time actually goes, and it is where most of the throughput gets lost. A model that reloads on every batch. A GPU that sits idle through a CPU decode. One corrupt JPEG that kills a six-hour job at hour five. These recipes are mostly about not doing that.
 
 :::{tip}
-The single idiom that carries most of these pages: pass a class to `map_batches`, `infer`,
-`embed`, or `generate`, never an instance and never a plain function. The engine constructs it
-once per worker, so the weights load in the constructor and stay loaded. A function is rebuilt
-on every batch, and on a GPU stage that is usually the whole performance story.
+The single idiom that carries most of these pages: pass a class to `map_batches`, `infer`, `embed`, or `generate`, never an instance and never a plain function. The engine constructs it once per worker, so the weights load in the constructor and stay loaded. A function is rebuilt on every batch, and on a GPU stage that is usually the whole performance story.
 :::
 
 ## Images, audio, and video
@@ -107,9 +100,7 @@ Aggregates and windows over an event log, without the future in them.
 
 ## What the engine buys you here
 
-Measured on 8xT4 with a prediction-agreement gate on every run. These are the workloads the
-recipes above are built on, and the full table lives in
-{doc}`/benchmarks/results/ai-and-gpu`.
+Measured on 8xT4 with a prediction-agreement gate on every run. These are the workloads the recipes above are built on, and the full table lives in {doc}`/benchmarks/results/ai-and-gpu`.
 
 | Workload | Model | Throughput |
 | --- | --- | ---: |
@@ -119,19 +110,15 @@ recipes above are built on, and the full table lives in
 | Batch inference | ResNet-50 | 2,504 img/s at 81% GPU |
 | LLM batch inference | HF gpt2 | 814.8 prompt/s |
 
-None of that comes from per-workload tuning. It comes from the model loading once, the CPU
-stage overlapping the GPU stage, and the decode running in the data plane.
+None of that comes from per-workload tuning. It comes from the model loading once, the CPU stage overlapping the GPU stage, and the decode running in the data plane.
 
 ## See also
 
 - {doc}`ML guide </ml/index>`: the reference for every surface these recipes call.
-- {doc}`Inference </ml/inference/inference>` and {doc}`GPU scheduling </ml/inference/gpu>`: pools, stage
-  overlap, adaptive batch sizing, fractional packing.
+- {doc}`Inference </ml/inference/inference>` and {doc}`GPU scheduling </ml/inference/gpu>`: pools, stage overlap, adaptive batch sizing, fractional packing.
 - {doc}`ML API reference </api/models/ml>`: the {py:obj}`ds.ml <batcher.Dataset.ml>` namespace and the `batcher.ml` functions.
-- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>` and
-  {doc}`tensor columns </architecture/deep-dives/memory/tensor-columns>`: the mechanisms underneath.
-- {doc}`Streaming recipes </cookbook/streaming/index>`: the same model stages, over a source that
-  never ends.
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>` and {doc}`tensor columns </architecture/deep-dives/memory/tensor-columns>`: the mechanisms underneath.
+- {doc}`Streaming recipes </cookbook/streaming/index>`: the same model stages, over a source that never ends.
 
 ```{toctree}
 :hidden:

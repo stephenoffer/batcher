@@ -1,8 +1,6 @@
 # Dates and times
 
-Start with the parts, then the arithmetic, then the two that most often produce a wrong report.
-
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
+The `.dt` accessor for timestamp columns. Start with the calendar parts, then durations and shifts, then truncation for rollup keys. The time-zone and business-day recipes come last because they are the two that most often produce a report that looks right and isn't.
 
 | Recipe | What it shows |
 |---|---|

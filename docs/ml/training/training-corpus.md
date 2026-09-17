@@ -5,8 +5,8 @@ several sources at the ratio you meant, dropping the documents that are not pros
 evaluation data that leaked in, and ordering what's left so a batch isn't mostly padding. Skip
 any of them and you get a data bug that presents as a model bug.
 
-Everything here is in `batcher.ml` and built on the public {py:class}`Dataset <batcher.Dataset>` API, so each step is a plan
-the optimizer sees whole rather than a pass over materialized rows.
+Everything here is in `batcher.ml` and built on the public {py:class}`Dataset <batcher.Dataset>`
+API, so each step is a plan the optimizer sees whole rather than a pass over materialized rows.
 
 ## Mixing sources at declared weights
 
@@ -77,7 +77,7 @@ print(quality_filter(docs, "text", QualityThresholds(min_words=3)).to_pydict()["
 Run `quality_report` on a sample first. It gives the keep rate of each rule independently, and
 the rule that removes the most is usually the one whose threshold is wrong for your corpus
 rather than the one finding the most junk. A code dataset is mostly symbols and a financial one
-mostly digits; prose thresholds delete either.
+mostly digits. Prose thresholds delete either.
 
 ```python
 print(quality_report(docs, "text", QualityThresholds(min_words=3)))
@@ -175,10 +175,10 @@ Measure with `bt.ml.padding_waste` before deciding it is worth it. The benefit d
 on the corpus's length distribution: on a uniform-length corpus it is zero either way, and the
 ordering is complexity for nothing.
 
-`megabatch_factor` is the dial. Larger means more length-homogeneous batches and less padding,
-and also a longer run of similar-length examples; 20 to 100 is the usual range. The length is
-read from the column's type, so the same call works on a text column before tokenization and on
-a token-id column after.
+`megabatch_factor` is the dial, 50 by default. Larger means more length-homogeneous batches and
+less padding, and also a longer run of similar-length examples. 20 to 100 is the usual range. The
+length is read from the column's type, so the same call works on a text column before
+tokenization and on a token-id column after.
 
 Consume the result in order. The ordering is the product, and re-shuffling downstream throws it
 away.
@@ -194,10 +194,15 @@ weight with documents you were going to drop anyway.
 Order last of all, after tokenization, since it is the shape of the batches you will actually
 train on.
 
+The figure puts the four steps in that order, with tokenization between the third and the fourth.
+
+![A flow in four numbered steps. The sources, such as web, code, and books, go first to quality_filter, applied to each source when source quality differs. The kept prose goes to mix_corpora, which samples each source to its weight and adds a source column. The mixed corpus goes to decontaminate, which drops documents sharing a verbatim span of n tokens, 13 by default, with the evaluation sets feeding in from the side. The clean text is tokenized, a step covered on the Tokenization page, and the token ids go to length_grouped_order, whose output you consume in order without re-shuffling.](/_static/diagrams/corpus_prep_order.svg)
+
 ## See also
 
-- {doc}`/ml/preparing/tokenization`: sequence packing and the token-id column, the next step after this page.
-- {doc}`/ml/training/data-loaders`: feeding the prepared corpus to a training loop.
-- {doc}`/ml/retrieval/llm-evaluation`: scoring what the trained model produces.
-- {doc}`/user-guide/transform/rows/distinct-and-dedup`: near-duplicate removal, which belongs in the same
-  pipeline.
+- {doc}`Tokenization </ml/preparing/tokenization>`: sequence packing and the token-id column, the next step after this page.
+- {doc}`Deduplication </ml/preparing/preprocessors/deduplication>`: near-duplicate removal, which belongs in the same pipeline.
+- {doc}`Distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`: exact duplicate removal with relational operators.
+- {doc}`Data loaders </ml/training/data-loaders>`: writing the prepared corpus as shards and feeding it to a training loop.
+- {doc}`Distributed training </ml/training/distributed-training>`: splitting the corpus across ranks.
+- {doc}`LLM evaluation </ml/retrieval/llm-evaluation>`: scoring what the trained model produces.

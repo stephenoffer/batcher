@@ -1,14 +1,10 @@
 # Multimodal and text analytics
 
-This page covers the scripts that work with images and binary payloads, and the ones that
-analyse text corpora at scale.
+This page covers the scripts that work with images and binary payloads, and the ones that analyse text corpora at scale.
 
 ## Filter on metadata before you decode
 
-An image read produces one row per file. It carries the bytes plus the metadata that can be
-had without decoding: size, mime type, width and height. Decoding is opt-in, because it is
-the expensive part, and putting the metadata filter ahead of it is the single biggest win
-available in a multimodal pipeline.
+An image read produces one row per file. It carries the bytes plus the metadata that can be had without decoding: size, mime type, width and height. Decoding is opt-in, because it is the expensive part, and putting the metadata filter ahead of it is the single biggest win available in a multimodal pipeline.
 
 ```python
 # docs: skip
@@ -31,15 +27,11 @@ decoded = bt.read.images(
 )
 ```
 
-`width` and `height` keep describing the source file after a decode; the pixels land in a new
-`image` column. `offload_blobs` and `materialize_blobs` are the pair that let a pipeline
-filter and join on metadata without carrying the payload, and re-materialize only what
-survived.
+`width` and `height` keep describing the source file after a decode; the pixels land in a new `image` column. `offload_blobs` and `materialize_blobs` are the pair that let a pipeline filter and join on metadata without carrying the payload, and re-materialize only what survived.
 
 ## Text at corpus scale
 
-Splitting into a list, exploding into rows, and grouping is the whole shape of a word
-frequency table, and no Python touches a token.
+Splitting into a list, exploding into rows, and grouping is the whole shape of a word frequency table, and no Python touches a token.
 
 ```python
 import batcher as bt
@@ -59,9 +51,7 @@ assert top["word"][0] == "the"
 assert top["n"][0] == 3
 ```
 
-Structural detection comes before semantic work. Questions, all-caps, code fences and
-markdown are all detectable without a model. Route on them and you notice that a third of a
-corpus is stack traces before you pay to embed it.
+Structural detection comes before semantic work. Questions, all-caps, code fences and markdown are all detectable without a model. Route on them and you notice that a third of a corpus is stack traces before you pay to embed it.
 
 ## Every script on this page
 
@@ -82,3 +72,9 @@ The table below lists the multimodal and text scripts in path order.
 | `examples/text_analytics/topic_keywords.py` | Keywords that distinguish one group from the rest |
 | `examples/text_analytics/word_frequencies.py` | A word-frequency table over real text, entirely in the engine |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/cookbook/ml/pipelines/multimodal/index`: complete image, audio, and video pipelines.
+- {doc}`/ml/preparing/multimodal/index`: the decode guide.
+- {doc}`/cookbook/metrics/text/index`: scoring a text column in aggregate.

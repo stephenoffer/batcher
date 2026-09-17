@@ -1,50 +1,43 @@
 # Apache Hudi
 
-**Hudi is read-only in Batcher.** There is no writer. {py:meth}`bt.read.hudi(path) <batcher.api.io_namespace.reader.Reader.hudi>` gives you a lazy
-{py:class}`Dataset <batcher.Dataset>` over a Hudi table; {py:meth}`ds.write.hudi(...) <batcher.api.io_namespace.writer.Writer.hudi>` raises immediately and tells you why. Writing
-Hudi means the Spark or Flink write stack: the commit protocol, the timeline, the index, the
-compaction service. None of that belongs in a Rust/Arrow data plane. Reading is served by hudi-rs
-(`pip install 'batcher-engine[hudi]'`).
+This page covers reading Apache Hudi tables. {py:meth}`bt.read.hudi(path) <batcher.api.io_namespace.reader.Reader.hudi>` gives you a lazy {py:class}`Dataset <batcher.Dataset>` over a Hudi table through hudi-rs, with no Spark and no JVM: snapshot reads, time travel to an instant, incremental reads between instants, file pruning, and one split per file slice on a copy-on-write table.
+
+Hudi tables are usually produced by a Spark or Flink ingest job that already exists and consumed by whatever runs the analytics. Batcher is built to be that consumer. Writing Hudi means the Spark or Flink write stack, with its commit protocol, timeline, index, and compaction service, so {py:meth}`ds.write.hudi(...) <batcher.api.io_namespace.writer.Writer.hudi>` raises and says why.
+
+The following table summarizes the connector:
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.hudi(path)`, with `as_of_instant=` |
-| **Write** | Not supported. `ds.write.hudi(...)` raises {py:exc}`BackendError <batcher.BackendError>`. |
-| **Extra** | `pip install 'batcher-engine[hudi]'` |
-| **Parallelism** | One split per file slice on copy-on-write. Merge-on-read reads whole. |
-| **Pushdown** | An AND of column-vs-literal comparisons, as hudi-rs filter tuples, pruning files |
-| **Incremental** | `HudiSource.read_incremental(start, end)` |
+| Read | `bt.read.hudi(path)`, with `as_of_instant=` |
+| Write | Not supported. `ds.write.hudi(...)` raises {py:exc}`BackendError <batcher.BackendError>`. |
+| Extra | `pip install 'batcher-engine[hudi]'` |
+| Parallelism | One split per file slice on copy-on-write. Merge-on-read reads whole. |
+| Pushdown | An AND of column-vs-literal comparisons, as hudi-rs filter tuples, pruning files |
+| Incremental | `HudiSource.read_incremental(start, end)` |
 
-That is the whole shape of this integration, and it fits the common case. Hudi tables are usually
-*produced* by a Spark or Flink ingest job that already exists, and *consumed* by whatever runs the
-analytics. Batcher is the consumer.
-
-The error is deliberate and immediate, not a silent no-op:
+The write error is immediate, not a silent no-op:
 
 ```python
 import os
 import tempfile
 
 import batcher as bt
-from batcher._internal.errors import BackendError
 
 target = os.path.join(tempfile.mkdtemp(), "events")
 try:
     bt.from_pydict({"id": [1]}).write.hudi(target)
-except BackendError as exc:
+except bt.BackendError as exc:
     print(exc)
 # Hudi writes require Spark/Flink; Batcher supports Hudi reads only
 ```
 
 :::{tip}
-If you need a table format Batcher can write transactionally, that is {doc}`Delta </integrations/lakehouse/delta-lake>`
-(append, overwrite, merge, replace-where) or {doc}`Iceberg </integrations/lakehouse/iceberg>` (append, overwrite).
+For a table format Batcher writes transactionally, use {doc}`Delta </integrations/lakehouse/delta-lake>` (append, overwrite, merge, replace-where) or {doc}`Iceberg </integrations/lakehouse/iceberg>` (append, overwrite, upsert, replace-where).
 :::
 
-## Reading
+## Read a table
 
-A read is a snapshot query against the current table state. It needs a real Hudi table, so the
-blocks below are not run here.
+A read is a snapshot query against the current table state. The blocks below need a real Hudi table, so they aren't run here.
 
 ```python
 # docs: skip
@@ -65,7 +58,7 @@ way.
 
 ## Time travel and incremental reads
 
-Hudi's timeline is a sequence of *instants* (the commit timestamps you see in `.hoodie/`).
+Hudi's timeline is a sequence of *instants*, the commit timestamps you see in `.hoodie/`.
 
 ::::{tab-set}
 
@@ -98,8 +91,7 @@ recent = bt.from_arrow(changed)
 ::::
 
 :::{warning}
-Both of these depend on the retention of the timeline. Hudi cleans old commits on a schedule that
-its *writer* controls, so an instant your reader still wants can be cleaned out from under you.
+Both of these depend on the retention of the timeline. Hudi cleans old commits on a schedule that its writer controls, so an instant your reader still wants can be cleaned out from under you.
 Coordinate the cleaner policy with whoever owns the ingest job.
 :::
 
@@ -131,7 +123,7 @@ Each split's row count comes from its base file's Parquet footer rather than fro
 metadata rather than a scan, and it is what lets the distributed planner bin-pack by real size.
 
 :::{important}
-**A merge-on-read table is read whole.** A MoR slice is a base file plus log files holding later
+A merge-on-read table is read whole. A MoR slice is a base file plus log files holding later
 updates and deletes, and the per-slice reader opens the base file only, so splitting one would
 resurrect superseded rows. A table with any log files therefore falls back to a single
 {py:class}`WholeSourceSplit <batcher.io.WholeSourceSplit>`, which hudi-rs merges correctly.
@@ -149,19 +141,13 @@ filter, which produces the same rows over a wider scan. If hudi-rs rejects the p
 outright, on a version or format mismatch, the read retries unfiltered rather than failing. A
 correct answer is never at stake, only I/O.
 
-## Failure modes worth knowing
+## Requirements and limitations
 
-**Merge-on-read tables.** hudi-rs applies log files on the read path, so the result is correct, but
-an MOR table with a long log-file tail reads slowly until the writer's compaction catches up. This
-is a property of the table, not the connector.
+hudi-rs applies log files on the read path, so a merge-on-read result is correct, but a table with a long log-file tail reads slowly, on one split, until the writer's compaction catches up.
 
-**The count is a footer read, not a log read.** Delta and Iceberg answer a row count from their
-own metadata. Hudi's `HudiFileSlice.num_records` reports the whole table's total on every slice,
-so summing it overcounts by the slice count; Batcher reads each base file's Parquet footer
-instead. That is still metadata rather than a scan, and it is exact, but it costs one pass over
-the footers on a table with many slices.
+The row count costs one pass over the base files' Parquet footers, which is metadata rather than a scan but still a read per slice on a table with many slices.
 
-**Version skew.** hudi-rs tracks the Hudi spec independently of the Spark/Flink writer that
+hudi-rs tracks the Hudi spec independently of the Spark/Flink writer that
 produced your table. A table written by a much newer Hudi than the installed `hudi` package can
 fail to open with a `BackendError` naming the table. Pin the reader version against the writer's.
 

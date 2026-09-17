@@ -1,6 +1,6 @@
 # Memory
 
-Start with the contract, then the accounting, then what happens when the accounting says no.
+These pages cover how Batcher holds data in memory, accounts for it, and stays alive when it does not fit. Read them in order: the contract, then the accounting, then what happens when the accounting says no.
 
 - {doc}`Arrow memory model </architecture/deep-dives/memory/arrow-memory>`: the only columnar contract, and what zero-copy really buys.
 - {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how an image becomes a column without a Python round trip.

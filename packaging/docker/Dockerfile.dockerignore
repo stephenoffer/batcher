@@ -1,0 +1,18 @@
+# BuildKit reads this file for packaging/docker/Dockerfile only, so it can exclude far more
+# than a repo-wide .dockerignore could. The engine build needs the crates, the Python package,
+# and the manifests; everything else only slows the context upload.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!pyproject.toml
+!README.md
+!LICENSE
+!.cargo/
+!crates/
+!python/
+!wheelhouse/
+crates/**/target/
+python/batcher/_native*.so
+python/batcher/_native*.pyd
+**/__pycache__/

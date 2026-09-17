@@ -1,8 +1,6 @@
 # Shaping the tables
 
-These recipes cover turning what arrived into tables people can query: combining sources,
-absorbing a schema someone changed without telling you, and keeping a history of a dimension
-that moves.
+These recipes cover turning what arrived into tables people can query: combining sources, absorbing a schema someone changed without telling you, and keeping a history of a dimension that moves.
 
 | Recipe | The problem |
 |---|---|

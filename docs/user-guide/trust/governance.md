@@ -1,20 +1,12 @@
 # Governance and security
 
-Batcher enforces *who may read which rows and columns, and through what mask*, in the
-engine itself. A {py:class}`SecurityCatalog <batcher.SecurityCatalog>` declares the policy, a {py:class}`Principal <batcher.Principal>` is the identity a
-query runs as, and {py:func}`bt.security(...) <batcher.security>` binds the two to a scope. Everything read inside
-that scope is governed.
+This page describes how Batcher enforces *who may read which rows and columns, and through what mask*, inside the engine itself. A {py:class}`SecurityCatalog <batcher.SecurityCatalog>` declares the policy, a {py:class}`Principal <batcher.Principal>` is the identity a query runs as, and {py:func}`bt.security(...) <batcher.security>` binds the two to a scope. Everything read inside that scope is governed.
 
-Policy is applied when a table is **read**, not when a query is executed. That is what
-makes it unbypassable: a {py:class}`Dataset <batcher.Dataset>` never holds an ungoverned plan, so there is no
-`count()`, `write()`, or streaming path that could skip the check. A database works the
-same way. A masking policy resolves against the role in effect when the column is read.
+Policy is applied when a table is *read*, not when a query is executed. A {py:class}`Dataset <batcher.Dataset>` therefore never holds an ungoverned plan, so there is no `count()`, `write()`, or streaming path that could skip the check. A database works the same way: a masking policy resolves against the role in effect when the column is read.
 
 ## Setup
 
-Governance keys on the path a table is read from. That is the only name a file-backed
-table has *before* anyone reads it, and a policy has to be declarable before the first
-read.
+Governance keys on the path a table is read from, because that is the only name a file-backed table has before anyone reads it. {doc}`How a table is named </user-guide/trust/table-names>` covers what each other source is named by and which path spellings fold together.
 
 ```python
 import os
@@ -34,12 +26,6 @@ bt.from_pydict(
     }
 ).write(customers, format="parquet")
 ```
-
-### What a table is named
-
-A policy is keyed on the **table**, never on the slice of it a particular query reads. See
-{doc}`How a table is named </user-guide/trust/table-names>` for what each source is named by
-and which path spellings fold together.
 
 ## Principals
 
@@ -135,8 +121,7 @@ Classify a column once with `tag`, then govern every column carrying that tag wi
 `email` as `pii` wherever it appears, write one policy, and tables added later are
 covered automatically.
 
-The masks themselves are ordinary expressions ({doc}``mask` </api/complete/governance>`,
-{py:func}`hmac_sha256 <batcher.hmac_sha256>`, {py:func}`aes_encrypt <batcher.aes_encrypt>`), so they run in the Rust data plane at full speed.
+The masks are ordinary expressions, {py:func}`mask <batcher.mask>`, {py:func}`hmac_sha256 <batcher.hmac_sha256>`, and {py:func}`aes_encrypt <batcher.aes_encrypt>`, so they run in the Rust data plane like any other column computation.
 
 ```python
 catalog = (
@@ -221,24 +206,16 @@ with bt.security(catalog, analyst):
     print(bt.read.parquet(customers).explain())
 ```
 
-The `project` is the columns the analyst may select, read through their masks. The
-`filter` under it is the row-access predicate. The `scan` sees the whole table. The
-estimate drops from 4 rows to 2 because the row policy is a predicate like any other:
+The `project` is the columns the analyst may select, read through their masks. The `filter` under it is the row-access predicate. The `scan` sees the whole table. The estimate drops from 4 rows to 2 because the row policy is a predicate like any other, and the optimizer has pushed it into the scan:
 
 ```text
-query plan (planned)                          3 operators
-─────────────────────────────────────────────────────────
-OPERATOR                   ESTIMATE  NOTES
-project                       est≈2  (learned)
-└─ filter  [region = eu]      est≈2  (learned)
-   └─ scan  [source 0]        est≈4  (exact)  pushed[region = eu]
-
-decisions:
-  - [core/io] source read at 0 MB/s (learned) — ~0.0s to read
+query plan (planned)                                 3 operators
+────────────────────────────────────────────────────────────────
+OPERATOR                  ESTIMATE  NOTES
+project                      est≈2  (default)
+└─ filter  [region = EU]     est≈2  (default)
+   └─ scan  [source 0]       est≈4  (exact)  pushed[region = EU]
 ```
-
-(The throughput under `decisions:` is measured; it reads 0 MB/s here because the whole
-table is a few kilobytes.)
 
 The order matters in both directions. The filter sits *below* the projection, which is
 what lets a row policy reference `region` when the analyst holds no `SELECT` on it. The
@@ -345,11 +322,7 @@ print(sample.select(m=bt.col("s").str.md5(), c=bt.col("s").str.crc32()).to_pydic
 # {'m': ['900150983cd24fb0d6963f7d28e17f72'], 'c': [891568578]}
 ```
 
-The same caution the table draws for a bare `sha256` applies to these: a `md5` or
-`sha1` digest is **not** a safe pseudonym. Both are cryptographic hashes, but a digest of
-a low-entropy value such as an email address is recovered by hashing every candidate. It
-leaks exactly what a pseudonym must hide. For pseudonymized-but-joinable analytics use
-`hmac_sha256` (above), whose key the attacker lacks. Reserve `hash_rows`, `md5`, `sha1`,
+The caution given above for a bare `sha256` applies to these too. An `md5` or `sha1` digest is *not* a safe pseudonym: a digest of a low-entropy value such as an email address is recovered by hashing every candidate. For pseudonymized but joinable analytics, use `hmac_sha256`, whose key the attacker lacks. Reserve `hash_rows`, `md5`, `sha1`,
 `crc32`, and the `xxhash64`/`hash64` pair for fingerprinting, bucketing, and integrity
 checks, never for de-identification.
 
@@ -386,11 +359,9 @@ with bt.security(catalog, analyst, audit=seen.append):
 print(seen[0].visible, seen[0].denied, seen[0].masked)
 ```
 
-The event names columns and policies, never **values** and never key material, so it is
-safe to write to a log that outlives the data. It is produced by the same traversal that
-rewrites the plan, so the record is by construction what was enforced. Every
-decision is also logged at `INFO` on the `batcher.governance` logger, whether or not you
-pass a sink.
+The event names columns and policies, never values and never key material, so it is safe to write to a log that outlives the data. It is produced by the same traversal that rewrites the plan, so the record is by construction what was enforced. Every decision is also logged at `INFO` on the `batcher.governance` logger, whether or not you pass a sink.
+
+A callback and a log line are easy to lose. For a durable trail, set `governance.audit_path` and Batcher appends every decision to that JSONL file, created owner-only. A write to it that fails raises, and the read fails with it, so a full disk can't quietly turn a governed deployment into an ungoverned one. {doc}`/user-guide/trust/hardening` covers the rest of the deployment settings.
 
 ## Column-level lineage
 
@@ -474,15 +445,17 @@ policy uses, and they lower to the data-plane functions above. {py:class}`Matche
 you picklable policy objects and enforces the catalog you give it. Where that policy lives
 is your platform's decision.
 
-## What this does not do
+## Requirements and limitations
 
-Batcher authorizes; it does not authenticate, and it does not encrypt data at rest or
-in transit for you. It has no persistent policy store either. A `SecurityCatalog` is
-built in Python, which makes it a serializable, diffable artifact you can load from your
-own store and check into review.
+Batcher authorizes. It does not authenticate, and it does not encrypt data at rest or in transit for you. {doc}`/user-guide/trust/hardening` covers verified identities and what to put around the engine.
+
+Batcher has no persistent policy store. A `SecurityCatalog` is built in Python, which makes it a serializable, diffable artifact you can load from your own store and check into review.
 
 ## See also
 
+- {doc}`Write privileges </user-guide/trust/write-privileges>`: `INSERT`, `UPDATE`, and `DELETE`, and the rewrites a policy block refuses.
+- {doc}`Secrets and keys </user-guide/trust/secrets>`: where the keys behind `aes_encrypt` and `hmac_sha256` come from.
+- {doc}`Hardening a deployment </user-guide/trust/hardening>`: making governance mandatory.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and quarantine rows before they reach a
   consumer.
 - {doc}`Complete API reference </api/complete/governance>`: `SecurityCatalog`, `Principal`,

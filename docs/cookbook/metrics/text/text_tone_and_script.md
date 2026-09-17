@@ -2,6 +2,8 @@
 
 Tone rates catch a model that has become hedging or sycophantic after a prompt change. Script rates catch a corpus that is not the language you think it is, which is the usual reason a "multilingual" eval quietly measures English.
 
+The script measures hedging, politeness, questions, exclamations, and a phrase list of your own, then the Latin, Cyrillic, CJK, Arabic, and emoji rates over a deliberately mixed corpus.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/metrics/text_tone_and_script.py

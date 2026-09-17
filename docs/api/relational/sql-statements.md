@@ -99,7 +99,7 @@ reflection actually selects. DuckDB's views are wider; the extra columns are nul
 Arrow relation, and padding them out would be inventing a shape rather than reporting one.
 
 `table_type` is always `BASE TABLE`. Batcher does not distinguish a table from a view:
-`CREATE TABLE … AS`, `CREATE VIEW … AS` and {py:meth}`Session.register
+`CREATE TABLE ... AS`, `CREATE VIEW ... AS` and {py:meth}`Session.register
 <batcher.Session.register>` all bind a lazy `Dataset`, so there is one kind of thing in the
 catalog and one value to report for it.
 

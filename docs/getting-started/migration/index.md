@@ -2,11 +2,15 @@
 
 You don't have to relearn data engineering to move onto Batcher. This section maps the operations you know from pandas, Polars, PySpark, DuckDB, Daft, and Ray Data onto their Batcher spellings, and each page ends by showing how to prove the port returns the same rows.
 
-Batcher keeps one spelling for each operation, so some of your vocabulary changes: `groupby`, `merge`, `fillna` and `drop_duplicates` are `group_by`, `join`, `fill_null` and `distinct` here. You don't have to memorize the difference. A familiar name Batcher spells differently raises an error that names its replacement.
+Batcher keeps one spelling for each operation, so some of your vocabulary changes: `groupby`, `merge`, `fillna` and `drop_duplicates` are `group_by`, `join`, `fill_null` and `distinct` here. Don't memorize the list. A familiar name Batcher spells differently raises an error that names its replacement.
 
-One concept matters before anything else. A {py:class}`Dataset <batcher.Dataset>` is *lazy*. Transformations such as `select`, `filter`, `group_by().agg()`, and `join` build a plan and return a new `Dataset`. Nothing runs until a terminal operation such as `collect`, `to_arrow`, `to_pandas`, `write`, `count`, or `iter_batches`. If you know the Polars `LazyFrame`, you already know this model.
+Learn one concept before anything else. A {py:class}`Dataset <batcher.Dataset>` is *lazy*. Transformations such as `select`, `filter`, `group_by().agg()`, and `join` build a plan and return a new `Dataset`. Nothing runs until a terminal operation such as `collect`, `to_arrow`, `to_pandas`, `write`, `count`, or `iter_batches`. If you know the Polars `LazyFrame`, you already know this model.
 
 ## Coming from
+
+Where you start depends on where your code runs today. Code from pandas, Polars, and PySpark starts with the verb-by-verb table. DuckDB and SQL go to the SQL guide, Daft to the ML pipelines page, and Ray Data to its own port guide. Every route ends in the same place, proving the port returns the same rows:
+
+![A decision tree from six source systems to the page to read first. pandas, where the shift is eager to lazy, Polars, where the LazyFrame model ports, and PySpark, where there is no SparkSession, all lead to Transforming and collecting, the verb-by-verb table. DuckDB and SQL, where the query often ports, lead to the SQL guide for bt.sql. Daft, where the shift is the UDF contract, leads to the ML pipelines page on batch inference. Ray Data, where there is no object store, leads to the Ray Data port guide. All four first pages then lead to Differences and verification, which covers what Batcher leaves out and how to prove the port returns the same rows. Name-by-name references list every public name for PySpark, Polars, Daft, and Ray Data.](/_static/diagrams/migration_chooser.svg)
 
 Each card names the one shift that matters most from that system and links to the page to read first.
 
@@ -16,8 +20,7 @@ Each card names the one shift that matters most from that system and links to th
 :::{grid-item-card} {octicon}`table;1.1em` pandas
 :link: /getting-started/migration/transforming
 :link-type: doc
-The one shift is eager to *lazy*. Operations build a plan and run on a terminal
-call. `assign`, `groupby`, and `merge` become `with_columns`, `group_by().agg()`, and `join`.
+The one shift is eager to *lazy*. Operations build a plan and run on a terminal call. `assign`, `groupby`, and `merge` become `with_columns`, `group_by().agg()`, and `join`.
 :::
 
 :::{grid-item-card} {octicon}`code;1.1em` Polars
@@ -61,7 +64,7 @@ distribution is an argument to `collect` rather than a property of the dataset.
 
 ## The translation tables
 
-The tables are shared across all six source systems, because they're organized by what you're porting rather than where it came from. Each page is short enough to read in one sitting.
+All six source systems share these tables, because they're organized by what you're porting rather than where it came from. Each page reads in one sitting.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -175,20 +178,15 @@ Where the difference is a default, it writes the default out. A Polars `sort` ga
 
 ## Porting with a coding agent
 
-Each source system has an agent skill that turns these tables into a procedure:
-`migrate-from-spark`, `migrate-from-polars-or-pandas`, `migrate-from-duckdb-sql`,
-`migrate-from-daft`, `migrate-from-ray-data`, and `migrate-from-a-sql-warehouse`. Beyond the mappings, each skill carries the concept shifts that silently produce wrong or slow results. Each one finishes by proving the ported script returns the same rows as the original. See {doc}`/agents`.
+Each source system has an agent skill that turns these tables into a procedure: `migrate-from-spark`, `migrate-from-polars-or-pandas`, `migrate-from-duckdb-sql`, `migrate-from-daft`, `migrate-from-ray-data`, and `migrate-from-a-sql-warehouse`. A skill carries more than the mappings. It also carries the concept shifts that silently produce wrong or slow results, and it finishes by proving the ported script returns the same rows as the original. See {doc}`/agents`.
 
 ## Reporting a problem
 
-{py:func}`bt.show_versions() <batcher.show_versions>` prints the Batcher version, the compiled engine version, Python,
-the platform, and which optional backends are installed. {py:func}`bt.versions() <batcher.versions>` returns the
-same information as a dict.
+{py:func}`bt.show_versions() <batcher.show_versions>` prints the Batcher version, the compiled engine version, Python, the platform, and which optional backends are installed. Paste its output into the report. {py:func}`bt.versions() <batcher.versions>` returns the same information as a dict.
 
 ## See also
 
-- {doc}`/agents`: the migration skills, with the failure modes and the
-  verification procedure.
+- {doc}`/agents`: the migration skills, with the failure modes and the verification procedure.
 - {doc}`/user-guide/index`: the task-oriented guides for the API these pages map onto.
 - {doc}`/getting-started/concepts/lazy`: the lazy, immutable `Dataset` model in one page.
 - {doc}`/architecture/overview`: why a `Dataset` is lazy, and what runs where.

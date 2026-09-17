@@ -2,24 +2,17 @@
 
 The queries an analyst actually writes, and the trap in each one.
 
-Most of these look trivial until the data gets big or the edge cases show up. A funnel
-joined the obvious way explodes. Sessionization done with a naive group-by double-counts.
-Top-k per group with a full sort does far more work than it needs to.
+Most of these look trivial until the data gets big or the edge cases show up. A funnel joined the obvious way explodes. Sessions keyed on the calendar day merge separate visits and split anyone browsing at midnight. A top-k written as sort-then-limit answers for the whole table instead of for each group. Each page shows the trap on data small enough to see, then the query that avoids it, as ordinary joins, aggregates, and window functions that Batcher runs in Rust.
 
-Every recipe here runs on a small table you can read, so you can see the answer and check
-it by eye. The same code runs on a billion rows.
+Every recipe here runs on a small table you can read, so you can see the answer and check it by eye. Swap the in-memory table for a reader and the query code stays the same.
 
 :::{tip}
-Most of these pages carry the main query twice, as a DataFrame chain and as {py:func}`bt.sql(...) <batcher.sql>`.
-They are two spellings of one logical plan rather than two implementations, so pick
-whichever reads better for the question you are asking.
+Most of these pages carry the main query twice, as a DataFrame chain and as {py:func}`bt.sql(...) <batcher.sql>`. They are two spellings of one logical plan rather than two implementations, so pick whichever reads better for the question you are asking.
 :::
 
 ## Start with one worked query
 
-{doc}`/cookbook/analytics/aggregates/analytics-query` runs aggregate, join, and window over one small orders table,
-spelled both as SQL and as DataFrame code. It is the shape the rest of this section
-specialises.
+{doc}`/cookbook/analytics/aggregates/analytics-query` runs aggregate, join, and window over one small orders table, spelled both as SQL and as DataFrame code. It is the shape the rest of this section specialises.
 
 ## Users over time
 

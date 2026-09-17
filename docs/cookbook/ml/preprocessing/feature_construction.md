@@ -1,6 +1,8 @@
 # Feature construction
 
-These are the featurizers that turn a raw table into a model-ready one. The time-series ones (`LagFeaturizer`, `RollingFeaturizer`) need an `order_by` and usually a `partition_by`: forgetting the partition silently leaks one entity's history into another's features.
+These featurizers turn a raw table into a model-ready one. The time-series ones, `LagFeaturizer` and `RollingFeaturizer`, need an `order_by` and usually a `partition_by`: forget the partition and one entity's history silently leaks into another's features.
+
+The script builds polynomial, interaction, and ratio features, calendar parts and a cyclical hour encoding, per-user lags and rolling means, group statistics, and text statistics. It finishes with `VarianceThreshold` dropping a column that never varies.
 
 The whole script, executed on every test run:
 

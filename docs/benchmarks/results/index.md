@@ -1,25 +1,24 @@
 # Results by workload
 
-The measured results, one page per workload family. Each page carries the hardware it ran on,
-the correctness gate it passed, and the standing on every shape measured, losses included.
+This section groups Batcher's measured results by workload family. Each page names the hardware, date and script behind every table, and reports the standing on every shape it measures, losses included.
 
-Read them when you want to know what Batcher does on work that looks like yours. Want the
-standing against one specific engine? {doc}`/benchmarks/comparisons/index` is arranged that
-way instead.
+Read these pages to see what Batcher does on work that looks like yours. For the standing against one named engine, {doc}`/benchmarks/comparisons/index` arranges the same numbers that way.
+
+The following table lists the pages:
 
 | Page | What it measures |
 |---|---|
-| {doc}`Analytics and I/O <analytics>` | Relational operators, TPC-H, ClickBench, and the connectors, against DuckDB and Polars on identical input |
-| {doc}`TPC-H <tpch>` | The full 22-query suite at scale factors 1 and 10, per query, against three engines and two DuckDB configurations |
-| {doc}`AI and GPU workloads <ai-and-gpu>` | Ten families on 8xT4 with real models: inference, embeddings, decode, and training ingest |
-| {doc}`Multimodal ingest <multimodal-ingest>` | Turning camera frames, LiDAR sweeps, and audio clips into model-ready tensors |
-| {doc}`Scaling out <scaling>` | What distribution buys, what it costs at small sizes, and how much of each suite runs distributed at all |
-| {doc}`The full engine matrix <engine-matrix>` | Every standard suite against every engine that can run it, with the gaps labeled |
+| {doc}`Analytics and I/O <analytics>` | TPC-H, ClickBench, JSON, scans and the operator mix, against DuckDB, Polars and Daft on identical input |
+| {doc}`TPC-H <tpch>` | The 22-query suite at scale factors 1 and 10, the correctness record of every engine, and the planner work behind the results |
+| {doc}`The engine matrix <engine-matrix>` | Every standard suite against every engine that can run it, with each gap labeled |
+| {doc}`AI and GPU workloads <ai-and-gpu>` | Ten model families on 8xT4, and inference pipelines against Ray Data and Daft |
+| {doc}`Multimodal ingest <multimodal-ingest>` | Camera frames, LiDAR sweeps, audio clips and video turned into model-ready tensors |
+| {doc}`Scaling out <scaling>` | How results move with the data, with cores and across a cluster |
 
 ## See also
 
-- {doc}`/benchmarks/methodology`: the hardware per family and the commands that reproduce each number.
-- {doc}`/benchmarks/index`: the one-table summary across every family here.
+- {doc}`/benchmarks/index`: the summary across every family.
+- {doc}`/benchmarks/methodology`: the correctness gate, the hardware per family, and the reproduce commands.
 
 ```{toctree}
 :hidden:

@@ -13,11 +13,12 @@ Every estimator implements the same `fit` / `transform` / `fit_transform` protoc
 ```{eval-rst}
 .. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: Preprocessor
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: Chain
-   :members:
+   Preprocessor
+   Chain
 ```
 
 ## Scalers and normalizers
@@ -25,20 +26,17 @@ Every estimator implements the same `fit` / `transform` / `fit_transform` protoc
 These rescale numeric columns:
 
 ```{eval-rst}
-.. autoclass:: StandardScaler
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: MinMaxScaler
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: MaxAbsScaler
-   :members:
-
-.. autoclass:: RobustScaler
-   :members:
-
-.. autoclass:: Normalizer
-   :members:
+   StandardScaler
+   MinMaxScaler
+   MaxAbsScaler
+   RobustScaler
+   Normalizer
 ```
 
 ## Distribution shaping
@@ -47,26 +45,19 @@ Reshaping a column's *distribution* rather than only its scale. Reach for these 
 feature is heavily skewed or long-tailed and a linear rescale would leave it that way:
 
 ```{eval-rst}
-.. autoclass:: PowerTransformer
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: BoxCoxTransformer
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: QuantileTransformer
-   :members:
-
-.. autoclass:: RankTransformer
-   :members:
-
-.. autoclass:: LogTransformer
-   :members:
-
-.. autoclass:: PCA
-   :members:
-
-.. autoclass:: TruncatedSVD
-   :members:
+   PowerTransformer
+   BoxCoxTransformer
+   QuantileTransformer
+   RankTransformer
+   LogTransformer
+   PCA
+   TruncatedSVD
 ```
 
 ## Encoders
@@ -74,47 +65,26 @@ feature is heavily skewed or long-tailed and a linear rescale would leave it tha
 These turn categorical columns into numeric ones:
 
 ```{eval-rst}
-.. autoclass:: OneHotEncoder
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: MultiHotEncoder
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: LabelBinarizer
-   :members:
-
-.. autoclass:: MultiLabelBinarizer
-   :members:
-
-.. autoclass:: LabelEncoder
-   :members:
-
-.. autoclass:: OrdinalEncoder
-   :members:
-
-.. autoclass:: BinaryEncoder
-   :members:
-
-.. autoclass:: TargetEncoder
-   :members:
-
-.. autoclass:: FrequencyEncoder
-   :members:
-
-.. autoclass:: HashingEncoder
-   :members:
-
-.. autoclass:: RareCategoryEncoder
-   :members:
-
-.. autoclass:: LeaveOneOutEncoder
-   :members:
-
-.. autoclass:: JamesSteinEncoder
-   :members:
-
-.. autoclass:: WOEEncoder
-   :members:
+   OneHotEncoder
+   MultiHotEncoder
+   LabelBinarizer
+   MultiLabelBinarizer
+   LabelEncoder
+   OrdinalEncoder
+   BinaryEncoder
+   TargetEncoder
+   FrequencyEncoder
+   HashingEncoder
+   RareCategoryEncoder
+   LeaveOneOutEncoder
+   JamesSteinEncoder
+   WOEEncoder
 ```
 
 ## Binning, imputation, text, and assembly
@@ -122,47 +92,26 @@ These turn categorical columns into numeric ones:
 The rest of the estimators cover discretization, missing values, text splitting, and feature assembly:
 
 ```{eval-rst}
-.. autoclass:: KBinsDiscretizer
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: SimpleImputer
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: IterativeImputer
-   :members:
-
-.. autoclass:: Tokenizer
-   :members:
-
-.. autoclass:: Concatenator
-   :members:
-
-.. autoclass:: PolynomialFeatures
-   :members:
-
-.. autoclass:: SplineTransformer
-   :members:
-
-.. autoclass:: FunctionTransformer
-   :members:
-
-.. autoclass:: Clipper
-   :members:
-
-.. autoclass:: MissingIndicator
-   :members:
-
-.. autoclass:: Binarizer
-   :members:
-
-.. autoclass:: VarianceThreshold
-   :members:
-
-.. autoclass:: ColumnSelector
-   :members:
-
-.. autoclass:: ColumnDropper
-   :members:
+   KBinsDiscretizer
+   SimpleImputer
+   IterativeImputer
+   Tokenizer
+   Concatenator
+   PolynomialFeatures
+   SplineTransformer
+   FunctionTransformer
+   Clipper
+   MissingIndicator
+   Binarizer
+   VarianceThreshold
+   ColumnSelector
+   ColumnDropper
 ```
 
 ## Feature selection
@@ -171,22 +120,18 @@ These prune columns rather than transform them. The choice is held as fitted sta
 validation split is pruned by the training split's decision:
 
 ```{eval-rst}
-.. autoclass:: SelectKBest
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: SelectPercentile
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: DropCorrelated
-   :members:
-
-.. autoclass:: SelectFromModel
-   :members:
-
-.. autoclass:: RFE
-   :members:
-
-.. autofunction:: feature_importances
+   SelectKBest
+   SelectPercentile
+   DropCorrelated
+   SelectFromModel
+   RFE
+   feature_importances
 ```
 
 ## Random projection and kernel approximation
@@ -195,50 +140,52 @@ Dimensionality reduction and kernel feature maps that need no covariance matrix.
 lower to plain arithmetic over the source columns, so the transform runs column-wise:
 
 ```{eval-rst}
-.. autoclass:: GaussianRandomProjection
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: SparseRandomProjection
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: RBFSampler
-   :members:
-
-.. autoclass:: Nystroem
-   :members:
-
-.. autofunction:: johnson_lindenstrauss_min_dim
+   GaussianRandomProjection
+   SparseRandomProjection
+   RBFSampler
+   Nystroem
+   johnson_lindenstrauss_min_dim
 ```
 
 ## Probability calibration
 
-`batcher.ml.metrics` measures calibration; these two correct it. Both are fitted on a split
+`batcher.ml.metrics` measures calibration. These two correct it. Both are fitted on a split
 the model did not train on, and both are monotone in the score, so neither changes the
 model's ranking:
 
 ```{eval-rst}
-.. autoclass:: PlattCalibrator
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: IsotonicCalibrator
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   PlattCalibrator
+   IsotonicCalibrator
 ```
 
 ## Text vectorizers
 
 These turn a text column into the bag-of-words features a classical text model trains on.
-`CountVectorizer` and `TfidfVectorizer` learn a vocabulary; `HashingVectorizer` decides a
+`CountVectorizer` and `TfidfVectorizer` learn a vocabulary. `HashingVectorizer` decides a
 term's feature index arithmetically and so needs no fit pass at all:
 
 ```{eval-rst}
-.. autoclass:: CountVectorizer
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: TfidfVectorizer
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: HashingVectorizer
-   :members:
+   CountVectorizer
+   TfidfVectorizer
+   HashingVectorizer
 ```
 
 ## Derived and grouped features
@@ -247,17 +194,16 @@ New columns built out of existing ones: products and ratios that a linear model 
 on its own, and group-relative statistics that let a row see its cohort:
 
 ```{eval-rst}
-.. autoclass:: InteractionFeatures
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: RatioFeatures
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: GroupStatEncoder
-   :members:
-
-.. autoclass:: GroupImputer
-   :members:
+   InteractionFeatures
+   RatioFeatures
+   GroupStatEncoder
+   GroupImputer
 ```
 
 ## Timestamp features
@@ -267,11 +213,14 @@ model can learn from: integer parts for a tree, and circular coordinates for any
 measures distance:
 
 ```{eval-rst}
-.. autoclass:: DateTimeFeaturizer
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: CyclicalEncoder
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   DateTimeFeaturizer
+   CyclicalEncoder
 ```
 
 ## Lag and rolling features
@@ -281,11 +230,14 @@ because a rolling window that includes it puts the target's own value inside its
 feature. That is the most common leak in a forecasting pipeline, and one that raises nothing:
 
 ```{eval-rst}
-.. autoclass:: LagFeaturizer
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
 
-.. autoclass:: RollingFeaturizer
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   LagFeaturizer
+   RollingFeaturizer
 ```
 
 ## Text surface features
@@ -294,8 +246,13 @@ Length, word count, and character mix. These need no model at all, and they ofte
 of the signal a gradient-boosted model splits on:
 
 ```{eval-rst}
-.. autoclass:: TextStatFeaturizer
-   :members:
+.. currentmodule:: batcher.ml.preprocessors
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   TextStatFeaturizer
 ```
 
 ## Persistence
@@ -308,10 +265,14 @@ do not fully control. A pickle is none of those.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.preprocessors
 
-.. autofunction:: save
-.. autofunction:: load
-.. autofunction:: to_dict
-.. autofunction:: from_dict
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   save
+   load
+   to_dict
+   from_dict
 ```
 
 ## See also

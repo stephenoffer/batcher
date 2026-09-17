@@ -5,10 +5,7 @@ scheduler such as Slurm, PBS, LSF, Grid Engine, Flux or HTCondor; a container or
 as Kubernetes, Nomad or YARN; or a managed job service such as AWS Batch, SageMaker, Vertex AI,
 Azure ML or SkyPilot.
 
-There is nothing to configure. Batcher reads what the scheduler already exported into the
-process and sizes itself against the *allocation* rather than against the machine. Below are
-the facts it reads, why each one matters, and what to check when a run looks like it is using
-a fraction of what you paid for.
+There's nothing to configure. Batcher reads what the scheduler already exported into the process and sizes itself against the allocation you were granted rather than the machine it landed on. Thread pools, GPU stages, memory admission, spill placement, and shuffle draining all follow the grant, so a job uses what it paid for and leaves its co-tenants alone.
 
 ## Why the allocation is not the machine
 
@@ -16,18 +13,9 @@ A local probe answers "what hardware is attached to this node". A scheduler answ
 hardware is this job allowed to use". They are the same number only when the job owns the whole
 node, and they diverge silently:
 
-- A Grid Engine job granted 8 of a node's 128 cores sees all 128 in its CPU affinity mask,
-  because most sites do not enable cgroup confinement. Sizing thread pools to the mask
-  oversubscribes the node sixteen-fold and steals from the co-tenants the scheduler placed
-  there.
-- A Kubernetes pod granted 2 of a node's 8 GPUs sees 8 through the driver. Sizing an inference
-  stage to 8 puts four times the working set on two devices.
-- A Slurm allocation of 64 nodes whose job step did not publish a node list reads as one node,
-  which turns off every cross-node decision the engine makes.
+A Grid Engine job granted 8 of a node's 128 cores sees all 128 in its CPU affinity mask, because most sites don't enable cgroup confinement. Sizing thread pools to the mask oversubscribes the node sixteen-fold. A Kubernetes pod granted 2 of a node's 8 GPUs sees 8 through the driver, and sizing an inference stage to 8 puts four times the working set on two devices. A Slurm allocation of 64 nodes whose job step published no node list reads as one node, which turns off every cross-node decision.
 
-Batcher reads the grant instead. The core bound is the smallest of the affinity mask, the
-cgroup CPU quota, and the scheduler's own grant; the device count is the allocation's, not the
-node's; the width of the job comes from the scheduler's node list or node count.
+Batcher reads the grant instead. The core bound is the smallest of the affinity mask, the cgroup CPU quota, and the scheduler's own grant. The device count is the allocation's, not the node's. The width of the job comes from the scheduler's node list or node count.
 
 Memory works the same way and matters more, because exceeding it is fatal rather than merely
 rude. The ceiling is the smallest of the host's RAM less any reserved hugepages, every cgroup
@@ -51,11 +39,9 @@ report = bt.accelerators()
 print(sorted(report.get("site", {})))
 ```
 
-The `site` block names the platform, the scheduler, and the shape the scheduler gave the job.
-It is absent entirely on a laptop and in CI, where every field would be empty: a report that
-says "provider: unknown, scheduler: none" has told you nothing and cost you a line. Within it,
-keys are present only when the scheduler actually published them, so an absent `nodes` key
-means "nobody said", not "one node".
+The `site` block names the platform, the scheduler, and the shape the scheduler gave the job. It's absent when every field would be empty, as on a laptop or in CI. Within it, a key is present only when the scheduler published it, so an absent `nodes` key means nobody said, not one node.
+
+The following table lists the keys:
 
 | Key | Meaning |
 |---|---|
@@ -76,14 +62,13 @@ started the processes, so Batcher reads the launcher's vocabulary instead: `RANK
 `WORLD_SIZE` / `LOCAL_RANK` / `LOCAL_WORLD_SIZE` from `torchrun`, `OMPI_COMM_WORLD_*` from Open
 MPI, and `PMI_RANK` / `PMI_SIZE` from the PMI family.
 
-This matters more than it looks. Without a rank, every worker in a four-node job believes it is
+Without a rank, every worker in a four-node job believes it is
 worker zero, and anything that shards by rank does the same quarter of the work four times
 while three quarters is never touched.
 
 ## Accelerator grants are read per vendor
 
-The device grant is read from whichever vendor's visibility variable is set, so a pinned pod
-reports its share rather than the node's:
+The device grant is read from whichever vendor's visibility variable is set, so a pinned pod reports its share rather than the node's. The following table lists the variables per vendor:
 
 | Vendor | Variable |
 |---|---|
@@ -91,7 +76,7 @@ reports its share rather than the node's:
 | AMD | `HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES` |
 | Intel Gaudi | `HABANA_VISIBLE_MODULES`, `HABANA_VISIBLE_DEVICES` |
 | Intel XPU | `ZE_AFFINITY_MASK` |
-| AWS Trainium, Inferentia | `NEURON_RT_VISIBLE_CORES` |
+| AWS Trainium and Inferentia | `NEURON_RT_VISIBLE_CORES` |
 | Cloud TPU | `TPU_VISIBLE_DEVICES` |
 
 The NVIDIA container toolkit's `NVIDIA_VISIBLE_DEVICES=all` is its way of saying "inject
@@ -124,7 +109,7 @@ is killed, instead of losing the stage mid-write.
 single-node Ray on whichever node the script landed on. The job then runs, returns the right
 answer, and uses a quarter of the hardware it was billed for.
 
-Batcher cannot fix this from inside the process, so it says so. When the allocation is wider
+Batcher can't fix this from inside the process, so it says so. When the allocation is wider
 than the Ray cluster, including the case where no cluster is running at all, it logs a warning
 naming both counts, once per process. Bringing Ray up across the allocation is the
 launcher's job. Pass `distributed=False` if the single node is what you meant, and the notice
@@ -144,15 +129,15 @@ python my_pipeline.py
 ## PBS, LSF and Grid Engine
 
 These place several tasks per node by default, and none of them confines a task to its share.
-Batcher reads the layout so a per-process budget is one share rather than the whole node:
+Batcher reads the layout so a per-process budget is one share rather than the whole node, as follows:
 
-- **PBS** writes one line per task *slot* to `PBS_NODEFILE`. The distinct names are the
+- PBS writes one line per task *slot* to `PBS_NODEFILE`. The distinct names are the
   allocation; the repetition count for this host is the task layout, and the node's core grant
   divided by it is the per-task budget.
-- **LSF** publishes a per-host slot breakdown in `LSB_MCPU_HOSTS`. Its job-wide total
+- LSF publishes a per-host slot breakdown in `LSB_MCPU_HOSTS`. Its job-wide total
   (`LSB_DJOB_NUMPROC`) is deliberately *not* used as a per-node bound, since it over-counts by
   the number of hosts.
-- **Grid Engine** writes `hostname nslots queue processors` per line to `PE_HOSTFILE`, so the
+- Grid Engine writes `hostname nslots queue processors` per line to `PE_HOSTFILE`, so the
   slot count is a column rather than a repeat count.
 
 ### Where a spill lands
@@ -173,9 +158,7 @@ also the only directory an HTCondor job is guaranteed to be able to write to.
 
 ### Draining before the wall-clock limit
 
-Only Slurm publishes the moment an allocation ends. The others publish a wall-clock *limit*,
-which Batcher cannot convert to an instant on its own. Export the lease and the same drain path
-turns on:
+Only Slurm publishes the moment an allocation ends. The others publish a wall-clock limit, which Batcher can't convert to an instant on its own. Export the lease and the same drain path turns on. `BATCHER_DEADLINE_SECONDS` is measured from when the Python process started, so setup time before Python runs makes the deadline late. When the launcher knows the exact end, export it as Unix epoch seconds in `BATCHER_DEADLINE_EPOCH_S` instead:
 
 ```bash
 # docs: skip
@@ -186,8 +169,7 @@ python my_pipeline.py
 
 ## Kubernetes
 
-Kubernetes injects nothing about the pod unless the manifest asks. Batcher reports the kind and
-whatever identity it can see, which is honest but thin. Adding the downward API is a few lines
+Kubernetes injects nothing about the pod unless the manifest asks. Batcher reports the kind and whatever identity it can see. Adding the downward API is a few lines
 and makes placement decisions and diagnostics legible:
 
 ```yaml
@@ -212,15 +194,14 @@ and `nofile` (`--ulimit nofile=65536`).
 ## Managed job services
 
 AWS Batch, SageMaker, Vertex AI, Azure ML and SkyPilot each publish the job's shape in their
-own form, and Batcher reads all five. Two are worth knowing about because they are the only
-place those platforms name the job's *peers*:
+own form, and Batcher reads all five. Two are worth knowing, because they're the only place those platforms name the job's peers:
 
-- **Vertex AI** publishes `CLUSTER_SPEC`, a JSON document mapping each worker pool to its
+- Vertex AI publishes `CLUSTER_SPEC`, a JSON document mapping each worker pool to its
   member addresses plus this task's own pool and index.
-- **SageMaker** publishes `SM_HOSTS` and `SM_CURRENT_HOST`, so a host's rank is its position in
+- SageMaker publishes `SM_HOSTS` and `SM_CURRENT_HOST`, so a host's rank is its position in
   the list.
 
-**SkyPilot is read before the platform it provisioned.** A SkyPilot task on a Kubernetes backend
+SkyPilot is read before the platform it provisioned. A SkyPilot task on a Kubernetes backend
 carries both sets of markers, and only SkyPilot knows the task spans four nodes; Kubernetes
 knows only about this pod.
 
@@ -241,6 +222,8 @@ equivalent) for the device grant, and `RANK`/`WORLD_SIZE` for the job's width.
 
 ## Requirements and limitations
 
+The following limits apply to detection:
+
 - Detection is local reads only: environment variables, the scheduler's own host files, and
   the firmware's description of the machine in `/sys/class/dmi/id`. Batcher never calls a
   metadata service or a scheduler API, because a network round trip on a control-plane path
@@ -254,6 +237,6 @@ equivalent) for the device grant, and `RANK`/`WORLD_SIZE` for the job's width.
 
 ## See also
 
-- {doc}`ray`: how a distributed run actually moves data, and why it bypasses the object store.
+- {doc}`/integrations/compute/ray`: how a distributed run actually moves data, and why it bypasses the object store.
 - {doc}`/configuration/environment`: every variable read, per scheduler.
 - {doc}`/architecture/fault-tolerance`: what draining does with the deadline this page reads.

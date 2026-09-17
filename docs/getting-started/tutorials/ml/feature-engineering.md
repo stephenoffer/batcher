@@ -56,7 +56,7 @@ print(train.columns)
 # ['user_id', 'age', 'tenure', 'plan', 'spend', 'churned']
 ```
 
-In practice you would produce `train` / `test` with
+In practice you would produce `train` and `test` with
 {py:obj}`ds.ml.train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>`,
 which assigns each row by a reproducible hash of its own content. Here the two splits are
 written out explicitly so the numbers below are deterministic.
@@ -82,9 +82,9 @@ Two splits, two different means. Only one of them may reach your features.
 :::{important}
 The rule that follows: call `fit` (or `fit_transform`) on `train` *only*, and put the
 held-out split through `transform`, never `fit_transform`, so it inherits the training
-statistics. `fit_transform` on your test split is the single most expensive typo in applied
-machine learning. It does not raise, it does not warn, and every offline metric you compute
-afterwards is optimistic. Every step below does exactly the right thing.
+statistics. `fit_transform` on your test split is an expensive typo. It doesn't raise, it
+doesn't warn, and every offline metric you compute afterwards is optimistic. Every step below
+follows the rule.
 :::
 
 ## Impute missing values

@@ -1,6 +1,6 @@
 # The relational surface
 
-The verbs, the column language, and the boundary data crosses. Each page leads with a runnable example and then enumerates the surface.
+This section is the reference for relational work in Batcher: the `Dataset` verbs, the expression language you write columns in, SQL, and the readers and writers data crosses on the way in and out. Each page leads with a runnable example and then enumerates the surface, so you can learn a call and look it up in the same place.
 
 | Page | Covers |
 |---|---|

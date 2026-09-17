@@ -12,13 +12,12 @@ from batcher import Config, set_config, config_context
 
 ## Low-latency small queries
 
-For many small, interactive queries the priority is low fixed overhead. Use a smaller morsel,
-so a tiny input is not split into one oversized batch, and keep all cores available.
+For many small, interactive queries the priority is low fixed overhead. `execution.fast_path` skips the per-query orchestration for small in-memory plans that provably don't need it, and still records learned statistics. It gives up observability: those queries don't appear in `explain(analyze=True)`, the event log, or the dashboard. `parallelism=0` keeps every core available.
 
 ```python
 base = Config()
 low_latency = base.replace(
-    execution=dataclasses.replace(base.execution, parallelism=0, morsel_rows=4096),
+    execution=dataclasses.replace(base.execution, parallelism=0, fast_path=True),
 )
 
 with config_context(low_latency):
@@ -63,28 +62,23 @@ print(container.memory.max_memory_bytes)
 # 4294967296
 ```
 
-## Conservative optimizer
+## Re-optimize sooner
 
-To re-optimize more aggressively when estimates miss, lower `reoptimize_error`. To
-spend more planning effort on many-way joins, raise the exact-DP threshold.
+To re-optimize more readily when estimates miss, lower `reoptimize_error`. The adaptive loop re-plans when `abs(actual - estimate) / estimate` exceeds it.
 
 ```python
 base = Config()
 aggressive = base.replace(
-    optimizer=dataclasses.replace(
-        base.optimizer,
-        reoptimize_error=1.5,
-        join_dp_max_tables=16,
-    ),
+    optimizer=dataclasses.replace(base.optimizer, reoptimize_error=1.5),
 )
-print((aggressive.optimizer.reoptimize_error, aggressive.optimizer.join_dp_max_tables))
-# (1.5, 16)
+print(aggressive.optimizer.reoptimize_error)
+# 1.5
 ```
 
 ## Bounded memory: spill instead of crash
 
 To make a single-node job survive an input far larger than memory, set
-`max_memory_bytes`. That bounds the engine **and** opts it into out-of-core
+`max_memory_bytes`. That bounds the engine and opts it into out-of-core
 spilling: the Rust runtime memory pool spills stateful operators that exceed the
 budget rather than letting the process get OOM-killed. Point `spill_dir` at fast
 local scratch (NVMe), and optionally overflow to object storage at PB scale.
@@ -94,7 +88,7 @@ base = Config()
 oom_resilient = base.replace(
     memory=dataclasses.replace(
         base.memory,
-        max_memory_bytes=8 * (1 << 30),  # 8 GiB cap → spill budget = 8 GiB × hard_limit
+        max_memory_bytes=8 * (1 << 30),  # 8 GiB cap, so the spill budget is 8 GiB * hard_limit
         spill_dir="/mnt/nvme/batcher-spill",
         spill_remote_uri="s3://my-bucket/spill/",  # overflow when local disk fills
     ),
@@ -123,7 +117,7 @@ resilient_cluster = base.replace(
         base.distributed,
         task_max_retries=4,  # rerun a transiently-failed shuffle task
         actor_max_restarts=2,  # respawn a crashed compute actor
-        recovery_max_attempts=5,  # more recompute→retry rounds for a flaky cluster
+        recovery_max_attempts=5,  # more recompute-and-retry rounds for a flaky cluster
         flight_idle_timeout_s=120.0,  # tolerate longer GC pauses before declaring death
         flight_keepalive_s=10.0,  # detect a dropped connection within ~10 s
         speculation_max_backups=2,  # back up the slowest stragglers

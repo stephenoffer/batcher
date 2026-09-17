@@ -1,11 +1,8 @@
 # Model selection and hyperparameter search
 
-This page describes how to cross-validate a model on Batcher, and how to search a
-hyperparameter space without hand-writing the loop.
+This page describes how to cross-validate a model on Batcher, and how to search a hyperparameter space without hand-writing the loop.
 
-Everything here takes `fit` and `predict` as callables rather than requiring a particular
-model class, so a Batcher estimator, a scikit-learn one, or a closure that fits a whole
-preprocessing pipeline all compose the same way.
+Every function here takes `fit` and `predict` as callables rather than a particular model class. A Batcher estimator, a scikit-learn one, and a closure that fits a whole preprocessing pipeline all plug in the same way.
 
 ## Cross-validated scoring
 
@@ -38,12 +35,9 @@ print(len(scores), all(s > 0.99 for s in scores))
 # 4 True
 ```
 
-Read the spread, not just the mean. A model with a great average and a wide spread across
-folds is one split away from looking bad, and the mean alone hides that.
+Read the spread, not just the mean. A model with a great average and a wide spread across folds is one split away from looking bad.
 
-Pass `key=` naming the columns that identify a row. The folds are content-hash filters, so
-hashing only the identity columns keeps the assignment stable when you re-derive a feature.
-Pass `stratify=` for an imbalanced target, so each fold carries the same class balance.
+Pass `key=` naming the columns that identify a row. The folds are content-hash filters, so hashing only the identity columns keeps a row in its fold when you re-derive a feature. Pass `stratify=` for an imbalanced target, so each fold carries the same class balance. {doc}`splits-and-resampling` covers how the folds are built.
 
 ## Searching a parameter space
 
@@ -72,9 +66,7 @@ Every combination is scored on the *same* folds. That makes the comparison paire
 rows train and validate each candidate, so a difference between two scores is a difference
 between the candidates rather than fold-assignment luck.
 
-Nothing is refitted on the full dataset afterwards. You get back the winning parameters,
-which keeps the search independent of whatever `fit` builds. Refit yourself with one more
-call.
+Nothing is refitted on the full dataset afterwards. You get the winning parameters back, which keeps the search independent of whatever `fit` builds, and the refit is one more call.
 
 ## Reading the whole search, not just the winner
 
@@ -128,8 +120,9 @@ print(by_error.best_params)
 ## Random search, for more than a couple of parameters
 
 Once three or more parameters are in play, a grid spends most of its budget re-testing the
-ones that do not matter. {py:func}`random_search <batcher.ml.random_search>` gives every
-parameter `n_iter` distinct values for the same number of fits.
+ones that do not matter. {py:func}`random_search <batcher.ml.random_search>` draws
+`n_iter` combinations instead, so for the same number of fits every parameter can take up to
+`n_iter` distinct values.
 
 A parameter's candidates are either a sequence, drawn from uniformly, or a callable taking
 a `random.Random`, which is how a continuous range is expressed.
@@ -179,19 +172,16 @@ for plotting the peak rather than just naming it.
 
 ## Requirements and limitations
 
-- A search costs one model fit per combination per fold. `grid_search` on a 3x3x3 grid with
-  5 folds is 135 fits; size the grid against what a fit costs.
-- Selecting hyperparameters on the same folds you report the score from is mildly
-  optimistic, because the winner was chosen partly by fold noise. Hold out a final test
-  split that the search never touches, or nest a second cross-validation around it.
-- `SearchResult` is frozen, so a search result cannot be edited after the fact.
-- `to_dataset` puts every parameter in a column, so a parameter whose values are not scalars
-  (a list, a nested estimator) has no sensible column type. Read `trials` directly for
-  those.
+A search costs one model fit per combination per fold. `grid_search` on a 3x3x3 grid with 5 folds is 135 fits, so size the grid against what a fit costs.
+
+Selecting hyperparameters on the same folds you report the score from is mildly optimistic, because fold noise helped choose the winner. Hold out a final test split the search never touches, or nest a second cross-validation around it.
+
+`SearchResult` is a frozen dataclass and can't be edited after the fact. `to_dataset` puts every parameter in a column, so a parameter whose values aren't scalars, such as a list or a nested estimator, has no sensible column type. Read `trials` directly for those.
 
 ## See also
 
 - {doc}`evaluation` for the metrics these searches optimize.
+- {doc}`/ml/training/ensembling` for stacking on the out-of-fold predictions `cross_val_predict` returns.
 - {doc}`splits-and-resampling` for the folds, stratified hold-outs, and class rebalancing these searches run over.
 - {doc}`/ml/preparing/preprocessors/feature-selection` for pruning features rather than
   tuning parameters.

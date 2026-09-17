@@ -1,6 +1,8 @@
 # In-engine classifiers
 
-Reach for a dummy baseline first. A model that cannot beat "always predict the most frequent class" is not a model, and on an imbalanced problem that baseline can look deceptively strong on accuracy alone.
+Batcher fits a set of classic classifiers from a Dataset: Gaussian, multinomial, and Bernoulli naive Bayes, linear and quadratic discriminant analysis, nearest centroid, a ridge classifier, and logistic regression.
+
+Fit a `DummyClassifier` first. A model that cannot beat always predicting the most frequent class is not a model, and on an imbalanced problem that baseline can look deceptively strong on accuracy alone.
 
 The whole script, executed on every test run:
 

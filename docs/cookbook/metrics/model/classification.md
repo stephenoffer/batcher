@@ -1,6 +1,8 @@
 # Classification metrics
 
-These are aggregate expressions, so evaluation is a `select` (or a `group_by` if you want the metric per segment) rather than a pull into pandas. On a table too big for memory that difference is the whole ballgame.
+Batcher's classification metrics are aggregate expressions over a table of labels and predictions, so evaluation is a `select` rather than a pull into pandas.
+
+The script builds a ten-row predictions table with a known confusion matrix, so every score can be checked by hand: accuracy 0.7, precision 0.6, recall 0.75. Put the same expressions under a `group_by` and you get the metrics per segment in the same pass. On a table too big for memory, that difference is the whole ballgame.
 
 The whole script, executed on every test run:
 

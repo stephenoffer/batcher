@@ -58,15 +58,15 @@ put across reboots: CPU vendor and model, logical CPUs, physical cores, NUMA nod
 width, page size, bucketed memory, L2 and L3 sizes, storage class, accelerators, and the
 operating system. A node with a fabric appends its fabric class.
 
-Three things are deliberately left out, and the reasoning generalizes:
+Three things are deliberately left out. The full CPU flag list is one. A microcode update
+changes it without changing anything the engine can exploit, which would discard every
+coefficient learned on the host. Exact memory bytes are another, because two nodes of one
+instance type differ by whatever the kubelet and firmware reserved, so raw bytes would give
+every node a key of its own.
 
-- **The full CPU flag list.** A microcode update changes it without changing anything the
-  engine can exploit, which would discard every coefficient learned on the host.
-- **Exact memory bytes.** Two nodes of one instance type differ by whatever the kubelet and
-  firmware reserved, so raw bytes would give every node a key of its own.
-- **Load, temperature and clock speed.** Real and important, but they vary minute to minute. A
-  fingerprint that changed under load would re-learn from scratch every time the box got busy,
-  which is exactly when the learned values matter most.
+The third is load, temperature and clock speed. They are real and important, but they vary
+minute to minute. A fingerprint that changed under load would re-learn from scratch every time
+the box got busy, which is exactly when the learned values matter most.
 
 Bucketing memory and omitting the flag list are what let near-identical nodes share a key, so a
 fleet of one instance type learns once rather than a hundred times.
@@ -123,15 +123,16 @@ of four NVMe reported as rotational prices a spilled byte thirty times too high 
 out-of-core plan on that machine is contorted to avoid a spill the device would have absorbed.
 
 Core already records the bytes each operator spilled and how long it ran, so the fleet's own
-history can settle it. The correction runs one way only, and the reason is worth stating
-because it looks like a limitation:
+history can settle it. The correction runs one way only, which looks like a limitation until
+you see why.
 
-The only clock on the record is the operator's **whole** wall time, which includes its compute.
-So spilled bytes over elapsed time is not the device's throughput, it is a *lower bound* on it.
+The only clock on the record is the operator's *whole* wall time, which includes its compute.
+So spilled bytes over elapsed time is a *lower bound* on the device's throughput, not the
+throughput itself.
 A lower bound supports one inference and refuses the other. A high reading proves the device
 moved that many bytes per millisecond, so a class claiming it is slower is wrong and the factor
-may come down. A low reading proves nothing. The operator may have been compute-bound, so the factor is left
-alone.
+may come down. A low reading proves nothing. The operator may have been compute-bound, so the factor is
+left alone.
 
 That asymmetry happens to line up with the bias it corrects. The structural reading errs toward
 pessimism, and pessimism is the direction a lower bound can disprove.
@@ -142,7 +143,7 @@ below the local-flash floor. One anomalous run cannot move a plan.
 ### When the box is holding the query back
 
 Every measurement above is spent on making a plan cheaper. This one exists to stop a *wrong
-inference*, which is a different job and worth separating.
+inference*, which is a different job.
 
 The per-task CPU share is sized from measured utilization: a family whose cores sat idle asks
 for less of a core, so several of its tasks pack onto one. That is right for a family that
@@ -159,7 +160,7 @@ Three independent measurements break the tie, and any one is sufficient:
 | Major page faults | The box paging against the query | Anything that is not memory |
 | CPU clamping | The quota or the silicon stopping the work | Nothing the other two catch |
 
-The third is the one added last, and it covers the case the first two structurally cannot.
+The third was added last. It covers the case the first two structurally cannot.
 **Quota throttling** dequeues a thread at the *end of a CFS period*, so at the default 100 ms
 period it yields on the order of ten involuntary switches per core-second against a threshold
 of two hundred, and it faults not at all. A container clamped to a third of its quota therefore
@@ -178,8 +179,7 @@ firing early costs one family's tuning while firing late costs the spiral.
 
 ## What the optimizer does not see
 
-Being explicit about this matters more than the list is long, because each of these is
-sometimes assumed to be in play.
+Each of these is sometimes assumed to be in play.
 
 - **Accelerator temperature.** GPU thermal telemetry is collected and is rich, but it reaches
   Carbonite only, where it marks a device degraded or blocklists it. It is a *health* signal
@@ -200,9 +200,9 @@ sometimes assumed to be in play.
   host whose silicon favours the compiled tier learns that on its own. Scaling the *cold*
   prior by vector width, which looks like the missing piece, is not: that parameter is a
   ratio between two already-vectorized paths, so a wider unit speeds up both sides of it and
-  largely cancels. What a cold machine cannot know is the weighting of the CPU axis against
-  the IO and network axes, which are hardware-scaled while it is not, and correcting that
-  needs benchmark evidence across machine classes, not a constant.
+  largely cancels. A cold machine cannot know the weighting of the CPU axis against the IO
+  and network axes, which are hardware-scaled while it is not. Correcting that needs
+  benchmark evidence across machine classes, not a constant.
 
 ## See also
 

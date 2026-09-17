@@ -1,12 +1,10 @@
 # Data quality and governance
 
-This page covers the scripts that assert contracts on data, and the ones that restrict who
-can read which rows and columns.
+This page covers the scripts that assert contracts on data, and the ones that restrict who can read which rows and columns.
 
 ## The four endings
 
-A `ds.dq` chain ends in one of four ways, and which one you want depends on whether a
-violation is a data problem to route or a promise that must hold.
+A `ds.dq` chain ends in one of four ways, and which one you want depends on whether a violation is a data problem to route or a promise that must hold.
 
 ```python
 import batcher as bt
@@ -29,27 +27,17 @@ assert clean.count() + rejected.count() == people.count()
 assert rejected.to_pydict()["id"] == [4]
 ```
 
-`drop` keeps only the conforming rows and `fail` raises. Profile first. Writing a contract
-without looking at the null rate, cardinality and range is guessing, and profiling is what
-makes the thresholds defensible.
+`drop` keeps only the conforming rows and `fail` raises. Profile first. Writing a contract without looking at the null rate, cardinality and range is guessing, and profiling is what makes the thresholds defensible.
 
 ## Checks that can actually fail
 
-Several classes of defect are invisible to a row count, so the scripts here check for them
-directly. A schema check catches a column that widened upstream while still holding the same
-values. A completeness check compares against the *expected* set of groups, because the rows
-that would have made the count wrong are the ones that are absent. A referential-integrity
-check is an anti join, and it finds exactly the rows an inner join would silently drop.
+Several classes of defect are invisible to a row count, so the scripts here check for them directly. A schema check catches a column that widened upstream while still holding the same values. A completeness check compares against the *expected* set of groups, because the rows that would have made the count wrong are the ones that are absent. A referential-integrity check is an anti join, and it finds exactly the rows an inner join would silently drop.
 
 ## Governance is a plan rewrite
 
-Masking and row-level security are injected into the plan rather than applied to the result.
-That distinction matters: an aggregate computed by a restricted principal is computed over
-the restricted rows, so a count cannot leak the size of the hidden set, and a masked column
-stays masked inside a group-by even when the query never projects it.
+Masking and row-level security are injected into the plan rather than applied to the result. That distinction matters: an aggregate computed by a restricted principal is computed over the restricted rows, so a count cannot leak the size of the hidden set, and a masked column stays masked inside a group-by even when the query never projects it.
 
-Residency defaults to `off`, so every check passes. That is deliberate: a fleet measures in
-`advisory` before it blocks in `strict`. Setting the mode is the whole control.
+Residency defaults to `off`, so every check passes. That is deliberate: a fleet measures in `advisory` before it blocks in `strict`. Setting the mode is the whole control.
 
 ## Every script on this page
 
@@ -74,7 +62,7 @@ The table below lists the quality, governance and security scripts in path order
 | `examples/quality/uniqueness_and_keys.py` | Checking that a key is actually a key |
 | `examples/governance/lineage.py` | Column lineage: which inputs does this output column actually depend on? |
 | `examples/governance/masking_and_filters.py` | Column masking and row filtering as a plan rewrite, not a wrapper |
-| `examples/governance/pii_transforms.py` | Masking, hashing, and encrypting a sensitive column |
+| `examples/governance/pii_transforms.py` | Masking, hashing, and keyed hashing of a sensitive column |
 | `examples/security/audit_and_lineage.py` | Proving where a governed column went |
 | `examples/security/audit_trail.py` | Recording who ran what, and proving the policy applied |
 | `examples/security/column_masking.py` | Masking a sensitive column by tag, not by name |
@@ -82,3 +70,9 @@ The table below lists the quality, governance and security scripts in path order
 | `examples/security/masking_functions.py` | The masking functions, and what each preserves |
 | `examples/security/row_level_security.py` | Restricting which rows a principal can see |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/user-guide/trust/data-quality`: the `ds.dq` builders and the fail, drop, and quarantine endings.
+- {doc}`/user-guide/trust/governance`: grants, masks, row filters, and the audit trail.
+- {doc}`/cookbook/governance/index`: governance recipes with the whole script on the page.

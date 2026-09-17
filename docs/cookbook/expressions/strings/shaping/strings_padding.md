@@ -1,6 +1,8 @@
 # Padding and trimming
 
-Padding matters when a join key is stored at different widths in two systems: an account id written `42` in one export and `000042` in another will not join until one side is padded. Trimming matters because a trailing space is invisible and breaks equality.
+Padding matters when a join key is stored at different widths in two systems. An account id written `42` in one export and `000042` in another won't join until one side is padded. Trimming matters because a trailing space is invisible and breaks equality.
+
+The script zero-pads with `zfill`, pads on either side with any fill character through `lpad` and `rpad`, and trims both ends with `trim` or one end with `strip_chars_start` and `strip_chars_end`. Note the default: the no-argument `trim` follows SQL `TRIM` and removes spaces only, so pass `" \t\n"` when the input may hold tabs or newlines.
 
 The whole script, executed on every test run:
 

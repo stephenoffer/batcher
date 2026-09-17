@@ -2,8 +2,7 @@
 
 *Spilling* is how a stateful operator keeps running when its state no longer fits in the
 memory envelope: it writes part of that state to disk and reads it back in bounded pieces.
-This page describes when Batcher decides to spill, the grace-partitioning algorithm behind
-it, which operators spill and how, and what spilling costs you.
+This page describes when Batcher spills, the algorithms behind it, and what it costs.
 
 A hash aggregate over a billion distinct keys doesn't fit in memory, and neither does the
 build side of a join against a table larger than RAM. The two honest options are to fail
@@ -37,7 +36,7 @@ fn admit(opts: &ExecOptions, op_id: u32, estimate_bytes: usize) -> Admit {
 }
 ```
 
-Read the first arm carefully. When a pool exists, *actual outstanding bytes* are the spill
+When a pool exists, *actual outstanding bytes* are the spill
 authority, not a static plan estimate. The estimate is only what the operator asks for.
 The per-operator budget path, `op_budget` keyed by Kyber's pre-order `op_id`, is the
 fallback for pool-less contexts.
@@ -49,8 +48,7 @@ cap rather than at it is the better strategy on paper and trades throughput for 
 waits on a benchmark rather than on an opinion.
 
 If `EngineConfig.memory_budget_bytes` is 0, `agg_spill` is `None` and the engine runs fully
-in memory with no spill machinery engaged at all. That's the zero-cost default when you opt
-out with `memory.unbounded_memory`.
+in memory with no spill machinery engaged at all. That's what `memory.unbounded_memory` asks for.
 
 ## Grace partitioning
 
@@ -94,16 +92,15 @@ The routing hash uses fixed `ahash` seeds so a key lands in the same bucket acro
 chunk. That's the entire correctness argument. Equal keys co-locate, so partitions are
 key-disjoint and each one can be reduced independently.
 
-Partition count is sized from the state, not guessed: `grace_partitions` returns
-`state_bytes.div_ceil(budget).max(2)`.
+The partition count is fixed by the store the caller hands in, sized from the operator's state against its budget rather than guessed.
 
 ### When a bucket is still too big
 
 A skewed key set can overflow a single bucket even after partitioning. `merge_partition`
 handles that by recursing: if a partition's bytes still exceed the budget, it re-partitions
-with a *different salt* (`salt = 0x9E37_79B9_7F4A_7C15 * (depth+1) | 1`) into sub-buckets
-and reduces those one at a time, up to `MAX_MERGE_DEPTH = 4`
-(`bc-runtime/src/agg/spill/mod.rs`).
+with a *different salt* (`0x9E37_79B9_7F4A_7C15` wrapping-multiplied by `depth + 1`, with the low bit set) into
+`bytes.div_ceil(budget)` sub-buckets, clamped to between 2 and 256, and reduces those one at a time, up to `MAX_MERGE_DEPTH = 4`
+(`bc-runtime/src/agg/spill/mod.rs`). The 256 cap bounds the file count of one level, not the total: the recursion reaches the same per-bucket size through more, cheaper levels.
 
 :::{warning}
 The different salt isn't an optimization. Re-hashing an overflowing bucket with the same
@@ -124,21 +121,19 @@ state. The table names the mechanism and the file that implements it:
 |---|---|---|
 | Aggregate | grace partition + per-bucket combine | `bc-runtime/src/agg/spill/mod.rs` |
 | Distinct / UNION dedup | the same grace path with an empty agg list | `bc-interp/src/par.rs::distinct` |
-| Sort (full) | sorted runs + bounded k-way merge | `bc-interp/src/ops/external_sort.rs` |
+| Sort (full) | size-bounded sorted runs + bounded k-way merge | `bc-interp/src/ops/external_sort.rs` |
 | Hash join | grace: co-partition both sides, join bucket-by-bucket | `bc-interp/src/join_par/mod.rs` |
 | ASOF join | partition by the `by` keys | `bc-interp/src/join_par/mod.rs` |
 | Window (PARTITION BY) | partition on the partition keys | `bc-interp/src/window_spill.rs` |
+| DISTINCT ON | grace, reduced to one row per key per morsel first | `bc-interp/src/distinct_on_spill.rs` |
 
 Top-N, a `Sort` carrying a `limit`, never spills. It runs a bounded heap, which is already
 memory-bounded.
 
-The **external sort** writes each morsel as a sorted run, then merges with a bounded
-fan-in of `execution.sort_merge_fanin`, default 16, streaming the output back to disk
-between passes. Peak memory is O(fan-in morsels), not O(input).
+The **external sort** grows sorted runs to a quarter of the operator's budget, at least 1 MiB and at most 64 MiB (`DEFAULT_RUN_TARGET_BYTES`), rather than cutting one run per morsel. Fewer, larger runs mean fewer merge passes. It then merges with a bounded fan-in of `execution.sort_merge_fanin`, default 16, streaming the output back to disk between passes, so peak memory is O(fan-in batches) rather than O(input).
 
-The **grace hash join** sizes its partition count from `build_bytes.div_ceil(budget)`
-*without materializing the build side*. It sums `get_array_memory_size()` over the
-incoming batches. Both sides are co-partitioned by join key into two stores, then bucket
+The **grace hash join** sizes its fan-out from the larger of its two sides, `bytes.div_ceil(budget)` clamped to 2..256,
+*without materializing either side*. It measures the incoming morsels with the slice-aware `batch_bytes`, because `get_array_memory_size()` charges every slice its whole parent buffer and once fanned joins out into far too many buckets. Both sides are co-partitioned by join key into two stores, then bucket
 `i` of the left is joined against bucket `i` of the right.
 
 ### The aggregates that would defeat grace
@@ -175,10 +170,17 @@ clobbering each other. `DiskSpillStore` has a `Drop` that removes the directory.
 Compression is `memory.spill_compression`, default `"auto"`, and auto is datatype-aware:
 
 ```rust
-fn classify(schema: &Schema) -> Self {
-    // LargeBinary | Binary | LargeUtf8 present -> Zstd, else None
+// crates/bc-runtime/src/agg/spill/store.rs
+pub(super) fn classify(schema: &Schema) -> Self {
+    if schema.fields().iter().any(|f| Self::carries_blobs(f.data_type())) {
+        Self::Zstd
+    } else {
+        Self::None
+    }
 }
 ```
+
+`carries_blobs` counts `Binary`, `BinaryView`, `LargeBinary`, `LargeUtf8`, and a wide enough `FixedSizeBinary`, and it looks inside lists, structs and maps. Nesting matters because `array_agg` over a blob column spills its partial state as a `List<LargeBinary>`, which a top-level check would miss. Plain `Utf8` stays uncompressed on purpose.
 
 On fast local disk, compressing numeric *or string* state costs more CPU than the I/O it
 saves. Only blob payloads win. The read path never needs to know the codec, because IPC
@@ -253,7 +255,7 @@ at `MAX_GRACE_SPLIT_DEPTH = 3`, with a fan-out capped at `MAX_GRACE_FANOUT = 256
 (`bc-interp/src/spill_split.rs`); the distributed path matches it at
 `dist/spill/buckets.py::GRACE_DEPTH = 3`. So every breaker that grace-splits stops at the
 same depth as every other, and the aggregate's merge recursion is the one that goes a level
-further. There is no constant named `MAX_DEPTH`; this page named one until 2026-09-13.
+further. 
 
 :::{warning}
 A key set so skewed that one group's state exceeds the budget on its own can't be partitioned

@@ -18,14 +18,14 @@ Each of these builds a {py:class}`Dataset <batcher.Dataset>` from data you alrea
 | --- | --- |
 | {py:func}`bt.from_pydict(mapping) <batcher.from_pydict>` | column-oriented dict |
 | {py:func}`bt.from_pylist(rows) <batcher.from_pylist>` | row-oriented list of dicts (JSON records) |
-| {py:func}`bt.from_items(items) <batcher.from_items>` | list of items, one row each (dicts → columns) |
+| {py:func}`bt.from_items(items) <batcher.from_items>` | list of items, one row each (dicts -> columns) |
 | {py:func}`bt.from_arrow(table_or_batches) <batcher.from_arrow>` | pyarrow Table, RecordBatch, or batch list |
 | {py:func}`bt.from_batches(factory, schema) <batcher.from_batches>` | streaming source from a batch factory |
 | {py:func}`bt.from_pandas(df) <batcher.from_pandas>` / {py:func}`bt.from_polars(df) <batcher.from_polars>` / {py:func}`bt.from_numpy(...) <batcher.from_numpy>` | framework adapters |
 | {py:func}`bt.from_spark(...) <batcher.from_spark>` / {py:func}`bt.from_daft(...) <batcher.from_daft>` / {py:func}`bt.from_dask(...) <batcher.from_dask>` / {py:func}`bt.from_ray_dataset(...) <batcher.from_ray_dataset>` | distributed-frame adapters |
 | {py:func}`bt.from_torch(...) <batcher.from_torch>` / {py:func}`bt.from_tf(...) <batcher.from_tf>` / {py:func}`bt.from_huggingface(...) <batcher.from_huggingface>` | framework adapters |
 | {py:func}`bt.from_duckdb(rel) <batcher.from_duckdb>` | DuckDB relation, or a connection plus a query |
-| {py:func}`bt.from_dict(d) <batcher.from_dict>` / {py:func}`bt.from_dicts(rows) <batcher.from_dicts>` / {py:func}`bt.from_records(rows, columns=...) <batcher.from_records>` | pandas/Polars-spelled aliases |
+| {py:func}`bt.from_records(rows, columns=...) <batcher.from_records>` | row tuples with `columns`, or row dicts, such as a DB-API `fetchall()` |
 | {py:func}`bt.from_iter(iterable) <batcher.from_iter>` | any Python iterable or generator, one row per item |
 | {py:func}`bt.from_any(obj) <batcher.from_any>` | dispatches on the type of whatever you hold |
 | {py:func}`bt.concat(frames, how="vertical") <batcher.concat>` | stack datasets (`vertical`/`vertical_relaxed`/`diagonal`/`horizontal`) |
@@ -44,7 +44,7 @@ All readers take a local or cloud path and return a Dataset. {py:obj}`bt.read <b
 | {py:meth}`bt.read.images <batcher.api.io_namespace.reader.Reader.images>`, {py:meth}`bt.read.audio <batcher.api.io_namespace.reader.Reader.audio>`, {py:meth}`bt.read.video <batcher.api.io_namespace.reader.Reader.video>` | multimodal |
 | {py:meth}`bt.read.sql <batcher.api.io_namespace.reader.Reader.sql>`, {py:meth}`bt.read.snowflake <batcher.api.io_namespace.reader.Reader.snowflake>`, {py:meth}`bt.read.bigquery <batcher.api.io_namespace.reader.Reader.bigquery>`, {py:meth}`bt.read.kafka <batcher.api.io_namespace.reader.Reader.kafka>` | external systems |
 
-The pandas and Polars spellings work too, as top-level shorthands for the same lazy readers: {py:func}`bt.read_csv <batcher.read_csv>`, {py:func}`bt.read_parquet <batcher.read_parquet>`, {py:func}`bt.read_json <batcher.read_json>`, {py:func}`bt.read_ndjson <batcher.read_ndjson>`, {py:func}`bt.read_ipc <batcher.read_ipc>`, {py:func}`bt.read_orc <batcher.read_orc>`, {py:func}`bt.read_avro <batcher.read_avro>`, {py:func}`bt.read_excel <batcher.read_excel>`, {py:func}`bt.read_delta <batcher.read_delta>`, {py:func}`bt.read_iceberg <batcher.read_iceberg>`, and {py:func}`bt.read_database <batcher.read_database>`. {py:func}`bt.read_table(name, ...) <batcher.read_table>` constructs any registered connector by name.
+{py:meth}`bt.read.table(name, ...) <batcher.api.io_namespace.reader.Reader.table>` constructs any registered connector by name.
 
 ## Dataset transformations
 
@@ -54,11 +54,11 @@ Each returns a new lazy Dataset.
 | --- | --- |
 | `.filter(expr)` | keep rows where the predicate is true |
 | {py:meth}`.select(*names, **derived) <batcher.Dataset.select>` | choose or derive the full output |
-| {py:meth}`.with_columns(**named) <batcher.Dataset.with_columns>` / {py:meth}`.with_column(name, expr) <batcher.Dataset.with_column>` | add or replace columns |
+| {py:meth}`.with_columns(**named) <batcher.Dataset.with_columns>` | add or replace columns |
 | `.drop(*names)` | remove columns |
 | `.rename({old: new})` | rename columns |
 | `.sort(*by, descending=False, nulls_first=False)` | order rows |
-| `.limit(n, offset=0)` / `.head(n=5)` | take a prefix |
+| `.limit(n, offset=0)` | take a prefix |
 | `.tail(n=5)` | take a suffix (executes a `count` first) |
 | {py:meth}`.gather_every(n, offset=0) <batcher.Dataset.gather_every>` | keep every `n`-th row (downsample) |
 | `.reverse()` | reverse the row order |
@@ -89,8 +89,8 @@ reverse:
 | {py:meth}`.with_row_index(name="index", offset=0) <batcher.Dataset.with_row_index>` | prepend a sequential row-index column (Polars) |
 | {py:meth}`.with_random(name="random", seed=0, normal=False) <batcher.Dataset.with_random>` | add a reproducible seeded random column (uniform or standard normal) |
 | {py:meth}`.unnest(*columns) <batcher.Dataset.unnest>` | lift struct fields into top-level columns |
-| {py:meth}`.pivot(index=[...], on=, values=, aggregate="sum") <batcher.Dataset.pivot>` | long → wide |
-| {py:meth}`.unpivot(on=[...], index=[...], ...) <batcher.Dataset.unpivot>` | wide → long |
+| {py:meth}`.pivot(index=[...], on=, values=, aggregate="sum") <batcher.Dataset.pivot>` | long -> wide |
+| {py:meth}`.unpivot(on=[...], index=[...], ...) <batcher.Dataset.unpivot>` | wide -> long |
 | {py:meth}`.value_counts(column, name="count") <batcher.Dataset.value_counts>` | frequency of each distinct value |
 
 ## Dataset terminal operations
@@ -111,9 +111,9 @@ Each of these executes the plan and returns a result or writes it out:
 | `.write.csv(path, **kw)` / `.write.json(path, **kw)` | writes CSV / JSON |
 | {py:meth}`.to_arrow() <batcher.Dataset.to_arrow>` | pyarrow Table (alias of `.collect()`) |
 | {py:meth}`.to_pandas() <batcher.Dataset.to_pandas>` / {py:meth}`.to_polars() <batcher.Dataset.to_polars>` | a pandas / Polars DataFrame |
-| {py:meth}`.to_numpy(columns=None) <batcher.Dataset.to_numpy>` | a `{column: numpy.ndarray}` dict (tensor columns → `(n, *shape)`) |
+| {py:meth}`.to_numpy(columns=None) <batcher.Dataset.to_numpy>` | a `{column: numpy.ndarray}` dict (tensor columns -> `(n, *shape)`) |
 | {py:meth}`.to_jax(columns=None) <batcher.Dataset.to_jax>` | a `{column: jax.Array}` dict, the JAX counterpart of {py:meth}`to_numpy <batcher.Dataset.to_numpy>` |
-| `.ml.iter_torch_batches(batch_size=None, columns=None)` / `.ml.to_tf(...)` | streamed Torch tensor batches / a TensorFlow dataset |
+| `.ml.iter_torch_batches(batch_size=None, columns=None)` / `.ml.to_tf(...)` | a Torch / TensorFlow dataset |
 | `.ml.to_torch_dataloader(...)` | a `torch.utils.data.DataLoader` |
 | {py:meth}`.to_ray_dataset() <batcher.Dataset.to_ray_dataset>` | a `ray.data.Dataset`, for a Ray Train / Tune / Serve stage |
 | {py:meth}`.to_daft() <batcher.Dataset.to_daft>` | a `daft.DataFrame` |
@@ -164,9 +164,9 @@ These build the {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` values every c
 | {py:func}`bt.when(c).then(v)...otherwise(d) <batcher.when>` | SQL CASE |
 | {py:func}`bt.coalesce(*exprs) <batcher.coalesce>` | first non-null per row (also the SQL `IFNULL` case) |
 | {py:func}`bt.nullif(a, b) <batcher.nullif>` | null when `a == b` |
-| {py:func}`bt.greatest(*exprs) <batcher.greatest>` / {py:func}`bt.least(*exprs) <batcher.least>` | row-wise extreme |
+| {py:func}`bt.greatest(*exprs) <batcher.greatest>` / {py:func}`bt.least(*exprs) <batcher.least>` | row-wise max / min across columns, ignoring nulls |
 | {py:func}`bt.array(*exprs) <batcher.array>` | build a list column |
-| {py:func}`bt.atan2(y, x) <batcher.atan2>` | two-argument arctangent |
+| {py:func}`bt.arctan2(y, x) <batcher.arctan2>` | two-argument arctangent |
 
 ## Column selectors
 
@@ -198,7 +198,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | {py:func}`bt.mask(e, show_first=0, show_last=0, char="X") <batcher.mask>` | redact a string, optionally revealing its ends |
 | {py:func}`bt.hmac_sha256(e, key) <batcher.hmac_sha256>` | keyed, irreversible pseudonym that still joins |
 | {py:func}`bt.aes_encrypt(e, key) <batcher.aes_encrypt>` / {py:func}`bt.aes_decrypt(e, key) <batcher.aes_decrypt>` | deterministic AES-256-GCM-SIV column encryption |
-| {py:func}`bt.log(base, value) <batcher.log>` | logarithm of `value` in the given `base` (→ Float64) |
+| {py:func}`bt.log(base, value) <batcher.log>` | logarithm of `value` in the given `base` (-> Float64) |
 | {py:func}`bt.gcd(a, b) <batcher.gcd>` / {py:func}`bt.lcm(a, b) <batcher.lcm>` | greatest common divisor / least common multiple |
 | {py:func}`bt.hypot(a, b) <batcher.hypot>` | Euclidean norm `sqrt(a² + b²)` |
 | {py:func}`bt.great_circle_distance(lat1, lon1, lat2, lon2, unit="km") <batcher.great_circle_distance>` | haversine distance between two lat/lon points, in `km`/`m`/`mi`/`nm` |
@@ -209,17 +209,16 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | {py:func}`bt.sequence(start, stop, step=1) <batcher.sequence>` | per-row integer list `[start..stop]` inclusive (DuckDB `generate_series`) |
 | {py:func}`bt.element() <batcher.element>` | the current element inside `list.transform` / `list.filter` (Polars) |
 | {py:func}`bt.sum_horizontal(*exprs) <batcher.sum_horizontal>` / {py:func}`bt.mean_horizontal(*exprs) <batcher.mean_horizontal>` | row-wise sum / mean across columns, ignoring nulls (Polars) |
-| {py:func}`bt.min_horizontal(*exprs) <batcher.min_horizontal>` / {py:func}`bt.max_horizontal(*exprs) <batcher.max_horizontal>` | row-wise min / max across columns, ignoring nulls (Polars) |
 | {py:func}`bt.all_horizontal(*exprs) <batcher.all_horizontal>` / {py:func}`bt.any_horizontal(*exprs) <batcher.any_horizontal>` | row-wise boolean AND / OR across columns (Polars) |
 | {py:func}`bt.hash_rows(*exprs, seed=0) <batcher.hash_rows>` | deterministic 64-bit row digest (also `expr.hash(seed=0)`) |
 | {py:func}`bt.count_if(condition) <batcher.count_if>` | count rows where `condition` is true (aggregate) |
-| {py:func}`bt.sum(x) <batcher.sum>` / {py:func}`bt.mean(x) <batcher.mean>` / {py:func}`bt.min(x) <batcher.min>` / {py:func}`bt.max(x) <batcher.max>` / {py:func}`bt.median(x) <batcher.median>` / {py:func}`bt.std(x) <batcher.std>` / {py:func}`bt.var(x) <batcher.var>` / {py:func}`bt.n_unique(x) <batcher.n_unique>` | the SQL-style column-aggregate shorthands for `col(x).<agg>()` |
-| {py:func}`bt.product(x) <batcher.product>` / {py:func}`bt.mode(x) <batcher.mode>` / {py:func}`bt.skewness(x) <batcher.skewness>` / {py:func}`bt.kurtosis(x) <batcher.kurtosis>` | product / most-frequent value / 3rd / 4th standardized moment (aggregate) |
+| {py:func}`bt.sum(x) <batcher.sum>` / {py:func}`bt.mean(x) <batcher.mean>` / {py:func}`bt.min(x) <batcher.min>` / {py:func}`bt.max(x) <batcher.max>` / {py:func}`bt.median(x) <batcher.median>` / {py:func}`bt.std(x) <batcher.std>` / {py:func}`bt.var(x) <batcher.var>` / {py:func}`bt.count_distinct(x) <batcher.count_distinct>` | the SQL-style column-aggregate shorthands for `col(x).<agg>()` |
+| {py:func}`bt.product(x) <batcher.product>` / {py:func}`bt.mode(x) <batcher.mode>` / {py:func}`bt.skew(x) <batcher.skew>` / {py:func}`bt.kurtosis(x) <batcher.kurtosis>` | product / most-frequent value / 3rd / 4th standardized moment (aggregate) |
 | {py:func}`bt.bool_and(x) <batcher.bool_and>` / {py:func}`bt.bool_or(x) <batcher.bool_or>` | boolean AND / OR reduction of a group (aggregate) |
 | {py:func}`bt.bit_and(x) <batcher.bit_and>` / {py:func}`bt.bit_or(x) <batcher.bit_or>` / {py:func}`bt.bit_xor(x) <batcher.bit_xor>` | bitwise AND / OR / XOR reduction of integers (aggregate) |
 | {py:func}`bt.array_agg(x) <batcher.array_agg>` | collect each group's values into a list (aggregate) |
 | {py:func}`bt.quantile(x, q) <batcher.quantile>` / {py:func}`bt.approx_quantile(x, q) <batcher.approx_quantile>` / {py:func}`bt.approx_median(x) <batcher.approx_median>` | exact / sketch-based quantile / median (aggregate) |
-| {py:func}`bt.approx_n_unique(x) <batcher.approx_n_unique>` / {py:func}`bt.histogram(x) <batcher.histogram>` | HyperLogLog distinct count / value→count map (aggregate) |
+| {py:func}`bt.approx_count_distinct(x) <batcher.approx_count_distinct>` / {py:func}`bt.histogram(x) <batcher.histogram>` | HyperLogLog distinct count / value->count map (aggregate) |
 | {py:func}`bt.corr(x, y) <batcher.corr>` | Pearson correlation (aggregate) |
 | {py:func}`bt.covar_pop(x, y) <batcher.covar_pop>` / {py:func}`bt.covar_samp(x, y) <batcher.covar_samp>` | population / sample covariance (aggregate) |
 | {py:func}`bt.regr_slope(y, x) <batcher.regr_slope>` / {py:func}`bt.regr_intercept(y, x) <batcher.regr_intercept>` / {py:func}`bt.regr_r2(y, x) <batcher.regr_r2>` | least-squares slope / intercept / R² of `y` on `x` (aggregate) |
@@ -265,20 +264,19 @@ These sit outside the `Dataset` and `Expr` surfaces:
   `.is_finite()`, `.is_infinite()`, `.clip(lower, upper)`, `.alias(name)`
 - Binning and gap-filling: `.cut(breaks, labels=None, left_closed=False)`,
   {py:meth}`.forward_fill() <batcher.plan.expr_ir.core.Expr.forward_fill>` and {py:meth}`.backward_fill() <batcher.plan.expr_ir.core.Expr.backward_fill>`. The two fills are window functions, so bind them with {py:meth}`.over(order_by=[...]) <batcher.AggExpr.over>`. An order is required.
-- Math: `.abs()`, `.round(digits)`, `.pow(e)`, `.sqrt()`, `.floor()`, `.ceil()`,
-  `.ln()`, `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.asin()`,
-  `.acos()`, `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`,
+- Math: `.abs()`, `.round(digits)`, `.sqrt()`, `.floor()`, `.ceil()`,
+  `.ln()`, `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.arcsin()`,
+  `.arccos()`, `.arctan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`,
   `.trunc()`, `.cbrt()`, `.degrees()`, `.radians()`, `.factorial()`
 - Bitwise (integers): {py:meth}`.bitwise_and(o) <batcher.plan.expr_ir.core.Expr.bitwise_and>`, {py:meth}`.bitwise_or(o) <batcher.plan.expr_ir.core.Expr.bitwise_or>`, {py:meth}`.bitwise_xor(o) <batcher.plan.expr_ir.core.Expr.bitwise_xor>`,
   {py:meth}`.bitwise_left_shift(o) <batcher.plan.expr_ir.core.Expr.bitwise_left_shift>`, {py:meth}`.bitwise_right_shift(o) <batcher.plan.expr_ir.core.Expr.bitwise_right_shift>`, {py:meth}`.bit_count() <batcher.plan.expr_ir.core.Expr.bit_count>`
 - Aggregates (inside `.agg`): `.sum()`, `.min()`, `.max()`, `.mean()`, `.var()`,
-  `.std()`, `.median()`, `.quantile(q)`, `.skewness()`, `.kurtosis()`, `.count()`,
-  `.n_unique()` / `.count_distinct()`, `.mode()`, `.first()`, `.last()`,
-  `.arg_min(order_by=...)`, `.arg_max(order_by=...)`, `.min_by(by)`, `.max_by(by)`,
-  `.mode_top_k(k)`, `.top_k(k)`,
+  `.std()`, `.median()`, `.quantile(q)`, `.skew()`, `.kurtosis()`, `.count()`,
+  `.count_distinct()`, `.mode()`, `.first()`, `.last()`,
+  `.arg_min(order_by=...)`, `.arg_max(order_by=...)`, `.min_by(by)`, `.max_by(by)`, `.mode_top_k(k)`, `.top_k(k)`,
   `.bool_and()`, `.bool_or()`,
   `.bit_and()` / `.bit_or()` / `.bit_xor()`, `.histogram()`, `.array_agg(order_by=...)`
-- Approximate aggregates, sketch-backed and mergeable so they scale: `.approx_n_unique()` /
+- Approximate aggregates, sketch-backed and mergeable so they scale:
   `.approx_count_distinct()` (HyperLogLog), `.approx_quantile(q)` / `.approx_median()` (DDSketch)
 - Cumulative & window analytics (bind with `.over(...)`): `.cum_sum()` / `.cum_min()` /
   {py:meth}`.cum_max() <batcher.plan.expr_ir.core.Expr.cum_max>` / {py:meth}`.cum_count() <batcher.plan.expr_ir.core.Expr.cum_count>`, {py:meth}`.rolling_sum(k) <batcher.plan.expr_ir.core.Expr.rolling_sum>` / {py:meth}`.rolling_mean(k) <batcher.plan.expr_ir.core.Expr.rolling_mean>` /

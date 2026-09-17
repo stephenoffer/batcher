@@ -1,13 +1,8 @@
 # Recommender features
 
-A recommender's training row is a `(user, item, label)` triple with features attached. The
-features are the whole job, and the failure mode is always the same: a feature computed
-over the entire event log, including events that happened *after* the label. The model
-learns that users who click a lot are users who clicked, offline AUC goes to 0.95, and the
-online lift is zero.
+A recommender's training row is a `(user, item, label)` triple with features attached. The features are the whole job, and the failure mode is always the same: a feature computed over the entire event log, including events that happened *after* the label. The model learns that users who click a lot are users who clicked, offline AUC goes to 0.95, and the online lift is zero.
 
-Point-in-time correctness is not a library feature. It is a filter you have to write, and
-this page shows where it goes.
+Point-in-time correctness is not a library feature. It is a filter you have to write, and this page shows where it goes.
 
 ## The event log
 
@@ -31,10 +26,7 @@ print(history.count(), labels.count())
 ```
 
 :::{warning}
-Every feature below is computed from `history` only. That single filter is what separates a
-model you can deploy from one you cannot. Compute one of them over the whole event log and the
-feature carries the answer inside it: offline AUC climbs, online lift is zero, and no error is
-raised anywhere in between.
+Every feature below is computed from `history` only. That single filter is what separates a model you can deploy from one you cannot. Compute one of them over the whole event log and the feature carries the answer inside it: offline AUC climbs, online lift is zero, and no error is raised anywhere in between.
 :::
 
 The features come in four shapes, and each has its own way of leaking:
@@ -48,9 +40,7 @@ The features come in four shapes, and each has its own way of leaking:
 
 ## Aggregate features per user
 
-`group_by().agg(...)` is a mergeable aggregation: it runs partial → combine → finalize, so
-the same code gives the same answer on one core, on 96, or across a cluster, and it spills
-instead of dying when the group set does not fit in memory.
+`group_by().agg(...)` is a mergeable aggregation: it runs partial → combine → finalize, so the same code gives the same answer on one core, on 96, or across a cluster, and it spills instead of dying when the group set does not fit in memory.
 
 ```python
 from batcher import col
@@ -58,15 +48,13 @@ from batcher import col
 user_features = history.group_by("user_id").agg(
     impressions=col("item_id").count(),
     clicks=col("clicked").sum(),
-    distinct_items=col("item_id").n_unique(),
+    distinct_items=col("item_id").count_distinct(),
 )
 print(user_features.sort("user_id").to_pydict())
 # {'user_id': [1, 2, 3], 'impressions': [2, 2, 1], 'clicks': [1, 2, 0], 'distinct_items': [2, 2, 1]}
 ```
 
-A click-through rate is a ratio of two of those, and a ratio over small counts is noise: a
-user with one impression and one click has a CTR of 1.0, which will dominate any model that
-believes it. Smooth it toward the global rate with a pseudo-count.
+A click-through rate is a ratio of two of those, and a ratio over small counts is noise: a user with one impression and one click has a CTR of 1.0, which will dominate any model that believes it. Smooth it toward the global rate with a pseudo-count.
 
 ```python
 ctr = user_features.with_columns(
@@ -78,9 +66,7 @@ print([round(v, 4) for v in ctr.sort("user_id").to_pydict()["user_ctr"]])
 
 ## Sequence features come from windows
 
-"How long since this user's last event" and "what did they see before this one" are window
-functions over the partition, not aggregates. `ds.window` computes them in one operator, in
-the engine.
+"How long since this user's last event" and "what did they see before this one" are window functions over the partition, not aggregates. `ds.window` computes them in one operator, in the engine.
 
 ```python
 sequenced = history.window(
@@ -95,15 +81,12 @@ print(out["user_id"], out["day"], out["days_since_last"])
 ```
 
 :::{note}
-The null on a user's first event is correct and should stay a null. Filling it with 0 tells
-the model "this user acted zero days ago", which is the opposite of the truth. Impute it
-with a sentinel, or let the model handle the null.
+The null on a user's first event is correct and should stay a null. Filling it with 0 tells the model "this user acted zero days ago", which is the opposite of the truth. Impute it with a sentinel, or let the model handle the null.
 :::
 
 ## Item-side features and the join
 
-Item features are the same shape, computed over the same history window, and joined onto
-the label rows.
+Item features are the same shape, computed over the same history window, and joined onto the label rows.
 
 ```python
 item_features = history.group_by("item_id").agg(
@@ -121,17 +104,14 @@ print(training.sort("user_id", "item_id").to_pydict()["item_impressions"])
 ```
 
 :::{tip}
-A `left` join, not an inner one. An item that appears for the first time in the label
-window has no history, and an inner join would silently delete exactly the cold-start rows
-you most need to handle. Keep them and let the nulls be a feature.
+A `left` join, not an inner one. An item that appears for the first time in the label window has no history, and an inner join would silently delete exactly the cold-start rows you most need to handle. Keep them and let the nulls be a feature.
 :::
 
 ## Item tags: multi-hot, learned on history
 
 :::{dropdown} One indicator column per tag, and why you never refit at serving time
 
-An item's tag list is a `list<string>` column. `MultiHotEncoder` learns the distinct tags
-over the training data and emits one indicator column per tag.
+An item's tag list is a `list<string>` column. `MultiHotEncoder` learns the distinct tags over the training data and emits one indicator column per tag.
 
 ```python
 from batcher.ml import MultiHotEncoder
@@ -147,22 +127,14 @@ print(encoded.collect().column_names)
 # ['item_id', 'tags', 'tags_news', 'tags_sports', 'tags_tech']
 ```
 
-Fit on the items present in the training window. A tag that first appears in production
-gets an all-zero row rather than a new column that shifts every other index, which is what
-would happen if you refit at serving time.
+Fit on the items present in the training window. A tag that first appears in production gets an all-zero row rather than a new column that shifts every other index, which is what would happen if you refit at serving time.
 :::
 
 ## Negative sampling
 
-An impression log is mostly negatives already. An *interaction* log (purchases, likes) is
-all positives, and a model trained on it learns to predict 1. Sample negatives from the
-items the user did not touch: a cross join to the candidate space, an anti-join, and a
-`sample` to size it.
+An impression log is mostly negatives already. An *interaction* log (purchases, likes) is all positives, and a model trained on it learns to predict 1. Sample negatives from the items the user did not touch: a cross join to the candidate space, an anti-join, and a `sample` to size it.
 
-Two different sets do two different jobs below. The positive labels come from `labels`, the
-window the model is being asked to predict, so they line up with features drawn from
-`history`. The anti-join runs against every pair the user ever touched, because an item
-clicked on day 1 is not a negative just for falling outside the label window.
+Two different sets do two different jobs below. The positive labels come from `labels`, the window the model is being asked to predict, so they line up with features drawn from `history`. The anti-join runs against every pair the user ever touched, because an item clicked on day 1 is not a negative just for falling outside the label window.
 
 ```python
 positives = labels.filter(col("clicked") == 1).select("user_id", "item_id")
@@ -180,15 +152,11 @@ print(positives.count(), negatives.count())
 # 2 4
 ```
 
-The cross join is the part that scales badly on a real catalog. A million users times a
-million items is not a table you want. In practice you sample the candidates first (from a
-popularity distribution, or from a retrieval model's top-k) and cross-join against *that*.
-The operators are the same; only the size of `catalog` changes.
+The cross join is the part that scales badly on a real catalog. A million users times a million items is not a table you want. In practice you sample the candidates first (from a popularity distribution, or from a retrieval model's top-k) and cross-join against *that*. The operators are the same; only the size of `catalog` changes.
 
 ## Then split, then fit
 
-Attach the history features to the labelled rows, split by user so no user lands on both
-sides, then fit the scalers on train only and stream the result into the model.
+Attach the history features to the labelled rows, split by user so no user lands on both sides, then fit the scalers on train only and stream the result into the model.
 
 ```python
 labelled = positives.with_columns(clicked=bt.lit(1)).union(negatives)
@@ -201,9 +169,7 @@ print(train.count(), test.count())
 # 4 2
 ```
 
-Splitting on `user_id` rather than on the row is the difference between measuring
-generalization to a new user and measuring memorization of an old one. See
-{doc}`train/test split </cookbook/ml/pipelines/features/train-test-split>` for the other two ways that goes wrong.
+Splitting on `user_id` rather than on the row is the difference between measuring generalization to a new user and measuring memorization of an old one. See {doc}`train/test split </cookbook/ml/pipelines/features/train-test-split>` for the other two ways that goes wrong.
 
 ## See also
 
@@ -215,7 +181,5 @@ generalization to a new user and measuring memorization of an old one. See
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: `MultiHotEncoder` and the rest of the estimators.
 - {doc}`Data loaders </ml/training/data-loaders>`: getting the finished rows into a training loop.
 - {doc}`ML API reference </api/models/ml>`: {py:meth}`ds.ml.train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>` and the `batcher.ml` estimators.
-- {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why these aggregates give the
-  same answer on one core and on a cluster.
-- {doc}`Sessionization </cookbook/analytics/behavior/sessionization>`: the window-function recipe this one borrows
-  its sequence features from.
+- {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why these aggregates give the same answer on one core and on a cluster.
+- {doc}`Sessionization </cookbook/analytics/behavior/sessionization>`: the window-function recipe this one borrows its sequence features from.

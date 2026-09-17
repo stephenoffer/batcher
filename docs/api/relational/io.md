@@ -48,7 +48,7 @@ These read a transactional table through its metadata layer, so a read sees one 
 | {py:meth}`bt.read.iceberg(table, catalog=, snapshot_id=) <batcher.api.io_namespace.reader.Reader.iceberg>` | an Iceberg table | |
 | {py:meth}`bt.read.hudi(path) <batcher.api.io_namespace.reader.Reader.hudi>` | an Apache Hudi table (read-only) | |
 | {py:meth}`bt.read.lance(path) <batcher.api.io_namespace.reader.Reader.lance>` | a Lance dataset | `lance` |
-| {py:meth}`bt.read.databricks(table) <batcher.api.io_namespace.reader.Reader.databricks>` | a Databricks / Unity Catalog table (→ Delta) | |
+| {py:meth}`bt.read.databricks(table) <batcher.api.io_namespace.reader.Reader.databricks>` | a Databricks / Unity Catalog table (-> Delta) | |
 | {py:meth}`bt.read.delta_sharing(url) <batcher.api.io_namespace.reader.Reader.delta_sharing>` | a Delta Sharing table by profile URL | |
 
 ### Warehouses and databases
@@ -150,9 +150,12 @@ row and the row already in the table. See the
 ```{eval-rst}
 .. currentmodule:: batcher
 
-.. autofunction:: source_col
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autofunction:: target_col
+   source_col
+   target_col
 ```
 
 ### Warehouses and databases
@@ -192,11 +195,12 @@ do you break into independently readable pieces? Each piece is a
 ```{eval-rst}
 .. currentmodule:: batcher.io
 
-.. autoclass:: Source
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: Sink
-   :members:
+   Source
+   Sink
 ```
 
 ### Splits
@@ -207,17 +211,16 @@ one file, and a {py:obj}`WholeSourceSplit <batcher.io.WholeSourceSplit>` is the
 degenerate case for a source that can't be divided.
 
 ```{eval-rst}
-.. autoclass:: Split
-   :members:
+.. currentmodule:: batcher.io
 
-.. autoclass:: RowGroupSplit
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: FileSplit
-   :members:
-
-.. autoclass:: WholeSourceSplit
-   :members:
+   Split
+   RowGroupSplit
+   FileSplit
+   WholeSourceSplit
 ```
 
 ### Built-in sources and sinks
@@ -225,37 +228,23 @@ degenerate case for a source that can't be divided.
 The concrete implementations behind `bt.read.*` and `ds.write.*`.
 
 ```{eval-rst}
-.. autoclass:: FileSource
-   :members:
+.. currentmodule:: batcher.io
 
-.. autoclass:: FileSink
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: ParquetSource
-   :members:
-
-.. autoclass:: ParquetSink
-   :members:
-
-.. autoclass:: CSVSource
-   :members:
-
-.. autoclass:: CSVSink
-   :members:
-
-.. autoclass:: JSONSource
-   :members:
-
-.. autoclass:: JSONSink
-   :members:
-
-.. autoclass:: InMemorySource
-   :members:
-
-.. autoclass:: IteratorSource
-   :members:
-
-.. autofunction:: read_blob_bytes
+   FileSource
+   FileSink
+   ParquetSource
+   ParquetSink
+   CSVSource
+   CSVSink
+   JSONSource
+   JSONSink
+   InMemorySource
+   IteratorSource
+   read_blob_bytes
 ```
 
 ### The registries
@@ -263,6 +252,8 @@ The concrete implementations behind `bt.read.*` and `ds.write.*`.
 Formats register themselves rather than being listed anywhere. Registering a source under a name makes `bt.read(path, format="myfmt")` resolve.
 
 ```{eval-rst}
+.. currentmodule:: batcher.io
+
 .. autodata:: SOURCES
 
 .. autodata:: SINKS
@@ -274,11 +265,14 @@ A write is terminal and returns a {py:obj}`WriteManifest <batcher.io.WriteManife
 list of files it produced. That's what makes a write auditable and a failed run resumable.
 
 ```{eval-rst}
-.. autoclass:: WriteManifest
-   :members:
+.. currentmodule:: batcher.io
 
-.. autoclass:: WrittenFile
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   WriteManifest
+   WrittenFile
 ```
 
 ## See also

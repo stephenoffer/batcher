@@ -1,19 +1,17 @@
 # Deduplication and matching
 
 This page covers removing near-duplicate rows and joining rows that mean the same thing
-without sharing a key. Both are preprocessing steps in the sense that matters: they run
-before a model sees the data, and both are relational operations on the engine rather
-than Python loops.
+without sharing a key. Both run before a model sees the data. Both are relational plans the
+engine executes, not Python loops.
 
 ## Fuzzy deduplication
 
-Exact deduplication is {py:meth}`distinct() <batcher.Dataset.distinct>`. On a web-scale training corpus it barely helps,
-because the duplicates are the same article behind a different header, or the same page
-with a changed timestamp. Removing *those* is the single biggest win in preprocessing an
-LLM pretraining set.
+Exact deduplication is {py:meth}`distinct() <batcher.Dataset.distinct>`. On a web-scale training corpus it barely helps.
+The duplicates there are the same article behind a different header, or the same page with
+a changed timestamp, and no two of them are byte-identical.
 
-{py:meth}`ds.ml.near_duplicates <batcher.api.dataset.ml.DatasetML.near_duplicates>` finds the pairs, and {py:meth}`ds.ml.drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` removes them,
-keeping one representative per cluster.
+{py:meth}`ds.ml.near_duplicates <batcher.api.dataset.ml.DatasetML.near_duplicates>` finds those pairs as `(key_a, key_b, jaccard)` rows.
+{py:meth}`ds.ml.drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` removes them, keeping one representative per cluster.
 
 ```python
 import batcher as bt
@@ -33,22 +31,22 @@ print(docs.distinct().count())  # exact dedup keeps all three
 # 3
 ```
 
-Under the hood, `str.minhash` reduces each document to a fixed-length signature whose
-positional agreement rate, computed by `list.jaccard`, estimates the documents' Jaccard
-similarity. LSH banding then turns the similarity join into an equi-join on a band hash.
-Every returned pair is **verified** against the threshold, so banding only costs recall,
-never precision. `bands` is the dial. More bands means more candidates, more recall, and
-more work.
+Here is the mechanism. `str.minhash` reduces each document to a signature of `num_perm`
+integers over its character `ngram`-shingles, 128 and 5 by default. The fraction of
+positions two signatures agree on, computed by `list.jaccard`, estimates the documents'
+Jaccard similarity. LSH banding then turns the similarity search into an equi-join on a band
+hash, and every candidate pair is verified against `threshold` before it is returned.
 
-Both are ordinary relational plans built from a projection, an `explode`, and some joins,
-so they run wherever a join runs.
+So banding costs recall and never precision. `bands` is the dial, 16 by default: more bands
+means more candidates, more recall, and more work. The whole thing is a projection, an
+`explode`, and some joins, so it runs wherever a join runs.
 
 ## Matching on meaning with similarity_join
 
 MinHash answers "are these two documents made of the same words". It says nothing about
-two rows that *mean* the same thing in different words. That is a question for embeddings,
-and {py:meth}`ds.ml.similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` is the same two-stage recipe with the signature swapped:
-{py:meth}`.list.simhash <batcher.plan.expr_ir.namespaces.collections._ListNamespace.simhash>` replaces `str.minhash`, and the verification is the **exact**
+two rows that *mean* the same thing in different words. That is a question for embeddings.
+{py:meth}`ds.ml.similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` is the same two-stage recipe with the signature swapped:
+{py:meth}`.list.simhash <batcher.plan.expr_ir.namespaces.collections._ListNamespace.simhash>` replaces `str.minhash`, and verification is the exact
 `list.cosine_similarity` over the original vectors.
 
 ```python
@@ -63,9 +61,9 @@ print(pairs.select("key_a", "key_b").to_pydict())
 # {'key_a': [1], 'key_b': [10]}
 ```
 
-This is entity resolution, matching a product catalog against a supplier feed or a CRM
-against a billing system, and it is also retrieval over a corpus. It covers any join
-whose key is "means the same thing" rather than "is the same string".
+Use it for entity resolution, such as matching a product catalog against a supplier feed
+or a CRM against a billing system. It fits any join whose key is "means the same thing"
+rather than "is the same string".
 
 `simhash` is Charikar's random-hyperplane LSH. `num_bits` hyperplanes are drawn through
 the origin and each bit records which side of one the vector falls on. Two vectors an
@@ -75,14 +73,15 @@ Jaccard estimate. The hyperplanes are derived by hashing `(seed, bit, dimension)
 than stored, so every partition and every machine draws the same ones and a signature
 computed on one node is comparable with one computed on another.
 
-Exactly as in fuzzy dedup, banding governs **recall, never precision**. No pair below
-`threshold` is ever returned, but a pair above it can miss every band. `bands` is the
-dial. Rows whose vector is null or empty have no direction, cannot clear any threshold,
-and are dropped rather than banded. Left in, they would all collide and blow the
-candidate set up quadratically.
+As in fuzzy dedup, banding governs recall and never precision. No pair below `threshold`
+is returned, but a pair above it can miss every band, and `bands` (8 by default here) is
+the dial. A row whose vector is null or empty has no direction and can't clear any
+threshold, so it is dropped rather than banded. Left in, every such row would collide with
+every other and blow the candidate set up quadratically.
 
 ## See also
 
 - {doc}`/user-guide/transform/rows/distinct-and-dedup`: exact and keyed deduplication.
 - {doc}`/ml/retrieval/embeddings`: producing the vectors {py:meth}`similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` matches on.
+- {doc}`/ml/retrieval/vector-search`: nearest-neighbour search when you want the top matches rather than every pair above a threshold.
 - {doc}`/ml/preparing/preprocessors/index`: the rest of the preprocessor family.

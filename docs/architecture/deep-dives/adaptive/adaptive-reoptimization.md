@@ -89,7 +89,7 @@ max(actual/estimate, estimate/actual) <= 1.0 + optimizer.reoptimize_error
 Staging isn't *triggered* by a bad estimate. Staging is the default, and a *good* estimate stops it. If a stage's measured rows land inside the band, the loop breaks and runs the whole residual plan in one shot. Inaccuracy is what keeps the loop paying for another round. That runs backwards from what most readers of the code expect on a first pass.
 :::
 
-The economics justify the inversion. Each stage costs roughly 20 to 40 ms of control plane. If the estimator is already tracking reality, buying another measurement is pure overhead. If it isn't, every additional measurement is worth more than it costs.
+The economics justify the inversion. Each stage costs a materialization, a re-plan, and the operator fusion given up at that boundary. If the estimator is already tracking reality, buying another measurement is pure overhead. If it isn't, every additional measurement is worth more than it costs.
 
 On a query whose estimates are accurate, the loop adapts at exactly one breaker and then stops paying for measurements it does not need. Re-planning at every breaker happens while estimates keep missing, which is the case the mechanism exists for.
 
@@ -103,7 +103,7 @@ That order is the ladder below, with the two routes that bypass it drawn above t
 
 ![When the within-query adaptive loop engages under adaptive equals auto. Two things skip the ladder: an explicit adaptive=True or False wins outright, and a distributed plan the one-shot dispatcher cannot route is staged whatever its size, because there staging is the only execution path rather than an optimization. Everything else passes three gates in order. Is there a join, since with no join there is nothing to re-decide. Does it clear the floor, which is charged per breaker and not per query. Is a join operand unsized, meaning breaker-produced and still a guess. Any no lands in the same place: plan once, run once, with no staging, no per-stage cut and no re-plan, which is where the great majority of queries land and is the cheaper path for them. A yes reaches stage, measure and re-plan, one breaker per stage, unless the route bandit, having measured both arms for this plan signature, says one-shot was faster. The floor itself is 5,000,000 rows OR about 320 MB, times the pipeline breakers the loop would cut at, so two breakers need 10,000,000 rows, four need 20,000,000 and six need 30,000,000. The flat 20,000,000-row whole-query gate is retired.](/_static/diagrams/adaptive_gating.svg)
 
-The distributed path asks first. A plan whose join operand already spans two sources, which is every star or snowflake query over three tables or more, has no one-shot route through the dispatcher at all. `dist.requires_staging` says so, and there staging isn't an optimization. It's the only way the query runs.
+The distributed path asks first, because `dist.requires_staging` names two shapes the one-shot dispatcher can't run correctly. The first is a join whose operand already spans two sources, which is every star or snowflake query over three tables or more: the dispatcher co-partitions exactly two sources per join, so there is no one-shot route at all. The second is a breaker beneath a breaker, such as `limit(100).group_by(k).agg(...)` or an aggregate over an aggregate. The one-shot executors ship the inner plan to every worker, so a nested `Limit` would keep its rows *per partition* and a nested `Aggregate` would emit per-partition partial groups. Both would return wrong answers rather than raise. For either shape staging isn't an optimization. It's the only correct way the query runs, so it happens at any size and with or without a join.
 
 Every other plan has to clear the size floor. It needs a join, and its total scan input needs to reach either 5,000,000 rows or roughly 320 MB, per pipeline breaker the loop would cut at. Both are module constants in `gating.py` rather than config knobs, and the byte floor is derived from the row floor rather than set beside it: `_ADAPTIVE_MIN_BYTES_PER_STAGE` is `_ADAPTIVE_MIN_ROWS_PER_STAGE` times the 64-byte row width `optimizer.row_bytes` assumes. The two are OR'd, so a query clears whichever of them suits its shape. That matters at both ends of the modality range. Twenty million rows of two `int64` keys is 320 MB, which the row floor admits. A million rows of decoded 224x224x3 images is 150 GB, which the row floor alone would turn adaptation off for.
 
@@ -117,7 +117,7 @@ The bandit matters more than it sounds, because staging is not the planning roun
 
 It is a bandit rather than a rule because which route wins is not a constant of the plan. Staging is the only distributed route for some shapes; it is what earns the statistics a cold shape has not learned yet; and the cost of a mis-estimated plan grows with the data. Exploration is bounded at roughly one run of the losing arm per signature, and the arms are re-explored as their measurements age (the discounted-UCB horizon in `bandit.py`).
 
-So on a small single-node query, adaptive is off and stays off. That floor exists because a sub-second query can't afford a staging round-trip to learn something it could have guessed. The gate reads exact source row counts, which separates scales cleanly: TPC-H sf1 is roughly 9M rows and stays off, sf10 is roughly 90M and turns on. Below its own floor you can still force it with `adaptive=True`.
+So on a small single-node query, adaptive is off and stays off. That floor exists because a sub-second query can't afford a staging round-trip to learn something it could have guessed. The gate reads exact source row counts, so the same query shape can be off at one scale and on at another. The breaker count it multiplies by is an upper bound, because the loop doesn't cut a breaker whose output size is already exact: across the TPC-H shapes, 17 of 51 breakers ran inline. Below the floor you can still force the loop with `adaptive=True`.
 
 ## Two feedback loops, one measurement layer
 
@@ -164,13 +164,18 @@ print(q.explain(analyze=True))
 
 :::{dropdown} The `analyze=True` output, estimate against actual
 ```text
-aggregate                       est~7 actual=7 (1.0x)  0.2ms (1%)  cpu=100%  out=112B  interp
-  filter                        est~3,500 actual=3,899 (1.1x)  1.1ms (4%)  cpu=100%  out=0B  jit
-    scan                        est~4,000 actual=4,000 (1.0x)  0.0ms (0%)  cpu=100%  out=62KB  interp
+query plan (measured)                                                3 operators  ·  7 rows  ·  75ms
+────────────────────────────────────────────────────────────────────────────────────────────────────
+OPERATOR                  ESTIMATE        ACTUAL   MISS   TIME     OP SHARE  NOTES
+aggregate  [by g · sum]      est≈7      actual=7  exact  358µs  ████▎░  70%  interp
+└─ filter  [x > 100]     est≈3,900  actual=3,899  exact  151µs  █▉░░░░  30%  interp
+   └─ scan  [source 0]   est≈4,000  actual=4,000  exact    1µs  ░░░░░░  <1%  interp  pushed[x > 100]
 ```
+
+The full output continues with where the time went, the bottleneck operator, and the decisions Kyber and Carbonite made. Timings move from run to run.
 :::
 
-The `(1.1x)` on the filter is the q-error for that operator. The filter's estimate came from the Selinger default for a range predicate, a third of rows, which happened to land close. A `LIKE '%x%'` or a correlated conjunction is where you see the number blow out, and that's exactly what gets recorded and corrected next run.
+The `MISS` column is the q-error for each operator. Here the filter's estimate is within a row of the truth, because an in-memory source carries exact column bounds and a range predicate over a known `[min, max]` is interpolated rather than guessed. A `LIKE '%x%'` or a correlated conjunction is where the number blows out, and that's exactly what gets recorded and corrected next run.
 
 ## Requirements and limitations
 

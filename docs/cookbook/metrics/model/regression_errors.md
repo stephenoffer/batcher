@@ -1,6 +1,8 @@
 # Regression errors
 
-Picking the metric is the modeling decision. MAE treats every miss equally, RMSE punishes big misses, MAPE is scale-free but explodes near zero, and Huber sits between MAE and MSE. All of them are aggregates here, so you can compute several in one pass.
+Picking the error metric is a modeling decision. MAE treats every miss equally, RMSE punishes big misses, MAPE is scale-free but explodes near zero, and Huber sits between MAE and MSE.
+
+The script's residuals are +1, -1, +2, and -4. Watch the one large miss pull RMSE above MAE while the median absolute error stays at 1.5. Every metric is an aggregate, so all seventeen come out of a single `select`.
 
 The whole script, executed on every test run:
 

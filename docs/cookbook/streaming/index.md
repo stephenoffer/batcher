@@ -2,13 +2,9 @@
 
 The same operators, over a source that never ends.
 
-Two things change when the input is unbounded. Time becomes something you have to reason
-about, because "the last hour" is not a fact you can look up. And the job *will* be
-restarted, so every recipe here has to answer what happens when it is.
+In Batcher, batch is the bounded special case of streaming: the same operators, the same windows, the same plan. The transformation you tested on a file is the one that runs on the Kafka topic. So each page shows the logic on a small bounded table you can run right now, then the unbounded wiring around it.
 
-Batch is the bounded special case of streaming in this engine: the same operators, the same
-windows, the same plan. So each page shows the logic on a small bounded table you can
-actually run, then the unbounded wiring around it.
+Two things do change when the input is unbounded. Time becomes something you have to reason about, because "the last hour" is not a fact you can look up. And the job *will* be restarted, so every recipe here answers what happens when it is.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -56,12 +52,11 @@ Stopping a source from handing you more than you can process.
 :::
 ::::
 
-## The sharp edges, up front
+## Requirements and limitations
 
-Streaming in Batcher has real limits, and each one is the kind you would rather read about
-than discover. None of them is a bug you can configure away.
+The table below lists the streaming behaviors to design around, with the recipe that covers each one.
 
-| The edge | What actually happens | Where it is covered |
+| Behavior | What happens | Covered in |
 | --- | --- | --- |
 | A stream-stream join has no checkpoint | It writes to a sink like any other streaming query, but `checkpoint=` is refused: the join's state is two buffers and two watermarks, not a source offset, so a restart begins with an empty join. | {doc}`Stream join </cookbook/streaming/stream-join>` |
 | A stream joined to a static dimension table serves a snapshot | The table is read once, when the query starts, and never refreshed. Restart the query to pick up a new one. | {doc}`Stream join </cookbook/streaming/stream-join>` |
@@ -74,12 +69,10 @@ than discover. None of them is a bug you can configure away.
 
 ## See also
 
-- {doc}`Streaming </user-guide/moving-data/streaming>`: the full source, sink, trigger, and output-mode
-  reference.
+- {doc}`Streaming </user-guide/moving-data/streaming>`: the full source, sink, trigger, and output-mode reference.
 - {doc}`Kafka integration </integrations/streams/kafka>`: brokers, consumer groups, and splits.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: the batch write surface and Delta commits.
-- {doc}`Late-arriving data </cookbook/data-engineering/ingest/late-arriving-data>`: the batch reconciliation
-  half of the same problem.
+- {doc}`Late-arriving data </cookbook/data-engineering/ingest/late-arriving-data>`: the batch reconciliation half of the same problem.
 - {doc}`ML recipes </cookbook/ml/pipelines/index>`: the model stages that these queries run per micro-batch.
 
 ```{toctree}

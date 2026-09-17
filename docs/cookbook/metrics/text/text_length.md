@@ -1,6 +1,8 @@
 # Length and readability
 
-Means hide the tail, which is where cost lives: a token budget is blown by the p99, not the average. `token_estimate_quantile` answers that directly, over a mergeable sketch. Read the token figures as estimates, though. They divide a character count by an assumed characters-per-token ratio, which is enough to size a context window or compare two runs and not enough to reconcile an invoice.
+Means hide the tail, which is where cost lives: a token budget is blown by the p99, not the average. `token_estimate_quantile` answers that directly, over a mergeable sketch.
+
+Read the token figures as estimates. They divide a character count by an assumed characters-per-token ratio, which is enough to size a context window or compare two runs and not enough to reconcile an invoice. The script also measures character and word-count quantiles, the share of rows over a token budget, and readability.
 
 The whole script, executed on every test run:
 

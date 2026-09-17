@@ -66,7 +66,7 @@ writes them:
 | `SUM(x) AS y` | `.agg(y=bt.col("x").sum())` |
 | `HAVING` | `.filter(...)` after `.agg` |
 | `ORDER BY x DESC` | `.sort("x", descending=True)` |
-| `SELECT` list | `.select(...)` (or the `agg` output itself) |
+| `SELECT` list | `.select(...)`, or the `agg` output itself |
 
 ```python
 same = (
@@ -93,6 +93,10 @@ two renderings settles the question:
 print(revenue.explain() == same.explain())
 # True
 ```
+
+The two spellings differ only until the plan exists. SQL is parsed with sqlglot and translated, and each DataFrame call adds a node. From the `LogicalPlan` on, everything is shared:
+
+![Two inputs, a SQL string passed to bt.sql, ds.sql, or Session.sql and a DataFrame chain such as filter, group_by, and agg, both build one LogicalPlan. The SQL string gets there through a sqlglot parse, and the DataFrame chain adds one node per call. The LogicalPlan goes through the Kyber optimizer, and the optimized plan travels as JSON IR to the Rust engine. explain() renders that optimized plan, which is why it is identical for both spellings. Nothing runs until a terminal such as to_pydict().](/_static/diagrams/sql_dataframe_one_plan.svg)
 
 There is no separate SQL engine to fall behind the DataFrame one. Pick whichever reads
 better for the query in front of you.
@@ -141,8 +145,7 @@ call, the rollup is SQL, and the plan does not know the difference.
 
 ## 6. A session, for a catalog you keep
 
-{py:class}`bt.Session <batcher.Session>` is the `DuckDBPyConnection` / `SparkSession` analogue: a dialect plus a catalog
-of tables and Python functions. Register once, query by name.
+{py:class}`bt.Session <batcher.Session>` plays the role of a DuckDB connection or a `SparkSession`: a dialect plus a catalog of tables and Python functions. Register once, then query by name.
 
 ```python
 s = bt.Session()
@@ -160,9 +163,7 @@ print(s.sql("SELECT order_id, amount FROM big ORDER BY amount").to_pydict())
 
 ## 7. Call Python from SQL
 
-A registered function is vectorized: it receives an Arrow array and returns one. It lowers
-to the same `map_batches` path the DataFrame API uses, so SQL and Python share one plan
-rather than one calling into the other.
+A registered function is vectorized by default: it receives an Arrow array and returns one. It lowers to a `map_batches` stage, the same one the DataFrame API builds, so SQL and Python share one plan rather than one calling into the other.
 
 ```python
 import pyarrow.compute as pc
@@ -173,10 +174,7 @@ print(s.sql("SELECT order_id, net(amount) AS net FROM big ORDER BY order_id").to
 ```
 
 :::{warning}
-Per-*row* Python is the thing to avoid, not Python itself. A vectorized function sees the
-whole array at once and returns an array. Write one that takes a scalar and you have put a
-Python interpreter in the inner loop of a Rust engine, and you will feel it. The same rule
-governs `map_batches`: whole batches, never rows.
+Per-row Python is the thing to avoid, not Python itself. A vectorized function sees the whole array at once and returns an array. Registering with `vectorized=False` calls your function once per row, which puts a Python interpreter in the inner loop of a Rust engine. The same rule governs `map_batches`: whole batches, never rows.
 :::
 
 ## 8. Point it at real files

@@ -1,14 +1,10 @@
 # Batch scoring
 
-An offline scoring job is a scan with a model in the middle. The model is the expensive
-part, so everything else in the pipeline exists to keep it busy. Filter before the model
-so you do not score rows you throw away, load the weights once per worker rather than
-once per batch, and size the batch to the device rather than to the file.
+This page walks through an offline scoring job: read a table, run a model over it, and write the predictions, with the settings that decide whether it finishes in an hour or a day. The job is a scan with a model in the middle. The model is the expensive part, so the rest of the pipeline exists to keep it busy: filter before the model, load the weights once per worker, and size the batch to the device rather than to the file.
 
 ## The shape of the job
 
-The job below reads reviews, cuts them down before the GPU sees them, scores what is left
-on an actor pool, and writes the result partitioned by label.
+The job below reads reviews, cuts them down before the GPU sees them, scores the rest on an actor pool, and writes the result partitioned by label.
 
 ```python
 # docs: skip
@@ -57,22 +53,15 @@ scored = (
 scored.write.parquet("s3://bucket/scored/", partition_by=["label"])
 ```
 
-Everything above the `infer` is an ordinary lazy pipeline. The filter and the projection
-get pushed into the scan, so the Parquet reader skips row groups and never decodes the
-columns the model does not read. That is not a micro-optimization. On a wide table it is
-most of the I/O.
+Everything above the `infer` is an ordinary lazy pipeline. The filter and the projection are pushed into the scan, so the Parquet reader skips row groups and never decodes the columns the model doesn't read. On a wide table that is most of the I/O.
 
-## Pass the class, not an instance, not a function
+## Pass a class, not a function
 
 :::{tip}
-This is the one mistake that costs an order of magnitude. A plain function is rebuilt per
-batch, which reloads the model per batch. A class is constructed **once per worker** and
-then called per batch. The engine raises a `PerformanceWarning` if a GPU stage gets a
-bare function, because it is the most common inference mistake there is.
+A plain function is rebuilt per batch, so a model loaded inside it reloads per batch. A class is constructed once per worker and then called per batch. Batcher emits a `PerformanceWarning` when a stage with `num_gpus > 0` gets a plain function, because it is the most common inference mistake.
 :::
 
-The mechanics are visible without a GPU. The "model" here is arithmetic, but the contract
-is exactly the real one: the constructor runs once, and `__call__` runs per batch.
+The contract is visible without a GPU. The "model" below is arithmetic, but the constructor runs once and `__call__` runs per batch, as with a real one. The example passes an instance because its constructor takes an argument and loads nothing. An instance is built on the driver and shipped to the workers, so when the constructor loads weights, pass the class.
 
 ```python
 import pyarrow as pa
@@ -100,16 +89,15 @@ print(scored.to_pydict())
 #  'label': [False, True, True, False]}
 ```
 
-`infer` is `map_batches` with inference defaults, so use whichever name reads better. Both
-take `batch_size`, `num_gpus`, `concurrency`, and `output_columns`.
+`infer` is `map_batches` with inference defaults. Both take `batch_size`, `num_gpus`, `concurrency`, and `output_columns`, so use whichever name reads better.
 
-## Sizing the pool
+## Size the pool
 
-Each actor holds `num_gpus` of a device, and `concurrency` sets how many actors run.
-
-The two pools that `concurrency` and `batch_size` are really tuning are nested, and they are easy to conflate:
+Each actor holds `num_gpus` of a device, and `concurrency` sets how many actors run. Behind that sit two nested pools that are easy to conflate: Ray actors across GPUs, and threads inside each actor sharing one model.
 
 ![Two nested pools sit behind one ds.ml.infer or ds.map_batches call, and they are not the same thing. The outer pool is one Ray actor per GPU and exists only on the distributed path: each partition goes to the emptiest actor, each actor builds your class once in __init__, num_gpus is a Ray reservation, and concurrency=(min, max) grows the pool while work waits and reaps an idle actor. Inside a single actor, an InferencePool of threads shares one model object and one CUDA context, so the threads buy overlap with host work rather than extra model replicas. They call your __call__ with a whole Arrow RecordBatch, in input order, and an autobatch controller hill-climbs the batch size under a VRAM cap from the measured rows per second; an out-of-memory error bisects the batch and records a ceiling for the run, and the size that worked is written back for the next one. batch_format reframes only the call, never the data plane, which stays Arrow, and ds.map is the row-at-a-time escape hatch, marked as one so a profile can price what it costs.](/_static/diagrams/inference_actor_pool.svg)
+
+The table maps common situations to the knobs that fit them:
 
 | The situation | The knobs | What happens |
 | --- | --- | --- |
@@ -118,21 +106,13 @@ The two pools that `concurrency` and `batch_size` are really tuning are nested, 
 | You would rather not work it out | `model_memory_gb=...` | the engine budgets host RAM per worker and packs small models onto shared GPUs |
 | A backlog that comes and goes | `concurrency=(2, 8)` | the pool autoscales to it |
 
-`model_memory_gb` is the better lever most of the time. State the model's footprint and
-eight workers will not each load a 20 GB model into a 64 GB box. See
-{doc}`GPU scheduling </ml/inference/gpu>`.
+`model_memory_gb` is usually the better lever. State the model's footprint and eight workers won't each load a 20 GB model into a 64 GB box. See {doc}`GPU scheduling </ml/inference/gpu>`.
 
-`batch_size` should be the model's batch size, not the file's. Too small a `batch_size`
-leaves the GPU launching kernels on tiny inputs. Too large and the activations do not
-fit. It is a property of the model and the device, so pin it explicitly rather than
-inheriting the morsel size.
+`batch_size` is the model's batch size, not the file's. Too small and the GPU launches kernels on tiny inputs. Too large and the activations don't fit. It belongs to the model and the device, so pin it rather than inheriting the morsel size.
 
-## Dirty data should not kill a six-hour job
+## Survive dirty data
 
-One corrupt image in ten million rows should cost you one row, not the run.
-`max_errored_rows` bisects a batch whose `fn` raises, isolates the offending rows, and
-drops them, up to the budget. Past the budget the error propagates, so a genuine bug on
-clean data still fails fast.
+One corrupt image in ten million rows should cost one row, not the run. `max_errored_rows` bisects a batch whose `fn` raises, isolates the offending rows, and drops them, up to the budget. Past the budget the error propagates, so a genuine bug on clean data still fails fast.
 
 ```python
 def parse_score(batch):
@@ -147,22 +127,14 @@ print(dirty.map_batches(parse_score, output_columns=["score"], max_errored_rows=
 ```
 
 :::{important}
-Set it deliberately and keep it small. A budget of a million silently deleted rows is not
-resilience. It is a data-loss bug with a config flag.
+Set it deliberately and keep it small. A budget of a million silently deleted rows is a data-loss bug with a config flag.
 :::
 
 ## Retry the endpoint, not the job
 
-A hosted model answers with a 429 or a 503 as a matter of routine, and re-running a
-six-hour job because one request out of a million was throttled is not an option.
-`max_retries` retries a batch whose model call raised, with `retry_backoff` seconds of
-jittered exponential backoff between attempts, and `timeout` bounds one call so a hung
-request cannot stall the run. `retry_on` narrows which exceptions count when you want a
-genuine bug to fail fast.
+A hosted model answers with a 429 or a 503 routinely, and one throttled request shouldn't rerun a six-hour job. `max_retries` retries a batch whose model call raised, with jittered exponential backoff starting from `retry_backoff` seconds. `timeout` bounds one call so a hung request can't stall the run, and `retry_on` narrows which exceptions count so a genuine bug still fails fast.
 
-The same five options work on every entry point that calls a model, so `generate`,
-`extract`, `classify`, `infer`, `predict`, and `embed` take them exactly as `map_batches`
-does:
+`generate`, `extract`, `classify`, `infer`, `predict`, and `embed` take these options exactly as `map_batches` does:
 
 ```python
 import batcher as bt
@@ -187,31 +159,19 @@ print(
 # {'text': ['good', 'bad'], 'response': ['GOOD', 'BAD']}
 ```
 
-Retries and the error budget compose, and they run in that order: a batch is retried
-first, and only a failure that survives every attempt is charged against
-`max_errored_rows`. So a transient outage costs latency, and a row the model will never
-accept costs one row.
+Retries run first, and only a failure that survives every attempt is charged against `max_errored_rows`. A transient outage costs latency, and a row the model will never accept costs one row.
 
-## Idempotency, because workers get preempted
+## Keep the model stage idempotent
 
 :::{warning}
-Under `distributed=True`, a worker whose node is reclaimed mid-batch is reassigned and
-its partition **recomputed** from the durable input. So the scoring function must be
-idempotent. A pure transform is. A function that POSTs a prediction to an API, upserts
-into a vector store, or increments an external counter is not. On a retry it applies the
-effect twice.
+Under `distributed=True`, a worker whose node is reclaimed mid-batch is reassigned and its partition recomputed from the durable input, so the scoring function must be idempotent. A pure transform is. A function that POSTs a prediction to an API, upserts into a vector store, or increments an external counter applies its effect twice on a retry.
 :::
 
-The fix is to keep side effects out of the model stage. Return the prediction as a
-column, and let a `write` land it. If you must call an external sink from inside the UDF,
-make it idempotent by upserting on a key. The retry is not optional. It is how a
-spot-instance job survives at all.
+Keep side effects out of the model stage. Return the prediction as a column and let a `write` land it. If you must call an external sink from inside the UDF, upsert on a key. You can't turn the recompute off, because it is how a spot-instance job survives at all.
 
 ## Checkpoint by partition
 
-A 10-hour scoring job that dies at hour 9 should not restart at hour 0. Partition the
-input and write each partition's output as it completes, so a rerun skips the partitions
-that already landed.
+A 10-hour scoring job that dies at hour 9 shouldn't restart at hour 0. Partition the input and write each partition's output as it completes, so a rerun skips what already landed.
 
 ```python
 # docs: skip
@@ -228,15 +188,12 @@ for day in days:
     )
 ```
 
-It is crude, and it works. The alternative, one enormous job with an internal checkpoint,
-is a lot of machinery to rebuild what a partitioned write gives you for free.
+It is crude, and it works. One enormous job with an internal checkpoint rebuilds, with a lot of machinery, what a partitioned write already gives you.
 
 ## Verify before you scale
 
 :::{tip}
-Run the pipeline over `head(1000)` first and look at the output. A model that returns the
-wrong label for every row costs you the same GPU-hours as one that works, and the
-distribution of the predictions is the cheapest possible check.
+Run the pipeline over `limit(1000)` first and look at the output. A model that returns the wrong label for every row costs the same GPU-hours as one that works, and the distribution of predictions is the cheapest check there is.
 :::
 
 ```python
@@ -244,14 +201,13 @@ print(scored.group_by("label").agg(n=bt.count()).sort("label").to_pydict())
 # {'label': [False, True], 'n': [2, 2]}
 ```
 
-If every row came back with the same class, the pipeline is wrong somewhere. Look for a
-column mix-up, a truncation, or a preprocessing step that did not run. Find that on a
-thousand rows, not on a billion.
+If every row comes back with the same class, look for a column mix-up, a truncation, or a preprocessing step that didn't run. Find it on a thousand rows, not a billion.
 
 ## See also
 
 - {doc}`Inference </ml/inference/inference>`: the model-as-callable contract and the batch formats.
 - {doc}`GPU scheduling </ml/inference/gpu>`: `num_gpus`, `concurrency`, and actor autoscaling.
+- {doc}`/ml/inference/tabular-models`: the same job for XGBoost, LightGBM, and scikit-learn models.
 - {doc}`Model serving patterns </ml/training/model-serving-patterns>`: calling a model that lives in
   another process.
 - {doc}`Multimodal </ml/preparing/multimodal/index>`: scoring images, audio, and video.

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 470" role="img" width="980" height="470"><defs><style>
+  .surface { fill: #ffffff; stroke: #cbd5e1; }
+  .band-blue { fill: #eff6ff; stroke: #3b82f6; }
+  .band-amber { fill: #fffbeb; stroke: #f59e0b; }
+  .band-grey { fill: #f8fafc; stroke: #cbd5e1; }
+  .t-title { fill: #1e293b; }
+  .t-sub { fill: #5b6675; }
+  .t-arrow { fill: #475569; }
+  .t-code { fill: #1e40af; }
+  .code-bg { fill: #f1f5f9; stroke: #e2e8f0; }
+  .pill-blue { fill: #dbeafe; } .pill-amber { fill: #fef3c7; } .pill-grey { fill: #e2e8f0; }
+  .pt-blue { fill: #1d4ed8; } .pt-amber { fill: #b45309; } .pt-grey { fill: #334155; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1e293b; stroke: #334155; }
+    .band-blue { fill: #172554; stroke: #3b82f6; }
+    .band-amber { fill: #2c1f06; stroke: #f59e0b; }
+    .band-grey { fill: #131c31; stroke: #334155; }
+    .t-title { fill: #e2e8f0; }
+    .t-sub { fill: #94a3b8; }
+    .t-arrow { fill: #cbd5e1; }
+    .t-code { fill: #93c5fd; }
+    .code-bg { fill: #0f172a; stroke: #334155; }
+    .pill-blue { fill: #1e3a8a; } .pill-amber { fill: #78350f; } .pill-grey { fill: #334155; }
+    .pt-blue { fill: #bfdbfe; } .pt-amber { fill: #fde68a; } .pt-grey { fill: #e2e8f0; }
+    #tintBlue stop[offset="0"] { stop-color: #16233d; }
+    #tintBlue stop[offset="1"] { stop-color: #1e3a8a; }
+    #tintAmber stop[offset="0"] { stop-color: #2a1e07; }
+    #tintAmber stop[offset="1"] { stop-color: #78350f; }
+  }
+</style>
+<filter id="sh" x="-20%" y="-30%" width="140%" height="180%">
+  <feDropShadow dx="0" dy="2.5" stdDeviation="4.5" flood-color="#0f172a" flood-opacity="0.18"/>
+</filter>
+<filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+  <feDropShadow dx="0" dy="4" stdDeviation="9" flood-color="#2563eb" flood-opacity="0.35"/>
+</filter>
+<linearGradient id="hero" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="0.5" stop-color="#2563eb"/><stop offset="1" stop-color="#4f46e5"/></linearGradient>
+<linearGradient id="heroAmber" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+<linearGradient id="tintBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="tintAmber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="ribbonBlue" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#93c5fd"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+<linearGradient id="ribbonAmber" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+<marker id="arB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/></marker>
+<marker id="arA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#d97706"/></marker>
+<marker id="arG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/></marker>
+</defs><g filter="url(#sh)"><rect x="40" y="44" width="240" height="84" rx="10" class="surface" stroke-width="1.2"/></g><text x="160.0" y="86.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Sources</text><text x="160.0" y="105.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">web, code, books</text><g filter="url(#sh)"><rect x="370" y="44" width="240" height="84" rx="11" fill="url(#tintBlue)" stroke="#bfdbfe" stroke-width="1.2"/></g><rect x="370" y="56" width="4" height="60" rx="2" fill="#3b82f6"/><text x="493.0" y="85.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Filter each source</text><text x="493.0" y="103.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">quality_filter</text><g filter="url(#sh)"><rect x="700" y="44" width="240" height="84" rx="11" fill="url(#tintBlue)" stroke="#bfdbfe" stroke-width="1.2"/></g><rect x="700" y="56" width="4" height="60" rx="2" fill="#3b82f6"/><text x="823.0" y="85.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Mix at weights</text><text x="823.0" y="103.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">mix_corpora adds source</text><circle cx="374" cy="46" r="14" fill="#2563eb"/><text x="374" y="50.5" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#ffffff">1</text><circle cx="704" cy="46" r="14" fill="#2563eb"/><text x="704" y="50.5" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#ffffff">2</text><path d="M 286 86.0 L 362 86.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="325.0" y="74.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="700" class="t-arrow">raw text</text><path d="M 616 86.0 L 692 86.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="655.0" y="74.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="700" class="t-arrow">prose kept</text><text x="490.0" y="152" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">first, when source quality differs</text><path d="M 820.0 136 L 820.0 216" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="832.0" y="180.0" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="700" class="t-arrow">mixed corpus</text><g filter="url(#sh)"><rect x="700" y="224" width="240" height="84" rx="11" fill="url(#tintAmber)" stroke="#fcd34d" stroke-width="1.2"/></g><rect x="700" y="236" width="4" height="60" rx="2" fill="#f59e0b"/><text x="823.0" y="265.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Decontaminate</text><text x="823.0" y="283.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">n = 13 tokens by default</text><circle cx="704" cy="226" r="14" fill="#d97706"/><text x="704" y="230.5" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#ffffff">3</text><g filter="url(#sh)"><rect x="370" y="224" width="240" height="84" rx="10" class="surface" stroke-width="1.2"/></g><text x="490.0" y="266.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Tokenize</text><text x="490.0" y="285.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">on the Tokenization page</text><g filter="url(#sh)"><rect x="40" y="224" width="240" height="84" rx="11" fill="url(#tintBlue)" stroke="#bfdbfe" stroke-width="1.2"/></g><rect x="40" y="236" width="4" height="60" rx="2" fill="#3b82f6"/><text x="163.0" y="265.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Order</text><text x="163.0" y="283.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">length_grouped_order</text><circle cx="44" cy="226" r="14" fill="#2563eb"/><text x="44" y="230.5" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#ffffff">4</text><path d="M 694 266.0 L 618 266.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="655.0" y="254.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="700" class="t-arrow">clean text</text><path d="M 364 266.0 L 288 266.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="325.0" y="254.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="700" class="t-arrow">token ids</text><g filter="url(#sh)"><rect x="700" y="378" width="240" height="60" rx="10" class="surface" stroke-width="1.2"/></g><text x="820.0" y="413.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Evaluation sets</text><path d="M 820.0 372 L 820.0 316" fill="none" stroke="#d97706" stroke-width="2.4" marker-end="url(#arA)"/><text x="832.0" y="350" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="700" class="t-arrow">verbatim spans</text><text x="160.0" y="332" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">last: consume in this order</text><text x="160.0" y="350" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">and do not re-shuffle</text></svg>

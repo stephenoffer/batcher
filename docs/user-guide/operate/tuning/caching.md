@@ -1,9 +1,8 @@
 # Caching results
 
-A {py:class}`Dataset <batcher.Dataset>` is a plan, not a result. Call {py:meth}`collect() <batcher.Dataset.collect>` twice and the plan runs twice.
-That surprises people coming from pandas, where a DataFrame *is* the data. Laziness is
-what lets the optimizer push filters into the scan and fuse projections, so the answer
-is not to make datasets eager. It is to say, once, which result you intend to reuse.
+This page covers how to keep a computed result so later queries reuse it: the in-process cache, its disk tier, the shared cache across processes, and the cache for remote file bytes.
+
+A {py:class}`Dataset <batcher.Dataset>` is a plan, not a result. Call {py:meth}`collect() <batcher.Dataset.collect>` twice and the plan runs twice. That surprises people coming from pandas, where a DataFrame *is* the data. Laziness is what lets the optimizer push filters into the scan and fuse projections, so the answer isn't to make datasets eager. It's to say, once, which result you intend to reuse.
 
 ## Setup
 
@@ -34,6 +33,10 @@ print(by_region.sort("region").to_pydict(), rows)
 Two terminals, two executions. On this data nobody notices. On a filtered 500 GB scan
 feeding five downstream reports, it is five scans.
 
+The figure sets two terminals over an uncached subquery beside the same two terminals over a cached one:
+
+![Two panels compare the same subquery, a scan of events followed by a filter on status equal to active, read by two terminals. Without cache(), each terminal, a collect() and then a count(), runs its own scan and its own filter, so the scan and filter run twice. With cache(), the scan and filter run once, the first collect() stores the Arrow result, and a later collect() and a count() are both served from that stored result with no re-run.](/_static/diagrams/cache_reuse.svg)
+
 ## cache()
 
 :::{tip}
@@ -50,18 +53,17 @@ separate question, answered by the storage level below.
 ```python
 hot = events.filter(bt.col("status") == "active").cache()
 
-first = hot.count()  # executes the plan, stores the result
+first = hot.to_pydict()  # executes the plan, stores the result
 second = hot.count()  # cache hit, no re-execution
 totals = hot.group_by("region").agg(total=bt.col("amount").sum())
 
-print(first, second)
+print(len(first["region"]), second)
 # 4 4
 print(totals.sort("region").to_pydict())
 # {'region': ['eu', 'us'], 'total': [12.0, 14.0]}
 ```
 
-The speedup is the whole plan, not a constant factor. A cached aggregate over 200,000
-rows drops from hundreds of milliseconds to well under one:
+The speedup is the whole plan, not a constant factor, because a warm call runs none of it:
 
 ```python
 import time
@@ -118,7 +120,7 @@ the expensive join or aggregate right before the branch point, not the leaf.
 ## What it costs and when it gives it back
 
 The cache is process-wide, keyed by the plan and its inputs, and bounded by
-`memory.result_cache_max_bytes` (256 MB by default). It yields memory back to running
+`memory.result_cache_max_bytes` (256 MiB by default). It yields memory back to running
 queries under pressure, so caching cannot grow the process without bound and cannot OOM a
 query that needs the memory more.
 
@@ -173,7 +175,7 @@ print(hot.count(), wide.count())
 # 4 2
 ```
 
-The disk tier is bounded by `memory.result_cache_disk_max_bytes` (4 GB by default) and
+The disk tier is bounded by `memory.result_cache_disk_max_bytes` (4 GiB by default) and
 lives beside the spill files, on `memory.spill_dir` or whichever fast local volume the node
 reports. When local disk fills it overflows to `memory.spill_remote_uri`, so a cache on a
 small-NVMe node degrades to object storage instead of failing. Set the budget to `0` to
@@ -190,7 +192,7 @@ Caching is self-managing: the budget evicts, and memory pressure reclaims. Reach
 finished with and you want its memory and disk back at a known moment.
 
 ```python
-hot.uncache()  # spelled unpersist() if you are coming from Spark
+hot.uncache()  # Spark's unpersist()
 print(hot.count())  # recomputed, same answer
 # 4
 ```
@@ -200,7 +202,7 @@ once, which is what you want between benchmark runs.
 
 ## Checking whether the cache is earning its budget
 
-{py:func}`bt.cache_stats() <batcher.cache_stats>` reports both tiers. Read two numbers
+{py:func}`bt.cache_stats() <batcher.cache_stats>` reports both tiers, plus `shared_*` keys when `memory.shared_cache_uri` is set and `file_*` keys when `memory.file_cache_dir` is set. Read two numbers
 together, because on their own they point the wrong way:
 
 ```python
@@ -219,8 +221,8 @@ Take a difference across two readings, as above. The counters are lifetime figur
 process, so they are not reset by `clear_cache()`: a number that reset whenever the cache
 was emptied could not tell you whether the cache was worth its budget.
 
-A low hit rate **with** evictions means the budget is too small: the results were dropped
-before anything read them again. A low hit rate with **no** evictions means the cache is
+A low hit rate with evictions means the budget is too small: the results were dropped
+before anything read them again. A low hit rate with *no* evictions means the cache is
 not useful for this workload, and a bigger budget will not change that. The same reading
 applies to the second tier: `demotions` with no `disk_hits` means results are being
 written down that nothing reads back, and the disk budget is being spent for nothing.
@@ -270,20 +272,13 @@ input has both a durable identity and a content version. The path says which tab
 is; the version token says which state of it. Rewrite the file and the key changes, so the
 next run recomputes rather than serving the previous run's rows.
 
-Three consequences follow, and they are all silent by design:
-
-- **In-memory data never shares.** `bt.from_pydict` has no cross-run identity, so a query
-  reading it uses the process cache only.
-- **A source that cannot version itself declines.** Unversioned is indistinguishable from
-  unchanged, and this is the boundary where that distinction has to be made.
-- **A tenant or a governed viewer never shares with another.** Both are in the key, because
-  a shared store makes that failure cross-process.
+Three consequences follow, all silent by design. In-memory data never shares, because `bt.from_pydict` has no cross-run identity, so a query reading it uses the process cache only. A source that can't version itself declines, because unversioned is indistinguishable from unchanged. And a tenant or a governed viewer never shares with another, because both are in the key.
 
 Declining costs a recompute, which is why nothing here guesses.
 
 ### What is too large to share
 
-A result over 256 MB is not written to the shared store. Sharing it would serialize a
+A result over 256 MiB is not written to the shared store. Sharing it would serialize a
 second full copy of it into the process that just computed it, then push those bytes at
 the network on every run of the query, and Redis refuses a value over 512 MB in any case.
 The process cache and its disk tier still hold results of any size, so a large result is
@@ -390,8 +385,7 @@ pushdown.
 :::
 ::::
 
-That second one is a checkpoint, and it is the right call more often than people expect.
-Here is the whole decision:
+The second is a checkpoint. The table below maps each situation to the tool that fits it:
 
 | Situation | Reach for |
 | --- | --- |
@@ -407,6 +401,7 @@ Here is the whole decision:
 
 - {doc}`Performance </user-guide/operate/tuning/performance>`: morsel sizing, spilling, and the memory budget.
 - {doc}`Explain plans </user-guide/operate/tuning/explain-plans>`: confirm the plan you cached is the plan you meant.
+- {doc}`object-storage`: the per-worker cache of decoded scan batches on a cluster.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: the checkpoint alternative.
 - {doc}`Query lifecycle </architecture/deep-dives/query/query-lifecycle>`: what "the plan runs twice" means,
   stage by stage.

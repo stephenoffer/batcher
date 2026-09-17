@@ -4,7 +4,7 @@ A *morsel* is the unit of work Batcher schedules across cores. It's an Arrow `Re
 and `bc_arrow::Morsel` is a type alias rather than a wrapper, so there's no second data
 structure. Its target size is 16,384 rows **or** 1 MiB, whichever it hits first
 (`bc_arrow::MorselTarget`). The row bound keeps a narrow batch cache-resident, and the byte
-bound keeps a wide one from ballooning. This page describes how morsels are made, how they're
+bound keeps a wide one from ballooning. `DEFAULT_MORSEL_ROWS` and `DEFAULT_MORSEL_BYTES` in `bc-arrow` hold the two defaults. This page describes how morsels are made, how they're
 scheduled, and where the granularity stops paying.
 
 The three sizes a morsel is chosen against are the three ways cutting a query goes wrong. One
@@ -74,7 +74,7 @@ morsel with 16,383 others.
 | aggregate, distinct | partial-aggregate each morsel in parallel, then `combine` + `finalize` |
 | join | hash-shuffle both sides into one bucket per worker, join the buckets in parallel |
 | sort | sample-sort: range-partition by the leading key, sort each range |
-| window | hash-partition by `PARTITION BY` key, run the serial kernel per bucket |
+| window | hash-partition by the `PARTITION BY` keys, run the serial kernel per bucket; a window with no partition keys runs its exact running aggregates as a parallel prefix scan |
 
 Every one of these is a *scheduling* choice. The hash-shuffle that parallelizes a join across
 threads is the same mechanism the distributed layer uses across actors, and the per-bucket
@@ -94,24 +94,34 @@ deliberately built to produce a **bit-identical** permutation. See
 ## How wide?
 
 `EngineConfig.parallelism` is honored verbatim when set: the control plane asked for that
-width, and the hash-shuffle bucket count keys off it. When it's `0`, meaning all cores, the
-width is `bc_arrow::usable_cores()` **capped by the number of morsels the inputs can produce**
-(`par::auto_width`). `usable_cores` is `available_parallelism()` clamped by the cgroup CPU
-quota, so a container or a Ray actor gets the width it may actually use rather than the width
-of the host.
+width, and the hash-shuffle bucket count keys off it. When it's `0`, meaning all cores,
+`par::auto_width` picks the width from two numbers. The first is `bc_arrow::operator_cores()`:
+every physical core plus a third of the SMT siblings, taken from `usable_cores()`, which is
+`available_parallelism()` clamped by the cgroup CPU quota. A container or a Ray actor therefore
+gets the width it may actually use rather than the width of the host. The second is the number
+of morsels the inputs can produce, which caps the first.
 
-The cap matters because an idle worker isn't free. Rayon still wakes it and it contends for the
-job queue, and because pools are cached per width, a one-row query would otherwise install and
-spin up a 96-thread pool. The engine's low-fixed-overhead goal is exactly this case. The cap is
-an upper bound on *useful* parallelism at the leaves, so it can never remove parallelism a plan
-could have used, and it never changes a result.
+Not every logical CPU gets a worker, and that was measured rather than assumed. A plan
+interleaves work that stalls on memory, such as hash build and probe, with work that saturates
+bandwidth, such as gather and scan, and SMT siblings help the first while doubling cache pressure
+on the second. Same binary, only the width changed, 164 of 198 benchmark queries preferred 64
+workers to 96 on a 96-CPU box. The fifteen H2O queries, each one large operator over 10M rows,
+paid 4% to 6% for it.
+
+The morsel cap matters because an idle worker isn't free. Rayon still wakes it and it contends
+for the job queue, and because pools are cached per width, a one-row query would otherwise
+install and spin up a 96-thread pool. The engine's low-fixed-overhead goal is exactly this case.
+The cap only bounds parallelism at the leaves, and it never changes a result.
 
 The morsel count is byte-aware for the same reason morsels are: a 176 MB audio batch of 2,000
 rows morselizes into ~176 pieces, and counting by rows alone scheduled it on one core.
 
-There is one deliberate exception. A plan containing a media decode lifts the cap to all
-cores, gated on `RelOp::contains_media_decode`, the plan-level walker over the expression
-predicate of the same name. Decode does heavy, embarrassingly-parallel work *inside* a morsel,
+Two kinds of plan lift the cap to every usable core, because the work below a leaf is not
+bounded by that leaf's morsel count. A plan that multiplies rows is the first
+(`RelOp::multiplies_rows`: `Unnest`, `Unpivot` and `RangeJoin`). A hundred rows of
+ten-thousand-element lists are one morsel at the leaf and a million rows one operator later, so
+capping on the leaf would pin the whole downstream to one core. A media decode is the second,
+gated on `RelOp::contains_media_decode`. Decode does heavy, embarrassingly-parallel work *inside* a morsel,
 and its input is tiny encoded bytes, so a whole corpus of JPEGs looks like one morsel to the
 morsel counter and would decode on one core. The decode kernel's own rayon fan-out shares the
 same pool, so there is no oversubscription.
@@ -123,7 +133,7 @@ several queries run at once.
 
 ## The allocator is part of the story
 
-This isn't a footnote. Every morsel-parallel operator allocates its output buffers per
+Every morsel-parallel operator allocates its output buffers per
 morsel, and glibc's malloc serves buffers of that size through `mmap`/`munmap`. Each `munmap`
 must invalidate the mapping on every core, so it broadcasts a TLB-shootdown IPI. With 96
 workers each freeing a buffer per morsel, that interrupt storm becomes a serialization point
@@ -182,7 +192,8 @@ concatenated and then re-gathered.
 
 ## Where the code lives
 
-- `crates/bc-arrow/src/lib.rs`: `Morsel`, `MorselTarget`, `DEFAULT_MORSEL_ROWS`, `RuntimeTuning`
+- `crates/bc-arrow/src/lib.rs`: `Morsel`, `MorselTarget`, `DEFAULT_MORSEL_ROWS`, `DEFAULT_MORSEL_BYTES`, `RuntimeTuning`
+- `crates/bc-arrow/src/hardware.rs`: `usable_cores`, `operator_cores`
 - `crates/bc-interp/src/ops/morsel.rs`: `morselize`, the split/coalesce rules
 - `crates/bc-interp/src/par.rs`: `auto_width`, `pool_for`, the per-operator schedules
 - `crates/bc-interp/src/ops/repartition.rs`: gather-once hash partitioning of morsels

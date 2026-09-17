@@ -1,8 +1,8 @@
 # Elasticsearch
 
-This page covers reading an Elasticsearch index into the engine, and indexing rows back into one.
+This page covers reading an Elasticsearch index into the engine and indexing rows back into one. The read takes an ES|QL result as a single Arrow stream, or slices a scroll across workers when you need raw documents. The write sends `_bulk` requests and checks every item in the response, which is the part an application-side loop usually gets wrong.
 
-A search index is a serving system with its own mappings and refresh semantics, and that shapes what the writer does rather than whether it exists. Batcher indexes documents into an index **you** manage: it never creates a mapping, never changes one, and never forces a refresh unless you ask. What it does do is send `_bulk` requests and read the response, which is the part an application-side loop usually gets wrong.
+Batcher indexes into an index you manage. It never creates or changes a mapping, and it never forces a refresh unless you ask.
 
 | | |
 | --- | --- |
@@ -21,7 +21,7 @@ A search index is a serving system with its own mappings and refresh semantics, 
 
 This is the one you want. Elasticsearch 8.18+ can return an ES|QL result as an Arrow stream, which
 Batcher reads straight into `RecordBatch`es with no per-row Python. The cluster does the filtering
-and the aggregation; you get columns back.
+and the aggregation, and columns come back.
 
 ```python
 # docs: skip
@@ -58,24 +58,22 @@ hits = bt.read.elasticsearch(
 ::::
 
 :::{warning}
-Omitting `esql=` is not a stylistic choice. It silently drops you onto the scroll path, with a
-JSON document per hit crossing Python before it becomes a column.
+Omitting `esql=` silently drops you onto the scroll path, with a JSON document per hit crossing
+Python before it becomes a column.
 :::
 
 ## Credentials
 
-`hosts` and `api_key` are stored verbatim on the source and never logged. The connector's
-identity, which keys its learned statistics, is `elasticsearch:<index>:<fingerprint>`, where the
-fingerprint is a `sha256` over the connection options with the credential-ish keys excluded. It
-used to be the index name alone, which made `orders` on staging and `orders` on production one
-relation as far as the optimizer was concerned. Use an API key scoped to the indices you read. A
-scroll holds a cursor open on the cluster, and you don't want that key to be able to do anything
-else.
+`hosts` and `api_key` are stored on the source and never logged. `api_key` also accepts an `env:`/`file:` reference, resolved on the worker that opens the connection.
+
+The connector's identity, which keys its learned statistics, is `elasticsearch:<index>:<fingerprint>`. The fingerprint is a `sha256` over the connection options with credential keys excluded, so `orders` on staging and `orders` on production keep separate statistics.
+
+Use an API key scoped to the indices you read. A scroll holds a cursor open on the cluster, and that key should not be able to do anything else.
 
 ## Predicate pushdown
 
 Kyber pushes the query's filter into the cluster, and how depends on the path. On the ES|QL path it
-becomes an appended `| WHERE` clause; on the scroll path it becomes an ES `bool` query AND-merged
+becomes an appended `| WHERE` clause. On the scroll path it becomes an ES `bool` query AND-merged
 with your DSL query.
 
 :::{dropdown} See the ES|QL translation, with no cluster running
@@ -111,7 +109,7 @@ hits = bt.read.elasticsearch(
 )
 ```
 
-The ES|QL path does **not** slice. The whole result comes back in one Arrow stream, as a single
+The ES|QL path does not slice. The whole result comes back in one Arrow stream, as a single
 split. That is the tradeoff, and it is usually the right one: ES|QL pushes the filter and the
 projection into the cluster, so what crosses the wire is small, and one fast stream of a small
 result beats eight slow scrolls of a large one. Reach for slices when you genuinely need to pull a
@@ -121,33 +119,6 @@ large, unaggregated slab of documents out.
 Sizing slices above the index's shard count buys nothing, because a slice cannot span a shard.
 Match `segments` to shards, not to your CPU count.
 :::
-
-## Failure modes worth knowing
-
-**No Arrow on an older cluster.** The `format="arrow"` ES|QL response is 8.18+. Against an older
-cluster the ES|QL call fails rather than silently degrading. Drop `esql=` and take the scroll path.
-
-**Schema comes from one document.** Scrolling infers the Arrow schema from the first hit's
-`_source`. Documents with heterogeneous fields, from a mapping that changed mid-index or an
-`object` field that is sometimes a scalar, produce a schema that does not describe the rest of the
-index. Constrain the shape with `esql=... | KEEP ...` (or a projection) so you are reading known
-columns rather than a union of everything anyone ever indexed.
-
-:::{warning}
-**Scroll contexts are a cluster resource.** Every slice holds one alive for its 2-minute window,
-refreshed as the engine drains it. Batcher clears them on the way out, best-effort, but a job
-killed mid-read leaves them to expire on their own. Many concurrent sliced reads against a busy
-cluster is a way to hurt production search latency.
-:::
-
-**`_source` only.** Scrolling reads `_source`, so a field that is indexed but not stored in
-`_source` does not come back. ES|QL, which reads doc values, does not have this problem. One more
-reason to prefer it.
-
-**No cheap count on the ES|QL path.** The scroll path answers `count()` exactly from the
-`_count` API, one round trip, no scan. An ES|QL result has no such endpoint, so a count there
-means a second full query: ask for it in the pipeline with `| STATS COUNT(*)` and let the
-cluster compute it.
 
 ## Writing
 
@@ -170,15 +141,27 @@ scored.write.elasticsearch(
 )
 ```
 
-**Every response is read, not just its status code.** `_bulk` reports per-document failures inside an HTTP 200: a mapping conflict on one document leaves the other 999 indexed and the call looking successful. Batcher inspects each item and raises a `BackendError` naming how many failed and what the first one said, so a partial write is a failure rather than a silence.
+Every response is read item by item. `_bulk` reports per-document failures inside an HTTP 200: a mapping conflict on one document leaves the other 999 indexed and the call looking successful. Batcher inspects each item and raises a `BackendError` naming how many failed and what the first one said, so a partial write is a failure rather than a silence.
 
-**Refresh is off by default**, as it is in Elasticsearch itself. Forcing a refresh per batch is the standard way to make a bulk load an order of magnitude slower. Pass `refresh=True` when the write must be searchable before the call returns, which is usually only true in a test.
+Refresh is off by default, as it is in Elasticsearch itself. Forcing a refresh per batch is the standard way to make a bulk load an order of magnitude slower. Pass `refresh=True` when the write must be searchable before the call returns, which is usually only true in a test.
 
-**The key column stays in the document body.** It is used as the `_id` *and* written as a field, because dropping it would make a read-write round trip lose it.
+The key column stays in the document body. It is used as the `_id` *and* written as a field, because dropping it would make a read-write round trip lose it.
 
 `overwrite` is refused past the first shard of a distributed write: every shard would empty the index, so each would discard the shards before it. Distribute an `upsert` instead.
 
-Batcher does not manage the index. Create it with the mappings, shard count and analyzers you want first; an index Elasticsearch auto-creates from a bulk write gets dynamic mappings, which is rarely what a search index should have.
+## Requirements and limitations
+
+The Arrow response for ES|QL, `format="arrow"`, needs Elasticsearch 8.18 or later. Against an older cluster the ES|QL call fails rather than degrading, so drop `esql=` and take the scroll path there.
+
+The scroll path infers its schema from the first hit's `_source`. Heterogeneous documents, from a mapping that changed mid-index or an `object` field that is sometimes a scalar, produce a schema that does not describe the rest of the index. Constrain the shape with `esql=... | KEEP ...` or a projection so you read known columns.
+
+Scroll contexts are a cluster resource. Every slice holds one open for a 2-minute window, refreshed as the engine drains it. Batcher clears them on the way out, best-effort, but a job killed mid-read leaves them to expire. Many concurrent sliced reads against a busy cluster can hurt production search latency.
+
+The scroll path reads `_source`, so a field that is indexed but not stored in `_source` does not come back. ES|QL reads doc values and does not have this gap.
+
+The scroll path answers `count()` exactly from the `_count` API in one round trip. An ES|QL result has no such endpoint, so count inside the pipeline with `| STATS COUNT(*)` and let the cluster compute it.
+
+Batcher does not manage the index. Create it with the mappings, shard count and analyzers you want before the first write. An index Elasticsearch auto-creates from a bulk write gets dynamic mappings, which is rarely what a search index should have.
 
 ## See also
 

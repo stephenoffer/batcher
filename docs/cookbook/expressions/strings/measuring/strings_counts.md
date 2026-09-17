@@ -1,6 +1,8 @@
 # Counting text structure
 
-Counts are the other half of a corpus filter. Length in characters says little; length in words, sentences, or paragraphs says whether a document is a fragment, a paragraph, or a scraped page. The entity counts (urls, emails, hashtags, mentions) find rows that are mostly links rather than prose.
+Counts are the other half of a corpus filter. Length in characters says little. Length in words, sentences, or lines says whether a document is a fragment, a paragraph, or a scraped page, and the entity counts for URLs, hashtags, and mentions find rows that are mostly links rather than prose.
+
+The script counts words, long words, lines, newlines, spaces, and sentences, measures average word length, and counts URLs, hashtags, and mentions. It ends with the filter these exist for: keep the prose and drop the link dump.
 
 The whole script, executed on every test run:
 

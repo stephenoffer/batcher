@@ -7,8 +7,8 @@ Batcher splits in two. Python is the control plane. It builds a query plan, opti
 it, and decides how much it should cost, but it never touches a row of data. Rust is
 the data plane, where every per-row and per-batch computation runs over Apache Arrow.
 The two meet at one boundary, a JSON plan plus zero-copy Arrow batches, and nothing
-else crosses it. That split lets the optimizer stay clean, malleable Python while the
-hot path runs at native speed.
+else crosses it. The optimizer stays easy-to-change Python. The hot path runs at native
+speed.
 
 The API is lazy. An operation doesn't compute anything. It returns a new plan, and work
 begins only at a terminal call such as `collect`. By then the optimizer sees the whole
@@ -74,23 +74,26 @@ result = (
 1. **Optimize.** On `collect`, Kyber rewrites the logical plan with predicate and
    projection pushdown, join reordering, and fusion, then lowers it to a physical plan
    tagged with estimated resource bounds.
-1. **Admit.** Carbonite checks the plan against the memory envelope. If it doesn't
-   fit, it returns a counter-offer, such as lower parallelism or a smaller credit
-   window, that Kyber re-plans around.
+1. **Admit.** Carbonite checks the plan's largest materializing operator against the
+   memory envelope. If memory is what doesn't fit, the verdict is a spill-friendly
+   counter-offer and the query runs out of core. Any other binding constraint has no
+   spill remedy, so the query fails with a `PlanError` before it starts.
 1. **Execute.** Core ships the physical plan as JSON IR to the Rust engine, which
    runs it over Arrow batches. Pipelines stream through filters and projections, and
    breakers materialize for joins, aggregates, and sorts.
-1. **Adapt.** At a stage boundary the engine has *measured* the real data size. When an
-   estimate was badly wrong, Kyber re-plans the rest of the query on the measured
-   numbers before continuing.
+1. **Adapt.** On a query large enough to qualify, the engine runs stage by stage. At each
+   stage boundary it has *measured* the real data size, and when an estimate was badly
+   wrong, Kyber re-plans the rest of the query on the measured numbers before continuing.
 1. **Return.** Results come back as a PyArrow `Table` from `collect`, a Python dict
    from {py:meth}`to_pydict <batcher.Dataset.to_pydict>`, a stream of batches from {py:meth}`iter_batches <batcher.Dataset.iter_batches>`, or are written to files.
 
-Step 5 is the feedback loop that distinguishes Batcher from a purely static optimizer.
-DuckDB optimizes once before it runs. Batcher's loop is stage-boundary re-optimization,
-the same granularity as Spark AQE, but it's available single-node as well as
-distributed. On top of it sits a sketch-backed cross-query learned-stats and bandit
-loop, so a plan improves the more a query runs. Both mechanisms are described in
+Step 5 is the feedback loop that separates Batcher from a static optimizer. DuckDB
+optimizes once, before it runs. Batcher's loop is stage-boundary re-optimization, the
+same granularity as Spark AQE, and it runs single-node as well as distributed. Single-node,
+it engages on a joined query that clears a floor of 5 million rows or about 320 MB per
+breaker it would cut at, so most small queries take the one-shot plan. On top of it sits
+a cross-query loop of sketches, calibrated costs and a bandit, so a plan improves the more
+a query runs, whatever its size. Both mechanisms are described in
 {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization`.
 
 ## One algebra, single node to cluster
@@ -125,3 +128,5 @@ for one mechanism.
 - {doc}`Execution engine </architecture/internals/execution>`: morsels and the tiers in detail.
 - {doc}`Kyber optimizer </architecture/internals/kyber>`: the passes and the re-optimization loop.
 - {doc}`Carbonite </architecture/internals/carbonite>`: the memory envelope and flow control.
+- {doc}`What makes Batcher different <differentiators>`: the design decisions this layout supports.
+- {doc}`Deep dives </architecture/deep-dives/index>`: one mechanism per page, starting with the query lifecycle.

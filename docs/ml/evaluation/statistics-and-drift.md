@@ -125,7 +125,9 @@ print(entropy(cats, "a"), cramers_v(cats, "a", "b"), mutual_information(cats, "a
 
 `spearman_corr` sees a monotone relationship a Pearson correlation underrates. How extreme an outlier is does not matter. It contributes only its rank. `cramers_v` is the categorical counterpart of a correlation. Unlike `chi_square` it does not grow with the row count, so it ranks features consistently across datasets of different sizes.
 
-`correlation_matrix` and `covariance_matrix` give the whole pairwise structure of a feature set in one scan, returned as a labeled square `Dataset`. Reading down a column shows what a feature moves with. That flags redundant features and multicollinearity. `partial_correlation` goes one step further and removes a confounder: two features can correlate only because both track a third, and the partial correlation is what survives holding that third fixed. `variance_inflation_factor` puts a number on that multicollinearity per feature, measuring how much the rest of the set inflates each column's variance. A VIF above 5 or 10 flags a feature whose linear-model coefficient will be unstable.
+`correlation_matrix` and `covariance_matrix` give the whole pairwise structure of a feature set in one scan, returned as a labeled square `Dataset`. Reading down a column shows what a feature moves with, which flags redundant features.
+
+`partial_correlation` removes a confounder. Two features can correlate only because both track a third, and the partial correlation is what survives holding that third fixed. `variance_inflation_factor` puts a number on multicollinearity per feature: how much the rest of the set inflates each column's variance. A VIF above 5 or 10 flags a feature whose linear-model coefficient will be unstable.
 
 Where `cramers_v` is symmetric, `theils_u` is directional: it reports the fraction of one categorical column's uncertainty that knowing the other removes, so `theils_u(ds, "x", "y")` and `theils_u(ds, "y", "x")` differ and answer "does `x` predict `y`" rather than "are they related". For a numeric column against a grouping, `eta_squared` and its bias-corrected sibling `epsilon_squared` are the bounded effect sizes `anova_f` lacks: both read as "this grouping explains 30% of the variance" and stay comparable across sample sizes, which a raw F never is. `omega_squared` corrects the bias furthest for generalizing beyond the sample, and `cohens_f` is the effect-size scale a power analysis is specified on.
 
@@ -271,7 +273,11 @@ print(round(population_stability_index(train, today, "x", buckets=5), 4))
 
 The bin edges always come from the *reference* distribution, then apply unchanged to the current data. A shift shows up as mass moving between bins rather than as the bins themselves moving. Deriving edges separately for each side would make two very different distributions look identical.
 
-Read the numbers with the conventions the monitoring literature settled on:
+The figure runs the example above through those steps. Five quantile bins of the reference hold 20% each. The same edges put 0%, 10%, 20%, 20%, and 50% of today's shifted data in those bins, and the PSI over those shares is far past the significant band.
+
+![Three panels for the example above. First, the reference column x from 0 to 199 is cut at its quantiles into five bins with edges at 39.8, 79.6, 119.4, and 159.2, so each bin holds 20% of the rows and the outer bins are open-ended. Second, today's column, the same values shifted by 60, is binned on those same reference edges and lands 0%, 10%, 20%, 20%, and 50% in them, so the mass moves between bins while the bins stay put. Third, the PSI sums (current minus reference) times ln(current over reference) over the five bins, with an empty bin counted as 1e-6, giving 2.7854, which reads as significant: below 0.1 is stable, 0.1 to 0.25 moderate, above 0.25 significant.](/_static/diagrams/drift_psi_bins.svg)
+
+The following table gives the usual reading of each measure. The PSI and information-value bands are rules of thumb, not tests:
 
 | Measure | Reading |
 |---|---|
@@ -281,7 +287,7 @@ Read the numbers with the conventions the monitoring literature settled on:
 | `categorical_drift` | The share of mass that would have to move for the two to match. |
 | `information_value` | Below 0.02 useless; 0.02 to 0.1 weak; 0.1 to 0.3 medium; above 0.3 strong. |
 
-`drift_report` runs the whole check and returns a `Dataset` ordered by descending PSI, which makes it appendable to a monitoring table. A single PSI is far less informative than its history:
+`drift_report` runs the whole check and returns a `Dataset` ordered by descending PSI, so you can append it to a monitoring table. A single PSI says far less than its history:
 
 ```python
 report = drift_report(train, today, ["x"], buckets=5)
@@ -292,9 +298,22 @@ print(report.columns)
 
 ## Hypothesis tests
 
-A test statistic says how large an effect is. The p-value says how surprising it is under the null hypothesis. That is the number you act on. `batcher.ml.stats` pairs each statistic with its p-value in one pass and returns a {py:class}`TestResult <batcher.ml.stats.TestResult>` carrying the statistic, its degrees of freedom, and the p-value.
+A test statistic says how large an effect is. The p-value says how surprising it is under the null hypothesis, and that is the number you act on. `batcher.ml.stats` pairs each statistic with its p-value in one pass and returns a {py:class}`TestResult <batcher.ml.stats.TestResult>` carrying the statistic, its degrees of freedom, and the p-value.
 
-Use `t_test_1samp` to check a column's mean against a target, `t_test_ind` for Welch's two-sample test of two groups, `anova_test` to extend that to several groups, `chi_square_test` for the independence of two categorical columns, and `normality_test` (Jarque-Bera) to screen a column before assuming it is Gaussian. `pearson_test` and `spearman_test` add a p-value to a linear or monotone correlation, `proportion_ztest` checks a success rate against a target (with `binomial_test` the exact small-sample version), and `mcnemar_test` compares two classifiers' error rates on the same rows. `mcnemar_test` is the paired test to reach for when deciding whether one model genuinely beats another.
+The following table lists the parametric tests by the question each answers:
+
+| Test | Question |
+|---|---|
+| `t_test_1samp` | Does a column's mean differ from a target? |
+| `t_test_ind` | Do two groups' means differ? Welch's test, so unequal variances are fine. |
+| `anova_test` | Do several groups' means differ? |
+| `chi_square_test` | Are two categorical columns independent? |
+| `normality_test` | Is a column plausibly Gaussian? Jarque-Bera, as a screen. |
+| `pearson_test`, `spearman_test` | Is a linear or monotone correlation real? |
+| `proportion_ztest`, `binomial_test` | Does a success rate differ from a target? `binomial_test` is exact for small samples. |
+| `mcnemar_test` | Does one classifier make fewer errors than another on the same rows? |
+
+`mcnemar_test` is the paired test to reach for when deciding whether one model genuinely beats another.
 
 ```python
 import batcher as bt
@@ -311,11 +330,13 @@ When the data itself is too skewed or ordinal for a t-test, `mann_whitney_u` (tw
 
 Report `cliffs_delta` or `common_language_effect_size` beside a Mann-Whitney result. The test says *whether* two groups differ; these say *how much*, as the probability that a random member of one exceeds a random member of the other.
 
-The tail probabilities come from dependency-free implementations of the Student's t, F, and chi-squared survival functions, checked against SciPy. The whole reduction is a handful of aggregates, so a test scales the same way every other statistic here does.
+The tail probabilities come from dependency-free implementations of the Student's t, F, and chi-squared survival functions, which the test suite checks against SciPy. The reduction is a handful of aggregates, so a test scales like every other statistic here.
 
 ## Time-series diagnostics
 
-A time series carries its signal in how a column relates to its own past, which a Pearson correlation cannot see. `batcher.ml.timeseries` orders a column by a time key and measures that self-relationship. `autocorrelation` gives the lag-`k` value, `autocorrelations` the whole function up to a maximum lag, `ljung_box` pools the first several lags into one white-noise test, and `durbin_watson` is the regression diagnostic for autocorrelated residuals. `partial_autocorrelation` and `partial_autocorrelations` give the *partial* function, which strips out what the intervening lags already explain and so cuts off sharply at the order of an autoregressive process. That sharp cutoff is what makes it the tool for choosing the order.
+A time series carries its signal in how a column relates to its own past, which a Pearson correlation can't see. `batcher.ml.timeseries` orders a column by a time key and measures that self-relationship. `autocorrelation` gives the lag-`k` value and `autocorrelations` the whole function up to a maximum lag. `ljung_box` pools the first several lags into one white-noise test, and `durbin_watson` is the regression diagnostic for autocorrelated residuals.
+
+`partial_autocorrelation` and `partial_autocorrelations` give the *partial* function, which strips out what the intervening lags already explain. It cuts off sharply at the order of an autoregressive process, and that cutoff is how you choose the order.
 
 ```python
 import batcher as bt
@@ -328,7 +349,7 @@ print(ljung_box(ds, "sales", 4, order_by="t").pvalue < 0.05)
 
 For scoring a forecast, `mean_absolute_scaled_error` is the scale-free metric: the model's mean absolute error divided by the naive seasonal forecast's, so a value below 1 beats naive and the number is comparable across series on any scale.
 
-An autocorrelation needs the whole series in time order, so unlike the mergeable statistics above these run over a single ordered window rather than a partitionable aggregate. The formulas are the Box-Jenkins definitions, checked against independent numpy references.
+An autocorrelation needs the whole series in time order, so unlike the mergeable statistics above these run over a single ordered window rather than a partitionable aggregate. The formulas are the Box-Jenkins definitions, and the test suite pins each to an independent numpy computation.
 
 ## Requirements and limitations
 
@@ -340,6 +361,7 @@ A drift measure needs a reference column with more than one distinct value. A co
 
 - {doc}`/ml/evaluation/splits-and-resampling`: rebalance a rare class, hold out a test set, and build the folds.
 - {doc}`/ml/evaluation/evaluation`: score a model once you have a trustworthy split.
+- {doc}`/ml/preparing/preprocessors/feature-selection`: act on these screens inside a fitted pipeline.
 - {doc}`/ml/preparing/preprocessors/index`: the transforms these statistics tell you a column needs.
 - {doc}`/user-guide/trust/data-quality`: assert contracts rather than measure them.
 - {doc}`/cookbook/metrics/statistics/index`: short runnable recipes for the functions on this page.

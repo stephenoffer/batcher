@@ -1,8 +1,8 @@
-"""Masking, hashing, and encrypting a sensitive column.
+"""Masking, hashing, and keyed hashing of a sensitive column.
 
 These are ordinary expressions, so they run in Rust at full speed and compose with
 everything else. Pick by what you need back: masking is one-way and readable, hashing is
-one-way and joinable, encryption is reversible with the key.
+one-way and joinable, and a keyed HMAC is joinable without being guessable.
 
     python examples/governance/pii_transforms.py
 """

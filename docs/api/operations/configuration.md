@@ -31,18 +31,18 @@ gives the fields.
 | `config.execution` | {py:class}`ExecutionConfig <batcher.ExecutionConfig>` | parallelism, morsel size, file-split size, CPUs per task |
 | `config.memory` | {py:class}`MemoryConfig <batcher.MemoryConfig>` | buffer-pool envelope, soft/hard limits, and spill thresholds |
 | `config.flow_control` | {py:class}`FlowControlConfig <batcher.FlowControlConfig>` | credit-based shuffle backpressure and AIMD credit tuning |
-| `config.streaming` | {py:class}`StreamingConfig <batcher.StreamingConfig>` | the micro-batch loop's idle cadence and progress history |
+| `config.streaming` | {py:class}`StreamingConfig <batcher.StreamingConfig>` | the micro-batch loop's cadence, backpressure, and checkpoint cadence |
 | `config.optimizer` | {py:class}`OptimizerConfig <batcher.OptimizerConfig>` | Kyber planning thresholds, cost model, and cardinality defaults |
 | `config.pid` | {py:class}`PIDConfig <batcher.PIDConfig>` | gains for the adaptive batch-size PID controller |
-| `config.metadata` | {py:class}`MetadataConfig <batcher.MetadataConfig>` | learned-stats backend, URI, and decay rate |
-| `config.distributed` | `DistributedConfig` | how the engine attaches to and shuffles across a Ray cluster |
-| `config.observability` | `ObservabilityConfig` | the `batcher.*` loggers and the per-query event log |
+| `config.metadata` | {py:class}`MetadataConfig <batcher.MetadataConfig>` | learned-stats backend and URI |
+| `config.distributed` | {py:class}`DistributedConfig <batcher.config.config.DistributedConfig>` | Ray attachment, the shuffle, inference stages, and the GPU backend |
+| `config.observability` | {py:class}`ObservabilityConfig <batcher.config.config.ObservabilityConfig>` | the `batcher.*` loggers, the per-query event log, tracing, the dashboard, and OpenLineage |
 | `config.governance` | {py:class}`GovernanceConfig <batcher.GovernanceConfig>` | whether row/column policy is advisory or mandatory |
 | `config.tenant` | {py:class}`TenantConfig <batcher.TenantConfig>` | which tenant a scope's work belongs to, and its share |
-| `config.accelerator` | {py:class}`AcceleratorConfig <batcher.config.AcceleratorConfig>` | GPU placement, VRAM headroom, MIG preference, and KV-cache sizing |
+| `config.accelerator` | {py:class}`AcceleratorConfig <batcher.config.AcceleratorConfig>` | GPU placement, VRAM headroom, MIG preference, KV-cache sizing, and profiling |
 | `config.fault_tolerance` | {py:class}`FaultToleranceConfig <batcher.config.FaultToleranceConfig>` | the retry budget and what happens when a device corrupts rather than loses |
 
-Two of those sections nest further, and the inner classes are exported as well.
+The accelerator and fault-tolerance sections nest further, and their inner classes are exported as well.
 
 | Section | Class | Covers |
 | --- | --- | --- |
@@ -85,9 +85,7 @@ print(cfg.execution.parallelism)
 
 ### Config.from_file
 
-{py:meth}`Config.from_file(path, base=None) <batcher.Config.from_file>` overlays a JSON document of nested section
-overrides onto `base` and returns a new `Config`. The JSON mirrors the section
-structure. See {doc}`configuration/environment </configuration/environment>` for the
+{py:meth}`Config.from_file(path, base=None) <batcher.Config.from_file>` overlays a document of nested section overrides onto `base` and returns a new `Config`. The suffix picks the parser: TOML, YAML, or JSON otherwise. The document mirrors the section structure. See {doc}`configuration/environment </configuration/environment>` for the
 format.
 
 ```python

@@ -1,9 +1,6 @@
 # Expressions
 
-Column work in Batcher is expressed with the {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` API, never with Python loops.
-An expression is a small, typed description of a computation. It lowers to the
-Rust data plane and runs over Arrow batches, so the same code is fast on three
-rows or three billion.
+This page covers {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, the language every column computation in Batcher is written in. An expression is a small, typed description of a computation, not a Python function. It lowers to the Rust data plane and runs over whole Arrow batches, where the optimizer can push it into a scan and the JIT can compile it, so the same code is fast on three rows or three billion.
 
 The blocks below build on each other in order.
 
@@ -21,8 +18,7 @@ ds = bt.from_pydict(
 
 ## Columns and literals
 
-{py:obj}`bt.col(name) <batcher.col>` refers to an input column. {py:obj}`bt.lit(value) <batcher.lit>` is a constant. Both are
-expressions, so they compose with operators and methods.
+{py:obj}`bt.col(name) <batcher.col>` refers to an input column. {py:obj}`bt.lit(value) <batcher.lit>` is a constant. Both are expressions, so they compose with operators and methods.
 
 ```python
 out = ds.select(
@@ -36,10 +32,7 @@ print(out.to_pydict())
 
 ## Arithmetic, comparison, and boolean operators
 
-Arithmetic uses `+ - * / %` and `**` (power). Reflected forms work, so a literal
-may lead: `2 * bt.col("x")`. Comparison uses `== != > >= < <=`. Boolean logic uses
-`&` (and), `|` (or), and `~` (not). Parenthesize each side, because `&` binds
-tighter than comparison.
+Arithmetic uses `+ - * / %` and `**` (power). Reflected forms work, so a literal may lead: `2 * bt.col("x")`. Comparison uses `== != > >= < <=`. Boolean logic uses `&` (and), `|` (or), and `~` (not). Parenthesize each side, because `&` binds tighter than comparison.
 
 ```python
 out = ds.select(
@@ -52,10 +45,9 @@ print(out.to_pydict())
 # {'name': ['Ann', 'bob', 'CARL'], 'cheap': [True, True, False], 'cheap_and_small': [True, False, False], 'not_cheap': [False, False, True]}
 ```
 
-## Conditionals: when / then / otherwise
+## Conditionals
 
-{py:obj}`bt.when(cond).then(value) <batcher.when>` builds a SQL `CASE`. Chain more {py:func}`.when(...).then(...) <batcher.when>`
-clauses and close with `.otherwise(default)`.
+{py:obj}`bt.when(cond).then(value) <batcher.when>` builds a SQL `CASE`. Chain more {py:func}`.when(...).then(...) <batcher.when>` clauses and close with `.otherwise(default)`.
 
 ```python
 out = ds.select(
@@ -70,8 +62,7 @@ print(out.to_pydict())
 # {'name': ['Ann', 'bob', 'CARL'], 'tier': ['low', 'mid', 'high']}
 ```
 
-With exactly two branches, {py:obj}`bt.iff(cond, if_true, if_false) <batcher.iff>`
-is the terse form of a single `when/then/otherwise`. It is the SQL `IF`/`IFF`.
+With exactly two branches, {py:obj}`bt.iff(cond, if_true, if_false) <batcher.iff>` is the terse form of a single `when/then/otherwise`. It is the SQL `IF`/`IFF`.
 
 ```python
 out = ds.select(
@@ -84,9 +75,7 @@ print(out.to_pydict())
 
 ## Null handling
 
-{py:obj}`bt.coalesce <batcher.coalesce>` returns the first non-null argument. {py:obj}`bt.nullif(a, b) <batcher.nullif>` returns null
-when `a == b`. {py:obj}`bt.greatest <batcher.greatest>` and {py:obj}`bt.least <batcher.least>` pick the extreme across columns. On a
-single expression, `.fill_null(value)`, `.is_null()`, and `.is_not_null()` apply.
+{py:obj}`bt.coalesce <batcher.coalesce>` returns the first non-null argument. {py:obj}`bt.nullif(a, b) <batcher.nullif>` returns null when `a == b`. {py:obj}`bt.greatest <batcher.greatest>` and {py:obj}`bt.least <batcher.least>` pick the extreme across columns. On a single expression, `.fill_null(value)`, `.is_null()`, and `.is_not_null()` apply.
 
 ```python
 nulls = bt.from_pydict({"a": [1, None, 3], "b": [9, 8, 7]})
@@ -99,30 +88,21 @@ print(out.to_pydict())
 # {'first_present': [1, 8, 3], 'filled': [1, 0, 3], 'bigger': [9, 8, 7]}
 ```
 
-A column where *every* value is null carries Arrow's `null` type, which records no other
-type at all. That is an ordinary thing to have: a left join that matched nothing, a column
-of all `None`, an empty aggregation, or a batch of model generations the engine could not
-produce all give you one. Every expression treats it the way it treats a null value, so a
-function over it returns nulls rather than raising, and you do not need to special-case the
-column before parsing it:
+A column where *every* value is null carries Arrow's `null` type, which records no other type at all. That is an ordinary thing to have: a left join that matched nothing, a column of all `None`, an empty aggregation, or a batch of model generations the engine could not produce all give you one. Every expression treats it the way it treats a null value, so a function over it returns nulls rather than raising, and you do not need to special-case the column before parsing it:
 
 ```python
 empty = bt.from_pydict({"note": [None, None]})
 out = empty.select(
     shouted=bt.col("note").str.upper(),
-    width=bt.col("note").str.len(),
+    width=bt.col("note").str.len_chars(),
 )
 print(out.to_pydict())
 # {'shouted': [None, None], 'width': [None, None]}
 ```
 
-That holds across the string, list, math, temporal, map, and struct methods alike, and it
-matches what DuckDB returns. Use `.is_null()` or a `count()` if you need to *know* the
-column was empty, because the result on its own cannot tell you.
+That holds across the string, list, math, temporal, map, and struct methods alike, and it matches what DuckDB returns. Use `.is_null()` or a `count()` if you need to *know* the column was empty, because the result on its own cannot tell you.
 
-A floating-point `NaN` is distinct from null. {py:obj}`bt.nanvl(value, fallback) <batcher.nanvl>`
-(Spark's `nanvl`) substitutes `fallback` only where `value` is `NaN`. Real numbers
-are left alone, and so are nulls.
+A floating-point `NaN` is distinct from null. {py:obj}`bt.nanvl(value, fallback) <batcher.nanvl>` (Spark's `nanvl`) substitutes `fallback` only where `value` is `NaN`. Real numbers are left alone, and so are nulls.
 
 ```python
 import math
@@ -133,21 +113,15 @@ print(out.to_pydict())
 # {'clean': [1.0, 0.0, 3.0]}
 ```
 
-## Row-wise (horizontal) reductions
+## Row-wise reductions
 
-Aggregates fold a column *down* to one value; the `*_horizontal` functions fold
-*across* columns within each row. {py:func}`sum_horizontal <batcher.sum_horizontal>`/{py:func}`mean_horizontal <batcher.mean_horizontal>` combine numeric
-columns (nulls treated as 0 / skipped), and {py:func}`min_horizontal <batcher.min_horizontal>`/{py:func}`max_horizontal <batcher.max_horizontal>` are the
-Polars-named row-wise `least`/`greatest`. `all_horizontal`/`any_horizontal` reduce
-many boolean columns into one, which is how you combine validation flags.
-{py:func}`count_horizontal <batcher.count_horizontal>` counts the non-null values in each row and {py:func}`product_horizontal <batcher.product_horizontal>`
-multiplies them (nulls treated as 1).
+Aggregates fold a column *down* to one value, and the `*_horizontal` functions fold *across* columns within each row. {py:func}`sum_horizontal <batcher.sum_horizontal>` treats a null as 0 and {py:func}`mean_horizontal <batcher.mean_horizontal>` skips it, and the row-wise minimum and maximum are {py:obj}`bt.least <batcher.least>` and {py:obj}`bt.greatest <batcher.greatest>`. `all_horizontal`/`any_horizontal` reduce many boolean columns into one, which is how you combine validation flags. {py:func}`count_horizontal <batcher.count_horizontal>` counts the non-null values in each row, and {py:func}`product_horizontal <batcher.product_horizontal>` multiplies them, treating a null as 1.
 
 ```python
 checks = bt.from_pydict({"a": [1, 2, 3], "b": [4, 6, 6], "c": [7, 8, 9]})
 out = checks.select(
     total=bt.sum_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
-    smallest=bt.min_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
+    smallest=bt.least(bt.col("a"), bt.col("b"), bt.col("c")),
     filled=bt.count_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
     prod=bt.product_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
     all_even=bt.all_horizontal(bt.col("a") % 2 == 0, bt.col("b") % 2 == 0),
@@ -156,10 +130,7 @@ print(out.to_pydict())
 # {'total': [12, 16, 18], 'smallest': [1, 2, 3], 'filled': [3, 3, 3], 'prod': [28, 96, 162], 'all_even': [False, True, False]}
 ```
 
-When no named `*_horizontal` helper fits, {py:func}`reduce_horizontal(fn, *exprs) <batcher.reduce_horizontal>` folds the
-columns left-to-right with your own binary combiner, and `fold_horizontal(acc, fn,
-*exprs)` does the same from an explicit seed. The combiner runs once at plan-build
-time on `Expr` operands, never on a row, so the fold still lowers to pure Rust:
+When no named `*_horizontal` helper fits, {py:func}`reduce_horizontal(fn, *exprs) <batcher.reduce_horizontal>` folds the columns left-to-right with your own binary combiner, and `fold_horizontal(acc, fn, *exprs)` does the same from an explicit seed. The combiner runs once at plan-build time on `Expr` operands, never on a row, so the fold still lowers to pure Rust:
 
 ```python
 cols = [bt.col("a"), bt.col("b"), bt.col("c")]
@@ -173,8 +144,7 @@ print(out.to_pydict())
 
 ## Membership, ranges, and casts
 
-Set membership, an inclusive range test, and a cast all read as methods on the column
-they apply to.
+Set membership, an inclusive range test, and a cast all read as methods on the column they apply to.
 
 ```python
 out = ds.select(
@@ -187,33 +157,24 @@ print(out.to_pydict())
 # {'name': ['Ann', 'bob', 'CARL'], 'in_set': [True, False, True], 'in_range': [False, True, True], 'qty_f': [1.0, 2.0, 3.0]}
 ```
 
-`.cast` takes an Arrow type name as a string (for example `"int64"`, `"float64"`,
-`"utf8"`).
+`.cast` takes a type name as a string, such as `"int64"`, `"float64"`, or `"utf8"`. {doc}`The type system <type-system>` lists every name it accepts.
 
 ## Math methods
 
-Numeric expressions carry a full set of math methods, including `.abs()`,
-`.round(digits)`, `.sqrt()`, `.pow(e)`, `.floor()`, `.ceil()`, `.ln()`,
-`.log10()`, `.log2()`, `.exp()`, the trig family (`.sin()`, `.cos()`, `.tan()`,
-{py:meth}`.asin() <batcher.plan.expr_ir.core.Expr.asin>`, {py:meth}`.acos() <batcher.plan.expr_ir.core.Expr.acos>`, {py:meth}`.atan() <batcher.plan.expr_ir.core.Expr.atan>`, {py:meth}`.sinh() <batcher.plan.expr_ir.core.Expr.sinh>`, {py:meth}`.cosh() <batcher.plan.expr_ir.core.Expr.cosh>`, {py:meth}`.tanh() <batcher.plan.expr_ir.core.Expr.tanh>`, {py:meth}`.cot() <batcher.plan.expr_ir.core.Expr.cot>`),
-`.sign()`, `.trunc()`, `.cbrt()`, `.degrees()`, and `.radians()`.
-{py:obj}`bt.atan2(y, x) <batcher.atan2>` is a top-level two-argument form.
+Numeric expressions carry a full set of math methods, including `.abs()`, `.round(digits)`, `.sqrt()`, `.floor()`, `.ceil()`, `.ln()`, `.log10()`, `.log2()`, `.exp()`, the trig family (`.sin()`, `.cos()`, `.tan()`, {py:meth}`.arcsin() <batcher.plan.expr_ir.core.Expr.arcsin>`, {py:meth}`.arccos() <batcher.plan.expr_ir.core.Expr.arccos>`, {py:meth}`.arctan() <batcher.plan.expr_ir.core.Expr.arctan>`, {py:meth}`.sinh() <batcher.plan.expr_ir.core.Expr.sinh>`, {py:meth}`.cosh() <batcher.plan.expr_ir.core.Expr.cosh>`, {py:meth}`.tanh() <batcher.plan.expr_ir.core.Expr.tanh>`, {py:meth}`.cot() <batcher.plan.expr_ir.core.Expr.cot>`), `.sign()`, `.trunc()`, `.cbrt()`, `.degrees()`, and `.radians()`. {py:obj}`bt.arctan2(y, x) <batcher.arctan2>` is a top-level two-argument form.
 
 ```python
 nums = bt.from_pydict({"x": [1.0, 4.0, 9.0]})
 out = nums.select(
     root=bt.col("x").sqrt(),
     third=(bt.col("x") / 3).round(2),
-    squared=bt.col("x").pow(2),
+    squared=(bt.col("x") ** 2),
 )
 print(out.to_pydict())
 # {'root': [1.0, 2.0, 3.0], 'third': [0.33, 1.33, 3.0], 'squared': [1.0, 16.0, 81.0]}
 ```
 
-A few math functions take two columns. {py:obj}`bt.gcd <batcher.gcd>` and
-{py:obj}`bt.lcm <batcher.lcm>` are integer number-theory helpers;
-{py:obj}`bt.hypot(a, b) <batcher.hypot>` is the Euclidean norm `sqrt(a^2 + b^2)`, a
-top-level two-argument form as `atan2` is.
+A few math functions take two columns. {py:obj}`bt.gcd <batcher.gcd>` and {py:obj}`bt.lcm <batcher.lcm>` are number-theory helpers that return integers, even from float columns as above. {py:obj}`bt.hypot(a, b) <batcher.hypot>` is the Euclidean norm `sqrt(a^2 + b^2)`, a top-level two-argument form as `atan2` is.
 
 ```python
 pairs = bt.from_pydict({"a": [12.0, 15.0], "b": [18.0, 20.0], "x": [3.0, 5.0], "y": [4.0, 12.0]})
@@ -223,14 +184,10 @@ out = pairs.select(
     dist=bt.hypot(bt.col("x"), bt.col("y")),
 )
 print(out.to_pydict())
-# {'g': [6.0, 5.0], 'l': [36.0, 60.0], 'dist': [5.0, 13.0]}
+# {'g': [6, 5], 'l': [36, 60], 'dist': [5.0, 13.0]}
 ```
 
-{py:obj}`bt.next_after(value, toward) <batcher.next_after>` is the two-argument
-function to reach for when a comparison has to be *strict* in floating point. It returns
-the adjacent representable double, one unit in the last place toward `toward`, which is
-something no addition can express: for a large `value` there is no constant small enough
-to change it and large enough to survive rounding.
+{py:obj}`bt.next_after(value, toward) <batcher.next_after>` is the two-argument function to reach for when a comparison has to be *strict* in floating point. It returns the adjacent representable double, one unit in the last place toward `toward`, which is something no addition can express. For a large `value` there is no constant small enough to change it and large enough to survive rounding.
 
 ```python
 edge = bt.from_pydict({"limit": [1.0, 1e16]})
@@ -242,13 +199,9 @@ print(out.to_pydict())
 # {'just_above': [1.0000000000000002, 1.0000000000000002e+16], 'naive': [1.000000000001, 1e+16]}
 ```
 
-The `naive` column is the point: adding a small constant moved the small limit too far
-and the large one not at all.
+The `naive` column is the point. Adding a small constant moved the small limit too far and the large one not at all.
 
-`hypot` measures a flat plane. For latitude and longitude,
-{py:obj}`bt.great_circle_distance(lat1, lon1, lat2, lon2, unit="km") <batcher.great_circle_distance>`
-measures the distance over the Earth's surface. It uses the haversine formula, which keeps
-its precision for nearby points, and that is the case a proximity filter cares about.
+`hypot` measures a flat plane. For latitude and longitude, {py:obj}`bt.great_circle_distance(lat1, lon1, lat2, lon2, unit="km") <batcher.great_circle_distance>` measures the distance over the Earth's surface. It uses the haversine formula, which keeps its precision for nearby points, and that is the case a proximity filter cares about.
 
 ```python
 trips = bt.from_pydict({"alat": [51.5074], "alon": [-0.1278], "blat": [48.8566], "blon": [2.3522]})
@@ -259,13 +212,9 @@ print(out.to_pydict())
 # {'km': [343.55653488088325]}
 ```
 
-The `unit` argument takes `"km"`, `"m"`, `"mi"` (statute miles), or `"nm"` (nautical
-miles).
+The `unit` argument takes `"km"`, `"m"`, `"mi"` for statute miles, or `"nm"` for nautical miles.
 
-{py:obj}`bt.width_bucket(value, low, high, count) <batcher.width_bucket>` assigns each
-value to one of `count` equal-width histogram buckets spanning `[low, high)`. The
-result is `1..count`, with `0` for values below the range and `count + 1` above it.
-Reach for it to bin a continuous column without a chain of `when`s.
+{py:obj}`bt.width_bucket(value, low, high, count) <batcher.width_bucket>` assigns each value to one of `count` equal-width histogram buckets spanning `[low, high)`. The result is `1..count`, with `0` for values below the range and `count + 1` above it. Reach for it to bin a continuous column without a chain of `when`s.
 
 ```python
 scores = bt.from_pydict({"score": [5.0, 55.0, 95.0, 120.0]})
@@ -297,9 +246,7 @@ print(nums.select(tau=bt.pi() * 2, e=bt.e()).limit(1).to_pydict())
 
 ## Aggregate expressions
 
-Aggregate methods such as `.sum()`, `.mean()`, `.min()`, `.max()`, `.median()`,
-`.std()`, `.var()`, `.quantile(q)`, `.count()`, and `.n_unique()` are used inside
-{py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>`. {py:obj}`bt.count() <batcher.count>` is the top-level `COUNT(*)`.
+Aggregate methods such as `.sum()`, `.mean()`, `.min()`, `.max()`, `.median()`, `.std()`, `.var()`, `.quantile(q)`, `.count()`, and `.count_distinct()` are used inside {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>`. {py:obj}`bt.count() <batcher.count>` is the top-level `COUNT(*)`.
 
 ```python
 out = ds.group_by().agg(
@@ -335,28 +282,12 @@ revenue.meta.tree_format()
 
 ## See also
 
-The rest of the expression language continues on two more pages:
-
-- {doc}`Expression accessors </user-guide/transform/columns/expression-accessors>`: the {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`,
-  {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, and {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>` namespaces, which hold the methods specific to one kind of
-  column.
-- {doc}`Expression recipes </user-guide/transform/columns/expression-recipes>`: porting from pandas or Polars, feature
-  engineering, and curating a text corpus.
-
-Then, for reference and for where expressions are used:
-
-- {doc}`Expressions API </api/relational/expressions>` and
-  {doc}`Expression accessors API </api/relational/expression-accessors>`: every `Expr` method and
-  every accessor method, enumerated.
-- {doc}`Aggregations </user-guide/analyze/aggregations>` and {doc}`Window functions </user-guide/analyze/window-functions>`: where
-  aggregate and windowed expressions are used.
+- {doc}`Expression accessors </user-guide/transform/columns/expression-accessors>`: the methods specific to one kind of column, under `.str`, `.dt`, `.list`, `.struct`, and `.json`.
+- {doc}`Expression recipes </user-guide/transform/columns/expression-recipes>`: porting from pandas or Polars, feature engineering, and curating a text corpus.
+- {doc}`The type system </user-guide/transform/columns/type-system>`: what `cast` accepts, and how nulls, NaN, and mixed types behave.
+- {doc}`Expressions API </api/relational/expressions>` and {doc}`Expression accessors API </api/relational/expression-accessors>`: every `Expr` method and every accessor method, enumerated.
+- {doc}`Aggregations </user-guide/analyze/aggregations>` and {doc}`Window functions </user-guide/analyze/window-functions>`: where aggregate and windowed expressions are used.
 - {doc}`SQL </user-guide/analyze/sql>`: the same column language, spelled as SQL.
-- {doc}`Transformations </user-guide/transform/rows/transformations>`: where expressions are applied to a Dataset.
-
-And for what happens to an expression after you write it:
-
-- {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: how a tree of `Expr`
-  nodes becomes vectorized work over an Arrow batch.
-- {doc}`JIT compilation </architecture/deep-dives/query/jit-compilation>`: when the Cranelift tier compiles an
-  arithmetic chain, and why it silently falls back rather than diverging.
-- {doc}`/cookbook/expressions/index`: 39 runnable recipes for the expression API.
+- {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: how a tree of `Expr` nodes becomes vectorized work over an Arrow batch.
+- {doc}`JIT compilation </architecture/deep-dives/query/jit-compilation>`: when the Cranelift tier compiles an arithmetic chain, and why it falls back rather than diverging.
+- {doc}`/cookbook/expressions/index`: runnable recipes for the expression API.

@@ -1,7 +1,6 @@
 # Aggregates and rankings
 
-These recipes are the shapes most analytical queries actually are: group, join, window, and
-rank. Start from the worked query if you want the whole shape in one page.
+These recipes are the shapes most analytical queries actually are: group, join, window, and rank. Start from the worked query if you want the whole shape in one page.
 
 | Recipe | The question |
 |---|---|

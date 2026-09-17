@@ -1,32 +1,28 @@
 # Data engineer learning path
 
-This path is for building and running data pipelines: read a source, reshape it, join it
-against another, aggregate, write the result. The pipeline stays lazy until a terminal
-operation, and all per-row work runs in Rust.
+This path is for building and running data pipelines: read a source, reshape it, join it against another, aggregate, write the result. The pipeline stays lazy until a terminal operation, and all per-row work runs in Rust.
 
 ## Reading order
 
 1. {doc}`Getting started </getting-started/index>`: install and run a first query.
 1. {doc}`Your first pipeline </getting-started/tutorials/foundations/first-pipeline>`: the end-to-end flow.
 1. {doc}`Reading data </user-guide/moving-data/reading-data>`: sources and file formats.
-1. {doc}`Transformations </user-guide/transform/rows/transformations>`: `select`, `with_columns`,
-   `filter`, `sort`.
+1. {doc}`Transformations </user-guide/transform/rows/transformations>`: `select`, `with_columns`, `filter`, `sort`.
 1. {doc}`Filtering </user-guide/transform/rows/filtering>`: predicate expressions.
 1. {doc}`Aggregations </user-guide/analyze/aggregations>`: `group_by` and `.agg`.
 1. {doc}`Joins </user-guide/analyze/joins>`: join kinds and keys.
-1. {doc}`Window functions </user-guide/analyze/window-functions>`: ranking and rolling
-   aggregates.
+1. {doc}`Window functions </user-guide/analyze/window-functions>`: ranking and rolling aggregates.
 1. {doc}`Writing data </user-guide/moving-data/writing-data>`: output formats and partitioning.
 1. {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: Delta read/write/merge and SCD.
-1. {doc}`Data quality </user-guide/trust/data-quality>`: validate against a contract and
-   quarantine what fails it.
+1. {doc}`Data quality </user-guide/trust/data-quality>`: validate against a contract and quarantine what fails it.
 1. {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: object-store paths.
 1. {doc}`Performance and memory </user-guide/operate/tuning/performance>`: caching and spill.
-1. {doc}`Best practices </user-guide/operate/tuning/best-practices>` and
-   {doc}`troubleshooting </user-guide/operate/running/troubleshooting>`.
+1. {doc}`Best practices </user-guide/operate/tuning/best-practices>` and {doc}`troubleshooting </user-guide/operate/running/troubleshooting>`.
 1. {doc}`Dataset API reference </api/relational/dataset>`.
 
 ## Example: transform and aggregate
+
+Revenue per region, largest first:
 
 ```python
 import batcher as bt
@@ -51,6 +47,8 @@ print(revenue.to_pydict())
 
 ## Example: join a dimension table
 
+A fact table picks up a label from a two-row dimension:
+
 ```python
 facts = bt.from_pydict({"region": ["west", "east", "west"], "amount": [1, 2, 3]})
 dim = bt.from_pydict({"region": ["west", "east"], "label": ["W", "E"]})
@@ -70,10 +68,9 @@ These scripts build their own data and run directly with `python examples/<name>
 - `timeseries.py` and `window_functions.py` show time buckets and rolling aggregates.
 - `spill.py` runs out-of-core under a bounded budget.
 
-## Recipes for the problems you will actually hit
+## Recipes for the problems you'll hit
 
-The {doc}`data-engineering cookbook </cookbook/data-engineering/index>` is the applied half
-of this path. Each recipe opens on the failure and shows the code that avoids it.
+The {doc}`data-engineering cookbook </cookbook/data-engineering/index>` is the applied half of this path. Each recipe opens on the failure and shows the code that avoids it.
 
 ::::{grid} 1 2 2 2
 :gutter: 3

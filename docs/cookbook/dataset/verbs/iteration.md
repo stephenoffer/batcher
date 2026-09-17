@@ -1,6 +1,8 @@
 # Getting results out
 
-Prefer `iter_batches`. It streams and stays columnar, so a result far larger than memory still comes back in bounded memory. `iter_rows` streams too, and per-row Python at the *end* of a pipeline is fine. Inside the query it is not, and that work belongs in an expression or a `map_batches`. `to_pylist` materializes the whole result, so reach for it only when you already know the size.
+Every pipeline ends by handing results to something that isn't the engine, and how you do that decides whether the result has to fit in memory. Prefer `iter_batches`. It streams Arrow batches, so a result far larger than memory comes back in bounded memory. `iter_rows` streams too, and per-row Python at the *end* of a pipeline is fine. Inside the query it is not: that work belongs in an expression or a `map_batches`.
+
+The script walks the exits from cheapest to most expensive: batches and slices, row tuples, `limit`/`tail` for a peek, `first`, `last` and `item` for single values, `top_k` instead of a full sort, and `to_pylist` for a result you already know is small. It closes by showing that a Python loop over `iter_rows` and a native `sum` agree, and only one of them stays in Rust.
 
 The whole script, executed on every test run:
 

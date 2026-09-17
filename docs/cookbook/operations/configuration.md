@@ -1,6 +1,8 @@
 # Configuration
 
-Configuration here is a value you pass. Nothing global mutates, so there is nothing to remember to undo. Reach for `option_context` when one step needs a different setting and `config_context` when a whole block does. Both restore the previous value on the way out, so a memory-tight step cannot leak its settings into the rest of the program. `set_option` is the global escape hatch, and it needs a matching `reset_option`.
+Configuration in Batcher is a value you pass. Reach for `option_context` when one step needs a different setting and `config_context` when a whole block does. Both restore the previous value on the way out, so a memory-tight step cannot leak its settings into the rest of the program.
+
+The script lists and reads options, scopes an override, and builds a variant of the whole configuration with `active_config().replace(...)`. `set_option` is the global escape hatch, and it needs a matching `reset_option`.
 
 The whole script, executed on every test run:
 

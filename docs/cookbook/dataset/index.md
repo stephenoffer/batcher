@@ -1,8 +1,10 @@
 # Dataset cookbook
 
-This section holds 14 runnable recipes for the {py:class}`Dataset <batcher.Dataset>` verbs, grouped by what you are doing to the table.
+A {py:class}`Dataset <batcher.Dataset>` is a lazy plan, and its verbs are how you build one: join it, group it, reshape it, clean it, and ask it questions. These 14 recipes cover those verbs, grouped by what you are doing to the table, and each one is a complete script you can copy and run.
 
-Every page embeds a complete, self-contained script from the [`examples/dataset/`](https://github.com/stephenoffer/batcher/tree/main/examples/dataset) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every page embeds a script from the [`examples/dataset/`](https://github.com/stephenoffer/batcher/tree/main/examples/dataset) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a recipe that stops matching the engine fails the suite instead of drifting.
+
+If you are new to Batcher, start with {doc}`joins </cookbook/dataset/verbs/joins>` and {doc}`grouping </cookbook/dataset/verbs/grouping>`. If someone has just handed you a table, start with {doc}`profiling </cookbook/dataset/inspecting/profiling>`.
 
 | Group | Recipes | Covers |
 |---|---|---|

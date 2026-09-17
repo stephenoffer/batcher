@@ -1,14 +1,10 @@
 # Retention curves
 
-Of the people who signed up on Monday, how many came back on day 1? Day 7? Day 30? A
-retention curve is a fraction, and every way of getting it wrong is a way of getting the
-numerator and the denominator out of alignment. The tell is a retention rate above 100%,
-which is common enough that most analysts have shipped one.
+Of the people who signed up on Monday, how many came back on day 1? Day 7? Day 30? A retention curve is a fraction, and every way of getting it wrong is a way of getting the numerator and the denominator out of alignment. The tell is a retention rate above 100%, which is common enough that most analysts have shipped one.
 
 ## The data
 
-Ten activity rows, four users. `u1` signs up on May 1st and is active twice that day, which is
-the detail that breaks the naive query.
+Ten activity rows, four users. `u1` signs up on May 1st and is active twice that day, which is the detail that breaks the naive query.
 
 ```python
 import datetime as dt
@@ -33,13 +29,9 @@ print(activity.count())
 
 ## Cohort and day number
 
-Same skeleton as {doc}`cohort analysis </cookbook/analytics/behavior/cohort-analysis>`, in days rather than months. The
-cohort is the user's first active day, and `day_n` is days since then.
+Same skeleton as {doc}`cohort analysis </cookbook/analytics/behavior/cohort-analysis>`, in days rather than months. The cohort is the user's first active day, and `day_n` is days since then.
 
-Dates do not subtract and window aggregates do not reduce a `Date32`, so convert to an
-integer day number once, up front. `dt.epoch()` gives seconds, so divide by 86,400 and cast.
-The string form of the date goes along for the ride as a readable cohort label. `min` over a
-string is well defined, and ISO dates sort correctly as text.
+Dates do not subtract and window aggregates do not reduce a `Date32`, so convert to an integer day number once, up front. `dt.epoch()` gives seconds, so divide by 86,400 and cast. The string form of the date goes along for the ride as a readable cohort label. `min` over a string is well defined, and ISO dates sort correctly as text.
 
 ```python
 SECONDS_PER_DAY = 86_400
@@ -65,9 +57,7 @@ print(labelled.sort("user", "day").select("user", "cohort", "day_n").to_pydict()
 ## The trap
 
 :::{warning}
-`COUNT(*)` counts events. Retention is about *people*. Those are the same number only when
-every user appears exactly once per day, which is true in test fixtures and never true in
-production.
+`COUNT(*)` counts events. Retention is about *people*. Those are the same number only when every user appears exactly once per day, which is true in test fixtures and never true in production.
 :::
 
 Count the rows in each cell:
@@ -79,10 +69,9 @@ print(naive.to_pydict())
 #  'day_n': [0, 1, 7, 0, 7], 'active': [4, 2, 2, 1, 1]}
 ```
 
-Four "active users" on day 0 of the May 1st cohort. There are three. `u1` logged in twice
-and got counted twice, so day-0 retention comes out as 4/3 = 133%.
+Four "active users" on day 0 of the May 1st cohort. There are three. `u1` logged in twice and got counted twice, so day-0 retention comes out as 4/3 = 133%.
 
-| Cohort, day | {py:func}`bt.count() <batcher.count>` rows | `n_unique()` people |
+| Cohort, day | {py:func}`bt.count() <batcher.count>` rows | `count_distinct()` people |
 | --- | --- | --- |
 | 2024-05-01, day 0 | 4 | 3 |
 | 2024-05-01, day 1 | 2 | 2 |
@@ -90,23 +79,18 @@ and got counted twice, so day-0 retention comes out as 4/3 = 133%.
 | 2024-05-02, day 0 | 1 | 1 |
 | 2024-05-02, day 7 | 1 | 1 |
 
-One cell differs, and it is the denominator cell. That is enough to put the whole curve
-above 100%.
+One cell differs, and it is the denominator cell. That is enough to put the whole curve above 100%.
 
 ## Count people
 
-`n_unique` on the user column, and the denominator taken from `day_n == 0`: the cohort's own
-size, not the total number of active users, not the size of the largest cohort. The SQL tab
-keys the cohort on the raw day number rather than a formatted date, because an integer is a
-cheaper shuffle key than a string and nothing downstream cares what it looks like until you
-render it.
+`count_distinct` on the user column, and the denominator taken from `day_n == 0`: the cohort's own size, not the total number of active users, not the size of the largest cohort. The SQL tab keys the cohort on the raw day number rather than a formatted date, because an integer is a cheaper shuffle key than a string and nothing downstream cares what it looks like until you render it.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
 ```python
-cells = labelled.group_by("cohort", "day_n").agg(active=col("user").n_unique())
+cells = labelled.group_by("cohort", "day_n").agg(active=col("user").count_distinct())
 sizes = (
-    labelled.filter(col("day_n") == 0).group_by("cohort").agg(cohort_size=col("user").n_unique())
+    labelled.filter(col("day_n") == 0).group_by("cohort").agg(cohort_size=col("user").count_distinct())
 )
 
 curve = (
@@ -161,8 +145,7 @@ print(sql_curve.to_pydict()["retention"])
 ::::
 
 :::{tip}
-Day 0 is 100% by construction, which is the sanity check. If it is not exactly 1.0, your
-cohort definition and your denominator disagree and everything downstream is wrong.
+Day 0 is 100% by construction, which is the sanity check. If it is not exactly 1.0, your cohort definition and your denominator disagree and everything downstream is wrong.
 :::
 
 ## Read the curve as a curve
@@ -179,31 +162,18 @@ print(grid.to_pydict())
 Two things to notice, and neither is a bug.
 
 :::{important}
-The nulls are not zeros. The May 2nd cohort has no day-1 number because none of its users
-were active on day 1, and here that genuinely means zero. But if the cohort were three days
-old and you asked for day 7, the null would mean *not yet observable*, and filling it with 0
-would drag your average retention curve downwards for no reason at all. Right-censoring is
-the technical name, and forgetting about it is the most common way retention charts lie.
+The nulls are not zeros. The May 2nd cohort has no day-1 number because none of its users were active on day 1, and here that genuinely means zero. But if the cohort were three days old and you asked for day 7, the null would mean *not yet observable*, and filling it with 0 would drag your average retention curve downwards for no reason at all. Right-censoring is the technical name, and forgetting about it is the most common way retention charts lie.
 :::
 
-The curve is also not monotonic. The May 1st cohort holds 66.7% at both day 1 and day 7,
-because users come back after a gap. Day-N retention measures activity *on that exact day*, so
-it bounces. If you want a curve that only falls, you want rolling retention instead (active on
-day N *or later*), which is what "N-day retention" means at some companies and not at others.
-Say which one you are reporting. The two can differ by a factor of two on the same data.
+The curve is also not monotonic. The May 1st cohort holds 66.7% at both day 1 and day 7, because users come back after a gap. Day-N retention measures activity *on that exact day*, so it bounces. If you want a curve that only falls, you want rolling retention instead (active on day N *or later*), which is what "N-day retention" means at some companies and not at others. Say which one you are reporting. The two can differ by a factor of two on the same data.
 
 :::{dropdown} Scaling notes: swapping the exact distinct count for a sketch
-`n_unique` is an exact distinct count, which means it holds every distinct user id per cell
-in memory. On a cohort table with hundreds of millions of users that is the step that hurts.
-`approx_n_unique` swaps it for a HyperLogLog sketch. Sixteen kilobytes per group at the
-default precision, ~0.8% relative error, and it merges by register-wise max, so the answer
-is identical single-node and distributed. On a retention *curve* that is well inside the
-noise you already have.
+`count_distinct` is an exact distinct count, which means it holds every distinct user id per cell in memory. On a cohort table with hundreds of millions of users that is the step that hurts. `approx_count_distinct` swaps it for a HyperLogLog sketch. Sixteen kilobytes per group at the default precision, ~0.8% relative error, and it merges by register-wise max, so the answer is identical single-node and distributed. On a retention *curve* that is well inside the noise you already have.
 
 ```python
 approx = (
     labelled.group_by("cohort", "day_n")
-    .agg(active=col("user").approx_n_unique())
+    .agg(active=col("user").approx_count_distinct())
     .sort("cohort", "day_n")
 )
 print(approx.to_pydict()["active"])
@@ -214,11 +184,9 @@ print(approx.to_pydict()["active"])
 ## See also
 
 - {doc}`Cohort analysis </cookbook/analytics/behavior/cohort-analysis>`: the same skeleton, measured in months and revenue.
-- {doc}`A/B testing </cookbook/analytics/inference/ab-testing>`: the other page where the denominator has to come from the
-  assignment rather than from the behavior.
-- {doc}`Aggregations </user-guide/analyze/aggregations>`: `n_unique` and its sketch-backed twin.
+- {doc}`A/B testing </cookbook/analytics/inference/ab-testing>`: the other page where the denominator has to come from the assignment rather than from the behavior.
+- {doc}`Aggregations </user-guide/analyze/aggregations>`: `count_distinct` and its sketch-backed twin.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: `min().over(...)` and the rest.
 - {doc}`Pivoting </user-guide/analyze/pivoting>`: laying the days out across the top.
-- {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: why the HyperLogLog
-  sketch merges in bounded memory and the exact count carries every value it saw.
+- {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: why the HyperLogLog sketch merges in bounded memory and the exact count carries every value it saw.
 - {doc}`Dataset API </api/relational/dataset>`: `group_by`, `join`, `pivot`.

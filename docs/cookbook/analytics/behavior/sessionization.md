@@ -1,14 +1,10 @@
 # Sessionization
 
-A click stream is a flat list of events. A *session* is a burst of them: everything a
-user did before they went away for a while. There is no session column in the data. You have
-to derive it, and the derivation is where people go wrong.
+A click stream is a flat list of events. A *session* is a burst of them: everything a user did before they went away for a while. There is no session column in the data. You have to derive it, and the derivation is where people go wrong.
 
 ## The data
 
-Eight page views, two users. `u1` browses for five minutes, disappears for forty, and
-comes back. `u2` visits once, then again ninety minutes later. With a 30-minute
-inactivity gap that is four sessions.
+Eight page views, two users. `u1` browses for five minutes, disappears for forty, and comes back. `u2` visits once, then again ninety minutes later. With a 30-minute inactivity gap that is four sessions.
 
 ```python
 import datetime as dt
@@ -37,13 +33,10 @@ print(events.count())
 ## The trap
 
 :::{warning}
-"Session = user + calendar day" merges every visit a user made that day and splits anyone
-still browsing at midnight. It undercounts sessions and overstates depth, and the error
-does not average out.
+"Session = user + calendar day" merges every visit a user made that day and splits anyone still browsing at midnight. It undercounts sessions and overstates depth, and the error does not average out.
 :::
 
-It is the shortcut everyone reaches for, because it is one `GROUP BY` and it needs no
-window function:
+It is the shortcut everyone reaches for, because it is one `GROUP BY` and it needs no window function:
 
 ```python
 by_day = events.group_by("user", day=col("ts").dt.truncate("day")).agg(hits=bt.count()).sort("user")
@@ -52,10 +45,7 @@ print(by_day.to_pydict())
 #  datetime.datetime(2024, 1, 1, 0, 0)], 'hits': [5, 3]}
 ```
 
-Two sessions, not four. Every one of `u1`'s two visits got merged, and the forty-minute
-gap in the middle vanished. Sessions per user, pages per session, session length: all wrong.
-In the other direction, a user still browsing at 23:58 gets *split* at midnight, so the
-same bug both merges and splits depending on the clock.
+Two sessions, not four. Every one of `u1`'s two visits got merged, and the forty-minute gap in the middle vanished. Sessions per user, pages per session, session length: all wrong. In the other direction, a user still browsing at 23:58 gets *split* at midnight, so the same bug both merges and splits depending on the clock.
 
 Against the gap-based answer built below:
 
@@ -65,16 +55,13 @@ Against the gap-based answer built below:
 | `u1` | one session, 5 pages | two sessions, 3 pages and 2 pages |
 | `u2` | one session, 3 pages | two sessions, 1 page and 2 pages |
 
-The other classic wrong answer is a self-join to find each event's predecessor
-(`e2.ts < e1.ts` and no event between them). It is correct and it is quadratic in the
-number of events per user. Do not.
+The other classic wrong answer is a self-join to find each event's predecessor (`e2.ts < e1.ts` and no event between them). It is correct and it is quadratic in the number of events per user. Do not.
 
 ## Gap, flag, cumulative sum
 
 Three steps, three window expressions, one shuffle on `user`.
 
-First, the gap to the previous event. `lag` over the user's events in time order. Timestamps
-do not subtract, so work in epoch seconds.
+First, the gap to the previous event. `lag` over the user's events in time order. Timestamps do not subtract, so work in epoch seconds.
 
 ```python
 gaps = events.with_columns(
@@ -87,12 +74,10 @@ print(gaps.sort("user", "ts").to_pydict()["gap_s"])
 
 The nulls are the first event of each user, which has no predecessor.
 
-Second, flag the session boundaries. An event starts a session if there is nothing before it,
-or if the gap exceeds the threshold.
+Second, flag the session boundaries. An event starts a session if there is nothing before it, or if the gap exceeds the threshold.
 
 :::{important}
-That first {py:meth}`is_null() <batcher.plan.expr_ir.core.Expr.is_null>` check is not a defensive nicety. Drop it and every user's first
-event silently falls into session 0.
+That first {py:meth}`is_null() <batcher.plan.expr_ir.core.Expr.is_null>` check is not a defensive nicety. Drop it and every user's first event silently falls into session 0.
 :::
 
 ```python
@@ -105,9 +90,7 @@ print(flagged.sort("user", "ts").to_pydict()["is_new"])
 # [1, 0, 0, 1, 0, 1, 1, 0]
 ```
 
-Third, number the sessions. A running sum of the flag, in time order, within the user. Each
-boundary bumps the counter, and everything between keeps the number. The SQL tab writes out all
-three steps as CTEs, one window function per projection, and lands on the same plan.
+Third, number the sessions. A running sum of the flag, in time order, within the user. Each boundary bumps the counter, and everything between keeps the number. The SQL tab writes out all three steps as CTEs, one window function per projection, and lands on the same plan.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -153,18 +136,14 @@ print(sql_sessions.to_pydict()["session"])
 ::::
 
 :::{note}
-Each window function gets its own projection in the SQL, and the arithmetic happens in the
-next CTE. That is not a Batcher quirk so much as good hygiene, and it is also how the plan
-looks internally either way.
+Each window function gets its own projection in the SQL, and the arithmetic happens in the next CTE. That is not a Batcher quirk so much as good hygiene, and it is also how the plan looks internally either way.
 :::
 
 `(user, session)` is now a key you can group on as you would any other.
 
 ## Session-level metrics
 
-An aggregate is not a scalar expression, so `col("t").max() - col("t").min()` will not
-type-check inside `agg`. Emit the two aggregates, then subtract them in the projection
-that follows, which is what SQL does with `MAX(t) - MIN(t)` anyway.
+An aggregate is not a scalar expression, so `col("t").max() - col("t").min()` will not type-check inside `agg`. Emit the two aggregates, then subtract them in the projection that follows, which is what SQL does with `MAX(t) - MIN(t)` anyway.
 
 ```python
 summary = (
@@ -172,7 +151,7 @@ summary = (
     .group_by("user", "session")
     .agg(
         pages=bt.count(),
-        distinct_pages=col("page").n_unique(),
+        distinct_pages=col("page").count_distinct(),
         started=col("t").min(),
         ended=col("t").max(),
     )
@@ -184,16 +163,12 @@ print(summary.select("user", "session", "pages", "duration_s").to_pydict())
 #  'duration_s': [300, 120, 0, 120]}
 ```
 
-Four sessions, and `u2`'s first one has a duration of zero: a single-page visit. Those are
-real and you should not filter them out only because they look like noise. A bounce rate is
-exactly the fraction of sessions with `pages == 1`.
+Four sessions, and `u2`'s first one has a duration of zero: a single-page visit. Those are real and you should not filter them out only because they look like noise. A bounce rate is exactly the fraction of sessions with `pages == 1`.
 
 ## The shortcut
 
 :::{tip}
-If all you want is the per-session aggregate and not the session id on every row,
-{py:meth}`session_window <batcher.Dataset.session_window>` does the whole thing in one call. It composes the same window and
-group-by operators, so the result is identical.
+If all you want is the per-session aggregate and not the session id on every row, {py:meth}`session_window <batcher.Dataset.session_window>` does the whole thing in one call. It composes the same window and group-by operators, so the result is identical.
 :::
 
 ```python
@@ -202,26 +177,17 @@ print(windowed.sort("user", "session_start").to_pydict()["pages"])
 # [3, 2, 1, 2]
 ```
 
-Reach for the three-step version when you need the session id attached to each event: to join
-sessions to conversions, say, or to look at within-session page sequences.
+Reach for the three-step version when you need the session id attached to each event: to join sessions to conversions, say, or to look at within-session page sequences.
 
 :::{dropdown} Picking the gap: why 30 minutes is arbitrary
-Thirty minutes is the web-analytics convention and it is arbitrary. Look at the
-distribution of `gap_s` before you commit: the inter-event gaps within a visit and the
-gaps between visits are usually two separate humps, and the threshold belongs in the
-valley between them. `col("gap_s").quantile(0.95)` on your own data is a better argument
-than "everyone uses 30".
+Thirty minutes is the web-analytics convention and it is arbitrary. Look at the distribution of `gap_s` before you commit: the inter-event gaps within a visit and the gaps between visits are usually two separate humps, and the threshold belongs in the valley between them. `col("gap_s").quantile(0.95)` on your own data is a better argument than "everyone uses 30".
 :::
 
 ## See also
 
-- {doc}`Funnel analysis </cookbook/analytics/behavior/funnel-analysis>`: scope a funnel to one session by grouping on
-  `(user, session)` instead of `user`.
-- {doc}`Time-series rollups </cookbook/analytics/aggregates/time-series-rollups>`: the other side of the clock, where the
-  bucket is fixed and the gaps are the problem.
+- {doc}`Funnel analysis </cookbook/analytics/behavior/funnel-analysis>`: scope a funnel to one session by grouping on `(user, session)` instead of `user`.
+- {doc}`Time-series rollups </cookbook/analytics/aggregates/time-series-rollups>`: the other side of the clock, where the bucket is fixed and the gaps are the problem.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: `lag`, frames, and `cum_sum`.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: the same sessions computed incrementally,
-  with a watermark bounding how long a session stays open.
-- {doc}`Window internals </architecture/deep-dives/operators/window-internals>`: the partition-sort-scan the
-  three window expressions above share.
+- {doc}`Streaming </user-guide/moving-data/streaming>`: the same sessions computed incrementally, with a watermark bounding how long a session stays open.
+- {doc}`Window internals </architecture/deep-dives/operators/window-internals>`: the partition-sort-scan the three window expressions above share.
 - {doc}`Expressions API </api/relational/expressions>`: `lag`, `cum_sum`, `dt.epoch`.

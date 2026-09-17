@@ -1,6 +1,8 @@
 # String hashing
 
-Hashes give you a fixed-width key from arbitrary text, which is how you bucket, partition, or pseudonymize without a lookup table. Encodings move bytes through channels that only accept text. Neither is encryption: a hash is one-way, base64 is not secret at all.
+A hash gives you a fixed-width key from arbitrary text, which is how you bucket, partition, or pseudonymize without a lookup table. An encoding moves bytes through a channel that only accepts text. Neither is encryption: a hash is one-way, and base64 is not secret at all.
+
+The script hashes an email column with `hash64`, `xxhash64`, `crc32`, `md5`, `sha1`, and `sha256`, shows that a digest is deterministic, and derives a stable shard number from the key. It round-trips values through base64, hex, and URL encoding. It also shows byte length and character length diverging once the text leaves ASCII.
 
 The whole script, executed on every test run:
 

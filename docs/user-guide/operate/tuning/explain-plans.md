@@ -1,11 +1,8 @@
 # Reading query plans
 
-When a query is slow, the first question is not "which operator is slow". It is "which
-plan did I actually get". A predicate that failed to push below a join, a build side
-chosen the wrong way round, a cardinality estimate off by 100x: all of them look
-identical from the outside, and all of them are visible in one line of output.
-`explain()` shows the plan the optimizer built. `explain(analyze=True)` runs it and
-shows what really happened.
+This page shows how to read the plans Batcher prints: `explain()` for the plan the optimizer built, `explain(analyze=True)` for what really happened when it ran, `stats()` for the same measurements as an object, and `format="json"` for tooling.
+
+When a query is slow, ask which plan you got before asking which operator is slow. A predicate that failed to push below a join, a build side chosen the wrong way round, a cardinality estimate off by 100x: all of them look identical from the outside, and each one is visible in a single line of output.
 
 ## Setup
 
@@ -56,31 +53,31 @@ decisions:
 
 Read it inside out: the leaves run first, and the spine shows what feeds what. A `├─`
 means the operator above it has another input below; a `└─` means this is the last one.
-On a join that is the whole question, so it is drawn rather than left to be counted out of
-an indent. Five things to look at.
+On a join that's the whole question, so the tree draws it rather than leaving you to count
+indents. Look at five things.
 
-The **bracketed description** after each operator says what *that* operator does: the join
+The *bracketed description* after each operator says what *that* operator does: the join
 type and its keys, the group keys and aggregates, the sort keys, the predicate, the source.
 Without it a plan with four joins prints four identical `hash_join` lines, and "which join
 is this one" is the first question anyone asks of a join tree.
 
-The **tree shape** is the optimized plan, not the one you typed. `filter` sits directly
+The *tree shape* is the optimized plan, not the one you typed. `filter` sits directly
 above the `orders` scan, below the join, so the predicate was pushed down. If you write a
 filter after a join and it does *not* appear below the join here, something blocked the
 pushdown (a UDF the optimizer cannot see through is the usual culprit), and you are
 joining rows you are about to throw away.
 
-The **estimate and its provenance** are the `est≈N (source)` column. `exact` means the
+The *estimate and its provenance* are the `est≈N (source)` column. `exact` means the
 row count came from real metadata: a file footer, or an in-memory table. `default` means
 the optimizer had nothing and used a heuristic. A plan full of `(default)` is a plan
 making decisions in the dark.
 
-The **pushed filter** is the `pushed[...]` note on a scan: the predicate the plan handed
+The *pushed filter* is the `pushed[...]` note on a scan: the predicate the plan handed
 that source to apply for itself, rather than reading the rows and filtering them after.
 A scan with no note received nothing. See {doc}`pushdown` for which predicate shapes each
 source can take.
 
-The **decisions** block is the optimizer narrating itself. Here Kyber compared the two
+The `decisions` block is the optimizer narrating itself. Here Kyber compared the two
 sides, found the filtered orders side smaller, and swapped the build side of the hash
 join so the smaller relation builds the table. That is the single most consequential
 join decision, and this is where you check it.
@@ -163,6 +160,10 @@ decisions:
 ```
 :::
 
+The figure takes the `aggregate` line from that output apart, column by column:
+
+![One operator line from explain(analyze=True), split into its columns and annotated. The OPERATOR column holds the optimized plan tree, with a play marker for the critical path and a bracket saying what the operator does. The ESTIMATE, ACTUAL and MISS columns, est≈2, actual=2 and exact, are read together: est≈ is the row count Kyber planned for, actual= is the row count that arrived, and MISS says how far and which way the estimate missed. TIME is the operator's wall time and OP SHARE ranks it against all operator time. NOTES carries conditional clauses such as interp or jit, broadcast, spill and pushed, each only when it applies. A lower panel reads the MISS column: exact means the estimate matched, 10.0x over means the plan expected ten times the rows that arrived, and 100.0x under means the plan expected 100 rows and got 10,000, which is fixed upstream in the statistics rather than in the join.](/_static/diagrams/explain_line_anatomy.svg)
+
 Every field on an operator line, and what it is telling you:
 
 | Column | Reads as | What it means |
@@ -171,14 +172,14 @@ Every field on an operator line, and what it is telling you:
 | `OPERATOR` | a tree, then `[detail]` | the optimized plan. The spine says what feeds what; a `└─` is a last input. The bracket says what the operator does: join type and keys, group keys and aggregates, sort keys, predicate. |
 | `ESTIMATE` | `est≈N` | the rows Kyber planned for, with its provenance in `NOTES` when the plan was not run. |
 | `ACTUAL` | `actual=N` | the rows the operator really produced. |
-| `MISS` | `exact`, `3.4x over`, `5000.0x under` | how far the estimate missed, and **which way**. `over` means the plan expected more rows than arrived. An estimate below one row is compared against one row rather than against itself: a row count is a count, so a selectivity that underflowed down a chain of predicates has no usable denominator, and dividing by it printed fifteen digits of an artifact. A genuine miss, however large, is still reported in full. |
-| `TIME` | `268µs`, `54ms`, `1m03s` | wall time in the operator. Sub-millisecond work is reported in microseconds rather than rounded to `0.0ms`, which used to make the fastest steps look unmeasured. |
+| `MISS` | `exact`, `3.4x over`, `5000.0x under` | how far the estimate missed, and which way. `over` means the plan expected more rows than arrived. An estimate below one row is compared against one row, so an underflowed selectivity doesn't print a meaningless ratio. |
+| `TIME` | `268µs`, `54ms`, `1m03s` | wall time in the operator, in microseconds when it's under a millisecond. |
 | `OP SHARE` | a bar and a percentage | the operator's share of **total operator time**, so the column ranks operators against each other. The wall clock's own division is the `where the time went` block. |
 | `NOTES` | conditional clauses | strategy (`broadcast`), backend (`interp` / `jit`), `spill 2.0 GiB`, `rss+…`, `pushed[…]`, `PAGING(…)`, `contended(…)`. Each appears only when it has something to say. |
 
 Below the table:
 
-`where the time went` splits the wall clock between the operators and everything else —
+`where the time went` splits the wall clock between the operators and everything else:
 planning, optimization, admission, the crossing into the Rust engine, and assembling the
 Arrow result. On a small query that remainder is usually most of it, and it is the number
 worth acting on. On a large one it should be a rounding error; if it is not, the plan is
@@ -192,11 +193,11 @@ the run against core saturation and, when a budget is known, peak memory against
 by 4x or more, an operator that spilled, or one the machine was paging against. Each entry
 says what happened and what to do about it.
 
-The estimation error is the one to read first. A `(0.01x)` on a join input means the
-optimizer planned for 100 rows and got 10,000, and the fix for that is upstream (stale
-statistics, a predicate on a column with no stats) rather than in the join. A `jit` that
-says `interp` is correct, just slower than it could be: the compiler hit an expression or
-a type it does not support and handed the batch back to the interpreter.
+Read the estimation error first. A `100.0x under` on a join input means the optimizer planned
+for 100 rows and got 10,000. The fix is upstream, in stale statistics or a predicate on a
+column with no stats, rather than in the join. An expression running as `interp` where you
+expected `jit` is correct, only slower: the compiler met an expression or a type it doesn't
+support and handed the batch back to the interpreter.
 
 :::{warning}
 On real data these numbers are wall-clock, so they move between runs. Compare shapes and
@@ -205,9 +206,9 @@ ratios, not milliseconds, and never gate a test on one of these timings.
 
 ## Large plans
 
-A generated plan — a `_sql` query over a wide star schema, a union of eighty partitions, a
-pipeline built by a loop — routinely runs to hundreds of operators. Printing all of them
-costs the reader the thing they came for, so past roughly two dozen operators
+A generated plan, such as a SQL query over a wide star schema, a union of eighty partitions, or a
+pipeline built by a loop, routinely runs to hundreds of operators. Printing all of them
+costs the reader the thing they came for, so past 24 operators
 `explain(analyze=True)` changes shape in three ways.
 
 It names the hot operators first, before the tree:
@@ -223,8 +224,8 @@ hot operators (top 5 of 143 measured)
 
 It marks the critical path with `▶`: the chain from the root that descends, at every
 branch, into whichever side holds the most time beneath it. On a deep join tree that is the
-answer to "which side is costing me", and no per-operator column can give it — both sides
-look individually modest while one of them carries the run.
+answer to "which side is costing me", and no per-operator column can give it. Both sides
+can look modest on their own while one of them carries the run.
 
 And it folds subtrees that cannot contain the answer:
 
@@ -234,17 +235,15 @@ And it folds subtrees that cannot contain the answer:
   17 operators folded: subtrees under 1% of operator time. explain(format="json") lists every one.
 ```
 
-Indentation stops growing past ten levels, and a `⋯` in place of the outermost ancestor
-bars says where it stopped. A long pipeline of chained `with_columns` and `filter` calls is
-a *deep* plan rather than a wide one, and the spine costs three columns per level: left
-unbounded it consumed the whole operator column, so the part of each row that survived
-truncation was the indentation and the part discarded was the operator's name. The nearest
-ancestors are the ones kept, because those are the branches a reader is still resolving.
+Indentation also stops growing past ten levels, and a `⋯` in place of the outermost ancestor
+bars marks where. A long chain of `with_columns` and `filter` calls is a *deep* plan, and
+without the cap its indentation would crowd out the operator names. The nearest ancestors are
+the ones kept, because those are the branches you're still resolving.
 
 A run of consecutive cold siblings collapses into one line rather than one line each,
 because seventeen `… 1 operator folded` markers are exactly as long as the seventeen rows
 they replaced. Nothing on the critical path is ever folded, no root is ever folded, and
-nothing is folded at all without measurements to judge coldness by — a plan explained
+nothing is folded at all without measurements to judge coldness by. A plan explained
 without `analyze=True` prints in full, because there is no basis for calling any of it
 cold. When you want every operator regardless, `format="json"` always carries all of them.
 
@@ -322,11 +321,11 @@ import json
 
 profile = json.loads(query.explain(analyze=True, format="json"))
 print(sorted(profile["ops"][0]))
-# ['algorithm', 'backend', 'cpu_util', 'depth', 'elapsed_ms', 'est_error', 'est_rows',
-#  'invol_ctx_switches', 'io_read_bytes', 'io_write_bytes', 'kind', 'major_faults',
-#  'measured', 'minor_faults', 'op_id', 'peak_rss_bytes', 'preemption_rate',
-#  'provenance', 'result_bytes', 'rows_in', 'rows_out', 'selectivity', 'spill_bytes',
-#  'spilled', 'threads', 'vol_ctx_switches']
+# ['algorithm', 'backend', 'cpu_ms', 'cpu_util', 'depth', 'detail', 'elapsed_ms', 'est_error',
+#  'est_rows', 'invol_ctx_switches', 'io_read_bytes', 'io_write_bytes', 'kind', 'major_faults',
+#  'measured', 'minor_faults', 'op_id', 'peak_rss_bytes', 'preemption_rate', 'provenance',
+#  'pushed', 'result_bytes', 'rows_in', 'rows_out', 'selectivity', 'spill_bytes', 'spilled',
+#  'threads', 'vol_ctx_switches']
 
 print(profile["rows"], profile["spilled"], profile["carbonite_summary"])
 # 2 False feasible

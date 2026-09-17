@@ -2,6 +2,8 @@
 
 Before reaching for an embedding, check whether cheap features answer the question. Length, character mix, and token counts separate a lot of classes on their own, and they cost a scan rather than a GPU.
 
+The script builds a block of statistics with `TextStatFeaturizer`, then the same features by hand with `.str` expressions. On its three documents, uppercase ratio and exclamation marks alone pick out the spam.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/ml/text_features.py

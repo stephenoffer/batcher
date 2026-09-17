@@ -1,157 +1,81 @@
 # vs DuckDB
 
-This page compares Batcher against DuckDB on single-node analytics: the operator shapes, the query suites, and the architecture behind the results.
+This page compares Batcher with DuckDB on single-node analytics: the suites, the operators, lakehouse reads, and the architecture behind the results.
 
-DuckDB is the single-node analytical engine to beat. On identical Arrow input Batcher beats it on every TPC-H and every ClickBench query. Against DuckDB's own native compressed store, which is the harder bar, Batcher leads TPC-H, ClickBench, JSON and the operator mix at scale factor 1.
+DuckDB is the single-node analytical engine to beat. On identical Arrow input Batcher is faster on every suite measured. Against DuckDB's own compressed store, the harder bar, Batcher leads TPC-H at sf1 and sf10, TPC-DS, ClickBench, JSON, the H2O.ai join task and the operator mix.
 
 :::{important}
-Every number below was produced by a run that had to pass the correctness gate first: the
-harness compares the two engines' results as a sorted row multiset within float tolerance
-and refuses to record a time when they disagree. Batcher matches DuckDB's result on all 22
-TPC-H queries, so nothing here is a correctness argument. It is a speed argument.
+Every number below passed the correctness gate first. The harness compares the two engines' results as a sorted row multiset within float tolerance, checks the order of every `ORDER BY` result, and refuses to record a ratio when they disagree. Batcher matches DuckDB on all 22 TPC-H queries.
 :::
 
-## Scorecard
+## Two bars, both published
 
-Every ratio on this page, this table included, is `batcher_ms / duckdb_ms`. **Lower is
-better, and anything below 1.00 is a Batcher win.** Each row is one workload shape, and the
-table further down that produced it says on what hardware:
-
-| Shape | `batcher / duckdb` |
-|---|---:|
-| Global aggregate, filtered count | **0.19x to 0.20x** |
-| Group-by (one or two keys) | **0.68x to 0.76x** |
-| Window running `sum()` | **0.71x** |
-| `MEDIAN` / `QUANTILE_CONT` per group | **0.91x to 0.92x** |
-| Delta file skipping (`count(*)` with a predicate) | **0.34x** |
-| TPC-H sf1, DuckDB reading the same Arrow | **0.26x**, wins all 22 |
-| ClickBench (43), DuckDB reading the same Arrow | **0.07x**, wins all 43 |
-| TPC-H sf1, DuckDB on its native store | **0.79x**, wins 16 of 22 |
-| TPC-H sf10, DuckDB on its native store | **0.963x**, a win as of 2026-08-25 |
-| H2O.ai `groupby` (10), DuckDB on its native store | 1.19x, wins 4 of 10 |
-| Join Order Benchmark (113), DuckDB on its native store | 1.29x, wins 35 of 109 |
-
-## Operators
-
-Single node, 16 cores, 30 GB, `python benchmarks/run.py --benchmark operators --tier single`.
-TPC-H `lineitem` at scale factor 1 (6,001,215 rows) held in Arrow and shared byte-identically
-between the engines. The ratio is `batcher / duckdb`, so **below 1.0 means Batcher is
-faster**.
-
-| Operator | Batcher | DuckDB | vs DuckDB |
-|---|---:|---:|---:|
-| global sum | 0.5 ms | 2.7 ms | **0.19x** |
-| filter → count | 0.6 ms | 2.7 ms | **0.20x** |
-| group-by, two keys | 11.6 ms | 16.9 ms | **0.68x** |
-| window running `sum()` | 171 ms | 240 ms | **0.71x** |
-| group-by sum, one key | 7.6 ms | 10.0 ms | **0.76x** |
-| window `sum()` over partition | 92.7 ms | 99.9 ms | **0.93x** |
-
-The filtered count is the widest margin, and it is not a micro-optimization. `.count()`
-over a filter compiles to a `COUNT(*)` aggregate, so projection pushdown prunes the scan
-to the one column the predicate touches and the count fuses into a single {py:func}`count_if <batcher.count_if>` pass.
-Nothing else is read, and no matching row is ever materialized.
-
-:::{note}
-`join → aggregate` has moved since this table was published. `BroadcastProbe::probe` was building a full 16,384-entry null mask per morsel and reading it per row, for a foreign-key probe whose key is never null. Skipping both when the probe key has no nulls took the operator to **0.90x to 0.97x**, verified bit-identical across the 84 join and stream oracle tests. `benchmarks/BENCHMARK_RESULTS.md` carries the measurement.
-:::
-
-:::{tip}
-The same margins are reachable from your own query. {py:meth}`ds.explain() <batcher.Dataset.explain>` shows whether the
-predicate reached the scan and which columns survived pruning; {py:meth}`ds.stats() <batcher.Dataset.stats>` reports what
-each operator actually cost. {doc}`/getting-started/tutorials/foundations/optimizing-a-slow-query` walks the loop.
-:::
-
-## Exact aggregates
-
-Batcher takes the exact order-statistic aggregates, on algorithms rather than tuning.
-16 cores, same fixture:
-
-| Query | Batcher | DuckDB |
-|---|---:|---:|
-| `MEDIAN(x) GROUP BY flag` (5M rows, 3 groups) | **210 ms** | 232 ms |
-| `QUANTILE_CONT(x, 0.9) GROUP BY flag` (5M rows) | **208 ms** | 226 ms |
-| `COUNT(DISTINCT id) GROUP BY flag` (2M rows) | **163 ms** | 181 ms |
-
-Median and quantile need the value at one rank, not a sorted list, so the finalize does
-quickselect instead of a full sort and runs each group's selection on its own core. The
-count-distinct is a Kyber rewrite: a lone `COUNT(DISTINCT x) GROUP BY g` becomes a
-distinct over `(g, x)` followed by a count, which parallelizes across the distinct values
-instead of the handful of groups.
-
-## Two bars, and both are published
-
-DuckDB can be measured two ways, and the difference between them is not a detail:
+DuckDB can be measured two ways, and the difference between them is not a detail.
 
 `duckdb_arrow`
-    DuckDB executing over the *same zero-copy Arrow* Batcher runs on. This is the
-    like-for-like comparison of two execution engines, and the one Batcher's Arrow-only
-    contract makes fair.
-`duckdb`
-    DuckDB over its own native store, ingested before the clock starts: compressed,
-    dictionary-encoded, zone-mapped. This measures DuckDB's *storage engine plus* its
-    execution engine against Batcher's execution engine alone. It is DuckDB at its best,
-    and it is the harder bar.
+: DuckDB executing over the same zero-copy Arrow Batcher runs on. This compares two execution engines on identical bytes.
 
-Both are reported, because quoting only the first would be choosing the flattering one.
-Suite geometric means of per-query `batcher / duckdb` ratios, 96 cores / 184 GiB, scale
-factor 1, measured 2026-08-15. **Below 1.0 means Batcher is faster**, and the count beside
-each ratio is queries won:
+`duckdb`
+: DuckDB over its own native store, ingested before the clock starts: compressed, dictionary-encoded and zone-mapped. This measures DuckDB's storage engine plus its execution engine against Batcher's execution engine alone. It is DuckDB at its best, and the harder bar.
+
+Batcher keeps Arrow as its only columnar format on purpose, because the same operators that read it also run distributed, stream and carry tensors. Both bars are reported, because quoting only the first would be choosing the flattering one.
+
+## The suites
+
+The current board was swept 2026-09-13 on a quiet 48-core (24 physical plus SMT), 92 GiB box, best of five, one process per case. Each cell is a suite geomean of `batcher_ms / duckdb_ms`, so **below 1.00 means Batcher is faster**:
 
 | Suite | vs `duckdb` (native store) | vs `duckdb_arrow` (same Arrow) |
 |---|---:|---:|
-| Semi-structured JSON (5) | **0.25x**, 5 of 5 | **0.04x**, 5 of 5 |
-| ClickBench (43) | **0.64x**, 28 of 43 | **0.07x**, 43 of 43 |
-| Operator mix (19) | **0.66x**, 11 of 19 | **0.36x**, 15 of 19 |
-| TPC-H (22) | **0.79x**, 16 of 22 | **0.26x**, 22 of 22 |
-| H2O.ai `join` (5) | **0.93x**, 3 of 5 | **0.24x**, 5 of 5 |
-| TPC-DS (98 of 99 timed) | **0.96x**, 38 of 98 | — |
-| H2O.ai `groupby` (10) | 1.19x, 4 of 10 | **0.09x**, 10 of 10 |
-| Join Order Benchmark (113) | 1.29x, 35 of 109 | — |
+| Semi-structured JSON (5) | **0.35** | **0.32** |
+| H2O.ai `join` (5) | **0.63** | **0.58** |
+| ClickBench (43) | **0.65** | **0.16** |
+| TPC-H sf1 (22) | **0.72** | **0.25** |
+| Operator mix (46) | **0.75** | **0.47** |
+| H2O.ai `groupby` (10) | 1.05 | **0.83** |
 
-The `—` in the right-hand column means no figure exists, not a tie. DuckDB over registered
-Arrow views is killed on TPC-DS q64, and on the Join Order Benchmark its planner has no
-storage statistics to order a many-way join with, so the comparison would measure a
-handicapped planner rather than an executor.
+On identical input Batcher's execution engine is 4x DuckDB's on TPC-H and 6x on ClickBench. Against the native store the margins narrow, because that comparison adds DuckDB's storage engine to its side.
 
-TPC-DS reports 98 rather than 99 because q67 fails the correctness gate on both engines.
-Float reassociation moves group sums in their last bits, which changes which sums tie, which
-moves an integer `rank()`. Neither engine is deterministic there, so the query is excluded
-rather than scored. The Join Order Benchmark times 109 of its 113; the other four do not
-clear the gate either, and the record does not attribute them to one cause.
+Three larger suites were measured against the native store in separate sweeps:
 
-Every suite in the right-hand column is a Batcher win. Read that column for a question about
-*engines*. The left-hand one answers a question about engines **and** storage formats
-together.
+| Suite | vs `duckdb` | Measured |
+|---|---|---|
+| TPC-H sf10 (60M-row `lineitem`) | **0.963x**, suite total 2,323 ms | 2026-08-25, 96 cores, 184 GiB |
+| TPC-DS sf1 (99) | **0.98x** | 2026-09-11, 48 cores, 92 GiB |
+| Join Order Benchmark (113) | Total **8,131 ms against 8,885 ms**, geomean 1.11x | 2026-08-25, 96 cores, 184 GiB |
 
-On identical input Batcher's execution engine is **3.9x DuckDB's on TPC-H and 14x on
-ClickBench**, and it wins every query of both. Against DuckDB's native store the margin
-narrows to 1.3x and 1.6x, because that comparison puts a storage engine and an execution
-engine together against an execution engine alone.
+The Join Order Benchmark's two statistics point in different directions. Batcher wins the large many-way joins, such as q17f in 75 ms and q10c in 46 ms, and still loses many of the small ones, so its total is lower while its geomean sits above 1.
 
-The suite's residue is concentrated in its two single-key high-cardinality queries, one
-string column with 100,000 distinct values. A *composite* string key no longer pays for being
-strings. Each column's distinct values are numbered in first-seen order and the ranked columns
-take the ordinary integer grouper, which brought a two-string-key group-by over 10M rows from
-41.7 ms to 32.6 ms. That is identical to the same query with two `int64` keys, which is the
-check that nothing about the strings is left to pay for.
+`duckdb_arrow` has no TPC-DS figure because DuckDB over registered Arrow is killed on q64 at 132 GB resident on a scale-factor-1 dataset. Batcher returns that query in 3.2 ms, and DuckDB on its native store in 58.4 ms.
 
-:::{warning}
-Five of the 43 ClickBench queries and two of the 19 operator cases are answered from
-Batcher's recorded column statistics rather than executed: an unfiltered `SUM`, `AVG` or
-`COUNT(DISTINCT)` over an immutable in-memory relation. The answers are exact, but the timing
-is a memo lookup rather than a scan. **Excluding them**, ClickBench is **0.77x over 38
-queries** and the operator mix **0.76x over 17**. Quote those when the claim is about
-execution speed.
+## Operators
+
+The operator mix times single kernels over TPC-H `lineitem` at sf1 (6,001,215 rows) held in Arrow and shared byte-identically. The following table is the complete run of 2026-07-13 on a 16-core, 30 GB node, from before the mix grew to 46 cases. The ratio is `batcher / duckdb`, so **below 1.0 means Batcher is faster**:
+
+| Operator | Batcher | DuckDB | vs DuckDB |
+|---|---:|---:|---:|
+| Global sum | 0.5 ms | 2.7 ms | **0.19x** |
+| Filter then count | 0.6 ms | 2.7 ms | **0.20x** |
+| Group-by, two keys | 11.6 ms | 16.9 ms | **0.68x** |
+| Window running `sum()` | 171 ms | 240 ms | **0.71x** |
+| Group-by sum, one key | 7.6 ms | 10.0 ms | **0.76x** |
+| Window `sum()` over partition | 92.7 ms | 99.9 ms | **0.93x** |
+| Sort then top-N | 14.1 ms | 13.3 ms | 1.06x |
+| Filter then project | 13.9 ms | 12.9 ms | 1.08x |
+| Join then aggregate | 98.3 ms | 85.6 ms | 1.15x |
+| Window `lag()` | 179.7 ms | 151.4 ms | 1.19x |
+| Window `rank()` | 220.7 ms | 132.7 ms | 1.66x |
+
+The filtered count is the widest margin, and it comes from the plan. `.count()` over a filter compiles to a `COUNT(*)` aggregate, so projection pushdown prunes the scan to the one column the predicate touches and the count fuses into a single {py:func}`count_if <batcher.count_if>` pass. Nothing else is read, and no matching row is materialized.
+
+The 46-case mix added string functions, set operations, scalar expressions and six join shapes. It found large wins that nothing had measured, a semi-join at 0.28x and an anti-join at 0.27x, and a set of string and temporal kernels where DuckDB does less work per row. `benchmarks/results/LOSS_BACKLOG.md` tracks every case where Batcher is behind.
+
+:::{tip}
+The same margins are reachable from your own query. {py:meth}`ds.explain() <batcher.Dataset.explain>` shows whether the predicate reached the scan and which columns survived pruning, and {py:meth}`ds.stats() <batcher.Dataset.stats>` reports what each operator cost. {doc}`/getting-started/tutorials/foundations/optimizing-a-slow-query` walks the loop.
 :::
-
 
 ## Lakehouse reads
 
-A selective predicate on a Delta table should open one data file, not all of them. The
-transaction log records each file's column bounds, and reading it at plan time is the whole
-game. `python benchmarks/scenarios/lakehouse_bench.py`, single node, 10M rows across 200
-Delta data files with one `day` per file, measured 2026-07-13:
+A selective predicate on a Delta table should open one data file, not all of them. The transaction log records each file's column bounds, and Batcher reads it at plan time. The benchmark counts rows matching one day across 10M rows in 200 Delta data files, one `day` per file, on a single node, measured 2026-07-13 with `benchmarks/scenarios/lakehouse_bench.py`:
 
 | `count(*) WHERE day = 42` | Time | Files opened |
 |---|---:|---:|
@@ -159,37 +83,44 @@ Delta data files with one `day` per file, measured 2026-07-13:
 | Batcher, before file skipping | 98.8 ms | 200 |
 | DuckDB `delta_scan` | 21.8 ms | not reported |
 
-Batcher is 2.9x faster than `delta_scan` here, having been 2.7x slower before the log was
-consulted at plan time, and it opens one file where the predicate selects one file. An
-unfiltered `count(*)` is 0.85 ms and opens nothing, answered from the log. The record does
-not name the machine for this run, so read the ratios and not the absolute times.
+Batcher is 2.9x faster than `delta_scan` here, and it opens the one file the predicate selects. An unfiltered `count(*)` takes 0.85 ms and opens no data file at all, because the log answers it. The record doesn't name the machine for this run, so read the ratio rather than the absolute times.
 
-Predicates are recovered from the user's plan, where a `Filter` on a `Scan` constrains that
-scan whatever the optimizer does above it. The most ordinary lakehouse query in existence
-therefore pushes down and skips the rest of the table.
+## What a static optimizer can't do
 
-## What DuckDB cannot do
+The largest difference doesn't show up as a number. DuckDB is single-node and its optimizer is static: it commits to a plan before the first row is read.
 
-The gap that matters most doesn't appear on this page as a number. DuckDB is single-node and its optimizer is static. It commits to a plan before the first row is read and can't change its mind.
+Batcher re-optimizes at stage boundaries on measured cardinalities. That is the same granularity Spark AQE works at, available on a single node too, and it adds a sketch-backed learned-statistics loop that carries across queries, so a recurring query plans better each time it runs. The same mergeable operators then run across a cluster and return the same rows, with floating-point reductions agreeing to the last bits because the partition count sets the summation order.
 
-Batcher re-optimizes at stage boundaries on measured cardinalities. That is the same granularity Spark AQE works at, available single-node too, and it carries a sketch-backed cross-query learned-stats loop that DuckDB has no equivalent for. The same mergeable operators then run across a cluster and return the same rows. Float reductions agree to the last bits rather than to every bit, because the partition count sets the summation order.
+The within-query loop isn't always on. It engages on a query with a join once the input clears 5M rows, or about 320 MB, for each pipeline breaker it would cut at, so the simplest joined shape qualifies at about 10M rows and a query with no join doesn't qualify single-node at any size.
 
-The loop is not free and it is not always on. It engages once a joined query clears 5M rows, or roughly 320 MB, for each pipeline breaker it would cut at, so the simplest joined shape qualifies at about 10M rows and a query with no join never qualifies at any size. See {doc}`/benchmarks/results/scaling`.
+## Requirements and limitations
+
+The following results are where DuckDB leads or where a figure needs its context:
+
+- **H2O.ai `groupby` against the native store** reads 1.05x. The remaining losses are low-cardinality string keys that DuckDB holds dictionary-encoded and Batcher reads as full Arrow strings, a storage difference: on the same Arrow the suite is 0.83x. Composite string keys no longer pay for being strings, since a two-string-key group-by over 10M rows runs as fast as the same query on two `int64` keys.
+- **Strings in general.** Batcher has no `StringView` and decodes dictionaries at the scan, and 19 of the 40 cases on the current board where it trails are that kind of storage gap.
+- **TPC-H at sf100** (600M rows) is still recorded as a loss on a single node.
+- **A first-seen query** costs Batcher about 2.6x its steady state on TPC-H sf1 against DuckDB's 1.15x. The boards time repeats.
+- **An unfiltered `SUM`, `AVG` or `COUNT(DISTINCT)` over an in-memory table** is answered exactly from statistics recorded on an earlier run, so on the ClickBench and operator cases of that shape the timing is a lookup rather than a scan.
 
 ## Reproduce
 
+The following commands rerun each result:
+
 ```bash
-python benchmarks/run.py --benchmark operators --tier single --scale 1
-python benchmarks/run.py --benchmark tpch      --tier single --scale 1
+python benchmarks/run.py --benchmark tpch --engines batcher,duckdb,duckdb_arrow --isolate
+python benchmarks/run.py --benchmark clickbench --engines batcher,duckdb,duckdb_arrow --isolate
+python benchmarks/run.py --benchmark tpch --scale 10 --engines batcher,duckdb
+python benchmarks/run.py --benchmark job --engines batcher,duckdb
+python benchmarks/run.py --benchmark operators --tier single
 python benchmarks/scenarios/lakehouse_bench.py
 ```
 
 ## See also
 
 - {doc}`/benchmarks/results/tpch` for the per-query breakdown.
-- {doc}`/benchmarks/results/analytics` for operators, connectors, and the lazy control plane.
-- {doc}`/benchmarks/comparisons/vs-polars` and {doc}`/benchmarks/comparisons/vs-daft` for the other two single-node engines.
-- {doc}`/architecture/deep-dives/operators/aggregation-internals` for the quickselect finalize behind the median and quantile wins.
+- {doc}`/benchmarks/results/analytics` for the other suites.
+- {doc}`/benchmarks/comparisons/vs-polars` and {doc}`/benchmarks/comparisons/vs-daft` for the other single-node engines.
 - {doc}`/architecture/deep-dives/operators/join-algorithms` for the join strategies behind the TPC-H results.
-- {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization` for what a static optimizer can't do.
-- {doc}`/benchmarks/methodology` for hardware, gating, and why cross-hardware comparison is meaningless.
+- {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization` for stage-boundary re-optimization and its size floor.
+- {doc}`/benchmarks/methodology` for hardware, gating, and why cross-hardware comparison means nothing.

@@ -6,6 +6,8 @@ FASTA wraps one record's sequence across as many lines as the writer felt like, 
 
 FASTQ's quality string is one character per base. A file where the sequence and quality lengths disagree is corrupt, and a reader that tolerates it produces a column where every score is attributed to the wrong base, which no downstream filter can detect.
 
+The script writes a small FASTA and FASTQ to a temporary directory, reads them back as tables, measures GC content and homopolymer runs as projections, and filters out a low-complexity contig. It then decodes FASTQ quality, filters reads on expected errors rather than on their mean, and writes both formats back out, including a FASTA of the proteins the contigs translate to.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/genomics_files.py

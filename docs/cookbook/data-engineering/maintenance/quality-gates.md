@@ -1,12 +1,9 @@
 # Quality gates
 
-A partner changed their export format. Amounts arrive negative, a currency code is
-garbage, one row has no amount at all.
+A partner changed their export format. Amounts arrive negative, a currency code is garbage, one row has no amount at all.
 
 :::{warning}
-Your loader does not care: it is a `read` and a `write`, and both succeed. The bad rows
-land in the warehouse, the finance dashboard reads them, and you hear about it nine days
-later from someone who is not in a good mood.
+Your loader does not care: it is a `read` and a `write`, and both succeed. The bad rows land in the warehouse, the finance dashboard reads them, and you hear about it nine days later from someone who is not in a good mood.
 :::
 
 The load was never the problem. The absence of a gate was.
@@ -27,10 +24,7 @@ customers = bt.from_pydict({"customer_id": [10, 20, 30], "name": ["ann", "bob", 
 
 ## Say what a good row is
 
-A constraint is a boolean expression that is TRUE for a valid row. {py:obj}`ds.dq <batcher.Dataset.dq>` accumulates
-them and returns a new accessor each time, so they chain, and the whole chain lowers to
-the same relational operators as everything else. There is no separate validation engine
-scanning your data a second time.
+A constraint is a boolean expression that is TRUE for a valid row. {py:obj}`ds.dq <batcher.Dataset.dq>` accumulates them and returns a new accessor each time, so they chain, and the whole chain lowers to the same relational operators as everything else. There is no separate validation engine scanning your data a second time.
 
 ```python
 checks = (
@@ -48,19 +42,15 @@ print(report.ok, report.total_violations)
 # False 3
 ```
 
-`validate()` counts violations per constraint and does not raise. `unique("order_id")`
-passed, so it is not in the report.
+`validate()` counts violations per constraint and does not raise. `unique("order_id")` passed, so it is not in the report.
 
 :::{note}
-The value constraints treat NULL as valid: {py:meth}`in_range <batcher.api.dataset.dq.DatasetDQ.in_range>` does not fire on the NULL amount,
-{py:meth}`not_null <batcher.api.dataset.dq.DatasetDQ.not_null>` does. That is deliberate, so the checks compose independently instead of
-double-counting one bad row. State the null rule explicitly when you mean it.
+The value constraints treat NULL as valid: {py:meth}`in_range <batcher.api.dataset.dq.DatasetDQ.in_range>` does not fire on the NULL amount, {py:meth}`not_null <batcher.api.dataset.dq.DatasetDQ.not_null>` does. That is deliberate, so the checks compose independently instead of double-counting one bad row. State the null rule explicitly when you mean it.
 :::
 
 ## Three ways to spend a report
 
-A report ends in one of three verdicts, and the choice decides what happens to the rows
-that failed:
+A report ends in one of three verdicts, and the choice decides what happens to the rows that failed:
 
 | Verdict | What happens to a bad row | What it is for |
 |---|---|---|
@@ -72,8 +62,7 @@ that failed:
 
 :::{tab-item} Stop the load
 
-`fail()` raises `DataQualityError` (carrying the counts) if anything is violated, and
-otherwise returns the dataset so the chain continues.
+`fail()` raises `DataQualityError` (carrying the counts) if anything is violated, and otherwise returns the dataset so the chain continues.
 
 ```python
 from batcher import DataQualityError
@@ -96,14 +85,12 @@ except DataQualityError as err:
 loadable = checks.drop()
 ```
 
-Use it when a bad row is genuinely noise and nobody will ever ask about it. That is rarer
-than people think.
+Use it when a bad row is genuinely noise and nobody will ever ask about it. That is rarer than people think.
 :::
 
 :::{tab-item} Quarantine them
 
-`quarantine()` splits the dataset in two. The split is total: every input row lands on
-exactly one side, so nothing evaporates.
+`quarantine()` splits the dataset in two. The split is total: every input row lands on exactly one side, so nothing evaporates.
 
 ```python
 clean, rejected = checks.quarantine()
@@ -115,24 +102,18 @@ print(rejected.sort("order_id").to_pydict())
 #  'currency': ['USD', 'XXX', 'USD']}
 ```
 
-Quarantine is the default answer for a partner feed. The good rows load on time, the bad
-rows go to a dead-letter table with the rest of the row intact, and someone can look at
-them on Monday instead of at 2am.
+Quarantine is the default answer for a partner feed. The good rows load on time, the bad rows go to a dead-letter table with the rest of the row intact, and someone can look at them on Monday instead of at 2am.
 :::
 
 ::::
 
 :::{important}
-`drop()` is the only one of the three that loses data. The rows it removes leave no trace,
-so the question "why is the total short" has no answer anywhere in the pipeline. Prefer
-`quarantine()` unless you can say out loud that nobody will ever ask.
+`drop()` is the only one of the three that loses data. The rows it removes leave no trace, so the question "why is the total short" has no answer anywhere in the pipeline. Prefer `quarantine()` unless you can say out loud that nobody will ever ask.
 :::
 
 ## A gate needs a threshold
 
-Quarantining three rows out of a million is Tuesday. Quarantining half the batch means
-the partner broke their export and you should not load *any* of it, because a
-half-loaded day is worse than a missing one: it looks complete.
+Quarantining three rows out of a million is Tuesday. Quarantining half the batch means the partner broke their export and you should not load *any* of it, because a half-loaded day is worse than a missing one: it looks complete.
 
 So make the decision on the rate, not on the presence of a violation:
 
@@ -149,16 +130,12 @@ else:
 ```
 
 :::{tip}
-Pick the threshold from what the feed actually does on a normal day, and alert on the rate
-itself, not only on the breach. A feed whose reject rate walks from 0.1% to 0.9% over a
-month is telling you something before it trips the gate.
+Pick the threshold from what the feed actually does on a normal day, and alert on the rate itself, not only on the breach. A feed whose reject rate walks from 0.1% to 0.9% over a month is telling you something before it trips the gate.
 :::
 
 ## Referential integrity
 
-`order_id=4` references customer 99, who does not exist. No constraint above catches it,
-because the answer is not in this dataset. {py:meth}`foreign_key <batcher.api.dataset.dq.DatasetDQ.foreign_key>` joins against the reference and
-returns the orphans, so an empty result means every key resolves:
+`order_id=4` references customer 99, who does not exist. No constraint above catches it, because the answer is not in this dataset. {py:meth}`foreign_key <batcher.api.dataset.dq.DatasetDQ.foreign_key>` joins against the reference and returns the orphans, so an empty result means every key resolves:
 
 ```python
 orphans = batch.dq.foreign_key("customer_id", references=customers)
@@ -166,14 +143,11 @@ print(orphans.to_pydict())
 # {'order_id': [4], 'customer_id': [99], 'amount': [7.5], 'currency': ['XXX']}
 ```
 
-Run this *before* the join that consumes the key. An inner join with an orphan key drops
-the row and reports nothing, so you find out from a row count that does not tie out. See
-{doc}`multi-source join </cookbook/data-engineering/modeling/multi-source-join>`, where that is the whole story.
+Run this *before* the join that consumes the key. An inner join with an orphan key drops the row and reports nothing, so you find out from a row count that does not tie out. See {doc}`multi-source join </cookbook/data-engineering/modeling/multi-source-join>`, where that is the whole story.
 
 ## Where the gate goes
 
-Before the write, not after. A gate downstream of the load is a report. A gate upstream
-of it is a gate.
+Before the write, not after. A gate downstream of the load is a report. A gate upstream of it is a gate.
 
 ```python
 # docs: skip
@@ -188,19 +162,13 @@ rejected.write.parquet("s3://lake/_rejects/orders/2024-01-02/")
 clean.write.delta("s3://lake/orders", merge_on="order_id")
 ```
 
-Two things this does not do. It will not catch a plausible-but-wrong value: an amount of
-`42.0` that should have been `4.20` passes every constraint you can write. And the checks
-cost a pass over the data. They are ordinary relational operators, so they fuse and run in
-Rust rather than in a Python loop, but "cheap" is not "free". Put the expensive ones
-(`unique`, `foreign_key`, which both hash) on the path where they earn it, and the scalar
-predicates everywhere.
+Two things this does not do. It will not catch a plausible-but-wrong value: an amount of `42.0` that should have been `4.20` passes every constraint you can write. And the checks cost a pass over the data. They are ordinary relational operators, so they fuse and run in Rust rather than in a Python loop, but "cheap" is not "free". Put the expensive ones (`unique`, `foreign_key`, which both hash) on the path where they earn it, and the scalar predicates everywhere.
 
 ## See also
 
 - {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: what `unique` found, and what to do about it.
 - {doc}`Schema evolution </cookbook/data-engineering/modeling/schema-evolution>`: gating the shape rather than the values.
-- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: the orphan key, and what an inner join does
-  with it.
+- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: the orphan key, and what an inner join does with it.
 - {doc}`Data quality </user-guide/trust/data-quality>`: every constraint in the accessor.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: where to land the quarantined rows.
 - {doc}`Delta Lake </integrations/lakehouse/delta-lake>`: the target the gate stands in front of.

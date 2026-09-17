@@ -6,11 +6,11 @@ the Rust data plane through one FFI call, and gets Arrow batches back. Everythin
 that touches a row happens in Rust.
 
 ```python
-out, metrics = _native.execute_plan_metered(plan.to_json(), sources, cfg.engine_config_json())
+out, metrics_json = _native.execute_plan_metered(plan.to_json(), sources, engine_cfg, query_id)
 ```
 
-The plan crosses the boundary as JSON; the data crosses as zero-copy Arrow
-`RecordBatch`es (the Arrow C Data Interface). Nothing else moves between the two
+The plan crosses the boundary as JSON, and the data crosses as zero-copy Arrow
+`RecordBatch`es through the Arrow C Data Interface. Nothing else moves between the two
 languages.
 
 This page is the contributor's view: the tiers, the crates each path lives in, the
@@ -21,7 +21,7 @@ the pipeline-and-breaker structure and the lazy API, and is the better place to 
 ## Execution tiers
 
 There is one set of operator semantics, exercised by three execution paths. The
-sequential interpreter is the oracle; the other two must agree with it.
+sequential interpreter is the oracle, and the other two must agree with it.
 
 ![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](/_static/diagrams/execution_tiers.svg)
 
@@ -31,20 +31,23 @@ sequential interpreter is the oracle; the other two must agree with it.
   only the scheduling: morselize, run on a rayon thread pool, and hash-shuffle into
   the breakers. It computes exactly what the sequential path does.
 - **Tier-1 JIT** (`bc-codegen`) compiles the supported subset of column
-  expressions to machine code with Cranelift, compiling once per operator and reusing
-  that across every morsel. On anything it does not support it falls back to the interpreter
-  rather than diverge. The JIT is bit-for-bit identical to the interpreter on its
-  subset.
+  expressions to machine code with Cranelift. Each distinct expression compiles once into
+  a process-wide cache (`bc-codegen/src/cache.rs`), keyed on the expression and the types
+  of the columns it reads, and is reused across every batch, operator and query that
+  shares that key. On anything it does not support, and on a batch its compiled code
+  cannot evaluate, it falls back to the interpreter rather than diverge. The JIT is
+  bit-for-bit identical to the interpreter on its subset.
 
-A query can drop from a compiled pipeline back to the interpreter at any breaker, which
-is how adaptivity and compilation coexist. Throwing a compiled artifact away costs the
-artifact and nothing else, because the relational state lives in the runtime library
-rather than in generated code.
+The JIT compiles scalar expressions, not whole pipelines, so there is no compiled pipeline
+for a re-plan to throw away. That is how adaptivity and compilation coexist: re-planning at
+a breaker changes the operators, the relational state lives in the runtime library rather
+than in generated code, and the new operators evaluate their expressions through the same
+cache.
 
 ## Which crate runs which scale
 
-The mergeable primitives (`partial(batch) → state`, `combine(states) → state`,
-`finalize(state) → rows`) are written once in `bc-runtime`, and three callers compose
+The mergeable primitives, `partial(batch) -> state`, `combine(states) -> state` and
+`finalize(state) -> rows`, are written once in `bc-runtime`, and three callers compose
 them. That mapping is the thing to know before touching a stateful operator:
 
 - On one core, `bc-interp`'s sequential `execute` runs it.
@@ -64,7 +67,7 @@ says nothing about that arm. A recorded cluster run is the evidence. See
 
 ## The thresholds, and what they are called
 
-The architecture page describes these behaviors; the exact gates and their config names
+The architecture page describes these behaviors. The exact gates and their config names
 live here, because these are the values you change or cite in code.
 
 Adaptive re-optimization triggers when an estimate was wrong by more than
@@ -75,10 +78,16 @@ simplest joined shape and more for a many-join one, because each cut is what cos
 query with no join is out at any size, which excludes more queries than the row floor
 does. Most small queries never reach the loop at all.
 
+One path skips the floor. A distributed plan that `dist.executors.plan_analysis.requires_staging`
+flags, such as a breaker beneath another breaker, is staged at any size and with no join,
+because the one-shot dispatcher would otherwise apply the inner breaker per partition and
+return a wrong answer. There staging is a correctness requirement rather than an
+optimization.
+
 A query that clears the gate gets stage-boundary re-optimization, the same mechanism and
-granularity as Spark AQE. It is not finer. Two things about it do reach further than
-AQE: it runs single-node as well as distributed, and what it measured is recorded to the
-MetadataHub and read by the *next* run. See {doc}`/architecture/internals/kyber` for that
+granularity as Spark AQE. Two things about it reach further than AQE: it runs single-node
+as well as distributed, and what it measured is recorded to the `MetadataHub` and read by
+the next run. See {doc}`/architecture/internals/kyber` for that
 cross-query half.
 
 Carbonite's memory envelope throttles new allocations at `memory.soft_limit` (0.85 of
@@ -86,10 +95,12 @@ the budget) and begins spilling at `memory.hard_limit` (0.90). Spilling is a pro
 the runtime primitive rather than a separate operator, so the plan does not change when
 a query goes out of core.
 
-The morsel is a `RecordBatch` of 16,384 rows by default (`execution.morsel_rows`), and
-`execution.parallelism` sets the worker-thread count (`0` uses every core). Both are
-shipped to the Rust data plane as part of the engine config, so the Python and Rust
-sides never disagree about them. {doc}`/configuration/options` is the full reference.
+A morsel is a `RecordBatch` of 16,384 rows (`execution.morsel_rows`) or 1 MiB
+(`execution.morsel_bytes`), whichever bound trips first, so a batch of wide rows splits on
+bytes long before it reaches the row count. `execution.parallelism` pins the worker-thread
+count, and its default of `0` lets the engine size the pool from the host: every physical
+core plus a third of the SMT siblings. All three are shipped to the Rust data plane as part
+of the engine config, so the Python and Rust sides never disagree about them. {doc}`/configuration/options` is the full reference.
 
 ## Answering from metadata (no scan)
 
@@ -106,19 +117,19 @@ The layer covers the terminals whose result a footer can carry:
   mergeable operators that keep an exact count (an empty-side join, {py:meth}`limit(0) <batcher.Dataset.limit>`, a
   UNION of exact counts).
 - Global (keyless) aggregates: `min` and `max` from footer bounds, `count(*)`,
-  `count(col)` from `rows − null_count`, `sum` from a catalog's recorded total,
-  `n_unique` and `count_distinct` from an exact distinct count, and `bool_and` and
+  `count(col)` from `rows - null_count`, `sum` from a catalog's recorded total,
+  `count_distinct` from an exact distinct count, and `bool_and` and
   `bool_or` from a boolean column's exact min/max.
 - Per-column existence and null facets: {py:meth}`null_count <batcher.Dataset.null_count>`, {py:meth}`has_nulls <batcher.Dataset.has_nulls>`, {py:meth}`all_null <batcher.Dataset.all_null>`.
 - Filtered counts. `WHERE col IS NULL` is exactly the recorded null count,
-  `col IS NOT NULL` is `rows − null_count`, and a provably out-of-range predicate
+  `col IS NOT NULL` is `rows - null_count`, and a provably out-of-range predicate
   (`col > max`, or `col = v` outside `[min, max]` or absent from the column's
   membership bloom) is exactly `0`. A predicate that only *partially* overlaps the
   column's range needs a histogram, so it is **not** answered and falls back.
-- {py:meth}`describe() <batcher.Dataset.describe>` and `summary()`, as a per-column snapshot assembled from whichever
+- {py:meth}`describe() <batcher.Dataset.describe>` and `ds.meta.col(name).summary()`, as a per-column snapshot assembled from whichever
   facets are exact, omitting the rest so the caller runs the real describe for what
   is missing.
-- A provably-empty plan. `_collect` short-circuits a contradiction filter,
+- A provably empty plan. Collection short-circuits a contradiction filter,
   `limit(0)`, an always-false predicate, or an empty-side join to a correct-schema,
   zero-row table with no scan.
 
@@ -126,15 +137,15 @@ The layer covers the terminals whose result a footer can carry:
 
 A wrong metadata answer is not a slow query. It is *silent corruption*. So the
 whole layer is gated on one rule: an exact answer is produced only from statistics
-that are `Provenance.EXACT` **end to end**. Footer min/max (on numeric, temporal,
+that are `Provenance.EXACT` end to end. Footer min/max (on numeric, temporal,
 boolean, and decimal columns), null counts, and exact row counts are EXACT; a
-byte-truncated string bound, a filtered/limited column (whose min/max survive only
-as *bounds*), a sketch-derived distinct count, and a learned prior are **not**. An
+byte-truncated string bound, the min and max of a filtered or limited column, which
+survive only as bounds, a sketch-derived distinct count, and a learned prior are not. An
 inexact statistic never answers an exact terminal. It may only inform cost or back
-an explicitly-named `approx_*` terminal (`approx_n_unique`, an approximate
+an explicitly-named `approx_*` terminal (`approx_count_distinct`, an approximate
 quantile). Provenance can only ever be *weakened* as stats propagate through the
-plan (via the single `weakest`/`downgrade` combiner), so nothing can silently
-over-claim. Every shortcut returns `None`, meaning "execute normally", the
+plan through the single `weakest` and `downgrade` combiners in `plan/stats.py`, so
+nothing can silently over-claim. Every shortcut returns `None`, meaning "execute normally", the
 moment it cannot prove exactness. A metadata answer is therefore an optimization
 that can never change a result.
 

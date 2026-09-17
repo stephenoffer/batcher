@@ -82,8 +82,7 @@ vectors = chunks.ml.embed(
 vectors.write.parquet("s3://index/chunks/")
 ```
 
-That warm pool is worth stating plainly, because it is the difference between a benchmark and
-a bill: MiniLM loads in about 2 seconds and embeds nearly instantly, so an engine that reloads
+That warm pool is the difference between a benchmark and a bill. MiniLM loads in about 2 seconds and embeds nearly instantly, so an engine that reloads
 the model per execution spends its entire runtime loading. Measured on 8xT4 over 8,192 texts,
 Batcher embeds at **33,611 text/s** with the model loaded once for the session.
 
@@ -113,8 +112,9 @@ print(index.count())
 ## 4. Retrieve
 
 Retrieval is a score and a top-N. {py:meth}`.list.cosine_similarity <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_similarity>` scores each row's vector against
-a query vector broadcast as a literal, and `top_k` keeps the best rows without sorting the
-relation, using the fused top-N heap, which runs 8.1x faster than Daft on the top-N benchmark.
+a query vector broadcast as a literal. `top_k` keeps the best rows without sorting the
+relation. It runs on the fused top-N heap that leads Daft 8.1x on an sf1
+`ORDER BY ... DESC LIMIT 20` in {doc}`the Daft comparison </benchmarks/comparisons/vs-daft>`.
 
 The {py:meth}`l2_norm <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` filter drops empty vectors: a zero vector has no direction, cannot clear any
 threshold, and would otherwise pollute the ranking with undefined scores.
@@ -172,8 +172,8 @@ vectors into candidate pairs, and only the candidates get the exact cosine score
 
 ## 5. Generate
 
-Build the prompt with a string expression (it is a column operation like any other) and hand
-it to a model. An *engine* is a zero-arg callable returning a
+Build the prompt with a string expression, which is a column operation like any other, and
+hand it to a model. An *engine* is a zero-arg callable returning a
 `list[str] -> list[str]` function, so a deterministic stub can stand in for a 7B model and
 the pipeline is testable with no GPU.
 
@@ -218,17 +218,19 @@ engine = vllm_engine(
 ```
 
 :::{warning}
-Set `chat=True` for any instruction-tuned model. The default is the completion path, which is
-right for a base model and quietly wrong for a chat model. It skips the chat template, so the
-model answers a prompt in a format it was never trained on. The output degrades, and nothing
-warns you. This is the most common way a RAG pipeline ends up producing plausible garbage.
+Set `chat=True` for any instruction-tuned model. Left unset, the engine takes the completion
+path, which is right for a base model and wrong for a chat model. It skips the chat template,
+so the model answers a prompt in a format it was never trained on. Batcher warns once per process
+when `chat` is unset and the model ships a chat template, but the job still runs and the output
+still degrades. Passing `chat=False` explicitly silences that warning. This is the most common
+way a RAG pipeline ends up producing plausible garbage.
 :::
 
 ## 6. Why the loop is fast
 
 Both halves of RAG are on the benchmark, and both are warm-pool workloads: the model loads
-once per session rather than once per job. Distributed over 8×T4, correctness-gated on
-output agreement:
+once per session rather than once per job. Distributed over 8xT4 and correctness-gated on
+output agreement, the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>` measured the following:
 
 | Half of RAG | Batcher |
 |---|---:|

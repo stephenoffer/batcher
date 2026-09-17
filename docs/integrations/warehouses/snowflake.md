@@ -1,28 +1,21 @@
 # Snowflake
 
-Snowflake is the one warehouse on this section's list that Batcher writes as well as reads.
-{py:meth}`bt.read.snowflake(query) <batcher.api.io_namespace.reader.Reader.snowflake>` pulls a
-query result back as parallel Arrow chunks, and
-{py:meth}`ds.write.snowflake(table) <batcher.api.io_namespace.writer.Writer.snowflake>` ingests a
-dataset into a table. BigQuery and Databricks are read-only here.
+This page covers reading from and writing to Snowflake. {py:meth}`bt.read.snowflake(query) <batcher.api.io_namespace.reader.Reader.snowflake>` submits a query once and reads its result chunks in parallel as Arrow. {py:meth}`ds.write.snowflake(table) <batcher.api.io_namespace.writer.Writer.snowflake>` loads a dataset into a table.
+
+The following table summarizes the connector:
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.snowflake(query, connection_kwargs=...)` |
-| **Write** | `ds.write.snowflake(table, connection_kwargs=...)`, `mode="append"` (default) or `"overwrite"` |
-| **Extra** | `pip install 'batcher-engine[snowflake]'` |
-| **Parallelism** | One split per result chunk from `get_result_batches()` |
-| **Pushdown** | Predicates, as a `WHERE` around your query. Projection is not pushed. |
-| **Credentials** | Everything inside the `connection_kwargs` dict |
+| Read | `bt.read.snowflake(query, connection_kwargs=...)` |
+| Write | `ds.write.snowflake(table, connection_kwargs=..., mode=...)`, with `mode` set to `"overwrite"` (the default) or `"append"` |
+| Extra | `pip install 'batcher-engine[snowflake]'` |
+| Parallelism | One split per result chunk from `get_result_batches()` |
+| Pushdown | Predicates, as a `WHERE` around your query. Projection isn't pushed. |
+| Credentials | Everything in the `connection_kwargs` dict, which accepts secret references |
 
-```bash
-pip install 'batcher-engine[snowflake]'
-```
+## Read a query
 
-## Reading
-
-Connection credentials travel as one `connection_kwargs` dict, passed verbatim to
-`snowflake.connector.connect`:
+Connection settings travel as one `connection_kwargs` dict, passed to `snowflake.connector.connect` on each worker:
 
 ```python
 # docs: skip
@@ -46,73 +39,47 @@ orders = bt.read.snowflake(
 recent = orders.filter(col("amount") > 100).collect()
 ```
 
-:::{warning}
-Not `account=`, `user=`, and friends as loose keywords. They belong inside `connection_kwargs`.
-:::
+Anything the connector accepts works in that dict, including key-pair auth, `authenticator="externalbrowser"`, and a `session_parameters` dict. Loose keywords such as `account=` or `user=` raise a `TypeError`, because they belong inside `connection_kwargs`.
 
-Anything the connector accepts works there, including key-pair auth,
-`authenticator="externalbrowser"`, and a `session_parameters` dict.
+Any string value in the dict can be a secret reference instead of the secret itself: `env:NAME`, `file:PATH`, `cmd:NAME`, or a key store such as `vault:`, `aws-sm:`, `gcp-sm:`, or `azure-kv:`. The reference is resolved on the worker when the connection opens, so the password never appears in the plan or in a pickled split. {doc}`/user-guide/trust/secrets` covers the schemes.
 
-:::{dropdown} The same read, with an SSO login instead of a key
 ```python
 # docs: skip
-sso = dict(conn, authenticator="externalbrowser")
-sso.pop("private_key_file")
-
-orders = bt.read.snowflake(
-    "SELECT order_id, customer_id, amount, ordered_at FROM sales.orders",
-    connection_kwargs=sso,
-)
+conn = {
+    "account": "acme-prod",
+    "user": "svc_batcher",
+    "password": "env:SNOWFLAKE_PASSWORD",
+    "warehouse": "ETL_WH",
+}
 ```
-:::
 
 ## How it parallelizes
 
-Snowflake's connector exposes `get_result_batches()`: after one query execution it hands back a
-list of `ResultBatch` handles, each a picklable pointer to one chunk of the result set sitting
-in cloud storage. That is exactly Batcher's split model. `splits()` returns one split per
-chunk, each worker calls {py:meth}`to_arrow() <batcher.Dataset.to_arrow>` on its own handle, and the query is not re-run.
+Snowflake's connector exposes `get_result_batches()`. After one query execution it returns a list of `ResultBatch` handles, each a picklable pointer to one chunk of the result sitting in cloud storage. That is exactly Batcher's split model. `splits()` returns one split per chunk, each worker fetches its own chunk as Arrow, and the query never runs again on the workers.
 
-Parallelism is therefore set by Snowflake's chunking of the result, not by anything you
-configure. A small result comes back as one chunk and reads on one worker. A large one fans out
-across as many workers as there are chunks, pulling from cloud storage in parallel without
-going back through the warehouse.
+Snowflake's chunking of the result sets the parallelism, not anything you configure. A small result comes back as one chunk and reads on one worker. A large one fans out across as many workers as there are chunks, each pulling from cloud storage without going back through the warehouse. A streaming read with `iter_batches` walks the chunks in turn, so only one chunk is in memory at a time.
 
-## Cost, which is the whole ballgame here
+## Keep the bill down
 
-The bill has three avoidable components.
+Batcher learns the schema from a zero-row probe, the query wrapped in `WHERE 1 = 0`. Snowflake answers that without scanning data, so constructing the dataset costs a round trip rather than a second run of your query. If Snowflake vends no chunk for the empty probe, the reader falls back to running the query and reading its first chunk.
 
-:::{important}
-**The query is submitted more than once.** `bt.read.snowflake(...)` is not free at
-construction: the reader needs a schema, and it gets one by executing the query and inspecting
-the first result chunk. Then {py:meth}`collect() <batcher.Dataset.collect>` executes it again. A heavy query behind a
-`bt.read.snowflake` call is a heavy query you have paid for at least twice.
-:::
+Predicates push down. A `filter` that Kyber can push becomes a `WHERE` wrapped around your query, so the warehouse filters before returning anything, on the distributed path as well as on one node.
 
-Shape the read to be cheap, a table or a narrow view, and do the work in Batcher. Or
-materialize an intermediate table in Snowflake first and read *that*.
+Column projection doesn't push down. A `select` after the read runs on chunks that already arrived, so every column your SQL names crosses the network. Name only the columns you want in the query text. It's the single highest-leverage habit on this page.
 
-**Column projection is not pushed down.** A `select` after the read is applied to the Arrow
-table *after* the fetch. Every column named in your SQL crosses the network and lands on your
-egress bill whether you use it or not. Name the columns you want in the query text. This is the
-single highest-leverage thing on this page.
-
-**Row filters are pushed down.** A `filter` that Kyber can push becomes a `WHERE` wrapped
-around your query, so the warehouse evaluates it before returning anything. That one works in
-your favor, and it means an early `filter` is worth writing even though an early `select` is
-not.
+The following table shows where each part of a read runs:
 
 | What you write | Where it runs |
 | --- | --- |
 | Columns named in the query text | The warehouse, before anything is returned |
 | `.filter(...)` after the read | The warehouse, as a `WHERE` around your query |
-| {py:meth}`.select(...) <batcher.Dataset.select>` after the read | Your process, on the Arrow table that already arrived |
+| {py:meth}`.select(...) <batcher.Dataset.select>` after the read | Your process, on chunks that already arrived |
 
-The fourth cost is not Batcher's. A suspended warehouse takes seconds to resume, and that
-latency lands on the first query of the run. If you are reading Snowflake in a
-latency-sensitive path, keep the warehouse warm or budget for the cold start.
+A suspended warehouse takes seconds to resume, and the first query of a run pays that. In a latency-sensitive path, keep the warehouse warm or budget for the cold start.
 
-## Writing
+## Write a table
+
+Snowflake folds unquoted identifiers to upper case, and the write creates columns exactly as Arrow names them. Alias columns to the case you want to query them by before you write:
 
 ```python
 import batcher as bt
@@ -120,8 +87,6 @@ from batcher import col
 
 orders = bt.from_pydict({"order_id": [1, 2], "amount": [10.0, 5.5]})
 
-# Snowflake folds unquoted identifiers to upper case, but the write creates columns
-# exactly as Arrow names them, so name them the way you want to query them.
 shaped = orders.select(
     col("order_id").alias("ORDER_ID"),
     col("amount").alias("AMOUNT"),
@@ -135,60 +100,32 @@ print(shaped.to_pydict())
 
 ```python
 # docs: skip
-manifest = shaped.write.snowflake("ORDERS", connection_kwargs=conn)
+manifest = shaped.write.snowflake("ORDERS", connection_kwargs=conn, mode="append")
 print(manifest)
 ```
 
-:::{warning}
-The identifier point above is not pedantry. The sink creates the table, and its columns,
-through `write_pandas` with `auto_create_table=True`, which quotes what it is given. Feed it
-lowercase Arrow column names and you get a table whose columns can only ever be referenced as
-`"order_id"`, with the quotes, forever. Alias them to upper case first.
-:::
+The sink loads through `write_pandas` with `auto_create_table=True`, which quotes what it's given. Lowercase Arrow names produce a table whose columns can only be referenced as `"order_id"`, quotes included, for the life of the table.
 
 :::{warning}
-`mode` defaults to `"append"`, so a re-run adds its rows again rather than replacing them.
-Pass `mode="overwrite"` to replace the destination table instead. Overwrite is the
-destructive one: the rows that were there are gone.
+`mode` defaults to `"overwrite"`, which replaces the destination table's rows. Pass `mode="append"` to add rows to an existing table. Overwrite is refused on a distributed write with more than one shard, because each shard would replace the rows the previous shard loaded.
 :::
 
-And it goes through pandas. The Arrow table is converted with {py:meth}`to_pandas() <batcher.Dataset.to_pandas>` and staged by
-`write_pandas`, which is a full copy in driver memory. That is why this path is fine for a few
-million rows and wrong for a few billion. For bulk loads, write Parquet to a stage and
-`COPY INTO` it.
+Each shard commits its own rows as it finishes, and there's no transaction across shards. A distributed append that dies halfway leaves the rows that already landed. Write to a staging table and swap, or key the data so a re-run is idempotent.
 
-There is no cross-shard transaction. Each shard of a distributed write commits its own rows as
-it finishes, and the driver's commit step is a no-op, so a write that dies halfway leaves the
-rows that already landed. Plan for it: write to a staging table and swap, or key the data so a
-re-run is idempotent. `mode="overwrite"` is refused outright past the first shard, because every
-shard would replace the table with its own rows and the last one to finish would be all that
-survived.
+## Requirements and limitations
 
-## Failure modes worth knowing
+The write converts each shard to pandas and stages it through `write_pandas`, a full copy in worker memory. That suits millions of rows. For billions, write Parquet to a stage and run `COPY INTO`.
 
-A result chunk can go stale. `ResultBatch` handles point at cloud storage that Snowflake
-garbage-collects, so a split that sits in a queue for a long time before a worker picks it up
-can find its chunk gone. Keep the gap between planning and reading short.
+Every split opens its own connection, so a hundred splits means a hundred connections. Watch the account's concurrency limits. Splits also carry `connection_kwargs` to every worker. The values are never logged, but on a shared cluster use secret references or a service account rather than a personal credential.
 
-Every split opens its own connection. Splits carry credentials and rebuild a connection on the
-worker, so a hundred splits means a hundred connections. Watch the account's concurrency
-limits.
+A result chunk is a handle to storage that Snowflake cleans up, so a split that waits a long time in a queue can find its chunk gone. Keep the gap between planning and reading short.
 
-Numerics widen. `NUMBER(38, x)` maps to an Arrow decimal, so a column declared wider than an
-int64 can hold comes back as decimal or float, not int. Cast explicitly if the downstream cares.
-
-Credentials live on the split. They are never logged, but they *are* serialized to every
-worker. On a shared cluster that is worth knowing before you reach for a personal token instead
-of a service account.
+A Snowflake read is a query rather than a named table, so a governance policy keyed on a table name doesn't match it.
 
 ## See also
 
-- {doc}`Reading data </user-guide/moving-data/reading-data>` and {doc}`Writing data </user-guide/moving-data/writing-data>`.
-- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: pulling only the
-  new rows, which is how you keep the query cost above under control.
-- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: a warehouse table
-  joined against the lake, in one plan.
-- {doc}`Reading and writing </api/relational/io>`: the full reader/writer surface.
-- {doc}`BigQuery </integrations/warehouses/bigquery>`: the other big warehouse. Read-only, with a genuinely parallel
-  server-side read path.
-- {doc}`Databricks </integrations/warehouses/databricks>`: the third, where the read lands on Delta files.
+- {doc}`BigQuery </integrations/warehouses/bigquery>` and {doc}`Databricks </integrations/warehouses/databricks>`: the other warehouse connectors.
+- {doc}`Reading data </user-guide/moving-data/reading-data>` and {doc}`Writing data </user-guide/moving-data/writing-data>`: the reader and writer surface.
+- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: pulling only new rows, which keeps query cost under control.
+- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: a warehouse table joined against the lake in one plan.
+- {doc}`Reading and writing </api/relational/io>`: the full API reference.

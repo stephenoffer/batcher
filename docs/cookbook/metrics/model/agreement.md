@@ -1,6 +1,8 @@
 # Agreement metrics
 
-Correlation says the shapes match. These say the *values* match. A forecast that is perfectly correlated but biased high scores well on correlation and badly here, which is usually the honest answer.
+Correlation says the shapes match. Concordance correlation, Nash-Sutcliffe efficiency, and Kling-Gupta efficiency say the *values* match.
+
+The script scores two forecasts against the same observations: a close tracker, and a series that is perfectly correlated but shifted up by 10. Plain correlation gives the shifted series 1.0. Every agreement metric marks it down, and Nash-Sutcliffe goes negative, because the forecast does worse than predicting the mean.
 
 The whole script, executed on every test run:
 

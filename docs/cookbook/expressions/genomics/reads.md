@@ -2,6 +2,8 @@
 
 Three things happen to a run of sequencing reads before any analysis: the bad ones are dropped, the rest are sketched so they can be compared, and the oligos that produced them are checked. Each is a column expression, so a run of hundreds of millions of reads stays a scan.
 
+The script decodes Phred scores with a stated offset, shows a read whose mean quality looks fine but whose expected errors fail the filter, and sketches reads with canonical k-mers and minimizers, including a k-mer frequency table built from `explode` and `group_by`. It finishes by screening candidate primers on melting temperature, GC content, and homopolymer length.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/genomics_reads.py

@@ -8,7 +8,7 @@ In Ray Data, a `Dataset` is a collection of blocks held as Ray objects, and ever
 
 Batcher uses Ray for *scheduling only*. Ray tasks carry control-plane metadata, and the bulk Arrow batches move directly between workers over Arrow Flight with credit-based flow control. Nothing large is written to the object store, so there is no object store size to tune and no spill storm to diagnose.
 
-Two practical consequences follow. You do not call `ray.init()` or size an object store before running a job. And distribution is a property of a single terminal call rather than of the dataset, so the same pipeline runs single-node or distributed without being rewritten.
+Two practical consequences follow. You don't call `ray.init()` or size an object store before running a job. And distribution is a property of a single terminal call, not of the dataset, so the same pipeline runs single-node or distributed without a rewrite.
 
 ```python
 import batcher as bt
@@ -31,7 +31,7 @@ out.collect(distributed=True, num_workers=8)
 
 Most Ray Data verbs have a Batcher spelling, and the column verbs take SQL names: `select_columns` is `select`, `drop_columns` is `drop`, and `groupby` is `group_by`. {doc}`ray-data/dataset` lists every `Dataset` method with its Batcher spelling and status. Read the status before renaming a call, because several verbs share a name and differ in behavior. `write_parquet` appends by default in Ray Data and overwrites by default here, and `random_shuffle` draws a new permutation on every execution where `ds.shuffle(seed=0)` returns the same one every run.
 
-Prefer an expression over a callback wherever Ray Data accepts either. `ds.filter(col("amount") > 10)` lowers into the engine and is pushed down to the scan, where `ds.filter(lambda r: r["amount"] > 10)` cannot be. This is the single largest performance difference in a ported script.
+Prefer an expression over a callback wherever Ray Data accepts either. `ds.filter(col("amount") > 10)` lowers into the engine and is pushed down to the scan. `ds.filter(lambda r: r["amount"] > 10)` can't be. This is the single largest performance difference in a ported script.
 
 ## Splitting
 
@@ -49,11 +49,11 @@ print([a.count(), b.count(), c.count()])
 # [2, 5, 3]
 ```
 
-They differ in one way, and it works in your favor. Ray Data materializes the dataset to split it, and Batcher does not. Each part is a lazy plan, so a pipeline that consumes one part never computes the others. The trade is that collecting every part reads the input once per part, so call `ds.cache()` first when the source is expensive and you want all of them.
+They differ in one way, and it works in your favor. Ray Data materializes the dataset to split it. Batcher doesn't. Each part is a lazy plan, so a pipeline that consumes one part never computes the others. The trade is that collecting every part reads the input once per part, so call `ds.cache()` first when the source is expensive and you want all of them.
 
 `ds.split(n)` keeps its name and its `equal=`, and takes the order a position is counted in as `order_by`. Ray Data counts position in block order, and a Batcher dataset has none, so number the rows where you read them with `with_row_index("i")` and pass `order_by="i"`. `ds.zip(other)` works the same way, pairing rows by position under `order_by` and refusing inputs whose row counts differ. `streaming_split` becomes `batcher.ml.streaming_split(dataset, world_size, rank=)`, which yields per-rank torch batches rather than n iterators. {doc}`ray-data/dataset` lists both differences.
 
-For train and test sets, prefer {py:meth}`ds.ml.train_test_split(...) <batcher.api.dataset.ml.DatasetML.train_test_split>`. It assigns each row by a hash of its own values rather than by position, which keeps the split identical however the data is partitioned.
+For train and test sets, prefer {py:meth}`ds.ml.train_test_split(...) <batcher.api.dataset.ml.DatasetML.train_test_split>`. It assigns each row by a hash of its own values, not by position, so the split stays identical however the data is partitioned.
 
 ## Batch inference and UDFs
 
@@ -83,7 +83,7 @@ For a model rather than arbitrary code, {py:meth}`ds.ml.infer(...) <batcher.api.
 
 ## Reading and writing
 
-Readers live on `bt.read` and writers on `ds.write`, rather than being module-level and method-level functions, so `ray.data.read_parquet(path)` becomes `bt.read.parquet(path)` and `ds.write_parquet(path)` becomes `ds.write.parquet(path)`. The defaults are not all the same. {doc}`ray-data/io` lists every reader with what differs, such as `read_images` decoding by default in Ray Data and not here, and {doc}`ray-data/dataset` lists the writers.
+Readers live on `bt.read` and writers on `ds.write`, not as module-level and method-level functions. `ray.data.read_parquet(path)` becomes `bt.read.parquet(path)`, and `ds.write_parquet(path)` becomes `ds.write.parquet(path)`. The defaults aren't all the same. {doc}`ray-data/io` lists every reader with what differs, such as `read_images` decoding by default in Ray Data and not here, and {doc}`ray-data/dataset` lists the writers.
 
 ## Consuming results
 
@@ -96,11 +96,11 @@ print(ds.select("city", "amount").limit(2).to_pylist())
 
 ## What has no equivalent, on purpose
 
-The block and object-ref surface is absent because the data plane does not use it. `get_internal_block_refs`, `to_arrow_refs`, `to_pandas_refs`, and `num_blocks` have nothing to return, because bulk Arrow never becomes a Ray object. Stream with `ds.iter_batches()` instead, and read what execution actually did from `ds.stats()`.
+The block and object-ref surface is absent because the data plane doesn't use it. `get_internal_block_refs`, `to_arrow_refs`, `to_pandas_refs`, and `num_blocks` have nothing to return, because bulk Arrow never becomes a Ray object. Stream with `ds.iter_batches()` instead, and read what execution actually did from `ds.stats()`.
 
 Datasets also carry no name, no id, and no per-dataset context. Configuration is process-wide through `bt.config` and `bt.set_config(...)`, and `ds.explain()` labels the plan.
 
-If you type one of these names, the error tells you what to use instead rather than raising a bare `AttributeError`:
+Type one of these names and the error tells you what to use instead. It isn't a bare `AttributeError`:
 
 ```python
 try:

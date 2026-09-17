@@ -1,6 +1,8 @@
 # Parquet round trip
 
-Parquet is the default for a reason: the footer carries statistics, so a filtered read skips row groups without decoding them and `count()` is answered from metadata alone. Partitioning on a column you always filter by turns that skipping into directory pruning.
+Parquet is the format to reach for first. Its footer carries row counts and column statistics, so `count()` is answered without decoding any data, and a read that selects one column never touches the others.
+
+The script writes a table, reads it back, then writes it again with `partition_by=["day"]`. A filter on `day` now prunes whole directories. Expect one change on the way back: the partition value is parsed out of the directory name, so the `day` strings read back as dates.
 
 The whole script, executed on every test run:
 

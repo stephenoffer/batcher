@@ -2,11 +2,10 @@
 
 Row filters, column masks, and lineage. Governance is a plan rewrite rather than a runtime
 check. {py:obj}`enforce <batcher.governance.enforce>` rewrites the `LogicalPlan` before it
-executes, so a principal who may not see a column never causes that column to be read.
+executes, so a column a principal may not see never enters the plan and is never read.
 There is no filtering pass after the fact, no privileged bypass to forget, and no execution
-path that can skip enforcement. A principal who may not read a column doesn't read it and
-then get filtered. The column never enters the plan, which is also why a policy costs a
-pushed-down filter rather than a per-row callback.
+path that can skip enforcement. That is also why a policy costs a pushed-down filter rather
+than a per-row callback.
 
 ```python
 from batcher.governance import Principal, SecurityCatalog, Grant, Redact, enforce
@@ -24,13 +23,12 @@ policy (`region = principal.attrs["region"]`) serves every user.
 ```{eval-rst}
 .. currentmodule:: batcher.governance
 
-.. autoclass:: Principal
-   :members:
-   :no-index:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: GovernanceEvent
-   :members:
-   :no-index:
+   Principal
+   GovernanceEvent
 ```
 
 ## Establishing an identity
@@ -76,23 +74,22 @@ JWKS, and needs the optional `pyjwt` dependency. For anything else, implement
 protocol all three satisfy.
 
 ```{eval-rst}
-.. autoclass:: batcher.governance.authn.ProcessIdentityVerifier
-   :members:
+.. currentmodule:: batcher.governance.authn
 
-.. autoclass:: batcher.governance.authn.HmacTokenVerifier
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: batcher.governance.authn.JwtVerifier
-   :members:
-
-.. autoclass:: batcher.governance.authn.CredentialVerifier
-   :members:
+   ProcessIdentityVerifier
+   HmacTokenVerifier
+   JwtVerifier
+   CredentialVerifier
 ```
 
 ```{warning}
 Verification is a deployment control rather than a security boundary. Code running inside the
 engine's process can construct a `Principal` with any `issuer` it likes, and no in-process
-mechanism can stop it. What this buys is that a query whose identity nobody established is
+mechanism can stop it. It buys one thing: a query whose identity nobody established is
 refused instead of silently trusted. The boundary is still the process, so run one per
 trust domain. See {doc}`/user-guide/trust/hardening`.
 ```
@@ -104,18 +101,20 @@ roles hold which privilege on which columns, which columns are masked, and which
 each principal may see.
 
 ```{eval-rst}
-.. autoclass:: SecurityCatalog
-   :members:
-   :no-index:
+.. currentmodule:: batcher.governance
 
-.. autoclass:: Grant
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   SecurityCatalog
+   Grant
 ```
 
 ### Privileges
 
 A grant carries one of `PRIVILEGES`, the four SQL privileges spelled the way Snowflake
-and Unity Catalog spell them. `SELECT` governs reads and is the default; `INSERT`,
+and Unity Catalog spell them. `SELECT` governs reads and is the default. `INSERT`,
 `UPDATE`, and `DELETE` govern writes, and which of them a write needs follows from what
 it does to the rows already in the destination. The {doc}`governance guide
 </user-guide/trust/governance>` has the table.
@@ -125,6 +124,8 @@ on it is deny-by-default, so granting one privilege never confers another: a rol
 `INSERT` can add rows and cannot drop them.
 
 ```{eval-rst}
+.. currentmodule:: batcher.governance
+
 .. autodata:: PRIVILEGES
    :annotation:
 ```
@@ -133,17 +134,22 @@ on it is deny-by-default, so granting one privilege never confers another: a rol
 
 A `Denial` refuses a privilege regardless of what any grant says, the same precedence
 `DENY` has in SQL Server and Unity Catalog. It exists because grants *union* across a
-principal's roles, which leaves two things unsayable: "every column except `salary`",
-whose complement is wrong as soon as a column is added; and a hard block on a role that
-another role's grant would otherwise union around.
+principal's roles, which leaves two things unsayable. One is "every column except `salary`",
+whose complement is wrong as soon as a column is added. The other is a hard block on a role
+that another role's grant would otherwise union around.
 
 Declare one with `SecurityCatalog.deny`, and withdraw a grant with
 `SecurityCatalog.revoke`. The two are not interchangeable: `revoke` removes a rule, so a
 later grant restores access, while `deny` adds one that a later grant does not override.
 
 ```{eval-rst}
-.. autoclass:: Denial
-   :members:
+.. currentmodule:: batcher.governance
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   Denial
 ```
 
 ## Row filters
@@ -153,14 +159,15 @@ is evaluated against the *principal*, not the row, so it lowers into the plan as
 ordinary pushed-down filter and costs nothing extra.
 
 ```{eval-rst}
-.. autoclass:: RowFilter
-   :members:
+.. currentmodule:: batcher.governance
 
-.. autoclass:: MatchesAttribute
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: AttributeIn
-   :members:
+   RowFilter
+   MatchesAttribute
+   AttributeIn
 ```
 
 ## Column masks
@@ -172,11 +179,14 @@ A mask changes how a column *reads* rather than whether it reads at all. An anal
 appears, including in tables added later.
 
 ```{eval-rst}
-.. autoclass:: ColumnMask
-   :members:
+.. currentmodule:: batcher.governance
 
-.. autoclass:: TagMask
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   ColumnMask
+   TagMask
 ```
 
 ### Mask functions
@@ -185,17 +195,16 @@ The masking primitives themselves. {py:obj}`Pseudonymize <batcher.governance.Pse
 is deterministic, so masked values still join and group correctly. {py:obj}`Encrypt <batcher.governance.Encrypt>` is reversible with the key, and {py:obj}`Nullify <batcher.governance.Nullify>` isn't.
 
 ```{eval-rst}
-.. autoclass:: Redact
-   :members:
+.. currentmodule:: batcher.governance
 
-.. autoclass:: Nullify
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: Pseudonymize
-   :members:
-
-.. autoclass:: Encrypt
-   :members:
+   Redact
+   Nullify
+   Pseudonymize
+   Encrypt
 ```
 
 ## Enforcement and lineage
@@ -208,9 +217,14 @@ to the source columns it derives from. That is how a tag on a source column keep
 value three transformations downstream, after it has been renamed and cast and aggregated.
 
 ```{eval-rst}
-.. autofunction:: enforce
+.. currentmodule:: batcher.governance
 
-.. autofunction:: column_lineage
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   enforce
+   column_lineage
 
 .. autodata:: Origin
 ```
@@ -251,18 +265,17 @@ candidate list in preference order. An empty intersection is a real answer: the 
 split, not placed.
 
 ```{eval-rst}
-.. autoclass:: DataResidency
-   :members:
+.. currentmodule:: batcher.governance
 
-.. autoclass:: ResidencyCatalog
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: ResidencyVerdict
-   :members:
-
-.. autofunction:: active_residency
-
-.. autofunction:: set_residency
+   DataResidency
+   ResidencyCatalog
+   ResidencyVerdict
+   active_residency
+   set_residency
 
 .. autodata:: RESIDENCY_MODES
 ```

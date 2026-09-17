@@ -2,6 +2,8 @@
 
 Sort order is where nulls, ties, and descending flags interact badly. Decide explicitly where nulls go and how ties break, because the default is rarely what a report wants and the difference is invisible until someone checks a boundary row.
 
+The script sorts ascending and descending, places nulls first and last on purpose, adds a tie-break column so the order is deterministic, and compares the `min` and `dense` rank methods on a tie. It also takes a top-N with `top_k` without sorting the whole table. Every assertion checks the sequence, not a set, because a sort test that compares sets cannot fail when the sort breaks.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/sorting_and_ranking.py

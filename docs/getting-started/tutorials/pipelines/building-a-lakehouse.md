@@ -14,6 +14,10 @@ Everything here runs as written, in a temp directory, with the `delta` extra
 | A temp directory | Provided by the first block |
 | A cluster | Only the last block, which is shown and not run |
 
+The following diagram shows the tables this page builds and the writes that change silver after its first load:
+
+![Bronze holds raw Parquet with no cleaning. An overwrite of its paid rows creates silver, a Delta table partitioned by day. Gold is a plain group_by over silver that sums revenue per day. After the first load, merge_on="order_id" upserts into silver as one commit, and replace_where with a predicate replaces one day's rows as a backfill that is safe to re-run. Reading version=0 returns silver as it was before the merge, because every commit is a version. The transaction log also records each file's bounds, which a filtered read prunes against.](/_static/diagrams/medallion_layers.svg)
+
 ## 1. Somewhere to work
 
 Every runnable block below writes into one temp directory, so nothing lands in your
@@ -30,7 +34,7 @@ work = tempfile.mkdtemp()
 
 ## 2. Bronze: land the raw data
 
-Bronze is the raw drop. No cleaning, no dedup, no opinions. Get it stored so nothing is lost.
+Bronze is the raw drop, with no cleaning and no dedup. Get it stored so nothing is lost.
 Parquet files are fine here.
 
 ```python
@@ -241,8 +245,9 @@ import batcher as bt
 The query is the same one. `distributed=True` and a bucket are the entire difference.
 
 A distributed write is **one** transaction. Workers produce files; the driver commits once.
-The commit is `O(files)`, not `O(rows)`, which is what took the 16-shard, 240 MB commit in
-the benchmark from 634 ms to 4.9 ms.
+The commit is `O(files)`, not `O(rows)`. In `benchmarks/BENCHMARK_RESULTS.md`, the driver
+commits 16 shards totalling 240 MB in 4.1 ms, against 661.8 ms to re-encode them through the
+driver, and 0 MB of data passes through the driver.
 
 ## Where to go next
 

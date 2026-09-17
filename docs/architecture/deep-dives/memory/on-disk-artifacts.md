@@ -1,9 +1,6 @@
 # On-disk artifacts
 
-This page catalogues everything Batcher writes to disk while a query runs: what each artifact
-is, what format it takes, where it lands, and the three properties every one of them has to
-have. Read it when you are adding a code path that writes bytes, or when you need to know what
-a running query has left on a shared machine.
+This page catalogues everything Batcher writes to disk while a query runs, and the three properties every artifact has to have. Read it when you add a code path that writes bytes, or when you need to know what a running query has left on a shared machine.
 
 ## What counts as an artifact
 
@@ -12,8 +9,7 @@ Whether it is temporary does not matter. A spilled partition is deleted
 within seconds and still holds the query's actual data for as long as it exists. A scratch
 volume on a Ray worker is a volume other tenants mount.
 
-Result caching is not on this list. `carbonite/cache.py` holds `pyarrow.Table` objects in
-process memory and writes nothing.
+The result cache is on the list once it runs out of memory. `carbonite/cache.py` holds `pyarrow.Table` objects in process memory, and under the default `MEMORY_AND_DISK` storage level an entry its budget sheds is demoted to a disk tier rather than dropped.
 
 ## The catalogue
 
@@ -26,6 +22,7 @@ one batch or memory-map the whole thing.
 |---|---|---|---|
 | Grace spill partition | `bc-runtime::agg::spill::DiskSpillStore` | IPC stream | `bc-spill-{pid}-{seq}/part-{i}.arrow` under the spill root |
 | Tiered spill bucket | `carbonite/spill/writer.py::BucketWriter` | IPC stream | the spill directory, or `memory.spill_remote_uri` |
+| Demoted cache result | `carbonite/cache_disk.py::DiskCacheTier`, through the tiered spill store | IPC stream | the spill scratch directory, up to `memory.result_cache_disk_max_bytes` |
 | Disk shuffle bucket | `dist/shuffle_io.py::IpcWriter` | IPC stream | the shuffle scratch directory |
 | Flight gather staging file | `bc-py::write_gather_file` | IPC stream | the reducer's work directory |
 | Same-node shuffle bucket | `bc-transport::shared` | IPC file | `/dev/shm/batcher_shm/` |
@@ -72,8 +69,7 @@ coalesce into a handful of large writes.
 
 Buffering is invisible to the reader, because the IPC bytes are identical either way, so it is
 pure throughput. Two shapes exist, and the difference is how many writers are open at once. The
-grace spill store holds one writer per partition and can be re-partitioned 4,096 ways under
-skew, so it budgets 32 MiB *in total* and divides it
+grace spill store holds one writer per partition, and the partition count grows with skew, so it budgets 32 MiB *in total* and divides it, never below 8 KiB or above 1 MiB per writer
 (`bc-runtime::agg::spill::store::write_buf_capacity`). The shm publisher and the Flight gather write
 exactly one file at a time, so each takes a fixed 1 MiB buffer that cannot multiply.
 
@@ -103,16 +99,16 @@ also why the choice is result-invariant: it trades CPU for bytes and nothing els
 
 ## Where the bytes go
 
-Two questions, one answer each. Both used to have several.
+Two questions decide where an artifact lands, and each has exactly one function answering it.
 
-`site.spill_scratch_dir()` resolves *which disk this process spills to*. It takes the configured
+`_internal/site/scratch.py::spill_scratch_dir()` resolves *which disk this process spills to*. It takes the configured
 `memory.spill_dir`, else the best measured node-local volume, else the system temp directory.
 The hardware fingerprint that keys every learned spill threshold reads the same function, so a
 learned threshold names the disk the spill actually landed on. When those two disagreed, the
 fingerprint described a container's overlay while the spill went to the node's NVMe, and two
 machine classes that behave nothing alike were merged into one.
 
-`shuffle_io.shared_scratch_root()` resolves *which directory every node can see*, which is a
+`dist/shuffle_io.py::shared_scratch_root()` resolves *which directory every node can see*, which is a
 different question. The disk shuffle passes only paths between Ray tasks, so a path has to
 resolve on whichever node the reducer lands on. That prefers a cluster-shared mount and falls
 back to node-local scratch only where no shared mount exists.
@@ -148,8 +144,8 @@ a `Drop` cannot reach are what the pid in its name is for.
 ![What a spill puts on disk, and its whole lifecycle. Under the spill root, which is memory.spill_dir or else the node's local scratch, each store owns a directory bc-spill-{pid}-{seq} holding part-0.arrow through part-N.arrow, one Arrow IPC stream each, made owner-only where the filesystem allows. A partition is a hash bucket for the grace operators and a sorted run for the external sort, in the same file format. A writer opens on the first append, so a bucket that received no rows has no file at all, and the codec comes from the first batch's schema: ZSTD for blob-bearing columns, none for anything else. The ordinary lifecycle is created, appended with rows and bytes counted per file, then read back once in the merge phase before the partition is released, and the store removes its own directory on drop, on success, on an error and on a panic alike. Two ends fall outside that: a SIGKILL leaves the directory behind, because the OOM killer picks the spilling process, and it is reclaimed by an orphan sweep that removes only directories whose embedded pid is no longer a live process, which is what keeps a concurrently spilling sibling safe. A truncated IPC stream reads back as a shorter valid one, so every read is checked against the row count taken on the way in.](/_static/diagrams/spill_artifacts.svg)
 
 Each artifact is removed by the thing that created it. `DiskSpillStore` has a `Drop` that
-removes its directory. `spill_scratch` removes a work directory it allocated and leaves an
-operator-configured one alone. The file cache evicts least-recently-used entries to stay under
+removes its directory. `dist/spill/buckets.py::spill_scratch` removes a work directory it allocated and leaves an
+operator-configured one alone. The cache's disk tier is process-scoped scratch rather than a durable store, and `DiskCacheTier.clear()` deletes its directory. The file cache evicts least-recently-used entries to stay under
 its byte budget.
 
 A remote file larger than the whole file-cache budget is never admitted. Caching it would
@@ -171,3 +167,4 @@ orphaned by a killed process is swept by name on the next run, which is what the
 - {doc}`The shuffle </architecture/deep-dives/distribution/shuffle-flight>`: what the shuffle buckets are for.
 - {doc}`Streaming </user-guide/moving-data/streaming>`: the checkpoint artifact, from a user's point of view.
 - {doc}`Carbonite </architecture/internals/carbonite>`: the subsystem that owns the spill decision.
+- {doc}`Arrow and memory </architecture/deep-dives/memory/arrow-memory>`: the IPC format every artifact here shares.

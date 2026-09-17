@@ -1,6 +1,8 @@
 # Arrow interop
 
-Arrow is the shared contract, so `from_arrow` and `to_arrow` are the cheapest boundary there is. The pandas and Polars bridges go through Arrow as well. A row-by-row conversion costs far more than any of them.
+Arrow is Batcher's columnar format, so `bt.from_arrow` and `to_arrow()` are the cheapest boundary there is: the buffers cross without a copy. The pandas and Polars bridges go through Arrow as well.
+
+The script moves one table through every exit. `to_pydict`, `to_pylist`, and `item` build Python objects and suit small results. `to_numpy`, `to_pandas`, and `to_polars` hand a block to another library. `iter_batches` hands out `RecordBatch`es one at a time, which is the streaming boundary.
 
 The whole script, executed on every test run:
 

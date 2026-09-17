@@ -3608,10 +3608,11 @@ class Expr:
         return sem.count_nulls_as_value(agg, self)
 
     def approx_quantile(self, q: float) -> AggExpr:
-        """Approximate quantile `q ∈ [0, 1]` via a KLL sketch (bounded memory).
+        """Approximate quantile `q ∈ [0, 1]` via a DDSketch (bounded memory, ~1% relative error).
 
         The skew-safe choice when an exact `quantile`/`median` on a hot key would
-        hold every value. Mergeable, so identical single-node and distributed.
+        hold every value. DDSketch merges by summing fixed buckets, so the result is identical
+        single-node and distributed.
 
         Args:
             q: The quantile in ``[0, 1]``.

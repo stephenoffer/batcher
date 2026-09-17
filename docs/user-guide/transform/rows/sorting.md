@@ -1,11 +1,8 @@
 # Sorting
 
-Sorting is a pipeline breaker: the engine has to see every row before it can emit the
-first one. That also makes it one of the few operators where a bug hides in plain sight.
-A result that is *almost* ordered still looks right in a `head(5)`, and an
-order-independent assertion in your test cannot see the difference at all. This page is
-the contract: what `sort` guarantees, where nulls and NaN land, and when not to sort at
-all.
+This page covers sorting in Batcher: what `sort` guarantees, where nulls and NaN land, when a top-n operator beats a sort, and what makes a sort fast on one core, out of core, and across a cluster.
+
+Sorting is a pipeline breaker, since the engine has to see every row before it can emit the first one. That also makes it one of the few operators where a bug hides in plain sight. A result that is *almost* ordered still looks right in a `limit(5)`, and an order-independent assertion in your test cannot see the difference at all. So this page states the contract precisely.
 
 ## Setup
 
@@ -30,10 +27,7 @@ print(ds.sort("score").select("name", "score").to_pydict())
 # {'name': ['dan', 'bob', 'ann', 'cy', 'eve'], 'score': [12, 25, 30, 30, 41]}
 ```
 
-`descending` and `nulls_first` are either one bool for every key or a list aligned with
-the keys. A multi-key sort with mixed directions is the common reporting shape: group
-label ascending, metric descending. The SQL spelling lowers to the same plan, so pick
-whichever reads better.
+`descending` and `nulls_first` are either one bool for every key or a list aligned with the keys. A multi-key sort with mixed directions is the common reporting shape, with the group label ascending and the metric descending. The SQL spelling lowers to the same plan, so pick whichever reads better.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -58,35 +52,27 @@ print(bt.sql("SELECT team, score, name FROM t ORDER BY team ASC, score DESC", t=
 :::
 ::::
 
-A sort key can be an expression, which is how you sort by something you never want in
-the output.
+A sort key can be an expression, which is how you sort by something you never want in the output.
 
 ```python
-print(ds.sort(bt.col("name").str.len(), descending=True).select("name").to_pydict())
+print(ds.sort(bt.col("name").str.len_chars(), descending=True).select("name").to_pydict())
 # {'name': ['ann', 'bob', 'dan', 'eve', 'cy']}
 ```
 
 ## Ties are not stable, so break them yourself
 
-Two rows with the same key can come back in either order, and the order can change
-between a sequential run, a multi-core run, and a distributed one. `ann` and `cy` both
-score 30 above, and nothing promises which comes first. If the order of tied rows matters
-(and it usually does, the moment you `head(n)` or write the result), add a tiebreaker
-key that is unique.
+Two rows with the same key can come back in either order, and the order can change between a sequential run, a multi-core run, and a distributed one. `ann` and `cy` both score 30 above, and nothing promises which comes first. If the order of tied rows matters, and it usually does the moment you `limit(n)` or write the result, add a tiebreaker key that is unique.
 
 ```python
 print(ds.sort("score", "name", descending=[True, False]).select("score", "name").to_pydict())
 # {'score': [41, 30, 30, 25, 12], 'name': ['eve', 'ann', 'cy', 'bob', 'dan']}
 ```
 
-This is the same discipline SQL demands: `ORDER BY score DESC` with ties is a
-non-deterministic result, whatever engine you run it on.
+This is the same discipline SQL demands. `ORDER BY score DESC` with ties is a non-deterministic result, whatever engine you run it on.
 
 ## Nulls sort last by default, in both directions
 
-`nulls_first=False` (the default) puts nulls at the end whether you sort ascending or
-descending. Nulls are not "smallest", they are "absent". Flip `nulls_first=True` to get
-them up front.
+`nulls_first=False`, the default, puts nulls at the end whether you sort ascending or descending. Nulls are not "smallest". They are "absent". Flip `nulls_first=True` to get them up front.
 
 ```python
 scores = bt.from_pydict({"name": ["a", "b", "c", "d"], "score": [3, None, 1, 2]})
@@ -101,16 +87,11 @@ print(scores.sort("score", nulls_first=True).to_pydict())
 # {'name': ['b', 'c', 'd', 'a'], 'score': [None, 1, 2, 3]}
 ```
 
-That matters for `head`: `sort("score", descending=True).head(1)` gives you the
-maximum, never a null row. If you want nulls out of the result entirely, say so with
-`drop_nulls`. Do not rely on where the sort happens to put them.
+That matters for `limit`: `sort("score", descending=True).limit(1)` gives you the maximum, never a null row. If you want nulls out of the result entirely, say so with `drop_nulls`. Do not rely on where the sort happens to put them.
 
 ## Floats: NaN is a value, null is absence
 
-NaN is not null and it is not "unordered". Batcher sorts it as larger than every
-number, so ascending puts it after `+inf` and before the nulls; descending puts it
-first. `-0.0` and `0.0` compare equal, so their relative order is a tie, the same as any
-other tie.
+NaN is not null and it is not "unordered". Batcher sorts it as larger than every number, so ascending puts it after `+inf` and before the nulls, and descending puts it first. `-0.0` and `0.0` compare equal, so their relative order is a tie, the same as any other tie.
 
 ```python
 floats = bt.from_pydict({"x": [1.0, float("nan"), -0.0, 0.0, None, -1.0]})
@@ -119,7 +100,7 @@ print(floats.sort("x").to_pydict())
 # {'x': [-1.0, -0.0, 0.0, 1.0, nan, None]}
 
 print(floats.sort("x", descending=True).to_pydict())
-# {'x': [nan, 1.0, 0.0, -0.0, -1.0, None]}
+# {'x': [nan, 1.0, -0.0, 0.0, -1.0, None]}
 ```
 
 Put the two flags together and the whole ordering is this:
@@ -132,19 +113,16 @@ Put the two flags together and the whole ordering is this:
 | `sort("x", descending=True, nulls_first=True)` | nulls, then NaN, then numbers descending |
 
 :::{warning}
-NaN is *larger than every number*, so it sorts last in ascending order and first in
-descending order, immediately before the nulls in both. A `head(10)` over a descending
-float sort therefore returns ten NaN rows the moment your data has ten of them, and the
-result looks exactly like a working query. If NaN in your data means "no measurement"
-rather than a real value, convert it before you sort: {py:meth}`.fill_nan(...) <batcher.plan.expr_ir.core.Expr.fill_nan>` replaces IEEE
-NaN, which `.fill_null(...)` never touches.
+NaN is *larger than every number*, so it sorts last in ascending order and first in descending order, immediately before the nulls in both. A `limit(10)` over a descending float sort therefore returns ten NaN rows the moment your data has ten of them, and the result looks exactly like a working query. If NaN in your data means "no measurement" rather than a real value, convert it before you sort: {py:meth}`.fill_nan(...) <batcher.plan.expr_ir.core.Expr.fill_nan>` replaces IEEE NaN, which `.fill_null(...)` never touches.
 :::
 
 ## Don't sort when you want the top n
 
-`sort(...).head(k)` asks the engine for a total order and then throws almost all of it
-away. `top_k(k, by=...)` keeps a bounded heap instead, so memory is O(k) rather than
-O(rows) and there is nothing to spill.
+`sort(...).limit(k)` asks the engine for a total order and then throws almost all of it away. `top_k(k, by=...)` keeps a bounded heap instead, so memory is O(k) rather than O(rows) and there is nothing to spill.
+
+The difference is easiest to see side by side. Both lanes below return the same `k` rows:
+
+![Why a top-N is not a sort followed by a slice. In the sort-then-slice lane, the morsels are concatenated into one giant batch, the whole relation is fully sorted with every row ordered and every column gathered, and only then sliced to k rows, so the relation is copied twice and ordered once to keep k rows of it. In the top-N lane, parallel_top_n runs heap_select_k on each morsel, a heap of k per morsel, where a row that cannot reach the answer costs one comparison against the current worst. Only the keys of the narrow candidates move on while the payload stays behind, the candidates are merged to k rows with ties broken on morsel and row so the survivor matches the stable sort's, and the wide payload columns are gathered once at the end, over k rows. The relation is never concatenated and never fully sorted. The heap is used when k is small against the morsel. Above that, the morsel is sorted and sliced, because a linear sort costs no more. A shared bound can skip a whole morsel whose key range cannot reach the answer, and switches itself off after 32 checks that excluded nothing.](/_static/diagrams/topn_heap.svg)
 
 :::{tip}
 Reach for the narrowest operator that answers the question you actually asked.
@@ -161,29 +139,17 @@ print(ds.top_k(2, by="score").select("name", "score").to_pydict())
 # {'name': ['eve', 'ann'], 'score': [41, 30]}
 ```
 
-`descending=True` is the default there, since top means largest. Pass `descending=False`
-for the bottom `k`. The same rule applies to `limit`: the optimizer can push a limit into a
-sort, but it cannot push one into a sort you wrote as a separate materialized step.
+`descending=True` is the default there, since top means largest. Pass `descending=False` for the bottom `k`. The same rule applies to `limit`: the optimizer can push a limit into a sort, but it cannot push one into a sort you wrote as a separate materialized step.
 
-Sorting to make a *later* operator cheaper is usually wasted too. A {py:meth}`group_by <batcher.Dataset.group_by>` hashes,
-it does not need sorted input, and a `join` builds a hash table. Sort at the end, once,
-for presentation or for the file layout you are writing.
+Sorting to make a *later* operator cheaper is usually wasted too. A {py:meth}`group_by <batcher.Dataset.group_by>` hashes, it does not need sorted input, and a `join` builds a hash table. Sort at the end, once, for presentation or for the file layout you are writing.
 
 ## What makes a sort fast
 
-The key's *type* decides which algorithm runs, and the difference is large enough to be worth
-knowing when you have a choice of key.
+The key's *type* decides which algorithm runs, and the difference is large enough to be worth knowing when you have a choice of key.
 
-A fixed-width key, such as an integer, a date or a timestamp, sorts by a counting sort over an
-order-preserving integer, which is linear in the rows. A string key has to compare bytes. Where
-a column is available in both forms, ordering by the fixed-width one is materially cheaper, and
-ordering by an `id` and rendering the label afterwards is cheaper still.
+A fixed-width key, such as an integer, a date or a timestamp, sorts by a counting sort over an order-preserving integer, which is linear in the rows. A string key has to compare bytes. Where a column is available in both forms, ordering by the fixed-width one is materially cheaper, and ordering by an `id` and rendering the label afterwards is cheaper still.
 
-Sorting by *several* fixed-width keys is not more expensive than sorting by one, as long as
-their combined value ranges are narrow. The engine measures each key's live range and packs the
-whole tuple into a single integer, so `ORDER BY <date>, <priority>` costs about what
-`ORDER BY <date>` costs. Mixed directions are free, and so is a key that turns out to be
-constant.
+Sorting by *several* fixed-width keys is not more expensive than sorting by one, as long as their combined value ranges are narrow. The engine measures each key's live range and packs the whole tuple into a single integer, so `ORDER BY <date>, <priority>` costs about what `ORDER BY <date>` costs. Mixed directions are free, and so is a key that turns out to be constant.
 
 | Leading key | What runs |
 | --- | --- |
@@ -207,21 +173,13 @@ print(events.sort("day", "priority", descending=[False, True]).to_pydict()["labe
 # ['a', 'c', 'b']
 ```
 
-None of this changes the answer. Only the time. If the key you have is a string, sort on it.
-The point is to reach for a fixed-width key when one is genuinely available, rather than to
-reshape data around the sort.
+None of this changes the answer. Only the time. If the key you have is a string, sort on it. The point is to reach for a fixed-width key when one is genuinely available, rather than to reshape data around the sort.
 
 ### Data that is already partly in order
 
-The engine looks for stretches of the key that are already ordered, and merges them instead of
-sorting them. You get this without asking, and it is common to have without realizing: a table
-whose files were each written sorted, batches appended in arrival order, a `union` of sorted
-sources, or a re-sort by the column a table is already clustered on.
+The engine looks for stretches of the key that are already ordered, and merges them instead of sorting them. You get this without asking, and it is common to have without realizing: a table whose files were each written sorted, batches appended in arrival order, a `union` of sorted sources, or a re-sort by the column a table is already clustered on.
 
-Detection is cheap enough to be unconditional. It samples along the key rather than scanning it,
-so an input with no order to find pays a few dozen comparisons and then sorts exactly as it
-would have. There is no flag, and nothing to declare: the engine checks the rows in hand rather
-than trusting a claim that they are sorted, so a wrong claim cannot produce a wrong answer.
+Detection is cheap enough to be unconditional. It samples along the key rather than scanning it, so an input with no order to find pays a few dozen comparisons and then sorts exactly as it would have. There is no flag, and nothing to declare: the engine checks the rows in hand rather than trusting a claim that they are sorted, so a wrong claim cannot produce a wrong answer.
 
 ```python
 import batcher as bt
@@ -234,22 +192,13 @@ print(merged.to_pydict()["v"])
 # ['a', 'e', 'b', 'f', 'c', 'g', 'd', 'h']
 ```
 
-Two things bound what this is worth. It applies to fixed-width keys, and the runs have to be
-long: a column that is *nearly* sorted with frequent out-of-order rows has no long stretches to
-merge, and sorts at its usual cost. On six million rows a fully sorted or run-structured key is
-1.1x to 1.3x faster than a random one, and the remainder is the cost of moving the rows into
-their new order, which no ordering trick removes.
+Two things bound what this is worth. It applies to fixed-width keys, and the runs have to be long. A column that is *nearly* sorted with frequent out-of-order rows has no long stretches to merge, and sorts at its usual cost. Measured on six million rows, run detection made a strictly descending key 1.32x faster and two concatenated sorted halves 1.26x faster than the same sort without it, and left random input unchanged. Most of what remains is the cost of moving the rows into their new order, which no ordering trick removes. {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>` has the measurement.
 
-Descending data counts as ordered too, and reversing it is free. That holds only when the
-descending stretch has no repeated keys: reversing a run holding two equal rows would put the
-later one first, and the engine's sort keeps ties in input order.
+Descending data counts as ordered too, and reversing it is free. That holds only when the descending stretch has no repeated keys, because reversing a run holding two equal rows would swap them.
 
 ### Binary keys
 
-A `binary` column is a first-class sort key and is ordered by the same byte comparison a string
-is, so a hash, a UUID, a checksum, or a key you encoded yourself sorts without being decoded
-first. All three Arrow spellings work and order identically: variable-length `binary` and
-`large_binary`, and fixed-width `binary(n)`.
+A `binary` column is a first-class sort key and is ordered by the same byte comparison a string is, so a hash, a UUID, a checksum, or a key you encoded yourself sorts without being decoded first. All three Arrow spellings work and order identically: variable-length `binary` and `large_binary`, and fixed-width `binary(n)`.
 
 ```python
 import pyarrow as pa
@@ -264,29 +213,21 @@ print(bt.from_arrow(records).sort("key").to_pydict()["payload"])
 # ['a', 'b', 'c']
 ```
 
-Prefer `binary(n)` when your values are genuinely fixed width, for the key and for the payload
-alike. It costs no offset buffer; the engine can prove that a padded comparison of its bytes is
-exact, which a variable-length column holding a zero byte does not allow; and moving it through
-a sort is a fixed-stride copy rather than an offset chase, which is the cheapest gather there
-is.
+Prefer `binary(n)` when your values are genuinely fixed width, for the key and for the payload alike. It costs no offset buffer. The engine can prove that a padded comparison of its bytes is exact, which a variable-length column holding a zero byte does not allow. And moving it through a sort is a fixed-stride copy rather than an offset chase, which is the cheapest gather there is.
 
-A binary key distributes like any other: `collect(distributed=True)` range-partitions on sampled
-byte quantiles and each worker sorts its own range, so a sort whose keys are bytes is not capped
-at one machine.
+A binary key distributes like any other. `collect(distributed=True)` range-partitions on sampled byte quantiles and each worker sorts its own range, so a sort whose keys are bytes is not capped at one machine.
 
-That holds even when the key is badly skewed. A range partition keeps equal keys together, so
-one dominant value would otherwise pin its whole share on a single worker no matter how many you
-add; the engine detects that from the sample and gives the value a bucket of its own, spread
-across several workers. You do not configure it, and it does not change the result.
+That holds even when the key is badly skewed. A range partition keeps equal keys together, so one dominant value would otherwise pin its whole share on a single worker no matter how many you add. The engine detects that from the sample and gives the value a bucket of its own, spread across several workers. You do not configure it, and it does not change the result.
 
-`examples/relational/sorting_binary_keys.py` works all of this end to end, including null
-placement and the fixed-layout record shape.
+`examples/relational/sorting_binary_keys.py` works all of this end to end, including null placement and the fixed-layout record shape.
 
 ## Sorting large results: spill
 
-A sort that does not fit in the memory budget spills sorted runs to disk and merges
-them. This is on by default under {py:meth}`collect(spill=True) <batcher.Dataset.collect>` and the out-of-core path, and
-the merged result is exactly the in-memory result: same order, same rows.
+A sort that does not fit in the memory budget spills sorted runs to disk and merges them. {py:meth}`collect(spill=True) <batcher.Dataset.collect>` takes that out-of-core path, and the merged result is exactly the in-memory result, with the same order and the same rows.
+
+The path has two passes, and only a sort that does not fit takes either of them:
+
+![The external merge sort, from admission to the last pass. First the memory pool decides whether the sort fits in its envelope. If it fits, parallel_sort_batch sorts in memory and touches no disk. If it does not fit, pass 0 accumulates morsels into a run bounded at a quarter of the operator's budget and at most 64 MiB, sorts it, and writes it out as one Arrow IPC stream file, dropping each input batch as the run is written so the relation is never all resident. Passes 1 to n then merge the runs on disk 16 at a time through a min-heap of run heads holding one batch per reader, and repeat while more than one run remains. The last pass emits the sorted rows 16,384 at a time. The merged row count is checked against the rows that went in, because a truncated spill file would otherwise read back as a valid shorter stream, a sorted prefix rather than an error.](/_static/diagrams/sort_run_merge.svg)
 
 ```python
 big = bt.range(0, 50_000).with_columns(k=(bt.col("value") * 7919) % 1000)
@@ -298,17 +239,12 @@ print(first, last, out.num_rows)
 ```
 
 :::{warning}
-Verify a spilled sort with an order-*dependent* check, as above. Comparing the sorted
-result to the expected result as a multiset passes even when the rows come back in an
-arbitrary order. That is exactly how a real `descending=True` spill bug once shipped
-green: every gate was passing, and the test could not see the one thing that was wrong.
+Verify a spilled sort with an order-*dependent* check, as above. Comparing the sorted result to the expected result as a multiset passes even when the rows come back in an arbitrary order. A multiset comparison cannot see the one property a sort exists to provide.
 :::
 
 ## Sorting and writing
 
-Sort order survives into the files you write, so a sorted write gives readers cheap
-range pruning on the sort key later. Pair it with `repartition` when you care about
-file layout.
+Sort order survives into the files you write, so a sorted write gives readers cheap range pruning on the sort key later. Pair it with `repartition` when you care about file layout.
 
 ```python
 # docs: skip
@@ -318,16 +254,11 @@ ds.sort("team", "score").repartition(by="team").write("out/")
 ## See also
 
 - {doc}`Filtering </user-guide/transform/rows/filtering>`: cut rows before you order them.
-- {doc}`Window functions </user-guide/analyze/window-functions>`: `row_number`/`rank` over an ordered
-  partition, which is the right tool for "top n per group".
+- {doc}`Window functions </user-guide/analyze/window-functions>`: `row_number` and `rank` over an ordered partition, which is the right tool for "top n per group".
 - {doc}`Performance </user-guide/operate/tuning/performance>`: the spill path and the memory budget.
-- {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>`: the run generation and k-way merge
-  that make the spilled result identical to the in-memory one.
-- {doc}`Sorting at scale </architecture/deep-dives/operators/sort-at-scale>`: what happens to a distributed sort as
-  the cluster grows, and how a skewed key is kept from pinning one worker.
+- {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>`: the run generation and k-way merge that make the spilled result identical to the in-memory one.
+- {doc}`Sorting at scale </architecture/deep-dives/operators/sort-at-scale>`: what happens to a distributed sort as the cluster grows, and how a skewed key is kept from pinning one worker.
 - {doc}`Dataset API </api/relational/dataset>`: the `sort`, `top_k`, and `limit` reference.
-- {doc}`Top k per group </cookbook/analytics/aggregates/top-k-per-group>`: the window recipe, worked
-  end to end.
-- {doc}`DuckDB comparison </benchmarks/comparisons/vs-duckdb>`: where sort stands against the
-  single-node bar.
+- {doc}`Top k per group </cookbook/analytics/aggregates/top-k-per-group>`: the window recipe, worked end to end.
+- {doc}`DuckDB comparison </benchmarks/comparisons/vs-duckdb>`: where sort stands against the single-node bar.
 - {doc}`/cookbook/expressions/scalar/sorting_and_ranking`: the sort edge cases that hide bugs, as a runnable script.

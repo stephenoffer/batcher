@@ -2,7 +2,7 @@
 
 This page describes the two paths on which Batcher runs work on a GPU, and the scheduling that keeps the device busy on each.
 
-A GPU costs roughly forty times what a CPU core costs and idles just as easily. The whole job of an engine running GPU work is to keep the device fed, and almost every way of failing at that is a *scheduling* failure rather than a kernel failure.
+A GPU idles as easily as a CPU core and costs far more while it does. The job of an engine running GPU work is to keep the device fed, and almost every way of failing at that is a *scheduling* failure rather than a kernel failure.
 
 Both GPU paths are Python. The `bc-*` crates contain no GPU code at all, which follows from the Arrow-only data-plane contract. The two paths differ in what they put on the device and in who dispatches them.
 
@@ -11,7 +11,7 @@ Both GPU paths are Python. The `bc-*` crates contain no GPU code at all, which f
 | GPU relational backend ({py:meth}`collect(backend="gpu") <batcher.Dataset.collect>`) | cuDF dataframe ops, with a torch scatter-reduce fallback | `core/gpu_plan/` translates, `dist/gpu/` schedules, in Ray tasks with `num_gpus=1` |
 | GPU inference stage (`map_batches(..., num_gpus=...)`) | the user's torch model | a Python Ray actor |
 
-The second is the larger workload. The first is an opt-in accelerator for relational shapes, described in the next section. An unsupported shape, an OOM, or a GPU-less cluster falls back to the CPU engine, so `backend="gpu"` is always safe to request.
+The relational backend is an opt-in accelerator for relational shapes, described in the next section. An unsupported shape, an OOM, or a GPU-less cluster falls back to the CPU engine, so `backend="gpu"` is always safe to request.
 
 ## The relational backend
 
@@ -19,7 +19,7 @@ The second is the larger workload. The first is an opt-in accelerator for relati
 
 | Layer | What translates |
 |---|---|
-| Operators | filter, project, group-by aggregate, sort, distinct, limit, window, equi/semi/anti join, union |
+| Operators | filter, project, group-by aggregate, sort, distinct, limit, window, unnest, unpivot, row id, plus equi/semi/anti joins of two chains and unions of chains |
 | Aggregates | sum, count, count(\*), mean, min, max, var, stddev, median, quantile, count-distinct, product, bool-and, bool-or |
 | Window functions | row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, forward and backward fill, and the aggregates over a whole partition, a running frame, or a moving frame |
 | Expressions | arithmetic, comparison, boolean, cast, `CASE`, coalesce, nullif, greatest, least, `IN`, null and NaN tests, twenty unary math functions, and the string and date vocabularies |
@@ -118,18 +118,18 @@ A warm pool only helps if the model is *loadable once*. That's why `map_batches(
 
 ## Batch sizing
 
-There are two controllers and they optimize different things. Conflating them is the mistake the design avoids. The table names each one, then the tabs below explain how each works.
+There are two controllers, and they optimize different things. The following table compares them, and the tabs below explain how each works.
 
 | | Latency controller | Throughput controller |
 |---|---|---|
 | For | online serving | offline batch |
 | Optimizes | a per-batch latency setpoint | maximum rows/sec under a VRAM cap |
 | Method | a PID over the *relative* latency error | a constrained hill-climb |
-| Lives in | `crates/bc-udf/src/batch_size.rs`, `ml/inference.py` | `ml/autobatch.py` |
+| Lives in | `ml/inference/pool.py` | `ml/autobatch.py` |
 
 ::::{tab-set}
 :::{tab-item} Latency (online serving)
-A PID over the *relative* per-batch latency error drives the batch size toward a latency setpoint. It's implemented identically in `crates/bc-udf/src/batch_size.rs::BatchSizeController` and `ml/inference.py::_LatencyController`, and shipped to Rust as `EngineConfig` so the two can't drift.
+A PID over the *relative* per-batch latency error drives the batch size toward a latency setpoint. The live controller is `ml/inference/pool.py::_LatencyController`, which reads its gains from the shared `PIDConfig`. It's a port of `crates/bc-udf/src/batch_size.rs::BatchSizeController`, which states the same law in Rust. `bc-udf` isn't linked into `bc-py`, so the Rust controller isn't on a live path.
 
 ```rust
 let error = (self.target_latency_ms - observed_latency_ms) / self.target_latency_ms;
@@ -198,7 +198,7 @@ Batcher starts the throughput hill-climb from a VRAM-safe 256 rows, streams it w
 
 Half precision isn't a free win. A conv or matmul forward gets tensor cores. An autoregressive generation loop is launch-bound and memory-bound and gets nothing, or worse. Half precision also isn't bit-identical, so applying it where it doesn't pay is a silent output change bought for nothing.
 
-So `ml/gpu.py::autocast_call` doesn't blindly wrap. It times FP32 against autocast on a 64-row probe (`_AUTOCAST_PROBE_ROWS`), taking the best of three timings with CUDA synchronized so GPU work is actually measured, and keeps autocast only if the speedup clears `_AUTOCAST_MIN_SPEEDUP`, which is 1.15. The verdict is cached per callable, and any failure during the probe returns the output-preserving FP32 path. `torch.compile` follows the same principle and is applied only to models containing a `Conv2d`, because it measured 0.92x on a small text transformer where dynamic sequence lengths force per-shape recompiles.
+So `ml/gpu.py::autocast_call` doesn't blindly wrap. It times FP32 against autocast on a 64-row probe (`_AUTOCAST_PROBE_ROWS`), taking the best of three timings with CUDA synchronized so GPU work is actually measured, and keeps autocast only if the speedup clears `_AUTOCAST_MIN_SPEEDUP`, which is 1.15. The verdict is cached per callable, and any failure during the probe returns the output-preserving FP32 path. `torch.compile` follows the same principle in `ml/inference/pipelines.py` and is applied only to models containing a `Conv2d`, because it measured 0.92x on a small text transformer where dynamic sequence lengths force per-shape recompiles.
 
 ## Measuring the device
 
@@ -257,7 +257,7 @@ The ceiling is arithmetic. A *single, maximally large, compute-bound* job runs a
 
 A GPU `fn` never runs in a process pool, because it has to keep a single process and CUDA context. The GIL is therefore a real constraint on a GPU stage whose Python glue is heavy.
 
-Multi-GPU collective placement doesn't work. `SchedulingEnvelope.gpu_collective` and `placement_strategy` exist in `plan/resource.py` and are read by `dist/executors/ray_runtime/scheduling.py`, but the actor pool sets only `num_gpus` and `accelerator_type` and there's no placement group behind them. This is about *inference* stages. The relational fan-out described above uses many devices, but as independent single-device tasks that share nothing, which is a weaker requirement than a collective.
+Gang placement for an inference pool is best-effort. The actor pool reserves a placement group sized to its autoscaling ceiling, and a stage flagged `gpu_collective` in `plan/resource/bounds.py` gets `STRICT_PACK` so its actors are co-located, as {doc}`the wires between GPUs </architecture/deep-dives/distribution/gpu-fabric>` describes. When the cluster can't grant the reservation in time, the pool logs a warning and falls back to default scheduling, which runs correctly but may place actors unevenly. The relational fan-out described above uses many devices as independent single-device tasks that share nothing, which is a weaker requirement than a collective.
 
 The relational backend has no device-to-device shuffle, so it distributes only what the algebra above covers. A chain that reduces with `median`, `quantile`, `var`, `stddev` or `count-distinct` runs on one device, because each needs a group's whole value set. A `right` or `full` join runs on one device, because broadcasting the build side would duplicate its unmatched rows, and a join the planner did not mark `broadcast` runs on one device because its build side does not fit. All are scale ceilings rather than wrong answers, and all would lift with a key-partitioning exchange between devices.
 
@@ -267,8 +267,7 @@ GPU tensors move between stages as Arrow through host memory. There's no device-
 
 ## Code map
 
-Each concern below maps to the file that owns it, so the device placement and batching
-rules on this page can be read directly:
+Each concern below maps to the file that owns it, so the device placement and batching rules on this page can be read directly:
 
 | Concern | File |
 |---|---|
@@ -277,7 +276,7 @@ rules on this page can be read directly:
 | OOM halving and dirty-row bisection | `python/batcher/core/udf/call.py` |
 | Threads vs processes policy | `python/batcher/core/udf/strategy.py` |
 | Distributed actor pools, warm pools | `python/batcher/dist/executors/map.py` |
-| Latency PID | `crates/bc-udf/src/batch_size.rs`, `python/batcher/ml/inference/` |
+| Latency PID | `python/batcher/ml/inference/pool.py`, mirrored in `crates/bc-udf/src/batch_size.rs` |
 | Throughput hill-climb | `python/batcher/ml/autobatch.py` |
 | Device detection, utilization, VRAM | `python/batcher/ml/gpu.py` |
 | GPU-vs-CPU backend policy | `python/batcher/kyber/gpu/policy.py` |
@@ -292,9 +291,10 @@ rules on this page can be read directly:
 
 ## See also
 
+- {doc}`The wires between GPUs </architecture/deep-dives/distribution/gpu-fabric>`: the interconnect facts behind multi-GPU placement.
 - {doc}`Architecture </architecture/index>`: why the GPU paths live in Python and not in the crates.
 - {doc}`Execution engine </architecture/internals/execution>`: the UDF stage this pipelines.
-- `docs/architecture/internals/rfcs/rfc-gpu-transport.md` (an in-tree RFC, not a site page): the device-to-device transport this page does not have.
+- `docs/architecture/internals/rfcs/rfc-gpu-transport.md`, an in-repo RFC rather than a site page: the device-to-device transport this page doesn't have.
 - {doc}`GPU guide </ml/inference/gpu>`: the knobs, from a user's side.
 - {doc}`ML guide </ml/index>`: how to write these pipelines.
 - {doc}`Batch inference tutorial </getting-started/tutorials/ml/batch-inference>`: the pipeline this page is underneath.

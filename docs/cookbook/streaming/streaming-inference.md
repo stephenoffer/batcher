@@ -1,18 +1,12 @@
 # Streaming inference
 
-This recipe scores an unbounded stream with a model, keeping the model loaded across
-micro-batches. One decision dominates whether it works at all, so it comes first.
+This recipe scores an unbounded stream with a model, keeping the model loaded across micro-batches. One decision dominates whether it works at all, so it comes first.
 
 :::{warning}
-The classic way to make a streaming inference job useless is to pass a plain function to
-`map_batches` that loads the model inside it. The model then loads once per batch. On a
-five-second trigger with a model that takes four seconds to initialize, the job spends its
-life loading weights, and the throughput number you report is a measurement of `from_pretrained`.
+The classic way to make a streaming inference job useless is to pass a plain function to `map_batches` that loads the model inside it. The model then loads once per batch. On a five-second trigger with a model that takes four seconds to initialize, the job spends its life loading weights, and the throughput number you report is a measurement of `from_pretrained`.
 :::
 
-The fix is in what you pass, not in how you configure it. Hand `map_batches` the **class**
-itself rather than an instance or a closure, and the engine constructs it once and reuses
-that instance across every micro-batch of the query.
+The fix is in what you pass, not in how you configure it. Hand `map_batches` the **class** itself rather than an instance or a closure, and the engine constructs it once and reuses that instance across every micro-batch of the query.
 
 | What you pass to `map_batches` | What the engine does with it | The cost |
 | --- | --- | --- |
@@ -65,15 +59,12 @@ print(len(LOADS))
 # 1
 ```
 
-One construction, two micro-batches. The `filter` after `map_batches` runs in Rust on the
-model's output, so rows you are going to throw away never reach Python. Put the cheap
-predicates before the model when you can, and the expensive ones after it.
+One construction, two micro-batches. The `filter` after `map_batches` runs in Rust on the model's output, so rows you are going to throw away never reach Python. Put the cheap predicates before the model when you can, and the expensive ones after it.
 :::
 
 :::{tab-item} A real model, on a topic
 
-Same shape, different `__call__`. {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` takes a HuggingFace model id and does the
-class-per-worker construction for you; `num_gpus` and `concurrency` place it:
+Same shape, different `__call__`. {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` takes a HuggingFace model id and does the class-per-worker construction for you; `num_gpus` and `concurrency` place it:
 
 ```python
 # docs: skip
@@ -99,22 +90,15 @@ query = sentiment.write.delta(
 query.await_termination()
 ```
 
-`batch_size` here is the model's batch size, not the source's. A Kafka poll assembles up to
-`poll_size` messages into one Arrow batch; `batch_size=64` rebatches to what the GPU
-actually wants. Those are independent numbers and conflating them is how you end up with a
-GPU that is 90% idle.
+`batch_size` here is the model's batch size, not the source's. A Kafka poll assembles up to `poll_size` messages into one Arrow batch; `batch_size=64` rebatches to what the GPU actually wants. Those are independent numbers and conflating them is how you end up with a GPU that is 90% idle.
 :::
 ::::
 
-The load is once **per query**, not once per process. Start the query again and the class
-is constructed again. That matters if your model takes minutes to load and you were
-planning to restart the job on a schedule.
+The load is once **per query**, not once per process. Start the query again and the class is constructed again. That matters if your model takes minutes to load and you were planning to restart the job on a schedule.
 
 ## The poison record
 
-A 24/7 job will eventually meet a row that breaks the model: a truncated UTF-8 sequence, a
-zero-byte image, a text field that is 400 KB of base64. If the exception propagates, the
-query stops. At 3am.
+A 24/7 job will eventually meet a row that breaks the model: a truncated UTF-8 sequence, a zero-byte image, a text field that is 400 KB of base64. If the exception propagates, the query stops. At 3am.
 
 `max_errored_rows` caps how many failures the pipeline absorbs before it gives up:
 
@@ -147,18 +131,12 @@ print(q.exception())
 Row 2 is gone and the query survived.
 
 :::{important}
-Be clear-eyed about what that means: the failing *batch* is dropped, not only the offending
-row, and the dropped rows go nowhere. There is no dead-letter output. `max_errored_rows` buys
-you uptime at the price of silent data loss. If the loss matters, catch the exception inside
-`__call__`, emit a null prediction plus an error string as columns, and route those rows
-yourself downstream.
+Be clear-eyed about what that means: the failing *batch* is dropped, not only the offending row, and the dropped rows go nowhere. There is no dead-letter output. `max_errored_rows` buys you uptime at the price of silent data loss. If the loss matters, catch the exception inside `__call__`, emit a null prediction plus an error string as columns, and route those rows yourself downstream.
 :::
 
 ## Rolling the scores up
 
-Scoring is rarely the last stage. Alerts per model version, a running mean, a count above
-threshold: a rollup over the scored stream is an ordinary aggregation over a `map_batches`
-input, and it writes to a sink like any other streaming aggregation.
+Scoring is rarely the last stage. Alerts per model version, a running mean, a count above threshold: a rollup over the scored stream is an ordinary aggregation over a `map_batches` input, and it writes to a sink like any other streaming aggregation.
 
 ```python
 rollup_schema = pa.schema([("model", pa.string()), ("text", pa.string())])
@@ -187,21 +165,15 @@ for batch in rollup.iter_batches():
 # [('v1', 6), ('v2', 2)]
 ```
 
-The UDF runs in Python once per micro-batch and the fold runs in the engine over what it
-returns, so a long-running rollup never holds the scored output, only the running state.
+The UDF runs in Python once per micro-batch and the fold runs in the engine over what it returns, so a long-running rollup never holds the scored output, only the running state.
 
 :::{warning}
-`checkpoint=` is refused on this shape. The running state is folded against whatever schema
-the UDF returns, which is not knowable before the UDF has run, so there is nothing for a
-restart to resume into. Accepting it would advance the offset log while the totals silently
-restarted at zero. Land the scores first and aggregate the table if you need resumption.
+`checkpoint=` is refused on this shape. The running state is folded against whatever schema the UDF returns, which is not knowable before the UDF has run, so there is nothing for a restart to resume into. Accepting it would advance the offset log while the totals silently restarted at zero. Land the scores first and aggregate the table if you need resumption.
 :::
 
 ### The scored stream is an ordinary stream
 
-A rollup is not the only thing that can sit above the model. The scored stream joins a
-static dimension, deduplicates, or takes the first *n* rows like any other, and each of
-those writes to a sink:
+A rollup is not the only thing that can sit above the model. The scored stream joins a static dimension, deduplicates, or takes the first *n* rows like any other, and each of those writes to a sink:
 
 ```python
 registry = bt.from_pydict({"model": ["v1", "v2"], "owner": ["ads", "risk"]})
@@ -216,14 +188,13 @@ for batch in attributed.iter_batches():
 # [('v1', 'ads'), ('v1', 'ads'), ('v2', 'risk')]
 ```
 
-Taking the first few scored rows is how you check a model against a live topic without
-waiting for the topic to end:
+Taking the first few scored rows is how you check a model against a live topic without waiting for the topic to end:
 
 ```python
 sample = (
     bt.from_batches(rollup_batches, rollup_schema, bounded=False)
     .map_batches(score_length, output_columns=["model", "score"])
-    .head(2)
+    .limit(2)
 )
 for batch in sample.iter_batches():
     print(batch.to_pydict()["score"])
@@ -247,30 +218,20 @@ print(q.is_active)
 ```
 :::
 
-`num_input_rows` versus `num_output_rows` on batch 1 is the dropped poison batch, visible
-in the metrics even though nothing raised. `p.input_rows_per_second` is the throughput
-number to alert on; if it is falling while the source's lag is rising, the model is your
-bottleneck and no amount of trigger tuning changes that.
+`num_input_rows` versus `num_output_rows` on batch 1 is the dropped poison batch, visible in the metrics even though nothing raised. `p.input_rows_per_second` is the throughput number to alert on; if it is falling while the source's lag is rising, the model is your bottleneck and no amount of trigger tuning changes that.
 
 :::{important}
-Two limits worth knowing before you scale this out. The resident-model path shown here is
-single-node: the model lives in the driver process for the life of the query. And
-`distributed=True` on a streaming write only covers an `available_now`/`once` drain of a
-stateless pipeline, with no checkpoint, so it is a backfill tool. Batcher has no GPU
-inference stream that spans nodes. Run the inference as a distributed *batch* job over the
-landed bronze table instead.
+Two limits worth knowing before you scale this out. The resident-model path shown here is single-node: the model lives in the driver process for the life of the query. And `distributed=True` on a streaming write only covers an `available_now`/`once` drain of a stateless pipeline, with no checkpoint, so it is a backfill tool. Batcher has no GPU inference stream that spans nodes. Run the inference as a distributed *batch* job over the landed bronze table instead.
 :::
 
 ## See also
 
-- {doc}`Batch inference </ml/inference/inference>`: the same `map_batches`/`ml.infer` surface,
-  bounded.
-- {doc}`ML for streaming </ml/inference/streaming>`: the model-over-a-stream surface in full.
+- {doc}`Batch inference </ml/inference/inference>`: the same `map_batches`/`ml.infer` surface, bounded.
+- {doc}`Streaming for training </ml/inference/streaming>`: how `iter_batches` streams a plan into a model loop in bounded memory.
 - {doc}`GPU pipelines </ml/inference/gpu>`: actor pools, `concurrency`, and accelerator placement.
 - {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`: landing the raw events this job scores.
 - {doc}`Exactly-once sinks </cookbook/streaming/exactly-once-sink>`: what the Delta write above actually guarantees.
-- {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: the same stage, run over the landed table
-  as a distributed batch.
+- {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: the same stage, run over the landed table as a distributed batch.
 - {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, checkpoints, and `recent_progress`.
 - {doc}`ML API reference </api/models/ml>`: `ds.ml.infer`, `map_batches`, `max_errored_rows`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what a warm, resident model is worth.

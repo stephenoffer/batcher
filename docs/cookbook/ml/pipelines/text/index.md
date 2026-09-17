@@ -1,8 +1,6 @@
 # Text and language models
 
-These pipelines run a language model over a corpus: labelling it, embedding it, or making it
-searchable. Each keeps the model inside the pipeline, so the corpus streams past it rather
-than being materialized first.
+These pipelines run a language model over a corpus: labelling it, embedding it, or making it searchable. Each keeps the model inside the pipeline, so the corpus streams past it rather than being materialized first.
 
 | Pipeline | What it builds |
 |---|---|

@@ -2,6 +2,8 @@
 
 An aggregate such as `sum()` collapses a column. The `*_horizontal` family collapses a *row* across several columns and leaves the row count alone. That is what you want for a per-row total, a "did any check fail" flag, or a coalesce-style fallback.
 
+The script reduces three quarterly columns with `sum_horizontal`, `mean_horizontal`, `least`, and `greatest`, counts the non-null values per row, combines boolean checks with `any_horizontal` and `all_horizontal`, falls back across columns with `coalesce`, and joins several columns into one string with `concat_str`. A null in one quarter shows how each function treats a missing value.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/horizontal.py

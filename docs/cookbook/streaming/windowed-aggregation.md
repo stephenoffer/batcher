@@ -1,23 +1,16 @@
 # Windowed aggregation
 
-A `GROUP BY` over a bounded table finishes. Over a stream it never does: every group
-stays live forever, because another row for it might arrive tomorrow.
+A `GROUP BY` over a bounded table finishes. Over a stream it never does: every group stays live forever, because another row for it might arrive tomorrow.
 
 :::{warning}
-Run a plain {py:meth}`group_by("user").agg(...) <batcher.Dataset.group_by>` against Kafka in `complete` mode and the state grows
-for as long as the job runs. Eventually the job's memory ends the query.
+Run a plain {py:meth}`group_by("user").agg(...) <batcher.Dataset.group_by>` against Kafka in `complete` mode and the state grows for as long as the job runs. Eventually the job's memory ends the query.
 :::
 
-Event-time windows fix this by making a group *finishable*. A window has an end. Once
-the watermark says no more rows for that window will arrive, the window is emitted and
-its state is freed. Windows plus a watermark is the only combination that gives you
-bounded state and `append` output.
+Event-time windows fix this by making a group *finishable*. A window has an end. Once the watermark says no more rows for that window will arrive, the window is emitted and its state is freed. Windows plus a watermark is the only combination that gives you bounded state and `append` output.
 
 ## The window is the same in batch and streaming
 
-`bt.window(time_col, duration)` assigns a row to a window; group by it like any other
-key. Nothing about the aggregation changes between the two tabs below: the source changes,
-and a watermark is declared.
+`bt.window(time_col, duration)` assigns a row to a window; group by it like any other key. Nothing about the aggregation changes between the two tabs below: the source changes, and a watermark is declared.
 
 ::::{tab-set}
 :::{tab-item} A bounded table
@@ -46,23 +39,14 @@ print(hourly.to_pydict())
 # {'w': [datetime.datetime(2024, 1, 1, 0, 0), datetime.datetime(2024, 1, 1, 1, 0)], 'total': [8, 18]}
 ```
 
-Two windows, two rows, done. Develop the aggregation here: it is the same operator the
-streaming path runs, so if the numbers are right on a fixture they are right on the
-stream.
+Two windows, two rows, done. Develop the aggregation here: it is the same operator the streaming path runs, so if the numbers are right on a fixture they are right on the stream.
 :::
 
 :::{tab-item} An unbounded source
 
-Now the source never ends. Add {py:meth}`.with_watermark(time_col, lateness) <batcher.Dataset.with_watermark>` and the identical
-`group_by(...).agg(...)` becomes a windowed streaming aggregation: state is one running
-partial per open window, and a window is emitted the moment the watermark passes its
-end.
+Now the source never ends. Add {py:meth}`.with_watermark(time_col, lateness) <batcher.Dataset.with_watermark>` and the identical `group_by(...).agg(...)` becomes a windowed streaming aggregation: state is one running partial per open window, and a window is emitted the moment the watermark passes its end.
 
-The watermark is the highest event time the stream has delivered, less the lateness. On a
-partitioned source the slowest partition sets it, which
-{doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>` covers. Watch it
-work. The second micro-batch carries an event at 02:10, which pushes the watermark to 02:00
-and closes the 00:00 window:
+The watermark is the highest event time the stream has delivered, less the lateness. On a partitioned source the slowest partition sets it, which {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>` covers. Watch it work. The second micro-batch carries an event at 02:10, which pushes the watermark to 02:00 and closes the 00:00 window:
 
 ```python
 import pyarrow as pa
@@ -88,17 +72,13 @@ for batch in windowed.iter_batches():
 # {'w': [datetime.datetime(2024, 1, 1, 2, 0)], 'total': [1]}
 ```
 
-The 00:00 window emitted while the stream was still running. The 02:00 window was still
-open when the feed ended, so it came out in the end-of-stream flush. On a real topic that
-flush happens when the query stops; until then, an open window sits in state.
+The 00:00 window emitted while the stream was still running. The 02:00 window was still open when the feed ended, so it came out in the end-of-stream flush. On a real topic that flush happens when the query stops; until then, an open window sits in state.
 :::
 ::::
 
 ## Wiring it to a sink
 
-`output_mode="append"` on a windowed aggregation emits a window's row once, when the
-watermark closes it. That is what a downstream table wants: no restatements, no
-upserts.
+`output_mode="append"` on a windowed aggregation emits a window's row once, when the watermark closes it. That is what a downstream table wants: no restatements, no upserts.
 
 :::{dropdown} The full Kafka → Delta gold query
 
@@ -134,14 +114,11 @@ The three output modes are not interchangeable, and the engine will tell you so:
 | `"complete"` | the whole result table, every micro-batch | right for a small, bounded key space (a dashboard of 50 regions), wrong for unbounded keys, because every group is retained forever |
 | `"update"` | only the rows that changed | your sink must be able to upsert |
 
-{py:meth}`Trigger.continuous(...) <batcher.Trigger.continuous>` does not run aggregations at all; it is stateless pipelines
-only. Use a processing-time trigger.
+{py:meth}`Trigger.continuous(...) <batcher.Trigger.continuous>` does not run aggregations at all; it is stateless pipelines only. Use a processing-time trigger.
 
 ## Sessions
 
-Windows with fixed boundaries do not describe user behavior. {py:meth}`session_window <batcher.Dataset.session_window>` groups
-consecutive events per key whose gap is under a timeout, and starts a new session when
-the gap is exceeded. Same aggregate expressions:
+Windows with fixed boundaries do not describe user behavior. {py:meth}`session_window <batcher.Dataset.session_window>` groups consecutive events per key whose gap is under a timeout, and starts a new session when the gap is exceeded. Same aggregate expressions:
 
 ```python
 sessions = events.session_window("ts", "45m", partition_by=["user"], total=col("amount").sum())
@@ -149,16 +126,11 @@ print(sessions.select("user", "session_start", "total").to_pydict()["total"])
 # [3, 5, 7, 11]
 ```
 
-User `a` clicked at 00:00 and again at 01:30, a 90-minute gap, so two sessions (3 and 7),
-not one of 10.
+User `a` clicked at 00:00 and again at 01:30, a 90-minute gap, so two sessions (3 and 7), not one of 10.
 
 ### A session over a stream has to wait
 
-A fixed window knows its end before a single row arrives, so the engine can close one the
-instant the watermark passes it. A session knows nothing in advance: every event extends
-the session it lands in, and an event arriving between two sessions merges them into one.
-So the operator holds a session's rows until the watermark passes its last event plus the
-gap, and only then aggregates and emits it.
+A fixed window knows its end before a single row arrives, so the engine can close one the instant the watermark passes it. A session knows nothing in advance: every event extends the session it lands in, and an event arriving between two sessions merges them into one. So the operator holds a session's rows until the watermark passes its last event plus the gap, and only then aggregates and emits it.
 
 The call is unchanged. Only the source is:
 
@@ -188,39 +160,22 @@ for batch in clicks.session_window(
 # [9]
 ```
 
-The first session emitted while the stream was still running, because the 05:00 event
-pushed the watermark past 00:02 plus the 45-minute gap. The second was still open when
-the feed ended, so it came out in the end-of-stream flush.
+The first session emitted while the stream was still running, because the 05:00 event pushed the watermark past 00:02 plus the 45-minute gap. The second was still open when the feed ended, so it came out in the end-of-stream flush.
 
-That gives the operator its memory bound: it buffers rows for sessions that are still
-open, which is the live key space times the gap rather than the length of the stream.
+That gives the operator its memory bound: it buffers rows for sessions that are still open, which is the live key space times the gap rather than the length of the stream.
 
 :::{warning}
-**A late event cannot reopen a session that was already emitted.** It is dropped, the
-same way a late row is dropped from a closed window, and for the same reason: the row
-downstream has already been written. `with_watermark("ts", "10m")` is how you buy a
-straggler room, and it costs exactly that much more buffering before any session closes.
+**A late event cannot reopen a session that was already emitted.** It is dropped, the same way a late row is dropped from a closed window, and for the same reason: the row downstream has already been written. `with_watermark("ts", "10m")` is how you buy a straggler room, and it costs exactly that much more buffering before any session closes.
 :::
 
 ## What bounds the state
 
-Memory for a windowed streaming aggregate is proportional to the number of *open*
-windows, and windows close only when the watermark advances. The watermark advances only
-when event time advances. So an idle partition, a clock skew, or a source that stops
-producing will stall the watermark, and open windows accumulate.
+Memory for a windowed streaming aggregate is proportional to the number of *open* windows, and windows close only when the watermark advances. The watermark advances only when event time advances. So an idle partition, a clock skew, or a source that stops producing will stall the watermark, and open windows accumulate.
 
-Batcher caps that state and fails loudly rather than dying by OOM: the retained state is
-checked against `memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>` names the column
-whose watermark is not advancing. That is a real signal, not a tuning knob to raise
-reflexively. If it fires, the usual cause is an event-time gap or a dead partition, not
-an undersized budget.
+Batcher caps that state and fails loudly rather than dying by OOM: the retained state is checked against `memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>` names the column whose watermark is not advancing. That is a real signal, not a tuning knob to raise reflexively. If it fires, the usual cause is an event-time gap or a dead partition, not an undersized budget.
 
 :::{important}
-There is no side output for the rows the watermark drops, so a window that closed early is
-short and the rows are gone. It is not silent, though: each micro-batch's `num_late_rows`
-counts what it discarded, and `state_operators` reports the watermark and the open-window
-state behind it. Late data is covered in
-{doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>`.
+There is no side output for the rows the watermark drops, so a window that closed early is short and the rows are gone. It is not silent, though: each micro-batch's `num_late_rows` counts what it discarded, and `state_operators` reports the watermark and the open-window state behind it. Late data is covered in {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>`.
 :::
 
 ## See also
@@ -230,10 +185,7 @@ state behind it. Late data is covered in
 - {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`: the bronze layer this gold one aggregates.
 - {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, output modes, and the query handle.
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the aggregate surface itself.
-- {doc}`Window functions </user-guide/analyze/window-functions>`: the other kind of window, over a
-  bounded frame.
+- {doc}`Window functions </user-guide/analyze/window-functions>`: the other kind of window, over a bounded frame.
 - {doc}`Delta Lake integration </integrations/lakehouse/delta-lake>`: the sink in the query above.
-- {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why one running partial per open
-  window is all the state there is.
-- {doc}`Time-series rollups </cookbook/analytics/aggregates/time-series-rollups>`: the same windows, computed as a
-  batch.
+- {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why one running partial per open window is all the state there is.
+- {doc}`Time-series rollups </cookbook/analytics/aggregates/time-series-rollups>`: the same windows, computed as a batch.

@@ -1,10 +1,6 @@
 # Preprocessors
 
-Preprocessors are scikit-learn-style `fit` and `transform` feature transformers that run
-on the engine. `fit` learns its state with one mergeable aggregate over the data, so it
-is distributed and spillable for free. `transform` is a lazy column rewrite. Fit
-on the training set, then `transform` the training **and** validation sets with the
-same learned state.
+Preprocessors are scikit-learn-style `fit` and `transform` feature transformers that run on the engine. If you know `sklearn.preprocessing`, you already know the API. What changes is where the work happens. `fit` learns its state with one mergeable aggregate over the data, so fitting a scaler on a billion rows is one distributed, spillable pass rather than a sample pulled into memory. `transform` is a lazy column rewrite that runs inside the plan. Fit on the training set, then `transform` the training **and** validation sets with the same learned state.
 
 Every preprocessor is importable from both `batcher.ml.preprocessors` and `batcher.ml`.
 `tests/unit/test_ml_preprocessing_workflow.py` pins that, so the two paths cannot drift.
@@ -88,13 +84,13 @@ These are the ones you reach for most, with what each `fit` learns and what its
 | {py:class}`OneHotEncoder <batcher.ml.preprocessors.OneHotEncoder>` | categories | one 0/1 indicator column per category |
 | {py:class}`BinaryEncoder <batcher.ml.preprocessors.BinaryEncoder>` | categories | the category's integer code in base 2, one column per bit |
 | {py:class}`MultiHotEncoder <batcher.ml.preprocessors.MultiHotEncoder>` | distinct list elements | one 0/1 indicator column per category, for a list column |
-| `TargetEncoder` | per-category target mean, global prior | smoothed mean-target code per high-cardinality category |
+| {py:class}`TargetEncoder <batcher.ml.preprocessors.TargetEncoder>` | per-category target mean, global prior | smoothed mean-target code per high-cardinality category |
 | {py:class}`KBinsDiscretizer <batcher.ml.preprocessors.KBinsDiscretizer>` | bin edges, quantile or uniform | integer bin index `0..n_bins-1` |
-| `Normalizer` | nothing, stateless | scale each row to unit L1, L2, or max norm across columns |
+| {py:class}`Normalizer <batcher.ml.preprocessors.Normalizer>` | nothing, stateless | scale each row to unit L1, L2, or max norm across columns |
 | {py:class}`SimpleImputer <batcher.ml.preprocessors.SimpleImputer>` | mean, median, mode, or constant | fill nulls |
-| `Concatenator` | nothing, stateless | stack columns into one tensor column |
-| `PolynomialFeatures` | nothing, stateless | add interaction and power terms such as `a*b` and `a^2` up to a degree |
-| `Tokenizer` | nothing, stateless | tokenize text with a user tokenizer |
+| {py:class}`Concatenator <batcher.ml.preprocessors.Concatenator>` | nothing, stateless | stack columns into one tensor column |
+| {py:class}`PolynomialFeatures <batcher.ml.preprocessors.PolynomialFeatures>` | nothing, stateless | add interaction and power terms such as `a*b` and `a^2` up to a degree |
+| {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` | nothing, stateless | tokenize text with a user tokenizer |
 | {py:class}`QuantileTransformer <batcher.ml.preprocessors.QuantileTransformer>` | `n_quantiles` cut points | map onto a uniform or normal distribution by rank |
 | {py:class}`PowerTransformer <batcher.ml.preprocessors.PowerTransformer>` | the Yeo-Johnson lambda, by maximum likelihood | make a skewed column more Gaussian |
 | {py:class}`BoxCoxTransformer <batcher.ml.preprocessors.BoxCoxTransformer>` | the Box-Cox lambda, by maximum likelihood | the same, for a strictly positive column |
@@ -181,10 +177,22 @@ Scalers, the row normalizer, and the distribution reshapers.
 Categorical encoders, missing-value imputation, and binning.
 :::
 
+:::{grid-item-card} {octicon}`typography;1.1em` Text vectorization
+:link: /ml/preparing/preprocessors/text-vectorization
+:link-type: doc
+Bag of words, TF-IDF, n-grams, and hashing vectorizers.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle;1.1em` Generating features
 :link: /ml/preparing/preprocessors/feature-generation
 :link-type: doc
 Timestamps, text statistics, history, PCA, and assembly.
+:::
+
+:::{grid-item-card} {octicon}`checklist;1.1em` Feature selection
+:link: /ml/preparing/preprocessors/feature-selection
+:link-type: doc
+Univariate filters, correlated-column removal, and recursive elimination.
 :::
 
 :::{grid-item-card} {octicon}`link;1.1em` Chaining and persisting

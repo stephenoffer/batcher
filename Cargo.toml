@@ -26,9 +26,11 @@ authors = ["Batcher contributors"]
 # actually supports the tz-aware timestamps it accepts across the FFI boundary.
 arrow = { version = "60", features = ["ffi", "prettyprint", "ipc", "ipc_compression", "chrono-tz"] }
 
-# PyO3 boundary — abi3 so one wheel covers all CPython >= 3.10.
+# PyO3 boundary — abi3 so one wheel covers all CPython >= 3.11. The abi3 floor is the tag pip
+# reads off the wheel, so it matches `requires-python` in pyproject.toml rather than claiming a
+# 3.10 the control plane cannot import on.
 # Pinned to 0.29 to match arrow-pyarrow 60 (avoids a duplicate pyo3 in the graph).
-pyo3 = { version = "0.29", features = ["abi3-py310", "extension-module"] }
+pyo3 = { version = "0.29", features = ["abi3-py311", "extension-module"] }
 arrow-pyarrow = "60"
 
 # Plan/expr IR is exchanged Python<->Rust as a stable, language-agnostic JSON document.

@@ -2,8 +2,7 @@
 
 These three tutorials teach the engine itself.
 
-Start here if you have never written a Batcher pipeline, and read them in order: the first
-builds the mental model the other two assume.
+Start here if you've never written a Batcher pipeline, and read them in order: the first builds the mental model the other two assume.
 
 | Tutorial | What you build |
 |---|---|

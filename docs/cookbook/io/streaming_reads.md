@@ -1,6 +1,8 @@
 # Reading in bounded memory
 
-`collect()` materializes. `iter_batches()` does not: it streams Arrow batches through the pipeline so a table larger than memory still works. The metadata shortcuts go further and answer some questions without reading any data at all.
+`collect()` materializes the whole result. `iter_batches()` streams Arrow `RecordBatch`es through the pipeline instead, so memory is bounded by the batch size rather than the table, and a table larger than memory still works.
+
+The script streams a Parquet file 128 rows at a time and shows that a filter and a `limit` both cut what the stream reads. Some questions need no data at all: `count()` and the schema come from file metadata.
 
 The whole script, executed on every test run:
 

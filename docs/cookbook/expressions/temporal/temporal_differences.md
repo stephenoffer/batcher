@@ -1,6 +1,8 @@
 # Time differences
 
-`*_between` gives a whole-unit difference between two columns, which is how you compute an age, a lead time, or a session length. `offset_by` shifts by a duration string, which is how you build a "30 days ago" cutoff without leaving the expression API.
+`*_between` gives a whole-unit difference between two timestamp columns, which is how you compute an age, a lead time, or a session length. `offset_by` shifts by a duration string, which is how you build a "30 days ago" cutoff without leaving the expression API.
+
+Read the direction carefully. `shipped.dt.days_between(placed)` counts from the argument to the receiver, so call it on the later column. Reversing the two gives a negative answer. The script measures order lead times in days, hours, minutes, and seconds, shifts timestamps, converts to epoch seconds and milliseconds, and ends with an SLA filter on anything that took more than two whole days.
 
 The whole script, executed on every test run:
 

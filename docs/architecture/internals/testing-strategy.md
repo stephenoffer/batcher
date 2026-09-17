@@ -1,186 +1,92 @@
 # Testing strategy
 
-Batcher aims to beat DuckDB, Spark, and Polars *and* to be correct. Without the
-second half the first half is worth nothing, and it is credible only when correctness is
-proven mechanically against a reference on every change. So the rule is blunt.
-Correctness comes before speed, and a fast wrong answer is a bug. The benchmark harness
-enforces that literally: it refuses to time a query whose result does not match the
-oracle.
+This page describes how Batcher proves a change correct: the two reference oracles, the property-based layer that searches for what examples miss, the test layout, and the gates each kind of change must clear.
+
+Batcher aims to beat DuckDB, Spark and Polars and to be correct while doing it, and the first aim is worth nothing without the second. So the rule is blunt: correctness comes before speed, and a fast wrong answer is a bug. The benchmark harness enforces that literally, refusing to time a query whose result doesn't match the oracle.
 
 ## Two oracles
 
-Tests do not hand-roll expected values. They check against one of two references.
+Tests don't hand-roll expected values. They check against one of two references.
 
-**DuckDB, for relational behavior.** Any operator, expression, SQL form, or
-optimizer rewrite must produce the same result DuckDB does on the same input. The
-harness is `tests/differential/conftest.py::assert_same`, an order-independent,
-type-tolerant comparison that accepts int-versus-float, Decimal-versus-float, and
-float rounding. Cases live in the `test_diff_*.py` files next to it. If Batcher and
-DuckDB legitimately differ, that is a decision to surface and document, never to
-hide by weakening a test.
+**DuckDB, for relational behavior.** Any operator, expression, SQL form or optimizer rewrite must produce the result DuckDB produces on the same input. The comparison helpers live in `tests/_harness.py` and are re-exported from `tests/differential/conftest.py`, beside the `duck` fixture. `assert_same` is an order-independent, type-tolerant multiset comparison that accepts int against float, Decimal against float, and float rounding. `assert_same_ordered` compares row by row, and `assert_same_for_query` picks between the two by whether the query ends in `ORDER BY`. Cases live in the `test_diff_*.py` files. If Batcher and DuckDB legitimately differ, that is a decision to surface and document, never one to hide by weakening a test.
 
-**The Tier-0 interpreter, for the Rust engine.** `bc-interp::execute` (sequential)
-is the reference. The parallel executor and the Cranelift JIT must agree with it
-bit-for-bit on every supported input. A new `bc-runtime` primitive also gets the
-mergeability test: `combine_finalize(partition(partial(pₖ)))` over all partitions
-must equal the single-node result. That equality is the guarantee that one core, many
-cores, and many machines compute the same thing.
+:::{warning}
+Never check a sort with `assert_same`. It sorts both sides before comparing, so an engine that returned unsorted rows would pass. A spilled descending sort once returned wrong data with every gate green for exactly this reason. Use `assert_same_ordered` for any result whose order is part of the answer.
+:::
 
-## Property-based behavior testing
+**The Tier-0 interpreter, for the Rust engine.** `bc-interp::execute`, the sequential path, is the reference. The parallel executor and the Cranelift JIT must agree with it bit for bit on every supported input. A new `bc-runtime` primitive also gets the mergeability test: `combine_finalize(partition(partial(p_k)))` over all partitions must equal the single-node result. That equality is the guarantee that one core, many cores and many machines compute the same thing.
 
-The two oracles say *what* the right answer is; property-based tests decide *where to look
-for a wrong one*. They are a first-class layer alongside the oracles, not a substitute:
-instead of one enumerated input, Hypothesis generates thousands of random tables and
-pipelines and asserts an invariant holds on every draw, shrinking any failure to a minimal
-counterexample. This is the layer that guards work whose correctness lives in a
-*combination*: the full optimizer rule set, the metadata shortcuts, and the adaptive and
-self-tuning paths. In all three, the bug an example misses is exactly the one that matters.
-The suite lives in `tests/property/`, and each file pins one invariant and drives it through
-an oracle.
+## Property-based testing
 
-**Optimizer result-invariance** (`test_prop_optimizer_result_invariance.py`). Kyber's full
-rule set must change the *plan* and never the *answer*. Hypothesis builds a random typed
-table and a random valid pipeline (filters carrying redundant and absorbing boolean shapes,
-derived columns, group-by aggregates, distinct, sort, limit, union) and asserts
+The two oracles say what the right answer is. Property-based tests decide where to look for a wrong one. Instead of one enumerated input, Hypothesis generates many random tables and pipelines, asserts an invariant on every draw, and shrinks any failure to a minimal counterexample. This layer guards work whose correctness lives in a combination: the full optimizer rule set, the metadata shortcuts, and the adaptive and self-tuning paths. In each of them, the bug an example misses is the one that matters. The suite lives in `tests/property/`, and each file pins one invariant and drives it through an oracle. The following files are the core of it.
+
+**Optimizer result-invariance** (`test_prop_optimizer_result_invariance.py`). Kyber's rule set must change the plan and never the answer. Hypothesis builds a random typed table and a random valid pipeline, with filters carrying redundant and absorbing boolean shapes, derived columns, group-by aggregates, distinct, sort, limit and union, and asserts the following:
 
 ```text
-result(FULL rule set)  ==  result(NO rules)  ==  ds.collect()
+result(full rule set)  ==  result(no rules)  ==  ds.collect()
 ```
 
-on an order-independent multiset compare, and on row order too when the pipeline is totally
-ordered. Any rule, or any rule *interaction*, that alters a result falls out as a
-counterexample. That is a real correctness bug to minimize and fix, never to weaken away.
+The comparison is an order-independent multiset, plus row order when the pipeline is totally ordered. Any rule, or any interaction between rules, that alters a result falls out as a counterexample to minimize and fix.
 
-**Confluence, termination, and determinism** (same file). Result-invariance says the rules
-are individually sound; confluence says they behave in *combination*. The test asserts the
-optimized IR at the production `fixpoint_iterations` cap equals the IR at a far larger cap.
-That proves the combined set reaches its plan fixpoint within the budget the engine actually
-runs, so no plan is silently *under*-optimized by being truncated mid-convergence as more
-rules are added. It also asserts that re-running is byte-identical, so the rule system is
-confluent with a unique normal form. Re-optimizing an already-optimized plan is a fixpoint
-and re-executes to the identical rows. This is the guarantee that a growing,
-grouped-by-family rule set does not regress into the interference and oscillation a large
-uncoordinated pass list would.
+**Confluence, termination and determinism**, in the same file. Result-invariance says the rules are sound one at a time. Confluence says they behave together. The test asserts that the optimized IR at the production `optimizer.fixpoint_iterations` cap equals the IR at a far larger cap, so the combined set reaches its fixpoint within the budget the engine runs and no plan is silently truncated mid-convergence as rules are added. It also asserts that re-running is byte-identical and that re-optimizing an optimized plan is a fixpoint. That is the guarantee that a growing rule set doesn't regress into interference and oscillation.
 
-**Metadata fidelity and the EXACT firewall** (`test_prop_metadata_fidelity.py`). The
-metadata shortcuts answer `count` / `is_empty` / `min` / `max` / `n_unique` / `n_null` from
-Parquet footer statistics without scanning a row. Two things must hold on random typed data
-written to Parquet and read back. The first is **fidelity**: whenever a shortcut fires, its
-answer equals both the engine-executed answer and DuckDB, because a wrong footer-derived
-answer is a silent bug that never scans a row to get caught. The second is the **EXACT
-firewall**: past a filter the source's bounds are no longer exact for the result, so a
-shortcut that cannot *prove* its answer must decline and fall back to execution rather than
-return a stale pre-filter value.
-The test asserts both the decline on a genuinely partial filter and that the executed
-fallback still matches DuckDB.
+**Metadata fidelity and the exact-only firewall** (`test_prop_metadata_fidelity.py`). The metadata shortcuts answer `count`, `is_empty`, `min`, `max`, `count_distinct` and null counts from Parquet footer statistics without scanning a row. Two properties must hold on random typed data written to Parquet and read back. Whenever a shortcut fires, its answer equals both the executed answer and DuckDB's, because a wrong footer-derived answer never scans a row that could catch it. And past a filter, where the source's bounds no longer describe the result exactly, a shortcut that can't prove its answer must decline and fall back to execution. The test asserts the decline on a partial filter and that the executed fallback still matches DuckDB.
 
-**Adaptive equals non-adaptive** (`test_prop_adaptive_equivalence.py`). Intra-query
-re-optimization re-plans each pipeline breaker on its *measured* cardinality, so a join's
-build side or broadcast choice can flip mid-query. The moat is that it plans *better*, never
-*differently*. On a random selective-filter-into-join, the shape where the measured count
-most diverges from the estimate, `adaptive=True`, `False`, and `"auto"` must produce the
-same rows, and for the inner join the shared result is cross-checked against DuckDB.
+**Adaptive equals non-adaptive** (`test_prop_adaptive_equivalence.py`). Stage-boundary re-optimization re-plans on measured cardinalities, so a join's build side or broadcast choice can flip mid-query. It must plan better, never differently. On a random selective filter feeding a join, the shape where the measured count diverges most from the estimate, `adaptive=True`, `False` and `"auto"` must produce the same rows, and the inner-join result is cross-checked against DuckDB.
 
-**Adaptive-tuning result-invariance** (`test_prop_tuning_invariance.py`). Every self-tuning
-lever is contractually result-invariant: morsel size, spill, shuffle partition count,
-adaptive morsel sizing, and the learned strategy choices behind them all change *how* a
-query runs, never *what* it returns. Hypothesis runs the same aggregate or distinct at
-opposite settings of each knob (a 1-row morsel against 64k, spill forced against in-memory,
-one partition against seven) and asserts byte-identical results. This is the contract every
-adaptive-tuning optimization must hold, and it is checked rather than trusted.
+**Tuning invariance** (`test_prop_tuning_invariance.py`). Every self-tuning lever is contractually result-invariant: morsel size, spill, shuffle partition count, adaptive morsel sizing, and the learned strategy choices behind them change how a query runs and never what it returns. Hypothesis runs the same aggregate or distinct at opposite settings of each knob, such as a 1-row morsel against 64k, spill forced against in-memory, and one partition against seven, and asserts byte-identical results.
 
-**The mergeable algebra** (`test_prop_mergeable_invariant.py`,
-`test_prop_partition_invariant.py`). Stateful operators are `partial → combine → finalize`
-with an associative-commutative `combine`; that is the single invariant that lets one
-implementation serve one core, many cores, and many machines. The tests assert an
-aggregate / distinct / sort-limit over one morsel equals the same over any random chunking
-of the input, and equals DuckDB. Because the native distributed primitives are directly
-callable, `test_prop_mergeable_invariant.py` also drives
-`combine_finalize(partition(partial(pₖ)))` over the raw Rust kernels and asserts it equals
-the single-node result. Partition-independence is therefore proven at the primitive, not
-only through the Python path.
+**The mergeable algebra** (`test_prop_mergeable_invariant.py` and `test_prop_partition_invariant.py`). Stateful operators are `partial`, `combine` and `finalize`, with an associative, commutative `combine`, and that single invariant lets one implementation serve one core, many cores and many machines. The tests assert that an aggregate, a distinct or a sort-limit over one morsel equals the same over any random chunking of the input, and equals DuckDB. Because the native distributed primitives are callable directly, `test_prop_mergeable_invariant.py` also drives `combine_finalize(partition(partial(p_k)))` over the raw Rust kernels, so partition-independence is proven at the primitive and not only through the Python path.
 
-**Why this layer earns its place.** These invariants caught real bugs during development that
-no example test would have surfaced: a transient crash under a concurrent plan edit, and an
-adaptive-vs-non-adaptive divergence that traced to a pre-existing empty-input engine
-limitation, where the adaptive path short-circuits an empty subtree while the one-shot path
-hits the gap. Both were surfaced honestly and isolated rather than papered over. A property
-that fails is a decision to surface, exactly like a differential mismatch, and weakening it
-to go green is not an option.
+The suite holds more than these, including streaming, watermark and path-equivalence properties. These invariants have caught bugs no example test surfaced, such as a crash under a concurrent plan edit and an adaptive divergence traced to an empty-input limitation in the one-shot path. A failing property is a decision to surface, exactly like a differential mismatch, and weakening it to go green isn't an option.
 
 ## Test layout
 
-Each directory holds one kind of test, and the kind decides what it is allowed to depend
-on:
+Each directory holds one kind of test, and the kind decides what it may depend on:
 
-```text
-tests/
-├── unit/           fast, no native engine: optimizer passes, IR validation, cost
-├── differential/   cross-check results against DuckDB/Polars (the correctness spine)
-├── integration/    end to end: I/O, adaptive re-optimization, distributed, spilling
-├── io/             source and sink formats
-├── property/       Hypothesis invariants: optimizer, metadata, adaptive, mergeable
-└── docs/           executes the code examples in the docs, and the examples/ scripts
-```
+| Directory | What it holds |
+|---|---|
+| `tests/unit/` | Fast tests with no native engine: optimizer passes, IR validation, cost |
+| `tests/differential/` | Results cross-checked against DuckDB and Polars, the correctness spine |
+| `tests/integration/` | End to end: I/O, adaptive re-optimization, distributed, spilling |
+| `tests/io/` | Source and sink formats and lakehouse round-trips |
+| `tests/property/` | Hypothesis invariants: optimizer, metadata, adaptive, mergeable |
+| `tests/docs/` | The code examples in these docs, the `examples/` scripts, and the docs structure |
 
-The `docs/` directory runs two harnesses: `test_doc_examples.py` executes the fenced
-`python` blocks embedded in this documentation, and `test_examples.py` runs every
-standalone script under the top-level `examples/` directory. Both fail the suite if a
-demonstrated API is removed or renamed, so usage coverage cannot rot.
+`tests/docs/` runs two example harnesses. `test_doc_examples.py` executes the fenced `python` blocks in this documentation, and `test_examples.py` runs every script under the top-level `examples/` directory. Both fail the suite when a demonstrated API is removed or renamed.
 
-Markers are declared in `pyproject.toml`: `unit`, `differential`, `integration`,
-`property`, and `docs`. Property tests (Hypothesis) are encouraged for algebraic
-invariants such as merge associativity, encode/decode round-trips, and optimizer
-idempotence, where one law covers a space no enumerated case can. The behavioral suite
-above (`tests/property/`) is where they guard the optimizer, metadata, adaptive, and tuning
-work. Those files carry both `property` and `integration` because they drive the native
-engine, and they run under `just test-py`. Unlike the rest of the integration suite they
-are counted in the coverage gate, because `tests/property` is in `cov-gate`'s measured set
-(described below), so the random-search coverage of those paths is part of the ratchet.
+Markers are declared in `pyproject.toml`: `unit`, `differential`, `integration`, `property`, `docs` and `io`. The property files carry both `property` and `integration`, because they drive the native engine, and they run under `just test-py`.
+
+Coverage of the cross-product matters as much as coverage of each operator. `tests/differential/test_diff_operator_matrix.py` runs every relational operator through `collect()`, `collect(spill=True)` and `iter_batches()` on one input loaded with nulls, empty input, a single row, `-0.0` and NaN float keys, every ordering flag, and enough rows to cross a morsel boundary. It exists because four wrong-answer bugs lived where an operator met a non-default path, such as a spilled descending sort that emitted nulls mid-result.
 
 ## What each change must prove
 
-The gate scales with what you touched.
+The gate scales with what you touched:
 
-- A new or changed operator or expression adds a differential test against DuckDB
-  covering nulls, empties, and type edges, and keeps the Rust sequential, parallel,
-  and JIT paths in agreement. Touching the JSON IR adds a round-trip test that the
-  Python `to_ir()` shape deserializes in Rust.
-- A new `bc-runtime` primitive gets a unit test and the mergeability invariant; if it
-  is stateful, it is tested spilled and partitioned too.
-- A new Kyber pass gets a unit test proving the rewrite is semantics-preserving (the
-  plan changes, the result does not) plus a differential test that the optimized
-  query still matches DuckDB.
-- A distributed change gets an equivalence test: single-node output equals
-  multi-partition output.
+- A new or changed operator or expression adds a differential test against DuckDB covering nulls, empties and type edges, and keeps the Rust sequential, parallel and JIT paths in agreement. Touching the JSON IR adds a round-trip test that the Python `to_ir()` shape deserializes in Rust.
+- A new `bc-runtime` primitive gets a unit test and the mergeability invariant. If it is stateful, it is tested spilled and partitioned too.
+- A new Kyber pass gets a unit test proving the rewrite is semantics-preserving, where the plan changes and the result doesn't, plus a differential test that the optimized query still matches DuckDB.
+- A distributed change gets an equivalence test showing single-node output equals multi-worker output. CI installs no Ray, so that test is skipped there, and a recorded cluster run is the evidence.
 - A bug fix lands with a regression test that fails before the fix.
+- Any test change runs `just lint-tests`, which catches a test that can't fail, and `just lint-methodology`, which catches one arranged so that it doesn't.
 
 ## Running the tests
 
+The following recipes run the suites:
+
 ```bash
-just test          # the CI sequence: check, test-rust, build, test-py
-just test-rust     # cargo test (the Rust oracle, parallel and JIT parity)
+just test          # the CI sequence: check, test-rust, build, test-py, cov-gate
+just test-rust     # cargo test: the Rust oracle, parallel and JIT parity
 just test-py       # pytest, including the differential suite and doc examples
 ```
 
-`just test-py` requires a built engine (`just build` first), because the
-differential and integration suites run real queries. The documentation's code
-examples are executed under `tests/docs/test_doc_examples.py`, so a doc snippet that
-stops working fails the build rather than rotting silently.
+`just test-py` needs a built engine, so run `just build` first, because the differential and integration suites run real queries.
 
-## Coverage philosophy
+## Coverage
 
-Cover the contract, not the implementation: every operator against empty input,
-nulls, a single row, multiple batches, and type boundaries. A wide enumerated suite
-of these edges catches more than chasing a coverage percentage, because the edges are
-where engines actually disagree.
+Cover the contract rather than the implementation: every operator against empty input, nulls, a single row, multiple batches and type boundaries. A wide suite of those edges catches more than chasing a percentage, because the edges are where engines disagree.
 
-## Coverage measurement
-
-Coverage is measured on both planes and gated as a ratchet. The floor sits just
-below the achieved baseline so it blocks regressions, and it is raised as coverage grows.
-It is a backstop against untested code creeping in, not a target to game. The edge
-suite above is what actually proves correctness.
+Coverage is still measured on both planes and gated as a ratchet, as a backstop against untested code creeping in:
 
 ```bash
 just cov-py        # Python control plane (pytest-cov, branch coverage)
@@ -188,24 +94,11 @@ just cov-rust      # Rust data plane (cargo-llvm-cov; one-time: cargo install ca
 just cov-gate      # the CI gate: runs the suite under coverage, fails below the floor
 ```
 
-`just test` runs the full correctness suite (`test-py`) and then `cov-gate`. The
-settings live in `[tool.coverage.*]` in `pyproject.toml`. The compiled `_native`
-extension is omitted, because it is exercised through the data plane rather than the
-Python suite, so counting it would mislead.
-
-The gate measures a **deterministic subset**, `tests/{unit,differential,property,io,docs}`,
-and deliberately excludes `tests/integration`. Those Ray, adaptive-learning, and
-distributed tests are stable on their own, and they run for correctness under `test-py`,
-but coverage instrumentation perturbs their timing enough to make them flaky, which
-would make an enforced gate non-deterministic. The floor is **85%** branch coverage of
-`python/batcher`, against a subset baseline measured at 87% on 2026-08-01. It sat at 62
-for a while, twenty-five points below what the suite reached, which is a ratchet nobody
-tightens and therefore not a ratchet. Raise the `--cov-fail-under` value in the
-`cov-gate` recipe whenever a round of new tests lifts the baseline. (`just cov-py`
-reports the same subset with line-by-line misses and an HTML drill-down.)
+The gate measures a deterministic subset, `tests/unit`, `tests/differential`, `tests/property`, `tests/io` and `tests/docs`, and fails below 85% branch coverage of `python/batcher`. It excludes `tests/integration`, whose Ray, adaptive-learning and distributed tests run for correctness under `test-py` but turn flaky under coverage instrumentation. The compiled `_native` extension is omitted, because the data plane exercises it rather than the Python suite. Settings live in `[tool.coverage.*]` in `pyproject.toml`. Raise `--cov-fail-under` in the `cov-gate` recipe whenever new tests lift the baseline, because a floor nobody tightens isn't a ratchet.
 
 ## See also
 
-- {doc}`/architecture/internals/execution`: the sequential, parallel, and JIT paths under test.
-- {doc}`/architecture/internals/kyber`: the passes the differential tests guard.
-- {doc}`/architecture/internals/extending`: where a new operator, rule, or format adds its own coverage.
+- {doc}`/architecture/internals/execution`: the sequential, parallel and JIT paths under test.
+- {doc}`/architecture/internals/kyber`: the rules the differential and property tests guard.
+- {doc}`/architecture/internals/extending`: where a new operator, rule or format adds its own tests.
+- {doc}`/benchmarks/methodology`: the same correctness gate applied to every benchmark number.

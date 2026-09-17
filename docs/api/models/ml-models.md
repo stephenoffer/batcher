@@ -17,13 +17,17 @@ load-once class UDF. See the {doc}`tabular models guide </ml/inference/tabular-m
 ```{eval-rst}
 .. currentmodule:: batcher.ml.tabular
 
-.. autofunction:: tabular_predictor
-.. autofunction:: predicted_column_names
-.. autofunction:: feature_matrix
-.. autofunction:: prediction_columns
-.. autofunction:: resolve_features
-.. autofunction:: detect_framework
-.. autofunction:: get_adapter
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   tabular_predictor
+   predicted_column_names
+   feature_matrix
+   prediction_columns
+   resolve_features
+   detect_framework
+   get_adapter
 ```
 
 ## Linear models
@@ -35,20 +39,15 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.linear
 
-.. autoclass:: LinearRegression
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: Ridge
-   :members:
-
-.. autoclass:: RidgeClassifier
-   :members:
-
-.. autoclass:: RidgeCV
-   :members:
-
-.. autoclass:: LogisticRegression
-   :members:
+   LinearRegression
+   Ridge
+   RidgeClassifier
+   RidgeCV
+   LogisticRegression
 ```
 
 `batcher.ml.dummy` holds the baseline predictors a real model must beat.
@@ -56,11 +55,12 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.dummy
 
-.. autoclass:: DummyRegressor
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: DummyClassifier
-   :members:
+   DummyRegressor
+   DummyClassifier
 ```
 
 `batcher.ml.sparse_linear` adds the L1-regularized linear models that select features by zeroing coefficients.
@@ -68,17 +68,14 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.sparse_linear
 
-.. autoclass:: Lasso
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: ElasticNet
-   :members:
-
-.. autoclass:: LassoCV
-   :members:
-
-.. autoclass:: ElasticNetCV
-   :members:
+   Lasso
+   ElasticNet
+   LassoCV
+   ElasticNetCV
 ```
 
 `batcher.ml.glm` fits the Tweedie family of generalized linear models by the same one-scan IRLS steps, covering the general form and its Poisson and gamma special cases.
@@ -86,17 +83,14 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.glm
 
-.. autoclass:: TweedieRegressor
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: PoissonRegressor
-   :members:
-
-.. autoclass:: GammaRegressor
-   :members:
-
-.. autoclass:: HuberRegressor
-   :members:
+   TweedieRegressor
+   PoissonRegressor
+   GammaRegressor
+   HuberRegressor
 ```
 
 `batcher.ml.naive_bayes` adds the probabilistic baseline whose entire fit is one grouped
@@ -105,14 +99,13 @@ aggregate.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.naive_bayes
 
-.. autoclass:: GaussianNB
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: MultinomialNB
-   :members:
-
-.. autoclass:: BernoulliNB
-   :members:
+   GaussianNB
+   MultinomialNB
+   BernoulliNB
 ```
 
 `batcher.ml.discriminant` adds the Gaussian classifiers: {py:class}`LinearDiscriminantAnalysis <batcher.ml.discriminant.LinearDiscriminantAnalysis>` shares one
@@ -122,11 +115,12 @@ its own (quadratic boundaries).
 ```{eval-rst}
 .. currentmodule:: batcher.ml.discriminant
 
-.. autoclass:: LinearDiscriminantAnalysis
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: QuadraticDiscriminantAnalysis
-   :members:
+   LinearDiscriminantAnalysis
+   QuadraticDiscriminantAnalysis
 ```
 
 `batcher.ml.multiclass` extends a two-class estimator to any number of classes.
@@ -138,8 +132,11 @@ model per class and predicts whichever scores highest.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.multiclass
 
-.. autoclass:: OneVsRestClassifier
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   OneVsRestClassifier
 ```
 
 `batcher.ml.compose` turns a classifier's raw scores into probabilities you can act on.
@@ -154,8 +151,11 @@ overconfidence it shows in production.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.compose.calibration
 
-.. autoclass:: CalibratedClassifierCV
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   CalibratedClassifierCV
 ```
 
 ## Evaluation
@@ -167,23 +167,27 @@ Everything here consumes a whole column at once. See the
 ```{eval-rst}
 .. currentmodule:: batcher.ml.metrics
 
-.. autofunction:: evaluate
-.. autofunction:: roc_auc
-.. autofunction:: average_precision
-.. autofunction:: ks_statistic
-.. autofunction:: gini_coefficient
-.. autofunction:: confusion_matrix
-.. autofunction:: threshold_sweep
-.. autofunction:: lift_table
-.. autofunction:: calibration_curve
-.. autofunction:: classification_report
-.. autofunction:: multiclass_averages
-.. autofunction:: residual_summary
-.. autofunction:: prediction_interval_coverage
-.. autofunction:: top_k_accuracy
-.. autofunction:: expected_calibration_error
-.. autofunction:: maximum_calibration_error
-.. autofunction:: brier_skill_score
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   evaluate
+   roc_auc
+   average_precision
+   ks_statistic
+   gini_coefficient
+   confusion_matrix
+   threshold_sweep
+   lift_table
+   calibration_curve
+   classification_report
+   multiclass_averages
+   residual_summary
+   prediction_interval_coverage
+   top_k_accuracy
+   expected_calibration_error
+   maximum_calibration_error
+   brier_skill_score
 
 .. autodata:: METRIC_SETS
 ```
@@ -193,22 +197,34 @@ queries, so these compute the metric per group and then average. Pooling rows ac
 silently rewards a model that ranks one heavy user well and everyone else badly.
 
 ```{eval-rst}
-.. autofunction:: precision_at_k
-.. autofunction:: recall_at_k
-.. autofunction:: hit_rate_at_k
-.. autofunction:: mean_reciprocal_rank
-.. autofunction:: map_at_k
-.. autofunction:: ndcg_at_k
+.. currentmodule:: batcher.ml.metrics
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   precision_at_k
+   recall_at_k
+   hit_rate_at_k
+   mean_reciprocal_rank
+   map_at_k
+   ndcg_at_k
 ```
 
 Picking a cutoff is the step between a good AUC and a deployed model, and 0.5 is almost never
 the right one:
 
 ```{eval-rst}
-.. autofunction:: best_threshold
-.. autofunction:: best_cost_threshold
-.. autofunction:: expected_cost_curve
-.. autofunction:: compare_models
+.. currentmodule:: batcher.ml.metrics
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   best_threshold
+   best_cost_threshold
+   expected_cost_curve
+   compare_models
 ```
 
 ## Outlier detection
@@ -219,15 +235,16 @@ the three standard rules (IQR, z-score, MAD), each a per-column bound learned in
 ```{eval-rst}
 .. currentmodule:: batcher.ml.outliers
 
-.. autofunction:: outlier_bounds
-.. autofunction:: flag_outliers
-.. autofunction:: count_outliers
-.. autofunction:: mahalanobis_distance
-.. autoclass:: OutlierClipper
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: EllipticEnvelope
-   :members:
+   outlier_bounds
+   flag_outliers
+   count_outliers
+   mahalanobis_distance
+   OutlierClipper
+   EllipticEnvelope
 ```
 
 ## Clustering
@@ -239,11 +256,12 @@ a single streaming pass.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.cluster
 
-.. autoclass:: KMeans
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: NearestCentroid
-   :members:
+   KMeans
+   NearestCentroid
 ```
 
 `batcher.ml.mixture` fits a Gaussian mixture by EM, which gives soft cluster membership and a density estimate at once.
@@ -251,8 +269,11 @@ a single streaming pass.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.mixture
 
-.. autoclass:: GaussianMixture
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   GaussianMixture
 ```
 
 Score a clustering against a reference labeling with `batcher.ml.metrics`, each computed from one
@@ -261,19 +282,23 @@ Score a clustering against a reference labeling with `batcher.ml.metrics`, each 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.metrics
 
-.. autofunction:: adjusted_rand_score
-.. autofunction:: rand_score
-.. autofunction:: normalized_mutual_info_score
-.. autofunction:: adjusted_mutual_info_score
-.. autofunction:: mutual_info_score
-.. autofunction:: homogeneity_score
-.. autofunction:: completeness_score
-.. autofunction:: v_measure_score
-.. autofunction:: fowlkes_mallows_score
-.. autofunction:: contingency_matrix
-.. autofunction:: pair_confusion_matrix
-.. autofunction:: calinski_harabasz_score
-.. autofunction:: davies_bouldin_score
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   adjusted_rand_score
+   rand_score
+   normalized_mutual_info_score
+   adjusted_mutual_info_score
+   mutual_info_score
+   homogeneity_score
+   completeness_score
+   v_measure_score
+   fowlkes_mallows_score
+   contingency_matrix
+   pair_confusion_matrix
+   calinski_harabasz_score
+   davies_bouldin_score
 ```
 
 ## Pipelines
@@ -284,17 +309,14 @@ construction the one `fit` used:
 ```{eval-rst}
 .. currentmodule:: batcher.ml
 
-.. autoclass:: Pipeline
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: TransformedTargetRegressor
-   :members:
-
-.. autoclass:: MultiOutputRegressor
-   :members:
-
-.. autoclass:: MultiOutputClassifier
-   :members:
+   Pipeline
+   TransformedTargetRegressor
+   MultiOutputRegressor
+   MultiOutputClassifier
 ```
 
 ## Nearest neighbours
@@ -305,16 +327,14 @@ the expression, so scoring is one projection rather than a join:
 ```{eval-rst}
 .. currentmodule:: batcher.ml
 
-.. autoclass:: KNeighborsRegressor
-   :members:
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: KNeighborsClassifier
-   :members:
-
-.. autoclass:: KNNImputer
-   :members:
-
-.. autofunction:: smote
+   KNeighborsRegressor
+   KNeighborsClassifier
+   KNNImputer
+   smote
 ```
 
 ## Model persistence
@@ -326,27 +346,33 @@ preprocessors use:
 ```{eval-rst}
 .. currentmodule:: batcher.ml.persistence
 
-.. autofunction:: save_model
-.. autofunction:: load_model
-.. autofunction:: model_to_dict
-.. autofunction:: model_from_dict
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   save_model
+   load_model
+   model_to_dict
+   model_from_dict
 ```
 
 ## Ensembling
 
 Combining several models into one prediction. `blend_predictions` is a weighted average and
-needs no fit; `StackingEnsemble` fits a meta-model on out-of-fold predictions, so the
+needs no fit. `StackingEnsemble` fits a meta-model on out-of-fold predictions, so the
 meta-model never sees a base model scoring a row it was fitted on.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.ensemble
 
-.. autofunction:: blend_predictions
-.. autofunction:: majority_vote
-.. autofunction:: out_of_fold_features
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: StackingEnsemble
-   :members:
+   blend_predictions
+   majority_vote
+   out_of_fold_features
+   StackingEnsemble
 ```
 
 ## Feature selection
@@ -357,10 +383,14 @@ which is both cheaper and less circular than reading a model's own importances.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.selection
 
-.. autofunction:: feature_report
-.. autofunction:: feature_profile
-.. autofunction:: constant_columns
-.. autofunction:: correlated_columns
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   feature_report
+   feature_profile
+   constant_columns
+   correlated_columns
 ```
 
 `batcher.ml.feature_scores` ranks each feature against the target with a univariate score,
@@ -369,11 +399,15 @@ the filter half of scikit-learn's `SelectKBest`.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.feature_scores
 
-.. autofunction:: f_classif_scores
-.. autofunction:: f_regression_scores
-.. autofunction:: chi2_scores
-.. autofunction:: mutual_info_scores
-.. autofunction:: select_k_best
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   f_classif_scores
+   f_regression_scores
+   chi2_scores
+   mutual_info_scores
+   select_k_best
 ```
 
 `batcher.ml.timeseries` diagnoses serial structure with the autocorrelation function and the standard tests of whether a series or a model's residuals still carry it.
@@ -381,13 +415,17 @@ the filter half of scikit-learn's `SelectKBest`.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.timeseries
 
-.. autofunction:: autocorrelation
-.. autofunction:: autocorrelations
-.. autofunction:: partial_autocorrelation
-.. autofunction:: partial_autocorrelations
-.. autofunction:: ljung_box
-.. autofunction:: durbin_watson
-.. autofunction:: mean_absolute_scaled_error
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   autocorrelation
+   autocorrelations
+   partial_autocorrelation
+   partial_autocorrelations
+   ljung_box
+   durbin_watson
+   mean_absolute_scaled_error
 ```
 
 ## See also

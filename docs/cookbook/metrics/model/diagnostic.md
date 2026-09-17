@@ -1,6 +1,8 @@
 # Diagnostic metrics
 
-Accuracy hides everything on an imbalanced problem. Likelihood ratios, informedness, and markedness describe how much a prediction actually moves your belief, which is the number you want when positives are rare.
+Accuracy hides everything on an imbalanced problem. Likelihood ratios, informedness, and markedness describe how much a prediction moves your belief, which is the number you want when positives are rare.
+
+The script reuses the confusion matrix from {doc}`classification`, so the false discovery rate, false omission rate, Jaccard score, and Hamming loss it asserts can all be checked against those four counts.
 
 The whole script, executed on every test run:
 

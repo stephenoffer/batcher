@@ -1,6 +1,8 @@
 # Cleaning scraped text
 
-This is the pre-processing pass in front of an embedding or LLM stage. Each call is one columnar operator, so a chain of ten of them still reads the column once per operator in Rust rather than materializing Python strings.
+Scraped text needs a cleaning pass before it goes to an embedding or LLM stage. Each call here is one columnar operator, so a chain of ten of them reads the column once per operator in Rust rather than materializing Python strings.
+
+The script strips HTML tags, bullets, and digits, removes or masks URLs and emails, collapses repeated punctuation and runs of whitespace, and derives a URL-safe key with `slugify`. Masking rather than removing keeps a visible trace that something was redacted.
 
 The whole script, executed on every test run:
 

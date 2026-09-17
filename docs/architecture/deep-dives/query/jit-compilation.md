@@ -17,7 +17,7 @@ against. There is no third option where it is "close enough".
 
 ## What compiles
 
-From `crates/bc-codegen/src/lib.rs` and `analyze.rs`:
+From `crates/bc-codegen/src/analyze.rs`, which is the authority. The crate docstring in `lib.rs` still lists only null-free `Int64`/`Float64` columns, which predates the temporal and nullable paths below.
 
 | Variant | Compiles | Notes |
 |---|---|---|
@@ -27,7 +27,9 @@ From `crates/bc-codegen/src/lib.rs` and `analyze.rs`:
 | `Not` | of a boolean sub-result | |
 | `Case` | over the numeric subset | lowered to a `select` chain in the interpreter's reverse-fold order, so the first matching `WHEN` wins |
 | `Cast` | exact numeric (`i64 → f64`, or a no-op) | |
-| everything else | no | strings, dates beyond comparison, lists, structs, `IsNull`, media decode → `CodegenError::Unsupported`, and the caller uses `Expr::eval` |
+| `Math`, `Math2` | value-only math over the numeric subset | libm calls, so the SIMD body excludes them |
+| `IsNan`, `IsInf` | over a `Float64` operand | any other operand type declines |
+| everything else | no | strings, date functions, lists, structs, `IsNull`, `Coalesce`, media decode → `CodegenError::Unsupported`, and the caller uses `Expr::eval` |
 
 One subtlety that is easy to get wrong and is worth stating: an integer divisor compiles only
 when it is a **nonzero, non-`-1` constant**. Cranelift's `sdiv`/`srem` trap on divide-by-zero
@@ -136,12 +138,12 @@ either.
 
 ## Who calls it
 
-Only the parallel executor. The sequential oracle passes `&None`:
+Only the parallel paths: `bc-interp::par` and the streaming executor in `bc-interp::stream`. The sequential oracle passes `&None`:
 
 ```rust
 // crates/bc-interp/src/ops/mod.rs
 pub(crate) fn filter_batch(batch: &RecordBatch, predicate: &Expr) -> Result<RecordBatch, InterpError> {
-    filter_batch_jit(batch, predicate, &None)   // the oracle never JITs
+    filter_batch_jit(batch, predicate, &None, None)   // the oracle never JITs
 }
 
 fn eval_jit(jit: &Jit, expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, InterpError> {
@@ -154,7 +156,7 @@ fn eval_jit(jit: &Jit, expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, Int
 }
 ```
 
-`bc-interp::par` compiles once per operator, using the first morsel as the type sample
+The parallel path compiles once per operator, using the first morsel as the type sample
 (`ops::try_compile`), and shares the `Arc<CompiledExpr>` across rayon workers (`CompiledExpr`
 is `Send + Sync`). Compiling per morsel would lose to the interpreter outright.
 
@@ -168,7 +170,7 @@ import batcher as bt
 
 ds = bt.from_pydict({"a": [1, 2, 3, 4], "b": [10.0, 20.0, 30.0, 40.0], "s": ["x", "y", "x", "z"]})
 
-# Numeric, null-free, arithmetic + comparison: this is the Tier-1 subset.
+# Numeric arithmetic and comparison: this is inside the Tier-1 subset.
 fast = ds.filter((bt.col("a") * 2 + 1) > bt.col("b") / 4).select("a", "b")
 
 # A string function is outside the subset: the interpreter evaluates it.
@@ -185,9 +187,8 @@ print(slow.to_pydict())
 
 ## What the subset covers
 
-The JIT's leverage is concentrated in numeric-heavy projection and filter chains, which is
-where its benchmark margins sit (`filter → count` at 0.20x DuckDB). A predicate that touches
-a string, a date function, or a null runs on the interpreter instead, at the same result.
+The JIT's leverage is concentrated in numeric-heavy projection and filter chains. A predicate
+that touches a string or a date function runs on the interpreter instead, at the same result.
 
 Growing the subset follows a fixed rule: teach the interpreter first, then either teach the
 JIT *and* prove parity against it, or leave the JIT to fall back. Never ship a JIT path that
@@ -208,7 +209,7 @@ disagrees with the oracle.
 - {doc}`Execution engine </architecture/internals/execution>`: the tiering contract at the architecture level.
 - `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the parity argument, stated formally.
 - {doc}`Performance </user-guide/operate/tuning/performance>`: writing predicates that land on this tier.
-- {doc}`Analytics benchmarks </benchmarks/results/analytics>`: the `filter → count` and `filter → project` ratios quoted above.
+- {doc}`Analytics benchmarks </benchmarks/results/analytics>`: the operator benchmarks on numeric filter and projection shapes.
 - {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: the Tier-0 oracle it must match.
 - {doc}`Morsel parallelism </architecture/deep-dives/operators/morsel-parallelism>`: the loop the compiled artifact runs inside.
 - {doc}`Cost model </architecture/deep-dives/adaptive/cost-model>`: how `jit_speedup` prices a compilable expression.

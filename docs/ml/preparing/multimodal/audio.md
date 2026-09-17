@@ -4,7 +4,7 @@ This page covers what a speech or audio pipeline does to a clip between reading 
 
 ## Measuring how a corpus was recorded
 
-Recording quality is the axis a scraped audio corpus varies on most and reports least. Six measures reduce a clip to one number, so triaging is an ordinary predicate:
+Recording quality is where a scraped audio corpus varies most and reports least. Six measures reduce a clip to one number, so triage is an ordinary predicate:
 
 ```python
 import base64
@@ -36,15 +36,15 @@ print(
 | `silence_ratio(threshold_db)` | fraction of samples below a floor | finds the recordings that are mostly dead air |
 | `zero_crossing_rate()` | fraction of adjacent pairs that change sign | the classic voiced/unvoiced descriptor |
 
-`dbfs()` and `peak_dbfs()` return null for digital silence rather than negative infinity. That is deliberate: an infinity compares less than every threshold, so a silent clip would pass every "quieter than X" filter *and* every "louder than X" one written with a negated comparison.
+`dbfs()` and `peak_dbfs()` return null for digital silence, not negative infinity. An infinity compares less than every threshold, so a silent clip would pass every "quieter than X" filter *and* every "louder than X" filter written as a negated comparison.
 
 ## Putting every clip on the same footing
 
-Clips from different sources differ in level, length and sample rate, and a model sees each of those as a different distribution rather than a different recording.
+Clips from different sources differ in level, length and sample rate. A model sees each of those differences as a different distribution, not a different recording.
 
-`rms_normalize(target_db=-20)` matches loudness. It is usually the one you want over `peak_normalize()`, which equalizes the *maximum*, so a clip with one loud click stays quiet everywhere else. The gain is capped so the result cannot clip, which means a whisper is lifted toward the target rather than driven into the rails.
+`rms_normalize(target_db=-20)` matches loudness, and it's usually the right choice. `peak_normalize()` equalizes the *maximum* instead, so a clip with one loud click stays quiet everywhere else. The gain is capped so the result can't clip: a whisper is lifted toward the target, never driven into the rails.
 
-`pad_or_trim(duration_secs, rate)` is the operation that makes a clip corpus batchable at all. Whisper requires exactly 30 seconds of 16 kHz audio and every other fixed-input audio model requires something like it, so without it a pipeline either loops in Python or hands the model rows of unequal length:
+`pad_or_trim(duration_secs, rate)` makes a clip corpus batchable at all. It truncates a longer clip and zero-pads a shorter one at the end. Whisper requires exactly 30 seconds of 16 kHz audio, and every other fixed-input audio model requires something like it. Without this step a pipeline either loops in Python or hands the model rows of unequal length:
 
 ```python
 # docs: skip
@@ -53,11 +53,11 @@ from batcher import col
 fixed = clips.with_columns(audio=col("bytes").audio.trim_silence().audio.pad_or_trim(30.0, 16000))
 ```
 
-`slice(offset_secs, duration_secs)` extracts a region, measured against the clip's own sample rate. A window past the end of the recording yields an empty list rather than null, because an empty region is a fact about the window and not a failure to read the clip.
+`slice(offset_secs, duration_secs)` extracts a region, measured against the clip's own sample rate. A window past the end of the recording yields an empty list, not null. An empty region is a fact about the window, not a failure to read the clip.
 
 `pre_emphasis(coefficient=0.97)` applies the first-order high-pass every classical ASR front end runs before framing, to flatten the spectral tilt of voiced speech.
 
-These compose. `trim_silence()` hands back a waveform and `rms_normalize()` reads one, so a two-step clean is one expression rather than a decode, a round trip through Python, and a re-encode:
+The methods compose. `trim_silence()` hands back a waveform and `rms_normalize()` reads one, so a two-step clean is one expression. There's no decode, Python round trip and re-encode between the steps:
 
 ```python
 # docs: skip
@@ -70,7 +70,7 @@ cleaned = clips.select(
 
 ## Writing audio back out
 
-Every waveform method hands back a `List<Float32>`, which is what a model wants and what nothing else can read. `encode_wav(rate=None)` closes the loop, producing a mono 16-bit PCM WAV container, the format every player, dataset loader and annotation tool accepts:
+Every waveform method hands back a `List<Float32>`. A model wants exactly that, and nothing else can read it. `encode_wav(rate=None)` closes the loop by producing a mono 16-bit PCM WAV container, which every player, dataset loader and annotation tool accepts:
 
 ```python
 # docs: skip
@@ -83,11 +83,11 @@ cleaned = clips.select(
 cleaned.write.parquet("s3://bucket/cleaned/")
 ```
 
-Without it, writing a trimmed and normalized corpus back to storage *as audio* meant encoding each row in Python.
+On encoded bytes, `rate` resamples before encoding, and omitting it keeps the clip's own rate. On a waveform column it's required, because a waveform carries no sample rate and a guess would play the clip at the wrong speed.
 
 ## Spectral features
 
-`mel_spectrogram` and `mfcc` are the speech front ends, matching `torchaudio`'s defaults so the result is model-drop-in. `spectrogram(rate, n_fft=, hop_length=)` is their unwarped sibling: a mel filterbank is tuned to human pitch perception, and a music, bioacoustic or machine-fault model wants the frequencies themselves.
+`mel_spectrogram` and `mfcc` are the speech front ends, and they match `torchaudio`'s defaults so the result drops into a model. `spectrogram(rate, n_fft=, hop_length=)` is the unwarped version. A mel filterbank is tuned to human pitch perception, while a music, bioacoustic or machine-fault model wants the frequencies themselves.
 
 Four descriptors reduce the whole clip to one number instead:
 
@@ -98,19 +98,21 @@ Four descriptors reduce the whole clip to one number instead:
 | `spectral_bandwidth(rate)` | the spread of frequencies about the centroid |
 | `spectral_flatness(rate)` | geometric over arithmetic mean of the power spectrum: near 0 for a tone, near 1 for noise |
 
-`spectral_rolloff` is the one worth reaching for first on an unknown corpus. It says where a recording's usable band *ends*, which is how an 8 kHz telephone recording upsampled to 16 kHz is caught: it has a full-rate header, ordinary loudness, and no energy above 4 kHz. Nothing else here can see that, and a model trained on the mixture learns the artifact.
+Reach for `spectral_rolloff` first on an unknown corpus. It says where a recording's usable band *ends*, which is how you catch an 8 kHz telephone recording upsampled to 16 kHz. That clip has a full-rate header, ordinary loudness, and no energy above 4 kHz. Nothing else here can see it, and a model trained on the mixture learns the artifact.
 
-All four average over frames and skip frames carrying no energy. A silent frame counted as "0 Hz" would drag the average toward DC and make a mostly-quiet recording look band-limited, which is the exact confusion the measure exists to resolve.
+All four average over frames and skip frames with no energy. Counting a silent frame as "0 Hz" would drag the average toward DC and make a mostly quiet recording look band-limited, which is the exact confusion these measures exist to resolve.
 
 ## Requirements and limitations
 
 - Native decode covers WAV/PCM and FLAC, the `symphonia` codecs the engine is built with. Bytes in any other container decode to null rather than raising, so a corpus of MP3 or Ogg needs a conversion pass before these methods see it.
-- Some methods need no sample rate: the level and hygiene measures, `trim_silence`, `peak_normalize`, `rms_normalize`, `pre_emphasis`, and `encode_wav`. Those take a waveform column as readily as encoded bytes, so they chain without re-decoding. The ones defined against a rate, meaning `resample`, `slice`, `pad_or_trim`, and the spectral front ends, need the bytes, because a waveform carries no sample rate. Handed a waveform, they say which method it was and what to do instead.
-- The waveform methods return a *variable*-length list, including `pad_or_trim`, whose length is knowable but whose column type stays `list<float32>` so the engine's declared schema matches the column it describes.
+- The level and hygiene measures, `trim_silence`, `peak_normalize`, `rms_normalize` and `pre_emphasis` need no sample rate, so they take a waveform column as readily as encoded bytes and chain without re-decoding. `encode_wav` also takes a waveform, provided you pass `rate`. The methods defined against a rate, meaning `resample`, `slice`, `pad_or_trim` and the spectral front ends, need encoded bytes. Handed a waveform, they name the method and say what to do instead.
+- The waveform methods return a variable-length `list<float32>` column. That includes `pad_or_trim`, whose rows all share one length but whose type stays `list<float32>`, so the declared schema matches the column.
 - Multi-channel audio is averaged to mono at decode.
 
 ## See also
 
 - {doc}`/ml/preparing/multimodal/decoding`: getting the bytes and decoding them.
 - {doc}`/ml/preparing/multimodal/curating`: the same triage question for images.
+- {doc}`/ml/preparing/multimodal/video`: the `.video` accessor, which follows the same null-on-failure convention.
+- {doc}`/ml/preparing/multimodal/pipelines`: offloading large payloads and feeding a model stage.
 - {doc}`/api/relational/expression-accessors`: the full `.audio` method list.

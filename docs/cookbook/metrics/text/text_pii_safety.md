@@ -1,6 +1,8 @@
 # PII and safety rates
 
-Run this over model output *and* over training data. On output it tells you whether the model is emitting personal data. On input it tells you whether you are about to train on it. Either way it is one aggregate pass, cheap enough to run on every batch.
+Run these rates over model output *and* over training data. On output they tell you whether the model emits personal data. On input they tell you whether you are about to train on it. Either way it is one aggregate pass, cheap enough to run on every batch.
+
+The script counts emails, phone numbers, and card-like and SSN-like strings, plus a denylist of your own terms with `contains_any_rate`. `pii_rate` combines email and phone only, so cards and SSNs are counted by their own metrics.
 
 The whole script, executed on every test run:
 

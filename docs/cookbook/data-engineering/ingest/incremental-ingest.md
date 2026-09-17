@@ -1,7 +1,6 @@
 # Incremental ingest
 
-An upstream system drops Parquet files into `landing/` every few minutes. Your job
-reads the directory and loads it into the warehouse. The naive version:
+An upstream system drops Parquet files into `landing/` every few minutes. Your job reads the directory and loads it into the warehouse. The naive version:
 
 ```python
 # docs: skip
@@ -9,15 +8,10 @@ bt.read.parquet("s3://bucket/landing/").write.parquet("warehouse/orders")
 ```
 
 :::{warning}
-Run that every five minutes and you re-read every file ever dropped. On day one it takes
-two seconds. On day ninety it takes twenty minutes, and the cost is entirely work you
-already did.
+Run that every five minutes and you re-read every file ever dropped. On day one it takes two seconds. On day ninety it takes twenty minutes, and the cost is entirely work you already did.
 :::
 
-The usual patch is a hand-rolled bookmark: a JSON file listing processed paths, or a
-`WHERE mtime > last_run` filter over the listing. Both drift. Clocks skew, a writer
-touches a file after you read it, the bookmark file gets clobbered by two overlapping
-runs, and you find out because a day of orders is missing.
+The usual patch is a hand-rolled bookmark: a JSON file listing processed paths, or a `WHERE mtime > last_run` filter over the listing. Both drift. Clocks skew, a writer touches a file after you read it, the bookmark file gets clobbered by two overlapping runs, and you find out because a day of orders is missing.
 
 | Discovery strategy | What it trusts | How it fails |
 |---|---|---|
@@ -28,10 +22,7 @@ runs, and you find out because a day of orders is missing.
 
 ## The seen-file store
 
-{py:meth}`bt.read.files_incremental(path, format, state_dir=...) <batcher.api.io_namespace.reader.Reader.files_incremental>` keeps that bookkeeping for
-you. Each read is one discovery pass: it lists `path`, subtracts the files already
-recorded in `state_dir`, reads only what is left, and records them. The store is a
-SQLite file (no service, no extra dependency), so it survives a process restart.
+{py:meth}`bt.read.files_incremental(path, format, state_dir=...) <batcher.api.io_namespace.reader.Reader.files_incremental>` keeps that bookkeeping for you. Each read is one discovery pass: it lists `path`, subtracts the files already recorded in `state_dir`, reads only what is left, and records them. The store is a SQLite file (no service, no extra dependency), so it survives a process restart.
 
 ```python
 import os
@@ -57,8 +48,7 @@ drop_file("2024-01-01T00.parquet", [1, 2])
 drop_file("2024-01-01T01.parquet", [2, 3])
 ```
 
-The source is unbounded (the directory keeps growing), so it will not {py:meth}`collect() <batcher.Dataset.collect>`.
-Consume it with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`:
+The source is unbounded (the directory keeps growing), so it will not {py:meth}`collect() <batcher.Dataset.collect>`. Consume it with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`:
 
 ```python
 def arrivals():
@@ -73,8 +63,7 @@ print(first.to_pydict())
 # {'order_id': [1, 2, 2, 3], 'amount': [10, 20, 20, 30]}
 ```
 
-Call it again with nothing new on disk and you get nothing back. This is the property
-the bookmark file was supposed to have:
+Call it again with nothing new on disk and you get nothing back. This is the property the bookmark file was supposed to have:
 
 ```python
 print(arrivals())
@@ -92,15 +81,10 @@ print(arrivals().to_pydict())
 ## Landing it idempotently
 
 :::{important}
-Discovery being exactly-once does not make the *load* exactly-once. Your process can die
-after the discovery pass marks a file seen and before the warehouse write commits. That
-file is now invisible to the next run, and the rows in it are gone from the warehouse
-with nothing to tell you so.
+Discovery being exactly-once does not make the *load* exactly-once. The store marks a file seen once the pass that read it has been drained, not when the write that follows commits. Drain the pass into a list and then write, and a process that dies between the two leaves files marked seen whose rows never reached the warehouse.
 :::
 
-Two things fix it. Make the write a keyed upsert rather than an append, so replaying a
-batch cannot double-count. And put the discovery pass and the write in the same
-function, so a crash between them costs you one batch of work, not a day of data.
+Two things fix it. Make the write a keyed upsert rather than an append, so replaying a batch cannot double-count. And keep the discovery pass and the write together, so the window between them is one batch of work rather than a day of data. The `ingest()` function below drains the pass first because it deduplicates across every file in it:
 
 ```python
 warehouse = os.path.join(work, "orders.parquet")
@@ -132,32 +116,20 @@ print(ingest())
 ```
 
 :::{tip}
-If exactly-once matters more than a little duplicate work, invert the order: write first,
-mark seen second. You then get at-least-once discovery, and the keyed merge makes the
-repeat harmless. That is the trade worth taking almost every time.
+To close that window entirely, write each batch inside the `for` loop, as the production tabs below do. The store confirms a pass only when the loop asks for the batch after the last one, so every write has landed before any file is marked seen. A crash then replays the pass, and the keyed merge makes the repeat harmless. That is the trade worth taking almost every time.
 :::
 
 ## What it does not do
 
-Discovery is per *file*, keyed by path. A producer that rewrites `part-0.parquet` in
-place with new contents will not be re-read: the path is already marked. If your
-upstream mutates files, this pattern is the wrong one. Read a change feed instead (see
-{doc}`CDC pipeline </cookbook/data-engineering/ingest/cdc-pipeline>`).
+Discovery is per *file*, keyed by path. A producer that rewrites `part-0.parquet` in place with new contents will not be re-read: the path is already marked. If your upstream mutates files, this pattern is the wrong one. Read a change feed instead (see {doc}`CDC pipeline </cookbook/data-engineering/ingest/cdc-pipeline>`).
 
-`state_dir` is single-writer. Two ingest jobs pointed at one landing zone and one state
-directory will race on the SQLite store. Give each consumer its own. Stores are cheap, and
-two independent consumers of one landing zone is exactly the case they exist for.
+`state_dir` is single-writer. Two ingest jobs pointed at one landing zone and one state directory will race on the SQLite store. Give each consumer its own. Stores are cheap, and two independent consumers of one landing zone is exactly the case they exist for.
 
-The listing has a lexical fast path: files whose names sort after the greatest name
-seen so far are the only candidates. Name your files with a timestamp or a monotonic
-sequence (`2024-01-01T03.parquet`, not `orders-a3f9.parquet`) and a landing zone with a
-million files still lists cheaply.
+File names don't need to sort in arrival order. Every listed file is a candidate, and the store answers which ones are new with an index probe over that listing, so `part-00000-<uuid>.parquet` names from Spark or Flink ingest as reliably as timestamped ones. The cost of a pass grows with the size of the listing, not with the number of files ever seen.
 
 ## In production
 
-Cloud paths work unchanged (`resolve_filesystem` handles the scheme), and the state
-directory can live next to the data. The only thing that changes between a laptop and a
-lake is the sink you land the arrivals in.
+Cloud paths work unchanged (`resolve_filesystem` handles the scheme), and the state directory can live next to the data. The only thing that changes between a laptop and a lake is the sink you land the arrivals in.
 
 ::::{tab-set}
 
@@ -186,21 +158,17 @@ for batch in source.iter_batches():
     bt.from_arrow(batch).write.merge(warehouse, on="order_id")
 ```
 
-The Parquet merge is copy-on-write and single-writer: it rewrites the files the keys
-reach and swaps them in.
+The Parquet merge is copy-on-write and single-writer: it rewrites the files the keys reach and swaps them in.
 :::
 
 ::::
 
-For a large one-shot load rather than a trickle, `resume=True` on the write is the
-other half of this: it skips output shards already committed, so a job killed by a spot
-preemption finishes the parts it did not write instead of starting over.
+For a large one-shot load rather than a trickle, `resume=True` on the write is the other half of this: it skips output shards already committed, so a job killed by a spot preemption finishes the parts it did not write instead of starting over.
 
 ## See also
 
 - {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: the incoming batch has duplicates in it.
-- {doc}`File compaction </cookbook/data-engineering/maintenance/file-compaction>`: a thousand small arrivals make a thousand
-  small files.
+- {doc}`File compaction </cookbook/data-engineering/maintenance/file-compaction>`: a thousand small arrivals make a thousand small files.
 - {doc}`Quality gates </cookbook/data-engineering/maintenance/quality-gates>`: what to check before the arrivals reach the table.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: the full reader surface.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: `merge`, `resume`, and the sink options.

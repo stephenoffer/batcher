@@ -1,11 +1,8 @@
 # User-defined functions
 
-The first rule of a UDF in Batcher is not to write one. An expression such as
-`bt.col("x") * 2` or {py:meth}`.str.contains(...) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.contains>` lowers to Rust, runs vectorized over Arrow, and
-can be JIT-compiled. A Python UDF is none of those things. The optimizer also can't see
-through your function, so it won't push a filter past it or prune a column it might read.
-Reach for a UDF when the expression language genuinely has no answer, and when you do,
-hand it whole batches.
+This page covers user-defined functions in Batcher: running your own Python over whole Arrow batches, per group, per row, or from SQL.
+
+The first rule of a UDF in Batcher is not to write one. An expression such as `bt.col("x") * 2` or {py:meth}`.str.contains(...) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.contains>` lowers to Rust, runs vectorized over Arrow, and can be JIT-compiled. A Python UDF is none of those things. The optimizer also can't see through your function, so it won't push a filter past it or prune a column it might read. Reach for a UDF when the expression language genuinely has no answer, and when you do, hand it whole batches. A batch UDF still runs zero-copy over Arrow, in parallel across cores or a cluster, so the engine around it keeps its speed.
 
 | Form | What the engine sees | Cost per row |
 | --- | --- | --- |
@@ -13,10 +10,12 @@ hand it whole batches.
 | `map_batches(fn)` | an opaque stage over an Arrow batch | whatever `fn` does, once per batch |
 | `map` / `flat_map` | an opaque stage over a Python dict per row | a Python object per row |
 
+Before you write one, ask these questions in order. The first "yes" names the form, and each form has its own section below.
+
+![Deciding whether a UDF is needed and which form to write, as four questions in order. First, if an expression such as bt.col, .str, .dt or .list can say it, write the expression, which is vectorized in Rust and needs no UDF. Second, if the work is per group, such as a session, a series or a document, use group_by(k).map_groups(fn), which hands every row of one group to each call. Third, if the function must see one row at a time, use map, flat_map or ml.filter, which build a Python object per row. Fourth, if there is costly setup such as a model, a client or a connection, pass a class to map_batches, which is built once per worker. Pass the class rather than an instance when construction must happen on the worker, such as for a CUDA context. Otherwise use map_batches with a plain function, called per batch. A batch function receives what batch_format asks for: a RecordBatch for "pyarrow", the default, a dict of ndarrays for "numpy", a DataFrame for "pandas", or a dict of tensors for "torch". The conversion happens around the call only, and the engine boundary stays Arrow.](/_static/diagrams/udf_choice.svg)
+
 :::{tip}
-`select` down to the columns the UDF reads *before* the UDF stage. The optimizer cannot
-prune across an opaque function, so anything still in the batch at that point is decoded,
-carried, and handed to Python whether `fn` looks at it or not.
+`select` down to the columns the UDF reads *before* the UDF stage. The optimizer cannot prune across an opaque function, so anything still in the batch at that point is decoded, carried, and handed to Python whether `fn` looks at it or not.
 :::
 
 ## Setup
@@ -35,11 +34,9 @@ ds = bt.from_pydict(
 )
 ```
 
-## map_batches: one function, one Arrow batch
+## One function per Arrow batch
 
-`fn` receives a `pyarrow.RecordBatch` and returns one. Everything inside should be
-vectorized Arrow compute. You are writing the *body* of a columnar operator, not a row
-loop.
+`fn` receives a `pyarrow.RecordBatch` and returns one. Everything inside should be vectorized Arrow compute. You are writing the *body* of a columnar operator, not a row loop.
 
 ```python
 def add_total(batch):
@@ -52,25 +49,15 @@ print(with_total.select("text", "total").to_pydict())
 # {'text': ['a,b', 'c', 'd,e,f'], 'total': [10.0, 40.0, 90.0]}
 ```
 
-`output_columns` declares the result schema when `fn` changes it. Omit it and later
-operations still believe the old schema, so a `select` on your new column fails at plan
-time. Declare it whenever the columns differ from the input.
+`output_columns` declares the result schema when `fn` changes it. Omit it and later operations still believe the old schema, so a `select` on your new column fails at plan time. Declare it whenever the columns differ from the input.
 
-`num_workers` defaults to `"auto"`, which fans the per-batch calls across local cores.
-That helps only if `fn` releases the GIL, which Arrow, NumPy, and torch all do. For a CPU-bound
-pure-Python `fn`, pass `multiprocessing=True`. Your script still needs an
-`if __name__ == "__main__":` guard, because a worker process starts by importing it.
+`num_workers` defaults to `"auto"`, which fans the per-batch calls across local cores. That helps only if `fn` releases the GIL, which Arrow, NumPy, and torch all do. For a CPU-bound pure-Python `fn`, pass `multiprocessing=True`. Your script still needs an `if __name__ == "__main__":` guard, because a worker process starts by importing it.
 
-A lambda or a closure is fine there as long as `cloudpickle` is installed, which is how the
-function reaches a worker that cannot import it by name. Without `cloudpickle` only a
-module-level function or a picklable callable object can cross, and anything else stays on
-threads with a warning saying so.
+A lambda or a closure is fine there as long as `cloudpickle` is installed, which is how the function reaches a worker that cannot import it by name. Without `cloudpickle` only a module-level function or a picklable callable object can cross, and anything else stays on threads with a warning saying so.
 
-## Declare what you read with input_columns
+## Declare what you read
 
-`input_columns` tells the optimizer which columns `fn` actually reads, so projection
-pushdown can prune the scan to those and skip decoding the rest. On a wide Parquet table
-that is the difference between reading a handful of columns and reading all of them.
+`input_columns` tells the optimizer which columns `fn` actually reads, so projection pushdown can prune the scan to those and skip decoding the rest. On a wide Parquet table that is the difference between reading a handful of columns and reading all of them.
 
 ```python
 priced = ds.map_batches(
@@ -83,21 +70,13 @@ print(priced.select("price", "cheap").to_pydict())
 ```
 
 :::{warning}
-`input_columns` is a *declaration to the optimizer*, not a filter on the batch `fn`
-receives. Naming a column does not hide the others, and leaving one out does not merely
-cost you nothing: the column you failed to declare can be pruned out of the scan from
-under the function, and `fn` then reads a column that is not there. That is a correctness
-bug, not a slow query. Leave `input_columns=None` (the default) if you are not sure,
-which keeps every column alive.
+`input_columns` is a *declaration to the optimizer*, not a filter on the batch `fn` receives. Naming a column does not hide the others, and leaving one out does not merely cost you nothing. The column you failed to declare can be pruned out of the scan from under the function, and `fn` then reads a column that is not there. That is a correctness bug, not a slow query. Leave `input_columns=None`, the default, if you are not sure. That keeps every column alive.
 :::
 
 ## A class loads once per worker
 
 :::{tip}
-A plain function is re-created on every batch. A class is instantiated *once per
-worker* and then called per batch, which is the difference between loading a model once
-per batch and loading it once per worker. Nothing else in this API buys as much for one
-word of typing.
+A plain function is re-created on every batch. A class is instantiated *once per worker* and then called per batch, which is the difference between loading a model once per batch and loading it once per worker. Nothing else in this API buys as much for one word of typing.
 :::
 
 ```python
@@ -118,14 +97,9 @@ print(
 # {'text': ['a,b', 'c', 'd,e,f'], 'parts': [2, 1, 3]}
 ```
 
-Pass the class itself, as in `map_batches(Classifier, num_gpus=1)`, when construction
-needs to happen inside the worker. That is the case for anything holding a CUDA context. The
-engine warns you if a GPU stage gets a bare function, because that is the single most
-expensive mistake in this API. See {doc}`inference </ml/inference/inference>`.
+Pass the class itself, as in `map_batches(Classifier, num_gpus=1)`, when construction needs to happen inside the worker. That is the case for anything holding a CUDA context. The engine warns you if a GPU stage gets a bare function, because that is the single most expensive mistake in this API. See {doc}`inference </ml/inference/inference>`.
 
-A model class almost never takes zero arguments, so `fn_constructor_args` and
-`fn_constructor_kwargs` supply them. The class is still built once per worker, so this is
-not the same as passing an instance:
+A model class almost never takes zero arguments, so `fn_constructor_args` and `fn_constructor_kwargs` supply them. The class is still built once per worker, so this is not the same as passing an instance:
 
 ```python
 print(
@@ -140,14 +114,11 @@ print(
 # {'parts': [2, 1, 3]}
 ```
 
-Use `fn_args` and `fn_kwargs` for arguments that vary per call rather than per worker.
-They arrive after the batch, as `fn(batch, *fn_args, **fn_kwargs)`.
+Use `fn_args` and `fn_kwargs` for arguments that vary per call rather than per worker. They arrive after the batch, as `fn(batch, *fn_args, **fn_kwargs)`.
 
-If the class holds a resource that must be released, give it a `close` method. Batcher
-calls it when the worker is done with the model, which is where a GPU allocation or an
-HTTP session goes back.
+If the class holds a resource that must be released, give it a `close` method. Batcher calls it when the worker is done with the model, which is where a GPU allocation or an HTTP session goes back.
 
-## batch_format: numpy, pandas, torch
+## Receive NumPy, pandas, or torch batches
 
 `batch_format` converts around the call only. The engine boundary stays Arrow.
 
@@ -166,13 +137,9 @@ print(
 
 ## Per-row functions, when you must
 
-`map` takes `fn(row_dict) -> row_dict` and `flat_map` returns any number of rows per
-input row. The rows are built inside the worker, never in the driver, so the hot-path
-rule holds. But you are paying Python-object cost per row, and it shows.
+`map` takes `fn(row_dict) -> row_dict` and `flat_map` returns any number of rows per input row. The rows are built inside the worker, never in the driver, so the hot-path rule holds. But you are paying Python-object cost per row, and it shows.
 
-Declare `input_columns` here if you declare it anywhere. A batch callback pays for an
-undeclared column once, when it is decoded. A row callback pays twice, because every one of
-those columns is also boxed into a Python object for every row.
+Declare `input_columns` here if you declare it anywhere. A batch callback pays for an undeclared column once, when it is decoded. A row callback pays twice, because every one of those columns is also boxed into a Python object for every row.
 
 ::::{tab-set}
 :::{tab-item} flat_map
@@ -198,11 +165,7 @@ print(ds.select(tok=bt.col("text").str.split(",")).explode("tok").to_pydict())
 
 ### A Python predicate
 
-{py:meth}`ds.filter <batcher.Dataset.filter>` takes a callable as well as an expression or a
-SQL predicate string. The callable is batch-level: it receives a whole batch in `batch_format`
-and returns one boolean per row. Reach for it when the condition genuinely cannot be written as
-an expression, such as a call into a library or a model's verdict. The expression form stays
-vectorized in Rust and is the right answer everywhere else.
+{py:meth}`ds.filter <batcher.Dataset.filter>` keeps the rows for which `fn(row_dict)` is true. Reach for it when the condition genuinely cannot be written as an expression, such as a call into a library or a model's verdict. {py:meth}`ds.filter <batcher.Dataset.filter>` stays vectorized in Rust and is the right answer everywhere else.
 
 ```python
 import pyarrow.compute as pc
@@ -211,31 +174,20 @@ print(ds.filter(lambda batch: pc.greater(pc.count_substring(batch["text"], ","),
 # {'text': ['a,b', 'd,e,f'], 'price': [10.0, 30.0], 'qty': [1, 3]}
 ```
 
-The answer is applied as one Arrow boolean mask, so the surviving rows keep their exact types
-and no value makes the round trip back through the callback's format. Dropping rows also
-changes no column, which the stage declares, so a cheap expression filter written after it is
-still pushed underneath and runs first. A class predicate is built once per worker, and the
-stage takes the same `fn_constructor_args`, `num_gpus` and `concurrency` options as
-`map_batches`.
+The predicate's answers become one Arrow boolean mask, so the surviving rows keep their exact types and no value makes the round trip back through Python. Dropping rows also changes no column, which the stage declares, so a cheap expression filter written after it is still pushed underneath and runs first.
 
-Declare `input_columns` here. Converting the batch into the callback's format is most of what
-the stage costs beyond the predicate itself, and declaring what it reads narrows the batch to
-those columns. Every column still comes out, because the output is the input masked. Reading a
-column you did not declare raises rather than working by accident.
+Declare `input_columns` here. Building a Python dict per row is the entire cost of a row predicate, and declaring what it reads narrows that dict to those columns. Every column still comes out, because the output is the input masked. Reading a column you did not declare raises rather than working by accident.
 
 ```python
 print(ds.filter(lambda batch: batch["text"].str.contains(","), batch_format="pandas", input_columns=["text"]).to_pydict())
 # {'text': ['a,b', 'd,e,f'], 'price': [10.0, 30.0], 'qty': [1, 3]}
 ```
 
-Same rows, and the expression form builds no Python object per row. Check for an
-expression before you write the loop.
+Same rows, and the expression form builds no Python object per row. Check for an expression before you write the loop.
 
-## @udf: a function bundled with its config
+## Bundle a function with its options
 
-`@bt.udf` bundles a function with its `map_batches` options so the transform is a
-reusable, named thing you apply to a dataset. Options go on the decorator, so the call
-site stays clean.
+`@bt.udf` bundles a function with its `map_batches` options so the transform is a reusable, named thing you apply to a dataset. Options go on the decorator, so the call site stays clean.
 
 ```python
 @bt.udf(output_columns=["text", "price", "qty", "discounted"])
@@ -249,9 +201,7 @@ print(discount(ds).select("price", "discounted").to_pydict())
 
 `@bt.udf(per_row=True)` wraps a `fn(row) -> row` callback the same way.
 
-A decorated function stays an ordinary Python function. Call it on a batch to test it
-without building a dataset, pass it to `map_batches` by hand, or reuse it inside another
-UDF:
+A decorated function stays an ordinary Python function. Call it on a batch to test it without building a dataset, pass it to `map_batches` by hand, or reuse it inside another UDF:
 
 ```python
 import pyarrow as pa
@@ -260,8 +210,7 @@ print(discount(pa.record_batch({"price": [10.0]})).column("discounted").to_pylis
 # [9.0]
 ```
 
-Use `options` to run the same function at a second scale rather than defining it twice.
-The original is unchanged, so a local smoke test and a cluster run share one definition:
+Use `options` to run the same function at a second scale rather than defining it twice. The original is unchanged, so a local smoke test and a cluster run share one definition:
 
 ```python
 big = discount.options(batch_size=4096)
@@ -271,9 +220,7 @@ print(big(ds).select("discounted").to_pydict())
 
 ## What your function may return
 
-The default `batch_format="pyarrow"` hands your function a `RecordBatch`. It may return
-any of the following, so a model wrapper does not have to convert its framework's output
-before Batcher sees it:
+The default `batch_format="pyarrow"` hands your function a `RecordBatch`. It may return any of the following, so a model wrapper does not have to convert its framework's output before Batcher sees it:
 
 | Return value | Use it when |
 |---|---|
@@ -282,9 +229,7 @@ before Batcher sees it:
 | `pandas.DataFrame` or `polars.DataFrame` | The transform is easier to write in a frame library. |
 | A list or generator of any of the above | One input batch expands into several output batches. |
 
-The generator form is what a row-expanding stage wants, such as decoding a video into
-frames or fanning one prompt out into several completions. Yield a batch per unit of work
-instead of concatenating everything first:
+The generator form is what a row-expanding stage wants, such as decoding a video into frames or fanning one prompt out into several completions. Yield a batch per unit of work instead of concatenating everything first:
 
 ```python
 def explode_chars(batch):
@@ -296,15 +241,11 @@ print(bt.from_pydict({"text": ["ab", "cd"]}).map_batches(explode_chars).to_pydic
 # {'ch': ['a', 'b', 'c', 'd']}
 ```
 
-Returning a list of *row* dicts is rejected, because that is {py:meth}`ds.flat_map <batcher.Dataset.flat_map>`, which
-declares the row-at-a-time cost rather than hiding it.
+Returning a list of *row* dicts is rejected, because that is {py:meth}`ds.flat_map <batcher.Dataset.flat_map>`, which declares the row-at-a-time cost rather than hiding it.
 
 ## Keep the output schema stable across batches
 
-Your function is called once per batch, and Batcher reconciles the batches it returns into
-one result. A column a later batch adds is filled with nulls for the earlier rows. That is
-deliberate: it lets a stage whose output grows a field, such as an LLM returning structured
-output, concatenate instead of failing at the merge:
+Your function is called once per batch, and Batcher reconciles the batches it returns into one result. A column a later batch adds is filled with nulls for the earlier rows. That is deliberate. It lets a stage whose output grows a field, such as an LLM returning structured output, concatenate instead of failing at the merge:
 
 ```python
 def gains_a_field(batch):
@@ -316,8 +257,7 @@ print(bt.from_pydict({"x": [1]}).map_batches(gains_a_field).to_pydict())
 # {'a': [1, 2], 'extra': [None, 9]}
 ```
 
-The reverse is almost always a bug. A column missing from a later batch is kept and
-null-filled, so a function that renames or drops one returns a result that is mostly null:
+The reverse is almost always a bug. A column missing from a later batch is kept and null-filled, so a function that renames or drops one returns a result that is mostly null:
 
 ```python
 def renames_halfway(batch):
@@ -329,19 +269,13 @@ print(bt.from_pydict({"x": [1]}).map_batches(renames_halfway).to_pydict())
 # {'a': [1, 2, None, None], 'b': [None, None, 3, 4]}
 ```
 
-Batcher logs a warning naming the dropped columns, because the result otherwise looks
-complete. It is a warning rather than an error because a column appearing and a column
-disappearing are the same operation at the schema level, and the first is supported.
+Batcher logs a warning naming the dropped columns, because the result otherwise looks complete. It is a warning rather than an error because a column appearing and a column disappearing are the same operation at the schema level, and the first is supported.
 
-Build the output columns once, outside any per-batch branching, so every return path has
-the same keys. A function that decides its columns inside an `if` is the shape this catches.
+Build the output columns once, outside any per-batch branching, so every return path has the same keys. A function that decides its columns inside an `if` is the shape this catches.
 
-## map_groups: one call per group
+## One call per group
 
-{py:meth}`map_groups <batcher.GroupBy.map_groups>` hands your function every row of one group and no row of another. It is the
-Batcher spelling of pandas {py:meth}`groupby().apply() <batcher.Dataset.groupby>`, Polars {py:meth}`group_by().map_groups() <batcher.Dataset.group_by>`, and Spark
-`applyInPandas`, and it is what per-entity work needs: a user's session sequence, a device's
-time series, a document's chunks.
+{py:meth}`map_groups <batcher.GroupBy.map_groups>` hands your function every row of one group and no row of another. It is the Batcher spelling of pandas `groupby().apply()`, Polars {py:meth}`group_by().map_groups() <batcher.Dataset.group_by>`, and Spark `applyInPandas`, and it is what per-entity work needs: a user's session sequence, a device's time series, a document's chunks.
 
 ```python
 sales = bt.from_pydict(
@@ -369,18 +303,13 @@ print(
 # {'region': ['east', 'west'], 'spread': [2.0, 3.0]}
 ```
 
-Pass `batch_format="pandas"` to receive each group as a `DataFrame`, which is the
-`applyInPandas` shape. The conversion happens per group, so the frame holds the group's rows.
+Pass `batch_format="pandas"` to receive each group as a `DataFrame`, which is the `applyInPandas` shape. The conversion happens per group, so the frame holds the group's rows.
 
 :::{warning}
-Do not call `map_batches` straight after `group_by`. It sees whatever batches the engine
-produces, and a group is not confined to one of them, so your function runs on *fragments*
-and returns a wrong answer rather than an error. Measured over 50,000 rows and 20 keys,
-every one of the 20 keys spanned more than one batch.
+Do not call `map_batches` straight after `group_by`. It sees whatever batches the engine produces, and a group is not confined to one of them, so your function runs on *fragments* of a group and returns a wrong answer rather than an error.
 :::
 
-Two cases do not need a callback at all. A plain reduction is `.agg(...)`, which runs in
-Rust. Broadcasting a group statistic back onto every row is a window:
+Two cases do not need a callback at all. A plain reduction is `.agg(...)`, which runs in Rust. Broadcasting a group statistic back onto every row is a window:
 
 ```python
 print(
@@ -391,21 +320,15 @@ print(
 # [8.0, 8.0, 17.0, 17.0]
 ```
 
-Prefer both of those when they fit. `map_groups` materializes one group at a time, so a
-single key holding hundreds of millions of rows needs a reduction rather than a callback.
-Row order within a group is not guaranteed either, so sort inside the function when it
-matters.
+Prefer both of those when they fit. `map_groups` materializes one group at a time, so a single key holding hundreds of millions of rows needs a reduction rather than a callback. Row order within a group is not guaranteed either, so sort inside the function when it matters.
 
 :::{note}
-`map_groups` builds an aggregation followed by a `map_batches`, so whether
-{py:meth}`collect(distributed=True) <batcher.Dataset.collect>` accepts the plan is the same question as for
-{py:meth}`ds.group_by("k").agg(...).map_batches(fn) <batcher.Dataset.group_by>`. Check it on your plan before relying on it.
+`map_groups` builds an aggregation followed by a `map_batches`, so whether {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` accepts the plan is the same question as for {py:meth}`ds.group_by("k").agg(...).map_batches(fn) <batcher.Dataset.group_by>`. Check it on your plan before relying on it.
 :::
 
 ## UDFs in SQL
 
-{py:func}`bt.register_function(name, fn, result_type=...) <batcher.register_function>` makes a Python function callable from
-{py:func}`bt.sql <batcher.sql>`. The vectorized form (the default) receives whole Arrow arrays.
+{py:func}`bt.register_function(name, fn, result_type=...) <batcher.register_function>` makes a Python function callable from {py:func}`bt.sql <batcher.sql>`. The vectorized form, which is the default, receives whole Arrow arrays.
 
 ```python
 bt.register_function("bump", lambda a: pc.add(a, 100), result_type="int64")
@@ -413,23 +336,15 @@ print(bt.sql("SELECT bump(qty) AS q FROM t", t=ds).to_pydict())
 # {'q': [101, 102, 103]}
 ```
 
-Scalar SQL functions do not work inside `GROUP BY` keys, aggregate arguments, or
-`ORDER BY`. Compute them in a subquery or a projected alias first. For a function that
-transforms a whole table, register it with `table=True` and it follows the `map_batches`
-contract, forwarding any `map_batches` option you pass alongside it.
+Scalar SQL functions do not work inside `GROUP BY` keys, aggregate arguments, or `ORDER BY`. Compute them in a subquery or a projected alias first. For a function that transforms a whole table, register it with `table=True` and it follows the `map_batches` contract, forwarding any `map_batches` option you pass alongside it.
 
-There is no aggregate form. An aggregate has to be mergeable, built from a partial,
-a combine and a finalize, so that one machine and a hundred produce the same answer. A Python
-callable over one batch cannot supply that. Use `ds.group_by(...).agg(...)` for a built-in aggregate,
-or `map_groups` for arbitrary Python over each group.
+There is no aggregate form. An aggregate has to be mergeable, built from a partial, a combine and a finalize, so that one machine and a hundred produce the same answer. A Python callable over one batch cannot supply that. Use `ds.group_by(...).agg(...)` for a built-in aggregate, or `map_groups` for arbitrary Python over each group.
 
-An option the call form cannot honour is rejected at registration rather than ignored, so a
-misspelled keyword fails where you wrote it.
+An option the call form cannot honor is rejected at registration rather than ignored, so a misspelled keyword fails where you wrote it.
 
 ## Taking it to a cluster
 
-Distributing a UDF stage, surviving a batch that raises, and the idempotency a preempted
-worker demands are all on {doc}`Running a UDF at scale <udfs-at-scale>`.
+Distributing a UDF stage, surviving a batch that raises, and the idempotency a preempted worker demands are all on {doc}`Running a UDF at scale <udfs-at-scale>`.
 
 ## See also
 
@@ -437,12 +352,8 @@ worker demands are all on {doc}`Running a UDF at scale <udfs-at-scale>`.
 - {doc}`Running a UDF at scale <udfs-at-scale>`: distributing a UDF stage, the `max_errored_rows` budget, and idempotency under retry.
 - {doc}`Inference </ml/inference/inference>`: the class-per-worker pattern with a real model.
 - {doc}`Explain plans </user-guide/operate/tuning/explain-plans>`: see what a UDF does to the plan the optimizer builds.
-- {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: what an expression
-  gets that a UDF cannot, meaning vectorization, fusion, and the JIT.
-- {doc}`Arrow memory </architecture/deep-dives/memory/arrow-memory>`: why `fn` is handed a zero-copy
-  `RecordBatch` and what happens when you convert it.
-- {doc}`Expressions API </api/relational/expressions>`: the method surface to check before you write
-  a function.
-- {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: batch functions and expressions
-  side by side in one job.
+- {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: what an expression gets that a UDF cannot, meaning vectorization, fusion, and the JIT.
+- {doc}`Arrow memory </architecture/deep-dives/memory/arrow-memory>`: why `fn` is handed a zero-copy `RecordBatch` and what happens when you convert it.
+- {doc}`Expressions API </api/relational/expressions>`: the method surface to check before you write a function.
+- {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: batch functions and expressions side by side in one job.
 - {doc}`/cookbook/ml/inference/batch_inference`: a model over every row without a Python loop, as a script.

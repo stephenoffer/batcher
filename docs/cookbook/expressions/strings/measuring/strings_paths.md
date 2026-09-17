@@ -2,6 +2,8 @@
 
 Object-storage listings arrive as one long URI per row. Splitting them in the engine keeps the partition key, the extension, and the directory available as ordinary columns you can group and filter by.
 
+The script parses paths with `parse_path`, `parse_filename`, and `parse_dirpath`, recovers a Hive-style partition value from the directory name with `extract`, and counts files per extension. It flags two traps along the way: `parse_dirname` is the root segment rather than the immediate parent, and a non-matching `extract` returns an empty string rather than a null.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../../examples/expressions/strings_paths.py

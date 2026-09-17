@@ -24,6 +24,8 @@ The same eight devices are one island or two depending on wires nothing in a job
 
 ## What changes because of it
 
+Five scheduling decisions read those facts. None of them changes a result, and each one falls back to its earlier behavior when the facts are missing.
+
 ### The collective library is told, not left to guess
 
 A multi-GPU stage that runs its own collective discovers the node's fabric by probing at initialization. Batcher has already measured it, so it hands over the answers in the GPU task's environment: the rail-aligned NIC list, the interfaces that actually carry the fabric, the real device-to-NIC distance for the GPUDirect threshold, and whether peer-to-peer can help on this node at all.
@@ -76,13 +78,18 @@ A shuffle's own statistics carry the same measurement while it runs. Alongside t
 
 ## Requirements and limitations
 
-- **The probes need the host's `/sys` tree.** A container without the PCI tree, the InfiniBand tree, or NVML mounted reports an unreadable topology, and every decision here falls back to the behavior it had before. Nothing fails. The fleet is scheduled blind.
-- **These are control-plane decisions.** Batcher places work, sizes it, and configures the collective library. It does not perform device-to-device copies itself: the Arrow contract at every operator boundary is unchanged, and the exchange schedule is a plan the framework doing the copying carries out.
-- **The figures are nameplate or measured, never inferred.** A device model Batcher does not recognize contributes no bandwidth figure rather than a guessed one, and an unpriced link makes a plan refuse rather than proceed optimistically.
-- **AMD's XGMI fabric is not read.** The sysfs names have moved between kernel releases, and a fabric figure that is wrong is worse than one that is absent, so an Instinct node reports its bus topology and no coherent fabric.
+The probes need the host's `/sys` tree. A container without the PCI tree, the InfiniBand tree, or NVML mounted reports an unreadable topology, and every decision here falls back to the behavior it had before. Nothing fails, but the fleet is scheduled blind.
+
+These are control-plane decisions. Batcher places work, sizes it, and configures the collective library. It doesn't perform device-to-device copies itself: the Arrow contract at every operator boundary is unchanged, and the exchange schedule in `carbonite/transfer/device_exchange.py` is a plan the framework doing the copying carries out.
+
+The figures are nameplate or measured, never inferred. A device model Batcher doesn't recognize contributes no bandwidth figure rather than a guessed one, and an unpriced link makes a plan refuse rather than proceed optimistically.
+
+AMD's XGMI fabric isn't read. The sysfs names have moved between kernel releases, and a fabric figure that's wrong is worse than one that's absent, so an Instinct node reports its bus topology and no coherent fabric.
 
 ## See also
 
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: the two paths that run work on a device.
 - {doc}`Shuffle over Arrow Flight </architecture/deep-dives/distribution/shuffle-flight>`: why bulk data bypasses the Ray object store.
 - {doc}`Credit-based flow control </architecture/deep-dives/distribution/credit-flow-control>`: how a fast producer is kept from burying a slow consumer.
+- {doc}`Hardware awareness </architecture/deep-dives/adaptive/hardware-awareness>`: what the optimizer knows about the machine it plans for.
+- {doc}`GPU guide </ml/inference/gpu>`: the device knobs, from a user's side.

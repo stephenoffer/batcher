@@ -1,6 +1,8 @@
 # String case
 
-Case folding is the cheapest way to stop a group_by splitting "ACME", "Acme", and "acme" into three groups. Do it once in the projection, then group on the normalized column.
+Case folding is the cheapest way to stop a `group_by` splitting "ACME", "Acme", and "acme" into three groups. Fold once in the projection. Then group on the normalized column.
+
+The script compares `lower`, `upper`, `to_titlecase`, and `capitalize`, which upper-cases only the first character. It ends by grouping four differently cased rows into the two vendors they really are.
 
 The whole script, executed on every test run:
 

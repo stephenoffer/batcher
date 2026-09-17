@@ -1,8 +1,6 @@
 # Writing data
 
-A Dataset is written to disk with a terminal write operation. Writing executes the
-plan and streams Arrow batches to the sink, so the same memory bounds and spill
-behavior that govern `collect` apply here too.
+This page covers writing a `Dataset` out: file formats and database sinks, partitioned layouts, file sizing, completion markers and distributed writes. A write is a terminal operation. It executes the plan and streams Arrow batches to the sink, so the memory bounds and spill behavior that govern `collect` apply here too.
 
 The format-specific helpers are `write.parquet`, `write.csv`, and `write.json`. The
 generic {py:obj}`write(path, format=...) <batcher.Dataset.write>` covers all of them and is the place to pass a
@@ -115,7 +113,7 @@ and the generic `write(path, format=...)` reaches them all, each returning a
 | `write.hbase(table, host=...)` | An HBase table via happybase batches | an HBase Thrift server |
 
 The database sinks take a `mode` that is not a save mode. `append` and `overwrite` load a
-table; `upsert`, `update` and `delete` *maintain* one, changing only the rows whose keys
+table. `upsert`, `update` and `delete` *maintain* one, changing only the rows whose keys
 match and leaving every other row alone. See
 {doc}`Writing to a database </integrations/databases/writing>` for what each mode does, which
 backend serves it, and the transaction it runs in.
@@ -256,6 +254,10 @@ partitions the incoming data covers and leaves the rest exactly as they were. It
 Spark's `partitionOverwriteMode="dynamic"` and Hive's `INSERT OVERWRITE`, and both of
 those spellings are accepted.
 
+The two modes differ only in what happens to the partitions the new rows never mention. The picture uses the same data as the example that follows:
+
+![A partitioned output directory under the two overwrite modes. Before the write, out/ holds a _SUCCESS marker and three partition directories, dt=a, dt=b and dt=c, each with one part-00000 file holding v=1, v=2 and v=3. The new rows mention only dt=b, with v=99, and are written with write.parquet(out/, partition_by=["dt"]). With mode="overwrite" the whole output is replaced: dt=b holds v=99, and dt=a and dt=c are deleted. With mode="overwrite_partitions" only dt=b is replaced with v=99, while dt=a with v=1 and dt=c with v=3 are kept. overwrite_partitions needs partition_by. The _SUCCESS marker is written last, and readers skip it.](/_static/diagrams/partitioned_write_modes.svg)
+
 ```python
 reload_dir = tempfile.mkdtemp()
 _ = bt.from_pydict({"dt": ["a", "b", "c"], "v": [1, 2, 3]}).write.parquet(
@@ -301,7 +303,7 @@ bucket is the same shape:
 ds.write.parquet("output/by_bucket", partition_by=[(bt.col("id") % 16).alias("bucket")])
 ```
 
-## Sizing the output files
+## Size the output files
 
 A write's file layout is a separate decision from its directory layout. Three options
 express it, and you pass one:
@@ -338,7 +340,7 @@ and is resolved against the shard that worker holds, because a streaming distrib
 write never materializes its result on the driver. `num_files` stays a total across the
 whole write, so its budget is divided among the shards rather than applied to each one.
 
-## Knowing a write finished
+## Confirm a write finished
 
 Every data file is published atomically, so a reader never sees a half-written one. That
 does not make a *directory* safe on its own: a run that dies partway leaves a directory of
@@ -365,7 +367,7 @@ and nothing else would tell you.
 ds = bt.read.parquet("s3://bucket/upstream-export/", require_success=True)
 ```
 
-## Compacting small files
+## Compact small files
 
 Incremental or streaming writes leave many tiny part files, which slow later reads. This
 is the small-files problem, and `compact` fixes a dataset in place. It reads `path`,
@@ -477,5 +479,6 @@ precondition in full.
   slowly-changing dimensions.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and quarantine before you write.
 - {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: write to an object store.
+- {doc}`/user-guide/moving-data/streaming`: the same `ds.write` with a trigger, as a continuous query.
 - {doc}`IO API </api/relational/io>`: the full {py:obj}`ds.write <batcher.Dataset.write>` writer reference.
 - {doc}`/cookbook/io/save_modes`: save modes and write manifests, as a runnable script.

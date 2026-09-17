@@ -41,7 +41,7 @@ Crossing between the WKB a geometry column holds and the text encodings people a
 
 ## Building and deriving geometry
 
-Turning coordinate columns into geometries, and reducing a geometry to a simpler shape. {py:func}`st_envelope <batcher.st_envelope>` and {py:func}`st_convex_hull <batcher.st_convex_hull>` are the two rungs of a filter ladder. The box is exact to compute and an index stores it; the hull bounds the shape more tightly but costs a sort.
+Turning coordinate columns into geometries, and reducing a geometry to a simpler shape. {py:func}`st_envelope <batcher.st_envelope>` and {py:func}`st_convex_hull <batcher.st_convex_hull>` are the two rungs of a filter ladder. The box is exact to compute and an index stores it. The hull bounds the shape more tightly but costs a sort.
 
 ```{eval-rst}
 .. autosummary::

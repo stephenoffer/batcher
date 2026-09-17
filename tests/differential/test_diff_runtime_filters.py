@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import batcher._native as nat
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
@@ -87,6 +88,17 @@ def _empty() -> pa.Table:
 def _reg(duck, name: str, table: pa.Table):
     duck.register(name, table)
     return bt.from_arrow(table)
+
+
+def _stored(tmp_path, table: pa.Table) -> Dataset:
+    """`table` read back from Parquet — a source that can use a pushed `IS NOT NULL`.
+
+    `push_is_not_null_from_join_key` declines on resident Arrow, where the predicate skips nothing
+    and only costs a filter pass, so the cases asserting it *fires* read from a file.
+    """
+    path = tmp_path / f"t{len(list(tmp_path.iterdir()))}.parquet"
+    pq.write_table(table, path)
+    return bt.read.parquet(str(path))
 
 
 def _optimized(ds):
@@ -180,17 +192,30 @@ def test_null_keys_survive_exactly_where_the_join_says_they_must(duck, how):
 
 
 @pytest.mark.parametrize("how", JOIN_TYPES)
-def test_is_not_null_fires_exactly_on_the_reducible_left(duck, how):
+def test_is_not_null_fires_exactly_on_the_reducible_left(duck, tmp_path, how):
     left, right = _left(), _right()
     _reg(duck, "fl", left)
     _reg(duck, "fr", right)
-    ds = bt.from_arrow(left).join(bt.from_arrow(right), on="k", how=how)
+    ds = _stored(tmp_path, left).join(_stored(tmp_path, right), on="k", how=how)
     expected_left = how in {"inner", "semi", "right"}
     expected_right = how in {"anti", "inner", "left", "semi"}
     assert _join_side_has_not_null(ds, "left") is expected_left
     assert _join_side_has_not_null(ds, "right") is expected_right
     cols = _cols_sql(how, "fl", "fr")
     assert_same(ds.collect(), duck.sql(f"SELECT {cols} FROM fl {_SQL_JOIN[how]} fr ON fl.k = fr.k"))
+
+
+def test_is_not_null_declines_on_resident_sources(duck):
+    # The positive control is the `inner` case above: the same tables read from Parquet gain the
+    # filter on both sides. Resident, neither does, and the answer is unchanged.
+    left, right = _left(), _right()
+    _reg(duck, "rl", left)
+    _reg(duck, "rr", right)
+    ds = bt.from_arrow(left).join(bt.from_arrow(right), on="k")
+    assert not _join_side_has_not_null(ds, "left")
+    assert not _join_side_has_not_null(ds, "right")
+    cols = _cols_sql("inner", "rl", "rr")
+    assert_same(ds.collect(), duck.sql(f"SELECT {cols} FROM rl JOIN rr ON rl.k = rr.k"))
 
 
 def test_full_join_is_never_reduced(duck):
@@ -208,12 +233,12 @@ def test_full_join_is_never_reduced(duck):
     )
 
 
-def test_composite_key_join_with_nulls(duck):
+def test_composite_key_join_with_nulls(duck, tmp_path):
     left = pa.table({"a": [1, 1, None, 2], "b": [1, None, 1, 2], "v": [1, 2, 3, 4]})
     right = pa.table({"a": [1, 2, None], "b": [1, 2, 1], "w": [7, 8, 9]})
     _reg(duck, "cl", left)
     _reg(duck, "cr", right)
-    ds = bt.from_arrow(left).join(bt.from_arrow(right), on=["a", "b"])
+    ds = _stored(tmp_path, left).join(_stored(tmp_path, right), on=["a", "b"])
     assert _pushed_not_null(ds, "a") and _pushed_not_null(ds, "b")
     assert_same(
         ds.collect(),

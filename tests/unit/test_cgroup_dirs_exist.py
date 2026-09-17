@@ -66,3 +66,23 @@ def test_the_live_footprint_is_actually_readable():
     from batcher.carbonite.memory.kernel import kernel_memory_state
 
     assert kernel_memory_state().current_bytes is not None
+
+
+def test_a_host_with_no_cgroup_mount_reads_nothing_rather_than_crashing(monkeypatch):
+    """No `/sys/fs/cgroup` at all empties the tuple, and the probes must answer with `None`.
+
+    Found installing the musllinux wheel into an Alpine chroot with no `/sys` mounted: the
+    usage fallback indexed `cgroup_v2_dirs()[0]` and the first query raised `IndexError`.
+    gVisor and some minimal container runtimes present the same empty view. The docstring of
+    `kernel_memory_state` already promises an all-`None` state outside a cgroup.
+    """
+    from batcher.carbonite.memory import kernel
+
+    monkeypatch.setattr(kernel, "cgroup_v2_dirs", lambda: ())
+    kernel.reset_kernel_sampling()
+    try:
+        state = kernel.kernel_memory_state()
+        assert state.current_bytes is None
+        assert state.oom_kills is None
+    finally:
+        kernel.reset_kernel_sampling()

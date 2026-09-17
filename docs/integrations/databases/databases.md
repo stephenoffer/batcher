@@ -1,33 +1,17 @@
 # SQL databases
 
-This page covers reading and writing any SQL database from a standard connection URI. One URI vocabulary covers PostgreSQL, MySQL, SQL Server, Oracle, SQLite, DuckDB, Trino, and the rest, and Batcher picks the backend that can serve it. For a database with no Arrow-native driver at all, the DB-API section at the end takes any PEP 249 driver instead.
+This page covers reading any SQL database from the connection URI you already have. One URI vocabulary of 36 schemes reaches PostgreSQL, MySQL, SQL Server, Oracle, SQLite, DuckDB, Trino and their wire-compatible relatives, and Batcher picks the Arrow-native backend that serves each one. A database with no Arrow-native driver still works through any PEP 249 driver, and a partitioned extract fans one query out into many.
 
 | | |
 | --- | --- |
 | **Read** | {py:meth}`bt.read.sql(query, uri=...) <batcher.api.io_namespace.reader.Reader.sql>`, {py:meth}`bt.read.sql(query, connection=...) <batcher.api.io_namespace.reader.Reader.sql>`, or {py:meth}`bt.read.table("dbapi", module=..., ...) <batcher.api.io_namespace.reader.Reader.table>` |
-| **Write** | {py:meth}`ds.write.sql(table, uri=..., mode=...) <batcher.api.io_namespace.writer.Writer.sql>`, every scheme on this page |
+| **Write** | {py:meth}`ds.write.sql(table, uri=..., mode=...) <batcher.api.io_namespace.writer.Writer.sql>`, every URI scheme on this page |
 | **Extra** | `pip install 'batcher-engine[sql]'` or `[connectorx]`, plus the per-database driver |
-| **Parallelism** | FlightSQL server-side partitions, or `partition_on=` range partitions on every other backend |
+| **Parallelism** | FlightSQL server-side partitions, or `partition_on=` range partitions |
 | **Pushdown** | Projection and predicate, both folded into the submitted SQL |
-| **Credentials** | `password="env:VAR"` or `"file:/path"`, resolved on the worker |
+| **Credentials** | A secret reference such as `password="env:VAR"`, resolved on the worker |
 
 The warehouse-specific pages cover the connectors that are not URI-routed: {doc}`Snowflake </integrations/warehouses/snowflake>`, {doc}`BigQuery </integrations/warehouses/bigquery>`, and {doc}`Databricks </integrations/warehouses/databricks>`.
-
-## This is an analytical read path, not a serving one
-
-Batcher pushes a point lookup's predicate all the way down, so the server does an index
-seek and returns one row. The query still takes about 3.5 ms, against 0.01 ms for the same
-lookup through the driver directly. One Batcher process serves roughly 260 such queries a
-second, and threads do not raise that: the control plane is Python, so plan construction and
-optimization hold the GIL.
-
-The cost is fixed rather than proportional, which is the whole shape of an analytical
-engine: a `Dataset` terminal op over a one-row table with no operators at all still costs
-~1.9 ms. Amortized over a million rows that is nothing; at one row it *is* the query.
-
-So use these connectors to extract, join, aggregate and write back. Do not put them behind a
-request path that needs an answer per user action. Call the driver for that. The measured
-figures are in `benchmarks/BENCHMARK_RESULTS.md`.
 
 ## Which backend serves which scheme
 
@@ -117,6 +101,24 @@ Wire compatibility is not SQL compatibility. The connection works, the query run
 
 Presto is deliberately not routed. Presto and Trino diverged after the fork, and ConnectorX ships a Trino reader, so sending Presto to it would be a guess dressed up as support. A `presto://` URI raises a {py:exc}`BackendError <batcher.BackendError>` pointing at ODBC, `bt.read.table("odbc", connection_string=...)`.
 
+### ClickHouse and ODBC have their own readers
+
+Two more readers take connection keywords instead of a URI. {py:meth}`bt.read.clickhouse <batcher.api.io_namespace.reader.Reader.clickhouse>` uses ClickHouse's official `clickhouse-connect` client, which returns Arrow directly (`pip install 'batcher-engine[clickhouse]'`). The ODBC source uses turbodbc, which also returns Arrow, and covers the enterprise systems with no first-party Arrow driver: DB2, Teradata, SAP HANA, Vertica, Presto, and anything else with an ODBC driver (`pip install 'batcher-engine[odbc]'`).
+
+```python
+# docs: skip
+events = bt.read.clickhouse(
+    "SELECT event_id, ts, kind FROM events",
+    host="clickhouse.internal",
+    username="svc",
+    password="env:CLICKHOUSE_PASSWORD",
+    database="analytics",
+)
+ledger = bt.read.table("odbc", query="SELECT * FROM ledger", dsn="TERADATA_PROD")
+```
+
+Each of these runs as one query and one split, so the parallelism is the server's own. Both push projection and predicate into the submitted SQL the same way the URI-routed backends do.
+
 ## Credentials
 
 A connection URI reaches log lines, error messages, and split identities, so a password embedded in its userinfo leaks everywhere the URI is merely mentioned. On the ADBC path Batcher lifts an inline password out of the URI and carries it in a field excluded from every `repr`. `redact_uri` gives you the same treatment for anything you log yourself.
@@ -135,6 +137,7 @@ That separation is not encryption. The password is still carried, and still pick
 
 - `password="env:PGPASSWORD"` reads the environment variable.
 - `password="file:/etc/secrets/pg"` reads the file and strips trailing whitespace.
+- `password="vault:secret/data/warehouse#password"`, `aws-sm:`, `gcp-sm:` and `azure-kv:` read from a key store, as {doc}`Secrets </user-guide/trust/secrets>` describes.
 
 The reference is what gets pickled. It becomes a secret only on the worker, at connect time, inside the process that opens the connection. A missing variable or an unreadable file raises a `BackendError` that names the reference and never the secret.
 
@@ -146,7 +149,7 @@ ConnectorX has no separate password channel. It takes credentials inside its URI
 ds = bt.read.table("connectorx", query="SELECT * FROM orders", conn_uri="env:MYSQL_URL")
 ```
 
-`bt.read.sql` parses its `uri=` before routing, so a reference passed there is rejected as a malformed URI. `bt.read.table("connectorx", ...)` is the spelling that works.
+`bt.read.sql` parses its `uri=` before routing, so pass a whole-URI reference to `bt.read.table("connectorx", ...)` instead.
 :::
 
 ## What reaches the server
@@ -157,15 +160,15 @@ Kyber pushes both the projection and the predicate into the SQL that is actually
 | --- | --- |
 | `.filter(...)` after the read | The database, as a `WHERE` below the projection |
 | {py:meth}`.select(...) <batcher.Dataset.select>` after the read | The database, as the submitted `SELECT` column list |
-| {py:meth}`.head(n) <batcher.Dataset.head>` / `.limit(n)` | The database, as a trailing `LIMIT`, where the dialect has one |
-| {py:meth}`.sort(...).head(n) <batcher.Dataset.sort>` | The database, as `ORDER BY … NULLS … LIMIT n`, where the dialect can spell it |
+| {py:meth}`.limit(n) <batcher.Dataset.limit>` | The database, as a trailing `LIMIT`, where the dialect has one |
+| {py:meth}`.sort(...).limit(n) <batcher.Dataset.sort>` | The database, as `ORDER BY ... NULLS ... LIMIT n`, where the dialect can spell it |
 | A predicate the translator cannot express | Your process, in the engine's `Filter` |
 
 The last row is a slowdown and never a wrong answer. An unpushed predicate is re-checked by the engine regardless, so the result is identical either way.
 
 The predicate is applied below the projection on purpose. Kyber pushes the two independently and routinely pushes a projection that omits the column the predicate filters on, so projecting first would produce SQL referencing a column that no longer exists.
 
-Column names are delimited for the dialect. Three ordinary names break unquoted: a reserved word such as `order`, `key` or `date`; a name holding a space, which parses as a column *aliased* to the second word and so returns the wrong column under the right name; and an unaliased aggregate from your own query, which comes back as a column literally called `count(*)`.
+Column names are delimited for the dialect. Three ordinary names break unquoted. A reserved word such as `order`, `key` or `date` is a syntax error. A name holding a space parses as a column *aliased* to the second word, which returns the wrong column under the right name. An unaliased aggregate from your own query comes back as a column literally called `count(*)`.
 
 ### Two things that push only where the dialect is known
 
@@ -181,7 +184,7 @@ If a driver types an empty result set from row data rather than query metadata, 
 
 ## How the read parallelizes
 
-Parallelism depends on the backend, and none of the three shapes is configured the same way.
+Each backend parallelizes differently.
 
 FlightSQL drivers partition server-side. Pass `partition=True` and Batcher makes a single `adbc_execute_partitions` submission, then builds one split per opaque descriptor returned. Each split rebuilds a fresh connection on its worker and reads its own slice. This is the only backend with true shippable distributed partitions. A driver that does not implement partitioning falls back to a single streaming split rather than failing.
 
@@ -191,9 +194,7 @@ Everything else range-partitions on a column you name. Without `partition_on=` a
 
 ## Parallel extraction
 
-A single SQL query is a single stream. One connection, one cursor, one core, however large the table. That is the difference between a warehouse extract that finishes in minutes and one that finishes in hours, and it is the reason every bulk-extract tool has some form of this feature.
-
-Name an indexed numeric column and its approximate range, and the read becomes that many independent queries over disjoint slices of the key:
+A single SQL query is a single stream. One connection, one cursor, one core, however large the table. Name an indexed numeric column and its approximate range, and the read becomes that many independent queries over disjoint slices of the key:
 
 ```python
 # docs: skip
@@ -216,7 +217,7 @@ The same four keywords work on `bt.read.table("dbapi", ...)`, so a PEP 249 drive
 `lower_bound` and `upper_bound` say where to *cut*, not what to *keep*. The first partition is unbounded below and the last is unbounded above, so a row outside the stated range is still read. It lands in an edge partition instead. Getting the bounds wrong costs skew, never rows.
 :::
 
-That is Spark's JDBC behavior too, and it is still the thing readers get wrong. If bounds filtered, a stale `upper_bound` would silently drop every row inserted since you wrote it, and the extract would report success. NULL keys are placed in the first partition explicitly, for the same reason: `col < x` and `col >= x` are both unknown for NULL, so without that placement every NULL-keyed row would match no partition and vanish.
+Spark's JDBC reader behaves the same way. If bounds filtered, a stale `upper_bound` would silently drop every row inserted since you wrote it, and the extract would report success. NULL keys are placed in the first partition explicitly, for the same reason: `col < x` and `col >= x` are both unknown for NULL, so without that placement every NULL-keyed row would match no partition and vanish.
 
 The two properties together give the invariant the implementation is built around. The partitions are disjoint and exhaustive, so concatenating them reproduces the unpartitioned read exactly, for any bounds, including wrong ones. The test suite asserts it directly at 1, 2, 3, 4, 8, and 16 partitions, with NULL and out-of-range keys present, and again after each split is pickled to a worker.
 
@@ -250,7 +251,7 @@ print(range_predicates("id", 5, 5, 8))
 
 ### Coming from Spark
 
-The spelling is deliberately Spark's JDBC reader's, and the mapping is near 1:1.
+The keywords follow Spark's JDBC reader, and the mapping is near 1:1.
 
 | Spark JDBC option | Batcher keyword | Difference |
 | --- | --- | --- |
@@ -267,7 +268,7 @@ The spelling is deliberately Spark's JDBC reader's, and the mapping is near 1:1.
 
 ConnectorX is the exception to that rule. It takes `partition_on` and `num_partitions` but no bounds, because it derives the ranges itself as part of the partitioned read.
 
-### What this costs
+### What partitioning costs
 
 The partition column must be numeric, and it should be indexed and reasonably uniform. A partitioned read on an unindexed column makes the database perform N full scans instead of one, which is slower than not partitioning at all. Check the plan on the server before raising `num_partitions`.
 
@@ -337,7 +338,7 @@ print(orders.filter(col("amount") > 9).select("id", "country").to_pydict())
 
 `module` is the importable driver name and must expose a module-level `connect()`. `connect_kwargs` is passed straight to it, and any string value there may be an `env:` or `file:` reference, resolved on the worker exactly as `password=` is elsewhere. Pass either `query=` or `table=`.
 
-### What this costs
+### What the DB-API path costs
 
 Rows are converted at batch granularity and never one at a time. A DB-API cursor is row-shaped, so the boundary is drawn at `fetchmany(batch_size)`: the driver returns a block of rows, that block is transposed column-wise, and it reaches Arrow in one call. Everything after that is columnar. `batch_size` defaults to 16,384, matching the engine's morsel size so a batch crossing FFI needs no rechunking, and it is the parameter that matters most for throughput here.
 
@@ -380,7 +381,7 @@ print(orders.filter(col("amount") > 9).select("id", "country").to_pydict())
 {'id': [1, 2], 'country': ['US', 'US']}
 ```
 
-A borrowed connection reads through the DB-API path, so its costs and its type handling are the ones in the DB-API section above. Three properties are specific to passing a live connection, and each is a deliberate choice rather than a limitation to work around:
+A borrowed connection reads through the DB-API path, so its costs and its type handling are the ones in the DB-API section above. Three properties are specific to a live connection:
 
 - It is single-node only. A live connection belongs to the process that opened it and cannot be pickled to a worker, so the read stays on one process. Combining `connection=` with `partition_on=` raises a `BackendError` rather than partitioning, because range partitioning runs one query per worker and there is no connection to give the other workers. Use `uri=` when you need to scale the read out.
 - Batcher never closes it. The caller owns a borrowed connection and keeps using it after the read, so Batcher closes only connections it opened itself. The connection in the example above is still open and usable when `collect` returns.
@@ -400,6 +401,12 @@ The `connection=` support is there so a `pandas.read_sql` line ports almost verb
 
 The result is a lazy {py:class}`Dataset <batcher.Dataset>` rather than an eager DataFrame, so nothing runs until a terminal op such as `collect` or `to_pydict`. When you have a URI rather than a connection object, `bt.read.sql(query, uri=...)` is the better port, because it scales across workers and keeps the password out of the process image.
 
+## Built for extraction, not per-request lookups
+
+The connectors on this page are shaped for moving and transforming data: extract, join, aggregate, write back. A point lookup still pushes its predicate all the way down, so the server does an index seek and returns one row. What remains is Batcher's own fixed cost of planning, optimizing and crossing into the engine, which is nothing amortized over a million rows and most of the query at one row.
+
+Measured on a 50,000-row SQLite table with a varying key, a lookup took about 3.5 ms against 0.01 ms through the driver directly, and one process served roughly 260 lookups a second. Turning off `observability.event_log` brought that to 2.93 ms and about 374 a second. Threads do not raise the ceiling, because plan construction and optimization hold the GIL. The figures and the method are in `benchmarks/BENCHMARK_RESULTS.md`. For a lookup behind a request path, call the driver.
+
 ## Requirements and limitations
 
 The `sql` extra installs `adbc-driver-manager` and `adbc-driver-flightsql` only. Per-database ADBC drivers are separate packages, so PostgreSQL also needs `pip install adbc-driver-postgresql`, SQLite needs `adbc-driver-sqlite`, and so on. ConnectorX schemes need `pip install 'batcher-engine[connectorx]'`.
@@ -408,7 +415,7 @@ The `sql` extra installs `adbc-driver-manager` and `adbc-driver-flightsql` only.
 
 ConnectorX is a reader, so a ConnectorX scheme has no Arrow-native write path. Those writes go through the scheme's PEP 249 driver instead, which is what `pip install pymysql` buys you.
 
-`row_count()` returns `None` on every backend here, so the optimizer has no row estimate for a SQL source until it reads one.
+`row_count()` returns `None` on every backend here, because counting would cost a second query on the server. A `table=` read on the ADBC and DB-API paths gives Kyber a row count and column statistics from the system catalog instead. A `query=` read has no catalog entry, so its estimate comes from learned statistics once it has run.
 
 Every split opens its own connection. A partitioned FlightSQL read with a hundred descriptors means a hundred connections, so check the server's concurrency limits before fanning out.
 

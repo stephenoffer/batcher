@@ -1,236 +1,68 @@
-# The full engine matrix
+# The engine matrix
 
-This page carries one number per suite per engine: every standard suite against every engine
-that can run it, measured in one sweep on one machine.
-
-A per-engine page can flatter by omission. Publishing the board whole makes the gaps visible,
-and each one is labeled with which kind of gap it is.
+This page sets every standard suite against every engine that can run it, one number per cell, with each gap labeled by kind. A page about one engine can flatter by what it leaves out, so this one publishes the board whole.
 
 ## How to read a cell
 
+Every ratio is a geometric mean over the suite of `batcher_ms / engine_ms`, counted only over cases that passed the correctness gate. The following table explains the other cell values:
+
 | Cell | Meaning |
 |---|---|
-| a ratio | `batcher_ms / engine_ms`, geometric mean over the suite. Below 1.00 means Batcher is faster. |
-| `--` | The engine cannot express this suite. Not a loss. |
-| `OOM` | The pair could not be held in memory together on this box. |
+| A ratio | Below 1.00 means Batcher is faster. |
+| `--` | The engine can't express this suite, because it has no SQL surface or rejects the SQL. Not a loss. |
+| `killed` | The engine took the benchmark process down on this suite. Not a ratio. |
+| `n/r` | Not run in this sweep. |
 
-A ratio is recorded only for cases that passed the correctness gate against an independent
-oracle. Cases an engine could not run are excluded from its geomean, and the count says how
-many remained.
+## The five-engine board
 
-## The board
+Taken 2026-08-28 on a 92-core box, best of five at sf1 and best of three at sf10, one process per suite, every case correctness-gated against DuckDB:
 
-48-core Xeon Platinum 8275CL, 92 GiB, quiet box, pairwise lineups, best of five, scale
-factor 1 where a suite has one. Measured 2026-09-11. Every cell is a time ratio, so lower is
-better and anything below 1.00 is a Batcher win.
-
-| Suite | DuckDB | Polars | PyArrow | Daft | Spark |
+| Suite | DuckDB native | DuckDB same Arrow | Polars | Daft | PyArrow |
 |---|---:|---:|---:|---:|---:|
-| JSON (5) | 0.36 | 0.01 | `--` | 0.06 | 0.01 |
-| operators (23) | 0.63 | 0.15 | 0.04 | 0.08 | 0.03 |
-| scan (27) | 0.63 | 0.25 | 0.07 | 0.13 | 0.21 |
-| H2O `join` (5) | 0.63 | 0.49 | `--` | 0.29 | 0.04 |
-| TPC-H sf1 (22) | 0.70 | 0.53 | `--` | 0.22 | 0.03 |
-| ClickBench (43) | 0.72 | 0.43 | `--` | 0.15 | 0.02 |
-| H2O `groupby` (10) | **1.01** | 0.52 | `--` | 0.38 | 0.07 |
-| TPC-DS (99) | 0.98 | `--` | `--` | `OOM` | 0.05 |
+| JSON | **0.25** | **0.17** | **0.01** | **0.04** | `--` |
+| ClickBench | **0.63** | **0.16** | **0.31** | **0.11** | `--` |
+| Operators | **0.67** | **0.36** | **0.12** | **0.07** | **0.03** |
+| TPC-H sf1 | **0.74** | **0.26** | **0.44** | **0.21** | `--` |
+| TPC-DS sf1 | **0.92** | `killed` | `--` | `n/r` | `--` |
+| TPC-H sf10 | 1.10 | **0.33** | **0.35** | **0.17** | `--` |
+| H2O.ai `groupby` | 1.10 | **0.82** | **0.41** | **0.38** | `--` |
+| H2O.ai `join` | 1.02 | **0.88** | **0.70** | **0.34** | `--` |
 
-One cell carrying a number is above 1.00. Everything else on the board goes to Batcher.
+Every like-for-like bar goes to Batcher, and so does every column that isn't DuckDB's native store. The three suites above 1.00 have since moved. TPC-H sf10 read 0.963x against the native store on 2026-08-25 on a 96-core node, and the 2026-09-13 board has H2O.ai `join` at 0.63x and `groupby` at 1.05x. {doc}`/benchmarks/index` carries that newer board.
 
-Read the board against what it covers. Every suite here runs on one node, at scale factor 1
-where it has one. {doc}`/benchmarks/results/scaling` carries how these move with the data.
-
+Spark isn't on this board. On TPC-H sf1, measured 2026-08-15 on a 96-core box after its adapter stopped round-tripping results through pandas and got one shuffle partition per core, local-mode Spark ran 20x to 50x behind Batcher. {doc}`/benchmarks/comparisons/vs-spark` has the detail.
 
 ## What the gaps are
 
-**PyArrow has no SQL surface.** Five suites are blank for it. A comparison exists only where
-a case can be written against `Table` and `compute`, meaning a single operator or a short
-chain of them. That is what the operators and scan suites are, and what the multi-table SQL
-suites are not.
+**PyArrow has no SQL surface.** A case exists for it only where the work can be written against `Table` and `compute`, which means a single operator or a short chain of them. The operator mix is that, and the multi-table SQL suites aren't.
 
-**Polars' SQL rejects comma joins.** `SELECT ... FROM a, b WHERE a.k = b.k` returns
-`SQLInterfaceError: multiple tables in FROM clause are not currently supported (found 2);
-use explicit JOIN syntax instead`, so Polars runs zero of the 99 TPC-DS queries. Its
-DataFrame API is not affected, and the TPC-H column is measured through it.
+**Polars' SQL frontend rejects comma joins.** `SELECT ... FROM a, b WHERE a.k = b.k` fails with `multiple tables in FROM clause are not currently supported`, so Polars runs none of the TPC-DS queries. Its DataFrame API isn't affected, and the TPC-H column is measured through it.
 
-**Daft and TPC-DS sf1 do not fit together.** The cgroup killed the pair at 71.1 GB resident,
-reproduced twice.
+**DuckDB over registered Arrow can't finish TPC-DS.** It is killed on q64 at 132 GB resident on a scale-factor-1 dataset, reproduced on a busy box and an idle one. On the same query Batcher returns in 3.2 ms and DuckDB on its native store in 58.4 ms. A killed process can't be caught as an exception, so the column is dropped from the suite rather than the suite from the board.
 
-## Disagreements, and which of them are an engine's fault
+**Daft doesn't complete TPC-DS in the same process.** A run with Daft in the lineup is killed, and the same lineup without Daft completes all 99 queries.
 
-A third engine in the lineup caught every disagreement below, which is the argument for
-three-engine lineups even though pairwise is cheaper. They are not all the same kind of
-thing, and the difference decides who should fix them.
+## Disagreements, and whose fault they are
 
-**An engine disagreeing with every other engine.** `SELECT AVG(UserID) FROM hits` returns a
-*negative* mean of non-negative identifiers from Daft (-2.66e12 against 1.948e18), where
-Batcher, DuckDB and Polars all agree. Spark disagrees on a timezone
-(`2013-07-15 19:40:00Z` against `12:40:00`), on a row count, and aliases `count(*)` as
-`count1` where the others project `count_star`. The naming ones are cosmetic. All are
-excluded from the ratios rather than counted against them, and the case counts say how many
-remained.
+A disagreement isn't always an engine's defect, and the difference decides who should fix it.
 
-**The benchmark's fault, not an engine's.** The three `scan-filter_agg-*` cases disagree for
-*both* Ray Data and Daft, and the suite's own module docstring predicts exactly this: its
-columns are `int64` drawn uniformly from `[0, 2^63)`, so a bare sum overflows 64 bits and
-engines disagree there **by design**. DuckDB widens, others wrap, "which would report an
-engine bug that is really a benchmark bug". The rule the suite draws from that is to take
-every sum over a bounded expression, and it was applied to every `SUM` and missed the one
-`AVG`, which sums before it divides. Those three rows are uncomparable rather than three
-engines being wrong, and the fix belongs in the benchmark.
+**An engine disagreeing with the rest.** On TPC-H, Daft returns wrong results on q6 and q15 and the wrong columns on q18, where Batcher, DuckDB and Polars agree. Those cases are excluded from Daft's geomean rather than counted for it, so it isn't credited with a fast wrong answer.
 
-Keep that mechanism in mind when reading the Daft row above. Accumulation width is a type
-decision rather than a correctness one in isolation, and the only thing making that case an
-engine's fault and this one the benchmark's is that three engines agree there and two
-disagree here.
+**The benchmark's fault.** The three `scan-filter_agg-*` cases disagree for Ray Data and Daft, and the suite predicts it. Its columns are `int64` drawn uniformly from `[0, 2^63)`, so a bare sum overflows 64 bits. DuckDB and Batcher widen before summing and return about 4.6e18, while engines that accumulate in `int64` wrap. The suite bounds every `SUM` for that reason and missed its one `AVG`, which sums before it divides. Those three cases are uncomparable, and the fix belongs in `benchmarks/suites/scan/shapes.py`.
 
-## Findings behind these numbers
+## Reproduce
 
-Short notes on what the sweep turned up, each measured rather than argued. The long form is
-in `benchmarks/BENCHMARK_RESULTS.md`.
-
-**Common-subplan reuse was refusing the shape it exists for.** A `ROLLUP` is one `GROUP BY`
-per level over one common input, so the input repeats once per level. That is exactly what
-the reuse pass is for, and on four TPC-DS queries it chose nothing. Three defects: a constant
-group key (`nullif(k, k)`, how both front-ends mark a rolled-up key) estimated at 10,000
-distinct values instead of 1; the size and cost gates reading the plan *as written*, where a
-`WHERE` still sits above the join tree, so q80's largest repeated subtree measured 1.6e13
-rows against its real 687; and the saving formula short by a factor of the appearance count,
-which made the bar *harder* the more there was to gain. Fixing those alone made TPC-DS
-**worse**, which exposed the fourth: materializing forfeits the fusion each appearance had
-with its parent, and that cost is a width. q18's subtree carried 133 columns where the plan
-read 11. Materializing only what the plan reads took the suite to 0.98.
-
-**The few-group loss is measured and its cause is still open.** Two plausible mechanisms were
-checked and neither holds, which is worth saying because both are the obvious guess. It is
-not the chunked-partial concatenation: that path is guarded by `width_from_sample`, which
-offers it only when a morsel *fails* to reduce, and a 100-group aggregate over 16,384-row
-morsels reduces 164:1, so the aggregate takes the per-morsel path and never concatenates.
-(This entry previously said otherwise, on a reading of the concatenation and its gate that
-skipped the guard above them.) Nor is it overhead or type widening, per the measurements
-above.
-
-The morsel-width candidate is refuted too, by a measurement that already exists. The patch
-narrowing the planned morsel to the columns a query reads moved this suite **1.02 to 1.05**,
-the wrong way. It is recorded separately as a real defect that ClickBench is 2.1x faster for.
-It is not this one.
-
-### Adding one layer at a time localizes the cost
-
-Over the same 10 M rows on a quiet box:
-
-| shape | Batcher | DuckDB | |
-|---|---:|---:|---:|
-| `count(*)` | 0.11 ms | 0.78 ms | 0.14x |
-| `count(*) WHERE k < 50` (a real scan) | 0.20 ms | 1.39 ms | 0.14x |
-| `sum(k)` | 0.13 ms | 1.16 ms | 0.12x |
-| `k, count(*) GROUP BY k` | 4.42 ms | 2.76 ms | 1.60x |
-| `k, sum(k) GROUP BY k` | 5.19 ms | 2.75 ms | 1.89x |
-
-The scan is seven times faster than DuckDB's. The group-by layer on top of it is what costs:
-adding `GROUP BY k` over 100 groups costs Batcher **4.2 ms** where it costs DuckDB
-**1.4 ms**. The whole gap sits in that one layer, over a scan that is a large win.
-
-Two other readings were tried and are wrong. Table width is not it: swept from 1 to 17
-columns the time is flat (4.48, 4.50, 4.49, 4.96, 4.92 ms), and an earlier measurement
-suggesting otherwise was noise from a loaded box. The key mapping is already the good one: a
-non-nullable `int32` key of span 100 takes the dense direct-map path, with no hashing and no
-probe.
-
-**And the layer stops scaling at about sixteen cores.** Pinned with `taskset` on an otherwise
-idle box, the same query:
-
-| cores | 1 | 2 | 4 | 8 | 16 | 32 | 46 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| ms | 34.15 | 18.59 | 16.74 | 10.20 | 4.52 | 4.44 | 4.43 |
-
-Past sixteen it is flat, and 46 cores buy 2% over 16. Amdahl's law fits the curve closely: a
-34.15 ms single-core time with a **4.4 ms serial section** predicts a 7.8x ceiling against
-the 7.69x measured, and that serial section on its own is larger than DuckDB's entire query.
-Higher cardinality makes it worse. At 10,000 groups the query is flat from 8 cores (12.41 ms)
-to 46 (13.98 ms), so whatever is serial grows with the group count.
-
-The partial merge is the obvious suspect and is **not** it: at 610 morsels x 100 groups the
-merge sees 61,000 partial rows, well past the 11,776 at which `combine` takes its
-radix-parallel path on this machine. Nor is the curve an artifact of the probe. With OpenBLAS
-pinned to one thread (its spin-server shows up in the profile at 28.6% of samples) the ladder
-is unchanged: 34.27, 11.85, 8.25, 5.26, 4.99, 4.43 ms.
-
-Besides the group-id assignment above, the profile names `agg::dispatch::accumulate` at 9.4%
-and `HyperLogLog::add_array_fast` at 1.4%, the cross-query sketch running inside a `count(*)`.
-
-### Per-query overhead is a closed direction, and here is the price sheet
-
-The engine's own measured plan for `k, count(*) GROUP BY k` over 10 M rows:
-
-```
-operators        79us     2%  of 3.9ms  (2.4ms cpu across workers)
-elsewhere       3.8ms    98%  planning, optimization, admission, FFI crossing, result assembly
-```
-
-**Ninety-eight per cent of the query is not operators.** Running the identical query over
-**three** rows isolates the fixed part and gives a **1.47 ms per-query floor**, more than half
-of DuckDB's entire 10 M-row time (2.76 ms) spent before any data is touched. SQL parsing and
-plan building are not it: a pre-built plan collects in 4.61 ms against 4.58 for one parsed
-each time, so both are already cached.
-
-It is tempting to let that one fact explain the whole suite. The arithmetic says otherwise.
-The floor is 15.5% of q4 but only 1.4% of q8, so removing it moves q4 from 1.76 to 1.49 and
-q8 from 1.48 only to 1.46. The larger losses are real work.
-
-The floor is the lever on the **geometric mean**, because it shaves every one of ten ratios a
-little and a geomean compounds them. Removing it entirely takes the suite from 1.038 to
-**0.988**, and the sensitivity says how much has to go:
-
-| floor removed | 0.00 | 0.50 | 0.75 | 1.00 | **1.25** | 1.47 |
-|---|---:|---:|---:|---:|---:|---:|
-| geomean | 1.038 | 1.021 | 1.013 | 1.004 | **0.995** | 0.988 |
-
-**The suite turns at about 1.25 ms of the 1.47**, an 85% cut. The obvious route is a fast path
-for a plan that has already run, skipping work that cannot have changed. Priced by stubbing
-each subsystem out entirely, that route **does not reach it**:
-
-| stubbed | saved |
-|---|---:|
-| event-log write | 0.408 ms |
-| learning-loop close | 0.100 ms |
-| `learn_column_stats` | -0.046 ms (no effect) |
-| `recommended_config` memoized | 0.097 ms |
-| **total** | **0.559 ms of 1.534** |
-
-Removing four whole subsystems, including the cross-query learning loop that is the stated
-moat, buys 0.56 ms against the 1.25 required and leaves the geomean near 1.019. The remaining
-0.975 ms is diffuse orchestration with no single owner: 418 `dict.get`, 486 `isinstance` and
-325 `getattr` per query across many small functions.
-
-So **this suite is not winnable by reducing per-query overhead**, and that is worth recording
-as a closed direction rather than an open one. The event log is still the single largest item
-in the floor at 27% of it, and worth fixing on its own merits. It just does not win the suite.
-Winning it takes a smaller constant *and* a faster aggregate, which is two programmes rather
-than one.
-
-Two things in the orchestration touch the filesystem on *every* query and look like the
-answer: `carbonite.memory.probe._cgroup_total_bytes` opens 1.48 files per collect, and
-`api.terminal.event_log._prune` unlinks one. Priced by stubbing both, they are worth
-**0.082 ms of 1.513**, five per cent. Recorded as a measured negative so the next reader does
-not spend the afternoon caching a cgroup read. Over 200 collects of the 3-row query the native
-call is **0.14 ms** of the floor; the rest is Python orchestration, and it agrees with the
-independently recorded finding that the control plane is a flat ~2.2 ms per query of which
-four named subsystems (event log, adaptive morsel sizing, the learning loops, column-stat
-learning) account for only 0.80 ms between them. Lowering it is broad control-plane work, not
-one change.
-
-## Reproducing it
+Run one suite per invocation, pairwise or with the lineup you want to compare:
 
 ```bash
-python benchmarks/run.py --benchmark <suite> --engines batcher,<engine>
+python benchmarks/run.py --benchmark <suite> --engines batcher,duckdb,duckdb_arrow,polars,daft,pyarrow
 ```
 
-Pairwise rather than all-at-once, because five engines holding TPC-DS sf1 simultaneously was
-killed at 71 GB. Spark needs `BENCH_SPARK_DRIVER_MEMORY=12g` for TPC-DS on a 92 GiB box.
+Put a large lineup on TPC-DS with care. Five engines holding TPC-DS sf1 in one process were killed at 71 GB, which is why the TPC-DS sweeps run pairwise.
 
 ## See also
 
-- {doc}`/benchmarks/methodology`: the correctness gate, the quiet-box rule, and the hardware.
-- {doc}`/benchmarks/comparisons/index`: one page per engine, with the architectural reason.
-- {doc}`/benchmarks/results/scaling`: what the board looks like at ten and a hundred times the data.
+- {doc}`/benchmarks/methodology`: the correctness gate and the hardware behind each board.
+- {doc}`/benchmarks/comparisons/index`: one page per engine, with the architectural reason behind each result.
+- {doc}`/benchmarks/results/scaling`: how these results move with the data and across a cluster.
+- {doc}`/benchmarks/results/tpch`: the TPC-H suite query by query.

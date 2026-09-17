@@ -109,8 +109,7 @@ state also has to stay numerically sound under merging.
 page: DDSketch's merge is **exactly** order-independent, so a distributed result is bit-identical
 to a single-node one. KLL's compaction is order-sensitive and would agree only within its error
 bounds, which breaks the guarantee this whole design exists to give. KLL still ships in
-`bc-sketches`, where Kyber uses it for cardinality estimates, and an estimate that varies within
-its bounds costs nothing.
+`bc-sketches` for estimates, where an answer that varies within its bounds costs nothing.
 
 The list-state aggregates (`median`, `count_distinct`) are **exact and mergeable, at the cost
 of memory linear in the group's values**. That is a real trade. When you can't afford it,
@@ -121,13 +120,8 @@ Both of those sketches reach the *same state* in any merge order, which is stron
 merging correctly and is why they are the two the aggregates use. A HyperLogLog folds
 register-wise by `max`. A DDSketch sums counts in fixed logarithmic buckets. Neither operation
 cares what order it sees its inputs in, and
-`agg/mod.rs::approx_quantile_is_merge_order_independent` pins it.
-
-That is not true of every sketch in `bc-sketches`. KLL and TDigest compact and re-cluster as
-they merge, so two reduces taking the same partials in different orders return estimates that
-differ, within the rank error the sketch already promises. Kyber uses those two for cardinality
-and quantile *estimates*, where an answer that varies inside its own error bound costs
-nothing.
+`agg/mod.rs::approx_quantile_is_merge_order_independent` pins it. KLL and TDigest are the
+contrast: they compact and re-cluster as they merge, so they stay on the estimate side.
 
 ## One canonical key
 
@@ -144,18 +138,20 @@ happened here: a float key split across `-0.0` and `0.0`, because Arrow's `RowCo
 encodes them to different bytes, and null integer keys scattered across every bucket.
 :::
 
-So `keys.rs` fixes the policy once:
+So the policy is written once. The float half lives in `bc-arrow` (`float_ident.rs`), the
+lowest crate that both `bc-runtime` and `bc-expr` see, so grouping keys and scalar comparisons
+cannot drift apart. `keys.rs` re-exports it beside the null rule:
 
 ```rust
-// canonical u64 key bits for an f64: all NaNs are one group, +/-0.0 are one group
-fn canon_f64(v: f64) -> u64 {
-    if v.is_nan()      { 0x7ff8_0000_0000_0000 }   // one canonical quiet NaN
+// bc-arrow: canonical u64 key bits for an f64 (all NaNs one group, +/-0.0 one group)
+pub fn canon_f64_bits(v: f64) -> u64 {
+    if v.is_nan()      { CANONICAL_NAN_BITS_F64 }   // 0x7ff8_0000_0000_0000
     else if v == 0.0   { 0 }                        // folds -0.0 into 0.0
     else               { v.to_bits() }
 }
 
-// one fixed hash for null keys, so every null row lands in one partition
-const NULL_HASH: u64 = 0xa5a5_5a5a_dead_beef;
+// bc-runtime keys.rs: one fixed hash for null keys, so every null row lands in one partition
+pub(crate) const NULL_HASH: u64 = 0xa5a5_5a5a_dead_beef;
 ```
 
 `canonicalize_float_keys` rewrites float key columns into canonical form *before* the general
@@ -283,10 +279,12 @@ If your operator genuinely has no mergeable form, that's a design conversation, 
 ## Where the code lives
 
 - `crates/bc-runtime/src/agg/mod.rs`: `partial`, `combine`, `finalize`, `AggFunc`
-- `crates/bc-runtime/src/keys.rs`: the one canonical key policy
+- `crates/bc-runtime/src/keys.rs`: the one canonical key policy, re-exporting the float rule
+- `crates/bc-arrow/src/float_ident.rs`: `canon_f64_bits` and `float_total_cmp`
 - `crates/bc-runtime/src/agg/spill/mod.rs`: grace aggregation (the same algebra, bounded)
 - `crates/bc-interp/src/dist.rs`: the distributed primitives
-- `crates/bc-sketches/`: mergeable HLL / KLL / Count-Min, fixed seed
+- `crates/bc-runtime/src/agg/sketch.rs`: the HLL and DDSketch aggregate states
+- `crates/bc-sketches/`: the mergeable sketches (HLL, DDSketch, KLL, TDigest, Count-Min), fixed seed
 
 ## See also
 

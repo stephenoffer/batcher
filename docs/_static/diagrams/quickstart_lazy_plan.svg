@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 520" role="img" width="980" height="520"><defs><style>
+  .surface { fill: #ffffff; stroke: #cbd5e1; }
+  .band-blue { fill: #eff6ff; stroke: #3b82f6; }
+  .band-amber { fill: #fffbeb; stroke: #f59e0b; }
+  .band-grey { fill: #f8fafc; stroke: #cbd5e1; }
+  .t-title { fill: #1e293b; }
+  .t-sub { fill: #5b6675; }
+  .t-arrow { fill: #475569; }
+  .t-code { fill: #1e40af; }
+  .code-bg { fill: #f1f5f9; stroke: #e2e8f0; }
+  .pill-blue { fill: #dbeafe; } .pill-amber { fill: #fef3c7; } .pill-grey { fill: #e2e8f0; }
+  .pt-blue { fill: #1d4ed8; } .pt-amber { fill: #b45309; } .pt-grey { fill: #334155; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1e293b; stroke: #334155; }
+    .band-blue { fill: #172554; stroke: #3b82f6; }
+    .band-amber { fill: #2c1f06; stroke: #f59e0b; }
+    .band-grey { fill: #131c31; stroke: #334155; }
+    .t-title { fill: #e2e8f0; }
+    .t-sub { fill: #94a3b8; }
+    .t-arrow { fill: #cbd5e1; }
+    .t-code { fill: #93c5fd; }
+    .code-bg { fill: #0f172a; stroke: #334155; }
+    .pill-blue { fill: #1e3a8a; } .pill-amber { fill: #78350f; } .pill-grey { fill: #334155; }
+    .pt-blue { fill: #bfdbfe; } .pt-amber { fill: #fde68a; } .pt-grey { fill: #e2e8f0; }
+    #tintBlue stop[offset="0"] { stop-color: #16233d; }
+    #tintBlue stop[offset="1"] { stop-color: #1e3a8a; }
+    #tintAmber stop[offset="0"] { stop-color: #2a1e07; }
+    #tintAmber stop[offset="1"] { stop-color: #78350f; }
+  }
+</style>
+<filter id="sh" x="-20%" y="-30%" width="140%" height="180%">
+  <feDropShadow dx="0" dy="2.5" stdDeviation="4.5" flood-color="#0f172a" flood-opacity="0.18"/>
+</filter>
+<filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+  <feDropShadow dx="0" dy="4" stdDeviation="9" flood-color="#2563eb" flood-opacity="0.35"/>
+</filter>
+<linearGradient id="hero" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="0.5" stop-color="#2563eb"/><stop offset="1" stop-color="#4f46e5"/></linearGradient>
+<linearGradient id="heroAmber" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+<linearGradient id="tintBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="tintAmber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="ribbonBlue" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#93c5fd"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+<linearGradient id="ribbonAmber" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+<marker id="arB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/></marker>
+<marker id="arA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#d97706"/></marker>
+<marker id="arG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/></marker>
+</defs><rect x="20" y="20" width="940" height="206" rx="16" class="band-blue" stroke-width="1.5"/><text x="38" y="44" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="1.5" fill="#3b82f6">LAZY  ·  EACH STEP RETURNS A NEW DATASET, NOTHING RUNS</text><rect x="48" y="62" width="380" height="100" rx="9" class="code-bg" stroke-width="1"/><text x="62" y="88.5" font-family="Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="13" class="t-code" xml:space="preserve">bt.read.parquet(&quot;sales.parquet&quot;)</text><text x="62" y="108.5" font-family="Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="13" class="t-code" xml:space="preserve">  .filter(bt.col(&quot;price&quot;) &gt;= 30.0)</text><text x="62" y="128.5" font-family="Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="13" class="t-code" xml:space="preserve">  .with_columns(total=...)</text><text x="62" y="148.5" font-family="Menlo,Consolas,DejaVu Sans Mono,monospace" font-size="13" class="t-code" xml:space="preserve">  .group_by(&quot;category&quot;).agg(...)</text><path d="M 440 123 L 590 123" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="515" y="111" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" class="t-arrow">describes</text><g filter="url(#glow)"><rect x="600" y="70" width="332" height="106" rx="16" fill="url(#hero)"/></g><text x="766.0" y="121.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="19" font-weight="800" fill="#ffffff">A query plan</text><text x="766.0" y="143.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#ffffff" fill-opacity="0.88">scan, filter, project, aggregate</text><text x="490" y="208" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Chain as many steps as you like. No row has been read yet.</text><rect x="20" y="262" width="940" height="234" rx="16" class="band-amber" stroke-width="1.5"/><text x="38" y="286" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="1.5" fill="#f59e0b">TERMINAL CALL  ·  THE PLAN RUNS ONCE</text><path d="M 766 176 L 766 304 L 179 304 L 179 324" fill="none" stroke="#d97706" stroke-width="2.4" stroke-linejoin="round" marker-end="url(#arA)"/><text x="752" y="249" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" class="t-arrow">collect()  ·  to_pydict()  ·  write</text><g filter="url(#sh)"><rect x="48" y="330" width="262" height="92" rx="10" class="surface" stroke-width="1.2"/></g><text x="179.0" y="376.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Optimize</text><text x="179.0" y="395.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">push filters, prune columns</text><g filter="url(#sh)"><rect x="372" y="330" width="262" height="92" rx="10" class="surface" stroke-width="1.2"/></g><text x="503.0" y="376.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Rust engine</text><text x="503.0" y="395.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">whole Arrow batches</text><g filter="url(#sh)"><rect x="696" y="330" width="236" height="92" rx="11" fill="url(#tintAmber)" stroke="#fcd34d" stroke-width="1.2"/></g><rect x="696" y="342" width="4" height="68" rx="2" fill="#f59e0b"/><text x="817.0" y="375.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Result</text><text x="817.0" y="393.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">Table, dict, or files</text><path d="M 310 376 L 372 376" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="341" y="362" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" class="t-arrow">plan</text><path d="M 634 376 L 696 376" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="665" y="362" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" class="t-arrow">rows</text><text x="490" y="466" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">The optimizer sees the whole plan before any work, so it can move a filter into the read.</text></svg>

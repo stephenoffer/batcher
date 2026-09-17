@@ -4,10 +4,11 @@ This page describes what Batcher's optimizer, Kyber, does to a query: the phases
 runs, the rewrites each phase applies, and how it re-plans on measured numbers.
 
 Kyber rewrites a logical plan into a better one and then lowers it to a physical plan.
-It's an ordered set of passes rather than an unstructured catalog. A rule ships only
-when it makes a query measurably better, and every rule is proven semantics-preserving.
-The optimizer runs automatically on every terminal operation, so the plan you describe
-and the plan that runs differ, but the result doesn't.
+It's an ordered set of phases rather than an unstructured catalog of rules. Property
+tests run the full rule set and check that it changes the plan and never the answer, and
+that it converges to a deterministic fixpoint. The optimizer runs automatically on every
+terminal operation, so the plan you describe and the plan that runs differ, but the
+result doesn't.
 
 The authoritative model, covering the rule families, cost coefficients, and
 configuration knobs, lives in {doc}`the Kyber reference </architecture/internals/kyber>`.
@@ -21,14 +22,14 @@ rather than converge to one.
 
 | Phase | Runs | What it does |
 |-------|------|--------------|
-| `NORMALIZE` | to fixpoint | constant folding, expression simplification, canonicalization |
-| `REWRITE` | to fixpoint | algebraic rewrites (e.g. redundant-distinct removal) |
-| `PUSHDOWN` | to fixpoint | predicate, projection, and limit pushdown; column pruning |
+| `NORMALIZE` | to fixpoint | constant folding, expression simplification, canonicalization, common subexpressions |
+| `REWRITE` | to fixpoint | subquery decorrelation, set-operation rewrites, CTE handling |
+| `PUSHDOWN` | to fixpoint | predicate, projection, and limit pushdown; partition pruning |
 | `JOIN_REORDER` | once | cost-based multi-table join ordering |
-| `FUSION` | to fixpoint | operator and top-N fusion |
-| *canonicalization round* | to fixpoint | the contracting rewrites, run once more |
-| `SELECTION` | once | physical algorithm choice (join build side) |
-| `ENFORCE` | once | distribution/exchange enforcement and validation |
+| `FUSION` | to fixpoint | operator fusion, top-N fusion, late materialization |
+| *canonicalization round* | to fixpoint | the contracting rewrites, re-run after fusion |
+| `SELECTION` | once | physical algorithm choice, such as the join build side and aggregate strategy |
+| `ENFORCE` | once | distribution and exchange enforcement, validation |
 
 The canonicalization round exists because the pipeline is a single forward pass. A rule that
 collapses a shape, such as folding two adjacent filters into one conjunction, runs early and
@@ -64,7 +65,7 @@ Kyber pushes the filter through projections, aggregates, sorts, and unions, spli
 conjunctions so each part lands as early as it legally can, and merges adjacent
 filters into one. For Parquet, a pushed predicate lets the reader skip row groups
 whose statistics rule them out, and skip partitions entirely when the column is a
-partition key. On a selective scan that can cut the work by orders of magnitude.
+partition key. On a selective scan, most of the file is never decoded.
 
 A source pushes what its backend can express, and no more. Every backend has terms it
 cannot spell. A database has no portable literal for `NaN`, and a Parquet reader will not
@@ -138,8 +139,9 @@ result = table_a.join(table_b, on="key").join(table_c, on="key")
 The hash join builds a table on one input and probes it with the other. Building the
 smaller side keeps that table in memory and the larger side streaming, so the
 `SELECTION` phase compares estimated input sizes and picks the build side, swapping
-the inputs when that helps. When one side is small enough, it is broadcast rather
-than shuffled.
+the inputs when that helps. When one side fits under `optimizer.broadcast_max_bytes`,
+it is broadcast rather than shuffled. The default of `0` sizes that threshold from the
+machine's last-level cache.
 
 ## Adaptive re-optimization
 
@@ -152,13 +154,15 @@ same mechanism runs single-node and distributed.
 
 This is stage-boundary re-optimization, the same granularity Spark AQE adapts at, and
 Batcher runs it on one machine too. DuckDB optimizes once, before execution, and never
-revises. Read the gate carefully before assuming your query is in it. `adaptive="auto"`,
-the default, engages the loop only on a query that contains a join, that clears a size
-floor charged per pipeline breaker the loop would cut at, and where measuring could still
-flip a downstream decision such as a build side or a join order. A query with no join is
-out at any size. {doc}`/architecture/internals/execution` carries the exact thresholds.
+revises. Check the gate before assuming your query is in it. On a single node,
+`adaptive="auto"`, the default, engages the loop only on a query that contains a join,
+where measuring could still flip a downstream decision such as a build side or a join
+order, and that clears a floor of 5 million rows or about 320 MB for each pipeline breaker
+the loop would cut at. A query with no join is out at any size. On a cluster, a plan the
+one-shot dispatcher can't run correctly takes the staged path regardless.
 Kyber also carries a cross-query loop that neither DuckDB nor Spark has: sketch-backed
-statistics and a bandit over join strategies, both persisted between runs.
+statistics, calibrated cost coefficients, and a bandit over join strategies, all persisted
+between runs.
 
 This split is the reason the architecture keeps Core, which measures, and Kyber, which
 decides, as separate subsystems with a feedback loop between them.
@@ -190,8 +194,8 @@ print(ds.explain())
 ```
 
 The output is the optimized plan tree annotated with estimated row counts and the
-provenance of each estimate, which is a default, a sketch, or a learned statistic,
-followed by any build-side swaps. This is how you confirm a predicate landed at the
+provenance of each estimate: `exact`, `histogram`, `sketch`, `learned`, or `default`.
+Predicates pushed into a scan show as `pushed[...]` on the scan line. This is how you confirm a predicate landed at the
 scan, or that a join was reordered the way you expected.
 
 ## See also
@@ -199,4 +203,6 @@ scan, or that a join was reordered the way you expected.
 - {doc}`Kyber reference </architecture/internals/kyber>`: the rule families, cost coefficients, and knobs.
 - {doc}`Architecture overview <overview>`: the control-plane and data-plane split.
 - {doc}`Execution model <execution>`: the breakers the adaptive loop measures at.
+- {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`: where each estimate comes from.
+- {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`: the stage loop and its gate.
 - {doc}`Configuration options <../configuration/options>`: the cost-model and cardinality settings.

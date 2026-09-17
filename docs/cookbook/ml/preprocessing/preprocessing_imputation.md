@@ -2,6 +2,8 @@
 
 Imputing silently destroys information: "no value recorded" often predicts the target better than whatever you filled in. `MissingIndicator` keeps that signal as its own column, so impute *and* flag rather than choosing.
 
+The script fills a numeric column with the mean and the median, and a categorical one with a constant and with the mode. `GroupImputer` fills each gap from the row's own region rather than the global mean. The recommended shape, flag then impute, closes the script as one `Chain`.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/ml/preprocessing_imputation.py

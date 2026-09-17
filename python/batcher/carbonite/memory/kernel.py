@@ -386,7 +386,10 @@ def _usage_dirs() -> tuple[str, ...]:
     reason — see `_memory_psi`.
     """
     own = _own_cgroup_dirs()
-    return own or (cgroup_v2_dirs()[0],)
+    # A slice, not `[0]`: with no cgroup v2 mount at all (gVisor, a chroot, some minimal
+    # container runtimes) `cgroup_v2_dirs` is empty, and indexing it crashed every query on a
+    # host this function's callers already treat as "the kernel published nothing".
+    return own or cgroup_v2_dirs()[:1]
 
 
 def _leafmost_bytes(name: str) -> int | None:

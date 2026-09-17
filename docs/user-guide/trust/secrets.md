@@ -5,8 +5,7 @@ out of your query and out of its plan. Batcher resolves a *reference* to a secre
 machine that needs it, so the secret itself never travels in the plan IR, a log line, or a
 pickled task.
 
-The functions that take a key are covered in {doc}`/user-guide/trust/governance`. This page is about where
-that key comes from.
+The functions that take a key are covered in {doc}`/user-guide/trust/governance`. This page is about where that key comes from.
 
 ## Keys by reference
 
@@ -23,6 +22,10 @@ the reference travels in the plan IR. Plan logs, the profile, `explain()`, and t
 boundary never see the secret, and the data plane resolves it on the machine that runs the
 query, so a distributed query reads the key on each worker rather than shipping it over the
 wire.
+
+The reference and the key take different routes, and only one of them leaves the machine it started on:
+
+![Three columns: the driver, what travels, and each worker. On the driver, ds.select(c=bt.aes_encrypt(bt.col('ssn'), 'env:AES_KEY')) lowers to the plan IR, which is shipped to every worker. The plan carries only the reference env:AES_KEY, never the key, so plan logs, the profile, explain() and the FFI boundary never see the key. An inline key instead of a reference puts the key in the plan and raises a SecurityWarning, or a PlanError at plan-build time when BATCHER_REQUIRE_KEY_REFS=1 is set. When the plan arrives on a worker, bc-secrets resolves the reference in the data plane by its scheme: env: reads an environment variable, file: reads a mounted file, and cmd: takes the stdout of the operator's BATCHER_SECRET_COMMAND run with NAME as its argument, failing if that variable is unset. The secret is cached per process for BATCHER_SECRET_TTL_SECONDS, 300 seconds by default, because key references resolve per batch, and the kernel uses the key on the machine that runs it. A missing reference fails naming the reference, never the key. Connector passwords and storage_options take the same references, resolved once per connection and not cached.](/_static/diagrams/secret_reference_flow.svg)
 
 A `file:` reference is an ordinary path, so the round trip runs anywhere:
 
@@ -69,8 +72,7 @@ bt.read.parquet(
 )
 ```
 
-All three schemes work here, including `cmd:`, and so do the `storage_options` an object
-store takes. A connector resolves once when it opens its connection rather than per batch,
+All three schemes work for connector options, including `cmd:`, and so do the `storage_options` an object store takes. A connector resolves once when it opens its connection rather than per batch,
 so there is no cache in this path and a rotated secret is picked up by the next connection.
 
 The reference is resolved on the machine that *opens the connection*, not on the driver
@@ -127,8 +129,9 @@ once:
 
 ```python
 # docs: skip
-ds = bt.read.table(
-    "postgres://analytics@warehouse.internal/sales",
+ds = bt.read.sql(
+    "SELECT * FROM orders",
+    uri="postgresql://analytics@warehouse.internal/sales",
     password="aws-sm:prod/warehouse#password",
 )
 ```
@@ -174,7 +177,7 @@ and the plan fingerprint, and out to every worker the plan is shipped to.
 
 Set `BATCHER_REQUIRE_KEY_REFS=1` to refuse inline keys outright. {py:func}`aes_encrypt <batcher.aes_encrypt>`,
 {py:func}`aes_decrypt <batcher.aes_decrypt>`, and {py:func}`hmac_sha256 <batcher.hmac_sha256>` then raise {py:exc}`PlanError <batcher.PlanError>` at plan-build time unless the key
-is an `env:` or `file:` reference. Set it in the pod spec or node environment for the whole
+is an `env:`, `file:`, or `cmd:` reference. Set it in the pod spec or node environment for the whole
 deployment, and leave it unset in notebooks and tests, where an inline key is legitimate.
 
 ```bash
@@ -182,9 +185,7 @@ export BATCHER_REQUIRE_KEY_REFS=1
 ```
 
 :::{note}
-Prefer `file:` over `env:` where a user-supplied UDF may run. A UDF executes in a worker
-process that inherits the environment, so it can read an `env:`-referenced key. A `file:`
-reference with restrictive permissions is not readable the same way.
+Prefer `file:` over `env:` where a user-supplied UDF may run. A UDF on the process pool runs in a child whose environment is rebuilt from an allowlist under the default `execution.udf_isolation="env"`, but a UDF that runs on a thread executes inside the engine process and can read its environment. A `file:` reference with restrictive permissions is not readable the same way. See {doc}`/user-guide/trust/hardening`.
 :::
 
 ## Data at rest on the node
@@ -210,6 +211,7 @@ through a spill, but costs a decrypt wherever the value is used.
 ## See also
 
 - {doc}`/user-guide/trust/governance`: the masking, row filters, and audit trail these keys feed.
+- {doc}`/user-guide/trust/hardening`: the rest of a production deployment, including UDF isolation, which keeps `env:` material away from user code.
 - {doc}`/user-guide/moving-data/reading-data`: the connectors whose credentials take the same references.
 - {doc}`/configuration/options`: `memory.spill_dir` and the rest of the configuration.
 - {doc}`/cookbook/governance/pii_transforms`: masking, hashing, and encrypting a column, as a script.

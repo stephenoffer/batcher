@@ -206,7 +206,7 @@ evaluation data that leaked into a web-scale corpus. See {doc}`/ml/training/trai
 
 Rerank a retrieved candidate set before it reaches a model.
 {py:obj}`cross_encoder_rerank_udf <batcher.ml.cross_encoder_rerank_udf>` rescores candidates
-with a model that reads the query and each passage together, which a vector search cannot do;
+with a model that reads the query and each passage together, which a vector search cannot do.
 {py:obj}`mmr_rerank_udf <batcher.ml.mmr_rerank_udf>` then drops the near-duplicates, so a
 context window is not spent on the same passage several times. See {doc}`/ml/retrieval/rag`.
 

@@ -55,7 +55,7 @@ per_region = ds.ml.evaluate("y", y_score="score", by="region", metrics=["accurac
 print(per_region.sort("region").to_pydict())
 ```
 
-This is the query worth reaching for first when a model looks fine overall. An aggregate accuracy of 0.94 routinely hides a segment at 0.61, and only the grouped form shows it.
+Reach for this first when a model looks fine overall. A strong aggregate can hide one weak segment, and only the grouped form shows it.
 
 ## Individual metrics inside any aggregate
 
@@ -81,11 +81,11 @@ The full vocabulary:
 | Multi-label | {py:func}`hamming_loss <batcher.hamming_loss>` (the fraction of label cells predicted wrong) |
 | Diagnostic-test | `jaccard_score`, `false_discovery_rate`, `false_omission_rate`, `positive_likelihood_ratio`, `negative_likelihood_ratio`, `diagnostic_odds_ratio`, `informedness`, `markedness`, `fowlkes_mallows_index`, `geometric_mean_score`, `prevalence_threshold` |
 
-Every one is checked against `sklearn.metrics` at 1e-12 in the test suite. The definitions are the ones you expect.
+The test suite checks each one against `sklearn.metrics` at a tolerance of 1e-12, so the definitions are scikit-learn's.
 
 ## Choosing the right metric
 
-A few of these exist specifically because the obvious choice misleads, and it is worth knowing which:
+Several of these exist because the obvious choice misleads.
 
 `accuracy` is misleading on imbalanced data. At 1% positives, predicting "negative" always scores 0.99. Report `balanced_accuracy` or `matthews_corrcoef` beside it.
 
@@ -93,11 +93,25 @@ A few of these exist specifically because the obvious choice misleads, and it is
 
 `mean_percentage_error` keeps the sign `mape` discards, so it measures a forecast's *bias*. A positive value means it systematically under-predicts. `normalized_rmse` divides the RMSE by the mean of the actuals, so two series on different scales compare directly. On the classification side `false_negative_rate` (`1 - recall`) is the miss rate to watch when an undetected positive is the costly outcome.
 
-`roc_auc` counts every negative equally, so at very low prevalence it stays high while the top of the ranking is worthless. Report `average_precision` instead when positives are rare.
+`roc_auc` counts every negative equally, so at very low prevalence it stays high while the top of the ranking is worthless. Report `average_precision` when positives are rare, because it is dominated by the head of the ranking, which is the part anyone acts on.
 
 `log_loss` and `brier_score` are the only metrics here that score *calibration*. A model that ranks perfectly but predicts probabilities twice as large as the truth looks excellent on AUC and fails the moment a prediction is multiplied by a dollar amount.
 
 {py:func}`hinge_loss <batcher.hinge_loss>` and {py:func}`squared_hinge_loss <batcher.squared_hinge_loss>` score a raw decision function rather than a probability, which is the margin a support-vector machine or a linear classifier produces. They are zero once a point is correctly classified with room to spare and grow with how far a point sits on the wrong side, which is the objective those models optimize.
+
+## Rank-based metrics
+
+ROC AUC, average precision, the KS statistic, and the Gini coefficient are functions over a `Dataset` rather than expressions, because each needs a global ordering:
+
+```python
+from batcher.ml.metrics import average_precision, gini_coefficient, ks_statistic, roc_auc
+
+ds = bt.from_pydict({"y": [0, 0, 1, 1], "s": [0.1, 0.4, 0.35, 0.8]})
+print(roc_auc(ds, "y", "s"), round(average_precision(ds, "y", "s"), 4))
+print(ks_statistic(ds, "y", "s"), gini_coefficient(ds, "y", "s"))
+```
+
+ROC AUC uses the rank identity rather than integrating a threshold sweep, so it is exact under ties and needs one sort rather than one scan per threshold. Average precision counts a group of tied scores as a single threshold, which is what scikit-learn's `average_precision_score` does. Each of these takes `by=` for a per-segment value.
 
 ## Diagnostic tables
 
@@ -215,32 +229,7 @@ print(equal_opportunity_difference(ds, "race", "y", "p"))  # true-positive-rate 
 each group. `group_fairness_report` returns the per-group rates the disparities are computed
 from. None of these is a verdict, because a gap can be justified. An unmeasured gap cannot.
 
-## Agreement, not just correlation
-
-A correlation says two series move together; it says nothing about whether they are *equal*. A
-prediction that is always half the truth correlates perfectly and is useless. {py:func}`bt.concordance_correlation <batcher.concordance_correlation>`
-(Lin's CCC) penalises a correlation by how far the means and variances differ;
-{py:func}`bt.nash_sutcliffe_efficiency <batcher.nash_sutcliffe_efficiency>` and {py:func}`bt.kling_gupta_efficiency <batcher.kling_gupta_efficiency>` are the hydrology efficiency
-scores that decompose agreement into correlation, bias, and variability.
-
-```python
-ds = bt.from_pydict({"y": [1.0, 2.0, 3.0, 4.0], "p": [3.0, 4.0, 5.0, 6.0]})
-print(round(ds.agg(m=bt.concordance_correlation("y", "p")).to_pydict()["m"][0], 4))  # < 1: shifted
-```
-
-## Rank-based metrics
-
-```python
-from batcher.ml.metrics import average_precision, gini_coefficient, ks_statistic, roc_auc
-
-ds = bt.from_pydict({"y": [0, 0, 1, 1], "s": [0.1, 0.4, 0.35, 0.8]})
-print(roc_auc(ds, "y", "s"), round(average_precision(ds, "y", "s"), 4))
-print(ks_statistic(ds, "y", "s"), gini_coefficient(ds, "y", "s"))
-```
-
-ROC AUC uses the rank identity rather than integrating a threshold sweep, so it is exact including under ties and needs one sort rather than one scan per threshold. Each of these takes `by=` for a per-segment value.
-
-## Is the probability calibrated?
+## Calibration
 
 `log_loss` and `brier_score` above score calibration as one number. These two say where the
 gap sits and how wide it is, which is what you need before deciding whether to correct it.
@@ -259,13 +248,11 @@ region of the score range drives a high-stakes call. `brier_skill_score` rescale
 score against the base rate so it reads like R²: 1 is perfect, 0 is no better than predicting
 the base rate, negative is worse.
 
-## Fixing a miscalibrated score
-
 Measuring the gap is half the job. {py:class}`PlattCalibrator <batcher.ml.preprocessors.PlattCalibrator>`
 and {py:class}`IsotonicCalibrator <batcher.ml.preprocessors.IsotonicCalibrator>` close it, by
 fitting the map from raw score to observed rate and applying it to every future score.
 
-Fit them on a split the model did **not** train on. Calibrating on the training split
+Fit them on a split the model did not train on. Calibrating on the training split
 measures the model's confidence on rows it memorized, which produces a calibration curve
 that looks perfect in development and is wrong in use.
 
@@ -280,22 +267,28 @@ print(calibrator.transform(scored).to_pydict()["calibrated"])
 # [0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0]
 ```
 
-Which to use depends on how much calibration data you have and what shape the distortion is:
+Platt scaling fits a two-parameter sigmoid, which suits a small calibration split. Isotonic regression fits a free-form non-decreasing step function, which corrects asymmetric distortion and needs more data. Both are monotone in the score, so AUC is unchanged and only the calibration metrics above move.
 
-| Calibrator | Parameters | Use it when |
-|---|---|---|
-| `PlattCalibrator` | Two | The calibration split is small, and the distortion is roughly sigmoid. |
-| `IsotonicCalibrator` | One per bin | You have a few thousand rows, and the distortion is not sigmoid. |
+To calibrate while you train, so the calibrator only ever sees out-of-fold scores, wrap the classifier in `CalibratedClassifierCV`. {doc}`/ml/inference/calibration` covers both routes and how to choose between the two curves.
 
-Platt scaling fits `sigmoid(a * score + b)`, so it cannot overfit much and cannot represent
-an asymmetric distortion. Isotonic regression assumes only that a higher score should never
-mean a lower probability, which fits a boosted tree's asymmetric overconfidence far better,
-at the cost of needing more data before its steps are trustworthy.
+## Beyond a single regression error
 
-Neither reorders the model's ranking, because both are monotone in the score. AUC is
-unchanged, and only the calibration metrics above move.
+RMSE and R² answer how far off a regression is on average. The three measures below answer the questions they can't: whether predictions equal the truth rather than track it, how to score a count or a rate, and which segment carries the error.
 
-## Count and rate models
+### Agreement, not just correlation
+
+A correlation says two series move together; it says nothing about whether they are *equal*. A
+prediction that is always half the truth correlates perfectly and is useless. {py:func}`bt.concordance_correlation <batcher.concordance_correlation>`
+(Lin's CCC) penalises a correlation by how far the means and variances differ;
+{py:func}`bt.nash_sutcliffe_efficiency <batcher.nash_sutcliffe_efficiency>` and {py:func}`bt.kling_gupta_efficiency <batcher.kling_gupta_efficiency>` are the hydrology efficiency
+scores that decompose agreement into correlation, bias, and variability.
+
+```python
+ds = bt.from_pydict({"y": [1.0, 2.0, 3.0, 4.0], "p": [3.0, 4.0, 5.0, 6.0]})
+print(round(ds.agg(m=bt.concordance_correlation("y", "p")).to_pydict()["m"][0], 4))  # < 1: shifted
+```
+
+### Count and rate models
 
 RMSE assumes symmetric, constant-variance error. A count (claims, clicks, defects) or a rate
 is neither, and a Poisson, gamma, or Tweedie model is fitted on the matching *deviance*
@@ -316,7 +309,7 @@ baseline (the target's median for absolute error, its `alpha`-quantile for pinba
 median or quantile regression gets the same self-contained 0-to-1 score R² gives a
 least-squares one.
 
-## Regression diagnostics
+### Where the error lives
 
 A single RMSE hides where the error lives. `residual_summary` groups the residual by any
 column, reporting its mean (the systematic bias), its spread, and its quantiles. That is what
@@ -348,8 +341,6 @@ print(DummyClassifier("y").fit(ds).constant_)  # the majority class a model must
 
 ## Requirements and limitations
 
-`average_precision` breaks ties in the engine's sort order, so a score column with heavy ties gives an optimistic value. `roc_auc` is exact under ties, and the safer choice there.
-
 A ranking metric on a split containing only one class is undefined and returns NaN. Check the class balance of a segment before trusting a per-segment AUC.
 
 The multi-class averages are computed from a per-class report rather than a single aggregate, so `by=` cannot partition them. Group the dataset and call `evaluate` per group when you need both.
@@ -358,5 +349,6 @@ The multi-class averages are computed from a per-class report rather than a sing
 
 - {doc}`/ml/inference/tabular-models`: produce the predictions this page scores.
 - {doc}`/ml/evaluation/statistics-and-drift`: watch the inputs when the labels have not arrived yet.
+- {doc}`/ml/inference/calibration`: turn scores into probabilities you can act on.
 - {doc}`/user-guide/analyze/aggregations`: the aggregate surface these metrics are built on.
 - {doc}`/cookbook/metrics/index`: short runnable recipes for each metric family.

@@ -1,6 +1,8 @@
 # Aggregates
 
-Exact aggregates read every row. The `approx_*` family reads sketches instead, trading a bounded error for a large constant-factor speedup and, more importantly, bounded memory on a high-cardinality column.
+Exact aggregates read every row. The `approx_*` family reads sketches instead, trading a bounded error for speed and, more importantly, for bounded memory on a high-cardinality column.
+
+The script runs the aggregate vocabulary over one small table: counts, sums, means, spread, median and quantiles, `first` and `last`, `arg_min` and `arg_max` for the value of one column where another peaks, boolean and bitwise reductions, and `approx_count_distinct`, `approx_median`, and `approx_quantile`. It closes by running the same aggregates per group in a single pass.
 
 The whole script, executed on every test run:
 

@@ -1,6 +1,8 @@
 # Embedding metrics
 
-Per-row similarity is a projection. These are the aggregates over it, and they are the cheap health checks for an embedding job: a drifting mean cosine similarity or a rising zero-vector rate usually means the upstream text changed rather than the model.
+Per-row similarity is a projection. These are the aggregates over it: mean cosine similarity, cosine and angular distance, dot product, and Euclidean and Manhattan distance across two vector columns, plus the mean norm, unit-norm rate, and zero-vector rate of one.
+
+They make cheap health checks for an embedding job. A zero vector is usually a failed embedding call, and the script ends by measuring exactly that. A drifting mean similarity usually means the upstream text changed rather than the model.
 
 The whole script, executed on every test run:
 

@@ -1,143 +1,72 @@
 # vs Spark
 
-This page compares Batcher and Spark on architecture: where each one re-plans a query, what
-moves the bulk data, and what that means for a single node.
+This page compares Batcher with Spark: the measured standing on a single node, and the architecture behind it, from where each engine re-plans a query to what moves its bulk data.
 
 ## The measured standing
 
-Spark 4.2 on OpenJDK 17, local mode, 48-core box, `batcher,spark` pairwise, best of five,
-every row correctness-gated. Measured 2026-09-11. Each cell is `batcher_ms / spark_ms`, so
-lower is better and every number here is a Batcher win.
+On one machine Batcher is far ahead. The following results are recorded in `benchmarks/BENCHMARK_RESULTS.md`, each correctness-gated against DuckDB:
 
-| Suite | b/spark | Cases |
-|---|---:|---:|
-| ClickBench | 0.02 | 39 |
-| operators | 0.03 | 23 |
-| TPC-H sf1 | 0.03 | 22 |
-| H2O `join` | 0.04 | 5 |
-| TPC-DS | 0.05 | 87 |
-| H2O `groupby` | 0.07 | 10 |
-| JSON | 0.01 | 5 |
-| scan | 0.21 | 27 |
+| Workload | Result | Measured |
+|---|---|---|
+| TPC-H sf1, local-mode Spark | Batcher **20x to 50x** faster | 2026-08-15, 96-core box |
+| Streaming drain of a Parquet backlog, 4M rows and 1,000 keys | **211.1 ms against 666.6 ms** for Spark Structured Streaming, 3.2x | 2026-08-18 |
+| Operator mix, sf1 | Batcher faster on **11 of 11** operators | 2026-07-25 |
 
-Batcher is between 5x and 100x faster on every suite. Read that as the single-node case it
-is: Spark's per-stage machinery is priced for a cluster, and none of it is amortized here.
-`scan` is the closest column because it is the one dominated by reading bytes from S3, which
-both engines pay in full.
+The operator sweep predates the Spark configuration fixes below, which the record notes changed no winner. The TPC-H figure was taken after three handicaps on Spark's side were removed: a pandas round trip on every result, 8 shuffle partitions on a 96-core box, and a Parquet re-read on every query where the other engines queried loaded tables. Spark now reads with `DataFrame.toArrow()`, uses one shuffle partition per core, and caches its tables before the clock starts. It is still 20x to 50x behind, because local-mode Spark carries about 90 ms of fixed cost per query that nothing amortizes on 6M rows.
 
-Three TPC-DS cases and two ClickBench cases are excluded from those counts because Spark
-disagreed with the result DuckDB and Batcher both produced: `count(*)` aliased as `count1`
-rather than `count_star` (three queries), a timezone rendered as `2013-07-15 19:40:00Z`
-against `12:40:00`, and one row count. The naming differences are cosmetic; they are
-excluded rather than waved through because the gate compares column names.
+Read these as single-node results. Spark's per-stage machinery is priced for a cluster, so a single-node board measures Spark where it is weakest. {doc}`/benchmarks/results/scaling` has Batcher's distributed measurements, taken against Daft's Ray runner.
 
-TPC-DS needs `BENCH_SPARK_DRIVER_MEMORY=12g` on a 92 GiB box. At the default 32g heap the
-pair was OOM-killed.
+## Where each engine re-plans
 
-:::{note}
-The section below is an architectural comparison rather than a benchmark, and is labeled so
-that nothing in it reads as a speed result.
-:::
+Spark's Adaptive Query Execution re-plans between stages. When a shuffle finishes, AQE reads the materialized shuffle statistics and can coalesce partitions, switch a sort-merge join to a broadcast join, or split a skewed partition. It is why Spark survives estimates that would sink a purely static optimizer.
 
-The design difference is specific and testable, which is what makes it worth writing down.
+Batcher re-plans the same way, at stage boundaries on measured cardinalities, with the same granularity as AQE. When an estimate is off by more than `optimizer.reoptimize_error` (2x by default), the rest of the query is re-planned on the measured numbers, and the result is identical either way. Two things differ. The loop runs on a single node too, where AQE needs shuffle stages to exist. And what it measures outlives the query: Core records actual cardinalities, operator times and peak memory into the metadata hub, sketches and calibrated costs feed Kyber on the next run, so a recurring query gets a better plan each time it executes.
 
-| | Where to look |
-|---|---|
-| Architectural comparison | Below |
-| Measured distributed results | {doc}`/benchmarks/results/scaling`, measured against {doc}`/benchmarks/comparisons/vs-daft` |
-| API migration | Mapped verb by verb in the {doc}`/getting-started/migration/index` |
-
-## Adaptation granularity
-
-Spark's Adaptive Query Execution re-plans between stages. When a shuffle finishes, AQE reads
-the materialized shuffle statistics and can coalesce partitions, switch a sort-merge join to
-a broadcast join, or split a skewed partition. It is a real and valuable capability, and it
-is why Spark survives bad estimates that would sink a purely static optimizer.
-
-The decision points sit where the shuffles do, and that is the constraint.
-Inside a stage (a scan, a filter, a projection, a hash-aggregate's build) Spark is committed
-to the plan it entered with, however wrong the estimate that produced it turns out to be.
-
-Batcher re-optimizes at every **pipeline breaker**: a sort, an aggregate, a join build. A
-breaker is a point where the engine has just *measured* the true size of what it processed,
-and there are more of them than there are shuffles. When an estimate is off by more than
-`optimizer.reoptimize_error` (2× by default), the rest of the query is re-planned on the
-measured numbers before it continues. The result is identical whichever way it runs;
-only the plan changes.
-
-That measured feedback also outlives the query. Core records actual cardinalities, operator
-times and peak memory into the MetadataHub, and Kyber reads them on the *next* run, so a
-recurring query gets a better plan each time it executes.
+The within-query loop isn't always on. Single-node, it engages on a query with a join once the input clears 5M rows, or about 320 MB, for each pipeline breaker it would cut at, so the simplest joined shape qualifies at about 10M rows.
 
 ## Where the two engines differ
 
-The differences that matter are architectural rather than incidental. Each row names one
-and gives both engines' answer:
+The following table sets the architectural choices side by side:
 
 | | Spark | Batcher |
 |---|---|---|
-| Re-optimization points | Stage (shuffle) boundaries | Every pipeline breaker |
+| Re-optimization | Stage boundaries, cluster only | Stage boundaries, single node or cluster, plus statistics learned across runs |
 | Data plane | JVM, row and columnar hybrid | Rust over Arrow, columnar throughout |
-| Expression evaluation | Whole-stage codegen (JVM bytecode) | Interpreter oracle plus a Cranelift JIT, bit-for-bit identical on its subset |
-| Small-query overhead | JVM start, driver, and scheduler | In-process; a metadata `count()` answers in 0.05 ms |
-| Single-node story | The cluster case, shrunk | A first-class, in-process engine |
-| Distributed story | The design center | The *same* mergeable operators, scheduled across nodes |
-| Bulk data movement | Shuffle files, exchange service | Arrow Flight with credit-based flow control; the Ray object store is bypassed |
+| Expression evaluation | Whole-stage codegen to JVM bytecode | Interpreter oracle plus a Cranelift JIT, bit-for-bit identical on its subset |
+| Small-query overhead | JVM, driver and scheduler | In process |
+| Single-node story | The cluster machinery with one executor | A first-class in-process engine |
+| Distributed story | The design center | The same mergeable operators, scheduled across nodes |
+| Bulk data movement | Shuffle files and an external shuffle service | Arrow Flight with credit-based flow control, bypassing the Ray object store |
 
-The second-to-last row carries the most weight. Batcher's stateful operators are
-built once as `partial → combine → finalize`, so one implementation serves a single core,
-many cores, and many machines. There is no separate distributed engine with its own
-semantics, and a distributed result holds the same rows and types as the single-node one
-(float reductions agree to the last bits, since the partition count sets the summation
-order). Spark's
-single-node mode is its cluster machinery running with one executor.
-
-## What this does not tell you
-
-:::{important}
-An architecture table is not a benchmark. Spark at petabyte scale with a tuned cluster is a
-serious system, and the claim that Batcher beats it is exactly the sort of claim this site
-refuses to make without a correctness-gated measurement. Do not cite this page as a speed
-result. It is not one.
-:::
-
-The layer beneath it is measured, and it does bear on the comparison. On a 128-CPU cluster
-Batcher's distributed path takes the join, the group-by, and the metadata count against
-Daft's Ray runner, and keeps per-node memory bounded through the mergeable algebra and spill.
-See {doc}`/benchmarks/results/scaling`.
-
-## Three things Spark has that Batcher does not
-
-The measured board above is a single-node board, and single-node is where Spark is weakest.
-Three of Spark's advantages do not appear on it at all.
-
-**An external shuffle service.** Batcher's shuffle replicas live in RAM, so they cost memory,
-and losing a whole node takes every copy with it and forces a recompute. Spark's shuffle
-outlives the executor that wrote it. This is the gap the scorecard in
-`docs/architecture/internals/competitive_architecture.md` records as structural rather than
-a tuning item.
-
-**Streaming guarantees.** Batcher's streaming is micro-batch. It cannot express what a
-continuous-operator engine expresses, which is a limitation against Flink first and Spark
-Structured Streaming second.
-
-**Lakehouse formats.** Batcher reaches Iceberg, Delta and Hudi through `pyiceberg` and
-`delta-rs` rather than through a native writer, so format support tracks those libraries.
+The distributed row carries the most weight. Batcher's stateful operators are built once as `partial`, `combine` and `finalize`, so one implementation serves a single core, many cores and many machines. There is no separate distributed engine with its own semantics, and a distributed result holds the same rows and types as the single-node one, with floating-point reductions agreeing to the last bits because the partition count sets the summation order.
 
 ## Migrating
 
-If you are coming from Spark, the API is deliberately close. {py:class}`Session <batcher.Session>`, SQL, `write` modes,
-triggers, watermarks, and output modes all mirror the Spark spelling. The
-{doc}`/getting-started/migration/index` maps them verb by verb.
+The API is deliberately close to Spark's. {py:class}`Session <batcher.Session>`, SQL, `write` modes, triggers, watermarks and output modes all mirror the Spark spelling, and {doc}`/getting-started/migration/index` maps them verb by verb.
+
+## Requirements and limitations
+
+The single-node board doesn't show what Spark does best. The following gaps are where Spark leads:
+
+- **Shuffle survivability.** Batcher's shuffle can spill to disk, but the spill directory is worker-local, so a bucket outlives its worker only if a replica does. Spark's external shuffle service keeps shuffle output after the executor that wrote it is gone.
+- **Streaming guarantees.** Batcher's streaming is micro-batch. It can't express what a continuous-operator engine expresses, which is a limitation against Flink first and Spark Structured Streaming second.
+- **Lakehouse formats.** Batcher reaches Iceberg and Delta through `pyiceberg` and `delta-rs` rather than through its own table-format implementation, so format support tracks those libraries.
+- **Cluster scale.** No recorded benchmark sets Batcher against a tuned Spark cluster. Don't read this page as a claim about petabyte-scale Spark.
+
+## Reproduce
+
+The following commands rerun the Spark measurements. Spark needs a JVM as well as the `pyspark` wheel, and without one its adapter reports unavailable and the lineup drops it:
+
+```bash
+python benchmarks/run.py --benchmark tpch --engines batcher,spark
+python benchmarks/scenarios/streaming_throughput.py
+```
 
 ## See also
 
-- {doc}`/benchmarks/results/scaling`: the distributed measurements that do exist.
+- {doc}`/benchmarks/results/scaling`: the distributed measurements.
 - {doc}`/benchmarks/methodology`: what has to be true before a number is published.
-- {doc}`/architecture/optimization`: how breaker-level re-planning works.
-- {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization`: the pipeline-breaker
-  mechanism, in detail.
-- {doc}`/architecture/deep-dives/adaptive/learned-metadata`: the feedback that outlives the
-  query.
-- {doc}`/getting-started/migration/index`: `Session`, SQL, triggers, watermarks, output
-  modes, verb by verb.
+- {doc}`/architecture/optimization`: how stage-boundary re-planning works.
+- {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization`: the mechanism and its size floor, in detail.
+- {doc}`/architecture/deep-dives/adaptive/learned-metadata`: the feedback that outlives the query.
+- {doc}`/getting-started/migration/index`: `Session`, SQL, triggers, watermarks and output modes, verb by verb.

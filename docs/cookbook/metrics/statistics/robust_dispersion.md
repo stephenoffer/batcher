@@ -1,6 +1,8 @@
 # Robust dispersion
 
-Standard deviation is a poor summary of a long-tailed distribution, which describes most latency and revenue data. These are the quantile-based alternatives: a single extreme row shifts them barely at all, so a dashboard built on them stops flapping.
+Standard deviation is a poor summary of a long-tailed column. One extreme row is enough to move it.
+
+The script appends a single value of 100,000 to the numbers 1 through 20. The standard deviation grows more than a hundredfold, while the median, trimean, and midhinge barely move. Reach for these quantile-based measures, such as the interdecile range and the robust coefficient of variation, when one bad row shouldn't make a dashboard flap.
 
 The whole script, executed on every test run:
 

@@ -46,8 +46,8 @@ many workers were added, so the busiest bucket did not move while every other on
 ## Adapting to the data
 
 The sort has no single algorithm, and which one runs is decided from the *data* rather than
-from the query. Four shapes get their own treatment, and all four now apply to every key
-family rather than only to numbers or only to text.
+from the query. Four shapes get their own treatment, and all four apply to every key family
+rather than only to numbers or only to text.
 
 | The data is | What happens | Where |
 |---|---|---|
@@ -70,8 +70,8 @@ differs inside its bytes and is above both. The float path's `nextafter` is the 
 representable* value. This one is the successor exactly.
 
 Measured over 600,000 rows with 40% on one value, the busiest bucket used to sit at 240,000
-rows at 8, 16 and 32 buckets alike, an overload of 3.2x, 6.4x and 12.8x. It now tracks the
-even share at 1.00x throughout.
+rows at 8, 16 and 32 buckets alike, an overload of 3.2x, 6.4x and 12.8x. With the hot value
+split, it tracks the even share at 1.00x throughout.
 
 :::{note}
 The rearrangement is sound only because every row it moves *ties* on the key, so their relative

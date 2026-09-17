@@ -1,6 +1,8 @@
 # Save modes and manifests
 
-The default refuses to clobber, which is the safe choice for a job that might be retried. `overwrite` replaces, `append` adds. Every write returns a manifest describing what it actually produced, which is what you record for lineage or resume.
+`ds.write` defaults to `mode="overwrite"`, so writing to a path that already exists replaces it. Pass `mode="error"` when a retried job must not clobber earlier output, or `mode="ignore"` to skip the write.
+
+`mode="append"` raises a `PlanError` on a plain file sink, because there is no table to add to. The script shows the two alternatives: one file per batch under a directory, read back as one relation, or a transactional Delta, Iceberg, or Hudi sink with a real append. Every write returns a `WriteManifest` describing what it produced, which is what you record for lineage or a resume.
 
 The whole script, executed on every test run:
 

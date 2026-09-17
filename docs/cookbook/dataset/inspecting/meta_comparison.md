@@ -1,6 +1,8 @@
 # Join estimates
 
-`ds.meta.against(other)` asks the question worth asking first: will this join produce anything at all? A join that returns zero rows because the keys never overlap is one of the quietest failures a pipeline has. The two footers usually knew.
+`ds.meta.against(other)` asks the question worth asking before a join: will it produce anything at all? A join that returns zero rows because the keys never overlap is one of the quietest failures a pipeline has, and the key ranges can often say so before you pay for the join.
+
+The script checks key overlap and estimated join size on a matching pair of tables, catches a pair whose ids never overlap, and wraps that in a guard that raises before the join runs. The second half reads `ds.meta.approx`, the sketch-backed statistics, which return `None` rather than guess when nothing has been recorded for a column.
 
 The whole script, executed on every test run:
 

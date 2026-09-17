@@ -1,6 +1,8 @@
 # Outlier detection
 
-A per-column rule misses the point that a row can be unremarkable on every axis and still be absurd as a combination. Mahalanobis distance catches that, which is why it is the one to reach for on correlated features.
+A per-column rule misses a row that is unremarkable on every axis and absurd as a combination. Mahalanobis distance catches it, which is why it is the one to reach for on correlated features.
+
+The script applies the IQR and z-score rules per column, then ranks rows by `mahalanobis_distance`. The row it puts first is 155 cm tall and weighs 200 kg, and its height alone looks perfectly ordinary.
 
 The whole script, executed on every test run:
 

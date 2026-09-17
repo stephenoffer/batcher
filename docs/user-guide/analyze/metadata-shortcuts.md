@@ -1,13 +1,10 @@
 # Metadata shortcuts
 
+This page covers how Batcher answers questions from metadata instead of data, and the optional `ds.meta` namespace that lets you ask the metadata layer directly.
+
 Most of what people ask a dataset, the dataset already knows.
 
-A Parquet footer records every column's minimum, maximum, and null count. An ORC stripe
-header records its row count. A lakehouse manifest records both, per file. A warehouse
-catalog records them per table. And an in-memory relation, being immutable, can compute
-them once and remember them forever. So when you ask "how many rows is that?", or "does
-this column have gaps?", or "is `id` actually unique?", there is very often nothing to
-compute, only something to read.
+A Parquet footer records every column's minimum, maximum, and null count. An ORC stripe header records its row count. A lakehouse manifest records both, per file. A warehouse catalog records them per table. And an in-memory relation, being immutable, can compute them once and remember them forever. So when you ask "how many rows is that?", or "does this column have gaps?", or "is `id` actually unique?", there is very often nothing to compute, only something to read.
 
 You do not have to ask for any of it. It happens underneath the API you already use:
 
@@ -25,37 +22,29 @@ ds.join(dim, on="region_id").collect()  # key ranges disjoint? no shuffle at all
 ds.dq.not_null("id").in_range("amount", 0, 1e6).fail()  # a contract the footer discharges
 ```
 
-Each of those is an ordinary call. Each one, on this data, costs a metadata round trip
-instead of a scan. Nothing in that snippet mentions metadata, and that is the point.
+Each of those is an ordinary call. Each one, on this data, costs a metadata round trip instead of a scan. Nothing in that snippet mentions metadata, and that is the point.
 
-The rest of this page explains *when* it fires, so you can tell why something was slow.
-It then covers {py:obj}`ds.meta <batcher.Dataset.meta>`, an *optional* introspection namespace for asking the metadata
-layer directly. You will rarely need it. Reach for it when you want to know what the engine
-knows, or to ask something the ordinary API has no spelling for, such as "would this join
-match anything?" or "how many files am I about to open?".
+The rest of this page explains *when* it fires, so you can tell why something was slow. It then covers {py:obj}`ds.meta <batcher.Dataset.meta>`, an *optional* introspection namespace for asking the metadata layer directly. You will rarely need it. Reach for it when you want to know what the engine knows, or to ask something the ordinary API has no spelling for, such as "would this join match anything?" or "how many files am I about to open?".
 
 ## The one rule that makes it safe
 
-**A shortcut returns exactly what executing would return.** Not an estimate of it, not a
-usually-right version of it. The same value.
+A shortcut returns exactly what executing would return. Not an estimate of it, not a usually-right version of it. The same value.
 
-That is not a hope. It is how the layer is built: Kyber only answers from a statistic whose
-provenance is *exact*, meaning a footer bound, a manifest count, or an immutable relation's
-own measurement. If the statistic it needs is missing or merely estimated, it declines, and
-`ds.meta` quietly runs the query that computes the answer instead. Which of the two happened
-is invisible to you, because the answers are identical. Only the cost moves.
+That is not a hope. It is how the layer is built: Kyber only answers from a statistic whose provenance is *exact*, meaning a footer bound, a manifest count, or an immutable relation's own measurement. If the statistic it needs is missing or merely estimated, it declines, and `ds.meta` quietly runs the query that computes the answer instead. Which of the two happened is invisible to you, because the answers are identical. Only the cost moves.
 
-So you never have to decide whether a shortcut is "safe here". It degrades to the query you
-would have written anyway.
+So you never have to decide whether a shortcut is "safe here". It degrades to the query you would have written anyway.
 
-The one exception is deliberately named: everything under {py:obj}`ds.meta.approx <batcher.api.dataset.meta.frame.DatasetMeta.approx>` is **approximate
-and never executes**. It answers from a sketch or returns `None`. More on that below.
+Two properties of the statistic decide which way a question goes, and every branch returns the same value:
+
+![A decision tree for a question about the data, such as a count, a min, a filter or a join, asked through any terminal. First: is an exact statistic recorded, meaning a footer bound, a manifest count, or an immutable relation's own measurement? If not, or if it is only estimated, the query runs, returning the same answer at full cost. If so, second: are the rows unchanged since the statistic was measured, with no filter, join, computed column or map_batches in between? If so, the question is answered from metadata, with the same value and no scan. If not, the statistic is only a bound now, so third: does that bound refute the question, as a comparison past the recorded maximum or key ranges that cannot overlap do? If so, the result is provably empty: a filter reads no files and a join does no shuffle. If not, a bound is not an answer and the query runs. Which path ran is invisible, because every branch returns what executing would return and only the cost moves. The one named exception is ds.meta.approx, which never executes and answers from a sketch or returns None.](/_static/diagrams/metadata_shortcut_decision.svg)
+
+The one exception is deliberately named: everything under {py:obj}`ds.meta.approx <batcher.api.dataset.meta.frame.DatasetMeta.approx>` is approximate and never executes. It answers from a sketch or returns `None`. More on that below.
 
 ## What the ordinary API gets for free
 
 These are the calls people already write. Nothing here needs `ds.meta`.
 
-| you write | what it costs, when the metadata is there |
+| You write | What it costs, when the metadata is there |
 |---|---|
 | {py:meth}`ds.count() <batcher.Dataset.count>`, `len(ds)`, {py:meth}`ds.is_empty() <batcher.Dataset.is_empty>`, {py:obj}`ds.has_rows <batcher.Dataset.has_rows>` | a recorded row count |
 | {py:meth}`ds.min(c) <batcher.Dataset.min>`, {py:meth}`ds.max(c) <batcher.Dataset.max>` | a footer bound |
@@ -64,19 +53,14 @@ These are the calls people already write. Nothing here needs `ds.meta`.
 | `ds.filter(p).count()` where `p` is `IS NULL` / out of range | the null count, or zero |
 | {py:meth}`ds.drop_nulls(c) <batcher.Dataset.drop_nulls>` / {py:meth}`ds.fill_null(...) <batcher.Dataset.fill_null>` on a column with no nulls | a no-op |
 | {py:meth}`ds.limit(n) <batcher.Dataset.limit>` with `n` at or above the row count | a no-op |
-| {py:meth}`ds.join(other, on=k) <batcher.Dataset.join>` whose key ranges are **disjoint** | no build, no probe, no shuffle |
+| {py:meth}`ds.join(other, on=k) <batcher.Dataset.join>` whose key ranges are disjoint | no build, no probe, no shuffle |
 | {py:meth}`ds.dq.not_null(...).fail() <batcher.api.dataset.dq.DatasetDQ.not_null>`, `.drop()`, or `.validate()` on a contract that holds | three numbers |
 
-The last two are the ones that change what a query costs rather than shaving it. A join whose
-key ranges cannot overlap emits nothing, which is provable from four numbers with neither
-side read. And a data-quality contract exists precisely to *confirm* that data is fine,
-which is the answer a footer usually already contains.
+The last two are the ones that change what a query costs rather than shaving it. A join whose key ranges cannot overlap emits nothing, which is provable from four numbers with neither side read. And a data-quality contract exists precisely to *confirm* that data is fine, which is the answer a footer usually already contains.
 
 ## Introspection: `ds.meta`
 
-Everything from here on is the *optional* namespace. You do not need it for any of the speed
-above. It exists to ask the metadata layer directly: what does the engine know, why wasn't
-that free, and the handful of questions the ordinary API has no spelling for.
+Everything from here on is the *optional* namespace. You do not need it for any of the speed above. It exists to ask the metadata layer directly: what does the engine know, why wasn't that free, and the handful of questions the ordinary API has no spelling for.
 
 The examples run against this dataset:
 
@@ -99,15 +83,11 @@ ds = bt.from_pydict(
 )
 ```
 
-### What it costs, and when it doesn't help
+## When a shortcut doesn't apply
 
-A filter usually takes the shortcut away. A footer's minimum is the smallest value
-*in the file*; once you filter the file, it is only a bound on the smallest surviving value,
-and a bound is not an answer. Joins, computed columns, and `map_batches` do the same.
+A filter usually takes the shortcut away. A footer's minimum is the smallest value *in the file*. Once you filter the file, it is only a bound on the smallest surviving value, and a bound is not an answer. Joins, computed columns, and `map_batches` do the same.
 
-{py:meth}`ds.meta.explain() <batcher.api.dataset.meta.frame.DatasetMeta.explain>` tells you exactly what is known, and is the fastest way to see why
-something fell back to a scan. It reports the exact row count (or `None`), the estimate, the
-recorded ordering, and per column every facet provable without a scan.
+{py:meth}`ds.meta.explain() <batcher.api.dataset.meta.frame.DatasetMeta.explain>` tells you exactly what is known, and is the fastest way to see why something fell back to a scan. It reports the exact row count (or `None`), the estimate, the recorded ordering, and per column every facet provable without a scan.
 
 ```python
 report = ds.meta.explain()
@@ -117,10 +97,7 @@ assert report["columns"]["amount"]["min"] == 3.25
 
 ## Rows, and whole-relation questions
 
-`shape` gives you `(rows, columns)`. `count_where` counts a filter's survivors, often for
-free, since `col IS NULL` is a recorded null count and a comparison above the recorded
-maximum is provably zero. {py:meth}`is_empty_where <batcher.api.dataset.meta.frame.DatasetMeta.is_empty_where>`, {py:meth}`any_match <batcher.api.dataset.meta.frame.DatasetMeta.any_match>`, {py:meth}`none_match <batcher.api.dataset.meta.frame.DatasetMeta.none_match>`, and {py:meth}`all_match <batcher.api.dataset.meta.frame.DatasetMeta.all_match>` are
-the boolean forms, and `none_match` is the one a pruning decision reads best as.
+`shape` gives you `(rows, columns)`. `count_where` counts a filter's survivors, often for free, since `col IS NULL` is a recorded null count and a comparison above the recorded maximum is provably zero. {py:meth}`any_match <batcher.api.dataset.meta.frame.DatasetMeta.any_match>`, {py:meth}`none_match <batcher.api.dataset.meta.frame.DatasetMeta.none_match>`, and {py:meth}`all_match <batcher.api.dataset.meta.frame.DatasetMeta.all_match>` are the boolean forms, and `none_match` is the one a pruning decision reads best as.
 
 ```python
 assert ds.meta.shape() == (4, 8)
@@ -128,13 +105,10 @@ assert ds.meta.count_where(bt.col("amount").is_null()) == 0
 assert ds.meta.none_match(bt.col("amount") > 1_000_000)  # provably no such row, no scan
 assert ds.meta.all_match(bt.col("status") == "ok")
 assert ds.meta.any_match(bt.col("amount") > 50)
-assert ds.meta.is_empty_where(bt.col("amount") > 1_000_000)
+assert ds.meta.none_match(bt.col("amount") > 1_000_000)
 ```
 
-{py:meth}`is_key <batcher.api.dataset.meta.frame.DatasetMeta.is_key>` checks a candidate primary key (unique *and* never null), for one column or a
-composite. {py:meth}`sorted_by <batcher.api.dataset.meta.frame.DatasetMeta.sorted_by>` reports the ordering the data is already known to carry, and
-{py:meth}`is_known_sorted_by <batcher.api.dataset.meta.frame.DatasetMeta.is_known_sorted_by>` tells you whether a sort would be a no-op. Both are one-sided: they
-report what is *recorded*, never guessing that unrecorded means unsorted.
+{py:meth}`is_key <batcher.api.dataset.meta.frame.DatasetMeta.is_key>` checks a candidate primary key (unique *and* never null), for one column or a composite. {py:meth}`sorted_by <batcher.api.dataset.meta.frame.DatasetMeta.sorted_by>` reports the ordering the data is already known to carry, and {py:meth}`is_known_sorted_by <batcher.api.dataset.meta.frame.DatasetMeta.is_known_sorted_by>` tells you whether a sort would be a no-op. Both are one-sided: they report what is *recorded*, never guessing that unrecorded means unsorted.
 
 ```python
 assert ds.meta.is_key("id")
@@ -146,8 +120,7 @@ assert ds.meta.is_known_sorted_by("day") is False
 
 ## One column at a time with `ds.meta.col(...)`
 
-{py:meth}`ds.meta.col(name) <batcher.api.dataset.meta.frame.DatasetMeta.col>` narrows the namespace to a single column. Every method below is
-answered from a recorded statistic when there is one, and from a query when there is not.
+{py:meth}`ds.meta.col(name) <batcher.api.dataset.meta.frame.DatasetMeta.col>` narrows the namespace to a single column. Every method below is answered from a recorded statistic when there is one, and from a query when there is not.
 
 ```python
 c = ds.meta.col("amount")
@@ -172,15 +145,11 @@ assert c.mean() == 34.4375
 assert c.summary()["n_unique"] == 4  # all of the above, as one dict
 ```
 
-`sum` and `mean` are the interesting pair. No footer records a sum, so they usually run an
-aggregate. But an immutable in-memory relation *computes and caches* one the first time you
-ask, so the second query that needs it is free. That is the
-learned-metadata idea in miniature: a query that gets cheaper the more it runs.
+`sum` and `mean` are the interesting pair. No footer records a sum, so they usually run an aggregate. But an immutable in-memory relation *computes and caches* one the first time you ask, so the second query that needs it is free. That is the learned-metadata idea in miniature: a query that gets cheaper the more it runs.
 
 ## Predicates on a column with `ds.meta.col(...).check`
 
-A minimum and a maximum are not only statistics. They are *values that occur in the column*,
-and that turns a whole class of questions into arithmetic on two numbers.
+A minimum and a maximum are not only statistics. They are *values that occur in the column*, and that turns a whole class of questions into arithmetic on two numbers.
 
 ```python
 amt = ds.meta.col("amount").check
@@ -202,12 +171,9 @@ assert not amt.any_less_than(0)
 assert not amt.any_less_equal(0)
 ```
 
-`any_greater_than` is worth dwelling on. A maximum *above* the threshold proves a match
-exists, and a maximum *at or below* it proves none does. That second half answers
-`WHERE amount > 1000000` over a column whose maximum is 99 with "no rows", without opening
-the file.
+`any_greater_than` is worth dwelling on. A maximum *above* the threshold proves a match exists, and a maximum *at or below* it proves none does. That second half answers `WHERE amount > 1000000` over a column whose maximum is 99 with "no rows", without opening the file.
 
-Membership is the other half, and it is **asymmetric** on purpose:
+Membership is the other half, and it is asymmetric on purpose:
 
 ```python
 ids = ds.meta.col("id").check
@@ -220,16 +186,11 @@ assert ids.any_in([3, 4])  # SQL IN, refuted for free when every candidate is ou
 assert ids.none_in([9998, 9999])
 ```
 
-A value outside `[min, max]`, or one a membership bloom rejects, is *not in the column*, and
-cannot be in any subset of it. That refutation is what skips a file, a partition, or a whole
-query. Presence is the other direction, and bounds cannot confirm it unless the column is
-constant, so a "maybe" runs the filter. `may_contain` never executes at all, and a `False`
-from it is always safe to act on.
+A value outside `[min, max]`, or one a membership bloom rejects, is *not in the column*, and cannot be in any subset of it. That refutation is what skips a file, a partition, or a whole query. Presence is the other direction, and bounds cannot confirm it unless the column is constant, so a "maybe" runs the filter. `may_contain` never executes at all, and a `False` from it is always safe to act on.
 
 ## Missing data with `ds.meta.nulls`
 
-The `nulls` namespace answers whole-relation completeness questions across every column at
-once.
+The `nulls` namespace answers whole-relation completeness questions across every column at once.
 
 ```python
 assert ds.meta.nulls.counts()["amount"] == 0  # every column, one question
@@ -241,13 +202,11 @@ assert ds.meta.nulls.columns_with_nulls() == []
 assert "amount" in ds.meta.nulls.complete_columns()
 ```
 
-When the footers cannot answer, this runs **one** aggregate covering every column, never
-one pass per column.
+When the footers cannot answer, this runs one aggregate covering every column, never one pass per column.
 
 ## Types with `ds.meta.schema`
 
-The cheapest shortcuts here: the plan knows its own output schema, so these never touch data
-and can never be wrong.
+The cheapest shortcuts here: the plan knows its own output schema, so these never touch data and can never be wrong.
 
 ```python
 schema = ds.meta.schema
@@ -275,8 +234,7 @@ assert schema.select("numeric").columns == ["id", "user_id", "amount"]
 
 ## Physical layout with `ds.meta.storage`
 
-What a scan *would* read, before it reads it. "340 files, 12 GB, partitioned by day" is a
-sentence you can act on, and it costs one metadata round trip to say.
+What a scan *would* read, before it reads it. "340 files, 12 GB, partitioned by day" is a sentence you can act on, and it costs one metadata round trip to say.
 
 ```python
 storage = ds.meta.storage
@@ -295,42 +253,30 @@ assert storage.total_bytes() > 0  # what the resident Arrow batches retain
 assert storage.bytes_per_row() == storage.total_bytes() / storage.row_count()
 ```
 
-`total_bytes` reports whatever each source can state for free, so its meaning follows the
-source. A Parquet source reports the stored, compressed size from its footer, which is what
-predicts scan time. An in-memory relation reports the size its Arrow buffers actually
-retain, which is uncompressed and therefore wider per row. Both are exact for what they
-measure, and `row_group_count` stays `None` here because an in-memory relation has no
-physical blocks a zone-map prune could skip.
+`total_bytes` reports whatever each source can state for free, so its meaning follows the source. A Parquet source reports the stored, compressed size from its footer, which is what predicts scan time. An in-memory relation reports the size its Arrow buffers actually retain, which is uncompressed and therefore wider per row. Both are exact for what they measure, and `row_group_count` stays `None` here because an in-memory relation has no physical blocks a zone-map prune could skip.
 
-On a Parquet source, `num_files` is the small-files diagnosis without a scan. A thousand
-files for a gigabyte means the query is about to spend its time on footers rather than on
-data. `row_group_count` is the granularity a zone-map prune actually skips at.
+On a Parquet source, `num_files` is the small-files diagnosis without a scan. A thousand files for a gigabyte means the query is about to spend its time on footers rather than on data. `row_group_count` is the granularity a zone-map prune actually skips at.
 
 ## Joins with `ds.meta.against(other)`
 
-The shortcut that saves the most work in absolute terms. If one side's key range is `[1, 10]`
-and the other's is `[900, 999]`, the inner join is **empty**, provably, from four numbers,
-with neither side read. No build, no probe, no shuffle.
+The shortcut that saves the most work in absolute terms. If one side's key range is `[1, 10]` and the other's is `[900, 999]`, the inner join is empty, provably, from four numbers, with neither side read. No build, no probe, no shuffle.
 
 ```python
 absent = bt.from_pydict({"user_id": [900, 901]})
 present = bt.from_pydict({"user_id": [10, 11]})
 
-assert ds.meta.against(absent).join_is_empty("user_id")  # disjoint ranges → no shuffle at all
+assert ds.meta.against(absent).join_is_empty("user_id")  # disjoint ranges, so no shuffle at all
 assert not ds.meta.against(absent).overlaps("user_id")
 assert ds.meta.against(present).overlaps("user_id")
 assert ds.meta.against(present).key_overlap("user_id") == (10, 11)
 assert ds.meta.against(present).estimated_rows("user_id") >= 0
 ```
 
-Only *emptiness* is proved. Overlapping ranges do not imply a match exists, because two key
-columns can share a range and share no value, so an overlap runs the join.
+Only *emptiness* is proved. Overlapping ranges do not imply a match exists, because two key columns can share a range and share no value, so an overlap runs the join.
 
 ## Approximate answers with `ds.meta.approx`
 
-Different contract, and it is named so it cannot be confused with the rest. **Nothing here
-executes, and nothing here is exact.** Each method reads a sketch a previous run recorded, and
-returns `None` if nobody has measured it yet.
+This namespace has a different contract, and its name keeps it from being confused with the rest. Nothing here executes, and nothing here is exact. Each method reads a sketch a previous run recorded, and returns `None` if nobody has measured it yet.
 
 ```python
 approx = ds.meta.approx
@@ -345,52 +291,31 @@ assert isinstance(approx.is_measured("amount"), bool)  # why is the rest returni
 
 # These read sketches a *previous* run recorded, so they are None until the query has run.
 approx.n_unique("user_id")  # from an HLL sketch, or None
-approx.cardinality_ratio("user_id")  # key-like (→ 1) or categorical (→ 0)?
+approx.cardinality_ratio("user_id")  # key-like (near 1) or categorical (near 0)?
 approx.top_k("country", 5)  # a skewed join key, with no GROUP BY
 approx.frequency("country", "US")
 approx.histogram("amount", 4)  # equal-probability buckets from a KLL grid
 ```
 
-`is_measured` is the introspection that explains the rest. These sketches are written by the
-executor when a query runs, so a column nobody has read has nothing measured. Run the query
-once and the second run answers for free.
+`is_measured` is the introspection that explains the rest. These sketches are written by the executor when a query runs, so a column nobody has read has nothing measured. Run the query once and the second run answers for free.
 
-Read it as the coarse question "is anything recorded for this column", because a distinct
-count, a quantile grid, a top-values map, and a plain column width all count. An in-memory
-source already knows a column's width, so `is_measured` reads `True` there while the
-distinct-count sketch is still absent. Test the value you are about to use rather than the
-column as a whole.
+Read it as the coarse question "is anything recorded for this column", because a distinct count, a quantile grid, a top-values map, and a plain column width all count. An in-memory source already knows a column's width, so `is_measured` reads `True` there while the distinct-count sketch is still absent. Test the value you are about to use rather than the column as a whole.
 
-If you need an approximate quantile *now*, use the {py:class}`Dataset <batcher.Dataset>` terminals {py:meth}`ds.approx_median <batcher.Dataset.approx_median>`,
-{py:meth}`ds.approx_quantile <batcher.Dataset.approx_quantile>`, and {py:meth}`ds.approx_n_unique <batcher.Dataset.approx_n_unique>`. They consult the same learned sketches first
-and then stream one if there is none. `ds.meta.approx` is the free-or-nothing probe.
+If you need an approximate quantile *now*, use the {py:class}`Dataset <batcher.Dataset>` terminals {py:meth}`ds.approx_median <batcher.Dataset.approx_median>`, {py:meth}`ds.approx_quantile <batcher.Dataset.approx_quantile>`, and {py:meth}`ds.approx_count_distinct <batcher.Dataset.approx_count_distinct>`. They consult the same learned sketches first and then stream one if there is none. `ds.meta.approx` is the free-or-nothing probe.
 
 ## Where this comes from
 
-`ds.meta` is the user-facing half of Batcher's metadata-first design. The other half is
-invisible: {py:meth}`ds.count() <batcher.Dataset.count>`, {py:meth}`ds.min() <batcher.Dataset.min>`, {py:meth}`ds.n_unique() <batcher.Dataset.n_unique>`, and the optimizer's own pruning all
-consult the same statistics before executing. The `meta` namespace opens that layer up and
-lets you ask it directly. Crucially, it also lets you ask things no SQL terminal has a
-spelling for, such as "would this join match anything?" or "how many files am I about to
-open?".
+`ds.meta` is the user-facing half of Batcher's metadata-first design. The other half is invisible: {py:meth}`ds.count() <batcher.Dataset.count>`, {py:meth}`ds.min() <batcher.Dataset.min>`, {py:meth}`ds.count_distinct() <batcher.Dataset.count_distinct>`, and the optimizer's own pruning all consult the same statistics before executing. The `meta` namespace opens that layer up and lets you ask it directly. It also lets you ask things no SQL terminal has a spelling for, such as "would this join match anything?" or "how many files am I about to open?".
 
-Two deep dives explain the machinery underneath. {doc}`/architecture/deep-dives/adaptive/learned-metadata`
-covers the sketches a finished query records for the next one, and
-{doc}`/architecture/deep-dives/adaptive/cardinality-estimation` covers how the optimizer turns them into row
-estimates. The measured payoff is on {doc}`/benchmarks/results/analytics`, where a `count()`
-after a transform chain returns in 0.05 ms because nothing is scanned.
+Two deep dives explain the machinery underneath. {doc}`/architecture/deep-dives/adaptive/learned-metadata` covers the sketches a finished query records for the next one, and {doc}`/architecture/deep-dives/adaptive/cardinality-estimation` covers how the optimizer turns them into row estimates. The measured payoff is on {doc}`/benchmarks/results/analytics`, where a `count()` after a transform chain returns in 0.05 ms because nothing is scanned.
 
 ## See also
 
-- {doc}`/user-guide/operate/tuning/explain-plans`: confirm that a predicate reached the scan, and that pruning
-  actually happened.
-- {doc}`/user-guide/trust/data-quality`: turn the `ds.meta.col(...).check` probes here into enforced
-  contracts with {py:obj}`ds.dq <batcher.Dataset.dq>`.
-- {doc}`/user-guide/operate/tuning/performance`: the other levers when a query is slower than its metadata suggests
-  it should be.
+- {doc}`/user-guide/operate/tuning/explain-plans`: confirm that a predicate reached the scan, and that pruning actually happened.
+- {doc}`/user-guide/trust/data-quality`: turn the `ds.meta.col(...).check` probes here into enforced contracts with {py:obj}`ds.dq <batcher.Dataset.dq>`.
+- {doc}`/user-guide/operate/tuning/performance`: the other levers when a query is slower than its metadata suggests it should be.
 - {doc}`/user-guide/moving-data/reading-data`: where footer statistics come from, per format.
 - {doc}`/user-guide/moving-data/lakehouse`: manifest-level statistics on Delta, Iceberg, and Hudi tables.
 - {doc}`/api/relational/dataset`: the `ds.meta` reference, namespace by namespace.
-- {doc}`/architecture/internals/execution`: the exact-or-fall-back rule that decides when a
-  statistic is allowed to answer a terminal.
+- {doc}`/architecture/internals/execution`: the exact-or-fall-back rule that decides when a statistic is allowed to answer a terminal.
 - {doc}`/cookbook/dataset/inspecting/meta_schema`: the `meta` accessor as a runnable script.

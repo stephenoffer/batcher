@@ -1,6 +1,8 @@
 # Deduplication
 
-"Remove duplicates" is under-specified. Which copy survives is the whole decision, and leaving it to an arbitrary one is how a pipeline becomes non-deterministic. The latest row by a timestamp is almost always what was meant.
+"Remove duplicates" is under-specified. Which copy survives is the whole decision, and leaving it to an arbitrary one is how a pipeline becomes non-deterministic. The latest row by a version or timestamp is almost always what was meant.
+
+The script contrasts whole-row `distinct` with `distinct(subset=...)` on a key subset, then keeps the latest version per id with a `row_number` window, which is the deterministic spelling. Before deciding anything it counts the duplicated keys, and it shows `ds.meta` answering "is this column a key?" without a full aggregate.
 
 The whole script, executed on every test run:
 

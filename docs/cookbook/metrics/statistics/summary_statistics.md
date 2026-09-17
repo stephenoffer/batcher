@@ -1,6 +1,8 @@
 # Summary statistics
 
-The averages here answer different questions. Geometric mean is the right average for growth rates, harmonic mean for rates and speeds, RMS for magnitudes that cancel. Using the arithmetic mean for all three is the most common quiet mistake in a metrics table.
+The averages here answer different questions. Geometric mean is the right average for growth rates, harmonic mean for rates and speeds, and RMS for magnitudes that cancel. Using the arithmetic mean for all three is the most common quiet mistake in a metrics table.
+
+The script also covers weighted mean and variance, standard error, the coefficient of variation, and the null and distinct rates. Its last check shows nulls dropping out of the mean while `null_rate` still counts them.
 
 The whole script, executed on every test run:
 

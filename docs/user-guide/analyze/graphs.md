@@ -1,13 +1,10 @@
 # Graphs
 
-This page covers graph analytics in Batcher: building a graph from an edge table, running
-the algorithms, and turning a graph into features a model can train on.
+This page covers graph analytics in Batcher: building a graph from an edge table, running centrality, component, community, path, and link-prediction algorithms, and turning a graph into features a model can train on. Every algorithm is relational underneath, so it runs on the same optimizer, spill, and distributed machinery as any other query, over a graph stored wherever a table can be.
 
 ## A graph is an edge table
 
-There is no graph data structure to build and no index to load. A graph is a {py:class}`Dataset <batcher.Dataset>`
-with two columns naming the endpoints, and every algorithm is a sequence of joins and
-aggregations over it:
+There is no graph data structure to build and no index to load. A graph is a {py:class}`Dataset <batcher.Dataset>` with two columns naming the endpoints, and every algorithm is a sequence of joins and aggregations over it:
 
 ```python
 import batcher as bt
@@ -25,23 +22,15 @@ print(bg.summarize(g).to_pydict())
 #  'average_degree': [2.5], 'max_degree': [4], 'isolated': [0], 'directed': [True]}
 ```
 
-That choice is the whole design. A join is a join, so PageRank over a billion edges
-distributes across a Ray cluster and spills under memory pressure using exactly the
-machinery any other query uses. The graph can live wherever a table can: Parquet on
-object storage, a lakehouse table, a database extract. And node identity is whatever the
-column holds, so strings and UUIDs work with no vertex-id mapping on the side.
+That choice is the whole design. A join is a join, so PageRank over an edge table too large for one machine distributes across a Ray cluster and spills under memory pressure using exactly the machinery any other query uses. The graph can live wherever a table can: Parquet on object storage, a lakehouse table, a database extract. And node identity is whatever the column holds, so strings and UUIDs work with no vertex-id mapping on the side.
 
 :::{tip}
-`summarize` is the right first call on any graph you did not build yourself. The cheap
-numbers tell you which expensive algorithms are worth running: a graph that is one giant
-component behaves nothing like a thousand islands, and a degree distribution with a long
-tail makes triangle counting cost far more than its average degree suggests.
+`summarize` is the right first call on any graph you did not build yourself. The cheap numbers tell you which expensive algorithms are worth running: a graph that is one giant component behaves nothing like a thousand islands, and a degree distribution with a long tail makes triangle counting cost far more than its average degree suggests.
 :::
 
 ## Isolated nodes are invisible unless you say otherwise
 
-An edge table cannot express a node with no edges. Such a node appears in no row. That
-silently changes every per-node average:
+An edge table cannot express a node with no edges. Such a node appears in no row. That silently changes every per-node average:
 
 ```python
 g_edges_only = bg.Graph.from_edges(bt.from_pydict({"src": [1], "dst": [2]}))
@@ -53,13 +42,15 @@ print(with_all.num_nodes(), round(bg.average_degree(with_all), 3))
 # 4 0.5
 ```
 
-Both answers are correct for their question. Attach the node table when the denominator
-should include everyone.
+The edge between 1 and 2 is the same in both graphs. What changes is which nodes exist:
+
+![Before and after, over the same single edge row with src 1 and dst 2. Built with Graph.from_edges alone, the graph holds nodes 1 and 2 joined by one edge, because a node with no edges appears in no row and so does not exist: num_nodes() is 2 and average_degree is 1.0. After with_nodes() attaches a node table holding 1, 2, 3 and 4, the graph holds the same edge from 1 to 2 plus nodes 3 and 4, which are isolated with no edges: num_nodes() is 4 and average_degree is 0.5. Both answers are correct for their question.](/_static/diagrams/graph_isolated_nodes.svg)
+
+Both answers are correct for their question. Attach the node table when the denominator should include everyone.
 
 ## Centrality: who matters
 
-`pagerank` is the default. A node scores highly when important nodes point at it and do
-not point at much else, which is what makes it far harder to game than degree:
+`pagerank` is the default. A node scores highly when important nodes point at it and do not point at much else, which is what makes it far harder to game than degree:
 
 ```python
 star = bt.from_pydict({"src": [1, 2, 3, 4], "dst": [0, 0, 0, 0]})
@@ -69,13 +60,9 @@ print([(n, round(v, 4)) for n, v in zip(*ranked.to_pydict().values())])
 # [(0, 0.5238), (1, 0.119), (2, 0.119), (3, 0.119), (4, 0.119)]
 ```
 
-Ranks sum to 1, including the mass that would otherwise leak. A node with no outgoing
-edges (node 0 here) has nowhere to send its rank, and a hand-rolled PageRank that does
-not redistribute that mass quietly stops summing to 1 while still looking plausible.
+Ranks sum to 1, including the mass that would otherwise leak. A node with no outgoing edges, such as node 0 here, has nowhere to send its rank, and a hand-rolled PageRank that does not redistribute that mass quietly stops summing to 1 while still looking plausible.
 
-`personalized_pagerank` teleports back to a chosen set instead of anywhere, which is the
-recommendation primitive. Seed it with the items one user touched, and the ranking that
-comes back orders everything else by closeness to those, measured through the whole graph.
+`personalized_pagerank` teleports back to a chosen set instead of anywhere, which is the recommendation primitive. Seed it with the items one user touched, and the ranking that comes back orders everything else by closeness to those, measured through the whole graph.
 
 ```python
 chain = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2, 3], "dst": [2, 3, 4]}))
@@ -89,13 +76,9 @@ print(
 # [(1, 0.314), (2, 0.267), (3, 0.227), (4, 0.193)]
 ```
 
-`hits` makes a distinction PageRank cannot: on a citation graph a survey paper and a
-seminal paper are both important, in opposite directions. It reports a hub score and an
-authority score per node.
+`hits` makes a distinction PageRank cannot. On a citation graph a survey paper and a seminal paper are both important, in opposite directions. It reports a hub score and an authority score per node.
 
-`betweenness_centrality` finds *bridges* rather than hubs: a node joining two dense
-clusters can have a small degree and a tiny PageRank while every path between the clusters
-runs through it. That is the single-point-of-failure measure.
+`betweenness_centrality` finds *bridges* rather than hubs. A node joining two dense clusters can have a small degree and a tiny PageRank while every path between the clusters runs through it. That is the single-point-of-failure measure.
 
 ```python
 bridge = bt.from_pydict({"src": ["a", "b", "c", "d"], "dst": ["c", "c", "d", "e"]})
@@ -105,9 +88,7 @@ print(scored.sort("betweenness", descending=True).to_pydict())
 # {'node': ['c', 'd', 'a', 'b', 'e'], 'betweenness': [4.0, 2.0, 0.0, 0.0, 0.0]}
 ```
 
-It is an estimate over the sources you give it, because the exact measure needs shortest
-paths from every node. The values scale with the source count, so compare ranks between
-runs rather than magnitudes.
+It is an estimate over the sources you give it, because the exact measure needs shortest paths from every node. The values scale with the source count, so compare ranks between runs rather than magnitudes.
 
 ## Components: what the pieces are
 
@@ -120,12 +101,9 @@ print(bg.largest_component(ig).num_edges())
 # 2
 ```
 
-Component labels are the smallest node id in the component rather than an arbitrary
-number, so they are stable across runs and comparable between them.
+Component labels are the smallest node id in the component rather than an arbitrary number, so they are stable across runs and comparable between them.
 
-`k_core` is the graduated version: repeatedly removing every node with fewer than `k`
-neighbours leaves the densely interconnected part. The removal cascades, since dropping a
-node lowers its neighbours' degrees too.
+`k_core` is the graduated version: repeatedly removing every node with fewer than `k` neighbors leaves the densely interconnected part. The removal cascades, since dropping a node lowers its neighbors' degrees too.
 
 ```python
 triangle_plus_tail = bt.from_pydict({"src": [1, 2, 3, 1], "dst": [2, 3, 1, 9]})
@@ -135,15 +113,10 @@ print(sorted(bg.k_core(tg, 2).nodes().to_pydict()["node"]))
 ```
 
 :::{warning}
-`Graph.to_undirected` materializes both directions of every edge, so on the result
-`degree` counts each neighbour twice. Use `out_degree` for a neighbour count on a
-symmetrized graph. Getting this wrong is why a k-core would keep the pendant nodes it
-exists to peel.
+`Graph.to_undirected` materializes both directions of every edge, so on the result `degree` counts each neighbor twice. Use `out_degree` for a neighbor count on a symmetrized graph. Getting this wrong is why a k-core would keep the pendant nodes it exists to peel.
 :::
 
-On a *directed* graph, "connected" has a second, stronger meaning: two nodes are in the
-same **strongly** connected component only when each can reach the other following edge
-direction. A chain is one weak component and N strong ones, because nothing gets back:
+On a *directed* graph, "connected" has a second, stronger meaning: two nodes are in the same *strongly* connected component only when each can reach the other following edge direction. A chain is one weak component and N strong ones, because nothing gets back:
 
 ```python
 chain_and_cycle = bt.from_pydict({"src": [1, 2, 3, 3], "dst": [2, 3, 1, 4]})
@@ -156,11 +129,9 @@ print(bg.connected_components(dg).sort("node").to_pydict()["component"])
 
 ## Dependency graphs
 
-A build order, a task schedule and a package graph are one question. Can these be ordered
-so every edge points forward? If not, what is in the way?
+A build order, a task schedule and a package graph are one question. Can these be ordered so every edge points forward? If not, what is in the way?
 
-`topological_order` returns *levels* rather than a flat sequence, because nodes at the
-same level are mutually independent and a scheduler can run a whole level at once:
+`topological_order` returns *levels* rather than a flat sequence, because nodes at the same level are mutually independent and a scheduler can run a whole level at once:
 
 ```python
 deps = bt.from_pydict({"src": ["a", "a", "b", "c"], "dst": ["b", "c", "d", "d"]})
@@ -168,9 +139,7 @@ print(bg.topological_order(bg.Graph.from_edges(deps)).sort("node").to_pydict())
 # {'node': ['a', 'b', 'c', 'd'], 'level': [0, 1, 1, 2]}
 ```
 
-A node inside or downstream of a cycle can never lose its last incoming edge, so it is
-absent from the order. That makes the count the acyclicity test, and it means the
-diagnostic comes free:
+A node inside or downstream of a cycle can never lose its last incoming edge, so it is absent from the order. That makes the count the acyclicity test, and it means the diagnostic comes free:
 
 ```python
 broken = bt.from_pydict({"src": ["a", "b", "c", "c"], "dst": ["b", "c", "b", "d"]})
@@ -181,8 +150,7 @@ print(bg.is_dag(bg_broken), sorted(bg.nodes_in_cycles(bg_broken).to_pydict()["no
 
 ## Triangles, clustering and communities
 
-Triangles are the smallest structure that distinguishes a real social graph from a random
-one with the same degrees. If your friends know each other, the graph has triangles.
+Triangles are the smallest structure that distinguishes a real social graph from a random one with the same degrees. If your friends know each other, the graph has triangles.
 
 ```python
 two_triangles = bt.from_pydict({"src": [1, 2, 1, 4, 5, 4], "dst": [2, 3, 3, 5, 6, 6]})
@@ -191,9 +159,7 @@ print(bg.triangles(cg).count(), round(bg.average_clustering(cg), 3))
 # 2 1.0
 ```
 
-`label_propagation` finds communities in near-linear time with no parameter beyond a
-round cap, and `modularity` scores the result. Above roughly 0.3 means real structure;
-near zero means the partition explains nothing the degree sequence does not already:
+`label_propagation` finds communities in near-linear time with no parameter beyond a round cap, and `modularity` scores the result. Above roughly 0.3 means real structure, and near zero means the partition explains nothing the degree sequence does not already:
 
 ```python
 communities = bg.label_propagation(cg)
@@ -204,16 +170,12 @@ print(round(bg.modularity(cg, communities), 4))
 ```
 
 :::{important}
-Triangle counting is a three-way join, so its cost is driven by the highest-degree node
-rather than the average. On a scale-free graph one celebrity account can dominate the
-whole run. Run `k_core` first, or cap the degree, before counting triangles on a large
-graph.
+Triangle counting is a three-way join, so its cost is driven by the highest-degree node rather than the average. On a scale-free graph one celebrity account can dominate the whole run. Run `k_core` first, or cap the degree, before counting triangles on a large graph.
 :::
 
 ## Distances
 
-`bfs` expands a frontier one hop at a time, so its cost is proportional to the part of
-the graph it reaches rather than to the whole of it:
+`bfs` expands a frontier one hop at a time, so its cost is proportional to the part of the graph it reaches rather than to the whole of it:
 
 ```python
 path = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2, 3], "dst": [2, 3, 4]}))
@@ -221,8 +183,7 @@ print(bg.bfs(path, bt.from_pydict({"node": [1]})).sort("node").to_pydict())
 # {'node': [1, 2, 3, 4], 'depth': [0, 1, 2, 3]}
 ```
 
-`shortest_path_lengths` is the weighted version, and it finds the cheap detour rather than
-the short one:
+`shortest_path_lengths` is the weighted version, and it finds the cheap detour rather than the short one:
 
 ```python
 detour = bt.from_pydict({"src": [1, 1, 2], "dst": [2, 3, 3], "w": [1.0, 9.0, 1.0]})
@@ -231,14 +192,11 @@ print(bg.shortest_path_lengths(dg, bt.from_pydict({"node": [1]})).sort("node").t
 # {'node': [1, 2, 3], 'distance': [0.0, 1.0, 2.0]}
 ```
 
-There is no all-pairs function. That is deliberate: an all-pairs distance matrix is
-quadratic in node count and does not fit anywhere. `harmonic_centrality` and
-`diameter_estimate` take a set of sources and are named for being estimates.
+There is no all-pairs function. That is deliberate, because an all-pairs distance matrix is quadratic in node count and does not fit anywhere. `harmonic_centrality` and `diameter_estimate` take a set of sources and are named for being estimates.
 
 ## Link prediction
 
-Which unconnected pairs look like they should be? The scores differ in how much a shared
-neighbour is worth:
+Which unconnected pairs look like they should be? The scores differ in how much a shared neighbor is worth:
 
 ```python
 social = bt.from_pydict({"src": [1, 3, 1, 3], "dst": [2, 2, 4, 4]})
@@ -251,25 +209,17 @@ print([round(v, 4) for v in scored.to_pydict()["adamic_adar"]])
 # [2.8854, 2.8854]
 ```
 
-`adamic_adar` weights a shared neighbour by `1 / log(its degree)`, on the insight that
-sharing an obscure neighbour is strong evidence and sharing a celebrity is almost none.
-`preferential_attachment` ignores neighbours entirely and scores by degree, which makes it
-the baseline the others have to beat: a neighbourhood score that does not is not using the
-neighbourhood.
+`adamic_adar` weights a shared neighbor by `1 / log(its degree)`, on the insight that sharing an obscure neighbor is strong evidence and sharing a celebrity is almost none. `preferential_attachment` ignores neighbors entirely and scores by degree, which makes it the baseline the others have to beat. A neighborhood score that does not beat it is not using the neighborhood.
 
 :::{warning}
-`candidate_pairs` is a self-join of the adjacency table, so its cost is the sum of squared
-degrees. One node with a million neighbours produces a trillion pairs on its own. Pass
-`max_degree` to drop hubs from the generator, which loses few real candidates for exactly
-the reason `adamic_adar` formalizes.
+`candidate_pairs` is a self-join of the adjacency table, so its cost is the sum of squared degrees. One node with a million neighbors produces a trillion pairs on its own. Pass `max_degree` to drop hubs from the generator, which loses few real candidates for exactly the reason `adamic_adar` formalizes.
 :::
 
 ## Graph ML: sampling and features
 
 A GNN cannot see a large graph at once. The two standard ways around that are both here.
 
-`neighbor_sample` bounds how many neighbours each node contributes, so a layer's cost is
-set by the bound rather than by the worst node. This is GraphSAGE, applied once per layer:
+`neighbor_sample` bounds how many neighbors each node contributes, so a layer's cost is set by the bound rather than by the worst node. This is GraphSAGE, applied once per layer:
 
 ```python
 skew = bt.from_pydict({"src": [1, 1, 1, 1, 2], "dst": [2, 3, 4, 5, 3]})
@@ -278,9 +228,7 @@ print(bg.neighbor_sample(kg, 2).group_by("src").agg(n=bt.count()).sort("src").to
 # {'src': [1, 2], 'n': [2, 1]}
 ```
 
-`random_walks` turns the graph into sequences, which is how DeepWalk and node2vec produce
-node embeddings: feed the walks to a word-embedding model and the geometry that comes back
-reflects the graph's structure.
+`random_walks` turns the graph into sequences, which is how DeepWalk and node2vec produce node embeddings: feed the walks to a word-embedding model and the geometry that comes back reflects the graph's structure.
 
 ```python
 cycle = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2, 3], "dst": [2, 3, 1]}))
@@ -289,12 +237,9 @@ print(walk.sort("step").to_pydict()["node"])
 # [1, 2, 3, 1]
 ```
 
-Both are deterministic given a seed. That is not politeness: a neighbour sample that
-changes between the training and inference passes is an accuracy loss that looks like
-drift, and an embedding trained on walks you cannot regenerate is one you cannot debug.
+Both are deterministic given a seed. That is not politeness. A neighbor sample that changes between the training and inference passes is an accuracy loss that looks like drift, and an embedding trained on walks you cannot regenerate is one you cannot debug.
 
-For features, `aggregate_neighbors` is one round of message passing, and
-`propagate_features` stacks several while keeping each round's output:
+For features, `aggregate_neighbors` is one round of message passing, and `propagate_features` stacks several while keeping each round's output:
 
 ```python
 flow = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2], "dst": [2, 3]}))
@@ -304,21 +249,15 @@ print(bg.propagate_features(flow, feats, ["x"], 2).sort("node").to_pydict())
 #  'x_hop2': [None, 0.0, 1.0]}
 ```
 
-That stack of hop columns is what a GNN learns to weight. Handing it to a gradient-boosted
-model instead is a strong baseline that trains in seconds and is far easier to explain.
+That stack of hop columns is what a GNN learns to weight. Handing it to a gradient-boosted model instead is a strong baseline that trains in seconds and is far easier to explain.
 
-`structural_features` goes the other way. It describes each node by its position alone,
-with no node attributes at all. On fraud and abuse problems those columns are
-frequently the strongest signal available, because the behaviour is a shape in the graph
-rather than a property of any single account.
+`structural_features` goes the other way. It describes each node by its position alone, with no node attributes at all. On fraud and abuse problems those columns are frequently the strongest signal available, because the behavior is a shape in the graph rather than a property of any single account.
 
 ## When the data is not already an edge list
 
-Embeddings, coordinates and interaction logs all want graph analysis, and none of them
-arrive as edges. Four constructors make that step explicit.
+Embeddings, coordinates and interaction logs all want graph analysis, and none of them arrive as edges. Four constructors make that step explicit.
 
-`knn_graph` connects each vector to its nearest neighbours, which is the bridge from an
-embedding space to every algorithm above:
+`knn_graph` connects each vector to its nearest neighbors, which is the bridge from an embedding space to every algorithm above:
 
 ```python
 vecs = bt.from_pydict({"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]})
@@ -326,11 +265,7 @@ print(bg.knn_graph(vecs, 1).edges.sort("src").to_pydict()["dst"])
 # ['b', 'a', 'b']
 ```
 
-`threshold_graph` connects everything closer than a cut-off, which is the deduplication
-shape: take `connected_components` of the result and each component is a cluster of
-records that are the same thing. The transitive closure is the point, since A matching B
-and B matching C groups all three even when A and C do not match directly. A record that
-matched nothing comes back as its own cluster rather than vanishing:
+`threshold_graph` connects everything closer than a cut-off, which is the deduplication shape: take `connected_components` of the result and each component is a cluster of records that are the same thing. The transitive closure is the point, since A matching B and B matching C groups all three even when A and C do not match directly. A record that matched nothing comes back as its own cluster rather than vanishing:
 
 ```python
 records = bt.from_pydict(
@@ -341,8 +276,7 @@ print(bg.connected_components(dedup).sort("node").to_pydict()["component"])
 # ['a', 'a', 'c']
 ```
 
-`spatial_graph` connects positions within a geodesic radius in metres, so the radius
-means the same thing at every latitude:
+`spatial_graph` connects positions within a geodesic radius in meters, so the radius means the same thing at every latitude:
 
 ```python
 sites = bt.from_pydict(
@@ -360,8 +294,7 @@ print(near.edges.sort("src").to_pydict()["src"], near.num_nodes())
 # ['ferry', 'pier'] 3
 ```
 
-`co_occurrence_graph` projects a user-item log into an item-item graph, which is the
-classic collaborative-filtering signal:
+`co_occurrence_graph` projects a user-item log into an item-item graph, which is the classic collaborative-filtering signal:
 
 ```python
 baskets = bt.from_pydict(
@@ -375,87 +308,25 @@ print(bg.co_occurrence_graph(baskets, min_count=2).edges.sort("src").to_pydict()
 ```
 
 :::{warning}
-All four compare every pair unless you block them. A million rows is a trillion
-comparisons. Every one takes a `block` argument that restricts comparison to rows sharing
-a key, and it is exact within each block: partition by a coarse cluster id, a date, a
-category, or a geohash prefix. Choosing that key is the engineering in each of these, not
-an optimization to add later.
+All four compare every pair unless you block them. A million rows is a trillion comparisons. Every one takes a `block` argument that restricts comparison to rows sharing a key, and it is exact within each block. Partition by a coarse cluster id, a date, a category, or a geohash prefix. Choosing that key is the engineering in each of these, not an optimization to add later.
 :::
 
 ## Requirements and limitations
 
-- **Iterative algorithms pass per-node state through the driver once per round.** A lazy
-  plan built fifty iterations deep would re-run every earlier iteration on execution, so
-  each round's state is collected and re-wrapped. The edge-side joins still distribute,
-  since the state is one row per *node* rather than per edge. The driver round-trip is the
-  real ceiling on an iterative algorithm here: a graph with more nodes than the driver can
-  hold will not finish, however many workers you add. The degree functions are single-pass
-  and have no such limit.
-- **Eleven algorithms cannot run under an explicit `distributed=True`.** They build a plan
-  shape the distributed executor has no path for, so {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` on a
-  file-backed graph raises {py:exc}`PlanError <batcher.PlanError>` rather than running. They still compute the right
-  answer single-node, and the default `distributed="auto"` still returns it, so this is a
-  scaling ceiling rather than a wrong result. The affected functions are `triangles`,
-  `triangle_count`, `clustering_coefficient`, `structural_features`, `candidate_pairs`,
-  `degree_distribution`, and the five link-prediction scores `adamic_adar`,
-  `common_neighbors`, `jaccard_similarity`, `preferential_attachment` and
-  `resource_allocation`.
+- Iterative algorithms pass per-node state through the driver once per round. A lazy plan built fifty iterations deep would re-run every earlier iteration on execution, so each round's state is collected and re-wrapped. The edge-side joins still distribute, since the state is one row per *node* rather than per edge. The driver is therefore the ceiling on an iterative algorithm: a graph with more nodes than the driver can hold will not finish, however many workers you add. The degree functions are single-pass and have no such limit.
+- Seven algorithms raise {py:exc}`PlanError <batcher.PlanError>` under an explicit {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` on a file-backed graph: `clustering_coefficient`, `structural_features`, `degree_distribution`, and the link-prediction scores `adamic_adar`, `jaccard_similarity`, `preferential_attachment`, and `resource_allocation`. They still compute the right answer single-node, and the default `distributed="auto"` returns it, so this is a scaling ceiling rather than a wrong result.
 
-  One engine limit accounts for all eleven, and it is reproducible in plain Batcher with no
-  graph code (`tests/integration/test_distributed.py` pins it with its controls). An
-  aggregate whose input contains a `union` cannot feed a join or a second aggregate. On its
-  own it distributes, and it can feed a filter, a sort or a `distinct`, but a `group_by` or
-  a join above it has no distributed path. Every one of these algorithms counts something
-  per node, which means aggregating over the edge table read from both directions, and then
-  joins or re-aggregates that count.
-
-  Three natural readings of that limit are wrong, so do not plan around them: it is not
-  about outer joins, since a `distinct` over the same union feeds a left join fine; it is
-  not about a pipeline breaker over a `union`, since a `distinct` there is fine; and it is
-  not about two-level aggregation, since {py:meth}`group_by <batcher.Dataset.group_by>` over {py:meth}`group_by <batcher.Dataset.group_by>` distributes over a plain
-  scan.
-
-  There are two ways around it. Where the join only restored zero rows for nodes that
-  contributed none, emit those rows as another `union` arm feeding the same `group_by`
-  instead; that is what the degree functions do and why they distribute. Otherwise
-  materialize the aggregate with {py:func}`bt.from_arrow(ds.collect()) <batcher.from_arrow>` before the next step, which
-  clears the limit at the cost of passing that intermediate through the driver.
-- **`betweenness_centrality` and `co_occurrence_graph` hang under `distributed=True`.**
-  Unlike the eleven above they raise nothing: the query reserves the cluster and then waits
-  on a task that can never be scheduled, and Carbonite reports `distributed barrier has
-  waited 240s with 0/1 tasks finished, cluster CPU 32/32 in use` until you kill it. Both
-  return in under a second single-node on the same input, and passing `num_workers` does
-  not avoid it. Use the default `distributed="auto"`, which runs them single-node and
-  returns the right answer. A hang is worse than a refusal, so this is the one limitation
-  here worth checking before you script an unattended job against a file-backed graph.
-- **An in-memory edge table never distributes, by design.** `distributed="auto"` routes a
-  plan whose sources are all resident in the driver to single-node at any size, because
-  shipping resident data out and gathering it back costs more than the compute it
-  parallelizes. Read the edges from Parquet or a lakehouse table to get the distributed
-  path; {py:func}`bt.from_pydict <batcher.from_pydict>` will stay local no matter how large it is.
-- **`Graph.cache` helps single-node only.** {py:meth}`Dataset.cache <batcher.Dataset.cache>` memoizes a result in a
-  process-local LRU, which the distributed executor does not consult. Caching a graph
-  before running several algorithms is worth it locally and is inert on a cluster, where
-  each algorithm re-reads the edge table.
-- **`connected_components` is weakly connected.** The graph is symmetrized first, so
-  `a -> b -> c` is one component even though nothing reaches `a`.
-  `strongly_connected_components` is the direction-respecting version, and is more
-  expensive: it is a colouring algorithm rather than Tarjan's, whose depth-first search
-  has no relational form.
-- **Distances are single-source or multi-source, never all-pairs.**
-  `harmonic_centrality`, `diameter_estimate` and `betweenness_centrality` all take a
-  source set and are estimates over it. There is no *exact* betweenness or closeness
-  centrality, because both need all-pairs shortest paths, which is quadratic in node
-  count. For betweenness the ranking stabilizes long before the values do, so sample a
-  few dozen high-degree sources and compare ranks rather than magnitudes.
-- **`label_propagation` is not stable under small changes.** Ties break deterministically,
-  so a run is reproducible, but a slightly different graph can produce a very different
-  partition. Score with `modularity` rather than trusting the label count.
-- **Weights must be non-negative for `shortest_path_lengths`**, which refuses a negative
-  one rather than diverging.
+  One engine limit accounts for them, and `tests/integration/test_distributed.py` pins it in plain Batcher with no graph code. An aggregate whose input contains a `union` cannot feed a join or a second aggregate on the one-shot distributed path. On its own it distributes, and it can feed a filter, a sort, or a `distinct`. Each of these algorithms counts something per node over the edge table read from both directions, then joins or re-aggregates that count. Where the join only restores zero rows for nodes that contributed none, emitting those rows as another `union` arm feeding the same `group_by` avoids the limit, which is how the degree functions distribute. Otherwise materialize the aggregate with {py:func}`bt.from_arrow(ds.collect()) <batcher.from_arrow>` before the next step, at the cost of passing that intermediate through the driver.
+- An in-memory edge table never distributes, by design. `distributed="auto"` routes a plan whose sources are all resident in the driver to single-node at any size, because shipping resident data out and gathering it back costs more than the compute it parallelizes. Read the edges from Parquet or a lakehouse table to get the distributed path. {py:func}`bt.from_pydict <batcher.from_pydict>` stays local no matter how large it is.
+- `Graph.cache` helps single-node only. {py:meth}`Dataset.cache <batcher.Dataset.cache>` memoizes a result in a process-local LRU, which the distributed executor does not consult, so on a cluster each algorithm re-reads the edge table.
+- `connected_components` is weakly connected. The graph is symmetrized first, so `a -> b -> c` is one component even though nothing reaches `a`. `strongly_connected_components` is the direction-respecting version and costs more, because it is a coloring algorithm rather than Tarjan's, whose depth-first search has no relational form.
+- Distances are single-source or multi-source, never all-pairs. `harmonic_centrality`, `diameter_estimate` and `betweenness_centrality` all take a source set and are estimates over it. There is no exact betweenness or closeness centrality, because both need all-pairs shortest paths. For betweenness the ranking stabilizes long before the values do, so sample a few dozen high-degree sources and compare ranks rather than magnitudes.
+- `label_propagation` is not stable under small changes. Ties break deterministically, so a run is reproducible, but a slightly different graph can produce a very different partition. Score with `modularity` rather than trusting the label count.
+- `shortest_path_lengths` requires non-negative weights, and refuses a negative one rather than diverging.
 
 ## See also
 
 - {doc}`/api/relational/graph`: every graph function, grouped and enumerated.
 - {doc}`/user-guide/analyze/joins`: the join mechanics every algorithm here composes.
 - {doc}`/user-guide/analyze/aggregations`: the `group_by` behind every degree count.
+- {doc}`/user-guide/analyze/geospatial`: the geometry behind `spatial_graph`.

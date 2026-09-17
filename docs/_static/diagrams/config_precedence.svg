@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 530" role="img" width="980" height="530"><defs><style>
+  .surface { fill: #ffffff; stroke: #cbd5e1; }
+  .band-blue { fill: #eff6ff; stroke: #3b82f6; }
+  .band-amber { fill: #fffbeb; stroke: #f59e0b; }
+  .band-grey { fill: #f8fafc; stroke: #cbd5e1; }
+  .t-title { fill: #1e293b; }
+  .t-sub { fill: #5b6675; }
+  .t-arrow { fill: #475569; }
+  .t-code { fill: #1e40af; }
+  .code-bg { fill: #f1f5f9; stroke: #e2e8f0; }
+  .pill-blue { fill: #dbeafe; } .pill-amber { fill: #fef3c7; } .pill-grey { fill: #e2e8f0; }
+  .pt-blue { fill: #1d4ed8; } .pt-amber { fill: #b45309; } .pt-grey { fill: #334155; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1e293b; stroke: #334155; }
+    .band-blue { fill: #172554; stroke: #3b82f6; }
+    .band-amber { fill: #2c1f06; stroke: #f59e0b; }
+    .band-grey { fill: #131c31; stroke: #334155; }
+    .t-title { fill: #e2e8f0; }
+    .t-sub { fill: #94a3b8; }
+    .t-arrow { fill: #cbd5e1; }
+    .t-code { fill: #93c5fd; }
+    .code-bg { fill: #0f172a; stroke: #334155; }
+    .pill-blue { fill: #1e3a8a; } .pill-amber { fill: #78350f; } .pill-grey { fill: #334155; }
+    .pt-blue { fill: #bfdbfe; } .pt-amber { fill: #fde68a; } .pt-grey { fill: #e2e8f0; }
+    #tintBlue stop[offset="0"] { stop-color: #16233d; }
+    #tintBlue stop[offset="1"] { stop-color: #1e3a8a; }
+    #tintAmber stop[offset="0"] { stop-color: #2a1e07; }
+    #tintAmber stop[offset="1"] { stop-color: #78350f; }
+  }
+</style>
+<filter id="sh" x="-20%" y="-30%" width="140%" height="180%">
+  <feDropShadow dx="0" dy="2.5" stdDeviation="4.5" flood-color="#0f172a" flood-opacity="0.18"/>
+</filter>
+<filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+  <feDropShadow dx="0" dy="4" stdDeviation="9" flood-color="#2563eb" flood-opacity="0.35"/>
+</filter>
+<linearGradient id="hero" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="0.5" stop-color="#2563eb"/><stop offset="1" stop-color="#4f46e5"/></linearGradient>
+<linearGradient id="heroAmber" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+<linearGradient id="tintBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="tintAmber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="ribbonBlue" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#93c5fd"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+<linearGradient id="ribbonAmber" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+<marker id="arB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/></marker>
+<marker id="arA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#d97706"/></marker>
+<marker id="arG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/></marker>
+</defs><g filter="url(#sh)"><rect x="130" y="70" width="500" height="66" rx="11" fill="url(#tintBlue)" stroke="#bfdbfe" stroke-width="1.2"/></g><rect x="130" y="82" width="4" height="42" rx="2" fill="#3b82f6"/><text x="383.0" y="102.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">config_context(cfg)</text><text x="383.0" y="120.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">also option_context and tenant</text><g filter="url(#sh)"><rect x="130" y="150" width="500" height="66" rx="11" fill="url(#tintBlue)" stroke="#bfdbfe" stroke-width="1.2"/></g><rect x="130" y="162" width="4" height="42" rx="2" fill="#3b82f6"/><text x="383.0" y="182.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">set_config(cfg)</text><text x="383.0" y="200.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">also set_option</text><g filter="url(#sh)"><rect x="130" y="260" width="500" height="66" rx="10" class="surface" stroke-width="1.2"/></g><text x="380.0" y="293.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">BATCHER_* variables</text><text x="380.0" y="312.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">Config.from_env</text><g filter="url(#sh)"><rect x="130" y="340" width="500" height="66" rx="10" class="surface" stroke-width="1.2"/></g><text x="380.0" y="373.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">BATCHER_CONFIG_FILE</text><text x="380.0" y="392.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">Config.from_file</text><g filter="url(#sh)"><rect x="130" y="420" width="500" height="66" rx="10" class="surface" stroke-width="1.2"/></g><text x="380.0" y="453.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Built-in defaults</text><text x="380.0" y="472.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">the dataclass field values</text><path d="M 76 486 L 76 74" fill="none" stroke="#d97706" stroke-width="2.4" marker-end="url(#arA)"/><text x="76" y="54" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="700" class="t-arrow">wins</text><text x="76" y="508" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">loses</text><path d="M 668 76 L 676 76 L 676 210 L 668 210" fill="none" stroke="#2563eb" stroke-width="2"/><path d="M 668 266 L 676 266 L 676 480 L 668 480" fill="none" stroke="#94a3b8" stroke-width="2"/><text x="130" y="54" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="800" letter-spacing="1.8" fill="#2563eb">SET AT RUNTIME</text><text x="700" y="107.0" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Innermost with block, restored on exit</text><text x="700" y="187.0" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Process-wide until changed</text><text x="130" y="244" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="800" letter-spacing="1.8" fill="#5b6675">READ ONCE AT IMPORT</text><text x="700" y="297.0" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Overlays the file</text><text x="700" y="377.0" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Overlays the defaults</text><text x="700" y="448.0" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">What reset_option restores, not</text><text x="700" y="466.0" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">the environment's values</text></svg>

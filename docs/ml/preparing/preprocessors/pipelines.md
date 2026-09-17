@@ -4,18 +4,17 @@ This page covers sequencing preprocessors into one object, fitting a whole pipel
 the training split, and saving the fitted state so serving applies exactly what training
 learned.
 
-Reach for {py:class}`Chain <batcher.ml.preprocessors.Chain>` when the steps are all preprocessors, and
+Use {py:class}`Chain <batcher.ml.preprocessors.Chain>` when the steps are all preprocessors, and
 {py:class}`Pipeline <batcher.ml.Pipeline>` when a model comes after them. Sequencing the
-objects by hand works too, and it is shown below, but it is the one you can get wrong
-without anything failing.
+objects by hand also works, as shown below, but it's the version you can get wrong without
+anything failing.
 
 ## Chaining steps
 
-`Chain` is the sklearn `Pipeline` equivalent. It fits each step on the **previous step's
-output** and replays the fitted steps, in order, over any split. Doing that by hand means
-fitting step *i* on data that steps *0..i-1* have already transformed, which is easy to
-get subtly wrong. The mistake leaks held-out statistics into training features and never
-fails.
+`Chain` is the equivalent of a scikit-learn `Pipeline` without the model. It fits each step
+on the previous step's output and replays the fitted steps, in order, over any split. By
+hand, that means fitting step *i* on data steps *0..i-1* have already transformed. Get it
+wrong and held-out statistics leak into the training features, with no error.
 
 ```python
 import batcher as bt
@@ -36,10 +35,9 @@ Call `fit` on the training split only, then `transform` on both. A `Chain` is it
 
 ## Sequencing by hand
 
-Worth seeing once, because it is what `Chain` does for you. Fit each step on the previous
-step's output, then push any split through the *same* fitted objects so train and
-validation share every learned statistic. The classic order is impute, then scale, then
-encode.
+This is what `Chain` does for you, spelled out once. Fit each step on the previous step's
+output, then push any split through the same fitted objects so train and validation share
+every learned statistic. The classic order is impute, then scale, then encode.
 
 ```python
 import batcher as bt
@@ -77,9 +75,9 @@ print(prepared_val.collect().column_names)
 
 ## Saving a fitted preprocessor
 
-A preprocessor is only useful because its state is learned once and reused: the scaler
-standardizing a request at serving time must hold the *training* set's mean. `save` writes
-that state as plain JSON.
+A fitted preprocessor is worth keeping because its state is learned once and reused. The
+scaler standardizing a request at serving time must hold the training set's mean. `save`
+writes that state as plain JSON.
 
 ```python
 import os
@@ -93,16 +91,17 @@ scaler.save(path)
 print(Preprocessor.load(path).mean_)
 ```
 
-JSON rather than a pickle, deliberately: the file is reviewable, diffable, portable to a
-serving stack in another language, and safe to load from a store you do not fully control.
-A cloud URI works wherever a local path does.
+JSON rather than a pickle is deliberate. You can review and diff the file, read it from a
+serving stack in another language, and load it from a store you don't fully control without
+running its code. A cloud URI such as `s3://`, `gs://`, or `abfs://` works wherever a local
+path does.
 
 ## Taking the model with it
 
-{py:class}`Chain <batcher.ml.preprocessors.Chain>` composes preprocessors and stops there,
-which leaves you responsible for remembering which transforms a model was trained behind and
-applying exactly those at serving time. That is where train/serve skew comes from, and it
-fails silently: a model scored behind one fewer transform returns numbers, not an error.
+{py:class}`Chain <batcher.ml.preprocessors.Chain>` stops at the preprocessors. You're left
+remembering which transforms a model was trained behind and applying exactly those at
+serving time. That's where train/serve skew comes from, and it fails silently: a model
+scored behind one fewer transform returns numbers, not an error.
 
 {py:class}`Pipeline <batcher.ml.Pipeline>` owns both halves. `fit` fits each step on the
 previous one's output and then the model on the fully transformed frame; `predict` replays
@@ -122,8 +121,8 @@ print("prediction" in pipe.predict(train).columns)
 # True
 ```
 
-One object saves as one file. The whole recipe ships to serving, rather than a model plus
-a memo about what preceded it:
+One object saves as one file, so the whole recipe ships to serving instead of a model plus
+a memo about what came before it:
 
 ```python
 import os
@@ -136,12 +135,12 @@ print([type(step).__name__ for step in served.steps])
 # ['SimpleImputer', 'StandardScaler']
 ```
 
-`transform` applies the steps without scoring, which is how you inspect what the model
-actually sees. A `Pipeline` exposes `fit` and `predict`, so it drops straight into
+`transform` applies the steps without scoring, so you can inspect what the model sees. A
+`Pipeline` exposes `fit` and `predict`, so it drops straight into
 {py:func}`cross_val_score <batcher.ml.cross_val_score>` and
-{py:func}`grid_search <batcher.ml.grid_search>`. That is the point of putting the
-preprocessing inside it: cross-validating a model whose scaler was fitted on the whole
-frame measures nothing.
+{py:func}`grid_search <batcher.ml.grid_search>`, which refit the preprocessing inside every
+fold. Cross-validating a model whose scaler was fitted on the whole frame measures
+nothing.
 
 ## Predicting several things at once
 
@@ -177,20 +176,21 @@ Each region gets its own slope, which a single shared model would have to averag
 Predictions are appended as `prediction_<target>`, and scoring every target is one pass
 because each sub-model contributes an expression to the same frame.
 
-{py:class}`MultiOutputClassifier <batcher.ml.MultiOutputClassifier>` is the same thing for
-labels. Be clear about which problem that is. Multi-*class* picks exactly
-one of several classes and belongs to {py:class}`OneVsRestClassifier
-<batcher.ml.multiclass.OneVsRestClassifier>`. Multi-*label* lets a row carry any number of
-independent tags at once, so a document can be both "finance" and "urgent"; each label is
-its own yes-or-no question with its own model and no argmax across them.
+{py:class}`MultiOutputClassifier <batcher.ml.MultiOutputClassifier>` does the same for
+labels, and it solves the multi-*label* problem. Multi-*class* picks exactly one of several
+classes and belongs to {py:class}`OneVsRestClassifier
+<batcher.ml.multiclass.OneVsRestClassifier>`. Multi-label lets a row carry any number of
+independent tags, so a document can be both "finance" and "urgent". Each label is its own
+yes-or-no question with its own model, and there's no argmax across them.
 
-This is a wrapper rather than an optimization. Two different targets genuinely need two
-different fits, so the cost is one fit per target. Where a shared fit is possible it is
-worth preferring, which is what {py:class}`RidgeCV <batcher.ml.linear.RidgeCV>` does for a
-penalty path.
+The wrapper saves bookkeeping, not compute. Two targets need two fits. Where one shared fit
+can serve several answers, prefer it, as {py:class}`RidgeCV <batcher.ml.linear.RidgeCV>`
+does for a penalty path.
 
 ## See also
 
 - {doc}`/ml/preparing/preprocessors/index`: the fit/transform contract each step in a chain obeys.
 - {doc}`/ml/preparing/preprocessors/feature-generation`: the steps a chain usually ends with.
+- {doc}`/ml/preparing/preprocessors/feature-selection`: selectors, which chain like any other step.
+- {doc}`/ml/evaluation/model-selection`: cross-validating and tuning a `Pipeline`.
 - {doc}`/getting-started/tutorials/ml/feature-engineering`: the same workflow end to end.

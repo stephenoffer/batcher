@@ -1,16 +1,12 @@
 # Anomaly detection
 
-One host in the fleet started answering slowly. Find it in the metrics table, without
-being told which host or when.
+One host in the fleet started answering slowly. Find it in the metrics table, without being told which host or when.
 
-The textbook answer is "flag anything more than three standard deviations from the mean".
-The textbook answer does not fire on this data, and the reason it does not fire is the
-interesting part.
+The textbook answer is "flag anything more than three standard deviations from the mean". The textbook answer does not fire on this data, and the reason it does not fire is the interesting part.
 
 ## The data
 
-Two hosts, six minutes of latency each. Host `a` sits around 100ms and spikes to 410ms at
-minute 4. Host `b` sits around 50ms and never misbehaves.
+Two hosts, six minutes of latency each. Host `a` sits around 100ms and spikes to 410ms at minute 4. Host `b` sits around 50ms and never misbehaves.
 
 ```python
 import batcher as bt
@@ -30,9 +26,7 @@ print(metrics.count())
 ## Trap one: one threshold for the fleet
 
 :::{warning}
-Pooling two hosts with different baselines manufactures a variance that belongs to neither
-of them. One fleet-wide threshold is then far too loose for the quiet host and barely tight
-enough for the busy one.
+Pooling two hosts with different baselines manufactures a variance that belongs to neither of them. One fleet-wide threshold is then far too loose for the quiet host and barely tight enough for the busy one.
 :::
 
 ```python
@@ -41,11 +35,7 @@ print(fleet.to_pydict())
 # {'mu': [101.58333333333333], 'sd': [100.37335605657812]}
 ```
 
-A fleet-wide mean of 102ms and a standard deviation of 100ms, because host `a` and host `b`
-run at completely different baselines. Three sigma above the mean is 403ms. The 410ms spike
-scrapes over that line by seven milliseconds, so a 400ms spike would sail straight through.
-Meanwhile host `b`, whose normal is 50ms, would have to reach 403ms (eight times its own
-baseline) before anyone heard about it.
+A fleet-wide mean of 102ms and a standard deviation of 100ms, because host `a` and host `b` run at completely different baselines. Three sigma above the mean is 403ms. The 410ms spike scrapes over that line by seven milliseconds, so a 400ms spike would sail straight through. Meanwhile host `b`, whose normal is 50ms, would have to reach 403ms (eight times its own baseline) before anyone heard about it.
 
 Compute the baseline per host. That is a {py:meth}`group_by <batcher.Dataset.group_by>` and a join back:
 
@@ -58,9 +48,7 @@ print(baseline.sort("host").to_pydict())
 
 ## Trap two: the outlier eats its evidence
 
-Look at host `a`: mean 153ms, standard deviation 126ms. Both numbers are nonsense. `a`'s
-normal latency is 98ms to 105ms. It has a *mean* of 153 and a *sigma* of 126 only because the
-410ms spike is inside the sample it is being compared against.
+Look at host `a`: mean 153ms, standard deviation 126ms. Both numbers are nonsense. `a`'s normal latency is 98ms to 105ms. It has a *mean* of 153 and a *sigma* of 126 only because the 410ms spike is inside the sample it is being compared against.
 
 ```python
 scored = (
@@ -74,8 +62,7 @@ print(scored.select("host", "minute", "z").to_pydict()["z"])
 #  -0.8017837257372732, 0.2672612419124244, 1.3363062095621219, -1.3363062095621219]
 ```
 
-A 4x latency spike scores **z = 2.04**. Filter at the conventional three sigma and you get
-nothing:
+A 4x latency spike scores **z = 2.04**. Filter at the conventional three sigma and you get nothing:
 
 ```python
 print(scored.filter(col("z").abs() > 3.0).count())
@@ -83,27 +70,18 @@ print(scored.filter(col("z").abs() > 3.0).count())
 ```
 
 :::{important}
-Zero alerts. The outage is right there in the data and the detector is silent. This is
-called masking, and it is not an edge case. It is what happens *every time*, because mean
-and standard deviation are both computed from the point you are trying to detect. One bad
-point in six can never exceed three sigma of a six-point sample: it has inflated sigma too
-much.
+Zero alerts. The outage is right there in the data and the detector is silent. This is called masking, and it is not an edge case. It is what happens *every time*, because mean and standard deviation are both computed from the point you are trying to detect. One bad point in six can never exceed three sigma of a six-point sample: it has inflated sigma too much.
 :::
 
 ## Median and MAD
 
 :::{tip}
-Swap the mean for the median and the standard deviation for the median absolute deviation.
-The median of six points does not move when one of them goes to 410, and neither does the MAD.
-The estimator stops defending the outlier.
+Swap the mean for the median and the standard deviation for the median absolute deviation. The median of six points does not move when one of them goes to 410, and neither does the MAD. The estimator stops defending the outlier.
 :::
 
-Two passes: the per-host median, then the median of the absolute deviations from it. The
-`0.6745` factor rescales MAD so that a modified z-score is comparable to an ordinary one on
-normal data (it is the 75th percentile of the standard normal).
+Two passes: the per-host median, then the median of the absolute deviations from it. The `0.6745` factor rescales MAD so that a modified z-score is comparable to an ordinary one on normal data (it is the 75th percentile of the standard normal).
 
-The SQL tab runs the same three CTEs and goes one step further, applying the 3.5 threshold
-in the outer `WHERE`.
+The SQL tab runs the same three CTEs and goes one step further, applying the 3.5 threshold in the outer `WHERE`.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -154,9 +132,7 @@ print(sql_scored.to_pydict())
 :::
 ::::
 
-83.2, for the same point that scored 2.04 under mean-and-sigma. Every other point is under 1.2.
-Now the threshold does not need tuning, because the signal is two orders of magnitude clear of
-the noise:
+83.2, for the same point that scored 2.04 under mean-and-sigma. Every other point is under 1.2. Now the threshold does not need tuning, because the signal is two orders of magnitude clear of the noise:
 
 ```python
 print(robust.filter(col("score").abs() > 3.5).select("host", "minute", "latency").to_pydict())
@@ -172,28 +148,16 @@ print(robust.filter(col("score").abs() > 3.5).select("host", "minute", "latency"
 | Alerts fired | 0 | 1 |
 
 :::{dropdown} Two caveats before you ship this
-MAD can be zero. If more than half a host's readings are identical (a counter pinned at 0, a
-rounded gauge) then the MAD is 0 and every score is a division by zero. Guard it with
-{py:func}`bt.when(col("mad") > 0).then(...).otherwise(bt.lit(0.0)) <batcher.when>`, or fall back to an interquartile
-range: `col("latency").quantile(0.75) - col("latency").quantile(0.25)`.
+MAD can be zero. If more than half a host's readings are identical (a counter pinned at 0, a rounded gauge) then the MAD is 0 and every score is a division by zero. Guard it with {py:func}`bt.when(col("mad") > 0).then(...).otherwise(bt.lit(0.0)) <batcher.when>`, or fall back to an interquartile range: `col("latency").quantile(0.75) - col("latency").quantile(0.25)`.
 
-A whole-history baseline is also not a baseline. Comparing today's latency to the median of
-the last two years hides slow drift and screams at every deploy. What you usually want is a
-trailing window: `col("latency").rolling_mean(60, partition_by=["host"], order_by=["minute"])`
-gives a moving reference, and the deviation from *that* is what you threshold. The
-`rolling_*` functions count rows, not minutes, so the series has to be dense first. See
-{doc}`time series rollups </cookbook/analytics/aggregates/time-series-rollups>`. Otherwise a gap in the metrics quietly
-stretches your one-hour window across a day.
+A whole-history baseline is also not a baseline. Comparing today's latency to the median of the last two years hides slow drift and screams at every deploy. What you usually want is a trailing window: `col("latency").rolling_mean(60, partition_by=["host"], order_by=["minute"])` gives a moving reference, and the deviation from *that* is what you threshold. The `rolling_*` functions count rows, not minutes, so the series has to be dense first. See {doc}`time series rollups </cookbook/analytics/aggregates/time-series-rollups>`. Otherwise a gap in the metrics quietly stretches your one-hour window across a day.
 :::
 
 ## See also
 
 - {doc}`Time series rollups </cookbook/analytics/aggregates/time-series-rollups>`: densify the series before you window over it.
-- {doc}`A/B testing </cookbook/analytics/inference/ab-testing>`: the other page here where a pooled statistic hides the
-  thing you were trying to measure.
-- {doc}`Aggregations </user-guide/analyze/aggregations>`: `median`, `quantile`, and the sketch-backed
-  `approx_median` for when the groups are too big to hold.
+- {doc}`A/B testing </cookbook/analytics/inference/ab-testing>`: the other page here where a pooled statistic hides the thing you were trying to measure.
+- {doc}`Aggregations </user-guide/analyze/aggregations>`: `median`, `quantile`, and the sketch-backed `approx_median` for when the groups are too big to hold.
 - {doc}`Joins </user-guide/analyze/joins>`: the baseline-broadcast join used three times here.
-- {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: why `median` is the
-  expensive aggregate and how the sketch-backed version avoids it.
+- {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: why `median` is the expensive aggregate and how the sketch-backed version avoids it.
 - {doc}`Expressions API </api/relational/expressions>`: `mean`, `std`, `median`, `abs`, `round`.

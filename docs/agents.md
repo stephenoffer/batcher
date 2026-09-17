@@ -32,7 +32,7 @@ diagnosing a query that misbehaves.
 
 | Skill | Use it when |
 |---|---|
-| `write-a-batcher-pipeline` | The default. Writing or reviewing any relational pipeline: read → transform → write, expressions, joins, aggregations, windows, batch UDFs. |
+| `write-a-batcher-pipeline` | The default. Writing or reviewing any relational pipeline: read, transform, write, expressions, joins, aggregations, windows, batch UDFs. |
 | `read-and-write-data` | Choosing a reader or writer, wiring object storage, or debugging a format, schema, path, or credential problem at the IO boundary. |
 | `manage-a-lakehouse-table` | Delta/Iceberg/Hudi lifecycle: upserts via `MERGE INTO`, slowly-changing dimensions, CDC, backfills, time travel, compaction. |
 | `write-a-streaming-pipeline` | The source is unbounded, or the query uses a trigger, checkpoint, or watermark and must run continuously. |
@@ -108,7 +108,7 @@ one rather than answer from a surface it doesn't cover.
 
 ## Using them in your own project
 
-The skills are part of the repository rather than the wheel, so `pip install batcher`
+The skills are part of the repository rather than the wheel, so `pip install batcher-engine`
 doesn't install them. They're agent instructions rather than importable code. To use
 them in a project that depends on Batcher, copy the directory into your own project's
 skill folder:
@@ -126,13 +126,9 @@ The usage and migration skills apply anywhere Batcher is installed. The extensio
 ## Keeping them honest
 
 A skill that describes an API which has since changed is worse than no skill, because an
-agent will trust it. Two things guard against that:
+agent will trust it. Two things guard against that.
 
-- Every skill was written against the live API rather than from memory, with symbols
-  verified by introspection and code blocks executed.
-- `tests/docs/test_skill_coverage.py` fails if a skill exists that this page does not
-  list, if a listed skill has no file, or if a skill is missing its `name`/`description`
-  frontmatter. The catalog above cannot silently fall behind the directory.
+Every skill was written against the live API rather than from memory, with symbols verified by introspection and code blocks executed. And `tests/docs/test_skill_coverage.py` fails if a skill exists that this page doesn't list, if a listed skill has no file, or if a skill is missing its `name` or `description` frontmatter, so the catalog can't quietly fall behind the directory.
 
 When you change an API, the skill that teaches it is part of the change, exactly as its
 documentation is.

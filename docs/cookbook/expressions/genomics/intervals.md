@@ -2,6 +2,8 @@
 
 Three formats carry the coordinate half of genomics: BED holds intervals, GFF and GTF hold annotations, and VCF holds variants. Reading them into tables is what turns "which variants fall in a coding exon" into a join and a filter rather than a script, and a join optimizes, streams, and distributes like any other query.
 
+The script reads a BED file of targets, a GFF3 annotation, and a VCF of variants, converts BED's coordinates explicitly, and joins variants against target regions and against coding exons. It then aggregates passing, common variants per contig from the INFO column and writes intervals back out.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/genomics_intervals.py
@@ -46,9 +48,9 @@ That column arrives as raw text. Parsing it here would mean guessing the dialect
 ```python
 # docs: skip
 # GFF3
-bt.col("attributes").str.regexp_extract(r"ID=([^;]+)", 1)
+bt.col("attributes").str.extract(r"ID=([^;]+)", 1)
 # GTF
-bt.col("attributes").str.regexp_extract(r'gene_id "([^"]+)"', 1)
+bt.col("attributes").str.extract(r'gene_id "([^"]+)"', 1)
 ```
 
 `.` reads as null in every optional column, so an absent score is a null rather than the string `"."` on a float column.
@@ -63,7 +65,7 @@ The specification's names are lower-cased to match every other column in the eng
 
 ```python
 # docs: skip
-bt.col("info").str.regexp_extract(r"AF=([0-9.]+)", 1).cast("float64")
+bt.col("info").str.extract(r"AF=([0-9.]+)", 1).cast("float64")
 bt.col("info").str.contains("DB")
 ```
 

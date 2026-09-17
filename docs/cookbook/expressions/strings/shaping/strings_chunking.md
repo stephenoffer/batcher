@@ -1,6 +1,8 @@
 # Text chunking
 
-`chunk` is the columnar version of the loop everyone writes by hand before indexing. Overlap matters: without it, a sentence spanning a boundary is retrievable from neither chunk, and that is exactly the passage the question was about.
+Retrieval-augmented generation needs documents split into overlapping chunks, and `chunk` is the columnar version of the loop everyone writes by hand before indexing. Overlap matters: without it, a sentence spanning a boundary is retrievable from neither chunk, and that is exactly the passage the question was about.
+
+The script produces fixed-size character chunks as a list column, shows that a short document yields one chunk and that more overlap yields more chunks, and chunks on word boundaries for prose. It ends with the shape a RAG index wants: one row per chunk, carrying its source id.
 
 The whole script, executed on every test run:
 

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 430" role="img" width="980" height="430"><defs><style>
+  .surface { fill: #ffffff; stroke: #cbd5e1; }
+  .band-blue { fill: #eff6ff; stroke: #3b82f6; }
+  .band-amber { fill: #fffbeb; stroke: #f59e0b; }
+  .band-grey { fill: #f8fafc; stroke: #cbd5e1; }
+  .t-title { fill: #1e293b; }
+  .t-sub { fill: #5b6675; }
+  .t-arrow { fill: #475569; }
+  .t-code { fill: #1e40af; }
+  .code-bg { fill: #f1f5f9; stroke: #e2e8f0; }
+  .pill-blue { fill: #dbeafe; } .pill-amber { fill: #fef3c7; } .pill-grey { fill: #e2e8f0; }
+  .pt-blue { fill: #1d4ed8; } .pt-amber { fill: #b45309; } .pt-grey { fill: #334155; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1e293b; stroke: #334155; }
+    .band-blue { fill: #172554; stroke: #3b82f6; }
+    .band-amber { fill: #2c1f06; stroke: #f59e0b; }
+    .band-grey { fill: #131c31; stroke: #334155; }
+    .t-title { fill: #e2e8f0; }
+    .t-sub { fill: #94a3b8; }
+    .t-arrow { fill: #cbd5e1; }
+    .t-code { fill: #93c5fd; }
+    .code-bg { fill: #0f172a; stroke: #334155; }
+    .pill-blue { fill: #1e3a8a; } .pill-amber { fill: #78350f; } .pill-grey { fill: #334155; }
+    .pt-blue { fill: #bfdbfe; } .pt-amber { fill: #fde68a; } .pt-grey { fill: #e2e8f0; }
+    #tintBlue stop[offset="0"] { stop-color: #16233d; }
+    #tintBlue stop[offset="1"] { stop-color: #1e3a8a; }
+    #tintAmber stop[offset="0"] { stop-color: #2a1e07; }
+    #tintAmber stop[offset="1"] { stop-color: #78350f; }
+  }
+</style>
+<filter id="sh" x="-20%" y="-30%" width="140%" height="180%">
+  <feDropShadow dx="0" dy="2.5" stdDeviation="4.5" flood-color="#0f172a" flood-opacity="0.18"/>
+</filter>
+<filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+  <feDropShadow dx="0" dy="4" stdDeviation="9" flood-color="#2563eb" flood-opacity="0.35"/>
+</filter>
+<linearGradient id="hero" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="0.5" stop-color="#2563eb"/><stop offset="1" stop-color="#4f46e5"/></linearGradient>
+<linearGradient id="heroAmber" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+<linearGradient id="tintBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="tintAmber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="ribbonBlue" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#93c5fd"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+<linearGradient id="ribbonAmber" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+<marker id="arB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/></marker>
+<marker id="arA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#d97706"/></marker>
+<marker id="arG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/></marker>
+</defs><rect x="16" y="20" width="948" height="314" rx="16" class="band-blue" stroke-width="1.5"/><text x="34" y="44" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="1.5" fill="#3b82f6">ONE PLAN  ·  ONE collect()</text><g filter="url(#sh)"><rect x="40" y="128" width="176" height="96" rx="10" class="surface" stroke-width="1.2"/></g><text x="128.0" y="176.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">bytes column</text><text x="128.0" y="195.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">two PNGs</text><rect x="84.15" y="237" width="87.7" height="20" rx="10" class="pill-grey"/><text x="128.0" y="251" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" font-weight="700" letter-spacing="0.4" class="pt-grey">id 1  noisy</text><rect x="84.15" y="267" width="87.7" height="20" rx="10" class="pill-grey"/><text x="128.0" y="281" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" font-weight="700" letter-spacing="0.4" class="pt-grey">id 2  black</text><g filter="url(#sh)"><rect x="290" y="128" width="196" height="96" rx="11" fill="url(#tintBlue)" stroke="#bfdbfe" stroke-width="1.2"/></g><rect x="290" y="140" width="4" height="72" rx="2" fill="#3b82f6"/><text x="391.0" y="175.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Screen</text><text x="391.0" y="193.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">brightness() > 0.05</text><path d="M 222 176 L 284 176" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="253" y="164" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">2 rows</text><path d="M 388 230 L 388 266" fill="none" stroke="#d97706" stroke-width="2.4" marker-end="url(#arA)"/><text x="398" y="254" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">id 2 fails</text><text x="388" y="292" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">never reaches the</text><text x="388" y="310" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">tensor or the hash</text><g filter="url(#sh)"><rect x="572" y="62" width="180" height="88" rx="11" fill="url(#tintAmber)" stroke="#fcd34d" stroke-width="1.2"/></g><rect x="572" y="74" width="4" height="64" rx="2" fill="#f59e0b"/><text x="665.0" y="105.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Decode</text><text x="665.0" y="123.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">to_tensor(8, 8)</text><g filter="url(#sh)"><rect x="572" y="202" width="180" height="88" rx="11" fill="url(#tintAmber)" stroke="#fcd34d" stroke-width="1.2"/></g><rect x="572" y="214" width="4" height="64" rx="2" fill="#f59e0b"/><text x="665.0" y="245.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Fingerprint</text><text x="665.0" y="263.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">phash()</text><path d="M 492 164 L 564 112" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><path d="M 492 188 L 564 240" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="516" y="180" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">id 1</text><g filter="url(#sh)"><rect x="822" y="128" width="124" height="96" rx="10" class="surface" stroke-width="1.2"/></g><text x="884.0" y="176.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">one row</text><text x="884.0" y="195.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">id, image, phash</text><path d="M 758 106 L 816 150" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="772" y="98" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" class="t-arrow">image</text><path d="M 758 246 L 816 202" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="772" y="266" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" class="t-arrow">phash</text><text x="884" y="252" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">image: 8x8x3 uint8</text><text x="884" y="272" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">phash: Int64</text><rect x="16" y="352" width="948" height="58" rx="16" class="band-grey" stroke-width="1.5"/><text x="34" y="376" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="1.5" fill="#94a3b8"></text><text x="490" y="386" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Each step is an expression in Rust over whole batches, so no image becomes a Python call.</text></svg>

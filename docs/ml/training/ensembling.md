@@ -3,12 +3,11 @@
 This page describes how to combine several models into one prediction on Batcher, and how
 to do it without the leak that makes a stacked ensemble look better than it is.
 
-Ensembling works because models make *different* mistakes. Two models that are individually
-mediocre but wrong about different rows combine into something better than either. Two models
-that are wrong about the same rows combine into the same mistakes with more compute. Check
-that before reaching for any of this.
+Ensembling works because models make *different* mistakes. Two mediocre models that are wrong
+about different rows combine into something better than either. Two that are wrong about the same
+rows combine into the same mistakes at twice the compute. Check which you have first.
 
-## Averaging, first
+## Start by averaging
 
 {py:func}`blend_predictions <batcher.ml.blend_predictions>` takes prediction columns already
 in the frame and appends their weighted mean. There is no fit, no held-out split, and no
@@ -37,7 +36,7 @@ a class neither model predicted. Blend the probability columns and threshold aft
 
 ## Voting, when the models emit labels
 
-When all you have is labels, there is nothing to average.
+When all you have is labels, there's nothing to average.
 {py:func}`majority_vote <batcher.ml.majority_vote>` counts votes instead:
 
 ```python
@@ -48,9 +47,9 @@ print(majority_vote(labelled, ["m1", "m2", "m3"]).to_pydict()["prediction"])
 # ['a', 'b']
 ```
 
-`weights` lets a model you trust more count for more, and ties resolve to whichever label
-comes first in `labels` so the result is reproducible rather than dependent on evaluation
-order.
+`weights` lets a model you trust more count for more. Ties resolve to whichever label comes
+first in `labels`, so the result doesn't depend on evaluation order. Leave `labels` out and they're
+learned with one `distinct` scan, which makes the call eager. Pass them to keep it lazy.
 
 Where the models expose probabilities, prefer `blend_predictions` on those and threshold
 afterwards. Soft voting uses more of what each model knows than a hard label does.
@@ -88,10 +87,10 @@ against `ridge` and `ols` here rather than against `x`.
 
 ## Why the out-of-fold part matters
 
-This is the one thing to get right. If the meta-model trains on predictions the base models
-made about rows they were *fitted on*, it learns to trust whichever base model memorized
-hardest. That is the model that will do worst on data it has not seen. The ensemble then
-scores beautifully in development and badly in production, with nothing failing in between.
+This is the one thing to get right. If the meta-model trains on predictions the base models made
+about rows they were *fitted on*, it learns to trust whichever base model memorized hardest, which
+is the one that does worst on unseen data. The ensemble scores beautifully in development and badly
+in production, and nothing fails in between.
 
 `StackingEnsemble` avoids that by fitting the meta-model on out-of-fold predictions: every
 row is scored by base models that never saw it. You can build that table directly with
@@ -116,25 +115,23 @@ feature is re-derived, and `stratify=` for an imbalanced target.
 
 ## Two sets of fitted models
 
-`fit` produces two different things, and the difference is deliberate:
+`fit` produces two different sets of models, on purpose. The out-of-fold columns come from `k`
+fold-fitted copies of each base model. They exist only to give the meta-model an honest training
+table, and each copy saw a fraction of the data.
 
-- The **out-of-fold columns** come from `k` fold-fitted copies of each base model. They exist
-  only to give the meta-model an honest training table, and each of them saw a fraction of
-  the data.
-- The **prediction path** uses one copy of each base model refitted on the whole training
-  split. Scoring a new row with a fold-fitted copy would throw away most of the training
-  data for no reason.
-
-So a `k=5` stack over three base models costs eighteen fits: fifteen for the features, three
-for the refit.
+The prediction path uses one copy of each base model refitted on the whole training split.
+Scoring a new row with a fold-fitted copy would throw away most of the training data for nothing.
+So a `k=5` stack over three base models costs eighteen fits: fifteen for the features and three for
+the refit.
 
 ## Requirements and limitations
 
 - Every base model's `predict` must append the same column name, `prediction` by default.
   A base model that writes nothing is reported by name rather than producing a silently
   empty feature.
-- A base model may not be named `prediction`, because its feature column would collide with
-  the column the models write into.
+- A base model can't share its name with the prediction column, `prediction` unless you pass
+  `prediction=`, because its feature column would collide with the column the models write into.
+- `k` must be at least 2.
 - Row order is not preserved by `out_of_fold_features`: it is the union of the scored folds.
   Sort or join on your key if order matters.
 - Stacking multiplies the fit cost. Blend first, and only stack if the blend leaves
@@ -142,5 +139,7 @@ for the refit.
 
 ## See also
 
-- {doc}`/ml/evaluation/evaluation` for the metrics to compare a blend against its bases.
-- {doc}`/api/models/ml-models` for the full reference.
+- {doc}`Evaluation </ml/evaluation/evaluation>`: the metrics to compare a blend against its bases.
+- {doc}`Model selection </ml/evaluation/model-selection>`: `cross_val_score` and the fold machinery stacking reuses.
+- {doc}`Calibration </ml/inference/calibration>`: making probabilities worth blending.
+- {doc}`ML models API </api/models/ml-models>`: the full reference.

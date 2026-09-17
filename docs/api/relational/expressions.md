@@ -29,7 +29,7 @@ build a value that has no column behind it:
 | {py:func}`bt.nullif(a, b) <batcher.nullif>` | null when `a == b` |
 | {py:func}`bt.greatest(*exprs) <batcher.greatest>` / {py:func}`bt.least(*exprs) <batcher.least>` | row-wise max / min across columns |
 | {py:func}`bt.array(*exprs) <batcher.array>` | build a list column from elements |
-| {py:func}`bt.atan2(y, x) <batcher.atan2>` | two-argument arctangent |
+| {py:func}`bt.arctan2(y, x) <batcher.arctan2>` | two-argument arctangent |
 | {py:func}`bt.count() <batcher.count>` | COUNT(*) aggregate |
 | {py:func}`bt.hash_rows(*exprs, seed=0) <batcher.hash_rows>` | deterministic 64-bit row digest (also `expr.hash(seed=0)`) |
 
@@ -65,7 +65,7 @@ fold *down* a column). They mirror the Polars `*_horizontal` family.
 | {py:func}`bt.product_horizontal(*exprs) <batcher.product_horizontal>` | row-wise product, nulls treated as 1 |
 | {py:func}`bt.reduce_horizontal(fn, *exprs) <batcher.reduce_horizontal>` / {py:func}`bt.fold_horizontal(acc, fn, *exprs) <batcher.fold_horizontal>` | fold columns row-wise with a binary `Expr` combiner (no seed / with seed) |
 | {py:func}`bt.mean_horizontal(*exprs) <batcher.mean_horizontal>` | row-wise mean, ignoring nulls |
-| {py:func}`bt.min_horizontal(*exprs) <batcher.min_horizontal>` / {py:func}`bt.max_horizontal(*exprs) <batcher.max_horizontal>` | row-wise min / max, ignoring nulls (the Polars-named `least` / `greatest`) |
+| {py:func}`bt.least(*exprs) <batcher.least>` / {py:func}`bt.greatest(*exprs) <batcher.greatest>` | row-wise min / max, ignoring nulls |
 | {py:func}`bt.all_horizontal(*exprs) <batcher.all_horizontal>` / {py:func}`bt.any_horizontal(*exprs) <batcher.any_horizontal>` | row-wise boolean AND / OR across predicate columns |
 
 ```python
@@ -111,8 +111,8 @@ replace one:
 | {py:meth}`.is_nan() <batcher.plan.expr_ir.core.Expr.is_nan>` / {py:meth}`.is_not_nan() <batcher.plan.expr_ir.core.Expr.is_not_nan>` | true where the float value is NaN, or is not NaN. NaN is distinct from null |
 | {py:meth}`.is_finite() <batcher.plan.expr_ir.core.Expr.is_finite>` / {py:meth}`.is_infinite() <batcher.plan.expr_ir.core.Expr.is_infinite>` | true where the float value is finite / ±infinity |
 | `.fill_null(value)` | replace nulls with a value |
-| {py:meth}`.forward_fill() <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`.backward_fill() <batcher.plan.expr_ir.core.Expr.backward_fill>` | carry the nearest non-null value along an ordered window ({py:meth}`.over(order_by=…) <batcher.AggExpr.over>` required) |
-| {py:meth}`.interpolate() <batcher.plan.expr_ir.core.Expr.interpolate>` | draw a straight line across an interior gap instead of holding the last value flat (`.over(order_by=…)` required) |
+| {py:meth}`.forward_fill() <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`.backward_fill() <batcher.plan.expr_ir.core.Expr.backward_fill>` | carry the nearest non-null value along an ordered window ({py:meth}`.over(order_by=...) <batcher.AggExpr.over>` required) |
+| {py:meth}`.interpolate() <batcher.plan.expr_ir.core.Expr.interpolate>` | draw a straight line across an interior gap instead of holding the last value flat (`.over(order_by=...)` required) |
 | `.cut(breaks, labels=None, left_closed=False)` | bin a numeric column into labeled intervals |
 
 ```python
@@ -145,19 +145,19 @@ print(out.to_pydict())
 
 ## Math methods
 
-`.abs()`, `.round(digits)`, `.pow(e)`, `.sqrt()`, `.floor()`, `.ceil()`, `.ln()`,
-`.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.asin()`, `.acos()`,
-`.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`, `.trunc()`,
+`.abs()`, `.round(digits)`, `.sqrt()`, `.floor()`, `.ceil()`, `.ln()`,
+`.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.arcsin()`, `.arccos()`,
+`.arctan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`, `.trunc()`,
 `.cbrt()`, `.degrees()`, `.radians()`, `.factorial()`, `.square()` (i.e. `x*x`),
 `.log1p()` / `.expm1()` (accurate near zero), and the inverse-hyperbolics
-{py:meth}`.asinh() <batcher.plan.expr_ir.core.Expr.asinh>` / {py:meth}`.acosh() <batcher.plan.expr_ir.core.Expr.acosh>` / {py:meth}`.atanh() <batcher.plan.expr_ir.core.Expr.atanh>` (→ Float64). The reciprocal trig pair
+{py:meth}`.arcsinh() <batcher.plan.expr_ir.core.Expr.arcsinh>` / {py:meth}`.arccosh() <batcher.plan.expr_ir.core.Expr.arccosh>` / {py:meth}`.arctanh() <batcher.plan.expr_ir.core.Expr.arctanh>` (-> Float64). The reciprocal trig pair
 {py:meth}`.sec() <batcher.plan.expr_ir.core.Expr.sec>` / {py:meth}`.csc() <batcher.plan.expr_ir.core.Expr.csc>`, the gamma function {py:meth}`.gamma() <batcher.plan.expr_ir.core.Expr.gamma>` and its log {py:meth}`.lgamma() <batcher.plan.expr_ir.core.Expr.lgamma>` (which stays
 finite where `.gamma()` overflows, above about 171), and two rounding modes that are not
 `.round()`'s default: `.round(mode="half_to_even")` rounds half to *even* (DuckDB
 `round_even`, Spark `bround`), and `.even()` rounds *away from zero* to the nearest even integer. Integer bitwise
 ops (distinct from the boolean `&`/`|`): {py:meth}`.bitwise_and(o) <batcher.plan.expr_ir.core.Expr.bitwise_and>`, {py:meth}`.bitwise_or(o) <batcher.plan.expr_ir.core.Expr.bitwise_or>`,
 {py:meth}`.bitwise_xor(o) <batcher.plan.expr_ir.core.Expr.bitwise_xor>`, {py:meth}`.bitwise_left_shift(o) <batcher.plan.expr_ir.core.Expr.bitwise_left_shift>`, {py:meth}`.bitwise_right_shift(o) <batcher.plan.expr_ir.core.Expr.bitwise_right_shift>`, and
-{py:meth}`.bit_count() <batcher.plan.expr_ir.core.Expr.bit_count>` (the number of set bits, i.e. population count → Int64).
+{py:meth}`.bit_count() <batcher.plan.expr_ir.core.Expr.bit_count>` (the number of set bits, i.e. population count -> Int64).
 
 ```python
 out = ds.select(root=bt.col("b").sqrt(), third=(bt.col("b") / 3).round(2))
@@ -174,7 +174,6 @@ the accessor namespaces:
 | --- | --- |
 | `.alias(name)` | bind an output name to a derived expression, for positional `select` |
 | {py:meth}`.pipe(fn, *args) <batcher.Expr.pipe>` | apply your own `fn(expr, *args)` and keep the chain fluent (Polars `pipe`, Spark `Column.transform`) |
-| {py:meth}`.neg() <batcher.plan.expr_ir.core.Expr.neg>` | arithmetic negation (the Polars spelling of the unary minus) |
 | `.chr()` | the character at this Unicode code point (DuckDB/Spark `chr`) |
 | {py:meth}`.to_base(radix) <batcher.plan.expr_ir.core.Expr.to_base>` | this integer written in base 2..36 (DuckDB {py:meth}`to_base <batcher.plan.expr_ir.core.Expr.to_base>`; `bin` is radix 2) |
 | {py:meth}`.format_bytes(si=False) <batcher.plan.expr_ir.core.Expr.format_bytes>` | a byte count as human-readable text, such as `1.5 KiB`, or `1.5 kB` with `si=True` |
@@ -186,16 +185,16 @@ the accessor namespaces:
 ## Aggregation methods
 
 Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
-`.var()`, `.std()`, `.median()`, `.quantile(q)`, `.skewness()` / `.kurtosis()`
+`.var()`, `.std()`, `.median()`, `.quantile(q)`, `.skew()` / `.kurtosis()`
 (third / fourth standardized moment of each group; DuckDB `skewness` / `kurtosis`),
 `.histogram()` (a
-`Map<value, count>` of each group's values, DuckDB `histogram`), `.count()`, `.n_unique()`
-(aliased `.count_distinct()`), `.mode()`, `.bool_and()`, `.bool_or()`,
+`Map<value, count>` of each group's values, DuckDB `histogram`), `.count()`,
+`.count_distinct()`, `.mode()`, `.bool_and()`, `.bool_or()`,
 `.bit_and()` / `.bit_or()` / `.bit_xor()` (bitwise reduction of the non-null
 `Int64` values in each group), `.array_agg(order_by=…)` (collect each group's values into a
 `List`; SQL `array_agg(x ORDER BY k)` /
 Spark `collect_list`), {py:meth}`.min_by(by) <batcher.plan.expr_ir.core.Expr.min_by>` / {py:meth}`.max_by(by) <batcher.plan.expr_ir.core.Expr.max_by>` (the value at the
-row with the extreme `by` key), {py:meth}`.arg_min(order_by=…) <batcher.plan.expr_ir.core.Expr.arg_min>` / {py:meth}`.arg_max(order_by=…) <batcher.plan.expr_ir.core.Expr.arg_max>` (the 0-based position of the group's extreme value along `order_by`, Polars `arg_min`/`arg_max`), and `.first(order_by=…)` / `.last(order_by=…)`
+row with the extreme `by` key), {py:meth}`.arg_min(order_by=...) <batcher.plan.expr_ir.core.Expr.arg_min>` / {py:meth}`.arg_max(order_by=...) <batcher.plan.expr_ir.core.Expr.arg_max>` (the 0-based position of the group's extreme value along `order_by`, Polars `arg_min`/`arg_max`), and `.first(order_by=...)` / `.last(order_by=...)`
 (the value at the first or last row in `order_by` order). `order_by` is required for the positions, first and last, because an arrival-order position wouldn't be partition-independent. `array_agg` accepts no `order_by` too, and then returns each group's elements in an unspecified order: the same elements on every execution path, but not the same sequence. Rows that tie on every `order_by` key are ordered by their value, ascending with nulls last, so an ordered list is the same however the rows were partitioned. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
 
 The assembly-contiguity aggregates measure how a set of lengths is distributed *by base*
@@ -224,7 +223,7 @@ engine resolves "unspecified" to the group minimum so a distributed run agrees w
 single-node one).
 
 For heavy skew, the bounded-memory approximate variants keep one fixed-size
-sketch per group instead of every value, so a hot key cannot OOM: `.approx_n_unique()`
+sketch per group instead of every value, so a hot key cannot OOM: `.approx_count_distinct()`
 (HLL, ~2% error) and `.approx_quantile(q)` / `.approx_median()` (DDSketch). They are
 mergeable, so results are identical single-node and distributed.
 
@@ -322,10 +321,10 @@ A window expression composes with ordinary arithmetic and other windows. The eng
 | `.rolling_sum(k)` / `.rolling_mean(k)` / `.rolling_min(k)` / `.rolling_max(k)` / `.rolling_count(k)` | `agg(x) OVER (ROWS BETWEEN k-1 PRECEDING AND CURRENT ROW)` |
 | {py:meth}`.rolling_var(k, ddof=1) <batcher.plan.expr_ir.core.Expr.rolling_var>` / {py:meth}`.rolling_std(k, ddof=1) <batcher.plan.expr_ir.core.Expr.rolling_std>` | sample (or population, `ddof=0`) variance / stddev over the same trailing frame |
 | {py:meth}`.rolling_sum_by(by, w) <batcher.plan.expr_ir.core.Expr.rolling_sum_by>` / {py:meth}`.rolling_mean_by <batcher.plan.expr_ir.core.Expr.rolling_mean_by>` / {py:meth}`.rolling_min_by <batcher.plan.expr_ir.core.Expr.rolling_min_by>` / {py:meth}`.rolling_max_by <batcher.plan.expr_ir.core.Expr.rolling_max_by>` / {py:meth}`.rolling_count_by <batcher.plan.expr_ir.core.Expr.rolling_count_by>` | the same aggregates over a *time* window: `RANGE BETWEEN w PRECEDING AND CURRENT ROW` ordered by `by`, where `w` may be a duration such as `"5m"` |
-| {py:meth}`.ewm_mean(…) <batcher.plan.expr_ir.core.Expr.ewm_mean>` / {py:meth}`.ewm_std(…) <batcher.plan.expr_ir.core.Expr.ewm_std>` / {py:meth}`.ewm_var(…) <batcher.plan.expr_ir.core.Expr.ewm_var>` | exponentially weighted moving statistics, decayed by `alpha` / `span` / `half_life` / `com` (`.over(order_by=…)` required) |
+| {py:meth}`.ewm_mean(...) <batcher.plan.expr_ir.core.Expr.ewm_mean>` / {py:meth}`.ewm_std(...) <batcher.plan.expr_ir.core.Expr.ewm_std>` / {py:meth}`.ewm_var(...) <batcher.plan.expr_ir.core.Expr.ewm_var>` | exponentially weighted moving statistics, decayed by `alpha` / `span` / `half_life` / `com` (`.over(order_by=...)` required) |
 | {py:meth}`.ewm_mean_by(by, half_life) <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` | the same smoother decayed by *elapsed* `by` rather than by row position, for an irregularly sampled series |
-| {py:meth}`.rle_id() <batcher.plan.expr_ir.core.Expr.rle_id>` | 0-based index of the current run of equal values (`.over(order_by=…)` required) |
-| {py:meth}`.peak_max(order_by=…) <batcher.plan.expr_ir.core.Expr.peak_max>` / {py:meth}`.peak_min(order_by=…) <batcher.plan.expr_ir.core.Expr.peak_min>` | true at a local extremum, strictly beyond both neighbours; an edge row is never one |
+| {py:meth}`.rle_id() <batcher.plan.expr_ir.core.Expr.rle_id>` | 0-based index of the current run of equal values (`.over(order_by=...)` required) |
+| {py:meth}`.peak_max(order_by=...) <batcher.plan.expr_ir.core.Expr.peak_max>` / {py:meth}`.peak_min(order_by=...) <batcher.plan.expr_ir.core.Expr.peak_min>` | true at a local extremum, strictly beyond both neighbours; an edge row is never one |
 
 All of them take `partition_by=` / `order_by=`, and {py:meth}`.fill_nan(v) <batcher.plan.expr_ir.core.Expr.fill_nan>` replaces IEEE NaN (which `.fill_null(v)` never touches, NaN being a value rather than a null).
 
@@ -356,28 +355,17 @@ print(
 
 ## Compatibility spellings
 
-For migration, many operations carry a second, framework-familiar name alongside the
+For migration, a few operations carry a second, framework-familiar name alongside the
 SQL-style primary. These delegate to the primary spelling, with the same behavior and no new IR.
 
-Trig / clip / range on `Expr`: {py:meth}`.arcsin() <batcher.plan.expr_ir.core.Expr.arcsin>`, {py:meth}`.arccos() <batcher.plan.expr_ir.core.Expr.arccos>`, {py:meth}`.arctan() <batcher.plan.expr_ir.core.Expr.arctan>`, {py:meth}`.arcsinh() <batcher.plan.expr_ir.core.Expr.arcsinh>`,
-{py:meth}`.arccosh() <batcher.plan.expr_ir.core.Expr.arccosh>`, {py:meth}`.arctanh() <batcher.plan.expr_ir.core.Expr.arctanh>` (the NumPy and Polars names for {py:meth}`.asin() <batcher.plan.expr_ir.core.Expr.asin>` and friends), {py:meth}`.clip_min(lo) <batcher.plan.expr_ir.core.Expr.clip_min>` /
-`.clip_max(hi)` (Polars, for `.clip(...)`), and `.is_between(lo, hi, closed="both")`
-(Polars, for `.between(...)`). Top-level {py:func}`bt.arctan2(y, x) <batcher.arctan2>` mirrors `bt.atan2`.
-
-On `.str`: `.to_lowercase()` / `.to_uppercase()` / `.to_titlecase()` (Polars, for
-`lower`/`upper`/`initcap`), `.pad_start(w, fill)` / `.pad_end(w, fill)` and pandas'
-`.ljust(w, fill)` / `.rjust(w, fill)` (for `lpad`/`rpad`), `.count_matches(pattern)`
-(for `count_matches`), `.extract(pattern, group=1)` / `.extract_all(pattern)` /
-{py:meth}`.replace_all(pattern, value) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.replace_all>` (for the `regexp_*` methods), {py:meth}`.len_chars() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.len_chars>` /
-`.len_bytes()` (for `len`/`octet_length`), `.strip_chars(chars=None)` /
-`.strip_chars_start(...)` / `.strip_chars_end(...)` (for `trim`/`lstrip`/`rstrip`), and
-`.head(n)` / `.tail(n)` / `.slice(offset, length=None)` (for `left`/`right`/`substr`).
+On `.str`: `.count_matches(pattern)` counts regex matches (DuckDB's `regexp_count`), and `.slice(offset, length=None)`,
+the 0-based counterpart of the 1-based `substr`.
 A negative `offset` counts back from the end, so `.slice(-3, 2)` on `"abcdef"` gives
 `"de"`, and an offset reaching past the front yields an empty string rather than the
 head. {py:meth}`.list.slice(offset, length=None) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.slice>` indexes the same way, which is what makes
 `.list.slice(-n, n)` the tail of each list.
 
-On `.dt`: {py:meth}`.truncate(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.truncate>` (and its `.floor` alias), `.ceil(unit)` and `.round(unit)` all take
+On `.dt`: {py:meth}`.truncate(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.truncate>`, `.ceil(unit)` and `.round(unit)` all take
 one vocabulary: the long names `year`/`quarter`/`month`/`week`/`day`/`hour`/`minute`/
 `second` (plus `millennium`/`century`/`decade`/`millisecond`/`microsecond` for `truncate`),
 and the duration spellings {py:meth}`offset_by <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.offset_by>` takes, such as `"1mo"` or `"mo"`. As in `offset_by`,
@@ -385,49 +373,35 @@ and the duration spellings {py:meth}`offset_by <batcher.plan.expr_ir.namespaces.
 `"5d"`, is rejected rather than floored to `"1d"`, because truncation reaches a calendar
 boundary and cannot express a bucket width.
 
-On `.dt`: `.weekday()` (for `isodow`), `.ordinal_day()` (for `dayofyear`),
-`.to_string(fmt)` (for `strftime`), `.date()` / `.month_start()` (for `truncate(...)`),
-{py:meth}`.month_end() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.month_end>` (for {py:meth}`last_day <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.last_day>`), and the sub-second components {py:meth}`.millisecond() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.millisecond>` /
+On `.dt`: `.date()` / `.month_start()` (for `truncate(...)`), and the sub-second components {py:meth}`.millisecond() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.millisecond>` /
 {py:meth}`.microsecond() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.microsecond>` / {py:meth}`.nanosecond() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.nanosecond>`.
 
-On `.list`: {py:meth}`.set_union(o) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.set_union>` / {py:meth}`.set_intersection(o) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.set_intersection>` / {py:meth}`.set_difference(o) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.set_difference>` (Polars
-names for `union`/`intersect`/`difference`).
-
-pandas string spellings: `.strip(chars=None)` (for `trim`), `.startswith(p)` /
-`.endswith(p)` (for `starts_with`/`ends_with`), `.match(pattern)` (for
-`regexp_matches`), `.title()` (for `initcap`), plus Python's `.removeprefix(p)` /
-{py:meth}`.removesuffix(s) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.removesuffix>`. pandas datetime spellings: {py:meth}`.day_name() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.day_name>` / {py:meth}`.month_name() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.month_name>` (for
-`dayname`/`monthname`), `.daysinmonth()` (for `days_in_month`), `.weekofyear()` (for
-`week`), `.normalize()` and {py:meth}`.floor(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.floor>` (for `truncate`), plus {py:meth}`.ceil(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.ceil>` (the next boundary, unless already on one) and {py:meth}`.round(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.round>` (the nearer one, half rounding up) over `second` through `year`, both measuring a calendar unit by real elapsed time so mid-February rounds to March.
+pandas string spellings: `.startswith(p)` /
+`.endswith(p)` (for `starts_with`/`ends_with`), and `.match(pattern)`, which is anchored at the start of the string as in pandas. pandas datetime spellings: `.normalize()` (for `truncate`). {py:meth}`.ceil(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.ceil>` goes to the next boundary, unless already on one, and {py:meth}`.round(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.round>` to the nearer one, half rounding up. Both work over `second` through `year` and measure a calendar unit by real elapsed time, so mid-February rounds to March.
 
 ### pandas names on `Expr`
 
-A script ported from pandas finds each operation under the name it already types. Every
-one of these delegates to the primary, so the plan is identical:
+Batcher has one spelling for each of these, so a script ported from pandas renames them:
 
-| pandas spelling | Batcher primary |
+| pandas spelling | Batcher spelling |
 |---|---|
 | `.astype(dtype)` | `.cast(dtype)` |
 | `.isna()`, `.isnull()` | `.is_null()` |
 | `.notna()`, `.notnull()` | `.is_not_null()` |
 | `.fillna(value)` | `.fill_null(value)` |
-| {py:meth}`.isin(values) <batcher.plan.expr_ir.core.Expr.isin>` | {py:meth}`.is_in(values) <batcher.plan.expr_ir.core.Expr.is_in>` |
-| `.nunique()` | `.n_unique()` |
+| `.isin(values)` | {py:meth}`.is_in(values) <batcher.plan.expr_ir.core.Expr.is_in>` |
+| `.nunique()` | `.count_distinct()` |
 | `.rename(name)` | `.alias(name)` |
-| `.skew()`, `.kurt()` | `.skewness()`, `.kurtosis()` |
-| `.cumsum()`, `.cummax()`, `.cummin()`, `.cumcount()`, {py:meth}`.cumprod() <batcher.plan.expr_ir.compat.names.cumprod>` | `.cum_sum()`, `.cum_max()`, `.cum_min()`, `.cum_count()`, `.cum_prod()` |
+| `.skew()`, `.kurt()` | `.skew()`, `.kurtosis()` |
+| `.cumsum()`, `.cummax()`, `.cummin()`, `.cumcount()`, `.cumprod()` | `.cum_sum()`, `.cum_max()`, `.cum_min()`, `.cum_count()`, {py:meth}`.cum_prod() <batcher.plan.expr_ir.core.Expr.cum_prod>` |
 | `.prod()` | `.product()` |
 | `.any()`, `.all()` | `.bool_or()`, `.bool_and()` |
 | `.log()` | `.ln()` (numpy's natural-log convention) |
 
-Cast type names are matched case-insensitively, so pandas' `.astype("Int64")` and SQL's
-`.cast("BIGINT")` spelling both resolve to the canonical `int64`.
+Cast type names are matched case-insensitively, so pandas' `.cast("Int64")` and SQL's
+`.cast("BIGINT")` both resolve to the canonical `int64`.
 
-Each operator also has the pandas method form, for code that cannot emit an operator:
-`.add(o)`, `.sub(o)`, `.mul(o)`, `.truediv(o)`, `.div(o)`, `.floordiv(o)`, `.mod(o)`,
-{py:meth}`.eq(o) <batcher.plan.expr_ir.core.Expr.eq>`, {py:meth}`.ne(o) <batcher.plan.expr_ir.core.Expr.ne>`, {py:meth}`.lt(o) <batcher.plan.expr_ir.core.Expr.lt>`, {py:meth}`.le(o) <batcher.plan.expr_ir.core.Expr.le>`, {py:meth}`.gt(o) <batcher.plan.expr_ir.core.Expr.gt>`, {py:meth}`.ge(o) <batcher.plan.expr_ir.core.Expr.ge>`. The boolean operators
-likewise carry {py:meth}`.and_(o) <batcher.plan.expr_ir.core.Expr.and_>`, {py:meth}`.or_(o) <batcher.plan.expr_ir.core.Expr.or_>`, {py:meth}`.not_() <batcher.plan.expr_ir.core.Expr.not_>`, and {py:meth}`.xor(o) <batcher.plan.expr_ir.core.Expr.xor>`, because Python's `and`,
-`or`, and `not` keywords cannot be overloaded.
+pandas' operator methods, such as `.add(o)` or `.eq(o)`, have no method form here. Write the operator instead: `+`, `-`, `*`, `/`, `//`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, and `&`, `|`, `~` for the boolean ones.
 
 ```python
 import batcher as bt
@@ -442,19 +416,6 @@ print(
 )
 # {'filled': [1, 0, 3], 'missing': [False, True, False], 'total': [11, None, 33]}
 ```
-
-### Python `str` and numpy names on the accessors
-
-On `.str`, the Python string predicates: {py:meth}`.isdigit() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.isdigit>`, {py:meth}`.isalpha() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.isalpha>`, {py:meth}`.isalnum() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.isalnum>`, and
-{py:meth}`.isspace() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.isspace>` (for {py:meth}`is_numeric <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_numeric>`/{py:meth}`is_alpha <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_alpha>`/{py:meth}`is_alnum <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_alnum>`/{py:meth}`is_space <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_space>`), plus Polars'
-`.strip_prefix(p)` / `.strip_suffix(s)` (for `removeprefix`/`removesuffix`).
-
-On `.dt`, the snake_case spellings {py:meth}`.day_of_week() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.day_of_week>`, {py:meth}`.day_of_year() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.day_of_year>`, and
-`.week_of_year()` (for `dayofweek`/`dayofyear`/`weekofyear`).
-
-On `.list`, `.lengths()` (the legacy Polars name for `len`), `.element_at(i)` (the
-PySpark name for `get`), and `.argmin()` / `.argmax()` (the numpy names for
-`arg_min`/`arg_max`).
 
 Some names from other engines are deliberately absent, because they mean something different
 here and a silently-wrong alias is worse than a missing one:

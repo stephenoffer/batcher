@@ -1,6 +1,8 @@
 # Business days
 
-Reports almost always want weekdays only, and almost always want a string at the end. Both are expressions, so the filter pushes down toward the scan and the formatting happens in Rust rather than in a Python `strftime` loop.
+Reports almost always want weekdays only, and almost always want a string at the end. Both are expressions, so the filter runs in the engine and the formatting happens in Rust rather than in a Python `strftime` loop.
+
+The script flags weekends, weekdays, and business days across four days in March 2024 that straddle a weekend, formats timestamps with `strftime`, and filters to weekday traffic. No holiday calendar is applied, so a business day is a weekday and nothing more.
 
 The whole script, executed on every test run:
 

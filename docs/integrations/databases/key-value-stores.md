@@ -1,31 +1,31 @@
 # Key-value stores
 
-This page covers DynamoDB, Cassandra (and ScyllaDB), Redis, and HBase: the stores Batcher reads and writes by *key* rather than by query. A full read of one of them fans out across the store's own parallel unit. A filtered read sometimes stops being a fan-out at all, and that is the difference between one read unit and the whole table's worth.
+This page covers DynamoDB, Cassandra, ScyllaDB, Redis and HBase: the stores Batcher reads and writes by *key* rather than by query. A full read fans out across each store's own parallel unit, a filter that pins the partition key collapses into a single-partition read, and a write goes out through the store's bulk primitive with partial failures checked.
 
 | | |
 | --- | --- |
-| **Read** | {py:meth}`bt.read.dynamodb(table=...) <batcher.api.io_namespace.reader.Reader.dynamodb>`, {py:meth}`bt.read.cassandra(...) <batcher.api.io_namespace.reader.Reader.cassandra>`, {py:meth}`bt.read.redis(...) <batcher.api.io_namespace.reader.Reader.redis>`, {py:meth}`bt.read.hbase(...) <batcher.api.io_namespace.reader.Reader.hbase>` |
+| **Read** | {py:meth}`bt.read.dynamodb(table=...) <batcher.api.io_namespace.reader.Reader.dynamodb>`, {py:meth}`bt.read.cassandra(...) <batcher.api.io_namespace.reader.Reader.cassandra>`, {py:meth}`bt.read.redis(...) <batcher.api.io_namespace.reader.Reader.redis>`, {py:meth}`bt.read.hbase(...) <batcher.api.io_namespace.reader.Reader.hbase>`, and `bt.read.table("scylla", ...)` |
 | **Write** | {py:meth}`ds.write.dynamodb(table, ...) <batcher.api.io_namespace.writer.Writer.dynamodb>`, {py:meth}`ds.write.cassandra(table, ...) <batcher.api.io_namespace.writer.Writer.cassandra>`, {py:meth}`ds.write.redis(prefix, ...) <batcher.api.io_namespace.writer.Writer.redis>`, {py:meth}`ds.write.hbase(table, ...) <batcher.api.io_namespace.writer.Writer.hbase>` |
-| **Extras** | `pip install 'batcher-engine[dynamodb]'`, `[cassandra]`, `[redis]`, `[hbase]` |
+| **Extras** | `pip install 'batcher-engine[dynamodb]'`, `[cassandra]`, `[nosql-redis]`, `[hbase]`, or `[nosql]` for all of them |
 | **Parallelism** | One split per scan segment, token range, hash-slot range, or region range |
-| **Credentials** | Passed as connection keywords, never logged, and `env:`/`file:` references resolve on the worker |
+| **Credentials** | Connection keywords, never logged. The DynamoDB secret key and the Redis password accept an `env:`/`file:` reference, resolved on the worker |
 
 ## Reading a whole store
 
-Each store has a native parallel unit, and Batcher maps one split onto each of them rather than inventing client-side range math.
+Each store has a native parallel unit, and Batcher maps one split onto each one.
 
 | Store | Parallel unit | Default |
 | --- | --- | --- |
 | DynamoDB | A `Scan` segment (`Segment` / `TotalSegments`) | one segment |
-| Cassandra | A Murmur3 token range | 64 ranges |
+| Cassandra and ScyllaDB | A Murmur3 token range | 64 ranges |
 | Redis | A contiguous hash-slot range of the 16,384 | one range |
 | HBase | A region's ``[start_key, stop_key)`` range | one per region |
 
-Raise the count with `partition_spec=PartitionSpec(segments=N)`. On Cassandra the default of 64 is already about one range per vnode; on DynamoDB the default is one, because segment count is read capacity you are choosing to spend.
+Raise the count with `partition_spec=PartitionSpec(segments=N)`, imported from `batcher.io.formats.nosql`. HBase reads its region boundaries and uses `segments` only when it cannot. On Cassandra the default of 64 is already about one range per vnode. On DynamoDB the default is one, because segment count is read capacity you are choosing to spend.
 
 ## A filter can stop the fan-out entirely
 
-A parallel scan is the right shape for reading a table. It is the wrong shape for reading one row. A server-side filter does not fix that.
+A parallel scan is the right shape for reading a table and the wrong one for reading one row, and a server-side filter does not change that.
 
 On DynamoDB it makes it worse than it looks. A `FilterExpression` is applied *after* items are read, and read capacity is billed for what was examined rather than for what came back. So a scan filtered down to one item costs the same as reading the table.
 
@@ -47,7 +47,7 @@ events = bt.read.dynamodb(table="events", region_name="us-east-1")
 recent = events.filter(col("user_id") == "u-42", col("ts") > 1_700_000_000)
 ```
 
-This is about **cost**, not latency. Reading one DynamoDB partition instead of scanning the
+The gain is cost, not latency. Reading one DynamoDB partition instead of scanning the
 table is the difference between one read unit and the whole table's worth of them, and on
 Cassandra between one replica set and the entire ring. It does not make Batcher a serving
 path: the query still carries the engine's fixed ~2 ms floor, and one process serves a few
@@ -61,7 +61,7 @@ The rewrite is sound only when reading the one partition cannot miss a matching 
 Three shapes look close and are not, and each falls back to the full scan:
 
 - **A top-level `OR`.** One branch pinning the key says nothing about the other, which can match a row in any partition.
-- **A range on the partition key.** `user_id > "a"` names no partition; the key is hashed, so ordering on it means nothing to the store.
+- **A range on the partition key.** `user_id > "a"` names no partition, because the key is hashed, so ordering on it means nothing to the store.
 - **A composite partition key only partly pinned.** Cassandra hashes the whole key together, so fixing one of two columns still names no partition.
 
 Everything the predicate says beyond the key becomes a `FilterExpression` on DynamoDB, or stays in the `WHERE` on Cassandra. A term that will not translate is left to the engine, which re-checks every row regardless.
@@ -80,7 +80,7 @@ events = bt.read.dynamodb(
 )
 ```
 
-Cassandra always needs `partition_key=`. The token predicate is built from it.
+Cassandra always needs `partition_key=`, because the token predicate is built from it. ScyllaDB reads through the same source under `bt.read.table("scylla", ...)` with the same keywords, and writes through `ds.write.cassandra`.
 
 ### Temporal predicates are not pushed
 
@@ -106,7 +106,7 @@ sessions.write.redis("session", host="cache", ttl_seconds=3600)
 
 `append` is missing from all four because none of them can express it. A DynamoDB `PutItem` replaces the item holding the same key, and no batch operation inserts only when the key is absent, so an "append" would silently be an upsert. A CQL `INSERT` and an HBase `Put` are upserts for the same reason. Redis `SET` replaces.
 
-`overwrite` is missing because emptying these stores is not a write. On DynamoDB it means scanning the table to delete every item at full read and write cost; on Cassandra it means `TRUNCATE`, a cluster-wide schema operation; on Redis it means `FLUSHDB`, which discards every key in the database rather than the ones this write would replace; on HBase it means disabling and truncating the table through the admin API. Reaching an operation of that reach by passing a string to `mode` is not something a write API should offer. Write to a new table or key prefix and re-point what reads it.
+`overwrite` is missing because emptying these stores is not a write. On DynamoDB it means scanning the table to delete every item at full read and write cost. On Cassandra it means `TRUNCATE`, a cluster-wide schema operation. Redis would need `FLUSHDB`, which discards every key in the database rather than the ones this write would replace, and HBase would need the admin API to disable and truncate the table. None of that belongs behind a string passed to `mode`. Write to a new table or key prefix and re-point what reads it.
 
 ### What HBase writes
 
@@ -125,7 +125,7 @@ Keys are prefixed by `prefix=` if given, and by the write's destination name oth
 
 Each of these APIs can fail *inside* a successful call, and each sink reads the response rather than the status.
 
-`BatchWriteItem` returns the requests it could not process under `UnprocessedItems` with a 200. Throttling, usually. Those are resent with jittered backoff, and a remainder that survives every attempt raises rather than being dropped. Cassandra's concurrent execution returns a success flag per statement; a failed one raises naming how many failed and what the first said.
+`BatchWriteItem` returns the requests it could not process under `UnprocessedItems` with a 200, usually because of throttling. Those are resent with jittered backoff, and a remainder that survives every attempt raises rather than being dropped. Cassandra's concurrent execution returns a success flag per statement, and a failed one raises naming how many failed and what the first said.
 
 A sink that trusted the call would have written some of its rows and reported success, which is the quietest kind of data loss there is.
 
@@ -139,7 +139,7 @@ Schema inference on DynamoDB, Cassandra, and HBase samples a single item or row.
 
 Rows cross into Python on both the read and the write for all four stores. That is the drivers' shape. It makes these good sinks for a serving or feature dataset and poor ones for moving a billion analytical rows, which belong in Parquet or a lakehouse table.
 
-Redis reads every matching key's value with a round trip per key inside its slot range. `match=` is what keeps that bounded; a read with no pattern walks the whole keyspace.
+Redis reads every matching key's value with a round trip per key inside its slot range. `match=` is what keeps that bounded. A read with no pattern walks the whole keyspace.
 
 ## See also
 

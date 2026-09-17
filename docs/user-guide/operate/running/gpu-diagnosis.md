@@ -3,7 +3,7 @@
 This page covers finding out why a GPU stage was slower than it should have been, when the
 answer is not in the plan. It assumes the query is correct and the plan is the one you wanted.
 
-The hard part is that a GPU fails slowly rather than loudly. A device clamped by its own
+A GPU fails slowly rather than loudly. A device clamped by its own
 thermals still returns the right answer. So does one whose host link trained at half width, one
 decoding video on its shader cores instead of its decoder, and one waiting on the stage in
 front of it. Every one of those leaves the query correct and the node a fraction as fast, and
@@ -65,7 +65,7 @@ costs more than no diagnosis, because somebody acts on it.
 
 ## Read the verdict
 
-Each device gets one verdict and one thing to change. The verdicts and what each one means:
+Each device gets one verdict and one thing to change. The following table lists the verdicts and what each one means:
 
 | Verdict | What the window showed | What to change |
 |---|---|---|
@@ -75,6 +75,7 @@ Each device gets one verdict and one thing to change. The verdicts and what each
 | `starved` | Everything quiet, or swinging between busy and idle | Deepen the prefetch, or raise the in-flight batch count |
 | `throttled` | The driver clamped the clocks | Cooling, or the enforced power limit |
 | `contended` | Another process was doing work on the device | Size fractionally, or place the work elsewhere |
+| `codec_bound` | A fixed-function engine, such as the video decoder, was saturated | Spread the decode across devices |
 | `occupancy_limited` | SMs busy while holding few warps | The kernel's register or shared-memory footprint |
 | `unknown` | Not enough signal to say | Sample for longer, or check driver visibility |
 
@@ -172,8 +173,7 @@ disabling the device path on a guess.
 
 The second is GPUDirect Storage that is not direct. KvikIO has a fallback called compat mode,
 in which every read is an ordinary host read into a bounce buffer followed by a copy to the
-device. It
-engages when the `nvidia-fs` kernel module is missing, which is the normal state of a container
+device. It engages when the `nvidia-fs` kernel module is missing, which is the normal state of a container
 built without it. Nothing raises, and the read is slower than the plain host read because it
 does the same work plus an extra buffer.
 
@@ -259,6 +259,7 @@ does not silently stop evaluating the day a container loses its driver mount.
 ## See also
 
 - {doc}`/user-guide/operate/running/gpu-fleets`: sizing, power budgets, health, and placement.
+- {doc}`/user-guide/operate/running/unstable-nodes`: a GPU stage that fails rather than slows.
 - {doc}`/user-guide/operate/running/metrics`: the metrics endpoint these series join.
 - {doc}`/user-guide/operate/tuning/performance`: the levers when the answer *is* in the plan.
 - {doc}`/ml/inference/gpu`: choosing devices and batch sizes from the pipeline side.

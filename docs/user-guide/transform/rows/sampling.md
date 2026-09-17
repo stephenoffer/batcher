@@ -1,10 +1,12 @@
 # Sampling and splitting
 
-Most sampling implementations draw from a random number generator per partition. That
-is reproducible only if the partitioning is, which it is not: change the file layout,
-the worker count, or run distributed instead of single-node, and you get a different
-sample from the same data. Batcher assigns rows by a seeded hash of their *values*
-instead, so a sample is a function of the data and the seed, and of nothing else.
+This page covers drawing samples and splits from a Batcher dataset that stay reproducible however the data is laid out or distributed.
+
+Most sampling implementations draw from a random number generator per partition. That is reproducible only if the partitioning is, which it is not: change the file layout, the worker count, or run distributed instead of single-node, and you get a different sample from the same data. Batcher assigns rows by a seeded hash of their *values* instead, so a sample is a function of the data and the seed, and of nothing else.
+
+Which operator to use depends on what you need back. Each one in the figure has a section below, and the table at the end of the page restates the choice.
+
+![Choosing a sampling or splitting operator, as four questions in order. First, if you want a number rather than rows, such as a distinct count or a quantile, use approx_count_distinct or approx_quantile, a mergeable sketch computed in one pass. Second, if you want consecutive ranges, such as a chronological holdout, use split_at_indices or split_proportionately, which cut by position, so sort first. Third, if each group must keep its share so a rare class does not starve, use stratified_split with by and test_size, which hashes within each group. Fourth, if you need exactly n rows, use sample(n=...), which ranks every row by hash and so is a pipeline breaker. Otherwise use sample with a fraction and a seed, which streams and returns a binomial number of rows. For disjoint train and test sets, use ml.train_test_split with key= a stable id, so a row never changes side. Every form that chooses rows, apart from the positional splits, assigns them by a seeded hash of their values, so one seed gives the same rows however the data is laid out or distributed.](/_static/diagrams/sampling_choice.svg)
 
 ## Setup
 
@@ -16,16 +18,14 @@ print(ds.columns)
 # ['value', 'bucket']
 ```
 
-## sample: a fraction or an exact count
+## Sample a fraction or an exact count
 
-The two forms are not interchangeable, and the difference is whether the operator has to
-see the whole relation before it can emit anything.
+The two forms are not interchangeable, and the difference is whether the operator has to see the whole relation before it can emit anything.
 
 ::::{tab-set}
 :::{tab-item} A fraction (streams)
 
-{py:meth}`sample(fraction) <batcher.Dataset.sample>` keeps each row whose hash falls under the fraction. No breaker, no
-materialization, so it works on an unbounded source.
+{py:meth}`sample(fraction) <batcher.Dataset.sample>` keeps each row whose hash falls under the fraction. There is no breaker and no materialization, so it works on an unbounded source.
 
 ```python
 half = ds.sample(0.5, seed=7)
@@ -33,8 +33,7 @@ print(half.count())
 # 520
 ```
 
-520, not 500. A hash-keyed fraction is binomial around `fraction * n`, not exact, which
-is the same trade Spark's `sample` makes.
+520, not 500. A hash-keyed fraction is binomial around `fraction * n`, not exact, which is the same trade Spark's `sample` makes.
 
 :::
 
@@ -59,31 +58,23 @@ print(a == b, len(a))
 # True 107
 ```
 
-With `seed=None` (the default) a fresh seed is baked in when the plan is *built*, not
-when it runs, so the two {py:meth}`collect() <batcher.Dataset.collect>` calls on one sampled dataset still agree with each
-other. Pass a seed explicitly if the sample has to reproduce across processes.
+With `seed=None`, the default, a fresh seed is baked in when the plan is *built*, not when it runs, so the two {py:meth}`collect() <batcher.Dataset.collect>` calls on one sampled dataset still agree with each other. Pass a seed explicitly if the sample has to reproduce across processes.
 
 ## Sampling is not a shuffle
 
-`sample(n=10)` gives you ten rows chosen by hash, which means the choice is stable but
-the *order* is arbitrary. It is not "ten random rows re-drawn each call", and it is not
-a permutation. If what you want is a random ordering, add a random column and sort by it.
-{py:meth}`with_random(name, seed=) <batcher.Dataset.with_random>` is a deterministic per-row uniform draw.
+`sample(n=10)` gives you ten rows chosen by hash, which means the choice is stable but the *order* is arbitrary. It is not "ten random rows re-drawn each call", and it is not a permutation. If what you want is a random ordering, add a random column and sort by it. {py:meth}`with_random(name, seed=) <batcher.Dataset.with_random>` is a deterministic per-row uniform draw.
 
 ```python
-shuffled = ds.with_random("r", seed=3).sort("r").head(3)
+shuffled = ds.with_random("r", seed=3).sort("r").limit(3)
 print(shuffled.select("value").to_pydict())
 # {'value': [91, 40, 731]}
 ```
 
-That sort is a full breaker over the whole relation, so reach for it on the small side
-of a pipeline, not before a 10 TB scan.
+That sort is a full breaker over the whole relation, so reach for it on the small side of a pipeline, not before a 10 TB scan.
 
 ## Train/test splits
 
-{py:meth}`train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>` is the split you want for modeling: the two parts are disjoint,
-they cover every row, and neither materializes. Each is a row-wise filter, so both stay
-lazy.
+{py:meth}`train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>` is the split you want for modeling. The two parts are disjoint, they cover every row, and neither materializes. Each is a row-wise filter, so both stay lazy.
 
 ```python
 train, test = ds.ml.train_test_split(0.2, seed=42, key="value")
@@ -92,11 +83,7 @@ print(train.count(), test.count(), train.count() + test.count())
 ```
 
 :::{warning}
-Pass `key`. Without it the assignment hashes *every column*, so recomputing an unrelated
-feature re-draws the split and rows silently migrate from train to test. That is the
-classic leak, and nothing in the metrics reports it: the model scores better than it
-should. Hashing a stable identifier instead keeps a row on the side it started on however
-the other columns change.
+Pass `key`. Without it the assignment hashes *every column*, so recomputing an unrelated feature re-draws the split and rows silently migrate from train to test. That is the classic leak, and nothing in the metrics reports it. The model just scores better than it should. Hashing a stable identifier instead keeps a row on the side it started on however the other columns change.
 :::
 
 {py:meth}`random_split <batcher.api.dataset.ml.DatasetML.random_split>` is the n-way generalization.
@@ -107,12 +94,11 @@ print(tr.count(), val.count(), te.count())
 # 728 149 123
 ```
 
-Sizes are binomial around the requested fractions, for the same reason `sample(0.5)`
-was not exactly 500. Disjointness and coverage are exact. The sizes are not.
+Sizes are binomial around the requested fractions, for the same reason `sample(0.5)` was not exactly 500. Disjointness and coverage are exact. The sizes are not.
 
 ## Positional splits
 
-Everything above assigns a row by hashing it. {py:meth}`split_at_indices <batcher.Dataset.split_at_indices>` and {py:meth}`split_proportionately <batcher.Dataset.split_proportionately>` do the other thing: they cut the relation at row *positions*, so the parts are consecutive ranges and their sizes are exact. This is Ray Data's spelling, and it is what you want for a chronological holdout or for handing consecutive shards to workers.
+Everything above assigns a row by hashing it. {py:meth}`split_at_indices <batcher.Dataset.split_at_indices>` and {py:meth}`split_proportionately <batcher.Dataset.split_proportionately>` do the other thing. They cut the relation at row *positions*, so the parts are consecutive ranges and their sizes are exact. This is Ray Data's spelling, and it is what you want for a chronological holdout or for handing consecutive shards to workers.
 
 ```python
 head, mid, tail = ds.split_at_indices([100, 900])
@@ -149,14 +135,30 @@ print([part.count() for part in ds.split(3, order_by="value", equal=True)])
 # [333, 333, 333]
 ```
 
-All three stay lazy, which is the difference from Ray Data's versions: nothing is materialized, and a pipeline that consumes one part never computes the others. The cost is the mirror image. Each part reads the input again, so call {py:meth}`cache() <batcher.Dataset.cache>` first when the source is expensive and you intend to collect them all.
+All three stay lazy, which is the difference from Ray Data's versions. Nothing is materialized, and a pipeline that consumes one part never computes the others. The cost is the mirror image. Each part reads the input again, so call {py:meth}`cache() <batcher.Dataset.cache>` first when the source is expensive and you intend to collect them all.
 
 For modeling, prefer the hash-based splits. A positional split puts whatever sits at the front of the file in one part, and that is rarely independent of the label.
 
 ## Stratified sampling
 
-There is no `stratified=True` flag. Sample per stratum and union, which is explicit
-about what the strata are and what fraction each one gets.
+A plain random split can starve a rare class. {py:meth}`stratified_split(by, test_size, seed=) <batcher.Dataset.stratified_split>` ranks rows within each group by a stable hash of their values, so every group contributes the same `test_size` fraction to the test side. Being value-hashed, the split is identical single-node, parallel, and distributed.
+
+```python
+train, test = ds.stratified_split("bucket", 0.2, seed=11)
+print(test.group_by("bucket").agg(n=bt.count()).sort("bucket").to_pydict())
+# {'bucket': [0, 1, 2, 3], 'n': [50, 50, 50, 50]}
+```
+
+Each bucket holds 250 rows, and each gives exactly 50 of them to the test side, where a hash-sampled split lands near 20% per group rather than on it.
+
+{py:meth}`sample_per_group(by, n, order_by=) <batcher.Dataset.sample_per_group>` caps each group at `n` rows instead, which balances a skewed corpus without dropping its rare groups.
+
+```python
+print(ds.sample_per_group("bucket", 3).count())
+# 12
+```
+
+When each stratum needs its own fraction, sample per stratum and union. That spells out exactly what the strata are and what each one gets:
 
 ```python
 parts = [ds.filter(bt.col("bucket") == b).sample(0.1, seed=11) for b in range(4)]
@@ -177,37 +179,31 @@ Sample when you want *rows*. Sketch when you want a *number*. The decision table
 | Rows to eyeball, or a dev fixture | `sample(fraction)` | streams, no breaker |
 | An exact row count out | `sample(n=...)` | ranks by hash, so it breaks |
 | Disjoint modeling splits | `ml.train_test_split` / `ml.random_split` | row-wise filters, both stay lazy |
+| A split that keeps class proportions | `stratified_split` | hashed within each group |
 | Consecutive ranges with exact sizes | `split_at_indices` / `split_proportionately` | cuts by position, so sort first |
 | `n` consecutive parts of near-equal size | `split(n, order_by=...)` | cuts by position under the order you pass |
 | A random *ordering* | `with_random(...)` then `sort` | a full breaker, so use it on the small side |
-| A distinct count or a quantile | `approx_n_unique` / `approx_quantile` | one pass, mergeable, no sampling error to reason about |
+| A distinct count or a quantile | `approx_count_distinct` / `approx_quantile` | one pass, mergeable, bounded error |
 :::
 
-Sampling to *estimate* an aggregate is usually the wrong tool. The engine already has
-exact and sketch-based answers that read the same data in one pass. `approx_n_unique`
-runs a HyperLogLog, and `approx_quantile` streams a TDigest, or answers from a learned
-KLL sketch left behind by a past run when one is available. Both sketches are mergeable,
-so they give the same number single-node and distributed.
+Sampling to *estimate* an aggregate is usually the wrong tool. The engine already has exact and sketch-based answers that read the same data in one pass. `approx_count_distinct` runs a HyperLogLog, and `ds.approx_quantile` streams a TDigest, or answers from a learned KLL sketch left behind by a past run when one is available. Both are mergeable, so they scale across a cluster in bounded memory. A HyperLogLog merges to the same estimate in any order, while a TDigest's merge can land at a slightly different value, inside the error the sketch promises. The `approx_quantile` aggregate inside `agg` uses a DDSketch instead, which merges identically in any order.
 
 ```python
-print(ds.approx_n_unique("value"), ds.n_unique("value"))
-# 993 1000
+estimate, exact = ds.approx_count_distinct("value"), ds.count_distinct("value")
+print(exact, abs(estimate - exact) / exact < 0.05)
+# 1000 True
 
-print(ds.approx_median("value"))
-# 499.5
+print(abs(ds.approx_median("value") - 499.5) < 25)
+# True
 ```
 
 ## See also
 
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the exact and approximate aggregate families.
 - {doc}`Filtering </user-guide/transform/rows/filtering>`: predicates, which is how a stratum is defined.
-- {doc}`Preprocessors </ml/preparing/preprocessors/index>`: fitting feature statistics on the train split
-  only.
-- {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`: the sketches behind
-  `approx_n_unique`, and the error bounds they hold to.
-- {doc}`Train/test split recipe </cookbook/ml/pipelines/features/train-test-split>`: the leak-free split on a
-  real feature table.
-- {doc}`A/B testing </cookbook/analytics/inference/ab-testing>`: hash-bucketed assignment, the same
-  machinery pointed at an experiment.
-- {doc}`Dataset API </api/relational/dataset>`: the `sample` and `with_random` reference.
+- {doc}`Preprocessors </ml/preparing/preprocessors/index>`: fitting feature statistics on the train split only.
+- {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`: the sketches behind `approx_count_distinct`, and the error bounds they hold to.
+- {doc}`Train/test split recipe </cookbook/ml/pipelines/features/train-test-split>`: the leak-free split on a real feature table.
+- {doc}`A/B testing </cookbook/analytics/inference/ab-testing>`: hash-bucketed assignment, the same machinery pointed at an experiment.
+- {doc}`Dataset API </api/relational/dataset>`: the `sample`, `stratified_split`, and `with_random` reference.
 - {doc}`/cookbook/dataset/cleaning/sampling_and_splits`: reproducible subsets that do not leak, as a script.

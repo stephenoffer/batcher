@@ -1,6 +1,8 @@
 # Inspecting a query
 
-`explain()` prints the optimized plan, one line per operator with its row estimate. That is where you confirm the filter really runs below the aggregate rather than above it. Guessing is slower. When you want to assert on plan shape in a test, `ds.meta.explain()` returns the plan as a dict instead of a string.
+`explain()` prints the optimized plan, one line per operator with its row estimate. That is where you confirm the filter really runs below the aggregate. Reading the plan is faster than guessing. When you want to assert on plan shape in a test, `ds.meta.explain()` returns the plan as a dict instead of a string.
+
+The script also takes the quick look at the data itself, with `describe`, `value_counts`, `null_count`, `glimpse`, and `show`, and confirms that `cache()` changes nothing about a result.
 
 The whole script, executed on every test run:
 

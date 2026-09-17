@@ -1,8 +1,6 @@
 # Payload formats
 
-A broker delivers a message as opaque bytes. This page describes how to turn those bytes
-into typed columns with `value_format`, including Avro and Protobuf payloads written
-against a Confluent Schema Registry.
+This page describes how to turn broker payloads into typed columns with `value_format`, including Avro and Protobuf payloads written against a Confluent Schema Registry. A broker delivers each message as opaque bytes, and naming the wire format makes Batcher decode them in the source, one column per micro-batch.
 
 Every broker source shares one message schema, in which `value` and `key` are `binary`.
 Naming a format decodes them in the source itself, so the stream's real schema is known
@@ -16,20 +14,16 @@ orders = bt.read.kafka(
     value_format="avro",
     schema_registry="http://schema-registry:8081",
 )
-orders.schema()  # value: struct<user: string, amount: int64>
+orders.schema  # value: struct<user: string, amount: int64>
 ```
 
-The same options work on every broker source, because the decode belongs to the shared
-broker base rather than to any one client: Kafka, Kinesis, Pulsar, Pub/Sub, and Event Hubs
-all take them.
+The same options work on every broker source, because the decode belongs to the shared broker base rather than to any one client. Kafka, Kinesis, Pulsar, Pub/Sub, and Event Hubs all take them, and the Kafka sink takes them for encoding.
 
 ## Why decode in the source
 
-You can decode a payload with `map_batches` and a hand-written function, and before these
-formats existed that was the only option. It costs three things.
+You can decode a payload with `map_batches` and a hand-written function. It costs three things.
 
-The engine cannot report the stream's schema, because the shape of the payload is inside a
-Python callback the optimizer cannot see. `Dataset.schema()` answers `binary`, so nothing
+The engine can't report the stream's schema, because the shape of the payload is inside a Python callback the optimizer can't see. `Dataset.schema` answers `binary`, so nothing
 downstream can be type-checked until rows arrive. A projection cannot be pushed into the
 decode either, so a query reading one field of a fifty-field record still pays for all
 fifty. And a malformed record raises from inside user code, where the engine cannot tell it
@@ -217,15 +211,14 @@ an inline `value_schema`, or drop `schema_registry` to write bare payloads.
 
 ## Requirements and limitations
 
-- Avro needs `pip install 'batcher-engine[avro]'`; Protobuf needs `[protobuf]`. JSON,
+- Avro needs `pip install 'batcher-engine[avro]'`, and Protobuf needs `[protobuf]`. JSON,
   `string`, and `bytes` need nothing beyond the base install.
 - The registry client resolves a subject's latest version once, at query start, and does not
   re-poll it. A reader schema that changed mid-query would change the stream's Arrow schema
   in flight, which no downstream operator can absorb. Restart the query to pick up a new
   reader schema.
 - Protobuf needs the generated message class even with a registry, for the reason above.
-- A JSON payload needs `value_schema=` or a registry subject; it is never inferred, for the
-  reason above.
+- A JSON payload needs `value_schema=` or a registry subject. It's never inferred, for the reason above.
 - JSON Schema documents from a registry are translated only for the
   object-with-`properties` shape a message payload uses. `oneOf` and cross-document `$ref`
   are refused rather than approximated, since a silently wrong column type is worse than an
@@ -233,6 +226,7 @@ an inline `value_schema`, or drop `schema_registry` to write bare payloads.
 
 ## See also
 
-- {doc}`Kafka </integrations/streams/kafka>`: the connector these options are set on.
+- {doc}`Kafka </integrations/streams/kafka>`: the connector these options are most often set on, and the one sink that encodes with them.
+- {doc}`/integrations/streams/index`: every broker source that accepts these options.
 - {doc}`Streaming pipelines </getting-started/tutorials/pipelines/streaming-pipeline>`: triggers, watermarks, and checkpoints.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: the Avro file reader, which shares this type mapping.

@@ -17,6 +17,7 @@ Run a diagram module directly to regenerate its ``.svg`` under
 
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 
 #: The scripts live in `tools/diagrams/`; the SVGs they emit live in the docs static
@@ -33,6 +34,7 @@ MUTED = "#5b6675"
 GREY = "#94a3b8"
 
 FONT = "Helvetica,Arial,sans-serif"
+MONO = "Menlo,Consolas,DejaVu Sans Mono,monospace"
 
 #: Restates every surface color for dark mode. `prefers-color-scheme` works inside an
 #: SVG referenced by <img>, so this adapts with the OS theme without any page script.
@@ -44,6 +46,10 @@ STYLE = """<style>
   .t-title { fill: #1e293b; }
   .t-sub { fill: #5b6675; }
   .t-arrow { fill: #475569; }
+  .t-code { fill: #1e40af; }
+  .code-bg { fill: #f1f5f9; stroke: #e2e8f0; }
+  .pill-blue { fill: #dbeafe; } .pill-amber { fill: #fef3c7; } .pill-grey { fill: #e2e8f0; }
+  .pt-blue { fill: #1d4ed8; } .pt-amber { fill: #b45309; } .pt-grey { fill: #334155; }
   @media (prefers-color-scheme: dark) {
     .surface { fill: #1e293b; stroke: #334155; }
     .band-blue { fill: #172554; stroke: #3b82f6; }
@@ -52,6 +58,14 @@ STYLE = """<style>
     .t-title { fill: #e2e8f0; }
     .t-sub { fill: #94a3b8; }
     .t-arrow { fill: #cbd5e1; }
+    .t-code { fill: #93c5fd; }
+    .code-bg { fill: #0f172a; stroke: #334155; }
+    .pill-blue { fill: #1e3a8a; } .pill-amber { fill: #78350f; } .pill-grey { fill: #334155; }
+    .pt-blue { fill: #bfdbfe; } .pt-amber { fill: #fde68a; } .pt-grey { fill: #e2e8f0; }
+    #tintBlue stop[offset="0"] { stop-color: #16233d; }
+    #tintBlue stop[offset="1"] { stop-color: #1e3a8a; }
+    #tintAmber stop[offset="0"] { stop-color: #2a1e07; }
+    #tintAmber stop[offset="1"] { stop-color: #78350f; }
   }
 </style>"""
 
@@ -59,6 +73,15 @@ DEFS = f"""<defs>{STYLE}
 <filter id="sh" x="-20%" y="-30%" width="140%" height="180%">
   <feDropShadow dx="0" dy="2.5" stdDeviation="4.5" flood-color="#0f172a" flood-opacity="0.18"/>
 </filter>
+<filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+  <feDropShadow dx="0" dy="4" stdDeviation="9" flood-color="#2563eb" flood-opacity="0.35"/>
+</filter>
+<linearGradient id="hero" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="0.5" stop-color="#2563eb"/><stop offset="1" stop-color="#4f46e5"/></linearGradient>
+<linearGradient id="heroAmber" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+<linearGradient id="tintBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="tintAmber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="ribbonBlue" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#93c5fd"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+<linearGradient id="ribbonAmber" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
 <marker id="arB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="{BLUE}"/></marker>
 <marker id="arA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="{AMBER_DEEP}"/></marker>
 <marker id="arG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="{GREY}"/></marker>
@@ -150,3 +173,126 @@ def write(name: str, content: str) -> Path:
     path = HERE / f"{name}.svg"
     path.write_text(content, encoding="utf-8")
     return path
+
+
+# --- Richer primitives ----------------------------------------------------------------
+# The set above draws an explanatory figure. The functions below draw the parts a reader
+# notices first on a landing or concept page: a gradient hero for the subject, tinted
+# accent cards, numbered steps, pills, code snippets, and check/cross marks for a matrix.
+# Every one of them restyles under dark mode through the classes and gradient ids in
+# `STYLE`, so none of them reintroduces the white-slab problem.
+
+
+def hero(
+    x: float, y: float, w: float, h: float, title: str, sub: str = "", kind: str = "blue"
+) -> str:
+    """A gradient card with white text and a soft glow, for the one subject of a figure."""
+    grad = {"blue": "hero", "amber": "heroAmber"}[kind]
+    cx = x + w / 2
+    ty = y + h / 2 + (7 if not sub else -2)
+    out = (
+        f'<g filter="url(#glow)"><rect x="{x}" y="{y}" width="{w}" height="{h}" rx="16" '
+        f'fill="url(#{grad})"/></g>'
+        f'<text x="{cx}" y="{ty}" text-anchor="middle" font-family="{FONT}" font-size="19" '
+        f'font-weight="800" fill="#ffffff">{title}</text>'
+    )
+    if sub:
+        out += (
+            f'<text x="{cx}" y="{y + h / 2 + 20}" text-anchor="middle" font-family="{FONT}" '
+            f'font-size="12" fill="#ffffff" fill-opacity="0.88">{sub}</text>'
+        )
+    return out
+
+
+def tint(
+    x: float, y: float, w: float, h: float, title: str, sub: str = "", kind: str = "blue"
+) -> str:
+    """A tinted card with a colored accent bar on its left edge, for peers in a group."""
+    grad, bar, stroke = {
+        "blue": ("tintBlue", BLUE_MID, "#bfdbfe"),
+        "amber": ("tintAmber", AMBER, "#fcd34d"),
+    }[kind]
+    cx = x + w / 2 + 3
+    ty = y + (h / 2 + 5) if not sub else y + h / 2 - 1
+    out = (
+        f'<g filter="url(#sh)"><rect x="{x}" y="{y}" width="{w}" height="{h}" rx="11" '
+        f'fill="url(#{grad})" stroke="{stroke}" stroke-width="1.2"/></g>'
+        f'<rect x="{x}" y="{y + 12}" width="4" height="{h - 24}" rx="2" fill="{bar}"/>'
+        f'<text x="{cx}" y="{ty}" text-anchor="middle" font-family="{FONT}" font-size="13.5" '
+        f'font-weight="700" class="t-title">{title}</text>'
+    )
+    if sub:
+        out += (
+            f'<text x="{cx}" y="{y + h / 2 + 17}" text-anchor="middle" font-family="{FONT}" '
+            f'font-size="11" class="t-sub">{sub}</text>'
+        )
+    return out
+
+
+def step(x: float, y: float, n: int | str, kind: str = "blue") -> str:
+    """A numbered circle centred on (x, y), for the order of a procedure."""
+    fill = {"blue": BLUE, "amber": AMBER_DEEP, "grey": GREY}[kind]
+    return (
+        f'<circle cx="{x}" cy="{y}" r="14" fill="{fill}"/>'
+        f'<text x="{x}" y="{y + 4.5}" text-anchor="middle" font-family="{FONT}" font-size="13" '
+        f'font-weight="800" fill="#ffffff">{n}</text>'
+    )
+
+
+def pill(x: float, y: float, text: str, kind: str = "blue", anchor: str = "start") -> str:
+    """A small rounded tag. `x` is the left edge, or the centre when `anchor` is middle."""
+    w = 14 + 6.7 * len(text)
+    left = x - w / 2 if anchor == "middle" else x
+    return (
+        f'<rect x="{left}" y="{y - 13}" width="{w}" height="20" rx="10" class="pill-{kind}"/>'
+        f'<text x="{left + w / 2}" y="{y + 1}" text-anchor="middle" font-family="{FONT}" '
+        f'font-size="11" font-weight="700" letter-spacing="0.4" class="pt-{kind}">{text}</text>'
+    )
+
+
+def code(x: float, y: float, lines: list[str], w: float, size: float = 12.5) -> str:
+    """A snippet of code on a quiet panel. Keep it to what a reader would type."""
+    h = 20 + len(lines) * (size + 7)
+    out = (
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="9" class="code-bg" stroke-width="1"/>'
+    )
+    for i, line in enumerate(lines):
+        out += (
+            f'<text x="{x + 14}" y="{y + 20 + i * (size + 7) + size / 2}" font-family="{MONO}" '
+            f'font-size="{size}" class="t-code" xml:space="preserve">{escape(line)}</text>'
+        )
+    return out
+
+
+def mark(x: float, y: float, ok: bool) -> str:
+    """A check or a cross in a circle, for a capability matrix. Shape carries the meaning."""
+    if ok:
+        return (
+            f'<circle cx="{x}" cy="{y}" r="10" fill="{BLUE}"/>'
+            f'<path d="M {x - 4.5} {y} L {x - 1} {y + 3.8} L {x + 5} {y - 3.8}" fill="none" '
+            f'stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>'
+        )
+    return (
+        f'<circle cx="{x}" cy="{y}" r="10" fill="none" stroke="{GREY}" stroke-width="1.8"/>'
+        f'<path d="M {x - 3.8} {y - 3.8} L {x + 3.8} {y + 3.8} M {x + 3.8} {y - 3.8} L {x - 3.8} {y + 3.8}" '
+        f'stroke="{GREY}" stroke-width="2" stroke-linecap="round"/>'
+    )
+
+
+def ribbon(x1: float, y1: float, x2: float, y2: float, kind: str = "blue") -> str:
+    """A thick S-curve with a gradient, for a fan-in or fan-out without arrowheads."""
+    mx = (x1 + x2) / 2
+    grad = {"blue": "ribbonBlue", "amber": "ribbonAmber"}[kind]
+    return (
+        f'<path d="M {x1} {y1} C {mx} {y1}, {mx} {y2}, {x2} {y2}" fill="none" '
+        f'stroke="url(#{grad})" stroke-width="3.5" stroke-linecap="round" opacity="0.85"/>'
+    )
+
+
+def heading(x: float, y: float, text: str, anchor: str = "start", kind: str = "blue") -> str:
+    """A letter-spaced caps label over a column or a region, without a band behind it."""
+    color = {"blue": BLUE, "amber": AMBER_DEEP, "grey": MUTED}[kind]
+    return (
+        f'<text x="{x}" y="{y}" text-anchor="{anchor}" font-family="{FONT}" font-size="12" '
+        f'font-weight="800" letter-spacing="1.8" fill="{color}">{text}</text>'
+    )

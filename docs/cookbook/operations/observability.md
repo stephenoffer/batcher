@@ -1,6 +1,8 @@
 # Observability
 
-Observability is configuration, not instrumentation you sprinkle through the pipeline. Turn it up for one block, read what happened, and turn it back down. The query code is unchanged either way. One caution about the numbers: read `stats.wall_clock_summary()` before the per-operator table, because on a query this small almost all of the wall clock is planning and result assembly, and nothing in the table is what you were waiting for.
+Observability in Batcher is configuration, not instrumentation you sprinkle through the pipeline. Turn verbosity, logging, or JSON log output up for one block, read what happened, and turn it back down. The query code is unchanged either way.
+
+`explain(analyze=True)` runs the query and prints each operator's estimate beside the measured actual. Read `stats.wall_clock_summary()` before that per-operator table, because on a query this small almost all of the wall clock is planning and result assembly, and nothing in the table is what you were waiting for.
 
 The whole script, executed on every test run:
 

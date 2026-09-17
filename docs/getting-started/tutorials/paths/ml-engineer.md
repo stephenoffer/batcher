@@ -1,9 +1,6 @@
 # ML engineer learning path
 
-This path covers running models over large data: batch inference, embeddings, and GPUs,
-all through the `.ml` accessor. Your function sees a whole Arrow batch rather than a
-row, so the data path stays vectorized. The model loads once per worker. A model loaded
-once per batch is the single most common reason an inference pipeline is slow.
+This path covers running models over large data: batch inference, embeddings, and GPUs, all through the `.ml` accessor. Your function sees a whole Arrow batch rather than a row, so the data path stays vectorized. A class-based model loads once per worker and is reused for every batch that worker sees, which keeps an expensive load out of the per-batch cost.
 
 ## Reading order
 
@@ -26,25 +23,23 @@ once per batch is the single most common reason an inference pipeline is slow.
 ```python
 import batcher as bt
 import pyarrow as pa
+import pyarrow.compute as pc
 
 ds = bt.from_pydict({"id": [1, 2, 3, 4], "feature": [0.5, 1.5, 2.5, 3.5]})
 
 
 def score(batch: pa.RecordBatch) -> pa.RecordBatch:
-    preds = [round(x * 2.0, 1) for x in batch.column("feature").to_pylist()]
-    return batch.append_column("score", pa.array(preds))
+    preds = pc.multiply(batch.column("feature"), 2.0)
+    return batch.append_column("score", preds)
 
 
 print(ds.map_batches(score).to_pydict())
 # {'id': [1, 2, 3, 4], 'feature': [0.5, 1.5, 2.5, 3.5], 'score': [1.0, 3.0, 5.0, 7.0]}
 ```
 
-## Example: a model loaded once per worker (sketch)
+## Example: load a model once per worker
 
-A class function is constructed once per worker and reused across every batch that worker
-sees, which is what turns an expensive model load from a cost you pay per batch into one
-you pay once. GPUs and concurrency are declared on the call itself. This one needs a real
-model, so it is shown rather than run.
+Pass a class instead of a function and Batcher constructs it once per worker, then calls it on every batch that worker sees. You pay for the model load once, not per batch. GPUs and concurrency are declared on the call itself. This example needs a real model, so it's shown rather than run. Replace `load_model()` with your own loader.
 
 ```python
 # docs: skip

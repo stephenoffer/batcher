@@ -23,7 +23,7 @@ conventions:
 | Pose layout | Translation `(tx, ty, tz)` first, then rotation `(qx, qy, qz, qw)` |
 | Pose application | Rotate, then translate |
 
-Scalar-last is the one that bites. ROS, SciPy and Eigen's storage order put `w` last;
+Scalar-last is the one that bites. ROS, SciPy and Eigen's storage order put `w` last.
 nuScenes, the Waymo protos and Eigen's *constructor* put it first. Read a quaternion out of
 one and pass it to the other and you get a different, entirely plausible rotation, with
 nothing anywhere able to detect the mistake. Every function here takes the four components

@@ -1,6 +1,8 @@
 # Column selectors
 
-A selector is an `Expr` leaf standing for *every* matching column, so "round every float" is one expression that keeps working when a column is added. Spelling out names is how a pipeline silently stops covering a new column. Combine selectors with `|`, `&`, `-`, and `~`.
+A selector is an `Expr` leaf standing for *every* matching column, so "round every float" is one expression that keeps working when a column is added. Spelling out names is how a pipeline silently stops covering a new column.
+
+The script selects columns by type family and by name pattern, takes everything or everything except, and combines selectors with `|`, `&`, `-`, and `~`. The payoff is a single `with_columns` that rounds every matched column in place and leaves the rest untouched.
 
 The whole script, executed on every test run:
 

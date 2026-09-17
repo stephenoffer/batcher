@@ -1,8 +1,6 @@
 # User behavior
 
-These recipes answer questions about what people did over time: who came back, who dropped
-out, and where one visit ends and the next begins. All four are window functions over an
-event table rather than anything specialised.
+These recipes answer questions about what people did over time: who came back, who dropped out, and where one visit ends and the next begins. All four are window functions over an event table rather than anything specialised.
 
 | Recipe | The question |
 |---|---|

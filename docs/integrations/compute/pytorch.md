@@ -1,9 +1,8 @@
 # PyTorch
 
-Batcher does not replace PyTorch's data loading. It replaces the part of it that is a data engine.
-Reading, filtering, joining, feature engineering, shuffling and sharding run in Rust over Arrow,
-and what reaches the training loop is `{column: tensor}` dicts, already batched and already on the
-device.
+This page covers feeding PyTorch from Batcher and running PyTorch models over a dataset. Batcher doesn't replace PyTorch's data loading, only the part of it that's a data engine. Reading, filtering, joining, feature engineering, shuffling, and sharding run in Rust over Arrow. What reaches the training loop is `{column: tensor}` dicts, already batched and already on the device.
+
+The following table summarizes the integration:
 
 | | |
 | --- | --- |
@@ -13,10 +12,9 @@ device.
 | **Inference** | {py:meth}`ds.map_batches(SomeClass, batch_format="torch") <batcher.Dataset.map_batches>` |
 | **Extra** | `pip install 'batcher-engine[torch]'` |
 
-The measured stake, on 10 M rows x 32 float features, `batch_size=1024`, `prefetch=2`: 1.76 Mrows/s
+Measured on 10 M rows x 32 float features with `batch_size=1024` and `prefetch=2`, the loader delivers 1.76 M rows/s
 through {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`, and 1.28 Mrows/s on a 4-rank DDP `streaming_split`
-(`benchmarks/BENCHMARK_RESULTS.md`). Ingest throughput is easy to assume and cheap to check,
-so measure it against your own data rather than taking either figure on trust.
+(`benchmarks/BENCHMARK_RESULTS.md`). Ingest throughput is cheap to check, so measure it on your own data too.
 
 ## Tensors in
 
@@ -52,22 +50,20 @@ each one goes through the same shape rules, so a `(features, labels)` pair keeps
 as a vector column.
 :::
 
-**Low-precision dtypes widen to `float32` on the way in, and say so.** `bfloat16` is what nearly
+Low-precision dtypes widen to `float32` on the way in, with a warning. `bfloat16` is what nearly
 every LLM checkpoint carries and `float8_e4m3fn`/`float8_e5m2` are what quantized inference emits.
 Neither NumPy nor Arrow has a dtype for any of them, so the tensor is widened and a `UserWarning`
 names the column's new width. No value moves, because `float32` has more mantissa bits and no fewer
 exponent bits than all three. What changes is four bytes a value instead of one or two, so cast the
 tensor yourself to `torch.float16` first if the width matters more than the precision.
 
-This is for adapting something you already have in memory. It is not the ingest path; for that,
-read the corpus with {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` and never build the tensors twice.
+`from_torch` adapts something you already have in memory. It isn't the ingest path. For that, read the corpus with {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` and never build the tensors twice.
 
 ## Tensors out
 
 `ds.ml.iter_torch_batches(...)` streams the dataset to the training loop, consuming
 {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` incrementally. Nothing is materialized, so it scales past memory and works on an
-unbounded source. Numeric columns convert; strings and other types are dropped (keep ids and text
-in the engine, not in the trainer's hot path).
+unbounded source. Numeric columns convert, and strings and other types are dropped, so keep ids and text in the engine rather than the trainer's hot path.
 
 ::::{tab-set}
 
@@ -127,9 +123,8 @@ sorted by label, a window will not save you. Shuffle the corpus at write time, o
 ## Distributed training
 
 `batcher.ml.streaming_split(ds, world_size, rank=...)` gives each DDP rank a disjoint shard of the
-same stream. It emits only **complete rounds** of `world_size` batches, so every rank yields the
-same number of batches and none stalls the others at the all-reduce barrier. That equal-count
-property is the whole reason to use it rather than slicing the stream yourself.
+same stream. It emits only complete rounds of `world_size` batches, so every rank yields the
+same number of batches and none stalls the others at the all-reduce barrier. Slicing the stream yourself doesn't give you that.
 
 ```python
 import batcher as bt
@@ -150,7 +145,7 @@ print([batch["label"].tolist() for batch in rank0])
 :::{warning}
 Called *without* `rank`, it returns a list of `world_size` iterators: one reader consumes the
 dataset once and fans batches out round-robin to bounded per-rank queues, so the data is read once
-total rather than once per rank. All the ranks must then be drained **concurrently**, because the
+total rather than once per rank. All the ranks must then be drained concurrently, because the
 reader blocks when any rank's queue fills. That is the DDP norm, and it deadlocks if you consume
 them one after another in a single thread.
 :::
@@ -160,18 +155,17 @@ split is exactly balanced, deterministic in `(seed, epoch)`, and resumable mid-e
 `global_consumed`, even onto a differently-sized cluster.
 
 :::{important}
-{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` is the one shard authority, so **turn off any framework auto-sharding**
+{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` is the one shard authority, so turn off any framework auto-sharding
 (`DistributedSampler`, a DataLoader sampler) or your ranks will overlap.
-{doc}`Streaming for training </ml/inference/streaming>` has the ordering contract.
+{doc}`Distributed training </ml/training/distributed-training>` has the ordering contract.
 :::
 
 ## Inference: load the model once
 
 :::{important}
-For batch inference, pass a **class** to `map_batches`. It is instantiated once per worker and the
+For batch inference, pass a class to `map_batches`. It is instantiated once per worker and the
 instance handles every batch. A plain function is rebuilt per batch, so it reloads
-the model every time. That is the single most common inference foot-gun here, and Batcher raises
-a `PerformanceWarning` when it sees a GPU stage given a function.
+the model every time. Batcher raises a `PerformanceWarning` when a stage with `num_gpus` set gets a plain function.
 :::
 
 ```python
@@ -205,7 +199,7 @@ scored.write.parquet("s3://lake/scores")
 Arrow either way, and the conversion happens only around the call. `model_memory_gb` lets the
 resource layer budget host RAM per worker and pack small models onto a shared GPU.
 
-### When the class is just a module
+## Score a module with `torch_predictor`
 
 For a module with nothing to wire beyond its inputs, {py:func}`torch_predictor <batcher.ml.torch_predictor>` writes the class for
 you. It applies `eval()` and `torch.inference_mode()`, casts each input to the weights'
@@ -231,32 +225,28 @@ forward, so it goes through `torch_predictor` instead. Passing one to `predict` 
 {py:class}`PlanError <batcher.PlanError>` that says so and names the function to use.
 :::
 
-## Failure modes worth knowing
+## Requirements and limitations
 
-:::{important}
-**Tensors own their memory, on purpose.** `column_to_tensor` copies out of the Arrow buffer.
+Tensors own their memory. `column_to_tensor` copies out of the Arrow buffer.
 Sharing it would be faster and is undefined behavior per torch, since a training loop mutates
-batches in place and the Arrow buffer is immutable. For **read-only inference** you can opt into
-`zero_copy=True` on `iter_torch_batches`, which hands the buffer over via DLPack and saves a copy.
-Do not set it for training.
-:::
+batches in place and the Arrow buffer is immutable. For read-only inference you can opt into `zero_copy=True` on `iter_torch_batches`, which hands the buffer over through DLPack and saves a copy. Don't set it for training.
 
-**Apple MPS has no 64-bit dtypes.** `device="auto"` downcasts float64/int64 to 32-bit when it
+Apple MPS has no 64-bit dtypes. `device="auto"` downcasts float64/int64 to 32-bit when it
 targets MPS, so a dev box works. Nothing downcasts on CUDA, so a float64 feature column will move 8
 bytes per value to the GPU forever. Cast in the plan.
 
-**A `map_batches` retry re-runs your `fn`.** Under `distributed=True`, a preempted worker's
+A `map_batches` retry re-runs your `fn`. Under `distributed=True`, a preempted worker's
 partition is recomputed. Side effects (writing to a feature store, POSTing to a service) can happen
 twice. Make them idempotent.
 
-**Don't do feature engineering in `__getitem__`.** Every row that goes through Python is a row the
+Don't do feature engineering in `__getitem__`. Every row that goes through Python is a row the
 engine could have vectorized. Express it as a `map_batches` or an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` instead. The work then
 runs in parallel, in Rust, before it becomes a tensor.
 
 ## See also
 
 - {doc}`PyTorch (ML guide) </ml/inference/pytorch>`: converters, DataLoader wrapping, the full loop.
-- {doc}`Streaming for training </ml/inference/streaming>`: the sample-order contract and resumption.
+- {doc}`Distributed training </ml/training/distributed-training>`: the sample-order contract and resumption.
 - {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: the engineering that happens before
   a row becomes a tensor.
 - {doc}`Train/test split </cookbook/ml/pipelines/features/train-test-split>`: a deterministic split that survives

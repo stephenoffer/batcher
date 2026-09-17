@@ -1,224 +1,130 @@
 # TPC-H
 
-This page reports Batcher's TPC-H results against DuckDB, Daft, and Polars.
+This page reports Batcher's TPC-H results against DuckDB, Polars, Daft and Spark at scale factors 1 and 10, and the planner work behind them.
 
-Against DuckDB reading the same Arrow, which is the like-for-like execution comparison, Batcher wins the suite at both scales measured, and wins every query at scale factor 1.
-
-Three runs are published, and they are not interchangeable:
-
-| Run | Scale | Hardware | Measured |
-|---|---|---|---|
-| Suite standing | sf10 | 96 cores | 2026-07-27 |
-| Suite standing | sf1 (`lineitem` = 6,001,215 rows) | 16 cores | 2026-07-31 |
-| Per-query detail | sf1 | 16 cores, 30 GB | 2026-07-18 |
-
-The sf10 run is the most demanding, so it leads. The July 31 sf1 run is the current sf1
-standing. The July 18 sf1 run is kept because it is the only one published query by query.
+Against DuckDB reading the same Arrow, Batcher is about four times faster at sf1 and three times faster at sf10. Against DuckDB on its own compressed store, the harder bar, it leads at both scales: 0.72x at sf1 and 0.963x at sf10.
 
 ## Correctness first
 
 :::{important}
-**Batcher matches DuckDB's result on all 22 queries.** That is the only claim on this page
-that is not about speed, and it is the one that gates every other number: the harness runs
-the query on each engine, compares the results as a sorted row multiset within float
-tolerance, and refuses to record a time when they disagree. A wrong answer produces no
-timing. It does not produce a fast timing.
+Batcher matches DuckDB's result on all 22 queries, and matches the official TPC-H answer on q6. That result gates every number on this page. The harness compares each engine's result with DuckDB's as a sorted row multiset within float tolerance, checks the order of every query that ends in `ORDER BY`, and refuses to record a ratio when they disagree.
 :::
 
-The gate earns its keep on other engines, too:
+The gate earns its keep on other engines. The following table lists what it found in the run recorded in `benchmarks/results/TPCH_SF1_SF10_RESULTS.md`:
 
 | Engine | Correctness on the suite |
 |---|---|
-| DuckDB | Reference. |
-| **Batcher** | **Matches DuckDB on all 22**, and matches the *official* TPC-H answer on q6. |
-| Daft | **q6 is wrong** (returns 75.2M against the official 123,141,078.2283); cannot parse `SUBSTRING(x FROM a FOR b)` in q22. |
-| Polars | **q6 is wrong** (same 75.2M); its SQL frontend errors on most of the suite (multi-table `FROM`, `EXISTS`, non-equi joins). |
+| DuckDB | The reference. |
+| Batcher | Matches DuckDB on all 22, and the official answer on q6. |
+| Daft | Wrong results on q6 and q15 at both scales, and returns the wrong columns on q18. Can't plan q21 (`Outer reference columns cannot be bound`) or q22 (`SUBSTRING(x FROM a FOR b)`). |
+| Polars | Its SQL frontend fails 9 of 22 queries and returns the wrong revenue on q6, so the harness drives Polars through its native `LazyFrame` pipelines instead. |
 
-:::{dropdown} What Daft and Polars actually get wrong on q6
-The predicate is `l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`. In IEEE double,
-`0.06 + 0.01` is `0.06999999999999999`, a hair under `0.07`, so an engine that folds the bound in floating point drops every `l_discount = 0.07` row and loses about 39% of the revenue. TPC-H defines `l_discount` as `DECIMAL`, so the 0.07 rows belong in the answer.
-
-Ground truth was computed independently in PyArrow over the identical input and equals the
-official sf1 answer, `123141078.2283`. Batcher returns exactly that.
+:::{dropdown} What goes wrong on q6
+The predicate is `l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`. In IEEE double, `0.06 + 0.01` is `0.06999999999999999`, a hair under `0.07`. An engine that folds the bound in floating point drops every `l_discount = 0.07` row and returns 75,207,768 instead of the official sf1 revenue of 123,141,078.2283. TPC-H defines `l_discount` as `DECIMAL`, so the 0.07 rows belong in the answer. Batcher returns the official figure.
 :::
 
-## At scale factor 10
+## Where the suite stands
 
-![Bar chart of the TPC-H scale-factor-10 suite ratio. Batcher is 1.89x faster than DuckDB reading the same Arrow, winning 21 of 22 queries, and 2.26x faster than Polars, winning 17 of 22.](/_static/diagrams/tpch_sf10.svg)
+Each row below is the most recent measurement against that engine, so the machines and dates differ by row. Every figure is a geometric mean of per-query `batcher_ms / engine_ms`, so **below 1.00 means Batcher is faster**:
 
-At sf10 on 96 cores, correctness-gated with all 22 queries reporting `OK`, the suite total is
-**4,453 ms**, down from 4,993 ms earlier in the same session. The two like-for-like
-comparisons:
+| Against | sf1 | sf10 | Measured |
+|---|---:|---:|---|
+| DuckDB, native store | **0.72** | | 2026-09-13, 48 cores, 92 GiB |
+| DuckDB, native store | | **0.963** | 2026-08-25, 96 cores, 184 GiB |
+| DuckDB, same Arrow | **0.25** | | 2026-09-13, 48 cores, 92 GiB |
+| DuckDB, same Arrow | | **0.33** | 2026-08-28, 92-core box |
+| Polars | **0.54** | | 2026-09-13, 48 cores, 92 GiB |
+| Polars | | **0.35** | 2026-08-28, 92-core box |
+| Daft | **0.21** | **0.17** | 2026-08-28, 92-core box |
 
-| Against | Suite ratio | Queries won |
-|---|---|---|
-| DuckDB on the same Arrow (`duckdb_arrow`) | **1.89x faster** | **21 of 22**; q9 is 1.01x, a tie |
-| Polars | **2.26x faster** | 17 of 22 |
-
-The single query that moved most is q5, which more than halved once the optimizer was given a
-distinct-count estimate before it chose the join order. Its peak resident memory is the result
-that matters more than the timing: q5 no longer takes the process past 110 GB.
-
-:::{warning}
-Treat the sf10 totals as indicative rather than exact. The box was shared with other work
-during the run, and at load average 16 to 41 a repeated run of the same build swings about
-25% (the same build measured 4,992 ms and 4,411 ms an hour apart). Per-query results quoted
-here were reproduced at least twice, and anything that moved by less than 2x was taken from a
-run at load average under 5.
-:::
-
-## Where the suite stands at scale factor 1
-
-Re-measured 2026-08-15 on 96 cores / 184 GiB, release build, all 22 queries reporting `OK`.
-Geometric mean of the per-query ratios, `batcher / other`, so **below 1.0x means Batcher is
-faster**. The second figure in each cell is that ratio inverted, for readers who prefer a
-speedup:
-
-| Against | Geomean | Queries won |
-|---|---:|---|
-| DuckDB on the same Arrow (`duckdb_arrow`) | **0.26x**, 3.9x faster | **22 of 22** |
-| Polars | **0.43x**, 2.4x faster | 21 of 22 |
-| Daft | **0.35x**, 2.9x faster | **20 of 20** |
-| DuckDB on its **native** compressed store (`duckdb`) | **0.79x**, 1.3x faster | **16 of 22** |
-
-The last row is the one that changed: leading DuckDB's own storage engine *and* execution
-engine, rather than only its execution engine, was new as of this sweep. It read 0.99x on
-16 cores in July. {doc}`/benchmarks/results/scaling` has what happens at ten times the data.
-
-The earlier 16-core reading of this suite, for continuity: total **871 ms** against DuckDB's
-2,062 ms on the same Arrow (2.37x) and Polars' 1,101 ms (1.26x).
-
-**Against DuckDB reading the same Arrow (a like-for-like *execution* comparison), Batcher
-wins all 22 queries at sf1.** That is the comparison Batcher's Arrow-only contract makes
-fair. q21 runs too, because correlated subqueries are supported, so all 22 are comparable.
-
-The suite total more than halved in this run, from 1,843 ms to **871 ms**, on a single
-cardinality fix. Core measures a quantile grid from raw Arrow values, so a `date32` column's
-grid counts epoch days, while Kyber read it with `date.toordinal()`, which counts from year 1
-and is therefore 719,163 days out. Every temporal literal landed outside its own column's
-grid, which interpolates to "no rows match", so
-`o_orderdate BETWEEN '1995-01-01' AND '1996-12-31'` estimated **0 rows against a true
-455,112** and a join with a zero-row side priced as free. Two queries carry almost all of the
-recovery:
+The sf10 result against the native store is the one that moved most recently. It read 1.087x on the tree before the changes of 2026-08-25 and 0.963x after them, measured as a same-day A/B on the same node with only Batcher and DuckDB in the lineup. The suite total fell from 2,938 ms to 2,323 ms, carried by individual queries rather than by the mean:
 
 | Query | Before | After |
 |---|---:|---:|
-| q8 | 735.0 ms | **20.7 ms** |
-| q7 | 309.5 ms | **30.5 ms** |
-| suite | 1,843 ms | **871 ms** |
+| q9 | 456 ms | **233 ms** |
+| q13 | 325 ms | **174 ms** |
+| q5 | 189 ms | **122 ms** |
+| q3 | 116 ms | **87 ms** |
+| q4 | 117 ms | **96 ms** |
+| q10 | 158 ms | **139 ms** |
 
-The defect bit only from a query's *second* execution, because the first has no measured grid
-to read. That is why it survived so long: a benchmark warms up before it times, so every
-timed run measured the broken state and the cold run that would have shown the good plan was
-the one thrown away.
+Four changes carried it. A probe-side Bloom filter was built once per build shard and merged serially, and it is now sharded like the hash table beside it. Two fitted constants that existed only to compensate for that cost are gone, so a multi-join query keeps every core. An ordered group key now uses the partitioning its layout already provides. And the group-count estimator no longer reads a clustered key as a small domain.
 
-:::{dropdown} Per-query ratios vs DuckDB on the same Arrow
-All 22 queries at **scale factor 1**, measured 2026-07-18 on a release build,
-correctness-gated. The ratio is `batcher / duckdb`, so **below 1.0 means Batcher is faster**.
-The sf10 standing above is a separate, later run on different hardware.
+![Bar chart of the TPC-H scale-factor-10 suite on the same Arrow input, from the 2026-08-28 sweep on 92 cores. Batcher is 3.03x faster than DuckDB reading the same Arrow and 2.86x faster than Polars.]](/_static/diagrams/tpch_sf10.svg)
 
-| Query | vs DuckDB-on-Arrow (same input) |
-|---|---:|
-| q1  | **0.51×** |
-| q2  | **0.42×** |
-| q3  | **0.59×** |
-| q4  | **0.50×** |
-| q5  | **0.24×** |
-| q6  | **0.27×** |
-| q7  | **0.35×** |
-| q8  | **0.35×** |
-| q9  | **0.27×** |
-| q10 | **0.43×** |
-| q11 | **0.15×** |
-| q12 | **0.38×** |
-| q13 | **0.81×** |
-| q14 | **0.40×** |
-| q15 | **0.14×** |
-| q16 | **0.64×** |
-| q17 | **0.91×** |
-| q18 | **0.43×** |
-| q19 | **0.91×** |
-| q20 | **0.77×** |
-| q21 | **0.53×** |
-| q22 | **0.78×** |
-| **total** | **22 of 22 won** |
+The chart above is the sf10 board of 2026-08-28 on 92 cores, best of three. Against DuckDB's own compressed store that board read 1.10, and the same-day A/B of 2026-08-25 in the table above read 0.963, so the native-store standing at sf10 sits close to parity while the execution comparison is a clear win.
+
+## Per query
+
+The most recent run published query by query is `benchmarks/results/TPCH_SF1_SF10_RESULTS.md`, taken 2026-07-28 on a c5d.24xlarge (96 vCPU, 184 GiB). It predates the sf10 gains above, so its native-store column reads 0.963x at sf1 and 1.521x at sf10. Batcher's total at sf1 was 617.5 ms against DuckDB's 649.2 ms on its native store, and 1,693.0 ms for DuckDB on the same Arrow.
+
+:::{dropdown} Per-query ratios at sf1, 2026-07-28
+Each cell is `batcher / engine`, so **below 1.00x means Batcher is faster**. Daft's `--` marks a wrong result and `n/a` a query it can't plan.
+
+| Query | DuckDB native | DuckDB same Arrow | Polars | Daft |
+|---|--:|--:|--:|--:|
+| q1 | 1.11x | 0.83x | 0.29x | 0.55x |
+| q2 | 0.71x | 0.17x | 0.70x | 0.25x |
+| q3 | 1.00x | 0.37x | 0.82x | 0.62x |
+| q4 | 1.13x | 0.49x | 0.40x | 1.38x |
+| q5 | 1.40x | 0.19x | 0.99x | 0.85x |
+| q6 | 1.79x | 0.32x | 0.26x | -- |
+| q7 | 1.03x | 0.39x | 0.23x | 0.61x |
+| q8 | 0.74x | 0.19x | 0.72x | 0.26x |
+| q9 | 0.77x | 0.42x | 0.84x | 0.61x |
+| q10 | 0.66x | 0.32x | 0.52x | 0.14x |
+| q11 | 0.94x | 0.19x | 0.37x | 0.21x |
+| q12 | 1.31x | 0.55x | 0.21x | 0.12x |
+| q13 | 1.00x | 0.84x | 0.35x | 0.85x |
+| q14 | 1.10x | 0.42x | 1.13x | 0.42x |
+| q15 | 0.68x | 0.25x | 0.37x | -- |
+| q16 | 0.62x | 0.24x | 0.51x | 0.34x |
+| q17 | 0.65x | 0.19x | 2.40x | 0.24x |
+| q18 | 1.05x | 0.42x | 0.58x | 0.87x |
+| q19 | 0.98x | 0.68x | 0.32x | 0.58x |
+| q20 | 1.07x | 0.32x | 0.45x | 0.91x |
+| q21 | 1.06x | 0.39x | 0.92x | n/a |
+| q22 | 1.15x | 0.48x | 0.89x | n/a |
 :::
-
-:::{dropdown} Per-query ratios vs Daft (re-measured 2026-07-18)
-Both single-node on the same 16 cores and the same Arrow input. Ratio is `batcher / daft`,
-so **below 1.0 means Batcher is faster**.
-
-| Query | vs Daft |
-|---|---:|
-| q12 | **0.14×** |
-| q11 | **0.18×** |
-| q10 | **0.26×** |
-| q15 | **0.43×** |
-| q2 | **0.53×** |
-| q8 | **0.55×** |
-| q1 | **0.58×** |
-| q14 | **0.60×** |
-| q9 | **0.63×** |
-| q7 | **0.64×** |
-| q13 | **0.99×** |
-
-**Batcher is faster on 11 of the 18 queries Daft answers correctly**, and the spread is wider
-in Batcher's favor (up to 7x). Daft also **cannot complete four**: q6 is wrong (above), q18
-returns an unaliased column, q21 fails to bind a correlated subquery, and q22 cannot parse
-`SUBSTRING(x FROM a FOR b)`.
-
-The parallel radix join and the whole-partition window kernel took q3 from 3.8× to 1.55× and
-q4 to 1.51× against Daft.
-:::
-
-## Kernels
-
-The in-memory kernel microbenchmark recorded in `benchmarks/BENCHMARK_RESULTS.md` loads about 60M rows into Arrow once, so no I/O is in the way, and times each engine's kernels on the same 16 cores. Its driver script is no longer in the tree, so the record is the only source for these three rows:
-
-| Operator | Batcher | Daft | Polars |
-|---|---:|---:|---:|
-| filter | 28 ms | 188 ms | 156 ms |
-| group-by | 359 ms | 487 ms | 223 ms |
-| sum | 10 ms | 181 ms | 6 ms |
-
-Batcher's kernels beat Daft's on all three and trade with Polars.
 
 ## Planner work behind these numbers
 
-Two planner fixes landed against this suite, and they are worth naming because they show
-where the wins come from.
+Several of the largest moves on this suite came from the optimizer rather than the kernels, and they show where the wins come from.
 
-**Build-side selection.** Broadcast eligibility used to be checked only on the right input,
-so when the small side arrived on the left, the join shuffled a 6M-row build instead of
-broadcasting. It is now decided from `min(left_bytes, right_bytes)`. q3 went 7.7× → 3.8×
-against Daft, and the q5 `orders ⋈ lineitem` join went 419 ms → 175 ms.
+**A date grid on the wrong number line.** Core measures a quantile grid from raw Arrow values, so a `date32` column's grid counts days since the Unix epoch. Kyber read it with `date.toordinal()`, which counts from year 1 and is 719,163 days out. Every date literal landed outside its column's grid, so `o_orderdate BETWEEN '1995-01-01' AND '1996-12-31'` estimated 0 rows against a true 455,112, and a join with a zero-row side priced as free. Fixing it took q8 from 735.0 ms to 20.7 ms and the sf1 suite total from 1,843 ms to 871 ms (2026-07-31, 16 cores). The defect bit only from a query's second execution, because the first has no measured grid. A benchmark warms up before it times, so every timed run measured the broken plan.
 
-**Cold-start join cardinality.** The estimator's join model is right (`|L||R| / max(ndv)`),
-but its NDV map read only *learned* NDV from past runs, so a cold join fell back to
-`max(left, right)`, which under-estimates a low-NDV many-to-many join badly enough to steer
-join order into 12M to 18M-row intermediates. Cold q5 ran 7,115 ms against a warm 300 ms. NDV is
-now seeded from source statistics (footer and written-file HLL sketches), so the cold plan is
-no longer flying blind.
+**Build-side selection.** Broadcast eligibility used to be checked only on the right input, so when the small side arrived on the left the join shuffled a 6M-row build instead of broadcasting. It is now decided from `min(left_bytes, right_bytes)`, which took the q5 `orders` to `lineitem` join from 419 ms to 175 ms.
 
-The radix join's partition loop also ran on a single core, so a join too large to broadcast
-funnelled a fully-parallel build and probe into a serial kernel. Joining the partitions
-concurrently, concatenating them in partition order so the sequential output is reproduced
-exactly, took TPC-H q4 from 115.6 ms to 43.0 ms and q3 from 110.3 ms to 66.3 ms.
+**Cold-start join cardinality.** The estimator's join model divides by the larger distinct count, but it used to read only distinct counts learned on past runs. A cold join fell back to `max(left, right)`, which underestimates a low-NDV many-to-many join badly enough to steer join order into intermediates of 12M to 18M rows. Cold q5 ran 7,115 ms against a warm 300 ms. Distinct counts are now seeded from source statistics, footer and written-file HLL sketches, so the cold plan has real inputs.
+
+**A serial partition loop.** The radix join joined its partitions on one core, so a join too large to broadcast funnelled a parallel build and probe into a serial kernel. Joining partitions concurrently, and concatenating them in partition order so the output is unchanged, took q4 from 115.6 ms to 43.0 ms and q3 from 110.3 ms to 66.3 ms.
+
+## Requirements and limitations
+
+These figures are single-node and steady state. The following limits apply:
+
+- **Scale factor 100** (600M rows) is still recorded as a loss to DuckDB on a single node.
+- **Spark** isn't in the standing table. Local-mode Spark ran 20x to 50x behind Batcher on TPC-H sf1 (2026-08-15), and earlier Spark ratios were taken before three handicaps in its benchmark adapter were removed.
+- **Rows from different dates** in the standing table describe different builds and machines. Compare within a row.
 
 ## Reproduce
 
+The following commands rerun the suite against each lineup. `BENCH_TPCH_BASE` points the loader at a local mirror when S3 is slow:
+
 ```bash
-python benchmarks/run.py --benchmark tpch --tier single --scale 1   # sf1, vs DuckDB / Polars
-python benchmarks/run.py --benchmark tpch --tier single --scale 10  # sf10, the suite standing
-python benchmarks/run.py --benchmark tpch --engines batcher,daft    # vs Daft
+python benchmarks/run.py --benchmark tpch --engines batcher,duckdb,duckdb_arrow,polars --isolate
+python benchmarks/run.py --benchmark tpch --scale 10 --engines batcher,duckdb
+python benchmarks/run.py --benchmark tpch --scale 10 --engines batcher,duckdb,duckdb_arrow,polars,spark,daft
 ```
+
+Spark needs a JVM as well as the `pyspark` wheel. Without one its adapter reports unavailable and the lineup drops it.
 
 ## See also
 
-- {doc}`/benchmarks/comparisons/vs-duckdb` and {doc}`/benchmarks/comparisons/vs-daft` for the full engine scorecards.
-- {doc}`/benchmarks/results/analytics` for operators and connectors.
+- {doc}`/benchmarks/comparisons/vs-duckdb` and {doc}`/benchmarks/comparisons/vs-daft` for the engine-by-engine scorecards.
+- {doc}`/benchmarks/results/analytics` for the other suites and the operator mix.
 - {doc}`/architecture/deep-dives/operators/join-algorithms` for the shuffle and broadcast paths behind these results.
-- {doc}`/architecture/deep-dives/adaptive/cardinality-estimation` for the cold-start NDV problem that ran q5 at 7,115 ms.
+- {doc}`/architecture/deep-dives/adaptive/cardinality-estimation` for the cold-start distinct-count problem.
 - {doc}`/architecture/deep-dives/adaptive/cost-model` for how the build side is chosen.
 - {doc}`/user-guide/analyze/sql` for the supported SQL surface.
 - {doc}`/benchmarks/methodology` for the correctness gate in detail.

@@ -1,6 +1,8 @@
 # JSON columns
 
-Semi-structured payloads arrive as text. The `.json` accessor runs a path query in the engine and returns a typed column, so you can filter and aggregate on a nested field without a `json.loads` per row.
+Semi-structured payloads often arrive as JSON text in a string column. The `.json` accessor runs a path query in the engine and returns a typed column, so you can filter and aggregate on a nested field without a `json.loads` per row.
+
+The script extracts typed values by JSONPath with `extract_int`, `extract_float`, `extract_string`, and `extract_bool`, asks shape questions with `keys`, `array_length`, and `type_of`, tests presence with `exists`, and reads a raw scalar with `value`. It ends by filtering and aggregating on a nested field with no Python parsing at all.
 
 The whole script, executed on every test run:
 

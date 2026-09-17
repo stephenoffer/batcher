@@ -60,8 +60,8 @@ plain (non-compound) array keeps the layout each reader already used: `.npy` bec
 `data` column, and an HDF5 dataset becomes `value` when it is 1-D and `c0`, `c1`, ... when
 it is 2-D.
 
-Each connector needs its service reachable (or its optional extra installed), so
-these are shown but not executed:
+The service connectors need a reachable service or an optional extra, so these
+examples are shown but not executed:
 
 ```python
 # docs: skip
@@ -188,15 +188,13 @@ pages = bt.read.documents("s3://bucket/reports/")
 chunks = pages.with_columns(chunk=col("text").str.chunk(512, overlap=64, boundary="sentence"))
 ```
 
-Two properties are worth knowing before you point it at a large corpus.
-
-**Extraction is skipped when you do not ask for the text.** Laying a page out into reading
+Extraction is skipped when you don't ask for the text. Laying a page out into reading
 order is most of the cost of reading a PDF, so `select("path", "page")` and `count()` walk
 the page tree and stop. Surveying a corpus is therefore cheap, and it is the right first
 step: `group_by("path").agg(pages=col("page").count())` tells you the shape of what you
 have without extracting a word.
 
-**Encrypted documents need their password.** A PDF encrypted for *permissions* only, to
+Encrypted documents need their password. A PDF encrypted for *permissions* only, to
 restrict printing or copying, carries an empty user password and opens without anything
 extra. One with a real password takes `password=`:
 
@@ -246,8 +244,8 @@ print(above_ground.select("x", "z").to_pydict())
 
 Because the cloud is columnar, the standard per-frame preprocessing is engine operators
 end to end. No Python runs per point, and one lazy plan fuses the stages rather than
-materializing a cloud for each. Two of the idioms are worth spelling out because they are
-not obvious:
+materializing a cloud for each. The block below shows four stages: a region-of-interest crop,
+voxel downsampling with `floor` and a group-by, a rigid ego-to-world transform, and range gating:
 
 ```python
 # docs: skip
@@ -321,7 +319,7 @@ lidar = log.filter(bt.col("topic") == "/lidar/top").select("log_time", sweep=bt.
 aligned = lidar.join_asof(imu, on="log_time")
 ```
 
-A drive-day directory usually contains one recording that was cut short; pass
+A drive-day directory often contains a recording that was cut short. Pass
 `on_error="skip"` to drop it and keep the rest, then check `corrupt_files()` to see what
 was dropped.
 
