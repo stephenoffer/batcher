@@ -60,7 +60,7 @@ The following table lists the pages in this section with the number of names eac
 | {doc}`dataframe` | 265 | 83 | 68 | 50 | 50 | 14 |
 | {doc}`expressions` | 218 | 92 | 29 | 18 | 76 | 3 |
 | {doc}`expression-namespaces` | 219 | 99 | 33 | 15 | 72 | 0 |
-| {doc}`functions` | 163 | 41 | 27 | 18 | 70 | 7 |
+| {doc}`functions` | 163 | 41 | 27 | 19 | 69 | 7 |
 | {doc}`io` | 38 | 11 | 19 | 3 | 4 | 1 |
 | {doc}`types` | 37 | 16 | 6 | 1 | 9 | 5 |
 | {doc}`session-and-sql` | 45 | 12 | 2 | 0 | 28 | 3 |

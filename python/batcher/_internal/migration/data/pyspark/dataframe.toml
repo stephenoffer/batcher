@@ -19,7 +19,7 @@ cov = { status = "canonical", batcher = "Dataset.cov" }
 createGlobalTempView = { status = "param", batcher = "Session.register", need = "global_temp database scope, and raise when the view already exists", wave = "W9" }
 createOrReplaceGlobalTempView = { status = "param", batcher = "Session.register", need = "global_temp database scope shared across sessions", wave = "W9" }
 createOrReplaceTempView = { status = "canonical", batcher = "Session.register" }
-createTempView = { status = "param", batcher = "Session.register", need = "raise when the view already exists (Session.register replaces)", wave = "W9" }
+createTempView = { status = "canonical", batcher = "Session.register" }
 crossJoin = { status = "canonical", batcher = "Dataset.cross_join" }
 crosstab = { status = "mismatch", batcher = "Dataset.crosstab", note = "Spark names the first column '<col1>_<col2>' and fills absent pairs with 0; Batcher keeps the index column name and leaves absent pairs null. Needs fill_value= and a name parameter", wave = "W0" }
 cube = { status = "canonical", batcher = "Dataset.cube" }
@@ -118,7 +118,7 @@ withMetadata = { status = "gap", need = "per-field metadata on a column", wave =
 withWatermark = { status = "canonical", batcher = "Dataset.with_watermark" }
 write = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly", wave = "W0" }
 writeStream = { status = "canonical", batcher = "Dataset.write" }
-writeTo = { status = "gap", need = "DataFrameWriterV2 catalog-table writer (create/replace/append/overwritePartitions)", wave = "W9" }
+writeTo = { status = "canonical", batcher = "Dataset.write.table" }
 zipWithIndex = { status = "mismatch", batcher = "Dataset.with_row_index", note = "Spark appends the index as the last column; Batcher inserts it first", wave = "W0" }
 
 [DataFrameNaFunctions]

@@ -49,7 +49,7 @@ The following table lists the waves that hold PySpark rows, in delivery order:
 | W6 | Temporal types: `TIME`, intervals, and a session time zone | 38 |
 | W7 | Semi-structured data: JSON, CSV, and XML functions | 31 |
 | W8 | Relational `DataFrame` gaps | 29 |
-| W9 | Catalogs and tables | 71 |
+| W9 | Catalogs and tables | 39 |
 | W10 | Streaming | 28 |
 | W11 | UDFs | 61 |
 | W13 | Readers and writers | 7 |
@@ -61,15 +61,15 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 152 | 54 | 45 | 26 | 21 | 6 |
+| {doc}`dataframe` | 152 | 56 | 44 | 26 | 20 | 6 |
 | {doc}`expressions` | 36 | 27 | 2 | 4 | 3 | 0 |
 | {doc}`functions-aggregates` | 135 | 49 | 13 | 5 | 68 | 0 |
 | {doc}`functions-collections` | 90 | 26 | 13 | 5 | 46 | 0 |
-| {doc}`functions-math-and-misc` | 133 | 75 | 14 | 5 | 31 | 8 |
+| {doc}`functions-math-and-misc` | 133 | 75 | 14 | 8 | 28 | 8 |
 | {doc}`functions-strings` | 93 | 53 | 7 | 17 | 16 | 0 |
 | {doc}`functions-temporal` | 88 | 39 | 11 | 9 | 29 | 0 |
-| {doc}`io` | 70 | 25 | 19 | 16 | 10 | 0 |
-| {doc}`session-and-sql` | 101 | 37 | 10 | 1 | 46 | 7 |
+| {doc}`io` | 70 | 34 | 14 | 17 | 5 | 0 |
+| {doc}`session-and-sql` | 101 | 58 | 14 | 1 | 21 | 7 |
 | {doc}`types-and-data-sources` | 57 | 13 | 34 | 2 | 8 | 0 |
 
 {doc}`leaving-batcher` maps the other way, from Batcher spellings back to PySpark.

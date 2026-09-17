@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Daft
 
-The following table maps 223 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
+The following table maps 263 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
 
 | Batcher | Daft |
 |---|---|
@@ -26,12 +26,14 @@ The following table maps 223 Batcher spellings to the Daft names that compute th
 | `bt.array` | `functions.to_list` |
 | `bt.bool_and` | `functions.bool_and` |
 | `bt.bool_or` | `functions.bool_or` |
+| `bt.Catalog` | `daft.Catalog` |
 | `bt.coalesce` | `Expression.coalesce`, `functions.coalesce` |
 | `bt.col` | `daft.col` |
 | `bt.concat_str` | `Expression.concat` |
 | `bt.concat_ws` | `functions.concat_ws` |
 | `bt.concat` | `daft.concat` |
 | `bt.count_distinct` | `functions.count_distinct` |
+| `bt.current_session` | `daft.current_session` |
 | `bt.Dataset` | `daft.DataFrame` |
 | `bt.dense_rank` | `functions.dense_rank` |
 | `bt.e` | `functions.e` |
@@ -71,11 +73,26 @@ The following table maps 223 Batcher spellings to the Daft names that compute th
 | `bt.read.parquet` | `daft.read_parquet` |
 | `bt.register_function` | `daft.attach_function` |
 | `bt.row_number` | `functions.row_number` |
+| `bt.Session` | `daft.Session` |
+| `bt.set_session` | `daft.set_session` |
 | `bt.skew` | `functions.skew` |
 | `bt.sql_expr` | `daft.sql_expr` |
 | `bt.sum_horizontal` | `functions.columns_sum` |
 | `bt.sum` | `functions.sum` |
+| `bt.Table` | `daft.Table` |
 | `bt` | `daft.functions` |
+| `Catalog.create_namespace` | `Catalog.create_namespace_if_not_exists`, `Catalog.create_namespace` |
+| `Catalog.create_table` | `Catalog.create_table` |
+| `Catalog.drop_namespace` | `Catalog.drop_namespace` |
+| `Catalog.drop_table` | `Catalog.drop_table` |
+| `Catalog.from_iceberg` | `Catalog.from_iceberg` |
+| `Catalog.from_pydict` | `Catalog.from_pydict`, `Table.from_pydict` |
+| `Catalog.get_table` | `Catalog.get_table` |
+| `Catalog.has_namespace` | `Catalog.has_namespace` |
+| `Catalog.has_table` | `Catalog.has_table` |
+| `Catalog.list_namespaces` | `Catalog.list_namespaces` |
+| `Catalog.list_tables` | `Catalog.list_tables` |
+| `Catalog.name` | `Catalog.name` |
 | `Dataset.agg` | `DataFrame.agg` |
 | `Dataset.agg` + `Expr.any_value` | `DataFrame.any_value` |
 | `Dataset.agg` + `Expr.array_agg` | `DataFrame.agg_list` |
@@ -109,6 +126,7 @@ The following table maps 223 Batcher spellings to the Daft names that compute th
 | `Dataset.with_columns` | `DataFrame.with_column`, `DataFrame.with_columns` |
 | `Dataset.write.clickhouse` | `DataFrame.write_clickhouse` |
 | `Dataset.write.delta` | `DataFrame.write_deltalake` |
+| `Dataset.write.table` | `Catalog.write_table`, `Session.write_table`, `daft.write_table` |
 | `Expr.abs` | `Expression.abs`, `functions.abs` |
 | `Expr.alias` | `Expression.alias` |
 | `Expr.approx_count_distinct` | `Expression.approx_count_distinct` |
@@ -237,7 +255,29 @@ The following table maps 223 Batcher spellings to the Daft names that compute th
 | `GroupBy.sum` | `GroupedDataFrame.sum` |
 | `lshift` operator | `Expression.shift_left`, `functions.shift_left` |
 | `rshift` operator | `Expression.shift_right`, `functions.shift_right` |
+| `Session.catalog.attach` | `Session.attach_catalog`, `daft.attach_catalog` |
+| `Session.catalog.create_namespace` | `Session.create_namespace`, `daft.create_namespace` |
+| `Session.catalog.create_table` | `Session.create_table`, `daft.create_table` |
+| `Session.catalog.current_catalog` | `Session.current_catalog`, `daft.current_catalog` |
+| `Session.catalog.current_namespace` | `Session.current_namespace`, `daft.current_namespace` |
+| `Session.catalog.detach` | `Session.detach_catalog`, `daft.detach_catalog` |
+| `Session.catalog.drop_namespace` | `Session.drop_namespace`, `daft.drop_namespace` |
+| `Session.catalog.drop_table` | `Session.drop_table`, `daft.drop_table` |
+| `Session.catalog.get_catalog` | `Session.get_catalog`, `daft.get_catalog` |
+| `Session.catalog.get_table` | `Session.get_table`, `daft.get_table` |
+| `Session.catalog.has_catalog` | `Session.has_catalog`, `daft.has_catalog` |
+| `Session.catalog.has_namespace` | `Session.has_namespace`, `daft.has_namespace` |
+| `Session.catalog.has_table` | `Session.has_table`, `daft.has_table` |
+| `Session.catalog.list_catalogs` | `Session.list_catalogs`, `daft.list_catalogs` |
+| `Session.catalog.list_namespaces` | `Session.list_namespaces` |
+| `Session.catalog.list_tables` | `Session.list_tables`, `daft.list_tables` |
+| `Session.catalog.use` | `Session.set_catalog`, `Session.set_namespace`, `Session.use`, `daft.set_catalog`, `daft.set_namespace` |
+| `Session.drop_function` | `Session.detach_function`, `daft.detach_function` |
 | `Session.register_function` | `Session.attach_function` |
-| `Session.register` | `Session.attach_view`, `Session.create_temp_view`, `daft.attach_view`, `daft.create_temp_view` |
+| `Session.register` | `Session.attach_table`, `Session.attach_view`, `Session.create_temp_view`, `Table.from_df`, `daft.attach_table`, `daft.attach_view`, `daft.create_temp_view` |
 | `Session.sql` | `Session.sql` |
+| `Session.table` | `Session.read_table`, `daft.read_table` |
+| `Table.name` | `Table.name` |
+| `Table.read` | `Catalog.read_table`, `Table.read` |
+| `Table.schema` | `Table.schema` |
 | `WindowExpr.over` | `Window.current_row`, `Window.partition_by`, `Window.unbounded_following`, `Window.unbounded_preceding` |

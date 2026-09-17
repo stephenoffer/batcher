@@ -3,7 +3,7 @@
 ["ray.data"]
 ActorPoolStrategy = { status = "param", batcher = "Dataset.map_batches", need = "an unbounded max_size and max_tasks_in_flight_per_actor raise; initial_size above min_size raises", wave = "W11" }
 BlockBasedFileDatasink = { status = "mismatch", batcher = "batcher.io.FileSink", note = "Ray subclasses implement write_block_to_file(block, file) and get a file per block; Batcher FileSink implements write(table, path)/write_partitioned and commits from a WriteManifest.", wave = "W11" }
-Catalog = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
+Catalog = { status = "mismatch", batcher = "bt.Catalog", note = "ray.data.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend", wave = "W9" }
 CatalogAccessMode = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
 ClickHouseTableSettings = { status = "gap", need = "ClickHouse writer table settings (engine, order_by, partition_by) for write_clickhouse", wave = "W13" }
 DataContext = { status = "mismatch", batcher = "bt.Config", note = "Ray DataContext is a mutable process singleton (DataContext.get_current().x = ...); Batcher Config is frozen and applied through set_config/config_context with Config.replace.", wave = "W9" }

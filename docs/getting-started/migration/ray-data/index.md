@@ -61,7 +61,7 @@ The following table lists the pages in this section with the number of names eac
 |---|---|---|---|---|---|---|
 | {doc}`dataset` | 117 | 12 | 17 | 60 | 12 | 16 |
 | {doc}`expressions` | 179 | 83 | 2 | 20 | 17 | 57 |
-| {doc}`io` | 96 | 19 | 11 | 32 | 22 | 12 |
+| {doc}`io` | 96 | 19 | 11 | 33 | 21 | 12 |
 | {doc}`udfs-ai-multimodal` | 46 | 4 | 15 | 15 | 9 | 3 |
 | {doc}`execution-context` | 92 | 0 | 15 | 3 | 2 | 72 |
 

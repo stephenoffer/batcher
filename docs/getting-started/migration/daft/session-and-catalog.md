@@ -18,49 +18,49 @@ The following table maps the 43 names on `Session`, sorted alphabetically.
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `attach` | `Session.register` | param | Missing: one attach() dispatching on Catalog, Table, UDF, provider or DataFrame. Wave W9. |
-| `attach_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `attach` | `Session.catalog.attach` | param | Missing: a DataFrame argument is Session.register instead. Wave W9. |
+| `attach_catalog` | `Session.catalog.attach` | canonical |  |
 | `attach_function` | `Session.register_function` | canonical |  |
 | `attach_provider` | `Session.register_engine` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `attach_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `attach_table` | `Session.register` | canonical |  |
 | `attach_view` | `Session.register` | canonical |  |
-| `create_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `create_namespace_if_not_exists` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `create_table` | n/a | gap | Not yet: catalog-backed create\_table from a schema or DataFrame. Wave W9. |
-| `create_table_if_not_exists` | n/a | gap | Not yet: catalog-backed create\_table\_if\_not\_exists. Wave W9. |
-| `create_temp_table` | `Session.register` | param | Missing: a materialized session temp table (register binds a lazy plan). Wave W9. |
+| `create_namespace` | `Session.catalog.create_namespace` | canonical |  |
+| `create_namespace_if_not_exists` | `Session.catalog.create_namespace` | param | Missing: port as the base method with if\_not\_exists=True. Wave W9. |
+| `create_table` | `Session.catalog.create_table` | canonical |  |
+| `create_table_if_not_exists` | `Session.catalog.create_table` | param | Missing: port as the base method with if\_not\_exists=True. Wave W9. |
+| `create_temp_table` | `Session.register` | param | Missing: Batcher binds the lazy plan rather than materializing it. Wave W9. |
 | `create_temp_view` | `Session.register` | canonical |  |
-| `current_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `current_catalog` | `Session.catalog.current_catalog` | canonical |  |
 | `current_model` | `Session.list_models` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `current_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `current_namespace` | `Session.catalog.current_namespace` | canonical |  |
 | `current_provider` | `Session.list_engines` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `detach_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `detach_function` | n/a | gap | Not yet: unregistering a session function. Wave W9. |
+| `detach_catalog` | `Session.catalog.detach` | canonical |  |
+| `detach_function` | `Session.drop_function` | canonical |  |
 | `detach_provider` | n/a | gap | Not yet: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `detach_table` | `Session.drop` | param | Missing: raise when the table is absent (Session.drop is silent). Wave W9. |
-| `drop_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `drop_table` | `Session.drop` | mismatch | Differs: Daft drop\_table drops the table from the current catalog; Batcher Session.drop only unregisters a session name and never touches storage. Wave W9. |
+| `detach_table` | `Session.drop` | param | Missing: Session.drop is silent when the name is absent. Wave W9. |
+| `drop_namespace` | `Session.catalog.drop_namespace` | canonical |  |
+| `drop_table` | `Session.catalog.drop_table` | canonical |  |
 | `get_aggregate_function` | n/a | gap | Not yet: look up a registered aggregate function as an Expression. Wave W9. |
-| `get_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `get_catalog` | `Session.catalog.get_catalog` | canonical |  |
 | `get_function` | n/a | gap | Not yet: look up a registered function as an Expression. Wave W9. |
 | `get_provider` | n/a | gap | Not yet: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `get_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `has_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `has_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `get_table` | `Session.catalog.get_table` | canonical |  |
+| `has_catalog` | `Session.catalog.has_catalog` | canonical |  |
+| `has_namespace` | `Session.catalog.has_namespace` | canonical |  |
 | `has_provider` | n/a | gap | Not yet: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `has_table` | n/a | gap | Not yet: has\_table predicate over session and catalog tables. Wave W9. |
-| `list_catalogs` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `list_namespaces` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `list_tables` | `Session.list` | param | Missing: pattern= filtering and catalog-backed tables. Wave W9. |
+| `has_table` | `Session.catalog.has_table` | canonical |  |
+| `list_catalogs` | `Session.catalog.list_catalogs` | canonical |  |
+| `list_namespaces` | `Session.catalog.list_namespaces` | canonical |  |
+| `list_tables` | `Session.catalog.list_tables` | canonical |  |
 | `load_extension` | n/a | out of scope | Declined: loads a Daft native extension library; Batcher extends through Python registries, not dynamic native loading. |
-| `read_table` | `Session.table` | param | Missing: catalog-backed tables and read options. Wave W9. |
-| `set_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `read_table` | `Session.table` | canonical |  |
+| `set_catalog` | `Session.catalog.use` | canonical |  |
 | `set_model` | `Session.register_model` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `set_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `set_namespace` | `Session.catalog.use` | canonical |  |
 | `set_provider` | `Session.register_engine` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
 | `sql` | `Session.sql` | canonical |  |
-| `use` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `write_table` | n/a | gap | Not yet: catalog-backed write\_table(identifier, df, mode=). Wave W9. |
+| `use` | `Session.catalog.use` | canonical |  |
+| `write_table` | `Dataset.write.table` | canonical |  |
 
 ## `Catalog`
 
@@ -69,29 +69,29 @@ The following table maps the 24 names on `Catalog`, sorted alphabetically.
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
 | `create_function` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `create_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `create_namespace_if_not_exists` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `create_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `create_table_if_not_exists` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `drop_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `drop_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `from_glue` | n/a | gap | Not yet: AWS Glue catalog backend. Wave W9. |
-| `from_gravitino` | n/a | gap | Not yet: Apache Gravitino catalog backend. Wave W9. |
-| `from_iceberg` | n/a | gap | Not yet: PyIceberg catalog wrapped as a Catalog object (bt.read.iceberg takes catalog= by name only). Wave W9. |
+| `create_namespace` | `Catalog.create_namespace` | canonical |  |
+| `create_namespace_if_not_exists` | `Catalog.create_namespace` | canonical |  |
+| `create_table` | `Catalog.create_table` | canonical |  |
+| `create_table_if_not_exists` | `Catalog.create_table` | param | Missing: port as create\_table(name, source, if\_not\_exists=True). Wave W9. |
+| `drop_namespace` | `Catalog.drop_namespace` | canonical |  |
+| `drop_table` | `Catalog.drop_table` | canonical |  |
+| `from_glue` | `Catalog.from_iceberg` | param | Missing: port through the matching pyiceberg catalog spec; not tested against the live service. Wave W9. |
+| `from_gravitino` | `Catalog.from_iceberg` | param | Missing: port through the matching pyiceberg catalog spec; not tested against the live service. Wave W9. |
+| `from_iceberg` | `Catalog.from_iceberg` | canonical |  |
 | `from_paimon` | n/a | gap | Not yet: Apache Paimon catalog backend. Wave W9. |
-| `from_postgres` | n/a | gap | Not yet: PostgreSQL catalog backend. Wave W9. |
-| `from_pydict` | `Session.register` | param | Missing: an in-memory Catalog object built from a dict of tables. Wave W9. |
-| `from_s3tables` | n/a | gap | Not yet: AWS S3 Tables catalog backend. Wave W9. |
-| `from_unity` | n/a | gap | Not yet: Unity Catalog client wrapped as a Catalog object. Wave W9. |
+| `from_postgres` | `Catalog.from_iceberg` | param | Missing: port through the matching pyiceberg catalog spec; not tested against the live service. Wave W9. |
+| `from_pydict` | `Catalog.from_pydict` | canonical |  |
+| `from_s3tables` | `Catalog.from_iceberg` | param | Missing: port through the matching pyiceberg catalog spec; not tested against the live service. Wave W9. |
+| `from_unity` | `Catalog.from_iceberg` | param | Missing: port through the matching pyiceberg catalog spec; not tested against the live service. Wave W9. |
 | `get_function` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `get_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `has_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `has_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `list_namespaces` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `list_tables` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `name` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `read_table` | `Session.table` | param | Missing: catalog-scoped identifiers and read options. Wave W9. |
-| `write_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `get_table` | `Catalog.get_table` | canonical |  |
+| `has_namespace` | `Catalog.has_namespace` | canonical |  |
+| `has_table` | `Catalog.has_table` | canonical |  |
+| `list_namespaces` | `Catalog.list_namespaces` | canonical |  |
+| `list_tables` | `Catalog.list_tables` | canonical |  |
+| `name` | `Catalog.name` | canonical |  |
+| `read_table` | `Table.read` | canonical |  |
+| `write_table` | `Dataset.write.table` | canonical |  |
 
 ## `Table`
 
@@ -99,17 +99,17 @@ The following table maps the 14 names on `Table`, sorted alphabetically.
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `append` | n/a | gap | Not yet: Table handle append. Wave W9. |
-| `from_df` | `Session.register` | param | Missing: a named read-only Table object backed by a DataFrame. Wave W9. |
+| `append` | `Dataset.write.table` | param | Missing: port as ds.write.table(table.name, mode=...); Table has no write methods. Wave W9. |
+| `from_df` | `Session.register` | canonical |  |
 | `from_gravitino` | n/a | gap | Not yet: Gravitino table handle. Wave W9. |
-| `from_iceberg` | n/a | gap | Not yet: PyIceberg table wrapped as a Table object. Wave W9. |
+| `from_iceberg` | `Catalog.from_iceberg` | param | Missing: port as Catalog.from\_iceberg(spec).get\_table(name). Wave W9. |
 | `from_paimon` | n/a | gap | Not yet: Paimon table handle. Wave W9. |
-| `from_pydict` | `Session.register` | param | Missing: a named read-only Table object built from a dict. Wave W9. |
+| `from_pydict` | `Catalog.from_pydict` | canonical |  |
 | `from_unity` | n/a | gap | Not yet: Unity Catalog table handle. Wave W9. |
-| `name` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `overwrite` | n/a | gap | Not yet: Table handle overwrite. Wave W9. |
-| `read` | `Session.table` | param | Missing: a Table object with read options. Wave W9. |
-| `schema` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `select` | n/a | gap | Not yet: Table handle select(\*columns) without materializing a DataFrame first. Wave W9. |
-| `show` | n/a | gap | Not yet: Table handle show(n). Wave W9. |
-| `write` | n/a | gap | Not yet: Table handle write(df, mode=). Wave W9. |
+| `name` | `Table.name` | canonical |  |
+| `overwrite` | `Dataset.write.table` | param | Missing: port as ds.write.table(table.name, mode=...); Table has no write methods. Wave W9. |
+| `read` | `Table.read` | canonical |  |
+| `schema` | `Table.schema` | canonical |  |
+| `select` | `Table.read` | param | Missing: port as table.read().select(...). Wave W9. |
+| `show` | `Table.read` | param | Missing: port as table.read().show(). Wave W9. |
+| `write` | `Dataset.write.table` | param | Missing: port as ds.write.table(table.name, mode=...); Table has no write methods. Wave W9. |

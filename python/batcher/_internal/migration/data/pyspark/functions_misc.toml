@@ -26,10 +26,10 @@ call_udf = { status = "gap", need = "call a registered UDF by name from the Data
 coalesce = { status = "canonical", batcher = "bt.coalesce" }
 col = { status = "canonical", batcher = "bt.col" }
 column = { status = "canonical", batcher = "bt.col" }
-current_catalog = { status = "gap", need = "current catalog name", wave = "W9" }
-current_database = { status = "gap", need = "current database name", wave = "W9" }
+current_catalog = { status = "mismatch", batcher = "Session.catalog.current_catalog", note = "Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current_catalog()). SQL current_catalog() works", wave = "W9" }
+current_database = { status = "mismatch", batcher = "Session.catalog.current_namespace", note = "Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current_namespace()). SQL current_database() works", wave = "W9" }
 current_path = { status = "gap", need = "current SQL path", wave = "W9" }
-current_schema = { status = "gap", need = "current schema name", wave = "W9" }
+current_schema = { status = "mismatch", batcher = "Session.catalog.current_namespace", note = "Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current_namespace()). SQL current_schema() works", wave = "W9" }
 current_user = { status = "gap", need = "current user name", wave = "W9" }
 desc = { status = "canonical", batcher = "Dataset.sort" }
 desc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }

@@ -2,88 +2,88 @@
 # Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
 
 [Session]
-attach = { status = "param", batcher = "Session.register", need = "one attach() dispatching on Catalog, Table, UDF, provider or DataFrame", wave = "W9" }
-attach_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+attach = { status = "param", batcher = "Session.catalog.attach", need = "a DataFrame argument is Session.register instead", wave = "W9" }
+attach_catalog = { status = "canonical", batcher = "Session.catalog.attach" }
 attach_function = { status = "canonical", batcher = "Session.register_function" }
 attach_provider = { status = "param", batcher = "Session.register_engine", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-attach_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+attach_table = { status = "canonical", batcher = "Session.register" }
 attach_view = { status = "canonical", batcher = "Session.register" }
-create_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-create_namespace_if_not_exists = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-create_table = { status = "gap", need = "catalog-backed create_table from a schema or DataFrame", wave = "W9" }
-create_table_if_not_exists = { status = "gap", need = "catalog-backed create_table_if_not_exists", wave = "W9" }
-create_temp_table = { status = "param", batcher = "Session.register", need = "a materialized session temp table (register binds a lazy plan)", wave = "W9" }
+create_namespace = { status = "canonical", batcher = "Session.catalog.create_namespace" }
+create_namespace_if_not_exists = { status = "param", batcher = "Session.catalog.create_namespace", need = "port as the base method with if_not_exists=True", wave = "W9" }
+create_table = { status = "canonical", batcher = "Session.catalog.create_table" }
+create_table_if_not_exists = { status = "param", batcher = "Session.catalog.create_table", need = "port as the base method with if_not_exists=True", wave = "W9" }
+create_temp_table = { status = "param", batcher = "Session.register", need = "Batcher binds the lazy plan rather than materializing it", wave = "W9" }
 create_temp_view = { status = "canonical", batcher = "Session.register" }
-current_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+current_catalog = { status = "canonical", batcher = "Session.catalog.current_catalog" }
 current_model = { status = "param", batcher = "Session.list_models", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-current_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+current_namespace = { status = "canonical", batcher = "Session.catalog.current_namespace" }
 current_provider = { status = "param", batcher = "Session.list_engines", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-detach_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-detach_function = { status = "gap", need = "unregistering a session function", wave = "W9" }
+detach_catalog = { status = "canonical", batcher = "Session.catalog.detach" }
+detach_function = { status = "canonical", batcher = "Session.drop_function" }
 detach_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-detach_table = { status = "param", batcher = "Session.drop", need = "raise when the table is absent (Session.drop is silent)", wave = "W9" }
-drop_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-drop_table = { status = "mismatch", batcher = "Session.drop", note = "Daft drop_table drops the table from the current catalog; Batcher Session.drop only unregisters a session name and never touches storage", wave = "W9" }
+detach_table = { status = "param", batcher = "Session.drop", need = "Session.drop is silent when the name is absent", wave = "W9" }
+drop_namespace = { status = "canonical", batcher = "Session.catalog.drop_namespace" }
+drop_table = { status = "canonical", batcher = "Session.catalog.drop_table" }
 get_aggregate_function = { status = "gap", need = "look up a registered aggregate function as an Expression", wave = "W9" }
-get_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+get_catalog = { status = "canonical", batcher = "Session.catalog.get_catalog" }
 get_function = { status = "gap", need = "look up a registered function as an Expression", wave = "W9" }
 get_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-get_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-has_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-has_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+get_table = { status = "canonical", batcher = "Session.catalog.get_table" }
+has_catalog = { status = "canonical", batcher = "Session.catalog.has_catalog" }
+has_namespace = { status = "canonical", batcher = "Session.catalog.has_namespace" }
 has_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-has_table = { status = "gap", need = "has_table predicate over session and catalog tables", wave = "W9" }
-list_catalogs = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-list_namespaces = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-list_tables = { status = "param", batcher = "Session.list", need = "pattern= filtering and catalog-backed tables", wave = "W9" }
+has_table = { status = "canonical", batcher = "Session.catalog.has_table" }
+list_catalogs = { status = "canonical", batcher = "Session.catalog.list_catalogs" }
+list_namespaces = { status = "canonical", batcher = "Session.catalog.list_namespaces" }
+list_tables = { status = "canonical", batcher = "Session.catalog.list_tables" }
 load_extension = { status = "out_of_scope", reason = "loads a Daft native extension library; Batcher extends through Python registries, not dynamic native loading" }
-read_table = { status = "param", batcher = "Session.table", need = "catalog-backed tables and read options", wave = "W9" }
-set_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+read_table = { status = "canonical", batcher = "Session.table" }
+set_catalog = { status = "canonical", batcher = "Session.catalog.use" }
 set_model = { status = "param", batcher = "Session.register_model", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-set_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+set_namespace = { status = "canonical", batcher = "Session.catalog.use" }
 set_provider = { status = "param", batcher = "Session.register_engine", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
 sql = { status = "canonical", batcher = "Session.sql" }
-use = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-write_table = { status = "gap", need = "catalog-backed write_table(identifier, df, mode=)", wave = "W9" }
+use = { status = "canonical", batcher = "Session.catalog.use" }
+write_table = { status = "canonical", batcher = "Dataset.write.table" }
 
 [Catalog]
 create_function = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-create_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-create_namespace_if_not_exists = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-create_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-create_table_if_not_exists = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-drop_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-drop_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-from_glue = { status = "gap", need = "AWS Glue catalog backend", wave = "W9" }
-from_gravitino = { status = "gap", need = "Apache Gravitino catalog backend", wave = "W9" }
-from_iceberg = { status = "gap", need = "PyIceberg catalog wrapped as a Catalog object (bt.read.iceberg takes catalog= by name only)", wave = "W9" }
+create_namespace = { status = "canonical", batcher = "Catalog.create_namespace" }
+create_namespace_if_not_exists = { status = "canonical", batcher = "Catalog.create_namespace", template = 'create_namespace_if_not_exists(identifier) -> self.create_namespace(identifier, if_not_exists=True)' }
+create_table = { status = "canonical", batcher = "Catalog.create_table" }
+create_table_if_not_exists = { status = "param", batcher = "Catalog.create_table", need = "port as create_table(name, source, if_not_exists=True)", wave = "W9" }
+drop_namespace = { status = "canonical", batcher = "Catalog.drop_namespace" }
+drop_table = { status = "canonical", batcher = "Catalog.drop_table" }
+from_glue = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+from_gravitino = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+from_iceberg = { status = "canonical", batcher = "Catalog.from_iceberg" }
 from_paimon = { status = "gap", need = "Apache Paimon catalog backend", wave = "W9" }
-from_postgres = { status = "gap", need = "PostgreSQL catalog backend", wave = "W9" }
-from_pydict = { status = "param", batcher = "Session.register", need = "an in-memory Catalog object built from a dict of tables", wave = "W9" }
-from_s3tables = { status = "gap", need = "AWS S3 Tables catalog backend", wave = "W9" }
-from_unity = { status = "gap", need = "Unity Catalog client wrapped as a Catalog object", wave = "W9" }
+from_postgres = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+from_pydict = { status = "canonical", batcher = "Catalog.from_pydict" }
+from_s3tables = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
+from_unity = { status = "param", batcher = "Catalog.from_iceberg", need = "port through the matching pyiceberg catalog spec; not tested against the live service", wave = "W9" }
 get_function = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-get_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-has_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-has_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-list_namespaces = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-list_tables = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-name = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-read_table = { status = "param", batcher = "Session.table", need = "catalog-scoped identifiers and read options", wave = "W9" }
-write_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+get_table = { status = "canonical", batcher = "Catalog.get_table" }
+has_namespace = { status = "canonical", batcher = "Catalog.has_namespace" }
+has_table = { status = "canonical", batcher = "Catalog.has_table" }
+list_namespaces = { status = "canonical", batcher = "Catalog.list_namespaces" }
+list_tables = { status = "canonical", batcher = "Catalog.list_tables" }
+name = { status = "canonical", batcher = "Catalog.name" }
+read_table = { status = "canonical", batcher = "Table.read" }
+write_table = { status = "canonical", batcher = "Dataset.write.table" }
 
 [Table]
-append = { status = "gap", need = "Table handle append", wave = "W9" }
-from_df = { status = "param", batcher = "Session.register", need = "a named read-only Table object backed by a DataFrame", wave = "W9" }
+append = { status = "param", batcher = "Dataset.write.table", need = "port as ds.write.table(table.name, mode=...); Table has no write methods", wave = "W9" }
+from_df = { status = "canonical", batcher = "Session.register" }
 from_gravitino = { status = "gap", need = "Gravitino table handle", wave = "W9" }
-from_iceberg = { status = "gap", need = "PyIceberg table wrapped as a Table object", wave = "W9" }
+from_iceberg = { status = "param", batcher = "Catalog.from_iceberg", need = "port as Catalog.from_iceberg(spec).get_table(name)", wave = "W9" }
 from_paimon = { status = "gap", need = "Paimon table handle", wave = "W9" }
-from_pydict = { status = "param", batcher = "Session.register", need = "a named read-only Table object built from a dict", wave = "W9" }
+from_pydict = { status = "canonical", batcher = "Catalog.from_pydict" }
 from_unity = { status = "gap", need = "Unity Catalog table handle", wave = "W9" }
-name = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-overwrite = { status = "gap", need = "Table handle overwrite", wave = "W9" }
-read = { status = "param", batcher = "Session.table", need = "a Table object with read options", wave = "W9" }
-schema = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-select = { status = "gap", need = "Table handle select(*columns) without materializing a DataFrame first", wave = "W9" }
-show = { status = "gap", need = "Table handle show(n)", wave = "W9" }
-write = { status = "gap", need = "Table handle write(df, mode=)", wave = "W9" }
+name = { status = "canonical", batcher = "Table.name" }
+overwrite = { status = "param", batcher = "Dataset.write.table", need = "port as ds.write.table(table.name, mode=...); Table has no write methods", wave = "W9" }
+read = { status = "canonical", batcher = "Table.read" }
+schema = { status = "canonical", batcher = "Table.schema" }
+select = { status = "param", batcher = "Table.read", need = "port as table.read().select(...)", wave = "W9" }
+show = { status = "param", batcher = "Table.read", need = "port as table.read().show()", wave = "W9" }
+write = { status = "param", batcher = "Dataset.write.table", need = "port as ds.write.table(table.name, mode=...); Table has no write methods", wave = "W9" }

@@ -29,7 +29,7 @@ The following table maps the 14 names on `DataFrameReader`, sorted alphabeticall
 | `orc` | `bt.read.orc` | canonical |  |
 | `parquet` | `bt.read.parquet` | canonical |  |
 | `schema` | `bt.read` | param | Missing: schema as a DDL string or StructType (Batcher takes a pyarrow.Schema). Wave W11. |
-| `table` | `bt.read.table` | mismatch | Differs: Spark reads a catalog table by name; bt.read.table reads a registered non-file source format. Use Session.table. Wave W9. |
+| `table` | `Session.table` | mismatch | Differs: bt.read.table constructs a registered connector by name; Spark's reader reads a catalog table, which is session.table(name). Wave W9. |
 | `text` | `bt.read.text` | mismatch | Differs: Spark returns a single 'value' column; Batcher returns path, line\_number and text columns. Wave W0. |
 | `xml` | `bt.read.xml` | param | Missing: rowTag= and Spark's XML option names. Wave W13. |
 
@@ -64,7 +64,7 @@ The following table maps the 18 names on `DataFrameWriter`, sorted alphabeticall
 | `clusterBy` | `Dataset.write` | param | Missing: record clustering columns in table metadata. Wave W13. |
 | `csv` | `Dataset.write.csv` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
 | `format` | `Dataset.write` | canonical |  |
-| `insertInto` | n/a | gap | Not yet: insert into an existing catalog table by position. Wave W9. |
+| `insertInto` | `Dataset.write.table` | canonical |  |
 | `jdbc` | `Dataset.write.sql` | param | Missing: url + table + properties connection form. Wave W13. |
 | `json` | `Dataset.write.json` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
 | `mode` | `Dataset.write` | canonical |  |
@@ -74,7 +74,7 @@ The following table maps the 18 names on `DataFrameWriter`, sorted alphabeticall
 | `parquet` | `Dataset.write.parquet` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
 | `partitionBy` | `Dataset.write` | canonical |  |
 | `save` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
-| `saveAsTable` | n/a | gap | Not yet: save as a managed catalog table. Wave W9. |
+| `saveAsTable` | `Dataset.write.table` | canonical |  |
 | `sortBy` | `Dataset.write` | param | Missing: sort within buckets, paired with bucketBy. Wave W13. |
 | `text` | `Dataset.write.text` | canonical |  |
 | `xml` | `Dataset.write.xml` | canonical |  |
@@ -85,17 +85,17 @@ The following table maps the 12 names on `DataFrameWriterV2`, sorted alphabetica
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `append` | `Dataset.write.iceberg` | param | Missing: DataFrameWriterV2 chain against a catalog table identifier: append. Wave W9. |
+| `append` | `Dataset.write.table` | mismatch | Differs: write.table(name, mode=append) creates a missing table, where the V2 append raises. Wave W9. |
 | `clusterBy` | n/a | gap | Not yet: clustering columns on a V2 table. Wave W9. |
-| `create` | n/a | gap | Not yet: create a catalog table from the Dataset. Wave W9. |
-| `createOrReplace` | n/a | gap | Not yet: create or replace a catalog table from the Dataset. Wave W9. |
+| `create` | `Dataset.write.table` | canonical |  |
+| `createOrReplace` | `Dataset.write.table` | canonical |  |
 | `option` | `Dataset.write.iceberg` | param | Missing: DataFrameWriterV2 chain against a catalog table identifier: write options. Wave W9. |
 | `options` | `Dataset.write.iceberg` | param | Missing: DataFrameWriterV2 chain against a catalog table identifier: write options. Wave W9. |
-| `overwrite` | `Dataset.write.iceberg` | param | Missing: DataFrameWriterV2 chain against a catalog table identifier: overwrite rows matching a condition. Wave W9. |
-| `overwritePartitions` | `Dataset.write.iceberg` | param | Missing: DataFrameWriterV2 chain against a catalog table identifier: dynamic partition overwrite. Wave W9. |
-| `partitionedBy` | `Dataset.write.iceberg` | param | Missing: DataFrameWriterV2 chain against a catalog table identifier: partition transforms on create. Wave W9. |
-| `replace` | n/a | gap | Not yet: replace a catalog table's contents and schema. Wave W9. |
-| `tableProperty` | `Dataset.write.iceberg` | param | Missing: DataFrameWriterV2 chain against a catalog table identifier: table properties. Wave W9. |
+| `overwrite` | `Dataset.write.table` | canonical |  |
+| `overwritePartitions` | `Dataset.write.table` | canonical |  |
+| `partitionedBy` | `Dataset.write.table` | canonical |  |
+| `replace` | `Dataset.write.table` | canonical |  |
+| `tableProperty` | `Dataset.write.table` | canonical |  |
 | `using` | n/a | gap | Not yet: choose the table provider for a V2 create. Wave W9. |
 
 ## `DataStreamWriter`

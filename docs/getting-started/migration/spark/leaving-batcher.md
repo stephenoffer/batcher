@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to PySpark
 
-The following table maps 291 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 310 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
@@ -50,6 +50,7 @@ The following table maps 291 Batcher spellings to the PySpark names that compute
 | `bt.covar_samp` | `functions.covar_samp` |
 | `bt.cume_dist` | `functions.cume_dist` |
 | `bt.current_date` | `functions.curdate`, `functions.current_date` |
+| `bt.current_session` | `SparkSession.active`, `SparkSession.getActiveSession` |
 | `bt.current_timestamp` | `functions.current_timestamp`, `functions.now` |
 | `bt.dense_rank` | `functions.dense_rank` |
 | `bt.e` | `functions.e` |
@@ -154,6 +155,7 @@ The following table maps 291 Batcher spellings to the PySpark names that compute
 | `Dataset.with_row_index` | `functions.monotonically_increasing_id` |
 | `Dataset.with_watermark` | `DataFrame.withWatermark` |
 | `Dataset.write.for_each` | `DataStreamWriter.foreach` |
+| `Dataset.write.table` | `DataFrame.writeTo`, `DataFrameWriter.insertInto`, `DataFrameWriter.saveAsTable`, `DataFrameWriterV2.createOrReplace`, `DataFrameWriterV2.create`, `DataFrameWriterV2.overwritePartitions`, `DataFrameWriterV2.overwrite`, `DataFrameWriterV2.partitionedBy`, `DataFrameWriterV2.replace`, `DataFrameWriterV2.tableProperty` |
 | `Dataset.write.text` | `DataFrameWriter.text` |
 | `Dataset.write.xml` | `DataFrameWriter.xml` |
 | `Dataset.write` | `DataFrame.writeStream`, `DataFrameWriter.format`, `DataFrameWriter.mode`, `DataFrameWriter.option`, `DataFrameWriter.options`, `DataFrameWriter.partitionBy`, `DataStreamWriter.format`, `DataStreamWriter.option`, `DataStreamWriter.options`, `DataStreamWriter.outputMode`, `DataStreamWriter.partitionBy`, `DataStreamWriter.queryName`, `DataStreamWriter.start` |
@@ -296,8 +298,24 @@ The following table maps 291 Batcher spellings to the PySpark names that compute
 | `GroupBy.agg` | `GroupedData.agg` |
 | `lshift` operator | `functions.shiftleft` |
 | `rshift` operator | `functions.shiftright` |
-| `Session.drop` | `Catalog.dropTempView` |
-| `Session.register` | `DataFrame.createOrReplaceTempView`, `DataFrame.registerTempTable` |
+| `Session.catalog.create_namespace` | `Catalog.createDatabase` |
+| `Session.catalog.current_catalog` | `Catalog.currentCatalog` |
+| `Session.catalog.current_namespace` | `Catalog.currentDatabase` |
+| `Session.catalog.drop_namespace` | `Catalog.dropDatabase` |
+| `Session.catalog.drop_table` | `Catalog.dropTable` |
+| `Session.catalog.get_table` | `Catalog.getTable` |
+| `Session.catalog.has_namespace` | `Catalog.databaseExists` |
+| `Session.catalog.has_table` | `Catalog.tableExists` |
+| `Session.catalog.list_catalogs` | `Catalog.listCatalogs` |
+| `Session.catalog.list_namespaces` | `Catalog.listDatabases` |
+| `Session.catalog.truncate_table` | `Catalog.truncateTable` |
+| `Session.catalog.use` | `Catalog.setCurrentCatalog`, `Catalog.setCurrentDatabase` |
+| `Session.catalog` | `SparkSession.catalog` |
+| `Session.drop` | `Catalog.dropTempView`, `Catalog.dropView` |
+| `Session.has_function` | `Catalog.functionExists` |
+| `Session.list` | `Catalog.listViews` |
+| `Session.register` | `DataFrame.createOrReplaceTempView`, `DataFrame.createTempView`, `DataFrame.registerTempTable` |
+| `Session.table` | `SparkSession.table` |
 | `StreamingQuery.await_termination` | `StreamingQuery.awaitTermination` |
 | `StreamingQuery.exception` | `StreamingQuery.exception` |
 | `StreamingQuery.id` | `StreamingQuery.id` |
@@ -309,3 +327,4 @@ The following table maps 291 Batcher spellings to the PySpark names that compute
 | `StreamingQuery.run_id` | `StreamingQuery.runId` |
 | `StreamingQuery.status` | `StreamingQuery.status` |
 | `StreamingQuery.stop` | `StreamingQuery.stop` |
+| `Table.properties` | `Catalog.getTableProperties` |

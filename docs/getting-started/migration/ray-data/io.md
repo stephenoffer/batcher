@@ -20,7 +20,7 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 |---|---|---|---|
 | `ActorPoolStrategy` | `Dataset.map_batches` | param | Missing: an unbounded max\_size and max\_tasks\_in\_flight\_per\_actor raise; initial\_size above min\_size raises. Wave W11. |
 | `BlockBasedFileDatasink` | `batcher.io.FileSink` | mismatch | Differs: Ray subclasses implement write\_block\_to\_file(block, file) and get a file per block; Batcher FileSink implements write(table, path)/write\_partitioned and commits from a WriteManifest. Wave W11. |
-| `Catalog` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |
+| `Catalog` | `bt.Catalog` | mismatch | Differs: ray.data.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend. Wave W9. |
 | `CatalogAccessMode` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |
 | `ClickHouseTableSettings` | n/a | gap | Not yet: ClickHouse writer table settings (engine, order\_by, partition\_by) for write\_clickhouse. Wave W13. |
 | `DatabricksUnityCatalog` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |

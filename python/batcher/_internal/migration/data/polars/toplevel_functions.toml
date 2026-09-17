@@ -3,7 +3,7 @@
 
 
 [polars]
-Catalog = { status = "gap", need = "Unity catalog client (list/get/create tables)", wave = "W9" }
+Catalog = { status = "mismatch", batcher = "bt.Catalog", note = "pl.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend", wave = "W9" }
 Config = { status = "mismatch", batcher = "bt.Config", note = "Polars Config holds display/formatting settings; Batcher's Config is the engine configuration (memory, optimizer, distribution)", wave = "W11" }
 DataFrame = { status = "canonical", batcher = "bt.Dataset", template = 'DataFrame(data) -> sem.frame(data)' }
 Expr = { status = "canonical", batcher = "bt.Expr" }

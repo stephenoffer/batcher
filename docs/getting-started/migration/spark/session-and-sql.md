@@ -18,13 +18,13 @@ The following table maps the 37 names on `SparkSession`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `active` | n/a | gap | Not yet: the active session accessor. Wave W9. |
+| `active` | `bt.current_session` | canonical |  |
 | `addArtifact` | n/a | out of scope | Declined: Spark Connect artifact upload to a remote server. |
 | `addArtifacts` | n/a | out of scope | Declined: Spark Connect artifact upload to a remote server. |
 | `addTag` | n/a | gap | Not yet: session operation tags. Wave W9. |
 | `Builder` | `bt.Session` + `bt.set_config` | canonical |  |
 | `builder` | `bt.Session` + `bt.set_config` | canonical |  |
-| `catalog` | n/a | gap | Not yet: Session.catalog (databases, tables, functions, properties, refresh). Wave W9. |
+| `catalog` | `Session.catalog` | canonical |  |
 | `clearProgressHandlers` | n/a | gap | Not yet: query progress handler registry for batch queries. Wave W10. |
 | `clearTags` | n/a | gap | Not yet: session operation tags. Wave W9. |
 | `client` | n/a | out of scope | Declined: Spark Connect client handle. |
@@ -33,7 +33,7 @@ The following table maps the 37 names on `SparkSession`, sorted alphabetically.
 | `createDataFrame` | `bt.from_pylist` + `bt.from_pandas` + `bt.from_arrow` | param | Missing: one constructor taking rows/tuples/pandas/Arrow with schema= as StructType, DDL string or column-name list. Wave W2. |
 | `dataSource` | `batcher.io.SOURCES` | param | Missing: register a Python DataSource class by name (dataSource.register). Wave W11. |
 | `emptyDataFrame` | `bt.from_pydict` | param | Missing: an empty Dataset from a Spark StructType schema; bt.from\_pydict(\{\}, schema=...) takes a pyarrow.Schema. Wave W2. |
-| `getActiveSession` | n/a | gap | Not yet: the active session accessor. Wave W9. |
+| `getActiveSession` | `bt.current_session` | canonical |  |
 | `getTags` | n/a | gap | Not yet: session operation tags. Wave W9. |
 | `interruptAll` | `bt.running_queries` + `bt.cancel_query` | canonical |  |
 | `interruptOperation` | `bt.cancel_query` | canonical |  |
@@ -50,7 +50,7 @@ The following table maps the 37 names on `SparkSession`, sorted alphabetically.
 | `sql` | `Session.sql` | param | Missing: args= parameter markers (named :param and positional ?). Wave W2. |
 | `stop` | `bt.release_cluster` | canonical |  |
 | `streams` | `bt.streams` + `bt.await_any_termination` | canonical |  |
-| `table` | `Session.table` | param | Missing: catalog tables and views, not only tables registered in the session. Wave W9. |
+| `table` | `Session.table` | canonical |  |
 | `tvf` | n/a | gap | Not yet: table-valued function namespace (range, explode, inline, ...). Wave W11. |
 | `udf` | `bt.register_function` | canonical |  |
 | `udtf` | `Session.register_function` | param | Missing: UDTF class protocol (eval/terminate/analyze) registered with table=True. Wave W11. |
@@ -63,42 +63,42 @@ The following table maps the 37 names on `Catalog`, sorted alphabetically.
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
 | `analyzeTable` | n/a | gap | Not yet: catalog API: compute table statistics. Wave W9. |
-| `cacheTable` | n/a | gap | Not yet: catalog API: cache a catalog table by name. Wave W9. |
+| `cacheTable` | `Session.table` | param | Missing: port as session.table(name).cache(). Wave W9. |
 | `clearCache` | `bt.clear_cache` | canonical |  |
-| `createDatabase` | n/a | gap | Not yet: catalog API: create a database. Wave W9. |
-| `createExternalTable` | n/a | gap | Not yet: catalog API: create an external table. Wave W9. |
-| `createTable` | n/a | gap | Not yet: catalog API: create a table. Wave W9. |
-| `currentCatalog` | n/a | gap | Not yet: catalog API: current catalog. Wave W9. |
-| `currentDatabase` | n/a | gap | Not yet: catalog API: current database. Wave W9. |
-| `databaseExists` | n/a | gap | Not yet: catalog API: database existence check. Wave W9. |
-| `dropDatabase` | n/a | gap | Not yet: catalog API: drop a database. Wave W9. |
+| `createDatabase` | `Session.catalog.create_namespace` | canonical |  |
+| `createExternalTable` | `Session.register` | param | Missing: a table over a path is registered as a view of bt.read(path). Wave W9. |
+| `createTable` | `Session.catalog.create_table` | param | Missing: Spark's path= and source= for an external table. Wave W9. |
+| `currentCatalog` | `Session.catalog.current_catalog` | canonical |  |
+| `currentDatabase` | `Session.catalog.current_namespace` | canonical |  |
+| `databaseExists` | `Session.catalog.has_namespace` | canonical |  |
+| `dropDatabase` | `Session.catalog.drop_namespace` | canonical |  |
 | `dropGlobalTempView` | `Session.drop` | param | Missing: global\_temp database scope. Wave W9. |
-| `dropTable` | n/a | gap | Not yet: catalog API: drop a table. Wave W9. |
+| `dropTable` | `Session.catalog.drop_table` | canonical |  |
 | `dropTempView` | `Session.drop` | canonical |  |
-| `dropView` | n/a | gap | Not yet: catalog API: drop a persistent view. Wave W9. |
-| `functionExists` | n/a | gap | Not yet: catalog API: function existence check. Wave W9. |
+| `dropView` | `Session.drop` | canonical |  |
+| `functionExists` | `Session.has_function` | canonical |  |
 | `getCreateTableString` | n/a | gap | Not yet: catalog API: SHOW CREATE TABLE text. Wave W9. |
 | `getDatabase` | n/a | gap | Not yet: catalog API: database object. Wave W9. |
 | `getFunction` | n/a | gap | Not yet: catalog API: function object. Wave W9. |
-| `getTable` | n/a | gap | Not yet: catalog API: table object. Wave W9. |
-| `getTableProperties` | n/a | gap | Not yet: catalog API: table properties. Wave W9. |
+| `getTable` | `Session.catalog.get_table` | canonical |  |
+| `getTableProperties` | `Table.properties` | canonical |  |
 | `isCached` | n/a | gap | Not yet: catalog API: whether a table is cached. Wave W9. |
-| `listCatalogs` | n/a | gap | Not yet: catalog API: list catalogs. Wave W9. |
-| `listColumns` | n/a | gap | Not yet: catalog API: list a table's columns. Wave W9. |
-| `listDatabases` | n/a | gap | Not yet: catalog API: list databases. Wave W9. |
-| `listFunctions` | `Session.list_functions` | param | Missing: Function objects with database/catalog and a pattern filter (Batcher returns names). Wave W9. |
+| `listCatalogs` | `Session.catalog.list_catalogs` | canonical |  |
+| `listColumns` | `Table.schema` | param | Missing: Column objects rather than an Arrow schema. Wave W9. |
+| `listDatabases` | `Session.catalog.list_namespaces` | canonical |  |
+| `listFunctions` | `Session.list_functions` | param | Missing: Function objects rather than names. Wave W9. |
 | `listPartitions` | n/a | gap | Not yet: catalog API: list a table's partitions. Wave W9. |
-| `listTables` | `Session.list` | param | Missing: Table objects with database, temporary flag and a pattern filter (Batcher returns names). Wave W9. |
-| `listViews` | n/a | gap | Not yet: catalog API: list views. Wave W9. |
+| `listTables` | `Session.catalog.list_tables` | param | Missing: Table objects rather than names. Wave W9. |
+| `listViews` | `Session.list` | canonical |  |
 | `recoverPartitions` | n/a | gap | Not yet: catalog API: recover partitions from storage. Wave W9. |
 | `refreshByPath` | n/a | gap | Not yet: catalog API: invalidate cached data under a path. Wave W9. |
 | `refreshTable` | n/a | gap | Not yet: catalog API: invalidate a table's cached metadata. Wave W9. |
 | `registerFunction` | `bt.register_function` | canonical |  |
-| `setCurrentCatalog` | n/a | gap | Not yet: catalog API: set the current catalog. Wave W9. |
-| `setCurrentDatabase` | n/a | gap | Not yet: catalog API: set the current database. Wave W9. |
-| `tableExists` | n/a | gap | Not yet: catalog API: table existence check. Wave W9. |
-| `truncateTable` | n/a | gap | Not yet: catalog API: truncate a table. Wave W9. |
-| `uncacheTable` | n/a | gap | Not yet: catalog API: uncache a catalog table by name. Wave W9. |
+| `setCurrentCatalog` | `Session.catalog.use` | canonical |  |
+| `setCurrentDatabase` | `Session.catalog.use` | canonical |  |
+| `tableExists` | `Session.catalog.has_table` | canonical |  |
+| `truncateTable` | `Session.catalog.truncate_table` | canonical |  |
+| `uncacheTable` | `Session.table` | param | Missing: port as session.table(name).uncache(). Wave W9. |
 
 ## `RuntimeConfig`
 

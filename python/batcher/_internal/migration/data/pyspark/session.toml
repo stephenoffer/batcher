@@ -4,12 +4,12 @@
 
 [SparkSession]
 Builder = { status = "canonical", batcher = ["bt.Session", "bt.set_config"] }
-active = { status = "gap", need = "the active session accessor", wave = "W9" }
+active = { status = "canonical", batcher = "bt.current_session" }
 addArtifact = { status = "out_of_scope", reason = "Spark Connect artifact upload to a remote server" }
 addArtifacts = { status = "out_of_scope", reason = "Spark Connect artifact upload to a remote server" }
 addTag = { status = "gap", need = "session operation tags", wave = "W9" }
 builder = { status = "canonical", batcher = ["bt.Session", "bt.set_config"] }
-catalog = { status = "gap", need = "Session.catalog (databases, tables, functions, properties, refresh)", wave = "W9" }
+catalog = { status = "canonical", batcher = "Session.catalog" }
 clearProgressHandlers = { status = "gap", need = "query progress handler registry for batch queries", wave = "W10" }
 clearTags = { status = "gap", need = "session operation tags", wave = "W9" }
 client = { status = "out_of_scope", reason = "Spark Connect client handle" }
@@ -18,7 +18,7 @@ copyFromLocalToFs = { status = "out_of_scope", reason = "Spark Connect local-to-
 createDataFrame = { status = "param", batcher = ["bt.from_pylist", "bt.from_pandas", "bt.from_arrow"], need = "one constructor taking rows/tuples/pandas/Arrow with schema= as StructType, DDL string or column-name list", wave = "W2", template = 'createDataFrame(data, schema=None) -> sem.spark_rows(data, schema)' }
 dataSource = { status = "param", batcher = "batcher.io.SOURCES", need = "register a Python DataSource class by name (dataSource.register)", wave = "W11" }
 emptyDataFrame = { status = "param", batcher = "bt.from_pydict", need = "an empty Dataset from a Spark StructType schema; bt.from_pydict({}, schema=...) takes a pyarrow.Schema", wave = "W2" }
-getActiveSession = { status = "gap", need = "the active session accessor", wave = "W9" }
+getActiveSession = { status = "canonical", batcher = "bt.current_session" }
 getTags = { status = "gap", need = "session operation tags", wave = "W9" }
 interruptAll = { status = "canonical", batcher = ["bt.running_queries", "bt.cancel_query"] }
 interruptOperation = { status = "canonical", batcher = "bt.cancel_query" }
@@ -35,7 +35,7 @@ sparkContext = { status = "out_of_scope", reason = "no RDD or JVM context" }
 sql = { status = "param", batcher = "Session.sql", need = "args= parameter markers (named :param and positional ?)", wave = "W2" }
 stop = { status = "canonical", batcher = "bt.release_cluster" }
 streams = { status = "canonical", batcher = ["bt.streams", "bt.await_any_termination"] }
-table = { status = "param", batcher = "Session.table", need = "catalog tables and views, not only tables registered in the session", wave = "W9" }
+table = { status = "canonical", batcher = "Session.table" }
 tvf = { status = "gap", need = "table-valued function namespace (range, explode, inline, ...)", wave = "W11" }
 udf = { status = "canonical", batcher = "bt.register_function" }
 udtf = { status = "param", batcher = "Session.register_function", need = "UDTF class protocol (eval/terminate/analyze) registered with table=True", wave = "W11" }
@@ -43,42 +43,42 @@ version = { status = "canonical", batcher = "bt.engine_version" }
 
 [Catalog]
 analyzeTable = { status = "gap", need = "catalog API: compute table statistics", wave = "W9" }
-cacheTable = { status = "gap", need = "catalog API: cache a catalog table by name", wave = "W9" }
+cacheTable = { status = "param", batcher = "Session.table", need = "port as session.table(name).cache()", wave = "W9" }
 clearCache = { status = "canonical", batcher = "bt.clear_cache" }
-createDatabase = { status = "gap", need = "catalog API: create a database", wave = "W9" }
-createExternalTable = { status = "gap", need = "catalog API: create an external table", wave = "W9" }
-createTable = { status = "gap", need = "catalog API: create a table", wave = "W9" }
-currentCatalog = { status = "gap", need = "catalog API: current catalog", wave = "W9" }
-currentDatabase = { status = "gap", need = "catalog API: current database", wave = "W9" }
-databaseExists = { status = "gap", need = "catalog API: database existence check", wave = "W9" }
-dropDatabase = { status = "gap", need = "catalog API: drop a database", wave = "W9" }
+createDatabase = { status = "canonical", batcher = "Session.catalog.create_namespace" }
+createExternalTable = { status = "param", batcher = "Session.register", need = "a table over a path is registered as a view of bt.read(path)", wave = "W9" }
+createTable = { status = "param", batcher = "Session.catalog.create_table", need = "Spark's path= and source= for an external table", wave = "W9" }
+currentCatalog = { status = "canonical", batcher = "Session.catalog.current_catalog" }
+currentDatabase = { status = "canonical", batcher = "Session.catalog.current_namespace" }
+databaseExists = { status = "canonical", batcher = "Session.catalog.has_namespace" }
+dropDatabase = { status = "canonical", batcher = "Session.catalog.drop_namespace" }
 dropGlobalTempView = { status = "param", batcher = "Session.drop", need = "global_temp database scope", wave = "W9" }
-dropTable = { status = "gap", need = "catalog API: drop a table", wave = "W9" }
+dropTable = { status = "canonical", batcher = "Session.catalog.drop_table" }
 dropTempView = { status = "canonical", batcher = "Session.drop" }
-dropView = { status = "gap", need = "catalog API: drop a persistent view", wave = "W9" }
-functionExists = { status = "gap", need = "catalog API: function existence check", wave = "W9" }
+dropView = { status = "canonical", batcher = "Session.drop" }
+functionExists = { status = "canonical", batcher = "Session.has_function" }
 getCreateTableString = { status = "gap", need = "catalog API: SHOW CREATE TABLE text", wave = "W9" }
 getDatabase = { status = "gap", need = "catalog API: database object", wave = "W9" }
 getFunction = { status = "gap", need = "catalog API: function object", wave = "W9" }
-getTable = { status = "gap", need = "catalog API: table object", wave = "W9" }
-getTableProperties = { status = "gap", need = "catalog API: table properties", wave = "W9" }
+getTable = { status = "canonical", batcher = "Session.catalog.get_table" }
+getTableProperties = { status = "canonical", batcher = "Table.properties" }
 isCached = { status = "gap", need = "catalog API: whether a table is cached", wave = "W9" }
-listCatalogs = { status = "gap", need = "catalog API: list catalogs", wave = "W9" }
-listColumns = { status = "gap", need = "catalog API: list a table's columns", wave = "W9" }
-listDatabases = { status = "gap", need = "catalog API: list databases", wave = "W9" }
-listFunctions = { status = "param", batcher = "Session.list_functions", need = "Function objects with database/catalog and a pattern filter (Batcher returns names)", wave = "W9" }
+listCatalogs = { status = "canonical", batcher = "Session.catalog.list_catalogs" }
+listColumns = { status = "param", batcher = "Table.schema", need = "Column objects rather than an Arrow schema", wave = "W9" }
+listDatabases = { status = "canonical", batcher = "Session.catalog.list_namespaces" }
+listFunctions = { status = "param", batcher = "Session.list_functions", need = "Function objects rather than names", wave = "W9" }
 listPartitions = { status = "gap", need = "catalog API: list a table's partitions", wave = "W9" }
-listTables = { status = "param", batcher = "Session.list", need = "Table objects with database, temporary flag and a pattern filter (Batcher returns names)", wave = "W9" }
-listViews = { status = "gap", need = "catalog API: list views", wave = "W9" }
+listTables = { status = "param", batcher = "Session.catalog.list_tables", need = "Table objects rather than names", wave = "W9" }
+listViews = { status = "canonical", batcher = "Session.list" }
 recoverPartitions = { status = "gap", need = "catalog API: recover partitions from storage", wave = "W9" }
 refreshByPath = { status = "gap", need = "catalog API: invalidate cached data under a path", wave = "W9" }
 refreshTable = { status = "gap", need = "catalog API: invalidate a table's cached metadata", wave = "W9" }
 registerFunction = { status = "canonical", batcher = "bt.register_function" }
-setCurrentCatalog = { status = "gap", need = "catalog API: set the current catalog", wave = "W9" }
-setCurrentDatabase = { status = "gap", need = "catalog API: set the current database", wave = "W9" }
-tableExists = { status = "gap", need = "catalog API: table existence check", wave = "W9" }
-truncateTable = { status = "gap", need = "catalog API: truncate a table", wave = "W9" }
-uncacheTable = { status = "gap", need = "catalog API: uncache a catalog table by name", wave = "W9" }
+setCurrentCatalog = { status = "canonical", batcher = "Session.catalog.use" }
+setCurrentDatabase = { status = "canonical", batcher = "Session.catalog.use" }
+tableExists = { status = "canonical", batcher = "Session.catalog.has_table" }
+truncateTable = { status = "canonical", batcher = "Session.catalog.truncate_table" }
+uncacheTable = { status = "param", batcher = "Session.table", need = "port as session.table(name).uncache()", wave = "W9" }
 
 [RuntimeConfig]
 get = { status = "canonical", batcher = "batcher.config.get_option" }

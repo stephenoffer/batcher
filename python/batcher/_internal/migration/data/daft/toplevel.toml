@@ -3,7 +3,7 @@
 
 [daft]
 AudioFile = { status = "gap", need = "File logical type (AudioFile)", wave = "W12" }
-Catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+Catalog = { status = "canonical", batcher = "bt.Catalog" }
 CheckpointConfig = { status = "gap", need = "per-source checkpointing for resumable reads", wave = "W13" }
 CheckpointStore = { status = "gap", need = "checkpoint store for resumable reads and idempotent commits", wave = "W13" }
 DataFrame = { status = "canonical", batcher = "bt.Dataset" }
@@ -23,42 +23,42 @@ MediaType = { status = "gap", need = "File media-type descriptor", wave = "W12" 
 ResourceRequest = { status = "param", batcher = "Dataset.map_batches", need = "a ResourceRequest object carrying num_cpus/num_gpus/memory_bytes", wave = "W11" }
 Schema = { status = "gap", need = "a Schema object model (Batcher exposes pyarrow.Schema)", wave = "W11" }
 Series = { status = "out_of_scope", reason = "a single-column eager array type; Batcher has no Series (columns are Expr, data is Arrow)" }
-Session = { status = "param", batcher = "bt.Session", need = "catalogs, namespaces, providers and temp tables on the session object", wave = "W9" }
-Table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+Session = { status = "canonical", batcher = "bt.Session" }
+Table = { status = "canonical", batcher = "bt.Table" }
 TimeUnit = { status = "gap", need = "time unit enum (Batcher takes unit strings)", wave = "W11" }
 UnionMode = { status = "gap", need = "union type mode enum", wave = "W11" }
 VideoFile = { status = "gap", need = "File logical type (VideoFile)", wave = "W12" }
 Window = { status = "mismatch", batcher = "WindowExpr.over", note = "A Daft Window with order_by and no explicit frame applies an aggregate over the whole partition; Batcher's over(order_by=) uses SQL's running frame. Param: frame=(None, None)", wave = "W0" }
-attach = { status = "param", batcher = "Session.register", need = "one attach() dispatching on Catalog, Table, UDF, provider or DataFrame", wave = "W9" }
-attach_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+attach = { status = "param", batcher = "Session.catalog.attach", need = "a DataFrame argument is Session.register instead", wave = "W9" }
+attach_catalog = { status = "canonical", batcher = "Session.catalog.attach" }
 attach_function = { status = "canonical", batcher = "bt.register_function" }
 attach_provider = { status = "param", batcher = "Session.register_engine", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
 attach_subscriber = { status = "param", batcher = "bt.add_streaming_listener", need = "subscribers for batch (non-streaming) query events", wave = "W9" }
-attach_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+attach_table = { status = "canonical", batcher = "Session.register" }
 attach_view = { status = "canonical", batcher = "Session.register" }
 cls = { status = "gap", need = "@daft.cls class UDFs usable as Expressions with gpus=/max_concurrency=/use_process=/on_error=/max_retries=", wave = "W11" }
 col = { status = "canonical", batcher = "bt.col" }
 concat = { status = "canonical", batcher = "bt.concat" }
 context = { status = "out_of_scope", reason = "Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object" }
-create_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-create_namespace_if_not_exists = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-create_table = { status = "gap", need = "catalog-backed create_table from a schema or DataFrame", wave = "W9" }
-create_table_if_not_exists = { status = "gap", need = "catalog-backed create_table_if_not_exists", wave = "W9" }
-create_temp_table = { status = "param", batcher = "Session.register", need = "a materialized session temp table (register binds a lazy plan)", wave = "W9" }
+create_namespace = { status = "canonical", batcher = "Session.catalog.create_namespace" }
+create_namespace_if_not_exists = { status = "param", batcher = "Session.catalog.create_namespace", need = "port as the base method with if_not_exists=True", wave = "W9" }
+create_table = { status = "canonical", batcher = "Session.catalog.create_table" }
+create_table_if_not_exists = { status = "param", batcher = "Session.catalog.create_table", need = "port as the base method with if_not_exists=True", wave = "W9" }
+create_temp_table = { status = "param", batcher = "Session.register", need = "Batcher binds the lazy plan rather than materializing it", wave = "W9" }
 create_temp_view = { status = "canonical", batcher = "Session.register" }
-current_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+current_catalog = { status = "canonical", batcher = "Session.catalog.current_catalog" }
 current_model = { status = "param", batcher = "Session.list_models", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-current_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+current_namespace = { status = "canonical", batcher = "Session.catalog.current_namespace" }
 current_provider = { status = "param", batcher = "Session.list_engines", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-current_session = { status = "gap", need = "a process-default session object (current_session/set_session/session)", wave = "W9" }
+current_session = { status = "canonical", batcher = "bt.current_session" }
 datasets = { status = "out_of_scope", reason = "bundled sample-dataset loaders (common_crawl, droid, lerobot), not engine surface" }
-detach_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-detach_function = { status = "gap", need = "unregistering a session function", wave = "W9" }
+detach_catalog = { status = "canonical", batcher = "Session.catalog.detach" }
+detach_function = { status = "canonical", batcher = "Session.drop_function" }
 detach_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
 detach_subscriber = { status = "param", batcher = "bt.remove_streaming_listener", need = "subscribers for batch (non-streaming) query events", wave = "W9" }
-detach_table = { status = "param", batcher = "Session.drop", need = "raise when the table is absent (Session.drop is silent)", wave = "W9" }
-drop_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-drop_table = { status = "mismatch", batcher = "Session.drop", note = "Daft drop_table drops the table from the current catalog; Batcher Session.drop only unregisters a session name and never touches storage", wave = "W9" }
+detach_table = { status = "param", batcher = "Session.drop", need = "Session.drop is silent when the name is absent", wave = "W9" }
+drop_namespace = { status = "canonical", batcher = "Session.catalog.drop_namespace" }
+drop_table = { status = "canonical", batcher = "Session.catalog.drop_table" }
 element = { status = "canonical", batcher = "bt.element" }
 execution_config_ctx = { status = "param", batcher = "bt.config_context", need = "Daft execution knob names (morsel size, shuffle algorithm, broadcast threshold) mapped onto Config fields", wave = "W9" }
 from_arrow = { status = "param", batcher = "bt.from_arrow", need = "an iterable of Arrow tables or any ArrowStreamExportable", wave = "W2" }
@@ -72,22 +72,22 @@ from_ray_dataset = { status = "canonical", batcher = "bt.from_ray_dataset" }
 func = { status = "gap", need = "@daft.func Expression-level UDFs with return_dtype=, unnest=, gpus=, max_concurrency=, use_process=, on_error=, max_retries=", wave = "W11" }
 functions = { status = "canonical", batcher = "bt" }
 get_aggregate_function = { status = "gap", need = "look up a registered aggregate function as an Expression", wave = "W9" }
-get_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+get_catalog = { status = "canonical", batcher = "Session.catalog.get_catalog" }
 get_context = { status = "out_of_scope", reason = "Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object" }
 get_function = { status = "gap", need = "look up a registered function as an Expression", wave = "W9" }
 get_loaded_extension_paths = { status = "out_of_scope", reason = "Daft native extension loading; Batcher extends through Python registries" }
 get_or_create_runner = { status = "out_of_scope", reason = "Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object" }
 get_or_infer_runner_type = { status = "out_of_scope", reason = "Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object" }
 get_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-get_table = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-has_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-has_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+get_table = { status = "canonical", batcher = "Session.catalog.get_table" }
+has_catalog = { status = "canonical", batcher = "Session.catalog.has_catalog" }
+has_namespace = { status = "canonical", batcher = "Session.catalog.has_namespace" }
 has_provider = { status = "gap", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-has_table = { status = "gap", need = "has_table predicate over session and catalog tables", wave = "W9" }
+has_table = { status = "canonical", batcher = "Session.catalog.has_table" }
 interval = { status = "gap", need = "interval literal (years/months/days/... ) as a month-day-nano INTERVAL value", wave = "W6" }
 io = { status = "mismatch", batcher = "bt.io", note = "daft.io holds IOConfig/S3Config credential classes, DataSource/DataSink protocols and the read_* functions; batcher.io holds Source/Sink extension classes, with readers at bt.read.<fmt> and credentials in batcher.io.credentials", wave = "W13" }
-list_catalogs = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
-list_tables = { status = "param", batcher = "Session.list", need = "pattern= filtering and catalog-backed tables", wave = "W9" }
+list_catalogs = { status = "canonical", batcher = "Session.catalog.list_catalogs" }
+list_tables = { status = "canonical", batcher = "Session.catalog.list_tables" }
 lit = { status = "canonical", batcher = "bt.lit" }
 load_extension = { status = "out_of_scope", reason = "loads a Daft native extension library; Batcher extends through Python registries, not dynamic native loading" }
 method = { status = "gap", need = "@daft.method on @daft.cls UDF classes", wave = "W11" }
@@ -108,7 +108,7 @@ read_mcap = { status = "param", batcher = "bt.read.mcap", need = "start_time=/en
 read_paimon = { status = "gap", need = "Apache Paimon reader", wave = "W13" }
 read_parquet = { status = "alias", batcher = "bt.read.parquet" }
 read_sql = { status = "param", batcher = "bt.read.sql", need = "partition_col=/num_partitions= parallel range partitioning and a connection factory callable", wave = "W13" }
-read_table = { status = "mismatch", batcher = "bt.read.table", note = "Daft read_table(identifier) reads a table from the session catalog; bt.read.table(name) constructs a registered connector by name. Rewrite: Session.table(identifier)", wave = "W9" }
+read_table = { status = "canonical", batcher = "Session.table" }
 read_text = { status = "param", batcher = "bt.read.text", need = "Daft reads each line as a row by default; pass skip_blank_lines= to match", note = "Daft read_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line_number columns and keeps blank lines. Param: skip_blank_lines=True, text column only", wave = "W13" }
 read_video_frames = { status = "mismatch", batcher = "bt.read.video", note = "Daft read_video_frames yields one row per decoded frame (image_height/width, sample_interval_seconds); Batcher read.video yields one row per file with num_frames sampled frames", wave = "W12" }
 read_warc = { status = "mismatch", batcher = "bt.read.warc", note = "Daft read_warc keeps WARC header names ('WARC-Record-ID', ...); Batcher read.warc snake_cases them ('warc_record_id')", wave = "W13" }
@@ -117,18 +117,18 @@ refresh_logger = { status = "out_of_scope", reason = "Daft Rust-logger plumbing;
 register_viz_hook = { status = "out_of_scope", reason = "notebook HTML visualization hook for Python classes, not engine surface" }
 runners = { status = "out_of_scope", reason = "Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object" }
 session = { status = "gap", need = "a process-default session object (current_session/set_session/session)", wave = "W9" }
-set_catalog = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+set_catalog = { status = "canonical", batcher = "Session.catalog.use" }
 set_execution_config = { status = "param", batcher = "bt.set_config", need = "Daft execution knob names (morsel size, shuffle algorithm, broadcast threshold) mapped onto Config fields", wave = "W9" }
 set_model = { status = "param", batcher = "Session.register_model", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
-set_namespace = { status = "gap", need = "Catalog/Table/Identifier objects with namespaces and table lifecycle", wave = "W9" }
+set_namespace = { status = "canonical", batcher = "Session.catalog.use" }
 set_planning_config = { status = "param", batcher = "bt.set_config", need = "planning knobs (default_io_config, strict filter pushdown) as Config fields", wave = "W9" }
 set_provider = { status = "param", batcher = "Session.register_engine", need = "a session provider/model registry (attach_provider/set_provider/set_model/current_model) that AI functions resolve against", wave = "W12" }
 set_runner_native = { status = "out_of_scope", reason = "Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object" }
 set_runner_ray = { status = "param", batcher = "Dataset.collect", need = "a process-wide switch to distributed execution (Batcher opts in per collect(distributed=...))", wave = "W9" }
-set_session = { status = "gap", need = "a process-default session object (current_session/set_session/session)", wave = "W9" }
+set_session = { status = "canonical", batcher = "bt.set_session" }
 sql = { status = "param", batcher = "bt.sql", need = "register_globals= discovery of DataFrames bound to Python variables", wave = "W1" }
 sql_expr = { status = "canonical", batcher = "bt.sql_expr" }
 udaf = { status = "gap", need = "user-defined mergeable aggregate functions (partial/combine/finalize) from a class", wave = "W11" }
 udf = { status = "mismatch", batcher = "bt.udf", note = "Daft @udf (deprecated) yields a column UDF called with Expressions and sized with num_gpus=/concurrency=/batch_size=; bt.udf yields a Dataset-level transform. Param: an Expr-returning UDF form", wave = "W11" }
 with_subscriber = { status = "param", batcher = "bt.add_streaming_listener", need = "subscribers for batch (non-streaming) query events, as a context manager", wave = "W9" }
-write_table = { status = "gap", need = "catalog-backed write_table(identifier, df, mode=)", wave = "W9" }
+write_table = { status = "canonical", batcher = "Dataset.write.table" }

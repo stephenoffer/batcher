@@ -34,7 +34,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `createGlobalTempView` | `Session.register` | param | Missing: global\_temp database scope, and raise when the view already exists. Wave W9. |
 | `createOrReplaceGlobalTempView` | `Session.register` | param | Missing: global\_temp database scope shared across sessions. Wave W9. |
 | `createOrReplaceTempView` | `Session.register` | canonical |  |
-| `createTempView` | `Session.register` | param | Missing: raise when the view already exists (Session.register replaces). Wave W9. |
+| `createTempView` | `Session.register` | canonical |  |
 | `crossJoin` | `Dataset.cross_join` | canonical |  |
 | `crosstab` | `Dataset.crosstab` | mismatch | Differs: Spark names the first column '\<col1\>\_\<col2\>' and fills absent pairs with 0; Batcher keeps the index column name and leaves absent pairs null. Needs fill\_value= and a name parameter. Wave W0. |
 | `cube` | `Dataset.cube` | canonical |  |
@@ -133,7 +133,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `withWatermark` | `Dataset.with_watermark` | canonical |  |
 | `write` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
 | `writeStream` | `Dataset.write` | canonical |  |
-| `writeTo` | n/a | gap | Not yet: DataFrameWriterV2 catalog-table writer (create/replace/append/overwritePartitions). Wave W9. |
+| `writeTo` | `Dataset.write.table` | canonical |  |
 | `zipWithIndex` | `Dataset.with_row_index` | mismatch | Differs: Spark appends the index as the last column; Batcher inserts it first. Wave W0. |
 
 ## `DataFrameNaFunctions`

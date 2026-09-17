@@ -18,42 +18,42 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `attach` | `Session.register` | param | Missing: one attach() dispatching on Catalog, Table, UDF, provider or DataFrame. Wave W9. |
-| `attach_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `attach` | `Session.catalog.attach` | param | Missing: a DataFrame argument is Session.register instead. Wave W9. |
+| `attach_catalog` | `Session.catalog.attach` | canonical |  |
 | `attach_function` | `bt.register_function` | canonical |  |
 | `attach_provider` | `Session.register_engine` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
 | `attach_subscriber` | `bt.add_streaming_listener` | param | Missing: subscribers for batch (non-streaming) query events. Wave W9. |
-| `attach_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `attach_table` | `Session.register` | canonical |  |
 | `attach_view` | `Session.register` | canonical |  |
 | `AudioFile` | n/a | gap | Not yet: File logical type (AudioFile). Wave W12. |
-| `Catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `Catalog` | `bt.Catalog` | canonical |  |
 | `CheckpointConfig` | n/a | gap | Not yet: per-source checkpointing for resumable reads. Wave W13. |
 | `CheckpointStore` | n/a | gap | Not yet: checkpoint store for resumable reads and idempotent commits. Wave W13. |
 | `cls` | n/a | gap | Not yet: @daft.cls class UDFs usable as Expressions with gpus=/max\_concurrency=/use\_process=/on\_error=/max\_retries=. Wave W11. |
 | `col` | `bt.col` | canonical |  |
 | `concat` | `bt.concat` | canonical |  |
 | `context` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
-| `create_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `create_namespace_if_not_exists` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `create_table` | n/a | gap | Not yet: catalog-backed create\_table from a schema or DataFrame. Wave W9. |
-| `create_table_if_not_exists` | n/a | gap | Not yet: catalog-backed create\_table\_if\_not\_exists. Wave W9. |
-| `create_temp_table` | `Session.register` | param | Missing: a materialized session temp table (register binds a lazy plan). Wave W9. |
+| `create_namespace` | `Session.catalog.create_namespace` | canonical |  |
+| `create_namespace_if_not_exists` | `Session.catalog.create_namespace` | param | Missing: port as the base method with if\_not\_exists=True. Wave W9. |
+| `create_table` | `Session.catalog.create_table` | canonical |  |
+| `create_table_if_not_exists` | `Session.catalog.create_table` | param | Missing: port as the base method with if\_not\_exists=True. Wave W9. |
+| `create_temp_table` | `Session.register` | param | Missing: Batcher binds the lazy plan rather than materializing it. Wave W9. |
 | `create_temp_view` | `Session.register` | canonical |  |
-| `current_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `current_catalog` | `Session.catalog.current_catalog` | canonical |  |
 | `current_model` | `Session.list_models` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `current_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `current_namespace` | `Session.catalog.current_namespace` | canonical |  |
 | `current_provider` | `Session.list_engines` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `current_session` | n/a | gap | Not yet: a process-default session object (current\_session/set\_session/session). Wave W9. |
+| `current_session` | `bt.current_session` | canonical |  |
 | `DataFrame` | `bt.Dataset` | canonical |  |
 | `datasets` | n/a | out of scope | Declined: bundled sample-dataset loaders (common\_crawl, droid, lerobot), not engine surface. |
 | `DataType` | n/a | gap | Not yet: a DataType object model (Batcher names types with Arrow type strings or pyarrow types). Wave W11. |
-| `detach_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `detach_function` | n/a | gap | Not yet: unregistering a session function. Wave W9. |
+| `detach_catalog` | `Session.catalog.detach` | canonical |  |
+| `detach_function` | `Session.drop_function` | canonical |  |
 | `detach_provider` | n/a | gap | Not yet: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
 | `detach_subscriber` | `bt.remove_streaming_listener` | param | Missing: subscribers for batch (non-streaming) query events. Wave W9. |
-| `detach_table` | `Session.drop` | param | Missing: raise when the table is absent (Session.drop is silent). Wave W9. |
-| `drop_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `drop_table` | `Session.drop` | mismatch | Differs: Daft drop\_table drops the table from the current catalog; Batcher Session.drop only unregisters a session name and never touches storage. Wave W9. |
+| `detach_table` | `Session.drop` | param | Missing: Session.drop is silent when the name is absent. Wave W9. |
+| `drop_namespace` | `Session.catalog.drop_namespace` | canonical |  |
+| `drop_table` | `Session.catalog.drop_table` | canonical |  |
 | `element` | `bt.element` | canonical |  |
 | `execution_config_ctx` | `bt.config_context` | param | Missing: Daft execution knob names (morsel size, shuffle algorithm, broadcast threshold) mapped onto Config fields. Wave W9. |
 | `Expression` | `bt.Expr` | canonical |  |
@@ -69,18 +69,18 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `func` | n/a | gap | Not yet: @daft.func Expression-level UDFs with return\_dtype=, unnest=, gpus=, max\_concurrency=, use\_process=, on\_error=, max\_retries=. Wave W11. |
 | `functions` | `bt` | canonical |  |
 | `get_aggregate_function` | n/a | gap | Not yet: look up a registered aggregate function as an Expression. Wave W9. |
-| `get_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `get_catalog` | `Session.catalog.get_catalog` | canonical |  |
 | `get_context` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
 | `get_function` | n/a | gap | Not yet: look up a registered function as an Expression. Wave W9. |
 | `get_loaded_extension_paths` | n/a | out of scope | Declined: Daft native extension loading; Batcher extends through Python registries. |
 | `get_or_create_runner` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
 | `get_or_infer_runner_type` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
 | `get_provider` | n/a | gap | Not yet: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `get_table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `has_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `has_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `get_table` | `Session.catalog.get_table` | canonical |  |
+| `has_catalog` | `Session.catalog.has_catalog` | canonical |  |
+| `has_namespace` | `Session.catalog.has_namespace` | canonical |  |
 | `has_provider` | n/a | gap | Not yet: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `has_table` | n/a | gap | Not yet: has\_table predicate over session and catalog tables. Wave W9. |
+| `has_table` | `Session.catalog.has_table` | canonical |  |
 | `Hdf5File` | n/a | gap | Not yet: File logical type (Hdf5File). Wave W12. |
 | `IdempotentCommit` | n/a | gap | Not yet: idempotent sink commits keyed by an idempotence key. Wave W13. |
 | `Identifier` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
@@ -92,8 +92,8 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `io` | `bt.io` | mismatch | Differs: daft.io holds IOConfig/S3Config credential classes, DataSource/DataSink protocols and the read\_\* functions; batcher.io holds Source/Sink extension classes, with readers at bt.read.\<fmt\> and credentials in batcher.io.credentials. Wave W13. |
 | `IOConfig` | `batcher.io.credentials` | param | Missing: one IOConfig object carrying s3/gcs/azure/http/hf settings passed per read. Wave W13. |
 | `KeyFilteringSettings` | n/a | gap | Not yet: tuning for the skip\_existing key-filtering anti-join. Wave W13. |
-| `list_catalogs` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
-| `list_tables` | `Session.list` | param | Missing: pattern= filtering and catalog-backed tables. Wave W9. |
+| `list_catalogs` | `Session.catalog.list_catalogs` | canonical |  |
+| `list_tables` | `Session.catalog.list_tables` | canonical |  |
 | `lit` | `bt.lit` | canonical |  |
 | `load_extension` | n/a | out of scope | Declined: loads a Daft native extension library; Batcher extends through Python registries, not dynamic native loading. |
 | `MediaType` | n/a | gap | Not yet: File media-type descriptor. Wave W12. |
@@ -115,7 +115,7 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `read_paimon` | n/a | gap | Not yet: Apache Paimon reader. Wave W13. |
 | `read_parquet` | `bt.read.parquet` | alias |  |
 | `read_sql` | `bt.read.sql` | param | Missing: partition\_col=/num\_partitions= parallel range partitioning and a connection factory callable. Wave W13. |
-| `read_table` | `bt.read.table` | mismatch | Differs: Daft read\_table(identifier) reads a table from the session catalog; bt.read.table(name) constructs a registered connector by name. Rewrite: Session.table(identifier). Wave W9. |
+| `read_table` | `Session.table` | canonical |  |
 | `read_text` | `bt.read.text` | param | Missing: Daft reads each line as a row by default; pass skip\_blank\_lines= to match. Daft read\_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line\_number columns and keeps blank lines. Param: skip\_blank\_lines=True, text column only. Wave W13. |
 | `read_video_frames` | `bt.read.video` | mismatch | Differs: Daft read\_video\_frames yields one row per decoded frame (image\_height/width, sample\_interval\_seconds); Batcher read.video yields one row per file with num\_frames sampled frames. Wave W12. |
 | `read_warc` | `bt.read.warc` | mismatch | Differs: Daft read\_warc keeps WARC header names ('WARC-Record-ID', ...); Batcher read.warc snake\_cases them ('warc\_record\_id'). Wave W13. |
@@ -126,20 +126,20 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `runners` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
 | `Schema` | n/a | gap | Not yet: a Schema object model (Batcher exposes pyarrow.Schema). Wave W11. |
 | `Series` | n/a | out of scope | Declined: a single-column eager array type; Batcher has no Series (columns are Expr, data is Arrow). |
-| `Session` | `bt.Session` | param | Missing: catalogs, namespaces, providers and temp tables on the session object. Wave W9. |
+| `Session` | `bt.Session` | canonical |  |
 | `session` | n/a | gap | Not yet: a process-default session object (current\_session/set\_session/session). Wave W9. |
-| `set_catalog` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `set_catalog` | `Session.catalog.use` | canonical |  |
 | `set_execution_config` | `bt.set_config` | param | Missing: Daft execution knob names (morsel size, shuffle algorithm, broadcast threshold) mapped onto Config fields. Wave W9. |
 | `set_model` | `Session.register_model` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `set_namespace` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `set_namespace` | `Session.catalog.use` | canonical |  |
 | `set_planning_config` | `bt.set_config` | param | Missing: planning knobs (default\_io\_config, strict filter pushdown) as Config fields. Wave W9. |
 | `set_provider` | `Session.register_engine` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
 | `set_runner_native` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
 | `set_runner_ray` | `Dataset.collect` | param | Missing: a process-wide switch to distributed execution (Batcher opts in per collect(distributed=...)). Wave W9. |
-| `set_session` | n/a | gap | Not yet: a process-default session object (current\_session/set\_session/session). Wave W9. |
+| `set_session` | `bt.set_session` | canonical |  |
 | `sql` | `bt.sql` | param | Missing: register\_globals= discovery of DataFrames bound to Python variables. Wave W1. |
 | `sql_expr` | `bt.sql_expr` | canonical |  |
-| `Table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
+| `Table` | `bt.Table` | canonical |  |
 | `TimeUnit` | n/a | gap | Not yet: time unit enum (Batcher takes unit strings). Wave W11. |
 | `udaf` | n/a | gap | Not yet: user-defined mergeable aggregate functions (partial/combine/finalize) from a class. Wave W11. |
 | `udf` | `bt.udf` | mismatch | Differs: Daft @udf (deprecated) yields a column UDF called with Expressions and sized with num\_gpus=/concurrency=/batch\_size=; bt.udf yields a Dataset-level transform. Param: an Expr-returning UDF form. Wave W11. |
@@ -147,4 +147,4 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `VideoFile` | n/a | gap | Not yet: File logical type (VideoFile). Wave W12. |
 | `Window` | `WindowExpr.over` | mismatch | Differs: A Daft Window with order\_by and no explicit frame applies an aggregate over the whole partition; Batcher's over(order\_by=) uses SQL's running frame. Param: frame=(None, None). Wave W0. |
 | `with_subscriber` | `bt.add_streaming_listener` | param | Missing: subscribers for batch (non-streaming) query events, as a context manager. Wave W9. |
-| `write_table` | n/a | gap | Not yet: catalog-backed write\_table(identifier, df, mode=). Wave W9. |
+| `write_table` | `Dataset.write.table` | canonical |  |

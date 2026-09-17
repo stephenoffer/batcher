@@ -32,7 +32,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `arg_where` | n/a | gap | Not yet: arg\_where. Wave W8. |
 | `build_info` | `bt.versions` | canonical |  |
 | `business_day_count` | n/a | gap | Not yet: business\_day\_count. Wave W6. |
-| `Catalog` | n/a | gap | Not yet: Unity catalog client (list/get/create tables). Wave W9. |
+| `Catalog` | `bt.Catalog` | mismatch | Differs: pl.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend. Wave W9. |
 | `coalesce` | `bt.coalesce` | canonical |  |
 | `col` | `bt.col` | canonical |  |
 | `collect_all` | n/a | gap | Not yet: collect\_all (execute several plans with shared subplans). Wave W8. |

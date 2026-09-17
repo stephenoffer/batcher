@@ -31,6 +31,13 @@
 "then" = "CaseBuilder"
 "when" = "CaseBuilder"
 
+["Catalog"]
+"create_table" = "Table"
+"from_directory" = "Catalog"
+"from_iceberg" = "Catalog"
+"from_pydict" = "Catalog"
+"get_table" = "Table"
+
 ["Config"]
 "from_dict" = "Config"
 "from_env" = "Config"
@@ -250,6 +257,7 @@
 "redis" = "WriteManifest"
 "snowflake" = "WriteManifest"
 "sql" = "WriteManifest"
+"table" = "WriteManifest"
 "text" = "WriteManifest"
 "tfrecord" = "WriteManifest"
 "webdataset" = "WriteManifest"
@@ -1010,9 +1018,18 @@
 "exclude" = "Selector"
 
 ["Session"]
+"catalog" = "Session.catalog"
 "register" = "Dataset"
 "sql" = "Dataset"
 "table" = "Dataset"
+
+["Session.catalog"]
+"create_table" = "Table"
+"get_catalog" = "Catalog"
+"get_table" = "Table"
+
+["Table"]
+"read" = "Dataset"
 
 ["Trigger"]
 "AvailableNow" = "Trigger"
@@ -1033,6 +1050,7 @@
 
 ["bt"]
 "AggExpr" = "AggExpr"
+"Catalog" = "Catalog"
 "Config" = "Config"
 "Dataset" = "Dataset"
 "Expr" = "Expr"
@@ -1040,6 +1058,7 @@
 "Selector" = "Selector"
 "Session" = "Session"
 "StreamingQueryListener" = "StreamingQueryListener"
+"Table" = "Table"
 "Trigger" = "Trigger"
 "accuracy" = "Expr"
 "active_config" = "Config"
@@ -1114,6 +1133,7 @@
 "credit_card_like_rate" = "Expr"
 "cume_dist" = "WindowExpr"
 "current_date" = "Expr"
+"current_session" = "Session"
 "current_timestamp" = "Expr"
 "cut" = "Expr"
 "cv" = "Expr"

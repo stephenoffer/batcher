@@ -108,10 +108,10 @@ The following table maps the 66 names on the `pyspark.sql.functions` module, sor
 | `coalesce` | `bt.coalesce` | canonical |  |
 | `col` | `bt.col` | canonical |  |
 | `column` | `bt.col` | canonical |  |
-| `current_catalog` | n/a | gap | Not yet: current catalog name. Wave W9. |
-| `current_database` | n/a | gap | Not yet: current database name. Wave W9. |
+| `current_catalog` | `Session.catalog.current_catalog` | mismatch | Differs: Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current\_catalog()). SQL current\_catalog() works. Wave W9. |
+| `current_database` | `Session.catalog.current_namespace` | mismatch | Differs: Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current\_namespace()). SQL current\_database() works. Wave W9. |
 | `current_path` | n/a | gap | Not yet: current SQL path. Wave W9. |
-| `current_schema` | n/a | gap | Not yet: current schema name. Wave W9. |
+| `current_schema` | `Session.catalog.current_namespace` | mismatch | Differs: Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current\_namespace()). SQL current\_schema() works. Wave W9. |
 | `current_user` | n/a | gap | Not yet: current user name. Wave W9. |
 | `desc` | `Dataset.sort` | canonical |  |
 | `desc_nulls_first` | `Dataset.sort` | canonical |  |
