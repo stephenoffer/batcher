@@ -76,14 +76,8 @@ _NO_INDEX: dict[str, str] = {
 # --- transposition needs a bounded, homogeneous, materialized frame ------------------
 _NO_TRANSPOSE: dict[str, str] = {
     "T": (
-        "Transposing needs a fully materialized, single-typed frame, which a lazy "
-        "(possibly unbounded) relation is not. Collect first: ds.to_pandas().T. "
-        "To reshape relationally use ds.unpivot() / ds.pivot()."
-    ),
-    "transpose": (
-        "Transposing needs a fully materialized, single-typed frame, which a lazy "
-        "(possibly unbounded) relation is not. Collect first: ds.to_pandas().T. "
-        "To reshape relationally use ds.unpivot() / ds.pivot()."
+        "Spelled ds.transpose(column_names='<column>') here, or "
+        "ds.transpose(order_by='<column>') to name the columns by row position."
     ),
     "stack": "Reshaping wide-to-long is ds.unpivot(index=[...], on=[...]).",
     "unstack": "Reshaping long-to-wide is ds.pivot(index=[...], on=..., values=...).",
@@ -134,10 +128,6 @@ _IMMUTABLE: dict[str, str] = {
     "pop": "A Dataset is immutable. Use ds.drop('col') to get a Dataset without a column.",
     "drop_in_place": (
         "A Dataset is immutable. Use ds.drop('col') to get a Dataset without a column."
-    ),
-    "update": (
-        "A Dataset is immutable. Derive a new one with ds.with_columns(...) or "
-        "join the replacement values in with ds.join(other, on=...)."
     ),
     "extend": "A Dataset is immutable. Stack rows with ds.union(other) (a new Dataset).",
     "clear": "A Dataset is immutable. For an empty, same-schema Dataset use ds.limit(0).",
@@ -303,9 +293,6 @@ _PREDICATES: dict[str, str] = {
     "fill_nan": (
         "Replace NaN (distinct from null) with bt.col('x').fill_nan(0) inside ds.with_columns(...)."
     ),
-    "drop_nans": (
-        "ds.drop_nulls() drops nulls, not NaN. Drop NaN with ds.filter(bt.col('x').is_not_nan())."
-    ),
     "is_duplicated": (
         "Flag duplicate rows with bt.col('key').is_duplicated() in ds.with_columns(...)."
     ),
@@ -344,10 +331,6 @@ _RESHAPE: dict[str, str] = {
         "Row-wise mean across columns is bt.mean_horizontal('a', 'b') in ds.select(...)."
     ),
     "hash_rows": "A per-row hash column is bt.hash_rows(...) in ds.with_columns(...).",
-    "partition_by": (
-        "For output layout use ds.write.parquet(partition_by=[...]); to process per group "
-        "use ds.group_by(...).agg(...) or a window."
-    ),
     "explode_multiple": "Explode a list column with ds.explode('col').",
 }
 

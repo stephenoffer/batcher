@@ -49,6 +49,14 @@ from batcher.api.dataset._build import (
     expand_selector_expr,
     selector_columns,
 )
+from batcher.api.dataset._build.combine import (
+    OrderSpec,
+    build_join_where,
+    build_update,
+    build_zip,
+)
+from batcher.api.dataset._build.conform import build_drop_nans, build_match_to_schema
+from batcher.api.dataset._build.reshape import build_partition_by, build_split, build_transpose
 from batcher.api.dataset._nulls import (
     build_drop_nulls,
     build_fill_null,
@@ -2333,6 +2341,140 @@ class Dataset:
         right = other.with_columns(**{key: lit(1)})
         return left.join(right, on=key, suffix=suffix).drop(key)
 
+    def join_where(self, other: Dataset, *predicates: Expr, suffix: str = "_right") -> Dataset:
+        """Inner-join on arbitrary predicates, such as inequalities (Polars ``join_where``).
+
+        Keeps every pair of a left and a right row for which all `predicates` are true, the
+        SQL ``JOIN ... ON a.t >= b.start AND a.t < b.end``. A predicate names left columns by
+        name and right columns by name too, with `suffix` appended to a right column whose
+        name a left column already has (``col("v_right")``). The output is the left columns,
+        then the right ones under those names.
+
+        One or two inequalities between a left and a right column run as a range join
+        (IEJoin for two), which is output-sensitive rather than quadratic, and an equality
+        runs as a hash join. Other predicates are checked on the pairs that survive. A null
+        makes a predicate false, as in SQL.
+
+        Args:
+            other: The right-hand dataset.
+            *predicates: Boolean expressions over both sides' columns, all of which must hold.
+                A list of them is accepted too.
+            suffix: Appended to right columns whose names collide with left ones.
+
+        Returns:
+            A new `Dataset` of the matching pairs.
+
+        Raises:
+            PlanError: If no predicate is given, or one is not an expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.from_pydict({"t": [1, 5, 9]})
+                >>> spans = bt.from_pydict({"lo": [0, 4], "hi": [6, 10], "span": ["a", "b"]})
+                >>> events.join_where(
+                ...     spans, bt.col("t") >= bt.col("lo"), bt.col("t") < bt.col("hi")
+                ... ).sort("t", "span").select("t", "span").to_pydict()
+                {'t': [1, 5, 5, 9], 'span': ['a', 'a', 'b', 'b']}
+        """
+        return build_join_where(self, other, predicates, suffix)
+
+    def update(
+        self,
+        other: Dataset,
+        on: str | list[str] | None = None,
+        how: str = "left",
+        *,
+        left_on: str | list[str] | None = None,
+        right_on: str | list[str] | None = None,
+        include_nulls: bool = False,
+    ) -> Dataset:
+        """Overwrite values with `other`'s where the keys match (Polars ``update``).
+
+        Every column the two datasets share, other than the keys, takes `other`'s value on
+        a matched row. A null in `other` leaves the value alone unless ``include_nulls=True``.
+        Columns only `other` has are ignored, and the result keeps this dataset's columns in
+        their order.
+
+        `how` picks the rows. ``"left"`` keeps every row of this dataset, ``"inner"`` only
+        the matched ones, and ``"full"`` also adds `other`'s unmatched rows. A key is required:
+        Polars pairs rows by position when it has none, and a relation has no row order to
+        pair by, so number both sides with `with_row_index` where they are read and join on
+        that. A null key matches nothing, and a key repeated in `other` repeats the row, as
+        in any join.
+
+        Args:
+            other: The dataset supplying the new values.
+            on: Key column(s) present on both sides.
+            how: ``"left"``, ``"inner"`` or ``"full"``.
+            left_on: This dataset's key column(s), when the names differ.
+            right_on: `other`'s key column(s), when the names differ.
+            include_nulls: Let a null in `other` overwrite a value.
+
+        Returns:
+            A new `Dataset` with the matched values replaced.
+
+        Raises:
+            PlanError: If `how` is unknown or no key is given.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> prices = bt.from_pydict({"id": [1, 2, 3], "price": [10, 20, 30]})
+                >>> fixes = bt.from_pydict({"id": [2, 3], "price": [25, None]})
+                >>> prices.update(fixes, on="id").sort("id").to_pydict()
+                {'id': [1, 2, 3], 'price': [10, 25, 30]}
+                >>> prices.update(fixes, on="id", include_nulls=True).sort("id").to_pydict()
+                {'id': [1, 2, 3], 'price': [10, 25, None]}
+        """
+        return build_update(self, other, on, how, left_on, right_on, include_nulls)
+
+    def zip(
+        self,
+        *others: Dataset,
+        order_by: OrderSpec,
+        descending: bool | Sequence[bool] = False,
+    ) -> Dataset:
+        """Pair rows by position, side by side, into one wider dataset (Ray Data ``zip``).
+
+        The first row of each dataset is joined with the first row of every other, and so
+        on. Position is taken under `order_by`, which every dataset must be able to
+        evaluate, because a relation has no row order of its own. For data read in a known
+        order, number each input where it is read with ``with_row_index("i")`` and pass
+        ``order_by="i"``. Ties in `order_by` pair arbitrarily, so give it a key that
+        identifies each row's position.
+
+        A column name already taken gets the smallest free suffix of ``_1``, ``_2`` and so on,
+        as Ray Data names it. The rows come out in position order.
+
+        The datasets must have the same number of rows, which is checked by **executing a
+        `count` of each eagerly**, so a mismatch fails here rather than as a short result.
+
+        Args:
+            *others: The datasets to zip onto this one, left to right.
+            order_by: The ordering keys that define each row's position in every dataset.
+            descending: Order every key, or each one, largest first.
+
+        Returns:
+            A new `Dataset` with this dataset's columns followed by each other's.
+
+        Raises:
+            PlanError: If no other dataset is given, the row counts differ, or `order_by`
+                names no key.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> a = bt.from_pydict({"i": [0, 1, 2], "x": ["a", "b", "c"]})
+                >>> b = bt.from_pydict({"i": [0, 1, 2], "x": [10, 20, 30]})
+                >>> a.zip(b, order_by="i").to_pydict()
+                {'i': [0, 1, 2], 'x': ['a', 'b', 'c'], 'i_1': [0, 1, 2], 'x_1': [10, 20, 30]}
+        """
+        return build_zip(self, others, order_by, descending)
+
     def explode(
         self,
         column: str,
@@ -2776,6 +2918,62 @@ class Dataset:
             self, _as_opt_str_list(index), _as_opt_str_list(on), variable_name, value_name
         )
 
+    def transpose(
+        self,
+        *,
+        column_names: str | list[str] | None = None,
+        include_header: bool = False,
+        header_name: str = "column",
+        order_by: OrderSpec | None = None,
+        descending: bool | Sequence[bool] = False,
+    ) -> Dataset:
+        """Turn rows into columns and columns into rows (Polars and Spark ``transpose``).
+
+        Each input column becomes one output row, and each input row one output column. The
+        output columns are named one of three ways. ``column_names="<column>"`` names them by
+        that column's values, which is Spark's ``transpose(indexColumn)``; that column is
+        not itself transposed, and must hold no null and no repeated value. A list names
+        them explicitly, one per row, and with neither they are ``column_0``,
+        ``column_1``, and so on.
+
+        A list or positional names tie each name to a row by position, so they need
+        `order_by`, because a relation has no row order of its own. Named by a column, the
+        output columns follow `order_by` when it is given and ascend by name otherwise,
+        which is Spark's order. ``include_header=True`` keeps a `header_name` column holding
+        each input column's name. Spark's form is
+        ``transpose(column_names=idx, include_header=True, header_name="key")``.
+
+        The transposed values share one column type, so they are cast to their common
+        supertype, or to ``string`` when there is none. The output is as wide as the input
+        is long, so this **executes eagerly** to learn the names (a scan of the naming
+        column, or a `count`). It is meant for small, summary-sized frames.
+
+        Args:
+            column_names: A column whose values name the output columns, or a list of names.
+            include_header: Keep a column naming each transposed input column.
+            header_name: The name of that column.
+            order_by: The row order behind positional names and the output column order.
+            descending: Order every `order_by` key, or each one, largest first.
+
+        Returns:
+            A new `Dataset` with one row per transposed input column.
+
+        Raises:
+            PlanError: If the input is empty, the naming column holds a null or a repeated
+                value, names are positional with no `order_by`, or a list has the wrong length.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"name": ["p", "q"], "a": [1, 2], "b": [3, 4]})
+                >>> ds.transpose(column_names="name", include_header=True).to_pydict()
+                {'column': ['a', 'b'], 'p': [1, 3], 'q': [2, 4]}
+        """
+        return build_transpose(
+            self, column_names, include_header, header_name, order_by, descending
+        )
+
     def fill_null(
         self,
         value: Any | dict[str, Any] | None = None,
@@ -2880,6 +3078,32 @@ class Dataset:
             keep = keep | Col(c).is_not_null()
         return self.filter(keep)
 
+    def drop_nans(self, subset: str | list[str] | None = None) -> Dataset:
+        """Drop rows holding a NaN in any of `subset`'s floating-point columns.
+
+        The NaN counterpart of `drop_nulls`, and a different test: a null is a missing value
+        and a NaN is a float that is not a number, so a row with a null but no NaN survives.
+        With `subset` omitted every floating-point column is checked. Lazy.
+
+        Args:
+            subset: The floating-point columns to check; ``None`` checks all of them.
+
+        Returns:
+            A new `Dataset` without the rows holding a NaN.
+
+        Raises:
+            PlanError: If a named column is unknown or not floating-point.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, float("nan"), None], "s": ["a", "b", "c"]})
+                >>> ds.drop_nans().to_pydict()
+                {'x': [1.0, None], 's': ['a', 'c']}
+        """
+        return build_drop_nans(self, _as_opt_str_list(subset))
+
     def cast(self, dtypes: str | dict[str, str], *, strict: bool = True) -> Dataset:
         """Cast columns to `dtypes` — one dtype for all, or per-column via a dict.
 
@@ -2902,6 +3126,56 @@ class Dataset:
                 {'x': [1.0, 2.0, 3.0]}
         """
         return build_cast(self, dtypes, strict=strict)
+
+    def match_to_schema(
+        self,
+        schema: dict[str, Any] | pa.Schema,
+        *,
+        missing_columns: str | dict[str, str | Expr] = "raise",
+        extra_columns: str = "raise",
+    ) -> Dataset:
+        """Conform to `schema`: its columns, in its order, with its types (Polars' spelling).
+
+        Every schema column must already have the named type; a mismatch raises instead of
+        casting, because a silent cast is how a pipeline stops failing on bad data. Cast
+        first with `cast` when a conversion is intended. Narrow numeric types are widened at
+        the engine boundary, so ``int32`` in `schema` matches an ``int64`` column. That is
+        why Polars' ``integer_cast``/``float_cast`` upcast options have nothing to allow
+        here.
+
+        A schema column the input lacks raises by default. ``missing_columns="insert"`` adds
+        it as nulls of its type, and a dict chooses per column, where an expression computes
+        the column instead. An input column the schema lacks raises by default, and
+        ``extra_columns="ignore"`` drops it. The check runs on the schema, before any data
+        is read.
+
+        Args:
+            schema: Column name to dtype (a Batcher dtype name, Python type or pyarrow type),
+                or a pyarrow schema.
+            missing_columns: ``"raise"`` or ``"insert"``, or a per-column dict of either or
+                of an expression computing the column.
+            extra_columns: ``"raise"`` or ``"ignore"``.
+
+        Returns:
+            A new `Dataset` with exactly `schema`'s columns.
+
+        Raises:
+            PlanError: On a type mismatch, a missing or extra column the policy refuses, or
+                an unknown policy.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"b": ["x"], "a": [1], "tmp": [0.5]})
+                >>> ds.match_to_schema(
+                ...     {"a": "int64", "b": "string", "c": "float64"},
+                ...     missing_columns="insert",
+                ...     extra_columns="ignore",
+                ... ).to_pydict()
+                {'a': [1], 'b': ['x'], 'c': [None]}
+        """
+        return build_match_to_schema(self, schema, missing_columns, extra_columns)
 
     def union(self, *others: Dataset, distinct: bool = False) -> Dataset:
         """Concatenate with other datasets (UNION ALL, or UNION if `distinct`).
@@ -3297,6 +3571,94 @@ class Dataset:
                 "use fewer parts, or split_at_indices() to allow empty ones"
             )
         return self.split_at_indices(cuts)
+
+    def split(
+        self,
+        n: int,
+        *,
+        order_by: OrderSpec,
+        descending: bool | Sequence[bool] = False,
+        equal: bool = False,
+    ) -> list[Dataset]:
+        """Split into `n` consecutive parts of near-equal size (Ray Data ``split``).
+
+        Rows are numbered under `order_by` and dealt out in runs: with 10 rows and ``n=3``
+        the parts hold positions ``1-4``, ``5-7`` and ``8-10``, the earlier parts taking the
+        remainder one row each, as ``numpy.array_split`` does. ``equal=True`` gives every
+        part exactly ``count // n`` rows and drops the remainder, which is Ray Data's
+        ``equal=True``. Each part iterates in `order_by` order.
+
+        `order_by` is required because a relation has no row order of its own: a parallel or
+        distributed scan fixes none, so "the first four rows" is only defined under an
+        explicit order. For data with no ordering column, number it where it is read with
+        ``with_row_index("i")`` and pass ``order_by="i"``. Ties in `order_by` are broken
+        arbitrarily, so give it a key that identifies each row's position.
+
+        Like `split_proportionately`, this **executes a `count` eagerly** before building
+        the parts, and each part stays lazy and re-reads the input when it runs. Unlike Ray
+        Data, nothing is materialized; call `cache` first when every part will be consumed.
+
+        Args:
+            n: The number of parts, at least 1.
+            order_by: The ordering keys that define each row's position.
+            descending: Order every key, or each one, largest first.
+            equal: Give every part the same size, dropping the remainder.
+
+        Returns:
+            `n` datasets, in position order.
+
+        Raises:
+            PlanError: If `n` is less than 1 or `order_by` names no key.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"i": list(range(10))})
+                >>> [p.to_pydict()["i"] for p in ds.split(3, order_by="i")]
+                [[0, 1, 2, 3], [4, 5, 6], [7, 8, 9]]
+                >>> [p.count() for p in ds.split(3, order_by="i", equal=True)]
+                [3, 3, 3]
+        """
+        return build_split(self, n, order_by, descending, equal)
+
+    def partition_by(
+        self, by: str | list[str], *more_by: str, include_key: bool = True
+    ) -> dict[tuple, Dataset]:
+        """Split into one dataset per distinct key value (Polars ``partition_by(as_dict=True)``).
+
+        The distinct keys are found by an **eager** ``distinct`` over the key columns; each
+        value of the returned dict is then a lazy filter of this dataset, so it re-reads the
+        input when it runs. That makes this the right tool for a handful of keys, such as one
+        output per region. For many keys, or to compute per group, `group_by` does the work
+        in one pass and scales out, where this builds one query per key in the driver.
+
+        Dict keys are always tuples, one element per key column, in ascending key order with
+        nulls last. A null key is a group of its own, as in `group_by`. Polars' list form
+        (``as_dict=False``) is ``list(ds.partition_by(...).values())``.
+
+        Args:
+            by: The key column, or a list of them.
+            *more_by: Further key columns.
+            include_key: Keep the key columns in each part.
+
+        Returns:
+            Key tuple to the dataset of that key's rows.
+
+        Raises:
+            PlanError: If a key is not a column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"k": ["a", "b", "a"], "v": [1, 2, 3]})
+                >>> parts = ds.partition_by("k", include_key=False)
+                >>> {key: part.to_pydict() for key, part in parts.items()}
+                {('a',): {'v': [1, 3]}, ('b',): {'v': [2]}}
+        """
+        keys = [by] if isinstance(by, str) else list(by)
+        return build_partition_by(self, [*keys, *more_by], include_key)
 
     def reverse(self) -> Dataset:
         """Reverse the row order — Polars ``reverse``.

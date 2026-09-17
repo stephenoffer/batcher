@@ -63,7 +63,7 @@ EXPR_UNSUPPORTED: dict[str, str] = {
         "Drop nulls at the Dataset level: ds.drop_nulls('x'), or filter bt.col('x').is_not_null()."
     ),
     "drop_nans": (
-        "Drop NaN with ds.filter(bt.col('x').is_not_nan()); .fill_nan(v) replaces them in place."
+        "Drop the rows holding NaN with ds.drop_nans('x'); .fill_nan(v) replaces them in place."
     ),
     "gather": (
         "Positional gather is not an expression op. Use ds.limit(n, offset=o) / "

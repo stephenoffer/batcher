@@ -139,16 +139,7 @@ DATASET_RAY_DATA: dict[str, str] = {
     "add_column": "Spelled ds.with_columns(name=bt.col('x') * 2) here.",
     "aggregate": "Spelled ds.agg(...) here, or ds.group_by('k').agg(...) for a grouped one.",
     "mix": "Spelled bt.concat([a, b]) here (or ds.union(other) for two).",
-    "zip": (
-        "There is no positional column-wise zip: a relation is an unordered multiset, so "
-        "pairing rows by position is only defined once you name the order. Add the position "
-        "and join on it: a.with_row_index('i').join(b.with_row_index('i'), on='i')."
-    ),
     # Splitting and sampling.
-    "split": (
-        "Split by position with ds.split_at_indices([2, 5]), or by fraction with "
-        "ds.split_proportionately([0.2, 0.5]). Both stay lazy and materialize nothing."
-    ),
     "streaming_split": (
         "Batcher's loaders stream without a split step: ds.ml.stream_loader(...) feeds one "
         "worker, and ds.split_proportionately([...]) gives disjoint shards that stay lazy."

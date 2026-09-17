@@ -144,6 +144,20 @@ print(back.drop_nulls().sort("region", "quarter").to_pydict())
 #  'amount': [30.0, 40.0, 15.0, 20.0]}
 ```
 
+## Transposing rows into columns
+
+{py:meth}`transpose <batcher.Dataset.transpose>` turns each input column into a row and each input row into a column. It suits a small summary table that reads better turned on its side, such as one row per statistic. `column_names` names the output columns by one column's values, and `include_header=True` keeps a column holding each input column's name.
+
+```python
+summary = bt.from_pydict({"stat": ["min", "max"], "price": [1.5, 9.0], "qty": [1, 12]})
+print(summary.transpose(column_names="stat", include_header=True).to_pydict())
+# {'column': ['price', 'qty'], 'max': [9.0, 12.0], 'min': [1.5, 1.0]}
+```
+
+The output columns ascend by name. The values share one column type, so `qty` became a float to sit beside `price`, and a set of columns with no common type becomes strings. Without `column_names` the output columns are `column_0`, `column_1` and so on, which ties a name to a row position, so pass `order_by` to say which row comes first.
+
+Like `pivot`, the output schema depends on the data, so `transpose` reads the naming column, or counts the rows, before it builds the plan. Keep it for summary-sized frames.
+
 ## See also
 
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the aggregate a pivot cell is built from.
@@ -157,5 +171,5 @@ print(back.drop_nulls().sort("region", "quarter").to_pydict())
   built from a long fact table.
 - {doc}`Cohort analysis </cookbook/analytics/behavior/cohort-analysis>`: the other classic pivot,
   with a declared column vocabulary.
-- {doc}`Dataset API </api/relational/dataset>`: the `pivot` and `unpivot` reference.
+- {doc}`Dataset API </api/relational/dataset>`: the `pivot`, `unpivot` and `transpose` reference.
 - {doc}`/cookbook/dataset/verbs/reshaping`: pivot, unpivot, explode, and unnest, as a runnable script.

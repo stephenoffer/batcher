@@ -51,7 +51,7 @@ print([a.count(), b.count(), c.count()])
 
 They differ in one way, and it works in your favor. Ray Data materializes the dataset to split it, and Batcher does not. Each part is a lazy plan, so a pipeline that consumes one part never computes the others. The trade is that collecting every part reads the input once per part, so call `ds.cache()` first when the source is expensive and you want all of them.
 
-`ds.split(n)` becomes `split_proportionately` with explicit fractions, `[1/n] * (n - 1)` for a contiguous n-way split, and Ray Data's `equal=` has no equivalent. `streaming_split` becomes `batcher.ml.streaming_split(dataset, world_size, rank=)`, which yields per-rank torch batches rather than n iterators. {doc}`ray-data/dataset` lists both differences.
+`ds.split(n)` keeps its name and its `equal=`, and takes the order a position is counted in as `order_by`. Ray Data counts position in block order, and a Batcher dataset has none, so number the rows where you read them with `with_row_index("i")` and pass `order_by="i"`. `ds.zip(other)` works the same way, pairing rows by position under `order_by` and refusing inputs whose row counts differ. `streaming_split` becomes `batcher.ml.streaming_split(dataset, world_size, rank=)`, which yields per-rank torch batches rather than n iterators. {doc}`ray-data/dataset` lists both differences.
 
 For train and test sets, prefer {py:meth}`ds.ml.train_test_split(...) <batcher.api.dataset.ml.DatasetML.train_test_split>`. It assigns each row by a hash of its own values rather than by position, which keeps the split identical however the data is partitioned.
 

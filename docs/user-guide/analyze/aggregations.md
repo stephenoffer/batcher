@@ -341,6 +341,18 @@ print(buckets.to_pydict())
 # {'tier': ['high', 'low'], 'n': [3, 2], 'revenue': [120.0, 30.0]}
 ```
 
+## Filtering groups
+
+{py:meth}`having <batcher.GroupBy.having>` keeps only the groups for which a predicate over their aggregates holds, which is SQL's `HAVING`. It goes between `group_by` and the reduction that finishes it, and the predicate's aggregates run in the same pass as the outputs.
+
+```python
+big = ds.group_by("category").having(bt.col("price").sum() > 70).agg(n=bt.count())
+print(big.to_pydict())
+# {'category': ['a'], 'n': [3]}
+```
+
+A filter before `group_by` removes rows, and `having` removes whole groups after they are summarized. A group whose predicate is null is dropped, as in SQL.
+
 ## Group order
 
 A grouped result has no defined row order, which is why the examples above end in `sort`. Pass `maintain_order=True` to `group_by` to get the groups in the order each one first appears in the input, as Polars does. The order is computed rather than observed: Batcher numbers the input rows, keeps each group's smallest number, and sorts on it, so the order is the same under `collect`, spilling, `iter_batches` and `distributed=True`. The price is one sort over the groups.

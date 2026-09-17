@@ -140,7 +140,16 @@ print(newest.select("value").to_pydict())
 ```
 :::
 
-Both stay lazy, which is the difference from Ray Data's versions: nothing is materialized, and a pipeline that consumes one part never computes the others. The cost is the mirror image. Each part reads the input again, so call {py:meth}`cache() <batcher.Dataset.cache>` first when the source is expensive and you intend to collect them all.
+{py:meth}`split <batcher.Dataset.split>` cuts into a number of consecutive parts of near-equal size, which is Ray Data's `split(n)`. It takes the order as `order_by` rather than relying on a sort before it, and the earlier parts take the remainder one row each. `equal=True` gives every part the same size by dropping the remainder instead.
+
+```python
+print([part.count() for part in ds.split(3, order_by="value")])
+# [334, 333, 333]
+print([part.count() for part in ds.split(3, order_by="value", equal=True)])
+# [333, 333, 333]
+```
+
+All three stay lazy, which is the difference from Ray Data's versions: nothing is materialized, and a pipeline that consumes one part never computes the others. The cost is the mirror image. Each part reads the input again, so call {py:meth}`cache() <batcher.Dataset.cache>` first when the source is expensive and you intend to collect them all.
 
 For modeling, prefer the hash-based splits. A positional split puts whatever sits at the front of the file in one part, and that is rarely independent of the label.
 
@@ -169,6 +178,7 @@ Sample when you want *rows*. Sketch when you want a *number*. The decision table
 | An exact row count out | `sample(n=...)` | ranks by hash, so it breaks |
 | Disjoint modeling splits | `ml.train_test_split` / `ml.random_split` | row-wise filters, both stay lazy |
 | Consecutive ranges with exact sizes | `split_at_indices` / `split_proportionately` | cuts by position, so sort first |
+| `n` consecutive parts of near-equal size | `split(n, order_by=...)` | cuts by position under the order you pass |
 | A random *ordering* | `with_random(...)` then `sort` | a full breaker, so use it on the small side |
 | A distinct count or a quantile | `approx_n_unique` / `approx_quantile` | one pass, mergeable, no sampling error to reason about |
 :::

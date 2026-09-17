@@ -21,6 +21,7 @@ from batcher.plan.expr_rewrite.naming import output_name
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
+    Filter,
     LogicalPlan,
     Project,
     Projection,
@@ -73,7 +74,7 @@ class GroupBy:
             {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
-    __slots__ = ("_keys", "_maintain_order", "_named", "_source")
+    __slots__ = ("_having", "_keys", "_maintain_order", "_named", "_source")
 
     def __init__(
         self,
@@ -82,12 +83,14 @@ class GroupBy:
         named: dict[str, Expr] | None = None,
         *,
         maintain_order: bool = False,
+        having: tuple[Expr, ...] = (),
     ) -> None:
         """Hold the source dataset and grouping keys until `agg` finishes the aggregation."""
         self._source = source
         self._keys = keys
         self._named = named or {}
         self._maintain_order = maintain_order
+        self._having = having
 
     def __repr__(self) -> str:
         """Show the grouping keys, e.g. ``GroupBy(keys=['region', 'day'])``."""
@@ -158,6 +161,53 @@ class GroupBy:
                 ['g']
         """
         return [*self._keys, *self._named]
+
+    def having(self, *predicates: Expr) -> GroupBy:
+        """Keep only the groups for which every predicate over aggregates holds (SQL ``HAVING``).
+
+        Each predicate is a boolean expression over the group's aggregates, such as
+        ``bt.count() > 1`` or ``bt.col("v").sum() >= 100``. It filters whichever reduction
+        finishes the grouping (`agg`, `sum`, `len`, ...), and its aggregates run in the same
+        mergeable pass as the outputs, so it adds no second scan and is identical single-node
+        and distributed. A predicate that is null for a group drops the group, as in SQL.
+        Calling `having` again adds predicates, all of which must hold.
+
+        Args:
+            *predicates: Boolean expressions over aggregates. A list of them is accepted too.
+
+        Returns:
+            A `GroupBy` over the same keys that drops the failing groups.
+
+        Raises:
+            PlanError: If no predicate is given, or one does not contain an aggregate.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [1, 2, 3]})
+                >>> ds.group_by("g").having(bt.count() > 1).agg(s=bt.col("v").sum()).to_pydict()
+                {'g': ['a'], 's': [3]}
+        """
+        from batcher.plan.expr_ir.walk import contains_aggregate
+
+        flat = flatten_varargs(predicates)
+        if not flat:
+            raise PlanError("having() requires at least one predicate, e.g. bt.count() > 1")
+        for p in flat:
+            if not isinstance(p, (Expr, AggExpr)) or not contains_aggregate(p):
+                raise PlanError(
+                    "having() predicates must be expressions over aggregates, such as "
+                    f"bt.col('v').sum() > 10; got {p!r}. Filter rows before grouping with "
+                    "ds.filter(...)"
+                )
+        return GroupBy(
+            self._source,
+            self._keys,
+            self._named,
+            maintain_order=self._maintain_order,
+            having=(*self._having, *flat),
+        )
 
     def agg(self, *aggs: AggExpr | dict[str, Any], **named: AggExpr | Expr) -> Dataset:
         """Compute aggregates per group, returning a new `Dataset`.
@@ -281,6 +331,7 @@ class GroupBy:
         from batcher.api.group_apply import build_map_groups
 
         self._refuse_maintain_order("map_groups")
+        self._refuse_having("map_groups")
         if self._named:
             raise PlanError(
                 "map_groups needs plain column keys; group_by was given a derived key "
@@ -326,6 +377,8 @@ class GroupBy:
         scalar expression re-evaluated in a following `Project`. When every output is a
         bare aggregate the projection is skipped — the plan shape is exactly as before.
         """
+        if self._having:
+            return self._lower_with_having(resolved)
         from batcher.plan.expr_ir.walk import (
             AggregateLeafRegistry,
             contains_aggregate,
@@ -702,6 +755,7 @@ class GroupBy:
         if n < 1:
             raise PlanError(f"group_by().head()/tail(): n must be >= 1, got {n}")
         self._refuse_maintain_order("head/tail")
+        self._refuse_having("head/tail")
         if self._named:
             raise PlanError(
                 "group_by().head()/tail() needs plain column keys — a derived key "
@@ -1022,7 +1076,39 @@ class GroupBy:
         ]
 
     def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:
+        if self._having:
+            return self._source._derive(self._lower_aggregates({s.alias: s.agg for s in specs}))
         return self._source._derive(self._aggregate(specs))
+
+    def _lower_with_having(self, resolved: dict[str, AggExpr | Expr]) -> LogicalPlan:
+        """The aggregation with each `having` predicate as a hidden output, filtered and dropped.
+
+        The predicates ride in the same aggregate pass as the outputs; a `Filter` then keeps
+        the groups where all of them are true and a `Project` removes them again.
+        """
+        from batcher.plan.expr_rewrite import combine_conjuncts
+
+        taken = set(resolved) | set(self.keys)
+        hidden: dict[str, AggExpr | Expr] = {}
+        for i, predicate in enumerate(self._having):
+            name = f"__bc_having_{i}"
+            while name in taken:
+                name += "_"
+            hidden[name] = predicate
+        plain = GroupBy(self._source, self._keys, self._named, maintain_order=self._maintain_order)
+        plan = plain._lower_aggregates({**resolved, **hidden})
+        kept = Filter(plan, combine_conjuncts([Col(h) for h in hidden]))
+        visible = [c for c in plan.available_columns() if c not in hidden]
+        return Project(kept, tuple(Projection(c, Col(c)) for c in visible))
+
+    def _refuse_having(self, method: str) -> None:
+        """`having` filters the groups a reduction emits; row methods emit no groups."""
+        if self._having:
+            raise PlanError(
+                f"group_by().having(...).{method}() is not supported: having filters the groups "
+                "an aggregation emits, and this method returns rows. Compute the group predicate "
+                "with a window and filter on it instead."
+            )
 
     def _aggregate(self, specs: tuple[AggregateSpec, ...], *, ordered: bool = True) -> LogicalPlan:
         """The `Aggregate` over the group keys, rewritten for `maintain_order` when it is set.

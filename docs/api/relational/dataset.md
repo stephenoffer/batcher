@@ -71,11 +71,19 @@ Each method returns a new `Dataset`. They chain.
 | {py:meth}`.sample(fraction=None, *, n=None, seed=None) <batcher.Dataset.sample>` | Sample a `fraction` of rows or a fixed count `n`. Deterministic and partition-independent (a stable seeded content hash), so identical single-node or distributed. |
 | {py:meth}`.split_at_indices(indices) <batcher.Dataset.split_at_indices>` | Cut into consecutive row ranges at the given positions (Ray Data's spelling). Every part stays lazy. |
 | {py:meth}`.split_proportionately(proportions) <batcher.Dataset.split_proportionately>` | Cut into parts holding the given row fractions, with exact sizes (executes a `count` first). |
+| {py:meth}`.split(n, *, order_by, equal=False) <batcher.Dataset.split>` | Cut into `n` consecutive parts of near-equal size under `order_by` (Ray Data's spelling; executes a `count` first). |
+| {py:meth}`.partition_by(by, *more_by, include_key=True) <batcher.Dataset.partition_by>` | One lazy dataset per distinct key, as a dict keyed by tuples (finds the keys eagerly). |
+| {py:meth}`.drop_nans(subset=None) <batcher.Dataset.drop_nans>` | Drop rows holding a NaN in the floating-point columns; nulls stay. |
+| {py:meth}`.match_to_schema(schema, *, missing_columns="raise", extra_columns="raise") <batcher.Dataset.match_to_schema>` | Conform to a schema's columns, order and types, refusing a mismatch. |
+| {py:meth}`.transpose(*, column_names=None, include_header=False, header_name="column", order_by=None) <batcher.Dataset.transpose>` | Turn rows into columns (executes eagerly to learn the names). |
 | {py:meth}`.distinct() <batcher.Dataset.distinct>` | Drop duplicate rows. |
 | `.union(*others, distinct=False)` | Concatenate datasets; set `distinct=True` to dedupe. |
 | `.intersect(other)` | Rows present in both. |
 | {py:meth}`.except_(other) <batcher.Dataset.except_>` | Rows in this dataset but not the other. |
 | `.join(other, ...)` | Relational join (see below). |
+| {py:meth}`.join_where(other, *predicates, suffix="_right") <batcher.Dataset.join_where>` | Inner join on arbitrary predicates; inequalities run as a range join. |
+| {py:meth}`.update(other, on=None, how="left", *, include_nulls=False) <batcher.Dataset.update>` | Overwrite shared columns with `other`'s values where the keys match. |
+| {py:meth}`.zip(*others, order_by) <batcher.Dataset.zip>` | Pair rows by position under `order_by`, side by side (Ray Data's spelling; counts each input first). |
 | {py:meth}`.window(...) <batcher.Dataset.window>` | Per-row windowed columns (see below). |
 | {py:meth}`.group_by(*keys, **derived) <batcher.Dataset.group_by>` | Start a grouped aggregation (returns `GroupBy`). |
 | `.rollup(*keys)` | Aggregate at every prefix of `keys` plus the grand total (SQL `ROLLUP`). |
@@ -259,6 +267,8 @@ summary = (
 print(summary.to_pydict())
 # {'category': ['c', 'a', 'b'], 'revenue': [360.0, 350.0, 200.0], 'orders': [1, 3, 2]}
 ```
+
+{py:meth}`having(*predicates) <batcher.GroupBy.having>` keeps only the groups whose aggregate predicates hold, such as `group_by("category").having(bt.count() > 1).agg(...)`, which is SQL's `HAVING`.
 
 Call `group_by()` with no keys for a global aggregate, and pass several keys to
 group by each unique combination. Derived keys are allowed as keyword expressions

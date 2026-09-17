@@ -76,6 +76,26 @@ print(ds.filter(bt.col("age").is_not_null()).to_pydict())
 That is also why `age > 25` dropped `dan` at the top of the page. The comparison never
 said false. It said nothing.
 
+A NaN is a different thing from a null: it is a float that is not a number. {py:meth}`drop_nans <batcher.Dataset.drop_nans>` drops the rows holding one in any floating-point column, or in the columns you name, and keeps the rows whose value is null.
+
+```python
+readings = bt.from_pydict({"sensor": ["a", "b", "c"], "value": [1.5, float("nan"), None]})
+print(readings.drop_nans().to_pydict())
+# {'sensor': ['a', 'c'], 'value': [1.5, None]}
+```
+
+## One dataset per key
+
+{py:meth}`partition_by <batcher.Dataset.partition_by>` splits a dataset into one dataset per distinct key value, returned as a dict keyed by tuples. It finds the keys with an eager `distinct`, and each part is a lazy filter that reads the input again, so it suits a handful of keys, such as one output per city.
+
+```python
+by_city = ds.partition_by("city")
+print({key: part.count() for key, part in by_city.items()})
+# {('la',): 1, ('nyc',): 2, ('sf',): 2}
+```
+
+To compute a result per group, `group_by` does the work in one pass instead.
+
 ## Trimming the result
 
 `distinct` removes duplicate rows across all columns.

@@ -184,6 +184,19 @@ print(ds.with_columns(qty=bt.col("qty").cast("float64")).to_pydict())
 # {'name': ['alice', 'bob', 'carol'], 'price': [10.0, 20.0, 30.0], 'qty': [1.0, 2.0, 3.0]}
 ```
 
+## Conforming to a schema
+
+{py:meth}`match_to_schema <batcher.Dataset.match_to_schema>` holds a dataset to a declared set of columns. The result has exactly the schema's columns, in its order, and a column whose type differs raises rather than being cast, so bad input stops the pipeline instead of flowing through it. `missing_columns="insert"` adds an absent column as nulls, and `extra_columns="ignore"` drops a column the schema does not name.
+
+```python
+raw = bt.from_pydict({"amount": [10, 20], "id": [1, 2], "debug": ["x", "y"]})
+contract = {"id": "int64", "amount": "int64", "currency": "string"}
+print(raw.match_to_schema(contract, missing_columns="insert", extra_columns="ignore").to_pydict())
+# {'id': [1, 2], 'amount': [10, 20], 'currency': [None, None]}
+```
+
+The check reads only the schema, so it fails before any data is read.
+
 ## Reusing your own transformations
 
 `pipe` applies a function to the dataset and returns its result, so a step you

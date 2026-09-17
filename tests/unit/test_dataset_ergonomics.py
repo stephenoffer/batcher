@@ -245,7 +245,7 @@ def test_dataframe_interchange_protocol(ds: bt.Dataset) -> None:
         ("reset_index", "no row index"),
         ("iloc", "positional indexer"),
         ("iterrows", "iter_rows"),
-        ("T", "Transposing"),
+        ("T", "ds.transpose"),
         ("rolling", "ds.window"),
         ("cumsum", "ds.window"),
         ("resample", "group_by"),
