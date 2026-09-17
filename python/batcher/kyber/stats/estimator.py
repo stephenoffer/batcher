@@ -843,17 +843,28 @@ class StatsEstimator:
 
         Bounded above by `rank_limit` rows per partition, and never `EXACT`: a partition
         holding fewer than `k` rows contributes fewer, so the bound is not the count.
+
+        A window delivers **no ordering**, whatever its input's. Only the in-memory kernel
+        scatters results back to input positions; every other schedule regroups rows first
+        and emits them in group order. A partitioned window under a memory envelope
+        grace-partitions by its `PARTITION BY` keys (`bc-interp::window_spill`), a global one
+        streams range buckets of its `ORDER BY` key (`dist.global_window`), and the
+        distributed paths shuffle by either. Which schedule runs is decided after Kyber, by
+        Carbonite's spill advice (measured pressure, so it can change between two runs of the
+        same plan in one process) and by `dist`. Claiming the input's ordering here let
+        `sort_elimination_from_ordering` delete the `Sort` above a window, and a spilled run
+        then returned rows in bucket order.
         """
         child = self.estimate(node.input)
         columns = col_prop.window_columns(node, child)
         if node.rank_limit is None:
             # Row-preserving: appends columns, never changes the row count, so the input
             # columns' stats (EXACT included) carry through untouched.
-            return RelStats(child.rows, child.provenance, columns, child.sorted_by)
+            return RelStats(child.rows, child.provenance, columns)
 
         partitions = self._partition_count(node, child)
         rows = min(child.rows, partitions * float(node.rank_limit))
-        return RelStats(rows, Provenance.DEFAULT, columns, child.sorted_by)
+        return RelStats(rows, Provenance.DEFAULT, columns)
 
     def _partition_count(self, node: Window, child: RelStats) -> float:
         """How many partitions the window's keys cut the input into (1 when unpartitioned).
