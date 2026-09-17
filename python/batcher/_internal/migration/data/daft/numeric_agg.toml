@@ -52,7 +52,7 @@ median = { status = "canonical", batcher = "Expr.median" }
 min = { status = "canonical", batcher = "Expr.min" }
 negate = { status = "canonical", batcher = "op:neg" }
 not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
-over = { status = "param", batcher = "WindowExpr.over", need = "over() on every Expr, taking a Window spec object", wave = "WF" }
+over = { status = "param", batcher = ["Expr.over"], need = "a Window spec object", wave = "WF" }
 percentile = { status = "canonical", batcher = "Expr.quantile" }
 pow = { status = "alias", batcher = "op:pow" }
 power = { status = "canonical", batcher = "op:pow" }
@@ -137,7 +137,7 @@ min = { status = "canonical", batcher = "bt.min" }
 monotonically_increasing_id = { status = "param", batcher = "Dataset.with_row_index", need = "an Expression form usable inside select/with_columns", wave = "W8" }
 negate = { status = "canonical", batcher = "op:neg" }
 not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
-over = { status = "param", batcher = "WindowExpr.over", need = "over() on every Expr, taking a Window spec object", wave = "WF" }
+over = { status = "param", batcher = ["Expr.over"], need = "a Window spec object", wave = "WF" }
 percentile = { status = "canonical", batcher = "Expr.quantile" }
 pi = { status = "gap", need = "pi constant expression (bt.lit(math.pi) works today)", wave = "W1" }
 pmod = { status = "gap", need = "positive modulo (Batcher % truncates toward zero, so pmod(-7, 3) is -1 not 2)", wave = "W3" }

@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 253 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 263 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -43,6 +43,7 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `bt.BatcherError` | `polars.exceptions` |
 | `bt.boolean` | `selectors.boolean` |
 | `bt.coalesce` | `polars.coalesce` |
+| `bt.col` | `polars.col` |
 | `bt.col` + `Expr.cum_count` | `polars.cum_count` |
 | `bt.concat` | `polars.union` |
 | `bt.contains` | `selectors.contains` |
@@ -109,6 +110,7 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `Dataset.pipe` | `DataFrame.pipe`, `LazyFrame.pipe` |
 | `Dataset.reverse` | `DataFrame.reverse`, `LazyFrame.reverse` |
 | `Dataset.schema` | `DataFrame.schema`, `LazyFrame.schema` |
+| `Dataset.select` | `DataFrame.select`, `LazyFrame.select` |
 | `Dataset.shape` | `DataFrame.shape` |
 | `Dataset.sql` | `DataFrame.sql`, `LazyFrame.sql` |
 | `Dataset.tail` | `DataFrame.tail`, `LazyFrame.tail` |
@@ -119,6 +121,7 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `Dataset.union` | `DataFrame.extend`, `DataFrame.vstack` |
 | `Dataset.unpivot` | `DataFrame.melt`, `DataFrame.unpivot`, `LazyFrame.melt`, `LazyFrame.unpivot` |
 | `Dataset.width` | `DataFrame.width`, `LazyFrame.width` |
+| `Dataset.with_columns` | `DataFrame.with_columns`, `LazyFrame.with_columns` |
 | `Dataset.with_columns` + `Dataset.select` | `DataFrame.insert_column` |
 | `Dataset.with_row_index` | `DataFrame.with_row_count`, `DataFrame.with_row_index`, `LazyFrame.with_row_count`, `LazyFrame.with_row_index` |
 | `Dataset.write.avro` | `DataFrame.write_avro` |
@@ -126,6 +129,7 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `Dataset` | `DataFrame.lazy`, `LazyFrame.lazy` |
 | `Expr.abs` | `Expr.abs` |
 | `Expr.alias` | `Expr.alias` |
+| `Expr.approx_count_distinct` | `Expr.approx_n_unique` |
 | `Expr.arccos` | `Expr.arccos` |
 | `Expr.arccosh` | `Expr.arccosh` |
 | `Expr.arcsin` | `Expr.arcsin` |
@@ -137,6 +141,8 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `Expr.array_agg` | `Expr.implode` |
 | `Expr.between` | `Expr.is_between` |
 | `Expr.bit_count` | `Expr.bitwise_count_ones` |
+| `Expr.bool_and` | `Expr.all` |
+| `Expr.bool_or` | `Expr.any` |
 | `Expr.cast` | `polars.Binary`, `polars.Boolean`, `polars.Date`, `polars.Decimal`, `polars.Float16`, `polars.Float32`, `polars.Float64`, `polars.Int16`, `polars.Int32`, `polars.Int64`, `polars.Int8`, `polars.String`, `polars.UInt16`, `polars.UInt32`, `polars.UInt8`, `polars.Utf8` |
 | `Expr.cbrt` | `Expr.cbrt` |
 | `Expr.ceil` | `Expr.ceil` |
@@ -144,6 +150,7 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `Expr.cos` | `Expr.cos` |
 | `Expr.cosh` | `Expr.cosh` |
 | `Expr.cot` | `Expr.cot` |
+| `Expr.count_distinct` | `Expr.n_unique` |
 | `Expr.count` | `Expr.count` |
 | `Expr.cum_max` | `Expr.cum_max` |
 | `Expr.cum_min` | `Expr.cum_min` |
@@ -217,6 +224,7 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `Expr.log10` | `Expr.log10` |
 | `Expr.log1p` | `Expr.log1p` |
 | `Expr.max_by` | `Expr.max_by` |
+| `Expr.max` | `Expr.max` |
 | `Expr.mean` | `Expr.mean` |
 | `Expr.median` | `Expr.median` |
 | `Expr.min_by` | `Expr.min_by` |
@@ -224,6 +232,7 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `Expr.pct_change` | `Expr.pct_change` |
 | `Expr.peak_max` | `Expr.peak_max` |
 | `Expr.peak_min` | `Expr.peak_min` |
+| `Expr.product` | `Expr.product` |
 | `Expr.quantile` | `Expr.quantile` |
 | `Expr.radians` | `Expr.radians` |
 | `Expr.rank` | `Expr.rank` |
@@ -257,6 +266,7 @@ The following table maps 253 Batcher spellings to the Polars names that compute 
 | `Expr.str.upper` | `Expr.str.to_uppercase` |
 | `Expr.str` | `Expr.str` |
 | `Expr.struct` | `Expr.struct` |
+| `Expr.sum` | `Expr.sum` |
 | `Expr.tan` | `Expr.tan` |
 | `Expr.tanh` | `Expr.tanh` |
 | `GroupBy.agg` | `GroupBy.agg`, `LazyGroupBy.agg` |

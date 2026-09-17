@@ -6,10 +6,10 @@
 agg = { status = "canonical", batcher = "GroupBy.agg" }
 all = { status = "canonical", batcher = "GroupBy.array_agg" }
 count = { status = "mismatch", batcher = "GroupBy.count", note = "Polars GroupBy.count counts rows into a column named count; port as group_by(k).len(name=count)", wave = "W0" }
-first = { status = "param", batcher = "GroupBy.first", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+first = { status = "param", batcher = "GroupBy.first", need = "implicit row order: GroupBy.first needs order_by", wave = "W2" }
 having = { status = "gap", need = "GroupBy.having (filter groups by an aggregate predicate)", wave = "W8" }
 head = { status = "param", batcher = "GroupBy.head", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
-last = { status = "param", batcher = "GroupBy.last", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+last = { status = "param", batcher = "GroupBy.last", need = "implicit row order: GroupBy.last needs order_by", wave = "W2" }
 len = { status = "canonical", batcher = "GroupBy.len" }
 map_groups = { status = "mismatch", batcher = "GroupBy.map_groups", note = "Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches", wave = "W0" }
 max = { status = "mismatch", batcher = "GroupBy.max", note = "Polars max ignores NaN; port as agg(col(c).max(nan_policy=ignore)) per column", wave = "W0" }
@@ -25,10 +25,10 @@ tail = { status = "param", batcher = "GroupBy.tail", need = "order_by optional (
 agg = { status = "canonical", batcher = "GroupBy.agg" }
 all = { status = "canonical", batcher = "GroupBy.array_agg" }
 count = { status = "mismatch", batcher = "GroupBy.count", note = "Polars LazyGroupBy.count counts rows into a column named count; port as group_by(k).len(name=count)", wave = "W0" }
-first = { status = "param", batcher = "GroupBy.first", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+first = { status = "param", batcher = "GroupBy.first", need = "implicit row order: GroupBy.first needs order_by", wave = "W2" }
 having = { status = "gap", need = "GroupBy.having (filter groups by an aggregate predicate)", wave = "W8" }
 head = { status = "param", batcher = "GroupBy.head", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
-last = { status = "param", batcher = "GroupBy.last", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+last = { status = "param", batcher = "GroupBy.last", need = "implicit row order: GroupBy.last needs order_by", wave = "W2" }
 len = { status = "canonical", batcher = "GroupBy.len" }
 map_groups = { status = "mismatch", batcher = "GroupBy.map_groups", note = "Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches", wave = "W0" }
 max = { status = "mismatch", batcher = "GroupBy.max", note = "Polars max ignores NaN; port as agg(col(c).max(nan_policy=ignore)) per column", wave = "W0" }

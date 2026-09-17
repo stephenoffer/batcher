@@ -156,5 +156,5 @@ The following table maps the 66 names on the `pyspark.sql.functions` module, sor
 | `UserDefinedFunction` | `bt.udf` | param | Missing: a UDF object applied to columns as an Expr, with returnType= and asNondeterministic(). Wave W11. |
 | `UserDefinedTableFunction` | n/a | gap | Not yet: Python UDTF protocol: UDTF object callable from the DataFrame API. Wave W11. |
 | `version` | `bt.engine_version` | mismatch | Differs: Spark version() is a column expression; bt.engine\_version() returns a Python str. Wave W1. |
-| `when` | `bt.when` + `CaseBuilder.then` | param | Missing: when(condition, value) in one call, and a chain without otherwise() returning null. Wave WF. |
+| `when` | `bt.when` + `CaseBuilder.then` | param | Missing: when(condition, value) in one call. Wave WF. |
 | `zeroifnull` | `Expr.fill_null` | canonical |  |

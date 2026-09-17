@@ -2935,7 +2935,7 @@ The `sem.<name>` transforms registry templates call for what the template DSL ca
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 199 | The transform registry, the context a transform reads, and the node helpers they share. |
-| `columns.py` | 228 | Transforms over column references, argument checks, positions and date patterns. |
+| `columns.py` | 230 | Transforms over column references, argument checks, positions and date patterns. |
 | `ordering.py` | 224 | Transforms over sort and window keys, whose null placement differs per engine. |
 | `relational.py` | 235 | Transforms over relational spellings: joins, writes, sessions, constructors, aggregates. |
 

@@ -160,4 +160,4 @@ try_deserialize = { status = "gap", need = "typed JSON decode that nulls on fail
 unnest = { status = "param", batcher = "Dataset.unnest", need = "an Expression-level unnest usable inside select", wave = "W8" }
 uuid = { status = "gap", need = "UUID v4/v7 generator expression (needs a determinism story across seq/par/dist)", wave = "W3" }
 value_counts = { status = "gap", need = "per-list value counts as a list of (value, count) structs", wave = "W4" }
-when = { status = "param", batcher = "bt.when", need = "the two-argument when(cond, then) form, and a CASE with no otherwise yielding null (Batcher raises)", wave = "WF" }
+when = { status = "param", batcher = "bt.when", need = "the two-argument when(cond, then) form", wave = "WF" }

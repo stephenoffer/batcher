@@ -31,7 +31,7 @@ like = { status = "canonical", batcher = "Expr.str.like" }
 name = { status = "canonical", batcher = "Expr.alias" }
 otherwise = { status = "canonical", batcher = "CaseBuilder.otherwise", template = 'otherwise(value) <-> self.otherwise(value)' }
 outer = { status = "gap", need = "outer column reference for lateral joins and correlated subqueries", wave = "W8" }
-over = { status = "param", batcher = ["AggExpr.over", "WindowExpr.over"], need = "a reusable Window spec object, and over() on every Expr rather than only aggregates and window functions", wave = "WF", template = 'over(window) -> self.over(sem.spark_window(window))' }
+over = { status = "param", batcher = ["Expr.over"], template = 'over(window) -> self.over(sem.spark_window(window))', need = "a reusable Window spec object", wave = "WF" }
 rlike = { status = "canonical", batcher = "Expr.str.regexp_matches" }
 startswith = { status = "canonical", batcher = "Expr.str.starts_with" }
 substr = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substr(0, 2) of 'hello' is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0" }

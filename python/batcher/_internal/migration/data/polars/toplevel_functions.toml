@@ -28,7 +28,7 @@ arg_where = { status = "gap", need = "arg_where", wave = "W8" }
 build_info = { status = "canonical", batcher = "bt.versions" }
 business_day_count = { status = "gap", need = "business_day_count", wave = "W6" }
 coalesce = { status = "canonical", batcher = "bt.coalesce" }
-col = { status = "param", batcher = "bt.col", need = "several names, regex patterns ('^a.*$') and dtypes in one col()", wave = "WF", template = 'col(name) <-> bt.col(name)' }
+col = { status = "canonical", batcher = "bt.col", template = 'col(name) <-> bt.col(name)' }
 collect_all = { status = "gap", need = "collect_all (execute several plans with shared subplans)", wave = "W8" }
 collect_all_async = { status = "gap", need = "collect_all_async", wave = "W8" }
 concat = { status = "param", batcher = "bt.concat", need = "how='diagonal_relaxed', 'align', 'horizontal' and relaxed supertype unification", wave = "W2" }
@@ -60,7 +60,7 @@ exceptions = { status = "canonical", batcher = "bt.BatcherError" }
 exclude = { status = "canonical", batcher = "bt.exclude" }
 explain_all = { status = "gap", need = "explain_all (plans of several frames)", wave = "W8" }
 field = { status = "gap", need = "field (struct field reference inside struct.with_fields)", wave = "W3" }
-first = { status = "param", batcher = "bt.first", need = "order_by optional, and pl.first() with no argument as the first-column selector", wave = "WF" }
+first = { status = "param", batcher = "bt.first", need = "pl.first() with no argument as the first-column selector", wave = "WF" }
 fold = { status = "canonical", batcher = "bt.fold_horizontal" }
 format = { status = "mismatch", batcher = "bt.format_string", note = "Polars format returns null when any input is null; Batcher renders a null as an empty string", wave = "W0" }
 from_arrow = { status = "canonical", batcher = "bt.from_arrow" }
@@ -79,7 +79,7 @@ head = { status = "gap", need = "head expression (first n values)", wave = "W8" 
 implode = { status = "canonical", batcher = "bt.array_agg" }
 int_range = { status = "gap", need = "int_range expression", wave = "W6" }
 int_ranges = { status = "mismatch", batcher = "bt.sequence", note = "Polars int_ranges excludes the end; Batcher's sequence includes it (int_ranges(0, n) is sequence(0, n - 1))", wave = "W0" }
-last = { status = "param", batcher = "bt.last", need = "order_by optional, and pl.last() with no argument as the last-column selector", wave = "WF" }
+last = { status = "param", batcher = "bt.last", need = "pl.last() with no argument as the last-column selector", wave = "WF" }
 len = { status = "canonical", batcher = "bt.count" }
 linear_space = { status = "gap", need = "linear_space", wave = "W6" }
 linear_spaces = { status = "gap", need = "linear_spaces", wave = "W6" }
@@ -127,5 +127,5 @@ union = { status = "canonical", batcher = "bt.concat" }
 unregister_extension_type = { status = "gap", need = "extension type registry", wave = "W11" }
 using_string_cache = { status = "out_of_scope", reason = "no global Categorical string cache: Arrow dictionaries are per batch" }
 var = { status = "param", batcher = "bt.var", need = "ddof=", wave = "W2" }
-when = { status = "param", batcher = "bt.when", need = "when/then without otherwise (null default), otherwise(None), several conditions and **constraints in one when()", wave = "WF", template = 'when(predicate) -> bt.when(predicate)' }
+when = { status = "param", batcher = "bt.when", template = 'when(predicate) -> bt.when(predicate)', need = "several conditions and **constraints in one when()", wave = "WF" }
 zeros = { status = "gap", need = "zeros expression", wave = "W8" }

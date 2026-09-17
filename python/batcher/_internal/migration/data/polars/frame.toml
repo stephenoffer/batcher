@@ -60,8 +60,8 @@ rename = { status = "param", batcher = "Dataset.rename", need = "strict= (raise 
 reverse = { status = "canonical", batcher = "Dataset.reverse" }
 rolling = { status = "gap", need = "Dataset.rolling (frame-level rolling group-by)", wave = "W5" }
 schema = { status = "canonical", batcher = "Dataset.schema" }
-select = { status = "param", batcher = "Dataset.select", need = "output-name inference for positional derived expressions (select(col('a') + 1) is refused today)", wave = "WF", template = 'select(*exprs, **named_exprs) -> self.select(sem.selectable(exprs), **named_exprs)' }
-select_seq = { status = "param", batcher = "Dataset.select", need = "output-name inference for positional derived expressions", wave = "WF" }
+select = { status = "canonical", batcher = "Dataset.select", template = 'select(*exprs, **named_exprs) -> self.select(sem.selectable(exprs), **named_exprs)' }
+select_seq = { status = "param", batcher = "Dataset.select", need = "sequential evaluation: Batcher always plans the expressions together, with identical results", wave = "W2" }
 serialize = { status = "gap", need = "Dataset.serialize (plan to bytes/JSON)", wave = "W8" }
 set_sorted = { status = "out_of_scope", reason = "sortedness flags are engine-owned metadata (Dataset.meta.sorted_by), not a user assertion" }
 shift = { status = "gap", need = "Dataset.shift (every column)", wave = "W5" }
@@ -87,8 +87,8 @@ unpivot = { status = "canonical", batcher = "Dataset.unpivot" }
 update = { status = "gap", need = "Dataset.update (overwrite values from another frame by key)", wave = "W8" }
 var = { status = "param", batcher = "Dataset.var", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=", wave = "W2" }
 width = { status = "canonical", batcher = "Dataset.width" }
-with_columns = { status = "param", batcher = "Dataset.with_columns", need = "output-name inference for positional derived expressions (with_columns(col('a') + 1) is refused today)", wave = "WF", template = 'with_columns(*exprs, **named_exprs) -> self.with_columns(sem.named(exprs), **named_exprs)' }
-with_columns_seq = { status = "param", batcher = "Dataset.with_columns", need = "output-name inference for positional derived expressions", wave = "WF" }
+with_columns = { status = "canonical", batcher = "Dataset.with_columns", template = 'with_columns(*exprs, **named_exprs) -> self.with_columns(sem.named(exprs), **named_exprs)' }
+with_columns_seq = { status = "param", batcher = "Dataset.with_columns", need = "sequential evaluation: Batcher always plans the expressions together, with identical results", wave = "W2" }
 with_context = { status = "out_of_scope", reason = "deprecated in Polars in favour of horizontal concat" }
 with_row_count = { status = "alias", batcher = "Dataset.with_row_index", template = 'with_row_count(name="row_nr", offset=0) -> self.with_row_index(name, offset=offset)' }
 with_row_index = { status = "canonical", batcher = "Dataset.with_row_index" }
@@ -176,8 +176,8 @@ rows = { status = "canonical", batcher = "Dataset.iter_rows" }
 rows_by_key = { status = "gap", need = "Dataset.rows_by_key", wave = "W8" }
 sample = { status = "param", batcher = "Dataset.sample", need = "with_replacement=, shuffle=", wave = "W2" }
 schema = { status = "canonical", batcher = "Dataset.schema" }
-select = { status = "param", batcher = "Dataset.select", need = "output-name inference for positional derived expressions (select(col('a') + 1) is refused today)", wave = "WF", template = 'select(*exprs, **named_exprs) -> self.select(sem.selectable(exprs), **named_exprs)' }
-select_seq = { status = "param", batcher = "Dataset.select", need = "output-name inference for positional derived expressions", wave = "WF" }
+select = { status = "canonical", batcher = "Dataset.select", template = 'select(*exprs, **named_exprs) -> self.select(sem.selectable(exprs), **named_exprs)' }
+select_seq = { status = "param", batcher = "Dataset.select", need = "sequential evaluation: Batcher always plans the expressions together, with identical results", wave = "W2" }
 serialize = { status = "gap", need = "Dataset.serialize (plan to bytes/JSON)", wave = "W8" }
 set_sorted = { status = "out_of_scope", reason = "sortedness flags are engine-owned metadata (Dataset.meta.sorted_by), not a user assertion" }
 shape = { status = "canonical", batcher = "Dataset.shape" }
@@ -214,8 +214,8 @@ upsample = { status = "gap", need = "Dataset.upsample (fill a regular time grid)
 var = { status = "param", batcher = "Dataset.var", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=", wave = "W2" }
 vstack = { status = "alias", batcher = "Dataset.union" }
 width = { status = "canonical", batcher = "Dataset.width" }
-with_columns = { status = "param", batcher = "Dataset.with_columns", need = "output-name inference for positional derived expressions (with_columns(col('a') + 1) is refused today)", wave = "WF", template = 'with_columns(*exprs, **named_exprs) -> self.with_columns(sem.named(exprs), **named_exprs)' }
-with_columns_seq = { status = "param", batcher = "Dataset.with_columns", need = "output-name inference for positional derived expressions", wave = "WF" }
+with_columns = { status = "canonical", batcher = "Dataset.with_columns", template = 'with_columns(*exprs, **named_exprs) -> self.with_columns(sem.named(exprs), **named_exprs)' }
+with_columns_seq = { status = "param", batcher = "Dataset.with_columns", need = "sequential evaluation: Batcher always plans the expressions together, with identical results", wave = "W2" }
 with_row_count = { status = "alias", batcher = "Dataset.with_row_index", template = 'with_row_count(name="row_nr", offset=0) -> self.with_row_index(name, offset=offset)' }
 with_row_index = { status = "canonical", batcher = "Dataset.with_row_index" }
 write_avro = { status = "canonical", batcher = "Dataset.write.avro" }

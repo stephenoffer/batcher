@@ -132,13 +132,15 @@ def column_name(ctx: Context, value: Bound) -> Any | None:
 
 @transform
 def named(ctx: Context, values: list[Bound]) -> list[Any] | None:
-    """Positional expressions that each carry an output name (`alias(...)`, or `col(...)`)."""
+    """Positional expressions, named as Polars names them.
+
+    Batcher infers a positional output's name the way Polars does (an alias, else the
+    leftmost column), so any expression carries over; a value that is not an expression
+    (a bare Python scalar, which Batcher refuses positionally) declines.
+    """
     out = []
     for value in values:
-        node = value.original
         if expression(ctx, value) is None:
-            return None
-        if not (isinstance(node, cst.Call) and callee_name(node.func) in ("alias", "col")):
             return None
         out.append(cst.Arg(value.node))
     return out

@@ -7,11 +7,11 @@ abs = { status = "canonical", batcher = "Expr.abs" }
 add = { status = "alias", batcher = "op:add" }
 agg_groups = { status = "gap", need = "agg_groups (group row indices as a list)", wave = "W8" }
 alias = { status = "canonical", batcher = "Expr.alias" }
-all = { status = "mismatch", batcher = "Expr.bool_and", note = "Polars all() ignores nulls and is true for an empty column where Batcher returns null. Port as col.bool_and(empty_value=True); the codemod keeps a marker until over() windows the composed form this parameter builds", wave = "W0" }
+all = { status = "canonical", batcher = "Expr.bool_and", template = 'all(*, ignore_nulls=True) -> self.bool_and(empty_value=True)' }
 and_ = { status = "alias", batcher = "op:and" }
-any = { status = "mismatch", batcher = "Expr.bool_or", note = "Polars any() ignores nulls and is false for an empty column where Batcher returns null. Port as col.bool_or(empty_value=False); the codemod keeps a marker until over() windows the composed form this parameter builds", wave = "W0" }
+any = { status = "canonical", batcher = "Expr.bool_or", template = 'any(*, ignore_nulls=True) -> self.bool_or(empty_value=False)' }
 append = { status = "gap", need = "Expr.append (length-changing concatenation of two expressions)", wave = "W8" }
-approx_n_unique = { status = "mismatch", batcher = "Expr.approx_count_distinct", note = "Polars counts null as a distinct value where Batcher skips it. Port as col.approx_count_distinct(count_nulls=True); the codemod keeps a marker until over() windows the composed form this parameter builds", wave = "W0" }
+approx_n_unique = { status = "canonical", batcher = "Expr.approx_count_distinct", template = 'approx_n_unique() -> self.approx_count_distinct(count_nulls=True)' }
 arccos = { status = "canonical", batcher = "Expr.arccos" }
 arccosh = { status = "canonical", batcher = "Expr.arccosh" }
 arcsin = { status = "canonical", batcher = "Expr.arcsin" }
@@ -99,10 +99,10 @@ is_between = { status = "alias", batcher = "Expr.between" }
 is_close = { status = "gap", need = "Expr.is_close (abs_tol/rel_tol/nans_equal)", wave = "W3" }
 is_duplicated = { status = "canonical", batcher = "Expr.is_duplicated" }
 is_finite = { status = "canonical", batcher = "Expr.is_finite" }
-is_first_distinct = { status = "param", batcher = "Expr.is_first_distinct", need = "order_by optional (Polars uses implicit row order)", wave = "W2" }
+is_first_distinct = { status = "param", batcher = "Expr.is_first_distinct", need = "implicit row order: Batcher needs order_by, here or through over(order_by=...)", wave = "W2" }
 is_in = { status = "canonical", batcher = "Expr.is_in", template = 'is_in(other, *, nulls_equal=False) -> self.is_in(other, nulls_equal=nulls_equal)' }
 is_infinite = { status = "canonical", batcher = "Expr.is_infinite" }
-is_last_distinct = { status = "param", batcher = "Expr.is_last_distinct", need = "order_by optional (Polars uses implicit row order)", wave = "W2" }
+is_last_distinct = { status = "param", batcher = "Expr.is_last_distinct", need = "implicit row order: Batcher needs order_by, here or through over(order_by=...)", wave = "W2" }
 is_nan = { status = "canonical", batcher = "Expr.is_nan" }
 is_not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
 is_not_null = { status = "canonical", batcher = "Expr.is_not_null" }
@@ -122,7 +122,7 @@ lower_bound = { status = "gap", need = "Expr.lower_bound (dtype minimum)", wave 
 lt = { status = "alias", batcher = "op:lt" }
 map_batches = { status = "gap", need = "Expr.map_batches (vectorized Python UDF as an expression)", wave = "W11" }
 map_elements = { status = "gap", need = "Expr.map_elements, only as a batch-vectorized wrapper (per-row Python stays refused)", wave = "W11" }
-max = { status = "mismatch", batcher = "Expr.max", note = "Polars max() ignores NaN where Batcher orders NaN above every number. Port as col.max(nan_policy=ignore); the codemod keeps a marker until over() windows the composed form this parameter builds", wave = "W0" }
+max = { status = "canonical", batcher = "Expr.max", template = 'max() -> self.max(nan_policy="ignore")' }
 max_by = { status = "canonical", batcher = "Expr.max_by", template = 'max_by(by) -> self.max_by(by, ignore_nulls=False)' }
 mean = { status = "canonical", batcher = "Expr.mean" }
 median = { status = "canonical", batcher = "Expr.median" }
@@ -132,7 +132,7 @@ min_by = { status = "canonical", batcher = "Expr.min_by", template = 'min_by(by)
 mod = { status = "mismatch", batcher = "op:mod", template = 'mod(other) -> self - (self // other) * other', note = "Polars % takes the sign of the divisor (floored); Batcher % truncates like SQL and DuckDB", wave = "W0" }
 mode = { status = "mismatch", batcher = "Expr.mode", template = 'mode(*, maintain_order=False) -> self.mode(all_modes=True)', note = "with all_modes=True every tied value is returned as Polars does; Polars also counts null as a mode candidate, Batcher does not", wave = "W0" }
 mul = { status = "alias", batcher = "op:mul" }
-n_unique = { status = "mismatch", batcher = "Expr.count_distinct", note = "Polars counts null as a distinct value where Batcher skips it. Port as col.count_distinct(count_nulls=True); the codemod keeps a marker until over() windows the composed form this parameter builds", wave = "W0" }
+n_unique = { status = "canonical", batcher = "Expr.count_distinct", template = 'n_unique() -> self.count_distinct(count_nulls=True)' }
 name = { status = "param", batcher = "Selector.name", need = ".name accessor (keep/prefix/suffix/map/case) on every Expr, not only on selectors", wave = "W2" }
 nan_max = { status = "gap", need = "Expr.nan_max (NaN-propagating max)", wave = "W3" }
 nan_min = { status = "gap", need = "Expr.nan_min (NaN-propagating min)", wave = "W3" }
@@ -142,13 +142,13 @@ neg = { status = "alias", batcher = "op:neg" }
 not_ = { status = "alias", batcher = "op:invert" }
 null_count = { status = "gap", need = "Expr.null_count aggregate", wave = "W8" }
 or_ = { status = "alias", batcher = "op:or" }
-over = { status = "param", batcher = "AggExpr.over", need = "over() on every Expr, with mapping_strategy=, order_by=, descending=, nulls_last=", wave = "WF", template = 'over(partition_by=None, *more_exprs, order_by=None, descending=False, nulls_last=False, mapping_strategy="group_to_rows") -> sem.polars_over(self, partition_by, more_exprs, order_by, descending, nulls_last, mapping_strategy)' }
+over = { status = "param", batcher = ["Expr.over"], template = 'over(partition_by=None, *more_exprs, order_by=None, descending=False, nulls_last=False, mapping_strategy="group_to_rows") -> sem.polars_over(self, partition_by, more_exprs, order_by, descending, nulls_last, mapping_strategy)', need = "mapping_strategy= join and explode", wave = "WF" }
 pct_change = { status = "canonical", batcher = "Expr.pct_change" }
 peak_max = { status = "canonical", batcher = "Expr.peak_max", template = 'peak_max() -> self.peak_max(edges=True, propagate_nulls=True)' }
 peak_min = { status = "canonical", batcher = "Expr.peak_min", template = 'peak_min() -> self.peak_min(propagate_nulls=True)' }
 pipe = { status = "gap", need = "Expr.pipe", wave = "W8" }
 pow = { status = "alias", batcher = "op:pow" }
-product = { status = "mismatch", batcher = "Expr.product", note = "Polars returns 1 for an empty or all-null input where Batcher returns null. Port as col.product(empty_value=1); the codemod keeps a marker until over() windows the composed form this parameter builds", wave = "W0" }
+product = { status = "canonical", batcher = "Expr.product", template = 'product() -> self.product(empty_value=1)' }
 qcut = { status = "gap", need = "Expr.qcut (quantile binning)", wave = "W3" }
 quantile = { status = "canonical", batcher = "Expr.quantile", template = 'quantile(quantile, interpolation="nearest") -> self.quantile(quantile, interpolation)' }
 radians = { status = "canonical", batcher = "Expr.radians" }
@@ -205,12 +205,12 @@ std = { status = "param", batcher = "Expr.std", need = "ddof=", wave = "W2" }
 str = { status = "canonical", batcher = "Expr.str" }
 struct = { status = "canonical", batcher = "Expr.struct" }
 sub = { status = "alias", batcher = "op:sub" }
-sum = { status = "mismatch", batcher = "Expr.sum", note = "Polars returns 0 for an empty or all-null input where Batcher returns null. Port as col.sum(empty_value=0); the codemod keeps a marker until over() windows the composed form this parameter builds", wave = "W0" }
+sum = { status = "canonical", batcher = "Expr.sum", template = 'sum() -> self.sum(empty_value=0)' }
 tail = { status = "gap", need = "Expr.tail (length-changing)", wave = "W8" }
 tan = { status = "canonical", batcher = "Expr.tan" }
 tanh = { status = "canonical", batcher = "Expr.tanh" }
 to_physical = { status = "gap", need = "Expr.to_physical", wave = "W3" }
-top_k = { status = "mismatch", batcher = "Expr.top_k", template = 'top_k(k=5) -> self.top_k(k)', note = "Polars pads a group with fewer than k non-null values with its nulls; Batcher returns the values it has (DuckDB max(x, k))", wave = "W0" }
+top_k = { status = "mismatch", batcher = "Expr.top_k", note = "Polars pads a group with fewer than k non-null values with its nulls; Batcher returns the values it has (DuckDB max(x, k))", wave = "W0" }
 top_k_by = { status = "gap", need = "Expr.top_k_by", wave = "W8" }
 truediv = { status = "alias", batcher = "op:truediv" }
 truncate = { status = "param", batcher = "Expr.trunc", need = "decimals= argument", wave = "W2" }

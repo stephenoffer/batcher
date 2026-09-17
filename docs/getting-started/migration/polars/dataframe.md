@@ -75,8 +75,8 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `reverse` | `Dataset.reverse` | canonical |  |
 | `rolling` | n/a | gap | Not yet: Dataset.rolling (frame-level rolling group-by). Wave W5. |
 | `schema` | `Dataset.schema` | canonical |  |
-| `select` | `Dataset.select` | param | Missing: output-name inference for positional derived expressions (select(col('a') + 1) is refused today). Wave WF. |
-| `select_seq` | `Dataset.select` | param | Missing: output-name inference for positional derived expressions. Wave WF. |
+| `select` | `Dataset.select` | canonical |  |
+| `select_seq` | `Dataset.select` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
 | `serialize` | n/a | gap | Not yet: Dataset.serialize (plan to bytes/JSON). Wave W8. |
 | `set_sorted` | n/a | out of scope | Declined: sortedness flags are engine-owned metadata (Dataset.meta.sorted\_by), not a user assertion. |
 | `shift` | n/a | gap | Not yet: Dataset.shift (every column). Wave W5. |
@@ -102,8 +102,8 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `update` | n/a | gap | Not yet: Dataset.update (overwrite values from another frame by key). Wave W8. |
 | `var` | `Dataset.var` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
 | `width` | `Dataset.width` | canonical |  |
-| `with_columns` | `Dataset.with_columns` | param | Missing: output-name inference for positional derived expressions (with\_columns(col('a') + 1) is refused today). Wave WF. |
-| `with_columns_seq` | `Dataset.with_columns` | param | Missing: output-name inference for positional derived expressions. Wave WF. |
+| `with_columns` | `Dataset.with_columns` | canonical |  |
+| `with_columns_seq` | `Dataset.with_columns` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
 | `with_context` | n/a | out of scope | Declined: deprecated in Polars in favour of horizontal concat. |
 | `with_row_count` | `Dataset.with_row_index` | alias |  |
 | `with_row_index` | `Dataset.with_row_index` | canonical |  |
@@ -196,8 +196,8 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `rows_by_key` | n/a | gap | Not yet: Dataset.rows\_by\_key. Wave W8. |
 | `sample` | `Dataset.sample` | param | Missing: with\_replacement=, shuffle=. Wave W2. |
 | `schema` | `Dataset.schema` | canonical |  |
-| `select` | `Dataset.select` | param | Missing: output-name inference for positional derived expressions (select(col('a') + 1) is refused today). Wave WF. |
-| `select_seq` | `Dataset.select` | param | Missing: output-name inference for positional derived expressions. Wave WF. |
+| `select` | `Dataset.select` | canonical |  |
+| `select_seq` | `Dataset.select` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
 | `serialize` | n/a | gap | Not yet: Dataset.serialize (plan to bytes/JSON). Wave W8. |
 | `set_sorted` | n/a | out of scope | Declined: sortedness flags are engine-owned metadata (Dataset.meta.sorted\_by), not a user assertion. |
 | `shape` | `Dataset.shape` | canonical |  |
@@ -234,8 +234,8 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `var` | `Dataset.var` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
 | `vstack` | `Dataset.union` | alias |  |
 | `width` | `Dataset.width` | canonical |  |
-| `with_columns` | `Dataset.with_columns` | param | Missing: output-name inference for positional derived expressions (with\_columns(col('a') + 1) is refused today). Wave WF. |
-| `with_columns_seq` | `Dataset.with_columns` | param | Missing: output-name inference for positional derived expressions. Wave WF. |
+| `with_columns` | `Dataset.with_columns` | canonical |  |
+| `with_columns_seq` | `Dataset.with_columns` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
 | `with_row_count` | `Dataset.with_row_index` | alias |  |
 | `with_row_index` | `Dataset.with_row_index` | canonical |  |
 | `write_avro` | `Dataset.write.avro` | canonical |  |
@@ -260,10 +260,10 @@ The following table maps the 17 names on `GroupBy`, sorted alphabetically.
 | `agg` | `GroupBy.agg` | canonical |  |
 | `all` | `GroupBy.array_agg` | canonical |  |
 | `count` | `GroupBy.count` | mismatch | Differs: Polars GroupBy.count counts rows into a column named count; port as group\_by(k).len(name=count). Wave W0. |
-| `first` | `GroupBy.first` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
+| `first` | `GroupBy.first` | param | Missing: implicit row order: GroupBy.first needs order\_by. Wave W2. |
 | `having` | n/a | gap | Not yet: GroupBy.having (filter groups by an aggregate predicate). Wave W8. |
 | `head` | `GroupBy.head` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
-| `last` | `GroupBy.last` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
+| `last` | `GroupBy.last` | param | Missing: implicit row order: GroupBy.last needs order\_by. Wave W2. |
 | `len` | `GroupBy.len` | canonical |  |
 | `map_groups` | `GroupBy.map_groups` | mismatch | Differs: Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches. Wave W0. |
 | `max` | `GroupBy.max` | mismatch | Differs: Polars max ignores NaN; port as agg(col(c).max(nan\_policy=ignore)) per column. Wave W0. |
@@ -284,10 +284,10 @@ The following table maps the 17 names on `LazyGroupBy`, sorted alphabetically.
 | `agg` | `GroupBy.agg` | canonical |  |
 | `all` | `GroupBy.array_agg` | canonical |  |
 | `count` | `GroupBy.count` | mismatch | Differs: Polars LazyGroupBy.count counts rows into a column named count; port as group\_by(k).len(name=count). Wave W0. |
-| `first` | `GroupBy.first` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
+| `first` | `GroupBy.first` | param | Missing: implicit row order: GroupBy.first needs order\_by. Wave W2. |
 | `having` | n/a | gap | Not yet: GroupBy.having (filter groups by an aggregate predicate). Wave W8. |
 | `head` | `GroupBy.head` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
-| `last` | `GroupBy.last` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
+| `last` | `GroupBy.last` | param | Missing: implicit row order: GroupBy.last needs order\_by. Wave W2. |
 | `len` | `GroupBy.len` | canonical |  |
 | `map_groups` | `GroupBy.map_groups` | mismatch | Differs: Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches. Wave W0. |
 | `max` | `GroupBy.max` | mismatch | Differs: Polars max ignores NaN; port as agg(col(c).max(nan\_policy=ignore)) per column. Wave W0. |

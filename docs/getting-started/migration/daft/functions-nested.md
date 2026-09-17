@@ -181,4 +181,4 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `unnest` | `Dataset.unnest` | param | Missing: an Expression-level unnest usable inside select. Wave W8. |
 | `uuid` | n/a | gap | Not yet: UUID v4/v7 generator expression (needs a determinism story across seq/par/dist). Wave W3. |
 | `value_counts` | n/a | gap | Not yet: per-list value counts as a list of (value, count) structs. Wave W4. |
-| `when` | `bt.when` | param | Missing: the two-argument when(cond, then) form, and a CASE with no otherwise yielding null (Batcher raises). Wave WF. |
+| `when` | `bt.when` | param | Missing: the two-argument when(cond, then) form. Wave WF. |

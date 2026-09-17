@@ -46,7 +46,7 @@ The following table maps the 36 names on `Column`, sorted alphabetically.
 | `name` | `Expr.alias` | canonical |  |
 | `otherwise` | `CaseBuilder.otherwise` | canonical |  |
 | `outer` | n/a | gap | Not yet: outer column reference for lateral joins and correlated subqueries. Wave W8. |
-| `over` | `AggExpr.over` + `WindowExpr.over` | param | Missing: a reusable Window spec object, and over() on every Expr rather than only aggregates and window functions. Wave WF. |
+| `over` | `Expr.over` | param | Missing: a reusable Window spec object. Wave WF. |
 | `rlike` | `Expr.str.regexp_matches` | canonical |  |
 | `startswith` | `Expr.str.starts_with` | canonical |  |
 | `substr` | `Expr.str.substr` | mismatch | Differs: Spark treats start position 0 as 1 (substr(0, 2) of 'hello' is 'he'); Batcher counts position 0 as before the string ('h'). Wave W0. |

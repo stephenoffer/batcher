@@ -68,7 +68,7 @@ The following table maps the 71 names on `Expression`, sorted alphabetically.
 | `min` | `Expr.min` | canonical |  |
 | `negate` | `-` operator | canonical |  |
 | `not_nan` | `Expr.is_not_nan` | canonical |  |
-| `over` | `WindowExpr.over` | param | Missing: over() on every Expr, taking a Window spec object. Wave WF. |
+| `over` | `Expr.over` | param | Missing: a Window spec object. Wave WF. |
 | `percentile` | `Expr.quantile` | canonical |  |
 | `pow` | `**` operator | alias |  |
 | `power` | `**` operator | canonical |  |
@@ -158,7 +158,7 @@ The following table maps the 89 names on the `daft.functions` module, sorted alp
 | `monotonically_increasing_id` | `Dataset.with_row_index` | param | Missing: an Expression form usable inside select/with\_columns. Wave W8. |
 | `negate` | `-` operator | canonical |  |
 | `not_nan` | `Expr.is_not_nan` | canonical |  |
-| `over` | `WindowExpr.over` | param | Missing: over() on every Expr, taking a Window spec object. Wave WF. |
+| `over` | `Expr.over` | param | Missing: a Window spec object. Wave WF. |
 | `percentile` | `Expr.quantile` | canonical |  |
 | `pi` | n/a | gap | Not yet: pi constant expression (bt.lit(math.pi) works today). Wave W1. |
 | `pmod` | n/a | gap | Not yet: positive modulo (Batcher % truncates toward zero, so pmod(-7, 3) is -1 not 2). Wave W3. |

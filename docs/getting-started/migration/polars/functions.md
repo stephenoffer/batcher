@@ -34,7 +34,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `business_day_count` | n/a | gap | Not yet: business\_day\_count. Wave W6. |
 | `Catalog` | n/a | gap | Not yet: Unity catalog client (list/get/create tables). Wave W9. |
 | `coalesce` | `bt.coalesce` | canonical |  |
-| `col` | `bt.col` | param | Missing: several names, regex patterns ('\^a.\*\$') and dtypes in one col(). Wave WF. |
+| `col` | `bt.col` | canonical |  |
 | `collect_all` | n/a | gap | Not yet: collect\_all (execute several plans with shared subplans). Wave W8. |
 | `collect_all_async` | n/a | gap | Not yet: collect\_all\_async. Wave W8. |
 | `concat` | `bt.concat` | param | Missing: how='diagonal\_relaxed', 'align', 'horizontal' and relaxed supertype unification. Wave W2. |
@@ -69,7 +69,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `explain_all` | n/a | gap | Not yet: explain\_all (plans of several frames). Wave W8. |
 | `Expr` | `bt.Expr` | canonical |  |
 | `field` | n/a | gap | Not yet: field (struct field reference inside struct.with\_fields). Wave W3. |
-| `first` | `bt.first` | param | Missing: order\_by optional, and pl.first() with no argument as the first-column selector. Wave WF. |
+| `first` | `bt.first` | param | Missing: pl.first() with no argument as the first-column selector. Wave WF. |
 | `fold` | `bt.fold_horizontal` | canonical |  |
 | `format` | `bt.format_string` | mismatch | Differs: Polars format returns null when any input is null; Batcher renders a null as an empty string. Wave W0. |
 | `from_arrow` | `bt.from_arrow` | canonical |  |
@@ -89,7 +89,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `implode` | `bt.array_agg` | canonical |  |
 | `int_range` | n/a | gap | Not yet: int\_range expression. Wave W6. |
 | `int_ranges` | `bt.sequence` | mismatch | Differs: Polars int\_ranges excludes the end; Batcher's sequence includes it (int\_ranges(0, n) is sequence(0, n - 1)). Wave W0. |
-| `last` | `bt.last` | param | Missing: order\_by optional, and pl.last() with no argument as the last-column selector. Wave WF. |
+| `last` | `bt.last` | param | Missing: pl.last() with no argument as the last-column selector. Wave WF. |
 | `LazyFrame` | `bt.Dataset` | canonical |  |
 | `len` | `bt.count` | canonical |  |
 | `linear_space` | n/a | gap | Not yet: linear\_space. Wave W6. |
@@ -142,7 +142,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `unregister_extension_type` | n/a | gap | Not yet: extension type registry. Wave W11. |
 | `using_string_cache` | n/a | out of scope | Declined: no global Categorical string cache: Arrow dictionaries are per batch. |
 | `var` | `bt.var` | param | Missing: ddof=. Wave W2. |
-| `when` | `bt.when` | param | Missing: when/then without otherwise (null default), otherwise(None), several conditions and \*\*constraints in one when(). Wave WF. |
+| `when` | `bt.when` | param | Missing: several conditions and \*\*constraints in one when(). Wave WF. |
 | `zeros` | n/a | gap | Not yet: zeros expression. Wave W8. |
 
 ## The `polars.selectors` module
