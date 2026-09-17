@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1465 Python modules across 215 packages and 289 Rust files across 15 crates.
+Covering 1475 Python modules across 216 packages and 289 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -2831,9 +2831,9 @@ The migration registry: every PySpark, Polars, Daft and Ray Data name, and its B
 | module | lines | what it is |
 |---|---|---|
 | `hints.py` | 147 | The migration half of an `AttributeError`: what a removed or foreign spelling is called here. |
-| `loader.py` | 136 | Load the migration registry from its TOML files. |
+| `loader.py` | 158 | Load the migration registry from its TOML files. |
 | `renames.py` | 241 | The rename decisions for Batcher's own second spellings, as typed rules the codemod can apply. |
-| `schema.py` | 157 | The shape of one migration-registry row: a competitor's name and what it becomes here. |
+| `schema.py` | 281 | The shape of one migration-registry row: a competitor's name and what it becomes here. |
 
 ### `batcher/_internal/site/` — 0 · utility
 
@@ -2903,11 +2903,27 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 
 | module | lines | what it is |
 |---|---|---|
-| `__main__.py` | 120 | `python -m batcher.migrate`: rewrite scripts onto Batcher's one spelling per capability. |
+| `__main__.py` | 174 | `python -m batcher.migrate`: rewrite scripts onto Batcher's API, or off it. |
 | `canonical.py` | 509 | Rewrite Batcher's own removed second spellings to the one spelling that stays. |
+| `engines.py` | 251 | What the foreign-engine codemod directions know about each engine besides the registry. |
+| `finish.py` | 369 | What both foreign-engine directions share: the site record, markers, and finishing a module. |
+| `outbound.py` | 271 | Rewrite a Batcher script onto PySpark, Polars, Daft or Ray Data: the conservative inverse. |
 | `project.py` | 119 | What the helper functions a script imports from its own project return. |
-| `receivers.py` | 458 | Which expressions in a script are Batcher objects, and which Batcher receiver each one is. |
+| `receivers.py` | 585 | Which expressions in a script are engine objects, and which receiver each one is. |
 | `snippets.py` | 148 | Apply the canonical-name rewrite to code that lives inside text: doctests and Markdown blocks. |
+| `templates.py` | 425 | Apply one registry template, or check one call against a signature, on libcst nodes. |
+| `translate.py` | 429 | Rewrite a PySpark, Polars, Daft or Ray Data script onto Batcher, driven by the registry. |
+
+### `batcher/migrate/semantics/` — ?
+
+The `sem.<name>` transforms registry templates call for what the template DSL cannot say.
+
+| module | lines | what it is |
+|---|---|---|
+| `base.py` | 199 | The transform registry, the context a transform reads, and the node helpers they share. |
+| `columns.py` | 228 | Transforms over column references, argument checks, positions and date patterns. |
+| `ordering.py` | 224 | Transforms over sort and window keys, whose null placement differs per engine. |
+| `relational.py` | 235 | Transforms over relational spellings: joins, writes, sessions, constructors, aggregates. |
 
 ## Rust data plane — `crates/`
 

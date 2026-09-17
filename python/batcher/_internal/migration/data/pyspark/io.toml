@@ -4,7 +4,7 @@
 
 [DataFrameReader]
 changes = { status = "param", batcher = "bt.read.read_change_feed", need = "change feeds from non-Delta tables and Spark's startingVersion/endingVersion option names", wave = "W13" }
-csv = { status = "mismatch", batcher = "bt.read.csv", note = "Spark defaults to header=false and inferSchema=false (string columns named _c0, _c1, ...); Batcher reads the header and infers types. Codemod passes the header and inference options explicitly", wave = "W0" }
+csv = { status = "mismatch", batcher = "bt.read.csv", note = "Spark defaults to header=false and inferSchema=false (string columns named _c0, _c1, ...); Batcher reads the header and infers types. Codemod passes the header and inference options explicitly", wave = "W0", template = 'csv(path, header=None, inferSchema=None) -> sem.spark_read_csv(self, path, header, inferSchema)' }
 format = { status = "canonical", batcher = "bt.read" }
 jdbc = { status = "param", batcher = "bt.read.sql", need = "url + table + properties form, and column/lowerBound/upperBound/numPartitions or predicates partitioning", wave = "W13" }
 json = { status = "canonical", batcher = "bt.read.json" }
@@ -41,12 +41,12 @@ csv = { status = "mismatch", batcher = "Dataset.write.csv", note = "Spark's defa
 format = { status = "canonical", batcher = "Dataset.write" }
 insertInto = { status = "gap", need = "insert into an existing catalog table by position", wave = "W9" }
 jdbc = { status = "param", batcher = "Dataset.write.sql", need = "url + table + properties connection form", wave = "W13" }
-json = { status = "mismatch", batcher = "Dataset.write.json", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0" }
+json = { status = "mismatch", batcher = "Dataset.write.json", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0", template = 'json(path, mode=None) -> sem.spark_write(self, "json", path, mode, None)' }
 mode = { status = "canonical", batcher = "Dataset.write" }
 option = { status = "canonical", batcher = "Dataset.write" }
 options = { status = "canonical", batcher = "Dataset.write" }
-orc = { status = "mismatch", batcher = "Dataset.write.orc", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0" }
-parquet = { status = "mismatch", batcher = "Dataset.write.parquet", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0" }
+orc = { status = "mismatch", batcher = "Dataset.write.orc", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0", template = 'orc(path, mode=None, partitionBy=None) -> sem.spark_write(self, "orc", path, mode, partitionBy)' }
+parquet = { status = "mismatch", batcher = "Dataset.write.parquet", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0", template = 'parquet(path, mode=None, partitionBy=None) -> sem.spark_write(self, "parquet", path, mode, partitionBy)' }
 partitionBy = { status = "canonical", batcher = "Dataset.write" }
 save = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0" }
 saveAsTable = { status = "gap", need = "save as a managed catalog table", wave = "W9" }

@@ -12,7 +12,7 @@ current_timestamp = { status = "canonical", batcher = "bt.current_timestamp" }
 current_timezone = { status = "gap", need = "session time zone configuration", wave = "W6" }
 date_add = { status = "param", batcher = "bt.date_add", need = "column-valued day amount", wave = "W2" }
 date_diff = { status = "mismatch", batcher = "Expr.dt.days_between", note = "Batcher bug: Expr.dt.days_between returns 0 on DATE columns (correct on timestamps). date_diff(end, start) is end.dt.days_between(start)", wave = "W0" }
-date_format = { status = "mismatch", batcher = "Expr.dt.strftime", note = "Spark takes Java DateTimeFormatter patterns (yyyy-MM-dd) and renders in the session time zone; strftime takes %Y-%m-%d. Codemod translates the pattern", wave = "W0" }
+date_format = { status = "mismatch", batcher = "Expr.dt.strftime", note = "Spark takes Java DateTimeFormatter patterns (yyyy-MM-dd) and renders in the session time zone; strftime takes %Y-%m-%d. Codemod translates the pattern", wave = "W0", template = 'date_format(date, format) -> sem.column(date).dt.strftime(sem.java_datetime(format))' }
 date_from_unix_date = { status = "canonical", batcher = "bt.from_unix_date" }
 date_part = { status = "mismatch", batcher = "bt.date_part", note = "Spark SECOND returns DECIMAL with the fraction and DAYOFWEEK/DOW count Sunday=1; bt.date_part follows DuckDB (integer seconds, dow Sunday=0)", wave = "W0" }
 date_sub = { status = "param", batcher = "bt.date_sub", need = "column-valued day amount", wave = "W2" }
@@ -65,7 +65,7 @@ timestamp_diff = { status = "param", batcher = ["Expr.dt.seconds_between", "Expr
 timestamp_micros = { status = "canonical", batcher = "bt.from_epoch" }
 timestamp_millis = { status = "canonical", batcher = "bt.from_epoch" }
 timestamp_seconds = { status = "canonical", batcher = "bt.from_epoch" }
-to_date = { status = "mismatch", batcher = "Expr.str.to_date", note = "Spark takes Java DateTimeFormatter patterns and casts when no format is given; Batcher takes strftime patterns. Codemod translates the pattern", wave = "W0" }
+to_date = { status = "mismatch", batcher = "Expr.str.to_date", note = "Spark takes Java DateTimeFormatter patterns and casts when no format is given; Batcher takes strftime patterns. Codemod translates the pattern", wave = "W0", template = 'to_date(col, format) -> sem.column(col).str.to_date(sem.java_datetime(format))' }
 to_time = { status = "gap", need = "parse strings to TIME", wave = "W6" }
 to_timestamp = { status = "mismatch", batcher = "Expr.str.to_datetime", note = "Spark takes Java DateTimeFormatter patterns (format optional) and yields a session-time-zone timestamp; Batcher takes strftime patterns and yields a naive timestamp", wave = "W0" }
 to_timestamp_ltz = { status = "gap", need = "parse to a timestamp with local time zone", wave = "W6" }

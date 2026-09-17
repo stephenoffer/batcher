@@ -28,7 +28,7 @@ from pathlib import Path
 
 from batcher._internal.migration.schema import ENGINES, Mapping, RegistryError, Status, validate
 
-__all__ = ["DATA_DIR", "Registry", "load_registry", "load_returns"]
+__all__ = ["DATA_DIR", "Registry", "load_codemod_tables", "load_registry", "load_returns"]
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -134,3 +134,25 @@ def load_returns() -> dict[str, dict[str, str]]:
         The table in `data/returns.toml`.
     """
     return tomllib.loads((DATA_DIR / "returns.toml").read_text())
+
+
+@lru_cache(maxsize=8)
+def load_codemod_tables(engine: str) -> dict[str, dict[str, dict[str, object]]]:
+    """What each member of an engine returns, and its parameters, for the foreign codemod.
+
+    Generated from the installed libraries by `tools/parity/gen_codemod_tables.py`. Each
+    engine's file holds `returns` and `params` tables; `batcher.toml` holds only `params`.
+
+    Args:
+        engine: One of `ENGINES`, or `"batcher"`.
+
+    Returns:
+        `{"returns": {surface: {member: surface}}, "params": {surface: {member: tokens}}}`.
+
+    Raises:
+        RegistryError: When no table exists for `engine`.
+    """
+    path = DATA_DIR / "codemod" / f"{engine}.toml"
+    if engine not in (*ENGINES, "batcher") or not path.is_file():
+        raise RegistryError(f"no codemod tables for engine {engine!r}")
+    return tomllib.loads(path.read_text())

@@ -74,7 +74,7 @@ split = { status = "mismatch", batcher = "Expr.str.split", note = "Spark's patte
 split_part = { status = "canonical", batcher = "Expr.str.split_part" }
 startswith = { status = "canonical", batcher = "Expr.str.starts_with" }
 substr = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substr('hello', 0, 2) is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0" }
-substring = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substring('hello', 0, 2) is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0" }
+substring = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substring('hello', 0, 2) is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0", template = 'substring(str, pos, len) -> sem.column(str).str.substr(sem.spark_position(pos), len)' }
 substring_index = { status = "canonical", batcher = "Expr.str.substring_index" }
 to_binary = { status = "mismatch", batcher = "Expr.str.to_binary", note = "Spark to_binary encodes to BINARY by format (hex, utf-8, base64); Expr.str.to_binary renders the bytes as '0'/'1' text", wave = "W0" }
 to_char = { status = "gap", need = "format numbers and dates with a format string", wave = "W3" }

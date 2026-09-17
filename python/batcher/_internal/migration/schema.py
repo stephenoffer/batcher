@@ -16,15 +16,53 @@ Each row carries a `Status`, and the status decides which other fields must be p
 `validate` enforces that, so a row missing the one field that makes it actionable (a
 mismatch with no note saying what differs, a gap with no wave) fails at load time rather
 than surfacing as a blank cell in the generated docs.
+
+A row may also carry a `template`: how the codemod rewrites a call whose arguments do not carry
+over unchanged, or whose difference a rewrite can restore. It is a small DSL rather than code,
+so every template is validated here at load time and none can import or execute anything:
+
+.. code-block:: text
+
+    <name>(<parameters>) -> <expression>     one way: foreign -> Batcher only
+    <name>(<parameters>) <-> <expression>    reversible: Batcher -> foreign as well
+
+The left side is the foreign call as a Python parameter list, which binds the call's arguments
+exactly as Python would (positional, keyword, defaults, `*args`, `**kwargs`). The right side is
+one Python expression over four kinds of name:
+
+* the parameters, which substitute the call's argument, or the parameter's default when the
+  call omits it, so the rewrite states the foreign default explicitly;
+* `self`, the rewritten receiver the method was called on;
+* `bt`, the Batcher module;
+* `sem.<transform>(...)`, a named transform in `batcher.migrate.semantics` for what the DSL
+  cannot say (Java date patterns, join `how` spellings, Spark window specs). A transform may
+  decline, and a declined template leaves the call alone with a marker comment.
+
+`*args` and `**kwargs` splice where they appear starred, and `**{"name": value}` with an
+identifier key renders as `name=value`, so `withColumn(colName, col) ->
+self.with_columns(**{colName: col})` turns `df.withColumn("total", e)` into
+`df.with_columns(total=e)`. A reversible template's right side must be one call on `self` or
+`bt` whose arguments are parameters (bare or starred) or literals, so its inverse is a pure
+re-binding of the Batcher call's arguments onto the left side.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass
 from enum import StrEnum
 
-__all__ = ["ENGINES", "WAVES", "Mapping", "RegistryError", "Status", "validate"]
+__all__ = [
+    "ENGINES",
+    "WAVES",
+    "Mapping",
+    "RegistryError",
+    "Status",
+    "Template",
+    "parse_template",
+    "validate",
+]
 
 ENGINES = ("pyspark", "polars", "daft", "ray_data")
 
@@ -138,6 +176,11 @@ def validate(engine: str, surface: str, name: str, raw: dict[str, object]) -> Ma
     wave = raw.get("wave")
     if wave is not None and wave not in WAVES:
         raise RegistryError(f"{where}: wave {wave!r} is not one of {WAVES}")
+    if raw.get("template") is not None:
+        try:
+            parse_template(str(raw["template"]), name)
+        except RegistryError as exc:
+            raise RegistryError(f"{where}: {exc}") from exc
     return Mapping(
         engine=engine,
         surface=surface,
@@ -155,3 +198,84 @@ def validate(engine: str, surface: str, name: str, raw: dict[str, object]) -> Ma
 def _opt_str(raw: dict[str, object], key: str) -> str | None:
     value = raw.get(key)
     return None if value is None else str(value)
+
+
+_RESERVED = frozenset({"self", "bt", "sem", "True", "False", "None"})
+
+
+@dataclass(frozen=True)
+class Template:
+    """One parsed registry template.
+
+    Attributes:
+        name: The foreign spelling the left side calls.
+        params: The left side's parameter list, as parsed by `ast`.
+        target: The right side's expression source.
+        reversible: Whether the template was written with `<->`.
+    """
+
+    name: str
+    params: ast.arguments
+    target: str
+    reversible: bool
+
+
+def parse_template(text: str, name: str) -> Template:
+    """Parse and validate one template against the DSL in the module docstring.
+
+    Args:
+        text: The template, `<name>(<params>) -> <expr>` or with `<->`.
+        name: The registry row's name, which the left side must call.
+
+    Returns:
+        The parsed template.
+
+    Raises:
+        RegistryError: On a side that does not parse, a left side calling another name, a
+            right side using a name that is neither a parameter nor `self`/`bt`/`sem`, or a
+            reversible template whose right side is not a plain re-binding call.
+    """
+    reversible = "<->" in text
+    left, sep, right = text.partition("<->" if reversible else "->")
+    if not sep:
+        raise RegistryError(f"template {text!r} has no `->` or `<->`")
+    try:
+        head = ast.parse(f"def {left.strip()}: pass").body[0]
+        body = ast.parse(right.strip(), mode="eval").body
+    except SyntaxError as exc:
+        raise RegistryError(f"template {text!r} does not parse: {exc.msg}") from exc
+    if not isinstance(head, ast.FunctionDef) or head.name != name:
+        raise RegistryError(f"template {text!r} does not rewrite {name!r}")
+    args = head.args
+    params = {a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
+    params |= {a.arg for a in (args.vararg, args.kwarg) if a is not None}
+    comprehended = {
+        t.id
+        for node in ast.walk(body)
+        if isinstance(node, ast.comprehension)
+        for t in ast.walk(node.target)
+        if isinstance(t, ast.Name)
+    }
+    for node in ast.walk(body):
+        if isinstance(node, ast.Name) and node.id not in params | comprehended | _RESERVED:
+            raise RegistryError(f"template {text!r} uses unknown name {node.id!r}")
+    if reversible:
+        _check_reversible(text, body, params)
+    return Template(head.name, args, right.strip(), reversible)
+
+
+def _check_reversible(text: str, body: ast.expr, params: set[str]) -> None:
+    root = body.func if isinstance(body, ast.Call) else None
+    while isinstance(root, ast.Attribute):
+        root = root.value
+    if not (isinstance(body, ast.Call) and isinstance(root, ast.Name)):
+        raise RegistryError(f"reversible template {text!r} must be one call on self or bt")
+    if root.id not in ("self", "bt"):
+        raise RegistryError(f"reversible template {text!r} must be one call on self or bt")
+    values = [a.value if isinstance(a, ast.Starred) else a for a in body.args]
+    values += [k.value for k in body.keywords]
+    for value in values:
+        if not (isinstance(value, ast.Name) and value.id in params) and not isinstance(
+            value, ast.Constant
+        ):
+            raise RegistryError(f"reversible template {text!r} may only re-bind parameters")

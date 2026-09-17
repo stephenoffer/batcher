@@ -16,7 +16,7 @@ bool_or = { status = "canonical", batcher = "bt.bool_or" }
 collect_list = { status = "mismatch", batcher = "Expr.array_agg", note = "Spark skips nulls when collecting; Expr.array_agg keeps them. Needs ignore_nulls=True", wave = "W0" }
 collect_set = { status = "param", batcher = "Expr.array_agg", need = "distinct=True collection that skips nulls", wave = "W2" }
 corr = { status = "canonical", batcher = "bt.corr" }
-count = { status = "canonical", batcher = ["Expr.count", "bt.count"] }
+count = { status = "canonical", batcher = ["Expr.count", "bt.count"], template = 'count(col) -> sem.spark_count(col)' }
 count_distinct = { status = "param", batcher = "bt.count_distinct", need = "several columns counted as one distinct tuple", wave = "W2" }
 count_if = { status = "canonical", batcher = "bt.count_if" }
 covar_pop = { status = "canonical", batcher = "bt.covar_pop" }

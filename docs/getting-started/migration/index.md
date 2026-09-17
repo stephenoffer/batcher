@@ -151,6 +151,28 @@ print(ported.equals(original))
 # True
 ```
 
+## Rewrite a script with the codemod
+
+`python -m batcher.migrate` rewrites a PySpark, Polars, Daft, or Ray Data script onto Batcher, and a Batcher script back onto any of the four. It reads the same migration registry these pages are built from, needs the `migrate` extra (`pip install "batcher-engine[migrate]"`), and doesn't need the compiled engine, so it runs anywhere Python does.
+
+To translate a Polars project and see the result before anything changes, run the following:
+
+```bash
+python -m batcher.migrate src/ --from polars --to batcher
+python -m batcher.migrate src/ --from polars --to batcher --write --report migrate.json
+```
+
+The first command prints a unified diff and leaves the files alone. The second rewrites them in place and writes every call it looked at to `migrate.json`, with a count of what it rewrote and what it left. `--check` exits with status 1 when any file would change, which is how you keep a converted tree converted in CI. The reverse direction is `--from batcher --to polars`, and exactly one side of every direction is `batcher`.
+
+The codemod only rewrites what it can prove means the same thing. When a name has a different meaning in Batcher, has no Batcher equivalent yet, or sits on an object it can't identify, the call stays as written and the line before it gets a comment that says why:
+
+```text
+# batcher-migrate: Polars `Expr.top_k` differs in Batcher (`Expr.top_k`): Polars top_k(k) returns the k largest values; Batcher's Expr.top_k returns the k most frequent values (to be renamed so top_k means largest)
+largest = df.select(pl.col("v").top_k(2))
+```
+
+Where the difference is a default, it writes the default out. A Polars `sort` gains `nulls_first=True`, a Ray Data `map_batches` gains `batch_format="numpy"`, and a PySpark write gains `mode="error"`. Search the rewritten tree for `batcher-migrate:` to find everything left for you to port by hand. The foreign directions rewrite `.py` files only.
+
 ## Porting with a coding agent
 
 Each source system has an agent skill that turns these tables into a procedure:

@@ -33,11 +33,11 @@ read_ods = { status = "param", batcher = "bt.read.excel", need = "OpenDocument s
 read_parquet = { status = "alias", batcher = "bt.read.parquet" }
 read_parquet_metadata = { status = "gap", need = "read Parquet key-value metadata", wave = "W13" }
 read_parquet_schema = { status = "gap", need = "read a Parquet file's schema without data", wave = "W13" }
-scan_csv = { status = "param", batcher = "bt.read.csv", need = "reader options: comment_prefix=, ignore_errors=, n_rows=, row_index_name=, include_file_paths=, missing_columns=, infer_schema_length=, decimal_comma=, truncate_ragged_lines=, credential_provider=, retries=", wave = "W2" }
+scan_csv = { status = "param", batcher = "bt.read.csv", need = "reader options: comment_prefix=, ignore_errors=, n_rows=, row_index_name=, include_file_paths=, missing_columns=, infer_schema_length=, decimal_comma=, truncate_ragged_lines=, credential_provider=, retries=", wave = "W2", template = 'scan_csv(source) -> bt.read.csv(source)' }
 scan_delta = { status = "param", batcher = "bt.read.delta", need = "reader options: storage_options=, delta_table_options=", wave = "W2" }
 scan_iceberg = { status = "param", batcher = "bt.read.iceberg", need = "reader options: a table path/object rather than a catalog identifier, storage_options=", wave = "W2" }
 scan_ipc = { status = "param", batcher = "bt.read.arrow", need = "reader options: row_index_name=, include_file_paths=, n_rows=", wave = "W2" }
 scan_lines = { status = "param", batcher = "bt.read.text", need = "reader options: name=, n_rows=, include_file_paths=", wave = "W2" }
 scan_ndjson = { status = "param", batcher = "bt.read.json", need = "reader options: infer_schema_length=, ignore_errors=, row_index_name=, include_file_paths=", wave = "W2" }
-scan_parquet = { status = "param", batcher = "bt.read.parquet", need = "reader options: row_index_name=, include_file_paths=, allow_missing_columns=, cast_options=, credential_provider=, retries=", wave = "W2" }
+scan_parquet = { status = "param", batcher = "bt.read.parquet", need = "reader options: row_index_name=, include_file_paths=, allow_missing_columns=, cast_options=, credential_provider=, retries=", wave = "W2", template = 'scan_parquet(source) -> bt.read.parquet(source)' }
 scan_pyarrow_dataset = { status = "gap", need = "scan a pyarrow.dataset.Dataset lazily", wave = "W13" }

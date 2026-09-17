@@ -4,7 +4,7 @@
 
 ["Expr.str"]
 concat = { status = "canonical", batcher = "Expr.str.join" }
-contains = { status = "mismatch", batcher = "Expr.str.contains", note = "Polars treats the pattern as a regex by default (literal=False); Batcher's contains is literal. Use Expr.str.regexp_matches or a literal= param", wave = "W0" }
+contains = { status = "mismatch", batcher = "Expr.str.contains", note = "Polars treats the pattern as a regex by default (literal=False); Batcher's contains is literal. Use Expr.str.regexp_matches or a literal= param", wave = "W0", template = 'contains(pattern, *, literal=False, strict=True) -> sem.polars_contains(self, pattern, literal)' }
 contains_any = { status = "param", batcher = "Expr.str.contains_any", need = "ascii_case_insensitive=", wave = "W2" }
 count_matches = { status = "param", batcher = "Expr.str.count_matches", need = "literal=", wave = "W2" }
 decode = { status = "mismatch", batcher = "Expr.str.unhex", note = "Polars decode('hex'|'base64') returns Binary; Batcher's unhex/from_base64 return Utf8. Param: return Binary", wave = "W0" }
@@ -31,7 +31,7 @@ replace = { status = "mismatch", batcher = "Expr.str.replace", note = "Polars re
 replace_all = { status = "canonical", batcher = "Expr.str.replace_all" }
 replace_many = { status = "gap", need = "Expr.str.replace_many", wave = "W3" }
 reverse = { status = "canonical", batcher = "Expr.str.reverse" }
-slice = { status = "mismatch", batcher = "Expr.str.substr", note = "Batcher keeps substr, which is 1-based: slice(o, n) is substr(o + 1, n) for o >= 0, and negative offsets differ", wave = "W0" }
+slice = { status = "mismatch", batcher = "Expr.str.substr", note = "Batcher keeps substr, which is 1-based: slice(o, n) is substr(o + 1, n) for o >= 0, and negative offsets differ", wave = "W0", template = 'slice(offset, length=None) -> self.substr(sem.plus_one(offset), length)' }
 split = { status = "param", batcher = "Expr.str.split", need = "inclusive=", wave = "W2" }
 split_exact = { status = "gap", need = "Expr.str.split_exact (to struct of n+1 fields)", wave = "W3" }
 splitn = { status = "gap", need = "Expr.str.splitn (to struct of n fields)", wave = "W3" }

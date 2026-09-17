@@ -15,9 +15,9 @@ clearTags = { status = "gap", need = "session operation tags", wave = "W9" }
 client = { status = "out_of_scope", reason = "Spark Connect client handle" }
 conf = { status = "canonical", batcher = ["batcher.config.get_option", "batcher.config.set_option"] }
 copyFromLocalToFs = { status = "out_of_scope", reason = "Spark Connect local-to-server file copy" }
-createDataFrame = { status = "param", batcher = ["bt.from_pylist", "bt.from_pandas", "bt.from_arrow"], need = "one constructor taking rows/tuples/pandas/Arrow with schema= as StructType, DDL string or column-name list", wave = "W2" }
+createDataFrame = { status = "param", batcher = ["bt.from_pylist", "bt.from_pandas", "bt.from_arrow"], need = "one constructor taking rows/tuples/pandas/Arrow with schema= as StructType, DDL string or column-name list", wave = "W2", template = 'createDataFrame(data, schema=None) -> sem.spark_rows(data, schema)' }
 dataSource = { status = "param", batcher = "batcher.io.SOURCES", need = "register a Python DataSource class by name (dataSource.register)", wave = "W11" }
-emptyDataFrame = { status = "canonical", batcher = "bt.from_pydict" }
+emptyDataFrame = { status = "param", batcher = "bt.from_pydict", need = "an empty Dataset from a Spark StructType schema; bt.from_pydict({}, schema=...) takes a pyarrow.Schema", wave = "W2" }
 getActiveSession = { status = "gap", need = "the active session accessor", wave = "W9" }
 getTags = { status = "gap", need = "session operation tags", wave = "W9" }
 interruptAll = { status = "canonical", batcher = ["bt.running_queries", "bt.cancel_query"] }
@@ -25,7 +25,7 @@ interruptOperation = { status = "canonical", batcher = "bt.cancel_query" }
 interruptTag = { status = "gap", need = "cancel operations by session tag", wave = "W9" }
 newSession = { status = "canonical", batcher = "bt.Session" }
 profile = { status = "gap", need = "UDF performance and memory profiler results", wave = "W11" }
-range = { status = "mismatch", batcher = "bt.range", note = "Spark names the column 'id'; bt.range names it 'value'. Codemod passes name='id'", wave = "W0" }
+range = { status = "mismatch", batcher = "bt.range", note = "Spark names the column 'id'; bt.range names it 'value'. Codemod passes name='id'", wave = "W0", template = 'range(start, end=None, step=1) -> bt.range(start, end, step, name="id")' }
 read = { status = "canonical", batcher = "bt.read" }
 readStream = { status = "canonical", batcher = "bt.read" }
 registerProgressHandler = { status = "gap", need = "query progress handler registry for batch queries", wave = "W10" }

@@ -474,6 +474,10 @@ exclude_also = [
 target-version = "py311"
 line-length = 100
 src = ["python", "tests", "benchmarks", "examples"]
+# The codemod's golden corpus is its input and output, byte for byte: `batcher.py`/`back.py` are
+# what `batcher.migrate` writes (marker comments, long chains and all), so reformatting them
+# would change the property under test. `tests/migrate/test_corpus.py` holds them exact instead.
+extend-exclude = ["tests/migrate/corpus"]
 
 [tool.ruff.lint]
 select = [

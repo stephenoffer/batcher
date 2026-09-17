@@ -142,7 +142,7 @@ neg = { status = "alias", batcher = "op:neg" }
 not_ = { status = "alias", batcher = "op:invert" }
 null_count = { status = "gap", need = "Expr.null_count aggregate", wave = "W8" }
 or_ = { status = "alias", batcher = "op:or" }
-over = { status = "param", batcher = "AggExpr.over", need = "over() on every Expr, with mapping_strategy=, order_by=, descending=, nulls_last=", wave = "WF" }
+over = { status = "param", batcher = "AggExpr.over", need = "over() on every Expr, with mapping_strategy=, order_by=, descending=, nulls_last=", wave = "WF", template = 'over(partition_by=None, *more_exprs, order_by=None, descending=False, nulls_last=False, mapping_strategy="group_to_rows") -> sem.polars_over(self, partition_by, more_exprs, order_by, descending, nulls_last, mapping_strategy)' }
 pct_change = { status = "canonical", batcher = "Expr.pct_change" }
 peak_max = { status = "mismatch", batcher = "Expr.peak_max", note = "Polars compares against neighbours with nulls and the edges as null/false inputs; Batcher returns false at the edges and around nulls. Param: edge/null policy", wave = "W0" }
 peak_min = { status = "mismatch", batcher = "Expr.peak_min", note = "Polars compares against neighbours with nulls and the edges as null/false inputs; Batcher returns false at the edges and around nulls. Param: edge/null policy", wave = "W0" }

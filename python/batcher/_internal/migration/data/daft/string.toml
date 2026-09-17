@@ -45,7 +45,7 @@ split = { status = "param", batcher = "Expr.str.split", need = "column-valued ar
 split_part = { status = "param", batcher = "Expr.str.split_part", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
 startswith = { status = "param", batcher = "Expr.str.starts_with", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
 strip = { status = "mismatch", batcher = "Expr.str.trim", note = "Daft strip removes all whitespace (tabs, newlines); Batcher trim() removes only the ASCII space by default. Param: chars=whitespace", wave = "W0" }
-substr = { status = "param", batcher = "Expr.str.slice", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression); Daft substr is 0-based like str.slice, not 1-based like str.substr", wave = "W2" }
+substr = { status = "param", batcher = "Expr.str.slice", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression); Daft substr is 0-based like str.slice, not 1-based like str.substr", wave = "W2", template = 'substr(start, length=None) -> self.str.slice(start, length)' }
 substring_index = { status = "param", batcher = "Expr.str.substring_index", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
 to_camel_case = { status = "canonical", batcher = "Expr.str.to_case" }
 to_kebab_case = { status = "canonical", batcher = "Expr.str.to_case" }

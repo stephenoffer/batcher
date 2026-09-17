@@ -5,10 +5,10 @@
 [polars]
 Catalog = { status = "gap", need = "Unity catalog client (list/get/create tables)", wave = "W9" }
 Config = { status = "mismatch", batcher = "bt.Config", note = "Polars Config holds display/formatting settings; Batcher's Config is the engine configuration (memory, optimizer, distribution)", wave = "W11" }
-DataFrame = { status = "canonical", batcher = "bt.Dataset" }
+DataFrame = { status = "canonical", batcher = "bt.Dataset", template = 'DataFrame(data) -> sem.frame(data)' }
 Expr = { status = "canonical", batcher = "bt.Expr" }
 GPUEngine = { status = "param", batcher = "Dataset.collect", need = "a GPU engine options object (device, memory resource, raise_on_fail); backend='gpu' exists", wave = "W2" }
-LazyFrame = { status = "canonical", batcher = "bt.Dataset" }
+LazyFrame = { status = "canonical", batcher = "bt.Dataset", template = 'LazyFrame(data) -> sem.frame(data)' }
 QueryOptFlags = { status = "param", batcher = "bt.OptimizerConfig", need = "per-collect optimization toggles (predicate/projection pushdown, CSE, slice pushdown)", wave = "W2" }
 SQLContext = { status = "canonical", batcher = "bt.Session" }
 Series = { status = "out_of_scope", reason = "Batcher has no Series type (user decision); a column is an Expr or a one-column Dataset" }
@@ -28,7 +28,7 @@ arg_where = { status = "gap", need = "arg_where", wave = "W8" }
 build_info = { status = "canonical", batcher = "bt.versions" }
 business_day_count = { status = "gap", need = "business_day_count", wave = "W6" }
 coalesce = { status = "mismatch", batcher = "bt.coalesce", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so coalesce('a', 'b') silently computes over the constants. Param: strings as column names", wave = "W0" }
-col = { status = "param", batcher = "bt.col", need = "several names, regex patterns ('^a.*$') and dtypes in one col()", wave = "WF" }
+col = { status = "param", batcher = "bt.col", need = "several names, regex patterns ('^a.*$') and dtypes in one col()", wave = "WF", template = 'col(name) <-> bt.col(name)' }
 collect_all = { status = "gap", need = "collect_all (execute several plans with shared subplans)", wave = "W8" }
 collect_all_async = { status = "gap", need = "collect_all_async", wave = "W8" }
 concat = { status = "param", batcher = "bt.concat", need = "how='diagonal_relaxed', 'align', 'horizontal' and relaxed supertype unification", wave = "W2" }
@@ -83,7 +83,7 @@ last = { status = "param", batcher = "bt.last", need = "order_by optional, and p
 len = { status = "canonical", batcher = "bt.count" }
 linear_space = { status = "gap", need = "linear_space", wave = "W6" }
 linear_spaces = { status = "gap", need = "linear_spaces", wave = "W6" }
-lit = { status = "param", batcher = "bt.lit", need = "list and ndarray literals, Polars dtype objects, allow_object=", wave = "W2" }
+lit = { status = "param", batcher = "bt.lit", need = "list and ndarray literals, Polars dtype objects, allow_object=", wave = "W2", template = 'lit(value) <-> bt.lit(value)' }
 map_batches = { status = "gap", need = "map_batches over several expressions (vectorized UDF)", wave = "W11" }
 map_groups = { status = "gap", need = "map_groups over several expressions (UDF per group)", wave = "W11" }
 max = { status = "mismatch", batcher = "bt.max", note = "Polars max ignores NaN; Batcher orders NaN above every number and returns NaN. Param: nan_policy='ignore'", wave = "W0" }
@@ -127,5 +127,5 @@ union = { status = "canonical", batcher = "bt.concat" }
 unregister_extension_type = { status = "gap", need = "extension type registry", wave = "W11" }
 using_string_cache = { status = "out_of_scope", reason = "no global Categorical string cache: Arrow dictionaries are per batch" }
 var = { status = "param", batcher = "bt.var", need = "ddof=", wave = "W2" }
-when = { status = "param", batcher = "bt.when", need = "when/then without otherwise (null default), otherwise(None), several conditions and **constraints in one when()", wave = "WF" }
+when = { status = "param", batcher = "bt.when", need = "when/then without otherwise (null default), otherwise(None), several conditions and **constraints in one when()", wave = "WF", template = 'when(predicate) -> bt.when(predicate)' }
 zeros = { status = "gap", need = "zeros expression", wave = "W8" }

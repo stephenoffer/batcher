@@ -48,7 +48,7 @@ from_pandas_refs = { status = "out_of_scope", reason = "Ray object-store block r
 from_spark = { status = "canonical", batcher = "bt.from_spark" }
 from_tf = { status = "mismatch", batcher = "bt.from_tf", note = "A tf.data.Dataset of dict elements converts identically; for non-dict elements Ray names the column 'item' and Batcher names it 'data'. Codemod: .rename(data='item').", wave = "W0" }
 from_torch = { status = "mismatch", batcher = "bt.from_torch", note = "Ray from_torch wraps each item of a map-style torch Dataset in an 'item' column; Batcher from_torch adapts tensors (one column per tensor) and raises AttributeError on a Dataset whose items are not tensors.", wave = "W0" }
-range = { status = "mismatch", batcher = "bt.range", note = "Ray range(n) names its column 'id'; Batcher bt.range names it 'value'. Codemod: bt.range(n, name='id').", wave = "W0" }
+range = { status = "mismatch", batcher = "bt.range", note = "Ray range(n) names its column 'id'; Batcher bt.range names it 'value'. Codemod: bt.range(n, name='id').", wave = "W0", template = 'range(n) -> bt.range(n, name="id")' }
 range_tensor = { status = "gap", need = "range of fixed-shape tensor rows (range_tensor(n, shape=))", wave = "W11" }
 read_audio = { status = "mismatch", batcher = "bt.read.audio", note = "Ray decodes by default into 'amplitude' and 'sample_rate' columns; Batcher read.audio defaults decode=False. Codemod passes decode=True; verify output column names.", wave = "W12" }
 read_avro = { status = "alias", batcher = "bt.read.avro" }

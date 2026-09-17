@@ -67,5 +67,5 @@ udtf = { status = "gap", need = "Python UDTF protocol: @udtf class decorator wit
 unwrap_udt = { status = "out_of_scope", reason = "JVM user-defined types; no JVM" }
 user = { status = "gap", need = "current user name", wave = "W9" }
 version = { status = "mismatch", batcher = "bt.engine_version", note = "Spark version() is a column expression; bt.engine_version() returns a Python str", wave = "W1" }
-when = { status = "param", batcher = ["bt.when", "CaseBuilder.then"], need = "when(condition, value) in one call, and a chain without otherwise() returning null", wave = "WF" }
+when = { status = "param", batcher = ["bt.when", "CaseBuilder.then"], need = "when(condition, value) in one call, and a chain without otherwise() returning null", wave = "WF", template = 'when(condition, value) -> bt.when(condition).then(value)' }
 zeroifnull = { status = "canonical", batcher = "Expr.fill_null" }
