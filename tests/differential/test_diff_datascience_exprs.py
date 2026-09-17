@@ -85,7 +85,7 @@ def test_rank_rejects_unknown_method(ds):
     from batcher._internal.errors import PlanError
 
     with pytest.raises(PlanError, match="method must be one of"):
-        col("x").rank("average")
+        col("x").rank("random")
 
 
 def test_is_duplicated_matches_duckdb(duck, ds):

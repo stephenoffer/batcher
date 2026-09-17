@@ -64,8 +64,8 @@ pub(crate) fn eval_math2(
     // `Int16` that fell through to the float promotion below, so `round(CAST(i AS SMALLINT), 0)`
     // came back DOUBLE while `round(i, 0)` came back BIGINT — the same expression typed two
     // ways depending on an upstream cast.
-    if matches!(func, Math2Func::Round) && l.data_type().is_integer() {
-        return round_int(l, r);
+    if matches!(func, Math2Func::Round | Math2Func::RoundEven) && l.data_type().is_integer() {
+        return round_int(l, r, matches!(func, Math2Func::RoundEven));
     }
     let lf = cast(l, &DataType::Float64)?;
     let rf = cast(r, &DataType::Float64)?;
@@ -87,7 +87,7 @@ fn apply_binary(func: Math2Func, x: f64, y: f64) -> f64 {
     match func {
         Math2Func::Pow => x.powf(y),
         Math2Func::Atan2 => x.atan2(y),
-        Math2Func::Round => {
+        Math2Func::Round | Math2Func::RoundEven => {
             let f = 10f64.powi(y as i32);
             let scaled = x * f;
             // A magnitude that overflows when scaled has no representable fractional
@@ -100,6 +100,8 @@ fn apply_binary(func: Math2Func, x: f64, y: f64) -> f64 {
                 // `10^y` underflowed: every value rounds to the nearest multiple of a
                 // number larger than any f64, which is zero.
                 0.0
+            } else if matches!(func, Math2Func::RoundEven) {
+                round_ties_even(scaled) / f
             } else {
                 scaled.round() / f
             }
@@ -141,9 +143,10 @@ fn next_after(from: f64, to: f64) -> f64 {
 /// `round(x, digits)` over an Int64 column, computed on the true i64 value.
 ///
 /// A non-negative `digits` is the identity on an integer. A negative `digits` rounds to
-/// that power of ten, half away from zero (DuckDB's direction), in `i128` so the scaled
-/// intermediate cannot overflow on the way.
-fn round_int(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
+/// that power of ten, half away from zero (DuckDB's direction) or, for `even`, half to
+/// even (DuckDB `round_even`'s values), in `i128` so the scaled intermediate cannot
+/// overflow on the way.
+fn round_int(l: &ArrayRef, r: &ArrayRef, even: bool) -> Result<ArrayRef, ExprError> {
     let ri = cast(r, &DataType::Int64)?;
     // `l` is cast rather than downcast: the caller admits every integer width, and
     // `as_primitive` on a narrower one panics rather than returning an error.
@@ -151,8 +154,30 @@ fn round_int(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
     let a = li.as_primitive::<Int64Type>();
     let b = ri.as_primitive::<Int64Type>();
     // `binary` unions the two null buffers once instead of testing validity per row.
-    let out: Int64Array = binary(a, b, round_i64)?;
+    let out: Int64Array = if even {
+        binary(a, b, round_i64_even)?
+    } else {
+        binary(a, b, round_i64)?
+    };
     Ok(Arc::new(out))
+}
+
+/// One `round_even(x, digits)` on i64: nearest multiple of `10^-digits`, ties to the even
+/// multiple.
+#[inline]
+fn round_i64_even(x: i64, digits: i64) -> i64 {
+    if digits >= 0 {
+        return x;
+    }
+    let f = 10i128.pow((-digits).min(19) as u32);
+    let v = i128::from(x);
+    // Floored quotient and a remainder in [0, f), so the tie test is one comparison
+    // whatever the sign.
+    let q = v.div_euclid(f);
+    let rem = v.rem_euclid(f);
+    let twice = 2 * rem;
+    let up = twice > f || (twice == f && q.rem_euclid(2) == 1);
+    ((if up { q + 1 } else { q }) * f) as i64
 }
 
 /// One `round(x, digits)` on i64, half away from zero.
@@ -476,8 +501,10 @@ fn round_ties_even(v: f64) -> f64 {
     let r = v.round();
     // `round` broke the tie away from zero. A tie is exactly a half, so detect it and
     // step back one when that landed on an odd integer.
+    // Stepping back keeps the input's sign, so `-0.5` lands on `-0.0` as IEEE (and DuckDB's
+    // `round_even`/`rint`) do; `r - signum` alone produced `+0.0` there.
     if (v - v.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
-        r - v.signum()
+        (r - v.signum()).copysign(v)
     } else {
         r
     }
@@ -734,6 +761,67 @@ mod int_math_tests {
         )
         .unwrap();
         assert_eq!(as_i64(&wide), vec![Some(0)]);
+    }
+
+    /// `round_even` breaks ties to the even neighbour on both paths and keeps `round`'s
+    /// guards: DuckDB 1.5.5 `round_even(2.5, 0)` 2.0, `(-2.5, 0)` -2.0, `(0.25, 1)` 0.2,
+    /// `(1.25, 1)` 1.2, `(2.675, 2)` 2.68, `(1e308, 1)` 1e308; integers `(-25, -1)` -20,
+    /// `(15, -1)` 20, `(-15, -1)` -20.
+    #[test]
+    fn round_even_ties_to_even_on_both_paths() {
+        let f: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(2.5),
+            Some(-2.5),
+            Some(3.5),
+            Some(0.25),
+            Some(1.25),
+            Some(2.675),
+            Some(1e308),
+            Some(-0.5),
+            None,
+        ]));
+        let digits = i64arr(vec![
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(1),
+            Some(0),
+            Some(0),
+        ]);
+        let r = eval_math2(Math2Func::RoundEven, &f, &digits).unwrap();
+        let got: Vec<Option<f64>> = r.as_primitive::<Float64Type>().iter().collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(2.0),
+                Some(-2.0),
+                Some(4.0),
+                Some(0.2),
+                Some(1.2),
+                Some(2.68),
+                Some(1e308),
+                Some(-0.0),
+                None
+            ]
+        );
+        assert!(got[7].unwrap().is_sign_negative(), "-0.5 rounds to -0.0");
+        let ints = i64arr(vec![
+            Some(-25),
+            Some(15),
+            Some(-15),
+            Some(25),
+            Some(26),
+            None,
+        ]);
+        let r = eval_math2(Math2Func::RoundEven, &ints, &i64arr(vec![Some(-1); 6])).unwrap();
+        assert_eq!(r.data_type(), &DataType::Int64);
+        assert_eq!(
+            as_i64(&r),
+            vec![Some(-20), Some(20), Some(-20), Some(20), Some(30), None]
+        );
     }
 
     /// `lcm` is Int64 and errors on i64 overflow rather than wrapping or losing precision.

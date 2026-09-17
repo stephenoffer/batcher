@@ -2,7 +2,7 @@
 
 Every default here is DuckDB's, and each parameterised form is checked against the DuckDB
 expression that spells the same meaning: ``coalesce(sum(x), 0)`` for ``sum(empty_value=0)``,
-``arg_max_null`` for ``arg_max(ignore_nulls=False)``, a sorted ``list`` indexed at
+``arg_max_null`` for ``max_by(ignore_nulls=False)``, a sorted ``list`` indexed at
 ``floor``/``ceil``/``round`` of the rank for the Polars quantile interpolations. The
 competitor side of the same claim is `test_diff_agg_competitor_params.py`.
 
@@ -171,8 +171,8 @@ AGGREGATES: dict[str, tuple] = {
     ),
     "first_keeps_null": (col("i").first("k", ignore_nulls=False), "arg_min_null(i, k)"),
     "last_keeps_null": (col("i").last("k", ignore_nulls=False), "arg_max_null(i, k)"),
-    "arg_min_keeps_null": (col("x").arg_min("k", ignore_nulls=False), "arg_min_null(x, k)"),
-    "arg_max_default": (col("x").arg_max("k"), "arg_max(x, k)"),
+    "arg_min_keeps_null": (col("x").min_by("k", ignore_nulls=False), "arg_min_null(x, k)"),
+    "arg_max_default": (col("x").max_by("k"), "arg_max(x, k)"),
     "var_ddof0": (col("y").var(ddof=0), "var_pop(y)"),
     "std_ddof0": (col("y").std(ddof=0), "stddev_pop(y)"),
     "std_ddof2": (
@@ -372,7 +372,7 @@ def test_default_forms_serialize_as_before():
         (col("x").max(nan_policy="propagate"), "max"),
         (col("x").skew(bias=False), "skewness"),
         (col("x").mode(all_modes=False), "mode"),
-        (col("x").arg_max("k", ignore_nulls=True), "arg_max"),
+        (col("x").max_by("k", ignore_nulls=True), "arg_max"),
         (col("x").std(ddof=1), "stddev"),
         (col("x").entropy(2.0), "entropy"),
     ]:

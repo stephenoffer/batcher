@@ -76,8 +76,8 @@ _TYPED_UNARY_COMPOSITE = {
 # the order DuckDB documents: `arg_max(value, ordering_key)`, `regr_slope(y, x)`,
 # `covar_pop(y, x)`.
 _TYPED_BINARY = {
-    "argmax": lambda a, b: a.arg_max(b),
-    "argmin": lambda a, b: a.arg_min(b),
+    "argmax": lambda a, b: a.max_by(b),
+    "argmin": lambda a, b: a.min_by(b),
     "corr": lambda a, b: AggExpr("corr", a, input2=b),
     "covarpop": lambda a, b: AggExpr("covar_pop", a, input2=b),
     "covarsamp": lambda a, b: AggExpr("covar_samp", a, input2=b),
@@ -118,7 +118,7 @@ _ANON: dict[str, object] = {
 _ANON_PARAM: dict[str, object] = {
     "quantile_disc": lambda x, p: x.quantile_disc(p),
     "percentile_disc": lambda x, p: x.quantile_disc(p),
-    "approx_top_k": lambda x, p: x.top_k(int(p)),
+    "approx_top_k": lambda x, p: x.mode_top_k(int(p)),
 }
 
 #: Every DuckDB aggregate name that arrives as `exp.Anonymous`. The collection sites
@@ -308,7 +308,7 @@ def build_typed_agg(tr, node) -> AggExpr | Expr | None:
         )
     if kind == "approxtopk":
         count = node.args.get("expression")
-        return tr._scalar(node.this).top_k(int(_fraction(count)))
+        return tr._scalar(node.this).mode_top_k(int(_fraction(count)))
     if kind == "approxquantile":
         return AggExpr(
             "approx_quantile",

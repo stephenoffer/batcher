@@ -12,7 +12,7 @@ A parameter left at its default never reaches this module: the method returns th
 `AggExpr`, so an existing plan serializes exactly as it did.
 
 The parameters that do need state (`quantile(interpolation=)`, `skew(bias=True)`,
-`mode(all_modes=True)`, `arg_min(ignore_nulls=False)`) are engine kernels instead, and live
+`mode(all_modes=True)`, `min_by(ignore_nulls=False)`) are engine kernels instead, and live
 beside the aggregate they extend in `bc-runtime`.
 """
 

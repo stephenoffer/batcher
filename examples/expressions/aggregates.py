@@ -39,8 +39,8 @@ def main() -> None:
         first_v=bt.first("v", order_by="w"),
         last_v=bt.last("v", order_by="w"),
         # The value of one column at the row where another is extreme.
-        w_at_max_v=bt.arg_max("w", col("v")),
-        w_at_min_v=bt.arg_min("w", col("v")),
+        w_at_max_v=bt.max_by("w", col("v")),
+        w_at_min_v=bt.min_by("w", col("v")),
         # Boolean reductions.
         any_flag=col("flag").bool_or(),
         all_flag=col("flag").bool_and(),

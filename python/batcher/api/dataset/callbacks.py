@@ -479,6 +479,19 @@ class Udf:
         return Udf(self.fn, per_row=self.per_row, config={**self.config, **config})
 
     def __call__(self, target: Any) -> Any:
+        from batcher._internal.errors import PlanError
+        from batcher.plan.expr_ir.core import AggExpr, Expr
+
+        if isinstance(target, (Expr, AggExpr)):
+            # Spark's `udf(f)(col)` shape. Running `fn` on the expression evaluated it once, at
+            # plan time, on the expression object: `lambda s: s + 1` quietly built a plain
+            # expression and `lambda s: s.upper()` raised an unrelated AttributeError.
+            raise PlanError(
+                "a @udf applies to a Dataset (or a batch), not to a column expression: "
+                "write `my_udf(ds)`, or `ds.map_batches(fn)` for a batch function. A "
+                "per-row column function is `ds.map(fn)`; most column logic is an "
+                "expression (`bt.col(...)...`) and needs no UDF."
+            )
         if not hasattr(target, "ml"):  # a batch (or a row), not a Dataset — run the fn itself
             return self.fn(target)
         if self.per_row:

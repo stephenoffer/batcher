@@ -687,7 +687,7 @@ def test_plain_date_trunc_still_translates(be):
     ("label", "agg"),
     [
         ("interpolation", lambda: col("y").quantile(0.5, "nearest")),
-        ("arg_max_null", lambda: col("y").arg_max("z", ignore_nulls=False)),
+        ("arg_max_null", lambda: col("y").max_by("z", ignore_nulls=False)),
         ("skewness_pop", lambda: col("y").skew(bias=True)),
         ("modes", lambda: col("y").mode(all_modes=True)),
     ],
@@ -725,3 +725,48 @@ def test_framed_or_null_skipping_value_window_declines(be, window):
     whole = bt.last_value("y").over(partition_by="x", order_by="y", frame=(None, None))
     got, exp = _run(lambda ds: ds.with_columns(r=whole), table, be)
     _assert_matches(got, exp, be)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: col("a") ^ col("b"),
+        lambda: col("x").round(1, mode="half_to_even"),
+        lambda: col("l").list.sort(nulls_last=False),
+        lambda: col("l").list.unique(drop_nulls=False),
+        lambda: col("l").list.n_unique(count_nulls=True),
+        lambda: col("x").hash(algorithm="murmur3"),
+    ],
+    ids=["bool_xor", "round_even", "sort_nulls_first", "unique_nulls", "n_unique_nulls", "murmur3"],
+)
+def test_scalar_and_list_parameter_forms_decline(be, build):
+    """The forms the scalar and list parameters put on the wire are not translated.
+
+    Boolean `^` answers a boolean in the engine where the device's bit path answers an
+    integer; `round_even`, the null-keeping list kernels and the engine-compatible hashes
+    have no translation. None may run as its default form, which would be a wrong answer
+    rather than a fallback; translating any of them needs a recorded `gpu_shadow_verify` run.
+    """
+    table = pa.table(
+        {
+            "a": pa.array([True, None]),
+            "b": pa.array([False, True]),
+            "x": pa.array([2.25, None], type=pa.float64()),
+            "l": pa.array([[1, None, 1], None], type=pa.list_(pa.int64())),
+        }
+    )
+    spec = gpu_plan_ops(bt.from_arrow(table).select(r=build())._plan)
+    assert spec is not None, "the projection is eligible; the form is what must decline"
+    with pytest.raises(Unsupported):
+        run_chain(table, spec[1], be)
+
+
+def test_integer_bit_xor_still_translates(be):
+    """Positive control: an integer `^`, and a boolean `^` against an integer, still run."""
+    table = pa.table(
+        {"a": pa.array([6, 3]), "b": pa.array([3, None]), "f": pa.array([True, False])}
+    )
+    for expr in (col("a") ^ col("b"), col("f") ^ col("a")):
+        spec = gpu_plan_ops(bt.from_arrow(table).select(r=expr)._plan)
+        assert spec is not None
+        run_chain(table, spec[1], be)

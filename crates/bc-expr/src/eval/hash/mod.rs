@@ -23,7 +23,25 @@ use arrow::array::{Array, ArrayRef, AsArray, Int64Array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 
-use crate::ExprError;
+use crate::{ExprError, HashAlgorithm};
+
+mod compat;
+
+/// Evaluate `hash(inputs…, seed)` under `algorithm`: Batcher's own digest, or one of the
+/// engine-compatible ones in [`compat`].
+pub(crate) fn eval_hash_with(
+    args: &[ArrayRef],
+    seed: i64,
+    algorithm: HashAlgorithm,
+    rows: usize,
+) -> Result<ArrayRef, ExprError> {
+    match algorithm {
+        HashAlgorithm::Batcher => eval_hash(args, seed, rows),
+        HashAlgorithm::Murmur3 => compat::spark_murmur3(args, seed, rows),
+        HashAlgorithm::Iceberg => compat::iceberg_murmur3(args),
+        HashAlgorithm::Xxhash3 => compat::daft_xxh3(args, seed),
+    }
+}
 
 /// A distinct, arbitrary constant mixed in for a null so it is a *value*, not an
 /// absence: without it `hash(1, NULL)` and `hash(NULL, 1)` would coincide.

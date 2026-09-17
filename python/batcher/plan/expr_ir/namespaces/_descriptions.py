@@ -214,15 +214,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("xs").list.len()).to_pydict()\n'
         "        {'r': [3]}"
     ),
-    "sum": (
-        "The sum of the elements of each list.\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.sum()).to_pydict()\n'
-        "        {'r': [6]}"
-    ),
     "min": (
         "The smallest element of each list.\n\n"
         "Examples:\n"
@@ -250,35 +241,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("xs").list.mean()).to_pydict()\n'
         "        {'r': [2.0]}"
     ),
-    "n_unique": (
-        "The count of distinct elements in each list (→ Int64).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.n_unique()).to_pydict()\n'
-        "        {'r': [3]}"
-    ),
-    "sort": (
-        "Each list sorted ascending (→ list).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.sort()).to_pydict()\n'
-        "        {'r': [[1, 2, 3]]}"
-    ),
-    "sort_desc": (
-        "Each list sorted descending, nulls last (\u2192 list).\n\n"
-        "Not the reverse of :meth:`sort`: ascending puts nulls last, so reversing would\n"
-        "move them to the front. DuckDB's ``list_reverse_sort`` leaves them at the back.\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[3, 1, None, 2]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.sort_desc()).to_pydict()\n'
-        "        {'r': [[3, 2, 1, None]]}"
-    ),
     "product": (
         "The product of the elements of each list.\n\n"
         "Examples:\n"
@@ -305,15 +267,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.var()).to_pydict()\n'
         "        {'r': [1.0]}"
-    ),
-    "unique": (
-        "The distinct elements of each list, first-seen order preserved (→ list).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.unique()).to_pydict()\n'
-        "        {'r': [[1, 2, 3]]}"
     ),
     "median": (
         "The median of the elements of each list (→ Float64).\n\n"

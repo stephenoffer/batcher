@@ -228,8 +228,8 @@ value functions are window-only: bind them with `.over(partition_by=…, order_b
    nunique_ratio
    first
    last
-   arg_min
-   arg_max
+   min_by
+   max_by
    row_number
    rank
    dense_rank

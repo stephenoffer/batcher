@@ -442,7 +442,7 @@ def list_function(tr, node):
         # nulls last, so reversing lands them at the *front*, where DuckDB keeps them at
         # the back — `list_reverse_sort([4, NULL, 6])` is `[6, 4, NULL]`, not
         # `[NULL, 6, 4]`.
-        return value.list.sort_desc() if descending else value.list.sort()
+        return value.list.sort(descending=descending)
     # sqlglot promotes a few vector functions to typed nodes (two args in `this`/`expression`)
     # rather than `Anonymous`; dispatch them to the same binary `.list` methods.
     typed_binary = _LIST_TYPED_BINARY.get(type(node).__name__)

@@ -149,6 +149,7 @@ def _representatives() -> dict[str, Any]:
             ],
         ),
         "math2": Math2Expr("pow", _X, Lit(2)),
+        "math2_round_even": Math2Expr("round_even", _X, Lit(2)),
         "coalesce": Coalesce([_X, Lit(0)]),
         # --- nodes.py leaves ----------------------------------------------------
         "case": Case([(_PRED, Lit(1))], Lit(0)),
@@ -158,6 +159,8 @@ def _representatives() -> dict[str, Any]:
         "array": Array([Lit(1), Lit(2)]),
         "hash": HashRows([_X, _Y], 7),
         "hash_default_seed": HashRows([_X], 0),
+        # An engine-compatible digest names itself; Batcher's own stays off the wire.
+        "hash_algorithm": HashRows([_X, _Y], 42, "murmur3"),
         "sequence": Sequence(Lit(1), Lit(10), Lit(2)),
         "make_struct": MakeStruct([("a", _X), ("b", Lit(1))]),
         "make_map": MakeMap(_X, Lit(1)),
@@ -199,7 +202,10 @@ def _representatives() -> dict[str, Any]:
         "window_buckets": WindowBuckets(Col("d"), 1000, 500),
         # --- list / collection --------------------------------------------------
         "list_func": ListFunc("sum", Col("a")),
+        "list_func_nulls_first": ListFunc("sort_desc_nulls_first", Col("a")),
+        "list_func_with_nulls": ListFunc("unique_with_nulls", Col("a")),
         "list_binary": ListBinary("dot", Col("a"), Col("b")),
+        "list_binary_jaccard_nonzero": ListBinary("jaccard_nonzero", Col("a"), Col("b")),
         "list_set": ListSet("array_intersect", Col("a"), Col("b")),
         "list_zip": ListZip("list_add", Col("a"), Col("b")),
         "list_transform": ListTransform(Col("a"), _ELEM),

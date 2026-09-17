@@ -131,7 +131,7 @@ def test_arg_extreme_partition_independent():
     )
     _assert_chunk_invariant(
         lambda ds: ds.group_by("g").agg(
-            hi=col("val").arg_max(by=col("key")), lo=col("val").arg_min(by=col("key"))
+            hi=col("val").max_by(by=col("key")), lo=col("val").min_by(by=col("key"))
         ),
         t,
     )

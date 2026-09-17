@@ -16,6 +16,7 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher.plan.expr_ir import Expr, coalesce, lit, nullif, when
+from batcher.plan.expr_ir.core import MathExpr
 
 __all__ = ["spark_function"]
 
@@ -146,7 +147,7 @@ def spark_function(tr, node) -> Expr | None:
         # does. Scaling by 10^d and back is the standard way to get it at `d` digits.
         digits = _const_int_arg(args[1], "bround(): digits")
         factor = lit(10.0**digits)
-        return (tr._scalar(args[0]) * factor).rint() / factor
+        return MathExpr("rint", tr._scalar(args[0]) * factor) / factor
     if name in _UTF8_VALID and len(args) == 1:
         return _utf8_validity(tr._scalar(args[0]), _UTF8_VALID[name])
     if name in ("timezone_hour", "timezone_minute") and len(args) == 1:

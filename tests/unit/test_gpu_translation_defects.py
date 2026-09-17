@@ -131,11 +131,14 @@ def test_capitalize_reaches_the_device(be):
 # --- a wrong column: booleans through the bit operators --------------------------------
 
 
-@pytest.mark.parametrize("fn", ["bitwise_and", "bitwise_or", "bitwise_xor"])
+@pytest.mark.parametrize("fn", ["bitwise_and", "bitwise_or"])
 def test_a_bit_operator_over_booleans_answers_in_an_integer(be, fn):
-    """The engine (and DuckDB) return an integer; both libraries return a boolean.
+    """The engine returns an integer for `&`/`|` bit ops over booleans; both libraries a boolean.
 
-    The values agree and the column does not, which a fan-out cannot concatenate.
+    The values agree and the column does not, which a fan-out cannot concatenate. `bit_xor`
+    over two booleans is a boolean in the engine (the exclusive-or of the predicates), and
+    that form declines on the device (see
+    `test_gpu_plan.py::test_scalar_and_list_parameter_forms_decline`).
     """
     ds = bt.from_arrow(NUMBERS).select(out=getattr(col("b"), fn)(col("b")))
     _assert_matches_engine(ds, NUMBERS, be)

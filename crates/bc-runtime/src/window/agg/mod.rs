@@ -126,8 +126,11 @@ impl Moments {
             return None;
         }
         // M2 is a sum of squares of *deviations*, so it is non-negative by construction;
-        // the clamp guards only against a -0.0 sneaking into `sqrt`.
-        Some((self.m2.max(0.0)) / (self.n - ddof) as f64)
+        // the clamp guards only against a -0.0 sneaking into `sqrt`. It is a comparison
+        // rather than `f64::max`, which returns the non-NaN operand: a frame holding a NaN
+        // answered a confident 0.0 variance instead of NaN.
+        let m2 = if self.m2 < 0.0 { 0.0 } else { self.m2 };
+        Some(m2 / (self.n - ddof) as f64)
     }
 
     #[inline]
@@ -797,6 +800,26 @@ mod tests {
         let values: ArrayRef = Arc::new(NullArray::new(3));
         let out = broadcast(WindowFn::CountDistinct, &[0, 0, 1], 2, &values).unwrap();
         assert_eq!(out.as_primitive::<Int64Type>().values(), &[0, 0, 0]);
+    }
+
+    /// A NaN makes the variance of the frames that hold it NaN, and only those: the
+    /// non-negativity clamp was `f64::max`, which drops a NaN operand, so a frame over
+    /// `[1.0, NaN]` answered 0.0. Polars `rolling_var` answers NaN there.
+    #[test]
+    fn a_nan_poisons_only_the_frames_that_hold_it() {
+        use crate::window::frame::{Frame, FrameBound, FrameUnit};
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![1.0, f64::NAN, 3.0, 4.0]));
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(1),
+            end: FrameBound::CurrentRow,
+        };
+        let ordered = vec![vec![0, 1, 2, 3]];
+        let out = framed(WindowFn::Var, &ordered, &values, frame, None, None, 4).unwrap();
+        let out = out.as_primitive::<Float64Type>();
+        assert!(out.is_null(0), "one value has no sample variance");
+        assert!(out.value(1).is_nan() && out.value(2).is_nan());
+        assert_eq!(out.value(3), 0.5);
     }
 
     /// The directly-keyed types still take the direct path and still agree.

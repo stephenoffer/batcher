@@ -23,14 +23,14 @@ from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
 from batcher.plan.functions.aggregate import _as_column, covar_pop
 
 __all__ = [
-    "arg_max",
-    "arg_min",
     "cv",
     "first",
     "geometric_mean",
     "harmonic_mean",
     "last",
+    "max_by",
     "midrange",
+    "min_by",
     "non_null_rate",
     "null_rate",
     "nunique_ratio",
@@ -339,8 +339,8 @@ def last(column: str | Expr, order_by: IntoExpr, *, ignore_nulls: bool = True) -
     return _as_column(column).last(order_by, ignore_nulls=ignore_nulls)
 
 
-def arg_min(value: str | Expr, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
-    """The `value` at the row where `by` is smallest (SQL ``ARG_MIN`` / ``MIN_BY``).
+def min_by(value: str | Expr, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+    """The `value` at the row where `by` is smallest (SQL ``MIN_BY`` / ``ARG_MIN``).
 
     Args:
         value: The column (or expression) whose value to return.
@@ -356,14 +356,14 @@ def arg_min(value: str | Expr, by: IntoExpr, *, ignore_nulls: bool = True) -> Ag
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"g": ["a", "a"], "x": [10, 20], "t": [3, 1]})
-            >>> ds.group_by("g").agg(v=bt.arg_min("x", "t")).to_pydict()
+            >>> ds.group_by("g").agg(v=bt.min_by("x", "t")).to_pydict()
             {'g': ['a'], 'v': [20]}
     """
-    return _as_column(value).arg_min(by, ignore_nulls=ignore_nulls)
+    return _as_column(value).min_by(by, ignore_nulls=ignore_nulls)
 
 
-def arg_max(value: str | Expr, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
-    """The `value` at the row where `by` is largest (SQL ``ARG_MAX`` / ``MAX_BY``).
+def max_by(value: str | Expr, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+    """The `value` at the row where `by` is largest (SQL ``MAX_BY`` / ``ARG_MAX``).
 
     Args:
         value: The column (or expression) whose value to return.
@@ -379,10 +379,10 @@ def arg_max(value: str | Expr, by: IntoExpr, *, ignore_nulls: bool = True) -> Ag
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"g": ["a", "a"], "x": [10, 20], "t": [3, 1]})
-            >>> ds.group_by("g").agg(v=bt.arg_max("x", "t")).to_pydict()
+            >>> ds.group_by("g").agg(v=bt.max_by("x", "t")).to_pydict()
             {'g': ['a'], 'v': [10]}
     """
-    return _as_column(value).arg_max(by, ignore_nulls=ignore_nulls)
+    return _as_column(value).max_by(by, ignore_nulls=ignore_nulls)
 
 
 def value_range(column: str | Expr) -> Expr:

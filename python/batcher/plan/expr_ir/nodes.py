@@ -39,6 +39,9 @@ class HashRows(IRNode):
     tag = ExprTag.HASH
     inputs: list[Expr] = children()
     seed: int = scalar(omit_falsy=True, default=0)
+    # `None` is Batcher's own digest and stays off the wire, so an existing plan
+    # serializes byte-identically; the others name an engine-compatible digest.
+    algorithm: str | None = scalar(omit_none=True, default=None)
 
 
 @expr_node

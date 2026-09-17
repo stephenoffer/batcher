@@ -313,6 +313,21 @@
     ],
     "seed": 7
   },
+  "hash_algorithm": {
+    "algorithm": "murmur3",
+    "e": "hash",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "col",
+        "name": "y"
+      }
+    ],
+    "seed": 42
+  },
   "hash_default_seed": {
     "e": "hash",
     "inputs": [
@@ -461,6 +476,18 @@
       "name": "b"
     }
   },
+  "list_binary_jaccard_nonzero": {
+    "e": "list_binary",
+    "fn": "jaccard_nonzero",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
   "list_contains": {
     "e": "list_contains",
     "input": {
@@ -495,6 +522,22 @@
   "list_func": {
     "e": "list",
     "fn": "sum",
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "list_func_nulls_first": {
+    "e": "list",
+    "fn": "sort_desc_nulls_first",
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "list_func_with_nulls": {
+    "e": "list",
+    "fn": "unique_with_nulls",
     "input": {
       "e": "col",
       "name": "a"
@@ -734,6 +777,20 @@
   "math2": {
     "e": "math2",
     "fn": "pow",
+    "left": {
+      "e": "col",
+      "name": "x"
+    },
+    "right": {
+      "e": "lit",
+      "value": {
+        "int": 2
+      }
+    }
+  },
+  "math2_round_even": {
+    "e": "math2",
+    "fn": "round_even",
     "left": {
       "e": "col",
       "name": "x"

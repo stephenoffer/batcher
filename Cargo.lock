@@ -619,6 +619,7 @@ dependencies = [
  "symphonia",
  "thiserror",
  "twox-hash 1.6.3",
+ "twox-hash 2.1.2",
  "zstd 0.13.3",
 ]
 

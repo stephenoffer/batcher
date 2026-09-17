@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1477 Python modules across 216 packages and 292 Rust files across 15 crates.
+Covering 1477 Python modules across 216 packages and 293 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -203,8 +203,8 @@ The `Dataset` builder package.
 | `_export.py` | 287 | Framework-export helpers behind `Dataset.to_torch` / `to_tf` and the engine hand-offs. |
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
-| `_window.py` | 139 | Lowering of window expressions into the relational `Window` operator. |
-| `callbacks.py` | 540 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
+| `_window.py` | 148 | Lowering of window expressions into the relational `Window` operator. |
+| `callbacks.py` | 553 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
 | `frame.py` | 5959 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 3560 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
@@ -348,7 +348,7 @@ Session entry points that create `Dataset`s.
 | `frames.py` | 515 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
 | `frameworks.py` | 465 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
-| `onboarding.py` | 140 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
+| `onboarding.py` | 149 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
 | `read.py` | 129 | The generic read dispatch behind the `bt.read` namespace. |
 | `sql.py` | 165 | The default SQL catalog: `bt.sql`, `bt.register_function` and `bt.register_model`. |
 | `versions.py` | 125 | Version and environment reporting (`engine_version`, `show_versions`). |
@@ -835,14 +835,14 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | module | lines | what it is |
 |---|---|---|
 | `aggregates.py` | 434 | DuckDB aggregate spellings → the Batcher aggregate surface. |
-| `anonymous.py` | 611 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
+| `anonymous.py` | 610 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
 | `collections.py` | 545 | SQL list/array functions — the Spark-shaped half, including the lambda forms. |
-| `functions.py` | 403 | Named-function dispatch for the SQL translator's scalar path. |
+| `functions.py` | 409 | Named-function dispatch for the SQL translator's scalar path. |
 | `json.py` | 157 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
-| `literals.py` | 557 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
+| `literals.py` | 556 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `maps.py` | 98 | SQL → `.map` accessor dispatch. |
 | `scalar.py` | 545 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
-| `spark.py` | 285 | Spark SQL names whose translation is a composition rather than a rename. |
+| `spark.py` | 286 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 222 | SQL string functions whose translation is more than a name lookup. |
 | `temporal.py` | 544 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
 
@@ -1020,7 +1020,7 @@ The *global* (no-``PARTITION BY``) ordered window, in bounded memory and across 
 | `boundary.py` | 123 | The one ordered-bucket correction that reads a *neighbouring* bucket's rows. |
 | `disk.py` | 191 | Distributed *global* ordered window over a disk Arrow-IPC shuffle. |
 | `flight.py` | 303 | Distributed *global* (no-``PARTITION BY``) ordered window over an Arrow Flight shuffle. |
-| `offsets.py` | 744 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
+| `offsets.py` | 740 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
 | `stream.py` | 103 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window, on one node. |
 
 ### `batcher/dist/gpu/` — 4 · backend
@@ -1214,7 +1214,7 @@ Kyber rule modules.
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
 | `agg_pushdown.py` | 583 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 | `fusion.py` | 396 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
-| `leaf_rewrite.py` | 311 | The shared machinery every leaf-level expression rule is built from. |
+| `leaf_rewrite.py` | 312 | The shared machinery every leaf-level expression rule is built from. |
 | `ordering.py` | 108 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 898 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 637 | Predicate pushdown — evaluate filters as early as possible. |
@@ -1407,7 +1407,7 @@ Null-reasoning rule families — three-valued logic and null-strictness.
 | module | lines | what it is |
 |---|---|---|
 | `strictness.py` | 328 | Push `IS NULL` / `IS NOT NULL` through the scalar functions that are null-strict. |
-| `three_valued.py` | 434 | Three-valued logic: collapsing the null predicates that other rules generate. |
+| `three_valued.py` | 435 | Three-valued logic: collapsing the null predicates that other rules generate. |
 
 ### `batcher/kyber/rules/predicate_algebra/` — 3 · subsystem
 
@@ -1678,7 +1678,7 @@ The translator's *named* vocabularies, one module per family — package façade
 |---|---|---|
 | `dates.py` | 149 | What the engine types as a calendar day, and how a temporal value is built from numbers. |
 | `lists.py` | 449 | List and vector expressions, built from the two primitives both dataframe libraries have. |
-| `operators.py` | 306 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
+| `operators.py` | 312 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
 | `regex.py` | 241 | The regular-expression functions, for the patterns three regex engines agree on. |
 | `strings.py` | 237 | The string function family — one entry per named function the engine ships. |
 
@@ -2335,13 +2335,13 @@ The scalar expression algebra.
 | module | lines | what it is |
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
-| `constructors.py` | 377 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6221 | The scalar expression base class and its core IR nodes. |
-| `fn_names.py` | 358 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
+| `constructors.py` | 413 | Module-level expression constructors (the user-facing entry points). |
+| `core.py` | 6484 | The scalar expression base class and its core IR nodes. |
+| `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 411 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
-| `nodes.py` | 553 | Leaf IR nodes the `Expr` base class does not construct. |
+| `nodes.py` | 556 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 273 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 412 | Structural traversals over the expression tree. |
@@ -2352,7 +2352,7 @@ Migration-error guidance for `Expr` and its typed accessors.
 
 | module | lines | what it is |
 |---|---|---|
-| `guidance.py` | 261 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
+| `guidance.py` | 263 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
 
@@ -2361,10 +2361,10 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | module | lines | what it is |
 |---|---|---|
 | `_bind.py` | 91 | Shared accessor-generation helper for the namespace families. |
-| `_descriptions.py` | 456 | The curated per-accessor docstrings, keyed by accessor name. |
+| `_descriptions.py` | 409 | The curated per-accessor docstrings, keyed by accessor name. |
 | `_dialect.py` | 54 | Plan-time constants for the `.str` parameters that select another engine's semantics. |
 | `_temporal_units.py` | 137 | The truncation-unit vocabulary shared by `.dt.truncate`/`floor`/`ceil`/`round`. |
-| `collections.py` | 1603 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 1796 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
 | `strings.py` | 4308 | The `.str` accessor namespace. |
 | `temporal.py` | 1335 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
@@ -2403,7 +2403,7 @@ The expression function library, grouped by family.
 | `partitioning.py` | 204 | Lakehouse partition transforms — the derived value a partitioned table stores. |
 | `quantiles.py` | 196 | Quantile, cardinality, and histogram aggregate shorthands. |
 | `regression.py` | 263 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
-| `scalar.py` | 411 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
+| `scalar.py` | 425 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
 | `security.py` | 333 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
 | `statistics.py` | 472 | Derived statistical aggregates built as expressions over mergeable primitives. |
 | `temporal.py` | 424 | Temporal free functions. |
@@ -2605,8 +2605,8 @@ Per-expression output-type inference — a column's Arrow type before the engine
 
 | module | lines | what it is |
 |---|---|---|
-| `arithmetic.py` | 356 | Output types for the arithmetic families: binary operators and the math functions. |
-| `collections.py` | 204 | Output types for the container accessors: `list`, `struct` and `map`. |
+| `arithmetic.py` | 364 | Output types for the arithmetic families: binary operators and the math functions. |
+| `collections.py` | 224 | Output types for the container accessors: `list`, `struct` and `map`. |
 | `dispatch.py` | 307 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `geospatial.py` | 106 | Output types for the `st_*` geometry and `quat_*`/`se3_*` rigid-body functions. |
 | `scalars.py` | 245 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
@@ -3056,7 +3056,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `shuffle.rs` | 1212 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 251 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window/agg/median_state.rs` | 82 | The running median's two-heap, kept apart from the aggregates that use it. |
-| `window/agg/mod.rs` | 754 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
+| `window/agg/mod.rs` | 757 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
 | `window/coerce.rs` | 193 | What a window value column has to be reshaped into before the typed kernels read it. |
 | `window/fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window/frame/bounds.rs` | 439 | Which rows a window frame covers — the geometry, with no arithmetic over them. |
@@ -3107,7 +3107,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `analyze.rs` | 526 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 174 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 766 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/binary.rs` | 778 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/branch/case.rs` | 71 | `CASE`: the first branch whose condition holds supplies the row's value. |
 | `eval/branch/coalesce.rs` | 76 | `COALESCE`: the first argument with a value supplies the row's value. |
 | `eval/branch/literal_case.rs` | 181 | A `CASE` whose arms are all literals, built in one pass instead of one array per arm. |
@@ -3116,21 +3116,22 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/cmp/mod.rs` | 11 | Comparison kernels for a column against a one-value literal. |
 | `eval/cmp/string.rs` | 318 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
-| `eval/dispatch.rs` | 523 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 527 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 382 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/grid.rs` | 238 | The grid and reference-system functions, which take plain numbers rather than geometry. |
 | `eval/geo/mod.rs` | 320 | Evaluation of the `Expr::Geo` variant — the array-level half of geospatial support. |
 | `eval/geo/scalar.rs` | 367 | The scalar-returning geospatial functions: accessors, measures, predicates, codecs. |
-| `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
+| `eval/hash/compat.rs` | 392 | Engine-compatible digests for `Expr::Hash` — Spark's `hash`, Iceberg's bucket hash, and Daft's default XXH3. |
+| `eval/hash/mod.rs` | 241 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
 | `eval/in_list.rs` | 271 | `x IN (lit, lit, …)` — hash-set membership. |
-| `eval/list.rs` | 768 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
+| `eval/list.rs` | 791 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 161 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
 | `eval/list_ops/gather.rs` | 175 | `list.gather` — reorder or select from a list by a second list of indices. |
-| `eval/list_ops/jaccard_str.rs` | 69 | `list.jaccard` over string element types. |
+| `eval/list_ops/jaccard_str.rs` | 126 | `list.jaccard` over string element types, and the non-zero-set Jaccard of two vectors. |
 | `eval/list_ops/lcs.rs` | 93 | `list.lcs_length` — the longest common subsequence length of two lists. |
 | `eval/list_ops/list_hof.rs` | 85 | Higher-order list ops for `Expr::ListTransform` / `Expr::ListFilter` (the `.list.transform` / `.list.filter` accessors). |
-| `eval/list_ops/list_reduce.rs` | 298 | Per-row numeric transforms over a `List` row for `eval/list.rs` (`normalize`, `softmax`, `log_softmax`, `arg_sort`, `cum_sum`, `diff`, `entropy`). |
+| `eval/list_ops/list_reduce.rs` | 326 | Per-row numeric transforms over a `List` row for `eval/list.rs` (`normalize`, `softmax`, `log_softmax`, `arg_sort`, `cum_sum`, `diff`, `entropy`). |
 | `eval/list_ops/list_reshape.rs` | 62 | Reshaping `List`-column operations that change nesting depth — currently `flatten` (`List<List<T>>` → `List<T>`). |
 | `eval/list_ops/list_set.rs` | 196 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
@@ -3140,7 +3141,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/map.rs` | 270 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/map_ops/make_map.rs` | 148 | Map construction for `Expr::MakeMap` — SQL `map(keys, values)`, Spark's `map_from_arrays` — pairing two `List` columns into one Arrow `Map` column. |
 | `eval/map_ops/mod.rs` | 9 | `Map`-column **construction**, as the counterpart to the read-side accessors in `eval/map.rs` (`map_keys`/`map_values`/`map_entries`/`element_at`). |
-| `eval/math.rs` | 551 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
+| `eval/math.rs` | 578 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 559 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image/hash.rs` | 159 | Perceptual hashes: the fingerprints that make image near-duplicate detection a join. |
 | `eval/media/image/mod.rs` | 705 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
@@ -3195,7 +3196,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/mod.rs` | 18 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/text.rs` | 232 | Text ↔ instant: `strftime` renders one, `strptime` reads one back. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 2553 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 2612 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 299 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 | `subset.rs` | 186 | Evaluating an expression over a *subset* of a batch's rows, and putting the answer back where it came from. |
 | `supertype.rs` | 207 | The common-supertype lattice over Arrow types — one answer for every tier. |

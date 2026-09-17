@@ -10,7 +10,7 @@ from typing import Any
 
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import LIST_UNSUPPORTED, accessor_attribute_error
-from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit, _wrap
+from batcher.plan.expr_ir.core import Coalesce, Expr, IntoExpr, Lit, _wrap
 from batcher.plan.expr_ir.func_nodes import (
     ListBinary,
     ListContains,
@@ -722,13 +722,18 @@ class _ListNamespace:
         """
         return ListGet(self._e, -1)
 
-    def contains(self, value: int | float | bool | str) -> ListContains:
+    def contains(self, value: int | float | bool | str, *, propagate_nulls: bool = False) -> Expr:
         """Test whether any element of each list equals ``value`` (→ Bool).
 
-        An empty list is ``False``; a null list is null.
+        An empty list is ``False``; a null list is null. A null element never matches,
+        so a list without ``value`` is ``False`` even when it holds a null (DuckDB
+        ``list_contains``). `propagate_nulls=True` is Spark's ``array_contains``, which
+        follows three-valued ``IN``: that case is null instead.
 
         Args:
             value: The literal to search for.
+            propagate_nulls: Answer null, not ``False``, when `value` is absent and the
+                list holds a null element.
 
         Returns:
             A new Boolean expression.
@@ -740,19 +745,54 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[3, 1, 2], [], None]})
                 >>> ds.select(bt.col("a").list.contains(1).alias("r")).to_pydict()
                 {'r': [True, False, None]}
-        """
-        return ListContains(self._e, value)
 
-    def position(self, value: int | float | bool | str) -> ListPosition:
+                >>> ds = bt.from_pydict({"a": [[1, None], [5, None]]})
+                >>> ds.select(r=bt.col("a").list.contains(5, propagate_nulls=True)).to_pydict()
+                {'r': [None, True]}
+        """
+        hit = ListContains(self._e, value)
+        if not propagate_nulls:
+            return hit
+        from batcher.plan.expr_ir.constructors import lit, when
+
+        unknown = lit(None, "bool")
+        return when(hit).then(Lit(True)).when(self._holds_null()).then(unknown).otherwise(hit)
+
+    def _holds_null(self) -> Expr:
+        """True where the list has a null element: dropping nulls shortens it."""
+        return ListFunc("len", self._e) > ListFunc("len", self.drop_nulls())
+
+    def _zero_unless_null(self) -> Expr:
+        """``0`` for a non-null list and null for a null one: its length times zero."""
+        return ListFunc("len", self._e) * Lit(0)
+
+    @staticmethod
+    def _null_unless(keep: Expr, result: Expr) -> Expr:
+        """`result` where `keep` holds, else a null of `result`'s own list type.
+
+        A null literal has no list type to take, so the null comes from gathering `result`
+        at positions that are ``[0, len)`` where `keep` holds and a null list elsewhere:
+        gathering at a null position list is a null row.
+        """
+        from batcher.plan.expr_ir.constructors import lit, when
+        from batcher.plan.functions.collection import sequence
+
+        last = when(keep).then(ListFunc("len", result) - Lit(1)).otherwise(lit(None, "int64"))
+        return ListSet("array_gather", result, sequence(Lit(0), last))
+
+    def position(self, value: int | float | bool | str, *, zero_if_absent: bool = False) -> Expr:
         """Return the 1-based index of the first element equal to ``value``; null if absent.
 
         DuckDB ``list_position`` (→ Int64). The first matching element is index 1.
+        `zero_if_absent=True` answers ``0`` for a list without ``value``, as Spark's
+        ``array_position`` does; a null list stays null.
 
         Args:
             value: The literal to locate.
+            zero_if_absent: Answer 0 rather than null when ``value`` is not in the list.
 
         Returns:
-            A new Int64 expression: the 1-based index, or null.
+            A new Int64 expression: the 1-based index, or null (or 0).
 
         Examples:
             .. doctest::
@@ -761,8 +801,15 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[3, 1, 2]]})
                 >>> ds.select(bt.col("a").list.position(2).alias("r")).to_pydict()
                 {'r': [3]}
+
+                >>> ds = bt.from_pydict({"a": [[3, 1], None]})
+                >>> ds.select(r=bt.col("a").list.position(9, zero_if_absent=True)).to_pydict()
+                {'r': [0, None]}
         """
-        return ListPosition(self._e, value)
+        found = ListPosition(self._e, value)
+        if not zero_if_absent:
+            return found
+        return Coalesce([found, self._zero_unless_null()])
 
     def intersect(self, other: IntoExpr) -> ListSet:
         """The distinct elements present in both this list and ``other`` (→ List).
@@ -785,16 +832,18 @@ class _ListNamespace:
         """
         return ListSet("array_intersect", self._e, _wrap(other))
 
-    def concat(self, other: IntoExpr) -> ListSet:
+    def concat(self, other: IntoExpr, *, propagate_nulls: bool = False) -> Expr:
         """This list's elements followed by ``other``'s, keeping duplicates (→ List).
 
         DuckDB ``list_concat``. Unlike :meth:`union` this does not deduplicate or reorder,
         and a null list counts as **empty** rather than making the row null — so
         ``concat`` of a null and ``[1]`` is ``[1]``, where ``union`` of the two is null.
-        The result is null only when both sides are.
+        The result is null only when both sides are. `propagate_nulls=True` makes a null
+        on either side a null row, as Polars ``list.concat`` does.
 
         Args:
             other: The other list column (or an ``array(...)`` literal).
+            propagate_nulls: A null list on either side makes the result null.
 
         Returns:
             A new List expression of the two lists appended.
@@ -807,7 +856,11 @@ class _ListNamespace:
                 >>> ds.select(bt.col("a").list.concat(bt.col("b")).alias("r")).to_pydict()
                 {'r': [[1, 2, 2, 3]]}
         """
-        return ListSet("array_concat", self._e, _wrap(other))
+        right = _wrap(other)
+        joined = ListSet("array_concat", self._e, right)
+        if not propagate_nulls:
+            return joined
+        return self._null_unless(self._e.is_not_null() & right.is_not_null(), joined)
 
     def gather(self, indices: IntoExpr) -> ListSet:
         """Take each row's elements at the positions `indices` names (→ list).
@@ -1271,16 +1324,19 @@ class _ListNamespace:
         """
         return ListSlice(self._e, 0, n)
 
-    def join(self, separator: str) -> ListJoin:
+    def join(self, separator: str, *, null_replacement: str | None = None) -> Expr:
         """Concatenate each list's elements into one string, joined by ``separator``.
 
         Elements are cast to text and null elements are skipped, matching DuckDB
         ``array_to_string``. An **empty** list yields the empty string, while a **null**
         list -- and a list whose elements are *all* null, which leaves nothing to join --
-        yields null (→ Utf8).
+        yields null (→ Utf8). `null_replacement` writes each null element as that text
+        instead of skipping it, so ``null_replacement=""`` is Daft's ``list_join``
+        (``["a", None, "b"]`` joins to ``"a--b"``).
 
         Args:
             separator: The text inserted between consecutive elements.
+            null_replacement: Text standing in for a null element; ``None`` skips them.
 
         Returns:
             A new Utf8 expression: the joined string, or null.
@@ -1296,14 +1352,27 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[], None, [None]]})
                 >>> ds.select(bt.col("a").list.join("-").alias("r")).to_pydict()
                 {'r': ['', None, None]}
-        """
-        return ListJoin(self._e, separator)
 
-    def flatten(self) -> ListFunc:
+                >>> ds = bt.from_pydict({"a": [["a", None, "b"]]})
+                >>> ds.select(r=bt.col("a").list.join("-", null_replacement="")).to_pydict()
+                {'r': ['a--b']}
+        """
+        if null_replacement is None:
+            return ListJoin(self._e, separator)
+        from batcher.plan.functions.collection import element
+
+        filled = element().cast("utf8").fill_null(Lit(null_replacement))
+        return ListJoin(ListTransform(self._e, filled), separator)
+
+    def flatten(self, *, propagate_nulls: bool = False) -> Expr:
         """Concatenate a list-of-lists into one list per row, preserving order.
 
         DuckDB ``flatten``: one level of nesting is removed. Null inner lists are
-        skipped; a null row stays null.
+        skipped; a null row stays null. `propagate_nulls=True` makes a row holding a
+        null inner list null instead, as Spark's ``flatten`` does.
+
+        Args:
+            propagate_nulls: A null inner list makes the whole row null.
 
         Returns:
             A new List expression with one level of nesting removed.
@@ -1315,8 +1384,15 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[[1, 2], [3]], [[4]]]})
                 >>> ds.select(bt.col("a").list.flatten().alias("r")).to_pydict()
                 {'r': [[1, 2, 3], [4]]}
+
+                >>> ds = bt.from_pydict({"a": [[[1], None, [2]]]})
+                >>> ds.select(r=bt.col("a").list.flatten(propagate_nulls=True)).to_pydict()
+                {'r': [None]}
         """
-        return ListFunc("flatten", self._e)
+        flat = ListFunc("flatten", self._e)
+        if not propagate_nulls:
+            return flat
+        return self._null_unless(~self._holds_null(), flat)
 
     def dot(self, other: IntoExpr) -> ListBinary:
         """Dot product with another vector column, paired element-wise (→ Float64).
@@ -1339,7 +1415,7 @@ class _ListNamespace:
         """
         return ListBinary("dot", self._e, _wrap(other))
 
-    def jaccard(self, other: IntoExpr) -> ListBinary:
+    def jaccard(self, other: IntoExpr, *, mode: str = "positional") -> ListBinary:
         """The fraction of positions where this list and `other` hold the same value.
 
         Over two `str.minhash` signatures this is the unbiased estimator of the two
@@ -1347,8 +1423,14 @@ class _ListNamespace:
         length lists it is simply the agreement rate. Null if either list is null, and
         null for two empty lists (no positions to agree on).
 
+        `mode="nonzero"` is Daft's ``jaccard_similarity`` over embeddings instead: the
+        Jaccard index of the two sets of positions holding a non-zero value (NaN counts,
+        ``-0.0`` and null do not). The lists must be the same length, and two lists with
+        no non-zero position are null.
+
         Args:
             other: The other equal-length list column to compare position-by-position.
+            mode: ``"positional"`` (the agreement rate) or ``"nonzero"``.
 
         Returns:
             A new Float64 expression: the fraction of agreeing positions.
@@ -1362,8 +1444,124 @@ class _ListNamespace:
                 >>> pair = bt.from_pydict({"a": [sigs[0]], "b": [sigs[1]]})
                 >>> pair.select(j=bt.col("a").list.jaccard(bt.col("b"))).to_pydict()["j"][0] > 0.5
                 True
+
+                >>> vec = bt.from_pydict({"a": [[1.0, 2.0, 0.0]], "b": [[3.0, 0.0, 5.0]]})
+                >>> vec.select(j=bt.col("a").list.jaccard(bt.col("b"), mode="nonzero")).to_pydict()
+                {'j': [0.3333333333333333]}
         """
-        return ListBinary("jaccard", self._e, _wrap(other))
+        if mode not in ("positional", "nonzero"):
+            raise PlanError(f"list.jaccard(): mode must be 'positional' or 'nonzero', got {mode!r}")
+        fn = "jaccard" if mode == "positional" else "jaccard_nonzero"
+        return ListBinary(fn, self._e, _wrap(other))
+
+    def sum(self, *, empty_as_zero: bool = False) -> Expr:
+        """The sum of the elements of each list; null elements are skipped.
+
+        A list with nothing to add -- empty, or all null -- sums to null, as DuckDB's
+        ``list_sum`` does. `empty_as_zero=True` sums it to ``0`` instead, which is Polars
+        ``list.sum``. A null list is null either way. An integer list sums exactly to
+        Int64.
+
+        Args:
+            empty_as_zero: Sum an empty or all-null list to 0 rather than null.
+
+        Returns:
+            A new expression carrying each list's sum.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"xs": [[1, 2, 3], [], None]})
+                >>> ds.select(r=bt.col("xs").list.sum()).to_pydict()
+                {'r': [6, None, None]}
+                >>> ds.select(r=bt.col("xs").list.sum(empty_as_zero=True)).to_pydict()
+                {'r': [6, 0, None]}
+        """
+        total = ListFunc("sum", self._e)
+        if not empty_as_zero:
+            return total
+        return Coalesce([total, self._zero_unless_null()])
+
+    def sort(self, *, descending: bool = False, nulls_last: bool = True) -> ListFunc:
+        """Each list sorted, NaN as the largest value and nulls last by default (→ list).
+
+        The defaults are DuckDB's ``list_sort``: ascending, NULLS LAST. `descending`
+        reverses the value order without moving the nulls, which is not the same as
+        reversing the ascending result. `nulls_last=False` puts the nulls first, which is
+        the Polars ``list.sort`` default and Spark's ascending ``sort_array``.
+
+        Args:
+            descending: Sort from the largest value down.
+            nulls_last: Place null elements after the values (``False`` puts them first).
+
+        Returns:
+            A new List expression, same element type.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"xs": [[3, None, 1, 2]]})
+                >>> ds.select(r=bt.col("xs").list.sort()).to_pydict()
+                {'r': [[1, 2, 3, None]]}
+                >>> down = bt.col("xs").list.sort(descending=True, nulls_last=False)
+                >>> ds.select(r=down).to_pydict()
+                {'r': [[None, 3, 2, 1]]}
+        """
+        fn = ("sort_desc" if descending else "sort") + ("" if nulls_last else "_nulls_first")
+        return ListFunc(fn, self._e)
+
+    def unique(self, *, drop_nulls: bool = True) -> ListFunc:
+        """The distinct elements of each list, first-seen order preserved (→ list).
+
+        Null elements are dropped by default, as DuckDB's ``list_distinct`` drops them.
+        `drop_nulls=False` keeps one null, where the first one was: Polars
+        ``list.unique`` and Spark ``array_distinct``. ``-0.0`` equals ``0.0`` and every
+        NaN equals every other.
+
+        Args:
+            drop_nulls: Drop null elements rather than keeping one.
+
+        Returns:
+            A new List expression, same element type.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"xs": [[1, None, 2, 2, None]]})
+                >>> ds.select(r=bt.col("xs").list.unique()).to_pydict()
+                {'r': [[1, 2]]}
+                >>> ds.select(r=bt.col("xs").list.unique(drop_nulls=False)).to_pydict()
+                {'r': [[1, None, 2]]}
+        """
+        return ListFunc("unique" if drop_nulls else "unique_with_nulls", self._e)
+
+    def n_unique(self, *, count_nulls: bool = False) -> ListFunc:
+        """The count of distinct elements in each list (→ Int64).
+
+        Null elements are not counted by default (DuckDB ``list_unique``); an empty list
+        is 0 and a null list is null. `count_nulls=True` counts a null as one more
+        distinct value when the list holds any, as Polars ``list.n_unique`` does.
+
+        Args:
+            count_nulls: Count null as a distinct value.
+
+        Returns:
+            A new Int64 expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"xs": [[1, 2, 2, None]]})
+                >>> ds.select(r=bt.col("xs").list.n_unique()).to_pydict()
+                {'r': [2]}
+                >>> ds.select(r=bt.col("xs").list.n_unique(count_nulls=True)).to_pydict()
+                {'r': [3]}
+        """
+        return ListFunc("n_unique_with_nulls" if count_nulls else "n_unique", self._e)
 
     def multiset_overlap(self, other: IntoExpr) -> ListBinary:
         """How many of this list's elements `other` accounts for, counting repeats (→ Float64).
@@ -1549,18 +1747,13 @@ class _ListNamespace:
 # Python accessor name → engine `ListFunc` wire tag.
 _LIST_FUNCS = {
     "len": "len",
-    "sum": "sum",
     "min": "min",
     "max": "max",
     "mean": "mean",
-    "n_unique": "n_unique",
-    "sort": "sort",  # → list
-    "sort_desc": "sort_desc",  # → list, descending, nulls last
     "reverse": "reverse",  # → list
     "product": "product",
     "std": "std",
     "var": "var",
-    "unique": "unique",  # → list
     "median": "median",
     "arg_min": "arg_min",  # index of min element (→ Int64)
     "arg_max": "arg_max",  # index of max element (→ Int64)

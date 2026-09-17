@@ -49,6 +49,7 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     ),
     "sort": "Sort rows at the Dataset level: ds.sort('x'). Inside a list use .list.sort().",
     "sort_by": "Sort rows at the Dataset level: ds.sort('x', descending=True).",
+    "rint": "Round half to even is bt.col('x').round(mode='half_to_even').",
     "explode": "Explode a list column at the Dataset level: ds.explode('x').",
     "value_counts": (
         "Value counts is a Dataset op: ds.value_counts('x'), or ds.group_by('x').len()."
@@ -85,8 +86,8 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     "coalesce": "Spelled bt.coalesce(bt.col('a'), bt.col('b')) (a top-level function) here.",
     "combine_first": "Fill nulls from another column with bt.coalesce(bt.col('a'), bt.col('b')).",
     # --- argmax / positional stats ----------------------------------------------------
-    "argmax": "Spelled bt.col('x').arg_max() here.",
-    "argmin": "Spelled bt.col('x').arg_min() here.",
+    "argmax": "Spelled bt.col('x').arg_max() here (the value at another column's max is max_by).",
+    "argmin": "Spelled bt.col('x').arg_min() here (the value at another column's min is min_by).",
     "idxmax": "The argmax index is bt.col('x').arg_max().",
     "idxmin": "The argmin index is bt.col('x').arg_min().",
     # --- clipping / casting naming ----------------------------------------------------
@@ -208,6 +209,7 @@ LIST_UNSUPPORTED: dict[str, str] = {
     # the same operation, so it redirects to `gather` rather than to the scalar accessors,
     # which index one position instead of taking a column of them.
     "take": "Positional take is .list.gather(indices), taking a column of positions per row.",
+    "sort_desc": "Sort descending with .list.sort(descending=True); the nulls stay last.",
     "count_matches": (
         "Count occurrences by filtering and .list.len(), or test with .list.contains(x)."
     ),

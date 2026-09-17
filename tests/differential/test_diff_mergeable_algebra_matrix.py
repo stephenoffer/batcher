@@ -62,7 +62,7 @@ def _aggregates():
         "entropy": c("s").entropy(), "mode": c("s").mode(), "any_value": c("s").any_value(),
         "bool_and": c("b").bool_and(), "bool_or": c("b").bool_or(),
         "bit_and": c("i").bit_and(), "bit_or": c("i").bit_or(), "bit_xor": c("i").bit_xor(),
-        "arg_min": c("s").arg_min(c("x")), "arg_max": c("s").arg_max(c("x")),
+        "arg_min": c("s").min_by(c("x")), "arg_max": c("s").max_by(c("x")),
         "approx_count_distinct": c("s").approx_count_distinct(),
         "approx_median": c("x").approx_median(),
     }  # fmt: skip

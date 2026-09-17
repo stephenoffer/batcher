@@ -38,6 +38,7 @@ from batcher import col
 from batcher.core.gpu_plan import DfBackend, gpu_plan_ops
 from batcher.core.gpu_plan.backend import Unsupported
 from batcher.core.gpu_plan.execute import run_chain
+from batcher.plan.expr_ir.core import MathExpr
 from batcher.plan.expr_ir.fn_names import MATH_FNS
 
 pytestmark = pytest.mark.unit
@@ -130,10 +131,22 @@ def test_every_math_function_is_translated_or_declined():
 _METHOD_NAME = {fn: "arc" + fn[1:] for fn in ("acos", "acosh", "asin", "asinh", "atan", "atanh")}
 
 
+def _unary_math(fn: str) -> bt.Expr:
+    """The `math` node for `fn`, through its `Expr` method where it has one.
+
+    A tag can outlive its method: `rint` is still the IR the SQL `rint` lowers to, while the
+    `Expr` spelling is `round(mode="half_to_even")`, which lowers to `round_even` instead.
+    """
+    name = _METHOD_NAME.get(fn, fn)
+    if hasattr(bt.Expr, name):
+        return getattr(col("x"), name)()
+    return MathExpr(fn, col("x"))
+
+
 @pytest.mark.parametrize("fn", TRANSLATED_MATH_FNS)
 def test_a_unary_math_function_matches_the_engine(be, fn):
     table = _MATH_DOMAIN.get(fn, NUMBERS)
-    ds = bt.from_arrow(table).select(out=getattr(col("x"), _METHOD_NAME.get(fn, fn))())
+    ds = bt.from_arrow(table).select(out=_unary_math(fn))
     _assert_matches_engine(ds, table, be)
 
 

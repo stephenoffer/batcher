@@ -175,8 +175,10 @@ def test_a_rolling_moment_survives_a_large_offset(agg, offset):
         .sort(col("i"))
         .to_pydict()["r"]
     )
-    # The first row's frame holds one value, so the sample statistic is undefined there.
-    assert got[0] != got[0], f"a one-value frame should be NaN, got {got[0]}"
+    # The first row's frame holds one value, so the sample statistic is undefined there:
+    # NULL, as DuckDB's `var_samp`/`stddev_samp` over a one-row frame and Polars' rolling
+    # moments answer. It was NaN while this was composed from moments.
+    assert got[0] is None, f"a one-value frame should be null, got {got[0]}"
     for i, value in enumerate(got[1:], start=1):
         assert value >= 0.0, f"row {i}: negative {agg} {value} is not a possible value"
     # Frames 3..6 are three consecutive integers, whose sample variance is exactly 1.
@@ -190,9 +192,12 @@ def test_a_rolling_variance_is_never_negative_on_a_constant_window():
     got = ds.with_columns(r=col("v").rolling_var(3, order_by=[col("i")])).sort(col("i"))
     assert got.to_pydict()["r"][1:] == [0.0, 0.0, 0.0]
     # ...while a non-finite value in the frame still propagates rather than being clipped.
+    # Row 0's frame is the one value 1.0, which has no sample variance (null); rows 1 and 2
+    # hold the NaN.
     nan_ds = bt.from_pydict({"i": [0, 1, 2], "v": [1.0, float("nan"), 2.0]})
     out = nan_ds.with_columns(r=col("v").rolling_var(3, order_by=[col("i")])).to_pydict()["r"]
-    assert all(v != v for v in out), f"NaN must propagate through the clamp, got {out}"
+    assert out[0] is None, f"a one-value frame has no sample variance, got {out[0]}"
+    assert all(v != v for v in out[1:]), f"NaN must propagate through the clamp, got {out}"
 
 
 # --- an approximate quantile is still an order statistic -----------------------------

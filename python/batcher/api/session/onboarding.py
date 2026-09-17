@@ -36,6 +36,15 @@ TOP_LEVEL_UNSUPPORTED: dict[str, str] = {
     ),
     "Index": "Batcher relations have no row index (they are unordered multisets, like SQL).",
     "Column": "A column reference is bt.col('x'); build derived columns with expressions.",
+    # --- renamed meanings -------------------------------------------------------------
+    "arg_max": (
+        "The value at the row where another column is largest is bt.max_by(value, by); "
+        "the position of a column's maximum is bt.col('x').arg_max()."
+    ),
+    "arg_min": (
+        "The value at the row where another column is smallest is bt.min_by(value, by); "
+        "the position of a column's minimum is bt.col('x').arg_min()."
+    ),
     "Categorical": (
         "There is no categorical constructor; store the values as a string column, and "
         "bt.col('x').label_encode() when you need integer codes."

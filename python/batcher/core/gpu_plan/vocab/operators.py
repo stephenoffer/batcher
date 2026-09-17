@@ -75,6 +75,10 @@ def eval_binary(ir, df, be, eval_expr):
         return date_difference(left, right, be)
     if op == "mod":
         return _truncated_mod(be.column(left, df), right, df, be)
+    if op == "bit_xor" and be.is_boolean(left) and be.is_boolean(right):
+        # The engine answers two booleans' xor as a boolean. That form is not translated:
+        # declined, so the CPU engine answers rather than the integer the mixed case gives.
+        raise Unsupported("bit_xor of two booleans")
     if op in _BITWISE and (be.is_boolean(left) or be.is_boolean(right)):
         return _boolean_bitwise(op, be.column(left, df), be.column(right, df), be)
     if op in _SHIFTS:
@@ -115,8 +119,10 @@ def date_difference(left, right, be):
     return days.astype(be.dtype(pa.int64()))
 
 
-#: The bit operators, whose result over a BOOLEAN operand is an **integer** in the engine (and
-#: in DuckDB) and a boolean in both dataframe libraries, which route them to logical `and`/`or`.
+#: The bit operators, whose result over a BOOLEAN operand is an **integer** in the engine and a
+#: boolean in both dataframe libraries, which route them to logical `and`/`or`. The one
+#: exception is `bit_xor` over *two* booleans, which the engine answers as a boolean and which
+#: `eval_binary` declines before reaching this set.
 #: The values agree; the column does not, so `col("flag").xor(other)` came back as `true`/`false`
 #: beside a CPU-recovered shard's `1`/`0` and the two could not be concatenated.
 _BITWISE = frozenset({"bit_and", "bit_or", "bit_xor"})

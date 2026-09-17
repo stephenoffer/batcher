@@ -204,8 +204,8 @@ def test_polars_first_last_and_max_by_keep_a_null():
         .agg(
             f=col("v").first("t", ignore_nulls=False),
             l=col("v").last("t", ignore_nulls=False),
-            mx=col("v").arg_max("key", ignore_nulls=False),
-            mn=col("v").arg_min("key", ignore_nulls=False),
+            mx=col("v").max_by("key", ignore_nulls=False),
+            mn=col("v").min_by("key", ignore_nulls=False),
             f_skip=col("v").first("t"),
         )
         .sort("g")
@@ -294,8 +294,8 @@ def test_spark_max_by_and_min_by_examples():
         }
     )
     got = courses.group_by("course").agg(
-        mx=col("year").arg_max("earnings", ignore_nulls=False),
-        mn=col("year").arg_min("earnings", ignore_nulls=False),
+        mx=col("year").max_by("earnings", ignore_nulls=False),
+        mn=col("year").min_by("earnings", ignore_nulls=False),
     )
     assert got.sort("course").to_pydict() == {
         "course": ["Java", "dotNET"],
@@ -310,8 +310,8 @@ def test_spark_max_by_and_min_by_examples():
         }
     )
     got = depts.group_by("department").agg(
-        mx=col("name").arg_max("years_in_dept", ignore_nulls=False),
-        mn=col("name").arg_min("years_in_dept", ignore_nulls=False),
+        mx=col("name").max_by("years_in_dept", ignore_nulls=False),
+        mn=col("name").min_by("years_in_dept", ignore_nulls=False),
     )
     assert got.sort("department").to_pydict() == {
         "department": ["Consult", "Finance"],

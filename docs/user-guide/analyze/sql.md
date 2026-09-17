@@ -367,7 +367,7 @@ does give a `TIMESTAMP`. This matches Spark and keeps a date column usable as a 
 cast explicitly if you need DuckDB's type. The row values are identical either way.
 
 Descending list sorts agree with DuckDB, NULLs included. `list_reverse_sort` lowers to
-`.list.sort_desc()`, a kernel of its own rather than `sort().reverse()`. Ascending puts NULLs
+`.list.sort(descending=True)`, a kernel of its own rather than `sort().reverse()`. Ascending puts NULLs
 last, so reversing would lift them to the front, where DuckDB keeps them at the back. Both
 spellings return `[2, 1, NULL]` for `[1, NULL, 2]`.
 

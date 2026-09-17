@@ -104,8 +104,10 @@ print(stats.to_pydict())
 
 ## Advanced aggregates
 
-Beyond the basics, `agg` supports `mode`, `first`/`last`, `arg_min`/`arg_max` (the
-value of one column at the row that minimizes/maximizes another), the boolean
+Beyond the basics, `agg` supports `mode`, `first`/`last`, `min_by`/`max_by` (the
+value of one column at the row that minimizes/maximizes another), `arg_min`/`arg_max` (the
+position of a column's own extreme), `top_k` and `mode_top_k` (a group's largest and most
+frequent values as a list), the boolean
 reductions `bool_and`/`bool_or`, and `array_agg` (collect a group's values into a
 list).
 
@@ -115,7 +117,7 @@ adv = (
     .agg(
         any_big=(bt.col("price") > 35).bool_or(),
         all_big=(bt.col("price") > 35).bool_and(),
-        costliest=bt.col("price").arg_max(bt.col("price")),
+        costliest=bt.col("price").max_by(bt.col("price")),
     )
     .sort("category")
 )

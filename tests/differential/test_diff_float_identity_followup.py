@@ -71,7 +71,7 @@ def test_arg_max_with_negative_nan_key_matches_duckdb(duck):
         }
     )
     duck_materialize(duck, "k", table)
-    out = bt.from_arrow(table).group_by("g").agg(am=bt.col("v").arg_max(bt.col("k"))).collect()
+    out = bt.from_arrow(table).group_by("g").agg(am=bt.col("v").max_by(bt.col("k"))).collect()
     assert_same(out, duck.sql("SELECT g, arg_max(v, k) AS am FROM k GROUP BY g"))
 
 

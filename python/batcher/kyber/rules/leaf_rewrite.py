@@ -117,8 +117,9 @@ def safe_expr(expr: Expr) -> bool:
     if isinstance(expr, MakeStruct):
         return all(safe_expr(e) for _, e in expr.fields)
     if isinstance(expr, HashRows):
-        # A row hash is defined for every input, nulls included, and never raises.
-        return all(safe_expr(e) for e in expr.inputs)
+        # Batcher's row hash is defined for every input, nulls included, and never raises.
+        # The engine-compatible digests raise on a type their engine does not hash.
+        return expr.algorithm is None and all(safe_expr(e) for e in expr.inputs)
     if isinstance(expr, NullIf):
         return safe_expr(expr.left) and safe_expr(expr.right)
     if isinstance(expr, Case):

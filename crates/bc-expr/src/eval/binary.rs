@@ -467,6 +467,18 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
                 }
             }
         }
+        // Boolean XOR stays boolean: `a ^ b` over two predicates is the exclusive-or
+        // of the predicates (Polars, Python, Spark's `xor`), null where either side is
+        // null. Casting both to Int64 first answered `1`/`0`, a number where every other
+        // engine answers a truth value; DuckDB defines no BOOLEAN xor to disagree with
+        // (its `xor(BOOLEAN, BOOLEAN)` is a binder error). `neq` over two booleans is
+        // exactly that function, nulls propagating.
+        BitXor
+            if matches!(l.data_type(), DataType::Boolean)
+                && matches!(r.data_type(), DataType::Boolean) =>
+        {
+            Arc::new(cmp::neq(&l.as_ref(), &r.as_ref())?)
+        }
         // Integer bitwise ops. Operands are coerced/cast to Int64.
         BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight => {
             use arrow::compute::kernels::bitwise::{bitwise_and, bitwise_or, bitwise_xor};
@@ -846,6 +858,32 @@ mod arith_semantics_tests {
             as_i64(&eval_binary(BinaryOp::Div, &l, &r3).unwrap()),
             vec![Some(1), Some(2), None]
         );
+    }
+
+    /// `^` over two booleans is the boolean exclusive-or (Polars `xor`), null-propagating,
+    /// and stays `Boolean`; over integers it is still the bitwise Int64 xor.
+    #[test]
+    fn boolean_xor_is_boolean() {
+        let l: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+        ]));
+        let r: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(false),
+        ]));
+        let out = eval_binary(BinaryOp::BitXor, &l, &r).unwrap();
+        assert_eq!(out.data_type(), &DataType::Boolean);
+        let got: Vec<Option<bool>> = out.as_boolean().iter().collect();
+        assert_eq!(got, vec![Some(false), Some(true), None, Some(true)]);
+        let li: ArrayRef = Arc::new(Int64Array::from(vec![6]));
+        let ri: ArrayRef = Arc::new(Int64Array::from(vec![3]));
+        let out = eval_binary(BinaryOp::BitXor, &li, &ri).unwrap();
+        assert_eq!(out.data_type(), &DataType::Int64);
     }
 
     /// trap; a non-zero divisor is unaffected and a null divisor stays null.

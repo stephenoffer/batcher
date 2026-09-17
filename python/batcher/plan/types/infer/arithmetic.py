@@ -141,7 +141,7 @@ def math2func_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataTy
     fn = expr.fn  # type: ignore[attr-defined]
     if fn in _MATH2_INT_RESULT:
         return pa.int64()
-    if fn == "round":
+    if fn in ("round", "round_even"):
         left = infer(expr.left, schema)  # type: ignore[attr-defined]
         return None if left is None else _widened_numeric(_alone_as_double(left))
     return pa.float64()
@@ -326,6 +326,14 @@ def binary_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataType 
     op = expr.op  # type: ignore[attr-defined]
     if op in _BINARY_BOOL:
         return pa.bool_()
+    if op == "bit_xor":
+        # Two booleans xor to a boolean (`bc_expr::eval::binary`); anything else is Int64.
+        left = infer(expr.left, schema)  # type: ignore[attr-defined]
+        right = infer(expr.right, schema)  # type: ignore[attr-defined]
+        if left is None or right is None:
+            return None
+        both_bool = pa.types.is_boolean(left) and pa.types.is_boolean(right)
+        return pa.bool_() if both_bool else pa.int64()
     if op in _BINARY_INT:
         return pa.int64()
     if op == "concat":

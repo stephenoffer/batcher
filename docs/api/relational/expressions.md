@@ -153,8 +153,8 @@ print(out.to_pydict())
 {py:meth}`.asinh() <batcher.plan.expr_ir.core.Expr.asinh>` / {py:meth}`.acosh() <batcher.plan.expr_ir.core.Expr.acosh>` / {py:meth}`.atanh() <batcher.plan.expr_ir.core.Expr.atanh>` (→ Float64). The reciprocal trig pair
 {py:meth}`.sec() <batcher.plan.expr_ir.core.Expr.sec>` / {py:meth}`.csc() <batcher.plan.expr_ir.core.Expr.csc>`, the gamma function {py:meth}`.gamma() <batcher.plan.expr_ir.core.Expr.gamma>` and its log {py:meth}`.lgamma() <batcher.plan.expr_ir.core.Expr.lgamma>` (which stays
 finite where `.gamma()` overflows, above about 171), and two rounding modes that are not
-`.round()`: `.rint()` rounds half to *even*, `.even()` rounds *away from zero* to the
-nearest even integer. Integer bitwise
+`.round()`'s default: `.round(mode="half_to_even")` rounds half to *even* (DuckDB
+`round_even`, Spark `bround`), and `.even()` rounds *away from zero* to the nearest even integer. Integer bitwise
 ops (distinct from the boolean `&`/`|`): {py:meth}`.bitwise_and(o) <batcher.plan.expr_ir.core.Expr.bitwise_and>`, {py:meth}`.bitwise_or(o) <batcher.plan.expr_ir.core.Expr.bitwise_or>`,
 {py:meth}`.bitwise_xor(o) <batcher.plan.expr_ir.core.Expr.bitwise_xor>`, {py:meth}`.bitwise_left_shift(o) <batcher.plan.expr_ir.core.Expr.bitwise_left_shift>`, {py:meth}`.bitwise_right_shift(o) <batcher.plan.expr_ir.core.Expr.bitwise_right_shift>`, and
 {py:meth}`.bit_count() <batcher.plan.expr_ir.core.Expr.bit_count>` (the number of set bits, i.e. population count → Int64).
@@ -193,8 +193,8 @@ Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
 `.bit_and()` / `.bit_or()` / `.bit_xor()` (bitwise reduction of the non-null
 `Int64` values in each group), `.array_agg()` (collect each group's values into a
 `List`; SQL `array_agg` /
-Spark `collect_list`), `.arg_min(by=…)` / `.arg_max(by=…)` (the value at the
-row with the extreme `by` key), and `.first(order_by=…)` / `.last(order_by=…)`
+Spark `collect_list`), {py:meth}`.min_by(by) <batcher.plan.expr_ir.core.Expr.min_by>` / {py:meth}`.max_by(by) <batcher.plan.expr_ir.core.Expr.max_by>` (the value at the
+row with the extreme `by` key), {py:meth}`.arg_min() <batcher.plan.expr_ir.core.Expr.arg_min>` / {py:meth}`.arg_max() <batcher.plan.expr_ir.core.Expr.arg_max>` (the 0-based position of the group's extreme value, Polars `arg_min`/`arg_max`), and `.first(order_by=…)` / `.last(order_by=…)`
 (the value at the first or last row in `order_by` order). `order_by` is required there, because an arrival-order first or last wouldn't be partition-independent. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
 
 The assembly-contiguity aggregates measure how a set of lengths is distributed *by base*
@@ -213,8 +213,9 @@ The distribution aggregates read a group's whole value list rather than a runnin
 total: `.entropy()` (base-2 Shannon entropy of the value distribution, DuckDB `entropy`),
 {py:meth}`.mad() <batcher.plan.expr_ir.core.Expr.mad>` (median absolute deviation, a spread measure a single outlier cannot move),
 `.kurtosis(bias=True)` (the population form of `.kurtosis()`), `.quantile_disc(q)` (the
-quantile *element*, where `.quantile(q)` interpolates between two of them), `.top_k(k)`
+quantile *element*, where `.quantile(q)` interpolates between two of them), {py:meth}`.mode_top_k(k) <batcher.plan.expr_ir.core.Expr.mode_top_k>`
 (the `k` most frequent values as a list, DuckDB `approx_top_k`, computed exactly here),
+{py:meth}`.top_k(k) <batcher.plan.expr_ir.core.Expr.top_k>` (the `k` largest values as a list, Polars `top_k`),
 {py:meth}`.kahan_sum() <batcher.plan.expr_ir.core.Expr.kahan_sum>` (compensated summation, DuckDB `fsum` or {py:meth}`kahan_sum <batcher.plan.expr_ir.core.Expr.kahan_sum>`) gives the same answer as
 `.sum()` on a well-conditioned column and a materially better one when the addends differ
 wildly in magnitude), and {py:meth}`.any_value() <batcher.plan.expr_ir.core.Expr.any_value>` (one value from the group, DuckDB {py:meth}`any_value <batcher.plan.expr_ir.core.Expr.any_value>` / `arbitrary`; the

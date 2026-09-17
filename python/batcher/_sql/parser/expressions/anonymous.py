@@ -59,7 +59,6 @@ _UNARY_EXPR = {
     "lgamma": "lgamma",
     "sec": "sec",
     "csc": "csc",
-    "rint": "rint",
     # Spark spellings whose Batcher method is identically named.
     "isnull": "is_null",
     "isnotnull": "is_not_null",

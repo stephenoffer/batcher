@@ -34,6 +34,7 @@ from batcher._sql.parser.expressions.spark import spark_function
 from batcher._sql.parser.expressions.strings import string_function
 from batcher._sql.parser.expressions.temporal import datetime_pattern, temporal_function
 from batcher.plan.expr_ir import Binary, Cast, Expr, Math2Expr, lit, when
+from batcher.plan.expr_ir.core import MathExpr
 from batcher.plan.functions.scalar import arctan2
 from batcher.plan.functions.temporal import current_date, make_date
 
@@ -118,6 +119,11 @@ def _scalar_function(tr, node):
         # that scale, so it truncates to itself. Without the guard `trunc(1e308, 1)`
         # scaled to +inf and came back as inf where DuckDB answers 1e308.
         return when(scaled.is_finite()).then(scaled.trunc() / factor).otherwise(value)
+    if name == "Rint":
+        # IEEE ties-to-even to an integral *double*. `Expr` spells ties-to-even
+        # `round(mode="half_to_even")`, which keeps an integer input an integer, so the
+        # `rint` node is built directly to keep Spark's and DuckDB's Float64 answer.
+        return MathExpr("rint", tr._scalar(node.this))
     if name in _UNARY_MATH:
         return getattr(tr._scalar(node.this), _UNARY_MATH[name])()
     if name == "Length":

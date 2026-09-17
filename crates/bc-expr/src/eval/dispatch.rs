@@ -328,12 +328,16 @@ impl Expr {
                     .collect::<Result<_, _>>()?;
                 eval_make_temporal(*func, &evaluated)
             }
-            Expr::Hash { inputs, seed } => {
+            Expr::Hash {
+                inputs,
+                seed,
+                algorithm,
+            } => {
                 let args: Vec<_> = inputs
                     .iter()
                     .map(|e| e.eval(batch))
                     .collect::<Result<_, _>>()?;
-                crate::eval::hash::eval_hash(&args, *seed, batch.num_rows())
+                crate::eval::hash::eval_hash_with(&args, *seed, *algorithm, batch.num_rows())
             }
             Expr::Sequence { start, stop, step } => {
                 let (s, e, d) = (start.eval(batch)?, stop.eval(batch)?, step.eval(batch)?);

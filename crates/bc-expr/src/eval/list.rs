@@ -363,6 +363,7 @@ pub(crate) fn eval_list_binary(
         {
             return jaccard_str::jaccard_utf8(la, ra);
         }
+        ListBinaryFunc::JaccardNonzero => return jaccard_str::jaccard_nonzero(la, ra),
         ListBinaryFunc::MultisetOverlap => return eval_multiset_overlap(la, ra),
         ListBinaryFunc::LcsLength => return eval_lcs_length(la, ra),
         _ => {}
@@ -450,7 +451,9 @@ pub(crate) fn eval_list_binary(
                 }
             }
             // Both returned above, before the numeric cast.
-            ListBinaryFunc::MultisetOverlap | ListBinaryFunc::LcsLength => {
+            ListBinaryFunc::MultisetOverlap
+            | ListBinaryFunc::LcsLength
+            | ListBinaryFunc::JaccardNonzero => {
                 unreachable!("routed to its own kernel")
             }
         }
@@ -472,9 +475,17 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     if let ListFunc::Reverse = func {
         return rebuild_list(list, |s, e, out| out.extend((s..e).rev().map(|k| k as u32)));
     }
-    if let ListFunc::Sort | ListFunc::SortDesc = func {
+    if let ListFunc::Sort
+    | ListFunc::SortDesc
+    | ListFunc::SortNullsFirst
+    | ListFunc::SortDescNullsFirst = func
+    {
         use arrow::compute::{sort_to_indices, SortOptions};
-        let descending = matches!(func, ListFunc::SortDesc);
+        let descending = matches!(func, ListFunc::SortDesc | ListFunc::SortDescNullsFirst);
+        let nulls_first = matches!(
+            func,
+            ListFunc::SortNullsFirst | ListFunc::SortDescNullsFirst
+        );
         let child = list.values();
         // DuckDB `list_sort` is ascending, NULLS LAST. arrow-rs `sort_to_indices` defaults
         // to NULLS FIRST, so pass explicit options — otherwise nulls sorted to the front and
@@ -485,7 +496,7 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         let child_key = bc_arrow::canon_float_array(child);
         let opts = SortOptions {
             descending,
-            nulls_first: false,
+            nulls_first,
         };
         return rebuild_list(list, |s, e, out| {
             let slice = child_key.slice(s, e - s);
@@ -495,7 +506,8 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             }
         });
     }
-    if let ListFunc::Unique = func {
+    if let ListFunc::Unique | ListFunc::UniqueWithNulls = func {
+        let keep_null = matches!(func, ListFunc::UniqueWithNulls);
         // Distinct elements in first-occurrence order, dropping nulls. Element identity is
         // type-general (any element type, not only numeric — casting a string list to
         // Float64 nulled every element and returned an empty list) and float-canonical, so
@@ -511,9 +523,17 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         let mut seen: crate::eval::FastSet<arrow::row::Row<'_>> = crate::eval::FastSet::default();
         return rebuild_list(list, |s, e, out| {
             seen.clear();
+            // `WithNulls` keeps the first null it meets, in place, and no later one.
+            let mut null_kept = !keep_null;
             out.extend(
                 (s..e)
-                    .filter(|&k| !child.is_null(k) && seen.insert(keys.row(k)))
+                    .filter(|&k| {
+                        if child.is_null(k) {
+                            !std::mem::replace(&mut null_kept, true)
+                        } else {
+                            seen.insert(keys.row(k))
+                        }
+                    })
                     .map(|k| k as u32),
             );
         });
@@ -543,7 +563,8 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         return Ok(Arc::new(n.collect::<Int64Array>()));
     }
 
-    if let ListFunc::NUnique = func {
+    if let ListFunc::NUnique | ListFunc::NUniqueWithNulls = func {
+        let count_null = matches!(func, ListFunc::NUniqueWithNulls);
         // Count distinct non-null elements, type-general and float-canonical (see `Unique`).
         let keys = element_identity(list.values())?;
         let child = list.values();
@@ -554,9 +575,11 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
                 let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
                 (!list.is_null(i)).then(|| {
                     seen.clear();
-                    (s..e)
+                    let distinct = (s..e)
                         .filter(|&k| !child.is_null(k) && seen.insert(keys.row(k)))
-                        .count() as i64
+                        .count() as i64;
+                    let has_null = count_null && (s..e).any(|k| child.is_null(k));
+                    distinct + i64::from(has_null)
                 })
             })
             .collect::<Vec<_>>();
@@ -1251,6 +1274,63 @@ mod tests {
 
     /// Build a `List<Int64>`; an inner `None` is a null *element*, an outer `None` a
     /// null *row*.
+    /// The null-keeping variants: `sort` with nulls first (DuckDB `list_sort(l, 'ASC',
+    /// 'NULLS FIRST')` is `[NULL, 1, 3]`, `'DESC', 'NULLS FIRST'` is `[NULL, 3, 1]`),
+    /// `unique` keeping one null at its first position and `n_unique` counting it (Polars
+    /// `[[1, None, 1, None]]` → `[1, None]` and 2), and an integer `diff` that stays Int64.
+    #[test]
+    fn null_keeping_variants_and_integer_diff() {
+        use arrow::array::AsArray;
+        let a = int_lists(&[
+            Some(vec![Some(3), None, Some(1)]),
+            Some(vec![]),
+            None,
+            Some(vec![None]),
+        ]);
+        let first = eval_list(ListFunc::SortNullsFirst, &a).unwrap();
+        let first = first.as_list::<i32>();
+        assert_eq!(i64s(&first.value(0)), vec![None, Some(1), Some(3)]);
+        assert!(first.value(1).is_empty() && first.is_null(2));
+        let desc = eval_list(ListFunc::SortDescNullsFirst, &a).unwrap();
+        assert_eq!(
+            i64s(&desc.as_list::<i32>().value(0)),
+            vec![None, Some(3), Some(1)]
+        );
+
+        let dup = int_lists(&[
+            Some(vec![None, Some(1), Some(1), None]),
+            Some(vec![]),
+            None,
+            Some(vec![Some(2)]),
+        ]);
+        let u = eval_list(ListFunc::UniqueWithNulls, &dup).unwrap();
+        let u = u.as_list::<i32>();
+        assert_eq!(i64s(&u.value(0)), vec![None, Some(1)]);
+        assert!(u.value(1).is_empty() && u.is_null(2));
+        let plain = eval_list(ListFunc::Unique, &dup).unwrap();
+        assert_eq!(i64s(&plain.as_list::<i32>().value(0)), vec![Some(1)]);
+        let n = eval_list(ListFunc::NUniqueWithNulls, &dup).unwrap();
+        assert_eq!(i64s(&n), vec![Some(2), Some(0), None, Some(1)]);
+        let n_plain = eval_list(ListFunc::NUnique, &dup).unwrap();
+        assert_eq!(i64s(&n_plain), vec![Some(1), Some(0), None, Some(1)]);
+
+        let big = int_lists(&[
+            Some(vec![Some(1), Some((1 << 53) + 3), None, Some(4)]),
+            Some(vec![Some(i64::MIN), Some(1)]),
+        ]);
+        let d = eval_list(ListFunc::Diff, &big).unwrap();
+        let d = d.as_list::<i32>();
+        assert_eq!(d.value_type(), DataType::Int64);
+        assert_eq!(
+            i64s(&d.value(0)),
+            vec![None, Some((1 << 53) + 2), None, None]
+        );
+        assert_eq!(
+            i64s(&d.value(1)),
+            vec![None, Some(1i64.wrapping_sub(i64::MIN))]
+        );
+    }
+
     fn int_lists(rows: &[Option<Vec<Option<i64>>>]) -> ArrayRef {
         use arrow::array::Int64Builder;
         let mut b = ListBuilder::new(Int64Builder::new());

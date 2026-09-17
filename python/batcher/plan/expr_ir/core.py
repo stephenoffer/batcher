@@ -378,8 +378,11 @@ class Expr:
         return Not(self)
 
     def __xor__(self, other: IntoExpr) -> Expr:
-        """Bitwise XOR ``a ^ b`` of two integer expressions (operands cast to Int64);
-        the operator spelling of :meth:`bitwise_xor`."""
+        """Exclusive or ``a ^ b``: boolean over two booleans, else bitwise over Int64.
+
+        Two boolean operands give a boolean (null where either is null), as Polars and
+        Python do; integer operands are cast to Int64 and xor bit by bit, the operator
+        spelling of :meth:`bitwise_xor`."""
         return Binary("bit_xor", self, _wrap(other))
 
     def __lshift__(self, other: IntoExpr) -> Expr:
@@ -391,7 +394,7 @@ class Expr:
         return Binary("shift_right", self, _wrap(other))
 
     def __rxor__(self, other: IntoExpr) -> Expr:
-        """Reflected bitwise XOR so ``scalar ^ expr`` works (operands cast to Int64)."""
+        """Reflected XOR so ``scalar ^ expr`` works (boolean or bitwise, as :meth:`__xor__`)."""
         return Binary("bit_xor", _wrap(other), self)
 
     def __rlshift__(self, other: IntoExpr) -> Expr:
@@ -631,6 +634,8 @@ class Expr:
     def bitwise_xor(self, other: IntoExpr) -> Expr:
         """Bitwise XOR ``self ^ other`` of two integers (per-row; Int64; nulls propagate).
 
+        Over two booleans it is the boolean exclusive-or, as ``^`` is.
+
         Args:
             other: The right-hand integer expression.
 
@@ -817,14 +822,22 @@ class Expr:
         """
         return IsNotNull(self)
 
-    def is_in(self, values: Iterable[IntoExpr]) -> Expr:
+    def is_in(self, values: Iterable[IntoExpr], *, nulls_equal: bool = False) -> Expr:
         """``self IN (values)`` — true if equal to any value.
 
-        Desugars to an OR of equality checks, so it follows SQL three-valued
-        logic (``NULL IN (...)`` is NULL) and an empty collection is always false.
+        Desugars to an OR of equality checks, so by default it follows SQL three-valued
+        logic: ``NULL IN (...)`` is NULL, a ``None`` among `values` turns every non-match
+        into NULL, and an empty collection is always false.
+
+        `nulls_equal=True` is the null-safe reading of Polars ``is_in(nulls_equal=True)``
+        and Ray Data ``is_in``: a null matches a ``None`` in `values`, and every other
+        answer is ``True`` or ``False``, never null. Its negation ``~x.is_in(v,
+        nulls_equal=True)`` is Ray Data's ``not_in``.
 
         Args:
             values: The scalars or expressions to test membership against.
+            nulls_equal: Treat null as a value that equals ``None``, so the result is
+                never null.
 
         Returns:
             A boolean expression, true where the value is in `values`.
@@ -836,8 +849,17 @@ class Expr:
                 >>> ds = bt.from_pydict({"x": [1, 2, 3]})
                 >>> ds.select(r=bt.col("x").is_in([1, 3])).to_pydict()
                 {'r': [True, False, True]}
+
+                >>> ds = bt.from_pydict({"x": [1, 2, None]})
+                >>> ds.select(
+                ...     sql=bt.col("x").is_in([1, None]),
+                ...     safe=bt.col("x").is_in([1, None], nulls_equal=True),
+                ... ).to_pydict()
+                {'sql': [True, None, None], 'safe': [True, False, True]}
         """
         vals = list(values)
+        if nulls_equal:
+            return _null_safe_membership(self, vals)
         # SQL three-valued logic: a NULL member never yields True, but it turns a
         # would-be False into NULL (``x IN (1, NULL)`` is True for x=1, NULL otherwise;
         # DuckDB agrees). A NULL member contributes an always-null disjunct, which
@@ -1036,18 +1058,27 @@ class Expr:
 
         return StrFunc("chr", self)
 
-    def to_base(self, radix: int) -> Expr:
+    def to_base(self, radix: int, *, twos_complement: bool = False) -> Expr:
         """This integer written in `radix` (DuckDB ``to_base``; ``bin`` is radix 2, → Utf8).
+
+        By default a negative value is its magnitude's digits after a ``-``, as DuckDB
+        writes it. `twos_complement=True` writes a negative value as the digits of its
+        64-bit two's-complement bit pattern instead, which is Spark ``bin`` and ``hex``
+        and Daft ``bin``: ``-1`` in radix 2 is sixty-four ``1``s. Only a power-of-two
+        radix has such a digit string, so the flag requires one. It is composed from
+        existing nodes (the top digit and the low bits rendered separately and padded).
 
         Args:
             radix: The base, from 2 to 36.
+            twos_complement: Render a negative value as its 64-bit two's complement.
 
         Returns:
             A new Utf8 expression: the digits in uppercase, with a leading ``-`` when
-            negative.
+            negative unless `twos_complement` is set.
 
         Raises:
-            PlanError: If `radix` is outside 2..36.
+            PlanError: If `radix` is outside 2..36, or `twos_complement` is set with a
+                radix that is not a power of two.
 
         Examples:
             .. doctest::
@@ -1056,12 +1087,23 @@ class Expr:
                 >>> ds = bt.from_pydict({"n": [15, 255]})
                 >>> ds.select(b=bt.col("n").to_base(2), h=bt.col("n").to_base(16)).to_pydict()
                 {'b': ['1111', '11111111'], 'h': ['F', 'FF']}
+
+                >>> neg = bt.from_pydict({"n": [-1, 5]})
+                >>> neg.select(h=bt.col("n").to_base(16, twos_complement=True)).to_pydict()
+                {'h': ['FFFFFFFFFFFFFFFF', '5']}
         """
         from batcher.plan.expr_ir.func_nodes import StrFunc
 
         if not 2 <= radix <= 36:
             raise PlanError(f"to_base(): radix must be between 2 and 36, got {radix}")
-        return StrFunc("to_base", self, start=radix)
+        plain = StrFunc("to_base", self, start=radix)
+        if not twos_complement:
+            return plain
+        if radix & (radix - 1):
+            raise PlanError(
+                f"to_base(twos_complement=True): radix must be a power of two, got {radix}"
+            )
+        return _twos_complement_digits(self, radix, plain)
 
     def format_bytes(self, *, si: bool = False) -> Expr:
         """This byte count as human-readable text (DuckDB ``format_bytes``, → Utf8).
@@ -1085,15 +1127,26 @@ class Expr:
 
         return StrFunc("format_bytes_si" if si else "format_bytes", self)
 
-    def round(self, digits: int | None = None) -> Expr:
-        """Round half-away-from-zero to the nearest integer, or to `digits` decimal places.
+    def round(self, digits: int | None = None, *, mode: str = "half_away_from_zero") -> Expr:
+        """Round to the nearest integer, or to `digits` decimal places.
+
+        `mode` picks the tie rule. ``"half_away_from_zero"`` (the default) is DuckDB's
+        ``round``: ``2.5`` becomes ``3.0`` and ``-2.5`` becomes ``-3.0``.
+        ``"half_to_even"`` is DuckDB's ``round_even``, the Polars and Ray Data default and
+        Spark ``bround``: a tie goes to the even neighbour, so ``2.5`` becomes ``2.0``.
+        It is also IEEE ``roundTiesToEven``, so summing rounded values does not drift
+        upward. An integer input stays an integer under either mode.
 
         Args:
-            digits: Number of decimal places to keep. ``None`` (the default) rounds to
-                a whole number.
+            digits: Number of decimal places to keep; negative rounds to tens, hundreds
+                and so on. ``None`` (the default) rounds to a whole number.
+            mode: ``"half_away_from_zero"`` or ``"half_to_even"``.
 
         Returns:
             A new expression of the rounded values.
+
+        Raises:
+            PlanError: If `mode` is not one of the two tie rules.
 
         Examples:
             .. doctest::
@@ -1102,7 +1155,17 @@ class Expr:
                 >>> ds = bt.from_pydict({"x": [1.234, 2.567]})
                 >>> ds.select(r=bt.col("x").round(2)).to_pydict()
                 {'r': [1.23, 2.57]}
+
+                >>> ties = bt.from_pydict({"x": [0.5, 1.5, 2.5, -2.5]})
+                >>> ties.select(r=bt.col("x").round(mode="half_to_even")).to_pydict()
+                {'r': [0.0, 2.0, 2.0, -2.0]}
         """
+        if mode == "half_to_even":
+            return Math2Expr("round_even", self, Lit(0 if digits is None else digits))
+        if mode != "half_away_from_zero":
+            raise PlanError(
+                f"round(): mode must be 'half_away_from_zero' or 'half_to_even', got {mode!r}"
+            )
         if digits is None:
             return MathExpr("round", self)
         return Math2Expr("round", self, Lit(digits))
@@ -2072,22 +2135,31 @@ class Expr:
         """
         return self.expanding_var(partition_by, order_by, ddof).sqrt()
 
-    def hash_bucket(self, buckets: int, seed: int = 0) -> Expr:
+    def hash_bucket(self, buckets: int, seed: int = 0, *, algorithm: str = "batcher") -> Expr:
         """Assign each value to one of `buckets` by a stable hash — ``|hash(x)| % buckets``.
 
         Deterministic across partitions, runs, and machines, which is what makes it a
         safe key for a reproducible train/test split, a shard assignment, or an A/B
         bucket.
 
+        `algorithm="iceberg"` computes the Iceberg bucket partition transform instead,
+        which is Spark's ``bucket(n, col)``: the Iceberg Murmur3 hash, masked
+        non-negative, modulo `buckets`. A null stays null there rather than landing in a
+        bucket, and the transform is defined for integers, dates, timestamps, strings,
+        binary and decimals only. Use it to read or write a table another engine bucketed.
+
         Args:
             buckets: How many buckets to spread values across (must be >= 1).
-            seed: Hash seed; vary it for an independent bucketing of the same keys.
+            seed: Hash seed; vary it for an independent bucketing of the same keys. The
+                Iceberg transform has no seed, so it must stay 0 there.
+            algorithm: ``"batcher"`` (the default) or ``"iceberg"``.
 
         Returns:
             An Int64 expression in ``[0, buckets)``.
 
         Raises:
-            PlanError: If `buckets` < 1.
+            PlanError: If `buckets` < 1, `algorithm` is unknown, or a seed is given to
+                the Iceberg transform.
 
         Examples:
             .. doctest::
@@ -2096,9 +2168,21 @@ class Expr:
                 >>> ds = bt.from_pydict({"k": ["a", "b", "c", "d"]})
                 >>> ds.select(b=bt.col("k").hash_bucket(4)).to_pydict()
                 {'b': [1, 3, 3, 1]}
+
+                >>> ice = bt.from_pydict({"id": [34, None]})
+                >>> ice.select(b=bt.col("id").hash_bucket(16, algorithm="iceberg")).to_pydict()
+                {'b': [3, None]}
         """
         buckets = require_int(buckets, func="hash_bucket", arg="buckets", minimum=1)
         seed = require_int(seed, func="hash_bucket", arg="seed")
+        if algorithm == "iceberg":
+            if seed:
+                raise PlanError("hash_bucket(algorithm='iceberg') has no seed; leave it at 0")
+            return self.hash(algorithm="iceberg").bitwise_and(Lit(0x7FFFFFFF)) % Lit(buckets)
+        if algorithm != "batcher":
+            raise PlanError(
+                f"hash_bucket(): algorithm must be 'batcher' or 'iceberg', got {algorithm!r}"
+            )
         return self.hash(seed=seed).abs() % Lit(buckets)
 
     def pct_of_total(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
@@ -2479,27 +2563,6 @@ class Expr:
         """
         return MathExpr("csc", self)
 
-    def rint(self) -> MathExpr:
-        """Round half to **even** — IEEE-754 ``roundTiesToEven`` (→ Float64).
-
-        The tie rule is the difference from :meth:`round`, which rounds half *away from
-        zero* here and in DuckDB: ``rint(2.5)`` is ``2.0`` where ``round(2.5)`` is
-        ``3.0``. Ties-to-even is what floating-point arithmetic itself uses, so summing
-        rounded values does not drift upward the way half-up rounding does.
-
-        Returns:
-            A new Float64 expression of the rounded values.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [0.5, 1.5, 2.5, 3.5, -2.5]})
-                >>> ds.select(r=bt.col("x").rint()).to_pydict()
-                {'r': [0.0, 2.0, 2.0, 4.0, -2.0]}
-        """
-        return MathExpr("rint", self)
-
     def even(self) -> MathExpr:
         """Round away from zero to the nearest even integer (DuckDB ``even``; → Float64).
 
@@ -2560,10 +2623,16 @@ class Expr:
         return MathExpr("lgamma", self)
 
     def factorial(self) -> MathExpr:
-        """``n!`` — factorial of a non-negative integer (DuckDB ``factorial``; → Float64).
+        """``n!`` — factorial of a non-negative integer (DuckDB ``factorial``; → Int64).
+
+        Computed exactly in 64-bit integers, so the defined inputs are ``0`` through
+        ``20``; a negative input or one past ``20!`` raises rather than wrapping. Spark
+        ``factorial`` answers null outside that range instead, which
+        ``bt.when(n.between(0, 20)).then(n.clip(0, 20).factorial()).otherwise(bt.lit(None))``
+        reproduces.
 
         Returns:
-            A new Float64 expression of the factorials.
+            A new Int64 expression of the factorials.
 
         Examples:
             .. doctest::
@@ -2747,14 +2816,18 @@ class Expr:
         """
         return _accessor("batcher.plan.expr_ir.namespaces.sequence", "_SeqNamespace")(self)
 
-    def hash(self, seed: int = 0) -> Expr:
+    def hash(self, seed: int = 0, *, algorithm: str = "batcher") -> Expr:
         """A deterministic 64-bit hash of this expression's value, per row → Int64.
 
         The single-argument spelling of :func:`batcher.hash_rows`. Typed rather than
         textual, so it neither depends on how a float renders nor pays to render it.
+        `algorithm` reproduces another engine's hash instead; see
+        :func:`batcher.hash_rows` for the three choices.
 
         Args:
             seed: Changes the digest; the same seed reproduces it.
+            algorithm: ``"batcher"`` (the default), ``"murmur3"`` (Spark ``hash``),
+                ``"iceberg"`` (the Iceberg bucket hash) or ``"xxhash3"`` (Daft ``hash``).
 
         Returns:
             An Int64 expression — the value's digest.
@@ -2770,7 +2843,7 @@ class Expr:
         """
         from batcher.plan.expr_ir.constructors import hash_rows
 
-        return hash_rows(self, seed=seed)
+        return hash_rows(self, seed=seed, algorithm=algorithm)
 
     def fill_null(self, value: IntoExpr) -> Coalesce:
         """Replace nulls with `value`, leaving non-null values unchanged (SQL ``COALESCE``).
@@ -3225,12 +3298,13 @@ class Expr:
             raise PlanError(f"quantile_disc q must be in [0, 1], got {q}")
         return AggExpr("quantile_disc", self, param=q)
 
-    def top_k(self, k: int) -> AggExpr:
+    def mode_top_k(self, k: int) -> AggExpr:
         """The `k` most frequent values per group, most frequent first (→ List).
 
         DuckDB's ``approx_top_k``, computed **exactly**: the aggregate already holds
         every value of the group, so a sketch could only lose accuracy. Ties break to
-        the smaller value, so the result does not depend on partition order.
+        the smaller value, so the result does not depend on partition order. The `k`
+        *largest* values are :meth:`top_k`.
 
         Args:
             k: How many values to return.
@@ -3243,10 +3317,45 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a"] * 6, "x": [1, 2, 2, 3, 3, 3]})
-                >>> ds.group_by("g").agg(r=bt.col("x").top_k(2)).to_pydict()
+                >>> ds.group_by("g").agg(r=bt.col("x").mode_top_k(2)).to_pydict()
                 {'g': ['a'], 'r': [[3, 2]]}
         """
         return AggExpr("approx_top_k", self, param=float(k))
+
+    def top_k(self, k: int) -> Expr:
+        """The `k` largest non-null values per group, largest first (Polars ``top_k``, → List).
+
+        Composed as the group's collected values with the nulls dropped, sorted
+        descending and cut to `k`, so it holds the whole group in memory the way
+        :meth:`array_agg` does, and is mergeable for the same reason. Ties keep every
+        copy (``[5, 5]``). Nulls are not values here, as in DuckDB's ``max(x, k)``, so a
+        group with fewer than `k` non-null values returns what it has, where Polars pads
+        the list with the group's nulls. The `k` most *frequent* values are
+        :meth:`mode_top_k`.
+
+        Args:
+            k: How many values to return (must be >= 1).
+
+        Returns:
+            An expression over an aggregate, for use in ``agg(...)``.
+
+        Raises:
+            PlanError: If `k` < 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 5, None, 3, 5]})
+                >>> ds.group_by("g").agg(r=bt.col("x").top_k(2)).to_pydict()
+                {'g': ['a'], 'r': [[5, 5]]}
+        """
+        from batcher.plan.expr_ir.func_nodes import ListFunc, ListSlice
+        from batcher.plan.expr_ir.namespaces.collections import _ListNamespace
+
+        k = require_int(k, func="top_k", arg="k", minimum=1)
+        values = _ListNamespace(self.array_agg())  # type: ignore[arg-type]
+        return ListSlice(ListFunc("sort_desc", values.drop_nulls()), 0, k)
 
     def kahan_sum(self) -> AggExpr:
         """Compensated sum of a group's values (DuckDB ``fsum``/``kahan_sum``, → Float64).
@@ -3677,17 +3786,17 @@ class Expr:
         func = "arg_max" if ignore_nulls else "arg_max_null"
         return AggExpr(func, self, input2=_col_or_expr(order_by))
 
-    def arg_min(self, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
-        """This expression's value at the row where `by` is minimal (SQL ``arg_min``/``min_by``).
+    def min_by(self, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+        """This expression's value at the row where `by` is minimal (SQL ``min_by``/``arg_min``).
 
         Key ties break to the smallest value, so the result is deterministic and
         partition-independent. A row whose `by` is null never counts. By default a row
         whose value is null does not either (DuckDB ``arg_min``); ``ignore_nulls=False``
         lets it win and return its null (DuckDB ``arg_min_null``, Spark and Polars
-        ``min_by``).
+        ``min_by``). The *position* of the minimum is :meth:`arg_min`.
 
         Args:
-            by: The expression whose minimum selects the row.
+            by: The expression whose minimum selects the row; a bare string names a column.
             ignore_nulls: Whether to skip rows whose value is null.
 
         Returns:
@@ -3698,20 +3807,22 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10], "t": [3, 1, 5]})
-                >>> ds.group_by("g").agg(r=bt.col("x").arg_min(bt.col("t"))).sort("g").to_pydict()
+                >>> ds.group_by("g").agg(r=bt.col("x").min_by(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 10]}
         """
         func = "arg_min" if ignore_nulls else "arg_min_null"
         return AggExpr(func, self, input2=_col_or_expr(by))
 
-    def arg_max(self, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
-        """This expression's value at the row where `by` is maximal (SQL ``arg_max``/``max_by``).
+    def max_by(self, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+        """This expression's value at the row where `by` is maximal (SQL ``max_by``/``arg_max``).
+
+        The *position* of the maximum is :meth:`arg_max`.
 
         Null handling mirrors :meth:`arg_min`: ``ignore_nulls=False`` is DuckDB's
         ``arg_max_null`` and Spark's and Polars' ``max_by``.
 
         Args:
-            by: The expression whose maximum selects the row.
+            by: The expression whose maximum selects the row; a bare string names a column.
             ignore_nulls: Whether to skip rows whose value is null.
 
         Returns:
@@ -3722,15 +3833,63 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10], "t": [3, 1, 5]})
-                >>> ds.group_by("g").agg(r=bt.col("x").arg_max(bt.col("t"))).sort("g").to_pydict()
+                >>> ds.group_by("g").agg(r=bt.col("x").max_by(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1, 10]}
 
                 >>> held = bt.from_pydict({"x": [1, None], "t": [1, 2]})
-                >>> held.agg(r=bt.col("x").arg_max("t", ignore_nulls=False)).to_pydict()
+                >>> held.agg(r=bt.col("x").max_by("t", ignore_nulls=False)).to_pydict()
                 {'r': [None]}
         """
         func = "arg_max" if ignore_nulls else "arg_max_null"
         return AggExpr(func, self, input2=_col_or_expr(by))
+
+    def arg_min(self) -> Expr:
+        """The 0-based position of the group's smallest non-null value (Polars ``arg_min``).
+
+        The first position wins a tie, and a group with no non-null value is null.
+        Positions count the group's rows in arrival order, nulls included, so the answer
+        is only as defined as that order: sort first when it matters. Composed as
+        :meth:`array_agg` followed by the list's own ``arg_min``. The *value* at another
+        column's minimum is :meth:`min_by`.
+
+        Returns:
+            An Int64 expression over an aggregate, for use in ``agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [4, None, 1, 1]})
+                >>> ds.agg(r=bt.col("x").arg_min()).to_pydict()
+                {'r': [2]}
+        """
+        from batcher.plan.expr_ir.func_nodes import ListFunc
+
+        return ListFunc("arg_min", self.array_agg())
+
+    def arg_max(self) -> Expr:
+        """The 0-based position of the group's largest non-null value (Polars ``arg_max``).
+
+        The first position wins a tie, and a group with no non-null value is null.
+        Positions count the group's rows in arrival order, nulls included, so the answer
+        is only as defined as that order: sort first when it matters. Composed as
+        :meth:`array_agg` followed by the list's own ``arg_max``. The *value* at another
+        column's maximum is :meth:`max_by`.
+
+        Returns:
+            An Int64 expression over an aggregate, for use in ``agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [None, 5, 2, 5]})
+                >>> ds.agg(r=bt.col("x").arg_max()).to_pydict()
+                {'r': [1]}
+        """
+        from batcher.plan.expr_ir.func_nodes import ListFunc
+
+        return ListFunc("arg_max", self.array_agg())
 
     def bool_and(self, *, empty_value: bool | None = None) -> AggExpr | Expr:
         """Logical AND of this boolean expression's non-null values per group.
@@ -3934,22 +4093,42 @@ class Expr:
     # or `filter`. `partition_by` gives a per-group running value; without `order_by`
     # the order is the row order (Polars' default), matching `cum_*` semantics.
     def _running(
-        self, agg: str, partition_by: Iterable[IntoExpr], order_by: Iterable[IntoExpr]
-    ) -> WindowExpr:
-        return AggExpr(agg, self).over(
-            partition_by=partition_by, order_by=order_by, frame=(None, 0)
-        )
+        self,
+        agg: str,
+        partition_by: Iterable[IntoExpr],
+        order_by: Iterable[IntoExpr],
+        *,
+        reverse: bool = False,
+        propagate_nulls: bool = False,
+    ) -> Expr:
+        """`agg` from the first row to this one, or from this one to the last (`reverse`).
+
+        `propagate_nulls` answers null on a null input row while the running value carries
+        on past it — Polars' reading — as a CASE over the same window, so it adds no IR.
+        The null is ``nullif(running, running)``, a null of the running value's own type.
+        """
+        from batcher.plan.expr_ir.constructors import nullif, when
+
+        frame = (0, None) if reverse else (None, 0)
+        running = AggExpr(agg, self).over(partition_by=partition_by, order_by=order_by, frame=frame)
+        if not propagate_nulls:
+            return running
+        return when(self.is_null()).then(nullif(running, running)).otherwise(running)
 
     def cum_sum(
-        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
-    ) -> WindowExpr:
+        self,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+        reverse: bool = False,
+        propagate_nulls: bool = False,
+    ) -> Expr:
         """Cumulative (running) sum from the first row to the current one — Polars ``cum_sum``.
 
         Nulls are **skipped, not propagated**: a null leaves the running value
         unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
-        Polars propagates instead, returning null at the null row and for it alone, so
-        the two agree on every column without nulls and differ exactly where one has
-        them.
+        Polars propagates instead, returning null at the null row and for it alone;
+        ``propagate_nulls=True`` gives that reading.
 
         A window expression (one value per row, no row collapse) — use it in
         ``with_columns``/``select``, not in scalar arithmetic or ``filter``. Without
@@ -3958,6 +4137,10 @@ class Expr:
         Args:
             partition_by: Restart the running sum per group of these key expressions.
             order_by: Order rows by these expressions before accumulating.
+            reverse: Accumulate from the last row back to the current one (Polars
+                ``reverse=True``).
+            propagate_nulls: Answer null on a null input row (Polars), while the running
+                value still skips it for the rows after.
 
         Returns:
             A window expression carrying the running sum.
@@ -3970,18 +4153,24 @@ class Expr:
                 >>> ds.with_columns(cs=bt.col("x").cum_sum()).to_pydict()
                 {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10]}
         """
-        return self._running("sum", partition_by, order_by)
+        return self._running(
+            "sum", partition_by, order_by, reverse=reverse, propagate_nulls=propagate_nulls
+        )
 
     def cum_min(
-        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
-    ) -> WindowExpr:
+        self,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+        reverse: bool = False,
+        propagate_nulls: bool = False,
+    ) -> Expr:
         """Cumulative (running) minimum up to the current row — Polars ``cum_min``.
 
         Nulls are **skipped, not propagated**: a null leaves the running value
         unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
-        Polars propagates instead, returning null at the null row and for it alone, so
-        the two agree on every column without nulls and differ exactly where one has
-        them.
+        Polars propagates instead, returning null at the null row and for it alone;
+        ``propagate_nulls=True`` gives that reading.
 
         A window expression; use it in ``with_columns``/``select``. Pass
         `partition_by` to restart per group and `order_by` to set the running order.
@@ -3989,6 +4178,10 @@ class Expr:
         Args:
             partition_by: Restart the running value per group of these key expressions.
             order_by: Order rows by these expressions before accumulating.
+            reverse: Accumulate from the last row back to the current one (Polars
+                ``reverse=True``).
+            propagate_nulls: Answer null on a null input row (Polars), while the running
+                value still skips it for the rows after.
 
         Returns:
             A window expression carrying the running minimum.
@@ -4001,18 +4194,24 @@ class Expr:
                 >>> ds.with_columns(cm=bt.col("x").cum_min()).to_pydict()
                 {'x': [3, 1, 4, 1, 5], 'cm': [3, 1, 1, 1, 1]}
         """
-        return self._running("min", partition_by, order_by)
+        return self._running(
+            "min", partition_by, order_by, reverse=reverse, propagate_nulls=propagate_nulls
+        )
 
     def cum_max(
-        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
-    ) -> WindowExpr:
+        self,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+        reverse: bool = False,
+        propagate_nulls: bool = False,
+    ) -> Expr:
         """Cumulative (running) maximum up to the current row — Polars ``cum_max``.
 
         Nulls are **skipped, not propagated**: a null leaves the running value
         unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
-        Polars propagates instead, returning null at the null row and for it alone, so
-        the two agree on every column without nulls and differ exactly where one has
-        them.
+        Polars propagates instead, returning null at the null row and for it alone;
+        ``propagate_nulls=True`` gives that reading.
 
         A window expression; use it in ``with_columns``/``select``. Pass
         `partition_by` to restart per group and `order_by` to set the running order.
@@ -4020,6 +4219,10 @@ class Expr:
         Args:
             partition_by: Restart the running value per group of these key expressions.
             order_by: Order rows by these expressions before accumulating.
+            reverse: Accumulate from the last row back to the current one (Polars
+                ``reverse=True``).
+            propagate_nulls: Answer null on a null input row (Polars), while the running
+                value still skips it for the rows after.
 
         Returns:
             A window expression carrying the running maximum.
@@ -4032,11 +4235,18 @@ class Expr:
                 >>> ds.with_columns(cm=bt.col("x").cum_max()).to_pydict()
                 {'x': [3, 1, 4, 1, 5], 'cm': [3, 3, 4, 4, 5]}
         """
-        return self._running("max", partition_by, order_by)
+        return self._running(
+            "max", partition_by, order_by, reverse=reverse, propagate_nulls=propagate_nulls
+        )
 
     def cum_prod(
-        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
-    ) -> WindowExpr:
+        self,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+        reverse: bool = False,
+        propagate_nulls: bool = False,
+    ) -> Expr:
         """Cumulative (running) product up to the current row — Polars ``cum_prod``.
 
         Completes the running family beside :meth:`cum_sum`, :meth:`cum_min`,
@@ -4051,6 +4261,10 @@ class Expr:
         Args:
             partition_by: Restart the running value per group of these key expressions.
             order_by: Order rows by these expressions before accumulating.
+            reverse: Accumulate from the last row back to the current one (Polars
+                ``reverse=True``).
+            propagate_nulls: Answer null on a null input row (Polars), while the running
+                value still skips it for the rows after.
 
         Returns:
             A window expression carrying the running product.
@@ -4071,7 +4285,9 @@ class Expr:
                 ... ).to_pydict()["growth"]
                 [1.1, 1.32, 1.0, 0.5]
         """
-        return self._running("product", partition_by, order_by)
+        return self._running(
+            "product", partition_by, order_by, reverse=reverse, propagate_nulls=propagate_nulls
+        )
 
     def cum_count(
         self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
@@ -4992,55 +5208,32 @@ class Expr:
         partition_by: Iterable[IntoExpr],
         order_by: Iterable[IntoExpr],
     ) -> Expr:
-        """Sample/population variance over the trailing frame, composed from moments.
+        """Sample/population variance over the trailing frame, on the framed variance kernel.
 
-        ``Var = E[x^2] - E[x]^2`` gives the population variance over the frame; the
-        Bessel correction ``n / (n - ddof)`` lifts it to the sample statistic. All the
-        terms reuse the tested `_rolling` machinery over the *same* frame, so rolling
-        variance adds no new IR and inherits the leading-partial-frame / `min_periods`
-        semantics of :meth:`rolling_sum`.
+        The frame is `_rolling`'s, so the leading partial frames and `min_periods` behave as
+        :meth:`rolling_sum`'s do. The sample variance comes from the engine's windowed
+        ``var`` (`bc_runtime::window::agg`), which slides Welford moments through a two-stack
+        fold: nothing is subtracted, so it neither cancels on large offsets nor lets a NaN
+        outlive the windows that hold it. Any other `ddof` rescales that exactly,
+        ``var_samp * (n - 1) / (n - ddof)``, and a frame of no more than `ddof` values has no
+        statistic, so it is null (DuckDB's ``var_samp`` of one value is NULL).
 
-        The values are **centered on the partition mean first**, which the identity
-        ``Var(x) = Var(x - k)`` makes exact for any constant `k`. Without it this is the
-        sum-of-powers formula that `bc-runtime`'s `var_state` was rewritten to escape: it
-        subtracts two nearly equal large numbers, so it loses a digit of precision for
-        every digit by which the mean exceeds the spread. Measured on
-        ``[k+1, k+2, ..., k+6]`` with a 3-wide frame, where the true variance is 1.0:
+        This replaced a composition over the centred moments ``E[x^2] - E[x]^2``. Centring
+        on the partition mean kept small offsets exact, but it could not keep a frame of
+        ``[1e9, 1e9 + 2]`` from cancelling to 0 in a partition that also held small values,
+        and one NaN anywhere made the centre, and so every row of the partition, NaN."""
+        from batcher.plan.expr_ir.constructors import nullif, when
 
-        ==============  ==================================
-        offset ``k``    ``E[x^2] - E[x]^2`` returned
-        ==============  ==================================
-        ``0``           1.0
-        ``1e6``         0.999939
-        ``1e9``         0.0        (reads as "constant")
-        ``1e12``        -201326592 (a negative variance)
-        ==============  ==================================
-
-        An epoch-second timestamp is ~1.7e9 and a monetary column in cents reaches 1e12,
-        so this is the ordinary case rather than an adversarial one. Centering removes the
-        offset before it can cancel; the partition mean is used because it is the constant
-        nearest the data that a window expression can name.
-
-        The residual is clamped at zero for the rounding that can still put a
-        mathematically non-negative quantity a few ulps below it — via a comparison, so a
-        genuine NaN (a non-finite value in the frame) propagates instead of being clipped
-        to a confident zero."""
-        from batcher.plan.expr_ir.constructors import when
-
-        centre = AggExpr("avg", self).over(partition_by=partition_by)
-        centered = self - centre
-        mean = centered._rolling("avg", window_size, min_periods, partition_by, order_by)
-        mean_sq = (centered * centered)._rolling(
-            "avg", window_size, min_periods, partition_by, order_by
-        )
-        raw = mean_sq - mean * mean
-        var_pop = when(raw < Lit(0.0)).then(Lit(0.0)).otherwise(raw)
-        if ddof == 0:
-            return var_pop
+        samp = self._rolling("var", window_size, min_periods, partition_by, order_by)
+        if ddof == 1:
+            return samp
         count = self._rolling("count", window_size, min_periods, partition_by, order_by).cast(
             "float64"
         )
-        return var_pop * (count / (count - Lit(ddof)))
+        # `var_samp` is null on one value, where the centred sum of squares is 0.
+        spread = Coalesce([samp * (count - Lit(1.0)), Lit(0.0)])
+        scaled = spread / (count - Lit(float(ddof)))
+        return when(count > Lit(float(ddof))).then(scaled).otherwise(nullif(scaled, scaled))
 
     def rolling_var(
         self,
@@ -5272,24 +5465,33 @@ class Expr:
         *,
         descending: bool = False,
         partition_by: Iterable[IntoExpr] = (),
+        propagate_nulls: bool = False,
     ) -> Expr:
         """Rank the rows by this expression's value — SQL ``RANK() OVER (ORDER BY self)``.
 
-        A window expression; use it in ``with_columns``/``select``. Ranks start at 1.
+        A window expression; use it in ``with_columns``/``select``. Ranks start at 1, and
+        null values sort last and are ranked like any other value unless
+        `propagate_nulls` is set. Polars ``rank()`` is ``method="average",
+        propagate_nulls=True``.
 
         Args:
             method: How ties are numbered. ``"min"`` gives tied rows the same rank and
                 leaves a gap (SQL ``RANK``); ``"dense"`` gives the same rank with no gap
                 (``DENSE_RANK``); ``"ordinal"`` breaks ties arbitrarily so every row gets
-                a distinct rank (``ROW_NUMBER``).
+                a distinct rank (``ROW_NUMBER``); ``"max"`` gives tied rows the highest
+                rank they span; ``"average"`` gives them the mean of that span, as
+                Float64 (Polars' default).
             descending: Rank from the largest value down instead of the smallest up.
             partition_by: Rank within each group of these key expressions.
+            propagate_nulls: A null value gets a null rank (Polars, pandas
+                ``na_option="keep"``).
 
         Returns:
             The 1-based rank of each row.
 
         Raises:
-            PlanError: If `method` is not one of ``min``/``dense``/``ordinal``.
+            PlanError: If `method` is not one of ``average``/``dense``/``max``/``min``/
+                ``ordinal``.
 
         Examples:
             .. doctest::
@@ -5298,13 +5500,38 @@ class Expr:
                 >>> ds = bt.from_pydict({"x": [10, 30, 10]})
                 >>> ds.with_columns(r=bt.col("x").rank()).to_pydict()
                 {'x': [10, 30, 10], 'r': [1, 3, 1]}
+
+                >>> ds = bt.from_pydict({"x": [3, 1, 3, None]})
+                >>> ds.with_columns(
+                ...     r=bt.col("x").rank("average", propagate_nulls=True)
+                ... ).to_pydict()["r"]
+                [2.5, 1.0, 2.5, None]
         """
+        from batcher.plan.expr_ir.constructors import nullif, when
         from batcher.plan.expr_ir.nodes import dense_rank, rank, row_number
 
         fns = {"min": rank, "dense": dense_rank, "ordinal": row_number}
-        if method not in fns:
-            raise PlanError(f"rank(): method must be one of {sorted(fns)}, got {method!r}")
-        return fns[method]().over(partition_by=partition_by, order_by=[(self, descending)])
+        if method not in (*fns, "average", "max"):
+            raise PlanError(
+                "rank(): method must be one of ['average', 'dense', 'max', 'min', 'ordinal'], "
+                f"got {method!r}"
+            )
+        ranked: Expr = fns.get(method, rank)().over(
+            partition_by=partition_by, order_by=[(self, descending)]
+        )
+        if method in ("average", "max"):
+            # A tie's span is its peer count: the rows sharing this value in the partition.
+            # Counting `self IS NULL` counts every row, a null value's peers included.
+            peers = AggExpr("count", IsNull(self)).over(
+                partition_by=[*normalize_key_list(partition_by), self]
+            )
+            if method == "max":
+                ranked = ranked + peers - Lit(1)
+            else:
+                ranked = ranked.cast("float64") + (peers - Lit(1)).cast("float64") / Lit(2.0)
+        if propagate_nulls:
+            return when(self.is_null()).then(nullif(ranked, ranked)).otherwise(ranked)
+        return ranked
 
     def is_duplicated(self) -> Expr:
         """True on every row whose value occurs more than once — Polars ``is_duplicated``.
@@ -5704,6 +5931,42 @@ def _membership_test(input: Expr, values: list) -> Expr:
     if _in_list_foldable(values):
         return InList(input, tuple(values))
     return combine_disjuncts([input == v for v in values])
+
+
+def _null_safe_membership(input: Expr, values: list) -> Expr:
+    """``is_in(values, nulls_equal=True)``: a two-valued membership where null equals ``None``.
+
+    The SQL test answers null for a null input or a non-match against a list holding a
+    null; coalescing it to false and OR-ing in ``input IS NULL`` (only when `values` holds
+    ``None``) gives the null-safe reading with no new node.
+    """
+    non_null = [v for v in values if v is not None]
+    hit: Expr = (
+        Coalesce([_membership_test(input, non_null), Lit(False)]) if non_null else Lit(False)
+    )
+    if len(non_null) == len(values):
+        return hit
+    return hit | IsNull(input)
+
+
+def _twos_complement_digits(value: Expr, radix: int, plain: Expr) -> Expr:
+    """`value` in the power-of-two `radix`, a negative one as its 64-bit two's complement.
+
+    A radix of ``2**k`` spends ``k`` bits a digit, so 64 bits are ``ceil(64 / k)`` digits
+    whose top one holds the leftover high bits. The top digit is read with an arithmetic
+    shift and a mask, the rest from the low bits masked non-negative and left-padded with
+    zeros, so no step needs an unsigned 64-bit type the engine does not have.
+    """
+    from batcher.plan.expr_ir.constructors import when
+
+    bits = radix.bit_length() - 1
+    digits = -(-64 // bits)
+    low_bits = (digits - 1) * bits
+    top_bits = 64 - low_bits
+    top = (value >> Lit(low_bits)).bitwise_and(Lit((1 << top_bits) - 1))
+    low = value.bitwise_and(Lit((1 << low_bits) - 1))
+    negative = Binary("concat", top.to_base(radix), low.to_base(radix).str.lpad(digits - 1, "0"))
+    return when(value < Lit(0)).then(negative).otherwise(plain)
 
 
 @expr_node

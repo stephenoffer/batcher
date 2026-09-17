@@ -256,7 +256,7 @@ AGG_FNS: Final = frozenset(
         # `quantile` does; `n50`/`n90`/`l50` are the public spellings over them.
         "n_length", "l_count", "aun",
         # Parameter forms with a state of their own to finalize, each reached only through
-        # a parameter on the one public spelling: `arg_min(by, ignore_nulls=False)`,
+        # a parameter on the one public spelling: `min_by(by, ignore_nulls=False)`,
         # `skew(bias=True)`, `mode(all_modes=True)`.
         "arg_min_null", "arg_max_null", "skewness_pop", "modes",
     }

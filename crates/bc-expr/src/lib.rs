@@ -376,10 +376,17 @@ pub enum Expr {
     /// string its UTF-8. Order-sensitive, and null is a distinct positional value. Stable
     /// across partitions, runs, machines and versions (pinned by golden tests) — which is
     /// what a reproducible split, a surrogate key, and hash bucketing all rest on.
+    ///
+    /// `algorithm` picks the digest. The default is Batcher's own (above); the others
+    /// reproduce another engine's value exactly, for a migrated job whose buckets or keys
+    /// must not move — see [`HashAlgorithm`]. Omitted from the wire when default, so an
+    /// existing plan serializes byte-identically.
     Hash {
         inputs: Vec<Expr>,
         #[serde(default)]
         seed: i64,
+        #[serde(default)]
+        algorithm: HashAlgorithm,
     },
 
     /// `sequence(start, stop, step)` — the integer series from `start` to `stop`
@@ -1236,6 +1243,12 @@ pub enum ListBinaryFunc {
     /// `minhash` signatures this is the standard unbiased estimator of the documents'
     /// Jaccard similarity; over arbitrary lists it is simply the agreement rate.
     Jaccard,
+    /// Jaccard similarity of the two lists' **non-zero position sets** — `|A∩B| / |A∪B|`
+    /// where `A` holds the indices `i` with `aᵢ ≠ 0` (Daft `jaccard_similarity` over
+    /// embeddings). NaN counts as non-zero, `-0.0` as zero, a null element as zero. Two
+    /// lists with no non-zero position → null (the ratio is 0/0); lists of different
+    /// lengths error; a null row on either side → null.
+    JaccardNonzero,
     /// The clipped multiset intersection size `Σ_v min(count_left(v), count_right(v))` —
     /// how many of the left list's elements the right can account for, **counting
     /// repeats**. Unlike `array_intersect(...).len()` a value repeated four times on the
@@ -1257,6 +1270,34 @@ pub enum ListBinaryFunc {
     LcsLength,
 }
 
+/// The digest an [`Expr::Hash`] computes.
+///
+/// Every non-default arm reproduces a specific engine's function to the bit, which is the
+/// only reason to choose one: the default is cheaper and hashes every type, while these
+/// exist so a job ported from Spark, Iceberg or Daft keeps the keys and buckets it already
+/// wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashAlgorithm {
+    /// Batcher's typed SplitMix64 fold (`eval::hash`). Null is a positional value.
+    #[default]
+    Batcher,
+    /// Spark's `hash(...)`: 32-bit Murmur3 (x86_32), seed-chained across the inputs, with
+    /// Spark's per-type encoding (`hashInt` for 32-bit and narrower integers, dates and
+    /// booleans; `hashLong` for 64-bit integers, timestamps and doubles; Spark's
+    /// non-standard tail for strings and binary). A null input leaves the running hash
+    /// unchanged. The Int32 result is sign-extended into Int64.
+    Murmur3,
+    /// The Iceberg bucket-transform hash: standard 32-bit Murmur3 with seed 0 over an
+    /// integer/date/timestamp's 8-byte little-endian value, or a string/binary's bytes.
+    /// One input; a null input yields null. Iceberg defines no bucket hash for floats,
+    /// booleans or nested types, so those error.
+    Iceberg,
+    /// Daft's default `hash`: XXH3-64 of the value's bytes with the seed. One input; a null
+    /// hashes like an empty input with seed 0. The UInt64 digest is reinterpreted as Int64.
+    Xxhash3,
+}
+
 /// Two-argument math functions (→ Float64).
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1267,6 +1308,11 @@ pub enum Math2Func {
     Atan2,
     /// `round(x, digits)` — round to `digits` decimal places.
     Round,
+    /// `round_even(x, digits)` — round to `digits` decimal places, ties to **even**
+    /// (DuckDB `round_even`, Polars `round(mode="half_to_even")`, Spark `bround`). Same
+    /// scaling, overflow guard and integer-typed integer path as `Round`; only the tie
+    /// rule differs.
+    RoundEven,
     /// `gcd(a, b)` — greatest common divisor of two integers (DuckDB `gcd`).
     Gcd,
     /// `lcm(a, b)` — least common multiple of two integers (DuckDB `lcm`).
@@ -1768,6 +1814,11 @@ pub enum ListFunc {
     /// front, where DuckDB's `list_reverse_sort` leaves them at the back. The null
     /// placement is the whole reason this is its own kernel rather than a composition.
     SortDesc,
+    /// `Sort` with the nulls **first** (DuckDB `list_sort(l, 'ASC', 'NULLS FIRST')`, the
+    /// Polars `list.sort` default and Spark's ascending `sort_array`).
+    SortNullsFirst,
+    /// `SortDesc` with the nulls **first** (DuckDB `list_sort(l, 'DESC', 'NULLS FIRST')`).
+    SortDescNullsFirst,
     /// Reverse each row's list → `List` (same element type).
     Reverse,
     /// Product of (non-null) elements → Float64; empty/null row → null.
@@ -1780,6 +1831,12 @@ pub enum ListFunc {
     /// Distinct elements preserving first-occurrence order → `List` (same element
     /// type); null elements are dropped.
     Unique,
+    /// `Unique` that keeps **one** null, at its first occurrence (Polars `list.unique`,
+    /// Spark `array_distinct`).
+    UniqueWithNulls,
+    /// `NUnique` that counts null as one more distinct value when the list holds any
+    /// (Polars `list.n_unique`).
+    NUniqueWithNulls,
     /// Median of the (non-null) elements → Float64; for an even count the average
     /// of the two middle values; empty/null row → null.
     Median,
@@ -1837,11 +1894,13 @@ pub enum ListFunc {
     /// retrieval score distribution, or an attention row. A non-positive element is skipped
     /// (`p ln p` is undefined there); a row totalling zero has no distribution and yields null.
     Entropy,
-    /// First difference over each row's list → `List<Float64>` of the **same length**:
-    /// element `i` is `xᵢ − xᵢ₋₁`, with element 0 null (no predecessor). If either
-    /// neighbor is null the difference is null (Polars `list.diff`). The delta-feature
-    /// building block for audio (MFCC deltas) and time-series (returns / velocity);
-    /// a null/empty row stays null/empty.
+    /// First difference over each row's list → a list of the **same length**: element `i`
+    /// is `xᵢ − xᵢ₋₁`, with element 0 null (no predecessor). If either neighbor is null the
+    /// difference is null (Polars `list.diff`). The delta-feature building block for audio
+    /// (MFCC deltas) and time-series (returns / velocity); a null/empty row stays
+    /// null/empty. An integer list (other than `UInt64`) differences exactly into
+    /// `List<Int64>` with wrapping subtraction, as Polars does; a float list stays
+    /// `List<Float64>`.
     Diff,
 }
 

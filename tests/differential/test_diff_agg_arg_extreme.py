@@ -36,7 +36,7 @@ def test_arg_extreme_skips_null_values(duck):
     out = (
         bt.from_arrow(_tbl())
         .group_by("g")
-        .agg(amx=col("v").arg_max(col("k")), amn=col("v").arg_min(col("k")))
+        .agg(amx=col("v").max_by(col("k")), amn=col("v").min_by(col("k")))
         .collect()
     )
     assert_same(
@@ -54,7 +54,7 @@ def test_arg_extreme_all_null_values_is_null(duck):
         }
     )
     duck.register("t", tbl)
-    out = bt.from_arrow(tbl).group_by("g").agg(amx=col("v").arg_max(col("k"))).collect()
+    out = bt.from_arrow(tbl).group_by("g").agg(amx=col("v").max_by(col("k"))).collect()
     assert_same(out, duck.sql("SELECT g, arg_max(v, k) AS amx FROM t GROUP BY g"))
 
 
@@ -68,7 +68,7 @@ def test_arg_extreme_null_value_single_node_equals_distributed():
     ds = (
         bt.from_pydict(g)
         .group_by("g")
-        .agg(amx=col("v").arg_max(col("k")), amn=col("v").arg_min(col("k")))
+        .agg(amx=col("v").max_by(col("k")), amn=col("v").min_by(col("k")))
     )
     single = {
         k: (a, b)

@@ -17,7 +17,15 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.constructors import col, lit, when
-from batcher.plan.expr_ir.core import Binary, Expr, IntoExpr, Math2Expr, MathExpr, _wrap
+from batcher.plan.expr_ir.core import (
+    Binary,
+    Expr,
+    IntoExpr,
+    Math2Expr,
+    MathExpr,
+    _col_or_expr,
+    _wrap,
+)
 
 __all__ = [
     "arctan2",
@@ -159,9 +167,11 @@ def arctan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
     The angle in radians of the point ``(x, y)`` from the positive x-axis, using both
     signs to place it in the correct quadrant (unlike a plain ``arctan(y / x)``).
 
+    A bare string names a **column**, as it does in Polars: ``arctan2("y", "x")``.
+
     Args:
-        y: The ordinate (numerator).
-        x: The abscissa (denominator).
+        y: The ordinate (numerator), or its column name.
+        x: The abscissa (denominator), or its column name.
 
     Returns:
         A Float64 expression of the angle in radians, in ``(-pi, pi]``.
@@ -174,7 +184,7 @@ def arctan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
             >>> ds.select(a=bt.arctan2(bt.col("y"), bt.col("x")).round(4)).to_pydict()
             {'a': [0.7854]}
     """
-    return Math2Expr("atan2", _wrap(y), _wrap(x))
+    return Math2Expr("atan2", _col_or_expr(y), _col_or_expr(x))
 
 
 def log(base: IntoExpr, value: IntoExpr) -> Expr:
@@ -348,7 +358,11 @@ def great_circle_distance(
     lon2: IntoExpr,
     unit: str = "km",
 ) -> Expr:
-    """Great-circle distance between two lat/lon points, in degrees (→ Float64).
+    """Great-circle distance between two lat/lon points, in `unit` (kilometres by default).
+
+    The inputs are degrees; the result is a length, not an angle. Daft's
+    ``great_circle_distance`` answers in metres on a 6,371,000 m sphere, which is
+    ``unit="m"`` scaled by ``6371000 / 6371008.8``.
 
     The haversine formula on a sphere of mean Earth radius. Haversine rather than the
     law of cosines because the latter loses precision for nearby points, where the

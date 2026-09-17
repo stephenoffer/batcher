@@ -726,7 +726,7 @@ pub(crate) fn libm_unary_symbol(func: bc_expr::MathFunc) -> Option<&'static str>
 /// not a single libm call (`Round`, which takes a digit count, stays on the
 /// interpreter).
 pub(crate) fn libm_binary_symbol(func: bc_expr::Math2Func) -> Option<&'static str> {
-    use bc_expr::Math2Func::{Atan2, Gcd, Hypot, Lcm, NextAfter, Pow, Round};
+    use bc_expr::Math2Func::{Atan2, Gcd, Hypot, Lcm, NextAfter, Pow, Round, RoundEven};
     Some(match func {
         Pow => "pow",
         Atan2 => "atan2",
@@ -737,7 +737,7 @@ pub(crate) fn libm_binary_symbol(func: bc_expr::Math2Func) -> Option<&'static st
         // interpreter computes it by stepping the bit pattern, which a libm `nextafter`
         // libcall need not reproduce for the subnormal and sign-crossing cases. The JIT
         // must be bit-for-bit identical to the oracle or fall back; it falls back.
-        Round | Gcd | Lcm | Hypot | NextAfter => return None,
+        Round | RoundEven | Gcd | Lcm | Hypot | NextAfter => return None,
     })
 }
 

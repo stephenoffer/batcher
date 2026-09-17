@@ -274,7 +274,8 @@ These sit outside the `Dataset` and `Expr` surfaces:
 - Aggregates (inside `.agg`): `.sum()`, `.min()`, `.max()`, `.mean()`, `.var()`,
   `.std()`, `.median()`, `.quantile(q)`, `.skewness()`, `.kurtosis()`, `.count()`,
   `.n_unique()` / `.count_distinct()`, `.mode()`, `.first()`, `.last()`,
-  `.arg_min()`, `.arg_max()`, `.bool_and()`, `.bool_or()`,
+  `.arg_min()`, `.arg_max()`, `.min_by(by)`, `.max_by(by)`, `.mode_top_k(k)`, `.top_k(k)`,
+  `.bool_and()`, `.bool_or()`,
   `.bit_and()` / `.bit_or()` / `.bit_xor()`, `.histogram()`, `.array_agg()`
 - Approximate aggregates, sketch-backed and mergeable so they scale: `.approx_n_unique()` /
   `.approx_count_distinct()` (HyperLogLog), `.approx_quantile(q)` / `.approx_median()` (DDSketch)

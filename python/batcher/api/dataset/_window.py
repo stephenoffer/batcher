@@ -50,8 +50,17 @@ def _window_node(plan: LogicalPlan, alias: str, we: WindowExpr) -> Window:
     order_specs: list[SortKeySpec] = []
     for key in we.order_by:
         if isinstance(key, tuple):
-            name, descending = key
-            order_specs.append(SortKeySpec(_as_key_expr(name), descending=bool(descending)))
+            # `(key, descending)` or `(key, descending, nulls_first)`, the same shapes
+            # `Dataset.window` reads. The two-element unpack used to raise a bare
+            # ValueError on the third, so Spark's nulls-first window order (`orderBy`
+            # on an ascending key) had no spelling on `over`.
+            name, descending, *rest = key
+            nulls_first = bool(rest[0]) if rest else False
+            order_specs.append(
+                SortKeySpec(
+                    _as_key_expr(name), descending=bool(descending), nulls_first=nulls_first
+                )
+            )
         else:
             order_specs.append(SortKeySpec(_as_key_expr(key)))
     frame = WindowFrame(*we.frame) if we.frame is not None else None

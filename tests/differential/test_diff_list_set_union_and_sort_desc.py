@@ -122,7 +122,7 @@ def test_sort_desc_matches_duckdb_element_by_element(duck):
     values = [[3, 1, 2], [5, 5, 1], [], [1], None, [2, None, 1]]
     table = pa.table({"a": values})
     duck.register("s", table)
-    got = bt.from_arrow(table).select(d=col("a").list.sort_desc()).to_pydict()["d"]
+    got = bt.from_arrow(table).select(d=col("a").list.sort(descending=True)).to_pydict()["d"]
     want = duck.sql("SELECT list_sort(a, 'DESC') d FROM s").to_arrow_table().to_pydict()["d"]
     assert got == want, f"{got}\nvs duckdb\n{want}"
 
@@ -131,7 +131,9 @@ def test_sort_desc_really_descends_and_keeps_every_element():
     """Asserted directly, because comparing a sort with a sorting comparison proves nothing."""
     values = [[3, 1, 2], [5, 5, 1], [10, -3, 0, 7]]
     got = (
-        bt.from_arrow(pa.table({"a": values})).select(d=col("a").list.sort_desc()).to_pydict()["d"]
+        bt.from_arrow(pa.table({"a": values}))
+        .select(d=col("a").list.sort(descending=True))
+        .to_pydict()["d"]
     )
     for original, ordered in zip(values, got, strict=True):
         assert ordered == sorted(original, reverse=True), f"{original} sorted to {ordered}"
@@ -144,7 +146,7 @@ def test_sort_desc_is_the_reverse_of_sort_on_a_list_with_no_nulls():
     """Cross-check against the ascending spelling, which is implemented separately."""
     values = [[3, 1, 2], [5, 5, 1], [10, -3, 0, 7], []]
     ds = bt.from_arrow(pa.table({"a": values}))
-    got = ds.select(up=col("a").list.sort(), down=col("a").list.sort_desc()).to_pydict()
+    got = ds.select(up=col("a").list.sort(), down=col("a").list.sort(descending=True)).to_pydict()
     for ascending, descending in zip(got["up"], got["down"], strict=True):
         assert descending == list(reversed(ascending)), f"{ascending} vs {descending}"
 
@@ -182,5 +184,5 @@ def test_a_null_list_on_the_right_is_read_as_an_empty_one():
 def test_sort_desc_leaves_an_empty_list_empty_and_a_null_list_null():
     """The distinction the sort must keep: a missing list is not an empty one."""
     table = pa.table({"a": [None, [], [2, 1]]}, schema=pa.schema([("a", pa.list_(pa.int64()))]))
-    got = bt.from_arrow(table).select(d=col("a").list.sort_desc()).to_pydict()["d"]
+    got = bt.from_arrow(table).select(d=col("a").list.sort(descending=True)).to_pydict()["d"]
     assert got == [None, [], [2, 1]]

@@ -83,7 +83,6 @@ _UNARY_MATH = {
     # Spark spellings sqlglot gives a typed node; each is an existing `Expr` method.
     "Sec": "sec",
     "Csc": "csc",
-    "Rint": "rint",
     "BitwiseCount": "bit_count",
     # Not math *functions*, but the same shape: a method on the value expression.
     "IsNan": "is_nan",
