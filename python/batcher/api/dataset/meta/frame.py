@@ -213,28 +213,6 @@ class DatasetMeta(MetaBase):
         """
         return self._ds.filter(predicate).count()
 
-    def is_empty_where(self, predicate: Expr) -> bool:
-        """Whether `predicate` would keep no row at all.
-
-        The pruning question: a ``WHERE x > 1000`` over a column whose maximum is 42 is
-        provably empty, and answering it from the footer is what lets the file go unread.
-
-        Args:
-            predicate: The filter to test.
-
-        Returns:
-            ``True`` if no row survives.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
-                >>> ds.meta.is_empty_where(bt.col("x") > 1000)
-                True
-        """
-        return self._ds.filter(predicate).is_empty()
-
     def any_match(self, predicate: Expr) -> bool:
         """Whether at least one row satisfies `predicate`.
 
@@ -251,7 +229,7 @@ class DatasetMeta(MetaBase):
                 >>> bt.from_pydict({"x": [1, 2, 3]}).meta.any_match(bt.col("x") > 2)
                 True
         """
-        return not self.is_empty_where(predicate)
+        return not self.none_match(predicate)
 
     def none_match(self, predicate: Expr) -> bool:
         """Whether no row satisfies `predicate` — the spelling a skip decision reads best as.
@@ -269,7 +247,7 @@ class DatasetMeta(MetaBase):
                 >>> bt.from_pydict({"x": [1, 2, 3]}).meta.none_match(bt.col("x") > 100)
                 True
         """
-        return self.is_empty_where(predicate)
+        return self._ds.filter(predicate).is_empty()
 
     def all_match(self, predicate: Expr) -> bool:
         """Whether every row satisfies `predicate`.

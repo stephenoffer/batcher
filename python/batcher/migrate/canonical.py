@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 from batcher._internal.migration import OPERATORS, KwargRename, Rename
 from batcher._internal.optional import require
-from batcher.migrate.receivers import ClassRef, Inference, Member, infer_module
+from batcher.migrate.receivers import ClassRef, FunctionRef, Inference, Member, infer_module
 
 cst = require("libcst", feature="batcher.migrate", provides="libcst", extra="migrate")
 metadata = require("libcst.metadata", feature="batcher.migrate", provides="libcst", extra="migrate")
@@ -149,6 +149,10 @@ def _argument(call: object, position: int, keyword: str) -> object | None:
 
 
 def _transform_call(rule: Rename, base: object, call: object) -> object | None:
+    if rule.transform == "identity":
+        # `ds.lazy()` / `ds.copy()`: a Dataset is already lazy and immutable, so the call is
+        # the dataset itself.
+        return base if not call.args else None  # type: ignore[attr-defined]
     func = cst.Attribute(value=base, attr=cst.Name(rule.to))
     if rule.transform == "with_column":
         name, expr = _argument(call, 0, "name"), _argument(call, 1, "expr")
@@ -196,6 +200,7 @@ def _apply_kwargs(call: object, rules: dict[str, KwargRename], failed: list[str]
     keywords: list[object] = []
     inserted: list[object] = []
     changed = False
+    present = {a.keyword.value for a in call.args if a.keyword is not None}  # type: ignore[attr-defined]
     for arg in call.args:  # type: ignore[attr-defined]
         rule = rules.get(arg.keyword.value) if arg.keyword is not None else None
         if rule is None:
@@ -204,13 +209,25 @@ def _apply_kwargs(call: object, rules: dict[str, KwargRename], failed: list[str]
             continue
         value = arg.value
         changed = True
-        if rule.action == "rename":
+        # A call already passing the kept keyword as well (`descending=True, ascending=False`)
+        # is a conflict the user has to resolve, not something to merge silently.
+        collides = rule.to in present and rule.to != arg.keyword.value
+        if collides:
+            failed.append(arg.keyword.value)
+            keywords.append(arg)
+        elif rule.action == "rename":
             keywords.append(arg.with_changes(keyword=cst.Name(rule.to)))
         elif rule.action == "positional" and (elems := _literal_elements(value)) is not None:
             inserted.extend(cst.Arg(e) for e in elems)
+        elif rule.action == "first_positional" and not positional:
+            inserted.append(cst.Arg(value))
         elif rule.action == "negate" and (neg := _negated(value)) is not None:
             keywords.append(arg.with_changes(keyword=cst.Name(rule.to), value=neg))
-        elif rule.action == "nulls_first" and isinstance(value, cst.SimpleString):
+        elif (
+            rule.action == "nulls_first"
+            and isinstance(value, cst.SimpleString)
+            and value.evaluated_value in ("first", "last")
+        ):
             first = cst.Name(str(value.evaluated_value == "first"))
             keywords.append(arg.with_changes(keyword=cst.Name(rule.to), value=first))
         else:
@@ -219,11 +236,52 @@ def _apply_kwargs(call: object, rules: dict[str, KwargRename], failed: list[str]
     if not changed:
         return call
     args = [*positional, *inserted, *keywords]
-    comma = cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
-    args = [
-        a.with_changes(comma=cst.MaybeSentinel.DEFAULT if i == len(args) - 1 else comma)
-        for i, a in enumerate(args)
-    ]
+    # Keep each argument's own comma (and the newline inside it on a multi-line call); only
+    # an argument that had none and is no longer last needs one.
+    last = cst.MaybeSentinel.DEFAULT
+    trailing = call.args[-1].comma if call.args else last  # type: ignore[attr-defined]
+    fixed = []
+    for i, a in enumerate(args):
+        if i == len(args) - 1:
+            fixed.append(a.with_changes(comma=trailing))
+        elif isinstance(a.comma, cst.Comma):
+            fixed.append(a)
+        else:
+            fixed.append(
+                a.with_changes(comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" ")))
+            )
+    return call.with_changes(args=fixed)  # type: ignore[attr-defined]
+
+
+def _apply_keys(call: object, rule: Rename) -> object:
+    """Turn the call's leading positional arguments into the rule's keywords, in order."""
+    if not rule.keys:
+        return call
+    args = list(call.args)  # type: ignore[attr-defined]
+    leading = []
+    for arg in args:
+        if arg.keyword is not None or arg.star:
+            break
+        leading.append(arg)
+    for i, (arg, key) in enumerate(zip(leading, rule.keys, strict=False)):
+        args[i] = arg.with_changes(keyword=cst.Name(key), equal=_kwarg(key, arg.value).equal)
+    return call.with_changes(args=args)  # type: ignore[attr-defined]
+
+
+def _apply_fill(call: object, rule: Rename) -> object:
+    """Pass the removed spelling's default explicitly where the kept spelling's differs."""
+    args = list(call.args)  # type: ignore[attr-defined]
+    positional = [a for a in args if a.keyword is None and not a.star]
+    named = {a.keyword.value for a in args if a.keyword is not None}
+    has_star = any(a.star for a in args)
+    for param, position, literal in rule.fill:
+        if param in named or position < len(positional) or has_star:
+            continue
+        if args and not isinstance(args[-1].comma, cst.Comma):
+            args[-1] = args[-1].with_changes(
+                comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
+            )
+        args.append(_kwarg(param, cst.parse_expression(literal)))
     return call.with_changes(args=args)  # type: ignore[attr-defined]
 
 
@@ -244,8 +302,10 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
         renames: dict[str, dict[str, Rename]],
         kwargs: dict[str, dict[str, KwargRename]],
         report: RenameReport,
+        assume_accessors: bool = False,
     ) -> None:
         super().__init__()
+        self.assume_accessors = assume_accessors
         self.scopes = scopes
         self.stack: list[object] = [module]
         self.renames = renames
@@ -257,11 +317,27 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
         top = scopes[module].scope.names.values()
         # An unknown receiver is only worth reporting in a file that uses Batcher at all, and
         # only for a word that is not also a method of Python's own containers.
-        self.uses_batcher = any(v == "bt" or isinstance(v, (Member, ClassRef)) for v in top)
+        self.uses_batcher = any(
+            v == "bt" or isinstance(v, (Member, ClassRef, FunctionRef)) for v in top
+        )
 
     @property
     def inference(self) -> Inference:
         return self.scopes[self.stack[-1]]
+
+    def _receiver(self, node: object) -> str | None:
+        found = self.inference.receiver(node)
+        # Opt-in, for code known to hold no pandas/cuDF/Polars objects (the expression and SQL
+        # layers): there `x.str` on an unknown `x` is a Batcher accessor. It is wrong for
+        # `core/gpu_plan`, which calls pandas' own `.str` and `.dt` methods.
+        if (
+            found is None
+            and self.assume_accessors
+            and isinstance(node, cst.Attribute)
+            and node.attr.value in ("str", "dt", "list", "struct", "json", "map")
+        ):
+            return f"Expr.{node.attr.value}"
+        return found
 
     def _line(self, node: object) -> int:
         return self.get_metadata(metadata.PositionProvider, node).start.line
@@ -279,6 +355,28 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
         self.stack.pop()
         return updated
 
+    def leave_ClassDef(self, original: object, updated: object) -> object:
+        """Rename the hooks a subclass of a Batcher class defines (`onQueryProgress`)."""
+        tables = []
+        for base in original.bases:  # type: ignore[attr-defined]
+            found = self.inference.value(base.value)
+            receiver = found.receiver if isinstance(found, ClassRef) else self._receiver(base.value)
+            if receiver in self.renames:
+                tables.append((receiver, self.renames[receiver]))
+        if not tables:
+            return updated
+        body = []
+        for stmt in updated.body.body:  # type: ignore[attr-defined]
+            if isinstance(stmt, cst.FunctionDef):
+                for receiver, table in tables:
+                    rule = table.get(stmt.name.value)
+                    if rule is not None and rule.kind == "name":
+                        edit = Edit(self._line(original), stmt.name.value, rule.to, receiver)
+                        self.report.renamed.append(edit)
+                        stmt = stmt.with_changes(name=cst.Name(rule.to))
+            body.append(stmt)
+        return updated.with_changes(body=updated.body.with_changes(body=body))  # type: ignore[attr-defined]
+
     def visit_Attribute(self, node: object) -> None:
         self.attr_names.add(id(node.attr))  # type: ignore[attr-defined]
 
@@ -291,7 +389,7 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
         name = original.attr.value  # type: ignore[attr-defined]
         if name not in self.removed:
             return updated
-        receiver = self.inference.receiver(original.value)  # type: ignore[attr-defined]
+        receiver = self._receiver(original.value)  # type: ignore[attr-defined]
         rule = _rule(self.renames, receiver, name) if receiver else None
         if rule is None:
             if receiver is None:
@@ -309,7 +407,7 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
         name = func.attr.value
         if name not in self.removed and name not in self.kwarg_methods:
             return updated
-        receiver = self.inference.receiver(func.value)
+        receiver = self._receiver(func.value)
         if receiver is None:
             return updated
         rule = _rule(self.renames, receiver, name)
@@ -329,6 +427,7 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
             # The attribute was renamed on the way up; the kept method's keyword rules apply too.
             kept = f"{receiver}.{rule.to.rpartition('.')[2]}"
             result = _apply_kwargs(result, self.kwargs.get(kept, {}), failed)
+            result = _apply_fill(_apply_keys(result, rule), rule)
         for keyword in failed:
             self._unresolved(
                 original, f"{name}({keyword}=)", "keyword value needs a manual rewrite"
@@ -360,7 +459,7 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
         if id(original) in self.attr_names:
             return updated
         bound = self.inference.scope.lookup(original.value)  # type: ignore[attr-defined]
-        if not (isinstance(bound, Member) and bound.receiver == "bt"):
+        if not (isinstance(bound, Member) and bound.receiver == "bt" and bound.imported):
             return updated
         rule = self.renames.get("bt", {}).get(bound.name)
         # Uses of an un-aliased import: `from batcher import read_csv` binds `read_csv`, and
@@ -380,6 +479,9 @@ def canonicalize(
     renames: dict[str, dict[str, Rename]],
     returns: dict[str, dict[str, str]],
     kwargs: dict[str, dict[str, KwargRename]] | None = None,
+    *,
+    assume_accessors: bool = False,
+    imported: dict[str, str] | None = None,
 ) -> tuple[str, RenameReport]:
     """Rewrite removed Batcher spellings in one source file.
 
@@ -389,13 +491,19 @@ def canonicalize(
         returns: `{receiver: {member: returned_receiver}}`, from `load_returns()`.
         kwargs: `{"<receiver>.<method>": {keyword: KwargRename}}`, from
             `load_kwarg_renames()`; keywords are left alone when omitted.
+        assume_accessors: Treat `x.str`/`x.dt`/`x.list` on an unknown `x` as a Batcher
+            accessor. Only for code that holds no pandas or Polars expressions.
+        imported: `{name: receiver}` for functions imported from the script's own project,
+            from `batcher.migrate.project.imported_function_receivers`.
 
     Returns:
         The rewritten source, and a report of what changed and what was left alone.
     """
     wrapper = metadata.MetadataWrapper(cst.parse_module(source))
-    scopes = infer_module(wrapper.module, returns)
+    scopes = infer_module(wrapper.module, returns, imported)
     report = RenameReport()
-    transformer = _Canonicalize(scopes, wrapper.module, renames, kwargs or {}, report)
+    transformer = _Canonicalize(
+        scopes, wrapper.module, renames, kwargs or {}, report, assume_accessors
+    )
     rewritten = wrapper.visit(transformer)
     return rewritten.code, report

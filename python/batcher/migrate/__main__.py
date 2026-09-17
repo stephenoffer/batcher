@@ -20,17 +20,21 @@ from pathlib import Path
 
 from batcher._internal.errors import ConfigError
 from batcher._internal.migration import load_kwarg_renames, load_renames, load_returns
-from batcher.migrate.canonical import canonicalize
+from batcher.migrate.project import imported_function_receivers
+from batcher.migrate.snippets import rewrite_markdown, rewrite_python
 
 _IMPLEMENTED = {("batcher", "batcher")}
 _ENGINES = ("batcher", "pyspark", "polars", "daft", "ray_data")
 
 
-def _python_files(paths: list[str]) -> list[Path]:
+def _source_files(paths: list[str]) -> list[Path]:
     out: list[Path] = []
     for raw in paths:
         path = Path(raw)
-        out.extend(sorted(path.rglob("*.py")) if path.is_dir() else [path])
+        if path.is_dir():
+            out.extend(sorted([*path.rglob("*.py"), *path.rglob("*.md")]))
+        else:
+            out.append(path)
     return out
 
 
@@ -53,6 +57,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--write", action="store_true", help="rewrite files in place")
     parser.add_argument("--check", action="store_true", help="exit 1 if any file would change")
     parser.add_argument("--report", type=Path, help="write a JSON report of every site")
+    parser.add_argument(
+        "--assume-accessors",
+        action="store_true",
+        help="treat x.str/x.dt/x.list on an unknown x as Batcher (code with no pandas/Polars)",
+    )
     args = parser.parse_args(argv)
     if (args.source, args.target) not in _IMPLEMENTED:
         raise ConfigError(
@@ -62,10 +71,21 @@ def main(argv: list[str] | None = None) -> int:
     renames, returns, kwargs = load_renames(), load_returns(), load_kwarg_renames()
     changed = 0
     report: dict[str, dict[str, list[dict[str, object]]]] = {}
-    for path in _python_files(args.paths):
+    for path in _source_files(args.paths):
         before = path.read_text()
         try:
-            after, sites = canonicalize(before, renames, returns, kwargs)
+            rewrite = rewrite_markdown if path.suffix == ".md" else rewrite_python
+            imported = (
+                imported_function_receivers(before, path, returns) if path.suffix == ".py" else {}
+            )
+            after, sites = rewrite(
+                before,
+                renames,
+                returns,
+                kwargs,
+                assume_accessors=args.assume_accessors,
+                imported=imported,
+            )
         except Exception as exc:  # an unparseable file is reported, not fatal to the run
             print(f"{path}: skipped, {type(exc).__name__}: {exc}", file=sys.stderr)
             continue

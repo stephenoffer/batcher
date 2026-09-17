@@ -38,7 +38,7 @@ def test_dataset_methods_rename_on_batcher_and_not_on_pandas() -> None:
         d = pdf.fillna(0).head(3)
         """
     )
-    assert 'a = ds.group_by("k").len()' in out
+    assert "a = ds.group_by(\"k\").len(name='size')" in out
     assert 'b = pdf.groupby("k").size()' in out
     assert 'c = ds.filter(bt.col("k") > 0).fill_null(0).limit(3)' in out
     assert "d = pdf.fillna(0).head(3)" in out
@@ -281,3 +281,235 @@ def test_pandas_keywords_are_rewritten_or_reported() -> None:
     assert 'e = ds.top_k(3, "x")' in out
     assert "f = ds.sort(by=cols, ascending=flag)" in out
     assert {e.old for e in report.unresolved} == {"sort(by=)", "sort(ascending=)"}
+
+
+def test_a_multi_line_call_keeps_its_layout() -> None:
+    out, _ = _run(
+        """
+        import batcher as bt
+
+        ds = bt.from_pydict({"x": [1]})
+        a = ds.sample(
+            frac=0.5,
+            random_state=7,
+        )
+        """
+    )
+    assert "a = ds.sample(\n    fraction=0.5,\n    seed=7,\n)" in out
+
+
+def test_doctest_examples_and_markdown_blocks_are_rewritten() -> None:
+    from batcher.migrate.snippets import rewrite_markdown, rewrite_python
+
+    tables = (load_renames(), load_returns(), load_kwarg_renames())
+    module = textwrap.dedent(
+        '''
+        def f():
+            """Example.
+
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"k": [1]})
+                >>> ds.groupby("k").size().to_dicts()
+                [{'k': 1}]
+                >>> pdf.groupby("k")  # doctest: +SKIP
+            """
+            return 1
+        '''
+    )
+    out, report = rewrite_python(module, *tables)
+    assert ">>> ds.group_by(\"k\").len(name='size').to_pylist()" in out
+    assert '>>> pdf.groupby("k")  # doctest: +SKIP' in out
+    assert "[{'k': 1}]" in out
+    assert {e.old for e in report.renamed} >= {"groupby", "size", "to_dicts"}
+
+    page = textwrap.dedent(
+        """
+        Intro.
+
+        ```python
+        import batcher as bt
+        ds = bt.from_pydict({"x": [1]})
+        ```
+
+        Later, the same session:
+
+        ```python
+        print(ds.head(1).to_dict())
+        ```
+        """
+    )
+    md, md_report = rewrite_markdown(page, *tables)
+    assert "print(ds.limit(1).to_pydict())" in md
+    assert "Later, the same session:" in md
+    assert all(e.line >= 10 for e in md_report.renamed)
+
+
+def test_a_differing_default_is_passed_explicitly() -> None:
+    out, _ = _run(
+        """
+        import batcher as bt
+
+        ds = bt.from_pydict({"k": [1], "s": ["a1"]})
+        a = ds.head()
+        b = ds.head(3)
+        c = ds.group_by("k").size()
+        d = bt.col("s").str.regexp_extract("([a-z])([0-9])")
+        e = bt.col("s").str.regexp_extract("([a-z])([0-9])", 2)
+        """
+    )
+    assert "a = ds.limit(n=5)" in out
+    assert "b = ds.limit(3)" in out
+    assert "c = ds.group_by(\"k\").len(name='size')" in out
+    assert 'd = bt.col("s").str.extract("([a-z])([0-9])", group=0)' in out
+    assert 'e = bt.col("s").str.extract("([a-z])([0-9])", 2)' in out
+
+
+def test_a_keyword_conflict_or_an_unknown_value_is_reported_not_merged() -> None:
+    out, report = _run(
+        """
+        import batcher as bt
+
+        ds = bt.from_pydict({"x": [1]})
+        a = ds.sort("x", descending=True, ascending=False)
+        b = ds.sort("x", na_position="middle")
+        """
+    )
+    assert 'a = ds.sort("x", descending=True, ascending=False)' in out
+    assert 'b = ds.sort("x", na_position="middle")' in out
+    assert {e.old for e in report.unresolved} == {"sort(ascending=)", "sort(na_position=)"}
+
+
+def test_positional_arguments_move_to_the_kept_keywords() -> None:
+    out, _ = _run(
+        """
+        import batcher as bt
+
+        a = bt.col("x").clip_max(2.0)
+        b = bt.col("x").clip_min(bt.col("lo"))
+        """
+    )
+    assert 'a = bt.col("x").clip(upper=2.0)' in out
+    assert 'b = bt.col("x").clip(lower=bt.col("lo"))' in out
+
+
+def test_engine_internal_imports_node_classes_and_typed_helpers() -> None:
+    out, _ = _run(
+        """
+        from typing import TYPE_CHECKING
+
+        from batcher.plan.expr_ir.constructors import col
+        from batcher.plan.expr_ir.core import Col
+
+        if TYPE_CHECKING:
+            from batcher.plan.expr_ir.core import Expr
+
+        def _text(value) -> Expr:
+            return value
+
+        def f(column, text):
+            a = Col(column).n_unique()
+            b = col(column).str.to_lowercase()
+            c = _text(text).str.regexp_extract("x", 1)
+            return a, b, c
+        """
+    )
+    assert "a = Col(column).count_distinct()" in out
+    assert "b = col(column).str.lower()" in out
+    assert 'c = _text(text).str.extract("x", 1)' in out
+
+
+def test_assumed_accessors_only_when_asked() -> None:
+    source = textwrap.dedent(
+        """
+        import batcher as bt
+
+        def f(pred, gold):
+            return pred.list.set_intersection(gold)
+        """
+    )
+    tables = (load_renames(), load_returns(), load_kwarg_renames())
+    plain, _ = canonicalize(source, *tables)
+    assumed, _ = canonicalize(source, *tables, assume_accessors=True)
+    assert "pred.list.set_intersection(gold)" in plain
+    assert "pred.list.intersect(gold)" in assumed
+
+
+def test_a_same_named_function_from_a_submodule_is_never_renamed() -> None:
+    out, _ = _run(
+        """
+        from batcher.dist.shuffle_io import read_ipc
+        from batcher.ml.preprocessors.persistence import from_dict
+
+        table = read_ipc("path")
+        model = from_dict({})
+        """
+    )
+    assert 'table = read_ipc("path")' in out
+    assert "model = from_dict({})" in out
+
+
+def test_a_function_local_import_types_names_in_that_function() -> None:
+    out, _ = _run(
+        """
+        def test_it(ds):
+            from batcher.plan.expr_ir import col
+
+            return col("x").skewness()
+        """
+    )
+    assert 'return col("x").skew()' in out
+
+
+def test_hooks_on_a_listener_subclass_are_renamed() -> None:
+    out, _ = _run(
+        """
+        import batcher as bt
+
+        class Watcher(bt.StreamingQueryListener):
+            def onQueryProgress(self, event):
+                return event
+
+        class Unrelated:
+            def onQueryProgress(self, event):
+                return event
+        """
+    )
+    assert out.count("def on_query_progress(self, event):") == 1
+    assert out.count("def onQueryProgress(self, event):") == 1
+
+
+def test_identity_calls_collapse_to_the_dataset() -> None:
+    out, _ = _run(
+        """
+        import batcher as bt
+
+        ds = bt.from_pydict({"x": [1]})
+        a = ds.lazy().filter(bt.col("x") > 0)
+        b = ds.copy()
+        """
+    )
+    assert 'a = ds.filter(bt.col("x") > 0)' in out
+    assert "b = ds" in out
+
+
+def test_a_helper_imported_from_the_project_is_followed(tmp_path) -> None:
+    from batcher.migrate.project import imported_function_receivers
+
+    helpers = tmp_path / "_common"
+    helpers.mkdir()
+    (helpers / "__init__.py").write_text("from _common.datasets import tpch\n")
+    (helpers / "datasets.py").write_text(
+        "import batcher as bt\n\n\ndef tpch(table: str) -> bt.Dataset:\n"
+        "    return bt.read.parquet(table)\n"
+    )
+    script = tmp_path / "relational" / "set_ops.py"
+    script.parent.mkdir()
+    source = "from _common import tpch\n\nrows = tpch('orders').head(10)\n"
+    imported = imported_function_receivers(source, script, load_returns())
+    assert imported == {"tpch": "Dataset"}
+    out, _ = canonicalize(
+        source, load_renames(), load_returns(), load_kwarg_renames(), imported=imported
+    )
+    assert "rows = tpch('orders').limit(10)" in out

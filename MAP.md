@@ -205,7 +205,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 135 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 540 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 5862 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 5876 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 3560 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -1313,7 +1313,7 @@ Extended Kyber rule families.
 | `projection_scan.py` | 364 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 470 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
 | `sargable.py` | 351 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
-| `setops.py` | 262 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
+| `setops.py` | 378 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 487 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
@@ -2336,7 +2336,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 377 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 5971 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 5967 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 353 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 467 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2522,7 +2522,7 @@ String free functions, in two halves: building text and reading structure out of
 
 | module | lines | what it is |
 |---|---|---|
-| `_setops.py` | 68 | What makes two set-operation branches compatible. |
+| `_setops.py` | 84 | What makes two set-operation branches compatible. |
 | `aggregate.py` | 277 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
 | `base.py` | 345 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
@@ -3021,9 +3021,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/asof.rs` | 248 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 246 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 335 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
-| `join/key_bits.rs` | 148 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
+| `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
 | `join/key_filter.rs` | 303 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 2089 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 2091 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 538 | Sortable key forms for a range join's axes, and the dense ranking built on them. |

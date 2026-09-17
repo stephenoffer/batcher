@@ -3278,7 +3278,7 @@ class Expr:
     def count_distinct(self) -> AggExpr:
         """Number of distinct non-null values per group (SQL ``COUNT(DISTINCT)``).
 
-        Exact, so it holds every distinct value — see :meth:`approx_n_unique` for the
+        Exact, so it holds every distinct value — see :meth:`approx_count_distinct` for the
         bounded-memory, skew-safe sketch. An aggregate for ``group_by().agg(...)``.
 
         Returns:
@@ -3294,13 +3294,11 @@ class Expr:
         """
         return AggExpr("count_distinct", self)
 
-    # SQL spelling; same aggregate as `n_unique`.
-
     def approx_count_distinct(self) -> AggExpr:
         """Approximate COUNT(DISTINCT) via a HyperLogLog sketch (~2% error).
 
         Bounded memory regardless of skew — the skew-safe choice when an exact
-        `n_unique` on a hot key would hold every distinct value. Mergeable, so it
+        `count_distinct` on a hot key would hold every distinct value. Mergeable, so it
         is identical single-node and distributed.
 
         Returns:
@@ -3311,13 +3309,10 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a", "a", "a"], "x": [1, 2, 3]})
-                >>> ds.group_by("g").agg(n=bt.col("x").approx_n_unique()).to_pydict()
+                >>> ds.group_by("g").agg(n=bt.col("x").approx_count_distinct()).to_pydict()
                 {'g': ['a'], 'n': [3]}
         """
         return AggExpr("approx_count_distinct", self)
-
-    # SQL spelling; same aggregate as `approx_n_unique`.
-    approx_count_distinct = approx_n_unique
 
     def approx_quantile(self, q: float) -> AggExpr:
         """Approximate quantile `q ∈ [0, 1]` via a KLL sketch (bounded memory).

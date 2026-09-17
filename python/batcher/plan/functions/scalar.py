@@ -16,7 +16,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError, require_int
-from batcher.plan.expr_ir import atan2
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.expr_ir.core import Binary, Expr, IntoExpr, Math2Expr, MathExpr, _wrap
 
@@ -155,7 +154,7 @@ def cut(
 
 
 def arctan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
-    """Two-argument arctangent — the NumPy/Polars ``arctan2`` spelling of :func:`atan2`.
+    """Two-argument arctangent of ``y / x`` in radians, quadrant chosen by both signs.
 
     The angle in radians of the point ``(x, y)`` from the positive x-axis, using both
     signs to place it in the correct quadrant (unlike a plain ``arctan(y / x)``).
@@ -175,7 +174,7 @@ def arctan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
             >>> ds.select(a=bt.arctan2(bt.col("y"), bt.col("x")).round(4)).to_pydict()
             {'a': [0.7854]}
     """
-    return atan2(y, x)
+    return Math2Expr("atan2", _wrap(y), _wrap(x))
 
 
 def log(base: IntoExpr, value: IntoExpr) -> Expr:
@@ -408,5 +407,5 @@ def great_circle_distance(
     # c = 2·atan2(√a, √(1−a)) — the atan2 form rather than 2·asin(√a) because it stays
     # defined when rounding pushes `a` a hair above 1 for antipodal points, where `asin`
     # would produce NaN.
-    central_angle = lit(2.0) * atan2(a.sqrt(), (lit(1.0) - a).sqrt())
+    central_angle = lit(2.0) * arctan2(a.sqrt(), (lit(1.0) - a).sqrt())
     return lit(_EARTH_RADIUS[unit]) * central_angle

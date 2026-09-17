@@ -7,7 +7,11 @@
 # A value is the kept attribute name, or an inline table when the replacement is not a plain
 # rename: `{ to = "write.csv" }` (a dotted path from the same receiver), `{ to = "count",
 # call = true }` (a property replaced by a call), `{ operator = "add" }` (an operator), or
-# `{ transform = "...", to = "..." }` (an argument reshaping). The rule types and their
+# `{ transform = "...", to = "..." }` (an argument reshaping). Any of them may add
+# `keys = ["<param>", ...]` (the call's positional arguments become those keywords, in order:
+# `clip_max(2)` is `clip(upper=2)`), or `fill = ["<param>@<position>=<python literal>"]`: when the removed call omits that argument,
+# the rewrite passes the removed spelling's default explicitly, because the kept one differs
+# (`head()` is `limit(5)`). The rule types and their
 # validation live in python/batcher/_internal/migration/renames.py.
 #
 # Three consumers read this: the `batcher.migrate` codemod rewrites the removed spelling in
@@ -19,6 +23,11 @@
 
 
 [Dataset]
+copy = { transform = "identity", to = "self" }
+lazy = { transform = "identity", to = "self" }
+skewness = "skew"
+n_unique = "count_distinct"
+approx_n_unique = "approx_count_distinct"
 append = "union"
 assign = "with_columns"
 astype = "cast"
@@ -29,7 +38,7 @@ dropna = "drop_nulls"
 empty = { to = "is_empty", call = true }
 fillna = "fill_null"
 groupby = "group_by"
-head = "limit"
+head = { to = "limit", fill = ["n@0=5"] }
 height = { to = "count", call = true }
 melt = "unpivot"
 merge = "join"
@@ -73,8 +82,8 @@ asinh = "arcsinh"
 astype = "cast"
 atan = "arctan"
 atanh = "arctanh"
-clip_max = "clip"
-clip_min = "clip"
+clip_max = { to = "clip", keys = ["upper"] }
+clip_min = { to = "clip", keys = ["lower"] }
 cumcount = "cum_count"
 cummax = "cum_max"
 cummin = "cum_min"
@@ -123,7 +132,7 @@ isodow = "weekday"
 month_end = "last_day"
 month_name = "monthname"
 ordinal_day = "dayofyear"
-to_string = "strftime"
+to_string = { to = "strftime", fill = ["format@0='%Y-%m-%dT%H:%M:%S'"] }
 week_of_year = "week"
 weekofyear = "week"
 
@@ -154,7 +163,7 @@ lstrip = "strip_chars_start"
 pad_end = "rpad"
 pad_start = "lpad"
 regexp_escape = "escape_regex"
-regexp_extract = "extract"
+regexp_extract = { to = "extract", fill = ["group@1=0"] }
 regexp_extract_all = "extract_all"
 regexp_replace_all = "replace_all"
 removeprefix = "strip_prefix"
@@ -170,7 +179,10 @@ to_uppercase = "upper"
 truncate_chars = "left"
 
 [GroupBy]
-size = "len"
+skewness = "skew"
+nunique = "count_distinct"
+n_unique = "count_distinct"
+size = { to = "len", fill = ["name@0='size'"] }
 
 [StreamingQuery]
 awaitTermination = "await_termination"
@@ -181,15 +193,17 @@ recentProgress = "recent_progress"
 runId = "run_id"
 
 [bt]
+skewness = "skew"
+n_unique = "count_distinct"
+approx_n_unique = "approx_count_distinct"
 atan2 = "arctan2"
 from_dict = "from_pydict"
 from_dicts = "from_pylist"
-from_records = "from_pylist"
 max_horizontal = "greatest"
 min_horizontal = "least"
 read_avro = { to = "read.avro" }
 read_csv = { to = "read.csv" }
-read_database = { to = "read.sql" }
+read_database = { to = "read.sql", keys = ["query", "uri"] }
 read_delta = { to = "read.delta" }
 read_excel = { to = "read.excel" }
 read_iceberg = { to = "read.iceberg" }
@@ -205,3 +219,9 @@ AvailableNow = "available_now"
 Continuous = "continuous"
 Once = "once"
 ProcessingTime = "processing_time"
+
+# Hook methods a subclass defines, renamed on the class that inherits from it.
+[StreamingQueryListener]
+onQueryProgress = "on_query_progress"
+onQueryStarted = "on_query_started"
+onQueryTerminated = "on_query_terminated"

@@ -24,7 +24,9 @@ def _two_valued(rows: int = 10_000) -> bt.Dataset:
 def test_fraction_on_two_distinct_values_is_not_the_fraction() -> None:
     """The realized fraction snaps to whole duplicate groups."""
     data = _two_valued()
-    kept = {fraction: data.sample(frac=fraction, seed=1).count() for fraction in (0.1, 0.5, 0.9)}
+    kept = {
+        fraction: data.sample(fraction=fraction, seed=1).count() for fraction in (0.1, 0.5, 0.9)
+    }
 
     # Every result is a whole group: nothing, one value, or both.
     assert set(kept.values()) <= {0, 5_000, 10_000}
@@ -46,8 +48,8 @@ def test_distinct_rows_sample_properly() -> None:
     """With a distinguishing column present the sampler is row-level, as intended."""
     data = bt.from_pydict({"flag": ["a", "b"] * 5_000, "key": list(range(10_000))})
 
-    tenth = data.sample(frac=0.1, seed=1).count()
-    half = data.sample(frac=0.5, seed=1).count()
+    tenth = data.sample(fraction=0.1, seed=1).count()
+    half = data.sample(fraction=0.5, seed=1).count()
 
     assert 800 < tenth < 1_200
     assert 4_500 < half < 5_500

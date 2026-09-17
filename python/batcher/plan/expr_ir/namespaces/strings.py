@@ -105,24 +105,6 @@ class _StrNamespace:
             raise AttributeError(name)
         raise accessor_attribute_error(self, "'.str' accessor", name, STR_UNSUPPORTED)
 
-    def len(self) -> StrFunc:
-        """Count the characters in the string (→ Int64).
-
-        Counts Unicode characters, not bytes (see :meth:`octet_length`). Null → null.
-
-        Returns:
-            A new Int64 expression: the character count.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["héllo", "hi"]})
-                >>> ds.select(bt.col("s").str.len().alias("r")).to_pydict()
-                {'r': [5, 2]}
-        """
-        return StrFunc("len", self._e)
-
     def hash64(self) -> StrFunc:
         """Compute a deterministic FNV-1a 64-bit hash of the string (→ Int64).
 
@@ -571,94 +553,6 @@ class _StrNamespace:
 
     # --- Polars/pandas-compatible spellings (delegate to the SQL-named methods) -----
 
-    def pad_start(self, width: int, fill: str = " ") -> StrFunc:
-        """Left-pad to ``width`` — the Polars ``pad_start`` spelling of :meth:`lpad`.
-
-        Unlike Polars', this **truncates** an input already longer than `width`, because
-        it is :meth:`lpad` and SQL ``LPAD`` truncates. Polars returns the input unchanged.
-        Reach for :meth:`zfill` when you want the never-truncate behaviour with a ``'0'``
-        fill, or guard the width yourself.
-
-        Args:
-            width: Target character width.
-            fill: Pad character, defaulting to a space.
-
-        Returns:
-            A new Utf8 expression: the left-padded string.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["ab"]})
-                >>> ds.select(r=bt.col("s").str.pad_start(5, "*")).to_pydict()
-                {'r': ['***ab']}
-        """
-        return self.lpad(require_int(width, func="str.pad_start", arg="width"), fill)
-
-    def pad_end(self, width: int, fill: str = " ") -> StrFunc:
-        """Right-pad to ``width`` — the Polars ``pad_end`` spelling of :meth:`rpad`.
-
-        Unlike Polars', this **truncates** an input already longer than `width`, because
-        it is :meth:`rpad` and SQL ``RPAD`` truncates. Polars returns the input unchanged.
-        Reach for :meth:`zfill` when you want the never-truncate behaviour with a ``'0'``
-        fill, or guard the width yourself.
-
-        Args:
-            width: Target character width.
-            fill: Pad character, defaulting to a space.
-
-        Returns:
-            A new Utf8 expression: the right-padded string.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["ab"]})
-                >>> ds.select(r=bt.col("s").str.pad_end(5, "*")).to_pydict()
-                {'r': ['ab***']}
-        """
-        return self.rpad(require_int(width, func="str.pad_end", arg="width"), fill)
-
-    def head(self, n: int) -> StrFunc:
-        """First ``n`` characters — the Polars ``str.head`` spelling of :meth:`left`.
-
-        Args:
-            n: How many leading characters to keep.
-
-        Returns:
-            A Utf8 expression of the first ``n`` characters.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hello"]})
-                >>> ds.select(r=bt.col("s").str.head(3)).to_pydict()
-                {'r': ['hel']}
-        """
-        return self.left(require_int(n, func="str.head", arg="n"))
-
-    def tail(self, n: int) -> StrFunc:
-        """Last ``n`` characters — the Polars ``str.tail`` spelling of :meth:`right`.
-
-        Args:
-            n: How many trailing characters to keep.
-
-        Returns:
-            A Utf8 expression of the last ``n`` characters.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hello"]})
-                >>> ds.select(r=bt.col("s").str.tail(3)).to_pydict()
-                {'r': ['llo']}
-        """
-        return self.right(require_int(n, func="str.tail", arg="n"))
-
     def slice(self, offset: int, length: int | None = None) -> StrFunc:
         """0-based substring — the Polars ``str.slice`` spelling over :meth:`substr` (1-based).
 
@@ -692,46 +586,6 @@ class _StrNamespace:
         # `slice(-3, 2)` on "abcdef" silently returned "ef" instead of "de", and
         # `slice(-1)` wrapped past the end to return the *whole* string.
         return self.substr(offset + 1 if offset >= 0 else offset, length)
-
-    def ljust(self, width: int, fill: str = " ") -> StrFunc:
-        """Left-justify to ``width`` (pad right) — pandas' ``str.ljust`` (see :meth:`rpad`).
-
-        Args:
-            width: Target character width.
-            fill: Pad character, defaulting to a space.
-
-        Returns:
-            A Utf8 expression: the right-padded string.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["ab"]})
-                >>> ds.select(r=bt.col("s").str.ljust(5, "*")).to_pydict()
-                {'r': ['ab***']}
-        """
-        return self.rpad(require_int(width, func="str.ljust", arg="width"), fill)
-
-    def rjust(self, width: int, fill: str = " ") -> StrFunc:
-        """Right-justify to ``width`` (pad left) — pandas' ``str.rjust`` (see :meth:`lpad`).
-
-        Args:
-            width: Target character width.
-            fill: Pad character, defaulting to a space.
-
-        Returns:
-            A Utf8 expression: the left-padded string.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["ab"]})
-                >>> ds.select(r=bt.col("s").str.rjust(5, "*")).to_pydict()
-                {'r': ['***ab']}
-        """
-        return self.lpad(require_int(width, func="str.rjust", arg="width"), fill)
 
     # --- text features (the cheap signals a text model or data check consumes) ------
 
@@ -935,7 +789,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_punctuation()).to_pydict()
                 {'r': ['ab c']}
         """
-        return self.regexp_replace_all(r"[^\w\s]", "")
+        return self.replace_all(r"[^\w\s]", "")
 
     def contains_all(self, patterns: Iterable[str]) -> Expr:
         """True where the string contains *every* one of the literal `patterns`.
@@ -1000,7 +854,7 @@ class _StrNamespace:
     def _char_ratio(self, pattern: str) -> Expr:
         """Fraction of characters matching `pattern`; null for an empty string."""
 
-        return self.regexp_count(pattern) / nullif(self.len(), lit(0))
+        return self.regexp_count(pattern) / nullif(self.len_chars(), lit(0))
 
     def alpha_ratio(self) -> Expr:
         """Fraction of characters that are ASCII letters — the core text-density signal.
@@ -1198,7 +1052,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.mean_line_length().round(2)).to_pydict()
                 {'r': [3.5]}
         """
-        return self.len() / self.line_count()
+        return self.len_chars() / self.line_count()
 
     def avg_word_length(self) -> Expr:
         """Average letters per whitespace-separated word — a tokenizer-free text-shape signal.
@@ -1278,7 +1132,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_urls()).to_pydict()
                 {'r': ['see  now']}
         """
-        return self.regexp_replace_all(self._URL_RE, "")
+        return self.replace_all(self._URL_RE, "")
 
     def remove_emails(self) -> StrFunc:
         """Strip email addresses from the text — a cheap PII scrub before training.
@@ -1294,7 +1148,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_emails()).to_pydict()
                 {'r': ['mail me ']}
         """
-        return self.regexp_replace_all(self._EMAIL_RE, "")
+        return self.replace_all(self._EMAIL_RE, "")
 
     def remove_non_ascii(self) -> StrFunc:
         """Drop every character outside ASCII — the blunt mojibake/emoji scrub.
@@ -1310,7 +1164,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_non_ascii()).to_pydict()
                 {'r': ['caf x']}
         """
-        return self.regexp_replace_all(self._NON_ASCII_RE, "")
+        return self.replace_all(self._NON_ASCII_RE, "")
 
     def remove_digits(self) -> StrFunc:
         """Drop every digit character — used to normalize IDs out of near-duplicate keys.
@@ -1326,26 +1180,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_digits()).to_pydict()
                 {'r': ['abc ']}
         """
-        return self.regexp_replace_all("[0-9]", "")
-
-    def truncate_chars(self, n: int) -> StrFunc:
-        """Keep at most the first `n` characters — a hard context-window guard.
-
-        Args:
-            n: Maximum characters to keep.
-
-        Returns:
-            A Utf8 expression truncated to `n` characters.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["abcdefgh"]})
-                >>> ds.select(r=bt.col("s").str.truncate_chars(3)).to_pydict()
-                {'r': ['abc']}
-        """
-        return self.left(require_int(n, func="str.truncate_chars", arg="n"))
+        return self.replace_all("[0-9]", "")
 
     def truncate_words(self, n: int) -> StrFunc:
         """Keep at most the first `n` whitespace-separated words, without splitting one.
@@ -1373,7 +1208,7 @@ class _StrNamespace:
         n = require_int(n, func="str.truncate_words", arg="n", minimum=1)
         # Unanchored: the leftmost match begins at the first non-space, so leading
         # whitespace is skipped rather than defeating the match and returning "".
-        return self.regexp_extract(r"(?:\S+\s+){0," + str(n - 1) + r"}\S+", 0)
+        return self.extract(r"(?:\S+\s+){0," + str(n - 1) + r"}\S+", 0)
 
     def has_url(self) -> StrFunc:
         """True where the text contains an HTTP(S) URL.
@@ -1496,7 +1331,7 @@ class _StrNamespace:
                 {'r': [2]}
         """
 
-        return (self.len() / Lit(chars_per_token)).cast("int64")
+        return (self.len_chars() / Lit(chars_per_token)).cast("int64")
 
     def fits_token_budget(self, budget: int, chars_per_token: float = 4.0) -> Expr:
         """True where :meth:`estimate_tokens` is within `budget` — the context-window filter.
@@ -1569,7 +1404,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_html_tags()).to_pydict()
                 {'r': ['hi there']}
         """
-        return self.regexp_replace_all("<[^>]+>", "")
+        return self.replace_all("<[^>]+>", "")
 
     def is_ascii_only(self) -> Expr:
         """True where every character is ASCII — the inverse of :meth:`has_non_ascii`.
@@ -1656,7 +1491,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_phones()).to_pydict()
                 {'r': ['Call  now']}
         """
-        return self.regexp_replace_all(self._PHONE_RE, "")
+        return self.replace_all(self._PHONE_RE, "")
 
     def mask_emails(self, replacement: str = "[EMAIL]") -> StrFunc:
         """Replace email addresses with a placeholder token, keeping the sentence shape.
@@ -1678,7 +1513,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.mask_emails()).to_pydict()
                 {'r': ['mail [EMAIL] now']}
         """
-        return self.regexp_replace_all(self._EMAIL_RE, replacement)
+        return self.replace_all(self._EMAIL_RE, replacement)
 
     def mask_urls(self, replacement: str = "[URL]") -> StrFunc:
         """Replace HTTP(S) URLs with a placeholder token, keeping the sentence shape.
@@ -1697,7 +1532,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.mask_urls()).to_pydict()
                 {'r': ['see [URL] now']}
         """
-        return self.regexp_replace_all(self._URL_RE, replacement)
+        return self.replace_all(self._URL_RE, replacement)
 
     def uppercase_word_count(self) -> StrFunc:
         """Count all-caps words of two or more letters (→ Int64) — a shouting/header signal.
@@ -2007,7 +1842,7 @@ class _StrNamespace:
         """
 
         max_chars = require_int(max_chars, func="str.is_short", arg="max_chars")
-        return self.len() <= Lit(max_chars)
+        return self.len_chars() <= Lit(max_chars)
 
     def is_long(self, min_chars: int) -> Expr:
         """True where the text is at least `min_chars` long.
@@ -2028,7 +1863,7 @@ class _StrNamespace:
         """
 
         min_chars = require_int(min_chars, func="str.is_long", arg="min_chars")
-        return self.len() >= Lit(min_chars)
+        return self.len_chars() >= Lit(min_chars)
 
     def is_question(self) -> StrFunc:
         """True where the text ends in a question mark.
@@ -2126,7 +1961,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.extract_urls()).to_pydict()
                 {'r': [['http://x.co']]}
         """
-        return self.regexp_extract_all(self._URL_RE)
+        return self.extract_all(self._URL_RE)
 
     def extract_emails(self) -> StrFunc:
         """Every email address in the text, as a ``List<Utf8>`` — PII auditing.
@@ -2142,7 +1977,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.extract_emails()).to_pydict()
                 {'r': [['a@b.com', 'c@d.org']]}
         """
-        return self.regexp_extract_all(self._EMAIL_RE)
+        return self.extract_all(self._EMAIL_RE)
 
     def extract_numbers(self) -> StrFunc:
         """Every run of digits in the text, as a ``List<Utf8>``.
@@ -2158,7 +1993,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.extract_numbers()).to_pydict()
                 {'r': [['42', '7']]}
         """
-        return self.regexp_extract_all("[0-9]+")
+        return self.extract_all("[0-9]+")
 
     def extract_hashtags(self) -> StrFunc:
         """Every ``#hashtag`` in the text, as a ``List<Utf8>``.
@@ -2174,7 +2009,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.extract_hashtags()).to_pydict()
                 {'r': [['#a', '#b']]}
         """
-        return self.regexp_extract_all(r"#\w+")
+        return self.extract_all(r"#\w+")
 
     def extract_mentions(self) -> StrFunc:
         """Every ``@mention`` in the text, as a ``List<Utf8>``.
@@ -2190,7 +2025,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.extract_mentions()).to_pydict()
                 {'r': [['@a', '@b']]}
         """
-        return self.regexp_extract_all(r"@\w+")
+        return self.extract_all(r"@\w+")
 
     def first_sentence(self) -> StrFunc:
         """The text up to and including the first sentence mark — a snippet/summary field.
@@ -2206,7 +2041,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.first_sentence()).to_pydict()
                 {'r': ['One.']}
         """
-        return self.regexp_extract(r"^[^.!?]*[.!?]", 0)
+        return self.extract(r"^[^.!?]*[.!?]", 0)
 
     def first_word(self) -> StrFunc:
         """The first whitespace-separated token.
@@ -2226,7 +2061,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.first_word()).to_pydict()
                 {'r': ['hello', 'indented']}
         """
-        return self.regexp_extract(r"\S+", 0)
+        return self.extract(r"\S+", 0)
 
     def slugify(self) -> StrFunc:
         """Lowercase and hyphenate into a URL/identifier-safe slug.
@@ -2245,7 +2080,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.slugify()).to_pydict()
                 {'r': ['hello-world']}
         """
-        return self.lower().str.regexp_replace_all(r"[^a-z0-9]+", "-").str.trim("-")
+        return self.lower().str.replace_all(r"[^a-z0-9]+", "-").str.trim("-")
 
     def remove_bullets(self) -> StrFunc:
         """Strip a leading list bullet (``-``, ``*``, or ``+``) and its spacing.
@@ -2261,7 +2096,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_bullets()).to_pydict()
                 {'r': ['item one']}
         """
-        return self.regexp_replace_all(r"^\s*[-*+]\s+", "")
+        return self.replace_all(r"^\s*[-*+]\s+", "")
 
     def remove_repeated_punctuation(self) -> StrFunc:
         """Collapse runs of sentence marks to one, turning ``"Wow!!!"`` into ``"Wow!"``.
@@ -2277,7 +2112,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_repeated_punctuation()).to_pydict()
                 {'r': ['Wow! ok']}
         """
-        return self.regexp_replace_all(r"([!?.])[!?.]+", r"\1")
+        return self.replace_all(r"([!?.])[!?.]+", r"\1")
 
     def remove_markdown_links(self) -> StrFunc:
         """Reduce ``[text](url)`` to just ``text``, dropping the target.
@@ -2296,7 +2131,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_markdown_links()).to_pydict()
                 {'r': ['see text here']}
         """
-        return self.regexp_replace_all(r"\[([^\]]*)\]\([^)]*\)", r"\1")
+        return self.replace_all(r"\[([^\]]*)\]\([^)]*\)", r"\1")
 
     def remove_code_blocks(self) -> StrFunc:
         """Delete fenced ``` code blocks, keeping the surrounding prose.
@@ -2312,7 +2147,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.remove_code_blocks()).to_pydict()
                 {'r': ['text  end']}
         """
-        return self.regexp_replace_all(r"```[^`]*```", "")
+        return self.replace_all(r"```[^`]*```", "")
 
     def remove_stopwords(self, words: Iterable[str]) -> StrFunc:
         """Delete whole-word occurrences of `words`, matching either case of the first letter.
@@ -2340,7 +2175,7 @@ class _StrNamespace:
         forms = [w for word in words for w in (re.escape(word), re.escape(word.capitalize()))]
         if not forms:
             raise PlanError("remove_stopwords() requires at least one word")
-        return self.regexp_replace_all(r"\b(?:" + "|".join(forms) + r")\b", "")
+        return self.replace_all(r"\b(?:" + "|".join(forms) + r")\b", "")
 
     def truncate_sentences(self, n: int) -> StrFunc:
         """Keep at most the first `n` sentences, cutting on a sentence mark.
@@ -2365,7 +2200,7 @@ class _StrNamespace:
                 {'r': ['One. Two!']}
         """
         n = require_int(n, func="str.truncate_sentences", arg="n", minimum=1)
-        return self.regexp_extract(r"^(?:[^.!?]*[.!?]){1," + str(n) + r"}", 0)
+        return self.extract(r"^(?:[^.!?]*[.!?]){1," + str(n) + r"}", 0)
 
     def avg_sentence_length(self) -> Expr:
         """Words per sentence — very long or very short values mark non-prose.
@@ -2421,7 +2256,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.last_word()).to_pydict()
                 {'r': ['world', 'space']}
         """
-        return self.regexp_extract(r"(\S+)\s*$", 1)
+        return self.extract(r"(\S+)\s*$", 1)
 
     def is_url(self) -> StrFunc:
         """True where the whole string is a single HTTP(S) URL.
@@ -2491,7 +2326,7 @@ class _StrNamespace:
         """
         return self.regexp_matches(f"^(?:{pattern})")
 
-    def removeprefix(self, prefix: str) -> StrFunc:
+    def strip_prefix(self, prefix: str) -> StrFunc:
         """Drop `prefix` from the start if present, else leave the string unchanged.
 
         Mirrors Python's ``str.removeprefix``; the literal is regex-escaped, so it is
@@ -2508,12 +2343,12 @@ class _StrNamespace:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"s": ["id_7", "7"]})
-                >>> ds.select(r=bt.col("s").str.removeprefix("id_")).to_pydict()
+                >>> ds.select(r=bt.col("s").str.strip_prefix("id_")).to_pydict()
                 {'r': ['7', '7']}
         """
         return self.regexp_replace("^" + re.escape(prefix), "")
 
-    def removesuffix(self, suffix: str) -> StrFunc:
+    def strip_suffix(self, suffix: str) -> StrFunc:
         """Drop `suffix` from the end if present, else leave the string unchanged.
 
         Mirrors Python's ``str.removesuffix``; the literal is regex-escaped.
@@ -2529,7 +2364,7 @@ class _StrNamespace:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"s": ["7_id", "7"]})
-                >>> ds.select(r=bt.col("s").str.removesuffix("_id")).to_pydict()
+                >>> ds.select(r=bt.col("s").str.strip_suffix("_id")).to_pydict()
                 {'r': ['7', '7']}
         """
         return self.regexp_replace(re.escape(suffix) + "$", "")
@@ -2605,42 +2440,6 @@ class _StrNamespace:
         if length is not None:
             length = require_int(length, func="str.overlay", arg="length")
         return StrFunc("overlay", self._e, replacement=replacement, start=pos, length=length)
-
-    def regexp_extract_all(self, pattern: str, group: int = 0) -> StrFunc:
-        """Collect every regex match as a list of strings (DuckDB ``regexp_extract_all``).
-
-        Returns an empty list when there are no matches. Chain ``.list`` to operate
-        on the result. Returns List<Utf8>.
-
-        With a ``group`` above 0 the list holds that capture group of each match rather
-        than the whole match, and an element is null where the group did not participate
-        in its match. Asking for a group the pattern does not have is an error, matching
-        DuckDB rather than returning empty lists.
-
-        Args:
-            pattern: The regular expression to match.
-            group: Capture group index; 0 (default) is the whole match.
-
-        Returns:
-            A new List<Utf8> expression of all matches.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> d = bt.from_pydict({"s": ["2024-01-15"]})
-                >>> d.select(
-                ...     bt.col("s").str.regexp_extract_all(r"\\d+").alias("r")
-                ... ).to_pydict()
-                {'r': [['2024', '01', '15']]}
-
-                >>> d = bt.from_pydict({"s": ["100-200, 300-400"]})
-                >>> d.select(
-                ...     bt.col("s").str.regexp_extract_all(r"(\\d+)-(\\d+)", 1).alias("r")
-                ... ).to_pydict()
-                {'r': [['100', '300']]}
-        """
-        return StrFunc("regexp_extract_all", self._e, pattern=pattern, start=group)
 
     def regexp_count(self, pattern: str) -> StrFunc:
         """Count non-overlapping regex matches (DuckDB ``regexp_count``).
@@ -2876,25 +2675,6 @@ class _StrNamespace:
         """
 
         return ListJoin(AggExpr("list_agg", self._e), delimiter)
-
-    def regexp_escape(self) -> StrFunc:
-        """Escape the regex metacharacters in the value (→ Utf8).
-
-        DuckDB ``regexp_escape``. Use it to embed data in a pattern as a literal, so a
-        value containing ``.`` or ``[`` matches itself instead of acting as syntax.
-
-        Returns:
-            A new Utf8 expression: the value with its metacharacters escaped.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["a.b"]})
-                >>> ds.select(e=bt.col("s").str.regexp_escape()).to_pydict()
-                {'e': ['a\\\\.b']}
-        """
-        return StrFunc("regexp_escape", self._e)
 
     def parse_filename(self) -> StrFunc:
         """Take the final component of a path (→ Utf8).
@@ -3587,8 +3367,8 @@ class _StrNamespace:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"s": ["hello " * 20]})
                 >>> out = ds.select(
-                ...     n=bt.col("s").str.compress("gzip").str.len_bytes(),
-                ...     raw=bt.col("s").str.len_bytes(),
+                ...     n=bt.col("s").str.compress("gzip").str.octet_length(),
+                ...     raw=bt.col("s").str.octet_length(),
                 ... ).to_pydict()
                 >>> out["n"][0] < out["raw"][0]
                 True
@@ -3812,26 +3592,6 @@ class _StrNamespace:
         """
         return StrFunc("regexp_replace", self._e, pattern=pattern, replacement=replacement)
 
-    def regexp_extract(self, pattern: str, group: int = 0) -> StrFunc:
-        """Extract one capture group of the regex; ``''`` if no match.
-
-        Args:
-            pattern: The regular expression to match.
-            group: Capture group index; 0 (default) is the whole match.
-
-        Returns:
-            A new Utf8 expression: the captured group, or ``''``.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["abc123"]})
-                >>> ds.select(bt.col("s").str.regexp_extract(r"(\\d+)", 1).alias("r")).to_pydict()
-                {'r': ['123']}
-        """
-        return StrFunc("regexp_extract", self._e, pattern=pattern, start=group)
-
     def replace(self, pattern: str, replacement: str) -> StrFunc:
         """Replace every occurrence of the literal ``pattern`` with ``replacement``.
 
@@ -3896,45 +3656,7 @@ class _StrNamespace:
                 ... ).to_pydict()
                 {'r': ['one two three']}
         """
-        return StrFunc("trim", self.regexp_replace_all(r"\s+", " "))
-
-    def lstrip(self, chars: str | None = None) -> StrFunc:
-        """Trim from the left: any of ``chars`` if given, else the ASCII space.
-
-        Args:
-            chars: The set of characters to strip; whitespace if omitted.
-
-        Returns:
-            A new Utf8 expression: the left-trimmed string.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["  hi  "]})
-                >>> ds.select(bt.col("s").str.lstrip().alias("r")).to_pydict()
-                {'r': ['hi  ']}
-        """
-        return StrFunc("l_trim", self._e, pattern=chars)
-
-    def rstrip(self, chars: str | None = None) -> StrFunc:
-        """Trim from the right: any of ``chars`` if given, else the ASCII space.
-
-        Args:
-            chars: The set of characters to strip; whitespace if omitted.
-
-        Returns:
-            A new Utf8 expression: the right-trimmed string.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["  hi  "]})
-                >>> ds.select(bt.col("s").str.rstrip().alias("r")).to_pydict()
-                {'r': ['  hi']}
-        """
-        return StrFunc("r_trim", self._e, pattern=chars)
+        return StrFunc("trim", self.replace_all(r"\s+", " "))
 
     def split_part(self, delimiter: str, n: int) -> StrFunc:
         """Return the ``n``-th field (1-based) after splitting on ``delimiter``.
@@ -3958,48 +3680,6 @@ class _StrNamespace:
         """
         n = require_int(n, func="str.split_part", arg="n")
         return StrFunc("split_part", self._e, pattern=delimiter, start=n)
-
-    def regexp_replace_all(self, pattern: str, replacement: str) -> StrFunc:
-        """Replace every regex match of ``pattern`` with ``replacement``.
-
-        DuckDB ``regexp_replace(..., 'g')``; Polars ``replace_all``; ``$1`` backrefs.
-
-        Args:
-            pattern: The regular expression to match.
-            replacement: The replacement text; ``$1``…​ refer to capture groups.
-
-        Returns:
-            A new Utf8 expression with every match replaced.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["a1b2"]})
-                >>> r = bt.col("s").str.regexp_replace_all(r"\\d", "X")
-                >>> ds.select(r.alias("r")).to_pydict()
-                {'r': ['aXbX']}
-        """
-        return StrFunc("regexp_replace_all", self._e, pattern=pattern, replacement=replacement)
-
-    def initcap(self) -> StrFunc:
-        """Title-case each word: uppercase its first letter, lowercase the rest (``initcap``).
-
-        A word starts after whitespace or punctuation, so ``"a-b c"`` → ``"A-B C"``;
-        null → null.
-
-        Returns:
-            A new Utf8 expression with each word title-cased.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hello world"]})
-                >>> ds.select(bt.col("s").str.initcap().alias("r")).to_pydict()
-                {'r': ['Hello World']}
-        """
-        return StrFunc("initcap", self._e)
 
     def octet_length(self) -> StrFunc:
         """Count the UTF-8 bytes, not characters, in the string (→ Int64).
@@ -4141,13 +3821,14 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.extract(r"([a-z])([0-9])", 2)).to_pydict()
                 {'r': ['1']}
         """
-        return self.regexp_extract(pattern, group)
+        return StrFunc("regexp_extract", self._e, pattern=pattern, start=group)
 
-    def extract_all(self, pattern: str) -> StrFunc:
-        """All regex matches as a list — Polars' ``extract_all`` (see :meth:`regexp_extract_all`).
+    def extract_all(self, pattern: str, group: int = 0) -> StrFunc:
+        """All regex matches as a list, one per non-overlapping match of `pattern`.
 
         Args:
             pattern: The regular expression to find all matches of.
+            group: The capture group to return from each match; ``0`` is the whole match.
 
         Returns:
             A ``List<Utf8>`` expression of every match per row.
@@ -4160,7 +3841,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.extract_all("[0-9]")).to_pydict()
                 {'r': [['1', '2']]}
         """
-        return self.regexp_extract_all(pattern)
+        return StrFunc("regexp_extract_all", self._e, pattern=pattern, start=group)
 
     def replace_all(self, pattern: str, value: str) -> StrFunc:
         """Replace every regex match — Polars' ``replace_all`` (see :meth:`regexp_replace_all`).
@@ -4180,7 +3861,101 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.replace_all("[0-9]", "#")).to_pydict()
                 {'r': ['a#b#']}
         """
-        return self.regexp_replace_all(pattern, value)
+        return StrFunc("regexp_replace_all", self._e, pattern=pattern, replacement=value)
+
+    def len_chars(self) -> StrFunc:
+        """Count the characters in the string (→ Int64).
+
+        Counts Unicode characters, not bytes (see :meth:`octet_length`). Null → null.
+
+        Returns:
+            A new Int64 expression: the character count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["héllo", "hi"]})
+                >>> ds.select(bt.col("s").str.len_chars().alias("r")).to_pydict()
+                {'r': [5, 2]}
+        """
+        return StrFunc("len", self._e)
+
+    def escape_regex(self) -> StrFunc:
+        """Escape the regex metacharacters in the value (→ Utf8).
+
+        DuckDB ``regexp_escape``. Use it to embed data in a pattern as a literal, so a
+        value containing ``.`` or ``[`` matches itself instead of acting as syntax.
+
+        Returns:
+            A new Utf8 expression: the value with its metacharacters escaped.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a.b"]})
+                >>> ds.select(e=bt.col("s").str.escape_regex()).to_pydict()
+                {'e': ['a\\\\.b']}
+        """
+        return StrFunc("regexp_escape", self._e)
+
+    def strip_chars_start(self, chars: str | None = None) -> StrFunc:
+        """Trim from the left: any of ``chars`` if given, else the ASCII space.
+
+        Args:
+            chars: The set of characters to strip; whitespace if omitted.
+
+        Returns:
+            A new Utf8 expression: the left-trimmed string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  hi  "]})
+                >>> ds.select(bt.col("s").str.strip_chars_start().alias("r")).to_pydict()
+                {'r': ['hi  ']}
+        """
+        return StrFunc("l_trim", self._e, pattern=chars)
+
+    def strip_chars_end(self, chars: str | None = None) -> StrFunc:
+        """Trim from the right: any of ``chars`` if given, else the ASCII space.
+
+        Args:
+            chars: The set of characters to strip; whitespace if omitted.
+
+        Returns:
+            A new Utf8 expression: the right-trimmed string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  hi  "]})
+                >>> ds.select(bt.col("s").str.strip_chars_end().alias("r")).to_pydict()
+                {'r': ['  hi']}
+        """
+        return StrFunc("r_trim", self._e, pattern=chars)
+
+    def to_titlecase(self) -> StrFunc:
+        """Title-case each word: uppercase its first letter, lowercase the rest (``initcap``).
+
+        A word starts after whitespace or punctuation, so ``"a-b c"`` → ``"A-B C"``;
+        null → null.
+
+        Returns:
+            A new Utf8 expression with each word title-cased.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello world"]})
+                >>> ds.select(bt.col("s").str.to_titlecase().alias("r")).to_pydict()
+                {'r': ['Hello World']}
+        """
+        return StrFunc("initcap", self._e)
 
 
 # Parameterless string→string transforms: accessor name → engine `StrFunc` tag.
@@ -4224,81 +3999,12 @@ _bind_accessors(
 # the `Args:`/`Returns:` sections and the signature come from the target, so an alias
 # cannot drift from the method it forwards to. See `_bind_aliases`.
 _STR_ALIASES: dict[str, tuple[str, ...]] = {
-    "to_lowercase": (
-        "lower",
-        "Lowercase the string — the Polars ``to_lowercase`` spelling of :meth:`lower`.",
-        '{"s": ["Hello"]}',
-        'bt.col("s").str.to_lowercase()',
-        "{'r': ['hello']}",
-    ),
-    "to_uppercase": (
-        "upper",
-        "Uppercase the string — the Polars ``to_uppercase`` spelling of :meth:`upper`.",
-        '{"s": ["Hello"]}',
-        'bt.col("s").str.to_uppercase()',
-        "{'r': ['HELLO']}",
-    ),
-    "to_titlecase": (
-        "initcap",
-        "Title-case the string — the Polars ``to_titlecase`` spelling of :meth:`initcap`.",
-        '{"s": ["hello world"]}',
-        'bt.col("s").str.to_titlecase()',
-        "{'r': ['Hello World']}",
-    ),
     "count_matches": (
         "regexp_count",
         "Count regex matches — the Polars ``count_matches`` spelling of :meth:`regexp_count`.",
         '{"s": ["a1b2c3"]}',
         'bt.col("s").str.count_matches("[0-9]")',
         "{'r': [3]}",
-    ),
-    "len_chars": (
-        "len",
-        "Character length — the Polars ``len_chars`` spelling of :meth:`len`.",
-        '{"s": ["café"]}',
-        'bt.col("s").str.len_chars()',
-        "{'r': [4]}",
-    ),
-    "len_bytes": (
-        "octet_length",
-        "UTF-8 byte length — the Polars ``len_bytes`` spelling of :meth:`octet_length`.",
-        '{"s": ["café"]}',
-        'bt.col("s").str.len_bytes()',
-        "{'r': [5]}",
-    ),
-    "strip_chars": (
-        "trim",
-        "Trim from both ends — the Polars ``strip_chars`` spelling of :meth:`trim`.",
-        '{"s": ["  ab  "]}',
-        'bt.col("s").str.strip_chars()',
-        "{'r': ['ab']}",
-        "Note the divergence from Polars: with ``chars=None`` this strips the ASCII **space**\n"
-        "only, following SQL ``TRIM`` (and DuckDB), not the whole whitespace class. Tabs and\n"
-        'newlines survive. Pass them explicitly — ``strip_chars(" \\t\\n")`` — when the input\n'
-        "may carry them, which scraped and CSV text usually does.",
-    ),
-    "strip_chars_start": (
-        "lstrip",
-        "Trim from the left — the Polars ``strip_chars_start`` spelling of :meth:`lstrip`.",
-        '{"s": ["  ab  "]}',
-        'bt.col("s").str.strip_chars_start()',
-        "{'r': ['ab  ']}",
-    ),
-    "strip_chars_end": (
-        "rstrip",
-        "Trim from the right — the Polars ``strip_chars_end`` spelling of :meth:`rstrip`.",
-        '{"s": ["  ab  "]}',
-        'bt.col("s").str.strip_chars_end()',
-        "{'r': ['  ab']}",
-    ),
-    "strip": (
-        "trim",
-        "Trim from both ends — the pandas ``str.strip`` spelling of :meth:`trim`.",
-        '{"s": ["  ab  "]}',
-        'bt.col("s").str.strip()',
-        "{'r': ['ab']}",
-        "Unlike Python's ``str.strip()``, the no-argument form removes the ASCII **space**\n"
-        'only, following SQL ``TRIM``. Pass ``strip(" \\t\\n")`` to also drop tabs and newlines.',
     ),
     "startswith": (
         "starts_with",
@@ -4313,25 +4019,6 @@ _STR_ALIASES: dict[str, tuple[str, ...]] = {
         '{"s": ["abc", "abx"]}',
         'bt.col("s").str.endswith("c")',
         "{'r': [True, False]}",
-    ),
-    "title": (
-        "initcap",
-        "Title-case each word — the pandas ``str.title`` spelling of :meth:`initcap`.",
-        '{"s": ["hello world", "x1y2"]}',
-        'bt.col("s").str.title()',
-        "{'r': ['Hello World', 'X1y2']}",
-        "The name is pandas', the semantics are :meth:`initcap`'s, and they part company\n"
-        'on one rule: pandas treats a **digit** as a word boundary, so ``"x1y2"`` becomes\n'
-        '``"X1Y2"`` there and ``"X1y2"`` here, and ``"123abc"`` becomes ``"123Abc"``\n'
-        "there and is unchanged here. This follows SQL ``initcap`` (PostgreSQL, DuckDB),\n"
-        "for which a digit is an ordinary word character.",
-    ),
-    "escape_regex": (
-        "regexp_escape",
-        "Escape the regex metacharacters, spelled as Polars ``str.escape_regex``.",
-        '{"s": ["a.b"]}',
-        'bt.col("s").str.escape_regex()',
-        "{'r': ['a\\\\.b']}",
     ),
 }
 

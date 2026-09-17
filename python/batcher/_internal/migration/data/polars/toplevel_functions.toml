@@ -19,7 +19,7 @@ all_horizontal = { status = "param", batcher = "bt.all_horizontal", need = "bare
 any = { status = "mismatch", batcher = "bt.bool_or", note = "Polars any() ignores nulls and returns false for an all-null or empty column; bool_or returns null there. Param: ignore_nulls=True with empty-is-false", wave = "W0" }
 any_horizontal = { status = "param", batcher = "bt.any_horizontal", need = "bare string arguments as column names (read as string literals and rejected today)", wave = "W2" }
 api = { status = "mismatch", batcher = "bt.api", note = "polars.api registers user namespaces; batcher.api is Batcher's internal conductor package. Namespace registration is the gap", wave = "W11" }
-approx_n_unique = { status = "mismatch", batcher = "bt.approx_n_unique", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
+approx_n_unique = { status = "mismatch", batcher = "bt.approx_count_distinct", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
 arange = { status = "gap", need = "arange expression (int range)", wave = "W6" }
 arctan2 = { status = "mismatch", batcher = "bt.arctan2", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so arctan2('a', 'b') silently computes over the constants. Param: strings as column names (all-null result)", wave = "W0" }
 arctan2d = { status = "gap", need = "arctan2d (degrees)", wave = "W3" }
@@ -69,7 +69,7 @@ from_dicts = { status = "alias", batcher = "bt.from_pylist" }
 from_epoch = { status = "mismatch", batcher = "bt.from_epoch", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so from_epoch('a', 'b') silently computes over the constants. Param: strings as column names (all-null result); Batcher also lacks time_unit='d'", wave = "W0" }
 from_numpy = { status = "param", batcher = "bt.from_numpy", need = "2-D arrays with schema= and orient=", wave = "W2" }
 from_pandas = { status = "canonical", batcher = "bt.from_pandas" }
-from_records = { status = "mismatch", batcher = "bt.from_pylist", note = "Polars takes schema= and orient= and can read a sequence of sequences as columns; Batcher reads rows with columns=", wave = "W0" }
+from_records = { status = "mismatch", batcher = "bt.from_records", note = "Polars takes schema= and orient= and can read a sequence of sequences as columns; Batcher reads rows with columns=", wave = "W0" }
 from_repr = { status = "out_of_scope", reason = "parsing a printed table repr is a notebook convenience, not engine surface" }
 from_torch = { status = "canonical", batcher = "bt.from_torch" }
 get_extension_type = { status = "gap", need = "extension type registry", wave = "W11" }
@@ -94,7 +94,7 @@ median = { status = "canonical", batcher = "bt.median" }
 merge_sorted = { status = "gap", need = "merge_sorted", wave = "W8" }
 min = { status = "canonical", batcher = "bt.min" }
 min_horizontal = { status = "mismatch", batcher = "bt.least", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so min_horizontal('a', 'b') silently computes over the constants. Param: strings as column names", wave = "W0" }
-n_unique = { status = "mismatch", batcher = "bt.n_unique", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
+n_unique = { status = "mismatch", batcher = "bt.count_distinct", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
 nth = { status = "gap", need = "nth (column by position)", wave = "W8" }
 ones = { status = "gap", need = "ones expression", wave = "W8" }
 plugins = { status = "gap", need = "Rust plugin ABI (register_plugin_function)", wave = "W11" }

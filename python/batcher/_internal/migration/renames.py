@@ -14,16 +14,25 @@ A value in `renames.toml` is either a string (the kept attribute name) or an inl
 * `{ to = "count", call = true }` - a property whose replacement is a zero-argument call;
 * `{ operator = "add" }` - `a.add(b)` becomes `a + b` (`invert`/`neg` are unary);
 * `{ transform = "<name>", to = "<kept>" }` - an argument reshaping implemented by name in
-  `batcher.migrate.transforms`, with `to` naming the method the result calls.
+  `batcher.migrate.canonical`, with `to` naming the method the result calls.
+
+Any rule may add `fill = ["<param>@<position>=<literal>"]` when the kept spelling's default
+differs from the removed one's (a call that omits the argument gets it passed explicitly), and
+`keys = ["<param>", ...]` when the kept spelling takes the arguments at other positions (the
+call's positional arguments become those keywords).
 
 A value in `kwarg_renames.toml`, under a `["<receiver>.<method>"]` table, is one of:
-`"<new_name>"` (rename the keyword), `"*"` (the value becomes positional arguments), or
+`"<new_name>"` (rename the keyword), `"*"` (a literal list becomes positional arguments),
+`"@"` (the value becomes the first positional argument), or
 `"!<new_name>"` (rename and logically negate a boolean), or `"nulls_first"` for the pandas
 `na_position="first"|"last"` string.
 """
 
 from __future__ import annotations
 
+import ast
+import dataclasses
+import re
 import tomllib
 from dataclasses import dataclass
 from functools import lru_cache
@@ -65,7 +74,7 @@ OPERATORS = {
 }
 
 # Argument reshapings the codemod implements by name.
-TRANSFORMS = frozenset({"with_column", "slice_to_limit"})
+TRANSFORMS = frozenset({"with_column", "slice_to_limit", "identity"})
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,11 @@ class Rename:
         to: The kept attribute name, or dotted path, the rewrite calls.
         operator: For `kind == "operator"`, the key into `OPERATORS`.
         transform: For `kind == "transform"`, the key into `TRANSFORMS`.
+        fill: `(param, position, literal)` triples: when a call omits `param` both as a
+            keyword and at `position`, the rewrite passes `param=literal`, because the kept
+            spelling's default differs from the removed one's.
+        keys: Keywords the call's positional arguments become, in order, because the kept
+            spelling takes them at other positions (`clip_max(2)` is `clip(upper=2)`).
     """
 
     receiver: str
@@ -87,6 +101,8 @@ class Rename:
     to: str = ""
     operator: str = ""
     transform: str = ""
+    fill: tuple[tuple[str, int, str], ...] = ()
+    keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,7 +112,9 @@ class KwargRename:
     Attributes:
         method: `"<receiver>.<method>"`.
         keyword: The keyword being removed.
-        action: `rename`, `positional`, `negate`, or `nulls_first`.
+        action: `rename`, `positional` (a literal list splatted into positional arguments),
+            `first_positional` (the value passed whole as the first positional argument),
+            `negate`, or `nulls_first`.
         to: The kept keyword, for `rename` and `negate`.
     """
 
@@ -106,13 +124,47 @@ class KwargRename:
     to: str = ""
 
 
+_FILL = re.compile(r"^(?P<param>[A-Za-z_]\w*)@(?P<pos>\d+)=(?P<literal>.+)$")
+
+
+def _fills(where: str, raw: object) -> tuple[tuple[str, int, str], ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise RegistryError(f"{where}: fill must be a list of 'param@position=literal'")
+    out = []
+    for item in raw:
+        match = _FILL.match(str(item))
+        if match is None:
+            raise RegistryError(f"{where}: fill entry {item!r} is not 'param@position=literal'")
+        try:
+            ast.literal_eval(match["literal"])
+        except (ValueError, SyntaxError) as exc:
+            raise RegistryError(
+                f"{where}: fill literal {match['literal']!r} is not a literal"
+            ) from exc
+        out.append((match["param"], int(match["pos"]), match["literal"]))
+    return tuple(out)
+
+
 def _rule(receiver: str, removed: str, raw: object) -> Rename:
+    rule = _base_rule(receiver, removed, raw)
+    fill = _fills(
+        f"renames.toml: {receiver}.{removed}", raw.get("fill") if isinstance(raw, dict) else None
+    )
+    keys = raw.get("keys", []) if isinstance(raw, dict) else []
+    if not isinstance(keys, list) or not all(isinstance(k, str) and k.isidentifier() for k in keys):
+        raise RegistryError(f"renames.toml: {receiver}.{removed}: keys must be a list of names")
+    return dataclasses.replace(rule, fill=fill, keys=tuple(keys))
+
+
+def _base_rule(receiver: str, removed: str, raw: object) -> Rename:
     where = f"renames.toml: {receiver}.{removed}"
     if isinstance(raw, str):
         return Rename(receiver, removed, "name", to=raw)
     if not isinstance(raw, dict):
         raise RegistryError(f"{where} must be a string or an inline table")
-    unknown = set(raw) - {"to", "call", "operator", "transform"}
+    unknown = set(raw) - {"to", "call", "operator", "transform", "fill", "keys"}
     if unknown:
         raise RegistryError(f"{where}: unknown field(s) {sorted(unknown)}")
     if "operator" in raw:
@@ -177,6 +229,8 @@ def load_kwarg_renames() -> dict[str, dict[str, KwargRename]]:
                 raise RegistryError(f"kwarg_renames.toml: {method}({keyword}=) must be a string")
             if raw == "*":
                 rules[keyword] = KwargRename(method, keyword, "positional")
+            elif raw == "@":
+                rules[keyword] = KwargRename(method, keyword, "first_positional")
             elif raw == "nulls_first":
                 rules[keyword] = KwargRename(method, keyword, "nulls_first", to="nulls_first")
             elif raw.startswith("!"):
