@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1483 Python modules across 217 packages and 294 Rust files across 15 crates.
+Covering 1483 Python modules across 217 packages and 295 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -3053,7 +3053,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/dense.rs` | 335 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
 | `join/key_filter.rs` | 303 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 2091 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 2103 | Hash join — produces match index-pairs, built to distribute. |
+| `join/probe_par.rs` | 111 | The flat hash join's probe, across cores, emitting exactly what the serial probe emits. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 538 | Sortable key forms for a range join's axes, and the dense ranking built on them. |

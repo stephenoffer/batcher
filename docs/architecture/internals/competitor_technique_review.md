@@ -2009,6 +2009,19 @@ their ranks must agree, not the intermediate column.
 Keep it in proportion: Batcher already led this shape by 10-20x over DuckDB and 2.5-10x over
 Polars, so this makes a win larger rather than closing a gap.
 
+**Update, 2026-09-16: the mask is gone as well.** The heap bounded each bucket's *ordering*, but
+the parallel window still scattered a rank for every input row back into input order so that
+`filter_by_rank_limit` could keep `k` per partition; `perf` put 21 % of H2O q8's shape (10M rows,
+100,000 partitions, `k = 2`) in that scatter. `bc_runtime::window::window_with_rank_limit` now
+keeps each bucket's survivors, named by input row, and orders them once, and the interpreter's
+window gathers only those rows; `filter_by_rank_limit` was deleted. The subtlety above is moot:
+the keep is `rank <= k` on both paths, so there is no unmasked column to compare against. Four
+alternating rounds on one commit took q8's shape from 121-252 ms to **63-68 ms**
+(`BENCHMARK_RESULTS.md`), and `rank_limited_equals_masking_the_full_window` holds the survivors
+equal to masking the full window. The differential test written for it,
+`test_diff_qualify_topn_parallel.py`, found a DuckDB 1.5.5 defect on the way: `row_number() <= 2`
+over a float order key holding NaN returns wrong rows for ~25 of 5,000 partitions.
+
 ### The measured census: 96 queries, four suites, ranked by what they actually cost
 
 The inventory says almost nothing is missing, so the bottlenecks have to be found by
