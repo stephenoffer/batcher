@@ -1,10 +1,12 @@
-"""The default SQL catalog: `bt.sql`, `bt.register_function` and `bt.register_model`.
+"""The default session: `bt.sql`, `bt.register_function`, `bt.register_model` and its accessors.
 
 A process-global `Session` backs all three, so ``CREATE TABLE AS`` in one call is
-visible to the next. `bt.Session` is the public handle for an isolated catalog.
+visible to the next, and `ds.write.table` resolves table names against it when no session
+is passed. `bt.current_session` returns it and `bt.set_session` replaces it; `bt.Session`
+builds an isolated one.
 
 `bt.sql_expr` and `bt.call_function` sit beside them: they reach the same SQL function
-table for a single expression, read in the default catalog's dialect unless told otherwise.
+table for a single expression, read in the default session's dialect unless told otherwise.
 """
 
 from __future__ import annotations
@@ -19,13 +21,64 @@ from batcher.api.sql_session import Session
 if TYPE_CHECKING:
     from batcher.plan.expr_ir import Expr
 
-__all__ = ["call_function", "register_function", "register_model", "sql", "sql_expr"]
+__all__ = [
+    "call_function",
+    "current_session",
+    "register_function",
+    "register_model",
+    "set_session",
+    "sql",
+    "sql_expr",
+]
 
-# The process-global default SQL session, backing the module-level `sql` /
-# `register_function` below. It is intentionally private: `bt.sql(...)` is the one
-# obvious entry point for the default catalog, and `bt.Session` is the public handle
-# for an isolated one.
-_catalog = Session()
+# The process-global default session, backing the module-level `sql` / `register_function`
+# below. A one-slot list so `set_session` can replace it without a `global` statement.
+_default: list[Session] = [Session()]
+
+
+def current_session() -> Session:
+    """The process-default `Session` that `bt.sql` and `ds.write.table` use.
+
+    Spark's ``SparkSession.active()`` and Daft's ``current_session()``. Tables created with
+    ``bt.sql("CREATE TABLE ...")`` and catalogs attached to it are visible to every later
+    `bt.sql` call in the process.
+
+    Returns:
+        The default session.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.current_session().catalog.current_catalog()
+            'memory'
+    """
+    return _default[0]
+
+
+def set_session(session: Session) -> None:
+    """Make `session` the process default that `bt.sql` and `ds.write.table` use.
+
+    Args:
+        session: The session to install.
+
+    Raises:
+        PlanError: `session` is not a `bt.Session`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> previous = bt.current_session()
+            >>> s = bt.Session()
+            >>> bt.set_session(s)
+            >>> bt.current_session() is s
+            True
+            >>> bt.set_session(previous)
+    """
+    if not isinstance(session, Session):
+        raise PlanError(f"set_session() takes a bt.Session, got {type(session).__name__}")
+    _default[0] = session
 
 
 def _bind(tables: Mapping[str, Any]) -> dict[str, Any]:
@@ -113,7 +166,8 @@ def sql(
             )
         bound.update(tables)
     bound.update(kwargs)
-    session = _catalog if dialect is None else _catalog._with_dialect(dialect)
+    default = current_session()
+    session = default if dialect is None else default._with_dialect(dialect)
     return session._run(query, _bind(bound))
 
 
@@ -154,7 +208,7 @@ def sql_expr(text: str, *, dialect: str | None = None) -> Expr:
     """
     from batcher._sql.expression import parse_sql_expression
 
-    return parse_sql_expression(text, dialect=dialect or _catalog._dialect)
+    return parse_sql_expression(text, dialect=dialect or _default[0]._dialect)
 
 
 def call_function(name: str, *args: Any, dialect: str | None = None) -> Expr:
@@ -191,7 +245,7 @@ def call_function(name: str, *args: Any, dialect: str | None = None) -> Expr:
     """
     from batcher._sql.expression import call_sql_function
 
-    return call_sql_function(name, args, dialect=dialect or _catalog._dialect)
+    return call_sql_function(name, args, dialect=dialect or _default[0]._dialect)
 
 
 def register_function(name: str, fn: Callable, **options: Any) -> None:
@@ -216,7 +270,7 @@ def register_function(name: str, fn: Callable, **options: Any) -> None:
             >>> bt.sql("SELECT dbl(x) AS y FROM t", t=t).to_pydict()
             {'y': [2, 4, 6]}
     """
-    _catalog.register_function(name, fn, **options)
+    current_session().register_function(name, fn, **options)
 
 
 def register_model(name: str, model: Any) -> None:
@@ -245,4 +299,4 @@ def register_model(name: str, model: Any) -> None:
             >>> [round(v, 6) for v in scored.to_pydict()["prediction"]]
             [10.0]
     """
-    _catalog.register_model(name, model)
+    current_session().register_model(name, model)

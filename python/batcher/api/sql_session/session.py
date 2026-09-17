@@ -20,8 +20,9 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher._internal.sql_errors import parse_sql
+from batcher.api.catalog import SessionCatalog
 from batcher.api.dataset import Dataset
-from batcher.api.sql_session import statements
+from batcher.api.sql_session import catalog_sql, statements
 from batcher.api.sql_session.registry import RegisteredFunction, resolve_type, validate_options
 
 __all__ = ["Session"]
@@ -46,6 +47,7 @@ class Session:
     """
 
     __slots__ = (
+        "_catalog",
         "_dialect",
         "_engines",
         "_functions",
@@ -62,6 +64,7 @@ class Session:
         self._models: dict[str, Any] = {}
         self._engines: dict[str, Any] = {}
         self._dialect = dialect
+        self._catalog = SessionCatalog()
         # Prepared-statement cache: (dialect, query, bound names) ->
         # (catalog generation, bound objects, Dataset).
         #
@@ -145,20 +148,47 @@ class Session:
         """
         return self.table(name)
 
+    @property
+    def catalog(self) -> SessionCatalog:
+        """The catalogs this session resolves table names against (Spark ``spark.catalog``).
+
+        Holds the attached `Catalog`s and the current catalog and namespace. A fresh session
+        has one in-memory catalog, ``memory``, with the namespace ``main``.
+
+        Returns:
+            This session's `SessionCatalog`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.catalog.create_table("orders", bt.from_pydict({"id": [1, 2]}))
+                >>> s.catalog.list_tables()
+                ['main.orders']
+        """
+        return self._catalog
+
     def _bump(self) -> None:
         """Invalidate the prepared-statement cache after a catalog mutation."""
         self._generation[0] += 1
 
     # --- tables ------------------------------------------------------------
-    def register(self, name: str, dataset: Dataset | pa.Table) -> Dataset:
-        """Register `dataset` as the table `name` for this session, replacing any prior.
+    def register(self, name: str, dataset: Dataset | pa.Table, *, replace: bool = True) -> Dataset:
+        """Register `dataset` as the session view `name`, replacing any prior by default.
 
-        The DuckDB ``con.register`` / Spark ``createOrReplaceTempView`` analogue. A
-        pyarrow table is lifted to a `Dataset`.
+        The DuckDB ``con.register`` / Spark ``createOrReplaceTempView`` analogue, and with
+        ``replace=False`` Spark's ``createTempView``. A view is a name bound to a lazy plan in
+        this session only; it shadows a catalog table of the same name and stores nothing.
+        A pyarrow table is lifted to a `Dataset`.
 
         Args:
             name: The table name SQL queries will refer to.
             dataset: A `Dataset` or pyarrow table to bind.
+            replace: Replace an existing view of the same name; when False, raise instead.
+
+        Raises:
+            PlanError: `name` is already registered and `replace` is False.
 
         Returns:
             The bound `Dataset`.
@@ -172,13 +202,22 @@ class Session:
                 >>> s.list()
                 ['t']
         """
+        if not replace and name in self._tables:
+            raise PlanError(
+                f"a view named {name!r} is already registered",
+                hint="Pass replace=True to replace it, or Session.drop it first.",
+            )
         ds = self._as_dataset(dataset)
         self._tables[name] = ds
         self._bump()
         return ds
 
     def table(self, name: str) -> Dataset:
-        """Return the `Dataset` registered as `name`, raising `PlanError` if absent.
+        """Return the view registered as `name`, or else the catalog table it resolves to.
+
+        A session view (`register`) shadows a catalog table of the same name. A catalog
+        name resolves as ``session.catalog`` describes: ``"t"``, ``"ns.t"`` or
+        ``"catalog.ns.t"``.
 
         Examples:
             .. doctest::
@@ -190,17 +229,22 @@ class Session:
                 {'x': [1, 2, 3]}
 
         Args:
-            name: The registered table name to look up.
+            name: The view or catalog table name to look up.
 
         Returns:
-            The `Dataset` bound to `name`.
+            The view's `Dataset`, or a lazy read of the catalog table.
 
         Raises:
-            PlanError: If no table is registered under `name`.
+            PlanError: If neither a view nor a catalog table has that name.
         """
-        if name not in self._tables:
-            raise PlanError(f"no table {name!r} in catalog; registered: {self.list()}")
-        return self._tables[name]
+        if name in self._tables:
+            return self._tables[name]
+        if self._catalog.has_table(name):
+            return self._catalog.get_table(name).read()
+        raise PlanError(
+            f"no table {name!r}: not a registered view, nor a catalog table; views: {self.list()}",
+            hint="List catalog tables with session.catalog.list_tables().",
+        )
 
     def list(self) -> list[str]:
         """The sorted names of all registered tables.
@@ -470,6 +514,55 @@ class Session:
         """
         return sorted(self._functions)
 
+    def has_function(self, name: str) -> bool:
+        """Whether a Python function is registered for SQL under `name`.
+
+        Args:
+            name: The SQL function name.
+
+        Returns:
+            True if registered.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> s.register_function("dbl", lambda a: a, result_type="int64")
+                >>> s.has_function("dbl")
+                True
+        """
+        return name in self._functions
+
+    def drop_function(self, name: str, *, if_exists: bool = False) -> None:
+        """Unregister the SQL function `name`.
+
+        Args:
+            name: The SQL function name.
+            if_exists: Do nothing when it is not registered, instead of raising.
+
+        Raises:
+            PlanError: No function is registered under `name` and `if_exists` is False.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> s.register_function("dbl", lambda a: a, result_type="int64")
+                >>> s.drop_function("dbl")
+                >>> s.list_functions()
+                []
+        """
+        if name not in self._functions:
+            if if_exists:
+                return
+            raise PlanError(
+                f"no function {name!r} is registered; registered: {self.list_functions()}"
+            )
+        del self._functions[name]
+        self._bump()
+
     # --- execution ---------------------------------------------------------
     def sql(self, query: str, **tables: Dataset | pa.Table) -> Dataset:
         """Run `query` against this session's tables, functions, and dialect.
@@ -525,14 +618,22 @@ class Session:
         from sqlglot import expressions as exp
 
         ast = parse_sql(query, dialect=self._dialect)
+        handled = catalog_sql.catalog_statement(self, ast, tables)
+        if handled is not None:
+            return handled
         if isinstance(ast, exp.Create):
             return statements.create(self, ast, tables)
         if isinstance(ast, exp.Drop):
             return statements.drop(self, ast)
         if isinstance(ast, (exp.Insert, exp.Delete, exp.Update, exp.Merge)):
             return statements.dml(self, ast, tables)
-        ds = self._translate(ast, tables)
-        self._remember(key, bound, ds)
+        ast, resolved, dynamic = catalog_sql.bind(self, ast, tables)
+        ds = self._translate_bound(ast, {**tables, **resolved})
+        # A plan over a catalog table, or one that inlined session state such as
+        # `current_catalog()`, is rebuilt every call: the table's storage and the session's
+        # position both change without the query text changing.
+        if not dynamic:
+            self._remember(key, bound, ds)
         return ds
 
     # How many prepared plans to keep. Entries pin their bound datasets alive, so this is
@@ -566,6 +667,11 @@ class Session:
         Returns:
             The lazy result relation.
         """
+        ast, resolved, _ = catalog_sql.bind(self, ast, tables)
+        return self._translate_bound(ast, {**tables, **resolved})
+
+    def _translate_bound(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
+        """Lower an AST whose catalog references `catalog_sql.bind` already resolved."""
         from batcher._sql import translate_ast
 
         return translate_ast(
@@ -609,6 +715,7 @@ class Session:
         view._functions = self._functions
         view._models = self._models
         view._engines = self._engines
+        view._catalog = self._catalog
         view._dialect = dialect
         view._plan_cache = self._plan_cache
         view._generation = self._generation

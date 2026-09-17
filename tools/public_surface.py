@@ -68,6 +68,7 @@ def _subpackage_exports() -> list[tuple[str, Any]]:
 
 def _accessor_namespaces() -> list[type]:
     """The typed accessor classes reached as attributes of Expr/Dataset."""
+    from batcher.api.catalog import SessionCatalog
     from batcher.api.dataset.dq import ConstraintResult, DatasetDQ, ValidationReport
     from batcher.api.dataset.meta import (
         ApproxMeta,
@@ -116,6 +117,8 @@ def _accessor_namespaces() -> list[type]:
         ValidationReport,
         ConstraintResult,
         DatasetSCD,
+        # `session.catalog` — the attached catalogs and where table names resolve.
+        SessionCatalog,
         # The `ds.meta` accessor tree — metadata shortcuts, reached as `ds.meta.col("x")`,
         # `ds.meta.col("x").check`, `ds.meta.schema`, `.nulls`, `.approx`, `.storage`,
         # and `ds.meta.against(other)`.

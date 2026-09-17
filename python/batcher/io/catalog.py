@@ -86,8 +86,12 @@ def _coerce_spec(spec: CatalogSpec | str) -> CatalogSpec:
     return dict(spec)
 
 
-def resolve_catalog(spec: CatalogSpec | str) -> Catalog:
+def resolve_catalog(spec: CatalogSpec | str | Catalog) -> Catalog:
     """Load a live pyiceberg `Catalog` from a friendly `spec`.
+
+    A catalog object that is already live (anything with ``load_table``) is returned as
+    it is, so a caller holding one — `batcher.Catalog.from_iceberg` does — reads and writes
+    through it without describing it again as properties.
 
     Args:
         spec: Either the name of a catalog configured in ``~/.pyiceberg.yaml`` /
@@ -114,6 +118,8 @@ def resolve_catalog(spec: CatalogSpec | str) -> Catalog:
         ...      "token": "dapi...", "warehouse": "my_catalog"}
         ... )
     """
+    if not isinstance(spec, (str, dict)) and hasattr(spec, "load_table"):
+        return spec
     catalog_mod = _require_pyiceberg()
     props = _coerce_spec(spec)
     name = props.pop("name", "default")

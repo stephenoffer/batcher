@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     from batcher.api.dataset import Dataset
     from batcher.api.merge import MergeBuilder
+    from batcher.api.sql_session import Session
     from batcher.api.streaming import StreamingQuery
     from batcher.io.manifest import WriteManifest
     from batcher.plan.streaming import Trigger
@@ -1635,6 +1636,75 @@ class Writer:
                 2
         """
         return self(path, "tfrecord", record_format=record_format, **opts)
+
+    # --- Catalog tables ----------------------------------------------------
+    def table(
+        self,
+        name: str,
+        *,
+        mode: str = "error",
+        by_name: bool = True,
+        partition_by: list[str] | None = None,
+        properties: dict[str, str] | None = None,
+        replace_where: Any = None,
+        session: Session | None = None,
+    ) -> WriteManifest:
+        """Write the result to a catalog table by name, creating it unless `mode` forbids.
+
+        The one spelling for Spark's ``saveAsTable``/``insertInto``/``writeTo``, and Daft's
+        and Polars' ``write_table``. `name` resolves through the session's catalogs the way
+        `Session.table` does. `mode` says what to do about the table existing:
+
+        * ``"error"`` (default) creates the table, and raises if it exists.
+        * ``"ignore"`` creates it, or does nothing if it exists.
+        * ``"append"`` adds rows, creating the table if it is missing.
+        * ``"overwrite"`` replaces rows and schema, creating the table if missing. With
+          `replace_where`, only the rows matching the predicate are replaced.
+        * ``"replace"`` replaces rows and schema of a table that must exist.
+        * ``"overwrite_partitions"`` replaces only the partitions the incoming rows have
+          values in, and keeps every other partition.
+
+        ``by_name=False`` matches columns to an existing table by position, as SQL
+        ``INSERT`` and Spark ``insertInto`` do.
+
+        Args:
+            name: The table name, qualified as far as needed (``"t"``, ``"ns.t"``,
+                ``"catalog.ns.t"``).
+            mode: The save mode above.
+            by_name: Match columns to an existing table by name (unlisted ones become
+                NULL), or by position when False.
+            partition_by: Partition columns for a created table, or the partitions an
+                ``"overwrite_partitions"`` write scopes to.
+            properties: Table properties, applied when the write creates or replaces it.
+            replace_where: A predicate scoping ``mode="overwrite"`` to matching rows.
+            session: The session whose catalogs resolve `name`; the current session when
+                omitted.
+
+        Returns:
+            A `WriteManifest` for the rows written (empty when nothing was).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = bt.from_pydict({"id": [1, 2]}).write.table("orders", session=s)
+                >>> _ = bt.from_pydict({"id": [3]}).write.table("orders", mode="append", session=s)
+                >>> s.table("orders").count()
+                3
+        """
+        from batcher.api.catalog.modes import write_to_table
+
+        return write_to_table(
+            self._ds,
+            name,
+            session=session,
+            mode=mode,
+            by_name=by_name,
+            partition_by=partition_by,
+            properties=properties,
+            replace_where=replace_where,
+        )
 
     # --- Upserts / MERGE INTO ----------------------------------------------
     def merge(

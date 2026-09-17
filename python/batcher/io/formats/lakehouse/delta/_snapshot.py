@@ -37,7 +37,7 @@ from batcher._internal.logging import note_suppressed
 from batcher._internal.optional import require
 from batcher.io.formats.lakehouse._time import normalize_timestamp
 
-__all__ = ["DeltaSnapshot", "open_snapshot", "require_deltalake"]
+__all__ = ["DeltaSnapshot", "forget_table", "open_snapshot", "require_deltalake"]
 
 # Bounded LRU of pinned (uri, version) snapshots, so a worker reading many splits of
 # the same table replays the log once, and a worker cycling across tables keeps its
@@ -508,6 +508,25 @@ def _relative_to(uri: str, table_uri: str) -> str:
         if uri.startswith(prefix):
             return uri[len(prefix) :]
     return uri.rsplit("/", 1)[-1] if "/" in uri and root not in uri else uri
+
+
+def forget_table(table_uri: str) -> None:
+    """Drop every cached snapshot and live handle for `table_uri` in this process.
+
+    The cache is keyed by ``(uri, version)`` on the premise that a version's state never
+    changes, and that premise breaks exactly once: when the table directory is deleted and
+    a new table is created at the same path, its first commit is version 0 again. Whoever
+    deletes a table calls this, or the next read of the new table is served the old one's
+    files. It only reaches this process; a worker that cached the old table keeps it.
+
+    Args:
+        table_uri: The table root, spelled as reads spell it.
+    """
+    root = table_uri.rstrip("/")
+    with _HANDLE_LOCK:
+        for cache in (_LATEST_HANDLES, _SNAPSHOT_CACHE):
+            for key in [k for k in cache if str(k[0]).rstrip("/") == root]:
+                del cache[key]
 
 
 def _cache_get(key: tuple) -> DeltaSnapshot | None:

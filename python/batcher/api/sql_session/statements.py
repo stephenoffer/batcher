@@ -103,14 +103,21 @@ def drop(session: Session, ast: Any) -> Dataset:
     Raises:
         PlanError: No such table, and ``IF EXISTS`` was not given.
     """
+    from batcher.api.sql_session.catalog_sql import qualified_name
+
     targets = list(ast.args.get("tables") or ([ast.this] if ast.this is not None else []))
-    names = [t.name for t in targets]
+    names = [qualified_name(t) for t in targets]
     if not names:
         raise PlanError("DROP TABLE names no table")
     if not bool(ast.args.get("exists")):
         for name in names:
-            if name not in session._tables:
+            if name not in session._tables and not session.catalog.has_table(name):
                 raise PlanError(f"no table {name!r} to drop")
     for name in names:
-        session._unbind(name)
+        # A session view shadows a catalog table of the same name, so dropping the name
+        # removes the view and leaves the table: the same thing the name reads.
+        if name in session._tables:
+            session._unbind(name)
+        elif session.catalog.has_table(name):
+            session.catalog.drop_table(name)
     return session._as_dataset(pa.table({"dropped": pa.array(names, pa.string())}))

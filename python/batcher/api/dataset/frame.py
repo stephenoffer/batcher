@@ -1931,9 +1931,10 @@ class Dataset:
                 >>> ds.sql("SELECT a, a * 2 AS d FROM self WHERE a > 1").to_pydict()
                 {'a': [2, 3], 'd': [4, 6]}
         """
-        from batcher.api.session.sql import _catalog
+        from batcher.api.session.sql import current_session
 
-        session = _catalog if dialect is None else _catalog._with_dialect(dialect)
+        default = current_session()
+        session = default if dialect is None else default._with_dialect(dialect)
         return session._run(query, {table_name: self})
 
     def drop(
