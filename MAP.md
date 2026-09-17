@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1476 Python modules across 216 packages and 290 Rust files across 15 crates.
+Covering 1476 Python modules across 216 packages and 292 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -1564,7 +1564,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | module | lines | what it is |
 |---|---|---|
 | `estimator.py` | 332 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
-| `kernel.py` | 466 | The kernel's own view of how close this process is to being OOM-killed. |
+| `kernel.py` | 463 | The kernel's own view of how close this process is to being OOM-killed. |
 | `learned.py` | 520 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 411 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 435 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
@@ -2360,14 +2360,14 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 
 | module | lines | what it is |
 |---|---|---|
-| `_bind.py` | 180 | Shared accessor-generation helper for the namespace families. |
+| `_bind.py` | 91 | Shared accessor-generation helper for the namespace families. |
 | `_descriptions.py` | 456 | The curated per-accessor docstrings, keyed by accessor name. |
 | `_dialect.py` | 54 | Plan-time constants for the `.str` parameters that select another engine's semantics. |
 | `_temporal_units.py` | 137 | The truncation-unit vocabulary shared by `.dt.truncate`/`floor`/`ceil`/`round`. |
-| `collections.py` | 1620 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 1603 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
-| `strings.py` | 4340 | The `.str` accessor namespace. |
-| `temporal.py` | 1326 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
+| `strings.py` | 4308 | The `.str` accessor namespace. |
+| `temporal.py` | 1335 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
 
@@ -2981,7 +2981,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/quantile_spill/mod.rs` | 741 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
 | `ops/radix_sort/mod.rs` | 389 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/radix_sort/packed.rs` | 498 | The **composite** packed key: several sort columns narrowed into one integer. |
-| `ops/repartition.rs` | 455 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
+| `ops/repartition.rs` | 441 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 548 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/run_sort.rs` | 275 | Natural-run detection for the fixed-width sort permutations. |
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
@@ -3106,14 +3106,16 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `analyze.rs` | 526 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 174 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 762 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/binary.rs` | 766 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/branch/case.rs` | 71 | `CASE`: the first branch whose condition holds supplies the row's value. |
 | `eval/branch/coalesce.rs` | 76 | `COALESCE`: the first argument with a value supplies the row's value. |
 | `eval/branch/literal_case.rs` | 181 | A `CASE` whose arms are all literals, built in one pass instead of one array per arm. |
 | `eval/branch/mod.rs` | 146 | Short-circuiting evaluation of the branch-selecting forms: `CASE` and `COALESCE`. |
 | `eval/cast.rs` | 612 | `cast` evaluation with DuckDB float→int rounding semantics. |
+| `eval/cmp/mod.rs` | 11 | Comparison kernels for a column against a one-value literal. |
+| `eval/cmp/string.rs` | 259 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
-| `eval/dispatch.rs` | 516 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 523 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 382 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/grid.rs` | 238 | The grid and reference-system functions, which take plain numbers rather than geometry. |
@@ -3153,7 +3155,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/media/video/mod.rs` | 299 | Video evaluation for `Expr::Video` (the `.video` namespace). |
 | `eval/media/video/sample.rs` | 602 | Turning a clip into pixels: `frames`, `thumbnail`, and `frame_at`. |
 | `eval/mime.rs` | 230 | What a payload is, decided from its bytes — the one magic-number table. |
-| `eval/mod.rs` | 52 | Evaluation bodies for the scalar `Expr` variants. |
+| `eval/mod.rs` | 53 | Evaluation bodies for the scalar `Expr` variants. |
 | `eval/security/crypto.rs` | 101 | Keyed cryptographic primitives: HMAC-SHA-256 pseudonymization and AES-256-GCM-SIV column encryption. |
 | `eval/security/keyref.rs` | 50 | Resolving a crypto key *reference* to the key material, at evaluation time. |
 | `eval/security/mask.rs` | 104 | Character masking — the redaction primitive behind partial-disclosure policies ("show only the last four digits"). |

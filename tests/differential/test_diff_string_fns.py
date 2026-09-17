@@ -45,7 +45,7 @@ def test_spark_only_string_fns_fixtures():
         .select(
             si=col("s").str.substring_index(".", 2),
             ov=col("s").str.overlay("XY", 2, 1),
-            rc=col("s").str.regexp_count("[a-z]"),
+            rc=col("s").str.count_matches("[a-z]"),
             sx=col("s").str.soundex(),
         )
         .collect()

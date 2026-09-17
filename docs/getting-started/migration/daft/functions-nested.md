@@ -66,7 +66,7 @@ The following table maps the 94 names on `Expression`, sorted alphabetically.
 | `deserialize` | n/a | gap | Not yet: typed JSON decode (json\_decode with a dtype). Wave W7. |
 | `dot_product` | `Expr.list.dot` | canonical |  |
 | `eq_null_safe` | `Expr.eq_missing` | canonical |  |
-| `euclidean_distance` | `Expr.list.euclidean_distance` | canonical |  |
+| `euclidean_distance` | `Expr.list.l2_distance` | canonical |  |
 | `explode` | `Dataset.explode` | mismatch | Differs: Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form). Wave W8. |
 | `fill_null` | `Expr.fill_null` | canonical |  |
 | `get` | `Expr.list.get` + `Expr.struct.field` | param | Missing: default= for a missing index/field, and one get over list, struct and map. Wave W4. |
@@ -128,7 +128,7 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `deserialize` | n/a | gap | Not yet: typed JSON decode (json\_decode with a dtype). Wave W7. |
 | `dot_product` | `Expr.list.dot` | canonical |  |
 | `eq_null_safe` | `Expr.eq_missing` | canonical |  |
-| `euclidean_distance` | `Expr.list.euclidean_distance` | canonical |  |
+| `euclidean_distance` | `Expr.list.l2_distance` | canonical |  |
 | `explode` | `Dataset.explode` | mismatch | Differs: Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form). Wave W8. |
 | `extract_day_uuid7` | n/a | gap | Not yet: UUIDv7 days-since-epoch extraction. Wave W3. |
 | `extract_hour_uuid7` | n/a | gap | Not yet: UUIDv7 hours-since-epoch extraction. Wave W3. |

@@ -16,7 +16,7 @@ from batcher.plan.expr_ir.compat.guidance import STR_UNSUPPORTED, accessor_attri
 from batcher.plan.expr_ir.constructors import lit, nullif, when
 from batcher.plan.expr_ir.core import AggExpr, Binary, Cast, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
-from batcher.plan.expr_ir.namespaces._bind import _bind_accessors, _bind_aliases
+from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 from batcher.plan.expr_ir.namespaces._dialect import UNICODE_WHITE_SPACE, escape_rust_regex
 from batcher.plan.expr_ir.nodes import ListJoin
 
@@ -680,7 +680,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.word_count()).to_pydict()
                 {'r': [3, 1]}
         """
-        # A native single-pass scan rather than `regexp_count(r"\S+")`, which is what this
+        # A native single-pass scan rather than `count_matches(r"\S+")`, which is what this
         # was: identical semantics (a maximal run of non-whitespace is a word either way),
         # but no regex automaton stepped per character. It matters because this is the
         # denominator of every Gopher-style quality ratio, so a corpus filter evaluates it
@@ -701,7 +701,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.digit_count()).to_pydict()
                 {'r': [3, 0]}
         """
-        return self.regexp_count("[0-9]")
+        return self.count_matches("[0-9]")
 
     def is_alpha(self) -> Expr:
         """True where the string is non-empty and all letters (pandas ``str.isalpha``).
@@ -944,7 +944,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.count_char(".")).to_pydict()
                 {'r': [2, 0]}
         """
-        return self.regexp_count(re.escape(char))
+        return self.count_matches(re.escape(char))
 
     # --- LLM training-data quality heuristics ---------------------------------------
     # The character-class ratios and shape statistics that Gopher / C4 / RefinedWeb-style
@@ -955,7 +955,7 @@ class _StrNamespace:
     def _char_ratio(self, pattern: str) -> Expr:
         """Fraction of characters matching `pattern`; null for an empty string."""
 
-        return self.regexp_count(pattern) / nullif(self.len_chars(), lit(0))
+        return self.count_matches(pattern) / nullif(self.len_chars(), lit(0))
 
     def alpha_ratio(self) -> Expr:
         """Fraction of characters that are ASCII letters — the core text-density signal.
@@ -1121,7 +1121,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.non_ascii_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"[^\x00-\x7F]")
+        return self.count_matches(r"[^\x00-\x7F]")
 
     def line_count(self) -> Expr:
         r"""Number of lines, counting newline separators plus one (→ Int64).
@@ -1137,7 +1137,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.line_count()).to_pydict()
                 {'r': [3]}
         """
-        return self.regexp_count("\n") + 1
+        return self.count_matches("\n") + 1
 
     def mean_line_length(self) -> Expr:
         r"""Average characters per line — short means mark navigation and link dumps.
@@ -1173,7 +1173,7 @@ class _StrNamespace:
                 {'r': [4.5]}
         """
 
-        return self.regexp_count("[A-Za-z]") / nullif(self.word_count(), lit(0))
+        return self.count_matches("[A-Za-z]") / nullif(self.word_count(), lit(0))
 
     def url_count(self) -> StrFunc:
         """Count HTTP(S) URLs in the string (→ Int64) — a boilerplate/link-dump signal.
@@ -1189,7 +1189,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.url_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"https?://\S+")
+        return self.count_matches(r"https?://\S+")
 
     def email_count(self) -> StrFunc:
         """Count email addresses in the string (→ Int64) — a PII and scrape-noise signal.
@@ -1205,7 +1205,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.email_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+        return self.count_matches(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
     # --- corpus cleaning and detection ----------------------------------------------
 
@@ -1470,7 +1470,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.sentence_count()).to_pydict()
                 {'r': [3]}
         """
-        return self.regexp_count(r"[.!?]")
+        return self.count_matches(r"[.!?]")
 
     def has_html(self) -> StrFunc:
         """True where the text still contains HTML tags — the un-stripped-markup check.
@@ -1576,7 +1576,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.phone_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(self._PHONE_RE)
+        return self.count_matches(self._PHONE_RE)
 
     def remove_phones(self) -> StrFunc:
         """Strip phone-number-shaped digit runs — a PII scrub alongside `remove_emails`.
@@ -1649,7 +1649,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.uppercase_word_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"\b[A-Z]{2,}\b")
+        return self.count_matches(r"\b[A-Z]{2,}\b")
 
     def long_word_count(self, min_length: int = 5) -> StrFunc:
         """Count words of at least `min_length` characters (→ Int64).
@@ -1668,7 +1668,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.long_word_count(5)).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"\b\w{" + str(min_length) + r",}\b")
+        return self.count_matches(r"\b\w{" + str(min_length) + r",}\b")
 
     def hashtag_count(self) -> StrFunc:
         """Count ``#hashtag`` tokens (→ Int64) — a social-media provenance signal.
@@ -1684,7 +1684,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.hashtag_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"#\w+")
+        return self.count_matches(r"#\w+")
 
     def mention_count(self) -> StrFunc:
         """Count ``@mention`` tokens (→ Int64) — a social-media provenance signal.
@@ -1700,7 +1700,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.mention_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"@\w+")
+        return self.count_matches(r"@\w+")
 
     def symbol_to_word_ratio(self) -> Expr:
         """Punctuation characters per word — high values mark markup and ASCII art.
@@ -1720,7 +1720,7 @@ class _StrNamespace:
                 {'r': [1.0]}
         """
 
-        return self.regexp_count(r"[^\w\s]") / nullif(self.word_count(), lit(0))
+        return self.count_matches(r"[^\w\s]") / nullif(self.word_count(), lit(0))
 
     def paragraph_count(self) -> Expr:
         r"""Count paragraphs, separated by a blank line (→ Int64).
@@ -1736,7 +1736,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.paragraph_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"\n\s*\n") + 1
+        return self.count_matches(r"\n\s*\n") + 1
 
     def code_fence_count(self) -> StrFunc:
         """Count Markdown code fences (→ Int64) — a code-content signal.
@@ -1752,7 +1752,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.code_fence_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count("```")
+        return self.count_matches("```")
 
     def looks_like_code(self) -> StrFunc:
         """True where the text shows source-code punctuation or keywords — a coarse filter.
@@ -1839,7 +1839,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.quote_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count('"')
+        return self.count_matches('"')
 
     def paren_count(self) -> StrFunc:
         """Count parenthesis characters (→ Int64) — a citation/code density signal.
@@ -1855,7 +1855,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.paren_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(r"[()]")
+        return self.count_matches(r"[()]")
 
     def digit_to_word_ratio(self) -> Expr:
         """Digit characters per word — high values mark tables, logs, and ID dumps.
@@ -1874,7 +1874,7 @@ class _StrNamespace:
                 {'r': [0.667]}
         """
 
-        return self.regexp_count("[0-9]") / nullif(self.word_count(), lit(0))
+        return self.count_matches("[0-9]") / nullif(self.word_count(), lit(0))
 
     def newline_count(self) -> StrFunc:
         r"""Count newline characters (→ Int64).
@@ -1890,7 +1890,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.newline_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count("\n")
+        return self.count_matches("\n")
 
     def tab_count(self) -> StrFunc:
         r"""Count tab characters (→ Int64) — a pasted-table signal.
@@ -1906,7 +1906,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.tab_count()).to_pydict()
                 {'r': [1]}
         """
-        return self.regexp_count("\t")
+        return self.count_matches("\t")
 
     def space_count(self) -> StrFunc:
         """Count space characters (→ Int64).
@@ -1922,7 +1922,7 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.space_count()).to_pydict()
                 {'r': [2]}
         """
-        return self.regexp_count(" ")
+        return self.count_matches(" ")
 
     def is_short(self, max_chars: int) -> Expr:
         """True where the text is at most `max_chars` long — the stub-document filter.
@@ -2542,7 +2542,7 @@ class _StrNamespace:
             length = require_int(length, func="str.overlay", arg="length")
         return StrFunc("overlay", self._e, replacement=replacement, start=pos, length=length)
 
-    def regexp_count(self, pattern: str, *, literal: bool = False) -> StrFunc:
+    def count_matches(self, pattern: str, *, literal: bool = False) -> StrFunc:
         """Count non-overlapping regex matches (DuckDB ``regexp_count``).
 
         Returns Int64. Daft ``count_matches`` and Ray Data ``str.count`` count a *literal*
@@ -2561,14 +2561,14 @@ class _StrNamespace:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"s": ["a1b2c3"]})
-                >>> ds.select(bt.col("s").str.regexp_count(r"\\d").alias("r")).to_pydict()
+                >>> ds.select(bt.col("s").str.count_matches(r"\\d").alias("r")).to_pydict()
                 {'r': [3]}
 
                 >>> dots = bt.from_pydict({"s": ["a.b.c"]})
-                >>> dots.select(r=bt.col("s").str.regexp_count(".", literal=True)).to_pydict()
+                >>> dots.select(r=bt.col("s").str.count_matches(".", literal=True)).to_pydict()
                 {'r': [2]}
         """
-        if require_bool(literal, func="str.regexp_count", arg="literal"):
+        if require_bool(literal, func="str.count_matches", arg="literal"):
             pattern = escape_rust_regex(pattern)
         return StrFunc("regexp_count", self._e, pattern=pattern)
 
@@ -4306,35 +4306,3 @@ _bind_accessors(
     _str_transform_doc,
     "A new string :class:`~batcher.Expr` with the transform applied.",
 )
-
-
-# The Polars/pandas compat vocabulary for `.str`: a second spelling of a method this
-# namespace already has, kept so a migrated script runs unchanged. Each row is
-# (target, summary, example data, example expression, expected output[, extra note]);
-# the `Args:`/`Returns:` sections and the signature come from the target, so an alias
-# cannot drift from the method it forwards to. See `_bind_aliases`.
-_STR_ALIASES: dict[str, tuple[str, ...]] = {
-    "count_matches": (
-        "regexp_count",
-        "Count regex matches — the Polars ``count_matches`` spelling of :meth:`regexp_count`.",
-        '{"s": ["a1b2c3"]}',
-        'bt.col("s").str.count_matches("[0-9]")',
-        "{'r': [3]}",
-    ),
-    "startswith": (
-        "starts_with",
-        "True where the string starts with `pattern` — the pandas ``str.startswith``.",
-        '{"s": ["abc", "xbc"]}',
-        'bt.col("s").str.startswith("a")',
-        "{'r': [True, False]}",
-    ),
-    "endswith": (
-        "ends_with",
-        "True where the string ends with `pattern` — the pandas ``str.endswith``.",
-        '{"s": ["abc", "abx"]}',
-        'bt.col("s").str.endswith("c")',
-        "{'r': [True, False]}",
-    ),
-}
-
-_bind_aliases(_StrNamespace, _STR_ALIASES)

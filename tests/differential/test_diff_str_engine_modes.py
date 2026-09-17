@@ -302,11 +302,11 @@ def test_strict_date_parsing_raises_where_the_lenient_form_nulls(duck):
 
 @pytest.mark.parametrize("pattern", [".", "a", "aa", "l", "ö", "-"])
 def test_literal_match_count_counts_non_overlapping_occurrences(duck, pattern):
-    literal = s.str.regexp_count(pattern, literal=True)
+    literal = s.str.count_matches(pattern, literal=True)
     assert _values(literal) == _duck(
         duck, "(length(s) - length(replace(s, ?, ''))) // length(?)", params=[pattern, pattern]
     )
-    regex = s.str.regexp_count(pattern)
+    regex = s.str.count_matches(pattern)
     assert _values(regex) == _duck(duck, "len(regexp_extract_all(s, ?))", params=[pattern])
 
 

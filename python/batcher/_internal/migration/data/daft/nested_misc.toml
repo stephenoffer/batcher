@@ -50,7 +50,7 @@ cosine_similarity = { status = "canonical", batcher = "Expr.list.cosine_similari
 deserialize = { status = "gap", need = "typed JSON decode (json_decode with a dtype)", wave = "W7" }
 dot_product = { status = "canonical", batcher = "Expr.list.dot" }
 eq_null_safe = { status = "canonical", batcher = "Expr.eq_missing" }
-euclidean_distance = { status = "canonical", batcher = "Expr.list.euclidean_distance" }
+euclidean_distance = { status = "canonical", batcher = "Expr.list.l2_distance" }
 explode = { status = "mismatch", batcher = "Dataset.explode", note = "Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form)", wave = "W8" }
 fill_null = { status = "canonical", batcher = "Expr.fill_null" }
 get = { status = "param", batcher = ["Expr.list.get", "Expr.struct.field"], need = "default= for a missing index/field, and one get over list, struct and map", wave = "W4" }
@@ -107,7 +107,7 @@ cosine_similarity = { status = "canonical", batcher = "Expr.list.cosine_similari
 deserialize = { status = "gap", need = "typed JSON decode (json_decode with a dtype)", wave = "W7" }
 dot_product = { status = "canonical", batcher = "Expr.list.dot" }
 eq_null_safe = { status = "canonical", batcher = "Expr.eq_missing" }
-euclidean_distance = { status = "canonical", batcher = "Expr.list.euclidean_distance" }
+euclidean_distance = { status = "canonical", batcher = "Expr.list.l2_distance" }
 explode = { status = "mismatch", batcher = "Dataset.explode", note = "Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form)", wave = "W8" }
 extract_day_uuid7 = { status = "gap", need = "UUIDv7 days-since-epoch extraction", wave = "W3" }
 extract_hour_uuid7 = { status = "gap", need = "UUIDv7 hours-since-epoch extraction", wave = "W3" }

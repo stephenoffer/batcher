@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 222 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 229 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -208,21 +208,28 @@ The following table maps 222 Batcher spellings to the Polars names that compute 
 | `Expr.sin` | `Expr.sin` |
 | `Expr.sinh` | `Expr.sinh` |
 | `Expr.sqrt` | `Expr.sqrt` |
-| `Expr.str.contains` | `Expr.bin.contains` |
+| `Expr.str.contains` | `Expr.bin.contains`, `Expr.str.contains` |
 | `Expr.str.ends_with` | `Expr.bin.ends_with`, `Expr.cat.ends_with`, `Expr.str.ends_with` |
 | `Expr.str.extract_all` | `Expr.str.extract_all` |
+| `Expr.str.extract` | `Expr.str.extract` |
 | `Expr.str.join` | `Expr.str.concat`, `Expr.str.join` |
 | `Expr.str.left` | `Expr.str.head` |
 | `Expr.str.len_chars` | `Expr.cat.len_chars`, `Expr.str.len_chars` |
 | `Expr.str.lower` | `Expr.str.to_lowercase` |
+| `Expr.str.lpad` | `Expr.str.pad_start` |
 | `Expr.str.octet_length` | `Expr.bin.size`, `Expr.cat.len_bytes`, `Expr.str.len_bytes` |
 | `Expr.str.replace_all` | `Expr.str.replace_all` |
 | `Expr.str.reverse` | `Expr.str.reverse` |
 | `Expr.str.right` | `Expr.str.tail` |
+| `Expr.str.rpad` | `Expr.str.pad_end` |
+| `Expr.str.slice` | `Expr.cat.slice`, `Expr.str.slice` |
 | `Expr.str.starts_with` | `Expr.bin.starts_with`, `Expr.cat.starts_with`, `Expr.str.starts_with` |
+| `Expr.str.strip_chars_end` | `Expr.str.strip_chars_end` |
+| `Expr.str.strip_chars_start` | `Expr.str.strip_chars_start` |
 | `Expr.str.strip_prefix` | `Expr.str.strip_prefix` |
 | `Expr.str.strip_suffix` | `Expr.str.strip_suffix` |
 | `Expr.str.to_titlecase` | `Expr.str.to_titlecase` |
+| `Expr.str.trim` | `Expr.str.strip_chars` |
 | `Expr.str.upper` | `Expr.str.to_uppercase` |
 | `Expr.str` | `Expr.str` |
 | `Expr.struct` | `Expr.struct` |

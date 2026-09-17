@@ -4,15 +4,15 @@
 
 ["Expr.str"]
 concat = { status = "canonical", batcher = "Expr.str.join" }
-contains = { status = "mismatch", batcher = "Expr.str.contains", note = "Polars treats the pattern as a regex by default (literal=False); Batcher's contains is literal. Use Expr.str.regexp_matches or a literal= param", wave = "W0", template = 'contains(pattern, *, literal=False, strict=True) -> sem.polars_contains(self, pattern, literal)' }
+contains = { status = "canonical", batcher = "Expr.str.contains", template = 'contains(pattern, *, literal=False, strict=True) -> self.contains(pattern, literal=literal)', note = "Polars treats the pattern as a regex by default (literal=False); Batcher's contains is literal. Use Expr.str.regexp_matches or a literal= param" }
 contains_any = { status = "param", batcher = "Expr.str.contains_any", need = "ascii_case_insensitive=", wave = "W2" }
 count_matches = { status = "param", batcher = "Expr.str.count_matches", need = "literal=", wave = "W2" }
 decode = { status = "mismatch", batcher = "Expr.str.unhex", note = "Polars decode('hex'|'base64') returns Binary; Batcher's unhex/from_base64 return Utf8. Param: return Binary", wave = "W0" }
 encode = { status = "mismatch", batcher = ["Expr.str.hex", "Expr.str.base64"], note = "Polars encode('hex') is lowercase; Batcher's hex is uppercase (base64 agrees). Param: lowercase hex", wave = "W0" }
 ends_with = { status = "canonical", batcher = "Expr.str.ends_with" }
-escape_regex = { status = "mismatch", batcher = "Expr.str.escape_regex", note = "Batcher also escapes spaces ('a b' -> 'a\\\\ b'); Polars leaves them. Both still match the literal, but the strings differ", wave = "W0" }
+escape_regex = { status = "mismatch", batcher = "Expr.str.escape_regex", note = "Batcher escapes a space as \\ (RE2 QuoteMeta, as DuckDB); Polars leaves it. Port as escape_regex().str.replace(backslash-space, space)", wave = "W0" }
 explode = { status = "gap", need = "Expr.str.explode (one row per character, length-changing)", wave = "W8" }
-extract = { status = "mismatch", batcher = "Expr.str.extract", note = "on no match Polars returns null; Batcher returns an empty string", wave = "W0" }
+extract = { status = "canonical", batcher = "Expr.str.extract", template = 'extract(pattern, group_index=1) -> self.extract(pattern, group_index, missing="null")', note = "on no match Polars returns null; Batcher returns an empty string" }
 extract_all = { status = "canonical", batcher = "Expr.str.extract_all" }
 extract_groups = { status = "gap", need = "Expr.str.extract_groups (capture groups to struct)", wave = "W3" }
 extract_many = { status = "gap", need = "Expr.str.extract_many (Aho-Corasick)", wave = "W3" }
@@ -25,25 +25,25 @@ json_path_match = { status = "param", batcher = "Expr.json.extract_string", need
 len_bytes = { status = "alias", batcher = "Expr.str.octet_length" }
 len_chars = { status = "canonical", batcher = "Expr.str.len_chars" }
 normalize = { status = "gap", need = "Expr.str.normalize (Unicode NFC/NFKC/NFD/NFKD)", wave = "W3" }
-pad_end = { status = "mismatch", batcher = "Expr.str.rpad", note = "Polars never truncates a longer string; Batcher's rpad/pad_end cut it to the width. Param: truncate=False", wave = "W0" }
-pad_start = { status = "mismatch", batcher = "Expr.str.lpad", note = "Polars never truncates a longer string; Batcher's lpad/pad_start cut it to the width. Param: truncate=False", wave = "W0" }
+pad_end = { status = "canonical", batcher = "Expr.str.rpad", template = 'pad_end(length, fill_char=" ") -> self.rpad(length, fill_char, truncate=False)' }
+pad_start = { status = "canonical", batcher = "Expr.str.lpad", template = 'pad_start(length, fill_char=" ") -> self.lpad(length, fill_char, truncate=False)' }
 replace = { status = "mismatch", batcher = "Expr.str.replace", note = "Polars replaces the first regex match (n=1, literal=False); Batcher replaces every literal occurrence. Params: n=, literal=", wave = "W0" }
 replace_all = { status = "canonical", batcher = "Expr.str.replace_all" }
 replace_many = { status = "gap", need = "Expr.str.replace_many", wave = "W3" }
 reverse = { status = "canonical", batcher = "Expr.str.reverse" }
-slice = { status = "mismatch", batcher = "Expr.str.substr", note = "Batcher keeps substr, which is 1-based: slice(o, n) is substr(o + 1, n) for o >= 0, and negative offsets differ", wave = "W0", template = 'slice(offset, length=None) -> self.substr(sem.plus_one(offset), length)' }
+slice = { status = "canonical", batcher = "Expr.str.slice" }
 split = { status = "param", batcher = "Expr.str.split", need = "inclusive=", wave = "W2" }
 split_exact = { status = "gap", need = "Expr.str.split_exact (to struct of n+1 fields)", wave = "W3" }
 splitn = { status = "gap", need = "Expr.str.splitn (to struct of n fields)", wave = "W3" }
 starts_with = { status = "canonical", batcher = "Expr.str.starts_with" }
-strip_chars = { status = "mismatch", batcher = "Expr.str.trim", note = "Polars strips all Unicode whitespace (tab, newline, NBSP) when no characters are given; Batcher strips only the space character. Param: whitespace='unicode'", wave = "W0" }
-strip_chars_end = { status = "mismatch", batcher = "Expr.str.strip_chars_end", note = "Polars strips all Unicode whitespace (tab, newline, NBSP) when no characters are given; Batcher strips only the space character. Param: whitespace='unicode'", wave = "W0" }
-strip_chars_start = { status = "mismatch", batcher = "Expr.str.strip_chars_start", note = "Polars strips all Unicode whitespace (tab, newline, NBSP) when no characters are given; Batcher strips only the space character. Param: whitespace='unicode'", wave = "W0" }
+strip_chars = { status = "canonical", batcher = "Expr.str.trim", template = 'strip_chars(characters=None) -> self.trim(characters, whitespace="all")' }
+strip_chars_end = { status = "canonical", batcher = "Expr.str.strip_chars_end", template = 'strip_chars_end(characters=None) -> self.strip_chars_end(characters, whitespace="all")' }
+strip_chars_start = { status = "canonical", batcher = "Expr.str.strip_chars_start", template = 'strip_chars_start(characters=None) -> self.strip_chars_start(characters, whitespace="all")' }
 strip_prefix = { status = "canonical", batcher = "Expr.str.strip_prefix" }
 strip_suffix = { status = "canonical", batcher = "Expr.str.strip_suffix" }
 strptime = { status = "param", batcher = ["Expr.str.to_datetime", "Expr.str.to_date"], need = "one entry point taking a target dtype, strict=, exact=, cache=", wave = "W2" }
 tail = { status = "alias", batcher = "Expr.str.right" }
-to_date = { status = "mismatch", batcher = "Expr.str.to_date", note = "Polars infers the format and raises on an unparseable value (strict=True); Batcher's parsing strictness differs. Param: strict=", wave = "W0" }
+to_date = { status = "mismatch", batcher = "Expr.str.to_date", note = "Polars parses strictly by default: str.to_date(format, strict=True). Format inference (no format) needs a manual port", wave = "W0" }
 to_datetime = { status = "param", batcher = "Expr.str.to_datetime", need = "optional format (inference), time_unit=, time_zone=, ambiguous=, strict=", wave = "W2" }
 to_decimal = { status = "param", batcher = "Expr.cast", need = "inferred precision/scale for decimal parsing (to_decimal(scale=))", wave = "W2" }
 to_integer = { status = "param", batcher = "Expr.cast", need = "base= and strict= for string-to-integer parsing", wave = "W2" }
@@ -51,4 +51,4 @@ to_lowercase = { status = "alias", batcher = "Expr.str.lower" }
 to_time = { status = "gap", need = "Expr.str.to_time (needs a TIME type)", wave = "W6" }
 to_titlecase = { status = "canonical", batcher = "Expr.str.to_titlecase" }
 to_uppercase = { status = "alias", batcher = "Expr.str.upper" }
-zfill = { status = "mismatch", batcher = "Expr.str.zfill", note = "Polars keeps a leading sign in front of the zeros ('-12' -> '-0012'); Batcher pads before the sign ('00-12')", wave = "W0" }
+zfill = { status = "mismatch", batcher = "Expr.str.zfill", note = "the sign now stays in front as in Polars; Polars measures width in bytes where Batcher counts characters, so non-ASCII text can differ", wave = "W0" }

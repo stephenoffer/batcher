@@ -72,7 +72,7 @@ fold *down* a column). They mirror the Polars `*_horizontal` family.
 flags = bt.from_pydict({"a": [1, None, 3], "b": [10, 20, None]})
 out = flags.select(
     total=bt.sum_horizontal(bt.col("a"), bt.col("b")),
-    lo=bt.min_horizontal(bt.col("a"), bt.col("b")),
+    lo=bt.least(bt.col("a"), bt.col("b")),
     both_pos=bt.all_horizontal(bt.col("a") > 0, bt.col("b") > 0),
 )
 print(out.to_pydict())
@@ -344,7 +344,7 @@ Trig / clip / range on `Expr`: {py:meth}`.arcsin() <batcher.plan.expr_ir.core.Ex
 On `.str`: `.to_lowercase()` / `.to_uppercase()` / `.to_titlecase()` (Polars, for
 `lower`/`upper`/`initcap`), `.pad_start(w, fill)` / `.pad_end(w, fill)` and pandas'
 `.ljust(w, fill)` / `.rjust(w, fill)` (for `lpad`/`rpad`), `.count_matches(pattern)`
-(for `regexp_count`), `.extract(pattern, group=1)` / `.extract_all(pattern)` /
+(for `count_matches`), `.extract(pattern, group=1)` / `.extract_all(pattern)` /
 {py:meth}`.replace_all(pattern, value) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.replace_all>` (for the `regexp_*` methods), {py:meth}`.len_chars() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.len_chars>` /
 `.len_bytes()` (for `len`/`octet_length`), `.strip_chars(chars=None)` /
 `.strip_chars_start(...)` / `.strip_chars_end(...)` (for `trim`/`lstrip`/`rstrip`), and
@@ -412,9 +412,9 @@ import batcher as bt
 ds = bt.from_pydict({"x": [1, None, 3], "y": [10, 20, 30]})
 print(
     ds.select(
-        filled=bt.col("x").fillna(0),
-        missing=bt.col("x").isna(),
-        total=bt.col("x").add(bt.col("y")),
+        filled=bt.col("x").fill_null(0),
+        missing=bt.col("x").is_null(),
+        total=(bt.col("x") + bt.col("y")),
     ).to_pydict()
 )
 # {'filled': [1, 0, 3], 'missing': [False, True, False], 'total': [11, None, 33]}
@@ -441,7 +441,7 @@ here and a silently-wrong alias is worse than a missing one:
 | `str.find`, `str.index` | `position` is 1-based and returns 0 when absent; pandas' `find` is 0-based and returns -1. |
 | `str.substring` | `substr` is 1-based SQL. Use the 0-based `str.slice(offset, length)`. |
 | `str.islower`, `str.isupper` | {py:meth}`is_lower <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_lower>`/{py:meth}`is_upper <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_upper>` are true for an uncased string such as `"123"`; Python's are false. |
-| `str.count` | pandas' `count` is a regex count. Use `str.regexp_count(pattern)`. |
+| `str.count` | pandas' `count` is a regex count. Use `str.count_matches(pattern)`. |
 | `str.casefold` | Python's casefold is not lowercase for non-ASCII (`"ß"` folds to `"ss"`). |
 
 ## Data science toolkit and evaluation metrics

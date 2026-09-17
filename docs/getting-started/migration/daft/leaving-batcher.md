@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Daft
 
-The following table maps 206 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
+The following table maps 212 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
 
 | Batcher | Daft |
 |---|---|
@@ -28,6 +28,7 @@ The following table maps 206 Batcher spellings to the Daft names that compute th
 | `bt.bool_or` | `functions.bool_or` |
 | `bt.coalesce` | `Expression.coalesce`, `functions.coalesce` |
 | `bt.col` | `daft.col` |
+| `bt.concat_str` | `Expression.concat` |
 | `bt.concat_ws` | `functions.concat_ws` |
 | `bt.concat` | `daft.concat` |
 | `bt.count_distinct` | `functions.count_distinct` |
@@ -163,9 +164,9 @@ The following table maps 206 Batcher spellings to the Daft names that compute th
 | `Expr.list.cosine_distance` | `Expression.cosine_distance`, `functions.cosine_distance` |
 | `Expr.list.cosine_similarity` | `Expression.cosine_similarity`, `functions.cosine_similarity` |
 | `Expr.list.dot` | `Expression.dot_product`, `functions.dot_product` |
-| `Expr.list.euclidean_distance` | `Expression.euclidean_distance`, `functions.euclidean_distance` |
 | `Expr.list.filter` | `Expression.list_filter`, `functions.list_filter` |
 | `Expr.list.flatten` | `Expression.list_flatten`, `functions.list_flatten` |
+| `Expr.list.l2_distance` | `Expression.euclidean_distance`, `functions.euclidean_distance` |
 | `Expr.list.max` | `Expression.list_bool_or`, `Expression.list_max`, `functions.list_bool_or`, `functions.list_max` |
 | `Expr.list.mean` | `Expression.list_mean`, `functions.list_mean` |
 | `Expr.list.min` | `Expression.list_bool_and`, `Expression.list_min`, `functions.list_bool_and`, `functions.list_min` |
@@ -195,15 +196,20 @@ The following table maps 206 Batcher spellings to the Daft names that compute th
 | `Expr.str.capitalize` | `Expression.capitalize`, `functions.capitalize` |
 | `Expr.str.compress` | `Expression.compress`, `Expression.try_compress`, `functions.compress`, `functions.try_compress` |
 | `Expr.str.decompress` | `Expression.decompress`, `Expression.try_decompress`, `functions.decompress`, `functions.try_decompress` |
+| `Expr.str.extract` | `Expression.regexp_extract`, `functions.regexp_extract` |
 | `Expr.str.join` | `Expression.string_agg`, `functions.string_agg` |
 | `Expr.str.len_chars` + `Expr.list.len` | `Expression.length`, `functions.length` |
 | `Expr.str.lower` | `Expression.lower`, `functions.lower` |
 | `Expr.str.mime_type` | `functions.guess_mime_type` |
 | `Expr.str.octet_length` | `Expression.length_bytes`, `functions.length_bytes` |
+| `Expr.str.replace_all` | `Expression.regexp_replace`, `functions.regexp_replace` |
 | `Expr.str.reverse` | `Expression.reverse`, `functions.reverse` |
 | `Expr.str.soundex` | `Expression.soundex`, `functions.soundex` |
+| `Expr.str.strip_chars_end` | `Expression.rstrip`, `functions.rstrip` |
+| `Expr.str.strip_chars_start` | `Expression.lstrip`, `functions.lstrip` |
 | `Expr.str.to_case` | `Expression.to_camel_case`, `Expression.to_kebab_case`, `Expression.to_snake_case`, `Expression.to_title_case`, `Expression.to_upper_camel_case`, `Expression.to_upper_kebab_case`, `Expression.to_upper_snake_case`, `functions.to_camel_case`, `functions.to_kebab_case`, `functions.to_snake_case`, `functions.to_title_case`, `functions.to_upper_camel_case`, `functions.to_upper_kebab_case`, `functions.to_upper_snake_case` |
 | `Expr.str.to_date` | `Expression.to_date`, `functions.to_date` |
+| `Expr.str.trim` | `Expression.strip`, `functions.strip` |
 | `Expr.str.upper` | `Expression.upper`, `functions.upper` |
 | `Expr.sum` | `Expression.sum` |
 | `Expr.tan` | `Expression.tan`, `functions.tan` |

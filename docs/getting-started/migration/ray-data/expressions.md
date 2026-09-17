@@ -66,7 +66,7 @@ The following table maps the 44 names on `Expr.str`, sorted alphabetically.
 | `capitalize` | `Expr.str.capitalize` | canonical |  |
 | `center` | n/a | gap | Not yet: center-pad a string to width (pad both sides). Wave W3. |
 | `contains` | `Expr.str.contains` | canonical |  |
-| `count` | `Expr.str.count_matches` | mismatch | Differs: Ray str.count counts literal substring occurrences; Batcher count\_matches treats the pattern as a regex ('.' counts every character). Port as: count\_matches(escape\_regex(p)); a literal= parameter does not exist yet. Wave W0. |
+| `count` | `Expr.str.count_matches` | canonical |  |
 | `count_regex` | `Expr.str.count_matches` | canonical |  |
 | `ends_with` | `Expr.str.ends_with` | canonical |  |
 | `extract` | `Expr.str.extract` | mismatch | Differs: Ray extract requires named groups and returns a struct with one field per group, null on no match; Batcher extract(pattern, group=1) returns one string and '' on no match. Wave W7. |
@@ -77,17 +77,17 @@ The following table maps the 44 names on `Expr.str`, sorted alphabetically.
 | `is_ascii` | `Expr.str.is_ascii_only` | canonical |  |
 | `is_decimal` | n/a | gap | Not yet: Unicode decimal-character test (is\_decimal; stricter than is\_digit). Wave W3. |
 | `is_digit` | `Expr.str.is_numeric` | canonical |  |
-| `is_lower` | `Expr.str.is_lower` | mismatch | Differs: On the empty string Ray (and Python str.islower) returns False; Batcher returns True. Non-empty strings agree. Wave W0. |
+| `is_lower` | `Expr.str.is_lower` | canonical |  |
 | `is_numeric` | `Expr.str.is_numeric` | canonical |  |
 | `is_printable` | n/a | gap | Not yet: printable-character test (is\_printable). Wave W3. |
 | `is_space` | `Expr.str.is_space` | canonical |  |
 | `is_title` | n/a | gap | Not yet: title-case test (is\_title). Wave W3. |
-| `is_upper` | `Expr.str.is_upper` | mismatch | Differs: On the empty string Ray (and Python str.isupper) returns False; Batcher returns True. Non-empty strings agree. Wave W0. |
+| `is_upper` | `Expr.str.is_upper` | canonical |  |
 | `len` | `Expr.str.len_chars` | alias |  |
 | `lower` | `Expr.str.lower` | canonical |  |
 | `lpad` | `Expr.str.lpad` | mismatch | Differs: Ray never truncates a string longer than width; Batcher truncates it to width (as DuckDB does). The restoring no-truncate parameter does not exist yet. Wave W2. |
 | `lstrip` | `Expr.str.strip_chars_start` | mismatch | Differs: Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet. Wave W2. |
-| `match` | `Expr.str.like` | mismatch | Differs: Ray str.match is a SQL LIKE match; Batcher Expr.str.match is a regex match. Port as: str.like(pattern). Wave W0. |
+| `match` | `Expr.str.like` | mismatch | Differs: Batcher str.match is an anchored regex (pandas); Ray str.match is a SQL LIKE pattern, which is Expr.str.like. Wave W0. |
 | `match_regex` | `Expr.str.regexp_matches` | canonical |  |
 | `pad` | `Expr.str.lpad` + `Expr.str.rpad` | mismatch | Differs: Ray pad(width, fillchar, side='right') never truncates and offers side='both'; Batcher lpad/rpad truncate to width and there is no both-sides pad. Wave W2. |
 | `repeat` | `Expr.str.repeat` | canonical |  |

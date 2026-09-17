@@ -116,7 +116,7 @@ def main() -> None:
     print(f"document corpus: {text_mb:.1f} MB of text")
 
     native = bench(lambda: docs.select(v=col("text").str.word_count()).collect())
-    regex = bench(lambda: docs.select(v=col("text").str.regexp_count(r"\S+")).collect())
+    regex = bench(lambda: docs.select(v=col("text").str.count_matches(r"\S+")).collect())
     _row("word_count (native scan)", native, text_mb)
     _row("word_count (regexp_count, the old one)", regex, text_mb)
     speedup = regex / native if native > 0 else float("nan")
@@ -124,7 +124,7 @@ def main() -> None:
 
     # Correctness before timing: the two must agree, or the number above is meaningless.
     a = docs.select(v=col("text").str.word_count()).to_pydict()["v"]
-    b = docs.select(v=col("text").str.regexp_count(r"\S+")).to_pydict()["v"]
+    b = docs.select(v=col("text").str.count_matches(r"\S+")).to_pydict()["v"]
     assert a == b, "the two spellings disagree; the timing above is not a comparison"
 
     # --- Document-quality filters ----------------------------------------------------

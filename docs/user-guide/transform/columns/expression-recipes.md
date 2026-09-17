@@ -93,7 +93,7 @@ here. `str.find` and `str.index` are absent because `position` is 1-based and re
 when the substring is absent, where pandas returns a 0-based index and -1. `str.islower`
 and `str.isupper` are absent because Batcher's {py:meth}`is_lower <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_lower>` / {py:meth}`is_upper <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_upper>` are true for a
 string with no cased characters, where Python's are false. Use `str.slice` rather than a
-`substring` alias, and `str.regexp_count` for pandas' regex `count`.
+`substring` alias, and `str.count_matches` for pandas' regex `count`.
 
 ## Feature engineering for data science
 
@@ -235,7 +235,7 @@ whole-string {py:meth}`is_url <batcher.plan.expr_ir.namespaces.strings._StrNames
 An embedding is a list column, so its vector methods live on {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` alongside the
 reductions above: `dim`, `is_zero_vector`, `sum_squares`, `mean_pool`, `max_pool`,
 `magnitude`, `is_unit_norm` (assert normalization before a cosine search),
-{py:meth}`euclidean_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.euclidean_distance>`, and {py:meth}`angular_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.angular_distance>`. Preparing the training set itself
+{py:meth}`l2_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_distance>`, and {py:meth}`angular_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.angular_distance>`. Preparing the training set itself
 uses {py:meth}`ds.shuffle(seed=) <batcher.Dataset.shuffle>`, {py:meth}`ds.stratified_split(label, test_size) <batcher.Dataset.stratified_split>`,
 {py:meth}`ds.sample_per_group(by, n) <batcher.Dataset.sample_per_group>`, {py:meth}`ds.class_balance(label) <batcher.Dataset.class_balance>`, and {py:meth}`ds.class_weights(label) <batcher.Dataset.class_weights>`.
 

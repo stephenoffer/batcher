@@ -44,7 +44,7 @@ def main() -> None:
 
     # Counting matches without materializing them.
     counts = orders.select(
-        words=col("o_comment").str.regexp_count(r"\w+"),
+        words=col("o_comment").str.count_matches(r"\w+"),
         has_final=col("o_comment").str.contains("final"),
     ).to_pydict()
     assert all(value > 0 for value in counts["words"])

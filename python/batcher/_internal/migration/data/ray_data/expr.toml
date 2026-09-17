@@ -44,7 +44,7 @@ byte_len = { status = "canonical", batcher = "Expr.str.octet_length" }
 capitalize = { status = "canonical", batcher = "Expr.str.capitalize" }
 center = { status = "gap", need = "center-pad a string to width (pad both sides)", wave = "W3" }
 contains = { status = "canonical", batcher = "Expr.str.contains" }
-count = { status = "mismatch", batcher = "Expr.str.count_matches", note = "Ray str.count counts literal substring occurrences; Batcher count_matches treats the pattern as a regex ('.' counts every character). Port as: count_matches(escape_regex(p)); a literal= parameter does not exist yet.", wave = "W0" }
+count = { status = "canonical", batcher = "Expr.str.count_matches", template = 'count(pattern) -> self.count_matches(pattern, literal=True)' }
 count_regex = { status = "canonical", batcher = "Expr.str.count_matches" }
 ends_with = { status = "canonical", batcher = "Expr.str.ends_with" }
 extract = { status = "mismatch", batcher = "Expr.str.extract", note = "Ray extract requires named groups and returns a struct with one field per group, null on no match; Batcher extract(pattern, group=1) returns one string and '' on no match.", wave = "W7" }
@@ -55,17 +55,17 @@ is_alpha = { status = "canonical", batcher = "Expr.str.is_alpha" }
 is_ascii = { status = "canonical", batcher = "Expr.str.is_ascii_only" }
 is_decimal = { status = "gap", need = "Unicode decimal-character test (is_decimal; stricter than is_digit)", wave = "W3" }
 is_digit = { status = "canonical", batcher = "Expr.str.is_numeric" }
-is_lower = { status = "mismatch", batcher = "Expr.str.is_lower", note = "On the empty string Ray (and Python str.islower) returns False; Batcher returns True. Non-empty strings agree.", wave = "W0" }
+is_lower = { status = "canonical", batcher = "Expr.str.is_lower", template = 'is_lower() -> self.is_lower(require_cased=True)' }
 is_numeric = { status = "canonical", batcher = "Expr.str.is_numeric" }
 is_printable = { status = "gap", need = "printable-character test (is_printable)", wave = "W3" }
 is_space = { status = "canonical", batcher = "Expr.str.is_space" }
 is_title = { status = "gap", need = "title-case test (is_title)", wave = "W3" }
-is_upper = { status = "mismatch", batcher = "Expr.str.is_upper", note = "On the empty string Ray (and Python str.isupper) returns False; Batcher returns True. Non-empty strings agree.", wave = "W0" }
+is_upper = { status = "canonical", batcher = "Expr.str.is_upper", template = 'is_upper() -> self.is_upper(require_cased=True)' }
 len = { status = "alias", batcher = "Expr.str.len_chars" }
 lower = { status = "canonical", batcher = "Expr.str.lower" }
 lpad = { status = "mismatch", batcher = "Expr.str.lpad", note = "Ray never truncates a string longer than width; Batcher truncates it to width (as DuckDB does). The restoring no-truncate parameter does not exist yet.", wave = "W2" }
 lstrip = { status = "mismatch", batcher = "Expr.str.strip_chars_start", note = "Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet.", wave = "W2" }
-match = { status = "mismatch", batcher = "Expr.str.like", note = "Ray str.match is a SQL LIKE match; Batcher Expr.str.match is a regex match. Port as: str.like(pattern).", wave = "W0" }
+match = { status = "mismatch", batcher = "Expr.str.like", template = 'match(pattern) -> self.like(pattern)', note = "Batcher str.match is an anchored regex (pandas); Ray str.match is a SQL LIKE pattern, which is Expr.str.like", wave = "W0" }
 match_regex = { status = "canonical", batcher = "Expr.str.regexp_matches" }
 pad = { status = "mismatch", batcher = ["Expr.str.lpad", "Expr.str.rpad"], note = "Ray pad(width, fillchar, side='right') never truncates and offers side='both'; Batcher lpad/rpad truncate to width and there is no both-sides pad.", wave = "W2" }
 repeat = { status = "canonical", batcher = "Expr.str.repeat" }

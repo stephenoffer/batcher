@@ -96,7 +96,7 @@ def test_ray_find_template(pattern):
 @pytest.mark.parametrize("pattern", ["l", "aa", ".", "é"])
 def test_ray_count_is_the_literal_match_count(pattern):
     want = pc.count_substring(pa.array([*_WORDS, "aaaa"]), pattern).to_pylist()
-    assert _values(s.str.regexp_count(pattern, literal=True), [*_WORDS, "aaaa"]) == want
+    assert _values(s.str.count_matches(pattern, literal=True), [*_WORDS, "aaaa"]) == want
 
 
 @pytest.mark.parametrize("pattern", ["h%", "%o", "_e%", "%", "a.b", "%\u00f6%"])

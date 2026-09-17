@@ -21,10 +21,10 @@ The following table maps the 58 names on `Expression`, sorted alphabetically.
 | `ascii` | `Expr.str.ascii` | canonical |  |
 | `capitalize` | `Expr.str.capitalize` | canonical |  |
 | `compress` | `Expr.str.compress` | canonical |  |
-| `concat` | `bt.concat_str` | mismatch | Differs: Daft concat(a, b) is null if either side is null; Batcher concat\_str skips nulls ('z' vs null). Param: ignore\_nulls=False. Wave W0. |
+| `concat` | `bt.concat_str` | canonical |  |
 | `contains` | `Expr.str.contains` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `count_matches` | `Expr.str.count_matches` | mismatch | Differs: Daft count\_matches counts literal patterns (with whole\_words= and case\_sensitive=); Batcher count\_matches counts regex matches ('.' on 'a.b.c' is 2 vs 5). Param: literal=True, whole\_words=, case\_sensitive=. Wave W0. |
-| `damerau_levenshtein_distance` | `Expr.str.damerau_levenshtein` | mismatch | Differs: Daft computes the restricted (optimal string alignment) distance; Batcher computes unrestricted Damerau-Levenshtein ('ca' vs 'abc' is 3 vs 2), and takes only a constant target. Param: restricted=True. Wave W0. |
+| `damerau_levenshtein_distance` | `Expr.str.damerau_levenshtein` | mismatch | Differs: with restricted=True the algorithm matches Daft; Batcher counts bytes where Daft counts characters, so non-ASCII text differs. Wave W0. |
 | `decode` | `Expr.str.from_base64` | mismatch | Differs: Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from\_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods. Wave W3. |
 | `decompress` | `Expr.str.decompress` | canonical |  |
 | `encode` | `Expr.str.base64` | mismatch | Differs: Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from\_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods. Wave W3. |
@@ -41,26 +41,26 @@ The following table maps the 58 names on `Expression`, sorted alphabetically.
 | `like` | `Expr.str.like` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `lower` | `Expr.str.lower` | canonical |  |
 | `lpad` | `Expr.str.lpad` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `lstrip` | `Expr.str.strip_chars_start` | mismatch | Differs: Daft lstrip removes all leading whitespace; Batcher removes only the ASCII space by default. Param: chars=whitespace. Wave W0. |
+| `lstrip` | `Expr.str.strip_chars_start` | canonical |  |
 | `normalize` | n/a | gap | Not yet: normalize(remove\_punct=, lowercase=, nfd\_unicode=, white\_space=) (Batcher has only the fixed squad\_normalize and normalize\_whitespace). Wave W3. |
 | `parse_url` | n/a | gap | Not yet: URL parsing into a \{scheme, username, password, host, port, path, query, fragment\} struct. Wave W3. |
 | `regexp` | `Expr.str.regexp_matches` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `regexp_count` | `Expr.str.count_matches` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `regexp_extract` | `Expr.str.extract` | mismatch | Differs: Daft index defaults to 0 (whole match) and a non-matching row is null; Batcher str.extract defaults to group 1 and returns '' on no match. Param: group=0, null on no match. Wave W0. |
+| `regexp_extract` | `Expr.str.extract` | canonical |  |
 | `regexp_extract_all` | `Expr.str.extract_all` | param | Missing: index= capture group (Batcher returns whole matches only). Wave W2. |
-| `regexp_replace` | `Expr.str.replace_all` | mismatch | Differs: Daft replacement strings use \$1/\$\{1\} backreferences; Batcher replace\_all only honours \\1, so '\$1' is inserted literally. Param: \$-style backreferences. Wave W0. |
+| `regexp_replace` | `Expr.str.replace_all` | canonical |  |
 | `regexp_split` | `Expr.str.regexp_split` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `repeat` | `Expr.str.repeat` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `replace` | `Expr.str.replace` | mismatch | Differs: Expr.replace remaps values through a dict; Daft replace(search, replacement) is literal substring replacement, which is Expr.str.replace. Wave W0. |
+| `replace` | `Expr.str.replace` | mismatch | Differs: Batcher Expr.replace maps whole values; Daft Expression.replace replaces a substring, which is Expr.str.replace. Wave W0. |
 | `reverse` | `Expr.str.reverse` | canonical |  |
 | `right` | `Expr.str.right` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `rpad` | `Expr.str.rpad` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `rstrip` | `Expr.str.strip_chars_end` | mismatch | Differs: Daft rstrip removes all trailing whitespace (e.g. a tab); Batcher removes only the ASCII space by default. Param: chars=whitespace. Wave W0. |
+| `rstrip` | `Expr.str.strip_chars_end` | canonical |  |
 | `soundex` | `Expr.str.soundex` | canonical |  |
 | `split` | `Expr.str.split` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `split_part` | `Expr.str.split_part` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `startswith` | `Expr.str.starts_with` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `strip` | `Expr.str.trim` | mismatch | Differs: Daft strip removes all whitespace (tabs, newlines); Batcher trim() removes only the ASCII space by default. Param: chars=whitespace. Wave W0. |
+| `strip` | `Expr.str.trim` | canonical |  |
 | `substr` | `Expr.str.slice` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression); Daft substr is 0-based like str.slice, not 1-based like str.substr. Wave W2. |
 | `substring_index` | `Expr.str.substring_index` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `to_camel_case` | `Expr.str.to_case` | canonical |  |
@@ -87,11 +87,11 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `capitalize` | `Expr.str.capitalize` | canonical |  |
 | `chr_func` | `Expr.chr` | canonical |  |
 | `compress` | `Expr.str.compress` | canonical |  |
-| `concat` | `bt.concat_str` | mismatch | Differs: bt.concat concatenates datasets; the string form is concat\_str, and Daft concat(a, b) is null if either side is null where concat\_str skips nulls. Param: ignore\_nulls=False. Wave W0. |
+| `concat` | `bt.concat_str` | mismatch | Differs: bt.concat stacks Datasets; Daft functions.concat joins two strings and yields null when either is null, which is bt.concat\_str(left, right, ignore\_nulls=False). Wave W0. |
 | `concat_ws` | `bt.concat_ws` | canonical |  |
 | `contains` | `Expr.str.contains` | mismatch | Differs: bt.contains is a column-name selector, not a string predicate; Daft contains(expr, substr) tests values. Rewrite: col.str.contains(substr). Wave W0. |
 | `count_matches` | `Expr.str.count_matches` | mismatch | Differs: Daft count\_matches counts literal patterns (with whole\_words= and case\_sensitive=); Batcher count\_matches counts regex matches ('.' on 'a.b.c' is 2 vs 5). Param: literal=True, whole\_words=, case\_sensitive=. Wave W0. |
-| `damerau_levenshtein_distance` | `Expr.str.damerau_levenshtein` | mismatch | Differs: Daft computes the restricted (optimal string alignment) distance; Batcher computes unrestricted Damerau-Levenshtein ('ca' vs 'abc' is 3 vs 2), and takes only a constant target. Param: restricted=True. Wave W0. |
+| `damerau_levenshtein_distance` | `Expr.str.damerau_levenshtein` | mismatch | Differs: with restricted=True the algorithm matches Daft; Batcher counts bytes where Daft counts characters, so non-ASCII text differs. Wave W0. |
 | `decode` | `Expr.str.from_base64` | mismatch | Differs: Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from\_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods. Wave W3. |
 | `decompress` | `Expr.str.decompress` | canonical |  |
 | `encode` | `Expr.str.base64` | mismatch | Differs: Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from\_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods. Wave W3. |
@@ -110,27 +110,27 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `like` | `Expr.str.like` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `lower` | `Expr.str.lower` | canonical |  |
 | `lpad` | `Expr.str.lpad` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `lstrip` | `Expr.str.strip_chars_start` | mismatch | Differs: Daft lstrip removes all leading whitespace; Batcher removes only the ASCII space by default. Param: chars=whitespace. Wave W0. |
+| `lstrip` | `Expr.str.strip_chars_start` | canonical |  |
 | `normalize` | n/a | gap | Not yet: normalize(remove\_punct=, lowercase=, nfd\_unicode=, white\_space=) (Batcher has only the fixed squad\_normalize and normalize\_whitespace). Wave W3. |
 | `parse_url` | n/a | gap | Not yet: URL parsing into a \{scheme, username, password, host, port, path, query, fragment\} struct. Wave W3. |
 | `regexp` | `Expr.str.regexp_matches` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `regexp_count` | `Expr.str.count_matches` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `regexp_extract` | `Expr.str.extract` | mismatch | Differs: Daft index defaults to 0 (whole match) and a non-matching row is null; Batcher str.extract defaults to group 1 and returns '' on no match. Param: group=0, null on no match. Wave W0. |
+| `regexp_extract` | `Expr.str.extract` | canonical |  |
 | `regexp_extract_all` | `Expr.str.extract_all` | param | Missing: index= capture group (Batcher returns whole matches only). Wave W2. |
-| `regexp_replace` | `Expr.str.replace_all` | mismatch | Differs: Daft replacement strings use \$1/\$\{1\} backreferences; Batcher replace\_all only honours \\1, so '\$1' is inserted literally. Param: \$-style backreferences. Wave W0. |
+| `regexp_replace` | `Expr.str.replace_all` | canonical |  |
 | `regexp_split` | `Expr.str.regexp_split` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `repeat` | `Expr.str.repeat` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `replace` | `Expr.str.replace` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `reverse` | `Expr.str.reverse` | canonical |  |
 | `right` | `Expr.str.right` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `rpad` | `Expr.str.rpad` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `rstrip` | `Expr.str.strip_chars_end` | mismatch | Differs: Daft rstrip removes all trailing whitespace (e.g. a tab); Batcher removes only the ASCII space by default. Param: chars=whitespace. Wave W0. |
+| `rstrip` | `Expr.str.strip_chars_end` | canonical |  |
 | `soundex` | `Expr.str.soundex` | canonical |  |
 | `space` | n/a | gap | Not yet: space(n) with a column-valued n. Wave W3. |
 | `split` | `Expr.str.split` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `split_part` | `Expr.str.split_part` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `startswith` | `Expr.str.starts_with` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
-| `strip` | `Expr.str.trim` | mismatch | Differs: Daft strip removes all whitespace (tabs, newlines); Batcher trim() removes only the ASCII space by default. Param: chars=whitespace. Wave W0. |
+| `strip` | `Expr.str.trim` | canonical |  |
 | `substr` | `Expr.str.slice` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression); Daft substr is 0-based like str.slice, not 1-based like str.substr. Wave W2. |
 | `substring_index` | `Expr.str.substring_index` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `to_camel_case` | `Expr.str.to_case` | canonical |  |

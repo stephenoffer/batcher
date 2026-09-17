@@ -154,7 +154,7 @@ PATTERNS = ["[0-9]", "[A-Za-z]", "<[^>]+>", r"[^\x00-\x7F]", "[.!?]", "a|b", "(?
 @pytest.mark.parametrize("pattern", PATTERNS)
 def test_counting_matches(be, pattern):
     """Non-overlapping matches, and null over a null input rather than zero."""
-    ds = bt.from_arrow(TEXT).select(out=col("s").str.regexp_count(pattern))
+    ds = bt.from_arrow(TEXT).select(out=col("s").str.count_matches(pattern))
     _assert_matches_engine(ds, TEXT, be)
 
 

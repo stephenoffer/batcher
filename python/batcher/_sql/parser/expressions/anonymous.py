@@ -333,7 +333,7 @@ _LIST_PAIR = {
     # implementation.
     "array_cosine_similarity": "cosine_similarity",
     "array_cosine_distance": "cosine_distance",
-    "array_distance": "euclidean_distance",
+    "array_distance": "l2_distance",
     "array_inner_product": "dot",
     "array_dot_product": "dot",
 }

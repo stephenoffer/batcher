@@ -21,7 +21,7 @@ from batcher.plan.expr_ir.func_nodes import (
     DateTrunc,
     Strftime,
 )
-from batcher.plan.expr_ir.namespaces._bind import _bind_accessors, _bind_aliases
+from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 from batcher.plan.expr_ir.namespaces._temporal_units import trunc_unit
 from batcher.plan.ir_tags import MICROS_PER_DAY
 
@@ -324,6 +324,26 @@ class _DtNamespace:
         """
         return self._e.cast("timestamp").cast("int64")
 
+    def epoch_us(self) -> Expr:
+        """Microseconds since the Unix epoch as an integer (DuckDB ``epoch_us``, → Int64).
+
+        The microsecond-resolution epoch: the timestamp's own underlying value. A ``Date``
+        input reads as its midnight instant.
+
+        Returns:
+            A new Int64 expression of microseconds since 1970-01-01 UTC.
+
+        Examples:
+            .. doctest::
+
+                >>> import datetime as dt
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2021, 1, 1)]})
+                >>> ds.select(r=bt.col("d").dt.epoch_us()).to_pydict()
+                {'r': [1609459200000000]}
+        """
+        return self._micros()
+
     def epoch_ms(self) -> Expr:
         """Milliseconds since the Unix epoch as an integer (DuckDB ``epoch_ms``, → Int64).
 
@@ -388,6 +408,23 @@ class _DtNamespace:
         """
         micros = self._micros()
         return (micros % 1_000_000 + 1_000_000) % 1_000_000
+
+    def microsecond(self) -> Expr:
+        """The microsecond-of-second component, 0-999999 (Polars ``dt.microsecond``, → Int64).
+
+        Returns:
+            A new Int64 expression of the microseconds past the whole second.
+
+        Examples:
+            .. doctest::
+
+                >>> import datetime as dt
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]})
+                >>> ds.select(r=bt.col("d").dt.microsecond()).to_pydict()
+                {'r': [123456]}
+        """
+        return self._subsecond_micros()
 
     def millisecond(self) -> Expr:
         """The millisecond-of-second component, 0-999 (Polars ``dt.millisecond``, → Int64).
@@ -1296,31 +1333,3 @@ _bind_accessors(
     lambda n: f"Extract the {n} field of a date/time column (→ Int64).",
     "A new :class:`~batcher.Expr` carrying the extracted field.",
 )
-
-
-# The Polars/pandas/DuckDB compat vocabulary for `.dt` -- a second spelling of a method
-# this namespace already has. Rows are (target, summary, example data, example
-# expression, expected output[, extra note]); the signature and the `Args:`/`Returns:`
-# sections come from the target, so an alias cannot drift from what it forwards to.
-# Only exact passthroughs live here: the spellings that bind a literal argument
-# (`month_start` -> `truncate("month")`, `days_between` -> `_delta_units(...)`) stay
-# written out, because the constant they choose is the whole content of the method.
-_DT_ALIASES: dict[str, tuple[str, ...]] = {
-    "epoch_us": (
-        "_micros",
-        "Microseconds since the Unix epoch as an integer (DuckDB ``epoch_us``, → Int64).",
-        '{"d": [dt.datetime(2021, 1, 1)]}',
-        'bt.col("d").dt.epoch_us()',
-        "{'r': [1609459200000000]}",
-        "The microsecond-resolution epoch — the timestamp's own underlying value.",
-    ),
-    "microsecond": (
-        "_subsecond_micros",
-        "The microsecond-of-second component, 0-999999 (Polars ``dt.microsecond``, → Int64).",
-        '{"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]}',
-        'bt.col("d").dt.microsecond()',
-        "{'r': [123456]}",
-    ),
-}
-
-_bind_aliases(_DtNamespace, _DT_ALIASES, preamble=("import datetime as dt",))

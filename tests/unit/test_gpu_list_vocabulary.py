@@ -200,7 +200,7 @@ def test_membership_and_position(be, value):
 @pytest.mark.parametrize(
     "fn",
     ["dot", "cosine_similarity", "cosine_distance", "l1_distance", "l2_distance",
-     "euclidean_distance", "angular_distance", "hamming_distance"],
+     "angular_distance", "hamming_distance"],
 )  # fmt: skip
 def test_a_vector_function_matches_the_engine(be, fn):
     ds = bt.from_arrow(PAIRS).select(out=getattr(col("a").list, fn)(col("b")))

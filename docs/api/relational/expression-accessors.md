@@ -53,7 +53,7 @@ encoding and the similarity measures.
 | `.substring_index(delimiter, count)` | substring before the `count`-th `delimiter` (Spark) |
 | {py:meth}`.overlay(replacement, pos, length=None) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.overlay>` | replace `length` chars from 1-based `pos` (SQL `OVERLAY`) |
 | {py:meth}`.regexp_extract_all(pattern) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_extract_all>` | every regex match as a `List<Utf8>` (DuckDB {py:meth}`regexp_extract_all <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_extract_all>`) |
-| {py:meth}`.regexp_count(pattern) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_count>` | number of non-overlapping regex matches (→ Int64) |
+| {py:meth}`.count_matches(pattern) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.count_matches>` | number of non-overlapping regex matches (→ Int64) |
 | {py:meth}`.regexp_split(pattern) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_split>` | split on every regex match into a `List<Utf8>` (DuckDB `regexp_split_to_array`) |
 | `.levenshtein(target)` | edit distance to the constant `target` (DuckDB `levenshtein`, → Int64) |
 | {py:meth}`.damerau_levenshtein(target) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.damerau_levenshtein>` | edit distance to `target` counting an adjacent-swap as one edit (DuckDB {py:meth}`damerau_levenshtein <batcher.plan.expr_ir.namespaces.strings._StrNamespace.damerau_levenshtein>`, → Int64), which handles typos better |
@@ -214,7 +214,7 @@ On {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>
 {py:meth}`.sum_squares() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.sum_squares>`, {py:meth}`.magnitude() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.magnitude>`,
 {py:meth}`.is_unit_norm(tol) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.is_unit_norm>` (assert the normalization invariant
 held), {py:meth}`.mean_pool() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.mean_pool>`, {py:meth}`.max_pool() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.max_pool>`,
-{py:meth}`.euclidean_distance(o) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.euclidean_distance>` and
+{py:meth}`.l2_distance(o) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_distance>` and
 {py:meth}`.angular_distance(o) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.angular_distance>`. Prefer angular distance over
 `1 - cosine`. It is a true metric, and nearest-neighbour indexes require one.
 

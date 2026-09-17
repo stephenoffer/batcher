@@ -3,7 +3,7 @@
 Batcher exports a pandas-shaped spelling for several verbs so a ported script keeps
 reading the way it did: ``ds.groupby`` beside ``ds.group_by``, ``ds.merge`` beside
 ``ds.join``, ``ds.sort_values``, ``ds.assign``, ``ds.abs``, ``ds.round``, ``ds.notna``,
-``ds.size``, and ``.str.startswith`` / ``.endswith`` / ``.match``. The execution-coverage
+``ds.size``, and ``.str.starts_with`` / ``.ends_with`` / ``.match``. The execution-coverage
 sweep found none of them called by a test, which is the worst place for that: an alias
 whose semantics have quietly drifted from the name it borrows is a silent wrong answer in
 exactly the script that trusted the name.
@@ -276,8 +276,8 @@ def test_to_ir_is_the_wire_shape_the_engine_receives(ds):
     )
 
 
-#: ``(method, argument, pandas method)`` for the three ``.str`` aliases.
-STRING_ALIASES = [("startswith", "Hel", "startswith"), ("endswith", "rld", "endswith")]
+#: ``(method, argument, pandas method)`` for the prefix and suffix tests pandas also has.
+STRING_ALIASES = [("starts_with", "Hel", "startswith"), ("ends_with", "rld", "endswith")]
 
 
 @pytest.mark.parametrize(("ours", "argument", "theirs"), STRING_ALIASES)
@@ -321,9 +321,9 @@ def test_str_match_anchors_every_arm_of_an_alternation():
 def test_the_string_aliases_delegate_to_the_primary_spellings(ds):
     """Each alias must equal the method it borrows the pandas name for."""
     got = ds.select(
-        alias_start=bt.col("s").str.startswith("Hel"),
+        alias_start=bt.col("s").str.starts_with("Hel"),
         primary_start=bt.col("s").str.starts_with("Hel"),
-        alias_end=bt.col("s").str.endswith("rld"),
+        alias_end=bt.col("s").str.ends_with("rld"),
         primary_end=bt.col("s").str.ends_with("rld"),
     ).to_pydict()
     assert got["alias_start"] == got["primary_start"]

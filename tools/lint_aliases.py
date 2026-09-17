@@ -137,6 +137,9 @@ def _delegate_call(fn: Any) -> tuple[str, str] | None:
     call = body[0].value
     if not isinstance(call, ast.Call):
         return None
+    generated = _generated_forward(fn, call)
+    if generated is not None:
+        return generated, "delegate"
     if isinstance(call.func, ast.Name):
         # A module-level function delegating to another one: `def f(x): return g(x)`.
         target = call.func.id
@@ -168,6 +171,32 @@ def _delegate_call(fn: Any) -> tuple[str, str] | None:
         # A parameter the method accepts but does not forward changes behaviour.
         return target, "wrapper"
     return target, kind
+
+
+def _generated_forward(fn: Any, call: ast.Call) -> str | None:
+    """The target of a forwarder built at import time: `getattr(self, _t)(*args, **kwargs)`.
+
+    A table-driven binder can stamp out one function per row that looks up its target by
+    a name held in a keyword default. Its source is the template's, so the plain AST check
+    sees no `self.<public>(...)` call; the target is only in `__kwdefaults__`. Such a
+    forwarder passes every argument through unchanged, which makes it a second spelling.
+    """
+    inner = call.func
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "getattr"
+        and len(inner.args) == 2
+        and isinstance(inner.args[0], ast.Name)
+        and inner.args[0].id == "self"
+        and isinstance(inner.args[1], ast.Name)
+    ):
+        return None
+    starred = [a for a in call.args if isinstance(a, ast.Starred)]
+    if len(call.args) != len(starred) or any(k.arg is not None for k in call.keywords):
+        return None
+    target = (getattr(fn, "__kwdefaults__", None) or {}).get(inner.args[1].id)
+    return target if isinstance(target, str) and not target.startswith("_") else None
 
 
 def _arg_kind(arg: ast.AST, params: set[str], used: set[str]) -> str:

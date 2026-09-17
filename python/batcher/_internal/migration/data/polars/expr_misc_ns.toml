@@ -14,7 +14,7 @@ ends_with = { status = "canonical", batcher = "Expr.str.ends_with" }
 get_categories = { status = "gap", need = "cat.get_categories (needs a Categorical type)", wave = "W3" }
 len_bytes = { status = "canonical", batcher = "Expr.str.octet_length" }
 len_chars = { status = "canonical", batcher = "Expr.str.len_chars" }
-slice = { status = "mismatch", batcher = "Expr.str.substr", note = "Batcher keeps substr, which is 1-based: slice(o, n) is substr(o + 1, n) for o >= 0", wave = "W0" }
+slice = { status = "canonical", batcher = "Expr.str.slice" }
 starts_with = { status = "canonical", batcher = "Expr.str.starts_with" }
 
 ["Expr.bin"]

@@ -10,6 +10,8 @@ than only on the live surface, whose answer is what it is being used to find.
 
 from __future__ import annotations
 
+import types
+
 from tools.lint_aliases import _delegates, _public_members, _same_object
 
 _PATTERN = "[a-z]+@[a-z]+"
@@ -51,6 +53,21 @@ class Planted:
     count_distinct = limit
 
 
+def _forward(self: Planted, *args: object, _t: str = "limit", **kwargs: object) -> object:
+    return getattr(self, _t)(*args, **kwargs)
+
+
+def _private_forward(self: Planted, *args: object, _t: str = "_x", **kwargs: object) -> object:
+    return getattr(self, _t)(*args, **kwargs)
+
+
+# What a table-driven binder produces: one copy of a template per row, target in a default.
+Planted.first_n = types.FunctionType(_forward.__code__, globals(), "first_n")  # type: ignore[attr-defined]
+Planted.first_n.__kwdefaults__ = {"_t": "limit"}  # type: ignore[attr-defined]
+Planted.micros = types.FunctionType(_private_forward.__code__, globals(), "micros")  # type: ignore[attr-defined]
+Planted.micros.__kwdefaults__ = {"_t": "_x"}  # type: ignore[attr-defined]
+
+
 def _kinds() -> dict[str, tuple[str, str]]:
     members = _public_members(Planted)
     found = _same_object("Planted", members) + _delegates("Planted", members)
@@ -77,6 +94,13 @@ def test_computed_arguments_and_dropped_parameters_are_wrappers() -> None:
     kinds = _kinds()
     assert kinds["has_email"] == ("wrapper", "truncate")
     assert kinds["head"] == ("wrapper", "truncate")
+
+
+def test_a_generated_forwarder_is_a_second_spelling_of_its_named_target() -> None:
+    kinds = _kinds()
+    assert kinds["first_n"] == ("delegate", "limit")
+    # Forwarding to a private helper is the only public spelling, not a second one.
+    assert "micros" not in kinds
 
 
 def test_a_method_with_its_own_body_is_not_reported() -> None:

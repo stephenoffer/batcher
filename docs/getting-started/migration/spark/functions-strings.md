@@ -29,7 +29,7 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `character_length` | `Expr.str.len_chars` | canonical |  |
 | `collate` | n/a | gap | Not yet: collation-aware string comparison (collate(col, name)). Wave W14. |
 | `collation` | n/a | gap | Not yet: report a column's collation. Wave W14. |
-| `concat` | `bt.concat` + `bt.concat_str` | mismatch | Differs: Spark concat returns null when any input is null and also concatenates arrays; bt.concat/concat\_str skip null inputs. Needs ignore\_nulls=False. Wave W0. |
+| `concat` | `bt.concat` + `bt.concat_str` | mismatch | Differs: Spark concat returns null when any argument is null: bt.concat\_str(\*cols, ignore\_nulls=False). Array arguments are list concatenation. Wave W0. |
 | `concat_ws` | `bt.concat_ws` | canonical |  |
 | `contains` | `Expr.str.contains` | mismatch | Differs: bt.contains is a column-name selector, not a string predicate; F.contains(left, right) is Expr.str.contains. Wave W0. |
 | `crc32` | `Expr.str.crc32` | canonical |  |
@@ -41,9 +41,9 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `format_number` | n/a | gap | Not yet: format a number with grouping separators to d decimal places. Wave W3. |
 | `format_string` | `bt.format_string` | mismatch | Differs: Spark uses printf-style placeholders (%s, %d, %.2f); bt.format\_string uses \{\} placeholders. Wave W0. |
 | `hash` | `Expr.hash` | mismatch | Differs: Spark hash is 32-bit Murmur3 with seed 42 over one or more columns ('ABC' -\> -757602832); Expr.hash is a different 64-bit hash of one value. Wave W0. |
-| `hex` | `Expr.str.hex` | mismatch | Differs: Spark hex(integer) renders the number in base 16 (hex(17) is '11'); Expr.str.hex hex-encodes the text bytes. Integers need Expr.to\_base(16). Wave W0. |
+| `hex` | `Expr.str.hex` | canonical |  |
 | `ilike` | `Expr.str.ilike` | param | Missing: escapeChar= and a column-valued pattern. Wave W2. |
-| `initcap` | `Expr.str.to_titlecase` | mismatch | Differs: Spark capitalizes only after whitespace ('hello-world' -\> 'Hello-world'); Batcher also capitalizes after punctuation ('Hello-World'). Wave W0. |
+| `initcap` | `Expr.str.to_titlecase` | canonical |  |
 | `instr` | `Expr.str.position` | canonical |  |
 | `is_valid_utf8` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (is\_valid\_utf8). Wave W1. |
 | `lcase` | `Expr.str.lower` | canonical |  |
@@ -56,7 +56,7 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `lpad` | `Expr.str.lpad` | canonical |  |
 | `ltrim` | `Expr.str.strip_chars_start` | canonical |  |
 | `make_valid_utf8` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (make\_valid\_utf8). Wave W1. |
-| `mask` | `bt.mask` | mismatch | Differs: Spark mask(col, upperChar='X', lowerChar='x', digitChar='n', otherChar) replaces by character class; bt.mask replaces every character with one char and can reveal the ends. Wave W0. |
+| `mask` | `bt.mask` | canonical |  |
 | `md5` | `Expr.str.md5` | canonical |  |
 | `octet_length` | `Expr.str.octet_length` | canonical |  |
 | `overlay` | `Expr.str.overlay` | canonical |  |
@@ -68,10 +68,10 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `regexp` | `Expr.str.regexp_matches` | canonical |  |
 | `regexp_count` | `Expr.str.count_matches` | canonical |  |
 | `regexp_extract` | `Expr.str.extract` | canonical |  |
-| `regexp_extract_all` | `Expr.str.extract_all` | mismatch | Differs: Spark idx defaults to 1 (the first capture group); Expr.str.extract\_all returns whole matches and takes no group argument. Needs group=. Wave W0. |
+| `regexp_extract_all` | `Expr.str.extract_all` | canonical |  |
 | `regexp_instr` | n/a | gap | Not yet: position of the first regex match. Wave W3. |
 | `regexp_like` | `Expr.str.regexp_matches` | canonical |  |
-| `regexp_replace` | `Expr.str.replace_all` | mismatch | Differs: Spark replaces every match and writes backreferences as \$1; Expr.str.replace\_all takes \\1 and leaves \$1 literal. Spark also accepts column-valued pattern and replacement. Wave W0. |
+| `regexp_replace` | `Expr.str.replace_all` | mismatch | Differs: Spark reads \$1 back-references and Java regex syntax; replace\_all(backrefs=dollar) reads \$1. Java-only constructs (lookaround, the \\\$ escape) and column-valued patterns need a manual port. Wave W0. |
 | `regexp_substr` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (regexp\_substr, null when there is no match). Wave W1. |
 | `repeat` | `Expr.str.repeat` | canonical |  |
 | `replace` | `Expr.str.replace` | canonical |  |
@@ -85,7 +85,7 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `sha1` | `Expr.str.sha1` | canonical |  |
 | `sha2` | `Expr.str.sha256` | param | Missing: numBits= 224/384/512 (only SHA-256 today). Wave W2. |
 | `soundex` | `Expr.str.soundex` | canonical |  |
-| `split` | `Expr.str.split` | mismatch | Differs: Spark's pattern is a Java regex with limit=; Expr.str.split is literal. Use Expr.str.regexp\_split, which lacks limit=. Wave W0. |
+| `split` | `Expr.str.split` | mismatch | Differs: Spark split(str, pattern, limit) with limit \> 0 is str.regexp\_split(pattern, limit=limit); limit \<= 0 means no limit. Java-only regex syntax needs a manual port. Wave W0. |
 | `split_part` | `Expr.str.split_part` | canonical |  |
 | `startswith` | `Expr.str.starts_with` | canonical |  |
 | `substr` | `Expr.str.substr` | mismatch | Differs: Spark treats start position 0 as 1 (substr('hello', 0, 2) is 'he'); Batcher counts position 0 as before the string ('h'). Wave W0. |
@@ -104,10 +104,10 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `try_url_decode` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (try\_url\_decode). Wave W1. |
 | `try_validate_utf8` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (try\_validate\_utf8). Wave W1. |
 | `ucase` | `Expr.str.upper` | canonical |  |
-| `unbase64` | `Expr.str.from_base64` | mismatch | Differs: Spark returns BINARY; Expr.str.from\_base64 returns UTF-8 text (null when the bytes are not valid text). Wave W0. |
-| `unhex` | `Expr.str.unhex` | mismatch | Differs: Spark returns BINARY; Expr.str.unhex returns UTF-8 text (null when the bytes are not valid text). Wave W0. |
+| `unbase64` | `Expr.str.from_base64` | canonical |  |
+| `unhex` | `Expr.str.unhex` | canonical |  |
 | `upper` | `Expr.str.upper` | canonical |  |
-| `url_decode` | `Expr.str.url_decode` | mismatch | Differs: Spark decodes application/x-www-form-urlencoded, so '+' becomes a space; Batcher leaves '+'. Wave W0. |
-| `url_encode` | `Expr.str.url_encode` | mismatch | Differs: Spark encodes a space as '+'; Batcher encodes it as '%20'. Wave W0. |
+| `url_decode` | `Expr.str.url_decode` | mismatch | Differs: with form=True the decode matches Spark; a malformed escape stays as written where Spark raises. Wave W0. |
+| `url_encode` | `Expr.str.url_encode` | canonical |  |
 | `validate_utf8` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (validate\_utf8). Wave W1. |
-| `xxhash64` | `Expr.str.xxhash64` | mismatch | Differs: Spark hashes one or more typed columns with seed 42 ('ABC' -\> 4105715581806190027); Batcher hashes one string's bytes ('ABC' -\> -1843406881296486760). Wave W0. |
+| `xxhash64` | `Expr.str.xxhash64` | mismatch | Differs: for one string or binary column, xxhash64(col) is col.str.xxhash64(seed=42). Several columns or other types chain the seed in Spark and need a manual port. Wave W0. |

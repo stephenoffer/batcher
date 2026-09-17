@@ -27,7 +27,7 @@ from batcher.plan.expr_ir.func_nodes import (
     StrFunc,
     StructField,
 )
-from batcher.plan.expr_ir.namespaces._bind import _bind_accessors, _bind_aliases
+from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 from batcher.plan.expr_ir.nodes import ListJoin
 
 
@@ -1601,20 +1601,3 @@ _bind_accessors(
     _list_reduction_doc,
     "A new :class:`~batcher.Expr` carrying the per-row reduction.",
 )
-
-
-# The vector/set compat spellings for `.list` -- a second name for a method this
-# namespace already has, kept because ML code says `l2_norm` and Polars says
-# `set_union`. Rows are (target, summary, example data, example expression, expected
-# output[, extra note]); the signature and the `Args:`/`Returns:` come from the target.
-_LIST_ALIASES: dict[str, tuple[str, ...]] = {
-    "euclidean_distance": (
-        "l2_distance",
-        "Straight-line distance between two vectors — the ``l2_distance`` spelling.",
-        '{"a": [[0.0, 0.0]], "b": [[3.0, 4.0]]}',
-        'bt.col("a").list.euclidean_distance(bt.col("b"))',
-        "{'r': [5.0]}",
-    ),
-}
-
-_bind_aliases(_ListNamespace, _LIST_ALIASES)

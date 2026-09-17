@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to PySpark
 
-The following table maps 255 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 262 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
@@ -58,6 +58,7 @@ The following table maps 255 Batcher spellings to the PySpark names that compute
 | `bt.lit` | `functions.lit` |
 | `bt.make_date` | `functions.make_date` |
 | `bt.map_from_arrays` | `functions.map_from_arrays` |
+| `bt.mask` | `functions.mask` |
 | `bt.matches` | `DataFrame.colRegex` |
 | `bt.max` | `functions.max` |
 | `bt.mean` | `functions.mean` |
@@ -227,7 +228,10 @@ The following table maps 255 Batcher spellings to the PySpark names that compute
 | `Expr.str.count_matches` | `functions.regexp_count` |
 | `Expr.str.crc32` | `functions.crc32` |
 | `Expr.str.ends_with` | `Column.endswith`, `functions.endswith` |
+| `Expr.str.extract_all` | `functions.regexp_extract_all` |
 | `Expr.str.extract` | `functions.regexp_extract` |
+| `Expr.str.from_base64` | `functions.unbase64` |
+| `Expr.str.hex` | `functions.hex` |
 | `Expr.str.ilike` | `Column.ilike` |
 | `Expr.str.join` | `functions.listagg`, `functions.string_agg` |
 | `Expr.str.len_chars` | `functions.char_length`, `functions.character_length`, `functions.length` |
@@ -250,9 +254,12 @@ The following table maps 255 Batcher spellings to the PySpark names that compute
 | `Expr.str.strip_chars_end` | `functions.rtrim` |
 | `Expr.str.strip_chars_start` | `functions.ltrim` |
 | `Expr.str.substring_index` | `functions.substring_index` |
+| `Expr.str.to_titlecase` | `functions.initcap` |
 | `Expr.str.translate` | `functions.translate` |
 | `Expr.str.trim` | `functions.btrim`, `functions.trim` |
+| `Expr.str.unhex` | `functions.unhex` |
 | `Expr.str.upper` | `functions.ucase`, `functions.upper` |
+| `Expr.str.url_encode` | `functions.url_encode` |
 | `Expr.struct.field` | `Column.getField` |
 | `Expr.tan` | `functions.tan` |
 | `Expr.tanh` | `functions.tanh` |

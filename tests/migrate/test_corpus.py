@@ -90,7 +90,9 @@ def test_the_corpus_rewrites_the_high_value_mappings() -> None:
     assert 'events.write.parquet("s3://bucket/copy/", mode="error")' in spark["io"]
     assert 'partition_by=["g"], order_by=["t"], frame=(None, 0)' in spark["windows"]
     polars = (CORPUS / "polars" / "expressions" / "batcher.py").read_text()
-    assert '.str.regexp_matches("an+")' in polars and '.str.contains("rr")' in polars
-    assert ".str.substr(2, 3)" in polars  # Polars `slice(1, 3)` is 0-based
+    # Polars `contains` is a regex unless told otherwise; Batcher's is literal by default.
+    assert '.str.contains("an+", literal=False)' in polars
+    assert '.str.contains("rr", literal=True)' in polars
+    assert ".str.slice(1, 3)" in polars  # Batcher's `str.slice` is 0-based, as Polars' is
     ray = (CORPUS / "ray_data" / "map_batches" / "batcher.py").read_text()
     assert 'map_batches(add_total, batch_format="numpy")' in ray

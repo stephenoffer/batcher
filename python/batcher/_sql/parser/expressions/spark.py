@@ -98,7 +98,7 @@ def spark_function(tr, node) -> Expr | None:
         from batcher._sql.parser.expressions.literals import _const_str_arg
 
         pat = _const_str_arg(node.expression, "regexp_count()", "pattern")
-        return tr._scalar(node.this).str.regexp_count(pat)
+        return tr._scalar(node.this).str.count_matches(pat)
     if isinstance(node, exp.RegexpSubstr):
         from batcher._sql.parser.expressions.literals import _const_str_arg
 

@@ -62,7 +62,7 @@ def test_dollar_replacement_is_daft_regexp_replace(pattern, template):
 
 @pytest.mark.parametrize("pattern", [".", "l", "lo", "ö", "zz"])
 def test_literal_match_count_is_daft_count_matches(pattern):
-    got = _batcher(s.str.regexp_count(pattern, literal=True))
+    got = _batcher(s.str.count_matches(pattern, literal=True))
     assert got == _daft(lambda c: F.count_matches(c, pattern))
 
 

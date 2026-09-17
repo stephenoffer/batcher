@@ -19,15 +19,15 @@ The following table maps the 49 names on `Expr.str`, sorted alphabetically.
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
 | `concat` | `Expr.str.join` | canonical |  |
-| `contains` | `Expr.str.contains` | mismatch | Differs: Polars treats the pattern as a regex by default (literal=False); Batcher's contains is literal. Use Expr.str.regexp\_matches or a literal= param. Wave W0. |
+| `contains` | `Expr.str.contains` | canonical | Polars treats the pattern as a regex by default (literal=False); Batcher's contains is literal. Use Expr.str.regexp\_matches or a literal= param. |
 | `contains_any` | `Expr.str.contains_any` | param | Missing: ascii\_case\_insensitive=. Wave W2. |
 | `count_matches` | `Expr.str.count_matches` | param | Missing: literal=. Wave W2. |
 | `decode` | `Expr.str.unhex` | mismatch | Differs: Polars decode('hex'\|'base64') returns Binary; Batcher's unhex/from\_base64 return Utf8. Param: return Binary. Wave W0. |
 | `encode` | `Expr.str.hex` + `Expr.str.base64` | mismatch | Differs: Polars encode('hex') is lowercase; Batcher's hex is uppercase (base64 agrees). Param: lowercase hex. Wave W0. |
 | `ends_with` | `Expr.str.ends_with` | canonical |  |
-| `escape_regex` | `Expr.str.escape_regex` | mismatch | Differs: Batcher also escapes spaces ('a b' -\> 'a\\\\ b'); Polars leaves them. Both still match the literal, but the strings differ. Wave W0. |
+| `escape_regex` | `Expr.str.escape_regex` | mismatch | Differs: Batcher escapes a space as \\ (RE2 QuoteMeta, as DuckDB); Polars leaves it. Port as escape\_regex().str.replace(backslash-space, space). Wave W0. |
 | `explode` | n/a | gap | Not yet: Expr.str.explode (one row per character, length-changing). Wave W8. |
-| `extract` | `Expr.str.extract` | mismatch | Differs: on no match Polars returns null; Batcher returns an empty string. Wave W0. |
+| `extract` | `Expr.str.extract` | canonical | on no match Polars returns null; Batcher returns an empty string. |
 | `extract_all` | `Expr.str.extract_all` | canonical |  |
 | `extract_groups` | n/a | gap | Not yet: Expr.str.extract\_groups (capture groups to struct). Wave W3. |
 | `extract_many` | n/a | gap | Not yet: Expr.str.extract\_many (Aho-Corasick). Wave W3. |
@@ -40,25 +40,25 @@ The following table maps the 49 names on `Expr.str`, sorted alphabetically.
 | `len_bytes` | `Expr.str.octet_length` | alias |  |
 | `len_chars` | `Expr.str.len_chars` | canonical |  |
 | `normalize` | n/a | gap | Not yet: Expr.str.normalize (Unicode NFC/NFKC/NFD/NFKD). Wave W3. |
-| `pad_end` | `Expr.str.rpad` | mismatch | Differs: Polars never truncates a longer string; Batcher's rpad/pad\_end cut it to the width. Param: truncate=False. Wave W0. |
-| `pad_start` | `Expr.str.lpad` | mismatch | Differs: Polars never truncates a longer string; Batcher's lpad/pad\_start cut it to the width. Param: truncate=False. Wave W0. |
+| `pad_end` | `Expr.str.rpad` | canonical |  |
+| `pad_start` | `Expr.str.lpad` | canonical |  |
 | `replace` | `Expr.str.replace` | mismatch | Differs: Polars replaces the first regex match (n=1, literal=False); Batcher replaces every literal occurrence. Params: n=, literal=. Wave W0. |
 | `replace_all` | `Expr.str.replace_all` | canonical |  |
 | `replace_many` | n/a | gap | Not yet: Expr.str.replace\_many. Wave W3. |
 | `reverse` | `Expr.str.reverse` | canonical |  |
-| `slice` | `Expr.str.substr` | mismatch | Differs: Batcher keeps substr, which is 1-based: slice(o, n) is substr(o + 1, n) for o \>= 0, and negative offsets differ. Wave W0. |
+| `slice` | `Expr.str.slice` | canonical |  |
 | `split` | `Expr.str.split` | param | Missing: inclusive=. Wave W2. |
 | `split_exact` | n/a | gap | Not yet: Expr.str.split\_exact (to struct of n+1 fields). Wave W3. |
 | `splitn` | n/a | gap | Not yet: Expr.str.splitn (to struct of n fields). Wave W3. |
 | `starts_with` | `Expr.str.starts_with` | canonical |  |
-| `strip_chars` | `Expr.str.trim` | mismatch | Differs: Polars strips all Unicode whitespace (tab, newline, NBSP) when no characters are given; Batcher strips only the space character. Param: whitespace='unicode'. Wave W0. |
-| `strip_chars_end` | `Expr.str.strip_chars_end` | mismatch | Differs: Polars strips all Unicode whitespace (tab, newline, NBSP) when no characters are given; Batcher strips only the space character. Param: whitespace='unicode'. Wave W0. |
-| `strip_chars_start` | `Expr.str.strip_chars_start` | mismatch | Differs: Polars strips all Unicode whitespace (tab, newline, NBSP) when no characters are given; Batcher strips only the space character. Param: whitespace='unicode'. Wave W0. |
+| `strip_chars` | `Expr.str.trim` | canonical |  |
+| `strip_chars_end` | `Expr.str.strip_chars_end` | canonical |  |
+| `strip_chars_start` | `Expr.str.strip_chars_start` | canonical |  |
 | `strip_prefix` | `Expr.str.strip_prefix` | canonical |  |
 | `strip_suffix` | `Expr.str.strip_suffix` | canonical |  |
 | `strptime` | `Expr.str.to_datetime` + `Expr.str.to_date` | param | Missing: one entry point taking a target dtype, strict=, exact=, cache=. Wave W2. |
 | `tail` | `Expr.str.right` | alias |  |
-| `to_date` | `Expr.str.to_date` | mismatch | Differs: Polars infers the format and raises on an unparseable value (strict=True); Batcher's parsing strictness differs. Param: strict=. Wave W0. |
+| `to_date` | `Expr.str.to_date` | mismatch | Differs: Polars parses strictly by default: str.to\_date(format, strict=True). Format inference (no format) needs a manual port. Wave W0. |
 | `to_datetime` | `Expr.str.to_datetime` | param | Missing: optional format (inference), time\_unit=, time\_zone=, ambiguous=, strict=. Wave W2. |
 | `to_decimal` | `Expr.cast` | param | Missing: inferred precision/scale for decimal parsing (to\_decimal(scale=)). Wave W2. |
 | `to_integer` | `Expr.cast` | param | Missing: base= and strict= for string-to-integer parsing. Wave W2. |
@@ -66,7 +66,7 @@ The following table maps the 49 names on `Expr.str`, sorted alphabetically.
 | `to_time` | n/a | gap | Not yet: Expr.str.to\_time (needs a TIME type). Wave W6. |
 | `to_titlecase` | `Expr.str.to_titlecase` | canonical |  |
 | `to_uppercase` | `Expr.str.upper` | alias |  |
-| `zfill` | `Expr.str.zfill` | mismatch | Differs: Polars keeps a leading sign in front of the zeros ('-12' -\> '-0012'); Batcher pads before the sign ('00-12'). Wave W0. |
+| `zfill` | `Expr.str.zfill` | mismatch | Differs: the sign now stays in front as in Polars; Polars measures width in bytes where Batcher counts characters, so non-ASCII text can differ. Wave W0. |
 
 ## `Expr.dt`
 
@@ -232,7 +232,7 @@ The following table maps the 6 names on `Expr.cat`, sorted alphabetically.
 | `get_categories` | n/a | gap | Not yet: cat.get\_categories (needs a Categorical type). Wave W3. |
 | `len_bytes` | `Expr.str.octet_length` | canonical |  |
 | `len_chars` | `Expr.str.len_chars` | canonical |  |
-| `slice` | `Expr.str.substr` | mismatch | Differs: Batcher keeps substr, which is 1-based: slice(o, n) is substr(o + 1, n) for o \>= 0. Wave W0. |
+| `slice` | `Expr.str.slice` | canonical |  |
 | `starts_with` | `Expr.str.starts_with` | canonical |  |
 
 ## `Expr.bin`

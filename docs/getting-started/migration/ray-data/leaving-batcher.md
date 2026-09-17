@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Ray Data
 
-The following table maps 105 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
+The following table maps 107 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
 
 | Batcher | Ray Data |
 |---|---|
@@ -97,13 +97,15 @@ The following table maps 105 Batcher spellings to the Ray Data names that comput
 | `Expr.sin` | `Expr.sin` |
 | `Expr.str.capitalize` | `Expr.str.capitalize` |
 | `Expr.str.contains` | `Expr.str.contains` |
-| `Expr.str.count_matches` | `Expr.str.count_regex` |
+| `Expr.str.count_matches` | `Expr.str.count_regex`, `Expr.str.count` |
 | `Expr.str.ends_with` | `Expr.str.ends_with` |
 | `Expr.str.is_alnum` | `Expr.str.is_alnum` |
 | `Expr.str.is_alpha` | `Expr.str.is_alpha` |
 | `Expr.str.is_ascii_only` | `Expr.str.is_ascii` |
+| `Expr.str.is_lower` | `Expr.str.is_lower` |
 | `Expr.str.is_numeric` | `Expr.str.is_digit`, `Expr.str.is_numeric` |
 | `Expr.str.is_space` | `Expr.str.is_space` |
+| `Expr.str.is_upper` | `Expr.str.is_upper` |
 | `Expr.str.len_chars` | `Expr.str.len` |
 | `Expr.str.lower` | `Expr.str.lower` |
 | `Expr.str.octet_length` | `Expr.str.byte_len` |
