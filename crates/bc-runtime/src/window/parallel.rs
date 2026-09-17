@@ -232,7 +232,19 @@ fn partition_row_indices(
         .collect())
 }
 
-/// The bucket id (`hash(key) % nbuckets`) of each row, computed in parallel. A single
+/// The bucket in `0..n` a 64-bit hash lands in, by multiply-shift rather than `%`.
+///
+/// `h % n` with a runtime `n` is a 64-bit division per row — tens of cycles, on every row of a
+/// windowed relation, to pick a bucket that never leaves this module. `(h * n) >> 64` maps the
+/// hash onto `0..n` just as uniformly (it reads the high bits, which `ahash` mixes fully) in a
+/// multiply. Which bucket a key gets is invisible in the result: buckets only group whole
+/// partitions, and the scatter restores every row to its original position.
+#[inline(always)]
+fn bucket_of_hash(h: u64, n: u64) -> u32 {
+    ((u128::from(h) * u128::from(n)) >> 64) as u32
+}
+
+/// The bucket id (a key hash reduced onto `0..nbuckets`) of each row, computed in parallel. A single
 /// integer / string key hashes its native value directly (no `RowConverter`).
 fn bucket_of_each_row(
     partition_keys: &[ArrayRef],
@@ -255,7 +267,7 @@ fn bucket_of_each_row(
                         } else {
                             SEED.hash_one(v.value(i))
                         };
-                        (h % n) as u32
+                        bucket_of_hash(h, n)
                     })
                     .collect());
             }
@@ -269,7 +281,7 @@ fn bucket_of_each_row(
                         } else {
                             SEED.hash_one(v.value(i))
                         };
-                        (h % n) as u32
+                        bucket_of_hash(h, n)
                     })
                     .collect());
             }
@@ -285,7 +297,7 @@ fn bucket_of_each_row(
     let converter = RowConverter::new(fields)?;
     let rows = converter.convert_columns(partition_keys)?;
     Ok((0..num_rows)
-        .map(|i| (SEED.hash_one(rows.row(i)) % n) as u32)
+        .map(|i| bucket_of_hash(SEED.hash_one(rows.row(i)), n))
         .collect())
 }
 
