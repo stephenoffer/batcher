@@ -194,6 +194,10 @@ pub(crate) fn try_scalar_binary(
         if let Some(out) = float_scalar_cmp(op, &arr, &lit_arr, lit_on_right) {
             return Ok(Some(out));
         }
+        // Strings likewise, from an eight-byte prefix instead of a `memcmp` per row.
+        if let Some(out) = crate::eval::cmp::string_scalar_cmp(op, &arr, &lit_arr, lit_on_right) {
+            return Ok(Some(out));
+        }
     }
     // Canonicalize both float operands for the comparison arms, exactly as the array path
     // does — this path must be bit-identical to it (see `canon_floats_for_cmp`). Arithmetic

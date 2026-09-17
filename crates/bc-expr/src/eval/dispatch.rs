@@ -83,6 +83,13 @@ impl Expr {
                 if let Some(out) = try_dict_compare(*op, left, right, batch)? {
                     return Ok(out);
                 }
+                // Fast path: a string range (`s >= 'a' AND s < 'b'`, what a sargable
+                // `LIKE 'a%'` becomes) walks the column once for both bounds.
+                if matches!(op, BinaryOp::And) {
+                    if let Some(out) = crate::eval::cmp::try_string_range(left, right, batch)? {
+                        return Ok(out);
+                    }
+                }
                 // Fast path: a numeric literal operand broadcasts as a scalar instead
                 // of materializing a full N-length array (bit-identical result).
                 if let Some(out) = try_scalar_binary(*op, left, right, batch)? {

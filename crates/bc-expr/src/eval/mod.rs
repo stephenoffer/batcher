@@ -32,6 +32,7 @@ pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, ahash::RandomSta
 pub(crate) mod binary;
 pub(crate) mod branch;
 pub(crate) mod cast;
+mod cmp;
 pub(crate) mod coerce;
 mod dispatch;
 pub(crate) mod generate;
