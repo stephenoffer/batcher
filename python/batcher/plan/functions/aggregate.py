@@ -7,6 +7,8 @@ single-node and distributed with no new engine state.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
+
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr
 
 __all__ = [
@@ -501,11 +503,25 @@ def bit_xor(column: str | Expr) -> AggExpr:
     return _as_column(column).bit_xor()
 
 
-def array_agg(column: str | Expr, *, ignore_nulls: bool = False) -> AggExpr | Expr:
+def array_agg(
+    column: str | Expr,
+    *,
+    order_by: IntoExpr | Iterable[IntoExpr] | None = None,
+    descending: bool | Sequence[bool] = False,
+    nulls_last: bool | Sequence[bool] = True,
+    ignore_nulls: bool = False,
+) -> AggExpr | Expr:
     """Collect each group's values into a list (SQL ``ARRAY_AGG`` / Spark ``collect_list``).
+
+    The element order is unspecified unless `order_by` fixes it; see
+    :meth:`Expr.array_agg <batcher.Expr.array_agg>` for the ordering and tie rules.
 
     Args:
         column: The column to collect, as a name or an expression.
+        order_by: The key or keys that order each list's elements.
+        descending: Order from the largest key, for every key or per key.
+        nulls_last: Place elements whose key is null after the others, for every key or
+            per key.
         ignore_nulls: Whether to leave nulls out of each list, as Spark's ``collect_list``
             and ``array_agg`` do; SQL and DuckDB keep them.
 
@@ -516,8 +532,10 @@ def array_agg(column: str | Expr, *, ignore_nulls: bool = False) -> AggExpr | Ex
         .. doctest::
 
             >>> import batcher as bt
-            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [2, 3, 4]})
-            >>> ds.group_by("g").agg(xs=bt.array_agg("x")).sort("g").to_pydict()
-            {'g': ['a', 'b'], 'xs': [[2, 3], [4]]}
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [2, 3, 4], "t": [1, 0, 0]})
+            >>> ds.group_by("g").agg(xs=bt.array_agg("x", order_by="t")).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'xs': [[3, 2], [4]]}
     """
-    return _as_column(column).array_agg(ignore_nulls=ignore_nulls)
+    return _as_column(column).array_agg(
+        order_by=order_by, descending=descending, nulls_last=nulls_last, ignore_nulls=ignore_nulls
+    )

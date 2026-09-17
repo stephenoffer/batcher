@@ -115,6 +115,11 @@ def _bind_agg(
             f"the two-input aggregate {agg.func!r} has no window form; compute it with "
             "group_by(...).agg(...) and join the result back"
         )
+    if agg.order_by:
+        raise PlanError(
+            "array_agg(order_by=...) has no window form; compute it with "
+            "group_by(...).agg(...) and join the result back"
+        )
     # `mean` is the DataFrame spelling; the window engine names the aggregate `avg`.
     func = "avg" if agg.func == "mean" else agg.func
     return WindowExpr(func, agg.input, partition, order, frame)

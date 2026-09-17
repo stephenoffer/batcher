@@ -86,10 +86,16 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     "coalesce": "Spelled bt.coalesce(bt.col('a'), bt.col('b')) (a top-level function) here.",
     "combine_first": "Fill nulls from another column with bt.coalesce(bt.col('a'), bt.col('b')).",
     # --- argmax / positional stats ----------------------------------------------------
-    "argmax": "Spelled bt.col('x').arg_max() here (the value at another column's max is max_by).",
-    "argmin": "Spelled bt.col('x').arg_min() here (the value at another column's min is min_by).",
-    "idxmax": "The argmax index is bt.col('x').arg_max().",
-    "idxmin": "The argmin index is bt.col('x').arg_min().",
+    "argmax": (
+        "Spelled bt.col('x').arg_max(order_by=...) here (the value at another column's max "
+        "is max_by)."
+    ),
+    "argmin": (
+        "Spelled bt.col('x').arg_min(order_by=...) here (the value at another column's min "
+        "is min_by)."
+    ),
+    "idxmax": "The argmax index is bt.col('x').arg_max(order_by=...).",
+    "idxmin": "The argmin index is bt.col('x').arg_min(order_by=...).",
     # --- clipping / casting naming ----------------------------------------------------
     "clip_lower": "Spelled bt.col('x').clip(lower=lo) here.",
     "clip_upper": "Spelled bt.col('x').clip(upper=hi) here.",

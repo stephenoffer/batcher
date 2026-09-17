@@ -7,7 +7,7 @@ only referenced for typing here.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import pyarrow as pa
@@ -15,7 +15,7 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher.api._varargs import flatten_varargs
 from batcher.api.dataset.compat.guidance import groupby_attribute_error
-from batcher.plan.expr_ir import AggExpr, Aliased, Col, Expr
+from batcher.plan.expr_ir import AggExpr, Aliased, Col, Expr, IntoExpr
 from batcher.plan.expr_ir.selectors import Selector, expand_selectors, has_selector
 from batcher.plan.expr_rewrite.naming import output_name
 from batcher.plan.logical import (
@@ -794,16 +794,29 @@ class GroupBy:
         """
         return self._reduce("product", columns, empty_value=empty_value)
 
-    def array_agg(self, *columns: str | Selector, ignore_nulls: bool = False) -> Dataset:
+    def array_agg(
+        self,
+        *columns: str | Selector,
+        order_by: IntoExpr | Iterable[IntoExpr] | None = None,
+        descending: bool | Sequence[bool] = False,
+        nulls_last: bool | Sequence[bool] = True,
+        ignore_nulls: bool = False,
+    ) -> Dataset:
         """Collect each value column's values into a list per group (all non-key by default).
 
         The group-wise ``array_agg`` / ``list`` aggregate — gather each group's values into a
-        `List` column, e.g. to build a per-entity sequence of features for a model. Values
-        appear in input order.
+        `List` column, e.g. to build a per-entity sequence of features for a model. Every
+        list is ordered by `order_by`, so the lists line up element for element; without it
+        the element order is unspecified, as for :meth:`Expr.array_agg
+        <batcher.Expr.array_agg>`.
 
         Args:
             *columns: Columns (names or selectors) to collect; defaults to every non-key
                 column.
+            order_by: The key or keys that order each list's elements.
+            descending: Order from the largest key, for every key or per key.
+            nulls_last: Place elements whose key is null after the others, for every key or
+                per key.
             ignore_nulls: Whether to leave nulls out of the lists, as Spark's
                 ``collect_list`` does.
 
@@ -814,11 +827,18 @@ class GroupBy:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3]})
-                >>> ds.group_by("g").array_agg().sort("g").to_pydict()
-                {'g': ['a', 'b'], 'x': [[1, 2], [3]]}
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3], "t": [1, 0, 0]})
+                >>> ds.group_by("g").array_agg("x", order_by="t").sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [[2, 1], [3]]}
         """
-        return self._reduce("array_agg", columns, ignore_nulls=ignore_nulls)
+        return self._reduce(
+            "array_agg",
+            columns,
+            order_by=order_by,
+            descending=descending,
+            nulls_last=nulls_last,
+            ignore_nulls=ignore_nulls,
+        )
 
     def mode(self, *columns: str | Selector, all_modes: bool = False) -> Dataset:
         """The most frequent value of each column per group (all non-key columns by default).
@@ -987,7 +1007,17 @@ class GroupBy:
             agg.input, source._plan.available_columns(), source._plan.available_schema()
         )
         return [
-            (name, AggExpr(agg.func, expr, input2=agg.input2, param=agg.param))
+            (
+                name,
+                AggExpr(
+                    agg.func,
+                    expr,
+                    input2=agg.input2,
+                    param=agg.param,
+                    interpolation=agg.interpolation,
+                    order_by=agg.order_by,
+                ),
+            )
             for name, expr in expanded
         ]
 

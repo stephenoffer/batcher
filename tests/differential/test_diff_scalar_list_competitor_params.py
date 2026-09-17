@@ -159,12 +159,15 @@ def test_polars_arg_extremes_top_k_and_max_by(pl):
         .sort("g")
         .to_dict(as_series=False)
     )
+    # Polars numbers a group's rows in frame order; Batcher needs that order named, so the
+    # frame is numbered at the source and the positions are taken along it.
     got = (
         bt.from_pydict(data)
+        .with_row_index("_row")
         .group_by("g")
         .agg(
-            imax=col("x").arg_max(),
-            imin=col("x").arg_min(),
+            imax=col("x").arg_max(order_by="_row"),
+            imin=col("x").arg_min(order_by="_row"),
             top=col("x").top_k(2),
             by=col("x").max_by("t"),
         )

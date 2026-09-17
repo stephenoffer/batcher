@@ -349,14 +349,53 @@ fn eval_partial_with(
             None => None,
         };
         evaluated[i] = values.clone();
-        // The ordering key for arg_min/arg_max (the aggregate's second input).
-        let key = match &item.input2 {
-            Some(expr) => Some(eval_input2(i, expr)?),
-            None => None,
+        // The ordering key for arg_min/arg_max (the aggregate's second input), or an ordered
+        // `list_agg`'s encoded order keys.
+        let key = if !item.order_by.is_empty() {
+            Some(encode_agg_order_keys(batch, item)?)
+        } else {
+            match &item.input2 {
+                Some(expr) => Some(eval_input2(i, expr)?),
+                None => None,
+            }
         };
         calls.push(AggCall::with_key(map_agg_func(item), values, key));
     }
     Ok(agg::partial(&group_arrays, &calls, batch.num_rows())?)
+}
+
+/// An ordered `list_agg`'s `ORDER BY` keys for `batch`, row-encoded into one sortable column.
+///
+/// Evaluated on the interpreter in both the interpreted and the JIT partial: the keys only feed
+/// an encoding, and one evaluation path is what keeps the two partials identical by
+/// construction. Each key is normalized the way every sort in the engine normalizes it
+/// ([`normalize_sort_key`]), so an ordered aggregate ranks `-0.0`, NaN and an all-null key
+/// exactly as `ORDER BY` does. Any other aggregate carrying keys is refused rather than
+/// silently computed unordered.
+fn encode_agg_order_keys(
+    batch: &RecordBatch,
+    item: &AggregateItem,
+) -> Result<ArrayRef, InterpError> {
+    if !matches!(item.func, AggFunc::ListAgg) {
+        return Err(bc_runtime::RuntimeError::OrderByNotSupported {
+            func: map_agg_func(item).name().to_string(),
+        }
+        .into());
+    }
+    let keys = item
+        .order_by
+        .iter()
+        .map(|k| {
+            Ok((
+                normalize_sort_key(k.expr.eval(batch)?),
+                SortOptions {
+                    descending: k.descending,
+                    nulls_first: k.nulls_first,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, InterpError>>()?;
+    Ok(agg::encode_order_keys(&keys)?)
 }
 
 pub(crate) fn eval_partial(
@@ -650,6 +689,8 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
             agg::Fraction::new(item.param.unwrap_or(0.5)),
             item.interpolation.unwrap_or_default(),
         ),
+        // The keys are what make the list ordered; without them it is the arrival-order form.
+        AggFunc::ListAgg if !item.order_by.is_empty() => agg::AggFunc::ListAggOrdered,
         AggFunc::ListAgg => agg::AggFunc::ListAgg,
         AggFunc::BoolAnd => agg::AggFunc::BoolAnd,
         AggFunc::BoolOr => agg::AggFunc::BoolOr,
@@ -1726,6 +1767,7 @@ mod input_alias_tests {
             func,
             input,
             input2,
+            order_by: Vec::new(),
             alias: "a".into(),
             param: None,
             interpolation: None,

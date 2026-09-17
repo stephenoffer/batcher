@@ -667,6 +667,7 @@ mod tests {
             func,
             input: input.map(col),
             input2: input2.map(col),
+            order_by: Vec::new(),
             param,
             interpolation: None,
             alias: alias.into(),
@@ -1326,6 +1327,57 @@ mod tests {
                 (out.num_rows() > 0).then_some(out)
             })
             .collect()
+    }
+
+    /// An ordered `list_agg` is compared **exactly**, element order included: that order is
+    /// the whole contract, so the sorted-multiset comparison the unordered form gets would
+    /// pass a list that came back in arrival order. Every map split, reducer count and spill
+    /// budget must reproduce the single-node list byte for byte -- including ties on the key
+    /// (group 3 has two rows at `o = 2`) and a null value.
+    #[test]
+    fn ordered_list_agg_is_identical_on_every_distributed_path() {
+        let g = gk("k");
+        let ordered = |key: &str, descending: bool, nulls_first: bool| AggregateItem {
+            order_by: vec![bc_ir::SortKey {
+                expr: bc_expr::Expr::Col { name: key.into() },
+                descending,
+                nulls_first,
+            }],
+            ..agg(AggFunc::ListAgg, Some("v"), None, None, "a")
+        };
+        let cases = [
+            ("asc", vec![ordered("o", false, false)]),
+            ("desc_nulls_first", vec![ordered("o", true, true)]),
+            // A boolean key ties almost every row, so the value tiebreak decides the order.
+            ("tied_bool_key", vec![ordered("b", true, false)]),
+        ];
+        let morsels = agg_morsels();
+        let map_splits: Vec<Vec<Vec<RecordBatch>>> = vec![
+            vec![morsels.clone()],
+            vec![morsels[..1].to_vec(), morsels[1..].to_vec()],
+            morsels.iter().map(|m| vec![m.clone()]).collect(),
+        ];
+        for (label, aggs) in &cases {
+            let want = result_map(&[single_node(&g, aggs, &morsels)]);
+            // Positive control: the key really orders the list, so an arrival-order answer
+            // could not pass. Group 3's rows arrive as [null, 60, 21, 31] with `o` [1, 3, 2, 2].
+            if *label == "asc" {
+                assert_eq!(want["3"], vec!["[, 21.0, 31.0, 60.0]".to_string()]);
+            }
+            for maps in &map_splits {
+                for n in [1usize, 2, 3, 7] {
+                    let got = result_map(&distributed(&g, aggs, maps, n));
+                    assert_eq!(got, want, "{label}: reducers={n}");
+                    for budget in [1usize, 1 << 20] {
+                        let scratch = ScratchDir::new();
+                        let got = result_map(&distributed_spilling(
+                            &g, aggs, maps, n, budget, &scratch.0,
+                        ));
+                        assert_eq!(got, want, "{label}: spilled reducers={n} budget={budget}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1495 Python modules across 218 packages and 293 Rust files across 15 crates.
+Covering 1495 Python modules across 218 packages and 294 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -175,7 +175,7 @@ The public, fluent, lazy, expression-first API surface.
 | `executors.py` | 587 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 817 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
-| `groupby.py` | 1038 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
+| `groupby.py` | 1068 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 254 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `multi_group.py` | 188 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 567 | Per-source statistics collection for the conductor. |
@@ -844,12 +844,12 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 
 | module | lines | what it is |
 |---|---|---|
-| `agg_rewrites.py` | 191 | Aggregate pre-pass rewrites for the SQL translator. |
+| `agg_rewrites.py` | 156 | Aggregate pre-pass rewrites for the SQL translator. |
 | `ai_functions.py` | 263 | Generative AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT``. |
 | `clauses.py` | 628 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
 | `core_utils.py` | 586 | Small stateless AST helpers shared across translator theme modules. |
 | `from_clause.py` | 635 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
-| `grouping.py` | 539 | Grouping, aggregation, and projection mapping for the SQL translator. |
+| `grouping.py` | 538 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 320 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
 | `statements.py` | 212 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 332 | Built-in table functions in the FROM clause: the series generators and model scoring. |
@@ -1244,7 +1244,7 @@ Kyber rule modules.
 | `fusion.py` | 396 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
 | `leaf_rewrite.py` | 312 | The shared machinery every leaf-level expression rule is built from. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
-| `projections.py` | 898 | Projection rewrites — collapse stacked projections and prune unread columns. |
+| `projections.py` | 885 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 637 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 574 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
@@ -1320,7 +1320,7 @@ Extended Kyber rule families.
 | module | lines | what it is |
 |---|---|---|
 | `adaptive_meta.py` | 164 | Adaptive metadata rules — simplifications a provably-EXACT cardinality unlocks. |
-| `agg_extra.py` | 502 | Extra aggregate / GROUP BY rewrites — small, local, always-correct simplifications. |
+| `agg_extra.py` | 505 | Extra aggregate / GROUP BY rewrites — small, local, always-correct simplifications. |
 | `agg_rules.py` | 504 | Aggregate rewrites driven by *proven* metadata — uniqueness, constancy, exact counts. |
 | `arith_algebra.py` | 355 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
 | `arith_extra.py` | 549 | NORMALIZE-phase arithmetic the other families leave on the table — math-function |
@@ -1339,7 +1339,7 @@ Extended Kyber rule families.
 | `predicate_impossible.py` | 385 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
 | `predicate_infer.py` | 495 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
 | `projection_scan.py` | 364 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
-| `pushdown_gaps.py` | 470 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
+| `pushdown_gaps.py` | 469 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
 | `sargable.py` | 351 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
 | `setops.py` | 388 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
@@ -1404,7 +1404,7 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | `order_search.py` | 504 | Join-order search: pick a tree over an extracted join graph, and build it. |
 | `projection.py` | 191 | Push a derived projection through a join onto the side it reads, so the join |
 | `range_join.py` | 365 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
-| `rewrites.py` | 649 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
+| `rewrites.py` | 648 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
 
 ### `batcher/kyber/rules/math_algebra/` — 3 · subsystem
 
@@ -1686,7 +1686,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 
 | module | lines | what it is |
 |---|---|---|
-| `aggs.py` | 492 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
+| `aggs.py` | 497 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
 | `backend.py` | 535 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 142 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 435 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
@@ -1770,7 +1770,7 @@ Governance — who may read which rows and columns, and through what mask.
 | `catalog.py` | 821 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
 | `enforce.py` | 202 | `enforce` — rewrite a plan so a principal can only read what the catalog allows. |
 | `filters.py` | 144 | Declarative, picklable row-filter factories for attribute-based row access. |
-| `lineage.py` | 213 | Column-level lineage — which source columns each output column is derived from. |
+| `lineage.py` | 212 | Column-level lineage — which source columns each output column is derived from. |
 | `masks.py` | 193 | Declarative, picklable column-mask factories. |
 | `policy.py` | 240 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
@@ -2364,7 +2364,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 487 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6608 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 6795 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2380,7 +2380,7 @@ Migration-error guidance for `Expr` and its typed accessors.
 
 | module | lines | what it is |
 |---|---|---|
-| `guidance.py` | 263 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
+| `guidance.py` | 269 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
 
@@ -2415,8 +2415,8 @@ Shared traversal for scalar `Expr` trees and for the expressions inside a node.
 |---|---|---|
 | `algebra.py` | 192 | Boolean-connective algebra, column substitution, and window hoisting. |
 | `naming.py` | 137 | The output name a positional expression gets when nothing names it. |
-| `nodes.py` | 141 | Apply an expression rewrite to every expression a *plan node* carries. |
-| `over.py` | 206 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
+| `nodes.py` | 129 | Apply an expression rewrite to every expression a *plan node* carries. |
+| `over.py` | 211 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
 | `subtrees.py` | 133 | Structural identity of an expression, and whole-subtree substitution. |
 | `traverse.py` | 291 | The structural ladder for scalar `Expr` trees — child access and rebuilding. |
 
@@ -2426,7 +2426,7 @@ The expression function library, grouped by family.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 523 | Aggregate free functions that compose existing mergeable aggregates. |
+| `aggregate.py` | 541 | Aggregate free functions that compose existing mergeable aggregates. |
 | `aggregate_semantics.py` | 146 | The aggregate parameters that restore another engine's semantics by composition. |
 | `collection.py` | 170 | Collection-construction free functions (`struct`, `named_struct`, `map_from_arrays`, `sequence`). |
 | `horizontal.py` | 261 | Row-wise ("horizontal") reductions across several columns. |
@@ -2555,13 +2555,13 @@ String free functions, in two halves: building text and reading structure out of
 | module | lines | what it is |
 |---|---|---|
 | `_setops.py` | 84 | What makes two set-operation branches compatible. |
-| `aggregate.py` | 292 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
+| `aggregate.py` | 313 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
 | `base.py` | 345 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 666 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
 | `transforms.py` | 678 | Plan transforms and predicates over `LogicalPlan` trees. |
-| `window.py` | 512 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
+| `window.py` | 522 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract
 
@@ -3005,7 +3005,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 578 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1718 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1759 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -3042,28 +3042,29 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg/accum.rs` | 787 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
+| `agg/accum.rs` | 795 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
 | `agg/argextreme.rs` | 128 | ARG_MIN / ARG_MAX — the value at the row with the extreme (min/max) ordering key. |
 | `agg/counted.rs` | 262 | Value-frequency state for the aggregates that only ever ask "how often?". |
-| `agg/dispatch.rs` | 230 | The per-function dispatch: the two steps where the aggregates stop being alike. |
+| `agg/dispatch.rs` | 233 | The per-function dispatch: the two steps where the aggregates stop being alike. |
 | `agg/distinct.rs` | 605 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/fused.rs` | 708 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1709 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 644 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/combine.rs` | 647 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
 | `agg/inputs/mod.rs` | 194 | Bringing an aggregate call's inputs to a type the accumulator kernels read. |
 | `agg/median.rs` | 607 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
-| `agg/mod.rs` | 729 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
+| `agg/mod.rs` | 743 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
+| `agg/ordered_list/mod.rs` | 184 | `array_agg(x ORDER BY k)`: a per-group list whose element order is a property of the rows. |
 | `agg/sketch.rs` | 196 | The sketch-backed aggregates: bounded memory in exchange for a bounded error. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
 | `agg/spill/store.rs` | 800 | The two spill stores and the codec that writes them. |
 | `agg/stats.rs` | 463 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 335 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `byte_key.rs` | 240 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
-| `error.rs` | 125 | The crate's error type: how the stateful runtime structures report failure. |
+| `error.rs` | 131 | The crate's error type: how the stateful runtime structures report failure. |
 | `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 753 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 248 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
@@ -3125,7 +3126,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `depth.rs` | 120 | How deep a plan document is, measured without recursing into it. |
 | `engine_config.rs` | 198 | Execution tunables shipped from the Python control plane alongside the plan. |
 | `error.rs` | 26 | The crate's error type: how a malformed plan IR is rejected at the wire boundary. |
-| `lib.rs` | 929 | `bc-ir` — the query intermediate representation. |
+| `lib.rs` | 938 | `bc-ir` — the query intermediate representation. |
 
 ### `bc-expr`
 

@@ -154,6 +154,7 @@ pub(super) fn accumulate(
         AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => {
             unreachable!("covar/corr handled in partial")
         }
+        AggFunc::ListAggOrdered => unreachable!("ordered list_agg handled in partial"),
     })
 }
 
@@ -175,6 +176,8 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             // array_agg: the collected per-group list IS the result, except a non-null
             // *empty* list (an aggregate over zero rows) becomes NULL to match DuckDB.
             AggFunc::ListAgg => finalize_list_agg(&state[0])?,
+            // The ordered form sorts each group by its encoded keys before the same NULL rule.
+            AggFunc::ListAggOrdered => finalize_ordered_list(state)?,
             AggFunc::ApproxCountDistinct => finalize_approx_distinct(&state[0]),
             AggFunc::ApproxQuantile(q) => finalize_approx_quantile(&state[0], q.get()),
             AggFunc::Mode => counted::finalize_mode(state)?,

@@ -263,9 +263,8 @@ def _consumer_columns(node: LogicalPlan) -> set[str]:
         for key in node.group_keys:
             used |= referenced_columns(key.expr)
         for spec in node.aggregates:
-            for operand in (spec.agg.input, spec.agg.input2):
-                if operand is not None:
-                    used |= referenced_columns(operand)
+            for operand in spec.agg.operands():
+                used |= referenced_columns(operand)
     return used
 
 

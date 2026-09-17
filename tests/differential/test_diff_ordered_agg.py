@@ -1,14 +1,14 @@
 """`string_agg(x ORDER BY y)` / `array_agg(x ORDER BY y)` vs DuckDB.
 
-An ordered aggregate collects its values in a requested order. The list aggregate appends
-in *input* order, so ordering the input once up front reproduces it exactly — the same
-shape as the DISTINCT rewrite's pre-dedup. Previously any `ORDER BY` inside an aggregate
-raised ``unsupported SQL expression: Order``.
+An ordered aggregate collects its values in a requested order. It lowers to the engine's
+ordered list aggregate, which carries its own `ORDER BY` keys through partial, combine and
+finalize, so the order survives a parallel, spilled or distributed run and each aggregate in a
+query keeps its own ordering. It used to be answered by sorting the input first and trusting
+the list aggregate to append in that order, which no partitioned path promises, and which
+could serve only one ordering per query.
 
-The sort is safe for the rest of the query because every other aggregate here is
-order-*independent* (`sum`/`count`/`min`/`max` do not care which order they see rows in).
-Two ordered aggregates wanting *different* orderings cannot share one pass, so that is
-rejected rather than answered with whichever sort happened to win.
+The order-sensitive, every-path coverage is `test_diff_array_agg_ordered.py`; this file keeps
+the SQL shapes.
 """
 
 from __future__ import annotations
@@ -81,8 +81,15 @@ def test_ordering_actually_applies(t):
     assert asc != desc, "ASC and DESC produced the same result"
 
 
-def test_two_different_orderings_reject(t):
-    """One input ordering cannot serve two different ORDER BY clauses."""
-    query = "SELECT string_agg(w, ',' ORDER BY v) AS a, string_agg(w, ',' ORDER BY k) AS b FROM t"
-    with pytest.raises(NotImplementedError, match="different ORDER BY"):
-        bt.sql(query, t=t).collect()
+def test_two_different_orderings_in_one_query(duck, t):
+    """Each ordered aggregate keeps its own ORDER BY, which one pre-sorted input never could.
+
+    Compared as plain strings per output column: a joined string *is* the order, so the row
+    multiset `assert_same` checks already sees a wrong one.
+    """
+    query = (
+        "SELECT string_agg(w, ',' ORDER BY v) AS a, string_agg(w, ',' ORDER BY w DESC) AS b FROM t"
+    )
+    got = bt.sql(query, t=t).collect().to_pydict()
+    assert got == {"a": ["x,y,z,p,q"], "b": ["z,y,x,q,p"]}
+    assert_same(bt.sql(query, t=t).collect(), duck.sql(query))

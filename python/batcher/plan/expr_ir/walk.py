@@ -280,8 +280,8 @@ class AggregateLeafRegistry:
 
 def _reject_nested_aggregate(agg: AggExpr) -> None:
     """An aggregate of an aggregate (``sum(x).mean()``) has no meaning — reject it early."""
-    for part in (agg.input, agg.input2):
-        if part is not None and contains_aggregate(part):
+    for part in agg.operands():
+        if contains_aggregate(part):
             raise PlanError(
                 "an aggregate cannot be nested inside another aggregate "
                 f"(in {agg!r}); aggregate the inner value in a prior group_by()"

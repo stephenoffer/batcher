@@ -705,6 +705,27 @@ def test_w0_aggregate_parameters_decline(label, agg):
     assert gpu_plan_ops(plain._plan) is not None
 
 
+def test_an_ordered_array_agg_declines():
+    """`order_by` on an aggregate is declined by the field, not only because `list_agg` is.
+
+    The node-level check is what a later `list_agg` translation would lean on, so it is pinned
+    on the IR directly: the same `sum` item translates without the field and declines with it.
+    The plan-level case then shows an ordered `array_agg` query falls back as a whole.
+    """
+    from batcher.core.gpu_plan.aggs import supported_aggregate
+
+    item = {"func": "sum", "alias": "s", "input": {"e": "col", "name": "y"}}
+    keyed = {**item, "order_by": [{"expr": {"e": "col", "name": "z"}, "descending": False}]}
+    assert supported_aggregate({"aggregates": [item]})
+    assert not supported_aggregate({"aggregates": [keyed]})
+
+    ds = bt.from_arrow(_table())
+    ordered = ds.group_by("x").agg(r=col("y").array_agg(order_by="z"))
+    assert gpu_plan_ops(ordered._plan) is None
+    # Positive control: the same grouping with a translatable aggregate is taken.
+    assert gpu_plan_ops(ds.group_by("x").agg(r=col("y").sum())._plan) is not None
+
+
 @pytest.mark.parametrize(
     "window",
     [

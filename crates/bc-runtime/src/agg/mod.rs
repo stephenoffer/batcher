@@ -130,6 +130,7 @@ mod distinct_on;
 mod fused;
 mod group;
 pub(crate) mod median;
+mod ordered_list;
 mod sketch;
 pub mod spill;
 mod stats;
@@ -166,6 +167,8 @@ use median::{
     finalize_entropy, finalize_histogram, finalize_list_agg, finalize_mad, finalize_median,
     finalize_quantile, finalize_quantile_disc, listagg_state, median_state, merge_median,
 };
+pub use ordered_list::encode_order_keys;
+use ordered_list::{finalize_ordered_list, merge_ordered_list, ordered_list_state};
 use sketch::{
     approx_distinct_state, approx_quantile_state, finalize_approx_distinct,
     finalize_approx_quantile, merge_approx_distinct, merge_approx_quantile,
@@ -313,6 +316,11 @@ pub enum AggFunc {
     /// `modes` — every most-frequent value, ascending, as a `List`. Same counted state as
     /// `Mode`, of which it is the untruncated form.
     Modes,
+    /// `array_agg(x ORDER BY k)` — `ListAgg` whose element order is defined: by the order
+    /// keys, then by the value (ascending, nulls last). Two-input: the call's `key` is the
+    /// keys pre-encoded by [`encode_order_keys`]. State is two aligned lists (values, encoded
+    /// keys); see `agg::ordered_list` for why the order survives any partitioning.
+    ListAggOrdered,
 }
 
 impl AggFunc {
@@ -338,6 +346,8 @@ impl AggFunc {
             | AggFunc::ArgMinNull
             | AggFunc::ArgMaxNull
             | AggFunc::KahanSum => 2,
+            // The values and their encoded order keys, as two aligned lists.
+            AggFunc::ListAggOrdered => 2,
             // Distinct values AND their counts.
             AggFunc::Mode | AggFunc::Modes | AggFunc::ApproxTopK(_) => 2,
             // Three: (sum, sum_of_squares, count).
@@ -376,7 +386,9 @@ impl AggFunc {
         }
     }
 
-    pub(crate) fn name(self) -> &'static str {
+    /// The snake_case name errors report this aggregate by.
+    #[must_use]
+    pub fn name(self) -> &'static str {
         match self {
             AggFunc::CountStar => "count_star",
             AggFunc::Count => "count",
@@ -425,6 +437,7 @@ impl AggFunc {
             AggFunc::ArgMaxNull => "arg_max_null",
             AggFunc::SkewnessPop => "skewness_pop",
             AggFunc::Modes => "modes",
+            AggFunc::ListAggOrdered => "list_agg_ordered",
         }
     }
 }
@@ -433,7 +446,8 @@ impl AggFunc {
 pub struct AggCall {
     pub func: AggFunc,
     pub values: Option<ArrayRef>,
-    /// Second input — the ordering key for `arg_min`/`arg_max`. `None` for all
+    /// Second input — the ordering key for `arg_min`/`arg_max`, the paired column for
+    /// `covar`/`corr`, or the encoded order keys for `ListAggOrdered`. `None` for all
     /// single-input aggregates.
     pub key: Option<ArrayRef>,
 }

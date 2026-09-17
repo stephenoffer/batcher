@@ -10,7 +10,7 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
-from batcher._sql.parser.agg_rewrites import rewrite_distinct_aggs, sort_for_ordered_aggs
+from batcher._sql.parser.agg_rewrites import rewrite_distinct_aggs
 from batcher._sql.parser.core_utils import (
     _alias_of,
     _has_aggregate,
@@ -267,7 +267,6 @@ def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=
     tr._agg_n = 0
     tr._agg_distinct = {}
     tr._agg_pending_distinct = []
-    tr._agg_order = []
     used_aliases = set(group_cols) | set(group_exprs)
     for p in projections:
         inner = _unwrap_alias(p)
@@ -297,8 +296,6 @@ def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=
                 _register_agg(tr, a, None, used_aliases)
 
     agg_kwargs = dict(tr._agg_map.values())
-    if agg_kwargs and tr._agg_order:
-        ds = sort_for_ordered_aggs(tr, ds)
     if agg_kwargs:
         if tr._agg_distinct:
             # The rewrite returns the relation to group and the aggregates to apply to it,
@@ -470,13 +467,15 @@ def _agg(tr, node) -> AggExpr | Expr:
             )
         arg = node.this
         if isinstance(arg, exp.Order):
-            # `string_agg(x ORDER BY y)` collects x in y's order. The list aggregate appends
-            # in input order, so ordering the *input* once up front gives exactly that —
-            # the same shape as the DISTINCT rewrite's pre-dedup. Recorded here and applied
-            # by the assembler, which checks every ordered aggregate asks for the same sort
-            # (one pass cannot serve two different orderings).
-            tr._agg_order.append((arg.sql(), list(arg.expressions)))
-            arg = arg.this
+            # `array_agg(x ORDER BY y)` / `string_agg(x, sep ORDER BY y)`: the order rides the
+            # aggregate itself, so each ordered aggregate keeps its own keys and the order
+            # survives a parallel, spilled or distributed run. sqlglot normalizes an absent
+            # NULLS clause to `nulls_first=False`, DuckDB's default for ASC and DESC alike.
+            keys = [
+                (tr._scalar(o.this), bool(o.args.get("desc")), bool(o.args.get("nulls_first")))
+                for o in arg.expressions
+            ]
+            return AggExpr("list_agg", tr._scalar(arg.this), order_by=keys)
         return AggExpr("list_agg", tr._scalar(arg))
     mapped = _AGG_FUNCS.get(fname)
     if mapped is None:

@@ -403,6 +403,15 @@ pub struct AggregateItem {
     /// side omits the field at its default, so a linear quantile serializes as it always did.
     #[serde(default)]
     pub interpolation: Option<QuantileInterpolation>,
+    /// The order `list_agg` collects a group's elements in, as `ORDER BY` keys evaluated
+    /// against the aggregate's input rows. Read by `list_agg` alone; the engine refuses it on
+    /// any other aggregate. Empty is `list_agg`'s unordered form, whose element order is
+    /// unspecified. Ties on every key break by the element's own value, ascending with nulls
+    /// last, so an ordered list is a property of the group's rows and not of how they were
+    /// partitioned. `#[serde(default)]` keeps every older plan, and the Python side omits the
+    /// field when there are no keys.
+    #[serde(default)]
+    pub order_by: Vec<SortKey>,
     pub alias: String,
 }
 
@@ -1013,6 +1022,31 @@ mod tests {
                 .is_err(),
             "an interpolation the engine does not have must be rejected, not defaulted"
         );
+    }
+
+    /// An ordered `list_agg` on the wire, in the shape Python's `to_ir()` emits
+    /// (`tests/unit/data/ir_snapshot_golden.json::agg_ordered_list`): `order_by` is a list of
+    /// sort keys, and it is absent on every other aggregate, which must still read as empty.
+    #[test]
+    fn aggregate_order_by_round_trips() {
+        let RelOp::Aggregate { aggregates, .. } = RelOp::from_json(
+            r#"{"op":"aggregate","input":{"op":"scan","source_id":0},"group_keys":[],
+                "aggregates":[
+                  {"func":"list_agg","alias":"xs","input":{"e":"col","name":"x"},
+                   "order_by":[{"expr":{"e":"col","name":"t"},"descending":true,
+                                "nulls_first":false},
+                               {"expr":{"e":"col","name":"u"},"descending":false,
+                                "nulls_first":true}]},
+                  {"func":"list_agg","alias":"ys","input":{"e":"col","name":"x"}}]}"#,
+        )
+        .expect("an ordered list_agg deserializes") else {
+            panic!("expected an Aggregate")
+        };
+        let keys = &aggregates[0].order_by;
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].descending && !keys[0].nulls_first);
+        assert!(!keys[1].descending && keys[1].nulls_first);
+        assert!(aggregates[1].order_by.is_empty());
     }
 
     /// `ignore_nulls` on a value window: present when set, absent (RESPECT NULLS) otherwise.

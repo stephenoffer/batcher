@@ -160,6 +160,25 @@ def _input_label(expr, alias: str) -> str:
     return f"column {expr.name!r}" if isinstance(expr, Col) else f"the input to {alias!r}"
 
 
+def _validate_order_keys(source: LogicalPlan, spec: AggregateSpec) -> None:
+    """Refuse ``order_by`` keys on an aggregate that has no element order to give them.
+
+    Only ``list_agg`` collects in an order; the engine refuses keys anywhere else, and saying
+    so at build time names the aggregate instead of failing after the scan. The keys reach
+    the same row encoder a sort uses, so a ``map`` key is refused here as it is there.
+    """
+    if spec.agg.func != "list_agg":
+        raise PlanError(
+            f"aggregate {spec.agg.func!r} for {spec.alias!r} does not take order_by keys; "
+            "only array_agg does"
+        )
+    validate_key_domains(
+        source,
+        [(key, spec.alias) for key, _, _ in spec.agg.order_by],
+        operation="array_agg(order_by=...)",
+    )
+
+
 #: The aggregates that pick one row by an order key: `first`/`last` and `min_by`/`max_by`,
 #: each with its null-keeping `_null` form. Without the key they have no defined answer.
 _ORDERED_PICKS = frozenset({"arg_min", "arg_max", "arg_min_null", "arg_max_null"})
@@ -201,8 +220,10 @@ class Aggregate(LogicalPlan):
 
                 name = "first" if spec.agg.func.startswith("arg_min") else "last"
                 raise PlanError(missing_order_message(name))
-            if spec.agg.input is not None:
-                _validate_refs(spec.agg.input, available, what=f"aggregate {spec.alias!r}")
+            for operand in spec.agg.operands():
+                _validate_refs(operand, available, what=f"aggregate {spec.alias!r}")
+            if spec.agg.order_by:
+                _validate_order_keys(self.input, spec)
         _validate_agg_input_types(self.input, self.aggregates)
         # A `map` key reaches the engine's row encoder as an internal "Row format support
         # not yet implemented" dump, after the scan, naming neither the column nor the

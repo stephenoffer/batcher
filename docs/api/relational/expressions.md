@@ -192,11 +192,11 @@ Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
 `Map<value, count>` of each group's values, DuckDB `histogram`), `.count()`, `.n_unique()`
 (aliased `.count_distinct()`), `.mode()`, `.bool_and()`, `.bool_or()`,
 `.bit_and()` / `.bit_or()` / `.bit_xor()` (bitwise reduction of the non-null
-`Int64` values in each group), `.array_agg()` (collect each group's values into a
-`List`; SQL `array_agg` /
+`Int64` values in each group), `.array_agg(order_by=…)` (collect each group's values into a
+`List`; SQL `array_agg(x ORDER BY k)` /
 Spark `collect_list`), {py:meth}`.min_by(by) <batcher.plan.expr_ir.core.Expr.min_by>` / {py:meth}`.max_by(by) <batcher.plan.expr_ir.core.Expr.max_by>` (the value at the
-row with the extreme `by` key), {py:meth}`.arg_min() <batcher.plan.expr_ir.core.Expr.arg_min>` / {py:meth}`.arg_max() <batcher.plan.expr_ir.core.Expr.arg_max>` (the 0-based position of the group's extreme value, Polars `arg_min`/`arg_max`), and `.first(order_by=…)` / `.last(order_by=…)`
-(the value at the first or last row in `order_by` order). `order_by` is required there, because an arrival-order first or last wouldn't be partition-independent. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
+row with the extreme `by` key), {py:meth}`.arg_min(order_by=…) <batcher.plan.expr_ir.core.Expr.arg_min>` / {py:meth}`.arg_max(order_by=…) <batcher.plan.expr_ir.core.Expr.arg_max>` (the 0-based position of the group's extreme value along `order_by`, Polars `arg_min`/`arg_max`), and `.first(order_by=…)` / `.last(order_by=…)`
+(the value at the first or last row in `order_by` order). `order_by` is required for the positions, first and last, because an arrival-order position wouldn't be partition-independent. `array_agg` accepts no `order_by` too, and then returns each group's elements in an unspecified order: the same elements on every execution path, but not the same sequence. Rows that tie on every `order_by` key are ordered by their value, ascending with nulls last, so an ordered list is the same however the rows were partitioned. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
 
 The assembly-contiguity aggregates measure how a set of lengths is distributed *by base*
 rather than by item, the measure genome-assembly quality is judged on:

@@ -23,7 +23,7 @@ import dataclasses
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
-from batcher.plan.expr_ir import AggExpr, Col, Expr, referenced_columns
+from batcher.plan.expr_ir import Col, Expr, referenced_columns
 from batcher.plan.expr_ir.walk import column_occurrence_counts
 from batcher.plan.expr_rewrite import (
     combine_conjuncts,
@@ -198,18 +198,8 @@ def projection_inlining_into_agg(node: Aggregate, _ctx: OptimizerContext) -> Log
     new_keys = tuple(Projection(k.alias, subst(k.expr)) for k in node.group_keys)
     new_aggs = []
     for spec in node.aggregates:
-        if spec.agg.input is None:
-            new_aggs.append(spec)
-            continue
-        input2 = subst(spec.agg.input2) if spec.agg.input2 is not None else None
-        agg = AggExpr(
-            spec.agg.func,
-            subst(spec.agg.input),
-            param=spec.agg.param,
-            input2=input2,
-            interpolation=spec.agg.interpolation,
-        )
-        new_aggs.append(dataclasses.replace(spec, agg=agg))
+        agg = spec.agg.map_operands(subst)
+        new_aggs.append(spec if agg is spec.agg else dataclasses.replace(spec, agg=agg))
     # The watermark names an event-time column of the aggregate's *input*. Dropping the
     # projection re-parents the aggregate onto `proj.input`, where that column may be
     # known by its pre-rename name — so the watermark has to be remapped through the
@@ -421,11 +411,10 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         for key in node.group_keys:
             child_need |= referenced_columns(key.expr)
         for spec in node.aggregates:
-            if spec.agg.input is not None:
-                child_need |= referenced_columns(spec.agg.input)
-            # arg_min/arg_max also reference an ordering key (the second input).
-            if spec.agg.input2 is not None:
-                child_need |= referenced_columns(spec.agg.input2)
+            # The input plus any ordering key: arg_min/arg_max's second input, or an ordered
+            # array_agg's order_by keys.
+            for operand in spec.agg.operands():
+                child_need |= referenced_columns(operand)
         # A watermark's event-time column is read by the streaming driver, not by any
         # expression in the plan, so column pruning cannot see that it is needed. Pruning
         # it away leaves the driver with no clock: the watermark never advances, closed
@@ -811,10 +800,8 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
         for key in node.group_keys:
             child_need |= referenced_columns(key.expr)
         for spec in node.aggregates:
-            if spec.agg.input is not None:
-                child_need |= referenced_columns(spec.agg.input)
-            if spec.agg.input2 is not None:
-                child_need |= referenced_columns(spec.agg.input2)
+            for operand in spec.agg.operands():
+                child_need |= referenced_columns(operand)
         _visit(node.input, child_need, acc)
 
     elif isinstance(node, Sort):

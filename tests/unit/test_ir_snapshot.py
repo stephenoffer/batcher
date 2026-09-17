@@ -275,6 +275,11 @@ def _representatives() -> dict[str, Any]:
         "q25"
     )
     out["agg_binary"] = AggExpr("corr", _X, input2=_Y).to_ir("r")
+    # An ordered array_agg: `order_by` present only with keys, so `agg_unary` above proves an
+    # aggregate without them still serializes without the field.
+    out["agg_ordered_list"] = AggExpr(
+        "list_agg", _X, order_by=[(_Y, True, False), (_X, False, True)]
+    ).to_ir("xs")
     return out
 
 

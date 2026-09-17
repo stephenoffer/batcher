@@ -139,9 +139,8 @@ def _lineage(node: LogicalPlan, tables: Sequence[str]) -> LineageMap:
         out = {key.alias: _from(child, key.expr) for key in node.group_keys}
         for spec in node.aggregates:
             origins: frozenset[Origin] = frozenset()
-            for arg in (spec.agg.input, spec.agg.input2):
-                if arg is not None:
-                    origins |= _from(child, arg)
+            for arg in spec.agg.operands():
+                origins |= _from(child, arg)
             out[spec.alias] = origins  # `count()` has no input → no origin
         return out
 

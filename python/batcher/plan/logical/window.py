@@ -360,11 +360,14 @@ def _order_dependent_label(fn: WindowFuncSpec) -> str:
     return _METHODS_BY_FUNC.get(fn.func, fn.func)
 
 
-def missing_order_message(func: str) -> str:
+def missing_order_message(func: str, *, over: bool = True) -> str:
     """The refusal every order-dependent expression gives when it has no ``order_by``.
 
     Args:
         func: The function or method name to name in the message.
+        over: Whether the expression also takes its order from ``.over(order_by=...)``, so
+            the message offers that spelling too. The positional aggregates (``arg_min``)
+            have no window form and take ``order_by=`` only.
 
     Returns:
         The error message, naming ``order_by=`` and the ``with_row_index`` fix.
@@ -375,12 +378,19 @@ def missing_order_message(func: str) -> str:
             >>> from batcher.plan.logical.window import missing_order_message
             >>> "with_row_index" in missing_order_message("shift")
             True
+            >>> ".over" in missing_order_message("arg_min", over=False)
+            False
     """
+    spelling = (
+        "pass order_by=... or bind it with .over(order_by=...)"
+        if over
+        else "pass the keys as order_by=<keys>"
+    )
     return (
-        f"{func} depends on row order and requires order_by keys: pass order_by=... or "
-        "bind it with .over(order_by=...). Batcher keeps no arrival order across a parallel "
-        "or distributed scan, so if the data has no ordering column, number the rows right "
-        'after reading with .with_row_index("_row") and order by "_row".'
+        f"{func} depends on row order and requires order_by keys: {spelling}. Batcher keeps "
+        "no arrival order across a parallel or distributed scan, so if the data has no "
+        "ordering column, number the rows right after reading with "
+        '.with_row_index("_row") and order by "_row".'
     )
 
 

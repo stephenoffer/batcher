@@ -15,6 +15,7 @@ import pytest
 
 import batcher as bt
 from batcher import col
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import AggExpr
 
 
@@ -31,8 +32,12 @@ def test_value_by_extreme_moved_to_max_by_and_min_by():
 
 
 def test_arg_max_and_arg_min_are_positions():
-    ds = bt.from_pydict({"x": [None, 5, 2, 5, -1]})
-    assert ds.agg(i=col("x").arg_max(), j=col("x").arg_min()).to_pydict() == {"i": [1], "j": [4]}
+    ds = bt.from_pydict({"x": [None, 5, 2, 5, -1]}).with_row_index("_row")
+    got = ds.agg(i=col("x").arg_max(order_by="_row"), j=col("x").arg_min(order_by="_row"))
+    assert got.to_pydict() == {"i": [1], "j": [4]}
+    # A position needs an order: the unordered call is refused, not numbered by arrival.
+    with pytest.raises(PlanError, match="requires order_by"):
+        col("x").arg_max()
 
 
 def test_top_level_value_by_names_are_gone_with_guidance():

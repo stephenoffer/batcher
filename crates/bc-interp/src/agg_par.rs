@@ -1179,6 +1179,7 @@ mod tests {
             func: AggFunc::Sum,
             input: Some(Expr::Col { name: "v".into() }),
             input2: None,
+            order_by: Vec::new(),
             alias: "s".into(),
             param: None,
             interpolation: None,

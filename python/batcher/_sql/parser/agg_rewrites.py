@@ -1,7 +1,9 @@
 """Aggregate pre-pass rewrites for the SQL translator.
 
-Two rewrites that reshape the *input* so an aggregate the engine cannot express directly
-becomes one it can: DISTINCT aggregates (dedup first) and ordered aggregates (sort first).
+A rewrite that reshapes the *input* so an aggregate the engine cannot express directly
+becomes one it can: DISTINCT aggregates (dedup first). An ordered aggregate
+(`array_agg(x ORDER BY y)`) needs no rewrite; it lowers to the engine's ordered list
+aggregate, which carries its own keys.
 
 `<agg>(DISTINCT x)` per group is `<agg>(x)` over the rows left once duplicate `x` values
 are removed *within* each group. Two shapes are handled:
@@ -21,12 +23,10 @@ argument — and because that module is at its size limit.
 
 from __future__ import annotations
 
-from sqlglot import expressions as exp
-
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import AggExpr, Expr, col
 
-__all__ = ["rewrite_distinct_aggs", "sort_for_ordered_aggs"]
+__all__ = ["rewrite_distinct_aggs"]
 
 
 def _undecomposable_message(names: list[str]) -> str:
@@ -154,38 +154,3 @@ def rewrite_distinct_aggs(
     }
     level2.update({name: AggExpr(_DECOMPOSABLE[a.func], col(name)) for name, a in plain.items()})
     return level1, level2
-
-
-def sort_for_ordered_aggs(tr, ds: Dataset) -> Dataset:
-    """Sort the input so `string_agg(x ORDER BY y)` collects in `y`'s order.
-
-    The list aggregate appends in input order, so ordering the input once reproduces the
-    ordered aggregate exactly. Every other aggregate in the query is order-*independent*
-    (`sum`/`count`/`min`/`max` do not care), so the sort cannot change their results.
-
-    Two ordered aggregates asking for *different* orderings cannot both be served by one
-    pass, so that is rejected rather than answered with whichever sort happened to win.
-
-    Args:
-        tr: The translator, carrying the orderings collected during registration.
-        ds: The dataset to sort.
-
-    Returns:
-        The dataset sorted by the requested ordering.
-    """
-    distinct_orders = {sql for sql, _ in tr._agg_order}
-    if len(distinct_orders) > 1:
-        raise NotImplementedError(
-            "two aggregates with different ORDER BY clauses in one query are not supported "
-            f"(got {sorted(distinct_orders)}); one input ordering cannot serve both, so "
-            "compute them in separate subqueries"
-        )
-    keys, descending = [], []
-    for item in tr._agg_order[0][1]:
-        if not isinstance(item.this, exp.Column):
-            raise NotImplementedError(
-                f"an aggregate's ORDER BY supports plain columns only; got {item.this.sql()!r}"
-            )
-        keys.append(item.this.name)
-        descending.append(bool(item.args.get("desc")))
-    return ds.sort(*keys, descending=descending)

@@ -21,6 +21,32 @@
     "interpolation": "nearest",
     "param": 0.25
   },
+  "agg_ordered_list": {
+    "alias": "xs",
+    "func": "list_agg",
+    "input": {
+      "e": "col",
+      "name": "x"
+    },
+    "order_by": [
+      {
+        "descending": true,
+        "expr": {
+          "e": "col",
+          "name": "y"
+        },
+        "nulls_first": false
+      },
+      {
+        "descending": false,
+        "expr": {
+          "e": "col",
+          "name": "x"
+        },
+        "nulls_first": true
+      }
+    ]
+  },
   "agg_param": {
     "alias": "p50",
     "func": "quantile",

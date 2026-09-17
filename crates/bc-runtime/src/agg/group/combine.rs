@@ -17,7 +17,8 @@ use super::assign::assign_groups;
 use super::hash::hash_partial_keys;
 use crate::agg::{
     accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_counted,
-    merge_covar, merge_distinct, merge_median, merge_moments, merge_welford, AggFunc, Partial,
+    merge_covar, merge_distinct, merge_median, merge_moments, merge_ordered_list, merge_welford,
+    AggFunc, Partial,
 };
 use crate::error::RuntimeError;
 
@@ -356,6 +357,8 @@ pub(crate) fn merge_state(
         | AggFunc::QuantileDisc(_) => {
             vec![merge_median(&state[0], group_ids, num_groups)?]
         }
+        // Two aligned lists, concatenated under the same group ids so they stay aligned.
+        AggFunc::ListAggOrdered => merge_ordered_list(state, group_ids, num_groups)?,
         // Counted states merge by summing the counts of equal values (see `agg::counted`);
         // addition is associative and commutative, which is this pair's mergeability.
         AggFunc::Mode | AggFunc::Modes | AggFunc::ApproxTopK(_) => {

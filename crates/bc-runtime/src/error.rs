@@ -12,6 +12,12 @@ pub enum RuntimeError {
     #[error("aggregate {func} requires an input column")]
     MissingAggregateInput { func: String },
 
+    /// An `order_by` on an aggregate whose answer does not depend on row order. Only the list
+    /// aggregate collects in an order; accepting the keys anywhere else would read as a
+    /// request the engine honoured when it ignored it.
+    #[error("aggregate {func} does not take order_by keys; only list_agg (array_agg) does")]
+    OrderByNotSupported { func: String },
+
     #[error("integer SUM overflowed i64; cast the column to a wider type first")]
     SumOverflow,
 

@@ -21,7 +21,7 @@ import datetime as _dt
 import decimal as _decimal
 import itertools
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError, require_float, require_int
@@ -52,6 +52,9 @@ if TYPE_CHECKING:
 
 # A value that can be promoted to an expression: another Expr or a Python scalar.
 IntoExpr = Union["Expr", int, float, bool, str]
+#: One ``ORDER BY`` key of an ordered aggregate: the key expression, ``descending``, and
+#: ``nulls_first`` -- the fields of the engine's ``SortKey``.
+AggOrderKey = tuple["Expr", bool, bool]
 
 
 def _wrap(value: IntoExpr) -> Expr:
@@ -3882,53 +3885,106 @@ class Expr:
         func = "arg_max" if ignore_nulls else "arg_max_null"
         return AggExpr(func, self, input2=_col_or_expr(by))
 
-    def arg_min(self) -> Expr:
+    def arg_min(
+        self,
+        *,
+        order_by: IntoExpr | Iterable[IntoExpr] | None = None,
+        descending: bool | Sequence[bool] = False,
+        nulls_last: bool | Sequence[bool] = True,
+    ) -> Expr:
         """The 0-based position of the group's smallest non-null value (Polars ``arg_min``).
 
-        The first position wins a tie, and a group with no non-null value is null.
-        Positions count the group's rows in arrival order, nulls included, so the answer
-        is only as defined as that order: sort first when it matters. Composed as
-        :meth:`array_agg` followed by the list's own ``arg_min``. The *value* at another
-        column's minimum is :meth:`min_by`.
+        A position only means something along an order, so `order_by` is **required**: the
+        rows are numbered in that order, nulls included, and the first position wins a tie on
+        the value. A group with no non-null value is null. Composed as the ordered
+        :meth:`array_agg` followed by the list's own ``arg_min``, so rows that tie on every
+        order key are numbered by their value, as there. The *value* at another column's
+        minimum is :meth:`min_by`.
+
+        `order_by` is keyword-only on purpose: ``arg_min(key)`` was the value-by-key
+        aggregate before it became :meth:`min_by`, and a positional key here would quietly
+        give that old call a new meaning instead of refusing it.
+
+        Args:
+            order_by: The key or keys that number the rows. For data with no ordering
+                column, number the rows at the source with ``with_row_index("_row")``.
+            descending: Number from the largest key, for every key or per key.
+            nulls_last: Number rows with a null key after the others, for every key or per
+                key.
 
         Returns:
             An Int64 expression over an aggregate, for use in ``agg(...)``.
+
+        Raises:
+            PlanError: If no `order_by` is given.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [4, None, 1, 1]})
-                >>> ds.agg(r=bt.col("x").arg_min()).to_pydict()
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [4, None, 1, 1]})
+                >>> ds.agg(r=bt.col("x").arg_min(order_by="t")).to_pydict()
                 {'r': [2]}
+                >>> ds.agg(r=bt.col("x").arg_min(order_by="t", descending=True)).to_pydict()
+                {'r': [0]}
         """
-        from batcher.plan.expr_ir.func_nodes import ListFunc
+        return self._position_of("arg_min", order_by, descending, nulls_last)
 
-        return ListFunc("arg_min", self.array_agg())
-
-    def arg_max(self) -> Expr:
+    def arg_max(
+        self,
+        *,
+        order_by: IntoExpr | Iterable[IntoExpr] | None = None,
+        descending: bool | Sequence[bool] = False,
+        nulls_last: bool | Sequence[bool] = True,
+    ) -> Expr:
         """The 0-based position of the group's largest non-null value (Polars ``arg_max``).
 
-        The first position wins a tie, and a group with no non-null value is null.
-        Positions count the group's rows in arrival order, nulls included, so the answer
-        is only as defined as that order: sort first when it matters. Composed as
-        :meth:`array_agg` followed by the list's own ``arg_max``. The *value* at another
-        column's maximum is :meth:`max_by`.
+        As :meth:`arg_min`, `order_by` is **required** and numbers the rows, nulls included;
+        the first position wins a tie on the value, and a group with no non-null value is
+        null. The *value* at another column's maximum is :meth:`max_by`.
+
+        Args:
+            order_by: The key or keys that number the rows.
+            descending: Number from the largest key, for every key or per key.
+            nulls_last: Number rows with a null key after the others, for every key or per
+                key.
 
         Returns:
             An Int64 expression over an aggregate, for use in ``agg(...)``.
+
+        Raises:
+            PlanError: If no `order_by` is given.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [None, 5, 2, 5]})
-                >>> ds.agg(r=bt.col("x").arg_max()).to_pydict()
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [None, 5, 2, 5]})
+                >>> ds.agg(r=bt.col("x").arg_max(order_by="t")).to_pydict()
                 {'r': [1]}
         """
-        from batcher.plan.expr_ir.func_nodes import ListFunc
+        return self._position_of("arg_max", order_by, descending, nulls_last)
 
-        return ListFunc("arg_max", self.array_agg())
+    def _position_of(
+        self,
+        fn: str,
+        order_by: IntoExpr | Iterable[IntoExpr] | None,
+        descending: bool | Sequence[bool],
+        nulls_last: bool | Sequence[bool],
+    ) -> Expr:
+        """`fn` (``arg_min``/``arg_max``) over the group's values collected in `order_by` order.
+
+        Refused without an order rather than numbered by arrival, which a morselized or
+        distributed scan does not fix. There is no ``.over(order_by=...)`` form to defer to:
+        the list aggregate has no window, so the refusal names only ``order_by=``.
+        """
+        from batcher.plan.expr_ir.func_nodes import ListFunc
+        from batcher.plan.logical.window import missing_order_message
+
+        if order_by is None or not normalize_key_list(order_by):
+            raise PlanError(missing_order_message(fn, over=False))
+        collected = self.array_agg(order_by=order_by, descending=descending, nulls_last=nulls_last)
+        return ListFunc(fn, collected)  # type: ignore[arg-type]
 
     def bool_and(self, *, empty_value: bool | None = None) -> AggExpr | Expr:
         """Logical AND of this boolean expression's non-null values per group.
@@ -4084,42 +4140,69 @@ class Expr:
         """
         return AggExpr("histogram", self)
 
-    def array_agg(self, *, ignore_nulls: bool = False) -> AggExpr | Expr:
+    def array_agg(
+        self,
+        *,
+        order_by: IntoExpr | Iterable[IntoExpr] | None = None,
+        descending: bool | Sequence[bool] = False,
+        nulls_last: bool | Sequence[bool] = True,
+        ignore_nulls: bool = False,
+    ) -> AggExpr | Expr:
         """Collect each group's values (including nulls) into a ``List`` (SQL ``array_agg``).
 
         Like DuckDB ``array_agg``/``list``: null elements are kept, so a group of
         ``[10, None, 30]`` collects to ``[10, None, 30]``. An aggregate over zero rows
-        (a global ``array_agg`` on an empty relation) is NULL, not ``[]``. Without an
-        explicit order the element order is arrival-dependent. Mergeable — the per-group
-        value list is the partial state, so the result is the same single-node and
-        distributed.
+        (a global ``array_agg`` on an empty relation) is NULL, not ``[]``. Mergeable: the
+        result is the same single-node and distributed.
+
+        ``order_by`` fixes the element order, as DuckDB's ``array_agg(x ORDER BY k)`` does:
+        by each key in turn, ``descending`` and ``nulls_last`` applying to every key or to
+        each, and then, for rows that tie on every key, by the value itself, ascending with
+        nulls last. That last rule is what makes the list the same however the rows were
+        partitioned, spilled or shuffled. **Without** ``order_by`` the elements come back in
+        no specified order, the same multiset on every path but not the same sequence, so
+        use it whenever a position in the list matters.
 
         Chain a list reduction on the result column to summarize it, e.g.
-        ``ds.group_by("g").agg(tags=col("t").array_agg())`` then
+        ``ds.group_by("g").agg(tags=col("t").array_agg(order_by="ts"))`` then
         ``col("tags").list.join(",")``.
 
         ``ignore_nulls=True`` leaves the nulls out, as Spark's ``collect_list`` and
         ``array_agg`` do, so a group of only nulls collects to ``[]``.
 
         Args:
+            order_by: The key or keys that order the elements; none leaves the order
+                unspecified.
+            descending: Order from the largest key, for every key or per key.
+            nulls_last: Place elements whose key is null after the others, for every key or
+                per key.
             ignore_nulls: Whether to leave null values out of the list.
 
         Returns:
-            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+            An aggregate expression for use in ``group_by().agg(...)``.
+
+        Raises:
+            PlanError: If ``descending`` or ``nulls_last`` is a sequence whose length is not
+                the number of ``order_by`` keys.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10]})
-                >>> ds.group_by("g").agg(r=bt.col("x").array_agg()).sort("g").to_pydict()
-                {'g': ['a', 'b'], 'r': [[1, 2], [10]]}
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10], "t": [2, 1, 0]})
+                >>> r = bt.col("x").array_agg(order_by="t")
+                >>> ds.group_by("g").agg(r=r).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'r': [[2, 1], [10]]}
+
+                >>> ds.agg(r=bt.col("x").array_agg(order_by="t", descending=True)).to_pydict()
+                {'r': [[1, 2, 10]]}
 
                 >>> nulls = bt.from_pydict({"x": [1, None]})
                 >>> nulls.agg(r=bt.col("x").array_agg(ignore_nulls=True)).to_pydict()
                 {'r': [[1]]}
         """
-        agg = AggExpr("list_agg", self)
+        keys = _agg_order_keys(order_by, descending, nulls_last, func="array_agg")
+        agg = AggExpr("list_agg", self, order_by=keys)
         if not ignore_nulls:
             return agg
         from batcher.plan.functions import aggregate_semantics as sem
@@ -6167,6 +6250,36 @@ FrameSpec = Union[
 ]
 
 
+def _agg_order_keys(
+    order_by: IntoExpr | Iterable[IntoExpr] | None,
+    descending: bool | Sequence[bool],
+    nulls_last: bool | Sequence[bool],
+    *,
+    func: str,
+) -> tuple[AggOrderKey, ...]:
+    """Normalize an ordered aggregate's ``order_by``/``descending``/``nulls_last`` into keys.
+
+    A string names a column, as for every ordering argument. Each flag is one boolean for
+    every key or a sequence with one per key; a sequence of the wrong length is refused
+    rather than silently zipped short.
+    """
+    keys = [_col_or_expr(k) for k in normalize_key_list(order_by)]
+
+    def per_key(flag: bool | Sequence[bool], name: str) -> list[bool]:
+        if isinstance(flag, bool):
+            return [flag] * len(keys)
+        flags = [bool(f) for f in flag]
+        if len(flags) != len(keys):
+            raise PlanError(
+                f"{func}(): {name} has {len(flags)} flag(s) for {len(keys)} order_by key(s)"
+            )
+        return flags
+
+    desc = per_key(descending, "descending")
+    last = per_key(nulls_last, "nulls_last")
+    return tuple((key, d, not n) for key, d, n in zip(keys, desc, last, strict=True))
+
+
 def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr] | None) -> list[IntoExpr]:
     """Normalize a ``partition_by``/``order_by`` argument to a list of key expressions.
 
@@ -6212,7 +6325,7 @@ class AggExpr:
             {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
-    __slots__ = ("func", "input", "input2", "interpolation", "name", "param")
+    __slots__ = ("func", "input", "input2", "interpolation", "name", "order_by", "param")
 
     def __init__(
         self,
@@ -6223,6 +6336,7 @@ class AggExpr:
         param: float | None = None,
         name: str | None = None,
         interpolation: str | None = None,
+        order_by: Iterable[AggOrderKey] = (),
     ) -> None:
         """Construct an aggregate over an optional input, plus an optional `input2` or `param`."""
         self.func = func
@@ -6242,6 +6356,69 @@ class AggExpr:
         # quantile serializes as it always has. Every site that rebuilds an `AggExpr` from
         # another must carry it, or a `nearest` quantile silently turns linear.
         self.interpolation = interpolation
+        # The `ORDER BY` keys an ordered `list_agg` collects in, as `(expr, descending,
+        # nulls_first)`. Empty for every other aggregate and omitted from the IR, so an
+        # unordered `array_agg` serializes as it always has. The same carry rule as
+        # `interpolation` applies, which is what `map_operands` exists to make mechanical.
+        self.order_by: tuple[AggOrderKey, ...] = tuple(order_by)
+
+    def operands(self) -> tuple[Expr, ...]:
+        """Every expression this aggregate reads: its input, second input, and order keys.
+
+        The one list a column walk, a nesting check or a lineage pass needs. Reading
+        ``input`` and ``input2`` by hand is how a new operand gets missed, and a missed
+        order key is a column that pruning removes from under the aggregate.
+
+        Returns:
+            The operand expressions, in field order, skipping the absent ones.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> agg = bt.col("x").array_agg(order_by="t")
+                >>> [e.name for e in agg.operands()]
+                ['x', 't']
+        """
+        parts = [self.input, self.input2, *(key for key, _, _ in self.order_by)]
+        return tuple(part for part in parts if part is not None)
+
+    def map_operands(self, fn: Callable[[Expr], Expr]) -> AggExpr:
+        """This aggregate with `fn` applied to every operand, every other field carried over.
+
+        Args:
+            fn: The rewrite to apply to each operand expression.
+
+        Returns:
+            The rebuilt aggregate, or this one when `fn` changed no operand.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> agg = bt.col("x").array_agg(order_by="t", descending=True)
+                >>> renamed = agg.map_operands(lambda e: bt.col(e.name.upper()))
+                >>> [e.name for e in renamed.operands()], renamed.order_by[0][1]
+                (['X', 'T'], True)
+        """
+        new_input = None if self.input is None else fn(self.input)
+        new_input2 = None if self.input2 is None else fn(self.input2)
+        new_order = tuple((fn(key), desc, nulls_first) for key, desc, nulls_first in self.order_by)
+        if (
+            new_input is self.input
+            and new_input2 is self.input2
+            and all(new[0] is old[0] for new, old in zip(new_order, self.order_by, strict=True))
+        ):
+            return self
+        return AggExpr(
+            self.func,
+            new_input,
+            input2=new_input2,
+            param=self.param,
+            name=self.name,
+            interpolation=self.interpolation,
+            order_by=new_order,
+        )
 
     def __repr__(self) -> str:
         """A source-like rendering, e.g. ``col('x').sum()`` or ``count()``."""
@@ -6252,6 +6429,10 @@ class AggExpr:
             args.append(repr(self.param))
         if self.interpolation is not None:
             args.append(repr(self.interpolation))
+        if self.order_by:
+            # Part of the aggregate's identity: `AggregateLeafRegistry` deduplicates by this
+            # rendering, so two orderings of one column must not render alike.
+            args.append(f"order_by={list(self.order_by)!r}")
         call = f"{self.func}({', '.join(args)})"
         rendered = call if self.input is None else f"{self.input!r}.{call}"
         return rendered if self.name is None else f"{rendered}.alias({self.name!r})"
@@ -6288,6 +6469,7 @@ class AggExpr:
             param=self.param,
             name=name,
             interpolation=self.interpolation,
+            order_by=self.order_by,
         )
 
     def to_ir(self, alias: str | None = None) -> dict[str, Any]:
@@ -6323,6 +6505,11 @@ class AggExpr:
             item["param"] = self.param
         if self.interpolation is not None:
             item["interpolation"] = self.interpolation
+        if self.order_by:
+            item["order_by"] = [
+                {"expr": key.to_ir(), "descending": desc, "nulls_first": nulls_first}
+                for key, desc, nulls_first in self.order_by
+            ]
         return item
 
     def over(

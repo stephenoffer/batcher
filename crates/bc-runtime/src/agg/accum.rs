@@ -10,7 +10,9 @@ use arrow::array::{
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Decimal128Type, Float64Type, Int64Type};
 
-use super::{accumulate, arg_extreme_state, covar_state, AggCall, AggFunc, Partial};
+use super::{
+    accumulate, arg_extreme_state, covar_state, ordered_list_state, AggCall, AggFunc, Partial,
+};
 use crate::error::RuntimeError;
 
 /// Produce the partial-state columns for one aggregate call. The two-input functions
@@ -32,6 +34,12 @@ pub(super) fn accumulate_call(
                 matches!(call.func, AggFunc::ArgMin | AggFunc::ArgMax),
             )
         }
+        AggFunc::ListAggOrdered => ordered_list_state(
+            require(call.values.as_ref(), call.func)?,
+            require(call.key.as_ref(), call.func)?,
+            group_ids,
+            num_groups,
+        ),
         AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => covar_state(
             require(call.values.as_ref(), call.func)?,
             require(call.key.as_ref(), call.func)?,

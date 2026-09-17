@@ -300,8 +300,8 @@ def test_top_k_is_the_largest_values_and_arg_extremes_are_positions(duck):
         .agg(
             top=col("x").top_k(2),
             freq=col("x").mode_top_k(1),
-            imax=col("x").arg_max(),
-            imin=col("x").arg_min(),
+            imax=col("x").arg_max(order_by="id"),
+            imin=col("x").arg_min(order_by="id"),
         )
     )
     assert_same(

@@ -247,11 +247,11 @@ _NEEDS_ORDER: dict[str, str] = {
     ),
     "idxmax": (
         "There is no row index. For the row itself use ds.sort('x', descending=True).head(1); "
-        "for the argmax within a group use bt.col('x').arg_max()."
+        "for the argmax within a group use bt.col('x').arg_max(order_by=...)."
     ),
     "idxmin": (
         "There is no row index. For the row itself use ds.sort('x').head(1); "
-        "for the argmin within a group use bt.col('x').arg_min()."
+        "for the argmin within a group use bt.col('x').arg_min(order_by=...)."
     ),
 }
 
