@@ -29,7 +29,7 @@ fill_null = { status = "param", batcher = "Dataset.fill_null", need = "limit= an
 filter = { status = "canonical", batcher = "Dataset.filter" }
 first = { status = "mismatch", batcher = "Dataset.first", note = "Polars LazyFrame.first() is a one-row LazyFrame; Batcher's first() executes and returns a tuple", wave = "W0" }
 gather_every = { status = "canonical", batcher = "Dataset.gather_every" }
-group_by = { status = "param", batcher = "Dataset.group_by", need = "maintain_order= (parsed as a key name today) and expression keys", wave = "WF", template = 'group_by(*by, maintain_order=False) -> self.group_by(sem.column_names(by), sem.expect(maintain_order, False))' }
+group_by = { status = "param", batcher = "Dataset.group_by", template = 'group_by(*by, maintain_order=False) -> self.group_by(sem.column_names(by), maintain_order=maintain_order)', need = "expression keys", wave = "WF" }
 group_by_dynamic = { status = "param", batcher = "bt.window", need = "frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start_by=, include_boundaries=", wave = "W5" }
 head = { status = "alias", batcher = "Dataset.limit", template = 'head(n=5) -> self.limit(n)' }
 inspect = { status = "gap", need = "Dataset.inspect (print the frame mid-plan)", wave = "W8" }
@@ -124,7 +124,7 @@ get_column = { status = "mismatch", batcher = "Dataset.select", note = "returns 
 get_column_index = { status = "gap", need = "Dataset.get_column_index", wave = "W8" }
 get_columns = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port", wave = "W8" }
 glimpse = { status = "canonical", batcher = "Dataset.glimpse" }
-group_by = { status = "param", batcher = "Dataset.group_by", need = "maintain_order= (parsed as a key name today) and expression keys", wave = "WF", template = 'group_by(*by, maintain_order=False) -> self.group_by(sem.column_names(by), sem.expect(maintain_order, False))' }
+group_by = { status = "param", batcher = "Dataset.group_by", template = 'group_by(*by, maintain_order=False) -> self.group_by(sem.column_names(by), maintain_order=maintain_order)', need = "expression keys", wave = "WF" }
 group_by_dynamic = { status = "param", batcher = "bt.window", need = "frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start_by=, include_boundaries=", wave = "W5" }
 hash_rows = { status = "mismatch", batcher = "bt.hash_rows", note = "different hash function: values never agree with Polars. Param: seed= and algorithm choice", wave = "W0" }
 head = { status = "alias", batcher = "Dataset.limit", template = 'head(n=5) -> self.limit(n)' }

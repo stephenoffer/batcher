@@ -51,7 +51,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `exists` | n/a | gap | Not yet: EXISTS subquery as a boolean column. Wave W8. |
 | `explain` | `Dataset.explain` | mismatch | Differs: Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str. Wave W0. |
 | `fillna` | `Dataset.fill_null` | alias |  |
-| `filter` | `Dataset.filter` | param | Missing: SQL string condition, e.g. filter('age \> 3'). Wave WF. |
+| `filter` | `Dataset.filter` | canonical |  |
 | `first` | `Dataset.first` | mismatch | Differs: Spark returns a Row (or None); Batcher returns a tuple, or a dict with named=True. Wave W0. |
 | `foreach` | n/a | gap | Not yet: distributed per-row side-effect action on a batch Dataset (write.for\_each is streaming only). Wave W11. |
 | `foreachPartition` | n/a | gap | Not yet: distributed per-partition side-effect action on a batch Dataset. Wave W11. |
@@ -124,7 +124,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `unionByName` | `Dataset.union` | param | Missing: match columns by name in any order, and allowMissingColumns= filling absent columns with null. Wave W2. |
 | `unpersist` | `Dataset.uncache` | alias |  |
 | `unpivot` | `Dataset.unpivot` | canonical |  |
-| `where` | `Dataset.filter` | param | Missing: SQL string condition, e.g. where('age \> 3'). Wave WF. |
+| `where` | `Dataset.filter` | canonical |  |
 | `withColumn` | `Dataset.with_columns` | canonical |  |
 | `withColumnRenamed` | `Dataset.rename` | param | Missing: no-op when the column is absent (Batcher raises). Wave W2. |
 | `withColumns` | `Dataset.with_columns` | canonical |  |

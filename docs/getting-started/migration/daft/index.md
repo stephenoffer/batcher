@@ -39,7 +39,7 @@ The following table lists the waves that hold Daft rows, in delivery order:
 
 | Wave | Scope | Rows |
 |---|---|---|
-| WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 6 |
+| WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 4 |
 | W0 | Silent mismatches: parameters that restore the other engine's semantics | 42 |
 | W1 | Python constructors over SQL functions Batcher already has | 5 |
 | W2 | Missing parameters across all four engines | 104 |
@@ -60,7 +60,7 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 115 | 54 | 20 | 28 | 11 | 2 |
+| {doc}`dataframe` | 115 | 56 | 18 | 28 | 11 | 2 |
 | {doc}`module` | 130 | 21 | 26 | 12 | 59 | 12 |
 | {doc}`functions-numeric` | 160 | 131 | 23 | 1 | 5 | 0 |
 | {doc}`functions-strings` | 121 | 52 | 46 | 18 | 5 | 0 |

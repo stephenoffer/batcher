@@ -1,7 +1,7 @@
 # Ray Data 2.58 `ray.data` module names and their Batcher spelling.
 
 ["ray.data"]
-ActorPoolStrategy = { status = "param", batcher = "Dataset.map_batches", need = "compute=ActorPoolStrategy(min_size, max_size, initial_size, max_tasks_in_flight_per_actor); Batcher has concurrency=int|(min, max) only", wave = "WF" }
+ActorPoolStrategy = { status = "param", batcher = "Dataset.map_batches", need = "an unbounded max_size and max_tasks_in_flight_per_actor raise; initial_size above min_size raises", wave = "W11" }
 BlockBasedFileDatasink = { status = "mismatch", batcher = "batcher.io.FileSink", note = "Ray subclasses implement write_block_to_file(block, file) and get a file per block; Batcher FileSink implements write(table, path)/write_partitioned and commits from a WriteManifest.", wave = "W11" }
 Catalog = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
 CatalogAccessMode = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
@@ -31,7 +31,7 @@ SaveMode = { status = "param", batcher = "Dataset.write.iceberg", need = "SaveMo
 Schema = { status = "mismatch", batcher = "Dataset.schema", note = "Ray Schema wraps a pyarrow or pandas schema with .names/.types; Batcher returns pyarrow.Schema directly.", wave = "W0" }
 SinkMode = { status = "gap", need = "ClickHouse sink mode enum (CREATE, APPEND, OVERWRITE) for write_clickhouse", wave = "W13" }
 StreamingAggFn = { status = "gap", need = "user streaming aggregation function protocol for Dataset.streaming_aggregate", wave = "W10" }
-TaskPoolStrategy = { status = "param", batcher = "Dataset.map_batches", need = "compute=TaskPoolStrategy(size) stateless task pool sizing; Batcher sizes stateless fan-out with num_workers only", wave = "WF" }
+TaskPoolStrategy = { status = "param", batcher = "Dataset.map_batches", need = "TaskPoolStrategy(size=n) raises: the stateless pool is sized by num_workers", wave = "W11" }
 from_arrow = { status = "param", batcher = "bt.from_arrow", need = "a list of pyarrow Tables (Batcher accepts a Table, a RecordBatch or a list of RecordBatches and raises TypeError on a list of Tables)", wave = "W2" }
 from_arrow_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
 from_blocks = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }

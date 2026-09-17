@@ -44,7 +44,7 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `filter` | `Dataset.filter` | canonical |  |
 | `first` | `Dataset.first` | mismatch | Differs: Polars LazyFrame.first() is a one-row LazyFrame; Batcher's first() executes and returns a tuple. Wave W0. |
 | `gather_every` | `Dataset.gather_every` | canonical |  |
-| `group_by` | `Dataset.group_by` | param | Missing: maintain\_order= (parsed as a key name today) and expression keys. Wave WF. |
+| `group_by` | `Dataset.group_by` | param | Missing: expression keys. Wave WF. |
 | `group_by_dynamic` | `bt.window` | param | Missing: frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start\_by=, include\_boundaries=. Wave W5. |
 | `head` | `Dataset.limit` | alias |  |
 | `inspect` | n/a | gap | Not yet: Dataset.inspect (print the frame mid-plan). Wave W8. |
@@ -144,7 +144,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `get_column_index` | n/a | gap | Not yet: Dataset.get\_column\_index. Wave W8. |
 | `get_columns` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
 | `glimpse` | `Dataset.glimpse` | canonical |  |
-| `group_by` | `Dataset.group_by` | param | Missing: maintain\_order= (parsed as a key name today) and expression keys. Wave WF. |
+| `group_by` | `Dataset.group_by` | param | Missing: expression keys. Wave WF. |
 | `group_by_dynamic` | `bt.window` | param | Missing: frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start\_by=, include\_boundaries=. Wave W5. |
 | `hash_rows` | `bt.hash_rows` | mismatch | Differs: different hash function: values never agree with Polars. Param: seed= and algorithm choice. Wave W0. |
 | `head` | `Dataset.limit` | alias |  |

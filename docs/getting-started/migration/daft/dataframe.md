@@ -40,7 +40,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `exclude` | `Dataset.drop` | canonical |  |
 | `explain` | `Dataset.explain` | mismatch | Differs: Daft explain() prints the plan (show\_all= adds the physical plan); Batcher explain() returns the plan as a string. Rewrite: print(ds.explain()). Wave W0. |
 | `explode` | `Dataset.explode` | mismatch | Differs: Daft explode keeps a null or empty list as one row with a null value and accepts several columns at once; Batcher explode drops those rows and takes one column. Param: outer=True, multiple columns. Wave W0. |
-| `filter` | `Dataset.filter` | param | Missing: a SQL-string predicate (Batcher routes strings through Dataset.query). Wave WF. |
+| `filter` | `Dataset.filter` | canonical |  |
 | `groupby` | `Dataset.group_by` | alias |  |
 | `intersect` | `Dataset.intersect` | canonical |  |
 | `intersect_all` | `Dataset.intersect` | canonical |  |
@@ -92,7 +92,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `unique` | `Dataset.distinct` | alias |  |
 | `unpivot` | `Dataset.unpivot` | canonical |  |
 | `var` | `Dataset.var` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.var takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=. Wave W0. |
-| `where` | `Dataset.filter` | param | Missing: a SQL-string predicate (Batcher routes strings through Dataset.query). Wave WF. |
+| `where` | `Dataset.filter` | canonical |  |
 | `with_column` | `Dataset.with_columns` | alias |  |
 | `with_column_renamed` | `Dataset.rename` | canonical |  |
 | `with_columns` | `Dataset.with_columns` | canonical |  |

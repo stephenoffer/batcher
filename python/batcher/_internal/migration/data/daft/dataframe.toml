@@ -24,7 +24,7 @@ except_distinct = { status = "canonical", batcher = "Dataset.except_" }
 exclude = { status = "canonical", batcher = "Dataset.drop" }
 explain = { status = "mismatch", batcher = "Dataset.explain", note = "Daft explain() prints the plan (show_all= adds the physical plan); Batcher explain() returns the plan as a string. Rewrite: print(ds.explain())", wave = "W0" }
 explode = { status = "mismatch", batcher = "Dataset.explode", note = "Daft explode keeps a null or empty list as one row with a null value and accepts several columns at once; Batcher explode drops those rows and takes one column. Param: outer=True, multiple columns", wave = "W0", template = 'explode(column, *, ignore_empty_and_null=False) -> self.explode(sem.column_name(column), outer=sem.negate(ignore_empty_and_null))' }
-filter = { status = "param", batcher = "Dataset.filter", need = "a SQL-string predicate (Batcher routes strings through Dataset.query)", wave = "WF", template = 'filter(predicate) -> self.filter(sem.expression(predicate))' }
+filter = { status = "canonical", batcher = "Dataset.filter", template = 'filter(predicate) -> self.filter(sem.expression(predicate))' }
 groupby = { status = "alias", batcher = "Dataset.group_by", template = 'groupby(*group_by) -> self.group_by(sem.column_names(group_by))' }
 intersect = { status = "canonical", batcher = "Dataset.intersect" }
 intersect_all = { status = "canonical", batcher = "Dataset.intersect" }
@@ -76,7 +76,7 @@ union_by_name = { status = "param", batcher = "Dataset.union", need = "by_name=T
 unique = { status = "alias", batcher = "Dataset.distinct" }
 unpivot = { status = "canonical", batcher = "Dataset.unpivot" }
 var = { status = "mismatch", batcher = "Dataset.var", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.var takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=", wave = "W0" }
-where = { status = "param", batcher = "Dataset.filter", need = "a SQL-string predicate (Batcher routes strings through Dataset.query)", wave = "WF", template = 'where(predicate) -> self.filter(sem.expression(predicate))' }
+where = { status = "canonical", batcher = "Dataset.filter", template = 'where(predicate) -> self.filter(sem.expression(predicate))' }
 with_column = { status = "alias", batcher = "Dataset.with_columns", template = 'with_column(column_name, expr) -> self.with_columns(**{column_name: expr})' }
 with_column_renamed = { status = "canonical", batcher = "Dataset.rename" }
 with_columns = { status = "canonical", batcher = "Dataset.with_columns" }

@@ -39,8 +39,8 @@ The following table lists the waves that hold Ray Data rows, in delivery order:
 
 | Wave | Scope | Rows |
 |---|---|---|
-| WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 8 |
-| W0 | Silent mismatches: parameters that restore the other engine's semantics | 58 |
+| WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 3 |
+| W0 | Silent mismatches: parameters that restore the other engine's semantics | 59 |
 | W2 | Missing parameters across all four engines | 36 |
 | W3 | Scalar functions | 9 |
 | W4 | Maps, higher-order functions, and list reduction | 2 |
@@ -49,7 +49,7 @@ The following table lists the waves that hold Ray Data rows, in delivery order:
 | W8 | Relational `DataFrame` gaps | 19 |
 | W9 | Catalogs and tables | 31 |
 | W10 | Streaming | 4 |
-| W11 | UDFs | 41 |
+| W11 | UDFs | 45 |
 | W12 | AI and multimodal | 19 |
 | W13 | Readers and writers | 21 |
 
@@ -59,7 +59,7 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataset` | 117 | 11 | 16 | 58 | 16 | 16 |
+| {doc}`dataset` | 117 | 11 | 15 | 59 | 16 | 16 |
 | {doc}`expressions` | 179 | 83 | 2 | 20 | 17 | 57 |
 | {doc}`io` | 96 | 19 | 11 | 32 | 22 | 12 |
 | {doc}`udfs-ai-multimodal` | 46 | 4 | 15 | 15 | 9 | 3 |

@@ -13,7 +13,7 @@ with_column = { status = "mismatch", batcher = ["Dataset.with_columns", "AggExpr
 
 [DataIterator]
 get_context = { status = "mismatch", batcher = "bt.active_config", note = "Ray returns the DataContext of the iterated dataset; Batcher configuration is process/context scoped (active_config).", wave = "W9" }
-iter_batches = { status = "mismatch", batcher = ["Dataset.iter_batches", "Dataset.ml.to_numpy_batches"], note = "Ray yields batch_format='default' ({col: ndarray}) batches of 256 rows; Batcher iter_batches yields pyarrow RecordBatches and has no batch_format, drop_last, local_shuffle_buffer_size/seed or prefetch_batches. Port as: ds.ml.to_numpy_batches(batch_size=256).", wave = "W2" }
+iter_batches = { status = "mismatch", batcher = ["Dataset.iter_batches", "Dataset.ml.to_numpy_batches"], note = "Ray iter_batches defaults to batch_format='default' ({col: ndarray}, nulls become NaN) and batch_size=256; Batcher yields pyarrow RecordBatches of engine size. Port as iter_batches(256, batch_format='numpy')", wave = "W2" }
 iter_jax_batches = { status = "gap", need = "streaming iterator of JAX array batches", wave = "W8" }
 iter_rows = { status = "mismatch", batcher = "Dataset.iter_rows", note = "Ray yields dict rows; Batcher yields tuples unless named=True.", wave = "W0" }
 iter_tf_batches = { status = "mismatch", batcher = "Dataset.ml.to_tf", note = "Ray yields TensorFlow tensor batches of 256 rows; Batcher ds.ml.to_tf returns a tf.data.Dataset. Pass batch_size=256.", wave = "W8" }

@@ -36,7 +36,7 @@ executionInfo = { status = "gap", need = "post-execution metrics object on the D
 exists = { status = "gap", need = "EXISTS subquery as a boolean column", wave = "W8" }
 explain = { status = "mismatch", batcher = "Dataset.explain", note = "Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str", wave = "W0" }
 fillna = { status = "alias", batcher = "Dataset.fill_null" }
-filter = { status = "param", batcher = "Dataset.filter", need = "SQL string condition, e.g. filter('age > 3')", wave = "WF", template = 'filter(condition) -> self.filter(sem.expression(condition))' }
+filter = { status = "canonical", batcher = "Dataset.filter", template = 'filter(condition) -> self.filter(sem.expression(condition))' }
 first = { status = "mismatch", batcher = "Dataset.first", note = "Spark returns a Row (or None); Batcher returns a tuple, or a dict with named=True", wave = "W0" }
 foreach = { status = "gap", need = "distributed per-row side-effect action on a batch Dataset (write.for_each is streaming only)", wave = "W11" }
 foreachPartition = { status = "gap", need = "distributed per-partition side-effect action on a batch Dataset", wave = "W11" }
@@ -109,7 +109,7 @@ unionAll = { status = "mismatch", batcher = "Dataset.union", note = "Spark union
 unionByName = { status = "param", batcher = "Dataset.union", need = "match columns by name in any order, and allowMissingColumns= filling absent columns with null", wave = "W2", template = 'unionByName(other, allowMissingColumns=False) -> self.union(other.select(*self.columns), sem.expect(allowMissingColumns, False))' }
 unpersist = { status = "alias", batcher = "Dataset.uncache" }
 unpivot = { status = "canonical", batcher = "Dataset.unpivot" }
-where = { status = "param", batcher = "Dataset.filter", need = "SQL string condition, e.g. where('age > 3')", wave = "WF", template = 'where(condition) -> self.filter(sem.expression(condition))' }
+where = { status = "canonical", batcher = "Dataset.filter", template = 'where(condition) -> self.filter(sem.expression(condition))' }
 withColumn = { status = "canonical", batcher = "Dataset.with_columns", template = 'withColumn(colName, col) -> self.with_columns(**{colName: col})' }
 withColumnRenamed = { status = "param", batcher = "Dataset.rename", need = "no-op when the column is absent (Batcher raises)", wave = "W2", template = 'withColumnRenamed(existing, new) -> self.rename({existing: new})' }
 withColumns = { status = "canonical", batcher = "Dataset.with_columns", template = 'withColumns(colsMap) -> self.with_columns(**colsMap)' }

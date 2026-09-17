@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Daft
 
-The following table maps 217 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
+The following table maps 218 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
 
 | Batcher | Daft |
 |---|---|
@@ -83,6 +83,7 @@ The following table maps 217 Batcher spellings to the Daft names that compute th
 | `Dataset.drop_nulls` | `DataFrame.drop_null` |
 | `Dataset.drop` | `DataFrame.exclude` |
 | `Dataset.except_` | `DataFrame.except_all`, `DataFrame.except_distinct` |
+| `Dataset.filter` | `DataFrame.filter`, `DataFrame.where` |
 | `Dataset.group_by` | `DataFrame.groupby` |
 | `Dataset.intersect` | `DataFrame.intersect_all`, `DataFrame.intersect` |
 | `Dataset.iter_batches` | `DataFrame.to_arrow_iter` |

@@ -39,7 +39,7 @@ The following table lists the waves that hold PySpark rows, in delivery order:
 
 | Wave | Scope | Rows |
 |---|---|---|
-| WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 5 |
+| WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 3 |
 | W0 | Silent mismatches: parameters that restore the other engine's semantics | 71 |
 | W1 | Python constructors over SQL functions Batcher already has | 29 |
 | W2 | Missing parameters across all four engines | 71 |
@@ -61,7 +61,7 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 152 | 51 | 47 | 26 | 22 | 6 |
+| {doc}`dataframe` | 152 | 53 | 45 | 26 | 22 | 6 |
 | {doc}`expressions` | 36 | 26 | 2 | 4 | 4 | 0 |
 | {doc}`functions-aggregates` | 135 | 49 | 13 | 5 | 68 | 0 |
 | {doc}`functions-collections` | 90 | 23 | 12 | 5 | 50 | 0 |

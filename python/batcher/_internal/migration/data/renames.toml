@@ -23,15 +23,12 @@
 
 
 [Dataset]
-copy = { transform = "identity", to = "self" }
-lazy = { transform = "identity", to = "self" }
-skewness = "skew"
-n_unique = "count_distinct"
-approx_n_unique = "approx_count_distinct"
 append = "union"
+approx_n_unique = "approx_count_distinct"
 assign = "with_columns"
 astype = "cast"
 coalesce = "repartition"
+copy = { transform = "identity", to = "self" }
 difference = "except_"
 drop_duplicates = "distinct"
 dropna = "drop_nulls"
@@ -40,12 +37,16 @@ fillna = "fill_null"
 groupby = "group_by"
 head = { to = "limit", fill = ["n@0=5"] }
 height = { to = "count", call = true }
+lazy = { transform = "identity", to = "self" }
 melt = "unpivot"
 merge = "join"
+n_unique = "count_distinct"
 nlargest = "top_k"
 nsmallest = "bottom_k"
 persist = "cache"
+query = "filter"
 sample_frac = "sample"
+skewness = "skew"
 slice = { transform = "slice_to_limit", to = "limit" }
 sort_values = "sort"
 to_csv = { to = "write.csv" }

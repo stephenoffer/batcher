@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to PySpark
 
-The following table maps 272 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 273 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
@@ -127,6 +127,7 @@ The following table maps 272 Batcher spellings to the PySpark names that compute
 | `Dataset.drop_nulls` + `Dataset.fill_null` | `DataFrame.na` |
 | `Dataset.except_` | `DataFrame.exceptAll`, `DataFrame.subtract` |
 | `Dataset.fill_null` | `DataFrame.fillna`, `DataFrameNaFunctions.fill` |
+| `Dataset.filter` | `DataFrame.filter`, `DataFrame.where` |
 | `Dataset.group_by` | `DataFrame.groupby` |
 | `Dataset.grouping_sets` | `DataFrame.groupingSets` |
 | `Dataset.intersect` | `DataFrame.intersectAll`, `DataFrame.intersect` |

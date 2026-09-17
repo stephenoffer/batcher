@@ -18,7 +18,7 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
-| `ActorPoolStrategy` | `Dataset.map_batches` | param | Missing: compute=ActorPoolStrategy(min\_size, max\_size, initial\_size, max\_tasks\_in\_flight\_per\_actor); Batcher has concurrency=int\|(min, max) only. Wave WF. |
+| `ActorPoolStrategy` | `Dataset.map_batches` | param | Missing: an unbounded max\_size and max\_tasks\_in\_flight\_per\_actor raise; initial\_size above min\_size raises. Wave W11. |
 | `BlockBasedFileDatasink` | `batcher.io.FileSink` | mismatch | Differs: Ray subclasses implement write\_block\_to\_file(block, file) and get a file per block; Batcher FileSink implements write(table, path)/write\_partitioned and commits from a WriteManifest. Wave W11. |
 | `Catalog` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |
 | `CatalogAccessMode` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |
@@ -93,7 +93,7 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 | `Schema` | `Dataset.schema` | mismatch | Differs: Ray Schema wraps a pyarrow or pandas schema with .names/.types; Batcher returns pyarrow.Schema directly. Wave W0. |
 | `SinkMode` | n/a | gap | Not yet: ClickHouse sink mode enum (CREATE, APPEND, OVERWRITE) for write\_clickhouse. Wave W13. |
 | `StreamingAggFn` | n/a | gap | Not yet: user streaming aggregation function protocol for Dataset.streaming\_aggregate. Wave W10. |
-| `TaskPoolStrategy` | `Dataset.map_batches` | param | Missing: compute=TaskPoolStrategy(size) stateless task pool sizing; Batcher sizes stateless fan-out with num\_workers only. Wave WF. |
+| `TaskPoolStrategy` | `Dataset.map_batches` | param | Missing: TaskPoolStrategy(size=n) raises: the stateless pool is sized by num\_workers. Wave W11. |
 
 ## `Datasource`
 
