@@ -34,7 +34,7 @@ DATASET_NAMING: dict[str, str] = {
     "withMetadata": (
         "Column metadata is not exposed. Rename or cast with ds.rename(...) / ds.cast(...)."
     ),
-    "selectExpr": "Use ds.sql('SELECT ... FROM self') or ds.select(<expressions>).",
+    "selectExpr": "Use ds.select(bt.sql_expr('a + 1 AS b'), ...), one bt.sql_expr per SQL string.",
     "groupBy": "Spelled ds.group_by(...) here (PEP 8 naming throughout).",
     "orderBy": "Spelled ds.sort(...) here.",
     "sortWithinPartitions": "Spelled ds.sort(...) here; ordering is global.",

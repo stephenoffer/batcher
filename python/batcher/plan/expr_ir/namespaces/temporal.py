@@ -19,6 +19,7 @@ from batcher.plan.expr_ir.func_nodes import (
     DateFunc,
     DateOffset,
     DateTrunc,
+    MakeTemporal,
     Strftime,
 )
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
@@ -37,6 +38,15 @@ _OFFSET_UNITS = {
     "s": (0, 0, 1_000_000),
 }
 _OFFSET_RE = re.compile(r"(-?\d+)(mo|[ymwdhs])")
+
+# `dt.next_day`: Spark's weekday spellings (full, three- and two-letter) as ISO day numbers.
+_WEEKDAYS = {
+    spelling: number
+    for number, name in enumerate(
+        ("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"), start=1
+    )
+    for spelling in (name, name[:3], name[:2])
+}
 
 
 def parse_offset(by: str) -> tuple[int, int, int]:
@@ -787,6 +797,88 @@ class _DtNamespace:
                 {'r': [6]}
         """
         return self._delta_units(other, 7 * MICROS_PER_DAY)
+
+    def months_between(self, other: Expr | str, *, round_off: bool = True) -> Expr:
+        """Fractional months from `other` to this date or timestamp (Spark ``months_between``).
+
+        Spark's definition. The whole-month count comes from the calendar fields. When both
+        values fall on the same day of the month, or both on the last day of their months,
+        the answer is that whole count. Otherwise the leftover days and time of day are
+        added as a fraction of a fixed 31-day month, not of the month's real length.
+        `round_off` rounds the result to 8 decimal places, as Spark does by default.
+        Timestamps are read as naive wall-clock values, with no session time zone.
+
+        DuckDB has no fractional form. Its ``date_diff('month', b, a)`` counts month
+        boundaries crossed and answers an integer.
+
+        Args:
+            other: The earlier date or timestamp, as an expression or a column name.
+            round_off: Round to 8 decimal places; ``False`` keeps full precision.
+
+        Returns:
+            A Float64 expression, negative when `other` is later.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [dt.datetime(1997, 2, 28, 10, 30)], "b": [dt.datetime(1996, 10, 30)]}
+                ... )
+                >>> ds.select(r=bt.col("a").dt.months_between("b")).to_pydict()
+                {'r': [3.94959677]}
+        """
+        other = _wrap_temporal(other)
+        right = other.dt
+        months = (self.year() - right.year()) * 12 + (self.month() - right.month())
+        same_day = self.day() == right.day()
+        both_month_ends = (self.day() == self.days_in_month()) & (
+            right.day() == right.days_in_month()
+        )
+        micros = (self.day() - right.day()) * MICROS_PER_DAY + (
+            self.time_of_day() - right.time_of_day()
+        )
+        fraction = months + micros.cast("float64") / lit(float(31 * MICROS_PER_DAY))
+        exact = fraction.round(8) if round_off else fraction
+        whole = months.cast("float64")
+        return when(same_day | both_month_ends).then(whole).otherwise(exact)
+
+    def next_day(self, day_of_week: str) -> Expr:
+        """The first date strictly after this one that falls on `day_of_week` (→ Date).
+
+        Spark ``next_day``. `day_of_week` is a day name, its three-letter abbreviation or
+        its two-letter one (``"Sunday"``, ``"Sun"``, ``"SU"``), in any case. A date already
+        on that weekday moves a full week ahead. A timestamp is read as its date.
+
+        Args:
+            day_of_week: The weekday to advance to.
+
+        Returns:
+            A Date expression.
+
+        Raises:
+            PlanError: If `day_of_week` does not name a weekday.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.date(2015, 7, 27)]})
+                >>> ds.select(r=bt.col("d").dt.next_day("Sun")).to_pydict()
+                {'r': [datetime.date(2015, 8, 2)]}
+        """
+        target = (
+            _WEEKDAYS.get(day_of_week.strip().upper()) if isinstance(day_of_week, str) else None
+        )
+        if target is None:
+            raise PlanError(f"dt.next_day(): {day_of_week!r} does not name a weekday such as 'Mon'")
+        # ((target - today + 6) mod 7) + 1 is 7 when the two coincide and never 0. The shift
+        # is per row and `offset_by` takes a constant, so it runs on the day count, which is
+        # what a Date holds.
+        shift = ((lit(target) - self.weekday() + 6) % 7) + 1
+        return MakeTemporal("from_unix_date", [self._e.cast("date").cast("int64") + shift])
 
     def quarter_end(self) -> Expr:
         """Last day of the calendar quarter at midnight — the close of the quarter.

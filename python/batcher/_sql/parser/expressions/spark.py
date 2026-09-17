@@ -17,6 +17,7 @@ from sqlglot import expressions as exp
 
 from batcher.plan.expr_ir import Expr, coalesce, lit, nullif, when
 from batcher.plan.expr_ir.core import MathExpr
+from batcher.plan.functions.scalar import bit_get, elt, pmod
 
 __all__ = ["spark_function"]
 
@@ -80,7 +81,7 @@ def spark_function(tr, node) -> Expr | None:
 
         return lit(" ").str.repeat(_const_int_arg(node.this, "space(): count"))
     if isinstance(node, exp.Elt):
-        return _elt(tr, [node.this, *node.expressions])
+        return _elt(tr, node.this, node.expressions)
     if isinstance(node, exp.WidthBucket):
         return _width_bucket(tr, node)
     if isinstance(node, exp.Getbit):
@@ -91,10 +92,7 @@ def spark_function(tr, node) -> Expr | None:
         # BIT type, so a non-integer argument is declined instead.
         if not _is_integer_operand(node.this):
             return None
-        # The bitwise methods, not `>>`/`&`: those operators are the *logical* ones on
-        # an `Expr`, and `&` on two integers raises rather than masking.
-        shifted = tr._scalar(node.this).bitwise_right_shift(tr._scalar(node.expression))
-        return shifted.bitwise_and(lit(1))
+        return bit_get(tr._scalar(node.this), tr._scalar(node.expression))
     if isinstance(node, exp.RegexpCount):
         from batcher._sql.parser.expressions.literals import _const_str_arg
 
@@ -103,8 +101,10 @@ def spark_function(tr, node) -> Expr | None:
     if isinstance(node, exp.RegexpSubstr):
         from batcher._sql.parser.expressions.literals import _const_str_arg
 
+        # Spark answers null where nothing matches, not the empty string `extract` defaults
+        # to (DuckDB `regexp_extract`'s answer), so the two stay distinguishable.
         pat = _const_str_arg(node.expression, "regexp_substr()", "pattern")
-        return tr._scalar(node.this).str.extract(pat, group=0)
+        return tr._scalar(node.this).str.extract(pat, group=0, missing="null")
     if isinstance(node, exp.ParseUrl):
         return _parse_url(tr, node)
     if isinstance(node, exp.Struct):
@@ -130,9 +130,7 @@ def spark_function(tr, node) -> Expr | None:
     if name == "zeroifnull" and len(args) == 1:
         return coalesce(tr._scalar(args[0]), lit(0))
     if name == "pmod" and len(args) == 2:
-        # The *positive* modulus: `pmod(-10, 3)` is 2 where `%` gives -1.
-        left, right = tr._scalar(args[0]), tr._scalar(args[1])
-        return ((left % right) + right) % right
+        return pmod(tr._scalar(args[0]), tr._scalar(args[1]))
     if name == "btrim" and len(args) in (1, 2):
         if len(args) == 1:
             return tr._scalar(args[0]).str.trim()
@@ -158,36 +156,14 @@ def spark_function(tr, node) -> Expr | None:
     return None
 
 
-# `parse_url(url, part)` → the regex that captures that part, group 1. Written against
-# the URL grammar rather than a parser because the engine's regex kernel is already the
-# fast path, and every part below is a single unambiguous capture.
-_URL_PART = {
-    "PROTOCOL": r"^([a-zA-Z][a-zA-Z0-9+.-]*):",
-    "HOST": r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^@/]*@)?([^:/?#]+)",
-    "PATH": r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]*([^?#]*)",
-    "QUERY": r"\?([^#]*)",
-    "REF": r"#(.*)$",
-    "AUTHORITY": r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]*)",
-    "USERINFO": r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^@/?#]*)@",
-}
-
-
-def _parse_url(tr, node) -> Expr | None:
-    """`parse_url(url, 'HOST')` — the named component of a URL, or null if absent.
-
-    `parse_url(url, 'QUERY', 'k')` (the three-argument form that reads one query
-    parameter) is declined rather than approximated: it needs the key escaped into the
-    pattern, and getting that subtly wrong would return a neighbouring parameter's value.
-    """
+def _parse_url(tr, node) -> Expr:
+    """`parse_url(url, part[, key])` → `.str.parse_url`, which owns the URL patterns."""
     from batcher._sql.parser.expressions.literals import _const_str_arg
 
-    if node.args.get("key") is not None:
-        return None
-    part = _const_str_arg(node.args.get("part_to_extract"), "parse_url()", "part").upper()
-    pattern = _URL_PART.get(part)
-    if pattern is None:
-        return None
-    return tr._scalar(node.this).str.extract(pattern, 1)
+    part = _const_str_arg(node.args.get("part_to_extract"), "parse_url()", "part")
+    key = node.args.get("key")
+    key_name = _const_str_arg(key, "parse_url()", "key") if key is not None else None
+    return tr._scalar(node.this).str.parse_url(part, key_name)
 
 
 def _is_integer_operand(node) -> bool:
@@ -235,18 +211,15 @@ def _struct_node(tr, node) -> Expr | None:
     return named_struct(*flat)
 
 
-def _elt(tr, args) -> Expr | None:
-    """`elt(n, a, b, ...)` — the nth argument, 1-based, null outside the range."""
-    if len(args) < 2:
+def _elt(tr, index, values) -> Expr | None:
+    """`elt(n, a, b, ...)` → `bt.elt`, folding a literal index at plan-build time."""
+    if not values:
         return None
-    index = args[0]
-    if not isinstance(index, exp.Literal) or index.is_string:
-        return None  # a per-row index would need a runtime switch, not a CASE
-    position = int(index.this)
-    if not 1 <= position < len(args):
-        value = tr._scalar(args[1])
-        return nullif(value, value)
-    return tr._scalar(args[position])
+    if isinstance(index, exp.Literal) and not index.is_string:
+        position: int | Expr = int(index.this)
+    else:
+        position = tr._scalar(index)
+    return elt(position, *(tr._scalar(v) for v in values))
 
 
 def _width_bucket(tr, node) -> Expr:
@@ -264,16 +237,15 @@ def _width_bucket(tr, node) -> Expr:
 
 
 def _find_in_set(tr, args) -> Expr | None:
-    """`find_in_set(needle, 'a,b,c')` — the 1-based position of `needle`, or 0.
+    """`find_in_set(needle, 'a,b,c')` → `.str.find_in_set`, for a constant needle only.
 
-    The needle must be a constant: `.list.position` compares against a scalar value, not
-    a per-row expression, so a column needle is declined rather than mistranslated.
+    A column needle is declined rather than mistranslated: the list position is compared
+    against a plan-time scalar, not a per-row expression.
     """
     needle = args[0]
     if not isinstance(needle, exp.Literal) or not needle.is_string:
         return None
-    parts = tr._scalar(args[1]).str.split(",")
-    return coalesce(parts.list.position(needle.this), lit(0))
+    return tr._scalar(args[1]).str.find_in_set(needle.this)
 
 
 def _typed_null(like: Expr) -> Expr:

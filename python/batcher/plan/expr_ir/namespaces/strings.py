@@ -30,6 +30,23 @@ _COMPRESSION_CODECS = frozenset({"gzip", "zlib", "deflate", "zstd", "brotli", "l
 # What `extract`/`extract_all` yield for a match that is not there (`missing=`).
 _MISSING = ("empty", "null")
 
+# A `%` not followed by two hex digits: the escape Java's `URLDecoder` rejects, and so the
+# row Spark `try_url_decode` nulls. Spelled without lookahead, which the engine's regex lacks.
+_MALFORMED_PERCENT = r"%(?:$|[^0-9A-Fa-f]|[0-9A-Fa-f](?:$|[^0-9A-Fa-f]))"
+
+# `parse_url(url, part)`: the regex whose group 1 captures each part. Written against the URL
+# grammar rather than a parser, because each part is one unambiguous capture.
+_URL_PART = {
+    "PROTOCOL": r"^([a-zA-Z][a-zA-Z0-9+.-]*):",
+    "HOST": r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^@/]*@)?([^:/?#]+)",
+    "PATH": r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]*([^?#]*)",
+    "QUERY": r"\?([^#]*)",
+    "REF": r"#(.*)$",
+    "FILE": r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]*([^#]*)",
+    "AUTHORITY": r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]*)",
+    "USERINFO": r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^@/?#]*)@",
+}
+
 
 def _require_codec(func: str, codec: str) -> str:
     """Return `codec` if it names a supported codec, else raise a `PlanError`.
@@ -2765,7 +2782,7 @@ class _StrNamespace:
         form = require_bool(form, func="str.url_encode", arg="form")
         return StrFunc("url_encode_form" if form else "url_encode", self._e)
 
-    def url_decode(self, *, form: bool = False) -> StrFunc:
+    def url_decode(self, *, form: bool = False, malformed: str = "keep") -> Expr:
         """Percent-decode the value (→ Utf8).
 
         DuckDB ``url_decode``, the inverse of :meth:`url_encode`. A malformed escape (a
@@ -2773,11 +2790,15 @@ class _StrNamespace:
         left as written rather than raising or nulling the row, matching DuckDB.
 
         A ``+`` stays a ``+``. Spark ``url_decode`` (Java's ``URLDecoder``) reads it as a
-        space, which ``form=True`` does; a malformed escape is still left as written, where
-        Spark raises.
+        space, which ``form=True`` does. Spark raises on a ``%`` not followed by two hex
+        digits, and Spark ``try_url_decode`` answers null there, which
+        ``form=True, malformed="null"`` does. Bytes that are not UTF-8 are still left as
+        written, where Java substitutes U+FFFD.
 
         Args:
             form: Decode ``+`` as a space (Spark ``url_decode``).
+            malformed: What a ``%`` without two hex digits yields: ``"keep"`` decodes the
+                rest and leaves it as written, ``"null"`` nulls the row.
 
         Returns:
             A new Utf8 expression: the decoded value.
@@ -2792,9 +2813,94 @@ class _StrNamespace:
 
                 >>> ds.select(u=bt.col("s").str.url_decode(form=True)).to_pydict()
                 {'u': ['a b/c', '100%', 'a b']}
+
+                >>> spark = bt.col("s").str.url_decode(form=True, malformed="null")
+                >>> ds.select(u=spark).to_pydict()
+                {'u': ['a b/c', None, 'a b']}
         """
         form = require_bool(form, func="str.url_decode", arg="form")
-        return StrFunc("url_decode_form" if form else "url_decode", self._e)
+        malformed = require_choice(
+            malformed, func="str.url_decode", arg="malformed", choices=("keep", "null")
+        )
+        decoded = StrFunc("url_decode_form" if form else "url_decode", self._e)
+        if malformed == "keep":
+            return decoded
+        bad = StrFunc("regexp_matches", self._e, pattern=_MALFORMED_PERCENT)
+        return when(bad).then(nullif(decoded, decoded)).otherwise(decoded)
+
+    def find_in_set(self, needle: str) -> Expr:
+        """The 1-based position of `needle` in this comma-separated list, or 0 (→ Int64).
+
+        Spark ``find_in_set(needle, str_list)``, read from the list's side. The list is split
+        on ``,`` and compared element by element, so a `needle` holding a comma is never
+        found. A null list is null.
+
+        Args:
+            needle: The constant string to look for.
+
+        Returns:
+            A new Int64 expression: the 1-based position, or 0 when `needle` is absent.
+
+        Raises:
+            PlanError: If `needle` is not a string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc,b,ab,c,def", "x,y", None]})
+                >>> ds.select(r=bt.col("s").str.find_in_set("ab")).to_pydict()
+                {'r': [3, 0, None]}
+        """
+        if not isinstance(needle, str):
+            raise PlanError(
+                f"str.find_in_set(): needle must be a constant string, got {type(needle).__name__}"
+            )
+        return self.split(",").list.position(needle, zero_if_absent=True)
+
+    def parse_url(self, part: str, key: str | None = None) -> Expr:
+        """One component of a URL, or null when the URL has none (Spark ``parse_url``, → Utf8).
+
+        `part` is one of ``PROTOCOL``, ``HOST``, ``PATH``, ``QUERY``, ``REF``, ``FILE``,
+        ``AUTHORITY`` or ``USERINFO``, in any case. ``FILE`` is the path with its query.
+        With a `key`, ``QUERY`` answers that one query parameter's value instead of the
+        whole query string, as Spark's three-argument form does.
+
+        Args:
+            part: The component to extract.
+            key: A query parameter name; only valid with ``part="QUERY"``.
+
+        Returns:
+            A new Utf8 expression: the component, or null when it is absent.
+
+        Raises:
+            PlanError: If `part` is not a recognized component, or `key` is given with a
+                part other than ``QUERY``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"u": ["https://spark.apache.org/path?query=1"]})
+                >>> ds.select(
+                ...     host=bt.col("u").str.parse_url("HOST"),
+                ...     q=bt.col("u").str.parse_url("QUERY", key="query"),
+                ... ).to_pydict()
+                {'host': ['spark.apache.org'], 'q': ['1']}
+        """
+        name = part.upper() if isinstance(part, str) else part
+        pattern = _URL_PART.get(name)
+        if pattern is None:
+            raise PlanError(
+                f"str.parse_url(): part must be one of {sorted(_URL_PART)}, got {part!r}"
+            )
+        found = self.extract(pattern, 1, missing="null")
+        if key is None:
+            return found
+        if name != "QUERY" or not isinstance(key, str):
+            raise PlanError("str.parse_url(): key needs part='QUERY' and a constant string key")
+        param = rf"(?:^|&){escape_rust_regex(key)}=([^&]*)"
+        return StrFunc("regexp_extract_or_null", found, pattern=param, start=1)
 
     def join(self, delimiter: str = "") -> Expr:
         """Concatenate every value into one string (Polars ``str.join``, → Utf8).

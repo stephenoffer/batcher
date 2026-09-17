@@ -862,6 +862,99 @@ class _ListNamespace:
             return joined
         return self._null_unless(self._e.is_not_null() & right.is_not_null(), joined)
 
+    def append(self, value: IntoExpr, *, propagate_nulls: bool = False) -> Expr:
+        """This list with `value` added as its last element (→ List).
+
+        DuckDB ``list_append`` and Spark ``array_append``. A null `value` is appended as a
+        null element. A null list counts as empty, so the result is ``[value]``, as in
+        DuckDB. `propagate_nulls=True` keeps a null list null, as Spark does.
+
+        Args:
+            value: The element to add. A string is a literal, so pass ``bt.col(...)`` to
+                append a column's value.
+            propagate_nulls: A null list stays null rather than becoming ``[value]``.
+
+        Returns:
+            A new List expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2], None]})
+                >>> ds.select(r=bt.col("a").list.append(3)).to_pydict()
+                {'r': [[1, 2, 3], [3]]}
+
+                >>> ds.select(r=bt.col("a").list.append(3, propagate_nulls=True)).to_pydict()
+                {'r': [[1, 2, 3], None]}
+        """
+        return self._splice(value, propagate_nulls, at_end=True)
+
+    def prepend(self, value: IntoExpr, *, propagate_nulls: bool = False) -> Expr:
+        """This list with `value` added as its first element (→ List).
+
+        DuckDB ``list_prepend(value, list)`` and Spark ``array_prepend(list, value)``, which
+        take their arguments in opposite orders. The null rules are those of :meth:`append`.
+
+        Args:
+            value: The element to add (``bt.col(...)`` for a column).
+            propagate_nulls: A null list stays null rather than becoming ``[value]``.
+
+        Returns:
+            A new List expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2], None]})
+                >>> ds.select(r=bt.col("a").list.prepend(0)).to_pydict()
+                {'r': [[0, 1, 2], [0]]}
+        """
+        return self._splice(value, propagate_nulls, at_end=False)
+
+    def _splice(self, value: IntoExpr, propagate_nulls: bool, *, at_end: bool) -> Expr:
+        """Concatenate a one-element list holding `value` onto one end of this list."""
+        from batcher.plan.expr_ir.constructors import array, lit
+
+        single = array(lit(None) if value is None else _wrap(value))
+        pair = (self._e, single) if at_end else (single, self._e)
+        joined = ListSet("array_concat", *pair)
+        if not propagate_nulls:
+            return joined
+        return self._null_unless(self._e.is_not_null(), joined)
+
+    def remove(self, value: int | float | bool | str) -> ListFilter:
+        """This list without the elements equal to `value` (Spark ``array_remove``, → List).
+
+        Null elements are kept, and a null list stays null.
+
+        Args:
+            value: The literal to remove.
+
+        Returns:
+            A new List expression.
+
+        Raises:
+            PlanError: If `value` is not a literal scalar.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2, None, 1], None]})
+                >>> ds.select(r=bt.col("a").list.remove(1)).to_pydict()
+                {'r': [[2, None], None]}
+        """
+        from batcher.plan.functions.collection import element
+
+        if isinstance(value, Expr) or value is None:
+            raise PlanError(
+                "list.remove(): value must be a literal scalar; filter with "
+                "list.filter(bt.element() != ...) to compare against an expression"
+            )
+        return self.filter(element().is_null() | (element() != value))
+
     def gather(self, indices: IntoExpr) -> ListSet:
         """Take each row's elements at the positions `indices` names (→ list).
 
@@ -923,12 +1016,17 @@ class _ListNamespace:
         """
         return self.intersect(_wrap(other)).list.len() == _wrap(other).list.n_unique()
 
-    def has_any(self, other: IntoExpr) -> Expr:
+    def has_any(self, other: IntoExpr, *, propagate_nulls: bool = False) -> Expr:
         """Whether this list shares any element with ``other`` (→ Boolean).
 
         DuckDB ``list_has_any``. The two share an element exactly when their intersection
         is non-empty, so an empty list on either side is false and a null list on either
-        side is null.
+        side is null. A null *element* never matches, so ``[1, NULL]`` and ``[2]`` share
+        nothing and the answer is false.
+
+        `propagate_nulls=True` is Spark's ``arrays_overlap``, which follows three-valued
+        logic there: with no shared element and a null element on either side, the null
+        might have been the shared one, so the answer is null instead of false.
 
         The trailing ``* 0`` is what carries `other`'s nullness. `intersect` treats a null
         right operand as an *empty* list (DuckDB does the same:
@@ -938,6 +1036,8 @@ class _ListNamespace:
 
         Args:
             other: The list of elements to look for.
+            propagate_nulls: Answer null, not ``False``, when nothing is shared and either
+                list holds a null element.
 
         Returns:
             A new Boolean expression.
@@ -949,9 +1049,23 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[1, 2], [1, 2]], "b": [[2, 5], [5, 6]]})
                 >>> ds.select(bt.col("a").list.has_any(bt.col("b")).alias("r")).to_pydict()
                 {'r': [True, False]}
+
+                >>> ds = bt.from_pydict({"a": [["a", None]], "b": [["b", None]]})
+                >>> overlap = bt.col("a").list.has_any(bt.col("b"), propagate_nulls=True)
+                >>> ds.select(r=overlap).to_pydict()
+                {'r': [None]}
         """
         other_expr = _wrap(other)
-        return (self.intersect(other_expr).list.len() + other_expr.list.len() * 0) > 0
+        # Nulls are dropped first because `intersect` pairs a null with a null, which would
+        # make `[1, NULL]` and `[2, NULL]` share an element where DuckDB says they do not.
+        shared = self.drop_nulls().list.intersect(other_expr)
+        hit = (shared.list.len() + other_expr.list.len() * 0) > 0
+        if not propagate_nulls:
+            return hit
+        from batcher.plan.expr_ir.constructors import lit, when
+
+        either_null = self._holds_null() | other_expr.list._holds_null()
+        return when(hit).then(Lit(True)).when(either_null).then(lit(None, "bool")).otherwise(hit)
 
     def difference(self, other: IntoExpr) -> ListSet:
         """The distinct elements in this list but not in ``other`` (→ List).

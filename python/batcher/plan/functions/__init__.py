@@ -74,6 +74,9 @@ from batcher.plan.functions.prompt import (
 )
 from batcher.plan.functions.scalar import (
     arctan2,
+    bit_get,
+    e,
+    elt,
     gcd,
     great_circle_distance,
     hypot,
@@ -82,6 +85,8 @@ from batcher.plan.functions.scalar import (
     log,
     nanvl,
     next_after,
+    pi,
+    pmod,
     width_bucket,
 )
 from batcher.plan.functions.security import aes_decrypt, aes_encrypt, hmac_sha256, mask
@@ -129,6 +134,7 @@ __all__ = [
     "all_horizontal",
     "any_horizontal",
     "arctan2",
+    "bit_get",
     "chatml_prompt",
     "concat",
     "concat_ws",
@@ -144,7 +150,9 @@ __all__ = [
     "date_add",
     "date_part",
     "date_sub",
+    "e",
     "element",
+    "elt",
     "ends_with_role",
     "extract_after",
     "extract_between",
@@ -191,6 +199,8 @@ __all__ = [
     "partition_months",
     "partition_truncate",
     "partition_years",
+    "pi",
+    "pmod",
     "product_horizontal",
     "prompt_token_estimate",
     "reduce_horizontal",

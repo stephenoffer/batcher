@@ -13,10 +13,11 @@ have seen had you written the composition by hand.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError, require_int
-from batcher.plan.expr_ir.constructors import col, lit, when
+from batcher.plan.expr_ir.constructors import col, lit, nullif, when
 from batcher.plan.expr_ir.core import (
     Binary,
     Expr,
@@ -29,7 +30,10 @@ from batcher.plan.expr_ir.core import (
 
 __all__ = [
     "arctan2",
+    "bit_get",
     "cut",
+    "e",
+    "elt",
     "gcd",
     "great_circle_distance",
     "hypot",
@@ -38,6 +42,8 @@ __all__ = [
     "log",
     "nanvl",
     "next_after",
+    "pi",
+    "pmod",
     "width_bucket",
 ]
 
@@ -423,3 +429,134 @@ def great_circle_distance(
     # would produce NaN.
     central_angle = lit(2.0) * arctan2(a.sqrt(), (lit(1.0) - a).sqrt())
     return lit(_EARTH_RADIUS[unit]) * central_angle
+
+
+def pi() -> Expr:
+    """The constant π as a Float64 expression (Spark, Daft and DuckDB ``pi()``).
+
+    Folds to a literal at plan-build time, so it costs nothing per row.
+
+    Returns:
+        A Float64 literal expression holding π.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"r": [1.0, 2.0]})
+            >>> ds.select(area=bt.pi() * bt.col("r") * bt.col("r")).to_pydict()
+            {'area': [3.141592653589793, 12.566370614359172]}
+    """
+    return lit(math.pi)
+
+
+def e() -> Expr:
+    """Euler's number *e* as a Float64 expression (Spark and Daft ``e()``).
+
+    Folds to a literal at plan-build time, like :func:`pi`.
+
+    Returns:
+        A Float64 literal expression holding *e*.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.from_pydict({"x": [0]}).select(r=bt.e()).to_pydict()
+            {'r': [2.718281828459045]}
+    """
+    return lit(math.e)
+
+
+def pmod(dividend: IntoExpr, divisor: IntoExpr) -> Expr:
+    """The positive modulus of `dividend` by `divisor` (Spark and Daft ``pmod``).
+
+    Spark's definition: take the remainder ``r = dividend % divisor``, and where ``r`` is
+    negative answer ``(r + divisor) % divisor`` instead. So ``pmod(-10, 3)`` is 2 where
+    ``%`` gives -1. A negative *divisor* can still give a negative result, as in Spark:
+    ``pmod(-5.0, -6.0)`` is -5.0 and ``pmod(7.0, -8.0)`` is 7.0. A zero divisor or a null
+    operand gives null, and a NaN operand gives NaN.
+
+    Args:
+        dividend: The value to divide: a number, a column name, or an expression.
+        divisor: The modulus: a number, a column name, or an expression.
+
+    Returns:
+        The positive remainder, in the operands' common numeric type.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [10, -10, 7], "b": [3, 3, 0]})
+            >>> ds.select(r=bt.pmod(bt.col("a"), bt.col("b"))).to_pydict()
+            {'r': [1, 2, None]}
+    """
+    right = _col_or_expr(divisor)
+    remainder = _col_or_expr(dividend) % right
+    return when(remainder < 0).then((remainder + right) % right).otherwise(remainder)
+
+
+def bit_get(value: IntoExpr, position: IntoExpr) -> Expr:
+    """The bit of an integer at `position`, counting from 0 at the least significant bit.
+
+    Spark ``bit_get`` and ``getbit``. The answer is 0 or 1, and null when either operand is
+    null. DuckDB's ``get_bit`` is a different function: it indexes a ``BIT`` string from
+    the left, and Batcher has no ``BIT`` type.
+
+    Args:
+        value: The integer to read: a number, a column name, or an expression.
+        position: The 0-based bit index: a number, a column name, or an expression.
+
+    Returns:
+        An Int64 expression holding 0 or 1.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"v": [1, 2, 3, None]})
+            >>> ds.select(r=bt.bit_get("v", 1)).to_pydict()
+            {'r': [0, 1, 1, None]}
+    """
+    shifted = _col_or_expr(value).bitwise_right_shift(_col_or_expr(position))
+    return shifted.bitwise_and(lit(1))
+
+
+def elt(index: IntoExpr, *values: IntoExpr) -> Expr:
+    """The `index`-th of `values`, counting from 1, or null outside ``1..len(values)``.
+
+    Spark ``elt``. A Python ``int`` index selects its candidate at plan-build time. A
+    column index becomes a ``CASE`` over the positions, so the choice is made per row. A
+    string index is a column name.
+
+    Args:
+        index: The 1-based position: an int, a column name, or an expression.
+        *values: The candidates, all of one type (columns or literals).
+
+    Returns:
+        An expression of the candidates' type.
+
+    Raises:
+        PlanError: If no candidate value is given.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"n": [1, 2, 3], "a": ["scala"] * 3, "b": ["java"] * 3})
+            >>> ds.select(r=bt.elt("n", bt.col("a"), bt.col("b"))).to_pydict()
+            {'r': ['scala', 'java', None]}
+    """
+    if not values:
+        raise PlanError("elt(): expected at least one value after the index")
+    candidates = [_wrap(v) for v in values]
+    # `nullif(x, x)` is a null of `x`'s type: a CASE branch has no untyped NULL spelling.
+    missing = nullif(candidates[0], candidates[0])
+    if isinstance(index, int) and not isinstance(index, bool):
+        return candidates[index - 1] if 1 <= index <= len(candidates) else missing
+    position = _col_or_expr(index)
+    chain = when(position == 1).then(candidates[0])
+    for number, value in enumerate(candidates[1:], start=2):
+        chain = chain.when(position == number).then(value)
+    return chain.otherwise(missing)

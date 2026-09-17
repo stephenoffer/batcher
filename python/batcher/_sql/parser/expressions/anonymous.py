@@ -29,8 +29,6 @@ prevent.
 
 from __future__ import annotations
 
-import math
-
 from batcher.plan.expr_ir import Binary, Expr, array, lit, nullif, when
 from batcher.plan.functions.collection import element
 from batcher.plan.functions.partitioning import (
@@ -40,7 +38,7 @@ from batcher.plan.functions.partitioning import (
     partition_truncate,
     partition_years,
 )
-from batcher.plan.functions.scalar import arctan2, gcd, hypot, lcm, nanvl, next_after
+from batcher.plan.functions.scalar import arctan2, e, gcd, hypot, lcm, nanvl, next_after, pi
 from batcher.plan.functions.temporal import current_date, make_date
 
 __all__ = ["anonymous_scalar", "known_names"]
@@ -90,11 +88,10 @@ _UNARY_STR = {
     "to_binary": "to_binary",
     "from_binary": "from_binary",
     "xxhash64": "xxhash64",
-    # Spark's `try_*` string forms differ from the plain ones only by returning null
-    # instead of raising on a *conversion* failure, and these two already return null
-    # rather than raising, so the two spellings mean the same thing here.
+    # Spark's `try_to_binary` differs from the plain form only by returning null instead
+    # of raising on a *conversion* failure, and `to_binary` already returns null rather
+    # than raising, so the two spellings mean the same thing here.
     "try_to_binary": "to_binary",
-    "try_url_decode": "url_decode",
 }
 
 # `f(m)` → a `.map` method. `map_keys` reaches the typed dispatch; `map_values` does not.
@@ -235,6 +232,9 @@ _UNARY_FN = {
     "partition_months": partition_months,
     "partition_days": partition_days,
     "partition_hours": partition_hours,
+    # Spark's `try_url_decode` is *not* DuckDB's `url_decode`: it reads `+` as a space and
+    # nulls a `%` without two hex digits, where `url_decode` leaves both as written.
+    "try_url_decode": lambda v: v.str.url_decode(form=True, malformed="null"),
 }
 
 
@@ -272,8 +272,8 @@ _TERNARY_FN = {
 # for them because there is nothing per-row to compute, so they fold to a literal at
 # plan-build time — which is also what makes them constant-foldable downstream.
 _NULLARY = {
-    "pi": lambda: lit(math.pi),
-    "e": lambda: lit(math.e),
+    "pi": pi,
+    "e": e,
     "today": current_date,
     # The lambda placeholder: `transform(xs, x -> x + 1)` rewrites its parameter to
     # `element()` before translating the body, and this row is what resolves it.

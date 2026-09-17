@@ -274,6 +274,27 @@ print(out.to_pydict())
 # {'bucket': [1.0, 3.0, 4.0, 5.0]}
 ```
 
+A few Spark functions have no DuckDB twin and are top-level functions too. {py:obj}`bt.pmod(a, b) <batcher.pmod>` is the positive remainder, where `%` keeps the dividend's sign. {py:obj}`bt.bit_get(value, position) <batcher.bit_get>` reads one bit of an integer, counting from the least significant. {py:obj}`bt.elt(index, *values) <batcher.elt>` picks the `index`-th of its arguments on each row, and is null when the index is out of range. A string argument to these is a column name.
+
+```python
+nums = bt.from_pydict({"n": [-10, 7, 2], "flags": [5, 2, 3]})
+out = nums.select(
+    rem=bt.col("n") % 3,
+    pos=bt.pmod("n", 3),
+    low_bit=bt.bit_get("flags", 0),
+    label=bt.elt(bt.col("flags") - 1, bt.lit("low"), bt.lit("mid"), bt.lit("high")),
+)
+print(out.to_pydict())
+# {'rem': [-1, 1, 2], 'pos': [2, 1, 2], 'low_bit': [1, 0, 1], 'label': [None, 'low', 'mid']}
+```
+
+{py:obj}`bt.pi() <batcher.pi>` and {py:obj}`bt.e() <batcher.e>` are the two constants, folded to a literal when the plan is built.
+
+```python
+print(nums.select(tau=bt.pi() * 2, e=bt.e()).limit(1).to_pydict())
+# {'tau': [6.283185307179586], 'e': [2.718281828459045]}
+```
+
 ## Aggregate expressions
 
 Aggregate methods such as `.sum()`, `.mean()`, `.min()`, `.max()`, `.median()`,
