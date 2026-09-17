@@ -173,6 +173,7 @@ the accessor namespaces:
 | Method | Description |
 | --- | --- |
 | `.alias(name)` | bind an output name to a derived expression, for positional `select` |
+| {py:meth}`.pipe(fn, *args) <batcher.Expr.pipe>` | apply your own `fn(expr, *args)` and keep the chain fluent (Polars `pipe`, Spark `Column.transform`) |
 | {py:meth}`.neg() <batcher.plan.expr_ir.core.Expr.neg>` | arithmetic negation (the Polars spelling of the unary minus) |
 | `.chr()` | the character at this Unicode code point (DuckDB/Spark `chr`) |
 | {py:meth}`.to_base(radix) <batcher.plan.expr_ir.core.Expr.to_base>` | this integer written in base 2..36 (DuckDB {py:meth}`to_base <batcher.plan.expr_ir.core.Expr.to_base>`; `bin` is radix 2) |

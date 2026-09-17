@@ -21,7 +21,7 @@ import datetime as _dt
 import decimal as _decimal
 import itertools
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError, require_float, require_int
@@ -686,6 +686,34 @@ class Expr:
         return Binary("shift_right", self, _wrap(other))
 
     # --- naming ------------------------------------------------------------
+    def pipe(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Apply `fn(self, *args, **kwargs)` and return its result, to keep a chain fluent.
+
+        The expression counterpart of ``Dataset.pipe`` (Polars ``Expr.pipe``, Spark
+        ``Column.transform``): a reusable expression builder reads in the order it runs,
+        ``col("x").pipe(clean).alias("y")``, where ``clean(col("x")).alias("y")`` would
+        not. It adds no node and returns whatever `fn` returns.
+
+        Args:
+            fn: A callable taking this expression as its first argument.
+            *args: Extra positional arguments forwarded to `fn`.
+            **kwargs: Extra keyword arguments forwarded to `fn`.
+
+        Returns:
+            Whatever `fn` returns, typically a new expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> def scaled(e, factor):
+                ...     return e * factor
+                >>> ds = bt.from_pydict({"x": [1, 2]})
+                >>> ds.select(y=bt.col("x").pipe(scaled, 10)).to_pydict()
+                {'y': [10, 20]}
+        """
+        return fn(self, *args, **kwargs)
+
     def alias(self, name: str) -> Aliased:
         """Bind an output name to this expression, for positional `select`.
 

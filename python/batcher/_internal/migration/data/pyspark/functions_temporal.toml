@@ -45,8 +45,8 @@ minute = { status = "canonical", batcher = "Expr.dt.minute" }
 month = { status = "canonical", batcher = "Expr.dt.month" }
 monthname = { status = "canonical", batcher = "Expr.dt.monthname", template = 'monthname(col) -> sem.column(col).dt.monthname(abbreviated=True)' }
 months = { status = "canonical", batcher = "bt.partition_months" }
-months_between = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (months_between with roundOff)", wave = "W1" }
-next_day = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (next_day)", wave = "W1" }
+months_between = { status = "canonical", batcher = "Expr.dt.months_between", template = 'months_between(date1, date2, roundOff=True) -> sem.column(date1).dt.months_between(sem.column(date2), round_off=roundOff)' }
+next_day = { status = "canonical", batcher = "Expr.dt.next_day", template = 'next_day(date, dayOfWeek) -> sem.column(date).dt.next_day(dayOfWeek)' }
 now = { status = "canonical", batcher = "bt.current_timestamp" }
 quarter = { status = "canonical", batcher = "Expr.dt.quarter" }
 second = { status = "canonical", batcher = "Expr.dt.second" }
@@ -80,7 +80,7 @@ try_make_timestamp_ntz = { status = "gap", need = "NTZ timestamp constructor ret
 try_to_date = { status = "gap", need = "to_date with Java patterns returning null on invalid input", wave = "W6" }
 try_to_time = { status = "gap", need = "to_time returning null on invalid input", wave = "W6" }
 try_to_timestamp = { status = "gap", need = "to_timestamp with Java patterns returning null on invalid input", wave = "W6" }
-unix_date = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (unix_date)", wave = "W1" }
+unix_date = { status = "canonical", batcher = "bt.partition_days", template = 'unix_date(col) -> bt.partition_days(sem.column(col))' }
 unix_micros = { status = "canonical", batcher = "Expr.dt.epoch_us" }
 unix_millis = { status = "canonical", batcher = "Expr.dt.epoch_ms" }
 unix_seconds = { status = "canonical", batcher = "Expr.dt.epoch" }

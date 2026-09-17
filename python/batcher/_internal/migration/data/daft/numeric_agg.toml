@@ -110,7 +110,7 @@ count_distinct = { status = "canonical", batcher = "bt.count_distinct" }
 csc = { status = "canonical", batcher = "Expr.csc" }
 degrees = { status = "canonical", batcher = "Expr.degrees" }
 dense_rank = { status = "canonical", batcher = "bt.dense_rank" }
-e = { status = "gap", need = "Euler's number constant expression (bt.lit(math.e) works today)", wave = "W1" }
+e = { status = "canonical", batcher = "bt.e" }
 exp = { status = "canonical", batcher = "Expr.exp" }
 expm1 = { status = "canonical", batcher = "Expr.expm1" }
 factorial = { status = "canonical", batcher = "Expr.factorial" }
@@ -139,7 +139,7 @@ negate = { status = "canonical", batcher = "op:neg" }
 not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
 over = { status = "param", batcher = ["Expr.over"], need = "a Window spec object", wave = "WF" }
 percentile = { status = "canonical", batcher = "Expr.quantile" }
-pi = { status = "gap", need = "pi constant expression (bt.lit(math.pi) works today)", wave = "W1" }
+pi = { status = "canonical", batcher = "bt.pi" }
 pmod = { status = "gap", need = "positive modulo (Batcher % truncates toward zero, so pmod(-7, 3) is -1 not 2)", wave = "W3" }
 pow = { status = "canonical", batcher = "op:pow" }
 power = { status = "canonical", batcher = "op:pow" }

@@ -21,7 +21,7 @@ asc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
 assert_true = { status = "gap", need = "raise when a condition is false", wave = "W3" }
 broadcast = { status = "out_of_scope", reason = "no join-hint IR; Kyber picks the build side from measured cardinalities (revisit)" }
 bucket = { status = "canonical", batcher = "Expr.hash_bucket", template = 'bucket(numBuckets, col) -> sem.column(col).hash_bucket(numBuckets, algorithm="iceberg")' }
-call_function = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (call_function by name)", wave = "W1" }
+call_function = { status = "param", batcher = "bt.call_function", need = "functions registered from Python with bt.register_function", wave = "W2" }
 call_udf = { status = "gap", need = "call a registered UDF by name from the DataFrame API", wave = "W11" }
 coalesce = { status = "canonical", batcher = "bt.coalesce" }
 col = { status = "canonical", batcher = "bt.col" }
@@ -35,7 +35,7 @@ desc = { status = "canonical", batcher = "Dataset.sort" }
 desc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
 desc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
 equal_null = { status = "canonical", batcher = "Expr.eq_missing" }
-expr = { status = "gap", need = "parse a SQL expression string into an Expr (bt.expr)", wave = "W1" }
+expr = { status = "canonical", batcher = "bt.sql_expr", template = 'expr(str) -> bt.sql_expr(str)' }
 ifnull = { status = "canonical", batcher = "Expr.fill_null" }
 input_file_block_length = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }
 input_file_block_start = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }

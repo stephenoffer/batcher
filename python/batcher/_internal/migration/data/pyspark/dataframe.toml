@@ -84,7 +84,7 @@ sampleBy = { status = "param", batcher = "Dataset.sample", need = "stratified sa
 scalar = { status = "gap", need = "scalar subquery as a column", wave = "W8" }
 schema = { status = "mismatch", batcher = "Dataset.schema", note = "Spark returns a StructType; Batcher returns a pyarrow.Schema", wave = "W0" }
 select = { status = "canonical", batcher = "Dataset.select" }
-selectExpr = { status = "gap", need = "SQL expression strings in select (bt.expr)", wave = "W1" }
+selectExpr = { status = "canonical", batcher = "Dataset.select" }
 semanticHash = { status = "gap", need = "semantic hash of the logical plan", wave = "W8" }
 show = { status = "param", batcher = "Dataset.show", need = "truncate= and vertical= display options (Spark shows 20 rows by default)", wave = "W2" }
 sort = { status = "mismatch", batcher = "Dataset.sort", note = "Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls_first=True for ascending keys", wave = "W0", template = 'sort(*cols, **kwargs) -> self.sort(sem.spark_sort(cols, kwargs))' }

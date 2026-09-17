@@ -5,7 +5,7 @@
 [functions]
 aggregate = { status = "gap", need = "higher-order function with a Python lambda over array elements (fold with initial value and finish)", wave = "W4" }
 array = { status = "canonical", batcher = "bt.array" }
-array_append = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (array_append)", wave = "W1" }
+array_append = { status = "canonical", batcher = "Expr.list.append", template = 'array_append(col, value) -> sem.column(col).list.append(value, propagate_nulls=True)' }
 array_compact = { status = "canonical", batcher = "Expr.list.drop_nulls" }
 array_contains = { status = "canonical", batcher = "Expr.list.contains", template = 'array_contains(col, value) -> sem.column(col).list.contains(value, propagate_nulls=True)' }
 array_distinct = { status = "canonical", batcher = "Expr.list.unique", template = 'array_distinct(col) -> sem.column(col).list.unique(drop_nulls=False)' }
@@ -16,13 +16,13 @@ array_join = { status = "param", batcher = "Expr.list.join", need = "null_replac
 array_max = { status = "canonical", batcher = "Expr.list.max" }
 array_min = { status = "canonical", batcher = "Expr.list.min" }
 array_position = { status = "canonical", batcher = "Expr.list.position", template = 'array_position(col, value) -> sem.column(col).list.position(value, zero_if_absent=True)' }
-array_prepend = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (array_prepend)", wave = "W1" }
-array_remove = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (array_remove)", wave = "W1" }
+array_prepend = { status = "canonical", batcher = "Expr.list.prepend", template = 'array_prepend(col, value) -> sem.column(col).list.prepend(value, propagate_nulls=True)' }
+array_remove = { status = "param", batcher = "Expr.list.remove", template = 'array_remove(col, element) -> sem.column(col).list.remove(element)', need = "a column-valued element", wave = "W2" }
 array_repeat = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (array_repeat)", wave = "W1" }
 array_size = { status = "canonical", batcher = "Expr.list.len" }
 array_sort = { status = "param", batcher = "Expr.list.sort", need = "comparator= lambda", wave = "W4" }
 array_union = { status = "canonical", batcher = "Expr.list.union" }
-arrays_overlap = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (arrays_overlap)", wave = "W1" }
+arrays_overlap = { status = "canonical", batcher = "Expr.list.has_any", template = 'arrays_overlap(a1, a2) -> sem.column(a1).list.has_any(sem.column(a2), propagate_nulls=True)' }
 arrays_zip = { status = "gap", need = "zip arrays into an array of structs", wave = "W3" }
 cardinality = { status = "canonical", batcher = ["Expr.list.len", "Expr.map.len"] }
 create_map = { status = "gap", need = "map from alternating key/value expressions", wave = "W4" }

@@ -13,7 +13,7 @@ atan2 = { status = "alias", batcher = "bt.arctan2" }
 atanh = { status = "canonical", batcher = "Expr.arctanh" }
 bin = { status = "canonical", batcher = "Expr.to_base", template = 'bin(col) -> sem.column(col).to_base(2, twos_complement=True)' }
 bit_count = { status = "canonical", batcher = "Expr.bit_count" }
-bit_get = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (bit_get)", wave = "W1" }
+bit_get = { status = "canonical", batcher = "bt.bit_get" }
 bitwise_not = { status = "gap", need = "integer bitwise NOT (~ on Expr is boolean-only and raises on integers)", wave = "W3" }
 bround = { status = "param", batcher = "Expr.round", template = 'bround(col, scale=0) -> sem.column(col).round(scale, mode="half_to_even")', need = "a column-valued scale", wave = "W2" }
 cbrt = { status = "canonical", batcher = "Expr.cbrt" }
@@ -25,12 +25,12 @@ cosh = { status = "canonical", batcher = "Expr.cosh" }
 cot = { status = "canonical", batcher = "Expr.cot" }
 csc = { status = "canonical", batcher = "Expr.csc" }
 degrees = { status = "canonical", batcher = "Expr.degrees" }
-e = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (e)", wave = "W1" }
+e = { status = "canonical", batcher = "bt.e" }
 exp = { status = "canonical", batcher = "Expr.exp" }
 expm1 = { status = "canonical", batcher = "Expr.expm1" }
 factorial = { status = "mismatch", batcher = "Expr.factorial", note = "Batcher returns Int64 and raises outside 0..20; Spark returns null there. Port as bt.when(n.between(0, 20)).then(n.factorial())", wave = "W0" }
 floor = { status = "param", batcher = "Expr.floor", need = "scale= digits, and a BIGINT result for scale-less input", wave = "W2" }
-getbit = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (getbit)", wave = "W1" }
+getbit = { status = "canonical", batcher = "bt.bit_get", template = 'getbit(col, pos) -> bt.bit_get(col, pos)' }
 greatest = { status = "canonical", batcher = "bt.greatest" }
 hypot = { status = "canonical", batcher = "bt.hypot" }
 least = { status = "canonical", batcher = "bt.least" }
@@ -42,9 +42,9 @@ log2 = { status = "canonical", batcher = "Expr.log2" }
 nanvl = { status = "canonical", batcher = "bt.nanvl" }
 negate = { status = "canonical", batcher = "op:neg" }
 negative = { status = "canonical", batcher = "op:neg" }
-pi = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (pi)", wave = "W1" }
-pmod = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (pmod)", wave = "W1" }
-positive = { status = "gap", need = "unary plus identity on an expression", wave = "W1" }
+pi = { status = "canonical", batcher = "bt.pi" }
+pmod = { status = "canonical", batcher = "bt.pmod" }
+positive = { status = "canonical", batcher = "Expr", template = 'positive(col) -> sem.column(col)' }
 pow = { status = "canonical", batcher = "op:pow" }
 power = { status = "canonical", batcher = "op:pow" }
 radians = { status = "canonical", batcher = "Expr.radians" }
@@ -65,7 +65,7 @@ tan = { status = "canonical", batcher = "Expr.tan" }
 tanh = { status = "canonical", batcher = "Expr.tanh" }
 try_add = { status = "gap", need = "addition returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
 try_divide = { status = "canonical", batcher = "Expr.safe_divide" }
-try_mod = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (try_mod)", wave = "W1" }
+try_mod = { status = "canonical", batcher = "op:mod" }
 try_multiply = { status = "gap", need = "multiplication returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
 try_subtract = { status = "gap", need = "subtraction returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
 uniform = { status = "gap", need = "uniform random value in [min, max) with seed", wave = "W3" }

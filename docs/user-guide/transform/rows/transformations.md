@@ -203,6 +203,16 @@ Without `pipe` the same pipeline reads backwards. `with_total(ds).filter(...)` p
 first step in the middle. Reach for `pipe` whenever a chain grows a step that has no
 built-in method.
 
+Expressions have the same method. {py:meth}`Expr.pipe <batcher.Expr.pipe>` hands the expression to your function, so a reusable column builder chains the same way:
+
+```python
+def discounted(price, rate):
+    return price * (1 - rate)
+
+
+print(ds.select(net=bt.col("price").pipe(discounted, 0.1)).to_pydict()["net"])
+```
+
 ## Flattening nested data
 
 Semistructured data arrives with lists and structs inside columns. Two relational

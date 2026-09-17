@@ -35,7 +35,7 @@ over = { status = "param", batcher = ["Expr.over"], template = 'over(window) -> 
 rlike = { status = "canonical", batcher = "Expr.str.regexp_matches" }
 startswith = { status = "canonical", batcher = "Expr.str.starts_with" }
 substr = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substr(0, 2) of 'hello' is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0" }
-transform = { status = "gap", need = "apply a Column -> Column function fluently (Column.transform(f))", wave = "W1" }
+transform = { status = "canonical", batcher = "Expr.pipe", template = 'transform(f) -> self.pipe(f)' }
 try_cast = { status = "canonical", batcher = "Expr.try_cast" }
 when = { status = "canonical", batcher = "CaseBuilder.when", template = 'when(condition, value) -> self.when(condition).then(value)' }
 withField = { status = "gap", need = "add or replace a nested struct field in place", wave = "W8" }

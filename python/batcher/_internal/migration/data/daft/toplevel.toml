@@ -127,7 +127,7 @@ set_runner_native = { status = "out_of_scope", reason = "Daft runner internals; 
 set_runner_ray = { status = "param", batcher = "Dataset.collect", need = "a process-wide switch to distributed execution (Batcher opts in per collect(distributed=...))", wave = "W9" }
 set_session = { status = "gap", need = "a process-default session object (current_session/set_session/session)", wave = "W9" }
 sql = { status = "param", batcher = "bt.sql", need = "register_globals= discovery of DataFrames bound to Python variables", wave = "W1" }
-sql_expr = { status = "gap", need = "parse a SQL string into an Expr (bt.expr)", wave = "W1" }
+sql_expr = { status = "canonical", batcher = "bt.sql_expr" }
 udaf = { status = "gap", need = "user-defined mergeable aggregate functions (partial/combine/finalize) from a class", wave = "W11" }
 udf = { status = "mismatch", batcher = "bt.udf", note = "Daft @udf (deprecated) yields a column UDF called with Expressions and sized with num_gpus=/concurrency=/batch_size=; bt.udf yields a Dataset-level transform. Param: an Expr-returning UDF form", wave = "W11" }
 with_subscriber = { status = "param", batcher = "bt.add_streaming_listener", need = "subscribers for batch (non-streaming) query events, as a context manager", wave = "W9" }

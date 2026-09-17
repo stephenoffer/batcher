@@ -111,7 +111,7 @@ self_dtype = { status = "gap", need = "self_dtype (dtype expression)", wave = "W
 set_random_seed = { status = "gap", need = "set_random_seed (global seed for sample/shuffle)", wave = "W8" }
 show_versions = { status = "canonical", batcher = "bt.show_versions" }
 sql = { status = "param", batcher = "bt.sql", need = "discover frames from the caller's globals, eager= flag", wave = "W2" }
-sql_expr = { status = "gap", need = "sql_expr (SQL expression string to Expr)", wave = "W8" }
+sql_expr = { status = "canonical", batcher = "bt.sql_expr" }
 std = { status = "param", batcher = "bt.std", need = "ddof=", wave = "W2" }
 struct = { status = "param", batcher = "bt.struct", need = "positional expressions (names inferred) and schema=", wave = "W2" }
 struct_with_fields = { status = "gap", need = "struct_with_fields", wave = "W3" }
