@@ -69,12 +69,13 @@ fn widens_decimal(func: AggFunc) -> bool {
             | AggFunc::Var
             | AggFunc::Stddev
             | AggFunc::Median
-            | AggFunc::Quantile(_)
+            | AggFunc::Quantile(..)
             | AggFunc::QuantileDisc(_)
             | AggFunc::ApproxQuantile(_)
             | AggFunc::Mad
             | AggFunc::Product
             | AggFunc::Skewness
+            | AggFunc::SkewnessPop
             | AggFunc::Kurtosis
             | AggFunc::KurtosisPop
             | AggFunc::KahanSum

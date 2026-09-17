@@ -363,12 +363,15 @@ def _window(tr, ds: Dataset, projections) -> Dataset:
             groups.append((part, order, frame, {out: func}))
 
     for part, order, frame, funcs in groups:
+        skipping = {name for name, f in funcs.items() if isinstance(f, _IgnoreNulls)}
         ds = ds.window(
             partition_by=list(part),
             order_by=list(order),
-            functions=funcs,
+            functions={name: tuple(f) if name in skipping else f for name, f in funcs.items()},
             frame=frame,
         )
+        if skipping:
+            ds = _mark_ignore_nulls(ds, skipping, bool(order))
     return ds
 
 
@@ -441,65 +444,111 @@ def _any_value_func(fn, order):
     )
 
 
+class _IgnoreNulls(tuple):
+    """A value function's `ds.window` spec that must skip nulls when it picks its answer.
+
+    `ds.window` has no spelling for `IGNORE NULLS`, so the spec travels marked through the
+    grouping in `_window` and the flag is set on the built `Window` node afterwards.
+    """
+
+
 def _ignore_nulls_func(win, fn, order):
-    """Map `<value fn>(x IGNORE NULLS) OVER (...)` onto the runtime's fill primitives.
+    """Map `<value fn>(x IGNORE NULLS) OVER (...)` onto the engine's `ignore_nulls` flag.
 
-    `IGNORE NULLS` makes a value function skip nulls when picking its answer. Two shapes
-    are exactly the engine's existing fills, so they need no new operator:
+    `IGNORE NULLS` makes `first_value`/`last_value`/`nth_value` pick among the frame's
+    non-null values, which the runtime computes for any frame, so the spec is the ordinary
+    value-function spec marked to skip nulls. The frame is the window's own, including SQL's
+    running default.
 
-    * ``last_value(x IGNORE NULLS)`` over the default frame (everything up to the current
-      row) is "the most recent non-null so far" — a **forward fill**.
-    * ``first_value(x IGNORE NULLS)`` over ``CURRENT ROW AND UNBOUNDED FOLLOWING`` is "the
-      next non-null from here" — a **backward fill**.
+    This replaced a mapping onto the fills (`forward_fill`/`backward_fill`), which read rows
+    in physical order and so answered a tie on the ORDER BY key by arrival: with
+    ``k = [1, 2, 2]`` and ``x = [1, 5, NULL]``, the NULL row read ``1`` or ``5`` depending on
+    which of the two tied rows came first, where the running frame includes the whole peer
+    group and DuckDB answers ``5``.
 
-    Other combinations (`lag`/`lead`/`nth_value` with IGNORE NULLS, or a value function
-    over some other frame) need per-row null-skipping the runtime does not have, and are
-    rejected rather than silently answered with the null-*respecting* result — which would
-    be a wrong answer, not a slower one.
+    `lag`/`lead` with IGNORE NULLS need a different per-row search the runtime does not have,
+    and are rejected rather than answered with the null-*respecting* result.
 
     Args:
-        win: The `Window` node, read for its frame spec.
+        win: The `Window` node.
         fn: The inner function node that `IgnoreNulls` wraps.
         order: The window's ORDER BY, required by every value function.
 
     Returns:
-        The `ds.window` functions-value — a `(fill, column)` pair.
+        The `ds.window` functions-value, marked to skip nulls.
     """
     name = type(fn).__name__.lower()
+    if name not in {"firstvalue", "lastvalue", "nthvalue"}:
+        raise NotImplementedError(
+            f"{name}(x) IGNORE NULLS is not supported. Supported: first_value, last_value and "
+            "nth_value with IGNORE NULLS over any frame"
+        )
+    del win
+    return _IgnoreNulls(_value_func(name, fn, order))
+
+
+def _mark_ignore_nulls(ds: Dataset, outputs: set[str], ordered: bool) -> Dataset:
+    """Set `ignore_nulls` on the functions of `ds`'s top `Window` node named in `outputs`.
+
+    `first_value` is the one whose frame changes with the flag: SQL leaves it frameless,
+    which is right while nulls count, and wrong once the first non-null so far is asked for.
+    """
+    import dataclasses
+
+    from batcher.plan.logical import Window
+    from batcher.plan.logical.window import sql_default_frame
+
+    node = ds._plan
+    if not isinstance(node, Window):
+        raise NotImplementedError("IGNORE NULLS needs the window to be its own operator")
+    functions = tuple(
+        dataclasses.replace(
+            f, ignore_nulls=True, frame=sql_default_frame(f.func, f.frame, ordered, True)
+        )
+        if f.alias in outputs
+        else f
+        for f in node.functions
+    )
+    return ds._derive(dataclasses.replace(node, functions=functions))
+
+
+_VALUE_FUNCS = {
+    "lag": "lag",
+    "lead": "lead",
+    "firstvalue": "first_value",
+    "lastvalue": "last_value",
+    "nthvalue": "nth_value",
+}
+
+
+def _value_func(name: str, fn, order):
+    """The `ds.window` spec of a positional value function (`lag`/`lead`/`*_value`)."""
     if not order:
         raise NotImplementedError(f"window function {name!r} requires ORDER BY")
     arg = fn.this
     if not isinstance(arg, exp.Column):
-        raise NotImplementedError("IGNORE NULLS supports a single plain column argument only")
-
-    def bound(key: str) -> str:
-        """A frame bound as an upper-case keyword, or "" when it is an offset literal.
-
-        An offset bound (`1 PRECEDING`) parses as a `Literal`, not a keyword string, so it
-        must not be coerced — it simply is not one of the shapes handled here.
-        """
-        if spec is None:
-            return ""
-        v = spec.args.get(key)
-        return v.upper() if isinstance(v, str) else ""
-
-    spec = win.args.get("spec")
-    kind, start, end = bound("kind"), bound("start"), bound("end")
-    # The default frame (no spec) runs from the partition start to the current row, which
-    # is what makes `last_value` a forward fill.
-    trailing = spec is None or (start == "UNBOUNDED" and end == "CURRENT ROW")
-    leading = kind in {"ROWS", "RANGE"} and start == "CURRENT ROW" and end == "UNBOUNDED"
-
-    if name == "lastvalue" and trailing:
-        return ("forward_fill", arg.name)
-    if name == "firstvalue" and leading:
-        return ("backward_fill", arg.name)
-    raise NotImplementedError(
-        f"{name}(x IGNORE NULLS) over this frame is not supported. Supported: "
-        "last_value(x IGNORE NULLS) over the default frame (a forward fill) and "
-        "first_value(x IGNORE NULLS) OVER (... ROWS BETWEEN CURRENT ROW AND UNBOUNDED "
-        "FOLLOWING) (a backward fill)"
-    )
+        raise NotImplementedError(f"window {name} supports a plain column argument only")
+    if name in ("lag", "lead"):
+        if fn.args.get("default") is not None:
+            # A default value fills the out-of-range rows; the engine has no
+            # such parameter, so honoring the offset while dropping the default
+            # would silently return NULL where SQL returns the default. Reject.
+            raise NotImplementedError(
+                f"{name}(expr, offset, default) with a default value is not supported yet"
+            )
+        off = fn.args.get("offset")
+        # A negative offset (`lag(x, -1)`) flips direction (== `lead(x, 1)`), which the
+        # engine supports; sqlglot wraps it in a `Neg` node, so `int(off.this)` would
+        # read the inner Literal and crash. `_const_int` evaluates the constant.
+        return (_VALUE_FUNCS[name], arg.name, _const_int(off, name) if off is not None else 1)
+    if name == "nthvalue":
+        n = fn.args.get("offset")
+        if n is None:
+            raise NotImplementedError("nth_value(expr, n) requires a constant N")
+        # The N rides in the offset slot of the (func, column, offset) spec. A
+        # non-positive N yields all-NULL (matching DuckDB), so it is not rejected here.
+        return ("nth_value", arg.name, _const_int(n, "nth_value"))
+    return (_VALUE_FUNCS[name], arg.name)
 
 
 #: Window functions whose first argument is a *value* the engine reads per row. Each takes
@@ -682,39 +731,7 @@ def _window_func(win, order):
             )
         return (tag, arg.name)
 
-    value = {
-        "lag": "lag",
-        "lead": "lead",
-        "firstvalue": "first_value",
-        "lastvalue": "last_value",
-        "nthvalue": "nth_value",
-    }
-    if name in value:
-        if not order:
-            raise NotImplementedError(f"window function {name!r} requires ORDER BY")
-        arg = fn.this
-        if not isinstance(arg, exp.Column):
-            raise NotImplementedError(f"window {name} supports a plain column argument only")
-        if name in ("lag", "lead"):
-            if fn.args.get("default") is not None:
-                # A default value fills the out-of-range rows; the engine has no
-                # such parameter, so honoring the offset while dropping the default
-                # would silently return NULL where SQL returns the default. Reject.
-                raise NotImplementedError(
-                    f"{name}(expr, offset, default) with a default value is not supported yet"
-                )
-            off = fn.args.get("offset")
-            # A negative offset (`lag(x, -1)`) flips direction (== `lead(x, 1)`), which the
-            # engine supports; sqlglot wraps it in a `Neg` node, so `int(off.this)` would
-            # read the inner Literal and crash. `_const_int` evaluates the constant.
-            return (value[name], arg.name, _const_int(off, name) if off is not None else 1)
-        if name == "nthvalue":
-            n = fn.args.get("offset")
-            if n is None:
-                raise NotImplementedError("nth_value(expr, n) requires a constant N")
-            # The N rides in the offset slot of the (func, column, offset) spec. A
-            # non-positive N yields all-NULL (matching DuckDB), so it is not rejected here.
-            return ("nth_value", arg.name, _const_int(n, "nth_value"))
-        return (value[name], arg.name)
+    if name in _VALUE_FUNCS:
+        return _value_func(name, fn, order)
 
     raise NotImplementedError(f"unsupported window function: {name}")

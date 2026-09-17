@@ -51,7 +51,7 @@ _TYPES: dict[str, pa.Array] = {
 }
 
 _PARAMETRIC = {"quantile", "approx_quantile", "quantile_disc", "n_length", "l_count"}
-_BINARY = {"corr", "covar_pop", "covar_samp", "arg_min", "arg_max"}
+_BINARY = {"corr", "covar_pop", "covar_samp", "arg_min", "arg_max", "arg_min_null", "arg_max_null"}
 
 #: Pairs the rule rejects that the engine *tolerates*, each with why rejecting is right.
 #: The engine's answer for every one of these is either all-null with no diagnostic or a
@@ -98,6 +98,10 @@ _DELIBERATELY_STRICTER = {
     ("skewness", "duration"),
     ("skewness", "string"),
     ("skewness", "timestamp"),
+    ("skewness_pop", "bool"),
+    ("skewness_pop", "duration"),
+    ("skewness_pop", "string"),
+    ("skewness_pop", "timestamp"),
 }
 
 

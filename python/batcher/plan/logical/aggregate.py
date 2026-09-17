@@ -61,6 +61,7 @@ _AGG_FLOAT = frozenset(
         "covar_pop",
         "covar_samp",
         "skewness",
+        "skewness_pop",
         "kurtosis",
         # `product` is unconditionally Float64 in the engine (Rust `AggFunc::Product`),
         # not `widen(input)` — an int column's product still comes back as double.
@@ -71,12 +72,14 @@ _AGG_BOOL = frozenset({"bool_and", "bool_or"})
 # Collection-valued aggregates: one column of the input's (widened) type per group.
 # `list_agg` gathers the group's values and `approx_top_k` its most frequent ones, so both
 # are a list of that type; `histogram` is a map from value to occurrence count.
-_AGG_LIST_OF_INPUT = frozenset({"list_agg", "approx_top_k"})
+_AGG_LIST_OF_INPUT = frozenset({"list_agg", "approx_top_k", "modes"})
 _AGG_MAP_COUNT_OF_INPUT = frozenset({"histogram"})
 # `l_count` is a number of contigs, so Int64 — reporting it as a float would be the
 # same mistake as a fractional row count. `n_length`/`aun` are lengths and land in
 # `_AGG_FLOAT` beside the other length-valued statistics.
-_AGG_INPUT = frozenset({"min", "max", "mode", "arg_min", "arg_max"})  # preserve input type
+_AGG_INPUT = frozenset(
+    {"min", "max", "mode", "arg_min", "arg_max", "arg_min_null", "arg_max_null"}
+)  # preserve input type
 _AGG_WIDEN_INPUT = frozenset(
     # `any_value` widens rather than preserves: it crosses the FFI boundary as an ordinary
     # gathered value, so an Int32 column's arbitrary member comes back Int64 like every other

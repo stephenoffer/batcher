@@ -29,6 +29,7 @@ from batcher.plan.logical import (
     WindowFrame,
     WindowFuncSpec,
 )
+from batcher.plan.logical.window import sql_default_frame
 from batcher.plan.types import normalize_dtype_spec
 
 if TYPE_CHECKING:
@@ -124,6 +125,7 @@ def build_window(
                     f"{sorted(WINDOW_AGGREGATES & WINDOW_FRAMEABLE)}"
                 )
             fn_frame = wframe if func in WINDOW_FRAMEABLE else None
+            fn_frame = sql_default_frame(func, fn_frame, ordered=bool(order_specs))
             specs.append(WindowFuncSpec(func, _as_key_expr(column), alias, int(offset), fn_frame))
         else:
             raise PlanError(

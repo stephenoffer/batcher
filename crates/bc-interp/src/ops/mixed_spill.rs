@@ -24,7 +24,7 @@ use std::path::Path;
 
 use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow::compute::{lexsort_to_indices, take, SortColumn, SortOptions};
-use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
+use bc_ir::{AggFunc, AggregateItem, ProjectionItem, QuantileInterpolation};
 use bc_runtime::agg;
 use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec};
 
@@ -44,16 +44,23 @@ type PathResult = (Vec<usize>, Vec<ArrayRef>, Vec<ArrayRef>);
 /// A value-list aggregate this module can bound via an external sort (excludes
 /// `Histogram`, whose bounded path is private to `quantile_spill`, and `ListAgg`,
 /// whose output *is* the value list).
-fn bounded_value_list(func: AggFunc) -> bool {
+fn bounded_value_list(item: &AggregateItem) -> bool {
     // `NLength`/`LCount`/`AuN` are deliberately absent, and their absence is correct rather
     // than an oversight. The bounded path here works by rank selection, which answers "the
     // k-th value" without holding the list; a contiguity statistic needs the *total* and then
     // a walk down the sorted order weighted by value, which is not a rank query. They fall
     // back to the grace path, which is slower and right.
-    matches!(
-        func,
-        AggFunc::Median | AggFunc::Quantile | AggFunc::CountDistinct | AggFunc::Mode
-    )
+    //
+    // Only a *linear* quantile is bounded here: the rank selection interpolates linearly, and
+    // a `lower`/`nearest`/... one taken through it would silently answer the linear quantile.
+    match item.func {
+        AggFunc::Quantile => matches!(
+            item.interpolation,
+            None | Some(QuantileInterpolation::Linear)
+        ),
+        AggFunc::Median | AggFunc::CountDistinct | AggFunc::Mode => true,
+        _ => false,
+    }
 }
 
 /// Bound a mixed grouped aggregate out of core, or `None` to fall back to grace.
@@ -74,7 +81,7 @@ pub(crate) fn try_bounded_mixed_spill(
     }
     let mut has_bounded_vl = false;
     for a in aggregates {
-        if bounded_value_list(a.func) {
+        if bounded_value_list(a) {
             has_bounded_vl = true;
         } else if matches!(a.func, AggFunc::ListAgg | AggFunc::Histogram) {
             return Ok(None); // a value-list aggregate we can't bound → grace
@@ -87,7 +94,7 @@ pub(crate) fn try_bounded_mixed_spill(
     // Each value-list aggregate via its own bounded external sort.
     let mut results: Vec<PathResult> = Vec::new();
     for (i, a) in aggregates.iter().enumerate() {
-        if !bounded_value_list(a.func) {
+        if !bounded_value_list(a) {
             continue;
         }
         let Some(value_expr) = a.input.as_ref() else {
@@ -115,7 +122,7 @@ pub(crate) fn try_bounded_mixed_spill(
     let cs_idx: Vec<usize> = aggregates
         .iter()
         .enumerate()
-        .filter(|(_, a)| !bounded_value_list(a.func))
+        .filter(|(_, a)| !bounded_value_list(a))
         .map(|(i, _)| i)
         .collect();
     if !cs_idx.is_empty() {

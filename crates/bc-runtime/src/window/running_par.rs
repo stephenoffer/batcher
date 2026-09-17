@@ -203,6 +203,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
             values: Some(values.clone()),
         }];
         let ok = [(order.clone(), SortOptions::default())];

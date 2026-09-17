@@ -21,7 +21,7 @@ use arrow::compute::take;
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::row::{RowConverter, SortField};
 
-use super::{bucket_values_into_list, flatten_list_state};
+use super::{bucket_values_into_list, flatten_list_state, QuantileInterpolation};
 use crate::error::RuntimeError;
 
 /// Partial state for MEDIAN: each group's non-null values as one `List` column.
@@ -136,10 +136,16 @@ pub(crate) fn finalize_median(state: &ArrayRef) -> Result<ArrayRef, RuntimeError
     finalize_select(state, "median", quickselect_median)
 }
 
-/// Continuous quantile per group at `q` in [0,1] (`percentile_cont`): linearly
-/// interpolate at position `q·(n-1)`. Always yields Float64; empty groups → null.
-pub(crate) fn finalize_quantile(state: &ArrayRef, q: f64) -> Result<ArrayRef, RuntimeError> {
-    finalize_select(state, "quantile", move |v| quickselect_quantile(v, q))
+/// Continuous quantile per group at `q` in [0,1]: resolve position `q·(n-1)` by
+/// `interpolation` (linear is `percentile_cont`). Always yields Float64; empty groups → null.
+pub(crate) fn finalize_quantile(
+    state: &ArrayRef,
+    q: f64,
+    interpolation: QuantileInterpolation,
+) -> Result<ArrayRef, RuntimeError> {
+    finalize_select(state, "quantile", move |v| {
+        quickselect_quantile(v, q, interpolation)
+    })
 }
 
 /// Shared finalize for median/quantile: each group's value list is independent, so the
@@ -226,14 +232,35 @@ pub(crate) fn quickselect_median(v: &mut [f64]) -> f64 {
 /// Continuous quantile of `v` at `q` via quickselect on the bracketing ranks: select the
 /// `floor(q·(n-1))`-th smallest; the next rank (when `q` falls between two) is the min of
 /// the resulting greater partition. Matches the sort-then-interpolate result.
-fn quickselect_quantile(v: &mut [f64], q: f64) -> f64 {
+///
+/// The non-linear interpolations are Polars' (`quantile(q, interpolation=...)`): `lower` and
+/// `higher` take the element at `floor`/`ceil` of the position, `nearest` rounds it half away
+/// from zero, and `midpoint` averages the two bracketing elements. Each reads at most the two
+/// elements around the position, so all of them share the one quickselect.
+fn quickselect_quantile(v: &mut [f64], q: f64, interpolation: QuantileInterpolation) -> f64 {
     use crate::keys::float_total_cmp;
     let n = v.len();
     let pos = q.clamp(0.0, 1.0) * (n - 1) as f64;
     let lo_i = pos.floor() as usize;
     let frac = pos - lo_i as f64;
-    let (_, lo_ref, greater) = v.select_nth_unstable_by(lo_i, |a, b| float_total_cmp(*a, *b));
+    let rank = match interpolation {
+        QuantileInterpolation::Higher => pos.ceil() as usize,
+        QuantileInterpolation::Nearest => pos.round() as usize,
+        QuantileInterpolation::Linear
+        | QuantileInterpolation::Lower
+        | QuantileInterpolation::Midpoint => lo_i,
+    }
+    .min(n - 1);
+    let (_, lo_ref, greater) = v.select_nth_unstable_by(rank, |a, b| float_total_cmp(*a, *b));
     let lo_val = *lo_ref;
+    if matches!(
+        interpolation,
+        QuantileInterpolation::Lower
+            | QuantileInterpolation::Higher
+            | QuantileInterpolation::Nearest
+    ) {
+        return lo_val;
+    }
     let hi_val = if frac == 0.0 || greater.is_empty() {
         lo_val
     } else {
@@ -245,6 +272,16 @@ fn quickselect_quantile(v: &mut [f64], q: f64) -> f64 {
             }
         })
     };
+    if interpolation == QuantileInterpolation::Midpoint {
+        // Halve before adding only when the sum would overflow, so the common case is the
+        // exact `(lo + hi) / 2` Polars computes.
+        let sum = lo_val + hi_val;
+        return if sum.is_finite() || !(lo_val.is_finite() && hi_val.is_finite()) {
+            sum / 2.0
+        } else {
+            lo_val / 2.0 + hi_val / 2.0
+        };
+    }
     // A convex combination, not `lo + (hi - lo) * frac`. The difference of two large
     // opposite-signed doubles overflows to infinity, so `quantile_cont(x, 0.25)` over
     // {-1.7e308, 1.7e308} returned **inf** where the answer is -8.5e307 — which is what DuckDB
@@ -715,7 +752,7 @@ mod tests {
                 let frac = pos - lo as f64;
                 let oq = sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
                 assert_eq!(
-                    super::quickselect_quantile(&mut v, q),
+                    super::quickselect_quantile(&mut v, q, QuantileInterpolation::Linear),
                     oq,
                     "quantile q={q} trial {trial} n={n}"
                 );
@@ -731,7 +768,7 @@ mod tests {
         let state = median_state(&values, &group_ids, 1).unwrap();
         let med = finalize_median(&state).unwrap();
         assert_eq!(med.len(), 1);
-        let q = finalize_quantile(&state, 0.9).unwrap();
+        let q = finalize_quantile(&state, 0.9, QuantileInterpolation::Linear).unwrap();
         assert_eq!(q.len(), 1);
     }
 
@@ -749,7 +786,79 @@ mod tests {
         assert_eq!(super::quickselect_median(&mut v), 2.5);
         // The 3rd-of-4 quantile (q=2/3) brackets ranks 2 and 3 → value 3.0, never the NaN.
         let mut v2 = vec![1.0, 2.0, 3.0, neg_nan];
-        assert_eq!(super::quickselect_quantile(&mut v2, 2.0 / 3.0), 3.0);
+        assert_eq!(
+            super::quickselect_quantile(&mut v2, 2.0 / 3.0, QuantileInterpolation::Linear),
+            3.0
+        );
+    }
+
+    /// The Polars interpolations against a sort-and-index oracle, over every position
+    /// class: exactly on an element, below the half, on the half, above it, and the ends.
+    #[test]
+    fn quantile_interpolations_match_sorted_oracle() {
+        use QuantileInterpolation::{Higher, Lower, Midpoint, Nearest};
+        let base = [5.0, 1.0, 4.0, 2.0, 3.0]; // sorted: 1 2 3 4 5, positions 0..=4
+        let cases: [(f64, [f64; 4]); 7] = [
+            // q      lower higher nearest midpoint
+            (0.0, [1.0, 1.0, 1.0, 1.0]),
+            (0.1, [1.0, 2.0, 1.0, 1.5]),   // pos 0.4
+            (0.125, [1.0, 2.0, 2.0, 1.5]), // pos 0.5: nearest rounds half away from zero
+            (0.375, [2.0, 3.0, 3.0, 2.5]), // pos 1.5
+            (0.5, [3.0, 3.0, 3.0, 3.0]),   // pos 2.0, exactly on an element
+            (0.9, [4.0, 5.0, 5.0, 4.5]),   // pos 3.6
+            (1.0, [5.0, 5.0, 5.0, 5.0]),
+        ];
+        for (q, want) in cases {
+            for (interp, w) in [Lower, Higher, Nearest, Midpoint].into_iter().zip(want) {
+                let mut v = base.to_vec();
+                assert_eq!(
+                    super::quickselect_quantile(&mut v, q, interp),
+                    w,
+                    "q={q} {interp:?}"
+                );
+            }
+        }
+        // A one-element group answers that element under every interpolation.
+        for interp in [Lower, Higher, Nearest, Midpoint] {
+            assert_eq!(super::quickselect_quantile(&mut [7.0], 0.3, interp), 7.0);
+        }
+        // Midpoint of two huge same-signed values must not overflow to infinity.
+        let mut big = vec![f64::MAX, f64::MAX];
+        assert_eq!(
+            super::quickselect_quantile(&mut big, 0.5, Midpoint),
+            f64::MAX
+        );
+    }
+
+    /// A quantile finalized from a merged state equals one finalized from the whole input,
+    /// for every interpolation: the state is the value list, and only finalize reads it.
+    #[test]
+    fn quantile_interpolation_merge_equals_single_node() {
+        use QuantileInterpolation::{Higher, Linear, Lower, Midpoint, Nearest};
+        let all: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(9.0),
+            None,
+            Some(2.0),
+            Some(7.0),
+            Some(4.0),
+            Some(4.0),
+        ]));
+        let whole = median_state(&all, &[0u32; 6], 1).unwrap();
+        let p1 = median_state(&all.slice(0, 3), &[0u32; 3], 1).unwrap();
+        let p2 = median_state(&all.slice(3, 3), &[0u32; 3], 1).unwrap();
+        let cat = arrow::compute::concat(&[p2.as_ref(), p1.as_ref()]).unwrap();
+        let merged = merge_median(&cat, &[0u32, 0], 1).unwrap();
+        for interp in [Linear, Lower, Higher, Nearest, Midpoint] {
+            for q in [0.0, 0.2, 0.5, 0.625, 1.0] {
+                let a = finalize_quantile(&whole, q, interp).unwrap();
+                let b = finalize_quantile(&merged, q, interp).unwrap();
+                assert_eq!(
+                    a.as_primitive::<Float64Type>().value(0),
+                    b.as_primitive::<Float64Type>().value(0),
+                    "q={q} {interp:?}"
+                );
+            }
+        }
     }
 
     mod contiguity_tests {

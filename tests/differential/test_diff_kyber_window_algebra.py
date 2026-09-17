@@ -83,7 +83,11 @@ def test_nth_value_at_one_matches_duckdb_without_order_keys(duck, t):
 def test_nth_value_beyond_one_is_untouched_and_still_matches(duck, t):
     out = (
         bt.from_arrow(t)
-        .with_columns(r=bt.nth_value(col("v"), 2).over(partition_by=["g"], order_by=["o"]))
+        # The whole-partition frame is explicit: with an ORDER BY and no frame, `nth_value`
+        # takes SQL's running default, which `test_diff_agg_semantic_params.py` pins.
+        .with_columns(
+            r=bt.nth_value(col("v"), 2).over(partition_by=["g"], order_by=["o"], frame=(None, None))
+        )
         .collect()
     )
     assert_same(

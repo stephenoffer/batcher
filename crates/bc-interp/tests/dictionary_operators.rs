@@ -311,6 +311,7 @@ fn group_by_a_dictionary_agrees_with_the_decoded_oracle() {
                     input: Some(col("v")),
                     input2: None,
                     param: None,
+                    interpolation: None,
                     alias: "s".into(),
                 },
                 AggregateItem {
@@ -318,6 +319,7 @@ fn group_by_a_dictionary_agrees_with_the_decoded_oracle() {
                     input: None,
                     input2: None,
                     param: None,
+                    interpolation: None,
                     alias: "n".into(),
                 },
             ],
@@ -339,6 +341,7 @@ fn aggregating_a_dictionary_value_agrees_with_the_decoded_oracle() {
                 input: Some(col("k")),
                 input2: None,
                 param: None,
+                interpolation: None,
                 alias: "lo".into(),
             }],
         },
@@ -491,6 +494,7 @@ fn windowing_over_a_dictionary_partition_agrees_with_the_decoded_oracle() {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -500,6 +504,7 @@ fn windowing_over_a_dictionary_partition_agrees_with_the_decoded_oracle() {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "rsum".into(),
                 },
             ],
@@ -626,6 +631,7 @@ fn a_float_dictionary_follows_the_engines_float_identity() {
             input: None,
             input2: None,
             param: None,
+            interpolation: None,
             alias: "n".into(),
         }],
     };

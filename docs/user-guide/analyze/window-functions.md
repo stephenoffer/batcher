@@ -189,10 +189,14 @@ is in the window. That is Polars' `closed="both"`, and the SQL
 
 Value specs are `(func, column)` for `"first_value"` and `"last_value"`,
 `(func, column, offset)` for `"lag"` and `"lead"`, and `(func, column, n)` for
-`"nth_value"`, which reads the `n`-th row of the ordered partition. {py:func}`nth_value <batcher.nth_value>` is SQL
+`"nth_value"`, which reads the `n`-th row of the frame. {py:func}`nth_value <batcher.nth_value>` is SQL
 `NTH_VALUE`, and {py:func}`first_value <batcher.first_value>` is its special case `n = 1`. Use `nth_value` when the
 reference point is a fixed rank, such as "each product's price relative to its category's
-second-cheapest".
+second-cheapest". With an `order_by` and no `frame`, `last_value` and `nth_value` use SQL's
+default frame, which ends at the current row, so `nth_value` stays null until the partition
+reaches its `n`-th row. Pass `frame=(None, None)` to read the whole partition on every row.
+The `first_value`, `last_value` and `nth_value` constructors also take `ignore_nulls=True`,
+which is SQL's `IGNORE NULLS`.
 
 ```python
 shifted = ds.window(
@@ -207,7 +211,7 @@ shifted = ds.window(
 print(shifted.to_pydict())
 # {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['y', 'z', 'x', 'q', 'p'],
 #  'price': [10, 20, 30, 15, 40], 'prev': [None, 10, 20, None, 15],
-#  'top': [10, 10, 10, 15, 15], 'second': [20, 20, 20, 40, 40]}
+#  'top': [10, 10, 10, 15, 15], 'second': [None, 20, 20, None, 40]}
 ```
 
 ## Top-N per partition

@@ -90,7 +90,11 @@ def supported_aggregate(ir: dict) -> bool:
     Returns:
         True when every group key and every reduction in the node is translatable.
     """
-    return all(a.get("func") in _SUPPORTED for a in ir["aggregates"])
+    # A non-linear `interpolation` is declined: the backends' `quantile` is only verified
+    # against the engine's linear form, and no GPU run has recorded the others.
+    return all(
+        a.get("func") in _SUPPORTED and a.get("interpolation") is None for a in ir["aggregates"]
+    )
 
 
 def _key_columns(df, ir: dict, be: DfBackend) -> tuple[list[str], list[str], dict[str, str]]:

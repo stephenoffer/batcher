@@ -263,6 +263,11 @@ def _representatives() -> dict[str, Any]:
     # AggExpr is not an Expr: its to_ir takes an output alias.
     out["agg_unary"] = AggExpr("sum", _X).to_ir("total")
     out["agg_param"] = AggExpr("quantile", _X, param=0.5).to_ir("p50")
+    # The one W0 aggregate field: present only off its default, so `agg_param` above proves
+    # a linear quantile still serializes without it.
+    out["agg_interpolation"] = AggExpr("quantile", _X, param=0.25, interpolation="nearest").to_ir(
+        "q25"
+    )
     out["agg_binary"] = AggExpr("corr", _X, input2=_Y).to_ir("r")
     return out
 

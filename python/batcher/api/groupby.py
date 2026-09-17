@@ -17,6 +17,7 @@ from batcher.api._varargs import flatten_varargs
 from batcher.api.dataset.compat.guidance import groupby_attribute_error
 from batcher.plan.expr_ir import AggExpr, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector
+from batcher.plan.expr_ir.walk import positional_aggregate_name
 from batcher.plan.logical import Aggregate, AggregateSpec, Project, Projection
 
 if TYPE_CHECKING:
@@ -363,6 +364,10 @@ class GroupBy:
         non-null entries of each value column (SQL ``COUNT(col)``, like pandas
         ``groupby().count()``). Name columns or pass a selector to count a subset.
 
+        This is **not** the ``count`` of Spark, Polars or Ray Data, which all count *rows*
+        into one column. Their ``group_by(k).count()`` is ``group_by(k).len(name="count")``
+        here (``name="count()"`` for Ray Data's column name).
+
         Args:
             *columns: Columns (names or selectors) to count; defaults to every
                 non-key column.
@@ -380,13 +385,18 @@ class GroupBy:
         """
         return self._reduce("count", columns)
 
-    def quantile(self, q: float, *columns: str | Selector) -> Dataset:
+    def quantile(
+        self, q: float, *columns: str | Selector, interpolation: str = "linear"
+    ) -> Dataset:
         """The `q`-quantile of each column per group (every non-key numeric column by default).
+
+        `interpolation` is as for :meth:`Expr.quantile`; Polars' default is ``"nearest"``.
 
         Args:
             q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median).
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            interpolation: How to resolve a rank that falls between two values.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group quantiles.
@@ -407,18 +417,20 @@ class GroupBy:
                 "group_by().quantile() has no numeric value columns to reduce — "
                 "name the columns to reduce explicitly"
             )
-        specs = tuple(AggregateSpec(c, Col(c).quantile(q)) for c in targets)
+        specs = tuple(AggregateSpec(c, Col(c).quantile(q, interpolation)) for c in targets)
         return self._finish(specs)
 
-    def sum(self, *columns: str | Selector) -> Dataset:
+    def sum(self, *columns: str | Selector, empty_value: int | float | None = None) -> Dataset:
         """Sum each value column per group (every non-key numeric column by default).
 
         Like pandas' ``numeric_only``, the no-argument form reduces only numeric
-        columns; name a non-numeric column explicitly to attempt to sum it.
+        columns; name a non-numeric column explicitly to attempt to sum it. A group whose
+        values are all null sums to null; ``empty_value=0`` answers ``0``, as Polars does.
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            empty_value: The sum of a group with no non-null value; ``None`` keeps null.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group sums, each
@@ -432,7 +444,7 @@ class GroupBy:
                 >>> ds.group_by("g").sum().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [3, 3], 'y': [30, 30]}
         """
-        return self._reduce("sum", columns)
+        return self._reduce("sum", columns, empty_value=empty_value)
 
     def mean(self, *columns: str | Selector) -> Dataset:
         """Average each value column per group (every non-key numeric column by default).
@@ -474,12 +486,16 @@ class GroupBy:
         """
         return self._reduce("min", columns)
 
-    def max(self, *columns: str | Selector) -> Dataset:
+    def max(self, *columns: str | Selector, nan_policy: str = "propagate") -> Dataset:
         """Maximum of each value column per group (all non-key columns by default).
+
+        A NaN is the greatest float, so it is a group's maximum; ``nan_policy="ignore"``
+        skips it unless nothing else is left, as Polars does (see :meth:`Expr.max`).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key column.
+            nan_policy: ``"propagate"`` or ``"ignore"``.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group maxima.
@@ -492,7 +508,7 @@ class GroupBy:
                 >>> ds.group_by("g").max().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [3, 2]}
         """
-        return self._reduce("max", columns)
+        return self._reduce("max", columns, nan_policy=nan_policy)
 
     def median(self, *columns: str | Selector) -> Dataset:
         """Median of each value column per group (every non-key numeric column by default).
@@ -514,12 +530,16 @@ class GroupBy:
         """
         return self._reduce("median", columns)
 
-    def count_distinct(self, *columns: str | Selector) -> Dataset:
+    def count_distinct(self, *columns: str | Selector, count_nulls: bool = False) -> Dataset:
         """Count distinct values of each column per group (all non-key columns by default).
+
+        Nulls are not counted; ``count_nulls=True`` counts a null as one more value, as
+        Polars' ``n_unique`` does.
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key column.
+            count_nulls: Whether a null counts as a distinct value.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group distinct counts.
@@ -532,9 +552,11 @@ class GroupBy:
                 >>> ds.group_by("g").count_distinct().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [1, 1]}
         """
-        return self._reduce("count_distinct", columns)
+        return self._reduce("count_distinct", columns, count_nulls=count_nulls)
 
-    def first(self, *columns: str | Selector, order_by: str | Expr) -> Dataset:
+    def first(
+        self, *columns: str | Selector, order_by: str | Expr, ignore_nulls: bool = True
+    ) -> Dataset:
         """The first value of each column per group, along an explicit `order_by`.
 
         `order_by` is required, and deliberately so: a relation has no inherent row
@@ -546,6 +568,8 @@ class GroupBy:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key column.
             order_by: The column or expression defining "first" within each group.
+            ignore_nulls: Whether to skip null values; ``False`` takes the first row's value
+                even when it is null, as Spark's and Polars' ``first`` do.
 
         Returns:
             A new `Dataset` of the group keys followed by each column's first value.
@@ -558,9 +582,11 @@ class GroupBy:
                 >>> ds.group_by("g").first("v", order_by="t").to_pydict()
                 {'g': ['a'], 'v': [10]}
         """
-        return self._ordered_reduce("first", columns, order_by)
+        return self._ordered_reduce("first", columns, order_by, ignore_nulls)
 
-    def last(self, *columns: str | Selector, order_by: str | Expr) -> Dataset:
+    def last(
+        self, *columns: str | Selector, order_by: str | Expr, ignore_nulls: bool = True
+    ) -> Dataset:
         """The last value of each column per group, along an explicit `order_by`.
 
         `order_by` is required for the same reason as in :meth:`first`: without a
@@ -570,6 +596,8 @@ class GroupBy:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key column.
             order_by: The column or expression defining "last" within each group.
+            ignore_nulls: Whether to skip null values; ``False`` takes the last row's value
+                even when it is null.
 
         Returns:
             A new `Dataset` of the group keys followed by each column's last value.
@@ -582,7 +610,7 @@ class GroupBy:
                 >>> ds.group_by("g").last("v", order_by="t").to_pydict()
                 {'g': ['a'], 'v': [20]}
         """
-        return self._ordered_reduce("last", columns, order_by)
+        return self._ordered_reduce("last", columns, order_by, ignore_nulls)
 
     def head(self, n: int = 5, *, order_by: str | Expr) -> Dataset:
         """The first `n` rows of each group along `order_by`, keeping every column.
@@ -660,7 +688,7 @@ class GroupBy:
         return ranked.filter(Col(rank) <= n).drop(rank)
 
     def _ordered_reduce(
-        self, fn: str, columns: tuple[str | Selector, ...], order_by: str | Expr
+        self, fn: str, columns: tuple[str | Selector, ...], order_by: str | Expr, ignore_nulls: bool
     ) -> Dataset:
         """Reduce with an order-dependent aggregate (`first`/`last`) along `order_by`."""
         targets = self._resolve_columns(columns, numeric_only=False)
@@ -669,15 +697,18 @@ class GroupBy:
                 f"group_by().{fn}() has no value columns to reduce; name them explicitly"
             )
         key = Col(order_by) if isinstance(order_by, str) else order_by
-        specs = tuple(AggregateSpec(c, getattr(Col(c), fn)(key)) for c in targets)
+        specs = tuple(
+            AggregateSpec(c, getattr(Col(c), fn)(key, ignore_nulls=ignore_nulls)) for c in targets
+        )
         return self._finish(specs)
 
-    def std(self, *columns: str | Selector) -> Dataset:
+    def std(self, *columns: str | Selector, ddof: int = 1) -> Dataset:
         """Sample standard deviation per group (every non-key numeric column by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            ddof: Delta degrees of freedom; ``0`` is the population standard deviation.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group standard deviations.
@@ -690,14 +721,15 @@ class GroupBy:
                 >>> ds.group_by("g").std().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [1.4142135623730951, 0.0]}
         """
-        return self._reduce("std", columns)
+        return self._reduce("std", columns, ddof=ddof)
 
-    def var(self, *columns: str | Selector) -> Dataset:
+    def var(self, *columns: str | Selector, ddof: int = 1) -> Dataset:
         """Sample variance of each column per group (every non-key numeric column by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            ddof: Delta degrees of freedom; ``0`` is the population variance.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group variances.
@@ -710,14 +742,15 @@ class GroupBy:
                 >>> ds.group_by("g").var().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [2.0, 0.0]}
         """
-        return self._reduce("var", columns)
+        return self._reduce("var", columns, ddof=ddof)
 
-    def product(self, *columns: str | Selector) -> Dataset:
+    def product(self, *columns: str | Selector, empty_value: float | None = None) -> Dataset:
         """Product of each value column per group (every non-key numeric column by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
+            empty_value: The product of a group with no non-null value; ``None`` keeps null.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group products.
@@ -730,9 +763,9 @@ class GroupBy:
                 >>> ds.group_by("g").product().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [6.0, 5.0]}
         """
-        return self._reduce("product", columns)
+        return self._reduce("product", columns, empty_value=empty_value)
 
-    def array_agg(self, *columns: str | Selector) -> Dataset:
+    def array_agg(self, *columns: str | Selector, ignore_nulls: bool = False) -> Dataset:
         """Collect each value column's values into a list per group (all non-key by default).
 
         The group-wise ``array_agg`` / ``list`` aggregate — gather each group's values into a
@@ -742,6 +775,8 @@ class GroupBy:
         Args:
             *columns: Columns (names or selectors) to collect; defaults to every non-key
                 column.
+            ignore_nulls: Whether to leave nulls out of the lists, as Spark's
+                ``collect_list`` does.
 
         Returns:
             A new `Dataset` of the group keys followed by a `List` column per collected column.
@@ -754,13 +789,14 @@ class GroupBy:
                 >>> ds.group_by("g").array_agg().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [[1, 2], [3]]}
         """
-        return self._reduce("array_agg", columns)
+        return self._reduce("array_agg", columns, ignore_nulls=ignore_nulls)
 
-    def mode(self, *columns: str | Selector) -> Dataset:
+    def mode(self, *columns: str | Selector, all_modes: bool = False) -> Dataset:
         """The most frequent value of each column per group (all non-key columns by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every non-key column.
+            all_modes: Whether to return every tied value as an ascending list.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group modes.
@@ -773,14 +809,15 @@ class GroupBy:
                 >>> ds.group_by("g").mode().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [5, 9]}
         """
-        return self._reduce("mode", columns)
+        return self._reduce("mode", columns, all_modes=all_modes)
 
-    def skew(self, *columns: str | Selector) -> Dataset:
+    def skew(self, *columns: str | Selector, bias: bool = False) -> Dataset:
         """Sample skewness of each column per group (every non-key numeric column by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every non-key
                 numeric column.
+            bias: Whether to return the population skewness, as Daft, Spark and Polars do.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group skewness.
@@ -793,14 +830,18 @@ class GroupBy:
                 >>> ds.group_by("g").skew().to_pydict()
                 {'g': ['a'], 'x': [0.0]}
         """
-        return self._reduce("skew", columns)
+        return self._reduce("skew", columns, bias=bias)
 
-    def kurtosis(self, *columns: str | Selector) -> Dataset:
+    def kurtosis(
+        self, *columns: str | Selector, bias: bool = False, fisher: bool = True
+    ) -> Dataset:
         """Sample excess kurtosis of each column per group (numeric columns by default).
 
         Args:
             *columns: Columns (names or selectors) to reduce; defaults to every non-key
                 numeric column.
+            bias: Whether to return the population estimate, as Spark and Polars do.
+            fisher: Whether to subtract 3, so a normal distribution scores 0.
 
         Returns:
             A new `Dataset` of the group keys followed by the per-group kurtosis.
@@ -813,7 +854,7 @@ class GroupBy:
                 >>> round(ds.group_by("g").kurtosis().to_pydict()["x"][0], 2)
                 -1.2
         """
-        return self._reduce("kurtosis", columns)
+        return self._reduce("kurtosis", columns, bias=bias, fisher=fisher)
 
     # Reductions whose default (all non-key columns) is restricted to numeric columns,
     # mirroring pandas' `numeric_only`: averaging or summing a string column is an error,
@@ -858,7 +899,7 @@ class GroupBy:
                 out.append(c)
         return out
 
-    def _reduce(self, fn: str, columns: tuple[str | Selector, ...]) -> Dataset:
+    def _reduce(self, fn: str, columns: tuple[str | Selector, ...], **options: Any) -> Dataset:
         targets = self._resolve_columns(columns, numeric_only=fn in self._NUMERIC_ONLY)
         if not targets:
             hint = (
@@ -867,19 +908,18 @@ class GroupBy:
                 else "no value columns to reduce; every column is a group key"
             )
             raise PlanError(f"group_by().{fn}() has {hint} — name the columns to reduce explicitly")
-        specs = tuple(AggregateSpec(c, getattr(Col(c), fn)()) for c in targets)
-        return self._finish(specs)
+        values = {c: getattr(Col(c), fn)(**options) for c in targets}
+        if all(isinstance(v, AggExpr) for v in values.values()):
+            return self._finish(tuple(AggregateSpec(c, v) for c, v in values.items()))
+        # A parameter that composes over the aggregate (`sum(empty_value=0)`) is an
+        # expression over aggregates, which only the `agg()` lowering knows how to plan.
+        return self._source._derive(self._lower_aggregates(values))
 
-    def _named_aggs(self, aggs: tuple[AggExpr, ...]) -> dict[str, AggExpr]:
+    def _named_aggs(self, aggs: tuple[AggExpr | Expr, ...]) -> dict[str, AggExpr | Expr]:
         """Resolve bare positional aggregates to an ordered {source_column: agg} map."""
-        out: dict[str, AggExpr] = {}
-        for a in aggs:
-            # An explicit `.alias(...)` names the output directly, which is what lets a
-            # positional `count()` (no input column to be named after) and two aggregates
-            # over one column both be spelled positionally, as Polars spells them.
-            name = a.name if isinstance(a, AggExpr) else None
-            if name is None and isinstance(a, AggExpr) and isinstance(a.input, Col):
-                name = a.input.name
+        out: dict[str, AggExpr | Expr] = {}
+        for item in aggs:
+            a, name, aliased = positional_aggregate_name(item)
             if name is None:
                 raise PlanError(
                     "a positional agg() argument must be a single-column aggregate that "
@@ -888,7 +928,7 @@ class GroupBy:
                     "(agg(total=...))"
                 )
             if name in out:
-                if a.name is None:
+                if not aliased:
                     raise PlanError(
                         f"agg() got two positional aggregates over column {name!r}, which "
                         "would both be named after it; give one a name, e.g. "

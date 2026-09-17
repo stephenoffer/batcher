@@ -11,6 +11,16 @@
       "name": "y"
     }
   },
+  "agg_interpolation": {
+    "alias": "q25",
+    "func": "quantile",
+    "input": {
+      "e": "col",
+      "name": "x"
+    },
+    "interpolation": "nearest",
+    "param": 0.25
+  },
   "agg_param": {
     "alias": "p50",
     "func": "quantile",

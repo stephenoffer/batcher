@@ -2913,12 +2913,20 @@ class Expr:
         return result
 
     # --- aggregate constructors (used inside group_by().agg(...)) -----------
-    def sum(self) -> AggExpr:
+    def sum(self, *, empty_value: int | float | None = None) -> AggExpr | Expr:
         """Sum of non-null values per group. Use in ``group_by().agg(...)`` or ``.over(...)``.
 
         An aggregate: it collapses a group to one row (or, via :meth:`AggExpr.over`,
         broadcasts the group result to each row). Mergeable, so identical single-node
         and distributed.
+
+        A group with no non-null value sums to null, as in SQL. ``empty_value=0`` answers
+        ``0`` there instead, which is what Polars' ``sum`` returns. That form is an
+        expression over the aggregate, so use it in ``agg(...)`` rather than ``.over(...)``.
+
+        Args:
+            empty_value: The result for a group with no non-null value; ``None`` keeps SQL's
+                null.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -2930,8 +2938,19 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10]})
                 >>> ds.group_by("g").agg(total=bt.col("x").sum()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'total': [3, 10]}
+
+                >>> nulls = bt.from_pydict({"x": [None, None]})
+                >>> nulls = nulls.with_columns(x=bt.col("x").cast("int64"))
+                >>> x = bt.col("x")
+                >>> nulls.agg(sql=x.sum(), polars=x.sum(empty_value=0)).to_pydict()
+                {'sql': [None], 'polars': [0]}
         """
-        return AggExpr("sum", self)
+        agg = AggExpr("sum", self)
+        if empty_value is None:
+            return agg
+        from batcher.plan.functions import aggregate_semantics as sem
+
+        return sem.with_empty_value(agg, empty_value)
 
     def min(self) -> AggExpr:
         """Minimum non-null value per group. Use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -2949,11 +2968,24 @@ class Expr:
         """
         return AggExpr("min", self)
 
-    def max(self) -> AggExpr:
+    def max(self, *, nan_policy: str = "propagate") -> AggExpr | Expr:
         """Maximum non-null value per group. Use in ``group_by().agg(...)`` or ``.over(...)``.
+
+        Floats follow SQL's total order, in which NaN is greater than every number, so one
+        NaN in a group is its maximum (``nan_policy="propagate"``, DuckDB's answer).
+        ``nan_policy="ignore"`` skips NaN and answers NaN only for a group holding nothing
+        else, which is Polars' ``max``. That form is an expression over aggregates, so use
+        it in ``agg(...)`` rather than ``.over(...)``.
+
+        Args:
+            nan_policy: ``"propagate"`` (NaN is the greatest value) or ``"ignore"`` (NaN is
+                skipped unless every value is NaN).
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
+        Raises:
+            PlanError: If `nan_policy` is not one of the two policies.
 
         Examples:
             .. doctest::
@@ -2962,8 +2994,15 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").max()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 10]}
+
+                >>> nan = bt.from_pydict({"x": [1.0, float("nan"), 3.0]})
+                >>> x = bt.col("x")
+                >>> nan.agg(sql=x.max(), polars=x.max(nan_policy="ignore")).to_pydict()
+                {'sql': [nan], 'polars': [3.0]}
         """
-        return AggExpr("max", self)
+        from batcher.plan.functions import aggregate_semantics as sem
+
+        return sem.nan_ignoring_max(self, nan_policy)
 
     def mean(self) -> AggExpr:
         """Arithmetic mean of non-null values per group (→ Float64).
@@ -2983,10 +3022,16 @@ class Expr:
         """
         return AggExpr("mean", self)
 
-    def var(self) -> AggExpr:
+    def var(self, *, ddof: int = 1) -> AggExpr | Expr:
         """Sample variance per group, Bessel-corrected (divides by ``n - 1``).
 
-        An aggregate for ``group_by().agg(...)``.
+        An aggregate for ``group_by().agg(...)``. ``ddof`` sets the divisor to ``n - ddof``
+        as Polars and Ray Data do: ``ddof=0`` is the population variance. A group with
+        ``n <= ddof`` values is null.
+
+        Args:
+            ddof: Delta degrees of freedom; the sum of squared deviations is divided by
+                ``n - ddof``.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -2998,13 +3043,23 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "a"], "x": [2, 4, 6]})
                 >>> ds.group_by("g").agg(r=bt.col("x").var()).to_pydict()
                 {'g': ['a'], 'r': [4.0]}
+                >>> ds.group_by("g").agg(r=bt.col("x").var(ddof=0).round(4)).to_pydict()
+                {'g': ['a'], 'r': [2.6667]}
         """
-        return AggExpr("var", self)
+        from batcher.plan.functions import aggregate_semantics as sem
 
-    def std(self) -> AggExpr:
+        return sem.variance_ddof(self, ddof, sqrt=False)
+
+    def std(self, *, ddof: int = 1) -> AggExpr | Expr:
         """Sample standard deviation per group — the square root of :meth:`var`.
 
-        An aggregate for ``group_by().agg(...)``.
+        An aggregate for ``group_by().agg(...)``. ``ddof`` sets the variance divisor to
+        ``n - ddof``, as Polars' and Ray Data's ``std(ddof=...)`` do. A group with
+        ``n <= ddof`` values is null; Ray Data answers NaN there.
+
+        Args:
+            ddof: Delta degrees of freedom; the sum of squared deviations is divided by
+                ``n - ddof`` before the square root.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3016,13 +3071,25 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "a"], "x": [2, 4, 6]})
                 >>> ds.group_by("g").agg(r=bt.col("x").std()).to_pydict()
                 {'g': ['a'], 'r': [2.0]}
+                >>> ds.group_by("g").agg(r=bt.col("x").std(ddof=0).round(4)).to_pydict()
+                {'g': ['a'], 'r': [1.633]}
         """
-        return AggExpr("stddev", self)
+        from batcher.plan.functions import aggregate_semantics as sem
 
-    def skew(self) -> AggExpr:
+        return sem.variance_ddof(self, ddof, sqrt=True)
+
+    def skew(self, *, bias: bool = False) -> AggExpr:
         """Sample skewness per group (adjusted Fisher-Pearson, matching DuckDB; → Float64).
 
         Null when the group has fewer than 3 values. Mergeable (sum-of-powers moment state).
+
+        ``bias=True`` is the population skewness ``m3 / m2^1.5`` instead, the default of
+        Spark's ``skewness``, Polars' ``skew`` and Daft's ``skew``. It is defined from one
+        value up and is null for a group with no variance, where Polars answers NaN.
+
+        Args:
+            bias: Whether to return the biased population estimate rather than the
+                sample-adjusted one.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3034,13 +3101,24 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a"] * 4, "x": [1, 2, 3, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").skew()).to_pydict()
                 {'g': ['a'], 'r': [1.763632614803888]}
+                >>> ds.group_by("g").agg(r=bt.col("x").skew(bias=True).round(6)).to_pydict()
+                {'g': ['a'], 'r': [1.018233]}
         """
-        return AggExpr("skewness", self)
+        return AggExpr("skewness_pop" if bias else "skewness", self)
 
-    def kurtosis(self) -> AggExpr:
+    def kurtosis(self, *, bias: bool = False, fisher: bool = True) -> AggExpr | Expr:
         """Sample excess kurtosis per group (0 for a normal distribution; → Float64).
 
         Matches DuckDB. Null when the group has fewer than 4 values. Mergeable.
+
+        ``bias=True`` is the population excess kurtosis ``m4 / m2² - 3`` (Spark's
+        ``kurtosis`` and Polars' default), the same value :meth:`kurtosis_pop` returns.
+        ``fisher=False`` reports Pearson's kurtosis, which is the excess plus 3.
+
+        Args:
+            bias: Whether to return the biased population estimate rather than the
+                sample-corrected one.
+            fisher: Whether to subtract 3, so a normal distribution scores 0.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3052,8 +3130,12 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").kurtosis()).to_pydict()
                 {'g': ['a'], 'r': [3.152000000000001]}
+                >>> pearson = bt.col("x").kurtosis(bias=True, fisher=False)
+                >>> ds.group_by("g").agg(r=pearson).to_pydict()
+                {'g': ['a'], 'r': [2.7880000000000003]}
         """
-        return AggExpr("kurtosis", self)
+        agg = AggExpr("kurtosis_pop" if bias else "kurtosis", self)
+        return agg if fisher else agg + Lit(3.0)
 
     def kurtosis_pop(self) -> AggExpr:
         """Population excess kurtosis per group (→ Float64).
@@ -3075,12 +3157,27 @@ class Expr:
         """
         return AggExpr("kurtosis_pop", self)
 
-    def entropy(self) -> AggExpr:
+    def entropy(
+        self, base: float = 2.0, *, of: str = "frequencies", normalize: bool = True
+    ) -> AggExpr | Expr:
         """Base-2 Shannon entropy of a group's value distribution (→ Float64).
 
         ``-Σ pᵢ·log₂(pᵢ)`` over the distinct values' frequencies: 0 when a group holds
         one distinct value, ``log₂(n)`` when all n are distinct. The measure to reach
         for when the question is how *concentrated* a column is, rather than how large.
+        This is DuckDB's ``entropy``.
+
+        ``of="values"`` reads the column itself as the probabilities instead, which is
+        Polars' ``entropy``: with `normalize` they are first scaled to sum to 1, and without
+        it they are used as given. Polars' default base is ``math.e``. A zero or negative
+        value is NaN there, as in Polars. Every form other than the default is an
+        expression over aggregates, so use it in ``agg(...)``.
+
+        Args:
+            base: The logarithm base; 2 measures bits, ``math.e`` nats.
+            of: ``"frequencies"`` (how often each distinct value occurs) or ``"values"``
+                (the values are the probabilities).
+            normalize: With ``of="values"``, whether to divide the values by their sum.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)``.
@@ -3092,8 +3189,16 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a"] * 4, "x": [1, 1, 2, 2]})
                 >>> ds.group_by("g").agg(r=bt.col("x").entropy()).to_pydict()
                 {'g': ['a'], 'r': [1.0]}
+
+                >>> p = bt.from_pydict({"p": [1.0, 2.0, 3.0]})
+                >>> p.agg(h=bt.col("p").entropy(base=2, of="values").round(6)).to_pydict()
+                {'h': [1.459148]}
         """
-        return AggExpr("entropy", self)
+        if base == 2.0 and of == "frequencies" and normalize:
+            return AggExpr("entropy", self)
+        from batcher.plan.functions import aggregate_semantics as sem
+
+        return sem.entropy_of(self, base, of, normalize)
 
     def mad(self) -> AggExpr:
         """Median absolute deviation per group (→ Float64).
@@ -3226,14 +3331,21 @@ class Expr:
         """
         return AggExpr("median", self)
 
-    def quantile(self, q: float) -> AggExpr:
+    def quantile(self, q: float, interpolation: str = "linear") -> AggExpr:
         """Continuous quantile at ``q`` in [0, 1] (linear interpolation).
 
         ``quantile(0.5)`` equals :meth:`median`. Raises ``PlanError`` if ``q`` is
         outside [0, 1].
 
+        `interpolation` decides what happens when rank ``q·(n-1)`` falls between two
+        values, with Polars' names: ``"linear"`` (DuckDB's ``quantile_cont``, the default),
+        ``"lower"``, ``"higher"``, ``"nearest"`` (half rounds away from zero, Polars'
+        default), ``"midpoint"``, and ``"equiprobable"`` (the element at rank
+        ``ceil(q·n) - 1``, which is :meth:`quantile_disc`).
+
         Args:
             q: The quantile in ``[0, 1]``.
+            interpolation: How to resolve a rank between two values.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3248,13 +3360,25 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").quantile(0.5)).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1.5, 10.0]}
+                >>> nearest = bt.col("x").quantile(0.5, "nearest")
+                >>> ds.group_by("g").agg(r=nearest).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'r': [2.0, 10.0]}
         """
         from batcher._internal.errors import PlanError
+        from batcher.plan.ir_tags import QUANTILE_INTERPOLATIONS
 
         q = require_float(q, func="quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"quantile q must be in [0, 1], got {q}")
-        return AggExpr("quantile", self, param=q)
+        if interpolation == "equiprobable":
+            return AggExpr("quantile_disc", self, param=q)
+        if interpolation not in QUANTILE_INTERPOLATIONS:
+            raise PlanError(
+                "quantile interpolation must be one of "
+                f"{sorted(QUANTILE_INTERPOLATIONS | {'equiprobable'})}, got {interpolation!r}"
+            )
+        mode = None if interpolation == "linear" else interpolation
+        return AggExpr("quantile", self, param=q, interpolation=mode)
 
     def count(self) -> AggExpr:
         """Number of non-null values per group (SQL ``COUNT(expr)``; nulls are skipped).
@@ -3275,11 +3399,17 @@ class Expr:
         """
         return AggExpr("count", self)
 
-    def count_distinct(self) -> AggExpr:
+    def count_distinct(self, *, count_nulls: bool = False) -> AggExpr | Expr:
         """Number of distinct non-null values per group (SQL ``COUNT(DISTINCT)``).
 
         Exact, so it holds every distinct value — see :meth:`approx_count_distinct` for the
         bounded-memory, skew-safe sketch. An aggregate for ``group_by().agg(...)``.
+
+        ``count_nulls=True`` counts null as one more distinct value when the group has
+        one, as Polars' ``n_unique`` does.
+
+        Args:
+            count_nulls: Whether a null counts as a distinct value.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3291,15 +3421,30 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").count_distinct()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 1]}
-        """
-        return AggExpr("count_distinct", self)
 
-    def approx_count_distinct(self) -> AggExpr:
+                >>> nulls = bt.from_pydict({"x": [1, None, 1]})
+                >>> nulls.agg(n=bt.col("x").count_distinct(count_nulls=True)).to_pydict()
+                {'n': [2]}
+        """
+        agg = AggExpr("count_distinct", self)
+        if not count_nulls:
+            return agg
+        from batcher.plan.functions import aggregate_semantics as sem
+
+        return sem.count_nulls_as_value(agg, self)
+
+    def approx_count_distinct(self, *, count_nulls: bool = False) -> AggExpr | Expr:
         """Approximate COUNT(DISTINCT) via a HyperLogLog sketch (~2% error).
 
         Bounded memory regardless of skew — the skew-safe choice when an exact
         `count_distinct` on a hot key would hold every distinct value. Mergeable, so it
         is identical single-node and distributed.
+
+        ``count_nulls=True`` adds one for a group holding a null, as Polars'
+        ``approx_n_unique`` does. The null is counted exactly, not estimated.
+
+        Args:
+            count_nulls: Whether a null counts as a distinct value.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3312,7 +3457,12 @@ class Expr:
                 >>> ds.group_by("g").agg(n=bt.col("x").approx_count_distinct()).to_pydict()
                 {'g': ['a'], 'n': [3]}
         """
-        return AggExpr("approx_count_distinct", self)
+        agg = AggExpr("approx_count_distinct", self)
+        if not count_nulls:
+            return agg
+        from batcher.plan.functions import aggregate_semantics as sem
+
+        return sem.count_nulls_as_value(agg, self)
 
     def approx_quantile(self, q: float) -> AggExpr:
         """Approximate quantile `q ∈ [0, 1]` via a KLL sketch (bounded memory).
@@ -3360,10 +3510,16 @@ class Expr:
         """
         return AggExpr("approx_quantile", self, param=0.5)
 
-    def mode(self) -> AggExpr:
+    def mode(self, *, all_modes: bool = False) -> AggExpr:
         """Most frequent value per group, ties broken by the smallest value.
 
         Deterministic and partition-independent. Works on any column type.
+
+        ``all_modes=True`` returns **every** most-frequent value as a list, ascending,
+        which is what Polars' ``mode`` returns. Nulls are not counted in either form.
+
+        Args:
+            all_modes: Whether to return every tied value as a list rather than one value.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3375,8 +3531,12 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 1, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").mode()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1, 10]}
+
+                >>> tied = bt.from_pydict({"x": [3, 3, 2, 2, 1]})
+                >>> tied.agg(r=bt.col("x").mode(all_modes=True)).to_pydict()
+                {'r': [[2, 3]]}
         """
-        return AggExpr("mode", self)
+        return AggExpr("modes" if all_modes else "mode", self)
 
     def n50(self) -> AggExpr:
         """Assembly N50 — the contig length at which half the assembly's bases are covered.
@@ -3473,7 +3633,7 @@ class Expr:
         """
         return AggExpr("aun", self)
 
-    def first(self, order_by: IntoExpr) -> AggExpr:
+    def first(self, order_by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
         """This expression's value at the first row in `order_by` order (SQL ``first``).
 
         Equivalent to ``arg_min(order_by)``, and that equivalence is the precise
@@ -3481,6 +3641,8 @@ class Expr:
         returns the first non-null value. SQL's own ``FIRST(x ORDER BY k)`` does not --
         it returns whatever sits in the first row, null included -- so the two agree on
         every column without nulls and differ exactly where one has them.
+        ``ignore_nulls=False`` is that SQL form, and also Spark's ``first`` and Polars'
+        ``first``: the value of the first row, even when it is null.
 
         An explicit `order_by` is **required**: an arrival-order first/last is not
         partition-independent, so it could not stay identical single-node and
@@ -3489,6 +3651,7 @@ class Expr:
 
         Args:
             order_by: The ordering expression; the value at its first row is returned.
+            ignore_nulls: Whether to skip rows whose value is null.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3500,19 +3663,25 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10], "t": [3, 1, 5]})
                 >>> ds.group_by("g").agg(r=bt.col("x").first(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 10]}
-        """
-        return AggExpr("arg_min", self, input2=_col_or_expr(order_by))
 
-    def last(self, order_by: IntoExpr) -> AggExpr:
+                >>> held = bt.from_pydict({"x": [None, 2], "t": [1, 2]})
+                >>> held.agg(r=bt.col("x").first("t", ignore_nulls=False)).to_pydict()
+                {'r': [None]}
+        """
+        func = "arg_min" if ignore_nulls else "arg_min_null"
+        return AggExpr(func, self, input2=_col_or_expr(order_by))
+
+    def last(self, order_by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
         """This expression's value at the last row in `order_by` order (SQL ``last``).
 
         Equivalent to ``arg_max(order_by)``, which -- as on :meth:`first` -- means it
-        **skips nulls** where SQL's ``LAST(x ORDER BY k)`` would return one. As with
-        :meth:`first`, an explicit `order_by` is required so the result stays
-        deterministic and mergeable across partitions.
+        **skips nulls** where SQL's ``LAST(x ORDER BY k)`` would return one;
+        ``ignore_nulls=False`` returns it. As with :meth:`first`, an explicit `order_by`
+        is required so the result stays deterministic and mergeable across partitions.
 
         Args:
             order_by: The ordering expression; the value at its last row is returned.
+            ignore_nulls: Whether to skip rows whose value is null.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3525,16 +3694,21 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").last(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1, 10]}
         """
-        return AggExpr("arg_max", self, input2=_col_or_expr(order_by))
+        func = "arg_max" if ignore_nulls else "arg_max_null"
+        return AggExpr(func, self, input2=_col_or_expr(order_by))
 
-    def arg_min(self, by: IntoExpr) -> AggExpr:
+    def arg_min(self, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
         """This expression's value at the row where `by` is minimal (SQL ``arg_min``/``min_by``).
 
         Key ties break to the smallest value, so the result is deterministic and
-        partition-independent.
+        partition-independent. A row whose `by` is null never counts. By default a row
+        whose value is null does not either (DuckDB ``arg_min``); ``ignore_nulls=False``
+        lets it win and return its null (DuckDB ``arg_min_null``, Spark and Polars
+        ``min_by``).
 
         Args:
             by: The expression whose minimum selects the row.
+            ignore_nulls: Whether to skip rows whose value is null.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3547,13 +3721,18 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").arg_min(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 10]}
         """
-        return AggExpr("arg_min", self, input2=_col_or_expr(by))
+        func = "arg_min" if ignore_nulls else "arg_min_null"
+        return AggExpr(func, self, input2=_col_or_expr(by))
 
-    def arg_max(self, by: IntoExpr) -> AggExpr:
+    def arg_max(self, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
         """This expression's value at the row where `by` is maximal (SQL ``arg_max``/``max_by``).
+
+        Null handling mirrors :meth:`arg_min`: ``ignore_nulls=False`` is DuckDB's
+        ``arg_max_null`` and Spark's and Polars' ``max_by``.
 
         Args:
             by: The expression whose maximum selects the row.
+            ignore_nulls: Whether to skip rows whose value is null.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3565,13 +3744,22 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10], "t": [3, 1, 5]})
                 >>> ds.group_by("g").agg(r=bt.col("x").arg_max(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1, 10]}
-        """
-        return AggExpr("arg_max", self, input2=_col_or_expr(by))
 
-    def bool_and(self) -> AggExpr:
+                >>> held = bt.from_pydict({"x": [1, None], "t": [1, 2]})
+                >>> held.agg(r=bt.col("x").arg_max("t", ignore_nulls=False)).to_pydict()
+                {'r': [None]}
+        """
+        func = "arg_max" if ignore_nulls else "arg_max_null"
+        return AggExpr(func, self, input2=_col_or_expr(by))
+
+    def bool_and(self, *, empty_value: bool | None = None) -> AggExpr | Expr:
         """Logical AND of this boolean expression's non-null values per group.
 
-        Null when the group has no non-null value.
+        Null when the group has no non-null value; ``empty_value=True`` answers ``True``
+        there, as Polars' ``all`` does.
+
+        Args:
+            empty_value: The result for a group with no non-null value; ``None`` keeps null.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3584,12 +3772,21 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").bool_and()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [False, True]}
         """
-        return AggExpr("bool_and", self)
+        agg = AggExpr("bool_and", self)
+        if empty_value is None:
+            return agg
+        from batcher.plan.functions import aggregate_semantics as sem
 
-    def bool_or(self) -> AggExpr:
+        return sem.with_empty_value(agg, empty_value)
+
+    def bool_or(self, *, empty_value: bool | None = None) -> AggExpr | Expr:
         """Logical OR of this boolean expression's non-null values per group.
 
-        Null when the group has no non-null value.
+        Null when the group has no non-null value; ``empty_value=False`` answers ``False``
+        there, as Polars' ``any`` does.
+
+        Args:
+            empty_value: The result for a group with no non-null value; ``None`` keeps null.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3602,12 +3799,21 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").bool_or()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [True, False]}
         """
-        return AggExpr("bool_or", self)
+        agg = AggExpr("bool_or", self)
+        if empty_value is None:
+            return agg
+        from batcher.plan.functions import aggregate_semantics as sem
 
-    def product(self) -> AggExpr:
+        return sem.with_empty_value(agg, empty_value)
+
+    def product(self, *, empty_value: float | None = None) -> AggExpr | Expr:
         """Product of non-null values per group (DuckDB ``product``; → Float64).
 
-        Mergeable, so identical single-node and distributed.
+        Mergeable, so identical single-node and distributed. A group with no non-null
+        value is null; ``empty_value=1`` answers ``1`` there, as Polars does.
+
+        Args:
+            empty_value: The result for a group with no non-null value; ``None`` keeps null.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
@@ -3620,7 +3826,12 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").product()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [6.0, 5.0]}
         """
-        return AggExpr("product", self)
+        agg = AggExpr("product", self)
+        if empty_value is None:
+            return agg
+        from batcher.plan.functions import aggregate_semantics as sem
+
+        return sem.with_empty_value(agg, float(empty_value))
 
     def bit_and(self) -> AggExpr:
         """Bitwise AND of non-null Int64 values per group (Spark/DuckDB ``bit_and``).
@@ -3695,7 +3906,7 @@ class Expr:
         """
         return AggExpr("histogram", self)
 
-    def array_agg(self) -> AggExpr:
+    def array_agg(self, *, ignore_nulls: bool = False) -> AggExpr | Expr:
         """Collect each group's values (including nulls) into a ``List`` (SQL ``array_agg``).
 
         Like DuckDB ``array_agg``/``list``: null elements are kept, so a group of
@@ -3709,6 +3920,12 @@ class Expr:
         ``ds.group_by("g").agg(tags=col("t").array_agg())`` then
         ``col("tags").list.join(",")``.
 
+        ``ignore_nulls=True`` leaves the nulls out, as Spark's ``collect_list`` and
+        ``array_agg`` do, so a group of only nulls collects to ``[]``.
+
+        Args:
+            ignore_nulls: Whether to leave null values out of the list.
+
         Returns:
             An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
@@ -3719,8 +3936,17 @@ class Expr:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10]})
                 >>> ds.group_by("g").agg(r=bt.col("x").array_agg()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [[1, 2], [10]]}
+
+                >>> nulls = bt.from_pydict({"x": [1, None]})
+                >>> nulls.agg(r=bt.col("x").array_agg(ignore_nulls=True)).to_pydict()
+                {'r': [[1]]}
         """
-        return AggExpr("list_agg", self)
+        agg = AggExpr("list_agg", self)
+        if not ignore_nulls:
+            return agg
+        from batcher.plan.functions import aggregate_semantics as sem
+
+        return sem.array_agg_without_nulls(agg)
 
     # --- Cumulative / shift (Polars-style window conveniences) ------------------
     # Each returns a window expression (running aggregate / lag-lead), so use it in
@@ -3918,26 +4144,43 @@ class Expr:
         greater: bool,
         partition_by: Iterable[IntoExpr],
         order_by: Iterable[IntoExpr],
+        edges: bool = False,
+        propagate_nulls: bool = False,
     ) -> Expr:
         """A local extremum: strictly beyond both neighbours along the given order.
 
-        Composed from two `lag`/`lead` windows, so it adds no IR. The comparison is
-        *strict*, which is what makes a plateau not a peak — and null-safe, because a
-        neighbouring null would otherwise make the comparison null rather than false: a
-        row with no neighbour on one side is not a peak, it is an edge."""
+        Composed from `lag`/`lead` windows, so it adds no IR. The comparison is *strict*,
+        which is what makes a plateau not a peak. By default it is also null-safe: a
+        neighbouring null, or a missing neighbour at an edge, makes that side false.
+
+        `edges` makes a missing neighbour true instead, so an edge row that beats its one
+        neighbour is a peak. `propagate_nulls` makes a comparison against a null (or of a
+        null row) unknown and combines the two sides with SQL's three-valued AND. An edge
+        and a null neighbour both read as null from `lag`, so the edge is told apart by
+        lagging ``is_null()``, which is itself never null."""
+        from batcher.plan.expr_ir.constructors import lit, when
         from batcher.plan.expr_ir.nodes import lag, lead
 
-        prev = lag(self, 1).over(partition_by=partition_by, order_by=order_by)
-        nxt = lead(self, 1).over(partition_by=partition_by, order_by=order_by)
-        cmp_prev = self > prev if greater else self < prev
-        cmp_next = self > nxt if greater else self < nxt
-        return cmp_prev.fill_null(False) & cmp_next.fill_null(False)
+        def side(window) -> Expr:
+            neighbour = window(self, 1).over(partition_by=partition_by, order_by=order_by)
+            at_edge = window(self.is_null(), 1).over(partition_by=partition_by, order_by=order_by)
+            beats = self > neighbour if greater else self < neighbour
+            if not propagate_nulls:
+                beats = beats.fill_null(False)
+            return when(at_edge.is_null()).then(Lit(edges)).otherwise(beats)
+
+        peak = side(lag) & side(lead)
+        if propagate_nulls:
+            return when(self.is_null()).then(lit(None, "bool")).otherwise(peak)
+        return peak
 
     def peak_max(
         self,
         *,
         partition_by: Iterable[IntoExpr] = (),
         order_by: Iterable[IntoExpr] = (),
+        edges: bool = False,
+        propagate_nulls: bool = False,
     ) -> Expr:
         """True at a local maximum — strictly above both neighbours (Polars ``peak_max``).
 
@@ -3956,9 +4199,15 @@ class Expr:
         Composed from two `shift` windows, so it adds no engine surface. `order_by` decides
         which rows are "neighbours" and is what makes the answer well defined.
 
+        Polars' ``peak_max`` is ``edges=True, propagate_nulls=True``: an edge row that beats
+        its one neighbour is a peak, and a comparison touching a null is null.
+
         Args:
             partition_by: Restart the neighbour comparison per group of these keys.
             order_by: Order rows by these expressions before comparing neighbours.
+            edges: Whether a first or last row counts as beating its missing neighbour.
+            propagate_nulls: Whether a null row or neighbour makes the answer null (SQL
+                three-valued logic) rather than false.
 
         Returns:
             A Boolean expression, true at a local maximum.
@@ -3970,23 +4219,32 @@ class Expr:
                 >>> ds = bt.from_pydict({"t": [1, 2, 3, 4, 5], "x": [1, 5, 2, 8, 3]})
                 >>> ds.with_columns(p=bt.col("x").peak_max(order_by=["t"])).to_pydict()["p"]
                 [False, True, False, True, False]
+                >>> edges = bt.col("x").peak_max(order_by=["t"], edges=True)
+                >>> ds.with_columns(p=edges).to_pydict()["p"]
+                [False, True, False, True, True]
         """
-        return self._peak(True, partition_by, order_by)
+        return self._peak(True, partition_by, order_by, edges, propagate_nulls)
 
     def peak_min(
         self,
         *,
         partition_by: Iterable[IntoExpr] = (),
         order_by: Iterable[IntoExpr] = (),
+        edges: bool = False,
+        propagate_nulls: bool = False,
     ) -> Expr:
         """True at a local minimum — strictly below both neighbours (Polars ``peak_min``).
 
-        The mirror of :meth:`peak_max`; see it for the strictness and the edge convention
-        (an edge row is never a peak, which is where Batcher and Polars differ).
+        The mirror of :meth:`peak_max`; see it for the strictness and the edge convention.
+        Polars' ``peak_min`` is ``propagate_nulls=True`` with the default ``edges=False``:
+        unlike its ``peak_max``, it never counts an edge row.
 
         Args:
             partition_by: Restart the neighbour comparison per group of these keys.
             order_by: Order rows by these expressions before comparing neighbours.
+            edges: Whether a first or last row counts as beating its missing neighbour.
+            propagate_nulls: Whether a null row or neighbour makes the answer null (SQL
+                three-valued logic) rather than false.
 
         Returns:
             A Boolean expression, true at a local minimum.
@@ -3999,7 +4257,7 @@ class Expr:
                 >>> ds.with_columns(p=bt.col("x").peak_min(order_by=["t"])).to_pydict()["p"]
                 [False, True, False, True, False]
         """
-        return self._peak(False, partition_by, order_by)
+        return self._peak(False, partition_by, order_by, edges, propagate_nulls)
 
     def forward_fill(self) -> WindowExpr:
         """Carry the last non-null value forward — Polars ``forward_fill``.
@@ -5599,7 +5857,7 @@ class AggExpr:
             {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
-    __slots__ = ("func", "input", "input2", "name", "param")
+    __slots__ = ("func", "input", "input2", "interpolation", "name", "param")
 
     def __init__(
         self,
@@ -5609,6 +5867,7 @@ class AggExpr:
         input2: Expr | None = None,
         param: float | None = None,
         name: str | None = None,
+        interpolation: str | None = None,
     ) -> None:
         """Construct an aggregate over an optional input, plus an optional `input2` or `param`."""
         self.func = func
@@ -5623,6 +5882,11 @@ class AggExpr:
         self.input2 = input2
         # The scalar parameter for parametric aggregates (the q of quantile); None otherwise.
         self.param = param
+        # How `quantile` resolves a rank between two values (`plan.ir_tags.
+        # QUANTILE_INTERPOLATIONS`). None is linear, and is omitted from the IR so a linear
+        # quantile serializes as it always has. Every site that rebuilds an `AggExpr` from
+        # another must carry it, or a `nearest` quantile silently turns linear.
+        self.interpolation = interpolation
 
     def __repr__(self) -> str:
         """A source-like rendering, e.g. ``col('x').sum()`` or ``count()``."""
@@ -5631,6 +5895,8 @@ class AggExpr:
             args.append(repr(self.input2))
         if self.param is not None:
             args.append(repr(self.param))
+        if self.interpolation is not None:
+            args.append(repr(self.interpolation))
         call = f"{self.func}({', '.join(args)})"
         rendered = call if self.input is None else f"{self.input!r}.{call}"
         return rendered if self.name is None else f"{rendered}.alias({self.name!r})"
@@ -5660,7 +5926,14 @@ class AggExpr:
                 ... ).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'total': [3, 3], 'n': [2, 1]}
         """
-        return AggExpr(self.func, self.input, input2=self.input2, param=self.param, name=name)
+        return AggExpr(
+            self.func,
+            self.input,
+            input2=self.input2,
+            param=self.param,
+            name=name,
+            interpolation=self.interpolation,
+        )
 
     def to_ir(self, alias: str | None = None) -> dict[str, Any]:
         """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`.
@@ -5693,6 +5966,8 @@ class AggExpr:
             item["input2"] = self.input2.to_ir()
         if self.param is not None:
             item["param"] = self.param
+        if self.interpolation is not None:
+            item["interpolation"] = self.interpolation
         return item
 
     def over(

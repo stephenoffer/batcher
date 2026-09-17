@@ -1181,6 +1181,7 @@ mod tests {
             input2: None,
             alias: "s".into(),
             param: None,
+            interpolation: None,
         }]
     }
 

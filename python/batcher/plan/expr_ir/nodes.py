@@ -196,6 +196,7 @@ class WindowExpr(Expr):
         "frame",
         "func",
         "half_life",
+        "ignore_nulls",
         "input",
         "offset",
         "order_by",
@@ -212,6 +213,7 @@ class WindowExpr(Expr):
         offset: int = 1,
         alpha: float | None = None,
         half_life: float | None = None,
+        ignore_nulls: bool = False,
     ) -> None:
         self.func = func
         self.input = input
@@ -221,6 +223,8 @@ class WindowExpr(Expr):
         self.offset = offset
         self.alpha = alpha
         self.half_life = half_life
+        # `IGNORE NULLS`, for `first_value`/`last_value`/`nth_value` only.
+        self.ignore_nulls = ignore_nulls
 
     def to_ir(self) -> dict[str, Any]:
         """Always raises: a window has no scalar IR — it must be hoisted to a `Window` node."""
@@ -242,6 +246,7 @@ class WindowExpr(Expr):
             self.offset,
             self.alpha,
             self.half_life,
+            self.ignore_nulls,
         )
 
     def over(
@@ -267,6 +272,7 @@ class WindowExpr(Expr):
             self.offset,
             self.alpha,
             self.half_life,
+            self.ignore_nulls,
         )
 
 
@@ -316,18 +322,22 @@ def lead(expr: IntoExpr, n: int = 1) -> WindowExpr:
     return WindowExpr("lead", _col_or_expr(expr), [], [], None, int(n))
 
 
-def first_value(expr: IntoExpr) -> WindowExpr:
+def first_value(expr: IntoExpr, *, ignore_nulls: bool = False) -> WindowExpr:
     """The first value of the ordered partition (SQL ``FIRST_VALUE``).
 
-    Reads the **whole partition** (``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
-    FOLLOWING``), not the running frame, so every row of a partition gets the same
-    value. Bind with ``.over(partition_by=…, order_by=…)``.
+    Bind with ``.over(partition_by=…, order_by=…)``. Every frame SQL defaults to starts at
+    the partition's first row, so every row of a partition gets the same value unless an
+    explicit ``frame`` moves the start.
+
+    ``ignore_nulls=True`` is SQL's ``IGNORE NULLS`` (Spark's ``ignoreNulls``): the first
+    *non-null* value in the frame.
 
     Args:
         expr: The column (or expression) to read the first value of.
+        ignore_nulls: Whether to skip null values.
 
     Returns:
-        A window expression yielding the partition's first value for every row.
+        A window expression yielding the frame's first value for every row.
 
     Examples:
         .. doctest::
@@ -337,23 +347,32 @@ def first_value(expr: IntoExpr) -> WindowExpr:
             >>> w = bt.first_value(bt.col("x")).over(order_by=["x"])
             >>> ds.with_columns(r=w).select("r").to_pydict()
             {'r': [10, 10, 10]}
+
+            >>> gaps = bt.from_pydict({"t": [1, 2, 3], "x": [None, 20, 30]})
+            >>> w = bt.first_value("x", ignore_nulls=True).over(order_by=["t"])
+            >>> gaps.with_columns(r=w).sort("t").select("r").to_pydict()
+            {'r': [None, 20, 20]}
     """
-    return WindowExpr("first_value", _col_or_expr(expr), [], [], None)
+    return WindowExpr("first_value", _col_or_expr(expr), [], [], None, ignore_nulls=ignore_nulls)
 
 
-def last_value(expr: IntoExpr) -> WindowExpr:
-    """The last value of the ordered partition (SQL ``LAST_VALUE``).
+def last_value(expr: IntoExpr, *, ignore_nulls: bool = False) -> WindowExpr:
+    """The last value of the window frame (SQL ``LAST_VALUE``).
 
-    Reads the **whole partition** (``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
-    FOLLOWING``), not the running frame — so this is the partition's final value, the
-    same for every row, not a running "last seen so far". Bind with
-    ``.over(partition_by=…, order_by=…)``.
+    Bind with ``.over(partition_by=…, order_by=…)``. With an ``order_by`` and no explicit
+    ``frame`` the frame is SQL's default, ``RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+    ROW``, so this is the running "last value so far", taken from the end of the current
+    row's peer group, as in DuckDB, Spark and Batcher SQL. Pass ``frame=(None, None)`` for the
+    partition's final value on every row, which is also the answer without an ``order_by``.
+
+    ``ignore_nulls=True`` is SQL's ``IGNORE NULLS``: the last *non-null* value in the frame.
 
     Args:
         expr: The column (or expression) to read the last value of.
+        ignore_nulls: Whether to skip null values.
 
     Returns:
-        A window expression yielding the partition's last value for every row.
+        A window expression yielding the frame's last value for every row.
 
     Examples:
         .. doctest::
@@ -361,27 +380,32 @@ def last_value(expr: IntoExpr) -> WindowExpr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [10, 20, 30]})
             >>> w = bt.last_value(bt.col("x")).over(order_by=["x"])
-            >>> ds.with_columns(r=w).select("r").to_pydict()
+            >>> ds.with_columns(r=w).sort("x").select("r").to_pydict()
+            {'r': [10, 20, 30]}
+            >>> whole = bt.last_value(bt.col("x")).over(order_by=["x"], frame=(None, None))
+            >>> ds.with_columns(r=whole).select("r").to_pydict()
             {'r': [30, 30, 30]}
     """
-    return WindowExpr("last_value", _col_or_expr(expr), [], [], None)
+    return WindowExpr("last_value", _col_or_expr(expr), [], [], None, ignore_nulls=ignore_nulls)
 
 
-def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
-    """The value of the ``n``-th row (1-based) of the ordered partition.
+def nth_value(expr: IntoExpr, n: int, *, ignore_nulls: bool = False) -> WindowExpr:
+    """The value of the ``n``-th row (1-based) of the window frame.
 
-    Backs SQL ``NTH_VALUE``; null if the partition has fewer than ``n`` rows. Like
-    :func:`first_value`/:func:`last_value`, this reads the **whole partition**
-    (equivalent to ``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING``), not
-    the running frame — so the ``n``-th value is the same for every row of a partition.
-    Bind with ``.over(partition_by=…, order_by=…)``.
+    Backs SQL ``NTH_VALUE``; null while the frame has fewer than ``n`` rows. As for
+    :func:`last_value`, an ``order_by`` without an explicit ``frame`` uses SQL's default
+    running frame, so rows before the ``n``-th peer group are null. Pass
+    ``frame=(None, None)`` for the partition's ``n``-th value on every row.
+
+    ``ignore_nulls=True`` counts only the non-null values, as SQL's ``IGNORE NULLS``.
 
     Args:
         expr: The column (or expression) to read.
-        n: The 1-based position within the partition to return.
+        n: The 1-based position within the frame to return.
+        ignore_nulls: Whether to count only non-null values.
 
     Returns:
-        A window expression yielding the partition's ``n``-th value for every row.
+        A window expression yielding the frame's ``n``-th value for every row.
 
     Raises:
         PlanError: If ``n`` is less than 1.
@@ -392,11 +416,11 @@ def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [10, 20, 30]})
             >>> w = bt.nth_value(bt.col("x"), 2).over(order_by=["x"])
-            >>> ds.with_columns(r=w).select("r").to_pydict()
-            {'r': [20, 20, 20]}
+            >>> ds.with_columns(r=w).sort("x").select("r").to_pydict()
+            {'r': [None, 20, 20]}
     """
     n = require_int(n, func="nth_value", arg="n", minimum=1)
-    return WindowExpr("nth_value", _col_or_expr(expr), [], [], None, n)
+    return WindowExpr("nth_value", _col_or_expr(expr), [], [], None, n, ignore_nulls=ignore_nulls)
 
 
 def row_number() -> WindowExpr:

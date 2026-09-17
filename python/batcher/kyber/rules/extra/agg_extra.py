@@ -85,6 +85,7 @@ def _agg_key(agg: AggExpr) -> str:
             "input": agg.input.to_ir() if agg.input is not None else None,
             "input2": agg.input2.to_ir() if agg.input2 is not None else None,
             "param": agg.param,
+            "interpolation": agg.interpolation,
         },
         sort_keys=True,
     )

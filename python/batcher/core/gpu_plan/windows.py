@@ -88,7 +88,14 @@ def _supported_function(f: dict, *, ordered: bool) -> bool:
     func = f["func"]
     if func in _RANKING:
         return ordered or func == "ntile"
-    if func in _VALUE or func in _FILL:
+    if func in _VALUE:
+        # The translation picks a position in the whole partition, so it takes no frame but
+        # the whole partition, and declines `IGNORE NULLS` and every narrower frame (SQL's
+        # default running frame for `last_value`/`nth_value` included).
+        frame = f.get("frame")
+        whole = frame is None or _is_whole_partition_frame(frame)
+        return ordered and whole and not f.get("ignore_nulls")
+    if func in _FILL:
         return ordered
     if func not in _PARTITION_AGG:
         return False
@@ -99,6 +106,14 @@ def _supported_function(f: dict, *, ordered: bool) -> bool:
     if _is_running_frame(frame):
         return func in _RUNNING
     return _rolling_width(frame) is not None and func in _ROLLING
+
+
+def _is_whole_partition_frame(frame: dict) -> bool:
+    """Whether an explicit frame is `UNBOUNDED PRECEDING → UNBOUNDED FOLLOWING`, in any units."""
+    return (
+        frame.get("start", {}).get("kind") == "unbounded_preceding"
+        and frame.get("end", {}).get("kind") == "unbounded_following"
+    )
 
 
 def _is_running_frame(frame: dict) -> bool:

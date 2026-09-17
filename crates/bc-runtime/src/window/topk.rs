@@ -212,6 +212,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         };
         // `rank_limit: None` forces the ordering path even for a shape the bounded one covers.
         let cols =
@@ -244,6 +245,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         };
         let cols = super::super::window_with(
             part,

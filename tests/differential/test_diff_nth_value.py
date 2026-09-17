@@ -1,7 +1,8 @@
 """Differential coverage for the `nth_value` window function.
 
-Batcher's value window functions read the whole partition (like `first_value`/
-`last_value`), so the DuckDB oracle uses the explicit UNBOUNDED ... UNBOUNDED frame.
+Both sides ask for the whole partition explicitly: the DuckDB oracle with the UNBOUNDED ...
+UNBOUNDED frame and Batcher with ``frame=(None, None)``. Without it an ORDER BY gives
+`nth_value` SQL's running default frame, pinned in `test_diff_agg_semantic_params.py`.
 """
 
 from __future__ import annotations
@@ -33,7 +34,9 @@ def test_nth_value_matches_duckdb(duck, n):
     duck.register("t", _data())
     out = (
         bt.from_arrow(_data())
-        .with_columns(r=nth_value(col("v"), n).over(partition_by=["g"], order_by=["t"]))
+        .with_columns(
+            r=nth_value(col("v"), n).over(partition_by=["g"], order_by=["t"], frame=(None, None))
+        )
         .collect()
     )
     # n=4 exceeds group 'a' (3 rows) and 'b' (2 rows) → null everywhere.

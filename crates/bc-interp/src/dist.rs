@@ -668,6 +668,7 @@ mod tests {
             input: input.map(col),
             input2: input2.map(col),
             param,
+            interpolation: None,
             alias: alias.into(),
         }
     }
@@ -953,6 +954,38 @@ mod tests {
             (
                 "kurtosis",
                 vec![agg(AggFunc::Kurtosis, Some("v"), None, None, "a")],
+            ),
+            // The W0 parameter forms: each rides an existing state, so the pipeline must
+            // carry it exactly as it carries the default form.
+            (
+                "quantile_nearest",
+                vec![AggregateItem {
+                    interpolation: Some(bc_ir::QuantileInterpolation::Nearest),
+                    ..agg(AggFunc::Quantile, Some("v"), None, Some(0.3), "a")
+                }],
+            ),
+            (
+                "quantile_midpoint",
+                vec![AggregateItem {
+                    interpolation: Some(bc_ir::QuantileInterpolation::Midpoint),
+                    ..agg(AggFunc::Quantile, Some("v"), None, Some(0.1234), "a")
+                }],
+            ),
+            (
+                "arg_min_null",
+                vec![agg(AggFunc::ArgMinNull, Some("v"), Some("o"), None, "a")],
+            ),
+            (
+                "arg_max_null",
+                vec![agg(AggFunc::ArgMaxNull, Some("v"), Some("o"), None, "a")],
+            ),
+            (
+                "skewness_pop",
+                vec![agg(AggFunc::SkewnessPop, Some("v"), None, None, "a")],
+            ),
+            (
+                "modes",
+                vec![agg(AggFunc::Modes, Some("o"), None, None, "a")],
             ),
             // Order-sensitive collection outputs: distributed may reorder, but must never
             // drop or duplicate an element (compared as a sorted multiset).

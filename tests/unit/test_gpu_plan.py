@@ -460,11 +460,19 @@ def test_ranking_window_matches_cpu_engine(function, be):
         lambda ds: ds.window(
             partition_by=["x"], order_by=[("y", False)], functions={"r": ("first_value", "y")}
         ),
+        # `last_value`/`nth_value` over the whole partition. Without the explicit frame an
+        # ORDER BY gives them SQL's running frame, which the translator declines.
         lambda ds: ds.window(
-            partition_by=["x"], order_by=[("y", False)], functions={"r": ("last_value", "y")}
+            partition_by=["x"],
+            order_by=[("y", False)],
+            functions={"r": ("last_value", "y")},
+            frame=(None, None),
         ),
         lambda ds: ds.window(
-            partition_by=["x"], order_by=[("y", False)], functions={"r": ("nth_value", "y")}
+            partition_by=["x"],
+            order_by=[("y", False)],
+            functions={"r": ("nth_value", "y")},
+            frame=(None, None),
         ),
         lambda ds: ds.window(
             partition_by=["x"], order_by=[("y", False)], functions={"r": ("lag", "y")}
@@ -673,3 +681,47 @@ def test_plain_date_trunc_still_translates(be):
     spec = gpu_plan_ops(bt.from_arrow(table).select(r=col("d").dt.truncate("month"))._plan)
     assert spec is not None
     run_chain(table, spec[1], be)
+
+
+@pytest.mark.parametrize(
+    ("label", "agg"),
+    [
+        ("interpolation", lambda: col("y").quantile(0.5, "nearest")),
+        ("arg_max_null", lambda: col("y").arg_max("z", ignore_nulls=False)),
+        ("skewness_pop", lambda: col("y").skew(bias=True)),
+        ("modes", lambda: col("y").mode(all_modes=True)),
+    ],
+)
+def test_w0_aggregate_parameters_decline(label, agg):
+    """The W0 aggregate parameters with engine state are not translated, so the node declines.
+
+    Each would change what the device computes (a different rank, a kept null, the biased
+    moment, a list), which needs a recorded `gpu_shadow_verify` run before it may translate.
+    """
+    ds = bt.from_arrow(_table())
+    assert gpu_plan_ops(ds.group_by("x").agg(r=agg())._plan) is None, label
+    # Positive control: the default forms of the same aggregates still translate.
+    plain = ds.group_by("x").agg(r=col("y").quantile(0.5))
+    assert gpu_plan_ops(plain._plan) is not None
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        lambda: bt.first_value("y", ignore_nulls=True).over(partition_by="x", order_by="y"),
+        lambda: bt.last_value("y").over(partition_by="x", order_by="y"),
+        lambda: bt.nth_value("y", 2).over(partition_by="x", order_by="y"),
+    ],
+)
+def test_framed_or_null_skipping_value_window_declines(be, window):
+    """A value window over a running frame, or skipping nulls, is not the whole-partition pick
+    the translator computes, so the stage declines rather than answering the partition's value.
+    """
+    table = _table()
+    spec = gpu_plan_ops(bt.from_arrow(table).with_columns(r=window())._plan)
+    if spec is not None:
+        with pytest.raises(Unsupported):
+            run_chain(table, spec[1], be)
+    whole = bt.last_value("y").over(partition_by="x", order_by="y", frame=(None, None))
+    got, exp = _run(lambda ds: ds.with_columns(r=whole), table, be)
+    _assert_matches(got, exp, be)

@@ -644,16 +644,18 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
         AggFunc::Var => agg::AggFunc::Var,
         AggFunc::Stddev => agg::AggFunc::Stddev,
         AggFunc::Median => agg::AggFunc::Median,
-        // Quantile in [0,1] → permille (median is the 0.5 default).
-        AggFunc::Quantile => {
-            agg::AggFunc::Quantile((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
-        }
+        // The fraction rides at full precision (median is the 0.5 default); a permille here
+        // once turned `quantile(x, 0.1234)` into the 0.123 quantile.
+        AggFunc::Quantile => agg::AggFunc::Quantile(
+            agg::Fraction::new(item.param.unwrap_or(0.5)),
+            item.interpolation.unwrap_or_default(),
+        ),
         AggFunc::ListAgg => agg::AggFunc::ListAgg,
         AggFunc::BoolAnd => agg::AggFunc::BoolAnd,
         AggFunc::BoolOr => agg::AggFunc::BoolOr,
         AggFunc::ApproxCountDistinct => agg::AggFunc::ApproxCountDistinct,
         AggFunc::ApproxQuantile => {
-            agg::AggFunc::ApproxQuantile((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
+            agg::AggFunc::ApproxQuantile(agg::Fraction::new(item.param.unwrap_or(0.5)))
         }
         AggFunc::Mode => agg::AggFunc::Mode,
         // The contiguity fraction rides `param`, exactly as the quantile does; the default
@@ -680,15 +682,18 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
         AggFunc::AnyValue => agg::AggFunc::AnyValue,
         AggFunc::Entropy => agg::AggFunc::Entropy,
         AggFunc::Mad => agg::AggFunc::Mad,
-        // Same permille encoding as `Quantile`: the param is a fraction on the wire and
-        // an integer permille in the runtime, so the two cannot drift apart.
+        // The same full-precision fraction as `Quantile`.
         AggFunc::QuantileDisc => {
-            agg::AggFunc::QuantileDisc((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
+            agg::AggFunc::QuantileDisc(agg::Fraction::new(item.param.unwrap_or(0.5)))
         }
         // `k` is a count, not a fraction, so it rides `param` unscaled.
         AggFunc::ApproxTopK => agg::AggFunc::ApproxTopK(item.param.unwrap_or(1.0).round() as u16),
         AggFunc::KurtosisPop => agg::AggFunc::KurtosisPop,
         AggFunc::KahanSum => agg::AggFunc::KahanSum,
+        AggFunc::ArgMinNull => agg::AggFunc::ArgMinNull,
+        AggFunc::ArgMaxNull => agg::AggFunc::ArgMaxNull,
+        AggFunc::SkewnessPop => agg::AggFunc::SkewnessPop,
+        AggFunc::Modes => agg::AggFunc::Modes,
     }
 }
 
@@ -1549,6 +1554,7 @@ pub(crate) fn window_batch_with(
             frame: map_frame(f.frame)?,
             alpha: f.alpha,
             half_life: f.half_life,
+            ignore_nulls: f.ignore_nulls,
         });
     }
 
@@ -1731,6 +1737,7 @@ mod input_alias_tests {
             input2,
             alias: "a".into(),
             param: None,
+            interpolation: None,
         }
     }
 

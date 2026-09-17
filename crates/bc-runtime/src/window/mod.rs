@@ -219,6 +219,9 @@ pub struct WindowCall {
     /// Set instead of `alpha` to decay by *elapsed key value* rather than by row position;
     /// only `ewm_mean` accepts it.
     pub half_life: Option<f64>,
+    /// `IGNORE NULLS` for `first_value`/`last_value`/`nth_value`: select among the non-null
+    /// values of the partition or frame. `false` is SQL's `RESPECT NULLS`.
+    pub ignore_nulls: bool,
 }
 
 /// Compute every window function over the partitioned/ordered input, returning
@@ -470,6 +473,7 @@ pub(crate) fn window_serial(
                 &ordered,
                 require(call.values.as_ref(), f)?,
                 call.offset,
+                call.ignore_nulls,
                 num_rows,
             )?,
             // first_value/last_value/nth_value over an explicit frame — the frame's
@@ -482,6 +486,7 @@ pub(crate) fn window_serial(
                 &ordered,
                 require(call.values.as_ref(), f)?,
                 call.offset,
+                call.ignore_nulls,
                 call.frame.expect("frame present"),
                 order_rows.as_ref(),
                 range_order.as_ref(),
@@ -567,11 +572,15 @@ fn series_window(
 /// output row selects another row's value by position within its ordered
 /// partition, so the result is type-generic: we build a per-row source-index map
 /// (with nulls for out-of-range) and `take` from the input column.
+///
+/// `ignore_nulls` (`first_value`/`last_value`/`nth_value` only) selects among the partition's
+/// non-null values instead of its rows; `lag`/`lead` never carry it.
 fn value_window(
     func: WindowFn,
     ordered: &[Vec<usize>],
     values: &ArrayRef,
     offset: i64,
+    ignore_nulls: bool,
     num_rows: usize,
 ) -> Result<ArrayRef, RuntimeError> {
     if func.is_fill() {
@@ -580,6 +589,20 @@ fn value_window(
     let mut src: Vec<Option<u32>> = vec![None; num_rows];
     for part in ordered {
         let len = part.len();
+        if ignore_nulls
+            && matches!(
+                func,
+                WindowFn::FirstValue | WindowFn::LastValue | WindowFn::NthValue
+            )
+        {
+            // One whole-partition answer shared by every row.
+            let nn = crate::window::frame::NonNullRanks::new(part, values);
+            let pick = nn.pick(func, offset, 0, len).map(|p| part[p] as u32);
+            for &row in part {
+                src[row] = pick;
+            }
+            continue;
+        }
         for (pos, &row) in part.iter().enumerate() {
             let pos = pos as i64;
             let take_pos: Option<usize> = match func {
@@ -1604,6 +1627,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         // Both the serial kernel (huge threshold) and the bucket-parallel path (threshold 1).
         for threshold in [1usize, 1 << 20] {
@@ -1654,6 +1678,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         for threshold in [1usize, 1 << 20] {
             let out = window_with(
@@ -1701,6 +1726,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::RowNumber,
@@ -1709,6 +1735,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Sum,
@@ -1717,6 +1744,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Lag,
@@ -1725,6 +1753,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         // Null-aware read (Lag yields nulls at each partition's first row; the raw
@@ -1766,6 +1795,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             }];
             // threshold 1 forces the parallel bucket path; usize::MAX keeps the oracle.
             let par = window_with(std::slice::from_ref(&part), &[], &funcs, n, 1, None).unwrap();
@@ -1799,6 +1829,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order.clone())], &f, 4).unwrap();
         assert_eq!(opt_ints(&out[0]), vec![Some(20), Some(30), Some(40), None]);
@@ -1810,6 +1841,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &f, 4).unwrap();
         assert_eq!(opt_ints(&out[0]), vec![None, Some(10), Some(20), Some(30)]);
@@ -1826,6 +1858,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &funcs, 3).unwrap();
         // sorted order: idx1(10)=1, idx2(20)=2, idx0(30)=3
@@ -1850,6 +1883,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -1858,6 +1892,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -1885,6 +1920,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -1893,6 +1929,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::RowNumber,
@@ -1901,6 +1938,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -1934,6 +1972,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::CumeDist,
@@ -1942,6 +1981,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -1959,6 +1999,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &funcs, 1).unwrap();
         assert_eq!(floats(&out[0]), vec![0.0]);
@@ -1975,6 +2016,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &funcs, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![1, 1, 1, 2, 2]);
@@ -1991,6 +2033,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(order)], &funcs, 2).unwrap();
         assert_eq!(ints(&out[0]), vec![1, 2]);
@@ -2005,6 +2048,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         assert!(window(&[], &[], &funcs, 3).is_err());
     }
@@ -2023,6 +2067,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -2031,6 +2076,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[part], &[asc(order)], &funcs, 4).unwrap();
@@ -2051,6 +2097,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[part], &[], &funcs, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![9, 6, 9, 6, 9]);
@@ -2067,6 +2114,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Min,
@@ -2075,6 +2123,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2083,6 +2132,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Count,
@@ -2091,6 +2141,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Avg,
@@ -2099,6 +2150,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[], &[], &funcs, 4).unwrap();
@@ -2129,6 +2181,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2137,6 +2190,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         // Whole-partition (no ORDER BY).
@@ -2171,6 +2225,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2179,6 +2234,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         let out = window(&[part], &[], &funcs, 3).unwrap();
@@ -2200,6 +2256,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         assert!(window(&[], &[], &funcs, 3).is_err());
     }
@@ -2215,6 +2272,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[part], &[], &funcs, 3).unwrap();
         assert_eq!(floats(&out[0]), vec![1.5, 1.5, 10.0]);
@@ -2240,6 +2298,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(part, &[asc(ord)], &funcs, n).unwrap();
         opt_ints(&out[0])
@@ -2333,6 +2392,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(ord)], &funcs, 3).unwrap();
         let s = out[0].as_any().downcast_ref::<StringArray>().unwrap();
@@ -2367,6 +2427,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             }];
             let order = [asc(ord.clone())];
             let serial = window_with(
@@ -2406,6 +2467,7 @@ mod tests {
             frame: Some(range_running),
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out = window(&[], &[asc(ord.clone())], &framed, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![2, 2, 4, 4, 5]);
@@ -2418,6 +2480,7 @@ mod tests {
             frame: None,
             alpha: None,
             half_life: None,
+            ignore_nulls: false,
         }];
         let out2 = window(&[], &[asc(ord)], &frameless, 5).unwrap();
         assert_eq!(ints(&out2[0]), vec![5, 5, 5, 5, 5]);

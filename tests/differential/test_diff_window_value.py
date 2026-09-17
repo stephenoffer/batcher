@@ -63,17 +63,37 @@ def test_expr_value_functions_match_dict_api_and_duckdb(duck, t):
 def test_last_value_whole_frame(duck, t):
     out = (
         bt.from_arrow(t)
-        .window(partition_by=["p"], order_by=[("v", False)], functions={"l": ("last_value", "v")})
+        .window(
+            partition_by=["p"],
+            order_by=[("v", False)],
+            functions={"l": ("last_value", "v")},
+            frame=(None, None),
+        )
         .select("p", "v", "l")
         .collect()
     )
-    # Batcher's last_value uses the whole-partition frame; match with explicit ROWS frame.
+    # The whole-partition frame, asked for explicitly on both sides. Without a frame an
+    # ORDER BY gives `last_value` SQL's running default instead (see `test_last_value_default`).
     assert_same(
         out,
         duck.sql(
             "SELECT p, v, last_value(v) OVER (PARTITION BY p ORDER BY v "
             "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) l FROM t"
         ),
+    )
+
+
+def test_last_value_default(duck, t):
+    # No frame: SQL's `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, so each row reads
+    # the end of its own peer group. This read the whole partition until W0 fixed it.
+    out = (
+        bt.from_arrow(t)
+        .window(partition_by=["p"], order_by=[("v", False)], functions={"l": ("last_value", "v")})
+        .select("p", "v", "l")
+        .collect()
+    )
+    assert_same(
+        out, duck.sql("SELECT p, v, last_value(v) OVER (PARTITION BY p ORDER BY v) l FROM t")
     )
 
 

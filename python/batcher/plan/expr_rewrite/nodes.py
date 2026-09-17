@@ -124,7 +124,13 @@ def _map_agg(spec: AggregateSpec, rule: ExprRule) -> AggregateSpec:
     input2 = rule(spec.agg.input2) if spec.agg.input2 is not None else None
     if input1 is spec.agg.input and input2 is spec.agg.input2:
         return spec
-    rebuilt = AggExpr(spec.agg.func, input1, param=spec.agg.param, input2=input2)
+    rebuilt = AggExpr(
+        spec.agg.func,
+        input1,
+        param=spec.agg.param,
+        input2=input2,
+        interpolation=spec.agg.interpolation,
+    )
     return dataclasses.replace(spec, agg=rebuilt)
 
 

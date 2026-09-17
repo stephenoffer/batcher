@@ -182,6 +182,39 @@ def _bound_ir(offset: int | None, *, preceding: bool) -> dict[str, Any]:
     return {"kind": "following", "n": offset}
 
 
+#: The value functions that take `IGNORE NULLS`.
+_IGNORE_NULLS_FUNCS = frozenset({"first_value", "last_value", "nth_value"})
+
+
+def sql_default_frame(
+    func: str, frame: WindowFrame | None, ordered: bool, ignore_nulls: bool = False
+) -> WindowFrame | None:
+    """The frame a positional value function runs over when none is given explicitly.
+
+    SQL's default frame with an ORDER BY is ``RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+    ROW``, which makes `last_value` the running value of the current peer group and
+    `nth_value` null until the frame reaches the n-th row. The engine's frameless form reads
+    the whole partition instead, so the builders resolve SQL's default here. `first_value`
+    is the same under either frame and stays frameless, as the SQL front-end leaves it --
+    except under `IGNORE NULLS`, where the first non-null value so far is null until one
+    arrives, which only the running frame answers.
+
+    Args:
+        func: The window function's tag.
+        frame: The explicit frame, or None.
+        ordered: Whether the window has an ORDER BY.
+        ignore_nulls: Whether the function skips nulls.
+
+    Returns:
+        `frame` when given; SQL's default running frame for an ordered `last_value` or
+        `nth_value`, or an ordered `first_value` that ignores nulls; otherwise None.
+    """
+    framed = {"last_value", "nth_value"} | ({"first_value"} if ignore_nulls else set())
+    if frame is None and ordered and func in framed:
+        return WindowFrame(None, 0, "range")
+    return frame
+
+
 @dataclass(frozen=True, slots=True)
 class WindowFuncSpec:
     """One window function: a function name, optional input expression, and alias.
@@ -206,6 +239,9 @@ class WindowFuncSpec:
     #: EWM half-life in the ORDER BY key's units (microseconds for a temporal key). Set
     #: instead of `alpha` to decay by elapsed key value; only `ewm_mean` takes it.
     half_life: float | None = None
+    #: `IGNORE NULLS`: pick among non-null values. Only the positional value functions
+    #: `first_value`/`last_value`/`nth_value` take it; omitted from the IR when false.
+    ignore_nulls: bool = False
 
     def __post_init__(self) -> None:
         if self.func not in WINDOW_FUNCS:
@@ -247,6 +283,11 @@ class WindowFuncSpec:
                 )
         elif self.alpha is not None or self.half_life is not None:
             raise PlanError(f"window function {self.func!r} does not take a smoothing factor")
+        if self.ignore_nulls and self.func not in _IGNORE_NULLS_FUNCS:
+            raise PlanError(
+                f"window function {self.func!r} does not take ignore_nulls; only "
+                f"{sorted(_IGNORE_NULLS_FUNCS)} do"
+            )
 
     def to_ir(self) -> dict[str, Any]:
         item: dict[str, Any] = {"func": self.func, "alias": self.alias, "offset": self.offset}
@@ -258,6 +299,8 @@ class WindowFuncSpec:
             item["alpha"] = self.alpha
         if self.half_life is not None:
             item["half_life"] = self.half_life
+        if self.ignore_nulls:
+            item["ignore_nulls"] = True
         return item
 
 

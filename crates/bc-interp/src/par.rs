@@ -2633,6 +2633,7 @@ fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
                 | AggFunc::Quantile
                 | AggFunc::CountDistinct
                 | AggFunc::Mode
+                | AggFunc::Modes
                 // The contiguity statistics hold a per-group value list exactly as `Median`
                 // does, so they need the same partitioning to stay bounded. Omitting them
                 // here compiles and passes every small test, and lets a grouped `n50` over a
@@ -3574,6 +3575,7 @@ mod tests {
                 input2: None,
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         };
         let norm = |bs: &[RecordBatch]| -> Vec<(Option<i64>, Option<i64>)> {
@@ -3775,6 +3777,7 @@ mod tests {
                     input2: None,
                     alias: "s".into(),
                     param: None,
+                    interpolation: None,
                 }],
             };
             // 4 groups; the filter keeps every row so the fold materializes the whole input.
@@ -3844,6 +3847,7 @@ mod tests {
                     input2: None,
                     alias: "s".into(),
                     param: None,
+                    interpolation: None,
                 }],
             };
             // 20k distinct keys → a large hash state; a 1 KiB budget forces the grace spill.
@@ -3932,6 +3936,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "s".into(),
                 }],
                 rank_limit: None,
@@ -4503,6 +4508,7 @@ mod tests {
                 input2: None,
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         };
         // Same data, split two different ways.
@@ -4557,6 +4563,7 @@ mod tests {
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
                 param,
+                interpolation: None,
                 alias: "m".into(),
             }],
         }
@@ -4673,6 +4680,7 @@ mod tests {
             input: Some(Expr::Col { name: "v".into() }),
             input2: None,
             param: None,
+            interpolation: None,
             alias: alias.into(),
         };
         let plan = RelOp::Aggregate {
@@ -4735,6 +4743,7 @@ mod tests {
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
                 param: None,
+                interpolation: None,
                 alias: format!("a{i}"),
             })
             .collect();
@@ -4838,6 +4847,7 @@ mod tests {
             input: Some(Expr::Col { name: "v".into() }),
             input2: None,
             param: None,
+            interpolation: None,
             alias: a.into(),
         };
 
@@ -4888,6 +4898,7 @@ mod tests {
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
                 param: None,
+                interpolation: None,
                 alias: "nd".into(),
             }],
         };
@@ -4963,6 +4974,7 @@ mod tests {
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
                 param: None,
+                interpolation: None,
                 alias: "mo".into(),
             }],
         };
@@ -5045,6 +5057,7 @@ mod tests {
                 input: Some(Expr::Col { name: "v".into() }),
                 input2: None,
                 param: None,
+                interpolation: None,
                 alias: "h".into(),
             }],
         };
@@ -5378,6 +5391,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -5387,6 +5401,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "s".into(),
                 },
             ],
@@ -5435,6 +5450,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -5444,6 +5460,7 @@ mod tests {
                     frame: None,
                     alpha: None,
                     half_life: None,
+                    ignore_nulls: false,
                     alias: "s".into(),
                 },
             ],
@@ -5503,6 +5520,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
                 alias: "rn".into(),
             }],
             rank_limit: Some(2),
@@ -5544,6 +5562,7 @@ mod tests {
                 input2: None,
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         };
         let data = vec![
@@ -6261,6 +6280,7 @@ mod tests {
                 input2: None,
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         };
         let data = vec![batch(&[1, 2, 1, 3, 2, 1], &[10, 20, 30, 40, 50, 60])];
@@ -6640,6 +6660,7 @@ mod tests {
                 input2: None,
                 alias: "s".into(),
                 param: None,
+                interpolation: None,
             }],
         }
     }
@@ -6722,6 +6743,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
                 alias: "s".into(),
             }],
             rank_limit: None,

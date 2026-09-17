@@ -658,6 +658,7 @@ mod fold_unit_tests {
                 input: Some(bc_expr::Expr::Col { name: "v".into() }),
                 input2: None,
                 param: None,
+                interpolation: None,
             }],
         }
     }

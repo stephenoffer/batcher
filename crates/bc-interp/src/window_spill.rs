@@ -233,6 +233,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
                 alias: "rn".into(),
             },
             WindowFunc {
@@ -242,6 +243,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
                 alias: "s".into(),
             },
         ];
@@ -288,6 +290,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
                 alias: "rn".into(),
             },
             WindowFunc {
@@ -297,6 +300,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
                 alias: "s".into(),
             },
         ];

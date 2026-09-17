@@ -69,6 +69,11 @@ PAIRS: list[tuple[str, str, str]] = [
     # either direction silently — the failure mode this whole module exists to close.
     ("bc-ir/src/lib.rs", "WindowFn", "batcher.plan.ir_tags:WINDOW_FUNCS"),
     ("bc-ir/src/lib.rs", "AggFunc", "batcher.plan.ir_tags:AGG_FNS"),
+    (
+        "bc-ir/src/lib.rs",
+        "QuantileInterpolation",
+        "batcher.plan.ir_tags:QUANTILE_INTERPOLATIONS",
+    ),
     ("bc-ir/src/lib.rs", "FrameUnits", "batcher.plan.ir_tags:FRAME_UNITS"),
     ("bc-ir/src/lib.rs", "FrameBound", "batcher.plan.ir_tags:FRAME_BOUND_KINDS"),
 ]

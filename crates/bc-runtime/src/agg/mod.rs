@@ -176,6 +176,32 @@ use stats::{
 };
 use var::{count_non_null, finalize_mean, finalize_var, merge_welford, var_state};
 
+/// A quantile's fraction `q`, carried at the full precision of the `f64` it arrived as.
+///
+/// It replaced a *permille* (`u16`, `round(q * 1000)`), which silently answered a different
+/// quantile than the one asked for: `quantile(x, 0.1234)` over `0..=1000` returned `123.0`
+/// where DuckDB returns `123.4`, and the bounded spill path -- which reads the plan's `f64`
+/// directly -- returned `123.4`, so the same query changed its answer when it spilled.
+/// Stored as the float's bits so `AggFunc` stays `Copy + Eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fraction(u64);
+
+impl Fraction {
+    /// The fraction `q` (expected in `[0, 1]`; finalizers clamp).
+    #[must_use]
+    pub fn new(q: f64) -> Self {
+        Self(q.to_bits())
+    }
+
+    /// The fraction as an `f64`.
+    #[must_use]
+    pub fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
+pub use bc_ir::QuantileInterpolation;
+
 /// An aggregate function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
@@ -198,10 +224,10 @@ pub enum AggFunc {
     /// sorts each list and takes the middle (averaging the two middle for an even
     /// count, matching DuckDB).
     Median,
-    /// Continuous quantile (`percentile_cont`) at permille `p` (e.g. 250 = 0.25).
-    /// Same list-state machinery as `Median` (which is the p=500 case); finalizing
-    /// sorts and linearly interpolates at position `p/1000 · (n-1)`.
-    Quantile(u16),
+    /// Continuous quantile (`percentile_cont`) at `q`. Same list-state machinery as
+    /// `Median` (which is the q=0.5 linear case); finalizing selects around position
+    /// `q · (n-1)` and resolves it by the interpolation (linear by default).
+    Quantile(Fraction, QuantileInterpolation),
     /// `array_agg` — collect each group's non-null values into a `List` (in
     /// arrival order). Same list-state as `Median`; finalize returns the list.
     ListAgg,
@@ -215,10 +241,10 @@ pub enum AggFunc {
     /// sketch (mergeable; ~2% error). The skew-safe alternative to `CountDistinct`,
     /// whose exact per-group value list can OOM on a hot key.
     ApproxCountDistinct,
-    /// `approx_quantile` at permille `p` (e.g. 500 = median) via a per-group KLL
-    /// sketch (mergeable, bounded memory). The skew-safe alternative to `Median`/
+    /// `approx_quantile` at `q` (e.g. 0.5 = median) via a per-group sketch
+    /// (mergeable, bounded memory). The skew-safe alternative to `Median`/
     /// `Quantile`, whose exact per-group value list can OOM on a hot key.
-    ApproxQuantile(u16),
+    ApproxQuantile(Fraction),
     /// `mode` — the most frequent value per group (same list state as `Median`).
     /// Ties broken by the smallest value, so it is deterministic / mergeable.
     Mode,
@@ -266,9 +292,9 @@ pub enum AggFunc {
     Entropy,
     /// `mad` — the median absolute deviation, `median(|x - median(x)|)`. Same state.
     Mad,
-    /// `quantile_disc` at `permille/1000` — the quantile *element*, not an
+    /// `quantile_disc` at `q` — the quantile *element*, not an
     /// interpolation between two of them. Same state.
-    QuantileDisc(u16),
+    QuantileDisc(Fraction),
     /// `approx_top_k` — the `k` most frequent values as a `List`, exactly. Same state.
     ApproxTopK(u16),
     /// `kurtosis_pop` — population excess kurtosis (`m4/m2² - 3`). Same 5-column
@@ -277,6 +303,16 @@ pub enum AggFunc {
     /// `kahan_sum`/`fsum` — compensated summation, 2-column `(sum, compensation)` state.
     /// Mergeable, and never less accurate than `Sum`.
     KahanSum,
+    /// `arg_min_null`/`arg_max_null` — `arg_min`/`arg_max` that keep a row whose *value* is
+    /// null (DuckDB's null-keeping forms, and Spark's/Polars' `min_by`/`max_by`). Same
+    /// `(key, value)` state; only a null key removes a row.
+    ArgMinNull,
+    ArgMaxNull,
+    /// `skewness_pop` — population skewness `m3/m2^1.5`. Same 5-column moment state.
+    SkewnessPop,
+    /// `modes` — every most-frequent value, ascending, as a `List`. Same counted state as
+    /// `Mode`, of which it is the untruncated form.
+    Modes,
 }
 
 impl AggFunc {
@@ -296,12 +332,20 @@ impl AggFunc {
     pub fn state_arity(self) -> usize {
         match self {
             // Two: a value and the counter or key that qualifies it.
-            AggFunc::Mean | AggFunc::ArgMin | AggFunc::ArgMax | AggFunc::KahanSum => 2,
-            AggFunc::Mode | AggFunc::ApproxTopK(_) => 2, // distinct values AND their counts
+            AggFunc::Mean
+            | AggFunc::ArgMin
+            | AggFunc::ArgMax
+            | AggFunc::ArgMinNull
+            | AggFunc::ArgMaxNull
+            | AggFunc::KahanSum => 2,
+            // Distinct values AND their counts.
+            AggFunc::Mode | AggFunc::Modes | AggFunc::ApproxTopK(_) => 2,
             // Three: (sum, sum_of_squares, count).
             AggFunc::Var | AggFunc::Stddev => 3,
             // Five / six: the sum-of-powers moment states.
-            AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => 5,
+            AggFunc::Skewness | AggFunc::SkewnessPop | AggFunc::Kurtosis | AggFunc::KurtosisPop => {
+                5
+            }
             AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => 6,
             // One: a scalar accumulator, a sketch, or a per-group value list.
             AggFunc::CountStar
@@ -311,7 +355,7 @@ impl AggFunc {
             | AggFunc::Min
             | AggFunc::Max
             | AggFunc::Median
-            | AggFunc::Quantile(_)
+            | AggFunc::Quantile(..)
             | AggFunc::QuantileDisc(_)
             | AggFunc::ListAgg
             | AggFunc::BoolAnd
@@ -344,7 +388,7 @@ impl AggFunc {
             AggFunc::Var => "var",
             AggFunc::Stddev => "stddev",
             AggFunc::Median => "median",
-            AggFunc::Quantile(_) => "quantile",
+            AggFunc::Quantile(..) => "quantile",
             AggFunc::ListAgg => "list_agg",
             AggFunc::BoolAnd => "bool_and",
             AggFunc::BoolOr => "bool_or",
@@ -377,6 +421,10 @@ impl AggFunc {
             AggFunc::ApproxTopK(_) => "approx_top_k",
             AggFunc::KurtosisPop => "kurtosis_pop",
             AggFunc::KahanSum => "kahan_sum",
+            AggFunc::ArgMinNull => "arg_min_null",
+            AggFunc::ArgMaxNull => "arg_max_null",
+            AggFunc::SkewnessPop => "skewness_pop",
+            AggFunc::Modes => "modes",
         }
     }
 }
@@ -1574,8 +1622,13 @@ mod tests {
         let vals: ArrayRef = Arc::new(Float64Array::from(
             (0..n).map(|i| (i % 200) as f64).collect::<Vec<_>>(),
         ));
-        let funcs = [AggFunc::ApproxQuantile(900)];
-        let call = |v: &ArrayRef| vec![AggCall::new(AggFunc::ApproxQuantile(900), Some(v.clone()))];
+        let funcs = [AggFunc::ApproxQuantile(Fraction::new(0.9))];
+        let call = |v: &ArrayRef| {
+            vec![AggCall::new(
+                AggFunc::ApproxQuantile(Fraction::new(0.9)),
+                Some(v.clone()),
+            )]
+        };
         // Whole-input (one partial).
         let whole = group_aggregate(std::slice::from_ref(&keys), &call(&vals), n).unwrap();
         let whole_v = whole.agg_columns[0]

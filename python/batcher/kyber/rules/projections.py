@@ -202,7 +202,13 @@ def projection_inlining_into_agg(node: Aggregate, _ctx: OptimizerContext) -> Log
             new_aggs.append(spec)
             continue
         input2 = subst(spec.agg.input2) if spec.agg.input2 is not None else None
-        agg = AggExpr(spec.agg.func, subst(spec.agg.input), param=spec.agg.param, input2=input2)
+        agg = AggExpr(
+            spec.agg.func,
+            subst(spec.agg.input),
+            param=spec.agg.param,
+            input2=input2,
+            interpolation=spec.agg.interpolation,
+        )
         new_aggs.append(dataclasses.replace(spec, agg=agg))
     # The watermark names an event-time column of the aggregate's *input*. Dropping the
     # projection re-parents the aggregate onto `proj.input`, where that column may be

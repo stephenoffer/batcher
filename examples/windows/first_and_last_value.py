@@ -1,9 +1,9 @@
 """Reaching the endpoints of a window: first_value, last_value, nth_value.
 
-`last_value` is where Batcher deliberately parts company with SQL. The SQL default frame
-ends at the current row, so `last_value` there returns the current row unless you widen
-the frame — a famous trap. Batcher defaults to the whole partition instead, so it returns
-the partition's last value, and you narrow the frame when you want the running form.
+`last_value` is the famous trap. With an ORDER BY, SQL's default frame ends at the current
+row's peer group, so `last_value` returns the current row unless you widen the frame.
+Batcher follows SQL (and DuckDB and Spark) here, so pass ``frame=(None, None)`` when you mean
+the partition's last value.
 
     python examples/windows/first_and_last_value.py
 """
@@ -34,7 +34,7 @@ def main() -> None:
         opening=bt.first_value(col("revenue")).over(order_by=["o_orderdate"]),
         # Widen the frame explicitly, or this returns the current row.
         closing=bt.last_value(col("revenue")).over(order_by=["o_orderdate"], frame=(None, None)),
-        # No frame: the whole partition, so this agrees with `closing` above.
+        # No frame: SQL's running default, so this is the current row, not `closing`.
         default_closing=bt.last_value(col("revenue")).over(order_by=["o_orderdate"]),
         # Narrowed to end at the current row — the running "latest so far".
         running_latest=bt.last_value(col("revenue")).over(
@@ -52,8 +52,9 @@ def main() -> None:
     assert abs(result["opening"][0] - result["revenue"][0]) < 1e-6
     assert abs(result["closing"][0] - result["revenue"][-1]) < 1e-6
 
-    # The default frame is the whole partition, so leaving it off changes nothing.
-    assert result["default_closing"] == result["closing"]
+    # The default frame ends at the current row, so leaving it off is the running form.
+    assert result["default_closing"] == result["revenue"]
+    assert result["default_closing"] != result["closing"]
     # Narrowing the frame to end at the current row gives the running form, which is
     # the current row on every row.
     assert result["running_latest"] == result["revenue"]

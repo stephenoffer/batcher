@@ -65,6 +65,7 @@ pub(crate) fn window_parallel(
                         frame: c.frame,
                         alpha: c.alpha,
                         half_life: c.half_life,
+                        ignore_nulls: c.ignore_nulls,
                         values: c.values.as_ref().map(g).transpose()?,
                     })
                 })
@@ -332,6 +333,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::LastValue,
@@ -340,6 +342,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Min,
@@ -348,6 +351,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -356,6 +360,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
             WindowCall {
                 func: WindowFn::Min,
@@ -364,6 +369,7 @@ mod tests {
                 frame: None,
                 alpha: None,
                 half_life: None,
+                ignore_nulls: false,
             },
         ];
         for call in cases {

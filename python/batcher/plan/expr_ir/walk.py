@@ -253,6 +253,39 @@ def contains_aggregate(expr: object) -> bool:
     return False
 
 
+def positional_aggregate_name(item: AggExpr | Expr) -> tuple[AggExpr | Expr, str | None, bool]:
+    """The output name a positional ``agg(...)`` argument takes, and the value to aggregate.
+
+    A bare aggregate is named by its ``.alias(...)``, else after its input column. An
+    expression *over* aggregates (``col("x").sum(empty_value=0)``) is named by its
+    ``.alias(...)``, else after the one column its aggregates read -- the name Polars gives
+    ``pl.col("x").sum().fill_null(0)``. Anything reading no column, or several, has no name.
+
+    Args:
+        item: A positional `agg()` argument.
+
+    Returns:
+        ``(value, name, aliased)``: the value with any alias wrapper removed, the output
+        name or None, and whether that name came from an explicit alias.
+    """
+    if isinstance(item, AggExpr):
+        if item.name is not None:
+            return item, item.name, True
+        return item, (item.input.name if isinstance(item.input, Col) else None), False
+    if isinstance(item, Aliased) and contains_aggregate(item.inner):
+        return item.inner, item.name, True
+    if not contains_aggregate(item):
+        return item, None, False
+    registry = AggregateLeafRegistry()
+    split_aggregate_leaves(item, registry)
+    columns: set[str] = set()
+    for _hidden, leaf in registry.leaves():
+        for part in (leaf.input, leaf.input2):
+            if part is not None:
+                columns |= referenced_columns(part)
+    return item, (next(iter(columns)) if len(columns) == 1 else None), False
+
+
 class AggregateLeafRegistry:
     """Collects the distinct `AggExpr` leaves of the composite specs into hidden columns.
 

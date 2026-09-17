@@ -169,7 +169,16 @@ fn single_quantile(aggregates: &[bc_ir::AggregateItem]) -> Option<(&bc_expr::Exp
     let a = &aggregates[0];
     let q = match a.func {
         bc_ir::AggFunc::Median => 0.5,
-        bc_ir::AggFunc::Quantile => a.param?, // the quantile in [0,1]
+        // The quantile in [0,1]. The bounded path interpolates linearly, so any other
+        // interpolation takes the in-memory path rather than a silently linear answer.
+        bc_ir::AggFunc::Quantile
+            if matches!(
+                a.interpolation,
+                None | Some(bc_ir::QuantileInterpolation::Linear)
+            ) =>
+        {
+            a.param?
+        }
         _ => return None,
     };
     a.input.as_ref().map(|e| (e, q))

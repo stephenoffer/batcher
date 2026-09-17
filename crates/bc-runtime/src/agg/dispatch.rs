@@ -75,7 +75,7 @@ pub(super) fn accumulate(
             var_state(require(values, func)?, group_ids, num_groups, func)?
         }
         AggFunc::Median
-        | AggFunc::Quantile(_)
+        | AggFunc::Quantile(..)
         | AggFunc::Histogram
         // The contiguity statistics differ from `Median` only in their finalize.
         | AggFunc::NLength(_)
@@ -130,7 +130,7 @@ pub(super) fn accumulate(
                 func,
             )?]
         }
-        AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => {
+        AggFunc::Skewness | AggFunc::SkewnessPop | AggFunc::Kurtosis | AggFunc::KurtosisPop => {
             moment_state(require(values, func)?, group_ids, num_groups, func)?
         }
         // The value-list family: entropy, the median absolute deviation and the discrete
@@ -139,7 +139,7 @@ pub(super) fn accumulate(
             vec![median_state(require(values, func)?, group_ids, num_groups)?]
         }
         // `mode`/`top_k` count values instead of keeping them — `agg::counted` says why.
-        AggFunc::Mode | AggFunc::ApproxTopK(_) => {
+        AggFunc::Mode | AggFunc::Modes | AggFunc::ApproxTopK(_) => {
             counted_state(require(values, func)?, group_ids, num_groups)?
         }
         // `any_value` folds with the same min reducer its combine uses, so a partial
@@ -148,7 +148,9 @@ pub(super) fn accumulate(
         // arg_min/arg_max and covar/corr are two-input; `partial` builds their state
         // directly (it has access to the second input), so they never reach the
         // single-input `accumulate`.
-        AggFunc::ArgMin | AggFunc::ArgMax => unreachable!("arg_extreme handled in partial"),
+        AggFunc::ArgMin | AggFunc::ArgMax | AggFunc::ArgMinNull | AggFunc::ArgMaxNull => {
+            unreachable!("arg_extreme handled in partial")
+        }
         AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => {
             unreachable!("covar/corr handled in partial")
         }
@@ -167,17 +169,16 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             // The distinct-set state's per-group list length IS the distinct count.
             AggFunc::CountDistinct => finalize_count_distinct(&state[0]),
             AggFunc::Median => finalize_median(&state[0])?,
-            AggFunc::Quantile(permille) => {
-                finalize_quantile(&state[0], f64::from(permille) / 1000.0)?
+            AggFunc::Quantile(q, interpolation) => {
+                finalize_quantile(&state[0], q.get(), interpolation)?
             }
             // array_agg: the collected per-group list IS the result, except a non-null
             // *empty* list (an aggregate over zero rows) becomes NULL to match DuckDB.
             AggFunc::ListAgg => finalize_list_agg(&state[0])?,
             AggFunc::ApproxCountDistinct => finalize_approx_distinct(&state[0]),
-            AggFunc::ApproxQuantile(permille) => {
-                finalize_approx_quantile(&state[0], f64::from(permille) / 1000.0)
-            }
+            AggFunc::ApproxQuantile(q) => finalize_approx_quantile(&state[0], q.get()),
             AggFunc::Mode => counted::finalize_mode(state)?,
+            AggFunc::Modes => counted::finalize_modes(state)?,
             AggFunc::NLength(p) => {
                 median::finalize_contiguity(&state[0], median::Contiguity::NLength(p))?
             }
@@ -186,18 +187,19 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             }
             AggFunc::AuN => median::finalize_contiguity(&state[0], median::Contiguity::AuN)?,
             // arg_min/arg_max: the value is state column 1 (column 0 is the key).
-            AggFunc::ArgMin | AggFunc::ArgMax => state[1].clone(),
+            AggFunc::ArgMin | AggFunc::ArgMax | AggFunc::ArgMinNull | AggFunc::ArgMaxNull => {
+                state[1].clone()
+            }
             AggFunc::CovarPop => finalize_covar(state, false)?,
             AggFunc::CovarSamp => finalize_covar(state, true)?,
             AggFunc::Corr => finalize_corr(state)?,
             AggFunc::Skewness => finalize_skewness(state)?,
+            AggFunc::SkewnessPop => stats::finalize_skewness_pop(state)?,
             AggFunc::Kurtosis => finalize_kurtosis(state)?,
             AggFunc::Histogram => finalize_histogram(&state[0])?,
             AggFunc::Entropy => finalize_entropy(&state[0])?,
             AggFunc::Mad => finalize_mad(&state[0])?,
-            AggFunc::QuantileDisc(permille) => {
-                finalize_quantile_disc(&state[0], f64::from(permille) / 1000.0)?
-            }
+            AggFunc::QuantileDisc(q) => finalize_quantile_disc(&state[0], q.get())?,
             AggFunc::ApproxTopK(k) => counted::finalize_top_k(state, k as usize)?,
             AggFunc::KurtosisPop => finalize_kurtosis_pop(state)?,
             // The compensation is added back exactly once, at the end.
