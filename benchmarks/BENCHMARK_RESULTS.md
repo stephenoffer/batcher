@@ -1,5 +1,96 @@
 # Batcher CPU benchmark results
 
+## Ten landed changes, a full re-sweep, and what the new cases found (2026-09-16)
+
+A whole-board pass: every suite re-run against the full lineup, the losing cases profiled with
+`perf` and `py-spy`, and ten changes landed on what that found. Every A/B below was
+interleaved in one window, because the box was shared with up to eight other sessions and its
+load average ran from 11 to 285. **Read the board as best-of-passes on a busy box, not as the
+quiet-box figures of the 2026-09-13 entry below.**
+
+### What landed, and what each measured
+
+| commit | change | measured |
+|---|---|---|
+| `30ecce22` | exact key-range bitmap rejects absent probe keys before hashing (`join/key_bits.rs`) | 6M probe x 204-key build, 1 thread: inner 77-92 -> 19 ms CPU, semi 76 -> 20; q17 15.5 -> 9.6 ms |
+| `2d27444a` | DISTINCT INTERSECT/EXCEPT -> semi/anti join when NULLs cannot differ (`set_membership_to_join`) | `op-intersect` 49.3 -> 24.3 ms, `op-except` 46.9 -> 32.4 |
+| `045ab2bd` | string vs literal from an 8-byte prefix; `s >= a AND s < b` in one pass | `LIKE 'the%'` count, 1 thread: 77 -> 65 ms CPU |
+| `cacdae88` | `COUNT(*) ... WHERE p` counts `nullif(p, false)`, not a CASE mask | same query: 65 -> 59 ms CPU; parallel wall 9.1 -> 7.4 ms |
+| `26d2b2d6` | short-literal string order as one branchless `u128` compare | 50%-selective `o_orderstatus = 'F'` filter: 27.1 -> 17.7 ms CPU |
+| `b7f5de66` | a PSI stall alone no longer spills a plan under 2% of the budget | TPC-H sf1 q8 (3.5 MB peak) had 86% of its samples in the spill writer |
+| `ca76e72e` | eleven operator-mix cases for untimed public API | see below |
+| `a72d1dcb` | `carried_columns` memoized per plan instance | q8 17.5 -> 17.0 ms, q5 18.4 -> 17.9 |
+| `31ed3b84` | list-state aggregates scatter values directly | grouped MEDIAN 112 -> 82 ms, QUANTILE_CONT 97 -> 80 |
+| `0b88b6b0` | window partition bucket by multiply-shift, not `%` | top-3 per supplier 707 -> 650 ms CPU, H2O q8 1414 -> 1294 |
+
+### The board after them
+
+Best of 2-3 passes per engine per case, then the geomean of Batcher over each rival. `losses`
+counts cases where any rival was faster in its own best pass.
+
+| suite | b/duckdb | b/duckdb_arrow | b/polars | b/daft | losses |
+|---|---:|---:|---:|---:|---:|
+| TPC-H sf1 | 0.68 | 0.25 | 0.53 | 0.21 | 5 of 21 |
+| operator mix (58 cases) | 0.71 | 0.46 | 0.17 | 0.11 | 21 of 58 |
+| H2O groupby 1e7 | 0.95 | 0.75 | 0.47 | 0.33 | 6 of 10 |
+| H2O join 1e7 | 0.77 | 0.66 | 0.60 | 0.31 | 0 of 5 (q1 re-run in isolation: 0.58-0.78x) |
+| JSON | 0.34 | 0.32 | 0.01 | 0.04 | 0 of 5 |
+| ClickBench | 0.66 | 0.18 | 0.38 | 0.12 | 11 of 40 |
+| TPC-DS sf1 | 0.99-1.40 | - | - | - | 61 of 97 |
+
+TPC-DS ran on `batcher,duckdb,polars` only. Polars' SQL front end rejects the suite, so every
+Polars cell is `ERR`. The 29.6% spread across its two passes is the load, not the engine.
+**Daft was measured at a 58 GB resident set on q64 and SIGKILLed**, which took the whole runner
+with it in two sweeps; Batcher peaks at 4.2 GB on the same query and DuckDB at 5.6 GB. Daft is
+now run in its own pass with `--skip tpcds-q64`.
+
+Three operator-mix rows read 1.4-1.7 s against DuckDB's 50 ms (`op-sort-float`,
+`op-sort-multikey-narrow`, `op-sort-string-lowcard`). They are spill artifacts rather than
+losses: re-run at PSI zero the same sort takes 64 ms. A 6M-row sort is large enough that a
+kernel stall still spills it, which is the protective behaviour working on a thrashing cgroup.
+
+### What the new operator cases found
+
+The operator mix had no case for `COUNT(DISTINCT)`, `MEDIAN`, `QUANTILE_CONT`, `STDDEV_SAMP`,
+`HAVING`, `FULL OUTER JOIN`, a bounded `ROWS` frame, `ROW_NUMBER() <= k`, `REGEXP_MATCHES`,
+an IN-list filter or a date `BETWEEN`. First readings against the best rival: HAVING, stddev,
+grouped `COUNT(DISTINCT)` and regexp at or ahead; full outer join 78 ms against DuckDB's 29;
+window top-k 61 against 33; median and quantile 97 and 91 against 57 and 52 before `31ed3b84`.
+
+### What was tried and not landed
+
+- **Parallel Full join on the broadcast path.** Correct and tested, and no wall-clock change
+  on `op-join-full-outer`. The case runs at 8% CPU utilization because the streaming executor's
+  `materialized_join_from` serves every Full join with a single-threaded `ops::join_batches`,
+  deliberately. Its order must match the sequential oracle for a `LIMIT` above the join, and a
+  parallel join's order diverges past `RADIX_MIN_BUILD_ROWS_BROADCAST`, where this 3M-row build
+  sits. Reverted. The fix needs an order-preserving parallel join, not a parallel one.
+- **A cheaper superset for `push_semijoin_into_decorrelated_aggregate` on q21.** That rule
+  refuses q21 because re-evaluating the probe spine costs more than the aggregate. Restricting
+  by a superset instead (the lineitem filter plus the 411-supplier join, without `orders`)
+  fired, cut operator CPU to 225 ms and the aggregate to 6.8 ms, and ran **87 -> 275 ms**: the
+  plan now reads source 1 twice, which bars the streaming executor, and the materializing path
+  ran it at 23% CPU. Measured separately, the spine takes 19.7 ms and yields 72,110 keys, the
+  full aggregate 50.5 ms and the key-restricted one 10.1 ms, so the win is real but needs a
+  shared subplan in the executor.
+- **`CHUNK_MERGE_CEILING` raised from 0.25 to 1.0** for H2O q7: q7 72.7 -> 91.6 ms and q3
+  70 -> 93, only q5 improved. Reverted.
+- **Fixed-width copies in the repartition string gather** for H2O q7: the `memmove` calls left
+  the profile and the time did not, because the cost is the random read of the source strings.
+  Reverted.
+
+### Where the largest gaps now are
+
+- **TPC-DS ROLLUP queries** (q5, q18, q22, q70, q77, q80): q77's operators take 1.1 ms of a
+  315 ms query. `py-spy` puts 62% in `subplan_reuse._materialize` and 28% in `_optimize`.
+- **TPC-DS q72, 13x**: join order. Batcher joins `inventory` (11.7M rows) to its dimensions and
+  reaches 16.4M rows before the selective `catalog_sales` side reduces anything; a filter
+  estimated at 70,233 rows passes 16,425,000.
+- **Control-plane overhead** is 3-17 ms per TPC-H query with the plan cache warm, and the four
+  remaining TPC-H losses to Polars (q2, q5, q8, q17) are 3-5 ms each.
+- **TPC-H q21** (see the superset attempt above) and **H2O q8 / window top-k**, where the
+  per-bucket gathers remain after the bucketing fix.
+
 ## The board as it stands, on four engines (2026-09-13)
 
 A full sweep with `duckdb_arrow` in the lineup, which is what makes the rest of this file

@@ -7,6 +7,26 @@ because the suite gained four operator families in between and because a differe
 every ratio (`BENCHMARK_RESULTS.md`: ratios from different machines "differ by an order of
 magnitude"). Read this board, not the arithmetic between them.
 
+## Update 2026-09-16: what moved, and what the next board should lead with
+
+Re-swept on the same 48-core box, shared this time, with ten changes landed on the results.
+`BENCHMARK_RESULTS.md` (2026-09-16) has the A/B for each and the full board; the rows below
+update this file's board rather than replace it.
+
+**Closed or narrowed.** `op-intersect` is now a win (24.3 ms against DuckDB's 48.3).
+`op-except` is 32.4 ms against Polars' 24.9, from 46.9. `tpch-q17` is 9.6-10.9 ms against
+Polars' 5.6-7.4, from 16.0. `tpch-q5` and `tpch-q8` each moved 2-3.5 ms. `h2o-join-q1` re-runs
+as a win. Grouped MEDIAN and QUANTILE_CONT, new to the board, dropped to 82 and 80 ms.
+
+**New rows the suite could not see before**, from the eleven operator cases added in
+`ca76e72e`: `op-join-full-outer` (78 vs 29 ms, single-threaded by design in the streaming
+executor, see the entry), `op-window-topk` (61 vs 33).
+
+**The board to lead with next is TPC-DS**, 61 losses of 97, which this file did not carry.
+Two causes cover the worst of it. The ROLLUP queries (q5, q18, q22, q70, q77, q80) spend
+their time around the operators rather than in them: q77's operators take 1.1 ms of 315 ms.
+q72 is a join order that reaches 16.4M rows before its selective side applies (13x).
+
 ## How to read it
 
 **Ordered by absolute gap, not by ratio.** A 2.5x on a 1.4 ms query is 2 ms of engineering value
