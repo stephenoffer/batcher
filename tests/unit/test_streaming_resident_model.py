@@ -32,7 +32,7 @@ class _CountingModel:
 
 def test_model_built_once_across_micro_batches():
     _BUILDS.clear()
-    ds = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(_CountingModel)
+    ds = bt.from_pydict({"x": [1, 2, 3]}).map_batches(_CountingModel)
     # `_build_run_batch` returns `(run_batch, projection, predicate)` — a `map_batches`
     # pipeline pushes nothing down, so the latter two are None here.
     run_batch, _projection, _predicate = _build_run_batch(ds._plan, ds._sources)

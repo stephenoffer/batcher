@@ -48,7 +48,7 @@ def triton_client(
             ...     input_columns=["input__0"],
             ...     output_columns=["output__0"],
             ... )
-            >>> ds.ml.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
+            >>> ds.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
 
     Args:
         url: the Triton endpoint (``host:8000`` for http, ``host:8001`` for grpc).
@@ -71,7 +71,7 @@ def triton_client(
             with one, a timed-out request raises and is retried like any transient failure.
 
     Returns:
-        A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
+        A class for ``ds.map_batches(...)`` — the client connects once per worker.
     """
     if protocol not in ("http", "grpc"):
         raise BackendError(f"triton protocol must be 'http' or 'grpc', got {protocol!r}")

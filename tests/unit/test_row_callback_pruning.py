@@ -13,6 +13,7 @@ result-equality half — that declaring columns does not change the answer — i
 
 from __future__ import annotations
 
+import pyarrow.compute as pc
 import pytest
 
 import batcher as bt
@@ -45,12 +46,12 @@ def _scanned(ds) -> set[str]:
 
 
 def test_map_carries_the_declaration_to_the_plan():
-    plan = _wide().ml.map(lambda row: {"id": row["id"]}, input_columns=["id"])._plan
+    plan = _wide().map(lambda row: {"id": row["id"]}, input_columns=["id"])._plan
     assert plan.input_columns == ("id",)
 
 
 def test_flat_map_carries_the_declaration_to_the_plan():
-    plan = _wide().ml.flat_map(lambda row: [row], input_columns=["id"])._plan
+    plan = _wide().flat_map(lambda row: [row], input_columns=["id"])._plan
     assert plan.input_columns == ("id",)
 
 
@@ -61,31 +62,31 @@ def test_the_dataset_level_sugar_carries_it_too():
 
 
 def test_a_declared_row_map_stops_the_scan_reading_the_wide_column():
-    ds = _wide().ml.map(lambda row: {"id": row["id"]}, input_columns=["id"], output_columns=["id"])
+    ds = _wide().map(lambda row: {"id": row["id"]}, input_columns=["id"], output_columns=["id"])
     assert _scanned(ds.select("id")) == {"id"}
 
 
 def test_a_declared_flat_map_prunes_too():
-    ds = _wide().ml.flat_map(lambda row: [row], input_columns=["id"], output_columns=["id"])
+    ds = _wide().flat_map(lambda row: [row], input_columns=["id"], output_columns=["id"])
     assert _scanned(ds.select("id")) == {"id"}
 
 
 def test_a_declared_row_filter_prunes_too():
-    ds = _wide().ml.filter(lambda row: row["id"] > 1, input_columns=["id"])
+    ds = _wide().filter(lambda batch: pc.greater(batch["id"], 1), input_columns=["id"])
     assert _scanned(ds.select("id")) == {"id"}
 
 
 def test_an_undeclared_row_map_must_keep_every_column_alive():
     """The safe default: with nothing declared the callback may read anything."""
-    ds = _wide().ml.map(lambda row: {"id": row["id"]}, output_columns=["id"])
+    ds = _wide().map(lambda row: {"id": row["id"]}, output_columns=["id"])
     assert _scanned(ds.select("id")) == {"id", "score", "img"}
 
 
 def test_declaring_the_columns_does_not_change_the_rows():
-    declared = _wide().ml.map(
+    declared = _wide().map(
         lambda row: {"id": row["id"] * 2}, input_columns=["id"], output_columns=["id"]
     )
-    undeclared = _wide().ml.map(lambda row: {"id": row["id"] * 2}, output_columns=["id"])
+    undeclared = _wide().map(lambda row: {"id": row["id"] * 2}, output_columns=["id"])
     assert declared.to_pydict() == undeclared.to_pydict() == {"id": [2, 4, 6]}
 
 
@@ -100,16 +101,12 @@ def test_a_row_map_can_tolerate_a_malformed_record():
     """`max_errored_rows` was a `map_batches` option only, and `map`/`flat_map` lower to
     `map_batches` — so the knob existed and no row callback could reach it."""
     ds = bt.from_pydict({"s": ["1", "2", "oops", "4"]})
-    assert ds.ml.map(_parse, output_columns=["n"], max_errored_rows=10).to_pydict() == {
-        "n": [1, 2, 4]
-    }
+    assert ds.map(_parse, output_columns=["n"], max_errored_rows=10).to_pydict() == {"n": [1, 2, 4]}
 
 
 def test_a_row_flat_map_can_too():
     ds = bt.from_pydict({"s": ["1", "oops"]})
-    out = ds.ml.flat_map(
-        lambda row: [{"n": int(row["s"])}], output_columns=["n"], max_errored_rows=10
-    )
+    out = ds.flat_map(lambda row: [{"n": int(row["s"])}], output_columns=["n"], max_errored_rows=10)
     assert out.to_pydict() == {"n": [1]}
 
 

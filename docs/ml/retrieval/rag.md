@@ -252,7 +252,7 @@ def scorer():  # stands in for a real cross-encoder in this example
     return lambda pairs: [float("everest" in passage) for _, passage in pairs]
 
 
-reranked = hits.ml.map_batches(
+reranked = hits.map_batches(
     cross_encoder_rerank_udf(
         scorer,
         query_column="question",
@@ -269,7 +269,7 @@ In production the first argument is a model id and the model loads once per work
 
 ```python
 # docs: skip
-reranked = hits.ml.map_batches(
+reranked = hits.map_batches(
     cross_encoder_rerank_udf(
         "cross-encoder/ms-marco-MiniLM-L-6-v2",
         query_column="question",
@@ -319,7 +319,7 @@ hits = bt.from_pydict(
         "scores": [[0.9, 0.89, 0.5]],
     }
 )
-reranked = hits.ml.map_batches(
+reranked = hits.map_batches(
     mmr_rerank_udf(
         embedding_column="vecs",
         score_column="scores",

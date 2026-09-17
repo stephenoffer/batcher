@@ -60,7 +60,7 @@ def _blob_len(batch: pa.RecordBatch) -> pa.RecordBatch:
 def test_filter_on_preserved_column_pushed_and_matches_duckdb(duck):
     ds = (
         _t()
-        .ml.map_batches(
+        .map_batches(
             _add_score,
             preserves_columns=["id", "v", "big"],
             output_columns=["id", "v", "big", "score"],
@@ -83,7 +83,7 @@ def test_filter_on_preserved_column_pushed_and_matches_duckdb(duck):
 def test_filter_on_rewritten_column_not_pushed_and_matches_duckdb(duck):
     # `v` is rewritten by the UDF and NOT declared preserved, so the filter must stay ABOVE
     # the UDF and see the post-UDF value. DuckDB filters on the same post-rewrite value.
-    ds = _t().ml.map_batches(_rewrite_v, output_columns=["id", "v", "big"]).filter(col("v") >= 130)
+    ds = _t().map_batches(_rewrite_v, output_columns=["id", "v", "big"]).filter(col("v") >= 130)
 
     opt = Optimizer().logical_rewrite(ds._plan)
     assert isinstance(opt, Filter)  # filter did NOT move below the UDF
@@ -101,7 +101,7 @@ def test_large_column_dropped_after_udf_matches_duckdb(duck):
     # the optimizer frees `big` right above the UDF. The result is unchanged.
     ds = (
         _t()
-        .ml.map_batches(
+        .map_batches(
             _blob_len,
             input_columns=["big"],
             output_columns=["id", "v", "big", "blen"],

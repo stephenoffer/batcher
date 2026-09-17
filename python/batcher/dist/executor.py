@@ -2595,7 +2595,7 @@ def _warn_accelerator_stage_falls_back(plan: LogicalPlan, reason: str) -> None:
     slower with nothing said, after the user asked for `distributed=True` and named a device.
 
     Measured on the 4xT4 cluster: `group_by(...).agg(...)` feeding
-    `ds.ml.map_batches(Model, num_gpus=1)` under `collect(distributed=True)` ran every batch
+    `ds.map_batches(Model, num_gpus=1)` under `collect(distributed=True)` ran every batch
     on the driver's CPU, while all four devices sat idle — because a shuffle beneath a
     `map_batches` is a shape the dispatcher has no one-shot path for and the intermediate is
     in-memory, so it landed here.

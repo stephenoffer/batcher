@@ -197,8 +197,8 @@ def test_a_streamed_stage_is_timed_on_its_own_work_not_its_upstreams_wait() -> N
 
     ds = (
         bt.from_arrow(pa.table({"x": list(range(2000))}))
-        .ml.map_batches(Decode, batch_size=250)
-        .ml.map_batches(Model, num_gpus=1, batch_size=250)
+        .map_batches(Decode, batch_size=250)
+        .map_batches(Model, num_gpus=1, batch_size=250)
     )
     ds.collect()  # warm up: the first num_gpus>0 run pays one-time device detection
     stats = ds.stats()
@@ -215,7 +215,7 @@ def test_a_per_row_map_is_named_as_such_in_the_tree() -> None:
     """`ds.map` lowers to `map_batches` over a row loop, so the plan tree shows one node for
     both. The measured tree distinguishes them, because the cost difference is 10-100x."""
     ds = bt.from_pydict({"x": list(range(256))})
-    kinds = [op.kind for op in ds.ml.map(lambda row: {"x": row["x"] + 1}).stats().ops]
+    kinds = [op.kind for op in ds.map(lambda row: {"x": row["x"] + 1}).stats().ops]
     assert "MapRows" in kinds
     assert "MapBatches" not in kinds
 

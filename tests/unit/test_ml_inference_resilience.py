@@ -1,6 +1,6 @@
 """The model-inference entry points expose the same fault tolerance as `map_batches`.
 
-`ds.ml.map`, `.filter` and `.flat_map` have always taken `max_errored_rows`, and
+`ds.map`, `.filter` and `.flat_map` have always taken `max_errored_rows`, and
 `map_batches` the full retry/timeout surface. The six methods that actually call a model or
 a remote endpoint — where a transient failure is not an edge case but the normal operating
 condition of a hosted API — took none of it. A single 503 from a provider, or one row a
@@ -31,7 +31,8 @@ _RESILIENCE = {"max_errored_rows", "timeout", "max_retries", "retry_backoff", "r
     "method", ["map_batches", "infer", "predict", "generate", "extract", "classify", "embed"]
 )
 def test_every_model_entry_point_takes_the_resilience_options(method: str) -> None:
-    params = set(inspect.signature(getattr(DatasetML, method)).parameters)
+    owner = bt.Dataset if method == "map_batches" else DatasetML
+    params = set(inspect.signature(getattr(owner, method)).parameters)
     assert params >= _RESILIENCE, f"{method} is missing {sorted(_RESILIENCE - params)}"
 
 

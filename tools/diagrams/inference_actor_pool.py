@@ -28,7 +28,7 @@ body = [
         44,
         600,
         56,
-        "ds.ml.map_batches(Scorer, num_gpus=1, concurrency=(2, 8))",
+        "ds.map_batches(Scorer, num_gpus=1, concurrency=(2, 8))",
         "ds.ml.infer is this call with inference defaults, not a separate operator",
     ),
     arrow(490, 102, 490, 190, "blue"),
@@ -74,7 +74,7 @@ body = [
     note(
         490,
         712,
-        "ds.ml.map is the row-at-a-time escape hatch, and it is marked as one so a profile can price what it costs.",
+        "ds.map is the row-at-a-time escape hatch, and it is marked as one so a profile can price what it costs.",
         anchor="middle",
     ),
 ]

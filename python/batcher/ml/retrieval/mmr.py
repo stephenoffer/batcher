@@ -130,7 +130,7 @@ def mmr_rerank_udf(
             ...     rerank_columns=("docs",),
             ...     k=2,
             ... )
-            >>> ds.ml.map_batches(udf).to_pydict()["docs"]
+            >>> ds.map_batches(udf).to_pydict()["docs"]
             [['twin a', 'different']]
     """
     if k < 1:

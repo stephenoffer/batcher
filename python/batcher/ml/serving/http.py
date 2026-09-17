@@ -232,7 +232,7 @@ def http_client(
             ...     input_columns=["feature"],
             ...     output_columns=["score"],
             ... )
-            >>> ds.ml.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
+            >>> ds.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
 
     Args:
         url: the inference endpoint (receives ``{column: list}``, returns the same).
@@ -256,7 +256,7 @@ def http_client(
             remote GPU idling between requests. Results stay in input order.
 
     Returns:
-        A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
+        A class for ``ds.map_batches(...)`` — the client connects once per worker.
 
     Raises:
         BackendError: if `tensor_encoding` is not one of ``auto``/``binary``/``json``.

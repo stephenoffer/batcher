@@ -29,7 +29,7 @@ def test_o4_3_udf_receives_arrow_recordbatch_one_columnar_contract():
         seen["type"] = type(batch).__module__ + "." + type(batch).__name__
         return batch
 
-    bt.from_pydict({"a": [1, 2, 3]}).ml.map_batches(grab, output_columns=["a"]).collect()
+    bt.from_pydict({"a": [1, 2, 3]}).map_batches(grab, output_columns=["a"]).collect()
     assert seen["type"] == "pyarrow.lib.RecordBatch"
 
 
@@ -40,7 +40,7 @@ def test_o1_6_immutable_dataflow_new_column_udf_works():
         return pa.RecordBatch.from_arrays(cols, names=[*batch.schema.names, "flag"])
 
     ds = bt.from_pydict({"x": [1, 2, 3]})
-    out = ds.ml.map_batches(add_flag, output_columns=["x", "flag"]).collect()
+    out = ds.map_batches(add_flag, output_columns=["x", "flag"]).collect()
     assert out.column_names == ["x", "flag"]
     assert out.column("flag").to_pylist() == [1, 1, 1]
 
@@ -82,7 +82,7 @@ def test_count_is_exact_on_in_memory_source():
 def test_count_and_aggregate_over_map_batches_do_not_crash_metadata_fastpath():
     # The metadata fast-path (count/aggregate from stats) must degrade to normal
     # execution for a map_batches/ML pipeline (opaque to the IR), never crash.
-    ds = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(lambda b: b, output_columns=["x"])
+    ds = bt.from_pydict({"x": [1, 2, 3]}).map_batches(lambda b: b, output_columns=["x"])
     assert ds.count() == 3
     agg = ds.group_by().agg(n=bt.count()).collect()
     assert agg.column("n").to_pylist() == [3]

@@ -63,7 +63,7 @@ def _non_overlapped():
 
 def test_streaming_pipeline_equals_single_node():
     out = bt.from_pydict({"id": list(range(200)), "x": list(range(200))})
-    out = out.ml.map_batches(_double).ml.map_batches(_AddOne)
+    out = out.map_batches(_double).map_batches(_AddOne)
     single = out.collect().sort_by("id").to_pydict()
     with _streaming():
         dist = out.collect(distributed=True, num_workers=2).sort_by("id").to_pydict()
@@ -75,7 +75,7 @@ def test_streaming_three_stage_equals_single_node():
     # CPU preprocess → load-once inference → CPU postprocess: the producer is the CPU
     # prefix, the consumer runs inference AND postprocess. Result must still match.
     out = bt.from_pydict({"id": list(range(180)), "x": list(range(180))})
-    out = out.ml.map_batches(_double).ml.map_batches(_AddOne).ml.map_batches(_postprocess)
+    out = out.map_batches(_double).map_batches(_AddOne).map_batches(_postprocess)
     single = out.collect().sort_by("id").to_pydict()
     with _streaming():
         dist = out.collect(distributed=True, num_workers=3).sort_by("id").to_pydict()
@@ -85,7 +85,7 @@ def test_streaming_three_stage_equals_single_node():
 
 def test_streaming_pipeline_equals_non_overlapped_map():
     out = bt.from_pydict({"id": list(range(150)), "x": list(range(150))})
-    out = out.ml.map_batches(_double).ml.map_batches(_AddOne)
+    out = out.map_batches(_double).map_batches(_AddOne)
     with _non_overlapped():
         plain = out.collect(distributed=True, num_workers=3).sort_by("id").to_pydict()
     with _streaming():
@@ -103,7 +103,7 @@ def test_stream_inference_is_on_by_default():
 
 def test_streaming_pipeline_empty_input():
     out = bt.from_pydict({"id": [], "x": []})
-    out = out.ml.map_batches(_double).ml.map_batches(_AddOne)
+    out = out.map_batches(_double).map_batches(_AddOne)
     with _streaming():
         dist = out.collect(distributed=True, num_workers=2).to_pydict()
     assert dist.get("y", []) == []
@@ -129,7 +129,7 @@ def test_production_window_bounds_producer_memory():
     )
     with config_context(cfg):
         ds = bt.from_pydict({"id": list(range(120)), "x": list(range(120))})
-        plan = ds.ml.map_batches(_double).ml.map_batches(_AddOne)._plan
+        plan = ds.map_batches(_double).map_batches(_AddOne)._plan
         cpu_stage, gpu_stage = split_into_resource_stages(plan)
         _ensure_ray(1)
         from batcher.dist.executors.map import _MapActor
@@ -212,7 +212,7 @@ def _stage_setup(rows: int, credits: int):
     ctx = config_context(cfg)
     ctx.__enter__()
     ds = bt.from_pydict({"id": list(range(rows)), "x": list(range(rows))})
-    plan = ds.ml.map_batches(_double).ml.map_batches(_AddOne)._plan
+    plan = ds.map_batches(_double).map_batches(_AddOne)._plan
     cpu_stage, gpu_stage = split_into_resource_stages(plan)
     _ensure_ray(1)
     src = InMemorySource([_one_row(i) for i in range(rows)])
@@ -330,8 +330,8 @@ def test_two_models_and_a_postprocess_run_as_four_stages():
     from batcher.dist.executors.plan_analysis import split_into_resource_stages
 
     out = bt.from_pydict({"id": list(range(160)), "x": list(range(160))})
-    out = out.ml.map_batches(_double).ml.map_batches(_AddOne)
-    out = out.ml.map_batches(_Rerank).ml.map_batches(_postprocess)
+    out = out.map_batches(_double).map_batches(_AddOne)
+    out = out.map_batches(_Rerank).map_batches(_postprocess)
     stages = split_into_resource_stages(out._plan)
     assert [s.wants_pool for s in stages] == [False, True, True, False]
 
@@ -424,7 +424,7 @@ def _three_stage_setup(rows: int, credits: int):
     ctx = config_context(cfg)
     ctx.__enter__()
     ds = bt.from_pydict({"id": list(range(rows)), "x": list(range(rows))})
-    plan = ds.ml.map_batches(_double).ml.map_batches(_AddOne).ml.map_batches(_Rerank)._plan
+    plan = ds.map_batches(_double).map_batches(_AddOne).map_batches(_Rerank)._plan
     stages = split_into_resource_stages(plan)
     _ensure_ray(1)
     src = InMemorySource([_one_row(i) for i in range(rows)])

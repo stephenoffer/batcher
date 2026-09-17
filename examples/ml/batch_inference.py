@@ -56,7 +56,7 @@ def main() -> None:
     assert [round(v, 9) for v in native["score"]] == [round(v, 9) for v in scored["score"]]
 
     # The `.ml` accessor is the same machinery with model-shaped defaults.
-    ml_scored = data.ml.map_batches(ScoringModel, batch_size=4).to_pydict()
+    ml_scored = data.map_batches(ScoringModel, batch_size=4).to_pydict()
     assert len(ml_scored["score"]) == 10
 
     # Inference streams, so a table larger than memory is the ordinary case.

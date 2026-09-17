@@ -25,7 +25,7 @@ class _Model:
 def test_gpu_plain_function_warns():
     ds = bt.from_arrow(pa.table({"x": [1, 2, 3]}))
     with pytest.warns(PerformanceWarning, match="once per worker"):
-        ds.ml.map_batches(lambda b: b, num_gpus=1, output_columns=["x"])
+        ds.map_batches(lambda b: b, num_gpus=1, output_columns=["x"])
 
 
 def test_gpu_class_does_not_warn():
@@ -33,7 +33,7 @@ def test_gpu_class_does_not_warn():
     ds = bt.from_arrow(pa.table({"x": [1, 2, 3]}))
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # any warning would fail the test
-        out = ds.ml.map_batches(_Model, num_gpus=1, output_columns=["x"])
+        out = ds.map_batches(_Model, num_gpus=1, output_columns=["x"])
     assert out.columns == ["x"]
 
 
@@ -42,7 +42,7 @@ def test_cpu_plain_function_does_not_warn():
     ds = bt.from_arrow(pa.table({"x": [1, 2, 3]}))
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        out = ds.ml.map_batches(lambda b: b, output_columns=["x"])  # num_gpus=0 default
+        out = ds.map_batches(lambda b: b, output_columns=["x"])  # num_gpus=0 default
     assert out.columns == ["x"]
 
 
@@ -60,7 +60,7 @@ def _wide(n: int) -> bt.Dataset:
 
 def test_a_wide_table_without_input_columns_warns():
     with pytest.warns(PerformanceWarning, match="input_columns"):
-        _wide(20).ml.map_batches(lambda b: b)
+        _wide(20).map_batches(lambda b: b)
 
 
 def test_declaring_input_columns_silences_it():
@@ -68,7 +68,7 @@ def test_declaring_input_columns_silences_it():
     ds = _wide(20)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        ds.ml.map_batches(lambda b: b, input_columns=["c0", "c1"])
+        ds.map_batches(lambda b: b, input_columns=["c0", "c1"])
 
 
 def test_a_narrow_table_does_not_warn():
@@ -77,7 +77,7 @@ def test_a_narrow_table_does_not_warn():
     ds = _wide(3)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        ds.ml.map_batches(lambda b: b)
+        ds.map_batches(lambda b: b)
 
 
 def test_an_append_a_column_udf_is_not_told_to_prune():
@@ -95,4 +95,4 @@ def test_a_narrowing_udf_over_a_wide_table_still_warns():
     fewer columns than it took is exactly the one that should have pruned its read."""
     ds = _wide(20)
     with pytest.warns(PerformanceWarning, match="input_columns"):
-        ds.ml.map_batches(lambda b: b.select(["c0"]), output_columns=["c0"])
+        ds.map_batches(lambda b: b.select(["c0"]), output_columns=["c0"])

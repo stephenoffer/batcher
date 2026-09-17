@@ -144,7 +144,7 @@ udf = llm_udf(
     output_column="answer",
     usage=True,  # also append prompt_tokens / completion_tokens
 )
-answered = ds.ml.map_batches(udf, num_gpus=1, concurrency=4)
+answered = ds.map_batches(udf, num_gpus=1, concurrency=4)
 ```
 
 It takes the same `template`, `image_column`, `adapter_column`, `parse_json`, and `usage`

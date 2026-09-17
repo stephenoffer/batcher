@@ -18,12 +18,24 @@ from batcher.api.dataset.compat.guidance import groupby_attribute_error
 from batcher.plan.expr_ir import AggExpr, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector
 from batcher.plan.expr_ir.walk import positional_aggregate_name
-from batcher.plan.logical import Aggregate, AggregateSpec, Project, Projection
+from batcher.plan.logical import (
+    Aggregate,
+    AggregateSpec,
+    LogicalPlan,
+    Project,
+    Projection,
+    RowId,
+    Sort,
+    SortKeySpec,
+)
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["GroupBy"]
+
+#: The hidden column `maintain_order` numbers input rows into and keeps the minimum of.
+_FIRST_ROW = "__bc_group_first_row"
 
 
 def _numeric_columns(schema: pa.Schema) -> set[str]:
@@ -61,15 +73,21 @@ class GroupBy:
             {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
-    __slots__ = ("_keys", "_named", "_source")
+    __slots__ = ("_keys", "_maintain_order", "_named", "_source")
 
     def __init__(
-        self, source: Dataset, keys: tuple[str, ...], named: dict[str, Expr] | None = None
+        self,
+        source: Dataset,
+        keys: tuple[str, ...],
+        named: dict[str, Expr] | None = None,
+        *,
+        maintain_order: bool = False,
     ) -> None:
         """Hold the source dataset and grouping keys until `agg` finishes the aggregation."""
         self._source = source
         self._keys = keys
         self._named = named or {}
+        self._maintain_order = maintain_order
 
     def __repr__(self) -> str:
         """Show the grouping keys, e.g. ``GroupBy(keys=['region', 'day'])``."""
@@ -253,6 +271,7 @@ class GroupBy:
         """
         from batcher.api.group_apply import build_map_groups
 
+        self._refuse_maintain_order("map_groups")
         if self._named:
             raise PlanError(
                 "map_groups needs plain column keys; group_by was given a derived key "
@@ -323,16 +342,16 @@ class GroupBy:
                 )
 
         group_keys = self._group_key_projections()
-        watermark = self._source._watermark
         if not has_composite:
-            return Aggregate(self._source._plan, group_keys, tuple(pure_specs), watermark=watermark)
+            return self._aggregate(tuple(pure_specs))
 
         hidden = tuple(AggregateSpec(name, agg) for name, agg in registry.leaves())
-        agg_plan = Aggregate(
-            self._source._plan, group_keys, tuple(pure_specs) + hidden, watermark=watermark
-        )
+        agg_plan = self._aggregate(tuple(pure_specs) + hidden, ordered=False)
         passthrough = tuple(Projection(k.alias, Col(k.alias)) for k in group_keys)
-        return Project(agg_plan, passthrough + tuple(project_items))
+        order = (Projection(_FIRST_ROW, Col(_FIRST_ROW)),) if self._maintain_order else ()
+        return self._in_first_row_order(
+            Project(agg_plan, passthrough + tuple(project_items) + order)
+        )
 
     def len(self, name: str = "len") -> Dataset:
         """Count the rows in each group.
@@ -673,6 +692,7 @@ class GroupBy:
         """Keep the `n` lowest- (or highest-) ranked rows per group, via `row_number`."""
         if n < 1:
             raise PlanError(f"group_by().head()/tail(): n must be >= 1, got {n}")
+        self._refuse_maintain_order("head/tail")
         if self._named:
             raise PlanError(
                 "group_by().head()/tail() needs plain column keys — a derived key "
@@ -942,10 +962,47 @@ class GroupBy:
         return out
 
     def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:
+        return self._source._derive(self._aggregate(specs))
+
+    def _aggregate(self, specs: tuple[AggregateSpec, ...], *, ordered: bool = True) -> LogicalPlan:
+        """The `Aggregate` over the group keys, rewritten for `maintain_order` when it is set.
+
+        The rewrite is plan-only and needs nothing from the engine: `RowId` numbers the input
+        rows, the aggregate keeps each group's smallest number beside the user's aggregates,
+        and (when `ordered`) a `Sort` on it restores first-appearance order before a `Project`
+        drops it. Each piece already means the same thing single-node, spilled and
+        distributed, so the order does too. `ordered=False` leaves the sort to a caller that
+        projects first.
+        """
+        source = self._source
+        if not self._maintain_order:
+            return Aggregate(
+                source._plan, self._group_key_projections(), specs, watermark=source._watermark
+            )
+        if source._watermark is not None:
+            raise PlanError(
+                "group_by(maintain_order=True) needs a bounded input: an unbounded stream "
+                "has no first appearance to sort its windows by. Sort the result instead."
+            )
+        first = AggregateSpec(_FIRST_ROW, Col(_FIRST_ROW).min())
         plan = Aggregate(
-            self._source._plan,
-            self._group_key_projections(),
-            specs,
-            watermark=self._source._watermark,
+            RowId(source._plan, _FIRST_ROW), self._group_key_projections(), (*specs, first)
         )
-        return self._source._derive(plan)
+        return self._in_first_row_order(plan) if ordered else plan
+
+    def _in_first_row_order(self, plan: LogicalPlan) -> LogicalPlan:
+        """`plan` sorted on the hidden first-row column, which is then dropped."""
+        if not self._maintain_order:
+            return plan
+        ordered = Sort(plan, (SortKeySpec(Col(_FIRST_ROW)),))
+        kept = [name for name in plan.available_columns() if name != _FIRST_ROW]
+        return Project(ordered, tuple(Projection(name, Col(name)) for name in kept))
+
+    def _refuse_maintain_order(self, method: str) -> None:
+        """`maintain_order` orders the groups an aggregation emits; row methods have none."""
+        if self._maintain_order:
+            raise PlanError(
+                f"group_by(maintain_order=True).{method}() is not supported: it orders the "
+                "groups an aggregation emits, and this method returns rows. Sort the result "
+                "instead."
+            )

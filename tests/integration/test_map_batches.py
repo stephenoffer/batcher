@@ -145,7 +145,7 @@ def test_row_map_preserves_declared_schema_on_empty_input():
     mapped = empty.map(lambda r: {"x": r["x"], "y": r["x"] * 10}, output_columns=["x", "y"])
     assert mapped.select("y").collect().to_pydict() == {"y": []}
 
-    flat = empty.ml.flat_map(
+    flat = empty.flat_map(
         lambda r: [{"x": r["x"], "y": r["x"]}, {"x": r["x"], "y": r["x"]}],
         output_columns=["x", "y"],
     )

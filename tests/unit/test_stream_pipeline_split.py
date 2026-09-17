@@ -58,7 +58,7 @@ def _ds():
 
 
 def test_cpu_then_inference_splits():
-    stages = split_into_resource_stages(_ds().ml.map_batches(_double).ml.map_batches(_AddOne)._plan)
+    stages = split_into_resource_stages(_ds().map_batches(_double).map_batches(_AddOne)._plan)
     assert [s.wants_pool for s in stages] == [False, True]
     assert all(_leaf(s.sub_plan).source_id == 0 for s in stages)
 
@@ -69,7 +69,7 @@ def test_a_postprocess_gets_its_own_stage_instead_of_riding_the_model():
     The postprocess used to run inside the model's actor, which spent device time on host
     work and tied the two stages' pool sizes to one number.
     """
-    out = _ds().ml.map_batches(_double).ml.map_batches(_AddOne).ml.map_batches(_post)
+    out = _ds().map_batches(_double).map_batches(_AddOne).map_batches(_post)
     stages = split_into_resource_stages(out._plan)
     assert [s.wants_pool for s in stages] == [False, True, False]
     assert [_count_maps(s.sub_plan) for s in stages] == [1, 1, 1]
@@ -77,25 +77,25 @@ def test_a_postprocess_gets_its_own_stage_instead_of_riding_the_model():
 
 def test_two_chained_models_get_a_pool_each():
     """Otherwise both models load into one actor, share a device, and take turns."""
-    out = _ds().ml.map_batches(_double).ml.map_batches(_AddOne).ml.map_batches(_Rerank)
+    out = _ds().map_batches(_double).map_batches(_AddOne).map_batches(_Rerank)
     stages = split_into_resource_stages(out._plan)
     assert [s.wants_pool for s in stages] == [False, True, True]
 
 
 def test_consecutive_cpu_maps_stay_in_one_stage():
     """A hand-off between two host transforms costs more than the overlap is worth."""
-    out = _ds().ml.map_batches(_double).ml.map_batches(_double).ml.map_batches(_AddOne)
+    out = _ds().map_batches(_double).map_batches(_double).map_batches(_AddOne)
     stages = split_into_resource_stages(out._plan)
     assert [_count_maps(s.sub_plan) for s in stages] == [2, 1]
 
 
 def test_no_model_stage_returns_none():
-    assert split_into_resource_stages(_ds().ml.map_batches(_double)._plan) is None
+    assert split_into_resource_stages(_ds().map_batches(_double)._plan) is None
 
 
 def test_a_lone_model_stage_returns_none():
     """One pool and nothing to overlap it with is the non-overlapped map, spelled longer."""
-    assert split_into_resource_stages(_ds().ml.map_batches(_AddOne)._plan) is None
+    assert split_into_resource_stages(_ds().map_batches(_AddOne)._plan) is None
 
 
 def test_a_bare_scan_prefix_folds_into_the_model_rather_than_becoming_a_hop():
@@ -104,7 +104,7 @@ def test_a_bare_scan_prefix_folds_into_the_model_rather_than_becoming_a_hop():
     The model reads the partition itself, and the postprocess above it is the hand-off that
     does pay. The old single cut declined this shape outright and ran it non-overlapped.
     """
-    stages = split_into_resource_stages(_ds().ml.map_batches(_AddOne).ml.map_batches(_post)._plan)
+    stages = split_into_resource_stages(_ds().map_batches(_AddOne).map_batches(_post)._plan)
     assert [s.wants_pool for s in stages] == [True, False]
 
 
@@ -144,7 +144,7 @@ def test_the_rag_four_stage_shape_gives_the_write_stage_its_own_pool():
         _ds()
         .map_batches(_double, output_columns=["id", "x", "x2"])  # extract  (CPU)
         .map_batches(_chunk, output_columns=["id", "x", "x2"])  # chunk    (CPU)
-        .ml.map_batches(_AddOne, output_columns=["id", "x", "x2", "y"])  # embed (model)
+        .map_batches(_AddOne, output_columns=["id", "x", "x2", "y"])  # embed (model)
         .map_batches(_post, output_columns=["id", "x", "x2", "y", "z"])  # write (CPU)
         ._plan
     )
@@ -162,7 +162,7 @@ def test_the_producer_carries_no_gpu_request():
     plan = (
         _ds()
         .map_batches(_double, output_columns=["id", "x", "x2"])
-        .ml.map_batches(_AddOne, num_gpus=1, output_columns=["id", "x", "x2", "y"])
+        .map_batches(_AddOne, num_gpus=1, output_columns=["id", "x", "x2", "y"])
         ._plan
     )
     producer, consumer = split_into_resource_stages(plan)
@@ -175,7 +175,7 @@ def test_a_postprocess_stage_carries_no_gpu_request_either():
     plan = (
         _ds()
         .map_batches(_double, output_columns=["id", "x", "x2"])
-        .ml.map_batches(_AddOne, num_gpus=1, output_columns=["id", "x", "x2", "y"])
+        .map_batches(_AddOne, num_gpus=1, output_columns=["id", "x", "x2", "y"])
         .map_batches(_post, output_columns=["id", "x", "x2", "y", "z"])
         ._plan
     )

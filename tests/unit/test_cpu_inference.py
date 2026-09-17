@@ -43,7 +43,7 @@ def test_a_cpu_stage_runs_its_forward_without_autograd():
     # reads and held each layer's activations alive for the whole call.
     pytest.importorskip("torch", reason="torch not installed")
     _RecordsGrad.saw_grad = None
-    bt.from_pydict({"a": [1, 2, 3]}).ml.map_batches(_RecordsGrad).collect()
+    bt.from_pydict({"a": [1, 2, 3]}).map_batches(_RecordsGrad).collect()
     assert _RecordsGrad.saw_grad is False
 
 
@@ -66,7 +66,7 @@ def test_a_udf_that_needs_gradients_can_decline():
     # as their result; the opt-out is what keeps this from breaking them.
     pytest.importorskip("torch", reason="torch not installed")
     _OptsOut.saw_grad = None
-    bt.from_pydict({"a": [1, 2, 3]}).ml.map_batches(_OptsOut).collect()
+    bt.from_pydict({"a": [1, 2, 3]}).map_batches(_OptsOut).collect()
     assert _OptsOut.saw_grad is True
 
 
@@ -127,7 +127,7 @@ class _NoTorch:
 def test_a_non_torch_cpu_udf_is_unaffected():
     # The wrap costs a `sys.modules` lookup when torch was never imported, so a numpy or
     # scikit-learn stage must be untouched in behaviour.
-    out = bt.from_pydict({"a": [1, 2, 3]}).ml.map_batches(_NoTorch).to_pydict()
+    out = bt.from_pydict({"a": [1, 2, 3]}).map_batches(_NoTorch).to_pydict()
     assert out["b"] == [2, 4, 6]
 
 
@@ -150,5 +150,5 @@ def test_a_cpu_stage_is_not_autocast(monkeypatch):
         "inference_mode_call",
         lambda call: (wrapped.append("inference_mode"), call)[1],
     )
-    bt.from_pydict({"a": [1, 2, 3]}).ml.map_batches(_NoTorch).collect()
+    bt.from_pydict({"a": [1, 2, 3]}).map_batches(_NoTorch).collect()
     assert wrapped == ["inference_mode"], wrapped

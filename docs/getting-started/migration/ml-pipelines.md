@@ -16,7 +16,7 @@ The entry points below cover the common ML shapes.
 
 | Task | Batcher | Note |
 |------|---------|------|
-| Map a model over batches | {py:meth}`ds.ml.map_batches(Model, ...) <batcher.api.dataset.ml.DatasetML.map_batches>` | class = model loaded once per worker |
+| Map a model over batches | {py:meth}`ds.map_batches(Model, ...) <batcher.Dataset.map_batches>` | class = model loaded once per worker |
 | Batch inference | `ds.ml.infer(model, num_gpus=, concurrency=)` | CPU readers feed GPU actors |
 | Embeddings | {py:meth}`ds.ml.embed(model) <batcher.api.dataset.ml.DatasetML.embed>` / {py:func}`batcher.ml.embed(...) <batcher.ml.embed>` | text or image to a vector column |
 | LLM generation | {py:func}`batcher.ml.llm_generate(..., engine=vllm_engine("...")) <batcher.ml.llm_generate>` | engine self-batches; no outer PID |

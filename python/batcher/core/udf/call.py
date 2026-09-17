@@ -290,7 +290,7 @@ def _iterable_parts(result: object) -> list | None:
         raise TypeError(
             "map_batches function returned a list of row dicts. Return one batch instead — "
             "a {column: list_of_values} dict, a pyarrow RecordBatch, or a DataFrame — or use "
-            "`ds.ml.flat_map` if the function is genuinely row-at-a-time."
+            "`ds.flat_map` if the function is genuinely row-at-a-time."
         )
     return parts
 

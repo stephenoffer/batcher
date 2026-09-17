@@ -109,7 +109,7 @@ def test_serving_udf_handles_tensor_columns():
 def test_http_client_through_map_batches(server):
     udf = http_client(server + "/predict", input_columns=["x"], output_columns=["pred"])
     ds = bt.from_pydict({"x": [1, 2, 3, 4], "label": ["a", "b", "c", "d"]})
-    out = ds.ml.map_batches(udf).collect()
+    out = ds.map_batches(udf).collect()
     assert out.column("pred").to_pylist() == [10, 20, 30, 40]
     assert out.column("label").to_pylist() == ["a", "b", "c", "d"]
 

@@ -3,7 +3,7 @@
 A serving backend (Triton, TorchServe, an HTTP endpoint) is reached through a
 `ServingClient`: ``predict({column: ndarray}) -> {column: ndarray}``. `serving_udf`
 wraps a *connect* function (run once per worker) into a class UDF for
-``ds.ml.map_batches`` — it extracts the input columns as NumPy (tensor columns keep
+``ds.map_batches`` — it extracts the input columns as NumPy (tensor columns keep
 their shape), calls the server, and appends the outputs. Because it returns a
 *class*, ``map_batches`` instantiates it once per worker (connection + warm model),
 the load-once pattern; only `batches` cross the wire, never per-row Python.
@@ -318,7 +318,7 @@ def serving_udf(
 
             >>> from batcher.ml import serving_udf  # doctest: +SKIP
             >>> udf = serving_udf(connect, input_columns=["image"])  # doctest: +SKIP
-            >>> ds.ml.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
+            >>> ds.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
 
     Args:
         connect: a zero-arg callable returning a connected `ServingClient`; run once
@@ -338,7 +338,7 @@ def serving_udf(
         retry_backoff: the base backoff in seconds, doubled and jittered per attempt.
 
     Returns:
-        A class for ``ds.ml.map_batches(...)`` — instantiate-once-per-worker inference.
+        A class for ``ds.map_batches(...)`` — instantiate-once-per-worker inference.
     """
     inputs = list(input_columns)
     outputs = None if output_columns is None else list(output_columns)

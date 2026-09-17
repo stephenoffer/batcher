@@ -10,7 +10,7 @@ weights at all.
 Each factory returns a **load-once class UDF** shaped exactly like
 `sentence_transformer_encoder`: instantiate once per worker (so the connection pool is
 built once, not per batch), call on a `pyarrow.RecordBatch`, and it appends the embedding
-column. So it drops into ``ds.ml.embed(<encoder>)`` / ``ds.ml.map_batches`` and reuses the
+column. So it drops into ``ds.ml.embed(<encoder>)`` / ``ds.map_batches`` and reuses the
 whole distributed / concurrency machinery, and it produces the same tensor (or
 ``fixed_size_list``) column the local encoder does — the two are interchangeable at the
 call site.
@@ -176,7 +176,7 @@ def openai_embedding_encoder(
 
     Calls ``{base_url}/embeddings`` — the shape OpenAI, Azure OpenAI, Together, and vLLM's
     embedding server all speak — and appends the vector as `output_column`. Drops into
-    ``ds.ml.embed(...)`` / ``ds.ml.map_batches`` exactly like `sentence_transformer_encoder`,
+    ``ds.ml.embed(...)`` / ``ds.map_batches`` exactly like `sentence_transformer_encoder`,
     so the served-model and local-model paths are interchangeable at the call site. No
     optional dependency: the request goes over the standard library.
 
@@ -271,7 +271,7 @@ def tei_encoder(
     ``{"inputs": [...]}`` and returns a plain list of vectors. TEI is the standard way to
     serve an open embedding model (BGE, GTE, E5, ...) on a GPU; this points the pipeline at
     that service instead of loading the weights into every worker. Drops into
-    ``ds.ml.embed(...)`` / ``ds.ml.map_batches`` like `sentence_transformer_encoder`.
+    ``ds.ml.embed(...)`` / ``ds.map_batches`` like `sentence_transformer_encoder`.
 
     `normalize` and `truncate` are handled **server-side** by TEI (they are fields on the
     request), so an over-length input is truncated to the model's context rather than

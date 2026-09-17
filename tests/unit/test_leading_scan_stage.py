@@ -34,7 +34,7 @@ class _Model:
 
 
 def _scan_then_gpu():
-    return bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(_Model, num_gpus=1.0)._plan
+    return bt.from_pydict({"x": [1, 2, 3]}).map_batches(_Model, num_gpus=1.0)._plan
 
 
 def test_a_scan_feeding_a_gpu_stage_is_one_stage_when_folded():
@@ -56,8 +56,8 @@ def test_a_cpu_prefix_is_unaffected_by_the_flag():
     """With a real CPU map before the model there was never a scan-only group to fold."""
     plan = (
         bt.from_pydict({"x": [1, 2, 3]})
-        .ml.map_batches(lambda b: b)
-        .ml.map_batches(_Model, num_gpus=1.0)
+        .map_batches(lambda b: b)
+        .map_batches(_Model, num_gpus=1.0)
         ._plan
     )
     folded = split_into_resource_stages(plan)
@@ -67,7 +67,7 @@ def test_a_cpu_prefix_is_unaffected_by_the_flag():
 
 
 def test_a_chain_with_no_pool_stage_still_declines_either_way():
-    plan = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b)._plan
+    plan = bt.from_pydict({"x": [1]}).map_batches(lambda b: b)._plan
     assert split_into_resource_stages(plan) is None
     assert split_into_resource_stages(plan, fold_leading_scan=False) is None
 
@@ -84,7 +84,7 @@ def test_a_cpu_only_pipeline_always_folds(monkeypatch):
         "batcher.dist.executors.ray_runtime.scaling.cpu_only_can_host",
         lambda *a, **k: called.append(a) or True,
     )
-    plan = bt.from_pydict({"x": [1]}).ml.map_batches(_Model)._plan
+    plan = bt.from_pydict({"x": [1]}).map_batches(_Model)._plan
     assert driver.fold_leading_scan(plan, workers=8) is True
     assert called == [], "the fleet is not even consulted for a chain with no accelerator"
 
@@ -135,8 +135,8 @@ def test_a_scan_whose_neighbour_is_a_host_stage_folds_even_on_a_mixed_fleet(monk
     )
     plan = (
         bt.from_pydict({"x": [1, 2, 3]})
-        .ml.map_batches(_Model, concurrency=4)
-        .ml.map_batches(_Model, num_gpus=1.0)
+        .map_batches(_Model, concurrency=4)
+        .map_batches(_Model, num_gpus=1.0)
         ._plan
     )
     assert driver.fold_leading_scan(plan, workers=8) is True

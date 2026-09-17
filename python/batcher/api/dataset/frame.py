@@ -898,35 +898,98 @@ class Dataset:
         """
         return fn(self, *args, **kwargs)
 
-    def filter(self, *predicates: Expr, **equals: Any) -> Dataset:
+    def filter(
+        self,
+        *predicates: Expr | str | Callable | type,
+        batch_size: int | None = None,
+        batch_format: str = "pyarrow",
+        input_columns: list[str] | None = None,
+        num_workers: int | str = "auto",
+        num_cpus: float | None = None,
+        num_gpus: float = 0.0,
+        memory: float | None = None,
+        compute: Any = None,
+        concurrency: int | tuple[int, ...] | None = None,
+        ray_remote_args: dict[str, Any] | None = None,
+        ray_remote_args_fn: Callable[[], dict[str, Any]] | None = None,
+        zero_copy_batch: bool = True,
+        fn_args: tuple | None = None,
+        fn_kwargs: dict | None = None,
+        fn_constructor_args: tuple | None = None,
+        fn_constructor_kwargs: dict | None = None,
+        max_concurrency: int = 0,
+        max_errored_rows: int = 0,
+        **equals: Any,
+    ) -> Dataset:
         """Keep only the rows where every predicate is true.
 
-        A predicate is an expression built from columns, e.g. ``col("amount") >
-        100``. Combine conditions with ``&`` (and), ``|`` (or), and ``~`` (not),
-        parenthesizing each side because those operators bind tighter than
-        comparisons. Rows where a predicate is null are dropped. Like every
-        transformation this is lazy and returns a new `Dataset`.
+        A predicate takes one of three forms, and the argument decides which:
 
-        Several predicates are ANDed together, and a keyword argument is an
-        equality shorthand: ``filter(status="paid", region="eu")`` means
-        ``filter((col("status") == "paid") & (col("region") == "eu"))``. Both
-        spellings save the parenthesizing that ``&`` would otherwise need.
+        - An **expression** built from columns, such as ``col("amount") > 100``. Combine
+          conditions with ``&`` (and), ``|`` (or), and ``~`` (not), parenthesizing each side
+          because those operators bind tighter than comparisons. This is the form to prefer:
+          it runs in Rust and the optimizer can push it into the scan.
+        - A **SQL string** such as ``"amount > 100 AND region = 'eu'"``, parsed as the
+          ``WHERE`` clause of a query over this dataset by the same front end as :meth:`sql`.
+        - A **callable** (a function or a class) for a condition the expression language
+          cannot say, such as a model's verdict. It is batch-level, never per row: `fn`
+          receives a whole batch in `batch_format` and returns one boolean per row (an Arrow
+          or NumPy boolean array, a pandas or Polars Series, or a list). A class is built
+          once per worker, like a `map_batches` model, and the Ray Data resource parameters
+          schedule it the way they schedule `map_batches`. The rows are masked as Arrow, so
+          every column keeps its exact type.
+
+        Rows where a predicate is null are dropped. Several expression or SQL predicates are
+        ANDed together, and a keyword argument is an equality shorthand: ``filter(status="paid",
+        region="eu")`` means ``filter((col("status") == "paid") & (col("region") == "eu"))``.
+        A column whose name is one of this method's parameters cannot use the shorthand;
+        compare it with ``col(...)`` instead.
 
         A predicate may compose window expressions — ``filter(col("x") >
         col("x").mean().over(partition_by=["g"]))`` keeps rows above their group
         mean. The window sees every input row, as in the SQL subquery it desugars to.
 
+        The keyword-only options below apply only to a callable predicate, and passing one
+        with an expression or SQL string raises. Ray Data's ``num_cpus``, ``memory`` and
+        ``ray_remote_args_fn`` cannot be honoured by the map scheduler and raise when set.
+
         Args:
-            *predicates: Boolean expressions evaluated per row, ANDed together. A list
-                of them is accepted in place of separate arguments.
+            *predicates: Boolean expressions or SQL predicate strings, ANDed together, or
+                exactly one callable batch predicate. A list is accepted in place of
+                separate arguments.
+            batch_size: Rows per batch handed to a callable predicate.
+            batch_format: What a callable predicate sees — ``"pyarrow"``, ``"numpy"``,
+                ``"pandas"``, ``"torch"``, ``"polars"`` or ``"jax"``.
+            input_columns: The columns a callable predicate reads. Prunes the scan, and
+                narrows the batch the predicate is handed to exactly these columns.
+            num_workers: Concurrent predicate calls within a worker (``"auto"`` sizes it).
+            num_cpus: Ray Data's per-worker CPU request; raises when set.
+            num_gpus: GPUs to reserve per worker.
+            memory: Ray Data's per-worker memory request; raises when set.
+            compute: A Ray Data ``ActorPoolStrategy``/``TaskPoolStrategy``, or
+                ``"actors"``/``"tasks"``; folded into `concurrency`.
+            concurrency: Size of the distributed actor pool: an int, ``(min, max)``, or
+                ``(min, max, initial)`` with ``initial == min``.
+            ray_remote_args: Ray options; ``num_gpus``, ``resources`` and
+                ``accelerator_type`` are honoured and any other key raises.
+            ray_remote_args_fn: Ray Data's per-task options callback; raises when set.
+            zero_copy_batch: Hand the predicate read-only zero-copy views. ``False`` copies
+                a NumPy, pandas or torch batch first so the predicate may mutate it.
+            fn_args: Positional arguments appended to every call: ``fn(batch, *fn_args)``.
+            fn_kwargs: Keyword arguments forwarded to every call.
+            fn_constructor_args: Positional arguments for a class predicate's construction.
+            fn_constructor_kwargs: Keyword arguments for a class predicate's construction.
+            max_concurrency: In-flight batches for an ``async def`` predicate; 0 = a default.
+            max_errored_rows: Rows a raising predicate may drop per worker before failing.
             **equals: Column-equals-value shorthands, ANDed with `predicates`.
 
         Returns:
             A new `Dataset` with the matching rows.
 
         Raises:
-            PlanError: If no condition is given, an argument is not an expression,
-                or a keyword names a column the dataset does not have.
+            PlanError: If no condition is given, an argument is none of the three forms, a
+                callable is mixed with another predicate, a keyword names a column the dataset
+                does not have, or a callable-only option is given without a callable.
 
         Examples:
             .. doctest::
@@ -936,11 +999,66 @@ class Dataset:
                 >>> ds.filter((bt.col("x") > 2) & bt.col("ok")).to_pydict()
                 {'x': [9], 'ok': [True]}
 
+                >>> ds.filter("x > 2 AND ok").to_pydict()
+                {'x': [9], 'ok': [True]}
+
+                >>> import pyarrow.compute as pc
+                >>> ds.filter(lambda batch: pc.greater(batch["x"], 2)).to_pydict()
+                {'x': [5, 9], 'ok': [False, True]}
+
                 >>> ds = bt.from_pydict({"g": ["a", "b", "a"], "x": [1, 2, 3]})
                 >>> ds.filter(g="a").to_pydict()
                 {'g': ['a', 'a'], 'x': [1, 3]}
         """
+        from batcher.api.dataset._udf import build_filter, resolve_placement
+        from batcher.api.dataset._udf.build import refuse_callable_options
+
         conditions = list(flatten_varargs(predicates))
+        fns = [c for c in conditions if callable(c) and not isinstance(c, Expr)]
+        options = {
+            "batch_size": batch_size,
+            "batch_format": batch_format,
+            "input_columns": input_columns,
+            "num_workers": num_workers,
+            "zero_copy_batch": zero_copy_batch,
+            "max_concurrency": max_concurrency,
+            "max_errored_rows": max_errored_rows,
+        }
+        ray = {
+            "num_cpus": num_cpus,
+            "num_gpus": num_gpus,
+            "memory": memory,
+            "compute": compute,
+            "concurrency": concurrency,
+            "ray_remote_args": ray_remote_args,
+            "ray_remote_args_fn": ray_remote_args_fn,
+        }
+        bindings = (fn_args, fn_kwargs, fn_constructor_args, fn_constructor_kwargs)
+        if fns:
+            if len(conditions) != 1 or equals:
+                raise PlanError(
+                    "filter() takes one callable predicate on its own; AND an expression with "
+                    "it in a second filter(...) call, which Kyber can push below the callable"
+                )
+            fn = fns[0]
+            return build_filter(
+                self,
+                fn,
+                placement=resolve_placement("filter", fn, **ray),
+                bindings=bindings,
+                **options,
+            )
+        refuse_callable_options(
+            Dataset.filter,
+            {
+                **options,
+                **ray,
+                "fn_args": fn_args,
+                "fn_kwargs": fn_kwargs,
+                "fn_constructor_args": fn_constructor_args,
+                "fn_constructor_kwargs": fn_constructor_kwargs,
+            },
+        )
         for name, value in equals.items():
             self._require_column(name, "filter")
             conditions.append(Col(name) == value)
@@ -948,18 +1066,39 @@ class Dataset:
             raise PlanError(
                 "filter() requires a condition, e.g. filter(col('x') > 0) or filter(x=1)"
             )
+        dataset = self
+        exprs: list[Expr] = []
         for cond in conditions:
-            if not isinstance(cond, Expr):
+            if isinstance(cond, str):
+                dataset = dataset._filter_sql(cond)
+            elif isinstance(cond, Expr):
+                exprs.append(cond)
+            else:
                 raise PlanError(
-                    "filter() requires an expression, e.g. col('x') > 0; got "
-                    f"{type(cond).__name__}. A SQL string goes to ds.sql(...) instead, and a "
-                    f"Python predicate the expression language cannot say goes to "
-                    f"ds.ml.filter(fn), which runs it per row."
+                    "filter() takes an expression (col('x') > 0), a SQL predicate string "
+                    "('x > 0'), or a callable batch predicate; got "
+                    f"{type(cond).__name__}"
                 )
-        combined = conditions[0]
-        for cond in conditions[1:]:
+        if not exprs:
+            return dataset
+        combined = exprs[0]
+        for cond in exprs[1:]:
             combined = combined & cond
-        return windowed_filter(self, combined)
+        return windowed_filter(dataset, combined)
+
+    def _filter_sql(self, predicate: str) -> Dataset:
+        """Keep the rows a SQL predicate string accepts, parsed as a ``WHERE`` clause."""
+        from batcher._internal.sql_errors import parse_sql
+
+        parsed = parse_sql(predicate, dialect="duckdb")
+        from sqlglot import expressions as exp
+
+        if isinstance(parsed, exp.Query | exp.Command) or not predicate.strip():
+            raise PlanError(
+                f"filter() got {predicate!r}, which is not a SQL predicate; pass the "
+                "condition alone, such as 'x > 1', or run a whole query with ds.sql(...)"
+            )
+        return self.sql(f"SELECT * FROM self WHERE ({predicate})")
 
     def select(self, *columns: str | Expr, **named: Expr | int | float | bool | str) -> Dataset:
         """Project to exactly the given columns.
@@ -1189,7 +1328,7 @@ class Dataset:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [1, 2, 3]})
-                >>> ds.ml.map(lambda r: {"x": r["x"] * 10}).to_pydict()
+                >>> ds.map(lambda r: {"x": r["x"] * 10}).to_pydict()
                 {'x': [10, 20, 30]}
         """
         # Imported here, not at module scope: the four accessor namespaces pull in the ML,
@@ -1282,13 +1421,19 @@ class Dataset:
         fn: Callable | type,
         *,
         batch_size: int | None = None,
+        batch_format: str = "pyarrow",
         input_columns: list[str] | None = None,
         preserves_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
+        num_cpus: float | None = None,
         num_gpus: float = 0.0,
-        concurrency: int | tuple[int, int] | None = None,
-        batch_format: str = "pyarrow",
+        memory: float | None = None,
+        compute: Any = None,
+        concurrency: int | tuple[int, ...] | None = None,
+        ray_remote_args: dict[str, Any] | None = None,
+        ray_remote_args_fn: Callable[[], dict[str, Any]] | None = None,
+        zero_copy_batch: bool = True,
         fn_args: tuple | None = None,
         fn_kwargs: dict | None = None,
         fn_constructor_args: tuple | None = None,
@@ -1304,50 +1449,104 @@ class Dataset:
         retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
         max_concurrency: int = 0,
     ) -> Dataset:
-        """Apply a Python function to each Arrow batch (sugar for `ds.ml.map_batches`).
+        """Apply a Python function to each batch.
 
-        Kept top-level for the familiar spelling, and it now forwards every option
-        `ds.ml.map_batches` accepts, so reaching the accessor is a matter of taste rather
-        than a requirement. See `ds.ml` for the fuller explanation of each.
+        `fn` receives one batch and returns the transformed batch — the building block for
+        batch inference, embeddings, and custom preprocessing. Pass a **class** instead of a
+        function to load a model *once per worker*: it is instantiated once, and the callable
+        instance handles each batch. That is the stateful GPU-inference pattern, and a class,
+        `num_gpus`, or `concurrency` is what puts the stage on a long-lived actor pool under
+        ``collect(distributed=True)``.
 
-        `num_workers` defaults to ``"auto"`` — the per-batch calls fan across all
-        local cores, so a batch transform is parallel by default rather than
-        single-threaded (the Ray Data foot-gun). Threads only speed up a
-        GIL-releasing `fn` (Arrow/NumPy/torch); pass ``multiprocessing=True`` for a
-        CPU-bound pure-Python `fn`. An explicit int wins.
+        `batch_format` chooses what `fn` sees and returns: ``"pyarrow"`` (a
+        `pyarrow.RecordBatch`, zero-copy, the default), ``"numpy"`` (a ``{column: ndarray}``
+        dict, Ray Data's default), ``"pandas"`` (a `DataFrame`), ``"torch"`` (a
+        ``{column: tensor}`` dict over numeric columns), ``"polars"`` (a `polars.DataFrame`),
+        or ``"jax"`` (a ``{column: jax.Array}`` dict over numeric columns). Conversion happens
+        only around the call; the engine boundary stays Arrow. A `pyarrow`/`numpy` `fn` may
+        also return a Table or column dict. With the default ``zero_copy_batch=True`` a
+        NumPy batch is a read-only view where the conversion allows one; pass ``False`` to
+        receive writable copies, as Ray Data does by default.
+
+        `num_workers` defaults to ``"auto"``: the per-batch calls fan across all local cores
+        for a CPU stage, or one model and CUDA context for a GPU stage, so a batch transform
+        is parallel by default rather than single-threaded. Threads only speed up a
+        GIL-releasing `fn` (Arrow/NumPy/torch); pass ``multiprocessing=True`` for a CPU-bound
+        pure-Python `fn`, which needs import-safe calling code (an
+        ``if __name__ == "__main__":`` guard) because the process pool spawns.
+
+        `max_errored_rows` gives dirty-data tolerance: a batch whose `fn` raises is bisected to
+        isolate the offending rows, and a failing row is dropped, up to this many per worker.
+        `max_retries`/`timeout`/`retry_on` add resilience for a flaky external `fn`: a batch
+        is retried with exponential backoff (`retry_backoff * 2**attempt` seconds), and a call
+        past `timeout` raises `TimeoutError`, retried like any transient. Pass an
+        ``async def`` `fn` for an I/O-bound stage; its batches run concurrently on one event
+        loop, up to `max_concurrency` in flight.
+
+        Under `distributed=True`, a partition whose worker is preempted is recomputed from its
+        durable input, so `fn` must be idempotent: make an external sink an upsert on a stable
+        key rather than a blind insert.
+
+        The Ray Data resource parameters land on what the map scheduler honours: `num_gpus`,
+        `concurrency` (an int, ``(min, max)``, or ``(min, max, initial)`` with
+        ``initial == min``), `compute` (folded into `concurrency`), and the ``num_gpus``,
+        ``resources`` and ``accelerator_type`` keys of `ray_remote_args`. ``num_cpus``,
+        ``memory``, ``ray_remote_args_fn`` and every other `ray_remote_args` key cannot be
+        honoured and raise `PlanError` when set, rather than being accepted and ignored.
+
+        Warns (`PerformanceWarning`) when a GPU stage is given a plain function rather than a
+        class, because a function rebuilds the model on every batch.
 
         Args:
-            fn: A callable (or stateful class) applied to each batch.
-            batch_size: Rows per batch handed to `fn`; ``None`` uses the engine default.
-            input_columns: The columns `fn` reads, letting projection pushdown prune the
-                scan to just those; ``None`` keeps every column alive. Omitting one `fn`
-                does read is a correctness bug — it gets pruned out from under it.
-            preserves_columns: The columns `fn` returns unchanged, which lets a later
-                `filter` on them run *below* the UDF so the model scores fewer rows.
-                Naming a column `fn` rewrites changes the result.
-            output_columns: The output column names, when `fn` reshapes the schema.
-            num_workers: Worker fan-out; ``"auto"`` spreads across local cores.
-            num_gpus: GPUs reserved per worker.
-            concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
-            batch_format: The batch type passed to `fn` (``"pyarrow"`` by default).
+            fn: A function (or class/factory) applied to each batch.
+            batch_size: Rebatch to this many rows before each call; ``None`` uses the
+                engine's batches.
+            batch_format: What `fn` sees — ``"pyarrow"``, ``"numpy"``, ``"pandas"``,
+                ``"torch"``, ``"polars"`` or ``"jax"``.
+            input_columns: The columns `fn` reads. Declaring them lets the optimizer prune
+                everything else out of the scan. Omitting a column the `fn` actually reads is
+                a correctness bug, not a slow path: it is pruned out from under the function.
+            preserves_columns: The columns `fn` returns unchanged, same name and same value in
+                every output row. A later `filter` reading only these runs *below* the UDF, so
+                the model scores fewer rows. Naming a column `fn` rewrites changes the result.
+            output_columns: The result schema when `fn` changes the columns.
+            num_workers: Concurrent per-batch calls within a worker (``"auto"`` sizes to the
+                stage), or an explicit int.
+            num_cpus: Ray Data's per-worker CPU request; raises when set.
+            num_gpus: GPUs to reserve per distributed worker.
+            memory: Ray Data's per-worker memory request; raises when set. Use
+                `model_memory_gb` to budget a model's footprint.
+            compute: A Ray Data ``ActorPoolStrategy``/``TaskPoolStrategy``, or
+                ``"actors"``/``"tasks"``; folded into `concurrency`.
+            concurrency: Size of the distributed actor pool: an int, ``(min, max)``, or
+                ``(min, max, initial)`` with ``initial == min``.
+            ray_remote_args: Ray options; ``num_gpus``, ``resources`` and
+                ``accelerator_type`` are honoured and any other key raises.
+            ray_remote_args_fn: Ray Data's per-task options callback; raises when set.
+            zero_copy_batch: Hand `fn` read-only zero-copy views. ``False`` copies a NumPy,
+                pandas or torch batch first so `fn` may mutate it.
             fn_args: Positional arguments appended to every call: ``fn(batch, *fn_args)``.
             fn_kwargs: Keyword arguments forwarded to every ``fn(batch, ...)`` call.
             fn_constructor_args: Positional arguments for a class `fn`'s one-per-worker
-                construction, such as a checkpoint path.
+                construction, such as a checkpoint path; invalid for a function.
             fn_constructor_kwargs: Keyword arguments for a class `fn`'s construction.
             accelerator_type: Pin actors to a device model (e.g. ``"NVIDIA_A100"``).
-            resources: Custom Ray resources per worker, e.g. ``{"TPU": 4}``.
-            model_memory_gb: The model's footprint, for memory budgeting.
-            multiprocessing: Use processes instead of threads for a CPU-bound `fn`.
-            max_errored_rows: How many per-row errors to tolerate before failing.
+            resources: Custom Ray resources per worker, e.g. ``{"TPU": 4}``, for an
+                accelerator Ray does not report as ``GPU``.
+            model_memory_gb: The model's footprint, for host-RAM budgeting and VRAM packing.
+            multiprocessing: Run CPU-bound pure-Python calls across processes.
+            max_errored_rows: Rows a raising `fn` may drop per worker before failing.
             timeout: Wall-clock ceiling (seconds) for one `fn` call; 0 = no timeout.
-            max_retries: Times to retry a batch whose `fn` raises before failing.
-            retry_backoff: Base retry backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            max_retries: Times to retry a batch whose `fn` raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
             retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
             max_concurrency: Max in-flight batches for an ``async def`` `fn`; 0 = a default.
 
         Returns:
-            A new `Dataset` of the transformed batches.
+            A new lazy `Dataset` with `fn` applied to every batch.
+
+        Raises:
+            PlanError: If an option is invalid, or a resource parameter cannot be honoured.
 
         Examples:
             .. doctest::
@@ -1359,23 +1558,52 @@ class Dataset:
                 ...     return batch.set_column(0, "x", pc.add(batch.column("x"), 1))
                 >>> ds.map_batches(add_one).to_pydict()
                 {'x': [2, 3, 4]}
+
+                >>> class AddN:
+                ...     def __init__(self, n):
+                ...         self.n = n
+                ...     def __call__(self, batch):
+                ...         return {"x": batch["x"] + self.n}
+                >>> added = ds.map_batches(AddN, fn_constructor_args=(10,), batch_format="numpy")
+                >>> added.to_pydict()
+                {'x': [11, 12, 13]}
         """
-        return self.ml.map_batches(
+        from batcher.api.dataset._udf import bind_fn, build_map_batches, resolve_placement
+        from batcher.api.dataset._udf.build import writable_format
+        from batcher.api.dataset._udf.checks import validate_fn
+
+        validate_fn(fn)  # before binding, which wraps a class in one that is always callable
+        placement = resolve_placement(
+            "map_batches",
             fn,
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            memory=memory,
+            compute=compute,
+            concurrency=concurrency,
+            ray_remote_args=ray_remote_args,
+            ray_remote_args_fn=ray_remote_args_fn,
+            accelerator_type=accelerator_type,
+            resources=resources,
+        )
+        bound = bind_fn(
+            fn,
+            fn_args,
+            fn_kwargs,
+            fn_constructor_args,
+            fn_constructor_kwargs,
+            writable_format("map_batches", batch_format, zero_copy_batch),
+        )
+        return build_map_batches(
+            self,
+            bound,
+            placement=placement,
             batch_size=batch_size,
+            batch_format=batch_format,
             input_columns=input_columns,
             preserves_columns=preserves_columns,
             output_columns=output_columns,
             num_workers=num_workers,
-            num_gpus=num_gpus,
-            concurrency=concurrency,
-            batch_format=batch_format,
-            fn_args=fn_args,
-            fn_kwargs=fn_kwargs,
-            fn_constructor_args=fn_constructor_args,
-            fn_constructor_kwargs=fn_constructor_kwargs,
-            accelerator_type=accelerator_type,
-            resources=resources,
             model_memory_gb=model_memory_gb,
             multiprocessing=multiprocessing,
             max_errored_rows=max_errored_rows,
@@ -1485,32 +1713,78 @@ class Dataset:
 
     def map(
         self,
-        fn: Callable,
+        fn: Callable | type,
         *,
+        batch_size: int | None = None,
+        batch_format: str = "pyarrow",
         input_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
-        batch_size: int | None = None,
         num_workers: int | str = "auto",
+        num_cpus: float | None = None,
+        num_gpus: float = 0.0,
+        memory: float | None = None,
+        compute: Any = None,
+        concurrency: int | tuple[int, ...] | None = None,
+        ray_remote_args: dict[str, Any] | None = None,
+        ray_remote_args_fn: Callable[[], dict[str, Any]] | None = None,
+        zero_copy_batch: bool = True,
+        fn_args: tuple | None = None,
+        fn_kwargs: dict | None = None,
+        fn_constructor_args: tuple | None = None,
+        fn_constructor_kwargs: dict | None = None,
         max_concurrency: int = 0,
         max_errored_rows: int = 0,
     ) -> Dataset:
-        """Apply a per-row function ``fn(row) -> row`` (Ray Data ``map``).
+        """Apply a per-row Python function ``fn(row) -> row`` (Ray Data ``map``).
 
-        Sugar for `ds.ml.map`. Prefer `map_batches` (vectorized) when you can; see `ds.ml`.
-        Pass an ``async def`` `fn` for a per-row I/O-bound call (a per-row LLM/API request):
-        each batch's rows are awaited concurrently, up to `max_concurrency`.
+        Each row is passed to `fn` as a ``{column: value}`` dict **inside the worker**, never
+        the driver, and the per-row cost is yours. Prefer the vectorized `map_batches` when
+        the work can be expressed over whole columns; it is far faster.
+
+        `input_columns` matters more here than anywhere else. A row callback pays for every
+        column twice, once to read it and once to box it into a Python object per row, so
+        declaring the columns it reads lets projection pushdown prune the scan.
+
+        `batch_format` picks the row values: ``"pyarrow"`` rows hold Python values, and
+        ``"numpy"`` rows hold NumPy values the way Ray Data's rows do, so a tensor column
+        arrives as an ``ndarray`` per row. Pass a class to build a model once per worker, and
+        an ``async def`` `fn` for an I/O-bound per-row call, whose rows are awaited
+        concurrently within each batch, up to `max_concurrency` at a time. The Ray Data
+        resource parameters behave as they do on `map_batches`.
 
         Args:
-            fn: A callable (or ``async def``) mapping one row dict to a new row dict.
-            input_columns: The columns `fn` reads, so the scan can be pruned to them.
-            output_columns: The output column names when `fn` changes the schema.
-            batch_size: Rebatch to this many rows before processing.
+            fn: A ``row -> row`` function, ``async def``, or class, applied per row.
+            batch_size: Rows handed to each worker call.
+            batch_format: The row values — ``"pyarrow"`` (Python values) or ``"numpy"``.
+            input_columns: The columns `fn` reads, so projection pushdown can prune the scan.
+                Omitting a column the callback reads is a correctness bug: the pruned column
+                is missing from the row dict.
+            output_columns: The result schema when `fn` changes the columns.
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
+            num_cpus: Ray Data's per-worker CPU request; raises when set.
+            num_gpus: GPUs to reserve per distributed worker.
+            memory: Ray Data's per-worker memory request; raises when set.
+            compute: A Ray Data ``ActorPoolStrategy``/``TaskPoolStrategy``, or
+                ``"actors"``/``"tasks"``; folded into `concurrency`.
+            concurrency: Size of the distributed actor pool: an int, ``(min, max)``, or
+                ``(min, max, initial)`` with ``initial == min``.
+            ray_remote_args: Ray options; ``num_gpus``, ``resources`` and
+                ``accelerator_type`` are honoured and any other key raises.
+            ray_remote_args_fn: Ray Data's per-task options callback; raises when set.
+            zero_copy_batch: With ``batch_format="numpy"``, ``False`` copies read-only
+                arrays so `fn` may mutate a row's values.
+            fn_args: Positional arguments appended to every call: ``fn(row, *fn_args)``.
+            fn_kwargs: Keyword arguments forwarded to every call.
+            fn_constructor_args: Positional arguments for a class `fn`'s construction.
+            fn_constructor_kwargs: Keyword arguments for a class `fn`'s construction.
             max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
             max_errored_rows: Rows a raising `fn` may drop per worker before failing.
 
         Returns:
-            A new `Dataset` of the mapped rows.
+            A new lazy `Dataset` with `fn` applied to every row.
+
+        Raises:
+            PlanError: If an option is invalid, or a resource parameter cannot be honoured.
 
         Examples:
             .. doctest::
@@ -1520,43 +1794,68 @@ class Dataset:
                 >>> ds.map(lambda row: {"x": row["x"] * 2}).to_pydict()
                 {'x': [2, 4, 6]}
         """
-        return self.ml.map(
-            fn,
-            input_columns=input_columns,
-            output_columns=output_columns,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            max_concurrency=max_concurrency,
-            max_errored_rows=max_errored_rows,
-        )
+        return self._map_rows(fn, False, locals())
 
     def flat_map(
         self,
-        fn: Callable,
+        fn: Callable | type,
         *,
+        batch_size: int | None = None,
+        batch_format: str = "pyarrow",
         input_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
-        batch_size: int | None = None,
         num_workers: int | str = "auto",
+        num_cpus: float | None = None,
+        num_gpus: float = 0.0,
+        memory: float | None = None,
+        compute: Any = None,
+        concurrency: int | tuple[int, ...] | None = None,
+        ray_remote_args: dict[str, Any] | None = None,
+        ray_remote_args_fn: Callable[[], dict[str, Any]] | None = None,
+        zero_copy_batch: bool = True,
+        fn_args: tuple | None = None,
+        fn_kwargs: dict | None = None,
+        fn_constructor_args: tuple | None = None,
+        fn_constructor_kwargs: dict | None = None,
         max_concurrency: int = 0,
         max_errored_rows: int = 0,
     ) -> Dataset:
-        """Apply a per-row function ``fn(row) -> iterable[row]`` and flatten.
+        """Apply ``fn(row) -> iterable[row]`` per row and flatten (Ray Data ``flat_map``).
 
-        The Ray Data ``flat_map`` — sugar for `ds.ml.flat_map`; see `ds.ml`. An ``async def``
-        `fn` has its rows awaited concurrently within a batch.
+        A one-to-many row transform. Like `map`, `fn` runs per row inside the worker, and each
+        call returns zero or more output rows, all concatenated. The options are `map`'s.
 
         Args:
-            fn: A callable (or ``async def``) mapping one row dict to an iterable of row dicts.
-            input_columns: The columns `fn` reads, so the scan can be pruned to them.
-            output_columns: The output column names when `fn` changes the schema.
-            batch_size: Rebatch to this many rows before processing.
+            fn: A ``row -> iterable[row]`` function, ``async def``, or class, applied per row.
+            batch_size: Rows handed to each worker call.
+            batch_format: The row values — ``"pyarrow"`` (Python values) or ``"numpy"``.
+            input_columns: The columns `fn` reads, so projection pushdown can prune the scan.
+            output_columns: The result schema when `fn` changes the columns.
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
+            num_cpus: Ray Data's per-worker CPU request; raises when set.
+            num_gpus: GPUs to reserve per distributed worker.
+            memory: Ray Data's per-worker memory request; raises when set.
+            compute: A Ray Data ``ActorPoolStrategy``/``TaskPoolStrategy``, or
+                ``"actors"``/``"tasks"``; folded into `concurrency`.
+            concurrency: Size of the distributed actor pool: an int, ``(min, max)``, or
+                ``(min, max, initial)`` with ``initial == min``.
+            ray_remote_args: Ray options; ``num_gpus``, ``resources`` and
+                ``accelerator_type`` are honoured and any other key raises.
+            ray_remote_args_fn: Ray Data's per-task options callback; raises when set.
+            zero_copy_batch: With ``batch_format="numpy"``, ``False`` copies read-only
+                arrays so `fn` may mutate a row's values.
+            fn_args: Positional arguments appended to every call: ``fn(row, *fn_args)``.
+            fn_kwargs: Keyword arguments forwarded to every call.
+            fn_constructor_args: Positional arguments for a class `fn`'s construction.
+            fn_constructor_kwargs: Keyword arguments for a class `fn`'s construction.
             max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
             max_errored_rows: Rows a raising `fn` may drop per worker before failing.
 
         Returns:
-            A new `Dataset` of the flattened rows.
+            A new lazy `Dataset` of the flattened rows.
+
+        Raises:
+            PlanError: If an option is invalid, or a resource parameter cannot be honoured.
 
         Examples:
             .. doctest::
@@ -1566,14 +1865,21 @@ class Dataset:
                 >>> ds.flat_map(lambda row: [{"x": row["x"]}, {"x": row["x"]}]).to_pydict()
                 {'x': [1, 1, 2, 2]}
         """
-        return self.ml.flat_map(
+        return self._map_rows(fn, True, locals())
+
+    def _map_rows(self, fn: Callable | type, flat: bool, given: dict[str, Any]) -> Dataset:
+        """The shared body of `map`/`flat_map`, over the caller's own arguments."""
+        from batcher.api.dataset._udf import build_rows, resolve_placement
+        from batcher.api.dataset._udf.build import BINDING_PARAMS, RAY_PARAMS, ROW_OPTIONS
+
+        ray = {name: given[name] for name in RAY_PARAMS}
+        return build_rows(
+            self,
             fn,
-            input_columns=input_columns,
-            output_columns=output_columns,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            max_concurrency=max_concurrency,
-            max_errored_rows=max_errored_rows,
+            flat=flat,
+            placement=resolve_placement("flat_map" if flat else "map", fn, **ray),
+            bindings=tuple(given[name] for name in BINDING_PARAMS),
+            **{name: given[name] for name in ROW_OPTIONS},
         )
 
     def sql(self, query: str, *, table_name: str = "self", dialect: str | None = None) -> Dataset:
@@ -3318,35 +3624,6 @@ class Dataset:
         """
         return self.collect().__dataframe__(nan_as_null=nan_as_null, allow_copy=allow_copy)
 
-    # --- ecosystem spellings ----------------------------------------------------------
-    # A migrant finds the operation under the name they already type. Each of these
-    # delegates to the Batcher primary — same plan, same semantics, no second
-    # implementation to keep in step.
-
-    def query(self, expr: str) -> Dataset:
-        """Keep rows matching a SQL boolean `expr` — the pandas ``query`` spelling.
-
-        The string is a SQL ``WHERE`` clause over this dataset's columns, evaluated
-        by the same SQL front end as :meth:`sql`. Prefer expressions
-        (``ds.filter(col("x") > 1)``) in code you own: they are checked when the plan
-        is built rather than when the string is parsed.
-
-        Args:
-            expr: A SQL boolean expression over this dataset's columns.
-
-        Returns:
-            A new `Dataset` with the matching rows.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 5, 9]})
-                >>> ds.query("x > 2").to_pydict()
-                {'x': [5, 9]}
-        """
-        return self.sql(f"SELECT * FROM self WHERE {expr}")
-
     # --- pandas-compatible spellings ------------------------------------------------
     # A data scientist arriving from pandas finds the operation under the name they
     # already type. Each delegates to the Batcher primary — same plan, same semantics.
@@ -4360,7 +4637,7 @@ class Dataset:
             },
         )
 
-    def group_by(self, *keys: str, **named: Expr) -> GroupBy:
+    def group_by(self, *keys: str, maintain_order: bool = False, **named: Expr) -> GroupBy:
         """Begin a grouped aggregation over the given keys.
 
         Positional args are key columns by name; keyword args bind a derived key
@@ -4369,9 +4646,17 @@ class Dataset:
         ``ds.group_by("dept").agg(total=col("salary").sum(), n=count())``.
         Global aggregation (no keys) is ``ds.group_by().agg(...)``.
 
+        Groups come out in no defined order unless `maintain_order` is set. With it, they come
+        out in the order each group's first row appears in the input, identically under
+        ``collect``, spilling, ``iter_batches`` and ``distributed=True``, because the order is
+        computed rather than observed: each input row is numbered, each group keeps its
+        smallest number, and the result is sorted on it. That costs a sort over the groups.
+        A derived key cannot be named ``maintain_order``.
+
         Args:
             *keys: Key columns by name. A list is accepted in place of separate
                 arguments.
+            maintain_order: Emit groups in the order of their first appearance in the input.
             **named: Derived key columns bound to expressions.
 
         Returns:
@@ -4384,7 +4669,13 @@ class Dataset:
                 >>> ds = bt.from_pydict({"g": ["a", "b", "a"], "v": [1, 2, 3]})
                 >>> ds.group_by("g").agg(s=bt.col("v").sum()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 's': [4, 2]}
+
+                >>> ds = bt.from_pydict({"g": ["b", "a", "b"], "v": [1, 2, 3]})
+                >>> ds.group_by("g", maintain_order=True).agg(s=bt.col("v").sum()).to_pydict()
+                {'g': ['b', 'a'], 's': [4, 2]}
         """
+        if not isinstance(maintain_order, bool):
+            raise PlanError(f"group_by(maintain_order=...) must be a bool, got {maintain_order!r}")
         keys = flatten_varargs(keys)
         available = set(self._plan.available_columns())
         for k in keys:
@@ -4399,7 +4690,7 @@ class Dataset:
             if not isinstance(expr, Expr):
                 raise PlanError(f"group_by() value for {alias!r} must be an expression")
             _reject_sliding_window_key(alias, expr)
-        return GroupBy(self, keys, named)
+        return GroupBy(self, keys, named, maintain_order=maintain_order)
 
     def rollup(self, *keys: str) -> MultiLevelGroupBy:
         """Aggregate at every prefix of `keys`, plus the grand total (SQL ``ROLLUP``).
@@ -5528,11 +5819,16 @@ class Dataset:
         self,
         batch_size: int | None = None,
         *,
+        batch_format: str = "pyarrow",
+        drop_last: bool = False,
+        local_shuffle_buffer_size: int | None = None,
+        local_shuffle_seed: int | None = None,
+        prefetch_batches: int = 0,
         distributed: bool | str = False,
         num_workers: int | None = None,
         transport: str = "auto",
-    ):
-        """Execute and yield the result as Arrow record batches.
+    ) -> Iterator[Any]:
+        """Execute and yield the result batch by batch.
 
         The execution mode is automatic: a breaker-free pipeline (filter / project /
         map_batches over a single source) — and top-level aggregate / distinct /
@@ -5542,7 +5838,15 @@ class Dataset:
         out-of-core bucket pipeline: the input is consumed to disk, then the result is
         yielded one bounded bucket at a time. Anything else materializes first; if the
         source is unbounded and the plan cannot stream, a `PlanError` is raised
-        rather than hanging. `batch_size` rebatches the output.
+        rather than hanging. `batch_size` rebatches the output so every batch but the last
+        holds exactly that many rows.
+
+        `batch_format` converts each batch as it is yielded, with the same conversions
+        `map_batches` uses. `drop_last` drops a final batch shorter than `batch_size`.
+        `local_shuffle_buffer_size` shuffles rows within blocks of that many rows before
+        batching, a streaming approximation of a global shuffle seeded by
+        `local_shuffle_seed`. `prefetch_batches` prepares that many batches ahead on a
+        background thread.
 
         With `distributed` (``True`` or ``"auto"`` on a multi-node cluster), a
         top-level breaker fans out across Ray workers and its result streams back one
@@ -5557,12 +5861,24 @@ class Dataset:
 
         Args:
             batch_size: Rebatch the output to this many rows; ``None`` keeps engine batches.
+            batch_format: The yielded batch type — ``"pyarrow"`` (a `RecordBatch`),
+                ``"numpy"``, ``"pandas"``, ``"torch"``, ``"polars"`` or ``"jax"``.
+            drop_last: Drop a final batch with fewer than `batch_size` rows. Requires
+                `batch_size`.
+            local_shuffle_buffer_size: Shuffle within blocks of this many rows; ``None``
+                keeps the engine's order.
+            local_shuffle_seed: Seed for the local shuffle; ``None`` uses seed 0, so a run
+                is reproducible.
+            prefetch_batches: Batches to prepare ahead on a background thread; 0 disables.
             distributed: Fan a top-level breaker across Ray workers (``True``/``"auto"``).
             num_workers: Worker fan-out for the distributed path.
             transport: The shuffle transport; ``"auto"`` selects one.
 
         Yields:
-            The result as Arrow record batches.
+            The result batches, in `batch_format`.
+
+        Raises:
+            PlanError: If an option is invalid, or `drop_last` is set without `batch_size`.
 
         Examples:
             .. doctest::
@@ -5571,10 +5887,21 @@ class Dataset:
                 >>> ds = bt.from_pydict({"x": [1, 2, 3]})
                 >>> sum(batch.num_rows for batch in ds.iter_batches())
                 3
+                >>> [len(b["x"]) for b in ds.iter_batches(2, batch_format="numpy", drop_last=True)]
+                [2]
         """
+        from batcher.api.dataset._export import shape_batches
         from batcher.api.terminal.core import _resolve_distributed, cached_batches
         from batcher.api.terminal.event_log import pipeline_signature, report_stream
 
+        shape = shape_batches(
+            batch_size=batch_size,
+            batch_format=batch_format,
+            drop_last=drop_last,
+            local_shuffle_buffer_size=local_shuffle_buffer_size,
+            local_shuffle_seed=local_shuffle_seed,
+            prefetch_batches=prefetch_batches,
+        )
         batches = cached_batches(self._plan, self._sources, self._cache, batch_size)
         if batches is None:
             batches = _iter_batches(
@@ -5588,10 +5915,12 @@ class Dataset:
             )
         # Wrapped here, at the single public entry, rather than inside `_iter_batches` —
         # which recurses on the `batch_size` path and would double-count every row.
-        yield from report_stream(
-            batches,
-            label=type(self._plan).__name__.lower(),
-            signature=pipeline_signature(self._plan),
+        yield from shape(
+            report_stream(
+                batches,
+                label=type(self._plan).__name__.lower(),
+                signature=pipeline_signature(self._plan),
+            )
         )
 
     @property
@@ -5764,35 +6093,6 @@ class Dataset:
                 [{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}]
         """
         return _to_pylist(self._plan, self._sources, self.columns, self._cache)
-
-    def to_torch(
-        self, *, columns: str | list[str] | None = None, batch_size: int | None = None
-    ) -> Any:
-        """A re-iterable ``torch.utils.data.IterableDataset`` of per-batch tensor dicts.
-
-        Each item is a ``{column: torch.Tensor}`` for one engine batch (non-numeric
-        columns are skipped). Re-iterating runs the query again, so it is safe for
-        multi-epoch training and streams in bounded memory. Needs `torch`.
-
-        Args:
-            columns: The columns to include; ``None`` uses all numeric columns.
-            batch_size: Rows per emitted tensor batch; ``None`` uses engine batches.
-
-        Returns:
-            A re-iterable ``torch.utils.data.IterableDataset`` of tensor dicts.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
-                >>> next(iter(ds.to_torch()))["x"].shape  # doctest: +SKIP
-                torch.Size([3])
-        """
-        from batcher.api.dataset._export import to_torch
-
-        cols = _require_columns(self.columns, _as_opt_str_list(columns), where="in to_torch()")
-        return to_torch(self, cols, batch_size)
 
     def to_ray_dataset(
         self,

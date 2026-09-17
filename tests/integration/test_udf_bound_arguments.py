@@ -101,10 +101,13 @@ def test_async_model_stays_async_when_bound(ds: bt.Dataset) -> None:
     assert out == {"x": [4, 8, 12]}
 
 
-def test_sugar_forwards_the_full_option_set(ds: bt.Dataset) -> None:
-    """`ds.map_batches` used to drop half of what `ds.ml.map_batches` accepts."""
+def test_the_binding_options_live_on_the_one_map_batches(ds: bt.Dataset) -> None:
+    """`ds.map_batches` was sugar over `ds.ml.map_batches` and dropped half its options.
+
+    There is now one spelling, so the binding options must be on it and the old one gone.
+    """
     import inspect
 
-    sugar = set(inspect.signature(bt.Dataset.map_batches).parameters)
-    full = set(inspect.signature(type(ds.ml).map_batches).parameters)
-    assert full - sugar == set()
+    params = set(inspect.signature(bt.Dataset.map_batches).parameters)
+    assert {"fn_args", "fn_kwargs", "fn_constructor_args", "fn_constructor_kwargs"} <= params
+    assert not hasattr(type(ds.ml), "map_batches")

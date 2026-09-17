@@ -1,9 +1,7 @@
-"""Framework-export helpers behind `Dataset.to_torch` / `to_tf` and the engine hand-offs.
+"""Export helpers: `iter_batches` stream shaping and the hand-offs to other frames.
 
-These bridge a `Dataset`'s output batches to PyTorch / TensorFlow training loops
-via the `Dataset`-free converters in `batcher.ml.converters`. The batch source is
-**re-iterable** — each pass re-runs the query — so a multi-epoch loader streams in
-bounded memory rather than materializing the whole dataset. They also hand a result to
+`shape_batches` turns `iter_batches`' consumer options (format, shuffle, ragged tail,
+look-ahead) into one stream transform. The rest hand a result to NumPy/JAX arrays or to
 another engine's frame: `to_ray_dataset`, `to_daft` and `to_spark`.
 """
 
@@ -21,50 +19,114 @@ from batcher._internal.optional import require
 from batcher.plan.types import retained_bytes
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
     from batcher.api.dataset.frame import Dataset
 
 
-class _ReiterableBatches:
-    """A re-iterable view over a dataset's output batches: each ``iter()`` re-runs
-    the query, so a training framework can take multiple passes (epochs)."""
+def shape_batches(
+    *,
+    batch_size: int | None,
+    batch_format: str,
+    drop_last: bool,
+    local_shuffle_buffer_size: int | None,
+    local_shuffle_seed: int | None,
+    prefetch_batches: int,
+) -> Callable[[Iterator[pa.RecordBatch]], Iterator[Any]]:
+    """Validate `iter_batches`' shaping options and return the stream transform they describe.
 
-    __slots__ = ("_size", "_source")
+    Validation happens here, before the query runs, so a bad option names itself instead of
+    surfacing from the first `next()` deep in a consumer. The transform then applies, in order:
+    the local shuffle, the exact rebatch a shuffle or `drop_last` needs, the ragged tail, the
+    format conversion, and the background look-ahead.
 
-    def __init__(self, source: Dataset, size: int | None) -> None:
-        self._source = source
-        self._size = size
+    Args:
+        batch_size: The caller's rows per batch, or `None`.
+        batch_format: The yielded type, one of `batcher.interop.formats.FORMATS`.
+        drop_last: Drop a final batch shorter than `batch_size`.
+        local_shuffle_buffer_size: Rows per shuffled block, or `None` for no shuffle.
+        local_shuffle_seed: The shuffle seed; `None` means 0.
+        prefetch_batches: Batches of background look-ahead; 0 disables it.
 
-    def __iter__(self) -> Any:
-        return self._source.iter_batches(self._size)
+    Returns:
+        A function from the engine's batch stream to the shaped stream.
 
-
-def to_torch(ds: Dataset, columns: list[str] | None, batch_size: int | None) -> Any:
-    """A re-iterable `torch.utils.data.IterableDataset` of per-batch tensor dicts."""
-    from batcher.ml.converters import to_torch_iterable
-
-    return to_torch_iterable(_ReiterableBatches(ds, batch_size), columns=columns)
-
-
-def to_torch_dataloader(
-    ds: Dataset, columns: list[str] | None, batch_size: int | None, **dl_kwargs: Any
-) -> Any:
-    """A `torch.utils.data.DataLoader` over the engine-batched tensor dicts.
-
-    The engine already produces batches, so the loader uses ``batch_size=None``
-    (one engine batch = one training batch); pass `batch_size` to size them.
+    Raises:
+        PlanError: If an option is invalid.
     """
-    from torch.utils.data import DataLoader
+    from batcher._internal.errors import PlanError
+    from batcher.interop.formats import FORMATS
 
-    return DataLoader(to_torch(ds, columns, batch_size), batch_size=None, **dl_kwargs)
+    if batch_format not in FORMATS:
+        raise PlanError(
+            f"iter_batches(batch_format=...) must be one of {sorted(FORMATS)}, got {batch_format!r}"
+        )
+    if not isinstance(drop_last, bool):
+        raise PlanError(f"iter_batches(drop_last=...) must be a bool, got {drop_last!r}")
+    if drop_last and batch_size is None:
+        raise PlanError("iter_batches(drop_last=True) requires an explicit batch_size")
+    for name, value, floor in (
+        ("local_shuffle_buffer_size", local_shuffle_buffer_size, 1),
+        ("local_shuffle_seed", local_shuffle_seed, 0),
+        ("prefetch_batches", prefetch_batches, 0),
+    ):
+        if value is None and name != "prefetch_batches":
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+            raise PlanError(f"iter_batches({name}=...) must be an int >= {floor}, got {value!r}")
+
+    def shape(batches: Iterator[pa.RecordBatch]) -> Iterator[Any]:
+        from batcher._internal.prefetch import prefetch
+        from batcher.api.terminal.stream.rebatch import _rebatch_exact
+
+        stream: Iterator[Any] = batches
+        if local_shuffle_buffer_size:
+            stream = _shuffled_blocks(stream, local_shuffle_buffer_size, local_shuffle_seed or 0)
+        if batch_size is not None and (local_shuffle_buffer_size or drop_last):
+            stream = _rebatch_exact(stream, batch_size)
+        if drop_last and batch_size is not None:
+            stream = (b for b in stream if b.num_rows >= batch_size)
+        if batch_format != "pyarrow":
+            from batcher.interop.formats import to_format
+
+            stream = (to_format(b, batch_format) for b in stream)
+        return prefetch(stream, prefetch_batches)
+
+    return shape
 
 
-def to_tf(ds: Dataset, columns: list[str] | None, batch_size: int | None) -> Any:
-    """A re-iterable ``tf.data.Dataset`` of per-batch tensor dicts."""
-    from batcher.ml.converters import to_tf_dataset
+def _shuffled_blocks(
+    batches: Iterator[pa.RecordBatch], buffer_rows: int, seed: int
+) -> Iterator[pa.RecordBatch]:
+    """Permute the rows within successive blocks of about `buffer_rows` rows.
 
-    return to_tf_dataset(_ReiterableBatches(ds, batch_size), columns=columns)
+    A block is also cut at the byte ceiling the training loaders use, so a row count that is
+    cheap over narrow rows cannot become an unbounded allocation over decoded images. Cutting
+    a block early only narrows the shuffle window; no row is dropped or repeated.
+    """
+    import numpy as np
+
+    from batcher.ml.loader.lazy import _SHUFFLE_BLOCK_MAX_BYTES
+
+    rng = np.random.RandomState(seed)
+    block: list[pa.RecordBatch] = []
+    rows = nbytes = 0
+
+    def _emit() -> Iterator[pa.RecordBatch]:
+        table = pa.Table.from_batches(block)
+        yield from table.take(pa.array(rng.permutation(table.num_rows))).to_batches()
+
+    for batch in batches:
+        if batch.num_rows == 0:
+            continue
+        block.append(batch)
+        rows += batch.num_rows
+        nbytes += retained_bytes(batch)
+        if rows >= buffer_rows or nbytes >= _SHUFFLE_BLOCK_MAX_BYTES:
+            yield from _emit()
+            block, rows, nbytes = [], 0, 0
+    if block:
+        yield from _emit()
 
 
 def to_jax(ds: Dataset, columns: list[str] | None) -> dict[str, Any]:

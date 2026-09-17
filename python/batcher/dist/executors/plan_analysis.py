@@ -342,8 +342,8 @@ def split_into_resource_stages(
             ...     def __call__(self, batch):
             ...         return batch
             >>> ds = bt.from_pydict({"x": [1]})
-            >>> ds = ds.ml.map_batches(lambda b: b).ml.map_batches(Model)
-            >>> ds = ds.ml.map_batches(lambda b: b)
+            >>> ds = ds.map_batches(lambda b: b).map_batches(Model)
+            >>> ds = ds.map_batches(lambda b: b)
             >>> [s.wants_pool for s in split_into_resource_stages(ds._plan)]
             [False, True, False]
     """

@@ -54,9 +54,10 @@ def test_filter_keyword_naming_an_unknown_column_is_rejected(ds: bt.Dataset) -> 
         ds.filter(nope=1)
 
 
-def test_filter_with_a_string_points_at_sql(ds: bt.Dataset) -> None:
+def test_filter_with_a_whole_query_string_points_at_sql(ds: bt.Dataset) -> None:
+    """A predicate string is a filter; a whole statement is not, and says where it goes."""
     with pytest.raises(PlanError, match=r"ds\.sql"):
-        ds.filter("x > 1")
+        ds.filter("SELECT * FROM self WHERE x > 1")
 
 
 # --- sample ---------------------------------------------------------------------
@@ -335,15 +336,15 @@ def test_group_by_first_requires_an_explicit_order(ds: bt.Dataset) -> None:
         ds.group_by("g").first("x")
 
 
-# --- second-wave spellings: query, explain -----------------------------------------
+# --- second-wave spellings: SQL filter strings, explain -----------------------------------------
 
 
-def test_query_is_a_sql_where_clause(ds: bt.Dataset) -> None:
-    assert ds.query("x > 2").to_pydict()["x"] == [3, 4]
+def test_a_filter_string_is_a_sql_where_clause(ds: bt.Dataset) -> None:
+    assert ds.filter("x > 2").to_pydict()["x"] == [3, 4]
 
 
-def test_query_matches_the_expression_spelling(ds: bt.Dataset) -> None:
-    assert ds.query("x > 2").equals(ds.filter(bt.col("x") > 2))
+def test_a_filter_string_matches_the_expression_spelling(ds: bt.Dataset) -> None:
+    assert ds.filter("x > 2").equals(ds.filter(bt.col("x") > 2))
 
 
 def test_explain_accepts_tree_as_an_alias_for_text(ds: bt.Dataset) -> None:

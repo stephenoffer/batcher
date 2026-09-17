@@ -98,13 +98,22 @@ differently. Check a port for every one of them.
 
 ## Resource parameters are the main gap
 
-`map_batches`, `map`, `flat_map`, `filter`, and `map_groups` have `param` or `mismatch` rows for
-the Ray resource parameters. Batcher's `map_batches` takes `num_gpus=`, `concurrency=` as an int
-or a `(min, max)` pair, and `fn_args`/`fn_kwargs`/`fn_constructor_args`/`fn_constructor_kwargs`;
-the rows list what is still missing, including `num_cpus`, `memory`, `compute=ActorPoolStrategy`,
-the three-tuple `concurrency`, and `ray_remote_args`. A class passed as `fn` is constructed once
-per worker, which is the port of a Ray callable-class UDF. For a model rather than arbitrary
-code, `ds.ml.infer` is the shorter path.
+`ds.map_batches`, `ds.map`, `ds.flat_map` and a callable `ds.filter` take Ray Data's whole
+resource parameter set by name: `num_cpus`, `num_gpus`, `memory`, `fn_args`/`fn_kwargs`/
+`fn_constructor_args`/`fn_constructor_kwargs`, `compute`, `concurrency` (an int, `(min, max)`, or
+`(min, max, initial)`), `ray_remote_args`, `ray_remote_args_fn`, `zero_copy_batch`, and
+`batch_size`/`batch_format`. Only the ones the map scheduler can act on are honoured: `num_gpus`,
+`concurrency` with `initial == min`, `compute` folded into `concurrency`, and the `num_gpus`,
+`resources` and `accelerator_type` keys of `ray_remote_args`. `num_cpus`, `memory`,
+`ray_remote_args_fn`, any other `ray_remote_args` key, and an initial pool size above the minimum
+raise `PlanError` naming the parameter, so drop them in the port rather than expecting them to
+be ignored. A class passed as `fn` is constructed once per worker, which is the port of a Ray
+callable-class UDF. For a model rather than arbitrary code, `ds.ml.infer` is the shorter path.
+
+Two of these verbs differ in meaning, not only in parameters. Ray's `filter(fn)` calls `fn` per
+row; Batcher's calls it per batch and expects one boolean per row back. Ray's
+`map_batches`/`iter_batches` default to NumPy batches; Batcher's default to `pyarrow`, so pass
+`batch_format="numpy"` to keep a Ray function unchanged.
 
 ## Porting recipe
 

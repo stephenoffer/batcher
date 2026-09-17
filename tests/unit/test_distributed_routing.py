@@ -162,7 +162,7 @@ def test_an_accelerator_stage_that_stays_local_says_so(monkeypatch, recwarn):
     from batcher.api.terminal import routing
 
     monkeypatch.setattr(routing, "_local_accelerator_present", lambda: False)
-    gpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b, num_gpus=1)
+    gpu = bt.from_pydict({"x": [1]}).map_batches(lambda b: b, num_gpus=1)
 
     assert routing.resolve_distributed(False, gpu._plan, None) is False
     messages = [str(w.message) for w in recwarn if w.category is PerformanceWarning]
@@ -178,7 +178,7 @@ def test_no_accelerator_warning_without_an_accelerator_stage(monkeypatch, recwar
     from batcher.api.terminal import routing
 
     monkeypatch.setattr(routing, "_local_accelerator_present", lambda: False)
-    cpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b)
+    cpu = bt.from_pydict({"x": [1]}).map_batches(lambda b: b)
 
     routing.resolve_distributed(False, cpu._plan, None)
     assert [w for w in recwarn if w.category is PerformanceWarning] == []
@@ -194,7 +194,7 @@ def test_no_accelerator_warning_when_the_device_is_present_or_unknown(monkeypatc
     from batcher._internal.errors import PerformanceWarning
     from batcher.api.terminal import routing
 
-    gpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b, num_gpus=1)
+    gpu = bt.from_pydict({"x": [1]}).map_batches(lambda b: b, num_gpus=1)
     for verdict in (True, None):
         monkeypatch.setattr(routing, "_local_accelerator_present", lambda v=verdict: v)
         routing.resolve_distributed(False, gpu._plan, None)
@@ -257,7 +257,7 @@ def test_a_batch_factory_source_stays_single_node(multinode):
     `InMemorySource` already declines, reached by a different route.
 
     Observed as a hang-then-crash rather than a slow query: on a Ray-connected process a
-    20,000-row `ds.ml.map_batches(SomeClass)` over `from_batches` fanned out to the cluster,
+    20,000-row `ds.map_batches(SomeClass)` over `from_batches` fanned out to the cluster,
     where the worker could not import the module `SomeClass` was defined in.
     """
     from batcher.io import IteratorSource

@@ -31,7 +31,7 @@ udf = bt.ml.onnx_predictor(
 )
 
 ds = bt.read.parquet("s3://images/features/")
-scored = ds.ml.map_batches(udf, num_gpus=1, concurrency=8)
+scored = ds.map_batches(udf, num_gpus=1, concurrency=8)
 scored.write.parquet("s3://images/scored/")
 ```
 
@@ -154,7 +154,7 @@ udf = bt.ml.openvino_predictor(
     performance_hint="THROUGHPUT",
     cache_dir="/mnt/shared/ov-cache",
 )
-ds.ml.map_batches(udf, concurrency=16).write.parquet("s3://out/")
+ds.map_batches(udf, concurrency=16).write.parquet("s3://out/")
 ```
 
 Batcher defaults to `"THROUGHPUT"` where OpenVINO defaults to `"LATENCY"`. Latency mode spreads one inference across every core, which is right for a request-response server and wrong for scoring a table: the cores idle at each stage boundary. Throughput mode keeps several inferences in flight and saturates them.
@@ -165,7 +165,7 @@ The runtime reads an OpenVINO IR `.xml`, an `.onnx` graph, or a saved TensorFlow
 
 ## Sizing the stage
 
-The runtimes are ordinary UDFs, so everything on {py:meth}`ds.ml.map_batches <batcher.api.dataset.ml.DatasetML.map_batches>` applies: `num_gpus` and `concurrency` place and size the actor pool, `batch_size` sets the rows per call, and upstream preprocessing stays on CPU workers while the model stays on the accelerator. See {doc}`/ml/inference/gpu`.
+The runtimes are ordinary UDFs, so everything on {py:meth}`ds.map_batches <batcher.Dataset.map_batches>` applies: `num_gpus` and `concurrency` place and size the actor pool, `batch_size` sets the rows per call, and upstream preprocessing stays on CPU workers while the model stays on the accelerator. See {doc}`/ml/inference/gpu`.
 
 Two options belong to the runtimes themselves:
 

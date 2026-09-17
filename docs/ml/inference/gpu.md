@@ -50,7 +50,7 @@ class Scorer:
 
 
 ds = bt.from_pydict({"k": ["a", "b", "a"]})
-print(ds.ml.map_batches(Scorer, num_gpus=0, concurrency=2).sort("k").to_pydict())
+print(ds.map_batches(Scorer, num_gpus=0, concurrency=2).sort("k").to_pydict())
 # {'k': ['a', 'a', 'b'], 'score': [1.5, 1.5, 2.0]}
 ```
 
@@ -84,7 +84,7 @@ ds = bt.read.parquet("data/features.parquet")
 ds.ml.infer(Model, batch_size=512, num_gpus=1, concurrency=4)
 
 # Two actors share each GPU; good for a small model.
-ds.ml.map_batches(Model, batch_size=256, num_gpus=0.5, concurrency=4)
+ds.map_batches(Model, batch_size=256, num_gpus=0.5, concurrency=4)
 ```
 
 Later examples on this page pass that same `Model`.
@@ -159,13 +159,13 @@ request it with `resources=`:
 ```python
 # docs: skip
 # Google TPU
-ds.ml.map_batches(Model, resources={"TPU": 4}, concurrency=2)
+ds.map_batches(Model, resources={"TPU": 4}, concurrency=2)
 
 # AWS Trainium / Inferentia
-ds.ml.map_batches(Model, resources={"neuron_cores": 2}, concurrency=4)
+ds.map_batches(Model, resources={"neuron_cores": 2}, concurrency=4)
 
 # Intel Gaudi
-ds.ml.map_batches(Model, resources={"HPU": 8})
+ds.map_batches(Model, resources={"HPU": 8})
 ```
 
 `resources` is a passthrough to Ray, not a fixed vendor list, so it equally requests a

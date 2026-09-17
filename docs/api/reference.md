@@ -113,8 +113,8 @@ Each of these executes the plan and returns a result or writes it out:
 | {py:meth}`.to_pandas() <batcher.Dataset.to_pandas>` / {py:meth}`.to_polars() <batcher.Dataset.to_polars>` | a pandas / Polars DataFrame |
 | {py:meth}`.to_numpy(columns=None) <batcher.Dataset.to_numpy>` | a `{column: numpy.ndarray}` dict (tensor columns → `(n, *shape)`) |
 | {py:meth}`.to_jax(columns=None) <batcher.Dataset.to_jax>` | a `{column: jax.Array}` dict, the JAX counterpart of {py:meth}`to_numpy <batcher.Dataset.to_numpy>` |
-| `.to_torch(columns=None, batch_size=None)` / `.to_tf(...)` | a Torch / TensorFlow dataset |
-| `.to_torch_dataloader(...)` | a `torch.utils.data.DataLoader` |
+| `.ml.iter_torch_batches(batch_size=None, columns=None)` / `.ml.to_tf(...)` | streamed Torch tensor batches / a TensorFlow dataset |
+| `.ml.to_torch_dataloader(...)` | a `torch.utils.data.DataLoader` |
 | {py:meth}`.to_ray_dataset() <batcher.Dataset.to_ray_dataset>` | a `ray.data.Dataset`, for a Ray Train / Tune / Serve stage |
 | {py:meth}`.to_daft() <batcher.Dataset.to_daft>` | a `daft.DataFrame` |
 | {py:meth}`.to_spark(spark, max_arrow_bytes=None, staging_path=None) <batcher.Dataset.to_spark>` | a `pyspark.sql.DataFrame` in `spark`, staged as Parquet past `max_arrow_bytes` |
@@ -332,7 +332,7 @@ model once per worker.
 
 | Method | Use |
 | --- | --- |
-| {py:meth}`ds.ml.map_batches(fn, ...) <batcher.api.dataset.ml.DatasetML.map_batches>` | arbitrary batch transform |
+| {py:meth}`ds.map_batches(fn, ...) <batcher.Dataset.map_batches>` | arbitrary batch transform |
 | {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` | batched inference |
 | {py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>` | batched embeddings |
 | {py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` | offline LLM text generation |

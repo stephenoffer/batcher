@@ -99,6 +99,6 @@ def test_map_batches_numpy_format_distributed_equals_single_node():
         return {"id": d["id"], "z": d["x"] + d["y"]}
 
     ds = bt.from_pydict({"id": list(range(300)), "x": list(range(300)), "y": list(range(300))})
-    out = ds.ml.map_batches(add, batch_format="numpy", output_columns=["id", "z"])
+    out = ds.map_batches(add, batch_format="numpy", output_columns=["id", "z"])
     single, dist = _both(out, "id")
     assert single == dist

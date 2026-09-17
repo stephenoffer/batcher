@@ -10,7 +10,7 @@ device.
 | **Tensors in** | {py:func}`bt.from_torch(tensor) <batcher.from_torch>` |
 | **Tensors out** | {py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` |
 | **Distributed** | {py:func}`batcher.ml.streaming_split(...) <batcher.ml.streaming_split>`, or {py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` |
-| **Inference** | {py:meth}`ds.ml.map_batches(SomeClass, batch_format="torch") <batcher.api.dataset.ml.DatasetML.map_batches>` |
+| **Inference** | {py:meth}`ds.map_batches(SomeClass, batch_format="torch") <batcher.Dataset.map_batches>` |
 | **Extra** | `pip install 'batcher-engine[torch]'` |
 
 The measured stake, on 10 M rows x 32 float features, `batch_size=1024`, `prefetch=2`: 1.76 Mrows/s
@@ -190,7 +190,7 @@ class Classifier:
         return {"id": batch["id"], "score": scores.cpu().numpy()}
 
 
-scored = bt.read.parquet("s3://lake/images/*.parquet").ml.map_batches(
+scored = bt.read.parquet("s3://lake/images/*.parquet").map_batches(
     Classifier,
     batch_format="torch",
     batch_size=64,
@@ -216,7 +216,7 @@ precision, and loads once per worker.
 from batcher.ml import torch_predictor
 
 udf = torch_predictor(model, input_columns=["features"], output_columns=["logits"])
-scored = ds.ml.map_batches(udf, num_gpus=1).collect()
+scored = ds.map_batches(udf, num_gpus=1).collect()
 ```
 
 `model` may be a TorchScript path, a pickled-module path, a zero-arg factory, or an `nn.Module`

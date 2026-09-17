@@ -1,6 +1,6 @@
 """A row callback returns the same relation on one node and on many.
 
-`ds.ml.filter` is a new operator surface, and `map`/`flat_map` gained declarations
+`ds.filter(fn)` is a callback operator surface, and `map`/`flat_map` gained declarations
 (`input_columns`) and a budget (`max_errored_rows`) that the distributed path has to honour
 the same way the local one does. Both are the kind of thing that works locally and diverges
 across workers: the filter's `preserves_columns` declaration invites the optimizer to move a
@@ -63,8 +63,10 @@ def _same(plan) -> None:
     assert sorted(one.to_pylist(), key=repr) == sorted(many.to_pylist(), key=repr)
 
 
-def _keep_even(row: dict) -> bool:
-    return row["id"] % 2 == 0
+def _keep_even(batch):
+    import pyarrow.compute as pc
+
+    return pc.equal(pc.bit_wise_and(batch["id"], 1), 0)
 
 
 def _double(row: dict) -> dict:
@@ -72,18 +74,18 @@ def _double(row: dict) -> dict:
 
 
 def test_a_row_filter_is_identical_across_workers():
-    _same(_ds().ml.filter(_keep_even))
+    _same(_ds().filter(_keep_even))
 
 
 def test_a_row_filter_under_a_pushed_predicate_is_identical():
     """The `preserves_columns` declaration lets the optimizer move the vectorized filter
     below the Python one. If that rewrite were unsound, this is where it would show."""
-    _same(_ds().ml.filter(_keep_even).filter(col("g") < 3))
+    _same(_ds().filter(_keep_even).filter(col("g") < 3))
 
 
 def test_a_declared_row_map_is_identical_across_workers():
-    _same(_ds().ml.map(_double, input_columns=["id"], output_columns=["id"]))
+    _same(_ds().map(_double, input_columns=["id"], output_columns=["id"]))
 
 
 def test_a_row_filter_composed_with_an_aggregate_is_identical():
-    _same(_ds().ml.filter(_keep_even).group_by("g").agg(n=bt.count(), total=col("id").sum()))
+    _same(_ds().filter(_keep_even).group_by("g").agg(n=bt.count(), total=col("id").sum()))

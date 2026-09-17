@@ -31,14 +31,14 @@ def _doubled(row: dict) -> dict:
 
 
 def test_declared_map_matches_duckdb(duck):
-    ds = _t().ml.map(_doubled, input_columns=["id", "v"], output_columns=["id", "doubled"])
+    ds = _t().map(_doubled, input_columns=["id", "v"], output_columns=["id", "doubled"])
     _register(duck)
     assert_same(ds.collect(), duck.sql("SELECT id, v * 2 AS doubled FROM t"))
 
 
 def test_declared_and_undeclared_map_agree(duck):
-    declared = _t().ml.map(_doubled, input_columns=["id", "v"], output_columns=["id", "doubled"])
-    undeclared = _t().ml.map(_doubled, output_columns=["id", "doubled"])
+    declared = _t().map(_doubled, input_columns=["id", "v"], output_columns=["id", "doubled"])
+    undeclared = _t().map(_doubled, output_columns=["id", "doubled"])
     _register(duck)
     expected = duck.sql("SELECT id, v * 2 AS doubled FROM t")
     assert_same(declared.collect(), expected)
@@ -46,7 +46,7 @@ def test_declared_and_undeclared_map_agree(duck):
 
 
 def test_declared_flat_map_matches_duckdb(duck):
-    ds = _t().ml.flat_map(
+    ds = _t().flat_map(
         lambda row: [{"id": row["id"]}, {"id": row["id"]}],
         input_columns=["id"],
         output_columns=["id"],
@@ -59,7 +59,7 @@ def test_a_declared_row_callback_composes_with_a_projection(duck):
     """The shape that makes pruning bite: the wide column is read by nobody above the stage."""
     ds = (
         _t()
-        .ml.map(_doubled, input_columns=["id", "v"], output_columns=["id", "doubled"])
+        .map(_doubled, input_columns=["id", "v"], output_columns=["id", "doubled"])
         .select("doubled")
     )
     _register(duck)

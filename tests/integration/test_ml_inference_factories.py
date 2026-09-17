@@ -6,7 +6,7 @@ found none of them exercised. That is the surface a user reaches for after their
 works, so a defect here surfaces at the least convenient moment.
 
 Two of them can be tested for real on this machine, and are: ``torch_predictor`` and
-``onnx_predictor`` run a genuine two-line model end to end through ``ds.ml.map_batches``,
+``onnx_predictor`` run a genuine two-line model end to end through ``ds.map_batches``,
 and their results are compared **against each other** as well as against the arithmetic.
 That is a real differential -- the same model exported two ways, executed by two runtimes,
 through two adapters -- and it is the one shape in this family where a wrong answer rather
@@ -93,7 +93,7 @@ def test_torch_predictor_runs_a_real_model_over_a_dataset(ds, torch_module):
     """End to end: a TorchScript module scoring every row, appended as a new column."""
     _, path = torch_module
     udf = ml.torch_predictor(path, input_columns=["x"], output_columns=["y"])
-    got = ds.ml.map_batches(udf).to_pydict()
+    got = ds.map_batches(udf).to_pydict()
     assert got["x"] == INPUT, "the input column must survive the projection"
     assert got["y"] == pytest.approx(EXPECTED), f"{got['y']}"
 
@@ -106,10 +106,10 @@ def test_onnx_predictor_runs_the_same_model_and_agrees_with_torch(ds, torch_modu
     two rather than as an exception in either.
     """
     _, torch_path = torch_module
-    through_torch = ds.ml.map_batches(
+    through_torch = ds.map_batches(
         ml.torch_predictor(torch_path, input_columns=["x"], output_columns=["y"])
     ).to_pydict()
-    through_onnx = ds.ml.map_batches(
+    through_onnx = ds.map_batches(
         ml.onnx_predictor(onnx_model, input_columns=["x"], output_columns=["y"])
     ).to_pydict()
     assert through_onnx["y"] == pytest.approx(EXPECTED)
@@ -125,7 +125,7 @@ def test_a_predictor_scores_every_row_across_several_batches(torch_module):
     rows = [float(i) for i in range(5000)]
     ds = bt.from_pydict({"x": rows})
     udf = ml.torch_predictor(path, input_columns=["x"], output_columns=["y"])
-    got = ds.ml.map_batches(udf).to_pydict()
+    got = ds.map_batches(udf).to_pydict()
     assert len(got["y"]) == len(rows), "a batch went missing"
     assert got["y"] == pytest.approx([x * 2.0 + 1.0 for x in rows])
 
@@ -147,7 +147,7 @@ def test_a_predictor_loads_its_model_at_execution_and_not_at_build(ds):
     if not hasattr(ml, "torch_predictor"):
         pytest.skip("torch_predictor is not exported on this build")
     udf = ml.torch_predictor("/nonexistent/model.pt", input_columns=["x"], output_columns=["y"])
-    pipeline = ds.ml.map_batches(udf)
+    pipeline = ds.map_batches(udf)
     assert pipeline is not None, "building the pipeline must not need the model"
 
     with pytest.raises((FileNotFoundError, ValueError)):

@@ -63,14 +63,14 @@ def _expected(module):
 def test_torch_predictor_matches_calling_the_module_directly(scripted):
     path, module = scripted
     udf = bt.ml.torch_predictor(path, input_columns=["features"], output_columns=["scores"])
-    out = bt.from_pydict(_rows()).ml.map_batches(udf).to_pydict()
+    out = bt.from_pydict(_rows()).map_batches(udf).to_pydict()
     assert _flat(out["scores"]) == pytest.approx(_flat(_expected(module)), abs=1e-5)
 
 
 def test_torch_predictor_keeps_the_input_columns_alongside_the_output(scripted):
     path, _ = scripted
     udf = bt.ml.torch_predictor(path, input_columns=["features"], output_columns=["scores"])
-    out = bt.from_pydict(_rows()).ml.map_batches(udf).to_pydict()
+    out = bt.from_pydict(_rows()).map_batches(udf).to_pydict()
     assert out["features"] == _rows()["features"]
 
 
@@ -82,10 +82,10 @@ def test_torch_predictor_splitting_a_batch_changes_nothing(scripted):
         path, input_columns=["features"], output_columns=["scores"], max_batch_size=1
     )
     ds = bt.from_pydict(_rows())
-    assert _flat(ds.ml.map_batches(split).to_pydict()["scores"]) == pytest.approx(
-        _flat(ds.ml.map_batches(whole).to_pydict()["scores"]), abs=1e-6
+    assert _flat(ds.map_batches(split).to_pydict()["scores"]) == pytest.approx(
+        _flat(ds.map_batches(whole).to_pydict()["scores"]), abs=1e-6
     )
-    assert _flat(ds.ml.map_batches(whole).to_pydict()["scores"]) == pytest.approx(
+    assert _flat(ds.map_batches(whole).to_pydict()["scores"]) == pytest.approx(
         _flat(_expected(module)), abs=1e-5
     )
 
@@ -99,7 +99,7 @@ def test_torch_predictor_pipelining_preserves_row_order(scripted):
         max_batch_size=1,
         pipeline_depth=3,
     )
-    out = bt.from_pydict(_rows()).ml.map_batches(udf).to_pydict()
+    out = bt.from_pydict(_rows()).map_batches(udf).to_pydict()
     assert _flat(out["scores"]) == pytest.approx(_flat(_expected(module)), abs=1e-5)
 
 
@@ -111,13 +111,13 @@ def test_torch_predictor_rejects_a_state_dict_with_an_actionable_message(tmp_pat
     torch.save(torch.nn.Linear(3, 2).state_dict(), str(path))
     udf = bt.ml.torch_predictor(str(path), input_columns=["features"], output_columns=["scores"])
     with pytest.raises(BackendError, match="state_dict"):
-        bt.from_pydict(_rows()).ml.map_batches(udf).collect()
+        bt.from_pydict(_rows()).map_batches(udf).collect()
 
 
 def test_onnx_predictor_matches_the_torch_model_it_was_exported_from(graph, scripted):
     _, module = scripted
     udf = bt.ml.onnx_predictor(graph, input_columns=["features"], output_columns=["scores"])
-    out = bt.from_pydict(_rows()).ml.map_batches(udf).to_pydict()
+    out = bt.from_pydict(_rows()).map_batches(udf).to_pydict()
     assert _flat(out["scores"]) == pytest.approx(_flat(_expected(module)), abs=1e-4)
 
 
@@ -130,7 +130,7 @@ def test_onnx_predictor_maps_a_differently_named_column_onto_the_graph_input(gra
         output_columns=["y"],
     )
     ds = bt.from_pydict({"x": _rows()["features"]})
-    out = ds.ml.map_batches(udf).to_pydict()
+    out = ds.map_batches(udf).to_pydict()
     assert _flat(out["y"]) == pytest.approx(_flat(_expected(module)), abs=1e-4)
 
 
@@ -141,7 +141,7 @@ def test_onnx_predictor_declines_an_input_the_graph_does_not_have(graph):
         graph, input_columns=["features"], input_names=["nope"], output_columns=["scores"]
     )
     with pytest.raises(BackendError, match="no input named"):
-        bt.from_pydict(_rows()).ml.map_batches(udf).collect()
+        bt.from_pydict(_rows()).map_batches(udf).collect()
 
 
 def test_onnx_predictor_reports_the_providers_it_actually_bound(graph):
@@ -159,6 +159,6 @@ def test_onnx_predictor_casts_the_feed_to_the_dtype_the_graph_declared(graph, sc
     _, module = scripted
     udf = bt.ml.onnx_predictor(graph, input_columns=["features"], output_columns=["scores"])
     rows = {"features": [[1.0, 2.0, 3.0]]}
-    out = bt.from_pydict(rows).ml.map_batches(udf).to_pydict()
+    out = bt.from_pydict(rows).map_batches(udf).to_pydict()
     assert len(out["scores"][0]) == 2
     assert out["scores"][0] == pytest.approx(list(_expected(module)[0]), abs=1e-4)

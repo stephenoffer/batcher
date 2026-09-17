@@ -133,11 +133,11 @@ Each row pairs a source system with its constructor and, where one exists, its e
 | Daft | {py:func}`bt.from_daft(df) <batcher.from_daft>` | {py:meth}`ds.to_daft() <batcher.Dataset.to_daft>` |
 | Dask | {py:func}`bt.from_dask(ddf) <batcher.from_dask>` | n/a |
 | HuggingFace | {py:func}`bt.from_huggingface(ds) <batcher.from_huggingface>` | n/a |
-| PyTorch | {py:func}`bt.from_torch(ds) <batcher.from_torch>` | {py:meth}`ds.to_torch() <batcher.Dataset.to_torch>` / {py:meth}`ds.ml.to_torch_dataloader() <batcher.api.dataset.ml.DatasetML.to_torch_dataloader>` |
+| PyTorch | {py:func}`bt.from_torch(ds) <batcher.from_torch>` | {py:meth}`ds.ml.iter_torch_batches() <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` / {py:meth}`ds.ml.to_torch_dataloader() <batcher.api.dataset.ml.DatasetML.to_torch_dataloader>` |
 | TensorFlow | {py:func}`bt.from_tf(ds) <batcher.from_tf>` | {py:meth}`ds.ml.to_tf() <batcher.api.dataset.ml.DatasetML.to_tf>` |
 
-The `to_torch` and `ml.to_tf` exporters yield a re-iterable dataset of per-batch tensor
-dicts, so a multi-epoch training loop streams the query in bounded memory.
+The `ml.iter_torch_batches` and `ml.to_tf` loaders stream per-batch tensor dicts, and each
+pass runs the query again, so a multi-epoch training loop streams in bounded memory.
 
 ## See also
 

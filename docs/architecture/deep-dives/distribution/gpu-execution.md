@@ -189,7 +189,7 @@ class Classifier:
 
 # No batch_size given. Batcher picks a VRAM-safe default.
 ds = bt.read.images("s3://bucket/frames/", decode=True, size=(224, 224))
-out = ds.ml.map_batches(Classifier, num_gpus=1, batch_format="torch").collect()
+out = ds.map_batches(Classifier, num_gpus=1, batch_format="torch").collect()
 ```
 
 Batcher starts the throughput hill-climb from a VRAM-safe 256 rows, streams it with stage overlap, and self-corrects on a CUDA OOM by halving the batch. That reaches 82% utilization at 2,451 img/s on 131k images across 8xT4, matching the hand-tuned `batch_size=128` path at 2,504 img/s and 81%, with no knobs.

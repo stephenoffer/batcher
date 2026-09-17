@@ -57,7 +57,7 @@ model or does network IO.
 `ds.ml.infer` / `ds.ml.embed` / `ds.ml.generate`.
 
 **Pass a class, not an instance**, to `ds.ml.infer` / `ds.ml.embed` /
-`ds.ml.map_batches`: the model is then constructed once per worker instead of being
+`ds.map_batches`: the model is then constructed once per worker instead of being
 pickled per batch. `num_gpus=` and `concurrency=` size the GPU actor pool; batch size
 adapts under a VRAM cap rather than being a number you tune.
 

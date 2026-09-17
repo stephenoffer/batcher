@@ -45,7 +45,7 @@ def test_stats_measures_a_map_batches_pipeline():
     every performance guide. The orchestrator measures the stages itself now.
     """
     tbl = pa.table({"x": list(range(512))})
-    ds = bt.from_arrow(tbl).ml.map_batches(lambda b: b, output_columns=["x"])
+    ds = bt.from_arrow(tbl).map_batches(lambda b: b, output_columns=["x"])
     st = ds.stats()
     stages = [op for op in st.ops if op.kind == "MapBatches"]
     assert len(stages) == 1

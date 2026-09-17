@@ -44,7 +44,8 @@ def test_ml_repr_is_informative(ds: bt.Dataset) -> None:
 
 def test_ml_dir_lists_operations(ds: bt.Dataset) -> None:
     listed = dir(ds.ml)
-    assert {"infer", "embed", "map_batches", "iter_torch_batches"} <= set(listed)
+    assert {"infer", "embed", "iter_torch_batches"} <= set(listed)
+    assert "map_batches" not in listed  # the UDF verbs live on Dataset
 
 
 def test_ml_unknown_attribute_suggests(ds: bt.Dataset) -> None:
@@ -71,7 +72,8 @@ def test_ml_unknown_attribute_names_accessor(ds: bt.Dataset) -> None:
     ],
 )
 def test_signatures_carry_standard_kwargs(ds: bt.Dataset, method: str, expected: set[str]) -> None:
-    params = set(inspect.signature(getattr(ds.ml, method)).parameters)
+    owner = ds if method == "map_batches" else ds.ml
+    params = set(inspect.signature(getattr(owner, method)).parameters)
     assert expected <= params
 
 
@@ -135,22 +137,22 @@ def test_validate_batch_size_and_num_gpus() -> None:
 # ---------------------------------------------------------- actionable ML errors
 def test_map_batches_validates_batch_size(ds: bt.Dataset) -> None:
     with pytest.raises(PlanError, match="batch_size"):
-        ds.ml.map_batches(lambda b: b, batch_size=0)
+        ds.map_batches(lambda b: b, batch_size=0)
 
 
 def test_map_batches_validates_num_gpus(ds: bt.Dataset) -> None:
     with pytest.raises(PlanError, match="num_gpus"):
-        ds.ml.map_batches(lambda b: b, num_gpus=-1)
+        ds.map_batches(lambda b: b, num_gpus=-1)
 
 
 def test_bad_batch_format_suggests(ds: bt.Dataset) -> None:
     with pytest.raises(PlanError, match="numpy"):
-        ds.ml.map_batches(lambda b: b, batch_format="numpyy")
+        ds.map_batches(lambda b: b, batch_format="numpyy")
 
 
 def test_fn_constructor_kwargs_requires_class(ds: bt.Dataset) -> None:
     with pytest.raises(PlanError, match="fn_constructor_kwargs"):
-        ds.ml.map_batches(lambda b: b, fn_constructor_kwargs={"a": 1})
+        ds.map_batches(lambda b: b, fn_constructor_kwargs={"a": 1})
 
 
 def test_infer_requires_column(ds: bt.Dataset) -> None:

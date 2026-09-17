@@ -50,7 +50,7 @@ def plan_requests_accelerator(plan: LogicalPlan | None) -> bool:
             >>> ds = bt.from_pydict({"x": [1]})
             >>> plan_requests_accelerator(ds._plan)
             False
-            >>> plan_requests_accelerator(ds.ml.map_batches(lambda b: b, num_gpus=1)._plan)
+            >>> plan_requests_accelerator(ds.map_batches(lambda b: b, num_gpus=1)._plan)
             True
     """
     from batcher.plan.logical import MapBatches

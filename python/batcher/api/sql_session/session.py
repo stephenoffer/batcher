@@ -334,7 +334,7 @@ class Session:
         validate_options(name, config, table=table, per_row=per_row)
         if table and not per_row:
             # `batch_format` is a `map_batches` option; the per-row form goes through
-            # `ml.map`, which has no such thing, so injecting it there would fail the very
+            # `Dataset.map`, which has no such thing, so injecting it there would fail the very
             # validation above at the point of use rather than at the point of the mistake.
             config = {"batch_format": batch_format, **config}
         self._functions[name] = RegisteredFunction(

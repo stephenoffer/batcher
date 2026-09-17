@@ -30,7 +30,7 @@ def _ds():
 
 def test_a_plain_plan_wants_no_accelerator():
     assert plan_requests_accelerator(_ds()._plan) is False
-    assert plan_requests_accelerator(_ds().ml.map_batches(lambda b: b)._plan) is False
+    assert plan_requests_accelerator(_ds().map_batches(lambda b: b)._plan) is False
     assert plan_requests_accelerator(None) is False
 
 
@@ -50,7 +50,7 @@ def test_a_plain_plan_wants_no_accelerator():
 def test_every_request_form_counts(kwargs):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", PerformanceWarning)
-        plan = _ds().ml.map_batches(lambda b: b, **kwargs)._plan
+        plan = _ds().map_batches(lambda b: b, **kwargs)._plan
     assert plan_requests_accelerator(plan) is True
 
 
@@ -61,7 +61,7 @@ def test_a_device_stage_under_a_join_is_found():
     cluster's devices."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", PerformanceWarning)
-        right = _ds().ml.map_batches(lambda b: b, num_gpus=1, output_columns=["x", "k"])
+        right = _ds().map_batches(lambda b: b, num_gpus=1, output_columns=["x", "k"])
     joined = _ds().join(right, on="k")
 
     assert plan_requests_accelerator(joined._plan) is True
@@ -82,7 +82,7 @@ def test_the_single_node_fallback_warns_for_a_device_stage(monkeypatch, recwarn)
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", PerformanceWarning)
-        plan = _ds().ml.map_batches(lambda b: b, num_gpus=1)._plan
+        plan = _ds().map_batches(lambda b: b, num_gpus=1)._plan
 
     executor._warn_accelerator_stage_falls_back(plan, "an unsupported operator combination")
 
@@ -109,7 +109,7 @@ def test_the_fallback_stays_quiet_when_a_device_is_present_or_unreadable(monkeyp
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", PerformanceWarning)
-        plan = _ds().ml.map_batches(lambda b: b, num_gpus=1)._plan
+        plan = _ds().map_batches(lambda b: b, num_gpus=1)._plan
 
     for verdict in (True, None):
         monkeypatch.setattr(

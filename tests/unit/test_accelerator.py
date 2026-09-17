@@ -242,9 +242,9 @@ def test_gpu_feedback_key_is_accelerator_type_aware():
     def model(batch):
         return batch
 
-    a100 = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(model, accelerator_type="A100")
-    t4 = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(model, accelerator_type="T4")
-    plain = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(model)
+    a100 = bt.from_pydict({"x": [1, 2, 3]}).map_batches(model, accelerator_type="A100")
+    t4 = bt.from_pydict({"x": [1, 2, 3]}).map_batches(model, accelerator_type="T4")
+    plain = bt.from_pydict({"x": [1, 2, 3]}).map_batches(model)
 
     assert "@A100" in gpu_feedback_key(a100._plan)
     # The same UDF on a different device class gets a distinct key (no cross-class

@@ -2,7 +2,7 @@
 
 Run batch inference against an external inference server (Triton, TorchServe, or any
 columnar-JSON HTTP endpoint) instead of loading the model in-process. Each adapter is
-a load-once class UDF for {py:meth}`ds.ml.map_batches <batcher.api.dataset.ml.DatasetML.map_batches>`, so preprocessing stays on CPU workers
+a load-once class UDF for {py:meth}`ds.map_batches <batcher.Dataset.map_batches>`, so preprocessing stays on CPU workers
 while the model call goes to the server, and the stage parallelizes across the cluster.
 
 ```python
@@ -11,7 +11,7 @@ import batcher as bt
 from batcher.ml.serving import triton_client
 
 udf = triton_client("triton:8000", "resnet50", input_columns=["image"], output_columns=["logits"])
-scored = bt.read.images("s3://bucket/imgs/", decode=True, size=(224, 224)).ml.map_batches(
+scored = bt.read.images("s3://bucket/imgs/", decode=True, size=(224, 224)).map_batches(
     udf, concurrency=(2, 8)
 )
 ```
@@ -110,7 +110,7 @@ udf = serving_udf(
     input_columns=["features"],
     output_columns=["logits"],
 )
-scored = ds.ml.map_batches(udf, concurrency=(2, 8))
+scored = ds.map_batches(udf, concurrency=(2, 8))
 ```
 
 The protocol is small enough to exercise without a server. Any object with a `predict`
@@ -131,7 +131,7 @@ class LocalClient:
 
 udf = serving_udf(LocalClient, input_columns=["features"], output_columns=["score"])
 ds = bt.from_pydict({"features": [1.0, 2.0, 3.0]})
-print(ds.ml.map_batches(udf).to_pydict())
+print(ds.map_batches(udf).to_pydict())
 # {'features': [1.0, 2.0, 3.0], 'score': [2.5, 4.5, 6.5]}
 ```
 

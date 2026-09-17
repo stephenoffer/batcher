@@ -147,7 +147,7 @@ Three idioms span several names and so have no single row:
 - **Do not assume a `map_batches` `fn` runs once.** A preempted worker recomputes its
   partition, so an `fn` with an external side effect can apply it twice — make sinks
   idempotent (upsert on a stable key).
-- **Do not hand-tune GPU/batch-size knobs first.** `ds.ml.infer` / `ds.ml.map_batches`
+- **Do not hand-tune GPU/batch-size knobs first.** `ds.ml.infer` / `ds.map_batches`
   adapt batch size and `num_gpus` from measurements; set them only when a measurement
   says to.
 

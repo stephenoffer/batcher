@@ -44,7 +44,7 @@ def _optimized(plan: object) -> object:
 
 
 def test_filter_pushed_below_map_batches_on_preserved_column():
-    plan = _ds().ml.map_batches(_ident, preserves_columns=["x"]).filter(col("x") < 5)._plan
+    plan = _ds().map_batches(_ident, preserves_columns=["x"]).filter(col("x") < 5)._plan
     # The unit rule fires directly: MapBatches rises to the top, the filter sinks under it.
     out = push_filter_through_map_batches(plan, None)
     assert isinstance(out, MapBatches)
@@ -58,7 +58,7 @@ def test_filter_pushed_below_map_batches_on_preserved_column():
 def test_filter_not_pushed_when_preserves_columns_unset():
     # preserves_columns=None (the default): the fn may rewrite anything, so the filter
     # MUST stay above the UDF. This is the test that stops a wrong answer.
-    plan = _ds().ml.map_batches(_ident).filter(col("x") < 5)._plan
+    plan = _ds().map_batches(_ident).filter(col("x") < 5)._plan
     assert push_filter_through_map_batches(plan, None) is None
     opt = _optimized(plan)
     assert isinstance(opt, Filter)
@@ -68,7 +68,7 @@ def test_filter_not_pushed_when_preserves_columns_unset():
 def test_filter_not_pushed_on_undeclared_column():
     # `x` is preserved but the predicate reads `y`, which is not declared preserved:
     # the fn may have rewritten `y`, so the filter must not move.
-    plan = _ds().ml.map_batches(_ident, preserves_columns=["x"]).filter(col("y") < 30)._plan
+    plan = _ds().map_batches(_ident, preserves_columns=["x"]).filter(col("y") < 30)._plan
     assert push_filter_through_map_batches(plan, None) is None
     opt = _optimized(plan)
     assert isinstance(opt, Filter)
@@ -80,7 +80,7 @@ def test_mixed_predicate_splits_preserved_conjunct_below():
     # while the `y` conjunct stays above it.
     plan = (
         _ds()
-        .ml.map_batches(_ident, preserves_columns=["x"])
+        .map_batches(_ident, preserves_columns=["x"])
         .filter((col("x") < 5) & (col("y") < 30))
         ._plan
     )
@@ -96,7 +96,7 @@ def test_rule_is_noop_off_map_batches():
 
 
 def test_optimizer_is_idempotent_on_pushdown():
-    plan = _ds().ml.map_batches(_ident, preserves_columns=["x"]).filter(col("x") < 5)._plan
+    plan = _ds().map_batches(_ident, preserves_columns=["x"]).filter(col("x") < 5)._plan
     once = _optimized(plan)
     twice = _optimized(once)
     assert repr(once) == repr(twice)  # a second pass changes nothing
@@ -117,7 +117,7 @@ def test_large_column_dropped_above_map_batches():
     # carries the wide column.
     plan = (
         _wide_ds()
-        .ml.map_batches(_ident, input_columns=["img"])
+        .map_batches(_ident, input_columns=["img"])
         .sort("score")
         .select("id", "score")
         ._plan
@@ -138,7 +138,7 @@ def test_large_column_dropped_above_map_batches():
 def test_no_drop_when_output_column_is_consumed():
     # When the final result keeps every column, there is nothing to drop and no Project
     # is inserted above the UDF.
-    plan = _wide_ds().ml.map_batches(_ident, input_columns=["img"])._plan
+    plan = _wide_ds().map_batches(_ident, input_columns=["img"])._plan
     opt = _optimized(plan)
     assert isinstance(opt, MapBatches)  # no wrapping Project
     assert set(opt.available_columns()) == {"id", "score", "img"}
@@ -147,7 +147,7 @@ def test_no_drop_when_output_column_is_consumed():
 def test_drop_optimizer_is_idempotent():
     plan = (
         _wide_ds()
-        .ml.map_batches(_ident, input_columns=["img"])
+        .map_batches(_ident, input_columns=["img"])
         .sort("score")
         .select("id", "score")
         ._plan

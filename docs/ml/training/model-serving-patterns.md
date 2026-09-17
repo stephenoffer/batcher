@@ -49,7 +49,7 @@ Score = http_client(
     retries=3,
 )
 
-scored = bt.read.parquet("s3://bucket/rows.parquet").ml.map_batches(Score, batch_size=64)
+scored = bt.read.parquet("s3://bucket/rows.parquet").map_batches(Score, batch_size=64)
 ```
 
 :::

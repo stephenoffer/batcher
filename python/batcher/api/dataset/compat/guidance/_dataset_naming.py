@@ -8,10 +8,19 @@ display or foreign-format concern. Merged back in `_dataset_table.DATASET_UNSUPP
 
 from __future__ import annotations
 
-__all__ = ["DATASET_EXPORTERS", "DATASET_NAMING", "DATASET_RAY_DATA"]
+__all__ = ["DATASET_EXPORTERS", "DATASET_ML_MOVED", "DATASET_NAMING", "DATASET_RAY_DATA"]
 
 
 DATASET_NAMING: dict[str, str] = {
+    # Batcher's own removed second spellings.
+    "query": (
+        'Removed: filter takes the SQL predicate string itself, ds.filter("x > 1"), as well '
+        "as an expression or a callable batch predicate."
+    ),
+    "to_torch": (
+        "Removed: stream {column: tensor} batches with ds.ml.iter_torch_batches(batch_size=...), "
+        "or build a DataLoader with ds.ml.to_torch_dataloader(...)."
+    ),
     "toPandas": "Spelled ds.to_pandas() here (PEP 8 naming throughout).",
     "toArrow": "Spelled ds.to_arrow() here (PEP 8 naming throughout).",
     "toJSON": "Write JSON with ds.write.json(path), or materialize rows with ds.to_pylist().",
@@ -241,4 +250,26 @@ DATASET_RAY_DATA: dict[str, str] = {
     ),
     "deserialize_lineage": "No lineage pickling; a Dataset is already a lazy plan.",
     "has_serializable_lineage": "No lineage pickling; a Dataset is already a lazy plan.",
+}
+
+
+#: What `ds.ml` answers for the UDF verbs that moved onto `Dataset`, where they take Ray Data's
+#: whole resource parameter set. The actor-pool and GPU inference path they dispatched to is
+#: unchanged; only the spelling moved.
+DATASET_ML_MOVED: dict[str, str] = {
+    "map_batches": (
+        "Moved: spelled ds.map_batches(fn, ...) with the same options, including num_gpus, "
+        "concurrency, fn_constructor_args and batch_format."
+    ),
+    "map": "Moved: spelled ds.map(fn, ...) with the same options.",
+    "flat_map": "Moved: spelled ds.flat_map(fn, ...) with the same options.",
+    "filter": (
+        "Moved: spelled ds.filter(fn, ...). The callable is batch-level: it receives a whole "
+        "batch and returns one boolean per row, so a per-row predicate becomes "
+        "lambda batch: [pred(row) for row in batch.to_pylist()]."
+    ),
+    "to_torch": (
+        "Spelled ds.ml.iter_torch_batches(...) here, or ds.ml.to_torch_dataloader(...) for a "
+        "DataLoader."
+    ),
 }

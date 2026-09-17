@@ -96,7 +96,7 @@ def test_a_rag_pipeline_composes_end_to_end():
     )
 
     # --- rerank for diversity --------------------------------------------------------
-    reranked = hits.ml.map_batches(
+    reranked = hits.map_batches(
         mmr_rerank_udf(
             embedding_column="vecs",
             score_column="scores",
@@ -139,7 +139,7 @@ def test_a_rag_pipeline_composes_end_to_end():
         gold=bt.lit("The sky is blue because of Rayleigh scattering."),
     )
     judge = lambda: lambda prompts: ["4"] * len(prompts)  # noqa: E731 - a stub engine
-    judged = answered.ml.map_batches(
+    judged = answered.map_batches(
         llm_score_udf(judge, template="Rate 1-5: {answer}"),
         output_columns=[*answered.columns, "score"],
     )

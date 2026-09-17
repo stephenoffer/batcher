@@ -201,7 +201,8 @@ columnar operator, not a row loop.
   `bt.register_function(name, fn)` makes one callable from `bt.sql`.
 - `Dataset.map` / `flat_map` are **per-row Python** — the slow path. `ds.select(tok=
   bt.col("text").str.split(",")).explode("tok")` beats a `flat_map` by roughly 10x.
-- `ds.ml.filter(fn)` is the row-predicate escape hatch for a condition no `Expr` can say.
+- `ds.filter(fn)` is the escape hatch for a condition no `Expr` can say: `fn(batch)` returns
+  one boolean per row. `ds.filter("x > 1")` takes a SQL predicate string.
   It declares that it changes no column, so a vectorized `ds.filter` written after it is
   still pushed underneath and runs first — keep the cheap predicate in the chain.
 - A preempted worker **recomputes** its partition, so `fn` must be idempotent — move side

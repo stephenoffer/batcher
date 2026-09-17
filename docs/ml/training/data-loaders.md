@@ -63,6 +63,14 @@ one containing a sort or a global aggregate, does that first. So {py:meth}`iter_
 filter-and-project chain streams a 10 TB source in bounded memory, and over a sort it does
 not. That is a property of the plan, not of the loader.
 
+`iter_batches` also shapes the stream for a loop that wants no framework. `batch_format` converts each batch with the same conversions `map_batches` uses, `drop_last` drops a ragged final batch, `local_shuffle_buffer_size` and `local_shuffle_seed` shuffle rows within blocks of that many rows, and `prefetch_batches` prepares batches ahead on a background thread. Every one defaults to off, so the plain call above is unchanged.
+
+```python
+for batch in ds.iter_batches(4, batch_format="numpy", drop_last=True, local_shuffle_buffer_size=6, local_shuffle_seed=0):
+    print(sorted(batch["label"].tolist()), len(batch["f0"]))
+# [0, 1, 1, 1] 4
+```
+
 ## iter_torch_batches: tensors, single process
 
 It folds the tensor conversion into the stream and yields `{column: tensor}` dicts over

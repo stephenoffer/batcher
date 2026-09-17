@@ -65,7 +65,7 @@ honest bound is therefore `workers x max_errored_rows`. Every drop is published 
 observability bus with the running total and the error text, so a long job reports the loss
 while it happens rather than at the end.
 
-The row callbacks take it too. `ds.map`, `ds.flat_map`, and `ds.ml.filter` all lower to a
+The row callbacks take it too. `ds.map`, `ds.flat_map`, and a callable `ds.filter` all lower to a
 `map_batches` stage, so the same budget isolates a raising callback down to the rows that
 raised:
 

@@ -44,7 +44,7 @@ def sentence_transformer_encoder(
 ) -> type:
     """A load-once class UDF that embeds `text_column` with a sentence-transformers model.
 
-    Drops into ``ds.ml.map_batches`` / ``ds.ml.embed`` (instantiate-once-per-worker), so
+    Drops into ``ds.map_batches`` / ``ds.ml.embed`` (instantiate-once-per-worker), so
     text embedding runs **distributed and GPU-aware** — the provider-pluggable
     model-id form of ``ds.ml.embed`` (cf. Daft's ``embed_text``). Needs
     ``sentence-transformers`` (``batcher-engine[st]``).

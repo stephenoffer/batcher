@@ -296,7 +296,7 @@ def onnx_predictor(
             ...     output_columns=["logits"],
             ...     providers=["cuda"],
             ... )
-            >>> ds.ml.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
+            >>> ds.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
 
     Args:
         model_path: filesystem path to the ``.onnx`` graph.
@@ -321,7 +321,7 @@ def onnx_predictor(
             while this worker converts the next sub-batch. Results stay in input order.
 
     Returns:
-        A class for ``ds.ml.map_batches(...)`` — the session loads once per worker.
+        A class for ``ds.map_batches(...)`` — the session loads once per worker.
     """
     columns = list(input_columns)
     graph_inputs = list(input_names) if input_names is not None else None

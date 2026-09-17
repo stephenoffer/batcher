@@ -68,12 +68,12 @@ def test_gpu_batch_rows_respects_learned_cap():
 
 
 def test_learned_gpu_cap_cold_is_config_default():
-    op = bt.from_arrow(pa.table({"x": [1]})).ml.map_batches(_stage2, num_gpus=1)._plan
+    op = bt.from_arrow(pa.table({"x": [1]})).map_batches(_stage2, num_gpus=1)._plan
     assert sizing.learned_gpu_cap(op) == sizing._GPU_STREAM_BATCH_ROWS
 
 
 def test_learned_gpu_cap_seeded_caps_down():
-    op = bt.from_arrow(pa.table({"x": [1]})).ml.map_batches(_stage2, num_gpus=1)._plan
+    op = bt.from_arrow(pa.table({"x": [1]})).map_batches(_stage2, num_gpus=1)._plan
     sig = sizing.stage_sig(op)
     default_hub().put_keyed_param(scoped(sizing._GPU_BATCH_NS), sig, {"ema": 40.0})
     assert sizing.learned_gpu_cap(op) == 40  # min(config cap, learned)
@@ -118,12 +118,12 @@ def test_ema_round_trip():
 
 
 def _run_chain(t: pa.Table):
-    return bt.from_arrow(t).ml.map_batches(_stage1).ml.map_batches(_stage2, num_gpus=1).to_pydict()
+    return bt.from_arrow(t).map_batches(_stage1).map_batches(_stage2, num_gpus=1).to_pydict()
 
 
 def test_streaming_gpu_batch_size_is_result_invariant():
     t = pa.table({"x": list(range(5000))})
-    sig = sizing.stage_sig(bt.from_arrow(t).ml.map_batches(_stage2, num_gpus=1)._plan)
+    sig = sizing.stage_sig(bt.from_arrow(t).map_batches(_stage2, num_gpus=1)._plan)
 
     cold = _run_chain(t)  # config-default GPU chunk
     default_hub().put_keyed_param(

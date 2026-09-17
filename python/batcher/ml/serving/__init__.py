@@ -1,7 +1,7 @@
 """Model-serving adapters — call an external inference server from `map_batches`.
 
 Each adapter returns a load-once class UDF (instantiate-once-per-worker) for
-``ds.ml.map_batches`` / ``ds.ml.infer``, so a Batcher pipeline can run batch inference
+``ds.map_batches`` / ``ds.ml.infer``, so a Batcher pipeline can run batch inference
 against Triton, TorchServe, or any columnar-JSON HTTP endpoint while keeping the
 preprocessing on CPU and the model call on the server.
 
@@ -9,7 +9,7 @@ preprocessing on CPU and the model call on the server.
 
     udf = triton_client("triton:8000", "resnet50", input_columns=["image"],
                         output_columns=["logits"])
-    scored = ds.ml.map_batches(udf, concurrency=4)
+    scored = ds.map_batches(udf, concurrency=4)
 """
 
 from __future__ import annotations

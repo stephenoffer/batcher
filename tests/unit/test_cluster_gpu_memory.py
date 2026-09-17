@@ -154,9 +154,7 @@ def test_actor_packing_uses_the_cluster_device_not_the_drivers(monkeypatch):
     import batcher as bt
 
     plan = (
-        bt.from_pydict({"x": [1]})
-        .ml.map_batches(lambda b: b, num_gpus=1, model_memory_gb=10.0)
-        ._plan
+        bt.from_pydict({"x": [1]}).map_batches(lambda b: b, num_gpus=1, model_memory_gb=10.0)._plan
     )
     ex._map_scheduling_envelope(plan, 1, None)
     assert calls == [16.0]  # the T4 worker, not the A100 driver
@@ -179,9 +177,7 @@ def test_packing_falls_back_to_the_local_device_off_cluster(monkeypatch):
     import batcher as bt
 
     plan = (
-        bt.from_pydict({"x": [1]})
-        .ml.map_batches(lambda b: b, num_gpus=1, model_memory_gb=10.0)
-        ._plan
+        bt.from_pydict({"x": [1]}).map_batches(lambda b: b, num_gpus=1, model_memory_gb=10.0)._plan
     )
     ex._map_scheduling_envelope(plan, 1, None)
     assert calls == [24.0]

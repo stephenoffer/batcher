@@ -80,7 +80,7 @@ A few familiar names are real methods, listed here with what they do:
 
 | You type | What it does |
 |---|---|
-| {py:meth}`ds.query("x > 2") <batcher.Dataset.query>` | the same filter as {py:meth}`ds.filter(bt.col("x") > 2) <batcher.Dataset.filter>` |
+| {py:meth}`ds.filter("x > 2") <batcher.Dataset.filter>` | the same filter as `ds.filter(bt.col("x") > 2)`, from a SQL predicate string, as pandas `query` and Daft `filter` take it |
 | {py:meth}`ds.first() <batcher.Dataset.first>` / {py:meth}`ds.last() <batcher.Dataset.last>` / {py:meth}`ds.item() <batcher.Dataset.item>` | terminal row accessors |
 | {py:obj}`ds.width <batcher.Dataset.width>` | `len(ds.columns)` |
 | {py:meth}`ds.info() <batcher.Dataset.info>` / {py:meth}`ds.glimpse() <batcher.Dataset.glimpse>` / {py:meth}`ds.memory_usage() <batcher.Dataset.memory_usage>` | schema-and-count summaries |

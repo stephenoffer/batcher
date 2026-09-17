@@ -4,7 +4,7 @@ Two surfaces take ``**config`` and hand it to `map_batches` (or, for a per-row c
 `map`): the `@udf` decorator and `register_function`. A catch-all is the right shape for them
 — the option set belongs to `map_batches`, not to each wrapper — but it moves every mistake to
 the point of *use*. A misspelled `output_column` on a decorator surfaced as
-``TypeError: DatasetML.map_batches() got an unexpected keyword argument``, raised from a method
+``TypeError: map_batches() got an unexpected keyword argument``, raised from a method
 the user never called, at whatever line finally applied the transform.
 
 So the check happens where the option was written, names the surface the user actually used,
@@ -23,9 +23,9 @@ def _parameters(*, per_row: bool) -> set[str]:
     """The keyword-only parameters of the method the options are forwarded to."""
     import inspect
 
-    from batcher.api.dataset.ml import DatasetML
+    from batcher.api.dataset.frame import Dataset
 
-    method = DatasetML.map if per_row else DatasetML.map_batches
+    method = Dataset.map if per_row else Dataset.map_batches
     return {
         name
         for name, p in inspect.signature(method).parameters.items()
