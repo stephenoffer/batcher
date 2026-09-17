@@ -15,7 +15,7 @@ use arrow::row::{RowConverter, SortField};
 use rayon::prelude::*;
 
 use crate::error::RuntimeError;
-use crate::window::{window_serial, WindowCall};
+use crate::window::{window_serial, RankLimited, WindowCall};
 
 /// Bucket-parallel window: hash-partition rows by `partition_keys` into `nbuckets`
 /// (equal keys together), run [`window_serial`] on each bucket across cores, and
@@ -30,6 +30,102 @@ pub(crate) fn window_parallel(
     nbuckets: usize,
     rank_limit: Option<usize>,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
+    let Some((buckets, per_bucket)) = run_buckets(
+        partition_keys,
+        order_keys,
+        funcs,
+        num_rows,
+        nbuckets,
+        rank_limit,
+    )?
+    else {
+        return window_serial(partition_keys, order_keys, funcs, num_rows, rank_limit);
+    };
+
+    // Scatter each function's per-bucket results back to original row order. For the
+    // primitive output types (every window function here yields Int64 or Float64) this is
+    // a cache-blocked parallel scatter ([`scatter_blocked`], the dominant window cost done
+    // right); other output types fall back to a concat + inverse-permutation gather.
+    (0..funcs.len())
+        .map(|f| {
+            let cols: Vec<&ArrayRef> = per_bucket.iter().map(|b| &b[f]).collect();
+            match cols[0].data_type() {
+                DataType::Int64 => scatter_blocked::<Int64Type>(&cols, &buckets, num_rows),
+                DataType::Float64 => scatter_blocked::<Float64Type>(&cols, &buckets, num_rows),
+                _ => scatter_by_gather(&cols, &buckets, num_rows),
+            }
+        })
+        .collect()
+}
+
+/// [`window_parallel`] for a fused `rank <= k`, returning only the surviving rows.
+///
+/// The buckets run exactly as there. Rather than scattering every row's result back into input
+/// order, each bucket keeps its survivors (named by their input row), and the survivors of all
+/// buckets are then ordered by input row once. See [`crate::window::window_with_rank_limit`].
+pub(crate) fn window_parallel_rank_limited(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+    nbuckets: usize,
+    rank_limit: usize,
+) -> Result<RankLimited, RuntimeError> {
+    let Some((buckets, per_bucket)) = run_buckets(
+        partition_keys,
+        order_keys,
+        funcs,
+        num_rows,
+        nbuckets,
+        Some(rank_limit),
+    )?
+    else {
+        let columns = window_serial(
+            partition_keys,
+            order_keys,
+            funcs,
+            num_rows,
+            Some(rank_limit),
+        )?;
+        return RankLimited::keep(columns, rank_limit, |i| i);
+    };
+    let kept: Vec<RankLimited> = per_bucket
+        .into_par_iter()
+        .zip(buckets.par_iter())
+        .map(|(columns, rows)| RankLimited::keep(columns, rank_limit, |p| rows[p as usize]))
+        .collect::<Result<_, _>>()?;
+
+    let rows: Vec<u32> = kept.iter().flat_map(|k| k.rows.iter().copied()).collect();
+    let mut order: Vec<u32> = (0..rows.len() as u32).collect();
+    order.par_sort_unstable_by_key(|&i| rows[i as usize]);
+    let order = UInt32Array::from(order);
+    let columns = (0..funcs.len())
+        .map(|f| -> Result<ArrayRef, RuntimeError> {
+            let parts: Vec<&dyn Array> = kept.iter().map(|k| k.columns[f].as_ref()).collect();
+            let merged = arrow::compute::concat(&parts)?;
+            Ok(take(merged.as_ref(), &order, None)?)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(RankLimited {
+        rows: order.values().iter().map(|&i| rows[i as usize]).collect(),
+        columns,
+    })
+}
+
+/// Hash-partition the rows into buckets and run [`window_serial`] over each, across cores.
+///
+/// Returns each bucket's input rows (ascending) and its results in bucket-local order, or
+/// `None` when one bucket holds most rows, where the partition/gather/scatter plumbing is pure
+/// overhead over the serial kernel and the caller should run that instead.
+#[allow(clippy::type_complexity)]
+fn run_buckets(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+    nbuckets: usize,
+    rank_limit: Option<usize>,
+) -> Result<Option<(Vec<Vec<u32>>, Vec<Vec<ArrayRef>>)>, RuntimeError> {
     let buckets = partition_row_indices(partition_keys, num_rows, nbuckets)?;
 
     // Load-balance guard for the pathological case: when a *single* partition holds
@@ -40,7 +136,7 @@ pub(crate) fn window_parallel(
     // dominates — otherwise stay on the parallel path.
     let max_bucket = buckets.iter().map(Vec::len).max().unwrap_or(0);
     if max_bucket > num_rows / 2 {
-        return window_serial(partition_keys, order_keys, funcs, num_rows, rank_limit);
+        return Ok(None);
     }
 
     // Each bucket gathers its rows' keys/order/values and runs the serial kernel over
@@ -73,21 +169,7 @@ pub(crate) fn window_parallel(
             window_serial(&bk, &bo, &bc, idx.len(), rank_limit)
         })
         .collect::<Result<_, _>>()?;
-
-    // Scatter each function's per-bucket results back to original row order. For the
-    // primitive output types (every window function here yields Int64 or Float64) this is
-    // a cache-blocked parallel scatter ([`scatter_blocked`], the dominant window cost done
-    // right); other output types fall back to a concat + inverse-permutation gather.
-    (0..funcs.len())
-        .map(|f| {
-            let cols: Vec<&ArrayRef> = per_bucket.iter().map(|b| &b[f]).collect();
-            match cols[0].data_type() {
-                DataType::Int64 => scatter_blocked::<Int64Type>(&cols, &buckets, num_rows),
-                DataType::Float64 => scatter_blocked::<Float64Type>(&cols, &buckets, num_rows),
-                _ => scatter_by_gather(&cols, &buckets, num_rows),
-            }
-        })
-        .collect()
+    Ok(Some((buckets, per_bucket)))
 }
 
 /// Cache-blocked parallel scatter of the per-bucket result columns back to original row
@@ -318,6 +400,74 @@ mod tests {
                 nulls_first: false,
             },
         )
+    }
+
+    /// The survivors of a rank-limited window are exactly the rows, in the order, that masking
+    /// the full window by `rank <= k` keeps, with the same values — across ranking functions
+    /// with ties, null partition keys, a trailing value function, every `k`, the parallel
+    /// buckets, the serial path, and the one-dominant-partition fallback.
+    #[test]
+    fn rank_limited_equals_masking_the_full_window() {
+        use crate::window::window_with_rank_limit;
+        let call = |func, values: Option<ArrayRef>| WindowCall {
+            func,
+            values,
+            offset: 1,
+            frame: None,
+            alpha: None,
+            half_life: None,
+            ignore_nulls: false,
+        };
+        let n = 3_000usize;
+        let spread: ArrayRef = Arc::new(Int64Array::from(
+            (0..n as i64)
+                .map(|i| (i % 97 != 5).then_some(i % 41))
+                .collect::<Vec<_>>(),
+        ));
+        let dominant = i64s(
+            &(0..n as i64)
+                .map(|i| i64::from(i % 10 == 0))
+                .collect::<Vec<_>>(),
+        );
+        let ord: ArrayRef = Arc::new(Int64Array::from(
+            (0..n as i64).map(|i| (i * 31 + 7) % 23).collect::<Vec<_>>(),
+        ));
+        let vals = i64s(&(0..n as i64).collect::<Vec<_>>());
+        let descending = (
+            ord,
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        );
+        for part in [spread, dominant] {
+            for func in [WindowFn::RowNumber, WindowFn::Rank, WindowFn::DenseRank] {
+                let funcs = [call(func, None), call(WindowFn::Sum, Some(vals.clone()))];
+                for k in [1, 2, 5, 10_000] {
+                    for threshold in [1, usize::MAX] {
+                        let pk = std::slice::from_ref(&part);
+                        let order = std::slice::from_ref(&descending);
+                        let full = window_with(pk, order, &funcs, n, threshold, Some(k)).unwrap();
+                        let rank = full[0].as_any().downcast_ref::<Int64Array>().unwrap();
+                        let mask = BooleanArray::from(
+                            (0..n)
+                                .map(|i| rank.is_valid(i) && rank.value(i) <= k as i64)
+                                .collect::<Vec<_>>(),
+                        );
+                        let kept =
+                            window_with_rank_limit(pk, order, &funcs, n, threshold, k).unwrap();
+                        let expect_rows: Vec<u32> =
+                            (0..n as u32).filter(|&i| mask.value(i as usize)).collect();
+                        let what = format!("{func:?} k={k} threshold={threshold}");
+                        assert_eq!(kept.rows, expect_rows, "{what}");
+                        for (got, all) in kept.columns.iter().zip(&full) {
+                            let want = arrow::compute::filter(all.as_ref(), &mask).unwrap();
+                            assert_eq!(got.as_ref(), want.as_ref(), "{what}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The parallel scatter for NON-primitive outputs (`scatter_by_gather`) must equal the

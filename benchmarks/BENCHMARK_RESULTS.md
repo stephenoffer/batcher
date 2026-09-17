@@ -29033,3 +29033,34 @@ as one pre-materialized batch took 17 ms. A window that concatenates only the co
 built and measured as well; it removed the concatenation and returned the 408 batches unmerged,
 costing more at the boundary than it saved, and was not kept.
 
+### A rank-limited window returns its survivors instead of ranking every row
+
+Same box, an in-memory 10M-row H2O-shaped table (`id6` over 100,000 values, `id4` over 100, a
+float `v3`) and TPC-H sf1 `lineitem`, SQL through `bt.sql`, best of 5 per case, four rounds with
+the build order alternated. Both builds are commit `dcd705bb`; the second adds
+`bc_runtime::window::window_with_rank_limit`. Load average 35-70 on 48 cores, so ranges, not
+points:
+
+| case | before | after |
+|---|---:|---:|
+| `row_number() ... <= 2` by `id6` (H2O q8's shape) | 121-252 ms | **63-68 ms** |
+| `row_number() ... <= 2` by `id4` | 126-143 ms | **50-88 ms** |
+| `row_number() ... <= 10` by `id6` | 142-182 ms | 84-158 ms |
+| `rank() ... <= 3` per `l_suppkey`, all 16 `lineitem` columns | 306-657 ms | 253-444 ms |
+| control: `row_number()` with no limit, summed | 530-858 ms | 431-576 ms |
+| control: `sum(v3) OVER (PARTITION BY id6)`, summed | 67-426 ms | 60-80 ms |
+
+The controls take no new code and moved only within the load's spread. `perf` on the q8 shape
+before the change put 21 % in `scatter_blocked`, writing a rank for all 10M rows back into input
+order so a mask could keep 200,000 of them; the new path keeps each bucket's survivors and orders
+those once. Rows, order and values are those of the mask by construction, and
+`rank_limited_equals_masking_the_full_window` holds the two forms equal across `row_number`,
+`rank` and `dense_rank` with ties, null keys, every `k`, both paths and the serial fallback.
+
+`test_diff_qualify_topn_parallel.py` (46 cases at 200,000 rows, above the parallel threshold)
+passes on both builds, as do the window, qualify, distinct, rank, limit and operator-matrix
+differential suites (4,878 tests) on the new one. Writing it found a DuckDB defect rather than a
+Batcher one: on DuckDB 1.5.5, `row_number() ... <= 2` over a float order key holding NaN returned
+wrong rows for ~25 of 5,000 partitions (for one, -26 and NaN where the two smallest values are -90
+and -77); Batcher's answer matched a ground truth computed in the test.
+

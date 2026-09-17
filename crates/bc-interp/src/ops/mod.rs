@@ -1558,10 +1558,23 @@ pub(crate) fn window_batch_with(
         });
     }
 
-    // `rank_limit` goes *down* to the per-bucket kernel rather than being applied here: the
-    // bounded top-N it enables must inherit `window_with`'s parallelism, not replace it. The
-    // mask below still runs — the bounded path marks a non-survivor `k + 1` — so this is a
-    // pure short-circuit and the filter stays the one place the bound is enforced.
+    // A fused `QUALIFY <rank> <= k` asks only for the rows it keeps, so gather those rather
+    // than computing every row's result and masking all but `k` per partition away. The
+    // survivors come back in input order, so this is the same batch the mask produced.
+    if let Some(k) = rank_limit {
+        let kept = window::window_with_rank_limit(
+            &part_arrays,
+            &order_arrays,
+            &calls,
+            num_rows,
+            parallel_row_threshold,
+            k,
+        )?;
+        let rows = arrow::array::UInt32Array::from(kept.rows);
+        let taken = arrow::compute::take_record_batch(batch, &rows)?;
+        return append_window_columns(&taken, functions, &kept.columns);
+    }
+
     let cols = window::window_with(
         &part_arrays,
         &order_arrays,
@@ -1571,52 +1584,30 @@ pub(crate) fn window_batch_with(
         rank_limit,
     )?;
 
-    // input columns + one appended column per function alias.
-    let in_schema = batch.schema();
-    let mut fields: Vec<Field> = in_schema
+    append_window_columns(batch, functions, &cols)
+}
+
+/// `batch` with one column appended per window function, named by its alias.
+fn append_window_columns(
+    batch: &RecordBatch,
+    functions: &[WindowFunc],
+    cols: &[ArrayRef],
+) -> Result<RecordBatch, InterpError> {
+    let mut fields: Vec<Field> = batch
+        .schema()
         .fields()
         .iter()
         .map(|f| f.as_ref().clone())
         .collect();
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    for (f, col) in functions.iter().zip(&cols) {
+    for (f, col) in functions.iter().zip(cols) {
         fields.push(Field::new(&f.alias, col.data_type().clone(), true));
         columns.push(col.clone());
     }
-    let out = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-    // Fused `QUALIFY <rank> <= k`: keep only rows whose ranking value is within the
-    // limit. The optimizer sets `rank_limit` only for a single ranking function, so
-    // the bound applies to the first appended column (`cols[0]`). This is exactly
-    // `Filter(Window, rank <= k)` — but fused, so the full windowed batch is never
-    // emitted downstream and the separate filter is gone.
-    match (rank_limit, cols.first()) {
-        (Some(k), Some(rank_col)) => Ok(filter_by_rank_limit(&out, rank_col, k)?),
-        _ => Ok(out),
-    }
-}
-
-/// Keep rows of `batch` whose `rank_col` value is `<= limit` (a fused per-partition
-/// top-N). `rank_col` is a ranking output (`row_number`/`rank`/`dense_rank`), whose
-/// per-partition values start at 1, so a global `<= limit` mask selects the top rows
-/// of every partition at once.
-fn filter_by_rank_limit(
-    batch: &RecordBatch,
-    rank_col: &ArrayRef,
-    limit: usize,
-) -> Result<RecordBatch, InterpError> {
-    use arrow::array::Int64Array;
-    use arrow::compute::filter_record_batch;
-
-    let ranks = rank_col
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("ranking window functions (row_number/rank/dense_rank) produce Int64 output");
-    let limit = limit as i64;
-    let mask: BooleanArray = ranks
-        .iter()
-        .map(|v| Some(v.is_some_and(|r| r <= limit)))
-        .collect();
-    Ok(filter_record_batch(batch, &mask)?)
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 fn map_window_func(f: WindowFn) -> window::WindowFn {

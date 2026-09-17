@@ -302,6 +302,33 @@ pub fn window_with(
     let canon_order = crate::keys::canonicalize_float_order_keys(order_keys);
     let order_keys: &[(ArrayRef, SortOptions)] = canon_order.as_deref().unwrap_or(order_keys);
 
+    match parallel_buckets(
+        partition_keys,
+        order_keys,
+        funcs,
+        num_rows,
+        parallel_row_threshold,
+    ) {
+        Some(nbuckets) => crate::window::parallel::window_parallel(
+            partition_keys,
+            order_keys,
+            funcs,
+            num_rows,
+            nbuckets,
+            rank_limit,
+        ),
+        None => window_serial(partition_keys, order_keys, funcs, num_rows, rank_limit),
+    }
+}
+
+/// How many hash buckets [`window_with`] spreads this window over, or `None` to run it serially.
+fn parallel_buckets(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+    parallel_row_threshold: usize,
+) -> Option<usize> {
     let nthreads = rayon::current_num_threads();
     let frameless_agg = order_keys.is_empty()
         && funcs
@@ -311,17 +338,98 @@ pub fn window_with(
         && (!order_keys.is_empty() || frameless_agg)
         && num_rows >= parallel_row_threshold
         && nthreads > 1;
-    if !worth_parallel {
-        return window_serial(partition_keys, order_keys, funcs, num_rows, rank_limit);
-    }
-    crate::window::parallel::window_parallel(
+    worth_parallel.then_some(nthreads)
+}
+
+/// The rows a window with a fused `rank <= k` keeps, and each function's value at them.
+///
+/// [`window_with`] answers the same question for every row, and its caller then masks all but
+/// the survivors away. Where `k` rows of each partition survive out of many, that is most of the
+/// work: on the H2O `groupby` q8 shape (10M rows, 100,000 partitions, `k = 2`) the parallel path
+/// scattered a rank for all 10M rows back into input order so a mask could keep 200,000 of them.
+/// This keeps only the survivors of each bucket and orders them by their input row once.
+///
+/// `rows` is ascending, so a gather by it yields exactly the rows, and the order, that masking
+/// [`window_with`]'s output by `rank <= k` does; `columns[f]` holds function `f`'s values at those
+/// rows. The bound applies to the first function, as it does for that mask.
+pub fn window_with_rank_limit(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+    parallel_row_threshold: usize,
+    rank_limit: usize,
+) -> Result<RankLimited, RuntimeError> {
+    // The same key canonicalization `window_with` applies, for the same reasons given there.
+    let canon = crate::keys::canonicalize_float_keys(partition_keys);
+    let partition_keys: &[ArrayRef] = canon.as_deref().unwrap_or(partition_keys);
+    let canon_order = crate::keys::canonicalize_float_order_keys(order_keys);
+    let order_keys: &[(ArrayRef, SortOptions)] = canon_order.as_deref().unwrap_or(order_keys);
+    match parallel_buckets(
         partition_keys,
         order_keys,
         funcs,
         num_rows,
-        nthreads,
-        rank_limit,
-    )
+        parallel_row_threshold,
+    ) {
+        Some(nbuckets) => crate::window::parallel::window_parallel_rank_limited(
+            partition_keys,
+            order_keys,
+            funcs,
+            num_rows,
+            nbuckets,
+            rank_limit,
+        ),
+        None => {
+            let columns = window_serial(
+                partition_keys,
+                order_keys,
+                funcs,
+                num_rows,
+                Some(rank_limit),
+            )?;
+            RankLimited::keep(columns, rank_limit, |i| i)
+        }
+    }
+}
+
+/// The survivors of a rank-limited window: see [`window_with_rank_limit`].
+pub struct RankLimited {
+    /// Input row of each survivor, ascending.
+    pub rows: Vec<u32>,
+    /// Each window function's value at `rows`.
+    pub columns: Vec<ArrayRef>,
+}
+
+impl RankLimited {
+    /// Keep the rows of `columns` whose first column is `<= limit`, naming each by `row_of`.
+    pub(crate) fn keep(
+        columns: Vec<ArrayRef>,
+        limit: usize,
+        row_of: impl Fn(u32) -> u32,
+    ) -> Result<Self, RuntimeError> {
+        let Some(rank) = columns.first() else {
+            return Ok(Self {
+                rows: Vec::new(),
+                columns,
+            });
+        };
+        let rank = rank.as_primitive::<Int64Type>();
+        let limit = limit as i64;
+        let positions: Vec<u32> = (0..rank.len())
+            .filter(|&i| rank.is_valid(i) && rank.value(i) <= limit)
+            .map(|i| i as u32)
+            .collect();
+        let idx = UInt32Array::from(positions);
+        let kept = columns
+            .iter()
+            .map(|c| take(c.as_ref(), &idx, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            rows: idx.values().iter().map(|&p| row_of(p)).collect(),
+            columns: kept,
+        })
+    }
 }
 
 pub(crate) fn window_serial(

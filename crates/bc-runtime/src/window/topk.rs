@@ -4,7 +4,7 @@
 //! reading per sensor" — is one of the shapes analytics is made of, and the plan Batcher builds
 //! for it computes far more than it keeps. Kyber's `qualify_to_partition_topn` folds the bound
 //! into `Window.rank_limit`, but that bound is applied as a **mask**: [`super::window_with`]
-//! ranks every row, which means ordering every partition, and `filter_by_rank_limit` then throws
+//! ranks every row, which means ordering every partition, and a `rank <= k` mask then throws
 //! all but `k` of them away. Only `k = 1` escapes, by a rewrite onto `DISTINCT ON`.
 //!
 //! Ordering a partition to keep two of its rows is the wrong algorithm, and the competitors say
@@ -257,7 +257,7 @@ mod tests {
         )
         .unwrap();
         let a = cols[0].as_any().downcast_ref::<Int64Array>().unwrap();
-        // Mask exactly as `bc_interp`'s `filter_by_rank_limit` does. The bounded path already
+        // Mask exactly as `RankLimited::keep` does. The bounded path already
         // marks a non-survivor `k + 1`, and a *declining* shape falls through to the ordering
         // path and returns its full ranks — the mask is what makes the two comparable, and it
         // is the operator's real contract: the rows kept, and their ranks, must agree.
