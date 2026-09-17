@@ -26,7 +26,7 @@ arrays_overlap = { status = "gap", need = "Python constructor over the existing 
 arrays_zip = { status = "gap", need = "zip arrays into an array of structs", wave = "W3" }
 cardinality = { status = "canonical", batcher = ["Expr.list.len", "Expr.map.len"] }
 create_map = { status = "gap", need = "map from alternating key/value expressions", wave = "W4" }
-element_at = { status = "mismatch", batcher = ["Expr.list.get", "Expr.map.get"], note = "Spark element_at is 1-based with negative indexes counting from the end (and a key lookup on maps); Expr.list.get is 0-based. Codemod subtracts 1 for positive literals", wave = "W0" }
+element_at = { status = "mismatch", batcher = ["Expr.list.get", "Expr.map.get"], note = "Spark element_at is 1-based with negative indexes counting from the end (and a key lookup on maps); Expr.list.get is 0-based. Subtract 1 for positive literals", wave = "W0" }
 exists = { status = "gap", need = "higher-order function with a Python lambda over array elements (any element matches)", wave = "W4" }
 explode = { status = "param", batcher = "Dataset.explode", need = "generator usable inside select, and map input producing key/value columns", wave = "W8" }
 explode_outer = { status = "param", batcher = "Dataset.explode", need = "generator usable inside select, and map input producing key/value columns", wave = "W8" }
@@ -67,7 +67,7 @@ schema_of_xml = { status = "gap", need = "infer a DDL schema from an XML string"
 sequence = { status = "param", batcher = "bt.sequence", need = "date and timestamp sequences with an interval step", wave = "W6" }
 shuffle = { status = "gap", need = "random permutation of an array with seed", wave = "W3" }
 size = { status = "canonical", batcher = ["Expr.list.len", "Expr.map.len"] }
-slice = { status = "mismatch", batcher = "Expr.list.slice", note = "Spark slice is 1-based with negative starts counting from the end; Expr.list.slice is 0-based. Codemod subtracts 1 for positive literal starts", wave = "W0" }
+slice = { status = "mismatch", batcher = "Expr.list.slice", note = "Spark slice is 1-based with negative starts counting from the end; Expr.list.slice is 0-based. Subtract 1 for positive literal starts", wave = "W0" }
 sort_array = { status = "mismatch", batcher = "Expr.list.sort", note = "Spark sort_array ascending puts nulls first (descending puts them last); Expr.list.sort puts nulls last. Needs nulls_first= and descending=", wave = "W0" }
 stack = { status = "gap", need = "stack(n, ...) generator separating columns into rows", wave = "W8" }
 str_to_map = { status = "gap", need = "split a delimited string into a map", wave = "W4" }

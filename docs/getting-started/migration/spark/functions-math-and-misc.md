@@ -97,7 +97,7 @@ The following table maps the 66 names on the `pyspark.sql.functions` module, sor
 | `arrow_udf` | `Dataset.map_batches` | param | Missing: Arrow UDF usable as a column expression (column in, column out) with returnType=. Wave W11. |
 | `arrow_udtf` | n/a | gap | Not yet: Python UDTF protocol: Arrow-batched UDTF. Wave W11. |
 | `ArrowUDFType` | n/a | gap | Not yet: Arrow UDF eval types (scalar, scalar-iterator, grouped-agg) as expressions. Wave W11. |
-| `asc` | `Dataset.sort` | mismatch | Differs: Spark asc(col) sorts nulls first; Batcher ascending sorts nulls last. Codemod passes nulls\_first=True. Wave W0. |
+| `asc` | `Dataset.sort` | mismatch | Differs: Spark asc(col) sorts nulls first; Batcher ascending sorts nulls last. Pass nulls\_first=True. Wave W0. |
 | `asc_nulls_first` | `Dataset.sort` | canonical |  |
 | `asc_nulls_last` | `Dataset.sort` | canonical |  |
 | `assert_true` | n/a | gap | Not yet: raise when a condition is false. Wave W3. |

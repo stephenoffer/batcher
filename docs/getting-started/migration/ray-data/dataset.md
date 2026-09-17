@@ -19,14 +19,14 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
 | `add_column` | `Dataset.map_batches` | mismatch | Differs: Ray add\_column(col, fn) hands fn a pandas batch (batch\_format='pandas' default) and appends its result as `col`. Batcher: map\_batches(fn, batch\_format='pandas') returning the batch with the column added, or with\_columns when the column is an expression. Wave WF. |
-| `aggregate` | `Dataset.agg` | mismatch | Differs: Ray aggregate(\*AggregateFn) is eager and returns a scalar or a dict keyed 'sum(x)'. Batcher agg is lazy and returns a one-row Dataset with alias-named columns. Codemod: .agg(...).to\_pylist()\[0\] with aliases 'sum(x)'. Wave W0. |
-| `columns` | `Dataset.columns` | mismatch | Differs: Ray columns() is a method (fetch\_if\_missing=True may execute); Batcher columns is a property. Codemod drops the call parentheses. Wave W0. |
+| `aggregate` | `Dataset.agg` | mismatch | Differs: Ray aggregate(\*AggregateFn) is eager and returns a scalar or a dict keyed 'sum(x)'. Batcher agg is lazy and returns a one-row Dataset with alias-named columns. Port as: .agg(...).to\_pylist()\[0\] with aliases 'sum(x)'. Wave W0. |
+| `columns` | `Dataset.columns` | mismatch | Differs: Ray columns() is a method (fetch\_if\_missing=True may execute); Batcher columns is a property. Drop the call parentheses. Wave W0. |
 | `context` | `bt.active_config` | mismatch | Differs: Ray returns the DataContext captured by this Dataset; Batcher configuration is process/context scoped (active\_config, config\_context), not carried per Dataset. Wave W9. |
 | `copy` | `Dataset` | canonical |  |
 | `count` | `Dataset.count` | canonical |  |
 | `deserialize_lineage` | n/a | out of scope | Declined: lineage serialization of object-store block refs for Ray fault tolerance; a Batcher plan is rebuilt from its JSON IR and sources. |
 | `drop_columns` | `Dataset.drop` | canonical |  |
-| `explain` | `Dataset.explain` | mismatch | Differs: Ray explain() prints the logical and physical plans and returns None; Batcher returns the rendered plan string. Codemod: print(ds.explain()). Wave W0. |
+| `explain` | `Dataset.explain` | mismatch | Differs: Ray explain() prints the logical and physical plans and returns None; Batcher returns the rendered plan string. Port as: print(ds.explain()). Wave W0. |
 | `filter` | `Dataset.filter` | param | Missing: callable row predicate fn (today only in ds.ml.filter), expr= as a SQL string (today Dataset.query), fn\_args/fn\_kwargs/fn\_constructor\_args/fn\_constructor\_kwargs, num\_gpus, num\_cpus, memory, compute (ActorPoolStrategy/TaskPoolStrategy), 3-tuple concurrency (min, max, initial), ray\_remote\_args, ray\_remote\_args\_fn. Dataset.filter(expr=Expr) already matches; the callable and SQL-string forms need the consolidation. Wave WF. |
 | `flat_map` | `Dataset.flat_map` | param | Missing: fn\_args/fn\_kwargs/fn\_constructor\_args/fn\_constructor\_kwargs, num\_gpus, num\_cpus, memory, compute (ActorPoolStrategy/TaskPoolStrategy), 3-tuple concurrency (min, max, initial), ray\_remote\_args, ray\_remote\_args\_fn. Wave WF. |
 | `get_dataset_id` | n/a | out of scope | Declined: Ray execution-internal dataset id used to tag metrics and logs; Batcher has no per-Dataset registration. |
@@ -35,19 +35,19 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `groupby` | `Dataset.group_by` | alias |  |
 | `has_serializable_lineage` | n/a | out of scope | Declined: lineage serialization of object-store block refs for Ray fault tolerance; a Batcher plan is rebuilt from its JSON IR and sources. |
 | `input_files` | n/a | gap | Not yet: list the source files a Dataset reads. Wave W8. |
-| `iter_batches` | `Dataset.iter_batches` + `Dataset.ml.to_numpy_batches` | mismatch | Differs: Ray iter\_batches defaults to batch\_format='default' (\{col: ndarray\}, nulls become NaN) and batch\_size=256; Batcher iter\_batches yields pyarrow RecordBatches of engine size and has no batch\_format. Codemod today: ds.ml.to\_numpy\_batches(batch\_size=256). Missing on iter\_batches: batch\_format=, drop\_last=, local\_shuffle\_buffer\_size=/local\_shuffle\_seed=, prefetch\_batches=. Wave W2. |
+| `iter_batches` | `Dataset.iter_batches` + `Dataset.ml.to_numpy_batches` | mismatch | Differs: Ray iter\_batches defaults to batch\_format='default' (\{col: ndarray\}, nulls become NaN) and batch\_size=256; Batcher iter\_batches yields pyarrow RecordBatches of engine size and has no batch\_format. Port as: ds.ml.to\_numpy\_batches(batch\_size=256). Missing on iter\_batches: batch\_format=, drop\_last=, local\_shuffle\_buffer\_size=/local\_shuffle\_seed=, prefetch\_batches=. Wave W2. |
 | `iter_internal_ref_bundles` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
 | `iter_jax_batches` | n/a | gap | Not yet: streaming iterator of JAX array batches (Batcher has only eager Dataset.to\_jax). Wave W8. |
 | `iter_rows` | `Dataset.iter_rows` | mismatch | Differs: Ray yields dict rows; Batcher yields tuples by default. Codemod: iter\_rows(named=True). Wave W0. |
 | `iter_tf_batches` | `Dataset.ml.to_tf` | mismatch | Differs: Ray returns an iterator of TensorFlow tensor batches (batch\_size=256); Batcher ds.ml.to\_tf returns a tf.data.Dataset of \{column: tensor\} batches. Pass batch\_size=256. Wave W8. |
-| `iter_torch_batches` | `Dataset.ml.iter_torch_batches` | mismatch | Differs: Ray defaults batch\_size=256 and prefetch\_batches=1; Batcher defaults batch\_size=None (engine morsel size) and prefetch\_batches=2, and lives on ds.ml. Codemod passes batch\_size=256, prefetch\_batches=1. Wave W0. |
+| `iter_torch_batches` | `Dataset.ml.iter_torch_batches` | mismatch | Differs: Ray defaults batch\_size=256 and prefetch\_batches=1; Batcher defaults batch\_size=None (engine morsel size) and prefetch\_batches=2, and lives on ds.ml. Pass batch\_size=256, prefetch\_batches=1. Wave W0. |
 | `iterator` | n/a | gap | Not yet: DataIterator object returned from a Dataset (shared iterator with state\_dict, iter\_\* methods). Wave W8. |
 | `join` | `Dataset.join` | param | Missing: left\_suffix=, right\_semi/right\_anti join types, Ray join\_type spellings (left\_outer/right\_outer/full\_outer/left\_semi/left\_anti map to how=left/right/full/semi/anti), num\_partitions/partition\_size\_hint/aggregator\_ray\_remote\_args. Ray raises when non-key columns overlap without suffixes; Batcher applies suffix='\_right'. Batcher puts the key columns first; Ray keeps left column order then right. Wave W2. |
 | `limit` | `Dataset.limit` | canonical |  |
 | `map` | `Dataset.map` | param | Missing: fn\_args/fn\_kwargs/fn\_constructor\_args/fn\_constructor\_kwargs (callable-class fn), num\_gpus, num\_cpus, memory, compute (ActorPoolStrategy/TaskPoolStrategy), 3-tuple concurrency (min, max, initial), ray\_remote\_args, ray\_remote\_args\_fn. Wave WF. |
 | `map_batches` | `Dataset.map_batches` | mismatch | Differs: Ray defaults batch\_format='default' (\{col: ndarray\}) and batch\_size=None/'auto'; Batcher defaults batch\_format='pyarrow'. Codemod passes batch\_format='numpy'. Also missing: num\_cpus, memory, compute (ActorPoolStrategy/TaskPoolStrategy), 3-tuple concurrency (min, max, initial), ray\_remote\_args, ray\_remote\_args\_fn, zero\_copy\_batch, udf\_modifying\_row\_count. Wave WF. |
 | `map_batches_internal` | n/a | out of scope | Declined: Ray-internal map\_batches without public validation, used by Ray libraries; not user API. |
-| `materialize` | `Dataset.cache` | mismatch | Differs: Ray materialize() executes now and pins blocks in the object store, returning a MaterializedDataset; Batcher cache() is lazy and stores the Arrow result on the first terminal op. Codemod: ds = ds.cache(); ds.count() to force it. Wave W0. |
+| `materialize` | `Dataset.cache` | mismatch | Differs: Ray materialize() executes now and pins blocks in the object store, returning a MaterializedDataset; Batcher cache() is lazy and stores the Arrow result on the first terminal op. Port as: ds = ds.cache(); ds.count() to force it. Wave W0. |
 | `max` | `Dataset.max` | param | Missing: on=list or None returning a dict keyed 'max(x)', ignore\_nulls=False. Wave W2. |
 | `mean` | `Dataset.mean` | param | Missing: on=list or None returning a dict keyed 'mean(x)', ignore\_nulls=False. Wave W2. |
 | `min` | `Dataset.min` | param | Missing: on=list or None returning a dict keyed 'min(x)', ignore\_nulls=False. Wave W2. |
@@ -63,8 +63,8 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `select_columns` | `Dataset.select` | canonical |  |
 | `serialize_lineage` | n/a | out of scope | Declined: lineage serialization of object-store block refs for Ray fault tolerance; a Batcher plan is rebuilt from its JSON IR and sources. |
 | `set_name` | n/a | out of scope | Declined: user-facing Dataset display name for Ray dashboard/metrics; Batcher Datasets are unnamed plan handles. |
-| `show` | `Dataset.show` | mismatch | Differs: Ray show(limit=20) prints one dict per row; Batcher show(limit=10) prints a table. Codemod passes limit=20. Wave W0. |
-| `size_bytes` | `Dataset.memory_usage` | mismatch | Differs: Ray size\_bytes() returns the total in-memory bytes from block metadata; Batcher memory\_usage() returns a per-column dict of estimated bytes. Codemod: sum(ds.memory\_usage().values()). Wave W0. |
+| `show` | `Dataset.show` | mismatch | Differs: Ray show(limit=20) prints one dict per row; Batcher show(limit=10) prints a table. Pass limit=20. Wave W0. |
+| `size_bytes` | `Dataset.memory_usage` | mismatch | Differs: Ray size\_bytes() returns the total in-memory bytes from block metadata; Batcher memory\_usage() returns a per-column dict of estimated bytes. Port as: sum(ds.memory\_usage().values()). Wave W0. |
 | `sort` | `Dataset.sort` | param | Missing: boundaries= (explicit range-partition boundaries). Wave W2. |
 | `split` | `Dataset.split_proportionately` | mismatch | Differs: Ray split(n) eagerly materializes n contiguous MaterializedDatasets, and equal=True drops the remainder; Batcher parts are lazy and each re-executes the input. split\_proportionately(\[1/n\]\*(n-1)) gives the contiguous n-way split; equal= and locality\_hints have no equivalent. Wave W8. |
 | `split_at_indices` | `Dataset.split_at_indices` | mismatch | Differs: Ray materializes once and returns MaterializedDatasets; Batcher parts are lazy row-index filters that each re-execute the input (cache() first). Rows per part are the same for a fixed input order. Wave W0. |
@@ -92,14 +92,14 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `to_tf` | `Dataset.ml.to_tf` | mismatch | Differs: Ray to\_tf(feature\_columns, label\_columns) yields (features, labels) tuples with batch\_size=1 default; Batcher ds.ml.to\_tf yields \{column: tensor\} dicts and has no feature/label split or additional\_columns/feature\_type\_spec. Dataset.to\_tf is being removed in favour of ds.ml.to\_tf. Wave W8. |
 | `train_test_split` | `Dataset.ml.train_test_split` | mismatch | Differs: Ray defaults shuffle=False, so the test set is the last test\_size rows in dataset order, and test\_size may be an int row count; Batcher assigns rows by a seeded hash (seed=0), takes only a fraction, and is lazy rather than materialized. Wave W0. |
 | `union` | `Dataset.union` | canonical |  |
-| `unique` | `Dataset.select` + `Dataset.distinct` + `Dataset.to_pylist` | mismatch | Differs: Ray unique(column) is eager and returns a list of the column's distinct values (ignore\_nulls=False keeps None); Batcher Dataset.unique deduplicates rows and returns a Dataset. Codemod: \[r\[c\] for r in ds.select(c).distinct().to\_pylist()\]. Wave W0. |
+| `unique` | `Dataset.select` + `Dataset.distinct` + `Dataset.to_pylist` | mismatch | Differs: Ray unique(column) is eager and returns a list of the column's distinct values (ignore\_nulls=False keeps None); Batcher Dataset.distinct deduplicates rows and returns a Dataset. Port as: \[r\[c\] for r in ds.select(c).distinct().to\_pylist()\]. Wave W0. |
 | `with_column` | `Dataset.with_columns` | alias |  |
 | `with_columns` | `Dataset.with_columns` | canonical |  |
 | `write_bigquery` | n/a | gap | Not yet: BigQuery writer (Batcher reads BigQuery via bt.read.bigquery but cannot write it). Wave W13. |
 | `write_clickhouse` | n/a | gap | Not yet: ClickHouse writer with SinkMode and ClickHouseTableSettings. Wave W13. |
 | `write_csv` | `Dataset.write.csv` | mismatch | Differs: Ray write\_csv defaults mode=SaveMode.APPEND and writes a directory of CSV files; Batcher defaults mode='overwrite' (replacing existing output) and supports append only for delta/iceberg/hudi/snowflake. Pass mode explicitly; file-sink append is missing. Wave W2. |
 | `write_datasink` | n/a | gap | Not yet: write through a user Datasink implementation. Wave W11. |
-| `write_delta` | `Dataset.write.delta` | mismatch | Differs: Both default to append, but Ray write\_delta defaults schema\_mode='merge' (new columns evolve the table) while Batcher defaults merge\_schema=False. Codemod passes merge\_schema=True. Wave W0. |
+| `write_delta` | `Dataset.write.delta` | mismatch | Differs: Both default to append, but Ray write\_delta defaults schema\_mode='merge' (new columns evolve the table) while Batcher defaults merge\_schema=False. Pass merge\_schema=True. Wave W0. |
 | `write_iceberg` | `Dataset.write.iceberg` | param | Missing: mode=SaveMode.UPSERT with upsert\_kwargs=, overwrite\_filter=, overwrite\_kwargs=, snapshot\_properties= (Batcher write.iceberg takes mode='append'\|'overwrite'). Wave W13. |
 | `write_images` | n/a | gap | Not yet: image-file writer from an image column (write\_images). Wave W12. |
 | `write_json` | `Dataset.write.json` | mismatch | Differs: Ray write\_json defaults mode=SaveMode.APPEND and writes a directory of JSONL files; Batcher defaults mode='overwrite' and cannot append to a file sink. Pass mode explicitly; file-sink append is missing. Wave W2. |
@@ -108,7 +108,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `write_mongo` | `Dataset.write.mongo` | mismatch | Differs: Ray write\_mongo(uri, database, collection) inserts; Batcher write.mongo(collection) defaults mode='upsert'. Pass mode='append' and the connection options. Wave W13. |
 | `write_numpy` | n/a | gap | Not yet: .npy writer for one column. Wave W13. |
 | `write_parquet` | `Dataset.write.parquet` | mismatch | Differs: Ray write\_parquet defaults mode=SaveMode.APPEND into a directory; Batcher defaults mode='overwrite' (replacing existing output) and supports append only for delta/iceberg/hudi/snowflake. Pass mode explicitly; file-sink append is missing. Wave W2. |
-| `write_snowflake` | `Dataset.write.snowflake` | mismatch | Differs: Ray write\_snowflake appends rows to the table; Batcher write.snowflake defaults mode='overwrite'. Codemod passes mode='append'. Wave W0. |
+| `write_snowflake` | `Dataset.write.snowflake` | mismatch | Differs: Ray write\_snowflake appends rows to the table; Batcher write.snowflake defaults mode='overwrite'. Pass mode='append'. Wave W0. |
 | `write_sql` | `Dataset.write.sql` | mismatch | Differs: Ray write\_sql(sql, connection\_factory) executes a user INSERT statement per row batch through a DB-API connection factory; Batcher write.sql(table, mode=, key\_columns=) writes a table by name. Wave W13. |
 | `write_tfrecords` | n/a | gap | Not yet: TFRecord writer. Wave W13. |
 | `write_turbopuffer` | n/a | gap | Not yet: Turbopuffer vector-namespace writer. Wave W13. |
@@ -138,7 +138,7 @@ The following table maps the 12 names on `DataIterator`, sorted alphabetically.
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
 | `get_context` | `bt.active_config` | mismatch | Differs: Ray returns the DataContext of the iterated dataset; Batcher configuration is process/context scoped (active\_config). Wave W9. |
-| `iter_batches` | `Dataset.iter_batches` + `Dataset.ml.to_numpy_batches` | mismatch | Differs: Ray yields batch\_format='default' (\{col: ndarray\}) batches of 256 rows; Batcher iter\_batches yields pyarrow RecordBatches and has no batch\_format, drop\_last, local\_shuffle\_buffer\_size/seed or prefetch\_batches. Codemod today: ds.ml.to\_numpy\_batches(batch\_size=256). Wave W2. |
+| `iter_batches` | `Dataset.iter_batches` + `Dataset.ml.to_numpy_batches` | mismatch | Differs: Ray yields batch\_format='default' (\{col: ndarray\}) batches of 256 rows; Batcher iter\_batches yields pyarrow RecordBatches and has no batch\_format, drop\_last, local\_shuffle\_buffer\_size/seed or prefetch\_batches. Port as: ds.ml.to\_numpy\_batches(batch\_size=256). Wave W2. |
 | `iter_jax_batches` | n/a | gap | Not yet: streaming iterator of JAX array batches. Wave W8. |
 | `iter_rows` | `Dataset.iter_rows` | mismatch | Differs: Ray yields dict rows; Batcher yields tuples unless named=True. Wave W0. |
 | `iter_tf_batches` | `Dataset.ml.to_tf` | mismatch | Differs: Ray yields TensorFlow tensor batches of 256 rows; Batcher ds.ml.to\_tf returns a tf.data.Dataset. Pass batch\_size=256. Wave W8. |

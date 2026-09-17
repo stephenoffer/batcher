@@ -46,13 +46,13 @@ from_numpy_refs = { status = "out_of_scope", reason = "Ray object-store block re
 from_pandas = { status = "param", batcher = "bt.from_pandas", need = "a list of pandas DataFrames (Ray concatenates them)", wave = "W2" }
 from_pandas_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
 from_spark = { status = "canonical", batcher = "bt.from_spark" }
-from_tf = { status = "mismatch", batcher = "bt.from_tf", note = "A tf.data.Dataset of dict elements converts identically; for non-dict elements Ray names the column 'item' and Batcher names it 'data'. Codemod: .rename(data='item').", wave = "W0" }
+from_tf = { status = "mismatch", batcher = "bt.from_tf", note = "A tf.data.Dataset of dict elements converts identically; for non-dict elements Ray names the column 'item' and Batcher names it 'data'. Port as: .rename(data='item').", wave = "W0" }
 from_torch = { status = "mismatch", batcher = "bt.from_torch", note = "Ray from_torch wraps each item of a map-style torch Dataset in an 'item' column; Batcher from_torch adapts tensors (one column per tensor) and raises AttributeError on a Dataset whose items are not tensors.", wave = "W0" }
 range = { status = "mismatch", batcher = "bt.range", note = "Ray range(n) names its column 'id'; Batcher bt.range names it 'value'. Codemod: bt.range(n, name='id').", wave = "W0", template = 'range(n) -> bt.range(n, name="id")' }
 range_tensor = { status = "gap", need = "range of fixed-shape tensor rows (range_tensor(n, shape=))", wave = "W11" }
-read_audio = { status = "mismatch", batcher = "bt.read.audio", note = "Ray decodes by default into 'amplitude' and 'sample_rate' columns; Batcher read.audio defaults decode=False. Codemod passes decode=True; verify output column names.", wave = "W12" }
+read_audio = { status = "mismatch", batcher = "bt.read.audio", note = "Ray decodes by default into 'amplitude' and 'sample_rate' columns; Batcher read.audio defaults decode=False. Pass decode=True; verify output column names.", wave = "W12" }
 read_avro = { status = "alias", batcher = "bt.read.avro" }
-read_binary_files = { status = "mismatch", batcher = "bt.read.binary", note = "Ray yields a 'bytes' column (plus 'path' with include_paths=True); Batcher yields uri, bytes, size and mime columns. Codemod: .select('bytes') or rename uri to path.", wave = "W0" }
+read_binary_files = { status = "mismatch", batcher = "bt.read.binary", note = "Ray yields a 'bytes' column (plus 'path' with include_paths=True); Batcher yields uri, bytes, size and mime columns. Port as: .select('bytes') or rename uri to path.", wave = "W0" }
 read_clickhouse = { status = "mismatch", batcher = "bt.read.clickhouse", note = "Ray read_clickhouse(table=, dsn=, columns=, filter=, order_by=) builds the query; Batcher read.clickhouse(query, **opts) takes SQL.", wave = "W13" }
 read_csv = { status = "alias", batcher = "bt.read.csv" }
 read_datasource = { status = "gap", need = "read through a user Datasource implementation", wave = "W11" }
@@ -60,9 +60,9 @@ read_delta = { status = "alias", batcher = "bt.read.delta" }
 read_delta_sharing_tables = { status = "canonical", batcher = "bt.read.delta_sharing" }
 read_hudi = { status = "canonical", batcher = "bt.read.hudi" }
 read_iceberg = { status = "alias", batcher = "bt.read.iceberg" }
-read_images = { status = "mismatch", batcher = "bt.read.images", note = "Ray decodes images by default into an 'image' ndarray column (mode=, size=); Batcher read.images defaults decode=False. Codemod passes decode=True.", wave = "W12" }
+read_images = { status = "mismatch", batcher = "bt.read.images", note = "Ray decodes images by default into an 'image' ndarray column (mode=, size=); Batcher read.images defaults decode=False. Pass decode=True.", wave = "W12" }
 read_json = { status = "mismatch", batcher = "bt.read.json", note = "Ray read_json defaults lines=False and reads JSON documents (including a top-level array); Batcher read.json reads newline-delimited JSON only and fails on a JSON array file.", wave = "W2" }
-read_kafka = { status = "mismatch", batcher = "bt.read.kafka", note = "Ray read_kafka is bounded (trigger='once', start_offset='earliest', end_offset='latest'); Batcher read.kafka is an unbounded streaming source. Codemod passes starting_offsets='earliest', ending_offsets='latest'.", wave = "W10" }
+read_kafka = { status = "mismatch", batcher = "bt.read.kafka", note = "Ray read_kafka is bounded (trigger='once', start_offset='earliest', end_offset='latest'); Batcher read.kafka is an unbounded streaming source. Pass starting_offsets='earliest', ending_offsets='latest'.", wave = "W10" }
 read_lance = { status = "canonical", batcher = "bt.read.lance" }
 read_lerobot = { status = "gap", need = "LeRobot robotics dataset reader", wave = "W12" }
 read_mcap = { status = "mismatch", batcher = "bt.read.mcap", note = "Both emit one row per message with topic, log_time, publish_time, sequence and data; Ray decodes JSON-encoded payloads into Python objects in 'data' and adds channel_id (include_metadata=True), while Batcher keeps every payload encoded as bytes.", wave = "W13" }
@@ -71,7 +71,7 @@ read_numpy = { status = "canonical", batcher = "bt.read.numpy" }
 read_parquet = { status = "alias", batcher = "bt.read.parquet" }
 read_snowflake = { status = "canonical", batcher = "bt.read.snowflake" }
 read_sql = { status = "mismatch", batcher = "bt.read.sql", note = "Ray read_sql(sql, connection_factory) calls a DB-API connection factory per read task and shards with shard_keys=; Batcher read.sql(query, uri=/connection=) takes a URI or one connection and has no shard_keys.", wave = "W13" }
-read_text = { status = "mismatch", batcher = "bt.read.text", note = "Ray yields a single 'text' column (drop_empty_lines=True); Batcher read.text also yields path and line_number columns. Codemod: .select('text').", wave = "W0" }
+read_text = { status = "mismatch", batcher = "bt.read.text", note = "Ray yields a single 'text' column (drop_empty_lines=True); Batcher read.text also yields path and line_number columns. Port as: .select('text').", wave = "W0" }
 read_tfrecords = { status = "mismatch", batcher = "bt.read.tfrecord", note = "Ray parses each tf.train.Example into one column per feature; Batcher yields the raw serialized payload in a 'record' binary column to decode downstream.", wave = "W13" }
 read_unity_catalog = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
 read_videos = { status = "mismatch", batcher = "bt.read.video", note = "Ray emits one row per decoded frame ('frame', 'frame_index'); Batcher read.video defaults decode=False and samples num_frames=8 per video.", wave = "W12" }

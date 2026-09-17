@@ -11,7 +11,7 @@ cache = { status = "canonical", batcher = "Dataset.cache" }
 checkpoint = { status = "param", batcher = "Dataset.cache", need = "eager=True materialization that also truncates the logical plan", wave = "W8" }
 coalesce = { status = "alias", batcher = "Dataset.repartition" }
 colRegex = { status = "canonical", batcher = "bt.matches" }
-collect = { status = "mismatch", batcher = "Dataset.collect", note = "Spark returns list[Row] eagerly; Batcher returns a pyarrow.Table. Codemod: .to_pylist()", wave = "W0" }
+collect = { status = "mismatch", batcher = "Dataset.collect", note = "Spark returns list[Row] eagerly; Batcher returns a pyarrow.Table. Port as: .to_pylist()", wave = "W0" }
 columns = { status = "canonical", batcher = "Dataset.columns" }
 corr = { status = "canonical", batcher = "Dataset.corr" }
 count = { status = "canonical", batcher = "Dataset.count" }
@@ -94,7 +94,7 @@ stat = { status = "canonical", batcher = ["Dataset.corr", "Dataset.cov"] }
 storageLevel = { status = "gap", need = "read back the storage level a cached Dataset was persisted with", wave = "W8" }
 subtract = { status = "canonical", batcher = "Dataset.except_" }
 summary = { status = "param", batcher = "Dataset.describe", need = "choose statistics by name (count, mean, stddev, min, max, '75%') with string output", wave = "W2" }
-tail = { status = "mismatch", batcher = "Dataset.tail", note = "Spark tail(n) eagerly returns list[Row]; Batcher returns a lazy Dataset. Codemod: .tail(n).to_pylist()", wave = "W0" }
+tail = { status = "mismatch", batcher = "Dataset.tail", note = "Spark tail(n) eagerly returns list[Row]; Batcher returns a lazy Dataset. Port as: .tail(n).to_pylist()", wave = "W0" }
 take = { status = "mismatch", batcher = "Dataset.limit", note = "Spark take(n) eagerly returns list[Row]; Batcher limit is lazy. Codemod: .limit(n).to_pylist()", wave = "W0", template = 'take(num) -> self.limit(num).to_pylist()' }
 to = { status = "param", batcher = "Dataset.cast", need = "reconcile to a target schema: reorder, project away and cast nested fields by name", wave = "W2" }
 toArrow = { status = "canonical", batcher = "Dataset.to_arrow" }
@@ -116,7 +116,7 @@ withColumns = { status = "canonical", batcher = "Dataset.with_columns", template
 withColumnsRenamed = { status = "param", batcher = "Dataset.rename", need = "no-op for absent columns (Batcher raises)", wave = "W2" }
 withMetadata = { status = "gap", need = "per-field metadata on a column", wave = "W11" }
 withWatermark = { status = "canonical", batcher = "Dataset.with_watermark" }
-write = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0" }
+write = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly", wave = "W0" }
 writeStream = { status = "canonical", batcher = "Dataset.write" }
 writeTo = { status = "gap", need = "DataFrameWriterV2 catalog-table writer (create/replace/append/overwritePartitions)", wave = "W9" }
 zipWithIndex = { status = "mismatch", batcher = "Dataset.with_row_index", note = "Spark appends the index as the last column; Batcher inserts it first", wave = "W0" }

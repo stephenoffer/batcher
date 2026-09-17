@@ -67,7 +67,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `select` | `Dataset.select` | canonical |  |
 | `show` | `Dataset.show` | param | Missing: format=/verbose=/max\_width=/align= display options (Daft defaults to 8 rows, Batcher to 10). Wave W2. |
 | `shuffle` | `Dataset.shuffle` | canonical |  |
-| `skew` | `Dataset.skew` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skewness takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True. Wave W0. |
+| `skew` | `Dataset.skew` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skew takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True. Wave W0. |
 | `skip_existing` | n/a | gap | Not yet: anti-join against keys already present in an existing output (resumable pipelines). Wave W13. |
 | `skipped_corrupt_files` | n/a | gap | Not yet: report of files skipped under ignore\_corrupt\_files=True. Wave W13. |
 | `sort` | `Dataset.sort` | mismatch | Differs: Daft sort(desc=True) places nulls first by default (nulls\_first follows desc); Batcher places nulls last. Param: nulls\_first=True when descending. Wave W0. |
@@ -120,7 +120,7 @@ The following table maps the 16 names on `GroupedDataFrame`, sorted alphabetical
 | `agg` | `GroupBy.agg` | canonical |  |
 | `any_value` | `GroupBy.agg` + `Expr.any_value` | canonical |  |
 | `count` | `GroupBy.count` | canonical |  |
-| `count_distinct` | `GroupBy.count_distinct` | param | Missing: the count\_distinct spelling Appendix D keeps (today GroupBy.n\_unique). Wave WF. |
+| `count_distinct` | `GroupBy.count_distinct` | param | Missing: GroupBy.count\_distinct, which Batcher keeps as the one spelling. Wave WF. |
 | `list_agg` | `GroupBy.array_agg` | canonical |  |
 | `list_agg_distinct` | `GroupBy.array_agg` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
 | `map_groups` | `GroupBy.map_groups` | param | Missing: a Daft-style UDF Expression argument whose result column is named after its first input. Wave W11. |

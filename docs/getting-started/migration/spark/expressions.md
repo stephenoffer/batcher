@@ -19,7 +19,7 @@ The following table maps the 36 names on `Column`, sorted alphabetically.
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
 | `alias` | `Expr.alias` | canonical |  |
-| `asc` | `Dataset.sort` | mismatch | Differs: Spark asc() sorts nulls first; Batcher ascending sorts nulls last. Codemod passes nulls\_first=True. Wave W0. |
+| `asc` | `Dataset.sort` | mismatch | Differs: Spark asc() sorts nulls first; Batcher ascending sorts nulls last. Pass nulls\_first=True. Wave W0. |
 | `asc_nulls_first` | `Dataset.sort` | canonical |  |
 | `asc_nulls_last` | `Dataset.sort` | canonical |  |
 | `astype` | `Expr.cast` | alias |  |

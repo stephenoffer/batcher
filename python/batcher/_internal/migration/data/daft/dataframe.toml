@@ -51,7 +51,7 @@ schema = { status = "mismatch", batcher = "Dataset.schema", note = "Daft schema(
 select = { status = "canonical", batcher = "Dataset.select" }
 show = { status = "param", batcher = "Dataset.show", need = "format=/verbose=/max_width=/align= display options (Daft defaults to 8 rows, Batcher to 10)", wave = "W2" }
 shuffle = { status = "canonical", batcher = "Dataset.shuffle" }
-skew = { status = "mismatch", batcher = "Dataset.skew", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skewness takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True", wave = "W0" }
+skew = { status = "mismatch", batcher = "Dataset.skew", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skew takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True", wave = "W0" }
 skip_existing = { status = "gap", need = "anti-join against keys already present in an existing output (resumable pipelines)", wave = "W13" }
 skipped_corrupt_files = { status = "gap", need = "report of files skipped under ignore_corrupt_files=True", wave = "W13" }
 sort = { status = "mismatch", batcher = "Dataset.sort", note = "Daft sort(desc=True) places nulls first by default (nulls_first follows desc); Batcher places nulls last. Param: nulls_first=True when descending", wave = "W0", template = 'sort(by, desc=False, nulls_first=None) -> self.sort(sem.daft_sort(by, desc, nulls_first))' }
@@ -99,7 +99,7 @@ write_turbopuffer = { status = "gap", need = "Turbopuffer vector-store sink", wa
 agg = { status = "canonical", batcher = "GroupBy.agg" }
 any_value = { status = "canonical", batcher = ["GroupBy.agg", "Expr.any_value"] }
 count = { status = "canonical", batcher = "GroupBy.count" }
-count_distinct = { status = "param", batcher = "GroupBy.count_distinct", need = "the count_distinct spelling Appendix D keeps (today GroupBy.n_unique)", wave = "WF" }
+count_distinct = { status = "param", batcher = "GroupBy.count_distinct", need = "GroupBy.count_distinct, which Batcher keeps as the one spelling", wave = "WF" }
 list_agg = { status = "canonical", batcher = "GroupBy.array_agg" }
 list_agg_distinct = { status = "param", batcher = "GroupBy.array_agg", need = "distinct=True (distinct values, nulls dropped)", wave = "W2" }
 map_groups = { status = "param", batcher = "GroupBy.map_groups", need = "a Daft-style UDF Expression argument whose result column is named after its first input", wave = "W11" }

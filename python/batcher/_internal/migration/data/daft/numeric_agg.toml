@@ -42,7 +42,7 @@ lead = { status = "param", batcher = "bt.lead", need = "default= fill value for 
 list_agg = { status = "canonical", batcher = "Expr.array_agg" }
 list_agg_distinct = { status = "param", batcher = "Expr.array_agg", need = "distinct=True (distinct values, nulls dropped)", wave = "W2" }
 ln = { status = "canonical", batcher = "Expr.ln" }
-log = { status = "alias", batcher = "Expr.ln", need = "base= argument (Batcher Expr.log is a second spelling of ln and is removed, then returns as log(base); Daft log(base=e))", wave = "W2" }
+log = { status = "alias", batcher = "Expr.ln", need = "base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e)", wave = "W2" }
 log10 = { status = "canonical", batcher = "Expr.log10" }
 log1p = { status = "canonical", batcher = "Expr.log1p" }
 log2 = { status = "canonical", batcher = "Expr.log2" }

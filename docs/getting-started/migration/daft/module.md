@@ -115,7 +115,7 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `read_paimon` | n/a | gap | Not yet: Apache Paimon reader. Wave W13. |
 | `read_parquet` | `bt.read.parquet` | alias |  |
 | `read_sql` | `bt.read.sql` | param | Missing: partition\_col=/num\_partitions= parallel range partitioning and a connection factory callable. Wave W13. |
-| `read_table` | `bt.read.table` | mismatch | Differs: Daft read\_table(identifier) reads a table from the session catalog; bt.read\_table(format) reads a registered source format by name. Rewrite: Session.table(identifier). Wave W9. |
+| `read_table` | `bt.read.table` | mismatch | Differs: Daft read\_table(identifier) reads a table from the session catalog; bt.read.table(name) constructs a registered connector by name. Rewrite: Session.table(identifier). Wave W9. |
 | `read_text` | `bt.read.text` | mismatch | Differs: Daft read\_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line\_number columns and keeps blank lines. Param: skip\_blank\_lines=True, text column only. Wave W13. |
 | `read_video_frames` | `bt.read.video` | mismatch | Differs: Daft read\_video\_frames yields one row per decoded frame (image\_height/width, sample\_interval\_seconds); Batcher read.video yields one row per file with num\_frames sampled frames. Wave W12. |
 | `read_warc` | `bt.read.warc` | mismatch | Differs: Daft read\_warc keeps WARC header names ('WARC-Record-ID', ...); Batcher read.warc snake\_cases them ('warc\_record\_id'). Wave W13. |

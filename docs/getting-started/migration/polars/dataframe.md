@@ -126,7 +126,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `describe` | `Dataset.describe` | param | Missing: interpolation= for the percentile rows. Wave W2. |
 | `deserialize` | n/a | gap | Not yet: Dataset.deserialize (plan from serialized bytes/JSON). Wave W8. |
 | `drop` | `Dataset.drop` | param | Missing: strict= (raise on a missing column). Wave W2. |
-| `drop_in_place` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review; the frame is not mutated. Wave W8. |
+| `drop_in_place` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port; the frame is not mutated. Wave W8. |
 | `drop_nans` | n/a | gap | Not yet: Dataset.drop\_nans (drop rows holding NaN). Wave W5. |
 | `drop_nulls` | `Dataset.drop_nulls` | canonical |  |
 | `dtypes` | `Dataset.dtypes` | canonical |  |
@@ -140,9 +140,9 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `flags` | n/a | out of scope | Declined: sortedness flags are engine-owned metadata, not user-visible. |
 | `fold` | n/a | gap | Not yet: DataFrame.fold (row-wise Python reduction over columns). Wave W11. |
 | `gather_every` | `Dataset.gather_every` | canonical |  |
-| `get_column` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review. Wave W8. |
+| `get_column` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
 | `get_column_index` | n/a | gap | Not yet: Dataset.get\_column\_index. Wave W8. |
-| `get_columns` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review. Wave W8. |
+| `get_columns` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
 | `glimpse` | `Dataset.glimpse` | canonical |  |
 | `group_by` | `Dataset.group_by` | param | Missing: maintain\_order= (parsed as a key name today) and expression keys. Wave WF. |
 | `group_by_dynamic` | `bt.window` | param | Missing: frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start\_by=, include\_boundaries=. Wave W5. |
@@ -156,7 +156,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `is_empty` | `Dataset.is_empty` | canonical |  |
 | `is_unique` | `Expr.is_unique` | param | Missing: whole-row form over several columns. Wave W2. |
 | `item` | `Dataset.item` | param | Missing: row= and column index arguments. Wave W2. |
-| `iter_columns` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review. Wave W8. |
+| `iter_columns` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
 | `iter_rows` | `Dataset.iter_rows` | canonical |  |
 | `iter_slices` | `Dataset.iter_slices` | mismatch | Differs: yields pyarrow RecordBatch rather than a DataFrame. Wave W0. |
 | `join` | `Dataset.join` | mismatch | Differs: on how='full' Polars keeps both key columns (key, key\_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=. Wave W0. |
@@ -220,7 +220,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `to_jax` | `Dataset.to_jax` | mismatch | Differs: Polars defaults to return\_type='array' (one 2-D array); Batcher returns a dict of arrays. Wave W0. |
 | `to_numpy` | `Dataset.to_numpy` | mismatch | Differs: Polars returns one 2-D ndarray; Batcher returns a dict of per-column arrays. Wave W0. |
 | `to_pandas` | `Dataset.to_pandas` | canonical |  |
-| `to_series` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review. Wave W8. |
+| `to_series` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
 | `to_struct` | n/a | gap | Not yet: Dataset.to\_struct (whole row as one struct column). Wave W8. |
 | `to_torch` | `Dataset.ml.iter_torch_batches` | mismatch | Differs: Polars returns a tensor, dict of tensors, or TensorDataset; Batcher yields per-batch tensor dicts. Wave W0. |
 | `top_k` | `Dataset.top_k` | canonical |  |

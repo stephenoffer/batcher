@@ -106,7 +106,7 @@ count = { status = "mismatch", batcher = "Dataset.count", note = "Polars count()
 describe = { status = "param", batcher = "Dataset.describe", need = "interpolation= for the percentile rows", wave = "W2" }
 deserialize = { status = "gap", need = "Dataset.deserialize (plan from serialized bytes/JSON)", wave = "W8" }
 drop = { status = "param", batcher = "Dataset.drop", need = "strict= (raise on a missing column)", wave = "W2" }
-drop_in_place = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review; the frame is not mutated", wave = "W8" }
+drop_in_place = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port; the frame is not mutated", wave = "W8" }
 drop_nans = { status = "gap", need = "Dataset.drop_nans (drop rows holding NaN)", wave = "W5" }
 drop_nulls = { status = "canonical", batcher = "Dataset.drop_nulls" }
 dtypes = { status = "canonical", batcher = "Dataset.dtypes" }
@@ -120,9 +120,9 @@ filter = { status = "canonical", batcher = "Dataset.filter" }
 flags = { status = "out_of_scope", reason = "sortedness flags are engine-owned metadata, not user-visible" }
 fold = { status = "gap", need = "DataFrame.fold (row-wise Python reduction over columns)", wave = "W11" }
 gather_every = { status = "canonical", batcher = "Dataset.gather_every" }
-get_column = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review", wave = "W8" }
+get_column = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port", wave = "W8" }
 get_column_index = { status = "gap", need = "Dataset.get_column_index", wave = "W8" }
-get_columns = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review", wave = "W8" }
+get_columns = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port", wave = "W8" }
 glimpse = { status = "canonical", batcher = "Dataset.glimpse" }
 group_by = { status = "param", batcher = "Dataset.group_by", need = "maintain_order= (parsed as a key name today) and expression keys", wave = "WF", template = 'group_by(*by, maintain_order=False) -> self.group_by(sem.column_names(by), sem.expect(maintain_order, False))' }
 group_by_dynamic = { status = "param", batcher = "bt.window", need = "frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start_by=, include_boundaries=", wave = "W5" }
@@ -136,7 +136,7 @@ is_duplicated = { status = "param", batcher = "Expr.is_duplicated", need = "whol
 is_empty = { status = "canonical", batcher = "Dataset.is_empty" }
 is_unique = { status = "param", batcher = "Expr.is_unique", need = "whole-row form over several columns", wave = "W2" }
 item = { status = "param", batcher = "Dataset.item", need = "row= and column index arguments", wave = "W2" }
-iter_columns = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review", wave = "W8" }
+iter_columns = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port", wave = "W8" }
 iter_rows = { status = "canonical", batcher = "Dataset.iter_rows" }
 iter_slices = { status = "mismatch", batcher = "Dataset.iter_slices", note = "yields pyarrow RecordBatch rather than a DataFrame", wave = "W0" }
 join = { status = "mismatch", batcher = "Dataset.join", note = "on how='full' Polars keeps both key columns (key, key_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=", wave = "W0", template = 'join(other, on=None, how="inner", *, left_on=None, right_on=None, suffix="_right", coalesce=None) -> self.join(other, sem.join_keys(on), how=sem.polars_how(how, coalesce), left_on=left_on, right_on=right_on, suffix=suffix)' }
@@ -200,7 +200,7 @@ to_init_repr = { status = "out_of_scope", reason = "Python source repr of a fram
 to_jax = { status = "mismatch", batcher = "Dataset.to_jax", note = "Polars defaults to return_type='array' (one 2-D array); Batcher returns a dict of arrays", wave = "W0" }
 to_numpy = { status = "mismatch", batcher = "Dataset.to_numpy", note = "Polars returns one 2-D ndarray; Batcher returns a dict of per-column arrays", wave = "W0" }
 to_pandas = { status = "canonical", batcher = "Dataset.to_pandas" }
-to_series = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the codemod flags Series-bound code for review", wave = "W8" }
+to_series = { status = "mismatch", batcher = "Dataset.select", note = "returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port", wave = "W8" }
 to_struct = { status = "gap", need = "Dataset.to_struct (whole row as one struct column)", wave = "W8" }
 to_torch = { status = "mismatch", batcher = "Dataset.ml.iter_torch_batches", note = "Polars returns a tensor, dict of tensors, or TensorDataset; Batcher yields per-batch tensor dicts", wave = "W0" }
 top_k = { status = "canonical", batcher = "Dataset.top_k" }

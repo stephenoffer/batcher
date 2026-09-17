@@ -62,7 +62,7 @@ The following table maps the 18 names on `DataFrameWriter`, sorted alphabeticall
 |---|---|---|---|
 | `bucketBy` | n/a | gap | Not yet: bucketed table writes (bucketBy with sortBy). Wave W13. |
 | `clusterBy` | `Dataset.write` | param | Missing: record clustering columns in table metadata. Wave W13. |
-| `csv` | `Dataset.write.csv` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
+| `csv` | `Dataset.write.csv` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
 | `format` | `Dataset.write` | canonical |  |
 | `insertInto` | n/a | gap | Not yet: insert into an existing catalog table by position. Wave W9. |
 | `jdbc` | `Dataset.write.sql` | param | Missing: url + table + properties connection form. Wave W13. |
@@ -73,7 +73,7 @@ The following table maps the 18 names on `DataFrameWriter`, sorted alphabeticall
 | `orc` | `Dataset.write.orc` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
 | `parquet` | `Dataset.write.parquet` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
 | `partitionBy` | `Dataset.write` | canonical |  |
-| `save` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
+| `save` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
 | `saveAsTable` | n/a | gap | Not yet: save as a managed catalog table. Wave W9. |
 | `sortBy` | `Dataset.write` | param | Missing: sort within buckets, paired with bucketBy. Wave W13. |
 | `text` | n/a | gap | Not yet: plain-text writer (single string column). Wave W13. |

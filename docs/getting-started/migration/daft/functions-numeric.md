@@ -58,7 +58,7 @@ The following table maps the 71 names on `Expression`, sorted alphabetically.
 | `list_agg` | `Expr.array_agg` | canonical |  |
 | `list_agg_distinct` | `Expr.array_agg` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
 | `ln` | `Expr.ln` | canonical |  |
-| `log` | `Expr.ln` | alias | Missing: base= argument (Batcher Expr.log is a second spelling of ln and is removed, then returns as log(base); Daft log(base=e)). Wave W2. |
+| `log` | `Expr.ln` | alias | Missing: base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e). Wave W2. |
 | `log10` | `Expr.log10` | canonical |  |
 | `log1p` | `Expr.log1p` | canonical |  |
 | `log2` | `Expr.log2` | canonical |  |

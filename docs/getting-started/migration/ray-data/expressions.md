@@ -32,7 +32,7 @@ The following table maps the 37 names on `Expr`, sorted alphabetically.
 | `floor` | `Expr.floor` | canonical |  |
 | `get_type` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `is_idempotent` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
-| `is_in` | `Expr.is_in` | mismatch | Differs: Ray is\_in is null-safe: a null input returns False, and a None in the list matches a null input. Batcher follows SQL three-valued logic: a null input returns null, and a None in the list makes every non-match null. Codemod: col.is\_in(vals).fill\_null(False), OR col.is\_null() when vals holds None. Wave W0. |
+| `is_in` | `Expr.is_in` | mismatch | Differs: Ray is\_in is null-safe: a null input returns False, and a None in the list matches a null input. Batcher follows SQL three-valued logic: a null input returns null, and a None in the list makes every non-match null. Port as: col.is\_in(vals).fill\_null(False), OR col.is\_null() when vals holds None. Wave W0. |
 | `is_not_null` | `Expr.is_not_null` | canonical |  |
 | `is_null` | `Expr.is_null` | canonical |  |
 | `list` | `Expr.list` | canonical |  |
@@ -42,7 +42,7 @@ The following table maps the 37 names on `Expr`, sorted alphabetically.
 | `map` | `Expr.map` | canonical |  |
 | `name` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `negate` | `-` operator | canonical |  |
-| `not_in` | `Expr.is_in` + `~` operator | mismatch | Differs: Ray not\_in is null-safe (a null input returns True unless None is listed); Batcher \~col.is\_in(vals) returns null for a null input under SQL three-valued logic. Codemod: (\~col.is\_in(vals)).fill\_null(True). Wave W0. |
+| `not_in` | `Expr.is_in` + `~` operator | mismatch | Differs: Ray not\_in is null-safe (a null input returns True unless None is listed); Batcher \~col.is\_in(vals) returns null for a null input under SQL three-valued logic. Port as: (\~col.is\_in(vals)).fill\_null(True). Wave W0. |
 | `nullable` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `power` | `**` operator | canonical |  |
 | `round` | `Expr.round` | mismatch | Differs: Ray round() rounds half to even (2.5 -\> 2.0, 0.5 -\> 0.0); Batcher rounds half away from zero (2.5 -\> 3.0). The restoring mode='half\_even' parameter does not exist yet. Wave W0. |
@@ -66,11 +66,11 @@ The following table maps the 44 names on `Expr.str`, sorted alphabetically.
 | `capitalize` | `Expr.str.capitalize` | canonical |  |
 | `center` | n/a | gap | Not yet: center-pad a string to width (pad both sides). Wave W3. |
 | `contains` | `Expr.str.contains` | canonical |  |
-| `count` | `Expr.str.count_matches` | mismatch | Differs: Ray str.count counts literal substring occurrences; Batcher count\_matches treats the pattern as a regex ('.' counts every character). Codemod: count\_matches(escape\_regex(p)); the literal= parameter from Appendix D does not exist yet. Wave W0. |
+| `count` | `Expr.str.count_matches` | mismatch | Differs: Ray str.count counts literal substring occurrences; Batcher count\_matches treats the pattern as a regex ('.' counts every character). Port as: count\_matches(escape\_regex(p)); a literal= parameter does not exist yet. Wave W0. |
 | `count_regex` | `Expr.str.count_matches` | canonical |  |
 | `ends_with` | `Expr.str.ends_with` | canonical |  |
 | `extract` | `Expr.str.extract` | mismatch | Differs: Ray extract requires named groups and returns a struct with one field per group, null on no match; Batcher extract(pattern, group=1) returns one string and '' on no match. Wave W7. |
-| `find` | `Expr.str.position` | mismatch | Differs: Ray find is 0-based and returns -1 when absent; Batcher position is 1-based and returns 0. Codemod: position(p) - 1. Wave W0. |
+| `find` | `Expr.str.position` | mismatch | Differs: Ray find is 0-based and returns -1 when absent; Batcher position is 1-based and returns 0. Port as: position(p) - 1. Wave W0. |
 | `find_regex` | n/a | gap | Not yet: 0-based position of the first regex match. Wave W3. |
 | `is_alnum` | `Expr.str.is_alnum` | canonical |  |
 | `is_alpha` | `Expr.str.is_alpha` | canonical |  |
@@ -87,17 +87,17 @@ The following table maps the 44 names on `Expr.str`, sorted alphabetically.
 | `lower` | `Expr.str.lower` | canonical |  |
 | `lpad` | `Expr.str.lpad` | mismatch | Differs: Ray never truncates a string longer than width; Batcher truncates it to width (as DuckDB does). The restoring no-truncate parameter does not exist yet. Wave W2. |
 | `lstrip` | `Expr.str.strip_chars_start` | mismatch | Differs: Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet. Wave W2. |
-| `match` | `Expr.str.like` | mismatch | Differs: Ray str.match is a SQL LIKE match; Batcher Expr.str.match is a regex match. Codemod: str.like(pattern). Wave W0. |
+| `match` | `Expr.str.like` | mismatch | Differs: Ray str.match is a SQL LIKE match; Batcher Expr.str.match is a regex match. Port as: str.like(pattern). Wave W0. |
 | `match_regex` | `Expr.str.regexp_matches` | canonical |  |
 | `pad` | `Expr.str.lpad` + `Expr.str.rpad` | mismatch | Differs: Ray pad(width, fillchar, side='right') never truncates and offers side='both'; Batcher lpad/rpad truncate to width and there is no both-sides pad. Wave W2. |
 | `repeat` | `Expr.str.repeat` | canonical |  |
 | `replace` | `Expr.str.replace` | canonical |  |
 | `replace_regex` | `Expr.str.replace_all` | canonical |  |
-| `replace_slice` | `Expr.str.overlay` | mismatch | Differs: Ray replace\_slice(start, stop, replacement) uses 0-based byte offsets (it fails on non-ASCII input); Batcher overlay(replacement, pos, length) uses 1-based character positions. Codemod: overlay(r, start + 1, stop - start). Wave W0. |
+| `replace_slice` | `Expr.str.overlay` | mismatch | Differs: Ray replace\_slice(start, stop, replacement) uses 0-based byte offsets (it fails on non-ASCII input); Batcher overlay(replacement, pos, length) uses 1-based character positions. Port as: overlay(r, start + 1, stop - start). Wave W0. |
 | `reverse` | `Expr.str.reverse` | canonical |  |
 | `rpad` | `Expr.str.rpad` | mismatch | Differs: Ray never truncates a string longer than width; Batcher truncates it to width (as DuckDB does). The restoring no-truncate parameter does not exist yet. Wave W2. |
 | `rstrip` | `Expr.str.strip_chars_end` | mismatch | Differs: Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet. Wave W2. |
-| `slice` | `Expr.str.slice` | mismatch | Differs: Ray slice(start, stop, step) takes a stop index and a step; Batcher slice(offset, length) takes a length and has no step. Codemod: slice(start, stop - start). Wave W0. |
+| `slice` | `Expr.str.slice` | mismatch | Differs: Ray slice(start, stop, step) takes a stop index and a step; Batcher slice(offset, length) takes a length and has no step. Port as: slice(start, stop - start). Wave W0. |
 | `split` | `Expr.str.split` | canonical |  |
 | `split_regex` | `Expr.str.regexp_split` | canonical |  |
 | `split_whitespace` | n/a | gap | Not yet: split on runs of Unicode whitespace, dropping empty pieces. Wave W3. |
@@ -116,7 +116,7 @@ The following table maps the 5 names on `Expr.list`, sorted alphabetically.
 | `flatten` | `Expr.list.flatten` | canonical |  |
 | `get` | `Expr.list.get` | canonical |  |
 | `len` | `Expr.list.len` | canonical |  |
-| `slice` | `Expr.list.slice` | mismatch | Differs: Ray list.slice(start, stop, step) takes a stop index and a step; Batcher slice(offset, length) takes a length and has no step. Codemod: slice(start, stop - start). Wave W4. |
+| `slice` | `Expr.list.slice` | mismatch | Differs: Ray list.slice(start, stop, step) takes a stop index and a step; Batcher slice(offset, length) takes a length and has no step. Port as: slice(start, stop - start). Wave W4. |
 | `sort` | `Expr.list.sort` | param | Missing: order='descending' and null\_placement='at\_start' (Batcher sorts ascending with nulls last only). Wave W4. |
 
 ## `Expr.dt`
@@ -176,7 +176,7 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `AggregateFnV2` | n/a | gap | Not yet: user-defined vectorized aggregate over block columns (aggregate\_block/combine/finalize). Wave W11. |
 | `Any` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `ApproximateQuantile` | `Expr.approx_quantile` | param | Missing: a list of quantiles in one aggregate returning a list, quantile\_precision=. Wave W2. |
-| `ApproximateTopK` | `Expr.top_k` | mismatch | Differs: Ray ApproximateTopK(on, k) returns \[\{column: value, 'count': n\}\] records; Batcher Expr.top\_k returns the values only (exactly, most frequent first) and is being renamed mode\_top\_k per Appendix D. Wave W0. |
+| `ApproximateTopK` | `Expr.top_k` | mismatch | Differs: Ray ApproximateTopK(on, k) returns \[\{column: value, 'count': n\}\] records; Batcher Expr.top\_k returns the values only (exactly, most frequent first) and its most-frequent meaning is being renamed so top\_k means largest. Wave W0. |
 | `ArrowAggSpec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `AsList` | `Expr.array_agg` | canonical |  |
 | `Block` | n/a | out of scope | Declined: Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime). |
@@ -185,7 +185,7 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `BlockColumnAccessor` | n/a | out of scope | Declined: Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime). |
 | `Callable` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Collection` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
-| `Count` | `bt.count` + `Expr.count` | mismatch | Differs: Ray Count() counts rows, and Count(on) defaults ignore\_nulls=False so it also counts nulls; Batcher col(x).count() skips nulls. Codemod: bt.count() for both unless ignore\_nulls=True, then col(x).count(). Wave W0. |
+| `Count` | `bt.count` + `Expr.count` | mismatch | Differs: Ray Count() counts rows, and Count(on) defaults ignore\_nulls=False so it also counts nulls; Batcher col(x).count() skips nulls. Port as: bt.count() for both unless ignore\_nulls=True, then col(x).count(). Wave W0. |
 | `count_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `CountDistinct` | `Expr.count_distinct` | canonical |  |
 | `Deprecated` | n/a | out of scope | Declined: ray.util.annotations decorator imported into the module, not Ray Data API. |
@@ -203,7 +203,7 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `Min` | `Expr.min` | canonical |  |
 | `minmax_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `missing_pct_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
-| `MissingValuePercentage` | `bt.null_rate` | mismatch | Differs: Ray returns a percentage in \[0, 100\] and counts NaN as missing; Batcher null\_rate returns a fraction in \[0, 1\] and counts only nulls. Codemod: bt.null\_rate(x) \* 100 after fill\_nan(None). Wave W0. |
+| `MissingValuePercentage` | `bt.null_rate` | mismatch | Differs: Ray returns a percentage in \[0, 100\] and counts NaN as missing; Batcher null\_rate returns a fraction in \[0, 1\] and counts only nulls. Port as: bt.null\_rate(x) \* 100 after fill\_nan(None). Wave W0. |
 | `np` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Optional` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `pa` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |

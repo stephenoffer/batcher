@@ -15,7 +15,7 @@ exp = { status = "canonical", batcher = "Expr.exp" }
 floor = { status = "canonical", batcher = "Expr.floor" }
 get_type = { status = "out_of_scope", reason = "Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection" }
 is_idempotent = { status = "out_of_scope", reason = "Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection" }
-is_in = { status = "mismatch", batcher = "Expr.is_in", note = "Ray is_in is null-safe: a null input returns False, and a None in the list matches a null input. Batcher follows SQL three-valued logic: a null input returns null, and a None in the list makes every non-match null. Codemod: col.is_in(vals).fill_null(False), OR col.is_null() when vals holds None.", wave = "W0" }
+is_in = { status = "mismatch", batcher = "Expr.is_in", note = "Ray is_in is null-safe: a null input returns False, and a None in the list matches a null input. Batcher follows SQL three-valued logic: a null input returns null, and a None in the list makes every non-match null. Port as: col.is_in(vals).fill_null(False), OR col.is_null() when vals holds None.", wave = "W0" }
 is_not_null = { status = "canonical", batcher = "Expr.is_not_null" }
 is_null = { status = "canonical", batcher = "Expr.is_null" }
 list = { status = "canonical", batcher = "Expr.list" }
@@ -25,7 +25,7 @@ log2 = { status = "canonical", batcher = "Expr.log2" }
 map = { status = "canonical", batcher = "Expr.map" }
 name = { status = "out_of_scope", reason = "Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection" }
 negate = { status = "canonical", batcher = "op:neg" }
-not_in = { status = "mismatch", batcher = ["Expr.is_in", "op:invert"], note = "Ray not_in is null-safe (a null input returns True unless None is listed); Batcher ~col.is_in(vals) returns null for a null input under SQL three-valued logic. Codemod: (~col.is_in(vals)).fill_null(True).", wave = "W0" }
+not_in = { status = "mismatch", batcher = ["Expr.is_in", "op:invert"], note = "Ray not_in is null-safe (a null input returns True unless None is listed); Batcher ~col.is_in(vals) returns null for a null input under SQL three-valued logic. Port as: (~col.is_in(vals)).fill_null(True).", wave = "W0" }
 nullable = { status = "out_of_scope", reason = "Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection" }
 power = { status = "canonical", batcher = "op:pow" }
 round = { status = "mismatch", batcher = "Expr.round", note = "Ray round() rounds half to even (2.5 -> 2.0, 0.5 -> 0.0); Batcher rounds half away from zero (2.5 -> 3.0). The restoring mode='half_even' parameter does not exist yet.", wave = "W0" }
@@ -44,11 +44,11 @@ byte_len = { status = "canonical", batcher = "Expr.str.octet_length" }
 capitalize = { status = "canonical", batcher = "Expr.str.capitalize" }
 center = { status = "gap", need = "center-pad a string to width (pad both sides)", wave = "W3" }
 contains = { status = "canonical", batcher = "Expr.str.contains" }
-count = { status = "mismatch", batcher = "Expr.str.count_matches", note = "Ray str.count counts literal substring occurrences; Batcher count_matches treats the pattern as a regex ('.' counts every character). Codemod: count_matches(escape_regex(p)); the literal= parameter from Appendix D does not exist yet.", wave = "W0" }
+count = { status = "mismatch", batcher = "Expr.str.count_matches", note = "Ray str.count counts literal substring occurrences; Batcher count_matches treats the pattern as a regex ('.' counts every character). Port as: count_matches(escape_regex(p)); a literal= parameter does not exist yet.", wave = "W0" }
 count_regex = { status = "canonical", batcher = "Expr.str.count_matches" }
 ends_with = { status = "canonical", batcher = "Expr.str.ends_with" }
 extract = { status = "mismatch", batcher = "Expr.str.extract", note = "Ray extract requires named groups and returns a struct with one field per group, null on no match; Batcher extract(pattern, group=1) returns one string and '' on no match.", wave = "W7" }
-find = { status = "mismatch", batcher = "Expr.str.position", note = "Ray find is 0-based and returns -1 when absent; Batcher position is 1-based and returns 0. Codemod: position(p) - 1.", wave = "W0" }
+find = { status = "mismatch", batcher = "Expr.str.position", note = "Ray find is 0-based and returns -1 when absent; Batcher position is 1-based and returns 0. Port as: position(p) - 1.", wave = "W0" }
 find_regex = { status = "gap", need = "0-based position of the first regex match", wave = "W3" }
 is_alnum = { status = "canonical", batcher = "Expr.str.is_alnum" }
 is_alpha = { status = "canonical", batcher = "Expr.str.is_alpha" }
@@ -65,17 +65,17 @@ len = { status = "alias", batcher = "Expr.str.len_chars" }
 lower = { status = "canonical", batcher = "Expr.str.lower" }
 lpad = { status = "mismatch", batcher = "Expr.str.lpad", note = "Ray never truncates a string longer than width; Batcher truncates it to width (as DuckDB does). The restoring no-truncate parameter does not exist yet.", wave = "W2" }
 lstrip = { status = "mismatch", batcher = "Expr.str.strip_chars_start", note = "Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet.", wave = "W2" }
-match = { status = "mismatch", batcher = "Expr.str.like", note = "Ray str.match is a SQL LIKE match; Batcher Expr.str.match is a regex match. Codemod: str.like(pattern).", wave = "W0" }
+match = { status = "mismatch", batcher = "Expr.str.like", note = "Ray str.match is a SQL LIKE match; Batcher Expr.str.match is a regex match. Port as: str.like(pattern).", wave = "W0" }
 match_regex = { status = "canonical", batcher = "Expr.str.regexp_matches" }
 pad = { status = "mismatch", batcher = ["Expr.str.lpad", "Expr.str.rpad"], note = "Ray pad(width, fillchar, side='right') never truncates and offers side='both'; Batcher lpad/rpad truncate to width and there is no both-sides pad.", wave = "W2" }
 repeat = { status = "canonical", batcher = "Expr.str.repeat" }
 replace = { status = "canonical", batcher = "Expr.str.replace" }
 replace_regex = { status = "canonical", batcher = "Expr.str.replace_all" }
-replace_slice = { status = "mismatch", batcher = "Expr.str.overlay", note = "Ray replace_slice(start, stop, replacement) uses 0-based byte offsets (it fails on non-ASCII input); Batcher overlay(replacement, pos, length) uses 1-based character positions. Codemod: overlay(r, start + 1, stop - start).", wave = "W0" }
+replace_slice = { status = "mismatch", batcher = "Expr.str.overlay", note = "Ray replace_slice(start, stop, replacement) uses 0-based byte offsets (it fails on non-ASCII input); Batcher overlay(replacement, pos, length) uses 1-based character positions. Port as: overlay(r, start + 1, stop - start).", wave = "W0" }
 reverse = { status = "canonical", batcher = "Expr.str.reverse" }
 rpad = { status = "mismatch", batcher = "Expr.str.rpad", note = "Ray never truncates a string longer than width; Batcher truncates it to width (as DuckDB does). The restoring no-truncate parameter does not exist yet.", wave = "W2" }
 rstrip = { status = "mismatch", batcher = "Expr.str.strip_chars_end", note = "Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet.", wave = "W2" }
-slice = { status = "mismatch", batcher = "Expr.str.slice", note = "Ray slice(start, stop, step) takes a stop index and a step; Batcher slice(offset, length) takes a length and has no step. Codemod: slice(start, stop - start).", wave = "W0" }
+slice = { status = "mismatch", batcher = "Expr.str.slice", note = "Ray slice(start, stop, step) takes a stop index and a step; Batcher slice(offset, length) takes a length and has no step. Port as: slice(start, stop - start).", wave = "W0" }
 split = { status = "canonical", batcher = "Expr.str.split" }
 split_regex = { status = "canonical", batcher = "Expr.str.regexp_split" }
 split_whitespace = { status = "gap", need = "split on runs of Unicode whitespace, dropping empty pieces", wave = "W3" }
@@ -89,7 +89,7 @@ upper = { status = "canonical", batcher = "Expr.str.upper" }
 flatten = { status = "canonical", batcher = "Expr.list.flatten" }
 get = { status = "canonical", batcher = "Expr.list.get" }
 len = { status = "canonical", batcher = "Expr.list.len" }
-slice = { status = "mismatch", batcher = "Expr.list.slice", note = "Ray list.slice(start, stop, step) takes a stop index and a step; Batcher slice(offset, length) takes a length and has no step. Codemod: slice(start, stop - start).", wave = "W4" }
+slice = { status = "mismatch", batcher = "Expr.list.slice", note = "Ray list.slice(start, stop, step) takes a stop index and a step; Batcher slice(offset, length) takes a length and has no step. Port as: slice(start, stop - start).", wave = "W4" }
 sort = { status = "param", batcher = "Expr.list.sort", need = "order='descending' and null_placement='at_start' (Batcher sorts ascending with nulls last only)", wave = "W4" }
 
 ["Expr.dt"]

@@ -25,7 +25,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `cache` | `Dataset.cache` | canonical |  |
 | `checkpoint` | `Dataset.cache` | param | Missing: eager=True materialization that also truncates the logical plan. Wave W8. |
 | `coalesce` | `Dataset.repartition` | alias |  |
-| `collect` | `Dataset.collect` | mismatch | Differs: Spark returns list\[Row\] eagerly; Batcher returns a pyarrow.Table. Codemod: .to\_pylist(). Wave W0. |
+| `collect` | `Dataset.collect` | mismatch | Differs: Spark returns list\[Row\] eagerly; Batcher returns a pyarrow.Table. Port as: .to\_pylist(). Wave W0. |
 | `colRegex` | `bt.matches` | canonical |  |
 | `columns` | `Dataset.columns` | canonical |  |
 | `corr` | `Dataset.corr` | canonical |  |
@@ -109,7 +109,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `storageLevel` | n/a | gap | Not yet: read back the storage level a cached Dataset was persisted with. Wave W8. |
 | `subtract` | `Dataset.except_` | canonical |  |
 | `summary` | `Dataset.describe` | param | Missing: choose statistics by name (count, mean, stddev, min, max, '75%') with string output. Wave W2. |
-| `tail` | `Dataset.tail` | mismatch | Differs: Spark tail(n) eagerly returns list\[Row\]; Batcher returns a lazy Dataset. Codemod: .tail(n).to\_pylist(). Wave W0. |
+| `tail` | `Dataset.tail` | mismatch | Differs: Spark tail(n) eagerly returns list\[Row\]; Batcher returns a lazy Dataset. Port as: .tail(n).to\_pylist(). Wave W0. |
 | `take` | `Dataset.limit` | mismatch | Differs: Spark take(n) eagerly returns list\[Row\]; Batcher limit is lazy. Codemod: .limit(n).to\_pylist(). Wave W0. |
 | `to` | `Dataset.cast` | param | Missing: reconcile to a target schema: reorder, project away and cast nested fields by name. Wave W2. |
 | `toArrow` | `Dataset.to_arrow` | canonical |  |
@@ -131,7 +131,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `withColumnsRenamed` | `Dataset.rename` | param | Missing: no-op for absent columns (Batcher raises). Wave W2. |
 | `withMetadata` | n/a | gap | Not yet: per-field metadata on a column. Wave W11. |
 | `withWatermark` | `Dataset.with_watermark` | canonical |  |
-| `write` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
+| `write` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
 | `writeStream` | `Dataset.write` | canonical |  |
 | `writeTo` | n/a | gap | Not yet: DataFrameWriterV2 catalog-table writer (create/replace/append/overwritePartitions). Wave W9. |
 | `zipWithIndex` | `Dataset.with_row_index` | mismatch | Differs: Spark appends the index as the last column; Batcher inserts it first. Wave W0. |
@@ -172,7 +172,7 @@ The following table maps the 15 names on `GroupedData`, sorted alphabetically.
 | `applyInPandasWithState` | `Dataset.transform_with_state` | param | Missing: GroupState with timeouts and outputMode. Wave W10. |
 | `avg` | `GroupBy.mean` | param | Missing: Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
 | `cogroup` | n/a | gap | Not yet: cogroup two grouped Datasets for applyInPandas/applyInArrow. Wave W10. |
-| `count` | `GroupBy.count` | mismatch | Differs: Spark counts rows into one 'count' column; GroupBy.count counts non-null values per column. Codemod: GroupBy.len(name='count'). Wave W0. |
+| `count` | `GroupBy.count` | mismatch | Differs: Spark counts rows into one 'count' column; GroupBy.count counts non-null values per column. Port as: GroupBy.len(name='count'). Wave W0. |
 | `max` | `GroupBy.max` | param | Missing: Spark names the output 'max(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
 | `mean` | `GroupBy.mean` | param | Missing: Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
 | `min` | `GroupBy.min` | param | Missing: Spark names the output 'min(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
@@ -188,7 +188,7 @@ The following table maps the 7 names on `Window`, sorted alphabetically.
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
 | `currentRow` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
-| `orderBy` | `AggExpr.over` + `WindowExpr.over` | mismatch | Differs: Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row\_number/lag. Codemod passes (col, False, True) keys. Wave W0. |
+| `orderBy` | `AggExpr.over` + `WindowExpr.over` | mismatch | Differs: Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row\_number/lag. Pass (col, False, True) keys. Wave W0. |
 | `partitionBy` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
 | `rangeBetween` | `AggExpr.over` + `WindowExpr.over` | param | Missing: RANGE frames with value offsets on the order key (frame units 'range' are unverified for non-zero offsets). Wave W5. |
 | `rowsBetween` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
@@ -201,7 +201,7 @@ The following table maps the 4 names on `WindowSpec`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `orderBy` | `AggExpr.over` + `WindowExpr.over` | mismatch | Differs: Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row\_number/lag. Codemod passes (col, False, True) keys. Wave W0. |
+| `orderBy` | `AggExpr.over` + `WindowExpr.over` | mismatch | Differs: Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row\_number/lag. Pass (col, False, True) keys. Wave W0. |
 | `partitionBy` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
 | `rangeBetween` | `AggExpr.over` + `WindowExpr.over` | param | Missing: RANGE frames with value offsets on the order key (frame units 'range' are unverified for non-zero offsets). Wave W5. |
 | `rowsBetween` | `AggExpr.over` + `WindowExpr.over` | canonical |  |

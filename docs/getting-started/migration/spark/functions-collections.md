@@ -41,7 +41,7 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `arrays_zip` | n/a | gap | Not yet: zip arrays into an array of structs. Wave W3. |
 | `cardinality` | `Expr.list.len` + `Expr.map.len` | canonical |  |
 | `create_map` | n/a | gap | Not yet: map from alternating key/value expressions. Wave W4. |
-| `element_at` | `Expr.list.get` + `Expr.map.get` | mismatch | Differs: Spark element\_at is 1-based with negative indexes counting from the end (and a key lookup on maps); Expr.list.get is 0-based. Codemod subtracts 1 for positive literals. Wave W0. |
+| `element_at` | `Expr.list.get` + `Expr.map.get` | mismatch | Differs: Spark element\_at is 1-based with negative indexes counting from the end (and a key lookup on maps); Expr.list.get is 0-based. Subtract 1 for positive literals. Wave W0. |
 | `exists` | n/a | gap | Not yet: higher-order function with a Python lambda over array elements (any element matches). Wave W4. |
 | `explode` | `Dataset.explode` | param | Missing: generator usable inside select, and map input producing key/value columns. Wave W8. |
 | `explode_outer` | `Dataset.explode` | param | Missing: generator usable inside select, and map input producing key/value columns. Wave W8. |
@@ -82,7 +82,7 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `sequence` | `bt.sequence` | param | Missing: date and timestamp sequences with an interval step. Wave W6. |
 | `shuffle` | n/a | gap | Not yet: random permutation of an array with seed. Wave W3. |
 | `size` | `Expr.list.len` + `Expr.map.len` | canonical |  |
-| `slice` | `Expr.list.slice` | mismatch | Differs: Spark slice is 1-based with negative starts counting from the end; Expr.list.slice is 0-based. Codemod subtracts 1 for positive literal starts. Wave W0. |
+| `slice` | `Expr.list.slice` | mismatch | Differs: Spark slice is 1-based with negative starts counting from the end; Expr.list.slice is 0-based. Subtract 1 for positive literal starts. Wave W0. |
 | `sort_array` | `Expr.list.sort` | mismatch | Differs: Spark sort\_array ascending puts nulls first (descending puts them last); Expr.list.sort puts nulls last. Needs nulls\_first= and descending=. Wave W0. |
 | `stack` | n/a | gap | Not yet: stack(n, ...) generator separating columns into rows. Wave W8. |
 | `str_to_map` | n/a | gap | Not yet: split a delimited string into a map. Wave W4. |

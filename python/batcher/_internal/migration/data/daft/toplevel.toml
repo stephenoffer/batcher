@@ -108,7 +108,7 @@ read_mcap = { status = "param", batcher = "bt.read.mcap", need = "start_time=/en
 read_paimon = { status = "gap", need = "Apache Paimon reader", wave = "W13" }
 read_parquet = { status = "alias", batcher = "bt.read.parquet" }
 read_sql = { status = "param", batcher = "bt.read.sql", need = "partition_col=/num_partitions= parallel range partitioning and a connection factory callable", wave = "W13" }
-read_table = { status = "mismatch", batcher = "bt.read.table", note = "Daft read_table(identifier) reads a table from the session catalog; bt.read_table(format) reads a registered source format by name. Rewrite: Session.table(identifier)", wave = "W9" }
+read_table = { status = "mismatch", batcher = "bt.read.table", note = "Daft read_table(identifier) reads a table from the session catalog; bt.read.table(name) constructs a registered connector by name. Rewrite: Session.table(identifier)", wave = "W9" }
 read_text = { status = "mismatch", batcher = "bt.read.text", note = "Daft read_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line_number columns and keeps blank lines. Param: skip_blank_lines=True, text column only", wave = "W13" }
 read_video_frames = { status = "mismatch", batcher = "bt.read.video", note = "Daft read_video_frames yields one row per decoded frame (image_height/width, sample_interval_seconds); Batcher read.video yields one row per file with num_frames sampled frames", wave = "W12" }
 read_warc = { status = "mismatch", batcher = "bt.read.warc", note = "Daft read_warc keeps WARC header names ('WARC-Record-ID', ...); Batcher read.warc snake_cases them ('warc_record_id')", wave = "W13" }

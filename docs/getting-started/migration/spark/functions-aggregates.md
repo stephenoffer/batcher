@@ -84,11 +84,11 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `listagg` | `Expr.str.join` | canonical |  |
 | `listagg_distinct` | `Expr.str.join` | param | Missing: distinct=True. Wave W2. |
 | `max` | `bt.max` | canonical |  |
-| `max_by` | `Expr.arg_max` | param | Missing: the Appendix D rename of value-by Expr.arg\_max(by) to max\_by, and k= for the top-k values. Wave W0. |
+| `max_by` | `Expr.arg_max` | param | Missing: renaming the value-by Expr.arg\_max(by) to max\_by, and k= for the top-k values. Wave W0. |
 | `mean` | `bt.mean` | canonical |  |
 | `median` | `bt.median` | canonical |  |
 | `min` | `bt.min` | canonical |  |
-| `min_by` | `Expr.arg_min` | param | Missing: the Appendix D rename of value-by Expr.arg\_min(by) to min\_by, and k= for the bottom-k values. Wave W0. |
+| `min_by` | `Expr.arg_min` | param | Missing: renaming the value-by Expr.arg\_min(by) to min\_by, and k= for the bottom-k values. Wave W0. |
 | `mode` | `bt.mode` | canonical |  |
 | `nth_value` | `bt.nth_value` | mismatch | Differs: Spark nth\_value uses the window's default frame (a running frame when ordered) and takes ignoreNulls=; bt.nth\_value always reads the whole partition. Wave W0. |
 | `ntile` | `bt.ntile` | canonical |  |
@@ -107,7 +107,7 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `regr_sxy` | `bt.regr_sxy` | canonical |  |
 | `regr_syy` | `bt.regr_syy` | canonical |  |
 | `row_number` | `bt.row_number` | canonical |  |
-| `skewness` | `bt.skew` | mismatch | Differs: Spark skewness is the population estimate (\[1,1,2\] -\> 0.7071); bt.skewness is the adjusted sample estimate. Needs a population variant. Wave W0. |
+| `skewness` | `bt.skew` | mismatch | Differs: Spark skewness is the population estimate (\[1,1,2\] -\> 0.7071); bt.skew is the adjusted sample estimate. Needs a population variant. Wave W0. |
 | `some` | `bt.bool_or` | canonical |  |
 | `std` | `bt.std` | canonical |  |
 | `stddev` | `bt.std` | canonical |  |

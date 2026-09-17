@@ -15,7 +15,7 @@ UserDefinedFunction = { status = "param", batcher = "bt.udf", need = "a UDF obje
 UserDefinedTableFunction = { status = "gap", need = "Python UDTF protocol: UDTF object callable from the DataFrame API", wave = "W11" }
 arrow_udf = { status = "param", batcher = "Dataset.map_batches", need = "Arrow UDF usable as a column expression (column in, column out) with returnType=", wave = "W11" }
 arrow_udtf = { status = "gap", need = "Python UDTF protocol: Arrow-batched UDTF", wave = "W11" }
-asc = { status = "mismatch", batcher = "Dataset.sort", note = "Spark asc(col) sorts nulls first; Batcher ascending sorts nulls last. Codemod passes nulls_first=True", wave = "W0" }
+asc = { status = "mismatch", batcher = "Dataset.sort", note = "Spark asc(col) sorts nulls first; Batcher ascending sorts nulls last. Pass nulls_first=True", wave = "W0" }
 asc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
 asc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
 assert_true = { status = "gap", need = "raise when a condition is false", wave = "W3" }

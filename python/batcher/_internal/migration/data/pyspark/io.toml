@@ -37,7 +37,7 @@ xml = { status = "mismatch", batcher = "bt.read.xml", note = "DataStreamReader.x
 [DataFrameWriter]
 bucketBy = { status = "gap", need = "bucketed table writes (bucketBy with sortBy)", wave = "W13" }
 clusterBy = { status = "param", batcher = "Dataset.write", need = "record clustering columns in table metadata", wave = "W13" }
-csv = { status = "mismatch", batcher = "Dataset.write.csv", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0" }
+csv = { status = "mismatch", batcher = "Dataset.write.csv", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly", wave = "W0" }
 format = { status = "canonical", batcher = "Dataset.write" }
 insertInto = { status = "gap", need = "insert into an existing catalog table by position", wave = "W9" }
 jdbc = { status = "param", batcher = "Dataset.write.sql", need = "url + table + properties connection form", wave = "W13" }
@@ -48,7 +48,7 @@ options = { status = "canonical", batcher = "Dataset.write" }
 orc = { status = "mismatch", batcher = "Dataset.write.orc", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0", template = 'orc(path, mode=None, partitionBy=None) -> sem.spark_write(self, "orc", path, mode, partitionBy)' }
 parquet = { status = "mismatch", batcher = "Dataset.write.parquet", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0", template = 'parquet(path, mode=None, partitionBy=None) -> sem.spark_write(self, "parquet", path, mode, partitionBy)' }
 partitionBy = { status = "canonical", batcher = "Dataset.write" }
-save = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly", wave = "W0" }
+save = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly", wave = "W0" }
 saveAsTable = { status = "gap", need = "save as a managed catalog table", wave = "W9" }
 sortBy = { status = "param", batcher = "Dataset.write", need = "sort within buckets, paired with bucketBy", wave = "W13" }
 text = { status = "gap", need = "plain-text writer (single string column)", wave = "W13" }

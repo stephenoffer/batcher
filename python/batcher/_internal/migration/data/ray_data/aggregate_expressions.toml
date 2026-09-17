@@ -8,7 +8,7 @@ AggregateFn = { status = "gap", need = "user-defined accumulator aggregate (init
 AggregateFnV2 = { status = "gap", need = "user-defined vectorized aggregate over block columns (aggregate_block/combine/finalize)", wave = "W11" }
 Any = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
 ApproximateQuantile = { status = "param", batcher = "Expr.approx_quantile", need = "a list of quantiles in one aggregate returning a list, quantile_precision=", wave = "W2" }
-ApproximateTopK = { status = "mismatch", batcher = "Expr.top_k", note = "Ray ApproximateTopK(on, k) returns [{column: value, 'count': n}] records; Batcher Expr.top_k returns the values only (exactly, most frequent first) and is being renamed mode_top_k per Appendix D.", wave = "W0" }
+ApproximateTopK = { status = "mismatch", batcher = "Expr.top_k", note = "Ray ApproximateTopK(on, k) returns [{column: value, 'count': n}] records; Batcher Expr.top_k returns the values only (exactly, most frequent first) and its most-frequent meaning is being renamed so top_k means largest.", wave = "W0" }
 ArrowAggSpec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
 AsList = { status = "canonical", batcher = "Expr.array_agg" }
 Block = { status = "out_of_scope", reason = "Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime)" }
@@ -17,7 +17,7 @@ BlockColumn = { status = "out_of_scope", reason = "Ray block abstraction importe
 BlockColumnAccessor = { status = "out_of_scope", reason = "Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime)" }
 Callable = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
 Collection = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
-Count = { status = "mismatch", batcher = ["bt.count", "Expr.count"], note = "Ray Count() counts rows, and Count(on) defaults ignore_nulls=False so it also counts nulls; Batcher col(x).count() skips nulls. Codemod: bt.count() for both unless ignore_nulls=True, then col(x).count().", wave = "W0" }
+Count = { status = "mismatch", batcher = ["bt.count", "Expr.count"], note = "Ray Count() counts rows, and Count(on) defaults ignore_nulls=False so it also counts nulls; Batcher col(x).count() skips nulls. Port as: bt.count() for both unless ignore_nulls=True, then col(x).count().", wave = "W0" }
 CountDistinct = { status = "canonical", batcher = "Expr.count_distinct" }
 Deprecated = { status = "out_of_scope", reason = "ray.util.annotations decorator imported into the module, not Ray Data API" }
 Dict = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
@@ -27,7 +27,7 @@ List = { status = "out_of_scope", reason = "module import plumbing, not Ray Data
 Max = { status = "canonical", batcher = "Expr.max" }
 Mean = { status = "canonical", batcher = "Expr.mean" }
 Min = { status = "canonical", batcher = "Expr.min" }
-MissingValuePercentage = { status = "mismatch", batcher = "bt.null_rate", note = "Ray returns a percentage in [0, 100] and counts NaN as missing; Batcher null_rate returns a fraction in [0, 1] and counts only nulls. Codemod: bt.null_rate(x) * 100 after fill_nan(None).", wave = "W0" }
+MissingValuePercentage = { status = "mismatch", batcher = "bt.null_rate", note = "Ray returns a percentage in [0, 100] and counts NaN as missing; Batcher null_rate returns a fraction in [0, 1] and counts only nulls. Port as: bt.null_rate(x) * 100 after fill_nan(None).", wave = "W0" }
 Optional = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
 Protocol = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
 PublicAPI = { status = "out_of_scope", reason = "ray.util.annotations decorator imported into the module, not Ray Data API" }
