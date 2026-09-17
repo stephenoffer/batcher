@@ -35,7 +35,7 @@ def test_levenshtein_matches_duckdb(duck):
 
 def test_regexp_extract_all_matches_duckdb(duck):
     duck.register("t", _strs())
-    out = bt.from_arrow(_strs()).select(r=col("s").str.regexp_extract_all("[a-z]")).collect()
+    out = bt.from_arrow(_strs()).select(r=col("s").str.extract_all("[a-z]")).collect()
     assert_same(out, duck.sql("SELECT regexp_extract_all(s, '[a-z]') AS r FROM t"))
 
 

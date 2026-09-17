@@ -115,7 +115,7 @@ def _registry() -> dict[str, Any]:
 def positional_arity(fn) -> tuple[int, int | None]:
     """(required, maximum) positional parameters — maximum None when the function is variadic.
 
-    `max_horizontal(*columns)` takes any number, and counting only the *named* positional
+    `greatest(*columns)` takes any number, and counting only the *named* positional
     parameters said it took none, so every call was refused as "takes 0 argument(s)".
     """
     signature = inspect.signature(fn)

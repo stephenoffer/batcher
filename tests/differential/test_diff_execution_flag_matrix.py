@@ -56,9 +56,9 @@ SHAPES = {
     "sort_desc": (lambda d: d.sort("v", descending=True), True),
     "sort_two_keys": (lambda d: d.sort("k", "i"), True),
     "top_n": (lambda d: d.sort("v", descending=True).limit(25), True),
-    "group_sum": (lambda d: d.groupby("k").agg(s=bt.col("v").sum()), False),
+    "group_sum": (lambda d: d.group_by("k").agg(s=bt.col("v").sum()), False),
     "group_multi": (
-        lambda d: d.groupby("k").agg(
+        lambda d: d.group_by("k").agg(
             s=bt.col("v").sum(), n=bt.col("i").count(), m=bt.col("v").max()
         ),
         False,

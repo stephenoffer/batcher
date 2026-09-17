@@ -58,7 +58,7 @@ def main() -> None:
     assert partial.count() < by_nation.count()
 
     # Per-period completeness, the same shape over time.
-    years = orders.with_columns(year=col("o_orderdate").dt.year()).n_unique("year")
+    years = orders.with_columns(year=col("o_orderdate").dt.year()).count_distinct("year")
     per_year = (
         orders.with_columns(year=col("o_orderdate").dt.year())
         .group_by("year")

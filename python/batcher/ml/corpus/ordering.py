@@ -60,7 +60,7 @@ def _length_of(ds: Dataset, column: str):
     ):
         return col(column).list.len()
     if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
-        return col(column).str.len()
+        return col(column).str.len_chars()
     raise PlanError(
         f"length_grouped_order: {column!r} is {dtype}, which has no length. Pass a list column "
         f"of token ids or a text column."

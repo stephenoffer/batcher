@@ -17,22 +17,17 @@ from batcher.plan.expr_ir import (
     Expr,
     IntoExpr,
     coalesce,
-    greatest,
-    least,
     lit,
     nullif,
 )
 from batcher.plan.expr_ir.core import _wrap
-from batcher.plan.expr_ir.nodes import Greatest, Least
 
 __all__ = [
     "all_horizontal",
     "any_horizontal",
     "count_horizontal",
     "fold_horizontal",
-    "max_horizontal",
     "mean_horizontal",
-    "min_horizontal",
     "product_horizontal",
     "reduce_horizontal",
     "sum_horizontal",
@@ -92,51 +87,6 @@ def mean_horizontal(*exprs: IntoExpr) -> Expr:
     count = functools.reduce(operator.add, [e.is_not_null().cast("int64") for e in wrapped])
     # Divide by NULLIF(count, 0): an all-null row has count 0 → null (no div-by-zero).
     return total / nullif(count, lit(0))
-
-
-def min_horizontal(*exprs: IntoExpr) -> Least:
-    """Row-wise minimum across the given columns, ignoring nulls (Polars ``min_horizontal``).
-
-    The Polars-named spelling of `least`, completing the horizontal family alongside
-    `sum_horizontal`/`mean_horizontal`; an all-null row yields null.
-
-    Args:
-        exprs: The columns to take the row-wise minimum of.
-
-    Returns:
-        A column holding the per-row minimum across the given columns.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"a": [1, 9], "b": [4, 2]})
-            >>> ds.select(lo=bt.min_horizontal(bt.col("a"), bt.col("b"))).to_pydict()
-            {'lo': [1, 2]}
-    """
-    return least(*exprs)
-
-
-def max_horizontal(*exprs: IntoExpr) -> Greatest:
-    """Row-wise maximum across the given columns, ignoring nulls (Polars ``max_horizontal``).
-
-    The Polars-named spelling of `greatest`; an all-null row yields null.
-
-    Args:
-        exprs: The columns to take the row-wise maximum of.
-
-    Returns:
-        A column holding the per-row maximum across the given columns.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"a": [1, 9], "b": [4, 2]})
-            >>> ds.select(hi=bt.max_horizontal(bt.col("a"), bt.col("b"))).to_pydict()
-            {'hi': [4, 9]}
-    """
-    return greatest(*exprs)
 
 
 def all_horizontal(*exprs: IntoExpr) -> Expr:
@@ -250,7 +200,7 @@ def reduce_horizontal(function: Callable[[Expr, Expr], Expr], *exprs: IntoExpr) 
     initial accumulator, then ``acc = function(acc, next)`` for each remaining column.
     `function` runs **once at plan-build time** on `Expr` operands to assemble the
     expression tree — it never sees a row — so any expression-valued combiner works
-    (``lambda a, b: a + b``, ``lambda a, b: bt.max_horizontal(a, b)``, …). Use it for a
+    (``lambda a, b: a + b``, ``lambda a, b: bt.greatest(a, b)``, …). Use it for a
     horizontal reduction the named ``*_horizontal`` helpers don't cover.
 
     Args:

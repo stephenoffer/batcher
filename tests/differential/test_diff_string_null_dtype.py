@@ -47,7 +47,7 @@ def test_upper_of_an_all_null_column_is_null(duck, t):
 
 
 def test_length_of_an_all_null_column_is_null(duck, t):
-    out = bt.from_arrow(t).select(g=col("g"), r=col("s").str.len()).collect()
+    out = bt.from_arrow(t).select(g=col("g"), r=col("s").str.len_chars()).collect()
     assert_same(out, duck.sql("select g, length(s::VARCHAR) as r from t"))
 
 
@@ -63,7 +63,7 @@ def test_replace_on_an_all_null_column_is_null(duck, t):
 
 def test_a_mixed_column_is_unaffected(duck, t):
     """The fix must not change a column that already had a string type."""
-    out = bt.from_arrow(t).select(g=col("g"), u=col("m").str.upper(), n=col("m").str.len())
+    out = bt.from_arrow(t).select(g=col("g"), u=col("m").str.upper(), n=col("m").str.len_chars())
     assert_same(out.collect(), duck.sql("select g, upper(m) as u, length(m) as n from t"))
 
 

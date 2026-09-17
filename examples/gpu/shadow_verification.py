@@ -35,10 +35,10 @@ def main() -> None:
         "grouped sum": lineitem.group_by("l_shipmode")
         .agg(revenue=col("l_extendedprice").sum())
         .sort("l_shipmode"),
-        "date projection": lineitem.select("l_orderkey", "l_shipdate").head(1_000),
+        "date projection": lineitem.select("l_orderkey", "l_shipdate").limit(1_000),
         "integer abs": lineitem.select(
             "l_orderkey", magnitude=(col("l_linenumber") - 4).abs()
-        ).head(1_000),
+        ).limit(1_000),
         "filtered count": lineitem.filter(col("l_quantity") > 30).agg(n=bt.count()),
     }
 

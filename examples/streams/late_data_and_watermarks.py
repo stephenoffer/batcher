@@ -25,7 +25,7 @@ def main() -> None:
     events = (
         tpch("lineitem")
         .select("l_orderkey", "l_shipdate", "l_receiptdate", "l_quantity")
-        .head(50_000)
+        .limit(50_000)
     )
 
     lateness = events.with_columns(delay=col("l_receiptdate") - col("l_shipdate"))

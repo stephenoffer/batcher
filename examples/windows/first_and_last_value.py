@@ -27,7 +27,7 @@ def main() -> None:
         orders.group_by("o_orderdate")
         .agg(revenue=col("o_totalprice").sum())
         .sort("o_orderdate")
-        .head(20)
+        .limit(20)
     )
 
     edges = daily.with_columns(

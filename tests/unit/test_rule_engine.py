@@ -85,7 +85,7 @@ def test_many_inapplicable_rules_never_fire():
         reg.add(node_rule(f"noop_{i}", Phase.REWRITE, mark, matches=(Window,)))
 
     emp, dept = _emp_dept()
-    plan = emp.join(dept, on="dept_id").filter(col("id") > 1).sort("id").head(2)._plan
+    plan = emp.join(dept, on="dept_id").filter(col("id") > 1).sort("id").limit(2)._plan
     ir = Optimizer(rules=reg.rules()).optimize(plan).ir
 
     assert fired["n"] == 0  # none fired — the plan has no Window node
@@ -108,7 +108,7 @@ def test_predicate_pushed_below_join_through_optimizer():
 
 def test_topn_fusion_through_optimizer():
     emp, _ = _emp_dept()
-    plan = emp.sort("id").head(2)._plan
+    plan = emp.sort("id").limit(2)._plan
     ir = Optimizer().optimize(plan).ir
     assert ir["op"] == "sort"
     assert ir["limit"] == 2  # Limit fused into the Sort as a top-N
@@ -129,7 +129,7 @@ def test_constant_folding_applied_through_optimizer():
 
 def test_optimization_is_deterministic():
     emp, dept = _emp_dept()
-    plan = emp.join(dept, on="dept_id").filter(col("id") > 1).sort("id").head(2)._plan
+    plan = emp.join(dept, on="dept_id").filter(col("id") > 1).sort("id").limit(2)._plan
     assert Optimizer().optimize(plan).ir == Optimizer().optimize(plan).ir
 
 

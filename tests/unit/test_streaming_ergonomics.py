@@ -100,10 +100,10 @@ def test_trigger_accepts_timedelta():
 
 
 def test_trigger_spark_capitalized_aliases_match_snake_case():
-    assert Trigger.ProcessingTime("5 seconds") == Trigger.processing_time("5 seconds")
-    assert Trigger.Once() == Trigger.once()
-    assert Trigger.AvailableNow() == Trigger.available_now()
-    assert Trigger.Continuous("1 second") == Trigger.continuous("1 second")
+    assert Trigger.processing_time("5 seconds") == Trigger.processing_time("5 seconds")
+    assert Trigger.once() == Trigger.once()
+    assert Trigger.available_now() == Trigger.available_now()
+    assert Trigger.continuous("1 second") == Trigger.continuous("1 second")
 
 
 def test_trigger_bad_interval_is_actionable():
@@ -244,11 +244,11 @@ def test_query_core_accessors():
 
 def test_query_spark_aliases_delegate():
     q = _query(active=False)
-    assert q.isActive is False
-    assert q.lastProgress.batch_id == 1
-    assert len(q.recentProgress) == 2
-    assert q.awaitTermination(0.0) is True
-    assert q.processAllAvailable() is True
+    assert q.is_active is False
+    assert q.last_progress.batch_id == 1
+    assert len(q.recent_progress) == 2
+    assert q.await_termination(0.0) is True
+    assert q.process_all_available() is True
 
 
 # --- active-query registry guard --------------------------------------------

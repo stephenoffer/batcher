@@ -23,8 +23,8 @@ def test_str_trim_with_chars(duck):
     duck.register("t", t)
     out = bt.from_arrow(t).select(
         b=col("s").str.trim("x"),
-        l=col("s").str.lstrip("-"),
-        r=col("s").str.rstrip(" "),
+        l=col("s").str.strip_chars_start("-"),
+        r=col("s").str.strip_chars_end(" "),
         w=col("s").str.trim(),
     )
     assert_same(
@@ -53,7 +53,7 @@ def test_str_split_part(duck):
 def test_str_regexp_replace_all(duck):
     t = pa.table({"s": ["a1b2c3", "no digits", None]})
     duck.register("t", t)
-    out = bt.from_arrow(t).select(g=col("s").str.regexp_replace_all("[0-9]", "#"))
+    out = bt.from_arrow(t).select(g=col("s").str.replace_all("[0-9]", "#"))
     assert_same(out.collect(), duck.sql("SELECT regexp_replace(s, '[0-9]', '#', 'g') g FROM t"))
 
 

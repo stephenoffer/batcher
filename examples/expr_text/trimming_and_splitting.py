@@ -33,9 +33,9 @@ def main() -> None:
     )
 
     cleaned = records.select(
-        trimmed=col("raw").str.strip(),
-        left_only=col("raw").str.lstrip(),
-        right_only=col("raw").str.rstrip(),
+        trimmed=col("raw").str.trim(),
+        left_only=col("raw").str.strip_chars_start(),
+        right_only=col("raw").str.strip_chars_end(),
     )
     result = cleaned.to_pydict()
     print([repr(value) for value in result["trimmed"]])
@@ -47,19 +47,19 @@ def main() -> None:
     assert result["right_only"][0].startswith("  ")
 
     # `strip_chars` with an explicit set removes all of it.
-    thorough = records.select(x=col("raw").str.strip_chars(" \t\n")).to_pydict()
+    thorough = records.select(x=col("raw").str.trim(" \t\n")).to_pydict()
     assert all(value == value.strip() for value in thorough["x"])
 
     # Splitting into a list keeps one row per record.
-    fields = records.select(parts=col("raw").str.strip_chars(" \t\n").str.split("|"))
+    fields = records.select(parts=col("raw").str.trim(" \t\n").str.split("|"))
     assert fields.count() == records.count()
     assert fields.select(n=col("parts").list.len()).to_pydict()["n"] == [3, 3, 3]
 
     # `split_part` takes one field directly, 1-based.
     picked = records.select(
-        name=col("raw").str.strip_chars(" \t\n").str.split_part("|", 1),
-        team=col("raw").str.strip_chars(" \t\n").str.split_part("|", 2),
-        city=col("raw").str.strip_chars(" \t\n").str.split_part("|", 3),
+        name=col("raw").str.trim(" \t\n").str.split_part("|", 1),
+        team=col("raw").str.trim(" \t\n").str.split_part("|", 2),
+        city=col("raw").str.trim(" \t\n").str.split_part("|", 3),
     ).to_pydict()
     print(picked)
     assert picked["name"] == ["alice", "bob", "carol"]

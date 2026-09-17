@@ -37,7 +37,7 @@ AGGREGATES = [
     ("bit_and", lambda c: c.bit_and(), "bit_and", "i"),
     ("bit_or", lambda c: c.bit_or(), "bit_or", "i"),
     ("bit_xor", lambda c: c.bit_xor(), "bit_xor", "i"),
-    ("count_distinct", lambda c: c.n_unique(), "count(DISTINCT %s)", "i"),
+    ("count_distinct", lambda c: c.count_distinct(), "count(DISTINCT %s)", "i"),
 ]
 
 
@@ -142,7 +142,7 @@ def test_a_window_aggregate_agrees_with_the_group_by_aggregate(duck, table):
     windowed = (
         bt.from_arrow(table)
         .select(g=col("g"), v=col("x").var().over("g"), s=col("x").std().over("g"))
-        .unique()
+        .distinct()
         .sort("g")
         .collect()
     )
@@ -202,6 +202,6 @@ def test_the_frame_boundary_is_the_folds_versus_everything_else():
     assert framed_std["r"][0] is None
     assert framed_std["r"][1] == pytest.approx(0.5**0.5)
     # The two that are not folds still refuse one.
-    for build in (lambda: col("i").n_unique(), lambda: col("x").median()):
+    for build in (lambda: col("i").count_distinct(), lambda: col("x").median()):
         with pytest.raises(Exception, match="frame"):
             ds.select(r=build().over("g", order_by="o", frame=(-1, 0))).collect()

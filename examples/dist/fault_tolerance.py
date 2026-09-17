@@ -24,13 +24,11 @@ def main() -> None:
     lineitem = tpch("lineitem")
 
     # The partials, as separate datasets — this is what each worker would produce.
-    shards = [lineitem.slice(start, 50_000) for start in range(0, 200_000, 50_000)]
+    shards = [lineitem.limit(50_000, offset=start) for start in range(0, 200_000, 50_000)]
     assert sum(shard.count() for shard in shards) == lineitem.count()
 
     partials = [
-        shard.group_by("l_shipmode").agg(
-            lines=bt.count(), qty=col("l_quantity").sum()
-        )
+        shard.group_by("l_shipmode").agg(lines=bt.count(), qty=col("l_quantity").sum())
         for shard in shards
     ]
 

@@ -22,8 +22,8 @@ def main() -> None:
 
     parts = codes.with_columns(
         # Fixed-width pieces from each end.
-        region=col("sku").str.head(2),
-        last4=col("sku").str.tail(4),
+        region=col("sku").str.left(2),
+        last4=col("sku").str.right(4),
         # From an offset. `slice` is 0-based; `substr` is 1-based like SQL.
         after_region=col("sku").str.slice(3),
         first_two_slice=col("sku").str.slice(0, 2),

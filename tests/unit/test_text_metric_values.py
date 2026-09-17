@@ -122,7 +122,6 @@ INTEROP: dict[str, Callable[[str], object]] = {
     "crc32": lambda s: zlib.crc32(s.encode()),
     "base64": lambda s: base64.b64encode(s.encode()).decode(),
     "url_encode": lambda s: urllib.parse.quote(s, safe=""),
-    "len_bytes": lambda s: len(s.encode()),
     "len_chars": len,
     "octet_length": lambda s: len(s.encode()),
     "bit_length": lambda s: len(s.encode()) * 8,
@@ -130,10 +129,6 @@ INTEROP: dict[str, Callable[[str], object]] = {
     "lower": str.lower,
     "capitalize": str.capitalize,
     "reverse": lambda s: s[::-1],
-    "isalpha": str.isalpha,
-    "isdigit": str.isdigit,
-    "isalnum": str.isalnum,
-    "isspace": lambda s: len(s) > 0 and s.isspace(),
     "is_blank": lambda s: len(s.strip()) == 0,
     "normalize_whitespace": lambda s: " ".join(s.split()),
 }

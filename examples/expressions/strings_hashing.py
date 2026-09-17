@@ -37,7 +37,7 @@ def main() -> None:
     assert len(hashed["md5"][0]) == 32
 
     # The bucketing this exists for: a stable shard from a high-cardinality key.
-    bucketed = ids.select(bucket=col("email").str.hash64().mod(4)).to_pydict()
+    bucketed = ids.select(bucket=(col("email").str.hash64() % 4)).to_pydict()
     print("buckets:", bucketed["bucket"])
     assert all(0 <= b < 4 for b in bucketed["bucket"])
     assert bucketed["bucket"][0] == bucketed["bucket"][2]

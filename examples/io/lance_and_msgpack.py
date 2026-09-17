@@ -20,7 +20,7 @@ from _common import tpch
 
 
 def main() -> None:
-    part = tpch("part").select("p_partkey", "p_name", "p_retailprice").head(5_000)
+    part = tpch("part").select("p_partkey", "p_name", "p_retailprice").limit(5_000)
     expected = part.sort("p_partkey").to_pydict()
 
     with tempfile.TemporaryDirectory() as directory:

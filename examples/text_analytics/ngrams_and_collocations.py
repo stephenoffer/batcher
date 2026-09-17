@@ -23,12 +23,12 @@ def main() -> None:
     comments = (
         tpch("lineitem")
         .select("l_orderkey", "l_linenumber", "l_comment")
-        .head(20_000)
+        .limit(20_000)
         .with_row_index(name="doc")
     )
 
     words = (
-        comments.select("doc", word=col("l_comment").str.to_lowercase().str.split(" "))
+        comments.select("doc", word=col("l_comment").str.lower().str.split(" "))
         .explode("word")
         .filter(col("word").str.len_chars() > 2)
     )
@@ -57,7 +57,7 @@ def main() -> None:
     assert all(" " in value for value in top["bigram"])
 
     # Every bigram is two words, and there is one fewer bigram than word per document.
-    assert paired.count() == words.count() - words.n_unique("doc")
+    assert paired.count() == words.count() - words.count_distinct("doc")
 
     # The most common bigram appears more than once, which is what makes it a collocation
     # rather than a coincidence.

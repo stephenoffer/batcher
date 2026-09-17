@@ -193,14 +193,14 @@ def test_trim_of_trim(duck):
 def test_trim_absorbs_ltrim(duck):
     tbl = pa.table({"s": ["  pad  ", "", "   ", None]})
     duck.register("t3", tbl)
-    out = bt.from_arrow(tbl).select(r=col("s").str.lstrip().str.trim()).collect()
+    out = bt.from_arrow(tbl).select(r=col("s").str.strip_chars_start().str.trim()).collect()
     assert_same(out, duck.sql("SELECT trim(ltrim(s)) AS r FROM t3"))
 
 
 def test_trim_absorbs_rtrim_with_chars(duck):
     tbl = pa.table({"s": ["xxpadxx", "xx", "", None]})
     duck.register("t3", tbl)
-    out = bt.from_arrow(tbl).select(r=col("s").str.rstrip("x").str.trim("x")).collect()
+    out = bt.from_arrow(tbl).select(r=col("s").str.strip_chars_end("x").str.trim("x")).collect()
     assert_same(out, duck.sql("SELECT trim(rtrim(s, 'x'), 'x') AS r FROM t3"))
 
 
@@ -223,7 +223,7 @@ def test_fold_case_of_literal(duck, t):
 
 
 def test_fold_len_of_literal(duck, t):
-    out = bt.from_arrow(t).select(r=bt.lit("héllo").str.len()).collect()
+    out = bt.from_arrow(t).select(r=bt.lit("héllo").str.len_chars()).collect()
     assert_same(out, duck.sql("SELECT length('héllo') AS r FROM t"))
 
 

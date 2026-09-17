@@ -29,7 +29,7 @@ def main() -> None:
     assert math.isinf(overflowing)
 
     # Over a handful of rows it is an ordinary number.
-    small = lineitem.head(10)
+    small = lineitem.limit(10)
     exact = small.agg(p=bt.product(col("l_quantity"))).to_pydict()["p"][0]
     by_hand = math.prod(small.to_pydict()["l_quantity"])
     print("product over 10 rows:", exact)
@@ -37,7 +37,7 @@ def main() -> None:
 
     # The log-sum form survives the full table and stays comparable across group sizes.
     log_space = lineitem.agg(
-        log_total=col("l_quantity").log().sum(),
+        log_total=col("l_quantity").ln().sum(),
         rows=bt.count(),
     ).to_pydict()
     geometric = math.exp(log_space["log_total"][0] / log_space["rows"][0])

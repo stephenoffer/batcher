@@ -502,12 +502,12 @@ def _concat(tr, node) -> Expr:
             # old fallback coalesced a dropped argument to `''` and kept its separator,
             # answering `'a,,b'` where DuckDB answers `'a,b'` — a wrong string, not a
             # refusal, and only on the spelling that takes a column.
-            stripped = StrFuncDyn("substr", raw, start=sep.str.len() + lit(1))
-            joined = when(raw.str.len() > lit(0)).then(stripped).otherwise(empty)
+            stripped = StrFuncDyn("substr", raw, start=sep.str.len_chars() + lit(1))
+            joined = when(raw.str.len_chars() > lit(0)).then(stripped).otherwise(empty)
             # A NULL separator makes the whole result NULL, including when every value was
             # dropped — which the length test above cannot see, since `raw` is `''` there.
             return when(sep.is_null()).then(nullif(empty, empty)).otherwise(joined)
-        return when(raw.str.len() > lit(0)).then(stripped).otherwise(empty)
+        return when(raw.str.len_chars() > lit(0)).then(stripped).otherwise(empty)
 
     # DuckDB's `concat` casts every argument to text (so `concat(id, name)` works on
     # a numeric column) and skips NULLs (treats them as ''). Coalescing to `''`

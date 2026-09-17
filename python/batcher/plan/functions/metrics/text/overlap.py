@@ -113,7 +113,7 @@ def token_set_precision(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             1.0
     """
     predicted, gold = tokens(_as_column(prediction)), tokens(_as_column(reference))
-    intersection = predicted.list.set_intersection(gold).list.len()
+    intersection = predicted.list.intersect(gold).list.len()
     return mean_ratio(intersection, predicted.list.n_unique())
 
 
@@ -140,7 +140,7 @@ def token_set_recall(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             1.0
     """
     predicted, gold = tokens(_as_column(prediction)), tokens(_as_column(reference))
-    intersection = predicted.list.set_intersection(gold).list.len()
+    intersection = predicted.list.intersect(gold).list.len()
     return mean_ratio(intersection, gold.list.n_unique())
 
 
@@ -170,7 +170,7 @@ def token_set_f1(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             0.6667
     """
     predicted, gold = tokens(_as_column(prediction)), tokens(_as_column(reference))
-    intersection = predicted.list.set_intersection(gold).list.len()
+    intersection = predicted.list.intersect(gold).list.len()
     total = predicted.list.n_unique() + gold.list.n_unique()
     ratio = when(total > lit(0)).then(lit(2.0) * intersection / total).otherwise(lit(0.0))
     return ratio.mean()
@@ -202,8 +202,8 @@ def token_set_jaccard(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             0.5
     """
     predicted, gold = tokens(_as_column(prediction)), tokens(_as_column(reference))
-    intersection = predicted.list.set_intersection(gold).list.len()
-    union = predicted.list.set_union(gold).list.len()
+    intersection = predicted.list.intersect(gold).list.len()
+    union = predicted.list.union(gold).list.len()
     ratio = when(union > lit(0)).then(intersection / union).otherwise(lit(0.0))
     return ratio.mean()
 
@@ -269,7 +269,7 @@ def char_ngram_precision(prediction: IntoExpr, reference: IntoExpr, n: int = 3) 
     """
     _validate_n(n)
     pred, gold = char_ngrams(_as_column(prediction), n), char_ngrams(_as_column(reference), n)
-    intersection = pred.list.set_intersection(gold).list.len()
+    intersection = pred.list.intersect(gold).list.len()
     size = pred.list.n_unique()
     return when(size > lit(0)).then(intersection / size).otherwise(lit(0.0)).mean()
 
@@ -300,7 +300,7 @@ def char_ngram_recall(prediction: IntoExpr, reference: IntoExpr, n: int = 3) -> 
     """
     _validate_n(n)
     pred, gold = char_ngrams(_as_column(prediction), n), char_ngrams(_as_column(reference), n)
-    intersection = pred.list.set_intersection(gold).list.len()
+    intersection = pred.list.intersect(gold).list.len()
     size = gold.list.n_unique()
     return when(size > lit(0)).then(intersection / size).otherwise(lit(0.0)).mean()
 
@@ -332,7 +332,7 @@ def char_ngram_f1(prediction: IntoExpr, reference: IntoExpr, n: int = 3) -> Expr
     """
     _validate_n(n)
     pred, gold = char_ngrams(_as_column(prediction), n), char_ngrams(_as_column(reference), n)
-    intersection = pred.list.set_intersection(gold).list.len()
+    intersection = pred.list.intersect(gold).list.len()
     precision = (
         when(pred.list.n_unique() > lit(0))
         .then(intersection / pred.list.n_unique())
@@ -377,6 +377,6 @@ def char_ngram_jaccard(prediction: IntoExpr, reference: IntoExpr, n: int = 3) ->
     """
     _validate_n(n)
     pred, gold = char_ngrams(_as_column(prediction), n), char_ngrams(_as_column(reference), n)
-    intersection = pred.list.set_intersection(gold).list.len()
-    union = pred.list.set_union(gold).list.len()
+    intersection = pred.list.intersect(gold).list.len()
+    union = pred.list.union(gold).list.len()
     return when(union > lit(0)).then(intersection / union).otherwise(lit(0.0)).mean()

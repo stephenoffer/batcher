@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
 from batcher.ml._estimator import require_fit_columns, require_fitted
+from batcher.plan.expr_ir import greatest
 from batcher.plan.expr_ir.constructors import col, lit, when
-from batcher.plan.functions.horizontal import max_horizontal, sum_horizontal
+from batcher.plan.functions.horizontal import sum_horizontal
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -143,7 +144,7 @@ class GaussianMixture:
         }
         ds = ds.with_columns(**weighted)
         log_terms = [col(f"__bt_lp{k}") for k in range(self.n_components)]
-        max_log = max_horizontal(*log_terms)
+        max_log = greatest(*log_terms)
         ds = ds.with_columns(__bt_maxlog=max_log)
         exps = {
             f"__bt_e{k}": (col(f"__bt_lp{k}") - col("__bt_maxlog")).exp()
@@ -359,7 +360,7 @@ class GaussianMixture:
             + self._component_log_density(self.means_[k], self.covariances_[k])
             for k in range(self.n_components)
         ]
-        max_log = max_horizontal(*log_terms)
+        max_log = greatest(*log_terms)
         scored = ds.with_columns(__bt_maxlog=max_log)
         exps = sum_horizontal(*[(term - col("__bt_maxlog")).exp() for term in log_terms])
         return scored.with_columns(**{output_column: col("__bt_maxlog") + exps.ln()}).drop(

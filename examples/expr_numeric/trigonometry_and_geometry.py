@@ -31,7 +31,7 @@ def main() -> None:
         "x",
         "y",
         distance=bt.hypot(col("x"), col("y")),
-        angle=bt.atan2(col("y"), col("x")),
+        angle=bt.arctan2(col("y"), col("x")),
         naive=(col("x") ** 2 + col("y") ** 2).sqrt(),
     )
     result = derived.to_pydict()

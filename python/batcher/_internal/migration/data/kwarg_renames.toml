@@ -1,7 +1,8 @@
 # Second keyword spellings, and the one each collapses to.
 #
 # One table per method, as `["<receiver>.<method>"]`; each key is a keyword being removed.
-# A value is the kept keyword, `"*"` when the value becomes positional arguments, `"!<kw>"`
+# A value is the kept keyword, `"*"` when a literal list becomes positional arguments, `"@"`
+# when the value becomes the first positional argument, `"!<kw>"`
 # when the kept keyword is the logical negation (`ascending` -> `descending`), or
 # `"nulls_first"` for pandas' `na_position="first"|"last"`. Tables for a *removed* method
 # (`Dataset.melt`) are applied before that method is renamed, so its pandas keywords land on
@@ -21,7 +22,7 @@ columns = "*"
 labels = "*"
 
 ["Dataset.rename"]
-columns = "*"
+columns = "@"
 
 ["Dataset.sample"]
 frac = "fraction"

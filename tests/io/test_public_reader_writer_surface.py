@@ -3,9 +3,7 @@
 ``bt.read`` carries 23 connector methods and ``ds.write`` eight that no test called:
 Cassandra, ClickHouse, Databricks, Delta Sharing, DynamoDB, Event Hubs, HBase, HDF5, Hudi,
 Kafka, Kinesis, MongoDB, Pub/Sub, Pulsar, Redis, Snowflake, Elasticsearch, and the
-file formats behind Excel, logs, MCAP, MDF, TFRecord, WebDataset and Zarr. The ten
-top-level ``bt.read_*`` aliases were also unexercised -- a separate surface from
-``bt.read.<format>``, and the one a ported pandas or Polars script actually calls.
+file formats behind Excel, logs, MCAP, MDF, TFRecord, WebDataset and Zarr.
 
 None of the external systems is reachable from a test box, so what this module holds them
 to is the contract that *is* checkable and that matters most in practice: **reaching a
@@ -13,10 +11,10 @@ connector must produce either a lazy plan or an actionable failure, never an unh
 one.** A reader that raises ``KeyError`` or ``AttributeError`` deep in an adapter is a
 support ticket; one that says which option is missing, or which package to install, is not.
 
-The format readers are checked properly, by round trip: ``read_csv``, ``read_json``,
-``read_ndjson``, ``read_ipc``, ``read_orc`` and ``read_avro`` write a frame and read it
-back, and ``read_database`` runs against a real SQLite file. Those are the ones a test box
-can actually prove.
+The format readers are checked properly, by round trip: ``read.csv``, ``read.json``,
+``read.arrow``, ``read.orc`` and ``read.avro`` write a frame and read it back, and
+``read.sql`` runs against a real SQLite file. Those are the ones a test box can actually
+prove.
 
 One thing the module records rather than asserts as desirable: several connectors surface a
 bare ``TypeError`` from the underlying source's ``__init__`` when a required option is
@@ -39,49 +37,31 @@ pytestmark = pytest.mark.io
 
 ROWS = {"a": [1, 2, 3], "s": ["x", "y", "z"]}
 
-#: ``(reader alias, writer format)`` for every format where the round trip is provable here.
-#: The writer name differs from the reader alias twice: ``read_ndjson`` reads what
-#: ``write.json`` produces (one document per line), and ``read_ipc`` reads ``write.arrow``.
+#: ``(bt.read method, writer format, file)`` for every format where the round trip is provable
+#: here. The two names differ once: ``read.arrow`` reads what ``write.arrow`` produces, and a
+#: ``.jsonl`` file is one document per line, which ``read.json`` reads as well.
 ROUND_TRIPS = [
-    ("read_csv", "csv", "t.csv"),
-    ("read_json", "json", "t.json"),
-    ("read_ndjson", "json", "t.jsonl"),
-    ("read_ipc", "arrow", "t.arrow"),
-    ("read_orc", "orc", "t.orc"),
-    ("read_avro", "avro", "t.avro"),
+    ("csv", "csv", "t.csv"),
+    ("json", "json", "t.json"),
+    ("json", "json", "t.jsonl"),
+    ("arrow", "arrow", "t.arrow"),
+    ("orc", "orc", "t.orc"),
+    ("avro", "avro", "t.avro"),
 ]
 
 
 @pytest.mark.parametrize(("reader", "writer", "filename"), ROUND_TRIPS)
-def test_a_top_level_read_alias_reads_back_what_was_written(tmp_path, reader, writer, filename):
-    """The ``bt.read_x`` spelling, checked by writing a frame and reading it back."""
+def test_a_reader_reads_back_what_was_written(tmp_path, reader, writer, filename):
+    """``bt.read.<format>``, checked by writing a frame and reading it back."""
     path = str(tmp_path / filename)
     getattr(bt.from_pydict(ROWS).write, writer)(path)
-    got = getattr(bt, reader)(path).to_pydict()
-    assert sorted(got) == sorted(ROWS), f"{reader} returned columns {sorted(got)}"
-    assert got["a"] == ROWS["a"], f"{reader}: {got['a']}"
+    got = getattr(bt.read, reader)(path).to_pydict()
+    assert sorted(got) == sorted(ROWS), f"read.{reader} returned columns {sorted(got)}"
+    assert got["a"] == ROWS["a"], f"read.{reader}: {got['a']}"
     assert got["s"] == ROWS["s"]
 
 
-@pytest.mark.parametrize(("reader", "writer", "filename"), ROUND_TRIPS)
-def test_the_alias_and_the_namespace_reader_agree(tmp_path, reader, writer, filename):
-    """``bt.read_csv`` and ``bt.read.csv`` are two spellings and must be one behaviour.
-
-    They are separate code paths -- the aliases exist for a ported pandas or Polars script --
-    so an alias that drifted from its namespace method would be invisible to every test of
-    the other.
-    """
-    path = str(tmp_path / filename)
-    getattr(bt.from_pydict(ROWS).write, writer)(path)
-    namespace_name = reader.removeprefix("read_")
-    if not hasattr(bt.read, namespace_name):
-        pytest.skip(f"bt.read has no {namespace_name} method; the alias is the only spelling")
-    assert (
-        getattr(bt, reader)(path).to_pydict() == getattr(bt.read, namespace_name)(path).to_pydict()
-    )
-
-
-def test_read_database_runs_a_query_against_a_real_sqlite_file(tmp_path):
+def test_read_sql_runs_a_query_against_a_real_sqlite_file(tmp_path):
     """The one database reader a test box can actually prove, end to end."""
     database = tmp_path / "x.db"
     connection = sqlite3.connect(database)
@@ -91,7 +71,9 @@ def test_read_database_runs_a_query_against_a_real_sqlite_file(tmp_path):
     connection.close()
 
     try:
-        got = bt.read_database("SELECT a, s FROM t ORDER BY a", f"sqlite:///{database}").to_pydict()
+        got = bt.read.sql(
+            query="SELECT a, s FROM t ORDER BY a", uri=f"sqlite:///{database}"
+        ).to_pydict()
     except MissingDependencyError as missing:
         # Which driver backs the SQL source depends on what is installed; where none is,
         # the reader must still say which package to add rather than fail obscurely.
@@ -100,14 +82,14 @@ def test_read_database_runs_a_query_against_a_real_sqlite_file(tmp_path):
     assert got == {"a": [1, 2], "s": ["x", "y"]}
 
 
-def test_read_database_names_the_argument_it_could_not_parse():
+def test_read_sql_names_the_argument_it_could_not_parse():
     """The query comes first and the URI second, which is the easy one to swap.
 
     Swapping them produces a URI with no scheme, and the message has to say so -- otherwise
     the failure reads as a broken database rather than as two arguments the wrong way round.
     """
     with pytest.raises(BatcherError) as failure:
-        bt.read_database("sqlite:///x.db", "SELECT 1").to_pydict()
+        bt.read.sql(query="sqlite:///x.db", uri="SELECT 1").to_pydict()
     message = str(failure.value)
     assert "SELECT 1" in message, "the message must quote what it tried to parse as a URI"
     assert "scheme" in message
@@ -388,19 +370,19 @@ def test_read_excel_and_read_delta_name_the_path_they_could_not_open(tmp_path):
     """The two file-backed aliases whose failure a user is most likely to hit first."""
     missing_excel = str(tmp_path / "absent.xlsx")
     with pytest.raises(Exception) as excel:
-        bt.read_excel(missing_excel)
+        bt.read.excel(missing_excel)
     assert "absent.xlsx" in str(excel.value)
 
     missing_delta = str(tmp_path / "absent-table")
     with pytest.raises(Exception) as delta:
-        bt.read_delta(missing_delta)
+        bt.read.delta(missing_delta)
     assert "absent-table" in str(delta.value)
 
 
 def test_read_iceberg_names_the_catalog_it_could_not_load():
     """Iceberg needs a catalog, and saying which one is the difference from a bare failure."""
     with pytest.raises(Exception) as failure:
-        bt.read_iceberg("db.table")
+        bt.read.iceberg("db.table")
     message = str(failure.value)
     assert "catalog" in message.lower()
     assert _is_actionable(message)

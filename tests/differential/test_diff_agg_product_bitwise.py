@@ -70,7 +70,7 @@ def test_groupby_shortcut_reducers_match_duckdb(duck):
         ds.group_by("g").product().collect(), duck.sql("SELECT g, product(x) x FROM t GROUP BY g")
     )
     assert_same(
-        ds.group_by("g").skewness().collect(), duck.sql("SELECT g, skewness(x) x FROM t GROUP BY g")
+        ds.group_by("g").skew().collect(), duck.sql("SELECT g, skewness(x) x FROM t GROUP BY g")
     )
     assert_same(
         ds.group_by("g").kurtosis().collect(), duck.sql("SELECT g, kurtosis(x) x FROM t GROUP BY g")

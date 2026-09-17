@@ -84,7 +84,7 @@ def _aggregate(ds: bt.Dataset) -> bt.Dataset:
         sd=col("v").std(),
         vv=col("v").var(),
         md=col("v").median(),
-        nd=col("v").n_unique(),
+        nd=col("v").count_distinct(),
     )
 
 

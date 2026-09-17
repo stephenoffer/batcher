@@ -31,7 +31,7 @@ def test_approx_count_distinct_canonicalizes_signed_zero_and_nan(duck):
             "f": pa.array([-0.0, 0.0, nan, nan, 1.5], pa.float64()),
         }
     )
-    out = bt.from_arrow(t).group_by("g").agg(v=bt.col("f").approx_n_unique()).collect()
+    out = bt.from_arrow(t).group_by("g").agg(v=bt.col("f").approx_count_distinct()).collect()
     duck.register("t", t)
     assert_same(out, duck.sql("SELECT g, approx_count_distinct(f) AS v FROM t GROUP BY g"))
 

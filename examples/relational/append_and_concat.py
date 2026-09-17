@@ -26,12 +26,12 @@ def main() -> None:
     closed = orders.filter(col("o_orderstatus") == "F")
     print("open:", open_orders.count(), "closed:", closed.count())
 
-    stacked = open_orders.vstack(closed)
+    stacked = open_orders.union(closed)
     assert stacked.count() == open_orders.count() + closed.count()
     assert stacked.columns == orders.columns
 
     # `append` is the same operation.
-    appended = open_orders.append(closed)
+    appended = open_orders.union(closed)
     assert appended.count() == stacked.count()
 
     # `bt.concat` takes several at once, which reads better than a chain.
@@ -50,8 +50,8 @@ def main() -> None:
 
     # Mismatched schemas: project to a shared shape and say what the missing column means.
     wide = orders.with_columns(source=bt.lit("primary"))
-    narrow = orders.head(10).with_columns(source=bt.lit("backfill"))
-    merged = wide.vstack(narrow)
+    narrow = orders.limit(10).with_columns(source=bt.lit("backfill"))
+    merged = wide.union(narrow)
     assert merged.count() == orders.count() + 10
     assert set(merged.select("source").distinct().to_pydict()["source"]) == {
         "primary",

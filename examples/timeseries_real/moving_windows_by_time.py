@@ -26,7 +26,7 @@ def main() -> None:
         orders.group_by("o_orderdate")
         .agg(revenue=col("o_totalprice").sum())
         .sort("o_orderdate")
-        .head(60)
+        .limit(60)
     )
     values = sparse.to_pydict()
     first, last = values["o_orderdate"][0], values["o_orderdate"][-1]

@@ -31,7 +31,7 @@ def main() -> None:
     print(extremes)
 
     # Cross-check against the sort-and-take-one version.
-    by_sort = lineitem.sort("l_extendedprice", descending=True).head(1).to_pydict()
+    by_sort = lineitem.sort("l_extendedprice", descending=True).limit(1).to_pydict()
     assert extremes["dearest_price"][0] == by_sort["l_extendedprice"][0]
     assert extremes["dearest_order"][0] == by_sort["l_orderkey"][0]
 
@@ -46,7 +46,7 @@ def main() -> None:
         .to_pydict()
     )
     print(per_mode)
-    assert len(per_mode["l_shipmode"]) == lineitem.n_unique("l_shipmode")
+    assert len(per_mode["l_shipmode"]) == lineitem.count_distinct("l_shipmode")
     assert max(per_mode["top_price"]) == extremes["dearest_price"][0]
 
 

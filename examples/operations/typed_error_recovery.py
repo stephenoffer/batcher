@@ -33,7 +33,7 @@ def main() -> None:
 
     good = revenue_by("o_orderstatus")
     assert good is not None
-    assert good.count() == orders.n_unique("o_orderstatus")
+    assert good.count() == orders.count_distinct("o_orderstatus")
 
     missing = revenue_by("o_channel")
     assert missing is None

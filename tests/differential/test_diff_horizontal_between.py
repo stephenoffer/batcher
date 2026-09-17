@@ -40,13 +40,13 @@ def _bools():
 
 
 def test_min_horizontal_matches_duckdb(duck):
-    out = bt.from_arrow(_nums()).select(m=bt.min_horizontal(col("a"), col("b"), col("c"))).collect()
+    out = bt.from_arrow(_nums()).select(m=bt.least(col("a"), col("b"), col("c"))).collect()
     duck.register("t", _nums())
     assert_same(out, duck.sql("SELECT least(a, b, c) AS m FROM t"))
 
 
 def test_max_horizontal_matches_duckdb(duck):
-    out = bt.from_arrow(_nums()).select(m=bt.max_horizontal(col("a"), col("b"), col("c"))).collect()
+    out = bt.from_arrow(_nums()).select(m=bt.greatest(col("a"), col("b"), col("c"))).collect()
     duck.register("t", _nums())
     assert_same(out, duck.sql("SELECT greatest(a, b, c) AS m FROM t"))
 
@@ -56,8 +56,8 @@ def test_horizontal_min_max_agree_with_sql_aliases(duck):
     out = (
         bt.from_arrow(_nums())
         .select(
-            lo=bt.min_horizontal(col("a"), col("b")),
-            hi=bt.max_horizontal(col("a"), col("b")),
+            lo=bt.least(col("a"), col("b")),
+            hi=bt.greatest(col("a"), col("b")),
         )
         .collect()
     )

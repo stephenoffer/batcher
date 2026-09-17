@@ -23,8 +23,8 @@ def main() -> None:
     lineitem = tpch("lineitem")
 
     both = lineitem.agg(
-        exact_parts=bt.n_unique(col("l_partkey")),
-        approx_parts=bt.approx_n_unique(col("l_partkey")),
+        exact_parts=bt.count_distinct(col("l_partkey")),
+        approx_parts=bt.approx_count_distinct(col("l_partkey")),
         exact_median=bt.median(col("l_extendedprice")),
         approx_median=bt.approx_median(col("l_extendedprice")),
     ).to_pydict()
@@ -42,7 +42,7 @@ def main() -> None:
     # The property that matters: the sketch is mergeable, so computing it per group and
     # over the whole table are consistent views of the same data. The union of the
     # per-group distinct sets bounds the global one from below.
-    per_mode = lineitem.group_by("l_shipmode").agg(parts=bt.approx_n_unique(col("l_partkey")))
+    per_mode = lineitem.group_by("l_shipmode").agg(parts=bt.approx_count_distinct(col("l_partkey")))
     largest_group = max(per_mode.to_pydict()["parts"])
     assert largest_group <= approx * 1.05
 

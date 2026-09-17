@@ -48,9 +48,9 @@ def test_o1_6_immutable_dataflow_new_column_udf_works():
 def test_o14_5_limit_and_head_keep_schema_known():
     # Ray's .limit() can return an Unknown schema; Batcher knows it from the plan.
     ds = bt.from_pydict({"a": [1, 2, 3], "b": ["x", "y", "z"]})
-    assert ds.head(2).columns == ["a", "b"]
+    assert ds.limit(2).columns == ["a", "b"]
     assert ds.limit(1).columns == ["a", "b"]
-    assert ds.head(2).collect().column_names == ["a", "b"]
+    assert ds.limit(2).collect().column_names == ["a", "b"]
 
 
 def test_o8_1_map_filter_project_pipeline_is_streamable():
@@ -65,7 +65,7 @@ def test_o8_1_map_filter_project_pipeline_is_streamable():
 def test_o8_6_head_streams_without_materializing_whole_source():
     # head(n) over a streamable pipeline yields n rows; correctness of the short-circuit
     # is covered in test_limit_shortcircuit — here we assert the contract holds via API.
-    out = bt.from_pydict({"x": list(range(1000))}).head(5).collect()
+    out = bt.from_pydict({"x": list(range(1000))}).limit(5).collect()
     assert out.column("x").to_pylist() == [0, 1, 2, 3, 4]
 
 

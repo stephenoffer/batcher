@@ -86,9 +86,9 @@ def _part_expr(column: str, part: str) -> Expr:
     if part == "weekday":
         return source.dt.weekday()
     if part == "day_of_year":
-        return source.dt.ordinal_day()
+        return source.dt.dayofyear()
     if part == "week_of_year":
-        return source.dt.weekofyear()
+        return source.dt.week()
     if part == "is_weekend":
         return source.dt.is_weekend()
     if part == "is_month_start":

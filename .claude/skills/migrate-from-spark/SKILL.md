@@ -29,11 +29,11 @@ reference.
 | `df.groupBy("k").agg(...)` | `ds.group_by("k").agg(total=bt.col("v").sum())` | named kwargs become output columns |
 | `F.avg("v")` | `bt.col("v").mean()` | `mean` is canonical; `avg` accepted |
 | `F.collect_list("v")` | `bt.col("v").array_agg()` | |
-| `F.countDistinct("v")` | `bt.col("v").n_unique()` | `bt.approx_n_unique` for the sketch |
+| `F.countDistinct("v")` | `bt.col("v").count_distinct()` | `bt.approx_count_distinct` for the sketch |
 | `df.orderBy("a")` / `.sort` | `ds.sort("a", descending=False)` | `nulls_first=` is explicit |
 | `df.join(o, "k", "left")` | `ds.join(o, on="k", how="left")` | also `left_on=`/`right_on=` |
 | `df.distinct()` | `ds.distinct()` | |
-| `df.limit(n)` | `ds.limit(n)` / `ds.head(n)` | |
+| `df.limit(n)` | `ds.limit(n)` | |
 | `F.when(c, a).otherwise(b)` | `bt.when(c).then(a).otherwise(b)` | |
 | `F.lit(x)` | `bt.lit(x)` | |
 | `F.rank().over(Window.partitionBy(..).orderBy(..))` | `bt.rank().over(partition_by=.., order_by=..)` | no `Window` object |

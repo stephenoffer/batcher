@@ -96,7 +96,7 @@ def test_partitioned_read_back_recovers_the_column_rather_than_losing_it(tmp_pat
     the explicit `read.parquet_dataset` entry point.
     """
     duckdb = pytest.importorskip("duckdb")
-    bt.from_pydict({"k": ["a", "b"], "v": [1, 2]}).to_parquet(str(tmp_path), partition_by=["k"])
+    bt.from_pydict({"k": ["a", "b"], "v": [1, 2]}).write.parquet(str(tmp_path), partition_by=["k"])
     with warnings.catch_warnings():
         warnings.simplefilter("error", DataWarning)  # nothing is lost, so nothing is announced
         got = bt.read.parquet(str(tmp_path)).to_pydict()

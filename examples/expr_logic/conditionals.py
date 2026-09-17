@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderkey", "o_totalprice").head(5_000)
+    orders = tpch("orders").select("o_orderkey", "o_totalprice").limit(5_000)
 
     banded = orders.with_columns(
         band=bt.when(col("o_totalprice") < 50_000)

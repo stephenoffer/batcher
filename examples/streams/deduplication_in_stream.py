@@ -20,21 +20,21 @@ from batcher import col
 
 
 def main() -> None:
-    base = tpch("orders").select("o_orderkey", "o_orderdate", "o_totalprice").head(20_000)
+    base = tpch("orders").select("o_orderkey", "o_orderdate", "o_totalprice").limit(20_000)
 
     # A stream with genuine duplicates: the same events replayed.
-    stream = base.union(base.head(5_000))
-    print("events:", stream.count(), "distinct keys:", stream.n_unique("o_orderkey"))
+    stream = base.union(base.limit(5_000))
+    print("events:", stream.count(), "distinct keys:", stream.count_distinct("o_orderkey"))
     assert stream.count() == 25_000
-    assert stream.n_unique("o_orderkey") == 20_000
+    assert stream.count_distinct("o_orderkey") == 20_000
 
     # Unbounded deduplication: correct, and needs every key in memory.
-    deduped = stream.drop_duplicates(subset=["o_orderkey"])
+    deduped = stream.distinct(subset=["o_orderkey"])
     assert deduped.count() == 20_000
 
     # Bounded deduplication: remember keys only within a watermark window.
     windowed = stream.with_columns(window=col("o_orderdate").dt.truncate("month"))
-    per_window = windowed.drop_duplicates(subset=["window", "o_orderkey"])
+    per_window = windowed.distinct(subset=["window", "o_orderkey"])
     print("after windowed dedup:", per_window.count())
 
     # A duplicate inside the same window is removed; the bound is what keeps state finite.

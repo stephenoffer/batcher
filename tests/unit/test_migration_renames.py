@@ -21,23 +21,27 @@ def renames() -> dict[str, dict[str, Rename]]:
     return load_renames()
 
 
-def test_every_blocking_pair_has_a_decision(renames) -> None:
+def test_no_second_spelling_is_left_on_the_surface() -> None:
+    # The alias removal is done: the lint must find nothing blocking. Its ability to find a
+    # second spelling at all is proven on planted classes in tests/unit/test_lint_aliases.py,
+    # which is what keeps this from passing vacuously.
     findings = [f for f in find_all() if f.kind in BLOCKING and f.key not in ALLOW]
-    assert findings, "the alias lint found nothing, so this test would pass vacuously"
-    undecided = []
-    for f in findings:
-        table = renames.get(f.receiver, {})
-        kept_names = {rule.to for rule in table.values()}
-        if f.name in table or (f.target in table and table[f.target].to == f.name):
-            continue
-        # Both names of a same-IR group can be removed in favour of a third spelling.
-        if f.target in table and f.name in kept_names:
-            continue
-        undecided.append(f"{f.key} ~ {f.target}")
-    assert not undecided, f"{len(undecided)} second spellings with no decision: {undecided}"
+    assert not findings, f"{len(findings)} second spellings on the surface: {findings}"
+
+
+def test_no_removed_spelling_still_resolves(renames) -> None:
+    alive = [
+        f"{rule.receiver}.{rule.removed}"
+        for table in renames.values()
+        for rule in table.values()
+        if resolve(f"{rule.receiver}.{rule.removed}") is not None
+    ]
+    assert not alive, f"removed spellings still resolve: {alive}"
 
 
 def _kept_target(rule: Rename) -> str:
+    if rule.transform == "identity":
+        return rule.receiver  # the call collapses to the receiver itself
     if rule.kind == "operator":
         from batcher._internal.migration.renames import OPERATORS
 
@@ -72,30 +76,24 @@ def _resolves(target: str):
     return resolve(target)
 
 
-def test_every_keyword_rule_names_a_real_parameter() -> None:
+def test_every_keyword_rule_names_a_real_parameter(renames) -> None:
     import inspect
 
     stale = []
     for method, rules in load_kwarg_renames().items():
-        fn = resolve(method)
+        receiver, _, name = method.rpartition(".")
+        # A table for a removed method (`Dataset.melt`) describes the call before its rename,
+        # so its kept keywords must exist on the method it is renamed to.
+        rule = renames.get(receiver, {}).get(name)
+        target = f"{receiver}.{rule.to}" if rule is not None else method
+        fn = resolve(target)
         if fn is None:
-            stale.append(f"{method} does not resolve")
+            stale.append(f"{method} -> {target} does not resolve")
             continue
         params = inspect.signature(fn).parameters
-        for keyword, rule in rules.items():
-            if rule.action in ("rename", "negate") and rule.to not in params:
-                target = next(
-                    (
-                        r.to
-                        for t in load_renames().values()
-                        for r in t.values()
-                        if f"{r.receiver}.{r.removed}" == method
-                    ),
-                    None,
-                )
-                kept = resolve(f"{method.rpartition('.')[0]}.{target}") if target else None
-                if kept is None or rule.to not in inspect.signature(kept).parameters:
-                    stale.append(f"{method}({keyword}=) -> {rule.to}")
+        for keyword, kw in rules.items():
+            if kw.action in ("rename", "negate") and kw.to not in params:
+                stale.append(f"{method}({keyword}=) -> {target}({kw.to}=)")
     assert not stale, f"keyword rules naming parameters that do not exist: {stale}"
 
 

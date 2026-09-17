@@ -43,7 +43,7 @@ def main() -> None:
         l2=col("vector").list.l2_distance(col("query")),
         l1=col("vector").list.l1_distance(col("query")),
         dot=col("vector").list.dot(col("query")),
-        magnitude=col("vector").list.magnitude(),
+        magnitude=col("vector").list.l2_norm(),
     )
 
     result = scored.sort("id").to_pydict()

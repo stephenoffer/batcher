@@ -26,11 +26,11 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "customers")
 
-        customer.head(1_000).write.delta(table)
+        customer.limit(1_000).write.delta(table)
         assert bt.read.delta(table).count() == 1_000
 
         # A batch that overlaps the existing keys and extends past them.
-        updates = customer.slice(900, 300).with_columns(c_acctbal=col("c_acctbal") + 100.0)
+        updates = customer.limit(300, offset=900).with_columns(c_acctbal=col("c_acctbal") + 100.0)
         updates.write.delta(table, merge_on="c_custkey")
 
         merged = bt.read.delta(table)
@@ -42,7 +42,7 @@ def main() -> None:
         assert len(keys) == len(set(keys))
 
         # The 100 overlapping rows were updated, not duplicated.
-        original = customer.slice(900, 100).sort("c_custkey").to_pydict()
+        original = customer.limit(100, offset=900).sort("c_custkey").to_pydict()
         after = (
             merged.filter(col("c_custkey").is_in(original["c_custkey"]))
             .sort("c_custkey")
@@ -62,7 +62,7 @@ def main() -> None:
         assert (
             untouched.to_pydict()["c_acctbal"]
             == (
-                customer.head(1_000)
+                customer.limit(1_000)
                 .join(updates.select("c_custkey"), on="c_custkey", how="anti")
                 .sort("c_custkey")
                 .to_pydict()["c_acctbal"]

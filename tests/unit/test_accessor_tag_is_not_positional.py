@@ -40,7 +40,7 @@ _CASES = [
     ("str", "upper", "lower"),
     ("str", "lower", "upper"),
     ("str", "reverse", "upper"),
-    ("list", "max_pool", "mean_pool"),
+    ("list", "max", "mean"),
     ("dt", "year", "month"),
 ]
 

@@ -79,7 +79,7 @@ def test_a_rag_pipeline_composes_end_to_end():
 
     # --- chunk ----------------------------------------------------------------------
     chunks = safe.with_columns(chunk=bt.col("text").str.chunk(60, overlap=10, boundary="word"))
-    exploded = chunks.explode("chunk").filter(bt.col("chunk").str.len() > bt.lit(0))
+    exploded = chunks.explode("chunk").filter(bt.col("chunk").str.len_chars() > bt.lit(0))
     assert exploded.count() >= safe.count()
 
     # --- retrieve (a stubbed vector search over the surviving chunks) ----------------
@@ -161,7 +161,7 @@ def test_a_rag_pipeline_composes_end_to_end():
 
     # --- the citation check the extractor exists for ----------------------------------
     cited = judged.select(
-        fabricated=bt.extract_citations("answer").list.set_difference(bt.col("hit_ids"))
+        fabricated=bt.extract_citations("answer").list.difference(bt.col("hit_ids"))
     ).to_pydict()
     assert cited["fabricated"][0] == []  # `[1]` names a chunk that was actually retrieved
 

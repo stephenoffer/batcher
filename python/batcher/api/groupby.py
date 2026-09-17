@@ -278,7 +278,7 @@ class GroupBy:
                 if reducer is None or not callable(reducer):
                     raise PlanError(
                         f"agg(): {fn!r} is not an aggregate; try 'sum', 'mean', 'min', "
-                        "'max', 'count', 'median', 'std', 'var', or 'n_unique'"
+                        "'max', 'count', 'median', 'std', 'var', or 'count_distinct'"
                     )
                 out[column if len(names) == 1 else f"{column}_{fn}"] = reducer()
         return out
@@ -514,7 +514,7 @@ class GroupBy:
         """
         return self._reduce("median", columns)
 
-    def n_unique(self, *columns: str | Selector) -> Dataset:
+    def count_distinct(self, *columns: str | Selector) -> Dataset:
         """Count distinct values of each column per group (all non-key columns by default).
 
         Args:
@@ -529,49 +529,10 @@ class GroupBy:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 1, 5]})
-                >>> ds.group_by("g").n_unique().sort("g").to_pydict()
+                >>> ds.group_by("g").count_distinct().sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [1, 1]}
         """
-        return self._reduce("n_unique", columns)
-
-    def nunique(self, *columns: str | Selector) -> Dataset:
-        """Count distinct values per group — the pandas ``nunique`` spelling of :meth:`n_unique`.
-
-        Args:
-            *columns: Columns (names or selectors) to reduce; defaults to every
-                non-key column.
-
-        Returns:
-            A new `Dataset` of the group keys followed by the per-group distinct counts.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 1, 5]})
-                >>> ds.group_by("g").nunique().sort("g").to_pydict()
-                {'g': ['a', 'b'], 'x': [1, 1]}
-        """
-        return self._reduce("n_unique", columns)
-
-    def size(self, name: str = "size") -> Dataset:
-        """Count the rows in each group — the pandas ``size`` spelling of :meth:`len`.
-
-        Args:
-            name: Name of the output count column.
-
-        Returns:
-            A new `Dataset` of the group keys followed by the per-group row count.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"g": ["a", "a", "b"]})
-                >>> ds.group_by("g").size().sort("g").to_pydict()
-                {'g': ['a', 'b'], 'size': [2, 1]}
-        """
-        return self.len(name)
+        return self._reduce("count_distinct", columns)
 
     def first(self, *columns: str | Selector, order_by: str | Expr) -> Dataset:
         """The first value of each column per group, along an explicit `order_by`.
@@ -814,7 +775,7 @@ class GroupBy:
         """
         return self._reduce("mode", columns)
 
-    def skewness(self, *columns: str | Selector) -> Dataset:
+    def skew(self, *columns: str | Selector) -> Dataset:
         """Sample skewness of each column per group (every non-key numeric column by default).
 
         Args:
@@ -829,10 +790,10 @@ class GroupBy:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a", "a", "a"], "x": [1.0, 2.0, 3.0]})
-                >>> ds.group_by("g").skewness().to_pydict()
+                >>> ds.group_by("g").skew().to_pydict()
                 {'g': ['a'], 'x': [0.0]}
         """
-        return self._reduce("skewness", columns)
+        return self._reduce("skew", columns)
 
     def kurtosis(self, *columns: str | Selector) -> Dataset:
         """Sample excess kurtosis of each column per group (numeric columns by default).
@@ -858,7 +819,7 @@ class GroupBy:
     # mirroring pandas' `numeric_only`: averaging or summing a string column is an error,
     # so an explicit-columns call is required to attempt it.
     _NUMERIC_ONLY = frozenset(
-        {"sum", "mean", "median", "std", "var", "product", "skewness", "kurtosis"}
+        {"sum", "mean", "median", "std", "var", "product", "skew", "kurtosis"}
     )
 
     def _value_columns(self, numeric_only: bool) -> list[str]:

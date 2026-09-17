@@ -115,8 +115,8 @@ def test_multiplier_is_refused_not_silently_floored(bad):
 def test_floor_alias_validates_the_same_way():
     """`.dt.floor` is the pandas spelling of `truncate`; it must not bypass the check."""
     with pytest.raises(PlanError, match="not a known unit"):
-        bt.col("d").dt.floor("bogus")
-    got = bt.from_pydict(_WHEN).select(r=bt.col("d").dt.floor("1h")).to_pydict()["r"][0]
+        bt.col("d").dt.truncate("bogus")
+    got = bt.from_pydict(_WHEN).select(r=bt.col("d").dt.truncate("1h")).to_pydict()["r"][0]
     assert got == dt.datetime(2024, 3, 15, 13)
 
 

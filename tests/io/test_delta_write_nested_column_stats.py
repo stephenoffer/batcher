@@ -50,7 +50,7 @@ def test_a_struct_column_commits_beside_any_neighbour(tmp_path, name, neighbour)
     table = pa.table({name: neighbour, "st": _struct_column()})
     path = str(tmp_path / f"delta_{name}")
     bt.from_arrow(table).write.delta(path)
-    back = bt.read_delta(path).collect()
+    back = bt.read.delta(path).collect()
     assert back.num_rows == 3
     assert back.schema.field("st").type == pa.struct([("k", pa.int64())])
 
@@ -75,7 +75,7 @@ def test_every_column_type_commits_in_one_table(tmp_path):
     )
     path = str(tmp_path / "delta_all")
     bt.from_arrow(table).write.delta(path)
-    back = bt.read_delta(path).collect()
+    back = bt.read.delta(path).collect()
     assert back.sort_by("i").to_pydict() == table.sort_by("i").to_pydict()
 
 
@@ -108,5 +108,5 @@ def test_a_written_delta_table_still_prunes_on_a_leaf_predicate(tmp_path):
     path = str(tmp_path / "delta_prune")
     table = pa.table({"i": pa.array([1, 2, 3], pa.int64()), "st": _struct_column()})
     bt.from_arrow(table).write.delta(path)
-    out = bt.read_delta(path).filter(bt.col("i") > 1).collect()
+    out = bt.read.delta(path).filter(bt.col("i") > 1).collect()
     assert sorted(out.to_pydict()["i"]) == [2, 3]

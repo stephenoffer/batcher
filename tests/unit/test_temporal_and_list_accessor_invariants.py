@@ -113,7 +113,7 @@ class TestEmptyIsNotNull:
     """The distinction this file refuses to flatten. Both answers are right, for different
     questions, and pinning a few of each stops a future change quietly unifying them."""
 
-    @pytest.mark.parametrize(("name", "expected"), [("len", 0), ("n_unique", 0), ("dim", 0)])
+    @pytest.mark.parametrize(("name", "expected"), [("len", 0), ("n_unique", 0)])
     def test_a_size_of_the_empty_list_is_zero(self, name, expected):
         assert _listwise(name)[LISTS.index([])] == expected
 

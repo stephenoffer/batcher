@@ -2101,7 +2101,7 @@ class DatasetML:
         return (
             self._ds.with_columns(**{distance_column: score})
             .sort(distance_column, descending=descending)
-            .head(k)
+            .limit(k)
         )
 
     def normalize_embeddings(self, column: str, *, output_column: str | None = None) -> Dataset:
@@ -2767,41 +2767,6 @@ class DatasetML:
             seed=seed,
             epoch=epoch,
             drop_last=drop_last,
-        )
-
-    def to_torch(
-        self,
-        *,
-        batch_size: int | None = None,
-        columns: list[str] | None = None,
-        device: object = "auto",
-        dtypes: dict[str, str] | str | None = None,
-        **kwargs: object,
-    ):
-        """Stream this dataset to PyTorch tensor batches (alias of `iter_torch_batches`).
-
-        The shorter name PyTorch users reach for; every keyword of `iter_torch_batches`
-        is accepted and forwarded unchanged.
-
-        Args:
-            batch_size: Rows per yielded ``{column: tensor}`` batch.
-            columns: The columns to yield as tensors; defaults to all.
-            device: Target device (``"auto"`` detects an accelerator, else CPU).
-            dtypes: Cast tensors to a torch dtype (one name, or a ``{column: dtype}`` map).
-            **kwargs: Further `iter_torch_batches` keyword arguments.
-
-        Yields:
-            ``{column: tensor}`` batches on `device`.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt  # doctest: +SKIP
-                >>> for batch in ds.ml.to_torch(batch_size=256):  # doctest: +SKIP
-                ...     train_step(batch)
-        """
-        return self.iter_torch_batches(
-            batch_size=batch_size, columns=columns, device=device, dtypes=dtypes, **kwargs
         )
 
     def to_torch_dataloader(

@@ -849,12 +849,12 @@ def test_an_unknown_dialect_pushes_no_cap_at_all(orders) -> None:
 
 def test_a_reserved_word_column_is_quoted_so_the_projection_parses(orders) -> None:
     """`SELECT order FROM ...` is a syntax error, not a slow query."""
-    back = bt.read.sql(None, uri=orders, table="orders").select("order").head(2)
+    back = bt.read.sql(None, uri=orders, table="orders").select("order").limit(2)
     assert back.to_pydict() == {"order": [0, 1]}
 
 
 def test_head_reads_only_what_it_asked_for(orders) -> None:
-    assert bt.read.sql("SELECT * FROM orders", uri=orders).head(3).to_pydict() == {
+    assert bt.read.sql("SELECT * FROM orders", uri=orders).limit(3).to_pydict() == {
         "order": [0, 1, 2],
         "amount": [0.0, 1.0, 2.0],
     }

@@ -47,7 +47,7 @@ def main() -> None:
     print("identical at 1,024, 4,096 and 65,536 rows per morsel")
 
     # A sorted top-N is the order-sensitive case, so check it position by position.
-    top = lineitem.sort("l_extendedprice", descending=True).head(10)
+    top = lineitem.sort("l_extendedprice", descending=True).limit(10)
     reference = top.to_pydict()["l_extendedprice"]
     with option_context("execution.morsel_rows", 1024):
         assert top.to_pydict()["l_extendedprice"] == reference

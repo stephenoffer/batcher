@@ -25,7 +25,7 @@ def test_approx_n_unique_grouped_within_tolerance(duck):
     t = pa.table({"g": (np.arange(n) % 4), "v": rng.integers(0, 3000, n)})
     duck.register("t", t)
 
-    approx = bt.from_arrow(t).group_by("g").agg(a=col("v").approx_n_unique()).collect()
+    approx = bt.from_arrow(t).group_by("g").agg(a=col("v").approx_count_distinct()).collect()
     exact = duck.sql("SELECT g, COUNT(DISTINCT v) e FROM t GROUP BY g").fetchall()
 
     approx_by_g = dict(
@@ -42,7 +42,9 @@ def test_approx_n_unique_global_within_tolerance(duck):
     t = pa.table({"v": rng.integers(0, 5000, n)})
     duck.register("t", t)
 
-    approx = bt.from_arrow(t).agg(a=col("v").approx_n_unique()).collect().column("a")[0].as_py()
+    approx = (
+        bt.from_arrow(t).agg(a=col("v").approx_count_distinct()).collect().column("a")[0].as_py()
+    )
     (exact,) = duck.sql("SELECT COUNT(DISTINCT v) FROM t").fetchone()
     assert abs(approx - exact) / exact < _TOL, f"approx {approx} vs exact {exact}"
 

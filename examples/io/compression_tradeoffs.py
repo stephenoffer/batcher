@@ -50,10 +50,10 @@ def main() -> None:
         assert measurements["zstd"][0] < measurements["snappy"][0]
 
         # Every codec round-trips identically — the trade is never fidelity.
-        reference = lineitem.sort("l_orderkey", "l_linenumber").head(200).to_pydict()
+        reference = lineitem.sort("l_orderkey", "l_linenumber").limit(200).to_pydict()
         for codec in measurements:
             back = bt.read.parquet(str(Path(directory) / f"{codec}.parquet"))
-            assert back.sort("l_orderkey", "l_linenumber").head(200).to_pydict() == reference
+            assert back.sort("l_orderkey", "l_linenumber").limit(200).to_pydict() == reference
 
 
 if __name__ == "__main__":

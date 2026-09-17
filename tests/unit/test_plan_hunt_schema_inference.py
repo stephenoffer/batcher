@@ -8,7 +8,7 @@ engine actually produces — a B18/B19-class bug. Each case below asserts the
 certain. Failing cases were real defects:
 
 - true division declared ``null`` (actually ``float64``);
-- ``str.reverse``/``translate``/``unhex`` and ``str.regexp_extract_all`` declared
+- ``str.reverse``/``translate``/``unhex`` and ``str.extract_all`` declared
   ``null`` (actually ``string`` / ``list<string>``);
 - every ``dt`` accessor (``dayname``/``year``/``last_day``/…) declared ``null``;
 - ``str.to_datetime`` (``Strptime``) declared ``null`` (actually ``timestamp[us]``);
@@ -50,7 +50,7 @@ def _cases() -> list[tuple[str, object]]:
         ("str_reverse", c("s").str.reverse()),
         ("str_translate", c("s").str.translate("a", "b")),
         ("str_unhex", c("s").str.unhex()),
-        ("str_regexp_extract_all", c("s").str.regexp_extract_all("(.)")),
+        ("str_extract_all", c("s").str.extract_all("(.)")),
         ("str_to_datetime", c("s").str.to_datetime("%Y")),
         ("dt_dayname", c("ts").dt.dayname()),
         ("dt_monthname", c("ts").dt.monthname()),

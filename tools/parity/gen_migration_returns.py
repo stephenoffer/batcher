@@ -111,7 +111,38 @@ def generate() -> dict[str, dict[str, str]]:
         elif inspect.isclass(obj) and obj in by_class:
             out.setdefault("bt", {})[name] = by_class[obj]
     out.setdefault("bt", {})["read"] = "bt.read"
+    _add_removed_spellings(out)
     return {r: dict(sorted(m.items())) for r, m in sorted(out.items())}
+
+
+def _add_removed_spellings(out: dict[str, dict[str, str]]) -> None:
+    """Record each removed spelling as returning what its replacement returns.
+
+    The codemod follows the *original* chain in old code, so `col.str.to_lowercase().str.len()`
+    is only followed past `to_lowercase` if the table still says what it returned. The removed
+    spellings are gone from the live classes, so their entries are derived from the kept ones.
+    """
+    from batcher._internal.migration.renames import load_renames
+
+    for receiver, rules in load_renames().items():
+        for rule in rules.values():
+            if rule.kind == "operator":
+                returned = "Expr"
+            elif rule.transform == "identity":
+                returned = receiver
+            else:
+                returned = _follow(out, receiver, rule.to.split("."))
+            if returned is not None:
+                out.setdefault(receiver, {}).setdefault(rule.removed, returned)
+
+
+def _follow(out: dict[str, dict[str, str]], receiver: str, path: list[str]) -> str | None:
+    current: str | None = receiver
+    for segment in path:
+        if current is None:
+            return None
+        current = out.get(current, {}).get(segment)
+    return current
 
 
 def render(data: dict[str, dict[str, str]]) -> str:

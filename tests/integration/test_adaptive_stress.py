@@ -149,7 +149,7 @@ def _ops() -> dict[str, callable]:
         "global_sum": lambda ds: ds.group_by().agg(s=col("v").sum(), n=count()),
         "global_median": lambda ds: ds.group_by().agg(m=col("v").median()),
         "groupby_median": lambda ds: ds.group_by("k").agg(m=col("v").median()),
-        "groupby_nunique": lambda ds: ds.group_by("k").agg(d=col("s").n_unique()),
+        "groupby_nunique": lambda ds: ds.group_by("k").agg(d=col("s").count_distinct()),
         "distinct_k": lambda ds: ds.select("k").distinct(),
         "sort_v": lambda ds: ds.sort("v"),
         "topn": lambda ds: ds.sort("v", descending=True).limit(17),

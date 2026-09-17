@@ -41,8 +41,8 @@ def main() -> None:
         )
 
     # Two arrivals of line items.
-    first_half = lineitem.head(100_000)
-    second_half = lineitem.slice(100_000, 100_000)
+    first_half = lineitem.limit(100_000)
+    second_half = lineitem.limit(100_000, offset=100_000)
 
     partial_one = per_order(first_half)
     partial_two = per_order(second_half)

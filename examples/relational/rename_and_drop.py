@@ -26,8 +26,8 @@ def main() -> None:
     assert "c_name" not in renamed.columns
     # The data is untouched; only the label moved.
     assert (
-        renamed.select("balance").head(3).to_pydict()["balance"]
-        == (customer.select("c_acctbal").head(3).to_pydict()["c_acctbal"])
+        renamed.select("balance").limit(3).to_pydict()["balance"]
+        == (customer.select("c_acctbal").limit(3).to_pydict()["c_acctbal"])
     )
 
     trimmed = customer.drop("c_comment", "c_address")

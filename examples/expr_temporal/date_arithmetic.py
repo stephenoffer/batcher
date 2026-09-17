@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderkey", "o_orderdate").head(500)
+    orders = tpch("orders").select("o_orderkey", "o_orderdate").limit(500)
 
     shifted = orders.select(
         "o_orderdate",
@@ -31,7 +31,7 @@ def main() -> None:
         minus_thirty=bt.date_sub(col("o_orderdate"), 30),
     )
 
-    result = shifted.head(3).to_pydict()
+    result = shifted.limit(3).to_pydict()
     print(result)
 
     full = shifted.to_pydict()

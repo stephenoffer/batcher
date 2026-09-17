@@ -73,7 +73,7 @@ _CASES = {
         lambda d: d.group_by("k").agg(lo=bt.col("v").min(), hi=bt.col("v").max()),
     ),
     "group_by_stddev": (False, lambda d: d.group_by("k").agg(s=bt.col("v").std())),
-    "group_by_n_unique": (False, lambda d: d.group_by("k").agg(n=bt.col("i").n_unique())),
+    "group_by_n_unique": (False, lambda d: d.group_by("k").agg(n=bt.col("i").count_distinct())),
     "group_by_sum_and_count": (
         False,
         lambda d: d.group_by("k").agg(s=bt.col("v").sum(), n=bt.col("v").count()),

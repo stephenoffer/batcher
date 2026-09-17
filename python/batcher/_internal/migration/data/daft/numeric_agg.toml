@@ -77,7 +77,7 @@ var = { status = "param", batcher = "Expr.var", need = "ddof= (Batcher var is al
 [functions]
 abs = { status = "canonical", batcher = "Expr.abs" }
 any_value = { status = "param", batcher = "Expr.any_value", need = "ignore_nulls=False (Batcher any_value always skips nulls)", wave = "W2" }
-approx_count_distinct = { status = "canonical", batcher = "Expr.approx_count_distinct" }
+approx_count_distinct = { status = "canonical", batcher = "bt.approx_count_distinct" }
 approx_percentiles = { status = "param", batcher = "Expr.approx_quantile", need = "a list of percentiles in one call (returns a list)", wave = "W2" }
 arccos = { status = "canonical", batcher = "Expr.arccos" }
 arccosh = { status = "canonical", batcher = "Expr.arccosh" }
@@ -106,7 +106,7 @@ cos = { status = "canonical", batcher = "Expr.cos" }
 cosh = { status = "canonical", batcher = "Expr.cosh" }
 cot = { status = "canonical", batcher = "Expr.cot" }
 count = { status = "mismatch", batcher = "bt.count", note = "bt.count() is COUNT(*) over rows and takes no column; Daft count(expr, mode='valid') counts an expression's non-null values. Rewrite: col.count()", wave = "W0" }
-count_distinct = { status = "canonical", batcher = "Expr.count_distinct" }
+count_distinct = { status = "canonical", batcher = "bt.count_distinct" }
 csc = { status = "canonical", batcher = "Expr.csc" }
 degrees = { status = "canonical", batcher = "Expr.degrees" }
 dense_rank = { status = "canonical", batcher = "bt.dense_rank" }
@@ -155,7 +155,7 @@ shift_right = { status = "canonical", batcher = "op:rshift" }
 sign = { status = "canonical", batcher = "Expr.sign" }
 sin = { status = "canonical", batcher = "Expr.sin" }
 sinh = { status = "canonical", batcher = "Expr.sinh" }
-skew = { status = "mismatch", batcher = "bt.skewness", note = "Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True", wave = "W0" }
+skew = { status = "mismatch", batcher = "bt.skew", note = "Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True", wave = "W0" }
 sqrt = { status = "canonical", batcher = "Expr.sqrt" }
 stddev = { status = "param", batcher = "bt.std", need = "ddof= (Batcher std is always the sample, ddof=1)", wave = "W2" }
 string_agg = { status = "canonical", batcher = "Expr.str.join" }

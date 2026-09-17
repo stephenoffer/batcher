@@ -41,7 +41,7 @@ def main() -> None:
     assert only_left.count() + only_right.count() + both.count() == union.count()
 
     # A spot check on one difference, so the counts are not just internally consistent.
-    sample = only_left.head(1).to_pydict()["o_orderkey"][0]
+    sample = only_left.limit(1).to_pydict()["o_orderkey"][0]
     assert right.filter(col("o_orderkey") == sample).count() == 0
     assert left.filter(col("o_orderkey") == sample).count() == 1
 

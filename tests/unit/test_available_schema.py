@@ -41,7 +41,7 @@ _CASES = {
     "select_cast_float": lambda d: d.select(bt.col("a").cast("float64").alias("c")),
     "select_cast_float32": lambda d: d.select(bt.col("a").cast("float32").alias("c")),
     "select_cast_string": lambda d: d.select(bt.col("a").cast("string").alias("c")),
-    "select_str_len": lambda d: d.select(bt.col("s").str.len().alias("c")),
+    "select_str_len": lambda d: d.select(bt.col("s").str.len_chars().alias("c")),
     "select_str_upper": lambda d: d.select(bt.col("s").str.upper().alias("c")),
     "select_str_contains": lambda d: d.select(bt.col("s").str.contains("a").alias("c")),
     "select_math_sqrt": lambda d: d.select(bt.col("f").sqrt().alias("c")),

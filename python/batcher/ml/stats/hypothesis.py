@@ -28,7 +28,7 @@ from batcher.ml.stats._special import (
 )
 from batcher.ml.stats.association import anova_f, chi_square
 from batcher.plan.expr_ir.constructors import col
-from batcher.plan.functions.aggregate import corr, count_if, mean, n_unique, std
+from batcher.plan.functions.aggregate import corr, count_distinct, count_if, mean, std
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -244,7 +244,7 @@ def anova_test(ds: Dataset, value: str, group: str) -> TestResult:
             True
     """
     f = anova_f(ds, value, group)
-    row = ds.agg(k=n_unique(col(group)), n=col(value).count()).collect()
+    row = ds.agg(k=count_distinct(col(group)), n=col(value).count()).collect()
     k = int(row.column("k")[0].as_py())
     n = int(row.column("n")[0].as_py())
     df1, df2 = float(k - 1), float(n - k)
@@ -279,7 +279,7 @@ def chi_square_test(ds: Dataset, x: str, y: str) -> TestResult:
             True
     """
     statistic = chi_square(ds, x, y)
-    row = ds.agg(cx=n_unique(col(x)), cy=n_unique(col(y))).collect()
+    row = ds.agg(cx=count_distinct(col(x)), cy=count_distinct(col(y))).collect()
     cx = int(row.column("cx")[0].as_py())
     cy = int(row.column("cy")[0].as_py())
     df = float((cx - 1) * (cy - 1))

@@ -300,7 +300,7 @@ def _image_empties(pred) -> bool:
         col("ts").dt.second() == 60,
         col("ts").dt.week() == 54,
         col("ts").dt.dayofweek() == 7,  # Sunday = 0, so 7 is out of range
-        col("ts").dt.isodow() == 0,  # Monday = 1, so 0 is out of range
+        col("ts").dt.weekday() == 0,  # Monday = 1, so 0 is out of range
         col("ts").dt.dayofyear() == 367,
         col("s").str.len_chars() < 0,
         col("s").str.len_chars() == -1,
@@ -309,11 +309,11 @@ def _image_empties(pred) -> bool:
         col("f").abs() <= -0.5,
         col("i").sign() == 5,
         col("i").sign() == -2,
-        col("s").str.to_uppercase() == "ab",  # an uppercased string has no ASCII lowercase
-        col("s").str.to_uppercase() == "Ab",  # one offending character is enough
-        col("s").str.to_lowercase() == "AB",
+        col("s").str.upper() == "ab",  # an uppercased string has no ASCII lowercase
+        col("s").str.upper() == "Ab",  # one offending character is enough
+        col("s").str.lower() == "AB",
         # Every counting function: a length or a match count is never negative.
-        col("s").str.len_bytes() < 0,
+        col("s").str.octet_length() < 0,
         col("s").str.count_matches("a") == -1,
         col("lst").list.len() < 0,
         col("lst").list.len() == -1,
@@ -338,20 +338,20 @@ def test_value_outside_the_image_empties_the_filter(pred):
         col("ts").dt.week() == 53,
         col("ts").dt.dayofweek() == 0,
         col("ts").dt.dayofweek() == 6,
-        col("ts").dt.isodow() == 7,
+        col("ts").dt.weekday() == 7,
         col("ts").dt.dayofyear() == 366,
         col("ts").dt.year() == -5,  # a year has no useful bound, so nothing is claimed
         col("s").str.len_chars() == 0,
         col("i").abs() == 0,
         col("f").abs() == -0.0,  # -0.0 equals 0.0, so this is satisfiable
         col("i").sign() == -1,
-        col("s").str.to_uppercase() == "AB",
-        col("s").str.to_uppercase() == "A1_",  # no letters to offend
-        col("s").str.to_lowercase() == "ab",
+        col("s").str.upper() == "AB",
+        col("s").str.upper() == "A1_",  # no letters to offend
+        col("s").str.lower() == "ab",
         col("ts").dt.month() != 13,  # `<>` is true on every row, not refuted
         col("lst").list.len() == 0,
         col("lst").list.len() >= 0,
-        col("s").str.len_bytes() == 0,
+        col("s").str.octet_length() == 0,
         col("s").str.count_matches("a") == 0,
         # `sqrt(-0.0)` is `-0.0`, which equals `0.0`, so the inclusive bound is reachable.
         col("f").sqrt() == 0,
@@ -369,9 +369,7 @@ def test_value_inside_the_image_is_left_alone(pred):
 def test_non_ascii_case_literal_is_left_alone():
     # The general Unicode case mappings are locale-sensitive at the edges, so the rule claims
     # nothing about a non-ASCII letter rather than guessing.
-    assert filter_function_range_contradiction(_plan(col("s").str.to_uppercase() == "é"), None) is (
-        None
-    )
+    assert filter_function_range_contradiction(_plan(col("s").str.upper() == "é"), None) is (None)
 
 
 def test_image_refutation_ignores_a_comparison_between_two_calls():

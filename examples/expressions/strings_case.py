@@ -21,11 +21,11 @@ def main() -> None:
     )
 
     normalized = vendors.with_columns(
-        lower=col("name").str.to_lowercase(),
-        upper=col("name").str.to_uppercase(),
+        lower=col("name").str.lower(),
+        upper=col("name").str.upper(),
         title=col("name").str.to_titlecase(),
         # `initcap` is the SQL spelling of title case.
-        initcap=col("name").str.initcap(),
+        initcap=col("name").str.to_titlecase(),
         # `capitalize` upper-cases only the first character.
         first_only=col("name").str.capitalize(),
     )
@@ -41,7 +41,7 @@ def main() -> None:
 
     # The point of all that: two vendors, not four.
     rolled = (
-        vendors.with_columns(key=col("name").str.to_lowercase())
+        vendors.with_columns(key=col("name").str.lower())
         .group_by("key")
         .agg(total=col("spend").sum())
         .sort("key")

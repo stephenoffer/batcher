@@ -27,15 +27,15 @@ def main() -> None:
         table = str(Path(directory) / "orders_delta")
 
         # First commit.
-        orders.head(1_000).write.delta(table)
+        orders.limit(1_000).write.delta(table)
         assert bt.read.delta(table).count() == 1_000
 
         # Append: a second commit, both visible.
-        orders.slice(1_000, 500).write.delta(table, mode="append")
+        orders.limit(500, offset=1_000).write.delta(table, mode="append")
         assert bt.read.delta(table).count() == 1_500
 
         # Overwrite: the table's contents are replaced, not deleted and rewritten.
-        orders.head(200).write.delta(table, mode="overwrite")
+        orders.limit(200).write.delta(table, mode="overwrite")
         current = bt.read.delta(table)
         print("after overwrite:", current.count())
         assert current.count() == 200

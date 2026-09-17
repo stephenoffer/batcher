@@ -4,7 +4,7 @@
 
 [functions]
 any_value = { status = "canonical", batcher = "Expr.any_value" }
-approx_count_distinct = { status = "param", batcher = "Expr.approx_count_distinct", need = "rsd= relative standard deviation", wave = "W2" }
+approx_count_distinct = { status = "param", batcher = "bt.approx_count_distinct", need = "rsd= relative standard deviation", wave = "W2" }
 approx_percentile = { status = "param", batcher = "Expr.approx_quantile", need = "a list of percentages, accuracy=, and returning an actual input value", wave = "W2" }
 array_agg = { status = "mismatch", batcher = "bt.array_agg", note = "Spark skips nulls when collecting; bt.array_agg keeps them. Needs ignore_nulls=True", wave = "W0" }
 avg = { status = "canonical", batcher = "Expr.mean" }
@@ -17,7 +17,7 @@ collect_list = { status = "mismatch", batcher = "Expr.array_agg", note = "Spark 
 collect_set = { status = "param", batcher = "Expr.array_agg", need = "distinct=True collection that skips nulls", wave = "W2" }
 corr = { status = "canonical", batcher = "bt.corr" }
 count = { status = "canonical", batcher = ["Expr.count", "bt.count"] }
-count_distinct = { status = "param", batcher = "Expr.count_distinct", need = "several columns counted as one distinct tuple", wave = "W2" }
+count_distinct = { status = "param", batcher = "bt.count_distinct", need = "several columns counted as one distinct tuple", wave = "W2" }
 count_if = { status = "canonical", batcher = "bt.count_if" }
 covar_pop = { status = "canonical", batcher = "bt.covar_pop" }
 covar_samp = { status = "canonical", batcher = "bt.covar_samp" }
@@ -60,7 +60,7 @@ regr_sxx = { status = "canonical", batcher = "bt.regr_sxx" }
 regr_sxy = { status = "canonical", batcher = "bt.regr_sxy" }
 regr_syy = { status = "canonical", batcher = "bt.regr_syy" }
 row_number = { status = "canonical", batcher = "bt.row_number" }
-skewness = { status = "mismatch", batcher = "bt.skewness", note = "Spark skewness is the population estimate ([1,1,2] -> 0.7071); bt.skewness is the adjusted sample estimate. Needs a population variant", wave = "W0" }
+skewness = { status = "mismatch", batcher = "bt.skew", note = "Spark skewness is the population estimate ([1,1,2] -> 0.7071); bt.skewness is the adjusted sample estimate. Needs a population variant", wave = "W0" }
 some = { status = "canonical", batcher = "bt.bool_or" }
 std = { status = "canonical", batcher = "bt.std" }
 stddev = { status = "canonical", batcher = "bt.std" }

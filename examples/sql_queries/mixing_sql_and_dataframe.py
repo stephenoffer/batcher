@@ -58,7 +58,7 @@ def main() -> None:
 
     # Three per priority, no more.
     assert all(value <= 3 for value in final["kept"])
-    assert len(final["o_orderpriority"]) == orders.n_unique("o_orderpriority")
+    assert len(final["o_orderpriority"]) == orders.count_distinct("o_orderpriority")
 
     # Nothing was materialized along the way: the whole thing is one plan.
     plan = enriched.explain()

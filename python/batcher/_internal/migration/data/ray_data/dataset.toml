@@ -5,7 +5,7 @@ add_column = { status = "mismatch", batcher = "Dataset.map_batches", note = "Ray
 aggregate = { status = "mismatch", batcher = "Dataset.agg", note = "Ray aggregate(*AggregateFn) is eager and returns a scalar or a dict keyed 'sum(x)'. Batcher agg is lazy and returns a one-row Dataset with alias-named columns. Codemod: .agg(...).to_pylist()[0] with aliases 'sum(x)'.", wave = "W0" }
 columns = { status = "mismatch", batcher = "Dataset.columns", note = "Ray columns() is a method (fetch_if_missing=True may execute); Batcher columns is a property. Codemod drops the call parentheses.", wave = "W0" }
 context = { status = "mismatch", batcher = "bt.active_config", note = "Ray returns the DataContext captured by this Dataset; Batcher configuration is process/context scoped (active_config, config_context), not carried per Dataset.", wave = "W9" }
-copy = { status = "canonical", batcher = "Dataset.copy" }
+copy = { status = "canonical", batcher = "Dataset" }
 count = { status = "canonical", batcher = "Dataset.count" }
 deserialize_lineage = { status = "out_of_scope", reason = "lineage serialization of object-store block refs for Ray fault tolerance; a Batcher plan is rebuilt from its JSON IR and sources" }
 drop_columns = { status = "canonical", batcher = "Dataset.drop" }

@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderkey", "o_orderdate", "o_totalprice").head(2_000)
+    orders = tpch("orders").select("o_orderkey", "o_orderdate", "o_totalprice").limit(2_000)
 
     # A price band table: which tier does each order fall into.
     bands = bt.from_pydict(
@@ -46,7 +46,7 @@ def main() -> None:
     assert sum(per_tier["orders"]) == orders.count()
 
     # Every assignment really satisfies its band.
-    sample = banded.select("o_totalprice", "low", "high", "tier").head(20).to_pydict()
+    sample = banded.select("o_totalprice", "low", "high", "tier").limit(20).to_pydict()
     assert all(
         low <= price < high
         for price, low, high in zip(

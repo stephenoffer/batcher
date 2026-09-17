@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1465 Python modules across 215 packages and 288 Rust files across 15 crates.
+Covering 1465 Python modules across 215 packages and 289 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -3020,9 +3020,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather/mod.rs` | 753 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 248 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 246 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
-| `join/dense.rs` | 357 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
+| `join/dense.rs` | 335 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
+| `join/key_bits.rs` | 148 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
 | `join/key_filter.rs` | 303 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 2006 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 2089 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 538 | Sortable key forms for a range join's axes, and the dense ranking built on them. |

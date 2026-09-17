@@ -52,7 +52,7 @@ def test_count_distinct_matches_duckdb(duck, shape):
     """The statistic that was `None` on every categorical column."""
     table = _encoded(_SHAPES[shape])
     duck.register("t", table)
-    got = bt.from_arrow(table).select(n=bt.col("c").n_unique()).collect()
+    got = bt.from_arrow(table).select(n=bt.col("c").count_distinct()).collect()
     assert_same(got, duck.sql("SELECT COUNT(DISTINCT c) AS n FROM t"))
 
 
@@ -123,7 +123,7 @@ def test_the_encoded_and_plain_forms_agree():
     plain = pa.table({"c": pa.array(values)})
     encoded = pa.table({"c": pa.array(values).dictionary_encode()})
     for query in (
-        lambda d: d.select(n=bt.col("c").n_unique()),
+        lambda d: d.select(n=bt.col("c").count_distinct()),
         lambda d: d.group_by("c").agg(n=bt.col("c").count()),
         lambda d: d.filter(bt.col("c") == "v3"),
     ):

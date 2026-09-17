@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from batcher.plan.expr_ir.constructors import (
     array,
-    atan2,
     coalesce,
     col,
     count,
@@ -110,7 +109,6 @@ __all__ = [
     "StructField",
     "WindowExpr",
     "array",
-    "atan2",
     "coalesce",
     "col",
     "count",

@@ -55,7 +55,7 @@ def main() -> None:
         ).write.parquet(path)
 
         back = bt.read.parquet(path)
-        assert back.count() == lineitem.n_unique("l_shipmode")
+        assert back.count() == lineitem.count_distinct("l_shipmode")
         assert sum(back.to_pydict()["lines"]) == lineitem.count()
         print("wrote", back.count(), "rows")
 

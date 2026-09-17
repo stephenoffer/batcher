@@ -32,7 +32,7 @@ def main() -> None:
         month=col("o_orderdate").dt.month(),
     )
 
-    sample = fiscal.head(5).to_pydict()
+    sample = fiscal.limit(5).to_pydict()
     for row in zip(
         sample["o_orderdate"],
         sample["calendar_year"],

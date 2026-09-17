@@ -301,7 +301,7 @@ def _next_day(tr, node) -> Expr | None:
     if target is None:
         return None
     date = Cast(tr._scalar(node.this), "date")
-    shift = ((lit(target) - date.dt.isodow() + lit(6)) % lit(7)) + lit(1)
+    shift = ((lit(target) - date.dt.weekday() + lit(6)) % lit(7)) + lit(1)
     # `offset_by` takes a constant duration, and this shift is per row, so the arithmetic
     # runs on the day count and is read back as a date.
     return from_unix_date(Cast(date, "timestamp").dt.epoch() // lit(86_400) + shift)

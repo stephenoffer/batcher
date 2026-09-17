@@ -31,13 +31,13 @@ def main() -> None:
     assert sample.to_pydict() == again.to_pydict()
 
     # A fraction of the table.
-    tenth = lineitem.sample(frac=0.1, seed=11)
+    tenth = lineitem.sample(fraction=0.1, seed=11)
     print("sampled", tenth.count(), "of", total)
     assert 0.05 * total < tenth.count() < 0.15 * total
 
     # Row numbers over a defined order.
     numbered = (
-        lineitem.sort("l_extendedprice", descending=True).with_row_index(name="rank").head(5)
+        lineitem.sort("l_extendedprice", descending=True).with_row_index(name="rank").limit(5)
     ).to_pydict()
     print(numbered["rank"], [round(value) for value in numbered["l_extendedprice"]])
     assert numbered["rank"] == [0, 1, 2, 3, 4]

@@ -1,6 +1,6 @@
 """`.dt.ceil` and `.dt.round`, checked against pandas and DuckDB.
 
-`.dt.floor`/`.dt.truncate` bias every instant one way. Bucketing a series for a plot or
+`.dt.truncate` biases every instant one way. Bucketing a series for a plot or
 aligning two feeds sampled off each other's grid wants the nearest boundary instead, and
 closing a half-open bucket wants the next one — so the accessor needs all three.
 
@@ -132,9 +132,9 @@ def test_an_exact_half_rounds_up():
 
 
 def test_rounding_and_flooring_bracket_the_instant():
-    """`floor <= round <= ceil` for every unit and instant — a property, not a fixture."""
+    """`truncate <= round <= ceil` for every unit and instant — a property, not a fixture."""
     for unit in sorted(_FIXED_UNITS) + sorted(_CALENDAR_UNITS):
-        lo = _batcher("floor", unit)
+        lo = _batcher("truncate", unit)
         mid = _batcher("round", unit)
         hi = _batcher("ceil", unit)
         for i, stamp in enumerate(_STAMPS):

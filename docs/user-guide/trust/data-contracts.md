@@ -184,7 +184,7 @@ measured and reported on every run, and never fails one.
 ## Profiling before you write the contract
 
 Writing bounds without profiling first is guessing. {py:meth}`describe <batcher.Dataset.describe>`,
-{py:meth}`null_count <batcher.Dataset.null_count>`, and {py:meth}`n_unique <batcher.Dataset.n_unique>` give you the numbers the
+{py:meth}`null_count <batcher.Dataset.null_count>`, and {py:meth}`count_distinct <batcher.Dataset.count_distinct>` give you the numbers the
 bounds should be built from, and {doc}`/user-guide/analyze/metadata-shortcuts` answers many of
 them from file footers without reading the data at all.
 

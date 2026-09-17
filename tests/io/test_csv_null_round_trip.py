@@ -43,14 +43,14 @@ def nulls() -> pa.Table:
 def test_a_csv_batcher_wrote_reads_back_unchanged(tmp_path, nulls):
     path = str(tmp_path / "rt.csv")
     bt.from_arrow(nulls).write.csv(path)
-    assert bt.read_csv(path).collect().to_pydict() == nulls.to_pydict()
+    assert bt.read.csv(path).collect().to_pydict() == nulls.to_pydict()
 
 
 def test_an_empty_string_and_a_null_stay_different(tmp_path, nulls):
     """The whole point: collapsing them is exactly what the reader used to do."""
     path = str(tmp_path / "rt.csv")
     bt.from_arrow(nulls).write.csv(path)
-    back = bt.read_csv(path).to_pydict()["s"]
+    back = bt.read.csv(path).to_pydict()["s"]
     assert back[1] == "", "the empty string became something else"
     assert back[2] is None, "the null came back as a value"
 
@@ -64,7 +64,7 @@ def test_a_quoted_null_token_is_still_a_string(tmp_path):
     tbl = pa.table({"s": pa.array(["NA", "NULL", "NaN", "N/A", "nan", "null"])})
     path = str(tmp_path / "tokens.csv")
     bt.from_arrow(tbl).write.csv(path)
-    assert bt.read_csv(path).collect().to_pydict() == tbl.to_pydict()
+    assert bt.read.csv(path).collect().to_pydict() == tbl.to_pydict()
 
 
 def test_a_bare_null_token_written_by_something_else_is_still_a_null(tmp_path):
@@ -75,7 +75,7 @@ def test_a_bare_null_token_written_by_something_else_is_still_a_null(tmp_path):
     """
     path = tmp_path / "foreign.csv"
     path.write_text("s,n\nx,1\nNA,2\n,3\n")
-    assert bt.read_csv(str(path)).collect().to_pydict() == {
+    assert bt.read.csv(str(path)).collect().to_pydict() == {
         "s": ["x", None, None],
         "n": [1, 2, 3],
     }

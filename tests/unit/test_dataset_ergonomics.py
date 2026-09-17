@@ -1,8 +1,8 @@
 """The Python-ergonomics contract of `Dataset` and `GroupBy`.
 
 These cover the surface a user reaches for by habit rather than by reading the
-reference: ecosystem argument spellings (`sort(by=, ascending=)`,
-`melt(id_vars=)`), the Python protocols (`np.asarray`, the DataFrame Interchange
+reference: convenience argument forms (`filter(g="a")`, a dict `agg` spec,
+`sample(0.5)`), the Python protocols (`np.asarray`, the DataFrame Interchange
 Protocol), and — most importantly — the *messages*. A migrant meets Batcher through
 its errors, so the guidance text is asserted here as behaviour, not decoration: if
 `ds.set_index(...)` ever degrades back to a bare `AttributeError`, that is a
@@ -70,11 +70,6 @@ def test_sample_reads_a_positional_float_as_a_fraction(ds: bt.Dataset) -> None:
     assert ds.sample(0.0, seed=1).count() == 0
 
 
-def test_sample_accepts_the_pandas_aliases(ds: bt.Dataset) -> None:
-    assert ds.sample(n=2, random_state=7).count() == 2
-    assert ds.sample(frac=0.0, seed=7).count() == 0
-
-
 def test_sample_rejects_a_count_and_a_fraction_together(ds: bt.Dataset) -> None:
     with pytest.raises(PlanError, match="not both"):
         ds.sample(2, n=2)
@@ -83,39 +78,22 @@ def test_sample_rejects_a_count_and_a_fraction_together(ds: bt.Dataset) -> None:
 # --- sort -----------------------------------------------------------------------
 
 
-def test_sort_accepts_the_pandas_by_and_ascending(ds: bt.Dataset) -> None:
+def test_sort_descending_orders_the_rows(ds: bt.Dataset) -> None:
     # Deliberately order-dependent: an order-independent comparison cannot see a
     # sort bug, which is exactly the failure this asserts against.
-    assert ds.sort(by="x", ascending=False).to_pydict()["x"] == [4, 3, 2, 1]
+    assert ds.sort("x", descending=True).to_pydict()["x"] == [4, 3, 2, 1]
 
 
-def test_sort_ascending_matches_descending(ds: bt.Dataset) -> None:
-    assert (
-        ds.sort("x", descending=True).to_pydict()["x"]
-        == ds.sort(by="x", ascending=False).to_pydict()["x"]
-    )
-
-
-def test_sort_na_position_puts_nulls_first(ds: bt.Dataset) -> None:
-    assert ds.sort("y", na_position="first").to_pydict()["y"][0] is None
-
-
-def test_sort_rejects_conflicting_spellings(ds: bt.Dataset) -> None:
-    with pytest.raises(PlanError, match="not both"):
-        ds.sort("x", descending=True, ascending=False)
-
-
-def test_sort_rejects_a_bad_na_position(ds: bt.Dataset) -> None:
-    with pytest.raises(PlanError, match="'first' or 'last'"):
-        ds.sort("x", na_position="middle")
+def test_sort_nulls_first_puts_nulls_first(ds: bt.Dataset) -> None:
+    assert ds.sort("y", nulls_first=True).to_pydict()["y"][0] is None
 
 
 # --- reshape and selection spellings ---------------------------------------------
 
 
-def test_melt_accepts_the_pandas_argument_names(ds: bt.Dataset) -> None:
+def test_unpivot_accepts_a_single_index_name(ds: bt.Dataset) -> None:
     wide = ds.select("x", "y")
-    assert wide.melt(id_vars="x").columns == wide.melt(index=["x"]).columns
+    assert wide.unpivot(index="x").columns == wide.unpivot(index=["x"]).columns
 
 
 def test_select_dtypes_accepts_python_types_and_dtype_names(ds: bt.Dataset) -> None:
@@ -145,10 +123,10 @@ def test_rename_rejects_a_callable_that_collides_names(ds: bt.Dataset) -> None:
 # --- null filling ----------------------------------------------------------------
 
 
-def test_fillna_fills_only_the_columns_that_can_hold_the_value(ds: bt.Dataset) -> None:
+def test_fill_null_fills_only_the_columns_that_can_hold_the_value(ds: bt.Dataset) -> None:
     # The regression this guards: filling a mixed frame used to reach Rust and fail
     # with "arguments need to have the same data type", naming no column at all.
-    out = ds.fillna(0).to_pydict()
+    out = ds.fill_null(0).to_pydict()
     assert out["y"] == [10.0, 20.0, 0.0, 40.0]
     assert out["g"] == ["a", "b", "a", "b"]
 
@@ -215,7 +193,7 @@ def test_item_needs_a_column_when_the_result_is_wide(ds: bt.Dataset) -> None:
 
 
 def test_width_height_and_empty(ds: bt.Dataset) -> None:
-    assert (ds.width, ds.height, ds.empty) == (3, 4, False)
+    assert (ds.width, ds.count(), ds.is_empty()) == (3, 4, False)
 
 
 def test_collect_schema_is_an_ordered_mapping(ds: bt.Dataset) -> None:
@@ -243,25 +221,8 @@ def test_equals_is_false_for_different_columns(ds: bt.Dataset) -> None:
 # --- ecosystem spellings and protocols ---------------------------------------------
 
 
-def test_ecosystem_aliases_match_their_primaries(ds: bt.Dataset) -> None:
-    assert ds.to_dicts() == ds.to_pylist()
-    assert ds.to_dict() == ds.to_pydict()
-    assert ds.drop_duplicates().count() == ds.distinct().count()
-    assert ds.with_row_count().columns == ds.with_row_index().columns
-    assert ds.vstack(ds).count() == ds.union(ds).count()
-    assert ds.append(ds).count() == ds.union(ds).count()
-    assert ds.difference(ds).count() == ds.except_(ds).count()
-
-
-def test_lazy_and_copy_are_identity_because_a_dataset_is_lazy_and_immutable(
-    ds: bt.Dataset,
-) -> None:
-    assert ds.lazy() is ds
-    assert ds.copy() is ds
-
-
-def test_transform_is_pipe(ds: bt.Dataset) -> None:
-    assert ds.transform(lambda d: d.count()) == 4
+def test_pipe_calls_the_function_with_the_dataset(ds: bt.Dataset) -> None:
+    assert ds.pipe(lambda d: d.count()) == 4
 
 
 def test_numpy_array_protocol(ds: bt.Dataset) -> None:
@@ -352,11 +313,13 @@ def test_agg_dict_rejects_an_unknown_reducer(ds: bt.Dataset) -> None:
         ds.group_by("g").agg({"x": "blah"})
 
 
-def test_group_by_nunique_and_size_are_the_pandas_spellings(ds: bt.Dataset) -> None:
-    assert ds.group_by("g").nunique().sort("g").to_pydict() == (
-        ds.group_by("g").n_unique().sort("g").to_pydict()
-    )
-    assert ds.group_by("g").size().sort("g").to_pydict()["size"] == [2, 2]
+def test_group_by_count_distinct_and_len_reduce_every_group(ds: bt.Dataset) -> None:
+    assert ds.group_by("g").count_distinct().sort("g").to_pydict() == {
+        "g": ["a", "b"],
+        "x": [2, 2],
+        "y": [1, 2],
+    }
+    assert ds.group_by("g").len(name="size").sort("g").to_pydict()["size"] == [2, 2]
 
 
 def test_group_by_first_and_last_follow_the_order_by(ds: bt.Dataset) -> None:
@@ -372,7 +335,7 @@ def test_group_by_first_requires_an_explicit_order(ds: bt.Dataset) -> None:
         ds.group_by("g").first("x")
 
 
-# --- second-wave spellings: query, explain, writer shortcuts ------------------------
+# --- second-wave spellings: query, explain -----------------------------------------
 
 
 def test_query_is_a_sql_where_clause(ds: bt.Dataset) -> None:
@@ -392,23 +355,11 @@ def test_explain_still_rejects_an_unknown_format(ds: bt.Dataset) -> None:
         ds.explain(format="yaml")
 
 
-@pytest.mark.parametrize("fmt", ["csv", "parquet", "json"])
-def test_pandas_writer_shortcuts_round_trip(ds: bt.Dataset, tmp_path, fmt: str) -> None:
-    out = str(tmp_path / f"out.{fmt}")
-    getattr(ds, f"to_{fmt}")(out)
-    assert getattr(bt.read, fmt)(out).count() == 4
+# --- third-wave spellings: drop/rename/cast/join ------------------------------------
 
 
-# --- third-wave spellings: drop/rename/cast/join/pivot keywords -----------------------
-
-
-def test_drop_accepts_the_pandas_columns_and_labels_keywords(ds: bt.Dataset) -> None:
-    assert ds.drop(columns=["x"]).columns == ["y", "g"]
-    assert ds.drop(labels="x").columns == ["y", "g"]
-
-
-def test_drop_mixes_positional_and_keyword_targets(ds: bt.Dataset) -> None:
-    assert ds.drop("x", columns=["y"]).columns == ["g"]
+def test_drop_takes_several_columns(ds: bt.Dataset) -> None:
+    assert ds.drop("x", "y").columns == ["g"]
 
 
 def test_drop_without_a_target_is_rejected(ds: bt.Dataset) -> None:
@@ -416,20 +367,15 @@ def test_drop_without_a_target_is_rejected(ds: bt.Dataset) -> None:
         ds.drop()
 
 
-def test_drop_rejects_conflicting_keyword_spellings(ds: bt.Dataset) -> None:
-    with pytest.raises(PlanError, match="not both"):
-        ds.drop(columns="x", labels="y")
-
-
-def test_rename_accepts_the_pandas_columns_keyword(ds: bt.Dataset) -> None:
-    assert ds.rename(columns={"x": "z"}).columns == ["z", "y", "g"]
+def test_rename_takes_a_mapping(ds: bt.Dataset) -> None:
+    assert ds.rename({"x": "z"}).columns == ["z", "y", "g"]
 
 
 def test_cast_accepts_python_types_and_arrow_types(ds: bt.Dataset) -> None:
     import pyarrow as pa
 
     assert str(ds.select("x").cast(float).dtypes[0]) == "double"
-    assert str(ds.select("x").astype({"x": float}).dtypes[0]) == "double"
+    assert str(ds.select("x").cast({"x": float}).dtypes[0]) == "double"
     assert str(ds.select("x").cast(pa.float64()).dtypes[0]) == "double"
 
 
@@ -456,17 +402,6 @@ def test_join_lists_cross_among_the_supported_types(ds: bt.Dataset) -> None:
 def test_value_counts_normalize_reports_shares(ds: bt.Dataset) -> None:
     got = ds.value_counts("g", normalize=True).to_pydict()
     assert got["proportion"] == [0.5, 0.5]
-
-
-def test_pivot_accepts_the_pandas_aggfunc_spelling(ds: bt.Dataset) -> None:
-    by_alias = ds.pivot(index=["g"], on="g", values="x", aggfunc="max")
-    by_primary = ds.pivot(index=["g"], on="g", values="x", aggregate="max")
-    assert by_alias.equals(by_primary)
-
-
-def test_pivot_rejects_both_aggregate_spellings(ds: bt.Dataset) -> None:
-    with pytest.raises(PlanError, match="not both"):
-        ds.pivot(index=["g"], on="g", values="x", aggregate="max", aggfunc="min")
 
 
 # --- drop_nulls how= ------------------------------------------------------------------

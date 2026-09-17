@@ -1,15 +1,15 @@
-"""Ecosystem argument spellings compute the same result as the Batcher primary.
+"""Ergonomic argument spellings compute the same result as DuckDB.
 
-The migration surface is only worth having if `sort(by=, ascending=False)` is the
-*same query* as `sort(descending=True)` rather than something that merely looks like
-it. Each test here runs the ecosystem spelling through the full optimizer and checks
-it against DuckDB, so an alias that silently drifts — a flipped null placement, a
-fraction read as a row count, a fill applied to the wrong columns — fails here rather
-than in a user's ported script.
+Each test here runs a convenience spelling (a keyword filter, a per-key `descending=`
+list, `nulls_first=`, a dict agg spec, a `fill_null` subset) through the full optimizer
+and checks it against DuckDB, so a spelling that silently drifts — a flipped null
+placement, a fill applied to the wrong columns — fails here rather than in a user's
+script. The pandas keyword spellings (`by=`, `ascending=`, `na_position=`) and method
+aliases that used to be tested here were removed so each capability has one name.
 
 Sort ordering is asserted with `assert_same_ordered`. `assert_same` is
 order-independent by design and therefore structurally blind to a sort bug, which is
-exactly the class of bug an `ascending=` alias could introduce.
+exactly the class of bug a flipped `descending=` could introduce.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from _harness import assert_same, assert_same_ordered
 from batcher import col
 
 # Nulls in both value columns, a duplicate row, and a NULL group key: the edges an
-# alias is most likely to get wrong.
+# spelling is most likely to get wrong.
 _DATA = pa.table(
     {
         "g": ["a", "b", "a", "b", None, "a"],
@@ -76,39 +76,33 @@ def test_keyword_filter_on_empty_input(duck):
 # --- sort -------------------------------------------------------------------
 
 
-def test_ascending_false_matches_descending_true(t):
-    out = _ds().sort(by="x", ascending=False, na_position="last").collect()
+def test_descending_true_matches_sql_desc(t):
+    out = _ds().sort("x", descending=True, nulls_first=False).collect()
     expected = t.sql("SELECT * FROM t ORDER BY x DESC NULLS LAST")
     assert_same_ordered(out, expected)
 
 
-def test_ascending_true_is_the_default_order(t):
-    out = _ds().sort(by="x", ascending=True, na_position="last").collect()
+def test_descending_false_is_the_default_order(t):
+    out = _ds().sort("x", descending=False, nulls_first=False).collect()
     assert_same_ordered(out, t.sql("SELECT * FROM t ORDER BY x ASC NULLS LAST"))
 
 
-def test_na_position_first_matches_nulls_first(t):
-    out = _ds().sort("x", na_position="first").collect()
+def test_nulls_first_matches_sql_nulls_first(t):
+    out = _ds().sort("x", nulls_first=True).collect()
     assert_same_ordered(out, t.sql("SELECT * FROM t ORDER BY x ASC NULLS FIRST"))
 
 
-def test_per_key_ascending_list(t):
-    out = _ds().sort(by=["g", "x"], ascending=[True, False], na_position="last").collect()
+def test_per_key_descending_list(t):
+    out = _ds().sort("g", "x", descending=[False, True], nulls_first=False).collect()
     expected = t.sql("SELECT * FROM t ORDER BY g ASC NULLS LAST, x DESC NULLS LAST")
     assert_same_ordered(out, expected)
-
-
-def test_alias_and_primary_agree_exactly():
-    left = _ds().sort(by="x", ascending=False, na_position="first").collect()
-    right = _ds().sort("x", descending=True, nulls_first=True).collect()
-    assert left.equals(right)
 
 
 # --- fill_null --------------------------------------------------------------
 
 
-def test_fillna_fills_every_compatible_column(t):
-    out = _ds().fillna(0).collect()
+def test_fill_null_fills_every_compatible_column(t):
+    out = _ds().fill_null(0).collect()
     expected = t.sql("SELECT g, coalesce(x, 0) AS x, coalesce(y, 0) AS y FROM t")
     assert_same(out, expected)
 
@@ -148,7 +142,7 @@ def test_agg_dict_spec_with_several_reducers(t):
 
 
 def test_group_by_size_counts_rows_including_null_groups(t):
-    out = _ds().group_by("g").size().collect()
+    out = _ds().group_by("g").len(name="size").collect()
     assert_same(out, t.sql("SELECT g, count(*) AS size FROM t GROUP BY g"))
 
 
@@ -159,33 +153,3 @@ def test_group_by_first_and_last_follow_the_order(t):
         "UNION ALL SELECT g, NULL FROM t GROUP BY g HAVING count(x) = 0"
     )
     assert_same(out, expected)
-
-
-# --- ecosystem aliases are the same query -----------------------------------
-
-
-@pytest.mark.parametrize(
-    ("alias", "primary"),
-    [
-        ("drop_duplicates", "distinct"),
-        ("vstack", "union"),
-        ("append", "union"),
-        ("difference", "except_"),
-    ],
-)
-def test_set_aliases_delegate_to_their_primary(alias, primary):
-    ds, other = _ds(), _ds().filter(col("x") > 2)
-    if alias == "drop_duplicates":
-        assert getattr(ds, alias)().equals(getattr(ds, primary)())
-    else:
-        assert getattr(ds, alias)(other).equals(getattr(ds, primary)(other))
-
-
-def test_row_index_aliases_agree():
-    assert _ds().with_row_count().equals(_ds().with_row_index())
-
-
-def test_export_aliases_agree():
-    ds = _ds()
-    assert ds.to_dicts() == ds.to_pylist()
-    assert ds.to_dict() == ds.to_pydict()

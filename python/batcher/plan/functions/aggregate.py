@@ -17,6 +17,7 @@ __all__ = [
     "bool_and",
     "bool_or",
     "corr",
+    "count_distinct",
     "count_if",
     "covar_pop",
     "covar_samp",
@@ -26,9 +27,8 @@ __all__ = [
     "median",
     "min",
     "mode",
-    "n_unique",
     "product",
-    "skewness",
+    "skew",
     "std",
     "sum",
     "var",
@@ -281,8 +281,8 @@ def var(column: str | Expr) -> AggExpr:
     return _as_column(column).var()
 
 
-def n_unique(column: str | Expr) -> AggExpr:
-    """Count distinct values of a column — ``pl.n_unique('x')`` for ``col('x').n_unique()``.
+def count_distinct(column: str | Expr) -> AggExpr:
+    """Count distinct values of a column — ``pl.n_unique('x')`` for ``col('x').count_distinct()``.
 
     Args:
         column: The column to reduce, as a name or an expression.
@@ -295,10 +295,10 @@ def n_unique(column: str | Expr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 1, 5]})
-            >>> ds.group_by("g").agg(bt.n_unique("x")).sort("g").to_pydict()
+            >>> ds.group_by("g").agg(bt.count_distinct("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'x': [1, 1]}
     """
-    return _as_column(column).n_unique()
+    return _as_column(column).count_distinct()
 
 
 def product(column: str | Expr) -> AggExpr:
@@ -341,7 +341,7 @@ def mode(column: str | Expr) -> AggExpr:
     return _as_column(column).mode()
 
 
-def skewness(column: str | Expr) -> AggExpr:
+def skew(column: str | Expr) -> AggExpr:
     """Sample skewness — the third standardized moment (DuckDB ``skewness``).
 
     Args:
@@ -355,10 +355,10 @@ def skewness(column: str | Expr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 100.0]})
-            >>> ds.agg(s=bt.skewness("x").round(4)).to_pydict()
+            >>> ds.agg(s=bt.skew("x").round(4)).to_pydict()
             {'s': [2.2324]}
     """
-    return _as_column(column).skewness()
+    return _as_column(column).skew()
 
 
 def kurtosis(column: str | Expr) -> AggExpr:

@@ -71,15 +71,11 @@ TOP_LEVEL_UNSUPPORTED: dict[str, str] = {
     "scan_ipc": "Every reader is already lazy: bt.read.arrow(path) (no scan_/read_ split).",
     "scan_delta": "Every reader is already lazy: bt.read.delta(path).",
     # --- SQL / database readers -------------------------------------------------------
-    "read_sql": (
-        "Read a query with bt.read_database(query, uri=...) or bt.read.sql(query, uri=...)."
-    ),
-    "read_sql_query": "Read a query with bt.read_database(query, uri=...).",
-    "read_sql_table": (
-        "Read a table with bt.read_database('SELECT * FROM t', uri=...) or bt.read.sql(...)."
-    ),
+    "read_sql": ("Read a query with bt.read.sql(query, uri=...)."),
+    "read_sql_query": "Read a query with bt.read.sql(query, uri=...).",
+    "read_sql_table": ("Read a table with bt.read.sql('SELECT * FROM t', uri=...)."),
     # --- foreign-format readers with no native path -----------------------------------
-    "read_feather": "Arrow/Feather is bt.read_ipc(path) or bt.read.arrow(path).",
+    "read_feather": "Arrow/Feather is bt.read.arrow(path).",
     "read_html": (
         "No native HTML reader; load with pandas then bt.from_pandas(pd.read_html(url)[0])."
     ),

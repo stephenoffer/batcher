@@ -20,10 +20,10 @@ from batcher import col
 
 
 def main() -> None:
-    lines = tpch("lineitem").select("l_shipmode", "l_comment").head(40_000)
+    lines = tpch("lineitem").select("l_shipmode", "l_comment").limit(40_000)
 
     words = (
-        lines.select("l_shipmode", word=col("l_comment").str.to_lowercase().str.split(" "))
+        lines.select("l_shipmode", word=col("l_comment").str.lower().str.split(" "))
         .explode("word")
         .filter(col("word").str.len_chars() > 3)
     )

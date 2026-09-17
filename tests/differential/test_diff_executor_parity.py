@@ -53,7 +53,7 @@ _QUERIES = {
     ),
     "group_by null key": lambda d: d.group_by("nl").agg(n=bt.col("k").count()),
     "global agg": lambda d: d.agg(
-        t=bt.col("v").sum(), n=bt.col("k").count(), u=bt.col("k").n_unique()
+        t=bt.col("v").sum(), n=bt.col("k").count(), u=bt.col("k").count_distinct()
     ),
     "distinct": lambda d: d.select("k", "g").distinct(),
     "sort asc": lambda d: d.sort("k", "v"),

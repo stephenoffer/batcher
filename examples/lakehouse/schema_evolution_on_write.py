@@ -26,11 +26,11 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "suppliers")
 
-        supplier.head(500).write.delta(table)
+        supplier.limit(500).write.delta(table)
         assert bt.read.delta(table).width == 3
 
         # A later batch carries an extra column.
-        widened = supplier.slice(500, 500).with_columns(s_tier=bt.lit("standard"))
+        widened = supplier.limit(500, offset=500).with_columns(s_tier=bt.lit("standard"))
         widened.write.delta(table, mode="append", merge_schema=True)
 
         combined = bt.read.delta(table)
@@ -46,7 +46,7 @@ def main() -> None:
         assert present == 500
 
         # The old data is otherwise untouched.
-        original = supplier.head(500).sort("s_suppkey").to_pydict()
+        original = supplier.limit(500).sort("s_suppkey").to_pydict()
         after = combined.filter(col("s_tier").is_null()).sort("s_suppkey").to_pydict()
         assert after["s_name"] == original["s_name"]
 

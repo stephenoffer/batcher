@@ -249,7 +249,7 @@ def normalized_entropy(ds: Dataset, column: str) -> float:
     import math
 
     require_columns(ds, column)
-    distinct = ds.agg(k=col(column).n_unique()).collect().column("k")[0].as_py()
+    distinct = ds.agg(k=col(column).count_distinct()).collect().column("k")[0].as_py()
     if distinct is None or distinct < 2:
         return float("nan")
     return entropy(ds, column, base=math.e) / math.log(distinct)

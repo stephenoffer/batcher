@@ -20,7 +20,7 @@ from batcher import col, ml
 
 
 def main() -> None:
-    lineitem = tpch("lineitem").select("l_quantity", "l_extendedprice", "l_discount").head(20_000)
+    lineitem = tpch("lineitem").select("l_quantity", "l_extendedprice", "l_discount").limit(20_000)
 
     folds = list(lineitem.ml.kfold(k=5, seed=5))
     print("folds:", len(folds))

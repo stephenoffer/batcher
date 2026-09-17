@@ -158,8 +158,8 @@ def test_count_distinct_not_answered_from_footer(duck, tmp_path):
     path = str(tmp_path / "g.parquet")
     pq.write_table(table, path)
     ds = bt.read.parquet(path)
-    assert metadata_aggregate_table(ds.agg(n=col("g").n_unique())._plan, ds._sources) is None
-    got = ds.agg(n=col("g").n_unique()).collect()
+    assert metadata_aggregate_table(ds.agg(n=col("g").count_distinct())._plan, ds._sources) is None
+    got = ds.agg(n=col("g").count_distinct()).collect()
     want = duck.sql(f"SELECT count(DISTINCT g) AS n FROM '{path}'")
     assert_same(got, want)
 

@@ -54,7 +54,8 @@ EXPR_UNSUPPORTED: dict[str, str] = {
         "Value counts is a Dataset op: ds.value_counts('x'), or ds.group_by('x').len()."
     ),
     "unique": (
-        "Distinct values are ds.select('x').distinct(); count them with bt.col('x').n_unique()."
+        "Distinct values are ds.select('x').distinct(); count them with "
+        "bt.col('x').count_distinct()."
     ),
     "unique_counts": "Per-value counts are ds.value_counts('x').",
     "drop_nulls": (
@@ -64,10 +65,11 @@ EXPR_UNSUPPORTED: dict[str, str] = {
         "Drop NaN with ds.filter(bt.col('x').is_not_nan()); .fill_nan(v) replaces them in place."
     ),
     "gather": (
-        "Positional gather is not an expression op. Use ds.slice(...) / ds.gather_every(...)."
+        "Positional gather is not an expression op. Use ds.limit(n, offset=o) / "
+        "ds.gather_every(...)."
     ),
-    "take": "Positional take is not an expression op. Use ds.slice(...) / ds.head(n).",
-    "head": "On a list use .list.head(n); at the Dataset level use ds.head(n).",
+    "take": "Positional take is not an expression op. Use ds.limit(n, offset=o).",
+    "head": "On a list use .list.head(n); at the Dataset level use ds.limit(n).",
     "tail": "On a list use .list.slice(-n, n); at the Dataset level use ds.tail(n).",
     "reverse": "On a list use .list.reverse(); at the Dataset level use ds.reverse().",
     "flatten": "Flatten a list column with .list.flatten(), or explode it with ds.explode('x').",
@@ -88,8 +90,8 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     "idxmax": "The argmax index is bt.col('x').arg_max().",
     "idxmin": "The argmin index is bt.col('x').arg_min().",
     # --- clipping / casting naming ----------------------------------------------------
-    "clip_lower": "Spelled bt.col('x').clip_min(lo) here.",
-    "clip_upper": "Spelled bt.col('x').clip_max(hi) here.",
+    "clip_lower": "Spelled bt.col('x').clip(lower=lo) here.",
+    "clip_upper": "Spelled bt.col('x').clip(upper=hi) here.",
     "to_physical": (
         "Reinterpret the storage type with bt.col('x').cast('int64') (or the target dtype)."
     ),
@@ -163,14 +165,14 @@ STR_UNSUPPORTED: dict[str, str] = {
     "encode": "Byte encoding is not exposed; string columns are already UTF-8 text.",
     "extractall": "Spelled .str.extract_all(pattern) here.",
     "find": "The index of a substring is .str.position(sub).",
-    "findall": "All matches are .str.extract_all(pattern) or .str.regexp_extract_all(pattern).",
+    "findall": "All matches are .str.extract_all(pattern).",
     "fullmatch": (
         ".str.match(pattern) anchors the start only, as pandas .str.match does; "
         "anchor the end yourself with .str.regexp_matches('^(?:pattern)$')."
     ),
     "get": "The i-th character is .str.slice(i, 1).",
     "index": "The index of a substring is .str.position(sub).",
-    "isdecimal": "Spelled .str.isdigit() / .str.is_numeric() here.",
+    "isdecimal": "Spelled .str.is_numeric() here.",
     "islower": "Spelled .str.is_lower() here.",
     "isnumeric": "Spelled .str.is_numeric() here.",
     "istitle": "There is no is_title; compare against .str.to_titlecase().",
@@ -210,7 +212,7 @@ LIST_UNSUPPORTED: dict[str, str] = {
         "Count occurrences by filtering and .list.len(), or test with .list.contains(x)."
     ),
     "set_symmetric_difference": (
-        "Symmetric difference is .list.set_difference(a, b) both ways, then .list.union(...)."
+        "Symmetric difference is .list.difference(b) both ways, then .list.union(...)."
     ),
     "shift": "Shifting elements within a list is not built in; explode, window, and re-aggregate.",
     "sample": "Sampling within a list is not built in; explode then ds.sample(...).",

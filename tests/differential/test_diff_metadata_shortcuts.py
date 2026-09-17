@@ -119,7 +119,6 @@ def _assert_agrees(ds, call) -> None:
         pytest.param(lambda d: d.meta.count_where(bt.col("i").is_null()), id="count_where-null"),
         pytest.param(lambda d: d.meta.count_where(bt.col("i") > 100), id="count_where-empty"),
         pytest.param(lambda d: d.meta.count_where(bt.col("i") > 2), id="count_where-partial"),
-        pytest.param(lambda d: d.meta.is_empty_where(bt.col("i") > 100), id="is_empty_where"),
         pytest.param(lambda d: d.meta.any_match(bt.col("i") > 2), id="any_match"),
         pytest.param(lambda d: d.meta.none_match(bt.col("i") > 100), id="none_match"),
         pytest.param(lambda d: d.meta.all_match(bt.col("key") > 0), id="all_match"),

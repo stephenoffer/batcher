@@ -36,7 +36,7 @@ def test_drop_rename_with_column():
     ds = bt.from_pydict({"a": [1, 2], "b": [3, 4], "c": [5, 6]})
     assert ds.drop("b").collect().column_names == ["a", "c"]
     assert ds.rename({"a": "x"}).collect().column_names == ["x", "b", "c"]
-    out = ds.with_column("d", col("a") + col("b")).collect().to_pydict()
+    out = ds.with_columns(d=col("a") + col("b")).collect().to_pydict()
     assert out["d"] == [4, 6]
 
 

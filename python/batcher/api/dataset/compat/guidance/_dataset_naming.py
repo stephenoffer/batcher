@@ -37,7 +37,7 @@ DATASET_NAMING: dict[str, str] = {
     "intersectAll": "Spelled ds.intersect(other) here.",
     "subtract": "Spelled ds.except_(other) here (set difference).",
     "crossJoin": "Spelled ds.cross_join(other) here.",
-    "dropDuplicates": "Spelled ds.distinct() (or ds.drop_duplicates()) here.",
+    "dropDuplicates": "Spelled ds.distinct() here; ds.distinct(subset) for dropDuplicates(cols).",
     "where": "Spelled ds.filter(bt.col('x') > 0) here (Spark's `where` alias).",
     "approxQuantile": "Spelled ds.approx_quantile(column, [0.5]) here.",
     "sampleBy": (
@@ -149,7 +149,7 @@ DATASET_RAY_DATA: dict[str, str] = {
         "Spelled ds.shuffle(seed=0) here. Batcher shuffles rows rather than reordering "
         "blocks, so there is no weaker block-level variant to choose."
     ),
-    "random_sample": "Spelled ds.sample_frac(0.1, seed=0) here, or ds.sample(n) for a row count.",
+    "random_sample": "Spelled ds.sample(0.1, seed=0) here, or ds.sample(n=10) for a row count.",
     "train_test_split": "Spelled ds.ml.train_test_split(0.2, seed=0) here.",
     "streaming_train_test_split": (
         "Spelled ds.ml.train_test_split(0.2, seed=0) here; it is already lazy, so both "
@@ -161,8 +161,8 @@ DATASET_RAY_DATA: dict[str, str] = {
     "take_batch": "Spelled ds.limit(n).to_arrow() here.",
     "materialize": (
         "Spelled ds.cache() here: it pins the computed result so downstream branches reuse "
-        "it instead of recomputing. ds.persist() is the Spark spelling of the same marker; "
-        "ds.cache('disk_only') keeps it off the memory budget entirely."
+        "it instead of recomputing; ds.cache('disk_only') keeps it off the memory budget "
+        "entirely."
     ),
     "iterator": "Spelled ds.iter_batches() here; ds.iter_rows() yields dicts.",
     "iter_torch_batches": "Spelled ds.ml.iter_torch_batches(...) here.",

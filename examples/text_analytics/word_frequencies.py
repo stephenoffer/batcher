@@ -19,10 +19,10 @@ from batcher import col
 
 
 def main() -> None:
-    comments = tpch("lineitem").select("l_comment").head(20_000)
+    comments = tpch("lineitem").select("l_comment").limit(20_000)
 
     words = (
-        comments.select(word=col("l_comment").str.to_lowercase().str.split(" "))
+        comments.select(word=col("l_comment").str.lower().str.split(" "))
         .explode("word")
         .filter(col("word").str.len_chars() > 3)
     )
@@ -44,7 +44,7 @@ def main() -> None:
     assert total_tokens > comments.count()
 
     # Vocabulary size versus token count is the type/token ratio.
-    vocabulary = words.n_unique("word")
+    vocabulary = words.count_distinct("word")
     print(f"vocabulary {vocabulary}, ratio {vocabulary / total_tokens:.4f}")
     assert 0 < vocabulary < total_tokens
 

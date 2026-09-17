@@ -240,7 +240,7 @@ def adamic_adar(g: Graph, pairs: Dataset, *, a: str = "a", b: str = "b") -> Data
         a,
         b,
         "adamic_adar",
-        lambda k: bt.lit(1.0) / bt.max_horizontal(k, bt.lit(2.0)).log(),
+        lambda k: bt.lit(1.0) / bt.greatest(k, bt.lit(2.0)).ln(),
     )
 
 
@@ -276,7 +276,7 @@ def resource_allocation(g: Graph, pairs: Dataset, *, a: str = "a", b: str = "b")
         a,
         b,
         "resource_allocation",
-        lambda k: bt.lit(1.0) / bt.max_horizontal(k, bt.lit(1.0)),
+        lambda k: bt.lit(1.0) / bt.greatest(k, bt.lit(1.0)),
     )
 
 

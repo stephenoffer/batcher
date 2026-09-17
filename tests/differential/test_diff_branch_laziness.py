@@ -149,11 +149,7 @@ def test_a_coalesce_argument_that_is_never_needed_does_not_raise(duck, t):
         (
             "a_string_branch_over_a_string_column",
             "CASE WHEN i > 3 THEN upper(s) ELSE lower(s) END",
-            lambda: (
-                when(col("i") > 3)
-                .then(col("s").str.to_uppercase())
-                .otherwise(col("s").str.to_lowercase())
-            ),
+            lambda: when(col("i") > 3).then(col("s").str.upper()).otherwise(col("s").str.lower()),
         ),
         (
             # A gathered branch is scattered back with `take`, so a nested output type is
@@ -224,7 +220,7 @@ def test_branch_selection_survives_the_column_shape(duck, shape):
         bt.from_arrow(tbl)
         .select(
             c=when(col("i") > 2)
-            .then(col("s").str.to_uppercase())
+            .then(col("s").str.upper())
             .when(col("i") > 1)
             .then(col("s").str.reverse())
             .otherwise(col("s")),
@@ -260,7 +256,7 @@ def test_streaming_agrees_with_collect(t):
     selected rows — the one thing a single whole-relation `collect` cannot vary."""
     ds = bt.from_arrow(t).select(
         o=when(col("i") == 3)
-        .then(col("s").str.to_uppercase())
+        .then(col("s").str.upper())
         .when(col("i") == 5)
         .then(col("s").str.reverse())
         .otherwise(col("s"))

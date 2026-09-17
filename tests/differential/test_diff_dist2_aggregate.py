@@ -73,7 +73,7 @@ def _agg_dataset(src: pa.Table):
             mn=col("v").min(),
             mx=col("v").max(),
             avg=col("v").mean(),
-            nu=col("v").n_unique(),
+            nu=col("v").count_distinct(),
             amx=col("v").arg_max(col("o")),
             amn=col("v").arg_min(col("o")),
         )

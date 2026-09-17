@@ -84,7 +84,7 @@ def test_aggregate_chunk_invariant(case: tuple[pa.Table, int]) -> None:
             a=col("v").mean(),
             lo=col("v").min(),
             hi=col("v").max(),
-            nd=col("v").approx_n_unique(),
+            nd=col("v").approx_count_distinct(),
         ),
         table,
         n_chunks,

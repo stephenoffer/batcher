@@ -63,7 +63,7 @@ def test_to_torch_selects_only_the_requested_columns(ds):
 def test_to_torch_dataloader_is_a_real_dataloader_over_the_same_rows(ds):
     """The ``DataLoader`` wrapper, checked by iterating it rather than by its type alone."""
     torch = pytest.importorskip("torch")
-    loader = ds.to_torch_dataloader(batch_size=2)
+    loader = ds.ml.to_torch_dataloader(batch_size=2)
     assert isinstance(loader, torch.utils.data.DataLoader)
     collected: dict[str, list[float]] = {"a": [], "b": []}
     for batch in loader:
@@ -76,7 +76,7 @@ def test_to_torch_dataloader_is_a_real_dataloader_over_the_same_rows(ds):
 def test_to_tf_yields_batches_holding_the_dataset_rows(ds):
     """The TensorFlow exit, same contract as the torch one."""
     pytest.importorskip("tensorflow")
-    exported = ds.to_tf(batch_size=2)
+    exported = ds.ml.to_tf(batch_size=2)
     seen: list[float] = []
     for batch in exported:
         assert set(batch) == {"a", "b"}

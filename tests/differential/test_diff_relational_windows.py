@@ -49,7 +49,7 @@ def test_ranking_window_under_limit_matches_duckdb(t, duck):
 
 def test_ranking_window_under_limit_with_offset(t, duck):
     """The offset must be added to the pushed cap, or rows 4 and 5 would be missing."""
-    got = bt.from_arrow(t).with_columns(rn=bt.row_number().over(order_by="a")).slice(2, 2)
+    got = bt.from_arrow(t).with_columns(rn=bt.row_number().over(order_by="a")).limit(2, offset=2)
     assert_same_ordered(
         got.collect(),
         duck.sql("select a, g, v, row_number() over (order by a) as rn from t limit 2 offset 2"),

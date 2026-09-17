@@ -45,8 +45,8 @@ def main() -> None:
     checks["aggregate"] = sum(grouped.to_pydict()["n"]) == lineitem.count()
     checks["window"] = lineitem.with_columns(
         r=bt.row_number().over(partition_by=["l_orderkey"], order_by=["l_linenumber"])
-    ).filter(col("r") == 1).count() == lineitem.n_unique("l_orderkey")
-    sorted_head = lineitem.sort("l_extendedprice", descending=True).head(5).to_pydict()
+    ).filter(col("r") == 1).count() == lineitem.count_distinct("l_orderkey")
+    sorted_head = lineitem.sort("l_extendedprice", descending=True).limit(5).to_pydict()
     checks["sort"] = sorted_head["l_extendedprice"] == sorted(
         sorted_head["l_extendedprice"], reverse=True
     )

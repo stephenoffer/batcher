@@ -22,7 +22,7 @@ from batcher import col
 def main() -> None:
     per_order = (
         tpch("lineitem")
-        .head(30_000)
+        .limit(30_000)
         .group_by("l_orderkey")
         .agg(quantities=bt.array_agg(col("l_quantity")))
         .sort("l_orderkey")
@@ -36,7 +36,7 @@ def main() -> None:
         smallest=col("quantities").list.min(),
         average=col("quantities").list.mean(),
     )
-    result = reduced.head(5).to_pydict()
+    result = reduced.limit(5).to_pydict()
     print(result)
 
     full = reduced.to_pydict()
@@ -51,7 +51,7 @@ def main() -> None:
     # And they agree with the grouped aggregate over the same data.
     direct = (
         tpch("lineitem")
-        .head(30_000)
+        .limit(30_000)
         .group_by("l_orderkey")
         .agg(total=col("l_quantity").sum(), lines=bt.count())
         .sort("l_orderkey")
@@ -62,7 +62,7 @@ def main() -> None:
 
     # Sorting and deduplicating inside the list, still without exploding.
     tidied = per_order.select(
-        unique=col("quantities").list.set_union(col("quantities")).list.len(),
+        unique=col("quantities").list.union(col("quantities")).list.len(),
         length=col("quantities").list.len(),
     ).to_pydict()
     assert all(

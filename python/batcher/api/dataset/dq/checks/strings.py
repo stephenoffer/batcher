@@ -163,5 +163,5 @@ def not_empty(column: str, *, strip: bool = True) -> RowConstraint:
         The row constraint.
     """
     c = Col(column)
-    value = c.str.strip_chars() if strip else c
+    value = c.str.trim() if strip else c
     return RowConstraint(f"not_empty({column})", c.is_null() | (value.str.len_chars() > 0))

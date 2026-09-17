@@ -111,13 +111,13 @@ def test_sort_values_matches_pandas_and_really_orders_the_rows(ds, frame):
     """Compared in order, element by element, because a sort is the one thing
     an order-independent comparison cannot see.
     """
-    got = ds.sort_values("x").to_pydict()["x"]
+    got = ds.sort("x").to_pydict()["x"]
     assert got == frame.sort_values("x")["x"].tolist()
     assert got == sorted(ROWS["x"]), "and it is genuinely ascending"
 
     # `ascending=` is the pandas keyword, not Batcher's own `descending=`; the alias takes
     # the borrowed spelling, which is the point of having it.
-    descending = ds.sort_values("x", ascending=False).to_pydict()["x"]
+    descending = ds.sort("x", descending=True).to_pydict()["x"]
     assert descending == frame.sort_values("x", ascending=False)["x"].tolist()
     assert descending == sorted(ROWS["x"], reverse=True)
     assert descending == list(reversed(got))
@@ -125,16 +125,13 @@ def test_sort_values_matches_pandas_and_really_orders_the_rows(ds, frame):
 
 def test_sort_values_delegates_to_sort(ds):
     """The alias and the primary spelling must produce the same rows in the same order."""
-    assert ds.sort_values("x").to_pydict() == ds.sort("x").to_pydict()
-    assert (
-        ds.sort_values("x", ascending=False).to_pydict()
-        == ds.sort("x", descending=True).to_pydict()
-    )
+    assert ds.sort("x").to_pydict() == ds.sort("x").to_pydict()
+    assert ds.sort("x", descending=True).to_pydict() == ds.sort("x", descending=True).to_pydict()
 
 
 def test_assign_matches_pandas_and_delegates_to_with_columns(ds, frame):
     """Adds a column, keeps the rest, and is exactly ``with_columns``."""
-    got = ds.assign(y=bt.col("x") * 2).to_pydict()
+    got = ds.with_columns(y=bt.col("x") * 2).to_pydict()
     want = frame.assign(y=frame["x"] * 2)
     assert got["y"] == pytest.approx(want["y"].tolist())
     assert sorted(got) == sorted(want.columns), "assign must not drop a column"
@@ -143,7 +140,7 @@ def test_assign_matches_pandas_and_delegates_to_with_columns(ds, frame):
 
 def test_groupby_matches_pandas_and_delegates_to_group_by(ds, frame):
     """The pandas spelling of the aggregate, keyed the same way."""
-    got = ds.groupby("g").agg(total=bt.col("x").sum()).to_pydict()
+    got = ds.group_by("g").agg(total=bt.col("x").sum()).to_pydict()
     want = frame.groupby("g")["x"].sum()
     assert dict(zip(got["g"], got["total"], strict=True)) == pytest.approx(want.to_dict())
     assert got == ds.group_by("g").agg(total=bt.col("x").sum()).to_pydict()
@@ -155,12 +152,12 @@ def test_merge_matches_pandas_and_delegates_to_join(ds, frame):
     right = bt.from_pydict(right_rows)
     right_frame = pandas.DataFrame(right_rows)
 
-    got = ds.merge(right, on="g").to_pydict()
+    got = ds.join(right, on="g").to_pydict()
     want = frame.merge(right_frame, on="g")
     assert sorted(got["w"]) == sorted(want["w"].tolist())
     assert got == ds.join(right, on="g").to_pydict()
 
-    left_outer = ds.merge(right, on="g", how="left").to_pydict()
+    left_outer = ds.join(right, on="g", how="left").to_pydict()
     assert len(left_outer["g"]) == len(frame.merge(right_frame, on="g", how="left"))
 
 
@@ -172,7 +169,7 @@ def test_merge_suffixes_a_clashing_column_the_way_it_says_it_does(ds):
     difference is visible to anyone porting a ``merge`` that relied on the pair.
     """
     right = bt.from_pydict({"g": ["a", "b"], "x": [10.0, 20.0]})
-    got = ds.merge(right, on="g", suffix="_r").to_pydict()
+    got = ds.join(right, on="g", suffix="_r").to_pydict()
     assert "x" in got and "x_r" in got, f"columns were {sorted(got)}"
     assert got["x_r"] == pytest.approx([10.0, 10.0, 20.0])
 
@@ -199,7 +196,7 @@ def test_groupby_std_and_var_match_pandas(ds, frame):
 NUMERIC = [
     ("arccos", (bt.col("x") / 4).arccos, lambda v: math.acos(v / 4)),
     ("arcsinh", lambda: bt.col("x").arcsinh(), math.asinh),
-    ("clip_min", lambda: bt.col("x").clip_min(0.0), lambda v: max(v, 0.0)),
+    ("clip_min", lambda: bt.col("x").clip(lower=0.0), lambda v: max(v, 0.0)),
 ]
 
 
@@ -215,7 +212,7 @@ def test_clip_min_is_the_lower_half_of_clip(ds):
     """``clip_min`` and ``clip_max`` composed must equal ``clip``, or one of them is wrong."""
     got = ds.select(
         both=bt.col("x").clip(0.0, 2.0),
-        chained=bt.col("x").clip_min(0.0).clip_max(2.0),
+        chained=bt.col("x").clip(lower=0.0).clip(upper=2.0),
     ).to_pydict()
     assert got["both"] == pytest.approx(got["chained"])
 

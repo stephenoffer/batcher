@@ -93,7 +93,7 @@ def _documents(n: int, words: int = 120) -> bt.Dataset:
 
 def _mb(ds: bt.Dataset, column: str) -> float:
     """Megabytes of text in `column`, for a per-byte rate rather than a per-row one."""
-    total = ds.select(n=col(column).str.len().sum()).to_pydict()["n"][0]
+    total = ds.select(n=col(column).str.len_chars().sum()).to_pydict()["n"][0]
     return total / 1e6
 
 

@@ -248,7 +248,7 @@ def bleu(prediction: IntoExpr, reference: IntoExpr, max_n: int = 4) -> Expr:
     # The geometric mean as an explicit root of the product rather than exp(mean(log p)):
     # a zero precision must give exactly 0, and `log(0)` is -inf, which propagates as a NaN
     # through the mean instead of the 0 the definition calls for.
-    geometric = product.pow(lit(1.0 / max_n))
+    geometric = product ** lit(1.0 / max_n)
     return (_per_row_brevity(prediction, reference) * geometric).mean()
 
 
@@ -331,7 +331,7 @@ def ngram_novelty(prediction: IntoExpr, reference: IntoExpr, n: int = 4) -> Expr
     pred = token_ngrams(_as_column(prediction), n)
     gold = token_ngrams(_as_column(reference), n)
     distinct = pred.list.n_unique()
-    shared = pred.list.set_intersection(gold).list.len()
+    shared = pred.list.intersect(gold).list.len()
     return _mean_over(distinct - shared, distinct)
 
 

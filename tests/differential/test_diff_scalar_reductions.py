@@ -74,8 +74,8 @@ def test_unknown_column_raises_plan_error(numbers):
 
 @pytest.mark.differential
 def test_reduction_family_is_complete_and_uniform(numbers):
-    """min/max/sum/mean/median/std/var/n_unique all take one column and return a scalar."""
+    """min/max/sum/mean/median/std/var/count_distinct all take one column and return a scalar."""
     ds = bt.from_arrow(numbers)
-    for method in ("min", "max", "sum", "mean", "median", "std", "var", "n_unique"):
+    for method in ("min", "max", "sum", "mean", "median", "std", "var", "count_distinct"):
         value = getattr(ds, method)("i")  # no AttributeError — the family is complete
         assert not isinstance(value, bt.Dataset)  # a scalar, not a lazy frame

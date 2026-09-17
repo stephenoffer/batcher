@@ -23,8 +23,8 @@ def main() -> None:
     lineitem = tpch("lineitem")
 
     # Two "days" of data from the same distribution.
-    baseline = lineitem.head(100_000)
-    today = lineitem.slice(100_000, 100_000)
+    baseline = lineitem.limit(100_000)
+    today = lineitem.limit(100_000, offset=100_000)
 
     def profile(dataset: bt.Dataset) -> dict[str, float]:
         row = dataset.agg(

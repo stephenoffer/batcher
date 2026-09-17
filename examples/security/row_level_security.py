@@ -23,7 +23,7 @@ from batcher import col
 def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "customers")
-        source = tpch("customer").select("c_custkey", "c_nationkey", "c_acctbal").head(2_000)
+        source = tpch("customer").select("c_custkey", "c_nationkey", "c_acctbal").limit(2_000)
         source.write.parquet(table)
 
         analyst = bt.Principal("analyst", roles={"analyst"})

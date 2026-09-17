@@ -40,7 +40,7 @@ def _s(expr):
         ((bt.col("d").dt.month() >= 1) & (bt.col("d").dt.month() <= 12), 1.0),
         ((bt.col("d").dt.month() > 3) & (bt.col("d").dt.month() < 5), 1 / 12),
         ((bt.col("t").dt.hour() >= 9) & (bt.col("t").dt.hour() <= 17), 9 / 24),
-        ((bt.col("d").dt.day_of_week() >= 5) & (bt.col("d").dt.day_of_week() <= 6), 2 / 7),
+        ((bt.col("d").dt.dayofweek() >= 5) & (bt.col("d").dt.dayofweek() <= 6), 2 / 7),
     ],
     ids=["spring", "whole-year", "strict", "business-hours", "weekend"],
 )

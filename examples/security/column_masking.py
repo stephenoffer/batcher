@@ -23,7 +23,7 @@ from batcher import col
 def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "customers")
-        tpch("customer").select("c_custkey", "c_name", "c_phone", "c_acctbal").head(
+        tpch("customer").select("c_custkey", "c_name", "c_phone", "c_acctbal").limit(
             500
         ).write.parquet(table)
 
@@ -39,9 +39,9 @@ def main() -> None:
         )
 
         with bt.security(catalog, analyst):
-            masked = bt.read.parquet(table).select("c_custkey", "c_phone").head(3).to_pydict()
+            masked = bt.read.parquet(table).select("c_custkey", "c_phone").limit(3).to_pydict()
         with bt.security(catalog, admin):
-            clear = bt.read.parquet(table).select("c_custkey", "c_phone").head(3).to_pydict()
+            clear = bt.read.parquet(table).select("c_custkey", "c_phone").limit(3).to_pydict()
 
         print("analyst sees:", masked["c_phone"])
         print("admin sees:  ", clear["c_phone"])
@@ -62,7 +62,7 @@ def main() -> None:
                 .group_by("c_phone")
                 .agg(n=bt.count())
                 .sort("n", descending=True)
-                .head(1)
+                .limit(1)
                 .to_pydict()
             )
         assert "X" in grouped["c_phone"][0]

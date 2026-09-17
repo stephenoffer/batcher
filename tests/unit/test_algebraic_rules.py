@@ -106,7 +106,7 @@ def test_remove_redundant_distinct_unit():
 
 
 def test_nested_limits_combine():
-    plan = _t().head(4).head(2)._plan
+    plan = _t().limit(4).limit(2)._plan
     ir = Optimizer().optimize(plan).ir
     assert ir["op"] == "limit"
     assert ir["input"]["op"] == "scan"  # only one limit remains
@@ -128,7 +128,7 @@ def test_combine_limits_offset_arithmetic_unit():
 
 
 def test_limit_pushed_through_project():
-    plan = _t().select(z=col("x") * col("y")).head(2)._plan
+    plan = _t().select(z=col("x") * col("y")).limit(2)._plan
     ir = Optimizer().optimize(plan).ir
     assert ir["op"] == "project"  # projection now on top
     assert ir["input"]["op"] == "limit"  # limit pushed under it
@@ -138,7 +138,7 @@ def test_limit_pushed_through_project():
 def test_limit_pushed_into_union_all():
     a = _t()
     b = _t()
-    plan = a.union(b).head(3)._plan  # union(distinct=False)
+    plan = a.union(b).limit(3)._plan  # union(distinct=False)
     ir = Optimizer().optimize(plan).ir
     assert ir["op"] == "limit"
     assert ir["input"]["op"] == "union"
@@ -149,7 +149,7 @@ def test_limit_pushed_into_union_all():
 def test_limit_not_pushed_into_distinct_union():
     a = _t()
     b = _t()
-    plan = a.union(b, distinct=True).head(3)._plan
+    plan = a.union(b, distinct=True).limit(3)._plan
     ir = Optimizer().optimize(plan).ir
     # distinct union: inputs must NOT be capped (dedup changes counts)
     union_ir = ir["input"] if ir["op"] == "limit" else ir

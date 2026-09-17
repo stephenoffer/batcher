@@ -40,7 +40,7 @@ def main() -> None:
         ),
     )
 
-    sample_customer = orders.head(1).to_pydict()["o_custkey"][0]
+    sample_customer = orders.limit(1).to_pydict()["o_custkey"][0]
     rows = enriched.filter(col("o_custkey") == sample_customer).sort("nth_order").to_pydict()
     print("customer", sample_customer)
     for index in range(len(rows["nth_order"])):

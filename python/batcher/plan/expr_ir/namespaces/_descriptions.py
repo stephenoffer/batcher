@@ -192,7 +192,7 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("d").dt.monthname()).to_pydict()\n'
         "        {'r': ['February']}"
     ),
-    "isodow": (
+    "weekday": (
         "The ISO day of week, Monday = 1 through Sunday = 7.\n\n"
         "For the DuckDB numbering (Sunday = 0 through Saturday = 6) use ``dayofweek``.\n\n"
         "Examples:\n"
@@ -200,7 +200,7 @@ _DESCRIPTIONS: dict[str, str] = {
         "        >>> import batcher as bt\n"
         "        >>> import datetime as dt\n"
         '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 18, 13, 45, 30)]})\n'
-        '        >>> ds.select(r=bt.col("d").dt.isodow()).to_pydict()  # a Sunday\n'
+        '        >>> ds.select(r=bt.col("d").dt.weekday()).to_pydict()  # a Sunday\n'
         "        {'r': [7]}"
     ),
     "century": (

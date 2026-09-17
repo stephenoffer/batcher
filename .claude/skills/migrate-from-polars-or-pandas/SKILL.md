@@ -54,7 +54,7 @@ round-trips.
 | `df.merge(o, on="k")` | `df.join(o, on="k")` | `ds.join(o, on="k", how="inner")` |
 | `df.sort_values("a", ascending=False)` | `df.sort("a", descending=True)` | `ds.sort("a", descending=True)` |
 | `df.drop_duplicates()` | `df.unique()` | `ds.distinct()` |
-| `df.head(n)` | `df.head(n)` | `ds.limit(n)` / `ds.head(n)` |
+| `df.head(n)` | `df.head(n)` | `ds.limit(n)` |
 | `df.explode("c")` | `df.explode("c")` | `ds.explode("c")` |
 | `df.melt(...)` | `df.unpivot(...)` | `ds.unpivot(index=..., on=...)` |
 | `df.pivot_table(...)` | `df.pivot(...)` | `ds.pivot(index=..., on=..., values=...)` |
@@ -66,9 +66,10 @@ round-trips.
 | `g.transform("sum")` | `pl.col("v").sum().over("k")` | `col("v").sum().over(partition_by=["k"])` |
 | (eager) | `df.collect()` | `ds.collect()` (pyarrow `Table`) |
 
-pandas-familiar aliases exist and are real (`ds.assign`, `ds.merge`, `ds.groupby`,
-`ds.sort_values`, `ds.astype`, `ds.fillna`, `ds.dropna`, `ds.nlargest`), but prefer the
-canonical spelling above — one obvious way per operation.
+There are no pandas-spelled aliases: `ds.merge`, `ds.groupby`, `ds.sort_values`, `ds.astype`,
+`ds.fillna` and the rest raise an `AttributeError` that names the Batcher spelling. Run
+`python -m batcher.migrate <paths>` first; it rewrites the spellings it can prove are Batcher
+calls and lists the sites it left for you.
 
 ## Conceptual shifts that bite
 

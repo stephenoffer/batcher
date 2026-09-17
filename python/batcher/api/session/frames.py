@@ -23,8 +23,6 @@ from batcher.io.source import InMemorySource, IteratorSource
 __all__ = [
     "from_arrow",
     "from_batches",
-    "from_dict",
-    "from_dicts",
     "from_items",
     "from_iter",
     "from_numpy",
@@ -210,29 +208,6 @@ def _column_error(caller: str, columns: dict[str, Any], cause: Exception) -> str
     return f"{caller}(): {describe_unconvertible(name, columns[name])}"
 
 
-def from_dict(mapping: Mapping[str, Any], *, schema: pa.Schema | None = None) -> Dataset:
-    """Create a `Dataset` from a column-oriented dict (the Polars/pandas spelling).
-
-    An alias of `from_pydict`, provided because ``from_dict`` is what
-    ``pl.from_dict`` and ``pd.DataFrame.from_dict`` are called.
-
-    Args:
-        mapping: Column name to its list of values.
-        schema: Declare the column types instead of inferring them.
-
-    Returns:
-        A lazy `Dataset` over the data.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> bt.from_dict({"x": [1, 2]}).to_pydict()
-            {'x': [1, 2]}
-    """
-    return from_pydict(mapping, schema=schema)
-
-
 def from_pylist(rows: Sequence[Mapping[str, Any]]) -> Dataset:
     """Create a `Dataset` from a row-oriented list of ``{column: value}`` dicts.
 
@@ -279,28 +254,6 @@ def _as_columns(rows: list) -> dict[str, list]:
         if isinstance(row, Mapping):
             names.update(dict.fromkeys(row))
     return {name: [row.get(name) for row in rows if isinstance(row, Mapping)] for name in names}
-
-
-def from_dicts(rows: Sequence[Mapping[str, Any]]) -> Dataset:
-    """Create a `Dataset` from a list of row dicts (the Polars spelling).
-
-    An alias of `from_pylist`, provided because ``pl.from_dicts`` is what a ported
-    Polars script says.
-
-    Args:
-        rows: A list of ``{column: value}`` dicts.
-
-    Returns:
-        A lazy `Dataset` over the rows.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> bt.from_dicts([{"a": 1}, {"a": 2}]).to_pydict()
-            {'a': [1, 2]}
-    """
-    return from_pylist(rows)
 
 
 def from_records(

@@ -44,7 +44,7 @@ def main() -> None:
 
     # `vstack`/`append` are the positional concatenation, for when the two sides are
     # already known to line up.
-    stacked = rich.head(10).vstack(building.head(10))
+    stacked = rich.limit(10).union(building.limit(10))
     assert stacked.count() == 20
 
 

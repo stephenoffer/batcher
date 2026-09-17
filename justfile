@@ -144,11 +144,13 @@ map:
 parity-snapshot:
     python tools/parity/surfaces.py
 
-# Second spellings on the public surface: two names bound to one function, or a method that
-# only forwards its parameters to another public method. Report mode until the alias removal
-# lands; then this becomes `--check` and joins the pre-commit hook.
+# Second spellings on the public surface: two names bound to one function, a method that only
+# forwards its parameters to another public method, or two expression methods that build the
+# same IR. One spelling per capability; the removed ones live in the migration registry, and
+# `python -m batcher.migrate` rewrites code that still uses them. Imports the engine, so it
+# runs after `just build`.
 lint-aliases:
-    python tools/lint_aliases.py
+    python tools/lint_aliases.py --check
 
 # Copy-paste detector. The subsystems cannot import each other, so copy-paste is the only
 # *wrong* way to share between them — this is what catches it.

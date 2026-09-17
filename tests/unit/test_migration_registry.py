@@ -120,12 +120,12 @@ def test_a_competitor_spelling_on_the_batcher_receiver_is_declared(registry, eng
 
 
 def test_the_second_spelling_check_can_fail() -> None:
-    # Negative control: `Dataset.groupby` is a live second spelling of `group_by` until the
-    # alias removal lands. Classified as plain `canonical`, the check must reject it; declared
-    # as `alias`, it must accept it.
-    planted = Mapping("ray_data", "Dataset", "groupby", Status.CANONICAL, ("Dataset.group_by",))
+    # Negative control: `sort` is a real `Dataset` method, so a row claiming a competitor's
+    # `sort` is spelled `limit` here would be a second spelling, and the check must reject it.
+    # Declared as a `mismatch` (the same word, a different meaning), it must accept it.
+    planted = Mapping("ray_data", "Dataset", "sort", Status.CANONICAL, ("Dataset.limit",))
     assert _undeclared_second_spellings([planted])
-    declared = Mapping("ray_data", "Dataset", "groupby", Status.ALIAS, ("Dataset.group_by",))
+    declared = Mapping("ray_data", "Dataset", "sort", Status.MISMATCH, ("Dataset.limit",))
     assert not _undeclared_second_spellings([declared])
 
 

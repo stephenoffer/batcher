@@ -87,6 +87,7 @@ def receivers() -> dict[str, Any]:
         "StreamingQuery": StreamingQuery,
         "WriteManifest": WriteManifest,
         "Trigger": bt.Trigger,
+        "StreamingQueryListener": bt.StreamingQueryListener,
         "Config": bt.Config,
     }
     for ns in ("str", "dt", "list", "struct", "json", "map", "image", "audio", "video", "seq"):

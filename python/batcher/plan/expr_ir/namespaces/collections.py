@@ -1059,7 +1059,7 @@ class _ListNamespace:
         """
         import math
 
-        return self.cosine_similarity(other).acos() / Lit(math.pi)
+        return self.cosine_similarity(other).arccos() / Lit(math.pi)
 
     def is_zero_vector(self) -> Expr:
         """True where every component is zero — the failed-embedding check.
@@ -1608,63 +1608,12 @@ _bind_accessors(
 # `set_union`. Rows are (target, summary, example data, example expression, expected
 # output[, extra note]); the signature and the `Args:`/`Returns:` come from the target.
 _LIST_ALIASES: dict[str, tuple[str, ...]] = {
-    "magnitude": (
-        "l2_norm",
-        "Euclidean length of the vector — the ``l2_norm`` spelling used in ML code.",
-        '{"v": [[3.0, 4.0]]}',
-        'bt.col("v").list.magnitude()',
-        "{'r': [5.0]}",
-    ),
     "euclidean_distance": (
         "l2_distance",
         "Straight-line distance between two vectors — the ``l2_distance`` spelling.",
         '{"a": [[0.0, 0.0]], "b": [[3.0, 4.0]]}',
         'bt.col("a").list.euclidean_distance(bt.col("b"))',
         "{'r': [5.0]}",
-    ),
-    "dim": (
-        "len",
-        "Number of components in the vector — the embedding dimension.",
-        '{"v": [[3.0, 4.0]]}',
-        'bt.col("v").list.dim()',
-        "{'r': [2]}",
-        "The named spelling of ``len`` for embedding columns; asserting it is uniform is\n"
-        "the first check when two models' outputs get mixed in one table.",
-    ),
-    "mean_pool": (
-        "mean",
-        "Average of the components — mean pooling over a token-embedding sequence.",
-        '{"v": [[1.0, 3.0]]}',
-        'bt.col("v").list.mean_pool()',
-        "{'r': [2.0]}",
-    ),
-    "max_pool": (
-        "max",
-        "Largest component — max pooling over a token-embedding sequence.",
-        '{"v": [[1.0, 3.0]]}',
-        'bt.col("v").list.max_pool()',
-        "{'r': [3.0]}",
-    ),
-    "set_union": (
-        "union",
-        "Set union of the two lists — the Polars ``set_union`` spelling of :meth:`union`.",
-        '{"a": [[1, 2]], "b": [[2, 3]]}',
-        'bt.col("a").list.set_union(bt.col("b"))',
-        "{'r': [[1, 2, 3]]}",
-    ),
-    "set_intersection": (
-        "intersect",
-        "Set intersection — the Polars ``set_intersection`` spelling of :meth:`intersect`.",
-        '{"a": [[1, 2, 3]], "b": [[2, 3, 4]]}',
-        'bt.col("a").list.set_intersection(bt.col("b"))',
-        "{'r': [[2, 3]]}",
-    ),
-    "set_difference": (
-        "difference",
-        "Set difference — the Polars ``set_difference`` spelling of :meth:`difference`.",
-        '{"a": [[1, 2, 3]], "b": [[2, 3, 4]]}',
-        'bt.col("a").list.set_difference(bt.col("b"))',
-        "{'r': [[1]]}",
     ),
 }
 

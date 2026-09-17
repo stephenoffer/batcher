@@ -132,7 +132,7 @@ def test_fd_group_key_fires_end_to_end():
 
 
 def _cd_plan(ds):
-    return ds.group_by("g").agg(n=col("id").n_unique())._plan
+    return ds.group_by("g").agg(n=col("id").count_distinct())._plan
 
 
 def test_count_distinct_of_unique_column_fires():

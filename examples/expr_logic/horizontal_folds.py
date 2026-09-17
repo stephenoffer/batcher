@@ -24,8 +24,8 @@ def main() -> None:
 
     folded = lineitem.select(
         total=bt.sum_horizontal(col("l_discount"), col("l_tax")),
-        biggest=bt.max_horizontal(col("l_discount"), col("l_tax")),
-        smallest=bt.min_horizontal(col("l_discount"), col("l_tax")),
+        biggest=bt.greatest(col("l_discount"), col("l_tax")),
+        smallest=bt.least(col("l_discount"), col("l_tax")),
         average=bt.mean_horizontal(col("l_discount"), col("l_tax")),
         any_charge=bt.any_horizontal(col("l_discount") > 0, col("l_tax") > 0),
         all_charges=bt.all_horizontal(col("l_discount") > 0, col("l_tax") > 0),
@@ -38,7 +38,7 @@ def main() -> None:
         ),
     )
 
-    result = folded.head(5).to_pydict()
+    result = folded.limit(5).to_pydict()
     print({name: column[:3] for name, column in result.items()})
 
     full = folded.to_pydict()

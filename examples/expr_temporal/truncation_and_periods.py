@@ -38,7 +38,9 @@ def main() -> None:
     assert sum(result["orders"]) == orders.count()
 
     # Extracting the month number is a *different* grouping: it folds years together.
-    by_month_number = orders.with_columns(month=col("o_orderdate").dt.month()).n_unique("month")
+    by_month_number = orders.with_columns(month=col("o_orderdate").dt.month()).count_distinct(
+        "month"
+    )
     print(f"{len(result['period'])} months vs {by_month_number} month numbers")
     assert by_month_number <= 12
     assert len(result["period"]) > by_month_number
@@ -48,11 +50,11 @@ def main() -> None:
         orders.select(
             "o_orderdate",
             month_start=col("o_orderdate").dt.month_start(),
-            month_end=col("o_orderdate").dt.month_end(),
+            month_end=col("o_orderdate").dt.last_day(),
             quarter_start=col("o_orderdate").dt.quarter_start(),
             year_start=col("o_orderdate").dt.year_start(),
         )
-        .head(3)
+        .limit(3)
         .to_pydict()
     )
     print(edges)

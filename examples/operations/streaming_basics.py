@@ -29,7 +29,7 @@ def main() -> None:
     # The transformation. Nothing here is streaming-specific.
     pipeline = (
         events.filter(col("amount") > 2)
-        .with_columns(bucket=col("ts").floordiv(5))
+        .with_columns(bucket=(col("ts") // 5))
         .group_by("bucket")
         .agg(total=col("amount").sum(), n=bt.count())
         .sort("bucket")
@@ -50,7 +50,7 @@ def main() -> None:
     # Use `floordiv` for the bucket, not `/` plus a cast: casting a float to an integer
     # *rounds to nearest*, so `ts=5` would land in window 1 rather than window 0.
     windowed = (
-        events.group_by(window=col("ts").floordiv(10))
+        events.group_by(window=(col("ts") // 10))
         .agg(total=col("amount").sum())
         .sort("window")
         .to_pydict()

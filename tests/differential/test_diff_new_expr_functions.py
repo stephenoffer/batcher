@@ -43,9 +43,9 @@ def test_math_methods_match_duckdb(duck, nums):
         sq=col("x").square(),
         l1p=col("x").log1p(),
         em1=col("x").expm1(),
-        ash=col("x").asinh(),
-        ach=col("xc").acosh(),
-        ath=col("xt").atanh(),
+        ash=col("x").arcsinh(),
+        ach=col("xc").arccosh(),
+        ath=col("xt").arctanh(),
     )
     expected = duck.sql(
         "SELECT x*x AS sq, ln(1+x) AS l1p, exp(x)-1 AS em1, asinh(x) AS ash, "

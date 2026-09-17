@@ -19,7 +19,7 @@ from _common import tpch
 
 
 def main() -> None:
-    lineitem = tpch("lineitem").head(20_000)
+    lineitem = tpch("lineitem").limit(20_000)
 
     ranked = bt.sql(
         """
@@ -36,9 +36,9 @@ def main() -> None:
 
     top_lines = ranked.filter(bt.col("rn") == 1)
     print("orders:", top_lines.count())
-    assert top_lines.count() == lineitem.n_unique("l_orderkey")
+    assert top_lines.count() == lineitem.count_distinct("l_orderkey")
 
-    sample = ranked.sort("l_orderkey", "rn").head(6).to_pydict()
+    sample = ranked.sort("l_orderkey", "rn").limit(6).to_pydict()
     print(sample["l_orderkey"], sample["rn"])
 
     # Within one order the ranking descends by price.
@@ -52,7 +52,7 @@ def main() -> None:
 
     # The partition total is the same on every row of the partition.
     totals = ranked.select("l_orderkey", "order_total").distinct()
-    assert totals.count() == lineitem.n_unique("l_orderkey")
+    assert totals.count() == lineitem.count_distinct("l_orderkey")
 
 
 if __name__ == "__main__":

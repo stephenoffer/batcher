@@ -40,7 +40,7 @@ def main() -> None:
             revenue=col("revenue").sum(),
             lines=bt.count(),
             biggest=col("revenue").max(),
-            parts=bt.approx_n_unique(col("l_partkey")),
+            parts=bt.approx_count_distinct(col("l_partkey")),
         )
         .sort("n_name", "l_shipmode")
     )
@@ -68,8 +68,7 @@ def main() -> None:
     # exact arithmetic and IEEE addition is not, so the partition count changes the
     # summation order; compensated summation bounds the difference to the last bits.
     assert all(
-        abs(a - b) <= abs(a) * 1e-12
-        for a, b in zip(left["revenue"], right["revenue"], strict=True)
+        abs(a - b) <= abs(a) * 1e-12 for a, b in zip(left["revenue"], right["revenue"], strict=True)
     )
     # A max is order-independent, so it is exact.
     assert left["biggest"] == right["biggest"]

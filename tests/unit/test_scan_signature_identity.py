@@ -54,23 +54,23 @@ def two_files(tmp_path):
 def test_two_relations_of_the_same_shape_get_different_signatures(two_files):
     """The defect, stated as the case it produces."""
     selective, permissive = two_files
-    one = bt.read_parquet(selective).filter(bt.col("k") < 40)
-    two = bt.read_parquet(permissive).filter(bt.col("k") < 40)
+    one = bt.read.parquet(selective).filter(bt.col("k") < 40)
+    two = bt.read.parquet(permissive).filter(bt.col("k") < 40)
     assert plan_signature(one._plan) != plan_signature(two._plan)
 
 
 def test_the_same_relation_keeps_one_signature_across_handles(two_files):
     """The property that must survive: learning has to accumulate for one table."""
     selective, _ = two_files
-    first = bt.read_parquet(selective).filter(bt.col("k") < 40)
-    second = bt.read_parquet(selective).filter(bt.col("k") < 40)
+    first = bt.read.parquet(selective).filter(bt.col("k") < 40)
+    second = bt.read.parquet(selective).filter(bt.col("k") < 40)
     assert plan_signature(first._plan) == plan_signature(second._plan)
 
 
 def test_literal_values_are_still_normalized(two_files):
     """The generalization the signature exists for is untouched."""
     selective, _ = two_files
-    frame = bt.read_parquet(selective)
+    frame = bt.read.parquet(selective)
     assert plan_signature(frame.filter(bt.col("k") < 40)._plan) == plan_signature(
         frame.filter(bt.col("k") < 41)._plan
     )
@@ -84,11 +84,11 @@ def test_one_tables_measurement_no_longer_answers_for_another(two_files):
 
     selective, permissive = two_files
     hub = core.default_hub()
-    other = bt.read_parquet(permissive)
+    other = bt.read.parquet(permissive)
     query = other.filter(bt.col("k") < 40)
     cold = CardinalityEstimator(other._sources).estimate(query._plan).rows
 
-    measured = bt.read_parquet(selective).filter(bt.col("k") < 40)
+    measured = bt.read.parquet(selective).filter(bt.col("k") < 40)
     for _ in range(4):
         measured.collect()
 
@@ -114,14 +114,14 @@ def test_a_file_source_contributes_a_stable_identity(two_files):
     from batcher.plan.source_stats import stable_source_key
 
     selective, _ = two_files
-    key = stable_source_key(bt.read_parquet(selective)._sources[0])
+    key = stable_source_key(bt.read.parquet(selective)._sources[0])
     assert key and "selective" in key
 
 
 def test_the_key_is_not_on_the_wire(two_files):
     """`to_ir` is the contract with Rust and must not gain a second copy of this."""
     selective, _ = two_files
-    scan = bt.read_parquet(selective)._plan
+    scan = bt.read.parquet(selective)._plan
     while not isinstance(scan, Scan):
         scan = scan.input
     assert scan.source_key

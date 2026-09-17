@@ -68,13 +68,13 @@ def _require_categorical(ds: Dataset, features: list[str], scorer: str) -> None:
         PlanError: If a feature has one distinct value per row.
     """
     from batcher._internal.errors import PlanError
-    from batcher.plan.functions.aggregate import n_unique
+    from batcher.plan.functions.aggregate import count_distinct
 
     if not features:
         return
     row = ds.agg(
         __bt_rows=col(features[0]).count(),
-        **{f"u{i}": n_unique(col(f)) for i, f in enumerate(features)},
+        **{f"u{i}": count_distinct(col(f)) for i, f in enumerate(features)},
     ).collect()
     rows = row.column("__bt_rows")[0].as_py()
     if not rows or rows < 3:

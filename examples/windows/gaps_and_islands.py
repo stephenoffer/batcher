@@ -22,7 +22,7 @@ from batcher import col
 def main() -> None:
     # Order keys in TPC-H are sparse: they skip values, which makes them a natural
     # gaps-and-islands subject.
-    keys = tpch("orders").select("o_orderkey").sort("o_orderkey").head(200)
+    keys = tpch("orders").select("o_orderkey").sort("o_orderkey").limit(200)
 
     islands = keys.with_columns(
         position=bt.row_number().over(order_by=["o_orderkey"]),

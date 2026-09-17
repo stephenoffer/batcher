@@ -288,13 +288,13 @@ def test_sort_emits_exactly_the_engines_columns(build, be):
         lambda: col("v").floor(),
         lambda: col("v").ceil(),
         lambda: col("v").round(1),
-        lambda: col("v").pow(2.0),
+        lambda: col("v") ** 2.0,
         lambda: col("v").sign(),
         lambda: col("v").exp(),
         lambda: col("v").log10(),
         col("s").str.upper,
         col("s").str.lower,
-        col("s").str.len,
+        col("s").str.len_chars,
         lambda: col("s").str.contains("a"),
         lambda: col("s").str.starts_with("a"),
         lambda: col("s").str.ends_with("c"),
@@ -335,9 +335,9 @@ def test_signed_arithmetic_matches_cpu_engine(expr, be):
 @pytest.mark.parametrize(
     "build",
     [
-        lambda ds: ds.select(r=col("s").str.strip()),
+        lambda ds: ds.select(r=col("s").str.trim()),
         lambda ds: ds.select(r=col("s").str.upper()),
-        lambda ds: ds.select(r=col("s").str.len()),
+        lambda ds: ds.select(r=col("s").str.len_chars()),
         # SQL `substring` is 1-based and inclusive; a 0-based slice returns a shifted window
         lambda ds: ds.select(r=col("s").str.substr(1, 3)),
         lambda ds: ds.select(r=col("s").str.substr(2, 2)),
@@ -384,7 +384,7 @@ def test_string_operations_match_cpu_engine(build, be):
         # SQL `position` is 1-based and reports 0 for "not found"; `find` is 0-based and -1
         lambda: col("s").str.position("o"),
         lambda: col("s").str.right(2),
-        col("s").str.initcap,
+        col("s").str.to_titlecase,
         # the fixed-duration truncations, which are a floor
         lambda: col("t").dt.truncate("day"),
         lambda: col("t").dt.truncate("hour"),

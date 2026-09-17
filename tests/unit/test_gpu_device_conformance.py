@@ -28,6 +28,7 @@ device replay itself; what this file prevents is the regression.
 from __future__ import annotations
 
 import datetime as dt
+import operator
 
 import pyarrow as pa
 import pytest
@@ -125,10 +126,14 @@ def test_every_math_function_is_translated_or_declined():
     assert not set(TRANSLATED_MATH_FNS) & DECLINED_MATH_FNS
 
 
+#: The inverse functions keep their SQL names as IR tags, and are spelled `arc*` on `Expr`.
+_METHOD_NAME = {fn: "arc" + fn[1:] for fn in ("acos", "acosh", "asin", "asinh", "atan", "atanh")}
+
+
 @pytest.mark.parametrize("fn", TRANSLATED_MATH_FNS)
 def test_a_unary_math_function_matches_the_engine(be, fn):
     table = _MATH_DOMAIN.get(fn, NUMBERS)
-    ds = bt.from_arrow(table).select(out=getattr(col("x"), fn)())
+    ds = bt.from_arrow(table).select(out=getattr(col("x"), _METHOD_NAME.get(fn, fn))())
     _assert_matches_engine(ds, table, be)
 
 
@@ -236,17 +241,17 @@ TRUTH = pa.table(
 )
 
 
-@pytest.mark.parametrize("fn", ["or_", "and_"])
+@pytest.mark.parametrize("fn", [operator.or_, operator.and_], ids=["or", "and"])
 def test_three_valued_logic_matches_the_engine(be, fn):
     """`true OR unknown` is true and `false OR unknown` is unknown — pandas implements that on
     an Arrow column and cuDF does not, so it is computed rather than inherited."""
-    ds = bt.from_arrow(TRUTH).select(out=getattr(col("a"), fn)(col("b")))
+    ds = bt.from_arrow(TRUTH).select(out=fn(col("a"), col("b")))
     _assert_matches_engine(ds, TRUTH, be)
 
 
 def test_a_filter_on_a_disjunction_keeps_the_rows_the_engine_keeps(be):
     """The consequence that costs rows rather than raising."""
-    ds = bt.from_arrow(TRUTH).filter(col("a").or_(col("b")))
+    ds = bt.from_arrow(TRUTH).filter(col("a") | col("b"))
     _assert_matches_engine(ds, TRUTH, be)
 
 
@@ -270,7 +275,7 @@ INSTANTS = pa.table(
 )
 
 
-@pytest.mark.parametrize("fn", ["date", "last_day", "month_end"])
+@pytest.mark.parametrize("fn", ["date", "last_day"])
 def test_a_computed_calendar_day_is_a_date(be, fn):
     """Neither library has a calendar-day type. The host backend's `astype` lands on `date32`
     anyway and the device's cannot, so this came back as `timestamp[ms]` from a GPU only."""

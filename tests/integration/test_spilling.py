@@ -138,11 +138,11 @@ def test_spill_count_distinct_matches_in_memory():
     with _forcing_buckets(), _counting_buckets() as counts:
         spilled = (
             bt.from_batches(factory, schema)
-            .agg(c=col("k").n_unique())
+            .agg(c=col("k").count_distinct())
             .collect(spill=True, num_partitions=16)
         )
     assert counts["buckets"] > 0, "nothing spilled, so this compared two in-memory runs"
-    in_memory = bt.from_arrow(table).agg(c=col("k").n_unique()).collect()
+    in_memory = bt.from_arrow(table).agg(c=col("k").count_distinct()).collect()
     assert _norm(spilled) == _norm(in_memory)
 
 
@@ -265,14 +265,14 @@ def test_spill_list_state_aggregates():
         spilled = (
             bt.from_batches(factory, schema)
             .group_by("k")
-            .agg(m=col("v").median(), nd=col("v").n_unique())
+            .agg(m=col("v").median(), nd=col("v").count_distinct())
             .collect(spill=True, num_partitions=8)
         )
     assert counts["buckets"] > 0, "no IPC round trip happened, so nothing here was verified"
     in_memory = (
         bt.from_arrow(table)
         .group_by("k")
-        .agg(m=col("v").median(), nd=col("v").n_unique())
+        .agg(m=col("v").median(), nd=col("v").count_distinct())
         .collect()
     )
     assert _norm(spilled) == _norm(in_memory)
@@ -903,7 +903,7 @@ def test_spill_global_value_list_matches_in_memory():
         return ds.group_by().agg(
             m=col("v").median(),
             s=col("v").sum(),
-            d=col("v").n_unique(),
+            d=col("v").count_distinct(),
             md=col("v").mode(),
         )
 

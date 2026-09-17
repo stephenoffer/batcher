@@ -60,7 +60,7 @@ def test_skewness_kurtosis_stable_at_large_offset(duck):
     base = (1.0, 2.0, 3.0, 4.0, 10.0, 1.0, 2.0)
     xs = [_OFF + v for v in base]
     ds = bt.from_arrow(pa.table({"x": xs}))
-    out = ds.agg(s=col("x").skewness(), k=col("x").kurtosis()).collect()
+    out = ds.agg(s=col("x").skew(), k=col("x").kurtosis()).collect()
     # Skewness/kurtosis are translation-invariant, so the oracle is DuckDB on the
     # *un-offset* data — where DuckDB is stable. (At `_OFF` DuckDB's own sum-of-powers
     # formula catastrophically cancels and returns NaN, so it cannot be the oracle there;
@@ -83,7 +83,7 @@ def test_covar_corr_grouped_single_node_equals_distributed():
         .group_by("g")
         .agg(
             c=corr(col("x"), col("y")),
-            s=col("x").skewness(),
+            s=col("x").skew(),
             cp=covar_pop(col("x"), col("y")),
         )
     )

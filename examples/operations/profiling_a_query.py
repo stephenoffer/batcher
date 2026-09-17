@@ -37,7 +37,7 @@ def main() -> None:
     # The query still returns its result; profiling does not change semantics.
     result = query.to_pydict()
     print(result["o_orderpriority"], result["lines"])
-    assert len(result["o_orderpriority"]) == orders.n_unique("o_orderpriority")
+    assert len(result["o_orderpriority"]) == orders.count_distinct("o_orderpriority")
     assert sum(result["lines"]) > 0
 
     # `meta` carries the metadata the executor recorded, which is what the optimizer

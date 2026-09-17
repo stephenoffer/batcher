@@ -30,7 +30,7 @@ def main() -> None:
         watermark = 0
         batches = 0
         for _ in range(3):
-            new_rows = source.filter(col("o_orderkey") > watermark).head(20_000)
+            new_rows = source.filter(col("o_orderkey") > watermark).limit(20_000)
             if new_rows.count() == 0:
                 break
 

@@ -37,7 +37,7 @@ def sales(duck):
         (bt.median, "median", "MEDIAN"),
         (bt.std, "std", "STDDEV_SAMP"),
         (bt.var, "var", "VAR_SAMP"),
-        (bt.n_unique, "n_unique", "COUNT(DISTINCT amount)"),
+        (bt.count_distinct, "count_distinct", "COUNT(DISTINCT amount)"),
     ],
 )
 def test_shorthand_equals_method_and_duckdb(duck, sales, shorthand, method, sql):

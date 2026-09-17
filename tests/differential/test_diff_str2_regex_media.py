@@ -40,8 +40,8 @@ def test_regexp_replace_backreferences_match_duckdb(duck, t):
         bt.from_arrow(t)
         .select(
             swap_first=col("s").str.regexp_replace(r"(a)(b)", r"\2\1"),
-            swap_all=col("s").str.regexp_replace_all(r"(a)(b)", r"\2\1"),
-            whole=col("s").str.regexp_replace_all(r"(ab)", r"[\0]"),
+            swap_all=col("s").str.replace_all(r"(a)(b)", r"\2\1"),
+            whole=col("s").str.replace_all(r"(ab)", r"[\0]"),
         )
         .collect()
     )
@@ -64,8 +64,8 @@ def test_regexp_replace_dollar_is_literal(duck, t):
     out = (
         bt.from_arrow(t)
         .select(
-            dollar=col("s").str.regexp_replace_all("a", "$1"),
-            bad_group=col("s").str.regexp_replace_all("a", r"\1"),
+            dollar=col("s").str.replace_all("a", "$1"),
+            bad_group=col("s").str.replace_all("a", r"\1"),
         )
         .collect()
     )

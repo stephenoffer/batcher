@@ -23,7 +23,7 @@ def main() -> None:
     lineitem = tpch("lineitem").select("l_shipmode", "l_quantity", "l_extendedprice")
 
     # Split the input into "arrivals" and fold each one in.
-    arrivals = [lineitem.slice(start, 40_000) for start in range(0, 200_000, 40_000)]
+    arrivals = [lineitem.limit(40_000, offset=start) for start in range(0, 200_000, 40_000)]
     assert sum(part.count() for part in arrivals) == lineitem.count()
 
     running: bt.Dataset | None = None

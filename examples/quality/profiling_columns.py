@@ -33,20 +33,20 @@ def main() -> None:
 
     # Cardinality tells you whether a column is a key, a category, or free text.
     for column in ("o_orderkey", "o_orderstatus", "o_clerk"):
-        distinct = orders.n_unique(column)
+        distinct = orders.count_distinct(column)
         ratio = distinct / orders.count()
         kind = "key" if ratio > 0.99 else ("category" if distinct < 50 else "high-cardinality")
         print(f"{column:<16} {distinct:>7} distinct ({ratio:.4f}) -> {kind}")
 
-    assert orders.n_unique("o_orderkey") == orders.count()
-    assert orders.n_unique("o_orderstatus") < 10
+    assert orders.count_distinct("o_orderkey") == orders.count()
+    assert orders.count_distinct("o_orderstatus") < 10
 
     # Range and shape, which is what an `in_range` check needs.
     shape = orders.agg(
         low=col("o_totalprice").min(),
         high=col("o_totalprice").max(),
         median=bt.median(col("o_totalprice")),
-        skew=bt.skewness(col("o_totalprice")),
+        skew=bt.skew(col("o_totalprice")),
     ).to_pydict()
     print({name: round(value[0], 2) for name, value in shape.items()})
     assert shape["low"][0] < shape["median"][0] < shape["high"][0]

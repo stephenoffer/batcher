@@ -33,7 +33,8 @@ from batcher._sql.parser.expressions.maps import map_function
 from batcher._sql.parser.expressions.spark import spark_function
 from batcher._sql.parser.expressions.strings import string_function
 from batcher._sql.parser.expressions.temporal import datetime_pattern, temporal_function
-from batcher.plan.expr_ir import Binary, Cast, Expr, Math2Expr, atan2, lit, when
+from batcher.plan.expr_ir import Binary, Cast, Expr, Math2Expr, lit, when
+from batcher.plan.functions.scalar import arctan2
 from batcher.plan.functions.temporal import current_date, make_date
 
 # sqlglot node names for the nullary constant functions → the literal they denote.
@@ -68,7 +69,7 @@ def _empty_string_is_minus_one(value: Expr) -> Expr:
     Returns:
         The code-point expression.
     """
-    return when(value.str.len() == lit(0)).then(lit(-1)).otherwise(value.str.ascii())
+    return when(value.str.len_chars() == lit(0)).then(lit(-1)).otherwise(value.str.ascii())
 
 
 def _collection_len(tr, arg):
@@ -266,7 +267,7 @@ def _scalar_function(tr, node):
         # `1709618828.123456`. Divide the microsecond count instead of truncating.
         return tr._scalar(node.this).dt.epoch_us() / lit(1_000_000.0)
     if name == "Atan2":
-        return atan2(tr._scalar(node.this), tr._scalar(node.expression))
+        return arctan2(tr._scalar(node.this), tr._scalar(node.expression))
     if name == "DateFromParts":  # make_date(y, m, d)
         return make_date(
             tr._scalar(node.args["year"]),

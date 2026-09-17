@@ -26,7 +26,7 @@ def main() -> None:
     agg = ds.select(
         n=bt.count(),
         non_null=col("v").count(),
-        distinct=col("v").n_unique(),
+        distinct=col("v").count_distinct(),
         total=col("v").sum(),
         smallest=col("v").min(),
         largest=col("v").max(),
@@ -42,8 +42,8 @@ def main() -> None:
         w_at_max_v=bt.arg_max("w", col("v")),
         w_at_min_v=bt.arg_min("w", col("v")),
         # Boolean reductions.
-        any_flag=col("flag").any(),
-        all_flag=col("flag").all(),
+        any_flag=col("flag").bool_or(),
+        all_flag=col("flag").bool_and(),
         # Bitwise reductions.
         bits_or=bt.bit_or("v"),
         bits_and=bt.bit_and("v"),
@@ -65,7 +65,7 @@ def main() -> None:
 
     # Approximate aggregates: sketch-backed, bounded memory.
     approx = ds.select(
-        distinct=col("v").approx_n_unique(),
+        distinct=col("v").approx_count_distinct(),
         median=col("v").approx_median(),
         p90=col("v").approx_quantile(0.9),
     ).to_pydict()

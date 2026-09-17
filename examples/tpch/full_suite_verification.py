@@ -43,7 +43,7 @@ def main() -> None:
         ("part", "p_partkey"),
         ("orders", "o_orderkey"),
     ):
-        assert tables[name].n_unique(key) == tables[name].count(), name
+        assert tables[name].count_distinct(key) == tables[name].count(), name
 
     # Composite key on partsupp.
     assert (

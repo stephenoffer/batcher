@@ -12,7 +12,7 @@ column_names = { status = "canonical", batcher = "Dataset.columns" }
 columns = { status = "mismatch", batcher = "Dataset.columns", note = "Daft columns is a list of column Expressions; Batcher columns is a list of names. Rewrite: [bt.col(c) for c in ds.columns]", wave = "W0" }
 concat = { status = "canonical", batcher = "Dataset.union" }
 count = { status = "mismatch", batcher = "Dataset.count", note = "Daft count() returns a one-row DataFrame ({'count': [n]}), and count(*cols) counts non-null values per column; Batcher count() returns a Python int of rows. Rewrite: ds.agg(n=bt.count())", wave = "W0" }
-count_distinct = { status = "canonical", batcher = ["Dataset.agg", "Expr.count_distinct"] }
+count_distinct = { status = "canonical", batcher = "Dataset.count_distinct" }
 count_rows = { status = "canonical", batcher = "Dataset.count" }
 describe = { status = "mismatch", batcher = "Dataset.describe", note = "Daft describe() returns the schema as a DataFrame (column_name, type); Batcher describe() returns summary statistics. Rewrite: Dataset.schema", wave = "W0" }
 distinct = { status = "canonical", batcher = "Dataset.distinct" }
@@ -51,7 +51,7 @@ schema = { status = "mismatch", batcher = "Dataset.schema", note = "Daft schema(
 select = { status = "canonical", batcher = "Dataset.select" }
 show = { status = "param", batcher = "Dataset.show", need = "format=/verbose=/max_width=/align= display options (Daft defaults to 8 rows, Batcher to 10)", wave = "W2" }
 shuffle = { status = "canonical", batcher = "Dataset.shuffle" }
-skew = { status = "mismatch", batcher = "Dataset.skewness", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skewness takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True", wave = "W0" }
+skew = { status = "mismatch", batcher = "Dataset.skew", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skewness takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True", wave = "W0" }
 skip_existing = { status = "gap", need = "anti-join against keys already present in an existing output (resumable pipelines)", wave = "W13" }
 skipped_corrupt_files = { status = "gap", need = "report of files skipped under ignore_corrupt_files=True", wave = "W13" }
 sort = { status = "mismatch", batcher = "Dataset.sort", note = "Daft sort(desc=True) places nulls first by default (nulls_first follows desc); Batcher places nulls last. Param: nulls_first=True when descending", wave = "W0" }
@@ -99,7 +99,7 @@ write_turbopuffer = { status = "gap", need = "Turbopuffer vector-store sink", wa
 agg = { status = "canonical", batcher = "GroupBy.agg" }
 any_value = { status = "canonical", batcher = ["GroupBy.agg", "Expr.any_value"] }
 count = { status = "canonical", batcher = "GroupBy.count" }
-count_distinct = { status = "param", batcher = "GroupBy.n_unique", need = "the count_distinct spelling Appendix D keeps (today GroupBy.n_unique)", wave = "WF" }
+count_distinct = { status = "param", batcher = "GroupBy.count_distinct", need = "the count_distinct spelling Appendix D keeps (today GroupBy.n_unique)", wave = "WF" }
 list_agg = { status = "canonical", batcher = "GroupBy.array_agg" }
 list_agg_distinct = { status = "param", batcher = "GroupBy.array_agg", need = "distinct=True (distinct values, nulls dropped)", wave = "W2" }
 map_groups = { status = "param", batcher = "GroupBy.map_groups", need = "a Daft-style UDF Expression argument whose result column is named after its first input", wave = "W11" }
@@ -107,7 +107,7 @@ max = { status = "canonical", batcher = "GroupBy.max" }
 mean = { status = "canonical", batcher = "GroupBy.mean" }
 min = { status = "canonical", batcher = "GroupBy.min" }
 product = { status = "canonical", batcher = "GroupBy.product" }
-skew = { status = "mismatch", batcher = "GroupBy.skewness", note = "Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True", wave = "W0" }
+skew = { status = "mismatch", batcher = "GroupBy.skew", note = "Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True", wave = "W0" }
 stddev = { status = "param", batcher = "GroupBy.std", need = "ddof=", wave = "W2" }
 string_agg = { status = "canonical", batcher = ["GroupBy.agg", "Expr.str.join"] }
 sum = { status = "canonical", batcher = "GroupBy.sum" }

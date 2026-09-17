@@ -49,7 +49,7 @@ def main() -> None:
     # Both spellings still number every partition from 1.
     for name, ranked in (("loose", loose), ("tight", tight)):
         firsts = ranked.filter(col("seq") == 1).count()
-        assert firsts == orders.n_unique("o_custkey"), name
+        assert firsts == orders.count_distinct("o_custkey"), name
 
     # `rank` shares a number between tied rows, so a customer with two orders on the same
     # day has a repeated rank where `row_number` does not.

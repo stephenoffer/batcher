@@ -142,7 +142,7 @@ def main() -> None:
     fasta.write_text(">c1\n" + "A" * 120 + "\n>c2\n" + "C" * 60 + "\n>c3\n" + "G" * 20 + "\n")
     from_file = (
         bt.read.fasta(str(fasta))
-        .with_columns(length=col("sequence").str.len())
+        .with_columns(length=col("sequence").str.len_chars())
         .agg(n50=col("length").n50(), l50=col("length").l50())
         .to_pydict()
     )

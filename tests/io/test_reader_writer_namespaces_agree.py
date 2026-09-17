@@ -133,8 +133,8 @@ def test_a_synonym_and_the_name_it_means_read_the_same_file(tmp_path):
     path = str(tmp_path / "t.arrow")
     table = {"a": [1, 2], "s": ["x", "y"]}
     bt.from_pydict(table).write.arrow(path)
-    assert bt.read_ipc(path).collect().to_pydict() == table
+    assert bt.read.arrow(path).collect().to_pydict() == table
 
     json_path = str(tmp_path / "t.json")
     bt.from_pydict(table).write.json(json_path)
-    assert bt.read_ndjson(json_path).collect().to_pydict() == table
+    assert bt.read.json(json_path).collect().to_pydict() == table

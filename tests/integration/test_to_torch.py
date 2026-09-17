@@ -54,6 +54,6 @@ def test_to_torch_tensors_are_writable():
 
 
 def test_to_torch_dataloader_iterates():
-    dl = _ds().to_torch_dataloader()
+    dl = _ds().ml.to_torch_dataloader()
     seen = sum(1 for _ in dl)
     assert seen >= 1

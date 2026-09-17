@@ -289,7 +289,7 @@ def test_the_boolean_identity_rewrite_does_not_fire_for_a_non_boolean_column(col
     from batcher.plan.expr_ir import Binary
 
     ds = bt.from_pydict({"i": [6, 3], "s": ["a", "b"]})
-    plan = ds.select(r=col(column).and_(lit(True)))._plan
+    plan = ds.select(r=(col(column) & lit(True)))._plan
     assert any(isinstance(item.expr, Binary) for item in simplify_expressions(plan).items), (
         "the `AND true` was dropped from a non-boolean column, which hides the type error"
     )
@@ -298,10 +298,10 @@ def test_the_boolean_identity_rewrite_does_not_fire_for_a_non_boolean_column(col
 @pytest.mark.parametrize(
     "expr",
     [
-        lambda: col("i").and_(lit(True)),
-        lambda: lit(True).and_(col("i")),
-        lambda: col("i").or_(lit(False)),
-        lambda: lit(False).or_(col("i")),
+        lambda: col("i") & lit(True),
+        lambda: lit(True) & col("i"),
+        lambda: col("i") | lit(False),
+        lambda: lit(False) | col("i"),
     ],
 )
 def test_an_integer_conjoined_with_true_is_refused_rather_than_answered(expr):
@@ -319,7 +319,7 @@ def test_an_integer_conjoined_with_true_is_refused_rather_than_answered(expr):
 def test_a_boolean_column_still_folds_its_identity():
     """The guard must not take out the case the rewrite exists for."""
     ds = bt.from_pydict({"b": [True, False]})
-    for expr in (col("b").and_(lit(True)), col("b").or_(lit(False))):
+    for expr in ((col("b") & lit(True)), (col("b") | lit(False))):
         out = ds.select(r=expr)
         assert _assert_declared_is_produced(out) == pa.bool_()
         assert out.to_pydict()["r"] == [True, False]

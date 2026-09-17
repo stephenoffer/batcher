@@ -185,7 +185,7 @@ class TweedieRegressor:
         for iteration in range(self.max_iter):
             eta = self._eta(list(beta[1:]), float(beta[0]))
             mu = eta.exp()
-            weight = mu.pow(lit(2.0 - self.power))
+            weight = mu ** lit(2.0 - self.power)
             working = eta + (col(self.target) - mu) / mu
             # Projected once, for the reason `_weighted_system` states at length: `weight`
             # and `working` both embed `eta`, which is a sum over every feature, and there

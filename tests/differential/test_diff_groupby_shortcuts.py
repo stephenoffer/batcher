@@ -37,7 +37,7 @@ def sales(duck):
         ("min", "MIN"),
         ("max", "MAX"),
         ("median", "MEDIAN"),
-        ("n_unique", "COUNT(DISTINCT {c})"),
+        ("count_distinct", "COUNT(DISTINCT {c})"),
     ],
 )
 def test_reduction_matches_duckdb(duck, sales, method, sql_fn):
@@ -143,7 +143,7 @@ def test_numeric_only_default_skips_string_columns(sales):
     # `region` is a non-key string column; it must not break or appear in sum().
     out = bt.from_arrow(sales).group_by("dept").sum()
     assert out.columns == ["dept", "amount", "score"]
-    # min()/max()/n_unique() are not numeric-only and keep the string column.
+    # min()/max()/count_distinct() are not numeric-only and keep the string column.
     assert bt.from_arrow(sales).group_by("dept").max().columns == [
         "dept",
         "region",

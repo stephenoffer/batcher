@@ -84,7 +84,7 @@ Breadth lives on **accessor namespaces**, not on `Expr` itself:
 ds = bt.from_pydict({"name": [" Ann ", "bob"], "tags": [["a", "b"], ["c"]]})
 
 ds = ds.with_columns(
-    clean=bt.col("name").str.strip().str.to_lowercase(),
+    clean=bt.col("name").str.trim().str.lower(),
     n_tags=bt.col("tags").list.len(),
     tier=bt.when(bt.col("name").str.len_chars() > 3).then("long").otherwise("short"),
 )
@@ -92,7 +92,7 @@ ds = ds.with_columns(
 
 Chain with `& | ~` (parenthesize each side — `&` binds tighter than a comparison).
 Conditionals are `bt.when(cond).then(a).otherwise(b)` (or `bt.iff(c, a, b)`). Horizontal
-folds across columns: `bt.sum_horizontal`, `bt.max_horizontal`, `bt.coalesce`,
+folds across columns: `bt.sum_horizontal`, `bt.greatest`, `bt.coalesce`,
 `bt.all_horizontal`. Column *sets* come from selectors: `bt.numeric()`, `bt.string()`,
 `bt.by_dtype(...)`, `bt.exclude(...)`.
 
@@ -141,7 +141,7 @@ and `group_by()` with no keys aggregates globally. Shorthand reducers on the `Gr
 (`.sum()`, `.mean()`, `.len()`, …) reduce every remaining column the same way.
 **Aggregates cannot be nested**, but expressions over them are fine
 (`avg_price=bt.col("price").sum() / bt.count()`). For huge cardinality prefer the sketch
-aggregates — `bt.approx_n_unique`, `bt.approx_quantile`, `bt.approx_median`.
+aggregates — `bt.approx_count_distinct`, `bt.approx_quantile`, `bt.approx_median`.
 
 ## Window functions
 

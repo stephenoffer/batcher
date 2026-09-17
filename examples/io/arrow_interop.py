@@ -31,7 +31,7 @@ def main() -> None:
     # Python-native structures, for small results only: these *do* build Python objects.
     assert ds.to_pydict()["id"] == [1, 2, 3]
     assert ds.to_pylist()[0] == {"id": 1, "v": "a"}
-    assert ds.to_dicts()[0]["v"] == "a"
+    assert ds.to_pylist()[0]["v"] == "a"
 
     # A single scalar, when the query returns exactly one.
     total = ds.select(t=col("id").sum())

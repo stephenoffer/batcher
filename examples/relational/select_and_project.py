@@ -43,7 +43,7 @@ def main() -> None:
     assert replaced.columns == orders.columns
 
     # `alias` is the expression-level spelling of the same rename.
-    aliased = orders.select(col("o_orderkey").alias("id")).head(3).to_pydict()
+    aliased = orders.select(col("o_orderkey").alias("id")).limit(3).to_pydict()
     print("aliased:", aliased)
     assert list(aliased) == ["id"]
 

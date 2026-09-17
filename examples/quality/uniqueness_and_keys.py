@@ -25,7 +25,7 @@ def main() -> None:
 
     # `o_orderkey` is a key: unique and never null.
     rows = orders.count()
-    distinct = orders.n_unique("o_orderkey")
+    distinct = orders.count_distinct("o_orderkey")
     nulls = orders.filter(col("o_orderkey").is_null()).count()
     print(f"o_orderkey: {distinct} distinct of {rows}, {nulls} null")
     assert distinct == rows
@@ -33,7 +33,7 @@ def main() -> None:
 
     # `l_orderkey` is not: it is a foreign key with repeats.
     line_rows = lineitem.count()
-    line_distinct = lineitem.n_unique("l_orderkey")
+    line_distinct = lineitem.count_distinct("l_orderkey")
     print(f"l_orderkey: {line_distinct} distinct of {line_rows}")
     assert line_distinct < line_rows
 

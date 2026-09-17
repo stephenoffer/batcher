@@ -207,7 +207,7 @@ def _shapes(path: str):
         "arith-heavy": lambda w: (
             src()
             .with_columns(
-                z=(bt.col("v") * 1.0000001 + bt.col("w")).sqrt().log().abs()
+                z=(bt.col("v") * 1.0000001 + bt.col("w")).sqrt().ln().abs()
                 + (bt.col("v") - bt.col("w")).sqrt().exp().abs()
             )
             .group_by("k")

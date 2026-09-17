@@ -95,21 +95,25 @@ def test_removing_an_unregistered_listener_says_so_rather_than_raising():
     assert remove_streaming_listener(_Recorder()) is False
 
 
-def test_the_spark_spelling_is_dispatched_too():
-    """A listener ported from PySpark overrides `onQueryProgress`, not the snake_case
-    name. Dispatching only one spelling would make it silently never fire."""
+def test_a_spark_spelled_hook_is_refused_rather_than_silently_never_called():
+    """A listener ported from PySpark overrides `onQueryProgress`. Only the snake_case hook is
+    dispatched, so without a refusal that listener would register cleanly and never fire."""
+    import pytest
 
-    class _Spark(StreamingQueryListener):
-        def __init__(self) -> None:
-            self.count = 0
+    from batcher._internal.errors import PlanError
 
-        def onQueryProgress(self, event):
-            self.count += 1
+    with pytest.raises(PlanError, match="on_query_progress"):
 
-    listener = _Spark()
+        class _Spark(StreamingQueryListener):
+            def onQueryProgress(self, event):
+                pass
+
+
+def test_the_snake_case_hook_is_dispatched():
+    listener = _Recorder()
     add_streaming_listener(listener)
     notify_query_progress("q", _progress())
-    assert listener.count == 1
+    assert [kind for kind, _ in listener.seen] == ["progress"]
 
 
 def test_a_listener_that_raises_does_not_break_the_query_or_the_others():

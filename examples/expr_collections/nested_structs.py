@@ -23,7 +23,7 @@ def main() -> None:
     orders = (
         tpch("orders")
         .select("o_orderkey", "o_custkey", "o_totalprice", "o_orderstatus", "o_orderdate")
-        .head(1_000)
+        .limit(1_000)
     )
 
     nested = orders.select(
@@ -34,7 +34,7 @@ def main() -> None:
             placed=col("o_orderdate"),
         ),
     )
-    print(nested.head(1).to_pydict())
+    print(nested.limit(1).to_pydict())
     assert nested.columns == ["o_orderkey", "detail"]
 
     # Reaching a leaf, two levels down.

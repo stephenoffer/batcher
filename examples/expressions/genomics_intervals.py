@@ -106,7 +106,7 @@ def main() -> None:
     # The same shape against the annotation table, restricted to CDS features, and pulling
     # the gene name out of the attributes column with the ordinary string vocabulary.
     coding = gff.filter(col("type") == "CDS").with_columns(
-        parent=col("attributes").str.regexp_extract(r"Parent=([^;]+)", 1)
+        parent=col("attributes").str.extract(r"Parent=([^;]+)", 1)
     )
     in_cds = (
         vcf.join(coding, left_on="chrom", right_on="seqid", how="inner")
@@ -122,7 +122,7 @@ def main() -> None:
     # number, so a group-by works on it like any other column.
     summary = (
         vcf.filter(col("filter") == "PASS")
-        .with_columns(af=col("info").str.regexp_extract(r"AF=([0-9.]+)", 1).cast("float64"))
+        .with_columns(af=col("info").str.extract(r"AF=([0-9.]+)", 1).cast("float64"))
         .group_by("chrom")
         .agg(n=bt.count(), mean_af=col("af").mean())
         .to_pydict()

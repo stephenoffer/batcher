@@ -114,7 +114,7 @@ def test_group_key_minmax_exact_ndv_not_claimed():
 def test_group_key_count_distinct_not_answerable_from_group_count():
     # Guard: a grouped key's ndv must NOT let count_distinct answer from the (estimated)
     # number of groups.
-    ds = _ds().group_by("x").agg(c=count()).agg(n=col("x").n_unique())
+    ds = _ds().group_by("x").agg(c=count()).agg(n=col("x").count_distinct())
     src = _exact_source(
         6, x=ColumnStat(min=0, max=5, null_count=0, ndv=6, provenance=Provenance.EXACT)
     )

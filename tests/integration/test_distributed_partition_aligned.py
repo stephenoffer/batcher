@@ -168,7 +168,7 @@ def test_a_non_mergeable_aggregate_is_exact_when_aligned(hive_table):
     is the shape that most directly proves the groups really were whole."""
     single, distrib = _both(
         hive_table,
-        lambda ds: ds.group_by("day").agg(m=col("v").median(), nd=col("v").n_unique()),
+        lambda ds: ds.group_by("day").agg(m=col("v").median(), nd=col("v").count_distinct()),
     )
     assert single == distrib
 
@@ -299,7 +299,7 @@ def test_delta_group_by_the_partition_column_matches_single_node(delta_table):
 
 def test_delta_non_mergeable_aggregate_is_exact_when_aligned(delta_table):
     single, distrib = _both_delta(
-        delta_table, lambda ds: ds.group_by("day").agg(nd=col("v").n_unique())
+        delta_table, lambda ds: ds.group_by("day").agg(nd=col("v").count_distinct())
     )
     assert single == distrib
 
@@ -459,7 +459,7 @@ def test_count_distinct_grouped_by_the_partition_column_matches_single_node(hive
     a `Distinct`, and the shuffle path has to dedup globally before it can count. Over a
     clustered relation the dedup is already global inside each partition."""
     single, distrib = _both(
-        hive_table, lambda ds: ds.group_by("day").agg(u=col("v").n_unique(), n=count())
+        hive_table, lambda ds: ds.group_by("day").agg(u=col("v").count_distinct(), n=count())
     )
     assert len(single) == 12
     assert single == distrib
@@ -469,7 +469,7 @@ def test_count_distinct_grouped_by_a_non_partition_column_matches_single_node(hi
     """The near-miss: `g` straddles every directory, so the global dedup still has to happen."""
     single, distrib = _both(
         hive_table,
-        lambda ds: ds.group_by("g").agg(u=col("v").n_unique()),
+        lambda ds: ds.group_by("g").agg(u=col("v").count_distinct()),
         expect_aligned=False,
     )
     assert len(single) == 5

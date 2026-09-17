@@ -48,7 +48,7 @@ _NO_INDEX: dict[str, str] = {
         "and pick columns with ds.select('a', 'b') or ds[['a', 'b']]."
     ),
     "iloc": (
-        "Batcher has no positional indexer. Use ds.slice(offset, length), ds.head(n), "
+        "Batcher has no positional indexer. Use ds.limit(n, offset=offset) "
         "or ds[0:10] for rows, and ds.select(...) for columns."
     ),
     "at": "Batcher has no scalar indexer. Use ds.filter(...).item() for a single value.",
@@ -141,7 +141,7 @@ _IMMUTABLE: dict[str, str] = {
     ),
     "extend": "A Dataset is immutable. Stack rows with ds.union(other) (a new Dataset).",
     "clear": "A Dataset is immutable. For an empty, same-schema Dataset use ds.limit(0).",
-    "clone": "A Dataset is already immutable; ds.copy() (an identity) is here if you want it.",
+    "clone": "A Dataset is already immutable: use the same `ds`; there is nothing to copy.",
     "insert_at_idx": "A Dataset is immutable. Add a column with ds.with_columns(name=expr).",
 }
 
@@ -243,7 +243,7 @@ _NEEDS_ORDER: dict[str, str] = {
     "tz_localize": "Attach a timezone with bt.col('t').dt.convert_timezone('UTC').",
     "truncate": (
         "Trim rows by a boundary column with ds.filter(...), or by position with "
-        "ds.slice(offset, length)."
+        "ds.limit(n, offset=offset)."
     ),
     "idxmax": (
         "There is no row index. For the row itself use ds.sort('x', descending=True).head(1); "
@@ -258,13 +258,13 @@ _NEEDS_ORDER: dict[str, str] = {
 # --- reductions that exist per-expression, reached through .agg(...) at frame level ---
 _AGG_REDUCTIONS: dict[str, str] = {
     "prod": "Spelled ds.product('x') here (or bt.col('x').product() inside ds.agg(...)).",
-    "skew": "Spelled ds.skewness('x') here (or bt.col('x').skewness() inside ds.agg(...)).",
     "kurt": "Spelled ds.kurtosis('x') here (or bt.col('x').kurtosis() inside ds.agg(...)).",
     "sem": "Standard error of the mean is bt.sem(bt.col('x')) inside ds.agg(...).",
     "corrwith": "Pairwise correlation is ds.corr('a', 'b'); the full matrix is ds.corr_matrix().",
     "dot": "A matrix product is not a relational op. Use ds.to_numpy() then NumPy.",
     "nunique_approx": (
-        "Approximate distinct count is bt.col('x').approx_n_unique(), or ds.approx_n_unique."
+        "Approximate distinct count is bt.col('x').approx_count_distinct(), or "
+        "ds.approx_count_distinct('x')."
     ),
 }
 
@@ -332,10 +332,10 @@ _RESHAPE: dict[str, str] = {
         "Reduce across columns with bt.fold_horizontal(fn, [bt.col('a'), bt.col('b')]) in a select."
     ),
     "max_horizontal": (
-        "Row-wise max across columns is bt.max_horizontal('a', 'b') in ds.select(...)."
+        "Row-wise max across columns is bt.greatest(bt.col('a'), bt.col('b')) in ds.select(...)."
     ),
     "min_horizontal": (
-        "Row-wise min across columns is bt.min_horizontal('a', 'b') in ds.select(...)."
+        "Row-wise min across columns is bt.least(bt.col('a'), bt.col('b')) in ds.select(...)."
     ),
     "sum_horizontal": (
         "Row-wise sum across columns is bt.sum_horizontal('a', 'b') in ds.select(...)."
@@ -369,7 +369,7 @@ _MANAGED: dict[str, str] = {
     "localCheckpoint": "Materialize and reuse a result with ds.cache().",
     "storageLevel": (
         "Not a property to read: pass the level in, as ds.cache('disk_only') or "
-        "ds.persist('memory_only'). bt.cache_stats() reports what the cache holds."
+        "ds.cache('memory_only'). bt.cache_stats() reports what the cache holds."
     ),
     "hint": (
         "The optimizer (Kyber) chooses join strategy and build side; inspect it with ds.explain()."

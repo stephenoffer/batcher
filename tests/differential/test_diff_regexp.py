@@ -40,8 +40,8 @@ def test_regexp_extract_vs_duckdb(duck, t):
     out = (
         bt.from_arrow(t)
         .select(
-            e0=col("s").str.regexp_extract(r"\d+"),
-            e1=col("s").str.regexp_extract(r"(\d+)-(\d+)", 1),
+            e0=col("s").str.extract(r"\d+", group=0),
+            e1=col("s").str.extract(r"(\d+)-(\d+)", 1),
         )
         .collect()
     )

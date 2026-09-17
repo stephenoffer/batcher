@@ -22,12 +22,12 @@ def main() -> None:
     lineitem = tpch("lineitem").select("l_orderkey", "l_quantity", "l_extendedprice", "l_shipdate")
 
     # Expression-level cast.
-    as_float = lineitem.select(qty=col("l_quantity").cast("float64")).head(3).to_pydict()
+    as_float = lineitem.select(qty=col("l_quantity").cast("float64")).limit(3).to_pydict()
     print(as_float)
     assert all(isinstance(value, float) for value in as_float["qty"])
 
     # Frame-level cast of several columns at once.
-    retyped = lineitem.astype({"l_orderkey": "float64", "l_quantity": "float64"})
+    retyped = lineitem.cast({"l_orderkey": "float64", "l_quantity": "float64"})
     types = dict(zip(retyped.columns, [str(dtype) for dtype in retyped.dtypes], strict=True))
     assert types["l_orderkey"] == "double"
 
@@ -39,7 +39,7 @@ def main() -> None:
             price=col("l_extendedprice"),
             whole=col("l_extendedprice").cast("int64"),
         )
-        .head(5)
+        .limit(5)
         .to_pydict()
     )
     print(truncated)
@@ -49,7 +49,7 @@ def main() -> None:
     )
     # To truncate instead, say so explicitly before the cast.
     floored = (
-        lineitem.select(whole=col("l_extendedprice").floor().cast("int64")).head(5).to_pydict()
+        lineitem.select(whole=col("l_extendedprice").floor().cast("int64")).limit(5).to_pydict()
     )
     assert all(
         floor_value <= round_value
@@ -57,7 +57,7 @@ def main() -> None:
     )
 
     # Dates cast to strings and back.
-    text = lineitem.select(day=col("l_shipdate").cast("string")).head(3).to_pydict()
+    text = lineitem.select(day=col("l_shipdate").cast("string")).limit(3).to_pydict()
     print(text)
     assert all(len(value) == 10 for value in text["day"])
 

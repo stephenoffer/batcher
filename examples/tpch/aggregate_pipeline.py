@@ -38,7 +38,7 @@ def main() -> None:
             revenue=col("revenue").sum(),
             # `o_orderkey` was consumed by the join, so the surviving spelling of the
             # order key is `l_orderkey`.
-            orders=col("l_orderkey").n_unique(),
+            orders=col("l_orderkey").count_distinct(),
             lines=bt.count(),
         )
         .with_columns(revenue_per_order=col("revenue") / col("orders"))

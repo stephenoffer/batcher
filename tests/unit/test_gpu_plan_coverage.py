@@ -70,11 +70,11 @@ BOOLS = pa.table(
 )
 
 
-@pytest.mark.parametrize("reducer", ["all", "any"])
+@pytest.mark.parametrize("reducer", ["bool_and", "bool_or"])
 def test_a_boolean_fold_over_an_all_null_group_is_null(be, reducer):
     """The libraries skip the nulls and return the fold's identity; the engine returns null.
 
-    Left alone, `.all()` over a group whose values were every one of them null reads as
+    Left alone, `.bool_and()` over a group whose values were every one of them null reads as
     "every one of them was true" — a wrong answer, not a missing feature.
     """
     got, expected = _run(lambda ds: ds.group_by("k").agg(r=getattr(col("b"), reducer)()), BOOLS, be)
@@ -84,13 +84,13 @@ def test_a_boolean_fold_over_an_all_null_group_is_null(be, reducer):
 
 
 def test_a_boolean_fold_still_folds_the_groups_that_have_values(be):
-    got, _ = _run(lambda ds: ds.group_by("k").agg(r=col("b").all()), BOOLS, be)
+    got, _ = _run(lambda ds: ds.group_by("k").agg(r=col("b").bool_and()), BOOLS, be)
     by_key = _by_key(got)
     assert by_key["all_true"] is True
     assert by_key["mixed"] is False
 
 
-@pytest.mark.parametrize("reducer", ["all", "any"])
+@pytest.mark.parametrize("reducer", ["bool_and", "bool_or"])
 def test_a_keyless_boolean_fold_over_all_nulls_is_null(be, reducer):
     """The keyless form is the distributed *combine* step, so it cannot be left wrong."""
     table = pa.table({"b": [None, None]}, schema=pa.schema([pa.field("b", pa.bool_())]))

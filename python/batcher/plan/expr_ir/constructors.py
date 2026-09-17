@@ -1,6 +1,6 @@
 """Module-level expression constructors (the user-facing entry points).
 
-`col`, `lit`, `when`, `coalesce`, `nullif`, `atan2`, `greatest`, `least`, and
+`col`, `lit`, `when`, `coalesce`, `nullif`, `greatest`, `least`, and
 `count` build expression trees out of the node classes in `core`. These are the
 free functions users call directly (e.g. `col("x")`, `when(c).then(v)`).
 """
@@ -16,7 +16,6 @@ from batcher.plan.expr_ir.core import (
     Expr,
     IntoExpr,
     Lit,
-    Math2Expr,
     _wrap,
 )
 from batcher.plan.expr_ir.nodes import (
@@ -147,31 +146,6 @@ def nullif(left: IntoExpr, right: IntoExpr) -> NullIf:
             {'r': [1, None, None]}
     """
     return NullIf(_wrap(left), _wrap(right))
-
-
-def atan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
-    """Two-argument arctangent of ``y / x`` (→ Float64).
-
-    Computes the angle of the point ``(x, y)`` from the positive x-axis, using the
-    signs of both arguments to place it in the correct quadrant, so the result
-    spans the full ``[-π, π]`` range (unlike single-argument ``atan``).
-
-    Args:
-        y: The ordinate (numerator).
-        x: The abscissa (denominator).
-
-    Returns:
-        A Float64 expression of the angle in radians.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"y": [0.0], "x": [1.0]})
-            >>> ds.select(r=bt.atan2(bt.col("y"), bt.col("x"))).to_pydict()
-            {'r': [0.0]}
-    """
-    return Math2Expr("atan2", _wrap(y), _wrap(x))
 
 
 def hash_rows(*exprs: IntoExpr, seed: int = 0) -> HashRows:

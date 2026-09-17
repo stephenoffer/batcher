@@ -19,7 +19,7 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_clerk", "o_comment").head(1_000)
+    orders = tpch("orders").select("o_clerk", "o_comment").limit(1_000)
 
     rewritten = orders.select(
         "o_clerk",
@@ -28,7 +28,7 @@ def main() -> None:
         found=col("o_clerk").str.position("#"),
         prefix=col("o_clerk").str.substring_index("#", 1),
     )
-    result = rewritten.head(3).to_pydict()
+    result = rewritten.limit(3).to_pydict()
     print(result)
 
     full = rewritten.to_pydict()

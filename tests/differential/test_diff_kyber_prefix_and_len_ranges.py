@@ -35,12 +35,12 @@ PREDICATES = [
     # A literal whose length disagrees with the substring length is not a prefix test;
     # it is unsatisfiable, and must stay that way rather than becoming a range.
     ("substr(s, 1, 2) = 'abc'", lambda: col("s").str.substr(1, 2) == "abc"),
-    ("length(s) = 0", lambda: col("s").str.len() == 0),
-    ("length(s) <> 0", lambda: col("s").str.len() != 0),
+    ("length(s) = 0", lambda: col("s").str.len_chars() == 0),
+    ("length(s) <> 0", lambda: col("s").str.len_chars() != 0),
     ("NOT (s LIKE 'ab%')", lambda: ~col("s").str.starts_with("ab")),
     (
         "s LIKE 'ab%' AND length(s) <> 0",
-        lambda: col("s").str.starts_with("ab") & (col("s").str.len() != 0),
+        lambda: col("s").str.starts_with("ab") & (col("s").str.len_chars() != 0),
     ),
 ]
 

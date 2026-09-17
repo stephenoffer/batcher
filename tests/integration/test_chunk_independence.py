@@ -95,7 +95,7 @@ def test_approx_distinct_partition_independent():
     # is bit-identical regardless of chunking — partition-independence holds exactly.
     t = pa.table({"g": [i % 4 for i in range(200)], "v": [(i * 7) % 60 for i in range(200)]})
     _assert_chunk_invariant(
-        lambda ds: ds.group_by("g").agg(nd=col("v").approx_n_unique()),
+        lambda ds: ds.group_by("g").agg(nd=col("v").approx_count_distinct()),
         t,
     )
 
@@ -212,7 +212,7 @@ def test_statistical_aggregates_partition_independent():
             vv=col("v").var(),
             sd=col("v").std(),
             m=col("v").median(),
-            nd=col("v").n_unique(),
+            nd=col("v").count_distinct(),
             fv=col("f").var(),
         ),
         _stat_table(),
@@ -222,7 +222,7 @@ def test_statistical_aggregates_partition_independent():
 def test_global_statistical_aggregates_partition_independent():
     _assert_chunk_invariant_approx(
         lambda ds: ds.group_by().agg(
-            m=col("v").median(), nd=col("v").n_unique(), sd=col("v").std()
+            m=col("v").median(), nd=col("v").count_distinct(), sd=col("v").std()
         ),
         _stat_table(),
     )

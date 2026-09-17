@@ -31,12 +31,12 @@ def main() -> None:
         hour_bucket=col("ts").dt.truncate("hour"),
         day_bucket=col("ts").dt.truncate("day"),
         # `floor` is the same operation under the Polars name.
-        floored=col("ts").dt.floor("hour"),
+        floored=col("ts").dt.truncate("hour"),
         # `normalize` drops the time of day (midnight of the same date).
         midnight=col("ts").dt.normalize(),
         # Calendar boundaries.
         month_start=col("ts").dt.month_start(),
-        month_end=col("ts").dt.month_end(),
+        month_end=col("ts").dt.last_day(),
         quarter_start=col("ts").dt.quarter_start(),
         quarter_end=col("ts").dt.quarter_end(),
         year_start=col("ts").dt.year_start(),

@@ -103,7 +103,7 @@ def spark_function(tr, node) -> Expr | None:
         from batcher._sql.parser.expressions.literals import _const_str_arg
 
         pat = _const_str_arg(node.expression, "regexp_substr()", "pattern")
-        return tr._scalar(node.this).str.regexp_extract(pat)
+        return tr._scalar(node.this).str.extract(pat, group=0)
     if isinstance(node, exp.ParseUrl):
         return _parse_url(tr, node)
     if isinstance(node, exp.Struct):
@@ -131,7 +131,7 @@ def spark_function(tr, node) -> Expr | None:
     if name == "pmod" and len(args) == 2:
         # The *positive* modulus: `pmod(-10, 3)` is 2 where `%` gives -1.
         left, right = tr._scalar(args[0]), tr._scalar(args[1])
-        return (left.mod(right) + right).mod(right)
+        return ((left % right) + right) % right
     if name == "btrim" and len(args) in (1, 2):
         if len(args) == 1:
             return tr._scalar(args[0]).str.trim()
@@ -186,7 +186,7 @@ def _parse_url(tr, node) -> Expr | None:
     pattern = _URL_PART.get(part)
     if pattern is None:
         return None
-    return tr._scalar(node.this).str.regexp_extract(pattern, 1)
+    return tr._scalar(node.this).str.extract(pattern, 1)
 
 
 def _is_integer_operand(node) -> bool:

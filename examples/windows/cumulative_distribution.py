@@ -42,7 +42,7 @@ def main() -> None:
     assert result["rank"] == list(range(1, len(result["rank"]) + 1))
 
     # Where does 80% fall?
-    crossing = ranked.filter(col("share") >= 0.8).sort("rank").head(1).to_pydict()
+    crossing = ranked.filter(col("share") >= 0.8).sort("rank").limit(1).to_pydict()
     customers = crossing["rank"][0]
     total_customers = per_customer.count()
     print(

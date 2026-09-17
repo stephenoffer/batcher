@@ -17,8 +17,8 @@ from batcher.plan.expr_ir.core import AggExpr, Expr
 from batcher.plan.functions.aggregate import _as_column
 
 __all__ = [
+    "approx_count_distinct",
     "approx_median",
-    "approx_n_unique",
     "approx_quantile",
     "histogram",
     "iqr",
@@ -92,7 +92,7 @@ def approx_median(column: str | Expr) -> AggExpr:
     return _as_column(column).approx_median()
 
 
-def approx_n_unique(column: str | Expr) -> AggExpr:
+def approx_count_distinct(column: str | Expr) -> AggExpr:
     """Approximate distinct count via a HyperLogLog sketch — bounded memory (~2% error).
 
     Args:
@@ -106,10 +106,10 @@ def approx_n_unique(column: str | Expr) -> AggExpr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [5, 5, 9]})
-            >>> ds.group_by("g").agg(n=bt.approx_n_unique("x")).sort("g").to_pydict()
+            >>> ds.group_by("g").agg(n=bt.approx_count_distinct("x")).sort("g").to_pydict()
             {'g': ['a', 'b'], 'n': [1, 1]}
     """
-    return _as_column(column).approx_n_unique()
+    return _as_column(column).approx_count_distinct()
 
 
 def histogram(column: str | Expr) -> AggExpr:

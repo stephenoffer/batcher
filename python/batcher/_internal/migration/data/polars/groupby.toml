@@ -16,7 +16,7 @@ max = { status = "mismatch", batcher = "GroupBy.max", note = "Polars ignores NaN
 mean = { status = "canonical", batcher = "GroupBy.mean" }
 median = { status = "canonical", batcher = "GroupBy.median" }
 min = { status = "canonical", batcher = "GroupBy.min" }
-n_unique = { status = "mismatch", batcher = "GroupBy.n_unique", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
+n_unique = { status = "mismatch", batcher = "GroupBy.count_distinct", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
 quantile = { status = "mismatch", batcher = "GroupBy.quantile", note = "Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=", wave = "W0" }
 sum = { status = "mismatch", batcher = "GroupBy.sum", note = "Polars sums an all-null group to 0; Batcher returns null. Param: empty_value=0", wave = "W0" }
 tail = { status = "param", batcher = "GroupBy.tail", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
@@ -35,7 +35,7 @@ max = { status = "mismatch", batcher = "GroupBy.max", note = "Polars ignores NaN
 mean = { status = "canonical", batcher = "GroupBy.mean" }
 median = { status = "canonical", batcher = "GroupBy.median" }
 min = { status = "canonical", batcher = "GroupBy.min" }
-n_unique = { status = "mismatch", batcher = "GroupBy.n_unique", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
+n_unique = { status = "mismatch", batcher = "GroupBy.count_distinct", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
 quantile = { status = "mismatch", batcher = "GroupBy.quantile", note = "Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=", wave = "W0" }
 sum = { status = "mismatch", batcher = "GroupBy.sum", note = "Polars sums an all-null group to 0; Batcher returns null. Param: empty_value=0", wave = "W0" }
 tail = { status = "param", batcher = "GroupBy.tail", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }

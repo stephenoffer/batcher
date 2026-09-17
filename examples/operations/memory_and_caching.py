@@ -38,7 +38,7 @@ def main() -> None:
     assert uncached == total
 
     # `persist` is the Spark spelling of the same marker.
-    persisted = data.filter(col("v") > 1900).persist()
+    persisted = data.filter(col("v") > 1900).cache()
     assert persisted.count() == 99
 
     # A storage level says which media the stored result may occupy. The default,

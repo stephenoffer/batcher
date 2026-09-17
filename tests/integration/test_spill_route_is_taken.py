@@ -62,7 +62,7 @@ SPILLING_SHAPES = {
     "group_by_multi_key": lambda d: d.group_by("k", "s").agg(t=col("v").sum()),
     "global_agg": lambda d: d.agg(s=col("v").sum()),
     "distinct": lambda d: d.select(col("k")).distinct(),
-    "count_distinct": lambda d: d.group_by("k").agg(n=col("v").n_unique()),
+    "count_distinct": lambda d: d.group_by("k").agg(n=col("v").count_distinct()),
     "stddev": lambda d: d.group_by("k").agg(sd=col("v").std()),
     "median": lambda d: d.group_by("k").agg(m=col("v").median()),
     "sort_numeric": lambda d: d.sort(col("k")),

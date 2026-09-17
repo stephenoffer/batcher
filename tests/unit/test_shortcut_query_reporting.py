@@ -78,7 +78,7 @@ def test_a_lazy_operation_reports_nothing():
     seen: list[events.Event] = []
     unsubscribe = events.subscribe(seen.append)
     try:
-        bt.from_pydict({"x": [1, 2, 3]}).head(2)
+        bt.from_pydict({"x": [1, 2, 3]}).limit(2)
     finally:
         unsubscribe()
     assert seen == []

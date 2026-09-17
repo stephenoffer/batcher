@@ -32,7 +32,7 @@ from batcher._internal.optional import require
 
 cst = require("libcst", feature="batcher.migrate", provides="libcst", extra="migrate")
 
-__all__ = ["ClassRef", "Inference", "Member", "ReceiverScope", "infer_module"]
+__all__ = ["ClassRef", "FunctionRef", "Inference", "Member", "ReceiverScope", "infer_module"]
 
 _EXPR_RECEIVERS = frozenset({"Expr", "AggExpr", "WindowExpr"})
 # Batcher classes, by the name they are defined and imported under, and the receiver an
@@ -49,6 +49,7 @@ _CLASS_RECEIVERS = {
     "Selector": "Selector",
     "Session": "Session",
     "StreamingQuery": "StreamingQuery",
+    "StreamingQueryListener": "StreamingQueryListener",
     "MergeBuilder": "MergeBuilder",
     "Writer": "Dataset.write",
     "Reader": "bt.read",
@@ -69,20 +70,37 @@ _CLASS_RECEIVERS = {
 
 @dataclass(frozen=True)
 class ClassRef:
-    """A Batcher class itself (not an instance), bound by an import or a definition."""
+    """A Batcher class itself (not an instance), bound by an import or a definition.
+
+    Calling it constructs an instance, so a call evaluates to `receiver`.
+    """
+
+    receiver: str
+
+
+@dataclass(frozen=True)
+class FunctionRef:
+    """A function in the same file whose return annotation, or every `return`, is `receiver`."""
 
     receiver: str
 
 
 @dataclass(frozen=True)
 class Member:
-    """An attribute of a receiver that has not been called or dereferenced yet."""
+    """An attribute of a receiver that has not been called or dereferenced yet.
+
+    `imported` is false for a name bound from a `batcher` *submodule*: the name matches a
+    `bt` member, which is good enough to infer what calling it returns, but it may be a
+    different function that shares the word (`batcher.dist.shuffle_io.read_ipc`), so its
+    uses are never renamed.
+    """
 
     receiver: str
     name: str
+    imported: bool = True
 
 
-Value = str | Member | ClassRef | None
+Value = str | Member | ClassRef | FunctionRef | None
 
 
 @dataclass
@@ -168,6 +186,8 @@ class Inference:
                 # calls the namespace, not a method that returns it.
                 called = self.returns.get(result or "", {}).get("__call__")
                 return called if called and "." in (result or "") else result
+            if isinstance(func, (ClassRef, FunctionRef)):
+                return func.receiver
             if isinstance(func, str):
                 return self.returns.get(func, {}).get("__call__")
             return None
@@ -220,7 +240,9 @@ def _module_statements(module: cst.Module) -> Iterator[cst.BaseSmallStatement]:
         yield from stmt.body
 
 
-def seed_imports(module: cst.Module, scope: ReceiverScope) -> None:
+def seed_imports(
+    module: cst.Module | cst.BaseSuite, scope: ReceiverScope, bt_members: frozenset[str]
+) -> None:
     """Bind the `batcher` module aliases, and the Batcher names imported into the file.
 
     `import batcher as bt` binds the alias. `from batcher import col` binds a pending member
@@ -228,9 +250,17 @@ def seed_imports(module: cst.Module, scope: ReceiverScope) -> None:
     import Dataset`) binds a `ClassRef`, which is what makes a bare `Dataset` annotation
     trustworthy. A class *defined* in the file under a receiver name binds one too.
 
+    Engine-internal code imports the same functions by module path (`from
+    batcher.plan.expr_ir.constructors import col`), so a name imported from any `batcher`
+    submodule that is also a top-level `bt` member binds as that member, and an expression
+    node class imported from `batcher.plan.expr_ir` (`Col`, `StrFunc`) binds as an `Expr`
+    class whose call is an `Expr`.
+
     Args:
-        module: The parsed script.
-        scope: The module scope to bind into.
+        module: The parsed script, or a function body (a function-local import binds in the
+            function's scope).
+        scope: The scope to bind into.
+        bt_members: The top-level `bt` names the returns table knows.
     """
     for small in _module_statements(module):
         if isinstance(small, cst.Import):
@@ -254,7 +284,11 @@ def seed_imports(module: cst.Module, scope: ReceiverScope) -> None:
                     scope.bind(bound, ClassRef(_CLASS_RECEIVERS[name]))
                 elif source == "batcher":
                     scope.bind(bound, Member("bt", name))
-    for stmt in module.body:
+                elif name in bt_members:
+                    scope.bind(bound, Member("bt", name, imported=False))
+                elif source.startswith("batcher.plan.expr_ir") and name[:1].isupper():
+                    scope.bind(bound, ClassRef("Expr"))
+    for stmt in getattr(module, "body", ()):
         if isinstance(stmt, cst.ClassDef) and stmt.name.value in _CLASS_RECEIVERS:
             scope.bind(stmt.name.value, ClassRef(_CLASS_RECEIVERS[stmt.name.value]))
 
@@ -341,35 +375,47 @@ def _returns_of(func: cst.FunctionDef, inference: Inference) -> str | None:
 
 
 def infer_module(
-    module: cst.Module, returns: dict[str, dict[str, str]]
+    module: cst.Module,
+    returns: dict[str, dict[str, str]],
+    imported: dict[str, str] | None = None,
 ) -> dict[cst.FunctionDef | cst.Module, Inference]:
     """Build one `Inference` per scope: the module, and every function in it.
 
     Args:
         module: The parsed script.
         returns: The generated returns table.
+        imported: Receivers returned by functions the script imports from its own project
+            (`batcher.migrate.project`), bound as function references.
 
     Returns:
         A map from each scope node to the inference that evaluates expressions inside it.
     """
     top = ReceiverScope()
-    seed_imports(module, top)
+    bt_members = frozenset(returns.get("bt", {}))
+    seed_imports(module, top, bt_members)
+    for name, receiver in (imported or {}).items():
+        top.bind(name, FunctionRef(receiver))
     top_inference = Inference(returns, top)
     _bind_body(module, top_inference)  # type: ignore[arg-type]
     functions = _all_functions(module)
     # Fixtures and helpers: a same-file function returning one receiver types parameters
     # that share its name.
     typed_functions: dict[str, str] = {}
-    for func, owner in functions:
-        inference = Inference(returns, ReceiverScope(parent=top))
-        _bind_params(func, inference, typed_functions, owner)
-        _bind_body(func.body, inference)
-        kind = _returns_of(func, inference)
-        if kind is not None and owner is None:
-            typed_functions[func.name.value] = kind
+    for _ in range(2):  # a helper calling another helper resolves on the second pass
+        for func, owner in functions:
+            inference = Inference(returns, ReceiverScope(parent=top))
+            seed_imports(func.body, inference.scope, bt_members)
+            _bind_params(func, inference, typed_functions, owner)
+            _bind_body(func.body, inference)
+            kind = _annotation_receiver(func.returns, top) or _returns_of(func, inference)
+            if kind is not None and owner is None and func.name.value not in top.conflicted:
+                typed_functions[func.name.value] = kind
+                if top.lookup(func.name.value) is None:
+                    top.names[func.name.value] = FunctionRef(kind)
     out: dict[cst.FunctionDef | cst.Module, Inference] = {module: top_inference}
     for func, owner in functions:
         inference = Inference(returns, ReceiverScope(parent=top))
+        seed_imports(func.body, inference.scope, bt_members)
         _bind_params(func, inference, typed_functions, owner)
         _bind_body(func.body, inference)
         out[func] = inference

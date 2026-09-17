@@ -44,7 +44,7 @@ def test_ml_repr_is_informative(ds: bt.Dataset) -> None:
 
 def test_ml_dir_lists_operations(ds: bt.Dataset) -> None:
     listed = dir(ds.ml)
-    assert {"infer", "embed", "map_batches", "to_torch"} <= set(listed)
+    assert {"infer", "embed", "map_batches", "iter_torch_batches"} <= set(listed)
 
 
 def test_ml_unknown_attribute_suggests(ds: bt.Dataset) -> None:
@@ -78,11 +78,6 @@ def test_signatures_carry_standard_kwargs(ds: bt.Dataset, method: str, expected:
 def test_stream_loader_batch_size_has_default(ds: bt.Dataset) -> None:
     default = inspect.signature(ds.ml.stream_loader).parameters["batch_size"].default
     assert default is not inspect.Parameter.empty
-
-
-def test_loader_aliases_exist(ds: bt.Dataset) -> None:
-    for name in ("to_torch", "to_torch_dataloader", "to_tf", "to_numpy_batches"):
-        assert hasattr(ds.ml, name)
 
 
 def test_to_numpy_batches_streams(ds: bt.Dataset) -> None:

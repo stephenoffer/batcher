@@ -37,7 +37,7 @@ def test_dt_extra_vs_duckdb(duck, t):
     out = (
         bt.from_arrow(t)
         .select(
-            d=col("ts").dt.isodow(),
+            d=col("ts").dt.weekday(),
             c=col("ts").dt.century(),
             de=col("ts").dt.decade(),
         )

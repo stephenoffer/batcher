@@ -60,7 +60,7 @@ def test_initcap_expected():
             ),
         }
     )
-    out = bt.from_arrow(tbl).select(ic=col("s").str.initcap()).collect().to_pydict()
+    out = bt.from_arrow(tbl).select(ic=col("s").str.to_titlecase()).collect().to_pydict()
     assert out["ic"] == [
         "Hello World",
         "Foo-Bar Baz",

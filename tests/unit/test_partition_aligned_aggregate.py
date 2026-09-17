@@ -448,7 +448,7 @@ def test_a_dedup_below_the_aggregate_is_partition_local(hive_table):
     """`COUNT(DISTINCT x) GROUP BY day` lowers to an aggregate over a `Distinct`. A dedup only
     collapses rows that agree, and rows that agree on `day` are already on one worker, so the
     whole thing folds with no shuffle."""
-    ds = bt.read.parquet(hive_table).group_by("day").agg(n=col("v").n_unique())
+    ds = bt.read.parquet(hive_table).group_by("day").agg(n=col("v").count_distinct())
     assert _partition_aligned_aggregate(ds._plan, list(ds._sources), 4, None) == ("day",)
 
 

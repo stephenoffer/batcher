@@ -43,7 +43,7 @@ def _agg_over_distinct(ds) -> bool:
 def test_lone_count_distinct_routes_through_distinct():
     # The `count_distinct → distinct + count` rewrite makes a lone n_unique an
     # Aggregate-over-Distinct; the map-local aggregate path must be bypassed.
-    ds = bt.from_arrow(_T).agg(n=col("x").n_unique())
+    ds = bt.from_arrow(_T).agg(n=col("x").count_distinct())
     assert _agg_over_distinct(ds)
 
 

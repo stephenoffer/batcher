@@ -112,7 +112,7 @@ def profile(ds: Dataset) -> Dataset:
     aggs = {_TOTAL: count()}
     for c in cols:
         aggs[f"{c}__cnt"] = col(c).count()
-        aggs[f"{c}__nd"] = col(c).approx_n_unique()
+        aggs[f"{c}__nd"] = col(c).approx_count_distinct()
     cell_row = ds.agg(**aggs).collect()
     cell = {name: cell_row.column(name)[0].as_py() for name in cell_row.column_names}
     total = cell[_TOTAL]

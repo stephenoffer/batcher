@@ -160,7 +160,7 @@ _WATERMARKED_SHAPES = {
     # These two rewrote into a `Distinct` and so dropped the watermark structurally.
     "aggregate_of_a_group_key": lambda d: d.group_by("k").agg(m=bt.col("k").max()),
     "count_of_a_group_key": lambda d: d.group_by("k").agg(n=bt.col("k").count()),
-    "count_distinct": lambda d: d.group_by("k").agg(n=bt.col("k").n_unique()),
+    "count_distinct": lambda d: d.group_by("k").agg(n=bt.col("k").count_distinct()),
 }
 
 

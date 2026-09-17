@@ -23,7 +23,7 @@ def main() -> None:
     # Real lists, built by collecting each order's part keys.
     per_order = (
         tpch("lineitem")
-        .head(20_000)
+        .limit(20_000)
         .group_by("l_orderkey")
         .agg(parts=bt.array_agg(col("l_partkey")))
         .sort("l_orderkey")
@@ -37,7 +37,7 @@ def main() -> None:
         beyond=col("parts").list.get(20),
     )
 
-    result = described.head(5).to_pydict()
+    result = described.limit(5).to_pydict()
     print(result)
 
     assert all(value >= 1 for value in result["size"])

@@ -35,8 +35,8 @@ def t(duck):
         (col("a").fill_null(0), "coalesce(a, 0)"),
         (coalesce(col("a"), lit(99)), "coalesce(a, 99)"),
         (col("s").str.trim(), "trim(s)"),
-        (col("s").str.lstrip(), "ltrim(s)"),
-        (col("s").str.rstrip(), "rtrim(s)"),
+        (col("s").str.strip_chars_start(), "ltrim(s)"),
+        (col("s").str.strip_chars_end(), "rtrim(s)"),
         (col("s").str.replace("X", "-"), "replace(s, 'X', '-')"),
     ],
 )

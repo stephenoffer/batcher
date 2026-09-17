@@ -120,12 +120,12 @@ def _nested_scalar(draw: st.DrawFn):
     """
     kind = draw(st.sampled_from(["str", "math", "cast", "trim"]))
     if kind == "str":
-        outer = draw(st.sampled_from(["upper", "lower", "reverse", "initcap"]))
-        inner = draw(st.sampled_from(["upper", "lower", "reverse", "initcap"]))
+        outer = draw(st.sampled_from(["upper", "lower", "reverse", "to_titlecase"]))
+        inner = draw(st.sampled_from(["upper", "lower", "reverse", "to_titlecase"]))
         return getattr(getattr(col("s").str, inner)().str, outer)()
     if kind == "trim":
-        outer = draw(st.sampled_from(["strip", "lstrip", "rstrip"]))
-        inner = draw(st.sampled_from(["strip", "lstrip", "rstrip"]))
+        outer = draw(st.sampled_from(["trim", "strip_chars_start", "strip_chars_end"]))
+        inner = draw(st.sampled_from(["trim", "strip_chars_start", "strip_chars_end"]))
         return getattr(getattr(col("s").str, inner)().str, outer)()
     if kind == "cast":
         # `cast(int -> float) OP literal` is the unwrap-cast family's exact shape.
@@ -255,7 +255,7 @@ def _query(draw: st.DrawFn) -> tuple[bt.Dataset, bool]:
             w_min=col("w").min(),
             w_max=col("w").max(),
             n=count(),
-            v_uniq=col("v").n_unique(),
+            v_uniq=col("v").count_distinct(),
             b_and=col("b").bool_and(),
             b_or=col("b").bool_or(),
         )
@@ -484,7 +484,15 @@ def test_every_list_function_pair_is_result_preserving(inner: str, outer: str) -
 #: Unary string functions the optimizer has collapse/involution rules over. Composing
 #: any two must leave the result unchanged; `extra/strings` collapses the idempotent
 #: ones and `exprs/text` unwraps the involutions.
-_STR_UNARY = ["upper", "lower", "reverse", "initcap", "strip", "lstrip", "rstrip"]
+_STR_UNARY = [
+    "upper",
+    "lower",
+    "reverse",
+    "to_titlecase",
+    "trim",
+    "strip_chars_start",
+    "strip_chars_end",
+]
 
 
 @pytest.mark.parametrize("inner", _STR_UNARY)
@@ -543,9 +551,9 @@ _DATE_PARTS = [
     "minute",
     "hour",
     "day",
-    "day_of_week",
-    "day_of_year",
-    "isodow",
+    "dayofweek",
+    "dayofyear",
+    "weekday",
     "week",
     "iso_year",
     "month",

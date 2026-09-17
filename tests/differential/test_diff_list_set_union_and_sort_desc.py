@@ -49,7 +49,7 @@ def test_set_union_matches_duckdb_on_lists_that_are_present(duck):
     right = [[2, 9], [1, 5], [7], []]
     table = pa.table({"a": left, "b": right}, schema=_SCHEMA)
     duck.register("t", table)
-    got = bt.from_arrow(table).select(u=col("a").list.set_union(col("b"))).to_pydict()["u"]
+    got = bt.from_arrow(table).select(u=col("a").list.union(col("b"))).to_pydict()["u"]
     want = (
         duck.sql("SELECT list_distinct(list_concat(a, b)) u FROM t")
         .to_arrow_table()
@@ -68,7 +68,7 @@ def test_a_null_element_is_a_member_of_the_union(duck):
     one, and so does Batcher.
     """
     table = pa.table({"a": [[1, None, 2]], "b": [[2, None]]}, schema=_SCHEMA)
-    got = bt.from_arrow(table).select(u=col("a").list.set_union(col("b"))).to_pydict()["u"][0]
+    got = bt.from_arrow(table).select(u=col("a").list.union(col("b"))).to_pydict()["u"][0]
     assert sorted(got, key=lambda v: (v is None, v)) == [1, 2, None]
     assert got.count(None) == 1, "the null element is deduplicated like any other"
 
@@ -99,7 +99,7 @@ def test_set_union_deduplicates_rather_than_concatenating():
     """The property that separates it from ``list.concat``, on a row that has both."""
     table = pa.table({"a": [[5, 5, 1]], "b": [[1, 5]]})
     ds = bt.from_arrow(table)
-    united = ds.select(u=col("a").list.set_union(col("b"))).to_pydict()["u"][0]
+    united = ds.select(u=col("a").list.union(col("b"))).to_pydict()["u"][0]
     concatenated = ds.select(c=col("a").list.concat(col("b"))).to_pydict()["c"][0]
     assert sorted(united) == [1, 5], "the union of {5,1} and {1,5} has two elements"
     assert len(concatenated) == 5, "concatenation keeps every element, which is the difference"
@@ -110,8 +110,8 @@ def test_set_union_is_commutative_when_both_lists_are_present():
     left = [[3, 1, 2], [5, 5, 1], [], [1, 2], [1, None, 2]]
     right = [[2, 9], [1, 5], [7], [], [2, None]]
     ds = bt.from_arrow(pa.table({"a": left, "b": right}, schema=_SCHEMA))
-    forward = ds.select(u=col("a").list.set_union(col("b"))).to_pydict()["u"]
-    backward = ds.select(u=col("b").list.set_union(col("a"))).to_pydict()["u"]
+    forward = ds.select(u=col("a").list.union(col("b"))).to_pydict()["u"]
+    backward = ds.select(u=col("b").list.union(col("a"))).to_pydict()["u"]
     key = lambda v: (v is None, v)  # noqa: E731
     for i, (one, other) in enumerate(zip(forward, backward, strict=True)):
         assert sorted(one, key=key) == sorted(other, key=key), f"row {i}"
@@ -166,15 +166,15 @@ def test_a_null_list_on_the_right_is_read_as_an_empty_one():
     table = pa.table({"a": [None, [1, 2], None], "b": [[1], None, None]}, schema=_SCHEMA)
     ds = bt.from_arrow(table)
     got = ds.select(
-        union=col("a").list.set_union(col("b")),
-        intersect=col("a").list.set_intersection(col("b")),
-        difference=col("a").list.set_difference(col("b")),
+        union=col("a").list.union(col("b")),
+        intersect=col("a").list.intersect(col("b")),
+        difference=col("a").list.difference(col("b")),
     ).to_pydict()
     assert got["union"] == [None, [1, 2], None]
     assert got["intersect"] == [None, [], None]
     assert got["difference"] == [None, [1, 2], None]
 
-    flipped = ds.select(u=col("b").list.set_union(col("a"))).to_pydict()["u"]
+    flipped = ds.select(u=col("b").list.union(col("a"))).to_pydict()["u"]
     assert flipped[0] == [1], "the same pair in the other order answers differently"
     assert got["union"][0] is None
 

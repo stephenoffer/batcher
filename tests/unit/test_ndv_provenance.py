@@ -76,7 +76,7 @@ def test_downgrade_weakens_the_ndv_tag_too():
 
 
 def test_count_distinct_refuses_a_sketch_ndv_end_to_end(tmp_path):
-    """`n_unique()` must execute, not answer from the HLL count the optimizer now holds."""
+    """`count_distinct()` must execute, not answer from the HLL count the optimizer now holds."""
     import batcher as bt
 
     path = str(tmp_path / "t.parquet")
@@ -85,4 +85,4 @@ def test_count_distinct_refuses_a_sketch_ndv_end_to_end(tmp_path):
 
     ds = bt.read.parquet(path)
     ds.collect()  # a first run measures the column, seeding a SKETCH ndv
-    assert ds.select("k").n_unique("k") == 1000  # exact, so it must be a real execution
+    assert ds.select("k").count_distinct("k") == 1000  # exact, so it must be a real execution

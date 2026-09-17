@@ -30,7 +30,7 @@ def main() -> None:
         up=revenue.ceil(),
     )
 
-    sample = rounded.head(5).to_pydict()
+    sample = rounded.limit(5).to_pydict()
     print(sample)
 
     full = rounded.to_pydict()

@@ -66,14 +66,14 @@ def _ds(src: _CountingSource) -> Dataset:
 
 def test_head_reads_only_the_needed_prefix():
     src = _source()  # 1000 rows across 10 batches
-    out = _ds(src).head(50).collect()
+    out = _ds(src).limit(50).collect()
     assert out.column("x").to_pylist() == list(range(50))
     assert src.batches_read == 1  # first 100-row batch covered 50
 
 
 def test_limit_spanning_two_batches():
     src = _source()
-    out = _ds(src).head(150).collect()
+    out = _ds(src).limit(150).collect()
     assert out.column("x").to_pylist() == list(range(150))
     assert src.batches_read == 2
 
@@ -95,13 +95,13 @@ def test_full_collect_reads_everything_for_contrast():
 def test_limit_after_filter_is_correct_and_bounded():
     # filter keeps every row (x >= 0), so head(30) still equals the first 30.
     src = _source()
-    out = _ds(src).filter(col("x") >= 0).head(30).collect()
+    out = _ds(src).filter(col("x") >= 0).limit(30).collect()
     assert out.column("x").to_pylist() == list(range(30))
     assert src.batches_read == 1
 
 
 def test_iter_batches_streams_limit():
     src = _source()
-    batches = list(_ds(src).head(50).iter_batches())
+    batches = list(_ds(src).limit(50).iter_batches())
     assert sum(b.num_rows for b in batches) == 50
     assert src.batches_read == 1

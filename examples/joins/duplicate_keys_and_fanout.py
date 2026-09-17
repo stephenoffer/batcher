@@ -25,7 +25,7 @@ def main() -> None:
 
     # Is the right-hand key unique? One count answers it.
     right_rows = lineitem.count()
-    right_keys = lineitem.n_unique("l_orderkey")
+    right_keys = lineitem.count_distinct("l_orderkey")
     print(f"lineitem: {right_rows} rows, {right_keys} distinct order keys")
     assert right_keys < right_rows  # not unique: expect fan-out
 
@@ -43,7 +43,7 @@ def main() -> None:
 
     # Pre-aggregating the right side makes the key unique and the join safe.
     reduced = lineitem.group_by("l_orderkey").agg(line_total=col("l_extendedprice").sum())
-    assert reduced.count() == reduced.n_unique("l_orderkey")
+    assert reduced.count() == reduced.count_distinct("l_orderkey")
     safe = orders.join(reduced, left_on="o_orderkey", right_on="l_orderkey")
     assert safe.count() <= orders.count()
 

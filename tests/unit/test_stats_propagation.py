@@ -105,7 +105,7 @@ def test_count_col_uses_null_count():
 
 
 def test_count_distinct_only_from_exact_ndv():
-    ds = _ds().agg(n=col("x").n_unique())
+    ds = _ds().agg(n=col("x").count_distinct())
     # SKETCH ndv must NOT be answerable (HLL is approximate).
     sketch = _exact_source(100, x=ColumnStat(ndv=42, provenance=Provenance.SKETCH))
     rs_sketch = _est(ds, sketch).estimate(ds._plan)
@@ -119,7 +119,7 @@ def test_count_distinct_only_from_exact_ndv():
 def test_learned_ndv_never_taints_exact_footer_column():
     # Regression: a learned (approximate) ndv must not be merged into an EXACT
     # footer column, or count_distinct would wrongly answer from an HLL estimate.
-    ds = _ds().agg(n=col("x").n_unique())
+    ds = _ds().agg(n=col("x").count_distinct())
     src = _exact_source(100, x=ColumnStat(min=0, max=99, null_count=0, provenance=Provenance.EXACT))
     learned = {"__column_ndv__": {"x": 42.0}}  # a stale/approximate distinct count
     rs = StatsEstimator(ds._sources, learned, source_stats=[src]).estimate(ds._plan)

@@ -14,7 +14,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_float
 from batcher.api._join_helpers import _as_key_expr
 from batcher.plan.expr_ir import Col, nullif, when
 from batcher.plan.expr_ir.selectors import Selector, expand_selectors
@@ -464,7 +464,8 @@ def build_sample(
     if seed is None:
         seed = random.randrange(2**63)
     # The fraction field is required by the node; for count mode it is unused (1.0).
-    return ds._derive(Sample(ds._plan, 1.0 if n is not None else float(fraction), int(seed), n))
+    rate = 1.0 if n is not None else require_float(fraction, func="sample", arg="fraction")
+    return ds._derive(Sample(ds._plan, rate, int(seed), n))
 
 
 def build_unpivot(

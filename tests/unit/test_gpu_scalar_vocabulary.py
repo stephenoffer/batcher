@@ -192,14 +192,14 @@ def test_date_trunc_to_a_month_groups_on_the_device(be):
 @pytest.mark.parametrize(
     "build",
     [
-        lambda e: e.dt.isodow(),
+        lambda e: e.dt.weekday(),
         lambda e: e.dt.century(),
         lambda e: e.dt.decade(),
         lambda e: e.dt.millennium(),
         lambda e: e.dt.iso_year(),
         lambda e: e.dt.last_day(),
     ],
-    ids=["isodow", "century", "decade", "millennium", "iso_year", "last_day"],
+    ids=["weekday", "century", "decade", "millennium", "iso_year", "last_day"],
 )
 def test_date_field_matches_the_engine(build, be):
     table = _timestamps()
@@ -277,11 +277,11 @@ def test_rint_and_round_disagree_on_a_half_and_both_are_right(be):
 @pytest.mark.parametrize(
     "build",
     [
-        bt.atan2,
+        bt.arctan2,
         bt.hypot,
         bt.next_after,
     ],
-    ids=["atan2", "hypot", "next_after"],
+    ids=["arctan2", "hypot", "next_after"],
 )
 def test_binary_math_matches_the_engine(build, be):
     table = _numbers()

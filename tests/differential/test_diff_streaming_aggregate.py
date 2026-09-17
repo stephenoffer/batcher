@@ -97,8 +97,8 @@ def test_streaming_topn_matches_batch_and_duckdb(duck):
     full = pa.Table.from_batches(batches)
     duck.register("t", full)
 
-    streamed = _streamed(_stream(batches).sort("id", descending=True).head(20))
-    batch_result = bt.from_arrow(full).sort("id", descending=True).head(20).collect()
+    streamed = _streamed(_stream(batches).sort("id", descending=True).limit(20))
+    batch_result = bt.from_arrow(full).sort("id", descending=True).limit(20).collect()
     expected = duck.sql("SELECT * FROM t ORDER BY id DESC LIMIT 20")
 
     assert streamed.to_pydict() == batch_result.to_pydict()  # ordered top-N → exact

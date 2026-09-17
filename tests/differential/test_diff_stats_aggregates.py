@@ -44,7 +44,7 @@ def test_corr_covar_match_duckdb(duck):
 
 def test_skewness_kurtosis_match_duckdb(duck):
     duck.register("t", _data())
-    out = bt.from_arrow(_data()).agg(s=col("x").skewness(), k=col("x").kurtosis()).collect()
+    out = bt.from_arrow(_data()).agg(s=col("x").skew(), k=col("x").kurtosis()).collect()
     assert_same(out, duck.sql("SELECT skewness(x) AS s, kurtosis(x) AS k FROM t"))
 
 
@@ -54,7 +54,7 @@ def test_stats_aggregates_single_node_equals_distributed():
         "x": [1.0, 2.0, 3.0, 1.0, 5.0, 2.0, 8.0],
         "y": [2.0, 4.0, 5.0, 1.0, 6.0, 3.0, 9.0],
     }
-    ds = bt.from_pydict(g).group_by("g").agg(c=corr(col("x"), col("y")), s=col("x").skewness())
+    ds = bt.from_pydict(g).group_by("g").agg(c=corr(col("x"), col("y")), s=col("x").skew())
     sd = ds.collect().to_pydict()
     single = {
         k: (round(c, 9), round(s, 9)) for k, c, s in zip(sd["g"], sd["c"], sd["s"], strict=True)

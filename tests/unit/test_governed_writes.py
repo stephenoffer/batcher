@@ -460,7 +460,7 @@ class TestThereIsNoUngovernedWritePath:
             bt.security(catalog, bt.Principal("ana", roles=["analyst"])),
             pytest.raises(AccessDeniedError, match="missing INSERT"),
         ):
-            source.write(dest, format="parquet", trigger=bt.Trigger.Once())
+            source.write(dest, format="parquet", trigger=bt.Trigger.once())
         assert not os.path.exists(dest)
 
     def test_the_granted_role_may_start_the_same_stream(self, tmp_path):
@@ -469,7 +469,7 @@ class TestThereIsNoUngovernedWritePath:
         catalog = bt.SecurityCatalog().grant("loader", on=dest, privilege="INSERT")
         source = bt.read.rate(rows_per_second=1)
         with bt.security(catalog, bt.Principal("etl", roles=["loader"])):
-            query = source.write(dest, format="parquet", trigger=bt.Trigger.Once())
+            query = source.write(dest, format="parquet", trigger=bt.Trigger.once())
         query.stop()
 
     def test_the_check_precedes_any_distributed_fan_out(self, monkeypatch, tmp_path):

@@ -78,10 +78,10 @@ def test_one_tables_width_does_not_reach_another(two_files):
     """The case that forced this module's revert, now covered by the scan-token identity."""
     wide, narrow = two_files
     hub = core.default_hub()
-    other = bt.read_parquet(narrow).filter(bt.col("k") < _ROWS - 1)
+    other = bt.read.parquet(narrow).filter(bt.col("k") < _ROWS - 1)
     cold = CardinalityEstimator(other._sources).row_width(other._plan, 64.0)
 
-    measured = bt.read_parquet(wide).filter(bt.col("k") < _ROWS - 1)
+    measured = bt.read.parquet(wide).filter(bt.col("k") < _ROWS - 1)
     for _ in range(4):
         measured.collect()
 
@@ -94,7 +94,7 @@ def test_the_measured_width_reaches_the_shape_that_earned_it(two_files):
     """And the measurement is worth having where the key is right."""
     wide, _ = two_files
     hub = core.default_hub()
-    query = bt.read_parquet(wide).filter(bt.col("k") < _ROWS - 1)
+    query = bt.read.parquet(wide).filter(bt.col("k") < _ROWS - 1)
     for _ in range(4):
         query.collect()
     warm = CardinalityEstimator(query._sources, load_learned_stats(hub))

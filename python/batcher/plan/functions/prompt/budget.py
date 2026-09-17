@@ -64,7 +64,7 @@ def truncate_to_token_budget(text: str | Expr, budget: int, chars_per_token: flo
             {'r': ['hell']}
     """
     chars = _char_budget(budget, chars_per_token, "truncate_to_token_budget")
-    return _as_column(text).str.truncate_chars(chars)
+    return _as_column(text).str.left(chars)
 
 
 def truncate_middle(
@@ -126,7 +126,7 @@ def truncate_middle(
         Lit(marker),
         column.str.right(tail_chars),
     )
-    return when(column.str.len() <= Lit(chars)).then(column).otherwise(shortened)
+    return when(column.str.len_chars() <= Lit(chars)).then(column).otherwise(shortened)
 
 
 def prompt_token_estimate(*parts: IntoExpr, chars_per_token: float = 4.0) -> Expr:

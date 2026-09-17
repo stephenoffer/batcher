@@ -23,15 +23,15 @@ def main() -> None:
 
     shaped = nation.select(
         "n_name",
-        upper=col("n_name").str.to_uppercase(),
-        lower=col("n_name").str.to_lowercase(),
+        upper=col("n_name").str.upper(),
+        lower=col("n_name").str.lower(),
         title=col("n_name").str.to_titlecase(),
         padded=col("n_name").str.rpad(20, "."),
         left_padded=col("n_name").str.lpad(20, " "),
         zeroed=col("n_name").str.zfill(20),
     )
 
-    result = shaped.head(3).to_pydict()
+    result = shaped.limit(3).to_pydict()
     for value in result["padded"]:
         print(repr(value))
 

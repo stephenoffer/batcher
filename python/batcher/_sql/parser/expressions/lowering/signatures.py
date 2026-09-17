@@ -201,7 +201,7 @@ def parameter_kinds(fn: Any, *, skip_first: bool = False) -> list[Any] | None:
             # method out entirely would deny, and it is 22 of `.image` alone.
             continue
         if parameter.kind is parameter.VAR_POSITIONAL:
-            # `max_horizontal(*columns)` takes any number of columns, and every one of them
+            # `greatest(*columns)` takes any number of columns, and every one of them
             # is a column. Stopping here (rather than declining the function) leaves the
             # tail unclassified, which `build_arguments` reads as `Expr` — the right answer,
             # and the one that keeps the eleven `*_horizontal` functions callable.

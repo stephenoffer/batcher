@@ -35,7 +35,7 @@ def main() -> None:
         .sort("o_custkey")
     )
     result = per_customer.to_pydict()
-    print(per_customer.head(3).to_pydict())
+    print(per_customer.limit(3).to_pydict())
 
     # Ordered by date, so first is not after last.
     assert all(
@@ -64,7 +64,7 @@ def main() -> None:
         .group_by("o_custkey")
         .agg(dates=bt.array_agg(col("o_orderdate")))
         .sort("o_custkey")
-        .head(5)
+        .limit(5)
         .to_pydict()
     )
     print(collected["dates"][0])

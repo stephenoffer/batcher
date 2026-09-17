@@ -38,7 +38,7 @@ def main() -> None:
     )
 
     # The bytes are there, and they really are JPEG: every JPEG starts with FF D8 FF.
-    raw = pictures.select("bytes").head(1).to_pydict()["bytes"][0]
+    raw = pictures.select("bytes").limit(1).to_pydict()["bytes"][0]
     assert raw[:3] == b"\xff\xd8\xff"
 
     # Metadata filtering costs no decode.

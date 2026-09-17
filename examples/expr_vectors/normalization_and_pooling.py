@@ -29,8 +29,8 @@ def main() -> None:
 
     described = vectors.select(
         "id",
-        magnitude=col("vector").list.magnitude(),
-        dimensions=col("vector").list.dim(),
+        magnitude=col("vector").list.l2_norm(),
+        dimensions=col("vector").list.len(),
         unit=col("vector").list.is_unit_norm(),
         zero=col("vector").list.is_zero_vector(),
         sum_squares=col("vector").list.sum_squares(),
@@ -61,8 +61,8 @@ def main() -> None:
     # `group_by` over chunk rows, not a call to these.
     pooled = vectors.select(
         "id",
-        mean=col("vector").list.mean_pool(),
-        peak=col("vector").list.max_pool(),
+        mean=col("vector").list.mean(),
+        peak=col("vector").list.max(),
     ).to_pydict()
     print(pooled)
     assert [round(value, 6) for value in pooled["mean"]] == [2.333333, 0.333333, 0.666667]

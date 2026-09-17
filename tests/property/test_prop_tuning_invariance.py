@@ -76,7 +76,7 @@ def _agg_result(table: pa.Table, **collect_kw: object) -> list[tuple]:
             a=col("v").mean(),
             sd=col("v").std(),
             md=col("v").median(),
-            nd=col("v").n_unique(),
+            nd=col("v").count_distinct(),
         )
     )
     return _rowset(ds.collect(**collect_kw))  # type: ignore[arg-type]

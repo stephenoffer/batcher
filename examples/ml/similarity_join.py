@@ -20,7 +20,7 @@ from batcher import col
 
 
 def main() -> None:
-    parts = tpch("part").select("p_partkey", "p_name").head(300)
+    parts = tpch("part").select("p_partkey", "p_name").limit(300)
 
     def embed(dataset: bt.Dataset, prefix: str) -> bt.Dataset:
         return dataset.select(
@@ -33,7 +33,7 @@ def main() -> None:
             ).alias(f"{prefix}_vector"),
         )
 
-    left = embed(parts.head(20), "q")
+    left = embed(parts.limit(20), "q")
     right = embed(parts, "d")
 
     scored = left.cross_join(right).select(

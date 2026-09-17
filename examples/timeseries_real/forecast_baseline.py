@@ -25,7 +25,7 @@ def main() -> None:
         .group_by("o_orderdate")
         .agg(actual=col("o_totalprice").sum())
         .sort("o_orderdate")
-        .head(200)
+        .limit(200)
     )
 
     forecast = daily.with_columns(

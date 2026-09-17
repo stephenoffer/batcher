@@ -74,7 +74,7 @@ def test_last_day_of_a_date_column_stays_a_date():
 
 def test_month_end_is_the_same_function_as_last_day():
     ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
-    out = ds.select(a=bt.col("d").dt.month_end(), b=bt.col("d").dt.last_day()).to_pydict()
+    out = ds.select(a=bt.col("d").dt.last_day(), b=bt.col("d").dt.last_day()).to_pydict()
     assert out["a"] == out["b"] == [dt.date(2024, 2, 29)]
 
 

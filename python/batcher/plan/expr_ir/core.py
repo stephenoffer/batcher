@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError, require_float, require_int
 from batcher._internal.mathx import is_nan
-from batcher.plan.expr_ir.compat import bind_compat_methods as _bind_compat_methods
 from batcher.plan.expr_ir.compat import expr_attribute_error as _expr_attribute_error
 from batcher.plan.ir_tags import MICROS_PER_DAY, ExprTag
 from batcher.plan.types import (
@@ -474,8 +473,8 @@ class Expr:
         raise TypeError(
             "a batcher expression is not iterable; wrap it in a list "
             "(e.g. over(partition_by=[col('g')]), not over(partition_by=col('g'))). "
-            "For a row-wise minimum/maximum across columns use min_horizontal(a, b) / "
-            "max_horizontal(a, b); for a column aggregate use .min() / .max()"
+            "For a row-wise minimum/maximum across columns use least(a, b) / "
+            "greatest(a, b); for a column aggregate use .min() / .max()"
         )
 
     def __len__(self) -> NoReturn:
@@ -1086,22 +1085,6 @@ class Expr:
 
         return StrFunc("format_bytes_si" if si else "format_bytes", self)
 
-    def neg(self) -> Expr:
-        """Arithmetic negation — the Polars ``neg`` spelling of the unary minus.
-
-        Returns:
-            A new expression of the negated values (nulls propagate).
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, -2, 3]})
-                >>> ds.select(r=bt.col("x").neg()).to_pydict()
-                {'r': [-1, 2, -3]}
-        """
-        return Lit(0) - self
-
     def round(self, digits: int | None = None) -> Expr:
         """Round half-away-from-zero to the nearest integer, or to `digits` decimal places.
 
@@ -1123,25 +1106,6 @@ class Expr:
         if digits is None:
             return MathExpr("round", self)
         return Math2Expr("round", self, Lit(digits))
-
-    def pow(self, exponent: IntoExpr) -> Math2Expr:
-        """This value raised to `exponent` (→ Float64); the method spelling of the ``**`` operator.
-
-        Args:
-            exponent: A scalar or expression power; applied per row, nulls propagate.
-
-        Returns:
-            A new Float64 expression of the powers.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [2.0, 3.0]})
-                >>> ds.select(r=bt.col("x").pow(2)).to_pydict()
-                {'r': [4.0, 9.0]}
-        """
-        return Math2Expr("pow", self, _wrap(exponent))
 
     def __pow__(self, other: IntoExpr) -> Math2Expr:
         """Exponentiation (``a ** b``, → Float64); the operator spelling of :meth:`pow`."""
@@ -1414,68 +1378,6 @@ class Expr:
         """
         return self.exp() - Lit(1)
 
-    def asinh(self) -> Expr:
-        """Inverse hyperbolic sine (→ Float64; defined for all reals; nulls propagate).
-
-        Evaluated by the engine's ``asinh`` rather than composed as
-        ``ln(x + sqrt(x*x + 1))``, which overflows to ``inf`` above ~1.3e154 and turns
-        ``-inf`` into NaN. Matches NumPy/DuckDB ``asinh``.
-
-        Returns:
-            A new Float64 expression of the inverse hyperbolic sines.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
-                >>> ds.select(r=bt.col("x").asinh()).to_pydict()
-                {'r': [0.0, 0.881373587019543]}
-        """
-        return MathExpr("asinh", self)
-
-    def acosh(self) -> Expr:
-        """Inverse hyperbolic cosine (→ Float64; defined for ``x >= 1``; nulls propagate).
-
-        Evaluated by the engine's ``acosh`` rather than composed as
-        ``ln(x + sqrt(x*x - 1))``, which overflows to ``inf`` above ~1.3e154. Matches
-        NumPy/DuckDB ``acosh``; inputs below 1 yield NaN, as the real inverse is
-        undefined there.
-
-        Returns:
-            A new Float64 expression of the inverse hyperbolic cosines.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1.0, 2.0]})
-                >>> ds.select(r=bt.col("x").acosh()).to_pydict()
-                {'r': [0.0, 1.3169578969248166]}
-        """
-        return MathExpr("acosh", self)
-
-    def atanh(self) -> Expr:
-        """Inverse hyperbolic tangent (→ Float64; defined for ``|x| < 1``; nulls propagate).
-
-        Evaluated by the engine's ``atanh`` rather than composed as
-        ``0.5 * ln((1 + x) / (1 - x))``, which loses precision to cancellation near
-        zero. Matches NumPy/DuckDB ``atanh``; ``|x| >= 1`` yields ±inf/NaN, as the real
-        inverse diverges there.
-
-        Returns:
-            A new Float64 expression of the inverse hyperbolic tangents.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [0.0, 0.5]})
-                >>> ds.select(r=bt.col("x").atanh()).to_pydict()
-                {'r': [0.0, 0.5493061443340548]}
-        """
-        return MathExpr("atanh", self)
-
     def arcsin(self) -> MathExpr:
         """Arcsine in radians — the Polars/NumPy ``arcsin`` spelling of :meth:`asin`.
 
@@ -1490,7 +1392,7 @@ class Expr:
                 >>> ds.select(r=bt.col("x").arcsin()).to_pydict()
                 {'r': [0.0, 1.5707963267948966]}
         """
-        return self.asin()
+        return MathExpr("asin", self)
 
     def arccos(self) -> MathExpr:
         """Arccosine in radians — the Polars/NumPy ``arccos`` spelling of :meth:`acos`.
@@ -1506,7 +1408,7 @@ class Expr:
                 >>> ds.select(r=bt.col("x").arccos()).to_pydict()
                 {'r': [0.0, 1.5707963267948966]}
         """
-        return self.acos()
+        return MathExpr("acos", self)
 
     def arctan(self) -> MathExpr:
         """Arctangent in radians — the Polars/NumPy ``arctan`` spelling of :meth:`atan`.
@@ -1522,7 +1424,7 @@ class Expr:
                 >>> ds.select(r=bt.col("x").arctan()).to_pydict()
                 {'r': [0.0, 0.7853981633974483]}
         """
-        return self.atan()
+        return MathExpr("atan", self)
 
     def arcsinh(self) -> Expr:
         """Inverse hyperbolic sine — the Polars/NumPy ``arcsinh`` spelling of :meth:`asinh`.
@@ -1538,7 +1440,7 @@ class Expr:
                 >>> ds.select(r=bt.col("x").arcsinh()).to_pydict()
                 {'r': [0.0, 0.881373587019543]}
         """
-        return self.asinh()
+        return MathExpr("asinh", self)
 
     def arccosh(self) -> Expr:
         """Inverse hyperbolic cosine — the Polars/NumPy ``arccosh`` spelling of :meth:`acosh`.
@@ -1554,7 +1456,7 @@ class Expr:
                 >>> ds.select(r=bt.col("x").arccosh()).to_pydict()
                 {'r': [0.0, 1.3169578969248166]}
         """
-        return self.acosh()
+        return MathExpr("acosh", self)
 
     def arctanh(self) -> Expr:
         """Inverse hyperbolic tangent — the Polars/NumPy ``arctanh`` spelling of :meth:`atanh`.
@@ -1570,66 +1472,7 @@ class Expr:
                 >>> ds.select(r=bt.col("x").arctanh()).to_pydict()
                 {'r': [0.0, 0.5493061443340548]}
         """
-        return self.atanh()
-
-    def is_between(self, lower: IntoExpr, upper: IntoExpr, closed: str = "both") -> Expr:
-        """Range test — the Polars ``is_between`` spelling of :meth:`between`.
-
-        Args:
-            lower: The lower bound.
-            upper: The upper bound.
-            closed: Which bounds are inclusive — ``"both"``/``"left"``/``"right"``/``"none"``.
-
-        Returns:
-            A boolean expression, true where the value lies in the range.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
-                >>> ds.select(r=bt.col("x").is_between(2, 3)).to_pydict()
-                {'r': [False, True, True]}
-        """
-        return self.between(lower, upper, closed)
-
-    def clip_min(self, lower: IntoExpr) -> Expr:
-        """Clamp values up to at least `lower` — the Polars ``clip_min`` spelling of :meth:`clip`.
-
-        Args:
-            lower: The lower bound; values below it become it.
-
-        Returns:
-            A new expression with each value raised to at least `lower`.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [-1, 5, 20]})
-                >>> ds.select(r=bt.col("x").clip_min(0)).to_pydict()
-                {'r': [0, 5, 20]}
-        """
-        return self.clip(lower=lower)
-
-    def clip_max(self, upper: IntoExpr) -> Expr:
-        """Clamp values down to at most `upper` — the Polars ``clip_max`` spelling of :meth:`clip`.
-
-        Args:
-            upper: The upper bound; values above it become it.
-
-        Returns:
-            A new expression with each value lowered to at most `upper`.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [-1, 5, 20]})
-                >>> ds.select(r=bt.col("x").clip_max(10)).to_pydict()
-                {'r': [-1, 5, 10]}
-        """
-        return self.clip(upper=upper)
+        return MathExpr("atanh", self)
 
     # --- feature engineering / ML transforms --------------------------------
     # Scalers broadcast a *window* aggregate over the whole column (or per
@@ -2503,54 +2346,6 @@ class Expr:
 
         return dense_rank().over(order_by=[self]) - Lit(1)
 
-    def asin(self) -> MathExpr:
-        """Arcsine in radians, inverse of :meth:`sin` (→ Float64; outside [-1, 1] → NaN).
-
-        Returns:
-            A new Float64 expression of the arcsines, in radians.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
-                >>> ds.select(r=bt.col("x").asin()).to_pydict()
-                {'r': [0.0, 1.5707963267948966]}
-        """
-        return MathExpr("asin", self)
-
-    def acos(self) -> MathExpr:
-        """Arccosine in radians, inverse of :meth:`cos` (→ Float64; outside [-1, 1] → NaN).
-
-        Returns:
-            A new Float64 expression of the arccosines, in radians.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1.0]})
-                >>> ds.select(r=bt.col("x").acos()).to_pydict()
-                {'r': [0.0]}
-        """
-        return MathExpr("acos", self)
-
-    def atan(self) -> MathExpr:
-        """Arctangent in radians, the inverse of :meth:`tan` (→ Float64; nulls propagate).
-
-        Returns:
-            A new Float64 expression of the arctangents, in radians.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [0.0]})
-                >>> ds.select(r=bt.col("x").atan()).to_pydict()
-                {'r': [0.0]}
-        """
-        return MathExpr("atan", self)
-
     def sinh(self) -> MathExpr:
         """Hyperbolic sine (→ Float64; nulls propagate).
 
@@ -3224,7 +3019,7 @@ class Expr:
         """
         return AggExpr("stddev", self)
 
-    def skewness(self) -> AggExpr:
+    def skew(self) -> AggExpr:
         """Sample skewness per group (adjusted Fisher-Pearson, matching DuckDB; → Float64).
 
         Null when the group has fewer than 3 values. Mergeable (sum-of-powers moment state).
@@ -3237,7 +3032,7 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a"] * 4, "x": [1, 2, 3, 10]})
-                >>> ds.group_by("g").agg(r=bt.col("x").skewness()).to_pydict()
+                >>> ds.group_by("g").agg(r=bt.col("x").skew()).to_pydict()
                 {'g': ['a'], 'r': [1.763632614803888]}
         """
         return AggExpr("skewness", self)
@@ -3480,7 +3275,7 @@ class Expr:
         """
         return AggExpr("count", self)
 
-    def n_unique(self) -> AggExpr:
+    def count_distinct(self) -> AggExpr:
         """Number of distinct non-null values per group (SQL ``COUNT(DISTINCT)``).
 
         Exact, so it holds every distinct value — see :meth:`approx_n_unique` for the
@@ -3494,15 +3289,14 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10]})
-                >>> ds.group_by("g").agg(r=bt.col("x").n_unique()).sort("g").to_pydict()
+                >>> ds.group_by("g").agg(r=bt.col("x").count_distinct()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 1]}
         """
         return AggExpr("count_distinct", self)
 
     # SQL spelling; same aggregate as `n_unique`.
-    count_distinct = n_unique
 
-    def approx_n_unique(self) -> AggExpr:
+    def approx_count_distinct(self) -> AggExpr:
         """Approximate COUNT(DISTINCT) via a HyperLogLog sketch (~2% error).
 
         Bounded memory regardless of skew — the skew-safe choice when an exact
@@ -6136,7 +5930,7 @@ class AggExpr:
 # documented examples are exactly `Expr`'s — one definition, one behavior.
 for _agg_math_method in (
     "sqrt", "cbrt", "exp", "ln", "log2", "log10", "log1p", "expm1", "square",
-    "abs", "sign", "round", "pow", "floor", "ceil", "trunc", "clip",
+    "abs", "sign", "round", "floor", "ceil", "trunc", "clip",
 ):  # fmt: skip
     setattr(AggExpr, _agg_math_method, getattr(Expr, _agg_math_method))
 del _agg_math_method
@@ -6175,4 +5969,3 @@ class Coalesce(IRNode):
 # `expr_ir.compat` and attached here, so this module stays the one-`Expr` hierarchy
 # rather than carrying a second, parallel copy of its own surface. The import is at
 # the bottom because `compat` names `Expr` only under `TYPE_CHECKING`.
-_bind_compat_methods(Expr)

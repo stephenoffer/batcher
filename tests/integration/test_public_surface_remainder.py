@@ -181,7 +181,7 @@ GROUP_SHORTHANDS = [
     ("mode", lambda: bt.col("n").mode()),
     ("product", lambda: bt.col("n").product()),
     ("kurtosis", lambda: bt.col("n").kurtosis()),
-    ("skewness", lambda: bt.col("n").skewness()),
+    ("skewness", lambda: bt.col("n").skew()),
 ]
 
 
@@ -275,7 +275,7 @@ def test_ml_to_torch_and_dataloader_carry_the_rows(ds):
     frame = bt.from_pydict({"a": [1.0, 2.0, 3.0, 4.0]})
 
     seen: list[float] = []
-    for batch in frame.ml.to_torch(batch_size=2, columns=["a"]):
+    for batch in frame.ml.iter_torch_batches(batch_size=2, columns=["a"]):
         seen.extend(float(v) for v in batch["a"].reshape(-1))
     assert seen == [1.0, 2.0, 3.0, 4.0]
 

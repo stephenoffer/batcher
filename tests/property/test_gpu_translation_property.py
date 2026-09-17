@@ -124,7 +124,7 @@ def _predicate(rng):
         lambda: (col("a") > 0) & (col("b") < 10.0),
         lambda: col("s").str.starts_with("k"),
         lambda: col("b").is_nan(),
-        lambda: col("s").str.len() > 1,
+        lambda: col("s").str.len_chars() > 1,
         lambda: (col("a") % 2) == 0,
         lambda: ~(col("g") == 3),
     ]

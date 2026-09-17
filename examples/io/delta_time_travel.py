@@ -27,9 +27,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "customers")
 
-        customer.head(500).write.delta(table)  # version 0
-        customer.slice(500, 300).write.delta(table, mode="append")  # version 1
-        customer.slice(800, 200).write.delta(table, mode="append")  # version 2
+        customer.limit(500).write.delta(table)  # version 0
+        customer.limit(300, offset=500).write.delta(table, mode="append")  # version 1
+        customer.limit(200, offset=800).write.delta(table, mode="append")  # version 2
 
         latest = bt.read.delta(table)
         print("latest:", latest.count())
@@ -48,7 +48,7 @@ def main() -> None:
         assert old_keys < new_keys
 
         # And the aggregate over an old version matches what it was at the time.
-        original = customer.head(500).agg(total=col("c_acctbal").sum()).to_pydict()["total"][0]
+        original = customer.limit(500).agg(total=col("c_acctbal").sum()).to_pydict()["total"][0]
         travelled = v0.agg(total=col("c_acctbal").sum()).to_pydict()["total"][0]
         assert abs(original - travelled) < 1e-6
 

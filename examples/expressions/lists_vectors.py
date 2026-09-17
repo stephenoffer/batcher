@@ -33,8 +33,8 @@ def main() -> None:
         l1=col("vec").list.l1_distance(col("query")),
         euclid=col("vec").list.euclidean_distance(col("query")),
         # Vector properties.
-        dim=col("vec").list.dim(),
-        norm=col("vec").list.magnitude(),
+        dim=col("vec").list.len(),
+        norm=col("vec").list.l2_norm(),
         l2_norm=col("vec").list.l2_norm(),
         unit=col("vec").list.is_unit_norm(),
         zero=col("vec").list.is_zero_vector(),

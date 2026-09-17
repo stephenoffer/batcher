@@ -26,7 +26,7 @@ def main() -> None:
         source = (
             tpch("customer")
             .select("c_custkey", "c_name", "c_phone", "c_nationkey", "c_acctbal")
-            .head(2_000)
+            .limit(2_000)
         )
         source.write.parquet(table)
 

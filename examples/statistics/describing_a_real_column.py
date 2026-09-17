@@ -28,7 +28,7 @@ def main() -> None:
         median=bt.median(col("o_totalprice")),
         std=bt.std(col("o_totalprice")),
         iqr=bt.iqr(col("o_totalprice")),
-        skew=bt.skewness(col("o_totalprice")),
+        skew=bt.skew(col("o_totalprice")),
         low=col("o_totalprice").min(),
         high=col("o_totalprice").max(),
     ).to_pydict()

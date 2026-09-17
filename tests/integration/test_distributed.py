@@ -47,7 +47,7 @@ def test_distributed_list_state_aggregates(transport):
     t = _data()
 
     def q(ds, **kw):
-        return ds.group_by("k").agg(m=col("v").median(), nd=col("v").n_unique()).collect(**kw)
+        return ds.group_by("k").agg(m=col("v").median(), nd=col("v").count_distinct()).collect(**kw)
 
     single = q(bt.from_arrow(t))
     distrib = q(bt.from_arrow(t), distributed=True, num_workers=4, transport=transport)

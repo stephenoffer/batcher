@@ -98,7 +98,7 @@ _COMPILED = [
     ("sqrt", col("y").sqrt() > 10.0),
     ("libm transcendental", col("y").ln() > 1.0),
     ("abs", col("x").abs() > 100),
-    ("pow", col("y").pow(2.0) > 100.0),
+    ("pow", (col("y") ** 2.0) > 100.0),
     # Float division is IEEE — it yields inf/nan and never traps — so a non-constant
     # divisor still compiles, unlike the integer case below.
     ("non-constant float divisor", col("x") / (col("y") + 1.0) > 0.5),

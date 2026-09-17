@@ -48,7 +48,7 @@ def main() -> None:
 
     # A `limit` in front of a `collect` is the third option, and the cheapest of all when
     # you only need a look at the data.
-    assert projection.head(5).collect().num_rows == 5
+    assert projection.limit(5).collect().num_rows == 5
 
 
 if __name__ == "__main__":

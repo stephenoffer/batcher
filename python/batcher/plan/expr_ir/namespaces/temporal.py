@@ -418,30 +418,6 @@ class _DtNamespace:
 
     # --- Polars-compatible spellings (delegate to the SQL-named accessors) ----------
 
-    def to_string(self, format: str = "%Y-%m-%dT%H:%M:%S") -> Expr:
-        """Format as text — the Polars ``dt.to_string`` spelling of :meth:`strftime`.
-
-        The default is the ISO-8601 datetime form. A Date column has no time of day, so
-        pass ``"%Y-%m-%d"`` for one rather than reading back a midnight that is not in
-        the data.
-
-        Args:
-            format: A strftime pattern, e.g. ``"%Y-%m-%d"``; ISO-8601 by default.
-
-        Returns:
-            A new Utf8 expression: the formatted text.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> import datetime as dt
-                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15)]})
-                >>> ds.select(r=bt.col("d").dt.to_string("%Y-%m-%d")).to_pydict()
-                {'r': ['2024-02-15']}
-        """
-        return self.strftime(format)
-
     def date(self) -> Expr:
         """Extract the calendar date — the Polars ``dt.date`` spelling of ``CAST(ts AS DATE)``.
 
@@ -852,24 +828,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.is_weekend()).to_pydict()
                 {'r': [True, False]}
         """
-        return self.isodow() >= 6
-
-    def is_weekday(self) -> Expr:
-        """True Monday through Friday — the complement of :meth:`is_weekend`.
-
-        Returns:
-            A Boolean expression, true on weekdays.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> import datetime as dt
-                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]})
-                >>> ds.select(r=bt.col("d").dt.is_weekday()).to_pydict()
-                {'r': [False, True]}
-        """
-        return self.isodow() <= 5
+        return self.weekday() >= 6
 
     def timestamp(self, unit: str = "us") -> Expr:
         """Epoch count at `unit` — the Polars ``dt.timestamp`` spelling (→ Int64).
@@ -1127,10 +1086,28 @@ class _DtNamespace:
         """
         return ConvertTimezone(self._e, from_tz, to_tz)
 
+    def is_business_day(self) -> Expr:
+        """True Monday through Friday — the complement of :meth:`is_weekend`.
+
+        Returns:
+            A Boolean expression, true on weekdays.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]})
+                >>> ds.select(r=bt.col("d").dt.is_business_day()).to_pydict()
+                {'r': [False, True]}
+        """
+        return self.weekday() <= 5
+
 
 # Python accessor name → engine `DateFunc` wire tag (serde snake_case). Each maps
 # to one Arrow `DatePart` and matches the same-named DuckDB function.
 _DT_FIELDS = {
+    "weekday": "isodow",  # ISO day of week: Monday = 1 … Sunday = 7 (→ Int64)
     "year": "year",
     "month": "month",
     "day": "day",
@@ -1144,7 +1121,6 @@ _DT_FIELDS = {
     "epoch": "epoch",  # seconds since the Unix epoch (→ Int64)
     "dayname": "dayname",  # full weekday name e.g. "Monday" (→ Utf8)
     "monthname": "monthname",  # full month name e.g. "January" (→ Utf8)
-    "isodow": "isodow",  # ISO day of week: Monday = 1 … Sunday = 7 (→ Int64)
     "century": "century",  # the century, e.g. 2021 → 21 (→ Int64)
     "decade": "decade",  # the decade, e.g. 2021 → 202 (→ Int64)
     "millennium": "millennium",  # the millennium, e.g. 2021 → 3 (→ Int64)
@@ -1183,83 +1159,6 @@ _DT_ALIASES: dict[str, tuple[str, ...]] = {
         '{"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]}',
         'bt.col("d").dt.microsecond()',
         "{'r': [123456]}",
-    ),
-    "weekday": (
-        "isodow",
-        "ISO weekday, Monday=1 … Sunday=7 — the Polars ``weekday`` spelling of ``isodow``.",
-        '{"d": [dt.datetime(2024, 2, 18)]}',
-        'bt.col("d").dt.weekday()',
-        "{'r': [7]}",
-        "Not to be confused with ``dayofweek`` / ``day_of_week``, which use the DuckDB\n"
-        "numbering (Sunday=0 … Saturday=6). The two agree on Monday through Saturday and\n"
-        "differ only on Sunday, so the example below is a Sunday.",
-    ),
-    "ordinal_day": (
-        "dayofyear",
-        "Day-of-year, 1-366 — the Polars ``ordinal_day`` spelling of ``dayofyear``.",
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.ordinal_day()',
-        "{'r': [46]}",
-    ),
-    "month_end": (
-        "last_day",
-        "Last day of the month, as a DATE — the ``month_end`` spelling of ``last_day``.",
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.month_end()',
-        "{'r': [datetime.date(2024, 2, 29)]}",
-        "Two things this does *not* share with the name it borrows. Polars'\n"
-        "``dt.month_end`` returns the input's own type and keeps its time of day; this is\n"
-        "``last_day``, so it returns a ``date32`` and the time is gone. And it is the one\n"
-        "member of the period-boundary family that is not a timestamp at midnight --\n"
-        "``month_start``, ``quarter_start``, ``quarter_end``, ``year_start`` and\n"
-        "``year_end`` all are. For a September timestamp ``month_end`` and ``quarter_end``\n"
-        "name the same instant in two different column types. Use ``quarter_end``'s\n"
-        "spelling, ``truncate('month').dt.offset_by('1mo').dt.offset_by('-1d')``, if you\n"
-        "want the timestamp.",
-    ),
-    "day_name": (
-        "dayname",
-        'Full weekday name, e.g. ``"Monday"`` — the pandas ``dt.day_name``.',
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.day_name()',
-        "{'r': ['Thursday']}",
-    ),
-    "month_name": (
-        "monthname",
-        'Full month name, e.g. ``"February"`` — the pandas ``dt.month_name``.',
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.month_name()',
-        "{'r': ['February']}",
-    ),
-    "daysinmonth": (
-        "days_in_month",
-        "Days in this date's month — the pandas ``dt.daysinmonth`` spelling.",
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.daysinmonth()',
-        "{'r': [29]}",
-    ),
-    "weekofyear": (
-        "week",
-        "ISO week number, 1-53 — the pandas ``dt.weekofyear`` spelling of ``week``.",
-        '{"d": [dt.datetime(2024, 2, 15)]}',
-        'bt.col("d").dt.weekofyear()',
-        "{'r': [7]}",
-    ),
-    "floor": (
-        "truncate",
-        "Round down to the start of `unit` — the pandas ``dt.floor`` spelling of ``truncate``.",
-        '{"d": [dt.datetime(2024, 2, 15, 13, 45)]}',
-        'bt.col("d").dt.floor("hour")',
-        "{'r': [datetime.datetime(2024, 2, 15, 13, 0)]}",
-    ),
-    "is_business_day": (
-        "is_weekday",
-        "True Monday through Friday — the Polars ``is_business_day`` spelling.",
-        '{"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]}',
-        'bt.col("d").dt.is_business_day()',
-        "{'r': [False, True]}",
-        "Holidays are not modelled: this is the weekday test, which is what the name\n"
-        "means everywhere it appears without a calendar argument.",
     ),
 }
 

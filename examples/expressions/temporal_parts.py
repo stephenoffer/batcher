@@ -37,8 +37,8 @@ def main() -> None:
         # Day-of-week and day-of-year, plus their readable names.
         dow=col("ts").dt.dayofweek(),
         doy=col("ts").dt.dayofyear(),
-        day_name=col("ts").dt.day_name(),
-        month_name=col("ts").dt.month_name(),
+        day_name=col("ts").dt.dayname(),
+        month_name=col("ts").dt.monthname(),
         # ISO calendar.
         iso_year=col("ts").dt.iso_year(),
         week=col("ts").dt.week(),

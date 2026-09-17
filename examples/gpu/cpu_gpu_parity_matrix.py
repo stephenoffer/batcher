@@ -28,27 +28,27 @@ def main() -> None:
     orders = tpch("orders")
 
     shapes = {
-        "projection": lineitem.select("l_orderkey", "l_quantity").head(1_000),
-        "filter": lineitem.filter(col("l_quantity") > 45).select("l_orderkey").head(1_000),
-        "arithmetic": lineitem.select(net=col("l_extendedprice") * (1 - col("l_discount"))).head(
+        "projection": lineitem.select("l_orderkey", "l_quantity").limit(1_000),
+        "filter": lineitem.filter(col("l_quantity") > 45).select("l_orderkey").limit(1_000),
+        "arithmetic": lineitem.select(net=col("l_extendedprice") * (1 - col("l_discount"))).limit(
             1_000
         ),
-        "integer abs": lineitem.select(m=(col("l_linenumber") - 3).abs()).head(1_000),
-        "date part": lineitem.select(y=col("l_shipdate").dt.year()).head(1_000),
-        "date passthrough": lineitem.select("l_shipdate").head(1_000),
+        "integer abs": lineitem.select(m=(col("l_linenumber") - 3).abs()).limit(1_000),
+        "date part": lineitem.select(y=col("l_shipdate").dt.year()).limit(1_000),
+        "date passthrough": lineitem.select("l_shipdate").limit(1_000),
         "grouped sum": lineitem.group_by("l_shipmode")
         .agg(t=col("l_extendedprice").sum())
         .sort("l_shipmode"),
         "grouped count": lineitem.group_by("l_returnflag").agg(n=bt.count()).sort("l_returnflag"),
         "join": lineitem.join(orders, left_on="l_orderkey", right_on="o_orderkey")
         .select("l_orderkey", "o_orderstatus")
-        .head(1_000),
+        .limit(1_000),
         "sort + limit": lineitem.sort("l_extendedprice", descending=True)
         .select("l_extendedprice")
-        .head(20),
+        .limit(20),
         "string filter": lineitem.filter(col("l_comment").str.contains("final"))
         .select("l_orderkey")
-        .head(1_000),
+        .limit(1_000),
         "distinct": lineitem.select("l_shipmode").distinct().sort("l_shipmode"),
     }
 

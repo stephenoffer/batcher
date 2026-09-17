@@ -26,13 +26,13 @@ def main() -> None:
         "o_orderdate",
         "o_totalprice",
         weekday=col("o_orderdate").dt.weekday(),
-        day_name=col("o_orderdate").dt.day_name(),
+        day_name=col("o_orderdate").dt.dayname(),
         is_weekend=col("o_orderdate").dt.is_weekend(),
-        is_weekday=col("o_orderdate").dt.is_weekday(),
+        is_weekday=col("o_orderdate").dt.is_business_day(),
         is_business=col("o_orderdate").dt.is_business_day(),
     )
 
-    sample = classified.head(3).to_pydict()
+    sample = classified.limit(3).to_pydict()
     print(sample)
 
     # Weekend and weekday partition the calendar.

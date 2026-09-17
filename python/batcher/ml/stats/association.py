@@ -123,8 +123,8 @@ def cramers_v(ds: Dataset, x: str, y: str) -> float:
     statistic = chi_square(ds, x, y)
     sizes = ds.agg(
         n=col(x).count(),
-        rows=col(x).n_unique(),
-        columns=col(y).n_unique(),
+        rows=col(x).count_distinct(),
+        columns=col(y).count_distinct(),
     ).collect()
     total = sizes.column("n")[0].as_py()
     smaller = min(sizes.column("rows")[0].as_py(), sizes.column("columns")[0].as_py())
@@ -209,7 +209,7 @@ def anova_f(ds: Dataset, value: str, group: str) -> float:
         ss_between=sum_(between * between),
         ss_within=sum_(within * within),
         n=col(value).count(),
-        k=col(group).n_unique(),
+        k=col(group).count_distinct(),
     ).collect()
     ss_between = summary.column("ss_between")[0].as_py()
     ss_within = summary.column("ss_within")[0].as_py()
@@ -286,7 +286,7 @@ def eta_squared(ds: Dataset, value: str, group: str) -> float:
     f = anova_f(ds, value, group)
     if math.isnan(f):
         return float("nan")
-    row = ds.agg(n=col(value).count(), k=col(group).n_unique()).collect()
+    row = ds.agg(n=col(value).count(), k=col(group).count_distinct()).collect()
     n = row.column("n")[0].as_py()
     k = row.column("k")[0].as_py()
     df1, df2 = k - 1, n - k
@@ -322,7 +322,7 @@ def epsilon_squared(ds: Dataset, value: str, group: str) -> float:
     f = anova_f(ds, value, group)
     if math.isnan(f):
         return float("nan")
-    row = ds.agg(n=col(value).count(), k=col(group).n_unique()).collect()
+    row = ds.agg(n=col(value).count(), k=col(group).count_distinct()).collect()
     n = row.column("n")[0].as_py()
     k = row.column("k")[0].as_py()
     df1, df2 = k - 1, n - k
@@ -357,7 +357,7 @@ def omega_squared(ds: Dataset, value: str, group: str) -> float:
     f = anova_f(ds, value, group)
     if math.isnan(f):
         return float("nan")
-    row = ds.agg(n=col(value).count(), k=col(group).n_unique()).collect()
+    row = ds.agg(n=col(value).count(), k=col(group).count_distinct()).collect()
     n = row.column("n")[0].as_py()
     k = row.column("k")[0].as_py()
     df1, df2 = k - 1, n - k
@@ -392,7 +392,7 @@ def cohens_f(ds: Dataset, value: str, group: str) -> float:
     f = anova_f(ds, value, group)
     if math.isnan(f):
         return float("nan")
-    row = ds.agg(n=col(value).count(), k=col(group).n_unique()).collect()
+    row = ds.agg(n=col(value).count(), k=col(group).count_distinct()).collect()
     n = row.column("n")[0].as_py()
     k = row.column("k")[0].as_py()
     df1, df2 = k - 1, n - k

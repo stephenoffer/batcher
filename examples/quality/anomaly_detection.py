@@ -48,9 +48,9 @@ def main() -> None:
     assert sigma_flagged.count() != extreme.count()
 
     # The two agree on the most extreme rows even where they disagree on the boundary.
-    top_by_z = set(scored.sort("z", descending=True).head(10).to_pydict()["o_orderkey"])
+    top_by_z = set(scored.sort("z", descending=True).limit(10).to_pydict()["o_orderkey"])
     top_by_value = set(
-        orders.sort("o_totalprice", descending=True).head(10).to_pydict()["o_orderkey"]
+        orders.sort("o_totalprice", descending=True).limit(10).to_pydict()["o_orderkey"]
     )
     assert top_by_z == top_by_value
 

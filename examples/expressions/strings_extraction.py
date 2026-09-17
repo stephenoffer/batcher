@@ -35,7 +35,7 @@ def main() -> None:
         first_sentence=col("body").str.first_sentence(),
         first_word=col("body").str.first_word(),
         last_word=col("body").str.last_word(),
-        preview=col("body").str.truncate_chars(20),
+        preview=col("body").str.left(20),
         headline=col("body").str.truncate_words(3),
     )
 

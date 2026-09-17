@@ -92,7 +92,7 @@ def test_cumprod_alias_is_the_same_expression(duck):
     table = _tbl([("a", 1, 2.0), ("a", 2, 3.0)])
     ds = bt.from_arrow(table)
     assert (
-        ds.with_columns(cp=bt.col("v").cumprod()).explain()
+        ds.with_columns(cp=bt.col("v").cum_prod()).explain()
         == ds.with_columns(cp=bt.col("v").cum_prod()).explain()
     )
 

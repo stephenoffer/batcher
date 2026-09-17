@@ -19,7 +19,7 @@ from batcher import col, ml
 
 
 def main() -> None:
-    parts = tpch("part").select("p_partkey", "p_name").head(5_000)
+    parts = tpch("part").select("p_partkey", "p_name").limit(5_000)
 
     # Statistical text features: length, word counts, character classes.
     featurizer = ml.TextStatFeaturizer("p_name").fit(parts)

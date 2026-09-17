@@ -3,7 +3,7 @@
 
 
 [LazyFrame]
-approx_n_unique = { status = "mismatch", batcher = "Dataset.approx_n_unique", note = "Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count_nulls=True", wave = "W0" }
+approx_n_unique = { status = "mismatch", batcher = "Dataset.approx_count_distinct", note = "Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count_nulls=True", wave = "W0" }
 bottom_k = { status = "canonical", batcher = "Dataset.bottom_k" }
 cache = { status = "canonical", batcher = "Dataset.cache" }
 cast = { status = "canonical", batcher = "Dataset.cast" }
@@ -38,7 +38,7 @@ join = { status = "mismatch", batcher = "Dataset.join", note = "on how='full' Po
 join_asof = { status = "param", batcher = "Dataset.join_asof", need = "strategy= ('backward'/'forward'/'nearest'), coalesce=, check_sortedness=", wave = "W2" }
 join_where = { status = "gap", need = "Dataset.join_where (inequality join over the existing range-join runtime)", wave = "W5" }
 last = { status = "mismatch", batcher = "Dataset.last", note = "Polars LazyFrame.last() is a one-row LazyFrame; Batcher's last() executes and returns a tuple", wave = "W0" }
-lazy = { status = "canonical", batcher = "Dataset.lazy" }
+lazy = { status = "canonical", batcher = "Dataset" }
 limit = { status = "canonical", batcher = "Dataset.limit" }
 map_batches = { status = "mismatch", batcher = "Dataset.map_batches", note = "Polars passes the whole DataFrame to fn once; Batcher calls fn per Arrow batch", wave = "W0" }
 match_to_schema = { status = "gap", need = "Dataset.match_to_schema", wave = "W8" }
@@ -94,7 +94,7 @@ with_row_count = { status = "alias", batcher = "Dataset.with_row_index" }
 with_row_index = { status = "canonical", batcher = "Dataset.with_row_index" }
 
 [DataFrame]
-approx_n_unique = { status = "mismatch", batcher = "Dataset.approx_n_unique", note = "Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count_nulls=True", wave = "W0" }
+approx_n_unique = { status = "mismatch", batcher = "Dataset.approx_count_distinct", note = "Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count_nulls=True", wave = "W0" }
 bottom_k = { status = "canonical", batcher = "Dataset.bottom_k" }
 cast = { status = "canonical", batcher = "Dataset.cast" }
 clear = { status = "param", batcher = "Dataset.limit", need = "clear(n) returning n all-null rows with the same schema (limit(0) covers n=0)", wave = "W8" }
@@ -142,7 +142,7 @@ iter_slices = { status = "mismatch", batcher = "Dataset.iter_slices", note = "yi
 join = { status = "mismatch", batcher = "Dataset.join", note = "on how='full' Polars keeps both key columns (key, key_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=", wave = "W0" }
 join_asof = { status = "param", batcher = "Dataset.join_asof", need = "strategy= ('backward'/'forward'/'nearest'), coalesce=, check_sortedness=", wave = "W2" }
 join_where = { status = "gap", need = "Dataset.join_where (inequality join over the existing range-join runtime)", wave = "W5" }
-lazy = { status = "canonical", batcher = "Dataset.lazy" }
+lazy = { status = "canonical", batcher = "Dataset" }
 limit = { status = "canonical", batcher = "Dataset.limit" }
 map_columns = { status = "gap", need = "DataFrame.map_columns", wave = "W8" }
 map_rows = { status = "gap", need = "DataFrame.map_rows (per-row Python function), only as a batch-vectorized wrapper", wave = "W11" }
@@ -157,7 +157,7 @@ merge_sorted = { status = "gap", need = "Dataset.merge_sorted", wave = "W8" }
 min = { status = "param", batcher = "Dataset.min", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar)", wave = "W2" }
 min_horizontal = { status = "param", batcher = "bt.least", need = "frame-level form over every column", wave = "W8" }
 n_chunks = { status = "out_of_scope", reason = "memory layout is engine-owned (morsels), not user-visible" }
-n_unique = { status = "mismatch", batcher = "Dataset.n_unique", note = "Polars df.n_unique(subset) counts unique rows; Batcher's n_unique(column) counts distinct non-null values of one column", wave = "W0" }
+n_unique = { status = "mismatch", batcher = "Dataset.count_distinct", note = "Polars df.n_unique(subset) counts unique rows; Batcher's n_unique(column) counts distinct non-null values of one column", wave = "W0" }
 null_count = { status = "canonical", batcher = "Dataset.null_count" }
 partition_by = { status = "gap", need = "Dataset.partition_by (split into a dict/list of frames)", wave = "W8" }
 pipe = { status = "canonical", batcher = "Dataset.pipe" }

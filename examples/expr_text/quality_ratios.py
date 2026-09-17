@@ -19,7 +19,7 @@ from batcher import col
 
 
 def main() -> None:
-    comments = tpch("orders").select("o_orderkey", "o_comment").head(2_000)
+    comments = tpch("orders").select("o_orderkey", "o_comment").limit(2_000)
 
     scored = comments.select(
         "o_orderkey",
@@ -31,7 +31,7 @@ def main() -> None:
         non_ascii=col("o_comment").str.non_ascii_ratio(),
     )
 
-    result = scored.head(3).to_pydict()
+    result = scored.limit(3).to_pydict()
     print({name: [round(value, 3) for value in column] for name, column in result.items()})
 
     # Every ratio is a proportion.

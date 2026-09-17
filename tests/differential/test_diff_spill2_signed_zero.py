@@ -1,12 +1,12 @@
 """Differential tests: spilled value-list aggregates on signed-zero float keys/values.
 
-The bounded out-of-core aggregate paths (`median`/`quantile`/`n_unique`/`mode`/`histogram`)
+The bounded out-of-core aggregate paths (`median`/`quantile`/`count_distinct`/`mode`/`histogram`)
 flatten `(group_keys.., value)` and sort them out of core, then detect group/value
 boundaries by the arrow row encoding. That encoding maps `-0.0` and `0.0` to *different*
 bytes — but SQL `GROUP BY` (and the in-memory `assign_groups`) fold them to one key. So a
 GROUP BY on a float key holding both `-0.0` and `0.0` used to return **two groups where
 DuckDB and the in-memory path return one** — a silent wrong answer that only appears once
-the aggregate spills. Likewise `n_unique` over a float value column over-counted the two
+the aggregate spills. Likewise `count_distinct` over a float value column over-counted the two
 zeros as two distinct values under spill (its in-memory path dedups through `assign_groups`,
 which canonicalizes). These pin both against DuckDB *and* against the non-spilling result.
 """
@@ -44,17 +44,17 @@ def test_spilling_median_signed_zero_key_matches_duckdb(duck, signed_zero_table)
     assert_tables_equal(out, plan.collect(), ordered=False)
 
 
-def test_spilling_n_unique_signed_zero_key_matches_duckdb(duck, signed_zero_table):
-    """`n_unique(v) GROUP BY <float key with -0.0 and 0.0>` — one group."""
+def test_spilling_count_distinct_signed_zero_key_matches_duckdb(duck, signed_zero_table):
+    """`count_distinct(v) GROUP BY <float key with -0.0 and 0.0>` — one group."""
     duck.register("t", signed_zero_table)
-    plan = bt.from_arrow(signed_zero_table).group_by("k").agg(n=bt.col("v").n_unique())
+    plan = bt.from_arrow(signed_zero_table).group_by("k").agg(n=bt.col("v").count_distinct())
     out = plan.collect(spill=True)
     assert_same(out, duck.sql("SELECT k, COUNT(DISTINCT v) AS n FROM t GROUP BY k"))
     assert_tables_equal(out, plan.collect(), ordered=False)
 
 
-def test_spilling_n_unique_signed_zero_value_matches_duckdb(duck):
-    """`n_unique(<float value with -0.0 and 0.0>)` folds the two zeros to one distinct."""
+def test_spilling_count_distinct_signed_zero_value_matches_duckdb(duck):
+    """`count_distinct(<float value with -0.0 and 0.0>)` folds the two zeros to one distinct."""
     table = pa.table(
         {
             "g": pa.array([1, 1, 1, 1, 2, 2], pa.int64()),
@@ -62,7 +62,7 @@ def test_spilling_n_unique_signed_zero_value_matches_duckdb(duck):
         }
     )
     duck.register("t", table)
-    plan = bt.from_arrow(table).group_by("g").agg(n=bt.col("f").n_unique())
+    plan = bt.from_arrow(table).group_by("g").agg(n=bt.col("f").count_distinct())
     out = plan.collect(spill=True)
     assert_same(out, duck.sql("SELECT g, COUNT(DISTINCT f) AS n FROM t GROUP BY g"))
     assert_tables_equal(out, plan.collect(), ordered=False)

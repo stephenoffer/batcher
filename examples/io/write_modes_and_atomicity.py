@@ -26,10 +26,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         table = str(Path(directory) / "orders_delta")
 
-        orders.head(1_000).write.delta(table)
+        orders.limit(1_000).write.delta(table)
         first = bt.read.delta(table).count()
 
-        orders.head(5_000).write.delta(table, mode="overwrite")
+        orders.limit(5_000).write.delta(table, mode="overwrite")
         second = bt.read.delta(table).count()
 
         print(f"{first} then {second} rows")
@@ -49,13 +49,13 @@ def main() -> None:
         # The file sink's manifest reports what it wrote, which is the same check for a
         # non-transactional target.
         parquet = str(Path(directory) / "orders.parquet")
-        manifest = orders.head(2_000).write.parquet(parquet)
+        manifest = orders.limit(2_000).write.parquet(parquet)
         print("manifest:", type(manifest).__name__)
         back = bt.read.parquet(parquet)
         assert back.count() == 2_000
 
         # And the totals reconcile, which catches a truncated write a row count would not.
-        expected = orders.head(2_000).agg(t=col("o_totalprice").sum()).to_pydict()["t"][0]
+        expected = orders.limit(2_000).agg(t=col("o_totalprice").sum()).to_pydict()["t"][0]
         actual = back.agg(t=col("o_totalprice").sum()).to_pydict()["t"][0]
         assert abs(expected - actual) < 1e-3
 

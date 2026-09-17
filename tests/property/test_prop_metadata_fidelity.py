@@ -1,6 +1,6 @@
 """Property: a metadata-answered terminal equals the executed answer and DuckDB.
 
-Batcher answers ``count`` / ``is_empty`` / ``min`` / ``max`` / ``n_unique`` / ``n_null``
+Batcher answers ``count`` / ``is_empty`` / ``min`` / ``max`` / ``count_distinct`` / ``n_null``
 from metadata (footer bounds, exact row counts, per-column null counts) *without
 scanning* when the answer is provably exact — the ~100 metadata shortcuts. Two things
 must hold, and Hypothesis checks both over random typed data (ints, floats, strings,
@@ -141,7 +141,7 @@ _PROP = settings(
 def test_metadata_terminal_equals_execution_and_duckdb(
     table: pa.Table, orderable: str, thr: int
 ) -> None:
-    """count/is_empty/min/max/n_unique/n_null: metadata == executed == DuckDB, + firewall."""
+    """count/is_empty/min/max/count_distinct/n_null: metadata == executed == DuckDB, + firewall."""
     con = duckdb.connect()
     with tempfile.TemporaryDirectory() as d:
         path = f"{d}/t.parquet"
@@ -164,7 +164,7 @@ def _run_checks(con, ds, plan, sources, table, orderable, thr) -> None:
 
     # Scalar aggregates over a *genuinely empty* relation raise a declared
     # "aggregation over empty input is not yet supported" engine limitation (an explicit
-    # error, not a wrong answer), so the min/max/n_unique/n_null fidelity checks — which
+    # error, not a wrong answer), so the min/max/count_distinct/n_null fidelity checks — which
     # must execute — are exercised on non-empty draws (empty is still covered by
     # count/is_empty above and the firewall below). Single-row and all-null non-empty
     # draws (where min/max legitimately return NULL) are included.
@@ -195,14 +195,14 @@ def _run_checks(con, ds, plan, sources, table, orderable, thr) -> None:
             label="max",
         )
 
-        # --- n_unique / n_null (over every tested column, incl. str/bool) ---
+        # --- count_distinct / n_null (over every tested column, incl. str/bool) ---
         for c in ("k", "v", "f", "s", "d", "bo"):
             nu_oracle = int(_duck_scalar(con, f"SELECT count(DISTINCT {c}) FROM t"))
             nu_meta = metadata_n_unique(plan, sources, c)
-            assert ds.n_unique(c) == nu_oracle, f"n_unique({c}) terminal != DuckDB"
-            assert int(_executed_agg(ds, col(c).n_unique()) or 0) == nu_oracle
+            assert ds.count_distinct(c) == nu_oracle, f"count_distinct({c}) terminal != DuckDB"
+            assert int(_executed_agg(ds, col(c).count_distinct()) or 0) == nu_oracle
             if nu_meta is not None:
-                assert nu_meta == nu_oracle, f"n_unique({c}) metadata != DuckDB"
+                assert nu_meta == nu_oracle, f"count_distinct({c}) metadata != DuckDB"
 
             nn_oracle = int(_duck_scalar(con, f"SELECT count(*) - count({c}) FROM t"))
             nn_meta = metadata_null_count(plan, sources, c)

@@ -58,7 +58,7 @@ _FIELDS = [
     ("quarter", "quarter(ts)"),
     ("week", "week(ts)"),
     ("dayofyear", "dayofyear(ts)"),
-    ("isodow", "isodow(ts)"),
+    ("weekday", "isodow(ts)"),
     ("century", "century(ts)"),
     ("decade", "decade(ts)"),
     ("millennium", "millennium(ts)"),

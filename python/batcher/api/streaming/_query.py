@@ -257,11 +257,6 @@ class StreamingQuery:
         return self._run_id
 
     @property
-    def runId(self) -> str:
-        """Spark spelling of `run_id` — a fresh identifier for this run."""
-        return self._run_id
-
-    @property
     def is_active(self) -> bool:
         """Whether the micro-batch loop is still running."""
         return self._engine.is_active
@@ -391,36 +386,3 @@ class StreamingQuery:
     # --- Spark Structured Streaming spellings ------------------------------
     # `ds.write(...)` returns this handle; a job ported from Spark reaches for the
     # camelCase names. They are thin aliases of the snake_case methods above.
-    def awaitTermination(self, timeout: float | None = None) -> bool:
-        """Spark spelling of `await_termination` — block until the query stops.
-
-        Args:
-            timeout: Maximum seconds to wait; ``None`` waits indefinitely.
-
-        Returns:
-            Whether the query has stopped.
-        """
-        return self.await_termination(timeout)
-
-    def processAllAvailable(self) -> bool:
-        """Spark spelling of `process_all_available` — block until the backlog is done.
-
-        Returns:
-            Whether the query has stopped once all available data was processed.
-        """
-        return self.process_all_available()
-
-    @property
-    def isActive(self) -> bool:
-        """Spark spelling of `is_active` — whether the query is still running."""
-        return self.is_active
-
-    @property
-    def lastProgress(self) -> StreamingQueryProgress | None:
-        """Spark spelling of `last_progress` — the most recent micro-batch's metrics."""
-        return self.last_progress
-
-    @property
-    def recentProgress(self) -> list[StreamingQueryProgress]:
-        """Spark spelling of `recent_progress` — metrics for the most recent batches."""
-        return self.recent_progress

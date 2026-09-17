@@ -49,8 +49,8 @@ def main() -> None:
     normed = vectors.with_columns(
         unit=col("v").list.normalize(),
         soft=col("v").list.softmax(),
-        pooled_mean=col("v").list.mean_pool(),
-        pooled_max=col("v").list.max_pool(),
+        pooled_mean=col("v").list.mean(),
+        pooled_max=col("v").list.max(),
     ).to_pydict()
     print(normed)
 

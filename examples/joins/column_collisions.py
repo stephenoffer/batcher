@@ -40,7 +40,7 @@ def main() -> None:
         col("n_name").alias("partner_name"),
     )
     tidy = nation.join(tidy_right, left_on="n_regionkey", right_on="partner_key", how="left")
-    print(tidy.head(3).to_pydict())
+    print(tidy.limit(3).to_pydict())
     assert not any(name.endswith("_right") for name in tidy.columns)
     assert set(tidy.columns) == {
         "n_nationkey",

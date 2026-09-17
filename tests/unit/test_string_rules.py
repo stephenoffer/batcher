@@ -314,7 +314,9 @@ def test_trim_stack_collapses_in_one_pass():
 
 
 def test_lstrip_of_lstrip_collapses():
-    out = st.collapse_idempotent_str_func(_proj(col("s").str.lstrip("ab").str.lstrip("ab")), None)
+    out = st.collapse_idempotent_str_func(
+        _proj(col("s").str.strip_chars_start("ab").str.strip_chars_start("ab")), None
+    )
     assert _expr_ir(out) == StrFunc("l_trim", Col("s"), pattern="ab").to_ir()
 
 
@@ -346,29 +348,36 @@ def test_idempotent_collapse_is_idempotent():
 
 
 def test_trim_absorbs_lstrip():
-    out = st.trim_absorbs_inner_side_trim(_proj(col("s").str.lstrip().str.trim()), None)
+    out = st.trim_absorbs_inner_side_trim(_proj(col("s").str.strip_chars_start().str.trim()), None)
     assert _expr_ir(out) == StrFunc("trim", Col("s")).to_ir()
 
 
 def test_trim_absorbs_rstrip_with_chars():
-    out = st.trim_absorbs_inner_side_trim(_proj(col("s").str.rstrip("ab").str.trim("ab")), None)
+    out = st.trim_absorbs_inner_side_trim(
+        _proj(col("s").str.strip_chars_end("ab").str.trim("ab")), None
+    )
     assert _expr_ir(out) == StrFunc("trim", Col("s"), pattern="ab").to_ir()
 
 
 def test_trim_does_not_absorb_a_different_char_set():
     assert (
-        st.trim_absorbs_inner_side_trim(_proj(col("s").str.lstrip("ab").str.trim("cd")), None)
+        st.trim_absorbs_inner_side_trim(
+            _proj(col("s").str.strip_chars_start("ab").str.trim("cd")), None
+        )
         is None
     )
 
 
 def test_lstrip_does_not_absorb_trim():
     # The other direction is NOT sound: ltrim(trim(x)) != ltrim(x) (the tail stays trimmed).
-    assert st.trim_absorbs_inner_side_trim(_proj(col("s").str.trim().str.lstrip()), None) is None
+    assert (
+        st.trim_absorbs_inner_side_trim(_proj(col("s").str.trim().str.strip_chars_start()), None)
+        is None
+    )
 
 
 def test_trim_absorb_idempotent():
-    once = st.trim_absorbs_inner_side_trim(_proj(col("s").str.lstrip().str.trim()), None)
+    once = st.trim_absorbs_inner_side_trim(_proj(col("s").str.strip_chars_start().str.trim()), None)
     assert st.trim_absorbs_inner_side_trim(once, None) is None
 
 
@@ -447,7 +456,7 @@ def test_bit_length_of_literal_folds():
 
 
 def test_len_of_column_does_not_fold():
-    assert sf.fold_len_of_literal(_proj(col("s").str.len()), None) is None
+    assert sf.fold_len_of_literal(_proj(col("s").str.len_chars()), None) is None
 
 
 # --- fold_concat_of_literals ------------------------------------------------

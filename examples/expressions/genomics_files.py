@@ -48,7 +48,7 @@ def main() -> None:
 
     # Measuring is a projection, so a whole-genome scan is one pass and no Python.
     measured = contigs.with_columns(
-        length=col("sequence").str.len(),
+        length=col("sequence").str.len_chars(),
         gc=col("sequence").seq.gc_content(),
         longest_run=col("sequence").seq.max_homopolymer(),
     )

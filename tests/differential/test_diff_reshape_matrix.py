@@ -323,7 +323,6 @@ SAMPLE_OPS: dict[str, object] = {
     "sample_fraction_none": lambda d: d.sample(0.0, seed=7),
     "sample_n": lambda d: d.sample(n=2, seed=7),
     "sample_n_over_cardinality": lambda d: d.sample(n=99, seed=7),
-    "sample_frac_pandas_spelling": lambda d: d.sample(frac=0.5, random_state=7),
 }
 
 

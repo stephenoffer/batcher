@@ -144,7 +144,7 @@ def test_map_groups_keeps_an_all_null_string_column_typed(fmt):
             "v": pa.array([1, 2, 3], type=pa.int64()),
         }
     )
-    out = bt.from_arrow(source).groupby("g").map_groups(lambda b: b, batch_format=fmt).collect()
+    out = bt.from_arrow(source).group_by("g").map_groups(lambda b: b, batch_format=fmt).collect()
     assert _types(out) == {"g": "string", "s": "string", "v": "int64"}
     assert out.num_rows == 3
 
@@ -153,7 +153,7 @@ def test_map_groups_keeps_an_all_null_string_column_typed(fmt):
 def test_map_groups_on_populated_columns_is_unchanged(fmt):
     """The control for `map_groups`: a column with values was never at risk, and stays put."""
     source = pa.table({"g": ["k1", "k1", "k2"], "s": ["a", "b", "c"], "v": [1, 2, 3]})
-    out = bt.from_arrow(source).groupby("g").map_groups(lambda b: b, batch_format=fmt).collect()
+    out = bt.from_arrow(source).group_by("g").map_groups(lambda b: b, batch_format=fmt).collect()
     assert _types(out) == {"g": "string", "s": "string", "v": "int64"}
     assert sorted(out.column("s").to_pylist()) == ["a", "b", "c"]
 

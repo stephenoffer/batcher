@@ -43,7 +43,7 @@ def empty(duck):
 def test_repeated_string_expression(t, duck):
     """The shape CSE targets: one expensive expression feeding three outputs."""
     e = col("s").str.regexp_replace("-", "+")
-    got = t.select(a=e, b=e.str.upper(), c=e.str.len()).collect()
+    got = t.select(a=e, b=e.str.upper(), c=e.str.len_chars()).collect()
     assert_same(
         got,
         duck.sql(
@@ -57,7 +57,7 @@ def test_repeated_string_expression(t, duck):
 
 def test_repeated_expression_over_nulls_and_empty_strings(t, duck):
     e = col("s").str.regexp_replace("a", "Z")
-    got = t.select(x=e, y=e.str.len(), z=e.str.upper()).collect()
+    got = t.select(x=e, y=e.str.len_chars(), z=e.str.upper()).collect()
     assert_same(
         got,
         duck.sql(
@@ -73,7 +73,7 @@ def test_nested_repeated_expressions(t, duck):
     """A binding that reads another binding — the let-chain."""
     inner = col("s").str.regexp_replace("-", "+")
     outer = inner.str.regexp_replace("a", "z")
-    got = t.select(a=inner, b=inner.str.upper(), c=outer, d=outer.str.len()).collect()
+    got = t.select(a=inner, b=inner.str.upper(), c=outer, d=outer.str.len_chars()).collect()
     assert_same(
         got,
         duck.sql(
@@ -101,7 +101,7 @@ def test_empty_input_still_produces_the_right_schema(empty, duck):
 def test_repeated_expression_under_a_filter(t, duck):
     """The binding sits above a filter, so it must see only the surviving rows."""
     e = col("s").str.regexp_replace("-", "+")
-    got = t.filter(col("n") > 1).select(a=e, b=e.str.upper(), c=e.str.len()).collect()
+    got = t.filter(col("n") > 1).select(a=e, b=e.str.upper(), c=e.str.len_chars()).collect()
     assert_same(
         got,
         duck.sql(

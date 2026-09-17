@@ -21,7 +21,7 @@ from batcher import ml
 def main() -> None:
     customer = tpch("customer").select("c_custkey", "c_mktsegment", "c_acctbal")
     train, holdout = customer.ml.train_test_split(test_size=0.2, seed=4)
-    categories = train.n_unique("c_mktsegment")
+    categories = train.count_distinct("c_mktsegment")
     print("segments:", categories)
 
     # Ordinal: one column, an invented ordering.
@@ -36,7 +36,7 @@ def main() -> None:
     assert len(indicators) == categories
 
     # Exactly one indicator is set per row.
-    rows = hot.select(*indicators).head(20).to_pydict()
+    rows = hot.select(*indicators).limit(20).to_pydict()
     for index in range(20):
         assert sum(rows[name][index] for name in indicators) == 1
 

@@ -122,7 +122,7 @@ absent from this table is either the same name or covered by the relational tabl
 | `length_bytes(c)` | `col("c").str.len_bytes()` |
 | `eq_null_safe(a, b)` | `a.eq_missing(b)` |
 | `is_inf(c)` / `not_null(c)` | `c.is_infinite()` / `c.is_not_null()` |
-| `columns_sum(...)` / `columns_max(...)` | `bt.sum_horizontal(...)` / `bt.max_horizontal(...)` |
+| `columns_sum(...)` / `columns_max(...)` | `bt.sum_horizontal(...)` / `bt.greatest(...)` |
 | `date_format(c, f)` / `datepart(p, c)` / `date_trunc(u, c)` | `col("c").dt.strftime(f)` / `bt.date_part(p, c)` / `col("c").dt.truncate(u)` |
 | `dot_product(a, b)` / `jaccard_similarity(a, b)` | `a.list.dot(b)` / `a.list.jaccard(b)` |
 | `list_sum(c)` / `list_max(c)` / … | `col("c").list.sum()` / `.list.max()` / … |

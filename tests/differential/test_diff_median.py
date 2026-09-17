@@ -42,7 +42,9 @@ def test_mixed_value_list_and_constant_state_aggregates(duck, t):
     out = (
         bt.from_arrow(t)
         .group_by("k")
-        .agg(m=col("v").median(), s=col("v").sum(), n=col("v").count(), nd=col("v").n_unique())
+        .agg(
+            m=col("v").median(), s=col("v").sum(), n=col("v").count(), nd=col("v").count_distinct()
+        )
         .collect()
     )
     assert_same(

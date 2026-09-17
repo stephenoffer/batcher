@@ -172,7 +172,6 @@ def test_id_is_stable_across_runs_and_run_id_is_not():
     first, second = run("rid1"), run("rid2")
     assert first.id == second.id == "supervised"
     assert first.run_id != second.run_id
-    assert first.runId == first.run_id
 
 
 @pytest.mark.integration
@@ -256,7 +255,7 @@ def test_process_all_available_has_the_snake_case_spelling_too():
     switch spelling for one call."""
     query = bt.read.rate_micro_batch(5, num_rows=10).write.noop(trigger=bt.Trigger.available_now())
     assert query.process_all_available() is True
-    assert query.processAllAvailable() is True
+    assert query.process_all_available() is True
 
 
 # --- what a driver-path query reports -------------------------------------------------
@@ -276,7 +275,7 @@ def test_a_driver_path_query_reports_no_state_metrics_and_counts_its_own_rows():
 
     query = (
         bt.from_batches(feed, schema, bounded=False)
-        .head(2)
+        .limit(2)
         .write.memory("driver_metrics", trigger=bt.Trigger.available_now())
     )
     assert query.await_termination(timeout=60) is True

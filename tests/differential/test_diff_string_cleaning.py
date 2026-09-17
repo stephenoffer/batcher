@@ -8,7 +8,7 @@ in characters, words or sentences. None had a test.
 Two oracles, chosen per method:
 
 * **Polars**, where Batcher's docstring names it as the reference (``to_titlecase`` is
-  documented as the Polars spelling of ``initcap``), so agreement is checkable rather
+  documented as the Polars spelling), so agreement is checkable rather
   than asserted.
 * **Python**, recomputed from the documented rule, for the rest.
 
@@ -253,7 +253,7 @@ def test_squad_normalize_makes_two_spellings_of_one_answer_equal():
 
 #: ``(method, argument, Python reference)`` for the truncation family.
 TRUNCATIONS = [
-    ("truncate_chars", 10, lambda d: d[:10]),
+    ("left", 10, lambda d: d[:10]),
     # The reference keeps the original spacing rather than re-joining on a single space:
     # `truncate_words` returns a prefix of its input, so a newline between two words
     # survives. Re-joining would assert a normalization the method does not perform.
@@ -276,7 +276,7 @@ def test_every_truncation_shortens_without_inventing_characters(ds):
     still has to satisfy it.
     """
     got = ds.select(
-        chars=bt.col("s").str.truncate_chars(10),
+        chars=bt.col("s").str.left(10),
         words=bt.col("s").str.truncate_words(3),
         sentences=bt.col("s").str.truncate_sentences(1),
     ).to_pydict()
@@ -328,7 +328,7 @@ def test_every_cleaner_leaves_a_null_null(ds):
         "urls": bt.col("s").str.mask_urls(),
         "titled": bt.col("s").str.to_titlecase(),
         "squad": bt.col("s").str.squad_normalize(),
-        "chars": bt.col("s").str.truncate_chars(5),
+        "chars": bt.col("s").str.left(5),
         "words": bt.col("s").str.truncate_words(2),
         "sentences": bt.col("s").str.truncate_sentences(1),
     }
@@ -346,7 +346,7 @@ def test_the_cleaners_compose_into_one_projection(ds):
         .str.mask_emails()
         .str.mask_urls()
         .str.remove_repeated_punctuation()
-        .str.truncate_chars(200)
+        .str.left(200)
     ).to_pydict()["v"]
     assert cleaned[NULL_ROW] is None
     assert "```" not in cleaned[1]

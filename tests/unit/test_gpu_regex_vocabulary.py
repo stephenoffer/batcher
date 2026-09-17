@@ -167,7 +167,7 @@ def test_testing_for_a_match(be, pattern):
 
 @pytest.mark.parametrize("pattern", PATTERNS)
 def test_replacing_every_match(be, pattern):
-    ds = bt.from_arrow(TEXT).select(out=col("s").str.regexp_replace_all(pattern, "Z"))
+    ds = bt.from_arrow(TEXT).select(out=col("s").str.replace_all(pattern, "Z"))
     _assert_matches_engine(ds, TEXT, be)
 
 
@@ -182,7 +182,7 @@ def test_replacing_only_the_first_match(be, pattern):
 def test_extracting_a_group_declines(be):
     """pandas' Arrow-backed `extract` accepts only *named* capture groups and cuDF's accepts
     only unnamed ones, so the verification backend cannot run the pattern the device would."""
-    ds = bt.from_arrow(TEXT).select(out=col("s").str.regexp_extract("([0-9]+)"))
+    ds = bt.from_arrow(TEXT).select(out=col("s").str.extract("([0-9]+)", group=0))
     _declines(ds, TEXT, be)
 
 
@@ -259,5 +259,5 @@ def test_a_vertical_tab_is_enough_to_decline(be):
 
 def test_a_replacement_carrying_a_group_reference_declines(be):
     """`$1`, `\\1` and a dedicated call — three engines, three spellings."""
-    ds = bt.from_arrow(TEXT).select(out=col("s").str.regexp_replace_all("([0-9])", r"\1\1"))
+    ds = bt.from_arrow(TEXT).select(out=col("s").str.replace_all("([0-9])", r"\1\1"))
     _declines(ds, TEXT, be)

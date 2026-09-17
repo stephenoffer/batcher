@@ -103,9 +103,9 @@ def test_power_transformer_reduces_skew() -> None:
 
     values = [float(2**i) for i in range(12)]
     ds = bt.from_pydict({"x": values})
-    before = ds.agg(s=col("x").skewness()).collect().column("s")[0].as_py()
+    before = ds.agg(s=col("x").skew()).collect().column("s")[0].as_py()
     after_ds = PowerTransformer("x", standardize=False).fit_transform(ds)
-    after = after_ds.agg(s=col("x").skewness()).collect().column("s")[0].as_py()
+    after = after_ds.agg(s=col("x").skew()).collect().column("s")[0].as_py()
     assert abs(after) < abs(before)
 
 

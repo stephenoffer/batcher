@@ -47,12 +47,10 @@ def main() -> None:
     left, right = in_memory.to_pydict(), spilled.to_pydict()
     assert left["l_orderkey"] == right["l_orderkey"]
     assert left["lines"] == right["lines"]
-    assert all(
-        abs(a - b) < 1e-6 for a, b in zip(left["revenue"], right["revenue"], strict=True)
-    )
+    assert all(abs(a - b) < 1e-6 for a, b in zip(left["revenue"], right["revenue"], strict=True))
 
     # A sort spills too, and its order must survive.
-    top = lineitem.sort("l_extendedprice", descending=True).head(20)
+    top = lineitem.sort("l_extendedprice", descending=True).limit(20)
     assert (
         top.collect(spill=True).to_pydict()["l_extendedprice"]
         == top.collect().to_pydict()["l_extendedprice"]

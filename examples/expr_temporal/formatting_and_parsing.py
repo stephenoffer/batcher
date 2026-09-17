@@ -20,16 +20,16 @@ from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderdate").head(500)
+    orders = tpch("orders").select("o_orderdate").limit(500)
 
     formatted = orders.select(
         "o_orderdate",
         iso=col("o_orderdate").dt.strftime("%Y-%m-%d"),
         pretty=col("o_orderdate").dt.strftime("%d %B %Y"),
         compact=col("o_orderdate").dt.strftime("%Y%m"),
-        as_text=col("o_orderdate").dt.to_string(),
+        as_text=col("o_orderdate").dt.strftime(format="%Y-%m-%dT%H:%M:%S"),
     )
-    sample = formatted.head(3).to_pydict()
+    sample = formatted.limit(3).to_pydict()
     print(sample)
 
     assert all(len(value) == 10 for value in sample["iso"])
@@ -52,7 +52,7 @@ def main() -> None:
 
     # The compact form groups by month with no date type involved, which is how this ends
     # up in a warehouse partition key.
-    months = formatted.n_unique("compact")
+    months = formatted.count_distinct("compact")
     print("distinct months:", months)
     assert 0 < months <= 12 * 8
 

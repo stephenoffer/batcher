@@ -373,10 +373,10 @@ def test_string_literal_folds_match_the_engine(t, duck):
         j=lit("abc").str.sha256(),
         k=lit("abc").str.crc32(),
         m=lit("abc").str.hex(),
-        n=lit("hello world").str.initcap(),
-        o=lit("  ab  ").str.strip(),
-        p=lit("  ab  ").str.lstrip(),
-        q=lit("  ab  ").str.rstrip(),
+        n=lit("hello world").str.to_titlecase(),
+        o=lit("  ab  ").str.trim(),
+        p=lit("  ab  ").str.strip_chars_start(),
+        q=lit("  ab  ").str.strip_chars_end(),
     )
     got = folded.collect()
     assert got.column("a").to_pylist()[0] == 3
@@ -404,7 +404,7 @@ def test_non_ascii_string_folds_are_declined(duck):
     """
     tbl = pa.table({"z": [1]})
     got = bt.from_arrow(tbl).select(
-        a=lit("été straße").str.initcap(),
+        a=lit("été straße").str.to_titlecase(),
         b=lit("été").str.reverse(),
     )
     engine = got.collect()
@@ -417,7 +417,7 @@ def test_non_ascii_string_folds_are_declined(duck):
 
 
 def test_regexp_replace_all_plain_becomes_replace(t, duck):
-    got = bt.from_arrow(t).select(r=col("s").str.regexp_replace_all("b", "X"))
+    got = bt.from_arrow(t).select(r=col("s").str.replace_all("b", "X"))
     assert_same(got.collect(), duck.sql("select regexp_replace(s, 'b', 'X', 'g') as r from t"))
 
 

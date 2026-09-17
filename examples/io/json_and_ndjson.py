@@ -20,7 +20,7 @@ from _common import tpch
 
 
 def main() -> None:
-    customer = tpch("customer").select("c_custkey", "c_name", "c_acctbal").head(500)
+    customer = tpch("customer").select("c_custkey", "c_name", "c_acctbal").limit(500)
 
     with tempfile.TemporaryDirectory() as directory:
         target = str(Path(directory) / "customers.json")

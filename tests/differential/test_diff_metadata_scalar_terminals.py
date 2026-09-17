@@ -1,6 +1,6 @@
 """Scalar metadata terminals equal DuckDB — over a real Parquet footer and in memory.
 
-`min` / `max` / `n_unique` / `n_null` / `has_nulls` / `all_null` are answered from
+`min` / `max` / `count_distinct` / `n_null` / `has_nulls` / `all_null` are answered from
 metadata when provably exact and otherwise executed; either way the returned scalar
 MUST equal DuckDB's executed answer. Each case runs twice — once over a Parquet file
 (real footer stats drive the shortcut) and once over an in-memory source (the shortcut
@@ -133,11 +133,11 @@ def test_all_null_matches_duckdb(pq_path, duck, col):
 
 @pytest.mark.differential
 @pytest.mark.parametrize("col", _ALL_COLS)
-def test_n_unique_matches_duckdb(pq_path, duck, col):
+def test_count_distinct_matches_duckdb(pq_path, duck, col):
     _duck(duck)
     expected = duck.execute(f"select count(distinct {col}) from t").fetchone()[0]
     for ds in _sources(pq_path).values():
-        assert ds.n_unique(col) == expected
+        assert ds.count_distinct(col) == expected
 
 
 @pytest.mark.differential
@@ -150,7 +150,7 @@ def test_scalar_terminals_on_empty_match_duckdb(pq_path, duck):
     assert empty.n_null("i") == 0
     assert empty.has_nulls("i") is False
     assert empty.all_null("i") is False
-    assert empty.n_unique("i") == 0
+    assert empty.count_distinct("i") == 0
     assert empty.has_rows is False
 
 
@@ -159,7 +159,7 @@ def test_scalar_terminals_on_single_row(pq_path):
     one = bt.from_arrow(_TABLE).limit(1)  # {i: 3, ...}
     assert one.min("i") == 3
     assert one.max("i") == 3
-    assert one.n_unique("i") == 1
+    assert one.count_distinct("i") == 1
     assert one.n_null("i") == 0
     assert one.has_nulls("i") is False
     assert one.has_rows is True
@@ -183,7 +183,7 @@ def test_approx_terminals_answer(pq_path):
         assert isinstance(ds.approx_median("f"), float)
         assert isinstance(ds.approx_percentile("f", 90), float)
         assert isinstance(ds.approx_quantile("f", 0.5), float)
-        au = ds.approx_n_unique("i")
+        au = ds.approx_count_distinct("i")
         assert au is not None and au >= 1
     # The streaming path (projected column through the TDigest) stays within [min, max].
     from batcher.api.orchestration import approx_quantile as _stream_q
@@ -201,7 +201,7 @@ def test_constant_column_n_unique_from_metadata(pq_path):
 
     ds = bt.read.parquet(pq_path).select(c=lit(9))
     assert metadata_n_unique(ds._plan, ds._sources, "c") == 1  # fired
-    assert ds.n_unique("c") == 1
+    assert ds.count_distinct("c") == 1
 
 
 @pytest.mark.differential
@@ -209,6 +209,6 @@ def test_unknown_column_raises(pq_path):
     from batcher._internal.errors import PlanError
 
     ds = bt.read.parquet(pq_path)
-    for op in (ds.min, ds.max, ds.n_unique, ds.n_null, ds.has_nulls, ds.all_null):
+    for op in (ds.min, ds.max, ds.count_distinct, ds.n_null, ds.has_nulls, ds.all_null):
         with pytest.raises(PlanError):
             op("nope")

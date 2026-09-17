@@ -459,4 +459,4 @@ def nunique_ratio(column: str | Expr) -> Expr:
             >>> ds.agg(v=bt.nunique_ratio("x")).to_pydict()
             {'v': [0.5]}
     """
-    return _as_column(column).n_unique() / count()
+    return _as_column(column).count_distinct() / count()
