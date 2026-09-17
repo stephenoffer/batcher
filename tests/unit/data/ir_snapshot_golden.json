@@ -933,6 +933,35 @@
       "name": "p"
     }
   },
+  "str_mask_by_class": {
+    "e": "str",
+    "fn": "mask_by_class",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "pattern": "Xxn\u0000"
+  },
+  "str_regexp_replace_dollar": {
+    "e": "str",
+    "fn": "regexp_replace_all_dollar",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "pattern": "(a)",
+    "replacement": "$1"
+  },
+  "str_regexp_split_limit": {
+    "e": "str",
+    "fn": "regexp_split",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "length": 2,
+    "pattern": "-"
+  },
   "str_replace": {
     "e": "str",
     "fn": "replace",
@@ -961,6 +990,15 @@
     "length": 3,
     "start": 1
   },
+  "str_xxhash64_seed": {
+    "e": "str",
+    "fn": "xxhash64",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "start": 42
+  },
   "strftime": {
     "e": "strftime",
     "format": "%Y-%m-%d",
@@ -976,6 +1014,15 @@
       "e": "col",
       "name": "s"
     }
+  },
+  "strptime_strict": {
+    "e": "strptime",
+    "format": "%Y-%m-%d",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "strict": true
   },
   "struct_field": {
     "e": "struct_field",

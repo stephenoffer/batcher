@@ -87,6 +87,8 @@ _UTF8_RESULT_FNS = frozenset(
         "regexp_extract", "regexp_replace", "regexp_replace_all", "repeat", "replace", "reverse",
         "right", "rpad", "sha1", "sha256", "soundex", "split_part", "strip_html", "substr",
         "substring_index", "translate", "trim", "unhex", "upper",
+        "initcap_space", "mask_by_class", "regexp_extract_or_null", "regexp_replace_all_dollar",
+        "regexp_replace_dollar", "url_decode_form", "url_encode_form",
     }
 )  # fmt: skip
 

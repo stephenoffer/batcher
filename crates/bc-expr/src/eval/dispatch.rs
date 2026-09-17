@@ -442,9 +442,13 @@ impl Expr {
                 let arr = input.eval(batch)?;
                 eval_convert_timezone(&arr, from_tz, to_tz)
             }
-            Expr::Strptime { input, format } => {
+            Expr::Strptime {
+                input,
+                format,
+                strict,
+            } => {
                 let arr = input.eval(batch)?;
-                eval_strptime(&arr, format)
+                eval_strptime(&arr, format, *strict)
             }
             Expr::DateOffset {
                 input,

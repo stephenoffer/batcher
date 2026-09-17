@@ -172,6 +172,7 @@ _STR_SHAPES: tuple[tuple[str, dict], ...] = (
     ("s", {"pattern": "gzip"}),  # compress / decompress -- a codec
     ("s", {"pattern": "snake"}),  # to_case -- a style
     ("s", {"pattern": _AES_KEY}),  # aes_encrypt / aes_decrypt -- a key
+    ("s", {"pattern": "Xxn\x00"}),  # mask_by_class -- one replacement per character class
     ("s", {"start": 1, "length": 2}),
 )
 

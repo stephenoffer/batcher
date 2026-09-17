@@ -95,6 +95,7 @@ _STR_COST: dict[str, float] = {
     "upper": 14.5,
     "lower": 14.5,
     "initcap": 18.0,
+    "initcap_space": 18.0,
     "trim": 12.0,
     "l_trim": 12.0,
     "r_trim": 12.0,
@@ -116,16 +117,22 @@ _STR_COST: dict[str, float] = {
     # Encodings.
     "hex": 25.0,
     "unhex": 25.0,
+    "unhex_binary": 25.0,
     "base64": 25.0,
     "from_base64": 25.0,
+    "from_base64_binary": 25.0,
     # Regex compiles once; the match is a per-row automaton walk. Cheaper than intuition
     # suggests because RE2 prefilters on required literals.
     "regexp_matches": 48.0,
     "regexp_count": 48.0,
     "regexp_extract": 55.0,
+    "regexp_extract_or_null": 55.0,
     "regexp_extract_all": 70.0,
+    "regexp_extract_all_or_empty": 70.0,
     "regexp_replace": 65.0,
+    "regexp_replace_dollar": 65.0,
     "regexp_replace_all": 75.0,
+    "regexp_replace_all_dollar": 75.0,
     # Edit distance is a real O(len^2) inner loop — far pricier than a regex.
     "levenshtein": 230.0,
     "soundex": 40.0,

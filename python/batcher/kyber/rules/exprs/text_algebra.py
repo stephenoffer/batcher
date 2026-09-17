@@ -79,7 +79,9 @@ def regexp_replace_all_plain_to_replace(
 
 
 def _split(expr: Expr) -> Expr:
-    if isinstance(expr, StrFunc) and expr.fn == "regexp_split":
+    # A `length` is a piece limit, which the literal `split` has no slot for; rewriting a
+    # limited split would drop it and return every piece.
+    if isinstance(expr, StrFunc) and expr.fn == "regexp_split" and expr.length is None:
         body = plain_pattern(expr.pattern)
         if body is not None:
             return StrFunc("split", expr.input, pattern=body)

@@ -66,7 +66,7 @@ def _rebuild_unary(call: Expr, value: Expr) -> Expr:
     if isinstance(call, Strftime):
         return Strftime(value, call.format)
     if isinstance(call, Strptime):
-        return Strptime(value, call.format)
+        return Strptime(value, call.format, strict=call.strict)
     if isinstance(call, ConvertTimezone):
         return ConvertTimezone(value, call.from_tz, call.to_tz)
     if isinstance(call, DateOffset):
@@ -156,7 +156,8 @@ _UNARY_FAMILIES: tuple[tuple[str, Callable[[Expr], bool], type], ...] = (
     ("strftime", lambda e: isinstance(e, Strftime), Strftime),
     ("nan_check", lambda e: isinstance(e, IsNan), IsNan),
     ("inf_check", lambda e: isinstance(e, IsInf), IsInf),
-    ("strptime", lambda e: isinstance(e, Strptime), Strptime),
+    # A strict parse raises on a malformed value, so it is not total and stays put.
+    ("strptime", lambda e: isinstance(e, Strptime) and not e.strict, Strptime),
     ("convert_timezone", lambda e: isinstance(e, ConvertTimezone), ConvertTimezone),
     ("date_offset", lambda e: isinstance(e, DateOffset), DateOffset),
     ("list_reduction", lambda e: isinstance(e, ListFunc), ListFunc),

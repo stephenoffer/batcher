@@ -145,13 +145,31 @@ def _validated_key(func: str, key: str) -> str:
     return key
 
 
-def mask(e: IntoExpr, *, show_first: int = 0, show_last: int = 0, char: str = "X") -> Expr:
+def mask(
+    e: IntoExpr,
+    *,
+    show_first: int = 0,
+    show_last: int = 0,
+    char: str = "X",
+    upper: str | None = None,
+    lower: str | None = None,
+    digit: str | None = None,
+    other: str | None = None,
+) -> Expr:
     """Replace each character of a string with `char`, optionally revealing its ends.
 
     Irreversible and unkeyed — the tool for showing a human just enough of a value to
     recognize it ("the card ending 1234"). The result has the same character length as
     the input, and when `show_first` and `show_last` together cover the whole value
     nothing is masked. Null → null.
+
+    Spark's ``mask`` replaces by character *class* instead: an uppercase letter with one
+    character, a lowercase letter with another, a digit with a third, and anything else
+    with a fourth or not at all. Naming any of `upper`, `lower`, `digit` or `other`
+    selects that form, and a class left as ``None`` keeps its characters. Spark's
+    defaults are ``upper="X", lower="x", digit="n"``. The classes are the Unicode
+    general categories ``Lu``, ``Ll`` and ``Nd``, and a character beyond the Basic
+    Multilingual Plane is "other" twice over, as Spark sees its two UTF-16 halves.
 
     Examples:
         .. doctest::
@@ -164,23 +182,53 @@ def mask(e: IntoExpr, *, show_first: int = 0, show_last: int = 0, char: str = "X
             >>> ds.select(m=bt.mask(bt.col("card"), show_first=2, char="*")).to_pydict()
             {'m': ['41**************']}
 
+            >>> ids = bt.from_pydict({"s": ["AbCD123-@$#"]})
+            >>> ids.select(m=bt.mask(bt.col("s"), upper="X", lower="x", digit="n")).to_pydict()
+            {'m': ['XxXXnnn-@$#']}
+
     Args:
         e: The column or expression to mask; cast to text first.
         show_first: Number of leading characters left in the clear.
         show_last: Number of trailing characters left in the clear.
         char: The single replacement character.
+        upper: The replacement for an uppercase letter, in the by-class form.
+        lower: The replacement for a lowercase letter, in the by-class form.
+        digit: The replacement for a decimal digit, in the by-class form.
+        other: The replacement for any other character, in the by-class form.
 
     Returns:
         A text expression of the same character length as `e`.
 
     Raises:
-        PlanError: If `char` is not exactly one character, or a reveal count is negative.
+        PlanError: If a replacement is not exactly one character, a reveal count is
+            negative, or the by-class form is combined with `char` or a reveal count.
     """
+    classes = {"upper": upper, "lower": lower, "digit": digit, "other": other}
+    if any(v is not None for v in classes.values()):
+        if (show_first, show_last, char) != (0, 0, "X"):
+            raise PlanError(
+                "mask(): upper/lower/digit/other replace by character class; they cannot "
+                "be combined with char, show_first or show_last"
+            )
+        spec = "".join(_mask_class_char(name, v) for name, v in classes.items())
+        return StrFunc("mask_by_class", _as_text(e), pattern=spec)
     if len(char) != 1:
         raise PlanError(f"mask(): char must be exactly one character, got {char!r}")
     if show_first < 0 or show_last < 0:
         raise PlanError("mask(): show_first and show_last must be non-negative")
     return StrFunc("mask", _as_text(e), pattern=char, start=show_first, length=show_last)
+
+
+def _mask_class_char(name: str, value: str | None) -> str:
+    """One position of `mask_by_class`'s four-character pattern: the replacement, or NUL to keep.
+
+    NUL is the engine's "keep this class" marker, so it cannot also be a replacement.
+    """
+    if value is None:
+        return "\0"
+    if not isinstance(value, str) or len(value) != 1 or value == "\0":
+        raise PlanError(f"mask(): {name} must be one character other than NUL, got {value!r}")
+    return value
 
 
 def hmac_sha256(e: IntoExpr, key: str) -> Expr:

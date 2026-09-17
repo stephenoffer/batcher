@@ -169,6 +169,13 @@ def _representatives() -> dict[str, Any]:
         "str_contains": StrFunc("contains", Col("s"), pattern="x"),
         "str_substr": StrFunc("substr", Col("s"), start=1, length=3),
         "str_replace": StrFunc("replace", Col("s"), pattern="a", replacement="b"),
+        # Another engine's semantics rides a tag or an existing slot, never a new field.
+        "str_regexp_replace_dollar": StrFunc(
+            "regexp_replace_all_dollar", Col("s"), pattern="(a)", replacement="$1"
+        ),
+        "str_xxhash64_seed": StrFunc("xxhash64", Col("s"), start=42),
+        "str_regexp_split_limit": StrFunc("regexp_split", Col("s"), pattern="-", length=2),
+        "str_mask_by_class": StrFunc("mask_by_class", Col("s"), pattern="Xxn\x00"),
         # The per-row-parameter form: each parameter is a child, and an absent one is
         # omitted rather than emitted as null.
         "str_dyn_full": StrFuncDyn(
@@ -186,6 +193,7 @@ def _representatives() -> dict[str, Any]:
         "date_offset_partial": DateOffset(Col("d"), 0, 5, 0),  # omit zero months/micros
         "strftime": Strftime(Col("d"), "%Y-%m-%d"),
         "strptime": Strptime(Col("s"), "%Y-%m-%d"),
+        "strptime_strict": Strptime(Col("s"), "%Y-%m-%d", strict=True),
         "window_start_min": WindowStart(Col("d"), 1000),
         "window_start_origin": WindowStart(Col("d"), 1000, 500),
         "window_buckets": WindowBuckets(Col("d"), 1000, 500),

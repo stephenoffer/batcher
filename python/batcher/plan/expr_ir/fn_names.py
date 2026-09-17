@@ -147,6 +147,11 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "from_binary", "hamming", "jaccard_similarity", "parse_dirname", "parse_dirpath",
         "parse_filename", "parse_path", "regexp_escape", "to_binary", "url_decode",
         "url_encode",
+        # Another engine's reading of a function above, selected by a parameter on the one
+        # `.str` spelling rather than by a second name (`eval::str::dialect` in `bc-expr`).
+        "damerau_levenshtein_osa", "from_base64_binary", "initcap_space", "mask_by_class",
+        "regexp_extract_all_or_empty", "regexp_extract_or_null", "regexp_replace_all_dollar",
+        "regexp_replace_dollar", "unhex_binary", "url_decode_form", "url_encode_form",
     }
 )  # fmt: skip
 

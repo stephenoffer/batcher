@@ -11,6 +11,7 @@ use crate::{ExprError, StrFunc};
 mod case;
 mod chunk;
 mod compress;
+mod dialect;
 mod dynamic;
 mod html;
 mod jaro;
@@ -92,7 +93,7 @@ pub(crate) fn eval_str(
     // dropped every non-UTF-8 row. DuckDB's `hex(BLOB)`/`md5(BLOB)`/… operate on the
     // bytes regardless of textual validity; do the same here.
     if matches!(arr.data_type(), DataType::Binary | DataType::LargeBinary) {
-        if let Some(out) = eval_bytes(func, arr, pattern)? {
+        if let Some(out) = eval_bytes(func, arr, pattern, start)? {
             return Ok(out);
         }
     }
@@ -335,6 +336,15 @@ pub(crate) fn eval_str(
             })?;
             Arc::new(regexp_replace_with(s, &re, rep, true))
         }
+        StrFunc::RegexpReplaceDollar | StrFunc::RegexpReplaceAllDollar => {
+            let re = compile_regex(pattern, func)?;
+            let rep = replacement.ok_or_else(|| ExprError::MissingArgument {
+                func: format!("{func:?}"),
+                arg: "replacement",
+            })?;
+            let global = matches!(func, StrFunc::RegexpReplaceAllDollar);
+            Arc::new(dialect::replace_dollar(s, &re, rep, global))
+        }
         StrFunc::SplitPart => {
             let delim = require_pattern(pattern, func)?;
             let n = start.unwrap_or(1);
@@ -348,6 +358,15 @@ pub(crate) fn eval_str(
                     .and_then(|c| c.get(group))
                     .map_or(String::new(), |m| m.as_str().to_string())
             }))
+        }
+        StrFunc::RegexpExtractOrNull => {
+            let re = compile_regex(pattern, func)?;
+            let group = start.unwrap_or(0).max(0) as usize;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.and_then(|v| re.captures(v)?.get(group).map(|m| m.as_str())))
+                    .collect::<StringArray>(),
+            )
         }
         StrFunc::JsonExtractString => {
             let path = json::parse_path(require_pattern(pattern, func)?);
@@ -500,6 +519,7 @@ pub(crate) fn eval_str(
                 .collect::<Int64Array>(),
         ),
         StrFunc::Initcap => Arc::new(map_str(s, initcap)),
+        StrFunc::InitcapSpace => Arc::new(map_str(s, dialect::initcap_space)),
         StrFunc::OctetLength => Arc::new(
             s.iter()
                 .map(|o| o.map(|v| v.len() as i64))
@@ -512,9 +532,11 @@ pub(crate) fn eval_str(
         ),
         // Data protection (keyed hash / encryption / redaction) — the arms that need a
         // per-array key schedule and a key that never reaches an error message.
-        StrFunc::HmacSha256 | StrFunc::AesEncrypt | StrFunc::AesDecrypt | StrFunc::Mask => {
-            super::security::eval_security(func, s, pattern, start, length)?
-        }
+        StrFunc::HmacSha256
+        | StrFunc::AesEncrypt
+        | StrFunc::AesDecrypt
+        | StrFunc::Mask
+        | StrFunc::MaskByClass => super::security::eval_security(func, s, pattern, start, length)?,
         StrFunc::Hex => Arc::new(map_str(s, hex_encode)),
         StrFunc::Md5 => {
             use md5::{Digest, Md5};
@@ -546,7 +568,7 @@ pub(crate) fn eval_str(
         ),
         StrFunc::XxHash64 => Arc::new(
             s.iter()
-                .map(|o| o.map(|v| xxhash64(v.as_bytes()) as i64))
+                .map(|o| o.map(|v| xxhash64(v.as_bytes(), start) as i64))
                 .collect::<Int64Array>(),
         ),
         StrFunc::Base64 => {
@@ -577,6 +599,23 @@ pub(crate) fn eval_str(
                 s.iter()
                     .map(|o| o.and_then(|v| hex_decode(v).and_then(|b| String::from_utf8(b).ok())))
                     .collect::<StringArray>(),
+            )
+        }
+        // The same two decoders stopping at the bytes: no UTF-8 check, so a decoded value
+        // that is not text is kept rather than nulled.
+        StrFunc::UnhexBinary => Arc::new(
+            s.iter()
+                .map(|o| o.and_then(hex_decode))
+                .collect::<arrow::array::BinaryArray>(),
+        ),
+        StrFunc::FromBase64Binary => {
+            use base64::Engine as _;
+            Arc::new(
+                s.iter()
+                    .map(|o| {
+                        o.and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
+                    })
+                    .collect::<arrow::array::BinaryArray>(),
             )
         }
         StrFunc::Translate => {
@@ -706,8 +745,10 @@ pub(crate) fn eval_str(
             let pos = start.unwrap_or(1);
             Arc::new(map_str(s, |v| overlay(v, rep, pos, length)))
         }
-        StrFunc::RegexpExtractAll => {
+        StrFunc::RegexpExtractAll | StrFunc::RegexpExtractAllOrEmpty => {
             use arrow::array::{Array, ListBuilder, StringBuilder};
+            // What a group that sat out a match contributes: DuckDB's null, or Spark's ''.
+            let absent_is_empty = matches!(func, StrFunc::RegexpExtractAllOrEmpty);
             let re = compile_regex(pattern, func)?;
             // The capture-group index rides `start`, as it does for the scalar
             // `RegexpExtract`. Without it every call collected the *whole* match, so
@@ -744,6 +785,7 @@ pub(crate) fn eval_str(
                                 // yields `''` instead — the two genuinely differ).
                                 match c.get(group) {
                                     Some(m) => builder.values().append_value(m.as_str()),
+                                    None if absent_is_empty => builder.values().append_value(""),
                                     None => builder.values().append_null(),
                                 }
                             }
@@ -758,6 +800,9 @@ pub(crate) fn eval_str(
         StrFunc::RegexpSplit => {
             use arrow::array::{Array, ListBuilder, StringBuilder};
             let re = compile_regex(pattern, func)?;
+            // A positive `length` caps the piece count; absent or not positive, it does not
+            // (Spark reads `limit <= 0` as "as many times as possible").
+            let split_limit = length.filter(|&n| n > 0).map(|n| n as usize);
             // The pieces together are at most the input bytes, so both buffers pre-size
             // from the input the way the literal `Split` does.
             let mut builder = ListBuilder::with_capacity(
@@ -773,6 +818,12 @@ pub(crate) fn eval_str(
                             // crate splits it into two pieces (`['', '']`); DuckDB reports
                             // `['']`, and the difference is only visible on this one row.
                             builder.values().append_value("");
+                        } else if let Some(limit) = split_limit {
+                            // `splitn` leaves the remainder unsplit in the last piece, which
+                            // is Java `String.split(regex, limit)` for a positive limit.
+                            for part in re.splitn(v, limit) {
+                                builder.values().append_value(part);
+                            }
                         } else {
                             for part in re.split(v) {
                                 builder.values().append_value(part);
@@ -795,6 +846,8 @@ pub(crate) fn eval_str(
         }
         StrFunc::UrlEncode => Arc::new(map_str(s, uri_path::url_encode)),
         StrFunc::UrlDecode => Arc::new(map_str(s, uri_path::url_decode)),
+        StrFunc::UrlEncodeForm => Arc::new(map_str(s, dialect::url_encode_form)),
+        StrFunc::UrlDecodeForm => Arc::new(map_str(s, dialect::url_decode_form)),
         StrFunc::RegexpEscape => Arc::new(map_str(s, uri_path::regexp_escape)),
         StrFunc::ParseFilename => Arc::new(map_str_borrow(s, uri_path::parse_filename)),
         StrFunc::ParseDirname => Arc::new(map_str_borrow(s, uri_path::parse_dirname)),
@@ -871,6 +924,14 @@ pub(crate) fn eval_str(
             Arc::new(
                 s.iter()
                     .map(|o| o.map(|v| damerau_levenshtein(v, target) as i64))
+                    .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::DamerauLevenshteinOsa => {
+            let target = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| dialect::osa_distance(v, target) as i64))
                     .collect::<Int64Array>(),
             )
         }
@@ -1217,6 +1278,7 @@ fn eval_bytes(
     func: StrFunc,
     arr: &ArrayRef,
     pattern: Option<&str>,
+    start: Option<i64>,
 ) -> Result<Option<ArrayRef>, ExprError> {
     use arrow::array::{BinaryArray, LargeBinaryArray};
     // Iterate the rows as `Option<&[u8]>` for either binary offset width.
@@ -1308,7 +1370,7 @@ fn eval_bytes(
         StrFunc::XxHash64 => Arc::new(
             bytes
                 .iter()
-                .map(|o| o.map(|v| xxhash64(v) as i64))
+                .map(|o| o.map(|v| xxhash64(v, start) as i64))
                 .collect::<Int64Array>(),
         ),
         StrFunc::Hash64 => Arc::new(
@@ -1593,11 +1655,14 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// 64-bit xxHash of `bytes` with seed 0 — fast, deterministic, and stable across
-/// machines (the standard bucketing/sharding hash). Uses the portable `Hasher` API.
-fn xxhash64(bytes: &[u8]) -> u64 {
+/// 64-bit xxHash of `bytes` — fast, deterministic, and stable across machines (the
+/// standard bucketing/sharding hash). Uses the portable `Hasher` API.
+///
+/// `seed` is the `start` slot, `0` when absent; the `i64` is reinterpreted as the `u64`
+/// seed, which is how Spark passes its `long` seed (`42`) to the same algorithm.
+fn xxhash64(bytes: &[u8], seed: Option<i64>) -> u64 {
     use std::hash::Hasher;
-    let mut h = twox_hash::XxHash64::with_seed(0);
+    let mut h = twox_hash::XxHash64::with_seed(seed.unwrap_or(0) as u64);
     h.write(bytes);
     h.finish()
 }
@@ -2309,9 +2374,25 @@ mod tests {
     #[test]
     fn xxhash64_known_vector_and_determinism() {
         // xxHash64(seed 0) of the empty input is the canonical 0xEF46DB3751D8E999.
-        assert_eq!(xxhash64(b""), 0xEF46_DB37_51D8_E999);
-        assert_eq!(xxhash64(b"customer-42"), xxhash64(b"customer-42"));
-        assert_ne!(xxhash64(b"a"), xxhash64(b"b"));
+        assert_eq!(xxhash64(b"", None), 0xEF46_DB37_51D8_E999);
+        assert_eq!(
+            xxhash64(b"customer-42", None),
+            xxhash64(b"customer-42", Some(0))
+        );
+        assert_ne!(xxhash64(b"a", None), xxhash64(b"b", None));
+    }
+
+    #[test]
+    fn xxhash64_seed_reproduces_sparks_documented_example() {
+        // `hash.scala`, `XxHash64`: `SELECT xxhash64('Spark', array(123), 2)` is
+        // 5602566077635097486. Spark seeds the first column with 42 and each later column
+        // with the running hash; an int (and an array's int element) hashes its four
+        // little-endian bytes. Reproducing the chain pins the seed as Spark passes it.
+        let h = xxhash64(b"Spark", Some(42));
+        let h = xxhash64(&123i32.to_le_bytes(), Some(h as i64));
+        let h = xxhash64(&2i32.to_le_bytes(), Some(h as i64));
+        assert_eq!(h as i64, 5_602_566_077_635_097_486);
+        assert_eq!(xxhash64(b"ABC", Some(42)) as i64, 4_105_715_581_806_190_027);
     }
 
     #[test]

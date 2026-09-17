@@ -42,6 +42,8 @@ _STR_INT = frozenset(
         # An edit *distance* is a count of edits. `damerau_levenshtein` is `levenshtein`
         # plus the transposition edit and was declaring nothing two lines from its twin.
         "damerau_levenshtein",
+        # The restricted (Optimal String Alignment) variant counts edits too.
+        "damerau_levenshtein_osa",
         "ascii",
         "bit_length",
         "octet_length",
@@ -81,7 +83,12 @@ _STR_STR = frozenset(
         "regexp_replace",
         "regexp_replace_all",
         "regexp_extract",
+        # Another engine's reading of an entry above: text in, text out all the same.
+        "regexp_replace_dollar",
+        "regexp_replace_all_dollar",
+        "regexp_extract_or_null",
         "initcap",
+        "initcap_space",
         "hex",
         "base64",
         "from_base64",
@@ -93,6 +100,7 @@ _STR_STR = frozenset(
         "aes_encrypt",
         "aes_decrypt",
         "mask",
+        "mask_by_class",
         "right",
         "substring_index",
         "overlay",
@@ -108,6 +116,8 @@ _STR_STR = frozenset(
         "unhex",
         "url_encode",
         "url_decode",
+        "url_encode_form",
+        "url_decode_form",
         "regexp_escape",
         "parse_filename",
         "parse_dirname",
@@ -137,7 +147,7 @@ _STR_STR = frozenset(
 #: produces a frame, and decompressing one produces the original bytes; neither is a string,
 #: and both were the only members of the family with no table at all, so a compressed column
 #: reported `null` for itself and for every column beside it.
-_STR_BINARY = frozenset({"compress", "decompress"})
+_STR_BINARY = frozenset({"compress", "decompress", "from_base64_binary", "unhex_binary"})
 
 # `str` accessor functions that split one document into many pieces -> List<String>.
 _STR_STR_LIST = frozenset(
@@ -146,6 +156,7 @@ _STR_STR_LIST = frozenset(
         "token_ngrams",  # one joined n-gram per window
         "split",
         "regexp_extract_all",  # every match of the pattern
+        "regexp_extract_all_or_empty",
         "regexp_split",
         "parse_path",  # the path's components
         # The two `.json` accessors that return a list of *text*: an object's keys in

@@ -96,6 +96,9 @@ STRICT_STR_FNS = frozenset(
         "sha256", "soundex", "split_part", "starts_with", "strip_html",
         "substring_index", "substr", "translate", "trim", "upper", "url_decode",
         "url_encode", "xxhash64",
+        # Another engine's reading of a function above, and as total as it is.
+        "damerau_levenshtein_osa", "initcap_space", "regexp_replace_all_dollar",
+        "regexp_replace_dollar", "url_decode_form", "url_encode_form",
     }
 )  # fmt: skip
 

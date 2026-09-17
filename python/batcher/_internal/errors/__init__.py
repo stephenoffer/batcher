@@ -50,7 +50,12 @@ from batcher._internal.errors.suggest import (
     suggestion,
     unknown_message,
 )
-from batcher._internal.errors.validate import require_float, require_int
+from batcher._internal.errors.validate import (
+    require_bool,
+    require_choice,
+    require_float,
+    require_int,
+)
 
 __all__ = [
     "AccessDeniedError",
@@ -83,6 +88,8 @@ __all__ = [
     "candidate_list",
     "did_you_mean",
     "public_members",
+    "require_bool",
+    "require_choice",
     "require_float",
     "require_int",
     "suggestion",

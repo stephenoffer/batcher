@@ -301,11 +301,14 @@ class Strftime(IRNode):
 class Strptime(IRNode):
     """`strptime(s, format)` — parse a string column into a Timestamp using a
     chrono/strftime format (e.g. ``%Y-%m-%d %H:%M:%S``). Values that do not match
-    become NULL (DuckDB ``try_strptime``). → Timestamp(us)."""
+    become NULL (DuckDB ``try_strptime``), or raise when ``strict`` (DuckDB ``strptime``,
+    Polars ``strict=True``). → Timestamp(us). ``strict`` is left out of the IR when false,
+    so a non-strict parse serializes exactly as it did before the field existed."""
 
     tag = ExprTag.STRPTIME
     input: Expr = child()
     format: str = scalar()
+    strict: bool = scalar(omit_falsy=True, default=False)
 
 
 @expr_node

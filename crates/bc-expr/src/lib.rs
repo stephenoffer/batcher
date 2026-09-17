@@ -546,7 +546,17 @@ pub enum Expr {
     /// `strptime(s, format)` — parse a Utf8 column into a Timestamp(microsecond)
     /// using a chrono/strftime `format`. Unparseable values → NULL (DuckDB
     /// `try_strptime`). The inverse of `Strftime`.
-    Strptime { input: Box<Expr>, format: String },
+    ///
+    /// `strict` turns an unparseable non-null value into an error instead (DuckDB
+    /// `strptime`, Polars `to_date(strict=True)`), for a pipeline where a bad value must
+    /// stop the query rather than become a null nobody looks at. `serde(default)` keeps
+    /// every existing document meaning what it meant.
+    Strptime {
+        input: Box<Expr>,
+        format: String,
+        #[serde(default)]
+        strict: bool,
+    },
 
     /// `offset_by` — shift a Date32/Timestamp by a calendar+fixed offset. `months`
     /// (incl. years×12) shift calendar months with end-of-month clamping; `days`
@@ -2028,14 +2038,31 @@ pub enum StrFunc {
     /// Replace the first match of regex `pattern` with `replacement`. → Utf8.
     RegexpReplace,
     /// Replace *every* match of regex `pattern` with `replacement` (DuckDB
-    /// `regexp_replace(..., 'g')`; Polars `replace_all`). → Utf8.
+    /// `regexp_replace(..., 'g')`). The replacement uses RE2's `\1` backreferences, and a
+    /// `$` in it is literal. → Utf8.
     RegexpReplaceAll,
+    /// [`StrFunc::RegexpReplace`] with the replacement read in the `regex` crate's syntax:
+    /// `$1` and `${name}` are groups and `$$` is a literal `$`. The group references are
+    /// the ones Polars `replace`, Daft `regexp_replace` and Java's `Matcher` (so Spark
+    /// `regexp_replace`) expand. The two syntaxes disagree on the same text: `'[$1]'` is
+    /// a group under this one and four literal characters under RE2's, so a port that
+    /// kept the default got the literal. → Utf8.
+    RegexpReplaceDollar,
+    /// [`StrFunc::RegexpReplaceAll`] with the `$`-syntax replacement of
+    /// [`StrFunc::RegexpReplaceDollar`]. → Utf8.
+    RegexpReplaceAllDollar,
     /// `split_part(string, delim, n)`: the `n`-th (1-based) field of the string
     /// split on `pattern` (the delimiter); `''` if `n` is out of range (DuckDB
     /// `split_part`; `start` carries `n`). → Utf8.
     SplitPart,
     /// Extract capture group `start` of regex `pattern` ('' if no match). → Utf8.
     RegexpExtract,
+    /// [`StrFunc::RegexpExtract`] answering **null** where DuckDB answers `''`: when the
+    /// pattern does not match, and when it matches but group `start` did not take part.
+    /// That is Polars `str.extract` and Daft `regexp_extract`, and the difference is
+    /// visible exactly where it matters, in telling "no match" apart from "matched an
+    /// empty group". → Utf8 (nullable).
+    RegexpExtractOrNull,
     /// Extract the string value at JSON `pattern` path (e.g. `$.a.b`); null if the
     /// input isn't valid JSON or the path is missing. → Utf8.
     JsonExtractString,
@@ -2111,6 +2138,11 @@ pub enum StrFunc {
     /// Capitalize the first letter of each word, lowercasing the rest. A word is a
     /// maximal run of alphanumerics (DuckDB `initcap`). → Utf8.
     Initcap,
+    /// Spark `initcap`: lowercase the string, then uppercase its first character and every
+    /// character that follows an ASCII space. Only the space starts a word, so
+    /// `'hello-world'` is `'Hello-world'` here and `'Hello-World'` under
+    /// [`StrFunc::Initcap`]; a tab does not start one either. → Utf8.
+    InitcapSpace,
     /// Number of UTF-8 bytes in the string (`v.len()`; DuckDB `octet_length`). → Int64.
     OctetLength,
     /// Number of bits in the string (bytes × 8; DuckDB `bit_length`). → Int64.
@@ -2127,9 +2159,18 @@ pub enum StrFunc {
     /// Decode standard base64 to bytes, then interpret as UTF-8 (DuckDB
     /// `from_base64`). Invalid base64 or non-UTF-8 bytes → null. → Utf8 (nullable).
     FromBase64,
+    /// Decode standard base64 to its **bytes**, whatever they are (DuckDB `from_base64`'s
+    /// own BLOB result, Spark `unbase64`, Polars `decode("base64")`). Unlike
+    /// [`StrFunc::FromBase64`] a decoded value that is not UTF-8 text is still a value, so
+    /// an image or a key survives the decode. Invalid base64 → null. → Binary (nullable).
+    FromBase64Binary,
     /// Parse pairs of hex digits to bytes, then interpret as UTF-8 (DuckDB
     /// `unhex`). Odd length, non-hex, or non-UTF-8 bytes → null. → Utf8 (nullable).
     Unhex,
+    /// Parse pairs of hex digits to **bytes** (DuckDB `unhex`'s own BLOB result, Spark
+    /// `unhex`, Polars `decode("hex")`), keeping bytes that are not UTF-8 text. Odd length
+    /// or a non-hex digit → null. → Binary (nullable).
+    UnhexBinary,
     /// SQL `LIKE`: anchored match where `pattern`'s `%` matches any run of chars,
     /// `_` matches exactly one char, every other char is literal. → Boolean.
     Like,
@@ -2156,6 +2197,10 @@ pub enum StrFunc {
     MimeType,
     /// 64-bit xxHash of the UTF-8 bytes (the u64 digest reinterpreted as i64). The
     /// fast non-cryptographic hash for bucketing/sharding. Null → null. → Int64.
+    ///
+    /// `start` carries the seed, `0` when absent. Spark's `xxhash64` seeds with `42`, so a
+    /// Spark-computed hash of one string column is reproduced with `start = 42`; the `i64`
+    /// is reinterpreted as the `u64` seed, as Spark's `long` seed is.
     #[serde(rename = "xxhash64")]
     XxHash64,
     /// `substring_index(s, delim, count)`: the substring before the `count`-th
@@ -2167,23 +2212,39 @@ pub enum StrFunc {
     /// 1-based `start` (`pos`) with `replacement` (SQL `OVERLAY`). `len` defaults to
     /// the replacement's length. → Utf8.
     Overlay,
-    /// Every match of regex `pattern` (capture group 0) as a `List<Utf8>` (DuckDB
-    /// `regexp_extract_all`; empty list if none, null input → null). → List<Utf8>.
+    /// Every match of regex `pattern` as a `List<Utf8>` (DuckDB `regexp_extract_all`;
+    /// empty list if none, null input → null). `start` carries the capture group, `0`
+    /// (the whole match) when absent; a group that did not take part in a match is a
+    /// null element. → List<Utf8>.
     RegexpExtractAll,
+    /// [`StrFunc::RegexpExtractAll`] with `''` rather than a null element for a group
+    /// that did not take part in a match, which is Spark `regexp_extract_all`
+    /// (`RegExpExtractBase.extractAll`). → List<Utf8>.
+    RegexpExtractAllOrEmpty,
     /// Number of non-overlapping matches of regex `pattern` (DuckDB `regexp_count`).
     /// → Int64.
     RegexpCount,
     /// Split on every match of regex `pattern` → a `List<Utf8>` of the pieces between
     /// matches. The regex counterpart of `Split`, whose delimiter is a literal. An empty
-    /// string yields `[""]` and a null input a null list, matching `Split`. → List<Utf8>.
+    /// string yields `[""]` and a null input a null list, matching `Split`.
+    ///
+    /// `length`, when positive, caps the list at that many pieces with the rest of the
+    /// string unsplit in the last one (Spark `split(str, regex, limit)`, Java
+    /// `String.split`); absent or not positive splits on every match. → List<Utf8>.
     RegexpSplit,
     /// Levenshtein edit distance to the literal string `pattern` (DuckDB
     /// `levenshtein` against a constant). → Int64.
     Levenshtein,
-    /// Damerau-Levenshtein (Optimal String Alignment) distance to the literal `pattern`
-    /// (DuckDB `damerau_levenshtein`): like `levenshtein` but an adjacent transposition
-    /// costs 1, so it scores a swapped-letter typo (`teh`↔`the`) as one edit. → Int64.
+    /// True (unrestricted) Damerau-Levenshtein distance to the literal `pattern` (DuckDB
+    /// `damerau_levenshtein`): like `levenshtein` but an adjacent transposition costs 1,
+    /// so it scores a swapped-letter typo (`teh`↔`the`) as one edit, and a substring may
+    /// be edited again after a transposition (`ca`→`abc` is 2). → Int64.
     DamerauLevenshtein,
+    /// The *restricted* Damerau-Levenshtein distance, Optimal String Alignment, to the
+    /// literal `pattern`: no substring is edited twice, so `ca`→`abc` is 3 where
+    /// [`StrFunc::DamerauLevenshtein`] says 2. Daft's `damerau_levenshtein_distance`
+    /// computes this one. Over UTF-8 bytes, as its unrestricted sibling is. → Int64.
+    DamerauLevenshteinOsa,
     /// Jaro similarity to the literal string `pattern` (DuckDB `jaro_similarity`): a
     /// `[0, 1]` fuzzy-match score based on matching characters and transpositions — the
     /// standard metric for entity resolution / record linkage on short strings like names.
@@ -2213,6 +2274,12 @@ pub enum StrFunc {
     /// single character in `pattern` (default `X`). Character-length preserving; when
     /// the revealed windows overlap the value is returned unmasked. Null → null. → Utf8.
     Mask,
+    /// Replace each character by the replacement for its Unicode general category (Spark
+    /// `mask`): `pattern` is exactly four characters, for an uppercase letter (`Lu`), a
+    /// lowercase letter (`Ll`), a decimal digit (`Nd`) and anything else, in that order.
+    /// A `\u{0}` in a position keeps that class unmasked, which is Spark's `null`
+    /// argument. Character-length preserving. Null → null. → Utf8.
+    MaskByClass,
     /// Readable text of an HTML document: drops tags *and* `<script>`/`<style>` bodies
     /// and comments, decodes entities, collapses whitespace, and separates elements with
     /// a space. Lenient on malformed markup. Null → null. → Utf8. See `eval::str::html`.
@@ -2242,6 +2309,15 @@ pub enum StrFunc {
     /// **as written** rather than erroring or nulling the row — verified against DuckDB,
     /// which returns `'a%2'` for `url_decode('a%2')`. Null → null. → Utf8.
     UrlDecode,
+    /// `application/x-www-form-urlencoded` encoding, which is Java's `URLEncoder` and so
+    /// Spark `url_encode`: a space becomes `+`, the letters, digits and `.-*_` stay, and
+    /// every other UTF-8 byte becomes `%XX`. It differs from [`StrFunc::UrlEncode`] on a
+    /// space, on `*` (kept here) and on `~` (encoded here). Null → null. → Utf8.
+    UrlEncodeForm,
+    /// Form decoding (Java's `URLDecoder`, Spark `url_decode`): `+` becomes a space, then
+    /// the `%XX` escapes decode as [`StrFunc::UrlDecode`] decodes them. A malformed escape
+    /// is left as written rather than raising as Spark does. Null → null. → Utf8.
+    UrlDecodeForm,
     /// Escape the regex metacharacters in the value (DuckDB `regexp_escape`), so it can
     /// be embedded in a pattern as a literal. Null → null. → Utf8.
     RegexpEscape,
