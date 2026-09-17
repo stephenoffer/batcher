@@ -107,7 +107,7 @@ max = { status = "canonical", batcher = "GroupBy.max" }
 mean = { status = "canonical", batcher = "GroupBy.mean" }
 min = { status = "canonical", batcher = "GroupBy.min" }
 product = { status = "canonical", batcher = "GroupBy.product" }
-skew = { status = "mismatch", batcher = "GroupBy.skew", note = "Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True", wave = "W0" }
+skew = { status = "mismatch", batcher = "GroupBy.skew", note = "Daft skew is the population value; port as agg(col(c).skew(bias=True)) per column", wave = "W0" }
 stddev = { status = "param", batcher = "GroupBy.std", need = "ddof=", wave = "W2" }
 string_agg = { status = "canonical", batcher = ["GroupBy.agg", "Expr.str.join"] }
 sum = { status = "canonical", batcher = "GroupBy.sum" }

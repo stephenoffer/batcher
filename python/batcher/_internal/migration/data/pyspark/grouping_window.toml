@@ -10,7 +10,7 @@ applyInPandas = { status = "param", batcher = "GroupBy.map_groups", need = "batc
 applyInPandasWithState = { status = "param", batcher = "Dataset.transform_with_state", need = "GroupState with timeouts and outputMode", wave = "W10" }
 avg = { status = "param", batcher = "GroupBy.mean", need = "Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }
 cogroup = { status = "gap", need = "cogroup two grouped Datasets for applyInPandas/applyInArrow", wave = "W10" }
-count = { status = "mismatch", batcher = "GroupBy.count", note = "Spark counts rows into one 'count' column; GroupBy.count counts non-null values per column. Port as: GroupBy.len(name='count')", wave = "W0" }
+count = { status = "mismatch", batcher = "GroupBy.count", note = "Spark GroupedData.count counts rows into a column named count; port as group_by(k).len(name=count). Batcher GroupBy.count counts non-null values", wave = "W0" }
 max = { status = "param", batcher = "GroupBy.max", need = "Spark names the output 'max(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }
 mean = { status = "param", batcher = "GroupBy.mean", need = "Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }
 min = { status = "param", batcher = "GroupBy.min", need = "Spark names the output 'min(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }

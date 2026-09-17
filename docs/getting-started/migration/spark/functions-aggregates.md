@@ -21,7 +21,7 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `any_value` | `Expr.any_value` | canonical |  |
 | `approx_count_distinct` | `bt.approx_count_distinct` | param | Missing: rsd= relative standard deviation. Wave W2. |
 | `approx_percentile` | `Expr.approx_quantile` | param | Missing: a list of percentages, accuracy=, and returning an actual input value. Wave W2. |
-| `array_agg` | `bt.array_agg` | mismatch | Differs: Spark skips nulls when collecting; bt.array\_agg keeps them. Needs ignore\_nulls=True. Wave W0. |
+| `array_agg` | `bt.array_agg` | canonical |  |
 | `avg` | `Expr.mean` | canonical |  |
 | `bit_and` | `bt.bit_and` | canonical |  |
 | `bit_or` | `bt.bit_or` | canonical |  |
@@ -34,7 +34,7 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `bitmap_or_agg` | n/a | gap | Not yet: DataSketches-binary-compatible bitmap sketch function. Wave W14. |
 | `bool_and` | `bt.bool_and` | canonical |  |
 | `bool_or` | `bt.bool_or` | canonical |  |
-| `collect_list` | `Expr.array_agg` | mismatch | Differs: Spark skips nulls when collecting; Expr.array\_agg keeps them. Needs ignore\_nulls=True. Wave W0. |
+| `collect_list` | `Expr.array_agg` | canonical |  |
 | `collect_set` | `Expr.array_agg` | param | Missing: distinct=True collection that skips nulls. Wave W2. |
 | `corr` | `bt.corr` | canonical |  |
 | `count` | `Expr.count` + `bt.count` | canonical |  |
@@ -46,8 +46,8 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `cume_dist` | `bt.cume_dist` | canonical |  |
 | `dense_rank` | `bt.dense_rank` | canonical |  |
 | `every` | `bt.bool_and` | canonical |  |
-| `first` | `bt.first` | mismatch | Differs: Spark first(col, ignorenulls) takes whatever row arrives first; bt.first requires order\_by= and has no ignore\_nulls=. Wave W0. |
-| `first_value` | `bt.first_value` | mismatch | Differs: Spark first\_value uses the window's default frame (a running frame when ordered) and takes ignoreNulls=; bt.first\_value always reads the whole partition. Wave W0. |
+| `first` | `bt.first` | mismatch | Differs: Spark first takes whatever row arrives first and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.first(order\_by, ignore\_nulls=ignorenulls). Wave W0. |
+| `first_value` | `bt.first_value` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.first\_value(x, ignore\_nulls=...). Wave W0. |
 | `grouping` | n/a | gap | Not yet: GROUPING() indicator inside cube/rollup/grouping sets aggregates. Wave W8. |
 | `grouping_id` | n/a | gap | Not yet: GROUPING\_ID() bit vector inside cube/rollup/grouping sets aggregates. Wave W8. |
 | `histogram_numeric` | n/a | gap | Not yet: approximate numeric histogram with nBins. Wave W14. |
@@ -76,10 +76,10 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `kll_sketch_to_string_bigint` | n/a | gap | Not yet: DataSketches-binary-compatible KLL sketch function. Wave W14. |
 | `kll_sketch_to_string_double` | n/a | gap | Not yet: DataSketches-binary-compatible KLL sketch function. Wave W14. |
 | `kll_sketch_to_string_float` | n/a | gap | Not yet: DataSketches-binary-compatible KLL sketch function. Wave W14. |
-| `kurtosis` | `bt.kurtosis` + `Expr.kurtosis_pop` | mismatch | Differs: Spark kurtosis is the population excess kurtosis (\[1,1,2\] -\> -1.5); bt.kurtosis is the sample estimate. Expr.kurtosis\_pop matches Spark. Wave W0. |
+| `kurtosis` | `bt.kurtosis` | canonical |  |
 | `lag` | `bt.lag` | param | Missing: default= value for rows before the partition start. Wave W5. |
-| `last` | `bt.last` | mismatch | Differs: Spark last(col, ignorenulls) takes whatever row arrives last; bt.last requires order\_by= and has no ignore\_nulls=. Wave W0. |
-| `last_value` | `bt.last_value` | mismatch | Differs: Spark last\_value uses the window's default frame (a running frame when ordered) and takes ignoreNulls=; bt.last\_value always reads the whole partition. Wave W0. |
+| `last` | `bt.last` | mismatch | Differs: Spark last takes whatever row arrives last and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.last(order\_by, ignore\_nulls=ignorenulls). Wave W0. |
+| `last_value` | `bt.last_value` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.last\_value(x, ignore\_nulls=...). Wave W0. |
 | `lead` | `bt.lead` | param | Missing: default= value for rows past the partition end. Wave W5. |
 | `listagg` | `Expr.str.join` | canonical |  |
 | `listagg_distinct` | `Expr.str.join` | param | Missing: distinct=True. Wave W2. |
@@ -90,7 +90,7 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `min` | `bt.min` | canonical |  |
 | `min_by` | `Expr.arg_min` | param | Missing: renaming the value-by Expr.arg\_min(by) to min\_by, and k= for the bottom-k values. Wave W0. |
 | `mode` | `bt.mode` | canonical |  |
-| `nth_value` | `bt.nth_value` | mismatch | Differs: Spark nth\_value uses the window's default frame (a running frame when ordered) and takes ignoreNulls=; bt.nth\_value always reads the whole partition. Wave W0. |
+| `nth_value` | `bt.nth_value` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.nth\_value(x, n, ignore\_nulls=...). Wave W0. |
 | `ntile` | `bt.ntile` | canonical |  |
 | `percent_rank` | `bt.percent_rank` | canonical |  |
 | `percentile` | `Expr.quantile` | param | Missing: a list of percentages and frequency= weights. Wave W2. |
@@ -107,7 +107,7 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `regr_sxy` | `bt.regr_sxy` | canonical |  |
 | `regr_syy` | `bt.regr_syy` | canonical |  |
 | `row_number` | `bt.row_number` | canonical |  |
-| `skewness` | `bt.skew` | mismatch | Differs: Spark skewness is the population estimate (\[1,1,2\] -\> 0.7071); bt.skew is the adjusted sample estimate. Needs a population variant. Wave W0. |
+| `skewness` | `bt.skew` | canonical |  |
 | `some` | `bt.bool_or` | canonical |  |
 | `std` | `bt.std` | canonical |  |
 | `stddev` | `bt.std` | canonical |  |

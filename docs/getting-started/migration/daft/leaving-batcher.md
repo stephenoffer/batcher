@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Daft
 
-The following table maps 212 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
+The following table maps 214 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
 
 | Batcher | Daft |
 |---|---|
@@ -68,6 +68,7 @@ The following table maps 212 Batcher spellings to the Daft names that compute th
 | `bt.read.parquet` | `daft.read_parquet` |
 | `bt.register_function` | `daft.attach_function` |
 | `bt.row_number` | `functions.row_number` |
+| `bt.skew` | `functions.skew` |
 | `bt.sum_horizontal` | `functions.columns_sum` |
 | `bt.sum` | `functions.sum` |
 | `bt` | `daft.functions` |
@@ -191,6 +192,7 @@ The following table maps 212 Batcher spellings to the Daft names that compute th
 | `Expr.sign` | `Expression.sign`, `functions.sign` |
 | `Expr.sin` | `Expression.sin`, `functions.sin` |
 | `Expr.sinh` | `Expression.sinh`, `functions.sinh` |
+| `Expr.skew` | `Expression.skew` |
 | `Expr.sqrt` | `Expression.sqrt`, `functions.sqrt` |
 | `Expr.str.ascii` | `Expression.ascii`, `functions.ascii_func` |
 | `Expr.str.capitalize` | `Expression.capitalize`, `functions.capitalize` |

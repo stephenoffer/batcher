@@ -121,14 +121,14 @@ The following table maps the 9 names on `GroupedData`, sorted alphabetically.
 
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
-| `aggregate` | `GroupBy.agg` | mismatch | Differs: Ray aggregate(\*AggregateFn) names outputs 'sum(x)'/'count()' and its Count counts nulls by default; Batcher agg takes AggExpr with alias names and col(x).count() skips nulls. Wave W0. |
-| `count` | `GroupBy.len` | mismatch | Differs: Ray count() adds one 'count()' column of rows per group; Batcher GroupBy.count counts non-null values per column. Codemod: group\_by(k).len(name='count()'). Wave W0. |
+| `aggregate` | `GroupBy.agg` | mismatch | Differs: Ray names each output after its function, such as sum(x); port as agg(\*\*\{sum(x): col(x).sum()\}), with Count(x) as bt.count(). Wave W0. |
+| `count` | `GroupBy.len` | mismatch | Differs: Ray GroupedData.count counts rows into a column named count(); port as group\_by(k).len(name=count()). Wave W0. |
 | `map_groups` | `GroupBy.map_groups` | mismatch | Differs: Ray map\_groups hands fn batch\_format='default' (\{col: ndarray\}); Batcher passes a pyarrow RecordBatch. Also missing: batch\_format=, fn\_args/fn\_kwargs/fn\_constructor\_args/fn\_constructor\_kwargs, compute, concurrency, num\_cpus, num\_gpus, memory, ray\_remote\_args. Wave WF. |
-| `max` | `GroupBy.max` | mismatch | Differs: Ray names the output column 'max(x)' and accepts on=list or None (every column) plus ignore\_nulls=False; Batcher names it after the input column. Codemod: agg(\*\*\{'max(x)': col('x').max()\}). Wave W0. |
-| `mean` | `GroupBy.mean` | mismatch | Differs: Ray names the output column 'mean(x)' and accepts on=list or None (every column) plus ignore\_nulls=False; Batcher names it after the input column. Codemod: agg(\*\*\{'mean(x)': col('x').mean()\}). Wave W0. |
-| `min` | `GroupBy.min` | mismatch | Differs: Ray names the output column 'min(x)' and accepts on=list or None (every column) plus ignore\_nulls=False; Batcher names it after the input column. Codemod: agg(\*\*\{'min(x)': col('x').min()\}). Wave W0. |
-| `std` | `GroupBy.std` | mismatch | Differs: Ray names the output 'std(x)', takes ddof= and on=list/None, and returns NaN for a group with one non-null value; Batcher names it 'x' (sample std, ddof=1 fixed) and returns null there. Wave W0. |
-| `sum` | `GroupBy.sum` | mismatch | Differs: Ray names the output column 'sum(x)' and accepts on=list or None (every column) plus ignore\_nulls=False; Batcher names it after the input column. Codemod: agg(\*\*\{'sum(x)': col('x').sum()\}). Wave W0. |
+| `max` | `GroupBy.max` | mismatch | Differs: Ray names the output max(x) and ignore\_nulls=False nulls a group with a null; port as agg(\*\*\{max(x): col(x).max()\}). Wave W0. |
+| `mean` | `GroupBy.mean` | mismatch | Differs: Ray names the output mean(x) and ignore\_nulls=False nulls a group with a null; port as agg(\*\*\{mean(x): col(x).mean()\}). Wave W0. |
+| `min` | `GroupBy.min` | mismatch | Differs: Ray names the output min(x) and ignore\_nulls=False nulls a group with a null; port as agg(\*\*\{min(x): col(x).min()\}). Wave W0. |
+| `std` | `GroupBy.std` | mismatch | Differs: port as agg(\*\*\{std(c): col(c).std(ddof=ddof)\}); Ray returns NaN where a group has no more than ddof rows and Batcher returns null. Wave W0. |
+| `sum` | `GroupBy.sum` | mismatch | Differs: Ray names the output sum(x) and ignore\_nulls=False nulls a group with a null; port as agg(\*\*\{sum(x): col(x).sum()\}). Wave W0. |
 | `with_column` | `Dataset.with_columns` + `AggExpr.over` | mismatch | Differs: Ray grouped with\_column(name, expr) evaluates expr within each group and keeps every row; Batcher spells it on the Dataset as a window: with\_columns(name=agg.over(partition\_by=keys)). Wave W5. |
 
 ## `DataIterator`

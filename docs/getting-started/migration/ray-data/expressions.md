@@ -185,7 +185,7 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `BlockColumnAccessor` | n/a | out of scope | Declined: Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime). |
 | `Callable` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Collection` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
-| `Count` | `bt.count` + `Expr.count` | mismatch | Differs: Ray Count() counts rows, and Count(on) defaults ignore\_nulls=False so it also counts nulls; Batcher col(x).count() skips nulls. Port as: bt.count() for both unless ignore\_nulls=True, then col(x).count(). Wave W0. |
+| `Count` | `bt.count` + `Expr.count` | mismatch | Differs: Ray Count() counts rows (bt.count()); Count(on, ignore\_nulls=True) is col(on).count(). Ray names the column count() or count(on). Wave W0. |
 | `count_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `CountDistinct` | `Expr.count_distinct` | canonical |  |
 | `Deprecated` | n/a | out of scope | Declined: ray.util.annotations decorator imported into the module, not Ray Data API. |
@@ -203,7 +203,7 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `Min` | `Expr.min` | canonical |  |
 | `minmax_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `missing_pct_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
-| `MissingValuePercentage` | `bt.null_rate` | mismatch | Differs: Ray returns a percentage in \[0, 100\] and counts NaN as missing; Batcher null\_rate returns a fraction in \[0, 1\] and counts only nulls. Port as: bt.null\_rate(x) \* 100 after fill\_nan(None). Wave W0. |
+| `MissingValuePercentage` | `bt.null_rate` | mismatch | Differs: Ray returns a percentage and counts NaN as missing: bt.null\_rate(col(x).fill\_nan(None)) \* 100. Wave W0. |
 | `np` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Optional` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `pa` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
@@ -214,7 +214,7 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `Quantile` | `Expr.quantile` | canonical |  |
 | `re` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Set` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
-| `Std` | `Expr.std` | mismatch | Differs: Ray Std(on, ddof=1) returns NaN for a group with one non-null value and takes ddof=; Batcher std is sample std (ddof=1 fixed) and returns null there. Wave W0. |
+| `Std` | `Expr.std` | mismatch | Differs: Ray Std(on, ddof) is col(on).std(ddof=ddof), named std(on); Ray returns NaN where a group has no more than ddof rows and Batcher returns null. Wave W0. |
 | `Sum` | `Expr.sum` | canonical |  |
 | `sum_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `SupportsRichComparisonType` | n/a | out of scope | Declined: typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API. |

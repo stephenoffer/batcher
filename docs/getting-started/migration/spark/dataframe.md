@@ -172,7 +172,7 @@ The following table maps the 15 names on `GroupedData`, sorted alphabetically.
 | `applyInPandasWithState` | `Dataset.transform_with_state` | param | Missing: GroupState with timeouts and outputMode. Wave W10. |
 | `avg` | `GroupBy.mean` | param | Missing: Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
 | `cogroup` | n/a | gap | Not yet: cogroup two grouped Datasets for applyInPandas/applyInArrow. Wave W10. |
-| `count` | `GroupBy.count` | mismatch | Differs: Spark counts rows into one 'count' column; GroupBy.count counts non-null values per column. Port as: GroupBy.len(name='count'). Wave W0. |
+| `count` | `GroupBy.count` | mismatch | Differs: Spark GroupedData.count counts rows into a column named count; port as group\_by(k).len(name=count). Batcher GroupBy.count counts non-null values. Wave W0. |
 | `max` | `GroupBy.max` | param | Missing: Spark names the output 'max(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
 | `mean` | `GroupBy.mean` | param | Missing: Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
 | `min` | `GroupBy.min` | param | Missing: Spark names the output 'min(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |

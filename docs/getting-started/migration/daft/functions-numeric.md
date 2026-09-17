@@ -81,7 +81,7 @@ The following table maps the 71 names on `Expression`, sorted alphabetically.
 | `sign` | `Expr.sign` | canonical |  |
 | `sin` | `Expr.sin` | canonical |  |
 | `sinh` | `Expr.sinh` | canonical |  |
-| `skew` | `Expr.skew` | mismatch | Differs: Daft skew is the population (biased) skewness; Batcher skew is the sample-adjusted Fisher-Pearson value (0.848 vs 1.469 on \[1,2,10,4\]). Param: bias=True. Wave W0. |
+| `skew` | `Expr.skew` | canonical |  |
 | `sqrt` | `Expr.sqrt` | canonical |  |
 | `stddev` | `Expr.std` | param | Missing: ddof= (Batcher std is always the sample, ddof=1). Wave W2. |
 | `string_agg` | `Expr.str.join` | canonical |  |
@@ -126,7 +126,7 @@ The following table maps the 89 names on the `daft.functions` module, sorted alp
 | `cos` | `Expr.cos` | canonical |  |
 | `cosh` | `Expr.cosh` | canonical |  |
 | `cot` | `Expr.cot` | canonical |  |
-| `count` | `bt.count` | mismatch | Differs: bt.count() is COUNT(\*) over rows and takes no column; Daft count(expr, mode='valid') counts an expression's non-null values. Rewrite: col.count(). Wave W0. |
+| `count` | `bt.count` | mismatch | Differs: Daft count(expr) counts non-null values of expr, which is col.count(); bt.count() counts rows. Wave W0. |
 | `count_distinct` | `bt.count_distinct` | canonical |  |
 | `csc` | `Expr.csc` | canonical |  |
 | `degrees` | `Expr.degrees` | canonical |  |
@@ -176,7 +176,7 @@ The following table maps the 89 names on the `daft.functions` module, sorted alp
 | `sign` | `Expr.sign` | canonical |  |
 | `sin` | `Expr.sin` | canonical |  |
 | `sinh` | `Expr.sinh` | canonical |  |
-| `skew` | `bt.skew` | mismatch | Differs: Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True. Wave W0. |
+| `skew` | `bt.skew` | canonical |  |
 | `sqrt` | `Expr.sqrt` | canonical |  |
 | `stddev` | `bt.std` | param | Missing: ddof= (Batcher std is always the sample, ddof=1). Wave W2. |
 | `string_agg` | `Expr.str.join` | canonical |  |

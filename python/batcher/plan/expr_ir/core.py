@@ -3112,7 +3112,7 @@ class Expr:
         Matches DuckDB. Null when the group has fewer than 4 values. Mergeable.
 
         ``bias=True`` is the population excess kurtosis ``m4 / m2² - 3`` (Spark's
-        ``kurtosis`` and Polars' default), the same value :meth:`kurtosis_pop` returns.
+        ``kurtosis``, Polars' default, and DuckDB's ``kurtosis_pop``).
         ``fisher=False`` reports Pearson's kurtosis, which is the excess plus 3.
 
         Args:
@@ -3136,26 +3136,6 @@ class Expr:
         """
         agg = AggExpr("kurtosis_pop" if bias else "kurtosis", self)
         return agg if fisher else agg + Lit(3.0)
-
-    def kurtosis_pop(self) -> AggExpr:
-        """Population excess kurtosis per group (→ Float64).
-
-        The uncorrected ``m4/m2² - 3``, where :meth:`kurtosis` applies the sample
-        correction. DuckDB has both, and on a small group they differ by a lot, so
-        pick the one your statistics call for rather than treating them as rounding.
-
-        Returns:
-            An aggregate expression for use in ``group_by().agg(...)``.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"g": ["a"] * 5, "x": [1, 2, 3, 4, 10]})
-                >>> ds.group_by("g").agg(r=bt.col("x").kurtosis_pop()).to_pydict()
-                {'g': ['a'], 'r': [-0.21199999999999974]}
-        """
-        return AggExpr("kurtosis_pop", self)
 
     def entropy(
         self, base: float = 2.0, *, of: str = "frequencies", normalize: bool = True

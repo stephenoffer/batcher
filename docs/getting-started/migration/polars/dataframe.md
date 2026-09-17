@@ -259,20 +259,20 @@ The following table maps the 17 names on `GroupBy`, sorted alphabetically.
 |---|---|---|---|
 | `agg` | `GroupBy.agg` | canonical |  |
 | `all` | `GroupBy.array_agg` | canonical |  |
-| `count` | `GroupBy.count` | mismatch | Differs: Polars counts rows per group (a 'count' column); Batcher counts non-null values of each column. GroupBy.len is the row count. Wave W0. |
+| `count` | `GroupBy.count` | mismatch | Differs: Polars GroupBy.count counts rows into a column named count; port as group\_by(k).len(name=count). Wave W0. |
 | `first` | `GroupBy.first` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 | `having` | n/a | gap | Not yet: GroupBy.having (filter groups by an aggregate predicate). Wave W8. |
 | `head` | `GroupBy.head` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 | `last` | `GroupBy.last` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 | `len` | `GroupBy.len` | canonical |  |
 | `map_groups` | `GroupBy.map_groups` | mismatch | Differs: Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches. Wave W0. |
-| `max` | `GroupBy.max` | mismatch | Differs: Polars ignores NaN in max; Batcher orders NaN above every number and returns NaN. Param: nan\_policy='ignore'. Wave W0. |
+| `max` | `GroupBy.max` | mismatch | Differs: Polars max ignores NaN; port as agg(col(c).max(nan\_policy=ignore)) per column. Wave W0. |
 | `mean` | `GroupBy.mean` | canonical |  |
 | `median` | `GroupBy.median` | canonical |  |
 | `min` | `GroupBy.min` | canonical |  |
-| `n_unique` | `GroupBy.count_distinct` | mismatch | Differs: Polars counts null as a distinct value; Batcher skips nulls. Param: count\_nulls=True. Wave W0. |
-| `quantile` | `GroupBy.quantile` | mismatch | Differs: Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=. Wave W0. |
-| `sum` | `GroupBy.sum` | mismatch | Differs: Polars sums an all-null group to 0; Batcher returns null. Param: empty\_value=0. Wave W0. |
+| `n_unique` | `GroupBy.count_distinct` | mismatch | Differs: Polars counts null as a distinct value; port as agg(col(c).count\_distinct(count\_nulls=True)) per column. Wave W0. |
+| `quantile` | `GroupBy.quantile` | mismatch | Differs: Polars defaults to nearest; port as agg(col(c).quantile(q, nearest)) per column. Wave W0. |
+| `sum` | `GroupBy.sum` | mismatch | Differs: Polars sums an all-null group to 0; port as agg(col(c).sum(empty\_value=0)) per column. Wave W0. |
 | `tail` | `GroupBy.tail` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 
 ## `LazyGroupBy`
@@ -283,20 +283,20 @@ The following table maps the 17 names on `LazyGroupBy`, sorted alphabetically.
 |---|---|---|---|
 | `agg` | `GroupBy.agg` | canonical |  |
 | `all` | `GroupBy.array_agg` | canonical |  |
-| `count` | `GroupBy.count` | mismatch | Differs: Polars counts rows per group (a 'count' column); Batcher counts non-null values of each column. GroupBy.len is the row count. Wave W0. |
+| `count` | `GroupBy.count` | mismatch | Differs: Polars LazyGroupBy.count counts rows into a column named count; port as group\_by(k).len(name=count). Wave W0. |
 | `first` | `GroupBy.first` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 | `having` | n/a | gap | Not yet: GroupBy.having (filter groups by an aggregate predicate). Wave W8. |
 | `head` | `GroupBy.head` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 | `last` | `GroupBy.last` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 | `len` | `GroupBy.len` | canonical |  |
 | `map_groups` | `GroupBy.map_groups` | mismatch | Differs: Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches. Wave W0. |
-| `max` | `GroupBy.max` | mismatch | Differs: Polars ignores NaN in max; Batcher orders NaN above every number and returns NaN. Param: nan\_policy='ignore'. Wave W0. |
+| `max` | `GroupBy.max` | mismatch | Differs: Polars max ignores NaN; port as agg(col(c).max(nan\_policy=ignore)) per column. Wave W0. |
 | `mean` | `GroupBy.mean` | canonical |  |
 | `median` | `GroupBy.median` | canonical |  |
 | `min` | `GroupBy.min` | canonical |  |
-| `n_unique` | `GroupBy.count_distinct` | mismatch | Differs: Polars counts null as a distinct value; Batcher skips nulls. Param: count\_nulls=True. Wave W0. |
-| `quantile` | `GroupBy.quantile` | mismatch | Differs: Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=. Wave W0. |
-| `sum` | `GroupBy.sum` | mismatch | Differs: Polars sums an all-null group to 0; Batcher returns null. Param: empty\_value=0. Wave W0. |
+| `n_unique` | `GroupBy.count_distinct` | mismatch | Differs: Polars counts null as a distinct value; port as agg(col(c).count\_distinct(count\_nulls=True)) per column. Wave W0. |
+| `quantile` | `GroupBy.quantile` | mismatch | Differs: Polars defaults to nearest; port as agg(col(c).quantile(q, nearest)) per column. Wave W0. |
+| `sum` | `GroupBy.sum` | mismatch | Differs: Polars sums an all-null group to 0; port as agg(col(c).sum(empty\_value=0)) per column. Wave W0. |
 | `tail` | `GroupBy.tail` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 
 ## `DynamicGroupBy`

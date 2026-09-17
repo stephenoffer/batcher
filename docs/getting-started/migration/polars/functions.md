@@ -19,12 +19,12 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
 | `align_frames` | n/a | gap | Not yet: align\_frames (outer-join frames on a key and sort). Wave W8. |
-| `all` | `bt.all` + `bt.bool_and` | mismatch | Differs: pl.all() is the all-columns selector (bt.all), but pl.all('a') means col('a').all(), which Batcher spells bool\_and and which returns null rather than true on an all-null column. Params: names form, ignore\_nulls=True. Wave W0. |
+| `all` | `bt.all` + `bt.bool_and` | mismatch | Differs: pl.all() with no names is the all-columns selector bt.all(); pl.all(name) is col(name).bool\_and(empty\_value=True). Wave W0. |
 | `all_horizontal` | `bt.all_horizontal` | param | Missing: bare string arguments as column names (read as string literals and rejected today). Wave W2. |
-| `any` | `bt.bool_or` | mismatch | Differs: Polars any() ignores nulls and returns false for an all-null or empty column; bool\_or returns null there. Param: ignore\_nulls=True with empty-is-false. Wave W0. |
+| `any` | `bt.bool_or` | mismatch | Differs: pl.any(names) ignores nulls and is false for an empty column: col(name).bool\_or(empty\_value=False) per name. Wave W0. |
 | `any_horizontal` | `bt.any_horizontal` | param | Missing: bare string arguments as column names (read as string literals and rejected today). Wave W2. |
 | `api` | `bt.api` | mismatch | Differs: polars.api registers user namespaces; batcher.api is Batcher's internal conductor package. Namespace registration is the gap. Wave W11. |
-| `approx_n_unique` | `bt.approx_count_distinct` | mismatch | Differs: Polars counts null as a distinct value; Batcher skips nulls. Param: count\_nulls=True. Wave W0. |
+| `approx_n_unique` | `bt.approx_count_distinct` | mismatch | Differs: pl.approx\_n\_unique(name) counts null as a distinct value: col(name).approx\_count\_distinct(count\_nulls=True). Wave W0. |
 | `arange` | n/a | gap | Not yet: arange expression (int range). Wave W6. |
 | `arctan2` | `bt.arctan2` | mismatch | Differs: Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so arctan2('a', 'b') silently computes over the constants. Param: strings as column names (all-null result). Wave W0. |
 | `arctan2d` | n/a | gap | Not yet: arctan2d (degrees). Wave W3. |
@@ -97,19 +97,19 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `lit` | `bt.lit` | param | Missing: list and ndarray literals, Polars dtype objects, allow\_object=. Wave W2. |
 | `map_batches` | n/a | gap | Not yet: map\_batches over several expressions (vectorized UDF). Wave W11. |
 | `map_groups` | n/a | gap | Not yet: map\_groups over several expressions (UDF per group). Wave W11. |
-| `max` | `bt.max` | mismatch | Differs: Polars max ignores NaN; Batcher orders NaN above every number and returns NaN. Param: nan\_policy='ignore'. Wave W0. |
-| `max_horizontal` | `bt.greatest` | mismatch | Differs: Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so max\_horizontal('a', 'b') silently computes over the constants. Param: strings as column names. Wave W0. |
+| `max` | `bt.max` | mismatch | Differs: pl.max(names) ignores NaN: col(name).max(nan\_policy=ignore) per name. Wave W0. |
+| `max_horizontal` | `bt.greatest` | mismatch | Differs: Polars reads a bare string as a column name and skips NaN; port as bt.greatest(bt.col(a), bt.col(b)), which reads a bare string as a literal. Wave W0. |
 | `mean` | `bt.mean` | canonical |  |
 | `mean_horizontal` | `bt.mean_horizontal` | param | Missing: bare string arguments as column names (rejected today). Wave W2. |
 | `median` | `bt.median` | canonical |  |
 | `merge_sorted` | n/a | gap | Not yet: merge\_sorted. Wave W8. |
 | `min` | `bt.min` | canonical |  |
-| `min_horizontal` | `bt.least` | mismatch | Differs: Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so min\_horizontal('a', 'b') silently computes over the constants. Param: strings as column names. Wave W0. |
-| `n_unique` | `bt.count_distinct` | mismatch | Differs: Polars counts null as a distinct value; Batcher skips nulls. Param: count\_nulls=True. Wave W0. |
+| `min_horizontal` | `bt.least` | mismatch | Differs: Polars reads a bare string as a column name and skips NaN; port as bt.least(bt.col(a), bt.col(b)), which reads a bare string as a literal. Wave W0. |
+| `n_unique` | `bt.count_distinct` | mismatch | Differs: pl.n\_unique(name) counts null as a distinct value: col(name).count\_distinct(count\_nulls=True). Wave W0. |
 | `nth` | n/a | gap | Not yet: nth (column by position). Wave W8. |
 | `ones` | n/a | gap | Not yet: ones expression. Wave W8. |
 | `plugins` | n/a | gap | Not yet: Rust plugin ABI (register\_plugin\_function). Wave W11. |
-| `quantile` | `bt.quantile` | mismatch | Differs: Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=. Wave W0. |
+| `quantile` | `bt.quantile` | canonical |  |
 | `QueryOptFlags` | `bt.OptimizerConfig` | param | Missing: per-collect optimization toggles (predicate/projection pushdown, CSE, slice pushdown). Wave W2. |
 | `reduce` | `bt.reduce_horizontal` | canonical |  |
 | `register_extension_type` | n/a | gap | Not yet: extension type registry. Wave W11. |
@@ -130,7 +130,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `StringCache` | n/a | out of scope | Declined: no global Categorical string cache: Arrow dictionaries are per batch. |
 | `struct` | `bt.struct` | param | Missing: positional expressions (names inferred) and schema=. Wave W2. |
 | `struct_with_fields` | n/a | gap | Not yet: struct\_with\_fields. Wave W3. |
-| `sum` | `bt.sum` | mismatch | Differs: Polars sums an all-null or empty column to 0; Batcher returns null. Param: empty\_value=0. Wave W0. |
+| `sum` | `bt.sum` | mismatch | Differs: pl.sum(names) sums an empty or all-null column to 0: col(name).sum(empty\_value=0) per name. Wave W0. |
 | `sum_horizontal` | `bt.sum_horizontal` | param | Missing: bare string arguments as column names (rejected today). Wave W2. |
 | `tail` | n/a | gap | Not yet: tail expression (last n values). Wave W8. |
 | `thread_pool_size` | `batcher.config.get_option` | param | Missing: the effective worker-thread count (execution.parallelism is the configured value and may be unset). Wave W2. |

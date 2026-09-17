@@ -139,7 +139,7 @@ def test_kurtosis_pop_is_the_population_form(ds):
     """
     values = [1.0, 2.0, 3.0, 4.0, 10.0]
     frame = bt.from_pydict({"v": values})
-    population = frame.agg(k=bt.col("v").kurtosis_pop()).to_pydict()["k"][0]
+    population = frame.agg(k=bt.col("v").kurtosis(bias=True)).to_pydict()["k"][0]
     sample = frame.agg(k=bt.col("v").kurtosis()).to_pydict()["k"][0]
     assert population is not None
     mean = sum(values) / len(values)
@@ -181,7 +181,7 @@ GROUP_SHORTHANDS = [
     ("mode", lambda: bt.col("n").mode()),
     ("product", lambda: bt.col("n").product()),
     ("kurtosis", lambda: bt.col("n").kurtosis()),
-    ("skewness", lambda: bt.col("n").skew()),
+    ("skew", lambda: bt.col("n").skew()),
 ]
 
 

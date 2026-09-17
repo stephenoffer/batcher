@@ -22,11 +22,11 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `add` | `+` operator | alias |  |
 | `agg_groups` | n/a | gap | Not yet: agg\_groups (group row indices as a list). Wave W8. |
 | `alias` | `Expr.alias` | canonical |  |
-| `all` | `Expr.bool_and` | mismatch | Differs: Polars all() ignores nulls and returns true for an all-null or empty column; bool\_and returns null there. Param: ignore\_nulls=True with empty-is-true. Wave W0. |
+| `all` | `Expr.bool_and` | mismatch | Differs: Polars all() ignores nulls and is true for an empty column where Batcher returns null. Port as col.bool\_and(empty\_value=True); the codemod keeps a marker until over() windows the composed form this parameter builds. Wave W0. |
 | `and_` | `&` operator | alias |  |
-| `any` | `Expr.bool_or` | mismatch | Differs: Polars any() ignores nulls and returns false for an all-null or empty column; bool\_or returns null there. Param: ignore\_nulls=True with empty-is-false. Wave W0. |
+| `any` | `Expr.bool_or` | mismatch | Differs: Polars any() ignores nulls and is false for an empty column where Batcher returns null. Port as col.bool\_or(empty\_value=False); the codemod keeps a marker until over() windows the composed form this parameter builds. Wave W0. |
 | `append` | n/a | gap | Not yet: Expr.append (length-changing concatenation of two expressions). Wave W8. |
-| `approx_n_unique` | `Expr.approx_count_distinct` | mismatch | Differs: Polars counts null as a distinct value; Batcher skips nulls. Param: count\_nulls=True. Wave W0. |
+| `approx_n_unique` | `Expr.approx_count_distinct` | mismatch | Differs: Polars counts null as a distinct value where Batcher skips it. Port as col.approx\_count\_distinct(count\_nulls=True); the codemod keeps a marker until over() windows the composed form this parameter builds. Wave W0. |
 | `arccos` | `Expr.arccos` | canonical |  |
 | `arccosh` | `Expr.arccosh` | canonical |  |
 | `arcsin` | `Expr.arcsin` | canonical |  |
@@ -75,7 +75,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `drop_nans` | n/a | gap | Not yet: Expr.drop\_nans (length-changing). Wave W8. |
 | `drop_nulls` | n/a | gap | Not yet: Expr.drop\_nulls (length-changing). Wave W8. |
 | `dt` | `Expr.dt` | canonical |  |
-| `entropy` | `Expr.entropy` | mismatch | Differs: Polars normalizes the input to probabilities with base e and normalize=True semantics (NaN on negative input); Batcher computes base-2 entropy of the value distribution. Params: base=, normalize=. Wave W0. |
+| `entropy` | `Expr.entropy` | mismatch | Differs: Polars entropy reads the values as a distribution in natural log; the template passes of=values and base e. Polars counts a null as a value. Wave W0. |
 | `eq` | `==` operator | alias |  |
 | `eq_missing` | `Expr.eq_missing` | canonical |  |
 | `ewm_mean` | `Expr.ewm_mean` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
@@ -90,7 +90,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `fill_nan` | `Expr.fill_nan` | canonical |  |
 | `fill_null` | `Expr.fill_null` | param | Missing: strategy= ('forward','backward','min','max','mean','zero','one') and limit=. Wave W2. |
 | `filter` | n/a | gap | Not yet: Expr.filter inside aggregation context (length-changing). Wave W8. |
-| `first` | `Expr.first` | mismatch | Differs: Polars first() takes the first row in implicit row order and keeps nulls; Batcher requires order\_by. Params: order\_by optional under the explicit-order policy, ignore\_nulls=False. Wave W0. |
+| `first` | `Expr.first` | mismatch | Differs: Polars first takes the first row in frame order, nulls included; Batcher needs an explicit order: col.first(order\_by, ignore\_nulls=False) after with\_row\_index. Wave W0. |
 | `flatten` | n/a | gap | Not yet: Expr.flatten (length-changing). Wave W8. |
 | `floor` | `Expr.floor` | canonical |  |
 | `floordiv` | `//` operator | alias |  |
@@ -124,8 +124,8 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `is_null` | `Expr.is_null` | canonical |  |
 | `is_unique` | `Expr.is_unique` | canonical |  |
 | `item` | n/a | gap | Not yet: Expr.item (assert a single value). Wave W8. |
-| `kurtosis` | `Expr.kurtosis` | mismatch | Differs: Polars defaults to the biased population estimate (fisher=True, bias=True); Batcher returns the sample estimate. Params: fisher=, bias=. Wave W0. |
-| `last` | `Expr.last` | mismatch | Differs: Polars last() takes the last row in implicit row order and keeps nulls; Batcher requires order\_by. Params: order\_by optional under the explicit-order policy, ignore\_nulls=False. Wave W0. |
+| `kurtosis` | `Expr.kurtosis` | canonical |  |
+| `last` | `Expr.last` | mismatch | Differs: Polars last takes the last row in frame order, nulls included; Batcher needs an explicit order: col.last(order\_by, ignore\_nulls=False) after with\_row\_index. Wave W0. |
 | `le` | `<=` operator | alias |  |
 | `len` | `bt.count` | canonical |  |
 | `limit` | n/a | gap | Not yet: Expr.limit (length-changing). Wave W8. |
@@ -137,7 +137,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `lt` | `<` operator | alias |  |
 | `map_batches` | n/a | gap | Not yet: Expr.map\_batches (vectorized Python UDF as an expression). Wave W11. |
 | `map_elements` | n/a | gap | Not yet: Expr.map\_elements, only as a batch-vectorized wrapper (per-row Python stays refused). Wave W11. |
-| `max` | `Expr.max` | mismatch | Differs: Polars max() ignores NaN (nan\_max propagates it); Batcher orders NaN above every number and returns NaN. Param: nan\_policy='ignore'. Wave W0. |
+| `max` | `Expr.max` | mismatch | Differs: Polars max() ignores NaN where Batcher orders NaN above every number. Port as col.max(nan\_policy=ignore); the codemod keeps a marker until over() windows the composed form this parameter builds. Wave W0. |
 | `max_by` | `Expr.arg_max` | mismatch | Differs: Batcher spells value-by-max as arg\_max(by) until the max\_by rename, and it skips rows whose value is null where Polars returns that null. Wave W0. |
 | `mean` | `Expr.mean` | canonical |  |
 | `median` | `Expr.median` | canonical |  |
@@ -145,9 +145,9 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `min` | `Expr.min` | canonical |  |
 | `min_by` | `Expr.arg_min` | mismatch | Differs: Batcher spells value-by-min as arg\_min(by) until the min\_by rename, and it skips rows whose value is null where Polars returns that null. Wave W0. |
 | `mod` | `%` operator | mismatch | Differs: Polars % takes the sign of the divisor (floored, consistent with //); Batcher's % truncates toward zero (-3 % 2 is 1 in Polars, -1 in Batcher) while its // floors. Batcher bug. Wave W0. |
-| `mode` | `Expr.mode` | mismatch | Differs: Polars mode() returns every most-frequent value (length-changing); Batcher returns one. Param: all\_modes=True. Wave W0. |
+| `mode` | `Expr.mode` | mismatch | Differs: with all\_modes=True every tied value is returned as Polars does; Polars also counts null as a mode candidate, Batcher does not. Wave W0. |
 | `mul` | `*` operator | alias |  |
-| `n_unique` | `Expr.count_distinct` | mismatch | Differs: Polars counts null as a distinct value; Batcher skips nulls. Param: count\_nulls=True. Wave W0. |
+| `n_unique` | `Expr.count_distinct` | mismatch | Differs: Polars counts null as a distinct value where Batcher skips it. Port as col.count\_distinct(count\_nulls=True); the codemod keeps a marker until over() windows the composed form this parameter builds. Wave W0. |
 | `name` | `Selector.name` | param | Missing: .name accessor (keep/prefix/suffix/map/case) on every Expr, not only on selectors. Wave W2. |
 | `nan_max` | n/a | gap | Not yet: Expr.nan\_max (NaN-propagating max). Wave W3. |
 | `nan_min` | n/a | gap | Not yet: Expr.nan\_min (NaN-propagating min). Wave W3. |
@@ -159,13 +159,13 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `or_` | `\|` operator | alias |  |
 | `over` | `AggExpr.over` | param | Missing: over() on every Expr, with mapping\_strategy=, order\_by=, descending=, nulls\_last=. Wave WF. |
 | `pct_change` | `Expr.pct_change` | canonical |  |
-| `peak_max` | `Expr.peak_max` | mismatch | Differs: Polars compares against neighbours with nulls and the edges as null/false inputs; Batcher returns false at the edges and around nulls. Param: edge/null policy. Wave W0. |
-| `peak_min` | `Expr.peak_min` | mismatch | Differs: Polars compares against neighbours with nulls and the edges as null/false inputs; Batcher returns false at the edges and around nulls. Param: edge/null policy. Wave W0. |
+| `peak_max` | `Expr.peak_max` | canonical |  |
+| `peak_min` | `Expr.peak_min` | canonical |  |
 | `pipe` | n/a | gap | Not yet: Expr.pipe. Wave W8. |
 | `pow` | `**` operator | alias |  |
-| `product` | `Expr.product` | mismatch | Differs: Polars returns 1 for an empty or all-null input; Batcher (SQL) returns null. Param: empty\_value=1. Wave W0. |
+| `product` | `Expr.product` | mismatch | Differs: Polars returns 1 for an empty or all-null input where Batcher returns null. Port as col.product(empty\_value=1); the codemod keeps a marker until over() windows the composed form this parameter builds. Wave W0. |
 | `qcut` | n/a | gap | Not yet: Expr.qcut (quantile binning). Wave W3. |
-| `quantile` | `Expr.quantile` | mismatch | Differs: Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=. Wave W0. |
+| `quantile` | `Expr.quantile` | canonical |  |
 | `radians` | `Expr.radians` | canonical |  |
 | `rank` | `Expr.rank` | mismatch | Differs: Polars defaults to method='average' (Float64) and leaves null rows null; Batcher ranks with integer ties and assigns nulls a rank. Params: method=, null rows stay null. Wave W0. |
 | `rechunk` | n/a | out of scope | Declined: memory layout is engine-owned (morsels), not user-visible. |
@@ -211,7 +211,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `sign` | `Expr.sign` | mismatch | Differs: Polars returns NaN for NaN input; Batcher returns 0.0. Batcher bug. Wave W0. |
 | `sin` | `Expr.sin` | canonical |  |
 | `sinh` | `Expr.sinh` | canonical |  |
-| `skew` | `Expr.skew` | mismatch | Differs: Polars defaults to the biased population estimate (bias=True); Batcher returns the sample estimate. Param: bias=. Wave W0. |
+| `skew` | `Expr.skew` | canonical |  |
 | `slice` | n/a | gap | Not yet: Expr.slice (length-changing). Wave W8. |
 | `sort` | n/a | gap | Not yet: Expr.sort (reorder within an expression). Wave W8. |
 | `sort_by` | n/a | gap | Not yet: Expr.sort\_by. Wave W8. |
@@ -220,7 +220,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `str` | `Expr.str` | canonical |  |
 | `struct` | `Expr.struct` | canonical |  |
 | `sub` | `-` operator | alias |  |
-| `sum` | `Expr.sum` | mismatch | Differs: Polars returns 0 for an empty or all-null input; Batcher (SQL) returns null. Param: empty\_value=0. Wave W0. |
+| `sum` | `Expr.sum` | mismatch | Differs: Polars returns 0 for an empty or all-null input where Batcher returns null. Port as col.sum(empty\_value=0); the codemod keeps a marker until over() windows the composed form this parameter builds. Wave W0. |
 | `tail` | n/a | gap | Not yet: Expr.tail (length-changing). Wave W8. |
 | `tan` | `Expr.tan` | canonical |  |
 | `tanh` | `Expr.tanh` | canonical |  |

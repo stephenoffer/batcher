@@ -101,7 +101,7 @@ _ANON: dict[str, object] = {
     "kahan_sum": lambda x: x.kahan_sum(),
     "sumkahan": lambda x: x.kahan_sum(),
     "mad": lambda x: x.mad(),
-    "kurtosis_pop": lambda x: x.kurtosis_pop(),
+    "kurtosis_pop": lambda x: x.kurtosis(bias=True),
     # DuckDB leaves the choice of row unspecified, and so does the engine's `any_value`
     # (it takes the group minimum, which is what a commutative combine can promise).
     "any_value": lambda x: x.any_value(),

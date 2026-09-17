@@ -100,6 +100,7 @@ isin = "is_in"
 isna = "is_null"
 isnull = "is_null"
 kurt = "kurtosis"
+kurtosis_pop = { to = "kurtosis", fill = ["bias@99=True"] }
 le = { operator = "le" }
 log = "ln"
 lt = { operator = "lt" }

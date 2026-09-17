@@ -128,7 +128,7 @@ The following table maps the 16 names on `GroupedDataFrame`, sorted alphabetical
 | `mean` | `GroupBy.mean` | canonical |  |
 | `min` | `GroupBy.min` | canonical |  |
 | `product` | `GroupBy.product` | canonical |  |
-| `skew` | `GroupBy.skew` | mismatch | Differs: Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True. Wave W0. |
+| `skew` | `GroupBy.skew` | mismatch | Differs: Daft skew is the population value; port as agg(col(c).skew(bias=True)) per column. Wave W0. |
 | `stddev` | `GroupBy.std` | param | Missing: ddof=. Wave W2. |
 | `string_agg` | `GroupBy.agg` + `Expr.str.join` | canonical |  |
 | `sum` | `GroupBy.sum` | canonical |  |

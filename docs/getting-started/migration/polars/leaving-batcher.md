@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 229 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 235 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -64,6 +64,7 @@ The following table maps 229 Batcher spellings to the Polars names that compute 
 | `bt.median` | `polars.median` |
 | `bt.min` | `polars.min` |
 | `bt.numeric` | `selectors.numeric` |
+| `bt.quantile` | `polars.quantile` |
 | `bt.read.arrow` | `polars.read_ipc` |
 | `bt.read.avro` | `polars.read_avro` |
 | `bt.read.csv` | `polars.read_csv` |
@@ -176,6 +177,7 @@ The following table maps 229 Batcher spellings to the Polars names that compute 
 | `Expr.is_not_null` | `Expr.is_not_null` |
 | `Expr.is_null` | `Expr.is_null` |
 | `Expr.is_unique` | `Expr.is_unique` |
+| `Expr.kurtosis` | `Expr.kurtosis` |
 | `Expr.list.arg_max` | `Expr.arr.arg_max`, `Expr.list.arg_max` |
 | `Expr.list.arg_min` | `Expr.arr.arg_min`, `Expr.list.arg_min` |
 | `Expr.list.difference` | `Expr.list.set_difference` |
@@ -204,9 +206,13 @@ The following table maps 229 Batcher spellings to the Polars names that compute 
 | `Expr.median` | `Expr.median` |
 | `Expr.min` | `Expr.min` |
 | `Expr.pct_change` | `Expr.pct_change` |
+| `Expr.peak_max` | `Expr.peak_max` |
+| `Expr.peak_min` | `Expr.peak_min` |
+| `Expr.quantile` | `Expr.quantile` |
 | `Expr.radians` | `Expr.radians` |
 | `Expr.sin` | `Expr.sin` |
 | `Expr.sinh` | `Expr.sinh` |
+| `Expr.skew` | `Expr.skew` |
 | `Expr.sqrt` | `Expr.sqrt` |
 | `Expr.str.contains` | `Expr.bin.contains`, `Expr.str.contains` |
 | `Expr.str.ends_with` | `Expr.bin.ends_with`, `Expr.cat.ends_with`, `Expr.str.ends_with` |

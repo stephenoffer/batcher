@@ -212,7 +212,7 @@ All four are mergeable, so a value computed over a shuffle equals the single-nod
 The distribution aggregates read a group's whole value list rather than a running
 total: `.entropy()` (base-2 Shannon entropy of the value distribution, DuckDB `entropy`),
 {py:meth}`.mad() <batcher.plan.expr_ir.core.Expr.mad>` (median absolute deviation, a spread measure a single outlier cannot move),
-`.kurtosis_pop()` (the population form of `.kurtosis()`), `.quantile_disc(q)` (the
+`.kurtosis(bias=True)` (the population form of `.kurtosis()`), `.quantile_disc(q)` (the
 quantile *element*, where `.quantile(q)` interpolates between two of them), `.top_k(k)`
 (the `k` most frequent values as a list, DuckDB `approx_top_k`, computed exactly here),
 {py:meth}`.kahan_sum() <batcher.plan.expr_ir.core.Expr.kahan_sum>` (compensated summation, DuckDB `fsum` or {py:meth}`kahan_sum <batcher.plan.expr_ir.core.Expr.kahan_sum>`) gives the same answer as

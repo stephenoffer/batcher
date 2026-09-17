@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to PySpark
 
-The following table maps 262 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 266 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
@@ -29,6 +29,7 @@ The following table maps 262 Batcher spellings to the PySpark names that compute
 | `batcher.io.Split` | `datasource.InputPartition` |
 | `bt.add_streaming_listener` | `StreamingQueryManager.addListener` |
 | `bt.arctan2` | `functions.atan2` |
+| `bt.array_agg` | `functions.array_agg` |
 | `bt.array` | `functions.array` |
 | `bt.await_any_termination` | `StreamingQueryManager.awaitAnyTermination` |
 | `bt.bit_and` | `functions.bit_and` |
@@ -54,6 +55,7 @@ The following table maps 262 Batcher spellings to the PySpark names that compute
 | `bt.from_unix_date` | `functions.date_from_unix_date` |
 | `bt.greatest` | `functions.greatest` |
 | `bt.hypot` | `functions.hypot` |
+| `bt.kurtosis` | `functions.kurtosis` |
 | `bt.least` | `functions.least` |
 | `bt.lit` | `functions.lit` |
 | `bt.make_date` | `functions.make_date` |
@@ -97,6 +99,7 @@ The following table maps 262 Batcher spellings to the PySpark names that compute
 | `bt.running_queries` + `bt.cancel_query` | `SparkSession.interruptAll` |
 | `bt.Session` | `SparkSession.newSession` |
 | `bt.Session` + `bt.set_config` | `SparkSession.Builder`, `SparkSession.builder` |
+| `bt.skew` | `functions.skewness` |
 | `bt.st_set_srid` | `functions.st_setsrid` |
 | `bt.st_srid` | `functions.st_srid` |
 | `bt.std` | `functions.std`, `functions.stddev_samp`, `functions.stddev` |
@@ -153,6 +156,7 @@ The following table maps 262 Batcher spellings to the PySpark names that compute
 | `Expr.arcsinh` | `functions.asinh` |
 | `Expr.arctan` | `functions.atan` |
 | `Expr.arctanh` | `functions.atanh` |
+| `Expr.array_agg` | `functions.collect_list` |
 | `Expr.between` | `Column.between` |
 | `Expr.bit_count` | `functions.bit_count` |
 | `Expr.bitwise_and` | `Column.bitwiseAND` |

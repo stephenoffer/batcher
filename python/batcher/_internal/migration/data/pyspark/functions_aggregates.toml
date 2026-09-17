@@ -6,14 +6,14 @@
 any_value = { status = "canonical", batcher = "Expr.any_value" }
 approx_count_distinct = { status = "param", batcher = "bt.approx_count_distinct", need = "rsd= relative standard deviation", wave = "W2" }
 approx_percentile = { status = "param", batcher = "Expr.approx_quantile", need = "a list of percentages, accuracy=, and returning an actual input value", wave = "W2" }
-array_agg = { status = "mismatch", batcher = "bt.array_agg", note = "Spark skips nulls when collecting; bt.array_agg keeps them. Needs ignore_nulls=True", wave = "W0" }
+array_agg = { status = "canonical", batcher = "bt.array_agg", template = 'array_agg(col) -> sem.column(col).array_agg(ignore_nulls=True)' }
 avg = { status = "canonical", batcher = "Expr.mean" }
 bit_and = { status = "canonical", batcher = "bt.bit_and" }
 bit_or = { status = "canonical", batcher = "bt.bit_or" }
 bit_xor = { status = "canonical", batcher = "bt.bit_xor" }
 bool_and = { status = "canonical", batcher = "bt.bool_and" }
 bool_or = { status = "canonical", batcher = "bt.bool_or" }
-collect_list = { status = "mismatch", batcher = "Expr.array_agg", note = "Spark skips nulls when collecting; Expr.array_agg keeps them. Needs ignore_nulls=True", wave = "W0" }
+collect_list = { status = "canonical", batcher = "Expr.array_agg", template = 'collect_list(col) -> sem.column(col).array_agg(ignore_nulls=True)' }
 collect_set = { status = "param", batcher = "Expr.array_agg", need = "distinct=True collection that skips nulls", wave = "W2" }
 corr = { status = "canonical", batcher = "bt.corr" }
 count = { status = "canonical", batcher = ["Expr.count", "bt.count"], template = 'count(col) -> sem.spark_count(col)' }
@@ -24,15 +24,15 @@ covar_samp = { status = "canonical", batcher = "bt.covar_samp" }
 cume_dist = { status = "canonical", batcher = "bt.cume_dist" }
 dense_rank = { status = "canonical", batcher = "bt.dense_rank" }
 every = { status = "canonical", batcher = "bt.bool_and" }
-first = { status = "mismatch", batcher = "bt.first", note = "Spark first(col, ignorenulls) takes whatever row arrives first; bt.first requires order_by= and has no ignore_nulls=", wave = "W0" }
-first_value = { status = "mismatch", batcher = "bt.first_value", note = "Spark first_value uses the window's default frame (a running frame when ordered) and takes ignoreNulls=; bt.first_value always reads the whole partition", wave = "W0" }
+first = { status = "mismatch", batcher = "bt.first", note = "Spark first takes whatever row arrives first and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.first(order_by, ignore_nulls=ignorenulls)", wave = "W0" }
+first_value = { status = "mismatch", batcher = "bt.first_value", note = "the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.first_value(x, ignore_nulls=...)", wave = "W0" }
 grouping = { status = "gap", need = "GROUPING() indicator inside cube/rollup/grouping sets aggregates", wave = "W8" }
 grouping_id = { status = "gap", need = "GROUPING_ID() bit vector inside cube/rollup/grouping sets aggregates", wave = "W8" }
 histogram_numeric = { status = "gap", need = "approximate numeric histogram with nBins", wave = "W14" }
-kurtosis = { status = "mismatch", batcher = ["bt.kurtosis", "Expr.kurtosis_pop"], note = "Spark kurtosis is the population excess kurtosis ([1,1,2] -> -1.5); bt.kurtosis is the sample estimate. Expr.kurtosis_pop matches Spark", wave = "W0" }
+kurtosis = { status = "canonical", batcher = "bt.kurtosis", template = 'kurtosis(col) -> sem.column(col).kurtosis(bias=True)' }
 lag = { status = "param", batcher = "bt.lag", need = "default= value for rows before the partition start", wave = "W5" }
-last = { status = "mismatch", batcher = "bt.last", note = "Spark last(col, ignorenulls) takes whatever row arrives last; bt.last requires order_by= and has no ignore_nulls=", wave = "W0" }
-last_value = { status = "mismatch", batcher = "bt.last_value", note = "Spark last_value uses the window's default frame (a running frame when ordered) and takes ignoreNulls=; bt.last_value always reads the whole partition", wave = "W0" }
+last = { status = "mismatch", batcher = "bt.last", note = "Spark last takes whatever row arrives last and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.last(order_by, ignore_nulls=ignorenulls)", wave = "W0" }
+last_value = { status = "mismatch", batcher = "bt.last_value", note = "the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.last_value(x, ignore_nulls=...)", wave = "W0" }
 lead = { status = "param", batcher = "bt.lead", need = "default= value for rows past the partition end", wave = "W5" }
 listagg = { status = "canonical", batcher = "Expr.str.join" }
 listagg_distinct = { status = "param", batcher = "Expr.str.join", need = "distinct=True", wave = "W2" }
@@ -43,7 +43,7 @@ median = { status = "canonical", batcher = "bt.median" }
 min = { status = "canonical", batcher = "bt.min" }
 min_by = { status = "param", batcher = "Expr.arg_min", need = "renaming the value-by Expr.arg_min(by) to min_by, and k= for the bottom-k values", wave = "W0" }
 mode = { status = "canonical", batcher = "bt.mode" }
-nth_value = { status = "mismatch", batcher = "bt.nth_value", note = "Spark nth_value uses the window's default frame (a running frame when ordered) and takes ignoreNulls=; bt.nth_value always reads the whole partition", wave = "W0" }
+nth_value = { status = "mismatch", batcher = "bt.nth_value", note = "the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.nth_value(x, n, ignore_nulls=...)", wave = "W0" }
 ntile = { status = "canonical", batcher = "bt.ntile" }
 percent_rank = { status = "canonical", batcher = "bt.percent_rank" }
 percentile = { status = "param", batcher = "Expr.quantile", need = "a list of percentages and frequency= weights", wave = "W2" }
@@ -60,7 +60,7 @@ regr_sxx = { status = "canonical", batcher = "bt.regr_sxx" }
 regr_sxy = { status = "canonical", batcher = "bt.regr_sxy" }
 regr_syy = { status = "canonical", batcher = "bt.regr_syy" }
 row_number = { status = "canonical", batcher = "bt.row_number" }
-skewness = { status = "mismatch", batcher = "bt.skew", note = "Spark skewness is the population estimate ([1,1,2] -> 0.7071); bt.skew is the adjusted sample estimate. Needs a population variant", wave = "W0" }
+skewness = { status = "canonical", batcher = "bt.skew", template = 'skewness(col) -> sem.column(col).skew(bias=True)' }
 some = { status = "canonical", batcher = "bt.bool_or" }
 std = { status = "canonical", batcher = "bt.std" }
 stddev = { status = "canonical", batcher = "bt.std" }

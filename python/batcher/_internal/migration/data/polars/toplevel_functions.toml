@@ -14,12 +14,12 @@ SQLContext = { status = "canonical", batcher = "bt.Session" }
 Series = { status = "out_of_scope", reason = "Batcher has no Series type (user decision); a column is an Expr or a one-column Dataset" }
 StringCache = { status = "out_of_scope", reason = "no global Categorical string cache: Arrow dictionaries are per batch" }
 align_frames = { status = "gap", need = "align_frames (outer-join frames on a key and sort)", wave = "W8" }
-all = { status = "mismatch", batcher = ["bt.all", "bt.bool_and"], note = "pl.all() is the all-columns selector (bt.all), but pl.all('a') means col('a').all(), which Batcher spells bool_and and which returns null rather than true on an all-null column. Params: names form, ignore_nulls=True", wave = "W0" }
+all = { status = "mismatch", batcher = ["bt.all", "bt.bool_and"], note = "pl.all() with no names is the all-columns selector bt.all(); pl.all(name) is col(name).bool_and(empty_value=True)", wave = "W0" }
 all_horizontal = { status = "param", batcher = "bt.all_horizontal", need = "bare string arguments as column names (read as string literals and rejected today)", wave = "W2" }
-any = { status = "mismatch", batcher = "bt.bool_or", note = "Polars any() ignores nulls and returns false for an all-null or empty column; bool_or returns null there. Param: ignore_nulls=True with empty-is-false", wave = "W0" }
+any = { status = "mismatch", batcher = "bt.bool_or", note = "pl.any(names) ignores nulls and is false for an empty column: col(name).bool_or(empty_value=False) per name", wave = "W0" }
 any_horizontal = { status = "param", batcher = "bt.any_horizontal", need = "bare string arguments as column names (read as string literals and rejected today)", wave = "W2" }
 api = { status = "mismatch", batcher = "bt.api", note = "polars.api registers user namespaces; batcher.api is Batcher's internal conductor package. Namespace registration is the gap", wave = "W11" }
-approx_n_unique = { status = "mismatch", batcher = "bt.approx_count_distinct", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
+approx_n_unique = { status = "mismatch", batcher = "bt.approx_count_distinct", note = "pl.approx_n_unique(name) counts null as a distinct value: col(name).approx_count_distinct(count_nulls=True)", wave = "W0" }
 arange = { status = "gap", need = "arange expression (int range)", wave = "W6" }
 arctan2 = { status = "mismatch", batcher = "bt.arctan2", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so arctan2('a', 'b') silently computes over the constants. Param: strings as column names (all-null result)", wave = "W0" }
 arctan2d = { status = "gap", need = "arctan2d (degrees)", wave = "W3" }
@@ -86,19 +86,19 @@ linear_spaces = { status = "gap", need = "linear_spaces", wave = "W6" }
 lit = { status = "param", batcher = "bt.lit", need = "list and ndarray literals, Polars dtype objects, allow_object=", wave = "W2", template = 'lit(value) <-> bt.lit(value)' }
 map_batches = { status = "gap", need = "map_batches over several expressions (vectorized UDF)", wave = "W11" }
 map_groups = { status = "gap", need = "map_groups over several expressions (UDF per group)", wave = "W11" }
-max = { status = "mismatch", batcher = "bt.max", note = "Polars max ignores NaN; Batcher orders NaN above every number and returns NaN. Param: nan_policy='ignore'", wave = "W0" }
-max_horizontal = { status = "mismatch", batcher = "bt.greatest", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so max_horizontal('a', 'b') silently computes over the constants. Param: strings as column names", wave = "W0" }
+max = { status = "mismatch", batcher = "bt.max", note = "pl.max(names) ignores NaN: col(name).max(nan_policy=ignore) per name", wave = "W0" }
+max_horizontal = { status = "mismatch", batcher = "bt.greatest", note = "Polars reads a bare string as a column name and skips NaN; port as bt.greatest(bt.col(a), bt.col(b)), which reads a bare string as a literal", wave = "W0" }
 mean = { status = "canonical", batcher = "bt.mean" }
 mean_horizontal = { status = "param", batcher = "bt.mean_horizontal", need = "bare string arguments as column names (rejected today)", wave = "W2" }
 median = { status = "canonical", batcher = "bt.median" }
 merge_sorted = { status = "gap", need = "merge_sorted", wave = "W8" }
 min = { status = "canonical", batcher = "bt.min" }
-min_horizontal = { status = "mismatch", batcher = "bt.least", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so min_horizontal('a', 'b') silently computes over the constants. Param: strings as column names", wave = "W0" }
-n_unique = { status = "mismatch", batcher = "bt.count_distinct", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
+min_horizontal = { status = "mismatch", batcher = "bt.least", note = "Polars reads a bare string as a column name and skips NaN; port as bt.least(bt.col(a), bt.col(b)), which reads a bare string as a literal", wave = "W0" }
+n_unique = { status = "mismatch", batcher = "bt.count_distinct", note = "pl.n_unique(name) counts null as a distinct value: col(name).count_distinct(count_nulls=True)", wave = "W0" }
 nth = { status = "gap", need = "nth (column by position)", wave = "W8" }
 ones = { status = "gap", need = "ones expression", wave = "W8" }
 plugins = { status = "gap", need = "Rust plugin ABI (register_plugin_function)", wave = "W11" }
-quantile = { status = "mismatch", batcher = "bt.quantile", note = "Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=", wave = "W0" }
+quantile = { status = "canonical", batcher = "bt.quantile", template = 'quantile(column, quantile, interpolation="nearest") -> sem.column(column).quantile(quantile, interpolation)' }
 reduce = { status = "canonical", batcher = "bt.reduce_horizontal" }
 register_extension_type = { status = "gap", need = "extension type registry", wave = "W11" }
 repeat = { status = "gap", need = "repeat expression", wave = "W8" }
@@ -115,7 +115,7 @@ sql_expr = { status = "gap", need = "sql_expr (SQL expression string to Expr)", 
 std = { status = "param", batcher = "bt.std", need = "ddof=", wave = "W2" }
 struct = { status = "param", batcher = "bt.struct", need = "positional expressions (names inferred) and schema=", wave = "W2" }
 struct_with_fields = { status = "gap", need = "struct_with_fields", wave = "W3" }
-sum = { status = "mismatch", batcher = "bt.sum", note = "Polars sums an all-null or empty column to 0; Batcher returns null. Param: empty_value=0", wave = "W0" }
+sum = { status = "mismatch", batcher = "bt.sum", note = "pl.sum(names) sums an empty or all-null column to 0: col(name).sum(empty_value=0) per name", wave = "W0" }
 sum_horizontal = { status = "param", batcher = "bt.sum_horizontal", need = "bare string arguments as column names (rejected today)", wave = "W2" }
 tail = { status = "gap", need = "tail expression (last n values)", wave = "W8" }
 thread_pool_size = { status = "param", batcher = "batcher.config.get_option", need = "the effective worker-thread count (execution.parallelism is the configured value and may be unset)", wave = "W2" }

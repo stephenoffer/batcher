@@ -65,7 +65,7 @@ shift_right = { status = "canonical", batcher = "op:rshift" }
 sign = { status = "canonical", batcher = "Expr.sign" }
 sin = { status = "canonical", batcher = "Expr.sin" }
 sinh = { status = "canonical", batcher = "Expr.sinh" }
-skew = { status = "mismatch", batcher = "Expr.skew", note = "Daft skew is the population (biased) skewness; Batcher skew is the sample-adjusted Fisher-Pearson value (0.848 vs 1.469 on [1,2,10,4]). Param: bias=True", wave = "W0" }
+skew = { status = "canonical", batcher = "Expr.skew", template = 'skew() -> self.skew(bias=True)' }
 sqrt = { status = "canonical", batcher = "Expr.sqrt" }
 stddev = { status = "param", batcher = "Expr.std", need = "ddof= (Batcher std is always the sample, ddof=1)", wave = "W2" }
 string_agg = { status = "canonical", batcher = "Expr.str.join" }
@@ -105,7 +105,7 @@ conv = { status = "gap", need = "base conversion between arbitrary radixes 2-36 
 cos = { status = "canonical", batcher = "Expr.cos" }
 cosh = { status = "canonical", batcher = "Expr.cosh" }
 cot = { status = "canonical", batcher = "Expr.cot" }
-count = { status = "mismatch", batcher = "bt.count", note = "bt.count() is COUNT(*) over rows and takes no column; Daft count(expr, mode='valid') counts an expression's non-null values. Rewrite: col.count()", wave = "W0" }
+count = { status = "mismatch", batcher = "bt.count", note = "Daft count(expr) counts non-null values of expr, which is col.count(); bt.count() counts rows", wave = "W0" }
 count_distinct = { status = "canonical", batcher = "bt.count_distinct" }
 csc = { status = "canonical", batcher = "Expr.csc" }
 degrees = { status = "canonical", batcher = "Expr.degrees" }
@@ -155,7 +155,7 @@ shift_right = { status = "canonical", batcher = "op:rshift" }
 sign = { status = "canonical", batcher = "Expr.sign" }
 sin = { status = "canonical", batcher = "Expr.sin" }
 sinh = { status = "canonical", batcher = "Expr.sinh" }
-skew = { status = "mismatch", batcher = "bt.skew", note = "Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True", wave = "W0" }
+skew = { status = "canonical", batcher = "bt.skew", template = 'skew(expr) -> sem.column(expr).skew(bias=True)' }
 sqrt = { status = "canonical", batcher = "Expr.sqrt" }
 stddev = { status = "param", batcher = "bt.std", need = "ddof= (Batcher std is always the sample, ddof=1)", wave = "W2" }
 string_agg = { status = "canonical", batcher = "Expr.str.join" }

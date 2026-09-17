@@ -17,7 +17,7 @@ BlockColumn = { status = "out_of_scope", reason = "Ray block abstraction importe
 BlockColumnAccessor = { status = "out_of_scope", reason = "Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime)" }
 Callable = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
 Collection = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
-Count = { status = "mismatch", batcher = ["bt.count", "Expr.count"], note = "Ray Count() counts rows, and Count(on) defaults ignore_nulls=False so it also counts nulls; Batcher col(x).count() skips nulls. Port as: bt.count() for both unless ignore_nulls=True, then col(x).count().", wave = "W0" }
+Count = { status = "mismatch", batcher = ["bt.count", "Expr.count"], note = "Ray Count() counts rows (bt.count()); Count(on, ignore_nulls=True) is col(on).count(). Ray names the column count() or count(on)", wave = "W0" }
 CountDistinct = { status = "canonical", batcher = "Expr.count_distinct" }
 Deprecated = { status = "out_of_scope", reason = "ray.util.annotations decorator imported into the module, not Ray Data API" }
 Dict = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
@@ -27,13 +27,13 @@ List = { status = "out_of_scope", reason = "module import plumbing, not Ray Data
 Max = { status = "canonical", batcher = "Expr.max" }
 Mean = { status = "canonical", batcher = "Expr.mean" }
 Min = { status = "canonical", batcher = "Expr.min" }
-MissingValuePercentage = { status = "mismatch", batcher = "bt.null_rate", note = "Ray returns a percentage in [0, 100] and counts NaN as missing; Batcher null_rate returns a fraction in [0, 1] and counts only nulls. Port as: bt.null_rate(x) * 100 after fill_nan(None).", wave = "W0" }
+MissingValuePercentage = { status = "mismatch", batcher = "bt.null_rate", note = "Ray returns a percentage and counts NaN as missing: bt.null_rate(col(x).fill_nan(None)) * 100", wave = "W0" }
 Optional = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
 Protocol = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
 PublicAPI = { status = "out_of_scope", reason = "ray.util.annotations decorator imported into the module, not Ray Data API" }
 Quantile = { status = "canonical", batcher = "Expr.quantile" }
 Set = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
-Std = { status = "mismatch", batcher = "Expr.std", note = "Ray Std(on, ddof=1) returns NaN for a group with one non-null value and takes ddof=; Batcher std is sample std (ddof=1 fixed) and returns null there.", wave = "W0" }
+Std = { status = "mismatch", batcher = "Expr.std", note = "Ray Std(on, ddof) is col(on).std(ddof=ddof), named std(on); Ray returns NaN where a group has no more than ddof rows and Batcher returns null", wave = "W0" }
 Sum = { status = "canonical", batcher = "Expr.sum" }
 SupportsRichComparisonType = { status = "out_of_scope", reason = "typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API" }
 TypeVar = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
