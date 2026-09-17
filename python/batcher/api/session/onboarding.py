@@ -39,11 +39,11 @@ TOP_LEVEL_UNSUPPORTED: dict[str, str] = {
     # --- renamed meanings -------------------------------------------------------------
     "arg_max": (
         "The value at the row where another column is largest is bt.max_by(value, by); "
-        "the position of a column's maximum is bt.col('x').arg_max()."
+        "the position of a column's maximum is bt.col('x').arg_max(order_by='_row')."
     ),
     "arg_min": (
         "The value at the row where another column is smallest is bt.min_by(value, by); "
-        "the position of a column's minimum is bt.col('x').arg_min()."
+        "the position of a column's minimum is bt.col('x').arg_min(order_by='_row')."
     ),
     "Categorical": (
         "There is no categorical constructor; store the values as a string column, and "
