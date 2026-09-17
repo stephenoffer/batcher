@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction isn't
 
 ## Batcher to Ray Data
 
-The following table maps 102 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
+The following table maps 105 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
 
 | Batcher | Ray Data |
 |---|---|
@@ -26,6 +26,7 @@ The following table maps 102 Batcher spellings to the Ray Data names that comput
 | `bt.col` | `expressions.col` |
 | `bt.Dataset` | `ray.data.Dataset` |
 | `bt.Expr` | `expressions.Expr` |
+| `bt.from_daft` | `ray.data.from_daft` |
 | `bt.from_dask` | `ray.data.from_dask` |
 | `bt.from_items` | `ray.data.from_items` |
 | `bt.from_numpy` | `ray.data.from_numpy` |
@@ -47,6 +48,8 @@ The following table maps 102 Batcher spellings to the Ray Data names that comput
 | `Dataset.group_by` | `Dataset.groupby` |
 | `Dataset.limit` | `Dataset.limit` |
 | `Dataset.select` | `Dataset.select_columns` |
+| `Dataset.to_daft` | `Dataset.to_daft` |
+| `Dataset.to_spark` | `Dataset.to_spark` |
 | `Dataset.union` | `Dataset.union` |
 | `Dataset.with_columns` | `Dataset.with_column`, `Dataset.with_columns` |
 | `Dataset` | `Dataset.copy` |

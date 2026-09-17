@@ -80,7 +80,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `take_all` | `Dataset.to_pylist` | mismatch | Differs: Ray take\_all(limit=) is eager and raises if the dataset has more than `limit` rows; Batcher to\_pylist() has no guard. Codemod: .to\_pylist() (with .limit(limit+1) and a length check when limit is given). Wave W0. |
 | `take_batch` | `Dataset.limit` + `Dataset.to_numpy` | mismatch | Differs: Ray take\_batch(batch\_size=20) returns one batch in batch\_format='default' (\{col: ndarray\}); Batcher: .limit(20).to\_numpy() returns \{col: ndarray\}; other batch\_format values need to\_arrow()/to\_pandas(). Wave W0. |
 | `to_arrow_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
-| `to_daft` | n/a | gap | Not yet: export a Dataset to a Daft DataFrame. Wave W8. |
+| `to_daft` | `Dataset.to_daft` | canonical |  |
 | `to_dask` | n/a | gap | Not yet: export a Dataset to a Dask DataFrame. Wave W8. |
 | `to_mars` | n/a | out of scope | Declined: Mars (pymars) interop; Batcher has no Mars bridge and converts through pandas (Dataset.to\_pandas). |
 | `to_modin` | n/a | out of scope | Declined: Modin wraps pandas; convert through Dataset.to\_pandas and modin.pandas.DataFrame. |
@@ -88,7 +88,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `to_pandas` | `Dataset.to_pandas` | param | Missing: limit= (raise if the dataset has more rows than limit). Wave W2. |
 | `to_pandas_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
 | `to_random_access_dataset` | n/a | out of scope | Declined: experimental actor-served key-value lookup over a sorted dataset; Batcher serves key lookups as a relational Dataset.lookup\_join. |
-| `to_spark` | n/a | gap | Not yet: export a Dataset to a PySpark DataFrame. Wave W8. |
+| `to_spark` | `Dataset.to_spark` | canonical |  |
 | `to_tf` | `Dataset.ml.to_tf` | mismatch | Differs: Ray to\_tf(feature\_columns, label\_columns) yields (features, labels) tuples with batch\_size=1 default; Batcher ds.ml.to\_tf yields \{column: tensor\} dicts and has no feature/label split or additional\_columns/feature\_type\_spec. Dataset.to\_tf is being removed in favour of ds.ml.to\_tf. Wave W8. |
 | `train_test_split` | `Dataset.ml.train_test_split` | mismatch | Differs: Ray defaults shuffle=False, so the test set is the last test\_size rows in dataset order, and test\_size may be an int row count; Batcher assigns rows by a seeded hash (seed=0), takes only a fraction, and is lazy rather than materialized. Wave W0. |
 | `union` | `Dataset.union` | canonical |  |

@@ -22,7 +22,7 @@ Each of these builds a {py:class}`Dataset <batcher.Dataset>` from data you alrea
 | {py:func}`bt.from_arrow(table_or_batches) <batcher.from_arrow>` | pyarrow Table, RecordBatch, or batch list |
 | {py:func}`bt.from_batches(factory, schema) <batcher.from_batches>` | streaming source from a batch factory |
 | {py:func}`bt.from_pandas(df) <batcher.from_pandas>` / {py:func}`bt.from_polars(df) <batcher.from_polars>` / {py:func}`bt.from_numpy(...) <batcher.from_numpy>` | framework adapters |
-| {py:func}`bt.from_spark(...) <batcher.from_spark>` / {py:func}`bt.from_dask(...) <batcher.from_dask>` / {py:func}`bt.from_ray_dataset(...) <batcher.from_ray_dataset>` | distributed-frame adapters |
+| {py:func}`bt.from_spark(...) <batcher.from_spark>` / {py:func}`bt.from_daft(...) <batcher.from_daft>` / {py:func}`bt.from_dask(...) <batcher.from_dask>` / {py:func}`bt.from_ray_dataset(...) <batcher.from_ray_dataset>` | distributed-frame adapters |
 | {py:func}`bt.from_torch(...) <batcher.from_torch>` / {py:func}`bt.from_tf(...) <batcher.from_tf>` / {py:func}`bt.from_huggingface(...) <batcher.from_huggingface>` | framework adapters |
 | {py:func}`bt.from_duckdb(rel) <batcher.from_duckdb>` | DuckDB relation, or a connection plus a query |
 | {py:func}`bt.from_dict(d) <batcher.from_dict>` / {py:func}`bt.from_dicts(rows) <batcher.from_dicts>` / {py:func}`bt.from_records(rows, columns=...) <batcher.from_records>` | pandas/Polars-spelled aliases |
@@ -116,6 +116,8 @@ Each of these executes the plan and returns a result or writes it out:
 | `.to_torch(columns=None, batch_size=None)` / `.to_tf(...)` | a Torch / TensorFlow dataset |
 | `.to_torch_dataloader(...)` | a `torch.utils.data.DataLoader` |
 | {py:meth}`.to_ray_dataset() <batcher.Dataset.to_ray_dataset>` | a `ray.data.Dataset`, for a Ray Train / Tune / Serve stage |
+| {py:meth}`.to_daft() <batcher.Dataset.to_daft>` | a `daft.DataFrame` |
+| {py:meth}`.to_spark(spark, max_arrow_bytes=None, staging_path=None) <batcher.Dataset.to_spark>` | a `pyspark.sql.DataFrame` in `spark`, staged as Parquet past `max_arrow_bytes` |
 
 ### Introspection
 

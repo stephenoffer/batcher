@@ -38,7 +38,7 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 | `from_arrow` | `bt.from_arrow` | param | Missing: a list of pyarrow Tables (Batcher accepts a Table, a RecordBatch or a list of RecordBatches and raises TypeError on a list of Tables). Wave W2. |
 | `from_arrow_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
 | `from_blocks` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
-| `from_daft` | n/a | gap | Not yet: import a Daft DataFrame. Wave W8. |
+| `from_daft` | `bt.from_daft` | canonical |  |
 | `from_dask` | `bt.from_dask` | canonical |  |
 | `from_huggingface` | `bt.from_huggingface` | param | Missing: datasets.IterableDataset (streaming) input; Batcher takes an Arrow-backed datasets.Dataset only. Wave W13. |
 | `from_items` | `bt.from_items` | canonical |  |

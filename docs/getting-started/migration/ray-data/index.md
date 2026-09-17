@@ -46,7 +46,7 @@ The following table lists the waves that hold Ray Data rows, in delivery order:
 | W4 | Maps, higher-order functions, and list reduction | 2 |
 | W5 | Window functions, including rolling and dynamic group-by | 1 |
 | W7 | Semi-structured data: JSON, CSV, and XML functions | 4 |
-| W8 | Relational `DataFrame` gaps | 22 |
+| W8 | Relational `DataFrame` gaps | 19 |
 | W9 | Catalogs and tables | 31 |
 | W10 | Streaming | 4 |
 | W11 | UDFs | 41 |
@@ -59,9 +59,9 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataset` | 117 | 9 | 16 | 58 | 18 | 16 |
+| {doc}`dataset` | 117 | 11 | 16 | 58 | 16 | 16 |
 | {doc}`expressions` | 179 | 77 | 2 | 26 | 17 | 57 |
-| {doc}`io` | 96 | 17 | 11 | 33 | 23 | 12 |
+| {doc}`io` | 96 | 18 | 11 | 33 | 22 | 12 |
 | {doc}`udfs-ai-multimodal` | 46 | 4 | 15 | 15 | 9 | 3 |
 | {doc}`execution-context` | 92 | 0 | 15 | 3 | 2 | 72 |
 

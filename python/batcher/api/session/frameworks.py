@@ -28,6 +28,7 @@ from batcher.io import interop
 
 __all__ = [
     "from_any",
+    "from_daft",
     "from_dask",
     "from_duckdb",
     "from_huggingface",
@@ -70,12 +71,18 @@ def from_pandas(df: Any) -> Dataset:
 
 
 def from_polars(df: Any) -> Dataset:
-    """Create a `Dataset` from a Polars `DataFrame` via its zero-copy Arrow export.
+    """Create a `Dataset` from a Polars `DataFrame`, `LazyFrame`, or `Series`.
 
-    Polars is Arrow-backed, so the buffers are referenced directly, not copied. A
-    `LazyFrame` is collected first, and a `Series` becomes a one-column dataset.
-    Needs polars (``pip install 'batcher-engine[polars]'``); raises `BackendError`
-    if it is absent.
+    A `DataFrame` goes through its Arrow export, and a `Series` becomes a one-column
+    dataset. A `LazyFrame` is not collected up front: its query runs under Polars'
+    ``collect_batches`` when the `Dataset` executes, and the chunks stream into the engine
+    one at a time. Each execution of the `Dataset` re-runs the Polars query. A Polars
+    release without ``collect_batches`` collects the `LazyFrame` instead.
+
+    Polars exports at its oldest Arrow compatibility level, so strings arrive as
+    ``large_string`` and binary as ``large_binary`` rather than the ``string_view`` and
+    ``binary_view`` layouts Batcher has no kernels for. Needs polars
+    (``pip install 'batcher-engine[polars]'``); raises `BackendError` if it is absent.
 
     Examples:
         .. doctest::
@@ -84,6 +91,10 @@ def from_polars(df: Any) -> Dataset:
             >>> import batcher as bt
             >>> bt.from_polars(pl.DataFrame({"a": [1, 2, 3]})).to_pydict()
             {'a': [1, 2, 3]}
+
+            >>> lazy = pl.LazyFrame({"a": [1, 2, 3]}).filter(pl.col("a") > 1)
+            >>> bt.from_polars(lazy).to_pydict()
+            {'a': [2, 3]}
 
     Args:
         df: The Polars `DataFrame`, `LazyFrame`, or `Series` to ingest.
@@ -94,8 +105,6 @@ def from_polars(df: Any) -> Dataset:
     Raises:
         BackendError: If polars is not installed.
     """
-    if type(df).__name__ == "LazyFrame" and hasattr(df, "collect"):
-        df = df.collect()
     if type(df).__name__ == "Series" and hasattr(df, "to_frame"):
         df = df.to_frame()
     return _scan(interop.from_polars(df))
@@ -244,11 +253,17 @@ def from_tf(tf_dataset: Any) -> Dataset:
 
 
 def from_spark(spark_df: Any) -> Dataset:
-    """Create a `Dataset` from a Spark `DataFrame` by collecting it through Arrow.
+    """Create a `Dataset` from a Spark `DataFrame`, streaming its partitions where possible.
 
-    The Spark frame is collected to the driver via its Arrow bridge, so this
-    materializes the data — for large frames write to a shared store and `read` it
-    instead. Needs ``pyspark`` (``pip install 'batcher-engine[spark]'``); raises
+    On PySpark 4.1 and later the frame exports an Arrow stream: Spark converts each
+    partition to Arrow on the executors and the driver receives the partitions one at a
+    time, so it holds one partition rather than the whole frame. Each execution of the
+    `Dataset` re-runs the Spark job. Earlier releases have no streaming export, so the frame
+    is collected eagerly through ``toArrow`` (PySpark 4.0) or the ``toPandas`` Arrow bridge.
+
+    Either way every row passes through the driver. For a frame too large for that, write
+    it to shared storage from Spark and `read` the files instead. `Dataset.to_spark` is the
+    return leg. Needs ``pyspark`` (``pip install 'batcher-engine[spark]'``); raises
     `BackendError` if it is absent.
 
     Examples:
@@ -261,15 +276,45 @@ def from_spark(spark_df: Any) -> Dataset:
             >>> ds = bt.from_spark(sdf)  # doctest: +SKIP
 
     Args:
-        spark_df: The Spark `DataFrame` to collect through Arrow.
+        spark_df: The Spark `DataFrame` to read through Arrow.
 
     Returns:
-        A lazy `Dataset` over the collected data.
+        A lazy `Dataset` over the frame's rows.
 
     Raises:
         BackendError: If ``pyspark`` is not installed.
     """
     return _scan(interop.from_spark(spark_df))
+
+
+def from_daft(daft_df: Any) -> Dataset:
+    """Create a streaming `Dataset` from a Daft `DataFrame`, one Arrow batch at a time.
+
+    The schema comes from Daft's plan without running it. When the `Dataset` executes, the
+    Daft query runs and its result streams into the engine through ``to_arrow_iter``, so
+    the frame is never collected into one table. Each execution re-runs the Daft query.
+    `Dataset.to_daft` is the return leg. Needs ``daft``
+    (``pip install 'batcher-engine[daft]'``); raises `BackendError` if it is absent.
+
+    Examples:
+        .. doctest::
+
+            >>> import daft  # doctest: +SKIP
+            >>> import batcher as bt
+            >>> frame = daft.from_pydict({"x": [1, 2, 3]})  # doctest: +SKIP
+            >>> bt.from_daft(frame).filter(bt.col("x") > 1).to_pydict()  # doctest: +SKIP
+            {'x': [2, 3]}
+
+    Args:
+        daft_df: The Daft `DataFrame` to stream in.
+
+    Returns:
+        A streaming lazy `Dataset` over the frame's batches.
+
+    Raises:
+        BackendError: If ``daft`` is not installed.
+    """
+    return _scan(interop.from_daft(daft_df))
 
 
 def from_dask(ddf: Any) -> Dataset:
@@ -341,6 +386,7 @@ _BY_TYPE: dict[tuple[str, str], str] = {
     ("torch", "Tensor"): "from_torch",
     ("tensorflow", "DatasetV2"): "from_tf",
     ("pyspark", "DataFrame"): "from_spark",
+    ("daft", "DataFrame"): "from_daft",
     ("dask", "DataFrame"): "from_dask",
     ("dask_expr", "DataFrame"): "from_dask",
     ("ray", "Dataset"): "from_ray_dataset",
@@ -363,7 +409,7 @@ def from_any(data: Any) -> Dataset:
     The generic on-ramp, for scripts and migration code that should not have to name
     the framework: a `Dataset` passes through, a path string is `read`, an Arrow
     table/batch, dict, list of dicts, list of values, NumPy array, pandas or Polars
-    frame, DuckDB relation, HuggingFace/Ray/Dask/Spark dataset, or anything exporting
+    frame, DuckDB relation, HuggingFace/Ray/Dask/Spark/Daft dataset, or anything exporting
     ``__arrow_c_stream__`` routes to the matching `from_*` constructor. Reach for the
     specific constructor when you know the type — the error messages are better.
 

@@ -35,7 +35,7 @@ TaskPoolStrategy = { status = "param", batcher = "Dataset.map_batches", need = "
 from_arrow = { status = "param", batcher = "bt.from_arrow", need = "a list of pyarrow Tables (Batcher accepts a Table, a RecordBatch or a list of RecordBatches and raises TypeError on a list of Tables)", wave = "W2" }
 from_arrow_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
 from_blocks = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
-from_daft = { status = "gap", need = "import a Daft DataFrame", wave = "W8" }
+from_daft = { status = "canonical", batcher = "bt.from_daft" }
 from_dask = { status = "canonical", batcher = "bt.from_dask" }
 from_huggingface = { status = "param", batcher = "bt.from_huggingface", need = "datasets.IterableDataset (streaming) input; Batcher takes an Arrow-backed datasets.Dataset only", wave = "W13" }
 from_items = { status = "canonical", batcher = "bt.from_items" }

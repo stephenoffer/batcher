@@ -1188,6 +1188,7 @@
 "from_any" = "Dataset"
 "from_arrow" = "Dataset"
 "from_batches" = "Dataset"
+"from_daft" = "Dataset"
 "from_dask" = "Dataset"
 "from_dict" = "Dataset"
 "from_dicts" = "Dataset"

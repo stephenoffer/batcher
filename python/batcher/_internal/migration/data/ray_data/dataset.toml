@@ -63,7 +63,7 @@ take = { status = "mismatch", batcher = ["Dataset.limit", "Dataset.to_pylist"], 
 take_all = { status = "mismatch", batcher = "Dataset.to_pylist", note = "Ray take_all(limit=) is eager and raises if the dataset has more than `limit` rows; Batcher to_pylist() has no guard. Codemod: .to_pylist() (with .limit(limit+1) and a length check when limit is given).", wave = "W0" }
 take_batch = { status = "mismatch", batcher = ["Dataset.limit", "Dataset.to_numpy"], note = "Ray take_batch(batch_size=20) returns one batch in batch_format='default' ({col: ndarray}); Batcher: .limit(20).to_numpy() returns {col: ndarray}; other batch_format values need to_arrow()/to_pandas().", wave = "W0" }
 to_arrow_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
-to_daft = { status = "gap", need = "export a Dataset to a Daft DataFrame", wave = "W8" }
+to_daft = { status = "canonical", batcher = "Dataset.to_daft" }
 to_dask = { status = "gap", need = "export a Dataset to a Dask DataFrame", wave = "W8" }
 to_mars = { status = "out_of_scope", reason = "Mars (pymars) interop; Batcher has no Mars bridge and converts through pandas (Dataset.to_pandas)" }
 to_modin = { status = "out_of_scope", reason = "Modin wraps pandas; convert through Dataset.to_pandas and modin.pandas.DataFrame" }
@@ -71,7 +71,7 @@ to_numpy_refs = { status = "out_of_scope", reason = "Ray object-store block refe
 to_pandas = { status = "param", batcher = "Dataset.to_pandas", need = "limit= (raise if the dataset has more rows than limit)", wave = "W2" }
 to_pandas_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
 to_random_access_dataset = { status = "out_of_scope", reason = "experimental actor-served key-value lookup over a sorted dataset; Batcher serves key lookups as a relational Dataset.lookup_join" }
-to_spark = { status = "gap", need = "export a Dataset to a PySpark DataFrame", wave = "W8" }
+to_spark = { status = "canonical", batcher = "Dataset.to_spark" }
 to_tf = { status = "mismatch", batcher = "Dataset.ml.to_tf", note = "Ray to_tf(feature_columns, label_columns) yields (features, labels) tuples with batch_size=1 default; Batcher ds.ml.to_tf yields {column: tensor} dicts and has no feature/label split or additional_columns/feature_type_spec. Dataset.to_tf is being removed in favour of ds.ml.to_tf.", wave = "W8" }
 train_test_split = { status = "mismatch", batcher = "Dataset.ml.train_test_split", note = "Ray defaults shuffle=False, so the test set is the last test_size rows in dataset order, and test_size may be an int row count; Batcher assigns rows by a seeded hash (seed=0), takes only a fraction, and is lazy rather than materialized.", wave = "W0" }
 union = { status = "canonical", batcher = "Dataset.union" }

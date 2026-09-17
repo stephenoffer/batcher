@@ -131,10 +131,10 @@ print(ported.equals(expected))
 
 ## Requirements and limitations
 
-- {py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_dask <batcher.from_dask>`, {py:func}`from_ray_dataset <batcher.from_ray_dataset>`,
+- {py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_daft <batcher.from_daft>`, {py:func}`from_dask <batcher.from_dask>`, {py:func}`from_ray_dataset <batcher.from_ray_dataset>`,
   {py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>` each need the source framework
   installed. Batcher doesn't depend on any of them.
-- Spark, Dask, and HuggingFace have a constructor but no exporter. To hand a result back to one of them, go through {py:meth}`to_arrow <batcher.Dataset.to_arrow>` or {py:meth}`to_pandas <batcher.Dataset.to_pandas>`.
+- Dask and HuggingFace have a constructor but no exporter. To hand a result back to one of them, go through {py:meth}`to_arrow <batcher.Dataset.to_arrow>` or {py:meth}`to_pandas <batcher.Dataset.to_pandas>`.
 - `append` mode is accepted by lakehouse sinks only.
 - `merge_on` is a `write.delta` parameter. It has no equivalent on a plain Parquet
   write.

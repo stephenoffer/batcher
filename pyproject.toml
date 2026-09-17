@@ -202,6 +202,8 @@ huggingface = ["datasets>=2.18"]
 # should have been pointing at all along.
 spark = ["pyspark>=3.5"]
 dask = ["dask[dataframe]>=2024.1"]
+# `bt.from_daft` and `Dataset.to_daft`.
+daft = ["daft>=0.3"]
 # --- Convenience bundles (self-referencing extras use the distribution name) ---
 lakehouse = ["batcher-engine[delta,iceberg,hudi,delta-sharing]"]
 warehouse = ["batcher-engine[sql,connectorx,snowflake,databricks,bigquery,clickhouse,odbc]"]

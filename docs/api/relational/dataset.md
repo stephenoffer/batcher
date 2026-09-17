@@ -34,9 +34,9 @@ The following table lists the in-memory and framework entry points, ordered from
 | {py:obj}`bt.from_arrow(table_or_batches) <batcher.from_arrow>` | A pyarrow `Table`, `RecordBatch`, or list of batches. |
 | {py:obj}`bt.from_batches(factory, schema) <batcher.from_batches>` | A reusable factory that yields Arrow batches (streaming source). |
 | {py:obj}`bt.from_pandas(df) <batcher.from_pandas>` | A pandas `DataFrame`. |
-| {py:obj}`bt.from_polars(df) <batcher.from_polars>` | A Polars `DataFrame`. |
+| {py:obj}`bt.from_polars(df) <batcher.from_polars>` | A Polars `DataFrame`, `LazyFrame`, or `Series`. |
 | {py:obj}`bt.from_numpy(...) <batcher.from_numpy>` | NumPy arrays. |
-| {py:obj}`bt.from_spark <batcher.from_spark>`, {py:obj}`bt.from_dask <batcher.from_dask>`, {py:obj}`bt.from_huggingface <batcher.from_huggingface>`, {py:obj}`bt.from_torch <batcher.from_torch>`, {py:obj}`bt.from_tf <batcher.from_tf>` | Framework adapters. |
+| {py:obj}`bt.from_spark <batcher.from_spark>`, {py:obj}`bt.from_daft <batcher.from_daft>`, {py:obj}`bt.from_dask <batcher.from_dask>`, {py:obj}`bt.from_huggingface <batcher.from_huggingface>`, {py:obj}`bt.from_torch <batcher.from_torch>`, {py:obj}`bt.from_tf <batcher.from_tf>` | Framework adapters. |
 
 File and object-store readers share the same surface; only the source changes.
 

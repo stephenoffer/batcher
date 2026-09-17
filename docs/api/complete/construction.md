@@ -42,6 +42,7 @@ reports the build, compiled engine included.
    from_polars
    from_duckdb
    from_spark
+   from_daft
    from_dask
    from_huggingface
    from_torch

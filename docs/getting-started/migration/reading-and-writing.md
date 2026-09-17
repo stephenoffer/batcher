@@ -129,7 +129,8 @@ Each row pairs a source system with its constructor and, where one exists, its e
 | Polars | {py:func}`bt.from_polars(df) <batcher.from_polars>` | {py:meth}`ds.to_polars() <batcher.Dataset.to_polars>` |
 | NumPy | {py:func}`bt.from_numpy(arr) <batcher.from_numpy>` | {py:meth}`ds.to_numpy() <batcher.Dataset.to_numpy>` |
 | Ray Data | {py:func}`bt.from_ray_dataset(ds) <batcher.from_ray_dataset>` | {py:meth}`ds.to_ray_dataset() <batcher.Dataset.to_ray_dataset>` |
-| Spark | {py:func}`bt.from_spark(df) <batcher.from_spark>` | n/a |
+| Spark | {py:func}`bt.from_spark(df) <batcher.from_spark>` | {py:meth}`ds.to_spark(spark) <batcher.Dataset.to_spark>` |
+| Daft | {py:func}`bt.from_daft(df) <batcher.from_daft>` | {py:meth}`ds.to_daft() <batcher.Dataset.to_daft>` |
 | Dask | {py:func}`bt.from_dask(ddf) <batcher.from_dask>` | n/a |
 | HuggingFace | {py:func}`bt.from_huggingface(ds) <batcher.from_huggingface>` | n/a |
 | PyTorch | {py:func}`bt.from_torch(ds) <batcher.from_torch>` | {py:meth}`ds.to_torch() <batcher.Dataset.to_torch>` / {py:meth}`ds.ml.to_torch_dataloader() <batcher.api.dataset.ml.DatasetML.to_torch_dataloader>` |

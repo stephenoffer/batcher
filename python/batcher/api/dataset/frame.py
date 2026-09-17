@@ -5843,6 +5843,89 @@ class Dataset:
             distributed=distributed,
         )
 
+    def to_daft(self) -> Any:
+        """Execute and hand the result to Daft as a ``daft.DataFrame`` (needs `daft`).
+
+        The return leg of :func:`batcher.from_daft`. The output batches are coalesced into
+        tables of about 128 MiB and passed to ``daft.from_arrow``, which builds the frame
+        from them, so the result is held in memory on this process by Daft. An empty result
+        still carries its schema.
+
+        Column types cross as Arrow. Batcher's ``string``/``binary`` become Daft's
+        ``String``/``Binary``, and a dictionary-encoded source column arrives decoded, since
+        the engine decodes dictionaries at its boundary.
+
+        Returns:
+            A ``daft.DataFrame`` over the result.
+
+        Raises:
+            BackendError: If ``daft`` is not installed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> frame = bt.from_pydict({"x": [1, 2, 3]}).to_daft()  # doctest: +SKIP
+                >>> frame.to_pydict()  # doctest: +SKIP
+                {'x': [1, 2, 3]}
+        """
+        from batcher.api.dataset._export import to_daft
+
+        return to_daft(self)
+
+    def to_spark(
+        self,
+        spark: Any,
+        *,
+        max_arrow_bytes: int | None = None,
+        staging_path: str | None = None,
+    ) -> Any:
+        """Execute and hand the result to a Spark session as a ``pyspark.sql.DataFrame``.
+
+        The return leg of :func:`batcher.from_spark`, taking the session explicitly so the
+        caller decides which Spark application receives the data. Output batches are pulled
+        until they pass `max_arrow_bytes`, 64 MiB by default. A result that stays under it
+        goes to ``spark.createDataFrame`` as one Arrow table, which PySpark 4 accepts
+        directly; PySpark 3 receives it through pandas.
+
+        A larger result is written as Parquet to a new ``to_spark-<id>`` directory under
+        `staging_path`, the batches already pulled first and then the rest of the stream,
+        and Spark reads that directory with ``spark.read.parquet``. The driver then holds
+        one engine batch at a time rather than the whole result. With no `staging_path` the
+        directory goes under a fresh local temporary directory, which only a Spark whose
+        executors share this machine's filesystem can read, so pass a shared path such as
+        ``s3://<bucket>/<prefix>`` for a cluster. Spark reads the staged files lazily, so
+        they are not removed. Delete the directory once the Spark frame is no longer used.
+        Timestamps are staged at microsecond precision, Spark's own, and a value that would
+        lose precision raises instead of being truncated.
+
+        Args:
+            spark: The ``pyspark.sql.SparkSession`` to create the frame in.
+            max_arrow_bytes: The largest result, in retained Arrow bytes, handed over in
+                memory. ``None`` uses 64 MiB. Pass ``0`` to always stage Parquet.
+            staging_path: The directory or URI under which a large result is staged.
+                ``None`` uses a new local temporary directory.
+
+        Returns:
+            A ``pyspark.sql.DataFrame`` over the result.
+
+        Raises:
+            BackendError: If ``pyspark`` is not installed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from pyspark.sql import SparkSession  # doctest: +SKIP
+                >>> spark = SparkSession.builder.getOrCreate()  # doctest: +SKIP
+                >>> sdf = bt.from_pydict({"x": [1, 2, 3]}).to_spark(spark)  # doctest: +SKIP
+                >>> sdf.count()  # doctest: +SKIP
+                3
+        """
+        from batcher.api.dataset._export import to_spark
+
+        return to_spark(self, spark, max_arrow_bytes=max_arrow_bytes, staging_path=staging_path)
+
     def show(self, limit: int = 10) -> None:
         """Print a preview of the first `limit` result rows to stdout.
 

@@ -161,7 +161,7 @@ Batcher — a native, JIT-compiling, adaptive data engine.
 
 | module | lines | what it is |
 |---|---|---|
-| `_exports.py` | 1384 | The routing tables behind Batcher's lazy re-export façades — GENERATED, do not edit. |
+| `_exports.py` | 1387 | The routing tables behind Batcher's lazy re-export façades — GENERATED, do not edit. |
 | `_lazy.py` | 136 | PEP 562 lazy re-export façades, shared by every package that is one. |
 
 ### `batcher/api/` — 5 · conductor
@@ -200,12 +200,12 @@ The `Dataset` builder package.
 |---|---|---|
 | `_dedup.py` | 326 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 213 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
-| `_export.py` | 176 | Framework-export helpers behind `Dataset.to_torch` / `to_tf` / `to_ray_dataset`. |
+| `_export.py` | 287 | Framework-export helpers behind `Dataset.to_torch` / `to_tf` and the engine hand-offs. |
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 135 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 540 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 5876 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 5959 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 3560 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -233,7 +233,7 @@ Migration-error guidance: the traceback is the documentation.
 
 | module | lines | what it is |
 |---|---|---|
-| `_dataset_naming.py` | 246 | The Spark/pandas/Ray Data naming and foreign-format-exporter half of the redirect table. |
+| `_dataset_naming.py` | 244 | The Spark/pandas/Ray Data naming and foreign-format-exporter half of the redirect table. |
 | `_dataset_table.py` | 408 | The Dataset half of the migration-error table: what a migrant types, and why it is absent. |
 | `_groupby_table.py` | 130 | The GroupBy half of the migration-error table. |
 | `dataset.py` | 57 | `Dataset.__getattr__`'s answer: an actionable error for a name Batcher does not have. |
@@ -346,7 +346,7 @@ Session entry points that create `Dataset`s.
 | `cache.py` | 109 | Session-level control of the process result cache: what it holds, and dropping it. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 515 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
-| `frameworks.py` | 419 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
+| `frameworks.py` | 465 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
 | `onboarding.py` | 140 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
 | `read.py` | 129 | The generic read dispatch behind the `bt.read` namespace. |
@@ -1770,7 +1770,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 720 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
-| `interop.py` | 543 | Framework-interop ingestion — build a `Source` from a foreign object. |
+| `interop.py` | 634 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `secret_backends.py` | 302 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
