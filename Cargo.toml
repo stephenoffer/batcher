@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/stephenoffer/batcher"
 authors = ["Batcher contributors"]
@@ -24,12 +24,12 @@ authors = ["Batcher contributors"]
 # panics with `Invalid timezone "UTC": only offset based timezones supported`. That made a plain
 # `tz_col > lit(datetime)` (and the Delta residual-filter / count paths) crash. Enabled so the engine
 # actually supports the tz-aware timestamps it accepts across the FFI boundary.
-arrow = { version = "56", features = ["ffi", "prettyprint", "ipc", "ipc_compression", "chrono-tz"] }
+arrow = { version = "60", features = ["ffi", "prettyprint", "ipc", "ipc_compression", "chrono-tz"] }
 
 # PyO3 boundary — abi3 so one wheel covers all CPython >= 3.10.
-# Pinned to 0.25 to match arrow-pyarrow 56 (avoids a duplicate pyo3 in the graph).
-pyo3 = { version = "0.25", features = ["abi3-py310", "extension-module"] }
-arrow-pyarrow = "56"
+# Pinned to 0.29 to match arrow-pyarrow 60 (avoids a duplicate pyo3 in the graph).
+pyo3 = { version = "0.29", features = ["abi3-py310", "extension-module"] }
+arrow-pyarrow = "60"
 
 # Plan/expr IR is exchanged Python<->Rust as a stable, language-agnostic JSON document.
 serde = { version = "1", features = ["derive"] }

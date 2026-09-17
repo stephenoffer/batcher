@@ -289,7 +289,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 336 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1860 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `reader.py` | 1861 | The `bt.read` namespace — typed, per-format dataset readers. |
 | `writer.py` | 1992 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
@@ -577,7 +577,7 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 | `limits.py` | 266 | Client-side rate limiting for a hosted LLM endpoint. |
 | `openai.py` | 350 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
 | `parallelism.py` | 392 | How many GPUs one LLM engine replica needs, and what that choice costs. |
-| `sglang.py` | 349 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
+| `sglang.py` | 348 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
 | `vllm.py` | 500 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
 
@@ -933,7 +933,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 828 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3163 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3167 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 550 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 709 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1564,7 +1564,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | module | lines | what it is |
 |---|---|---|
 | `estimator.py` | 332 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
-| `kernel.py` | 463 | The kernel's own view of how close this process is to being OOM-killed. |
+| `kernel.py` | 466 | The kernel's own view of how close this process is to being OOM-killed. |
 | `learned.py` | 520 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 411 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 435 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
@@ -1954,7 +1954,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
 | `routing.py` | 137 | Which SQL backend serves this call — the one router the read and the write share. |
-| `snowflake.py` | 326 | Snowflake source + sink — one query submission, N shippable result chunks. |
+| `snowflake.py` | 328 | Snowflake source + sink — one query submission, N shippable result chunks. |
 | `uri.py` | 708 | Connection-URI parsing — one industry-standard URI, routed to the right backend. |
 
 ### `batcher/io/formats/sql/adbc/` — 2 · neutral IO
@@ -2336,7 +2336,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 377 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 5966 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 5967 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 358 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2940,7 +2940,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
-| `flight.rs` | 703 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
+| `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 287 | What the engine's own process knows about its hardware and its allocator. |
 | `lib.rs` | 791 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 738 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
@@ -2948,7 +2948,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
 | `route.rs` | 169 | Which executor a plan runs on, and the two different affordability tests behind that. |
 | `shuffle/gather.rs` | 419 | The reducer's gather: how a worker pulls its bucket from every mapper. |
-| `shuffle/mod.rs` | 555 | Shuffle FFI: partitioners and the concurrent reducer gather. |
+| `shuffle/mod.rs` | 554 | Shuffle FFI: partitioners and the concurrent reducer gather. |
 | `sketches.rs` | 608 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
 | `tracing_init.rs` | 194 | Rust data-plane `tracing` → Python `logging` bridge. |
 
@@ -2985,7 +2985,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/reshape.rs` | 548 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/run_sort.rs` | 275 | Natural-run detection for the fixed-width sort permutations. |
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
-| `ops/sample_sort/mod.rs` | 745 | Single-node parallel full sort by **sample-sort**. |
+| `ops/sample_sort/mod.rs` | 746 | Single-node parallel full sort by **sample-sort**. |
 | `par.rs` | 3401 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
@@ -3033,7 +3033,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/var.rs` | 335 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `byte_key.rs` | 240 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `error.rs` | 125 | The crate's error type: how the stateful runtime structures report failure. |
-| `gather/fixed.rs` | 258 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
+| `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 753 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 248 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 246 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
@@ -3113,7 +3113,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/branch/mod.rs` | 146 | Short-circuiting evaluation of the branch-selecting forms: `CASE` and `COALESCE`. |
 | `eval/cast.rs` | 612 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/cmp/mod.rs` | 11 | Comparison kernels for a column against a one-value literal. |
-| `eval/cmp/string.rs` | 259 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
+| `eval/cmp/string.rs` | 318 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
 | `eval/dispatch.rs` | 523 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
@@ -3141,7 +3141,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/map_ops/mod.rs` | 9 | `Map`-column **construction**, as the counterpart to the read-side accessors in `eval/map.rs` (`map_keys`/`map_values`/`map_entries`/`element_at`). |
 | `eval/math.rs` | 551 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 559 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
-| `eval/media/image/hash.rs` | 157 | Perceptual hashes: the fingerprints that make image near-duplicate detection a join. |
+| `eval/media/image/hash.rs` | 159 | Perceptual hashes: the fingerprints that make image near-duplicate detection a join. |
 | `eval/media/image/mod.rs` | 705 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/image/probe.rs` | 110 | Header-only facts: what an image is, without decoding a pixel of it. |
 | `eval/media/image/quality.rs` | 317 | Image-curation measures: how bright an image is, and how sharp. |
@@ -3228,7 +3228,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `bloom.rs` | 212 | Bloom filter — approximate set membership for runtime join filters. |
+| `bloom.rs` | 214 | Bloom filter — approximate set membership for runtime join filters. |
 | `countmin.rs` | 201 | Count-Min — frequency (heavy-hitter) estimation. |
 | `ddsketch.rs` | 434 | DDSketch — relative-error quantile sketch (Masson, Rim, Lee). |
 | `frequent.rs` | 237 | Misra-Gries — frequent-items (heavy-hitter *key*) enumeration. |
@@ -3252,10 +3252,10 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `handler.rs` | 428 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 107 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 408 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
-| `shared.rs` | 410 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
+| `shared.rs` | 412 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
 | `store.rs` | 407 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 93 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
-| `tls.rs` | 186 | TLS configuration for the inter-node Flight shuffle. |
+| `tls.rs` | 207 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |
 
 ### `bc-resource`
@@ -3280,12 +3280,12 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
-| `lib.rs` | 799 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
-| `page_index.rs` | 266 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
+| `lib.rs` | 792 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 67 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns. |
 | `row_filter.rs` | 418 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
-| `split_read.rs` | 259 | Split an oversized object-store read into several concurrent range GETs. |
+| `split_read.rs` | 275 | Split an oversized object-store read into several concurrent range GETs. |
 | `store.rs` | 416 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-udf`
@@ -3328,7 +3328,7 @@ The opaque-operator boundary + dynamic-batching machinery for the UDF / ML infer
 | `grid/mod.rs` | 20 | Discrete spatial grids — the bridge from continuous coordinates to a group key. |
 | `grid/s2.rs` | 253 | S2 cell identifiers — Google's spherical cell hierarchy, as BigQuery and many geospatial warehouses index by. |
 | `grid/tile.rs` | 202 | Slippy-map tiles and Bing quadkeys — the grid every map tile server is indexed by. |
-| `lib.rs` | 80 | `bc-geo` — the geometry data plane: codecs, planar algorithms, grids, projections. |
+| `lib.rs` | 83 | `bc-geo` — the geometry data plane: codecs, planar algorithms, grids, projections. |
 | `proj/crs.rs` | 314 | Coordinate reference system transforms, for a deliberately small set of systems. |
 | `proj/geodesy.rs` | 289 | Distances and areas on the Earth, in metres. |
 | `proj/mod.rs` | 10 | Answers about the Earth rather than about the coordinate plane. |

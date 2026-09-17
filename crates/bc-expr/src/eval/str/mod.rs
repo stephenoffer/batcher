@@ -1426,11 +1426,11 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
 /// for an odd number of digits or any non-hex character.
 fn hex_decode(v: &str) -> Option<Vec<u8>> {
     let bytes = v.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);

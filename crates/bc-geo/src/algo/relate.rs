@@ -231,7 +231,7 @@ fn scan_interior(poly: &Polygon) -> Option<Coord> {
             }
         }
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        for pair in xs.chunks_exact(2) {
+        for pair in xs.as_chunks::<2>().0 {
             if pair[1] > pair[0] {
                 let c = Coord::new(f64::midpoint(pair[0], pair[1]), y);
                 if point_in_polygon(c, poly) == PointRing::Inside {

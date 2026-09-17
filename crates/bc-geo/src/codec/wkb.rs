@@ -459,12 +459,12 @@ pub fn read_hex_wkb(s: &str) -> GeoResult<Geom> {
         .strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(GeoError::parse("WKB", "hex string has an odd length"));
     }
     let mut bytes = Vec::with_capacity(s.len() / 2);
     let raw = s.as_bytes();
-    for pair in raw.chunks_exact(2) {
+    for pair in raw.as_chunks::<2>().0 {
         let hi = (pair[0] as char)
             .to_digit(16)
             .ok_or_else(|| GeoError::parse("WKB", "non-hex character in hex WKB"))?;

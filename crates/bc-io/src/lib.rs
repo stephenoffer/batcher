@@ -16,9 +16,8 @@ use std::sync::{Arc, OnceLock};
 
 use arrow::record_batch::RecordBatch;
 use futures::{StreamExt, TryStreamExt};
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -390,7 +389,7 @@ impl parquet::arrow::async_reader::AsyncFileReader for PrefetchedFooter {
         // the parquet crate asserts rather than re-fetching.
         let file_size = self.tail_start + self.tail.len() as u64;
         let prefetch = self.tail.len();
-        let page_index = options.map(|o| o.page_index()).unwrap_or(false);
+        let page_index = options.is_some_and(page_index::wanted);
         async move {
             let reader = parquet::file::metadata::ParquetMetaDataReader::new()
                 // `Optional`, never `Required`: a file written without a page index is
@@ -468,11 +467,7 @@ async fn load_metadata_cached(
     // The page index sits just below the footer, so it is normally inside the tail above and
     // costs nothing extra; when it is not, `PrefetchedFooter` fetches it and the file simply
     // takes the second request it would have taken anyway.
-    let amd = ArrowReaderMetadata::load_async(
-        &mut probe,
-        ArrowReaderOptions::new().with_page_index(true),
-    )
-    .await?;
+    let amd = ArrowReaderMetadata::load_async(&mut probe, page_index::required_options()).await?;
     meta_cache()
         .lock()
         .unwrap()
@@ -582,9 +577,7 @@ async fn read_parquet_async(
             };
             if !permissive {
                 if let Some(cols) = row_filter::plan(pred, arrow_meta.schema()) {
-                    let reader =
-                        ParquetObjectReader::new(resolved.store.clone(), resolved.path.clone())
-                            .with_file_size(size);
+                    let reader = split_read::object_reader(&resolved.store, &resolved.path, size);
                     let mask = projection::exact_columns(
                         arrow_meta.parquet_schema(),
                         cols.iter().map(String::as_str),
@@ -636,7 +629,7 @@ async fn read_parquet_async(
         // Over the network a row group's contiguous column chunks coalesce into one enormous
         // GET, which one connection then serves at a fraction of the link — see `split_read`.
         // Local reads keep the plain reader: the page cache has no such limit.
-        let base = ParquetObjectReader::new(store.clone(), loc.clone()).with_file_size(size);
+        let base = split_read::object_reader(&store, &loc, size);
         let reader = split_read::maybe_split(base, &store, &loc, remote);
         let amd = arrow_meta.clone();
         let proj = projection.clone();
@@ -881,7 +874,7 @@ mod tests {
     fn write_parquet(path: &std::path::Path, batches: &[RecordBatch], rows_per_group: usize) {
         let file = std::fs::File::create(path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(rows_per_group)
+            .set_max_row_group_row_count(Some(rows_per_group))
             .build();
         let mut w = ArrowWriter::try_new(file, batches[0].schema(), Some(props)).unwrap();
         for b in batches {
@@ -1372,7 +1365,7 @@ mod bloom_tests {
         .unwrap();
         let props = WriterProperties::builder()
             .set_bloom_filter_enabled(true)
-            .set_max_row_group_size(rows_per_group)
+            .set_max_row_group_row_count(Some(rows_per_group))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();

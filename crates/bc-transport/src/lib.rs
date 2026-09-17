@@ -1672,10 +1672,17 @@ mod tests {
             .fetch(ticket.to_string())
             .await
             .expect_err("an unauthenticated do_get must not return partition data");
-        assert!(
-            format!("{err}").contains("nauthenticated"),
-            "expected Unauthenticated, got: {err}"
-        );
+        // Asserted on the status *code*, not its rendering: tonic 0.14 displays the code by its
+        // description ("The request does not have valid authentication credentials") where 0.13
+        // printed `Unauthenticated`, so a substring match tested the formatter, not the auth.
+        match &err {
+            TransportError::Flight(arrow_flight::error::FlightError::Tonic(status)) => assert_eq!(
+                status.code(),
+                tonic::Code::Unauthenticated,
+                "expected Unauthenticated, got: {err}"
+            ),
+            other => panic!("expected a tonic Unauthenticated status, got: {other}"),
+        }
     }
 
     /// The same fetch succeeds once the caller presents the token.

@@ -171,7 +171,7 @@ pub(super) fn to_binary(s: &str) -> String {
 /// characters or the bytes are not UTF-8 (the row becomes null, as `unhex` does).
 pub(super) fn from_binary(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes.len() % 8 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(8) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 8);

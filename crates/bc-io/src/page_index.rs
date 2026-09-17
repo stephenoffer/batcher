@@ -29,11 +29,28 @@
 //! rather than merely slow ones, which is why each case is spelled out here and pinned by a
 //! test below.
 
-use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-use parquet::file::metadata::ParquetMetaData;
-use parquet::file::page_index::index::Index;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
+use parquet::file::page_index::column_index::{ColumnIndexMetaData, PrimitiveColumnIndex};
 
 use crate::predicate::{float_range_survives, is_unsigned_int, range_survives, CmpOp, Lit, Pred};
+
+/// Whether a footer read under `options` must load the page index.
+///
+/// parquet 60 split the old `page_index()` flag into one policy per index. Either of them
+/// not being `Skip` is exactly what the single flag reported.
+pub(crate) fn wanted(options: &ArrowReaderOptions) -> bool {
+    options.column_index_policy() != PageIndexPolicy::Skip
+        || options.offset_index_policy() != PageIndexPolicy::Skip
+}
+
+/// Reader options that load the page index along with the footer.
+///
+/// `Required` is what parquet 56's `with_page_index(true)` set. `PrefetchedFooter` relaxes it
+/// to `Optional` when it reads, so a file written without a page index still opens.
+pub(crate) fn required_options() -> ArrowReaderOptions {
+    ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required)
+}
 
 /// The rows of row group `rg` that could satisfy `pred`, or `None` to read all of it.
 ///
@@ -79,10 +96,10 @@ fn eval(meta: &ParquetMetaData, pred: &Pred, rg: usize) -> Option<RowSelection> 
     }
 }
 
-/// One page's bounds, normalized out of the typed `Index` so the predicate arithmetic is
-/// written once rather than per physical type.
+/// One page's bounds, normalized out of the typed `ColumnIndexMetaData` so the predicate
+/// arithmetic is written once rather than per physical type.
 struct Page<'a> {
-    index: &'a Index,
+    index: &'a ColumnIndexMetaData,
     ordinal: usize,
     unsigned: bool,
     rows: u64,
@@ -105,9 +122,12 @@ fn column_selection(
         parts.len() == 1 && parts[0] == col
     })?;
 
-    let index = meta.column_index()?.get(rg)?.get(leaf)?;
-    let locations = meta.offset_index()?.get(rg)?.get(leaf)?.page_locations();
-    if matches!(index, Index::NONE) || locations.is_empty() {
+    // parquet 60 exposes the page index per row group through a provider; a column with no
+    // index (what parquet 56 spelled `Index::NONE`) is simply `None` here.
+    let page_index = meta.page_index_for_row_group(rg);
+    let index = page_index.column_index(leaf)?;
+    let locations = page_index.offset_index(leaf)?.page_locations();
+    if locations.is_empty() {
         return None;
     }
     let unsigned = is_unsigned_int(group.column(leaf).column_descr());
@@ -154,25 +174,26 @@ fn isnull_page(page: &Page, negated: bool) -> bool {
     }
 }
 
-/// `NativeIndex<T>`'s `T` is bounded by a *sealed* trait (`ParquetValueType`), so a generic
-/// helper cannot name the bound. A macro over the variants is the way to write this once.
-fn null_count(index: &Index, ordinal: usize) -> Option<u64> {
-    macro_rules! count {
-        ($i:expr) => {
-            $i.indexes.get(ordinal)?.null_count.map(|n| n as u64)
-        };
+/// A page's null count, or `None` when the index does not record one.
+///
+/// Bounds-checked first: the accessor indexes its vector directly and panics on an
+/// out-of-range page, where the parquet 56 `indexes.get(ordinal)` this replaces returned
+/// `None` ("cannot decide") — and a panic here would cross the FFI.
+fn null_count(index: &ColumnIndexMetaData, ordinal: usize) -> Option<u64> {
+    if ordinal as u64 >= index.num_pages() {
+        return None;
     }
-    match index {
-        Index::NONE => None,
-        Index::BOOLEAN(i) => count!(i),
-        Index::INT32(i) => count!(i),
-        Index::INT64(i) => count!(i),
-        Index::INT96(i) => count!(i),
-        Index::FLOAT(i) => count!(i),
-        Index::DOUBLE(i) => count!(i),
-        Index::BYTE_ARRAY(i) => count!(i),
-        Index::FIXED_LEN_BYTE_ARRAY(i) => count!(i),
+    index.null_count(ordinal).map(|n| n as u64)
+}
+
+/// One primitive page's `(min, max)`, each `None` on an all-null page, or `None` overall when
+/// the page is out of range — the same shape parquet 56's `PageIndex { min, max }` had, so
+/// the bounds arithmetic below is unchanged.
+fn bounds<T: Copy>(i: &PrimitiveColumnIndex<T>, ordinal: usize) -> Option<(Option<T>, Option<T>)> {
+    if ordinal as u64 >= i.num_pages() {
+        return None;
     }
+    Some((i.min_value(ordinal).copied(), i.max_value(ordinal).copied()))
 }
 
 /// Can any value in this page satisfy `value <op> lit`?
@@ -186,71 +207,71 @@ fn null_count(index: &Index, ordinal: usize) -> Option<u64> {
 fn cmp_page(page: &Page, op: CmpOp, lit: &Lit) -> bool {
     let ordinal = page.ordinal;
     match (page.index, lit) {
-        (Index::INT32(i), Lit::Int(v)) => {
-            let Some(p) = i.indexes.get(ordinal) else {
+        (ColumnIndexMetaData::INT32(i), Lit::Int(v)) => {
+            let Some((min, max)) = bounds(i, ordinal) else {
                 return true;
             };
             let (mn, mx) = if page.unsigned {
                 (
-                    p.min.map(|x| i128::from(x as u32)),
-                    p.max.map(|x| i128::from(x as u32)),
+                    min.map(|x| i128::from(x as u32)),
+                    max.map(|x| i128::from(x as u32)),
                 )
             } else {
-                (p.min.map(i128::from), p.max.map(i128::from))
+                (min.map(i128::from), max.map(i128::from))
             };
             range_survives(mn, mx, i128::from(*v), op)
         }
-        (Index::INT64(i), Lit::Int(v)) => {
-            let Some(p) = i.indexes.get(ordinal) else {
+        (ColumnIndexMetaData::INT64(i), Lit::Int(v)) => {
+            let Some((min, max)) = bounds(i, ordinal) else {
                 return true;
             };
             let (mn, mx) = if page.unsigned {
                 (
-                    p.min.map(|x| i128::from(x as u64)),
-                    p.max.map(|x| i128::from(x as u64)),
+                    min.map(|x| i128::from(x as u64)),
+                    max.map(|x| i128::from(x as u64)),
                 )
             } else {
-                (p.min.map(i128::from), p.max.map(i128::from))
+                (min.map(i128::from), max.map(i128::from))
             };
             range_survives(mn, mx, i128::from(*v), op)
         }
-        (Index::FLOAT(i), Lit::Float(v)) => {
-            let Some(p) = i.indexes.get(ordinal) else {
+        (ColumnIndexMetaData::FLOAT(i), Lit::Float(v)) => {
+            let Some((min, max)) = bounds(i, ordinal) else {
                 return true;
             };
-            float_range_survives(p.min.map(f64::from), p.max.map(f64::from), *v, op)
+            float_range_survives(min.map(f64::from), max.map(f64::from), *v, op)
         }
-        (Index::DOUBLE(i), Lit::Float(v)) => {
-            let Some(p) = i.indexes.get(ordinal) else {
+        (ColumnIndexMetaData::DOUBLE(i), Lit::Float(v)) => {
+            let Some((min, max)) = bounds(i, ordinal) else {
                 return true;
             };
-            float_range_survives(p.min, p.max, *v, op)
+            float_range_survives(min, max, *v, op)
         }
-        (Index::FLOAT(i), Lit::Int(v)) if int_exact_in_f64(*v) => {
-            let Some(p) = i.indexes.get(ordinal) else {
+        (ColumnIndexMetaData::FLOAT(i), Lit::Int(v)) if int_exact_in_f64(*v) => {
+            let Some((min, max)) = bounds(i, ordinal) else {
                 return true;
             };
-            float_range_survives(p.min.map(f64::from), p.max.map(f64::from), *v as f64, op)
+            float_range_survives(min.map(f64::from), max.map(f64::from), *v as f64, op)
         }
-        (Index::DOUBLE(i), Lit::Int(v)) if int_exact_in_f64(*v) => {
-            let Some(p) = i.indexes.get(ordinal) else {
+        (ColumnIndexMetaData::DOUBLE(i), Lit::Int(v)) if int_exact_in_f64(*v) => {
+            let Some((min, max)) = bounds(i, ordinal) else {
                 return true;
             };
-            float_range_survives(p.min, p.max, *v as f64, op)
+            float_range_survives(min, max, *v as f64, op)
         }
-        (Index::BOOLEAN(i), Lit::Bool(v)) => {
-            let Some(p) = i.indexes.get(ordinal) else {
+        (ColumnIndexMetaData::BOOLEAN(i), Lit::Bool(v)) => {
+            let Some((min, max)) = bounds(i, ordinal) else {
                 return true;
             };
-            range_survives(p.min, p.max, *v, op)
+            range_survives(min, max, *v, op)
         }
-        (Index::BYTE_ARRAY(i), Lit::Str(v)) => {
-            let Some(p) = i.indexes.get(ordinal) else {
+        (ColumnIndexMetaData::BYTE_ARRAY(i), Lit::Str(v)) => {
+            if ordinal as u64 >= i.num_pages() {
                 return true;
-            };
+            }
             range_survives(
-                p.min.as_ref().map(|b| b.data().to_vec()),
-                p.max.as_ref().map(|b| b.data().to_vec()),
+                i.min_value(ordinal).map(<[u8]>::to_vec),
+                i.max_value(ordinal).map(<[u8]>::to_vec),
                 v.as_bytes().to_vec(),
                 op,
             )

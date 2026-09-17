@@ -297,35 +297,34 @@ pub(crate) fn gather_combine(
     let sources = parse_sources(sources)?;
     let pool = client.pool.clone();
 
-    let out: Result<(Option<RecordBatch>, Vec<(usize, String)>), GatherErr> =
-        py.allow_threads(|| {
-            shared_runtime().block_on(async {
-                let mut running: Option<RecordBatch> = None;
-                let fold = |batches: Vec<RecordBatch>| -> Result<(), InterpError> {
-                    let merged: Vec<RecordBatch> = match running.take() {
-                        Some(r) => std::iter::once(r).chain(batches).collect(),
-                        None => batches,
-                    };
-                    running = Some(bc_interp::dist::combine(&group_keys, &aggregates, &merged)?);
-                    Ok(())
+    let out: Result<(Option<RecordBatch>, Vec<(usize, String)>), GatherErr> = py.detach(|| {
+        shared_runtime().block_on(async {
+            let mut running: Option<RecordBatch> = None;
+            let fold = |batches: Vec<RecordBatch>| -> Result<(), InterpError> {
+                let merged: Vec<RecordBatch> = match running.take() {
+                    Some(r) => std::iter::once(r).chain(batches).collect(),
+                    None => batches,
                 };
-                let unreachable = drive(
-                    server, pool, &sources, &replicas, credits, fan_in, token, shm, fold,
-                )
-                .await?;
-                if !unreachable.is_empty() {
-                    return Ok((None, unreachable)); // incomplete → driver recomputes + retries
-                }
-                let payload = match running {
-                    Some(state) if finalize => Some(
-                        bc_interp::dist::combine_finalize(&group_keys, &aggregates, &[state])
-                            .map_err(GatherErr::Combine)?,
-                    ),
-                    other => other,
-                };
-                Ok((payload, Vec::new()))
-            })
-        });
+                running = Some(bc_interp::dist::combine(&group_keys, &aggregates, &merged)?);
+                Ok(())
+            };
+            let unreachable = drive(
+                server, pool, &sources, &replicas, credits, fan_in, token, shm, fold,
+            )
+            .await?;
+            if !unreachable.is_empty() {
+                return Ok((None, unreachable)); // incomplete → driver recomputes + retries
+            }
+            let payload = match running {
+                Some(state) if finalize => Some(
+                    bc_interp::dist::combine_finalize(&group_keys, &aggregates, &[state])
+                        .map_err(GatherErr::Combine)?,
+                ),
+                other => other,
+            };
+            Ok((payload, Vec::new()))
+        })
+    });
 
     let (payload, unreachable) = out.map_err(GatherErr::into_pyerr)?;
     Ok((payload.map(PyArrowType), unreachable))
@@ -355,7 +354,7 @@ pub(crate) fn gather_concat(
     let sources = parse_sources(sources)?;
     let pool = client.pool.clone();
 
-    let out: Result<(Vec<RecordBatch>, Vec<(usize, String)>), GatherErr> = py.allow_threads(|| {
+    let out: Result<(Vec<RecordBatch>, Vec<(usize, String)>), GatherErr> = py.detach(|| {
         shared_runtime().block_on(async {
             let mut rows: Vec<RecordBatch> = Vec::new();
             let collect = |batches: Vec<RecordBatch>| -> Result<(), InterpError> {
@@ -404,7 +403,7 @@ pub(crate) fn combine_finalize_spilling(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let out = py
-        .allow_threads(|| {
+        .detach(|| {
             bc_interp::dist::combine_finalize_spilling(
                 &group_keys,
                 &aggregates,
@@ -499,7 +498,7 @@ pub(crate) fn gather_to_files(
     let pool = client.pool.clone();
     let dir = PathBuf::from(dir);
 
-    let out: Result<(Vec<String>, Vec<(usize, String)>), GatherErr> = py.allow_threads(|| {
+    let out: Result<(Vec<String>, Vec<(usize, String)>), GatherErr> = py.detach(|| {
         shared_runtime().block_on(async {
             let mut paths: Vec<String> = Vec::new();
             let mut seq: usize = 0;

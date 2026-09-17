@@ -157,8 +157,8 @@ impl ColumnIndex {
 /// physical min/max stats must be read back as unsigned before comparison.
 pub(crate) fn is_unsigned_int(descr: &parquet::schema::types::ColumnDescriptor) -> bool {
     use parquet::basic::{ConvertedType, LogicalType};
-    match descr.logical_type() {
-        Some(LogicalType::Integer { is_signed, .. }) => !is_signed,
+    match descr.logical_type_ref() {
+        Some(LogicalType::Integer(int)) => !int.is_signed,
         // Pre-`LogicalType` files carry the same information in the deprecated converted type.
         _ => matches!(
             descr.converted_type(),

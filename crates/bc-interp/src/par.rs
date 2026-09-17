@@ -4788,7 +4788,7 @@ mod tests {
                 let mut vs: Vec<Option<i64>> = Vec::with_capacity(n);
                 for _ in 0..n {
                     ks.push((xs(&mut s) % kmod as u64) as i64);
-                    vs.push(if xs(&mut s) % 10 == 0 {
+                    vs.push(if xs(&mut s).is_multiple_of(10) {
                         None // ~10% nulls (incl. occasional all-null groups)
                     } else {
                         Some((xs(&mut s) % vmod as u64) as i64)

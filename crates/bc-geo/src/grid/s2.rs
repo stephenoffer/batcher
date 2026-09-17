@@ -171,7 +171,7 @@ pub fn level_of(id: u64) -> Option<u32> {
     let tz = id.trailing_zeros();
     // The marker bit always sits at an even offset; an odd one means the id was
     // truncated or hand-assembled, and reporting a level for it would be a lie.
-    (tz % 2 == 0 && tz <= 2 * MAX_LEVEL).then(|| MAX_LEVEL - tz / 2)
+    (tz.is_multiple_of(2) && tz <= 2 * MAX_LEVEL).then(|| MAX_LEVEL - tz / 2)
 }
 
 /// The ancestor of `id` at `level`, or `None` when `level` is finer than `id`'s own.

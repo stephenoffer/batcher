@@ -14,16 +14,20 @@ arrow.workspace = true
 # others are 0600. `bc-arrow` is the lowest crate all three see; it adds no third-party code
 # to a graph that already carries arrow, libc and chrono.
 bc-arrow.workspace = true
-# Arrow Flight (gRPC) inter-node transport. Pinned to 56.x to match arrow 56 so
+# Arrow Flight (gRPC) inter-node transport. Pinned to 60.x to match arrow 60 so
 # the RecordBatch/Schema types are identical across the dependency graph.
-arrow-flight = "56"
-# tonic 0.13 is the gRPC stack arrow-flight 56 is built against; keeping it in
+arrow-flight = "60"
+# tonic 0.14 is the gRPC stack arrow-flight 60 is built against; keeping it in
 # lockstep avoids a duplicate tonic/prost in the graph. `tls-ring` adds
 # rustls-over-ring TLS (server identity + mTLS client-cert verification) so the
 # inter-node shuffle can be encrypted and mutually authenticated — required to run
 # the data plane across an untrusted network. `ring`/`rustls`/`tokio-rustls` are
-# already in the graph (the cloud IO stack pulls them), so this adds no new C build.
-tonic = { version = "0.13", features = ["tls-ring"] }
+# already in the graph (the cloud IO stack pulls them).
+tonic = { version = "0.14", features = ["tls-ring"] }
+# Named directly only to install `ring` as the process-level rustls provider (`tls.rs`):
+# `object_store` 0.14 also enables rustls' `aws-lc-rs` backend, and with two backends
+# compiled in rustls refuses to pick a default. Same version tonic already links.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 # TcpListenerStream: lets us bind an ephemeral port, read it back, then hand the
 # listener to tonic via serve_with_incoming.

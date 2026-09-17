@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::buffer::Buffer;
-use arrow::ipc::convert::fb_to_schema;
+use arrow::ipc::convert::try_fb_to_schema;
 use arrow::ipc::reader::{read_footer_length, FileDecoder};
 use arrow::ipc::root_as_footer;
 use arrow::ipc::writer::FileWriter;
@@ -309,7 +309,9 @@ fn read_mmap_zero_copy(mmap: Mmap) -> Result<Vec<RecordBatch>, arrow::error::Arr
     let footer_schema = footer
         .schema()
         .ok_or_else(|| arrow::error::ArrowError::IpcError("shm footer has no schema".into()))?;
-    let schema = Arc::new(fb_to_schema(footer_schema));
+    // The fallible form: arrow 60 deprecated `fb_to_schema`, which `expect`s — a hostile footer
+    // schema would have panicked here despite the contract above. Now it is a miss like the rest.
+    let schema = Arc::new(try_fb_to_schema(footer_schema)?);
     let mut decoder = FileDecoder::new(schema, footer.version());
     for block in footer.dictionaries().iter().flatten() {
         let data = block_slice(&buffer, block)?;

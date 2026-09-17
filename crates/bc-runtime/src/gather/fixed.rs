@@ -229,11 +229,14 @@ fn take_fixed_size_binary_parallel(
          `take_fixed_width_parallel` guards this"
     );
     let src = arr.value_data();
-    // `value_data` is the whole underlying buffer, while `value(i)` reads at
-    // `(offset + i) * width` — so a **sliced** array's first row does not start at byte zero.
-    // Indexing from zero would silently gather the wrong bytes, which is a wrong answer rather
-    // than an error, and every morselized path here hands out slices.
-    let base = arr.value_offset(0) as usize;
+    // A **sliced** array's first row must be located correctly: gathering from the wrong byte
+    // would be a wrong answer rather than an error, and every morselized path here hands out
+    // slices. Arrow's `FixedSizeBinaryArray::slice` slices `value_data` itself and keeps no
+    // separate element offset (`Array::offset` is always 0 — in arrow 56 as in 60), so row `i`
+    // is at `i * width` within `value_data` and the base is zero. It is spelled from
+    // `Array::offset` rather than as a literal so that stays true if arrow ever reintroduces a
+    // logical offset; arrow 60 deprecated `value_offset(i)`, which computed the same thing.
+    let base = arr.offset() * width;
     let idx = indices.values();
     // `alloc_zeroed`, which at this size is zero pages rather than a write pass — the same
     // reasoning the byte fills record.

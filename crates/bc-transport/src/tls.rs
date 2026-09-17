@@ -15,9 +15,28 @@
 //! * [`TlsClientConfig`] — the CA the peer's server certificate must chain to, the name
 //!   to verify against it, and (for mTLS) this node's client identity.
 
+use std::sync::Once;
+
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 
 use crate::{TransportError, TransportResult};
+
+/// Make `ring` the process-level rustls `CryptoProvider` if nothing has chosen one yet.
+///
+/// tonic builds its rustls configs from the *process default* provider, which rustls can only
+/// pick on its own when exactly one of its `ring` / `aws-lc-rs` features is enabled. Up to
+/// `object_store` 0.12 only `ring` was (via tonic's `tls-ring`); `object_store` 0.14's cloud
+/// features pull in reqwest's `aws-lc-rs` rustls backend as well, and with both present rustls
+/// panics at the first handshake instead of guessing. Installing `ring` keeps the shuffle on
+/// the provider it has always used. reqwest passes its provider explicitly, so the object-store
+/// clients are unaffected. An `Err` means another component already installed a default, which
+/// rustls then uses — that is a valid provider, not a failure, so it is deliberately ignored.
+fn ensure_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// A PEM-encoded certificate + private key identifying a node.
 ///
@@ -101,6 +120,7 @@ impl TlsServerConfig {
 
     /// Translate to a tonic [`ServerTlsConfig`].
     pub(crate) fn to_tonic(&self) -> ServerTlsConfig {
+        ensure_crypto_provider();
         let mut cfg = ServerTlsConfig::new().identity(self.identity.to_tonic());
         if let Some(ca) = &self.client_ca_pem {
             cfg = cfg.client_ca_root(Certificate::from_pem(ca.as_bytes()));
@@ -142,6 +162,7 @@ impl TlsClientConfig {
 
     /// Translate to a tonic [`ClientTlsConfig`].
     pub(crate) fn to_tonic(&self) -> ClientTlsConfig {
+        ensure_crypto_provider();
         let mut cfg = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(self.ca_pem.as_bytes()))
             .domain_name(self.domain.clone());

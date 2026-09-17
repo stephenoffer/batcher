@@ -83,7 +83,7 @@ fn execute_plan(
         materialize_fits,
     } = prepare_exec(plan_json, sources, engine_config, query_id)?;
     let out = py
-        .allow_threads(|| {
+        .detach(|| {
             if streaming {
                 match bc_interp::execute_streaming_parallel_or_hand_off(
                     &plan,
@@ -143,7 +143,7 @@ fn execute_plan_metered(
         budget,
         materialize_fits,
     } = prepare_exec(plan_json, sources, engine_config, query_id)?;
-    // Started outside `allow_threads` so it brackets *everything* the executor does,
+    // Started outside `detach` (pyo3 0.25's `allow_threads`) so it brackets *everything* the executor does,
     // including a streaming-to-materializing hand-off. This is the one boundary that sees
     // every tier, which is why the whole-execution resource measurement is taken here rather
     // than inside an executor: the streaming tier cannot attribute OS counters to an operator
@@ -151,7 +151,7 @@ fn execute_plan_metered(
     // or disk consumption at all.
     let query_watch = bc_interp::QueryStopwatch::start();
     let (out, metrics) = py
-        .allow_threads(|| {
+        .detach(|| {
             if streaming {
                 match bc_interp::execute_streaming_parallel_metered_or_hand_off(
                     &plan,
@@ -438,7 +438,7 @@ fn execute_plan_aggregated(
     } = prepare_exec(plan_json, sources, engine_config, None)?;
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
-    let out = py.allow_threads(|| {
+    let out = py.detach(|| {
         let rows = bc_interp::execute_parallel_with(&plan, &sources, &opts)?;
         // Narrow exactly where `execute_plan` would have, so the aggregate sees the same
         // dtypes it saw when this ran as two calls (a no-op unless `shrink_output_dtypes`).
@@ -505,7 +505,7 @@ fn read_parquet(
     // fetch instead of serializing behind it. Holding the GIL here made the native read
     // ~3x slower than PyArrow (which releases it) in the distributed path.
     let batches = py
-        .allow_threads(|| bc_io::read_parquet(uri, &row_groups, columns.as_deref(), batch_size))
+        .detach(|| bc_io::read_parquet(uri, &row_groups, columns.as_deref(), batch_size))
         .map_err(to_pyerr)?;
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
@@ -529,7 +529,7 @@ fn read_parquet_filtered(
     predicate: &str,
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
     let batches = py
-        .allow_threads(|| {
+        .detach(|| {
             bc_io::read_parquet_filtered(
                 uri,
                 &row_groups,
@@ -556,7 +556,7 @@ fn read_parquet_many(
     batch_size: usize,
 ) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
     let per_file = py
-        .allow_threads(|| bc_io::read_parquet_many(&uris, columns.as_deref(), batch_size))
+        .detach(|| bc_io::read_parquet_many(&uris, columns.as_deref(), batch_size))
         .map_err(to_pyerr)?;
     Ok(per_file
         .into_iter()
@@ -606,7 +606,7 @@ fn parquet_footer_stats(
     // Released across the whole pass: the footer GETs are object-store I/O and the walk
     // itself is native, so nothing here needs the interpreter.
     let stats = py
-        .allow_threads(|| bc_io::parquet_footer_stats(&uris))
+        .detach(|| bc_io::parquet_footer_stats(&uris))
         .map_err(to_pyerr)?;
     let columns = stats
         .columns
@@ -651,7 +651,7 @@ fn parquet_file_manifest(
     columns: Vec<String>,
 ) -> PyResult<PyArrowType<RecordBatch>> {
     let batch = py
-        .allow_threads(|| bc_io::parquet_file_manifest(&uris, &columns))
+        .detach(|| bc_io::parquet_file_manifest(&uris, &columns))
         .map_err(to_pyerr)?;
     Ok(PyArrowType(batch))
 }
@@ -669,7 +669,7 @@ fn read_avro(
     batch_size: usize,
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
     let batches = py
-        .allow_threads(|| bc_io::read_avro_bytes(data, batch_size))
+        .detach(|| bc_io::read_avro_bytes(data, batch_size))
         .map_err(to_pyerr)?;
     Ok(batches.into_iter().map(PyArrowType).collect())
 }

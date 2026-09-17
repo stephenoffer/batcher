@@ -303,7 +303,7 @@ impl FlightShuffleServer {
             .iter()
             .map(|b| normalize_batch(&b.0))
             .collect::<PyResult<_>>()?;
-        py.allow_threads(|| {
+        py.detach(|| {
             shared_runtime().block_on(self.exchange.publish(&t, batches));
             // Charge the new footprint (and spill if the pool will not cover it) while the
             // GIL is still released: reconciliation can write a bucket to disk.
@@ -317,7 +317,7 @@ impl FlightShuffleServer {
     /// assert the credit bound was honored: this never exceeds the granted window.
     fn max_inflight(&self, py: Python<'_>, ticket: &str) -> PyResult<Option<i64>> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
-        Ok(py.allow_threads(|| shared_runtime().block_on(self.exchange.max_inflight(&t))))
+        Ok(py.detach(|| shared_runtime().block_on(self.exchange.max_inflight(&t))))
     }
 
     /// Read a partition this server itself published, without a network hop — the
@@ -329,8 +329,7 @@ impl FlightShuffleServer {
         ticket: &str,
     ) -> PyResult<Option<Vec<PyArrowType<RecordBatch>>>> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
-        let batches =
-            py.allow_threads(|| shared_runtime().block_on(self.exchange.local_partition(&t)));
+        let batches = py.detach(|| shared_runtime().block_on(self.exchange.local_partition(&t)));
         Ok(batches.map(|bs| bs.into_iter().map(PyArrowType).collect()))
     }
 
@@ -351,7 +350,7 @@ impl FlightShuffleServer {
             .map(|b| normalize_batch(&b.0))
             .collect::<PyResult<_>>()?;
         let addr = self.addr.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             let _ = bc_transport::publish_shared(&addr, ticket, &batches);
         });
         Ok(())
@@ -367,7 +366,7 @@ impl FlightShuffleServer {
         ticket: &str,
     ) -> PyResult<Option<Vec<PyArrowType<RecordBatch>>>> {
         let batches = py
-            .allow_threads(|| bc_transport::fetch_shared(source_addr, ticket))
+            .detach(|| bc_transport::fetch_shared(source_addr, ticket))
             .map_err(to_pyerr)?;
         Ok(batches.map(|bs| bs.into_iter().map(PyArrowType).collect()))
     }
@@ -375,13 +374,13 @@ impl FlightShuffleServer {
     /// Remove every shared-memory file this server published (plan teardown).
     fn clear_shared(&self, py: Python<'_>) {
         let addr = self.addr.clone();
-        py.allow_threads(|| bc_transport::clear_shared(&addr));
+        py.detach(|| bc_transport::clear_shared(&addr));
     }
 
     /// Evict one published partition (its reducers have fetched it), freeing it.
     fn release(&self, py: Python<'_>, ticket: &str) -> PyResult<()> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
-        py.allow_threads(|| {
+        py.detach(|| {
             shared_runtime().block_on(self.exchange.release(&t));
             self.spiller.reconcile(); // credit the freed bucket back to the pool
         });
@@ -392,7 +391,7 @@ impl FlightShuffleServer {
     /// worker doesn't accumulate finished plans' shuffle outputs).
     fn clear_plan(&self, py: Python<'_>, plan_id: u64) {
         let addr = self.addr.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             shared_runtime().block_on(self.exchange.clear_plan(plan_id));
             self.spiller.reconcile();
             // The shm half, which nothing freed before. `/dev/shm` is RAM-backed, so a
@@ -405,7 +404,7 @@ impl FlightShuffleServer {
 
     /// Evict every published partition on this server.
     fn clear(&self, py: Python<'_>) {
-        py.allow_threads(|| {
+        py.detach(|| {
             shared_runtime().block_on(self.exchange.clear());
             self.spiller.reconcile();
         });
@@ -414,7 +413,7 @@ impl FlightShuffleServer {
     /// Number of partitions currently retained (telemetry / leak tests).
     #[getter]
     fn partition_count(&self, py: Python<'_>) -> usize {
-        py.allow_threads(|| shared_runtime().block_on(self.exchange.partition_count()))
+        py.detach(|| shared_runtime().block_on(self.exchange.partition_count()))
     }
 
     /// Bytes this server's published partitions currently hold in memory.
@@ -478,7 +477,7 @@ pub(crate) fn flight_fetch(
     token: Option<&str>,
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
     let batches = py
-        .allow_threads(|| bc_transport::fetch_blocking_with_credits(addr, ticket, credits, token))
+        .detach(|| bc_transport::fetch_blocking_with_credits(addr, ticket, credits, token))
         .map_err(transport_to_pyerr)?;
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
@@ -688,9 +687,7 @@ impl ShuffleClient {
     ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
         let batches = py
-            .allow_threads(|| {
-                shared_runtime().block_on(self.pool.fetch_secured(addr, &t, credits, token))
-            })
+            .detach(|| shared_runtime().block_on(self.pool.fetch_secured(addr, &t, credits, token)))
             .map_err(transport_to_pyerr)?;
         Ok(batches.into_iter().map(PyArrowType).collect())
     }

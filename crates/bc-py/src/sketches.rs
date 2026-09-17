@@ -135,7 +135,7 @@ pub(crate) fn column_ndv(
 ) -> PyResult<std::collections::HashMap<String, f64>> {
     use rayon::prelude::*;
 
-    Ok(py.allow_threads(move || {
+    Ok(py.detach(move || {
         let sketches: Vec<Option<bc_sketches::HyperLogLog>> = columns
             .par_iter()
             .map(|name| {
@@ -182,7 +182,7 @@ pub(crate) fn column_stats(
     columns: Vec<String>,
     batches: Vec<PyArrowType<RecordBatch>>,
 ) -> PyResult<std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>> {
-    let merged = py.allow_threads(|| merge_column_stats(&columns, &batches));
+    let merged = py.detach(|| merge_column_stats(&columns, &batches));
     let mut out = std::collections::HashMap::new();
     for (name, s) in merged {
         let mut d = std::collections::HashMap::new();
@@ -294,7 +294,7 @@ pub(crate) fn column_quantiles(
     // grid (one overloaded reducer). Numeric columns are untouched.
     let batches = temporal_cols_as_i64(&columns, &batches);
     // GIL released for the sketch build; see `column_stats` for why it dominates the cost.
-    let merged = py.allow_threads(|| merge_column_stats(&columns, &batches));
+    let merged = py.detach(|| merge_column_stats(&columns, &batches));
     Ok(merged
         .into_iter()
         .map(|(name, s)| (name, quantile_values(&s, &probs)))
@@ -318,7 +318,7 @@ pub(crate) fn column_stats_full(
     std::collections::HashMap<String, Vec<f64>>,
 )> {
     // GIL released for the sketch build; see `column_stats` for why it dominates the cost.
-    let merged = py.allow_threads(|| merge_column_stats(&columns, &batches));
+    let merged = py.detach(|| merge_column_stats(&columns, &batches));
     let mut stats = std::collections::HashMap::new();
     let mut quants = std::collections::HashMap::new();
     for (name, s) in merged {

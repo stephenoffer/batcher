@@ -47,7 +47,7 @@
 use std::sync::OnceLock;
 
 use pyo3::prelude::*;
-use pyo3::sync::GILOnceCell;
+use pyo3::sync::PyOnceLock;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::filter::{filter_fn, FilterExt, LevelFilter};
@@ -136,7 +136,7 @@ impl<S: Subscriber> Layer<S> for PyLogBridge {
         };
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let _ = forward(py, level, &visitor.message);
         });
     }
@@ -168,7 +168,7 @@ impl Visit for MessageVisitor {
 /// and levels are mutated on that object, and a reconfiguration after this point is still
 /// seen. What it avoids is re-importing `logging` and re-walking the logger dictionary on
 /// every event, which the `DEBUG` path pays per record.
-static LOGGER: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
+static LOGGER: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 fn logger<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
     let cached = LOGGER.get_or_try_init(py, || -> PyResult<Py<PyAny>> {

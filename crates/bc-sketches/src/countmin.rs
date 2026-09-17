@@ -117,7 +117,7 @@ impl CountMinSketch {
             .collect();
         corrected.sort_by(|a, b| a.partial_cmp(b).expect("counts are finite"));
         let mid = corrected.len() / 2;
-        let median = if corrected.len() % 2 == 0 {
+        let median = if corrected.len().is_multiple_of(2) {
             f64::midpoint(corrected[mid - 1], corrected[mid])
         } else {
             corrected[mid]

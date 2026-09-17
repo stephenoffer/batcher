@@ -71,7 +71,7 @@ pub(super) fn translate(
         protein.clear();
         if bytes.len() > frame {
             protein.reserve((bytes.len() - frame) / 3);
-            for codon in bytes[frame..].chunks_exact(3) {
+            for codon in bytes[frame..].as_chunks::<3>().0 {
                 let residue = match (base4(codon[0]), base4(codon[1]), base4(codon[2])) {
                     (Some(a), Some(b), Some(c)) => CODONS[a * 16 + b * 4 + c],
                     _ => b'X',

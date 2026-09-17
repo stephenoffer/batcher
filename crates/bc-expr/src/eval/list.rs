@@ -709,7 +709,7 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             // DuckDB; a bare `partial_cmp` leaves NaN unordered and misplaces the middle.
             sorted.sort_by(|a, b| float_total_cmp(*a, *b));
             let mid = sorted.len() / 2;
-            let m = if sorted.len() % 2 == 0 {
+            let m = if sorted.len().is_multiple_of(2) {
                 // Overflow-free: `(a + b) / 2.0` reports `inf` when both middles are
                 // large finite doubles. See `bc_runtime::agg::median`.
                 f64::midpoint(sorted[mid - 1], sorted[mid])

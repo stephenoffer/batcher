@@ -787,13 +787,13 @@ mod tests {
             let l: Vec<Option<i64>> = (0..nl)
                 .map(|_| {
                     let v = rng.next();
-                    (v % 7 != 0).then(|| (v % 20) as i64 - 10)
+                    (!v.is_multiple_of(7)).then(|| (v % 20) as i64 - 10)
                 })
                 .collect();
             let r: Vec<Option<i64>> = (0..nr)
                 .map(|_| {
                     let v = rng.next();
-                    (v % 9 != 0).then(|| (v % 20) as i64 - 10)
+                    (!v.is_multiple_of(9)).then(|| (v % 20) as i64 - 10)
                 })
                 .collect();
             for op in OPS {
@@ -820,7 +820,7 @@ mod tests {
                 (0..n)
                     .map(|_| {
                         let v = rng.next();
-                        (v % nullmod != 0).then(|| (v % 14) as i64 - 7)
+                        (!v.is_multiple_of(nullmod)).then(|| (v % 14) as i64 - 7)
                     })
                     .collect()
             };
@@ -866,7 +866,7 @@ mod tests {
                 (0..n)
                     .map(|_| {
                         let v = rng.next();
-                        (v % nullmod != 0).then(|| (v % 14) as i64 - 7)
+                        (!v.is_multiple_of(nullmod)).then(|| (v % 14) as i64 - 7)
                     })
                     .collect()
             };
@@ -912,7 +912,7 @@ mod tests {
                 (0..n)
                     .map(|_| {
                         let v = rng.next();
-                        (v % 7 != 0).then(|| (v % 20) as i64 - 10)
+                        (!v.is_multiple_of(7)).then(|| (v % 20) as i64 - 10)
                     })
                     .collect()
             };
