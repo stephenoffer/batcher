@@ -64,8 +64,8 @@ first = { status = "param", batcher = "bt.first", need = "pl.first() with no arg
 fold = { status = "canonical", batcher = "bt.fold_horizontal" }
 format = { status = "mismatch", batcher = "bt.format_string", note = "Polars format returns null when any input is null; Batcher renders a null as an empty string", wave = "W0" }
 from_arrow = { status = "canonical", batcher = "bt.from_arrow" }
-from_dict = { status = "alias", batcher = "bt.from_pydict" }
-from_dicts = { status = "alias", batcher = "bt.from_pylist" }
+from_dict = { status = "canonical", batcher = "bt.from_pydict" }
+from_dicts = { status = "canonical", batcher = "bt.from_pylist" }
 from_epoch = { status = "mismatch", batcher = "bt.from_epoch", note = "Polars time_unit=d reads days since 1970; port that as bt.from_unix_date(column). Other units map to bt.from_epoch(column, unit=time_unit)", wave = "W0" }
 from_numpy = { status = "param", batcher = "bt.from_numpy", need = "2-D arrays with schema= and orient=", wave = "W2" }
 from_pandas = { status = "canonical", batcher = "bt.from_pandas" }

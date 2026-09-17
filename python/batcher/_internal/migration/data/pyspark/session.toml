@@ -96,16 +96,16 @@ registerJavaUDAF = { status = "out_of_scope", reason = "JVM UDAF registration; n
 register = { status = "param", batcher = "bt.register_function", need = "UDTF class protocol (eval/terminate/analyze) registered with table=True", wave = "W11" }
 
 [StreamingQuery]
-awaitTermination = { status = "alias", batcher = "StreamingQuery.await_termination" }
+awaitTermination = { status = "canonical", batcher = "StreamingQuery.await_termination" }
 exception = { status = "canonical", batcher = "StreamingQuery.exception" }
 explain = { status = "mismatch", batcher = "StreamingQuery.explain", note = "Spark prints the plan and returns None; Batcher returns the plan as a str", wave = "W0" }
 id = { status = "canonical", batcher = "StreamingQuery.id" }
-isActive = { status = "alias", batcher = "StreamingQuery.is_active" }
-lastProgress = { status = "alias", batcher = "StreamingQuery.last_progress" }
+isActive = { status = "canonical", batcher = "StreamingQuery.is_active" }
+lastProgress = { status = "canonical", batcher = "StreamingQuery.last_progress" }
 name = { status = "canonical", batcher = "StreamingQuery.name" }
-processAllAvailable = { status = "alias", batcher = "StreamingQuery.process_all_available" }
-recentProgress = { status = "alias", batcher = "StreamingQuery.recent_progress" }
-runId = { status = "alias", batcher = "StreamingQuery.run_id" }
+processAllAvailable = { status = "canonical", batcher = "StreamingQuery.process_all_available" }
+recentProgress = { status = "canonical", batcher = "StreamingQuery.recent_progress" }
+runId = { status = "canonical", batcher = "StreamingQuery.run_id" }
 status = { status = "canonical", batcher = "StreamingQuery.status" }
 stop = { status = "canonical", batcher = "StreamingQuery.stop" }
 

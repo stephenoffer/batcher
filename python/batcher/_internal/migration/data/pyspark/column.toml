@@ -7,7 +7,7 @@ alias = { status = "canonical", batcher = "Expr.alias" }
 asc = { status = "mismatch", batcher = "Dataset.sort", note = "Spark asc() sorts nulls first; Batcher ascending sorts nulls last. Pass nulls_first=True", wave = "W0" }
 asc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
 asc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
-astype = { status = "alias", batcher = "Expr.cast" }
+astype = { status = "canonical", batcher = "Expr.cast" }
 between = { status = "canonical", batcher = "Expr.between" }
 bitwiseAND = { status = "canonical", batcher = "Expr.bitwise_and" }
 bitwiseOR = { status = "canonical", batcher = "Expr.bitwise_or" }
@@ -26,7 +26,7 @@ ilike = { status = "canonical", batcher = "Expr.str.ilike" }
 isNaN = { status = "mismatch", batcher = "Expr.is_nan", template = 'isNaN() -> self.is_nan().fill_null(False)', note = "Spark isnan(null) is false; Batcher (DuckDB) returns null", wave = "W0" }
 isNotNull = { status = "canonical", batcher = "Expr.is_not_null" }
 isNull = { status = "canonical", batcher = "Expr.is_null" }
-isin = { status = "alias", batcher = "Expr.is_in" }
+isin = { status = "canonical", batcher = "Expr.is_in" }
 like = { status = "canonical", batcher = "Expr.str.like" }
 name = { status = "canonical", batcher = "Expr.alias" }
 otherwise = { status = "canonical", batcher = "CaseBuilder.otherwise", template = 'otherwise(value) <-> self.otherwise(value)' }

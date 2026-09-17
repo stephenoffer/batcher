@@ -96,7 +96,7 @@ def _removed(rule: Rename) -> str:
 def _row_text(row: Mapping) -> str:
     targets = " with ".join(_spelled(t) for t in row.batcher)
     label = _ENGINE_LABEL[row.engine]
-    if row.status in (Status.CANONICAL, Status.ALIAS):
+    if row.status is Status.CANONICAL:
         return f"{label}'s `{row.name}` is {targets} here."
     if row.status is Status.PARAM:
         return f"{label}'s `{row.name}` is {targets} here, without: {row.need}."

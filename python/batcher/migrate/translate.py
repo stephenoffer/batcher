@@ -136,7 +136,7 @@ class _Translate(SiteRecorder):
         )
         # A decorator (`@daft.func`) is a use of the name even though it is not called here.
         decorator = id(original) in self.decorators and row is not None and row.template is None
-        if decorator and row.status not in (Status.CANONICAL, Status.ALIAS, Status.PARAM):
+        if decorator and row.status not in (Status.CANONICAL, Status.PARAM):
             return self.keep(original, self._apply(row, original, updated, original.value))
         if row is None or not (tokens == ["@property"] or namespace):
             return self.keep(original, updated)
@@ -169,7 +169,7 @@ class _Translate(SiteRecorder):
         spelling = f"{row.surface}.{row.name}"
         if row.template is not None:
             return self._render(row, original, updated, base, spelling)
-        if row.status not in (Status.CANONICAL, Status.ALIAS, Status.PARAM):
+        if row.status not in (Status.CANONICAL, Status.PARAM):
             why = {
                 Status.MISMATCH: f"differs in Batcher (`{' / '.join(row.batcher)}`): {row.note}",
                 Status.GAP: f"has no Batcher equivalent yet: {row.need}",

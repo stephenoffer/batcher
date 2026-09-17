@@ -136,16 +136,16 @@ The following table maps the 12 names on `StreamingQuery`, sorted alphabetically
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `awaitTermination` | `StreamingQuery.await_termination` | alias |  |
+| `awaitTermination` | `StreamingQuery.await_termination` | canonical |  |
 | `exception` | `StreamingQuery.exception` | canonical |  |
 | `explain` | `StreamingQuery.explain` | mismatch | Differs: Spark prints the plan and returns None; Batcher returns the plan as a str. Wave W0. |
 | `id` | `StreamingQuery.id` | canonical |  |
-| `isActive` | `StreamingQuery.is_active` | alias |  |
-| `lastProgress` | `StreamingQuery.last_progress` | alias |  |
+| `isActive` | `StreamingQuery.is_active` | canonical |  |
+| `lastProgress` | `StreamingQuery.last_progress` | canonical |  |
 | `name` | `StreamingQuery.name` | canonical |  |
-| `processAllAvailable` | `StreamingQuery.process_all_available` | alias |  |
-| `recentProgress` | `StreamingQuery.recent_progress` | alias |  |
-| `runId` | `StreamingQuery.run_id` | alias |  |
+| `processAllAvailable` | `StreamingQuery.process_all_available` | canonical |  |
+| `recentProgress` | `StreamingQuery.recent_progress` | canonical |  |
+| `runId` | `StreamingQuery.run_id` | canonical |  |
 | `status` | `StreamingQuery.status` | canonical |  |
 | `stop` | `StreamingQuery.stop` | canonical |  |
 

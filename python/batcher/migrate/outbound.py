@@ -77,7 +77,7 @@ def _inverse(engine: str) -> dict[tuple[str, str], list[_Candidate]]:
                 pattern = ast.parse(template.target, mode="eval").body
                 _add_pattern(out, _Candidate(row, "method", preference), source, pattern)  # type: ignore[arg-type]
             continue
-        if row.status not in (Status.CANONICAL, Status.ALIAS) or len(row.batcher) != 1:
+        if row.status is not Status.CANONICAL or len(row.batcher) != 1:
             continue
         full = _norm(row.batcher[0])
         if source and row.surface in objects and full.startswith(_norm(source) + "."):

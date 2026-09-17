@@ -104,7 +104,7 @@ def _undeclared_second_spellings(rows) -> list[str]:
     out = []
     for row in rows:
         receiver = SURFACE_RECEIVERS.get((row.engine, row.surface))
-        if receiver is None or row.status in (Status.ALIAS, Status.MISMATCH):
+        if receiver is None or row.status is Status.MISMATCH:
             continue
         own = f"{receiver}.{row.name}"
         if resolve(own) is None or own in row.batcher:

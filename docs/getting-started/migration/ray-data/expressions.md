@@ -19,11 +19,11 @@ The following table maps the 37 names on `Expr`, sorted alphabetically.
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
 | `abs` | `Expr.abs` | canonical |  |
-| `acos` | `Expr.arccos` | alias |  |
+| `acos` | `Expr.arccos` | canonical |  |
 | `alias` | `Expr.alias` | canonical |  |
 | `arr` | n/a | gap | Not yet: arr namespace for FixedSizeList columns (arr.to\_list). Wave W7. |
-| `asin` | `Expr.arcsin` | alias |  |
-| `atan` | `Expr.arctan` | alias |  |
+| `asin` | `Expr.arcsin` | canonical |  |
+| `atan` | `Expr.arctan` | canonical |  |
 | `cast` | `Expr.cast` | canonical |  |
 | `ceil` | `Expr.ceil` | canonical |  |
 | `cos` | `Expr.cos` | canonical |  |
@@ -83,7 +83,7 @@ The following table maps the 44 names on `Expr.str`, sorted alphabetically.
 | `is_space` | `Expr.str.is_space` | canonical |  |
 | `is_title` | n/a | gap | Not yet: title-case test (is\_title). Wave W3. |
 | `is_upper` | `Expr.str.is_upper` | canonical |  |
-| `len` | `Expr.str.len_chars` | alias |  |
+| `len` | `Expr.str.len_chars` | canonical |  |
 | `lower` | `Expr.str.lower` | canonical |  |
 | `lpad` | `Expr.str.lpad` | mismatch | Differs: Ray never truncates a string longer than width; Batcher truncates it to width (as DuckDB does). The restoring no-truncate parameter does not exist yet. Wave W2. |
 | `lstrip` | `Expr.str.strip_chars_start` | mismatch | Differs: Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet. Wave W2. |
@@ -104,7 +104,7 @@ The following table maps the 44 names on `Expr.str`, sorted alphabetically.
 | `starts_with` | `Expr.str.starts_with` | canonical |  |
 | `strip` | `Expr.str.trim` | mismatch | Differs: Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet. Wave W2. |
 | `swapcase` | n/a | gap | Not yet: swap letter case. Wave W3. |
-| `title` | `Expr.str.to_titlecase` | alias |  |
+| `title` | `Expr.str.to_titlecase` | canonical |  |
 | `upper` | `Expr.str.upper` | canonical |  |
 
 ## `Expr.list`
@@ -127,7 +127,7 @@ The following table maps the 10 names on `Expr.dt`, sorted alphabetically.
 |---|---|---|---|
 | `ceil` | `Expr.dt.ceil` | canonical |  |
 | `day` | `Expr.dt.day` | canonical |  |
-| `floor` | `Expr.dt.truncate` | alias |  |
+| `floor` | `Expr.dt.truncate` | canonical |  |
 | `hour` | `Expr.dt.hour` | canonical |  |
 | `minute` | `Expr.dt.minute` | canonical |  |
 | `month` | `Expr.dt.month` | canonical |  |

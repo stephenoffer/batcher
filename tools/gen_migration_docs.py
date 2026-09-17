@@ -64,10 +64,6 @@ _HEADER = (
 # What each status means to a reader, in the order the legend lists them.
 _STATUS_MEANING: dict[Status, str] = {
     Status.CANONICAL: "Both engines compute the same thing. Use the Batcher spelling.",
-    Status.ALIAS: (
-        "Batcher once accepted this name as a second spelling. Batcher keeps one spelling per "
-        "capability, so use the Batcher spelling instead."
-    ),
     Status.PARAM: (
         "The capability exists, but Batcher lacks an option the other engine offers. The notes "
         "say which."
@@ -82,7 +78,6 @@ _STATUS_MEANING: dict[Status, str] = {
 
 _STATUS_LABEL: dict[Status, str] = {
     Status.CANONICAL: "canonical",
-    Status.ALIAS: "alias",
     Status.PARAM: "param",
     Status.MISMATCH: "mismatch",
     Status.GAP: "gap",
@@ -589,7 +584,7 @@ class _Renderer:
 
     def _count_row(self, page: Page) -> str:
         c = Counter(r.status for r in self._page_rows(page))
-        same = c[Status.CANONICAL] + c[Status.ALIAS]
+        same = c[Status.CANONICAL]
         return (
             f"| {{doc}}`{page.slug}` | {c.total()} | {same} | {c[Status.PARAM]} | "
             f"{c[Status.MISMATCH]} | {c[Status.GAP]} | {c[Status.OUT_OF_SCOPE]} |"
@@ -600,7 +595,7 @@ class _Renderer:
         back: dict[str, list[str]] = {}
         for page in e.pages:
             for r in self._page_rows(page):
-                if r.status in (Status.CANONICAL, Status.ALIAS) and r.batcher:
+                if r.status is Status.CANONICAL and r.batcher:
                     back.setdefault(_spelling(r.batcher), []).append(_code(f"{r.surface}.{r.name}"))
         lines = [
             _HEADER.format(engine=e.key),

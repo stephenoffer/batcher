@@ -18,11 +18,11 @@ extract_groups = { status = "gap", need = "Expr.str.extract_groups (capture grou
 extract_many = { status = "gap", need = "Expr.str.extract_many (Aho-Corasick)", wave = "W3" }
 find = { status = "mismatch", batcher = "Expr.str.position", note = "Polars find is 0-based, regex by default, and returns null when absent; Batcher's position is 1-based, literal, and returns 0 when absent", wave = "W0" }
 find_many = { status = "gap", need = "Expr.str.find_many", wave = "W3" }
-head = { status = "alias", batcher = "Expr.str.left" }
+head = { status = "canonical", batcher = "Expr.str.left" }
 join = { status = "canonical", batcher = "Expr.str.join" }
 json_decode = { status = "gap", need = "Expr.str.json_decode(dtype) to a typed struct/list", wave = "W7" }
 json_path_match = { status = "param", batcher = "Expr.json.extract_string", need = "JSONPath evaluation parity (Polars json_path_match) verified across nested/array paths", wave = "W7" }
-len_bytes = { status = "alias", batcher = "Expr.str.octet_length" }
+len_bytes = { status = "canonical", batcher = "Expr.str.octet_length" }
 len_chars = { status = "canonical", batcher = "Expr.str.len_chars" }
 normalize = { status = "gap", need = "Expr.str.normalize (Unicode NFC/NFKC/NFD/NFKD)", wave = "W3" }
 pad_end = { status = "canonical", batcher = "Expr.str.rpad", template = 'pad_end(length, fill_char=" ") -> self.rpad(length, fill_char, truncate=False)' }
@@ -42,13 +42,13 @@ strip_chars_start = { status = "canonical", batcher = "Expr.str.strip_chars_star
 strip_prefix = { status = "canonical", batcher = "Expr.str.strip_prefix" }
 strip_suffix = { status = "canonical", batcher = "Expr.str.strip_suffix" }
 strptime = { status = "param", batcher = ["Expr.str.to_datetime", "Expr.str.to_date"], need = "one entry point taking a target dtype, strict=, exact=, cache=", wave = "W2" }
-tail = { status = "alias", batcher = "Expr.str.right" }
+tail = { status = "canonical", batcher = "Expr.str.right" }
 to_date = { status = "mismatch", batcher = "Expr.str.to_date", note = "Polars parses strictly by default: str.to_date(format, strict=True). Format inference (no format) needs a manual port", wave = "W0" }
 to_datetime = { status = "param", batcher = "Expr.str.to_datetime", need = "optional format (inference), time_unit=, time_zone=, ambiguous=, strict=", wave = "W2" }
 to_decimal = { status = "param", batcher = "Expr.cast", need = "inferred precision/scale for decimal parsing (to_decimal(scale=))", wave = "W2" }
 to_integer = { status = "param", batcher = "Expr.cast", need = "base= and strict= for string-to-integer parsing", wave = "W2" }
-to_lowercase = { status = "alias", batcher = "Expr.str.lower" }
+to_lowercase = { status = "canonical", batcher = "Expr.str.lower" }
 to_time = { status = "gap", need = "Expr.str.to_time (needs a TIME type)", wave = "W6" }
 to_titlecase = { status = "canonical", batcher = "Expr.str.to_titlecase" }
-to_uppercase = { status = "alias", batcher = "Expr.str.upper" }
+to_uppercase = { status = "canonical", batcher = "Expr.str.upper" }
 zfill = { status = "mismatch", batcher = "Expr.str.zfill", note = "the sign now stays in front as in Polars; Polars measures width in bytes where Batcher counts characters, so non-ASCII text can differ", wave = "W0" }

@@ -73,8 +73,8 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `fold` | `bt.fold_horizontal` | canonical |  |
 | `format` | `bt.format_string` | mismatch | Differs: Polars format returns null when any input is null; Batcher renders a null as an empty string. Wave W0. |
 | `from_arrow` | `bt.from_arrow` | canonical |  |
-| `from_dict` | `bt.from_pydict` | alias |  |
-| `from_dicts` | `bt.from_pylist` | alias |  |
+| `from_dict` | `bt.from_pydict` | canonical |  |
+| `from_dicts` | `bt.from_pylist` | canonical |  |
 | `from_epoch` | `bt.from_epoch` | mismatch | Differs: Polars time\_unit=d reads days since 1970; port that as bt.from\_unix\_date(column). Other units map to bt.from\_epoch(column, unit=time\_unit). Wave W0. |
 | `from_numpy` | `bt.from_numpy` | param | Missing: 2-D arrays with schema= and orient=. Wave W2. |
 | `from_pandas` | `bt.from_pandas` | canonical |  |

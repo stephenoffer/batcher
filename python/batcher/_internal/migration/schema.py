@@ -81,15 +81,13 @@ class Status(StrEnum):
     """How a competitor's name relates to Batcher's surface.
 
     `CANONICAL` means the capability exists with the same semantics under the Batcher
-    spelling in `batcher`. `ALIAS` means it is reachable today only through a second
-    spelling that is being removed, and `batcher` names the spelling that stays. `PARAM`
-    means the capability exists but lacks an option the competitor offers (`need`).
-    `GAP` means there is no capability yet. `MISMATCH` means both engines have it and
-    answer differently (`note`). `OUT_OF_SCOPE` is a deliberate decline (`reason`).
+    spelling in `batcher`, whatever the competitor calls it. `PARAM` means the capability
+    exists but lacks an option the competitor offers (`need`). `GAP` means there is no
+    capability yet. `MISMATCH` means both engines have it and answer differently (`note`).
+    `OUT_OF_SCOPE` is a deliberate decline (`reason`).
     """
 
     CANONICAL = "canonical"
-    ALIAS = "alias"
     PARAM = "param"
     GAP = "gap"
     MISMATCH = "mismatch"
@@ -99,7 +97,6 @@ class Status(StrEnum):
 # Which optional fields each status requires. `batcher` is the target spelling.
 _REQUIRED: dict[Status, tuple[str, ...]] = {
     Status.CANONICAL: ("batcher",),
-    Status.ALIAS: ("batcher",),
     Status.PARAM: ("batcher", "need", "wave"),
     Status.GAP: ("need", "wave"),
     Status.MISMATCH: ("batcher", "note", "wave"),

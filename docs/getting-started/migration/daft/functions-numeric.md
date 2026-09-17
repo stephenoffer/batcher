@@ -58,7 +58,7 @@ The following table maps the 71 names on `Expression`, sorted alphabetically.
 | `list_agg` | `Expr.array_agg` | canonical |  |
 | `list_agg_distinct` | `Expr.array_agg` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
 | `ln` | `Expr.ln` | canonical |  |
-| `log` | `Expr.ln` | alias | Missing: base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e). Wave W2. |
+| `log` | `Expr.ln` | canonical | Missing: base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e). Wave W2. |
 | `log10` | `Expr.log10` | canonical |  |
 | `log1p` | `Expr.log1p` | canonical |  |
 | `log2` | `Expr.log2` | canonical |  |
@@ -70,7 +70,7 @@ The following table maps the 71 names on `Expression`, sorted alphabetically.
 | `not_nan` | `Expr.is_not_nan` | canonical |  |
 | `over` | `Expr.over` | param | Missing: a Window spec object. Wave WF. |
 | `percentile` | `Expr.quantile` | canonical |  |
-| `pow` | `**` operator | alias |  |
+| `pow` | `**` operator | canonical |  |
 | `power` | `**` operator | canonical |  |
 | `product` | `Expr.product` | canonical |  |
 | `radians` | `Expr.radians` | canonical |  |

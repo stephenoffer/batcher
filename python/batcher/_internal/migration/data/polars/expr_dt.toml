@@ -28,7 +28,7 @@ month_end = { status = "canonical", batcher = "Expr.dt.last_day", template = 'mo
 month_start = { status = "canonical", batcher = "Expr.dt.month_start", template = 'month_start() -> self.month_start(keep_time=True)' }
 nanosecond = { status = "canonical", batcher = "Expr.dt.nanosecond" }
 offset_by = { status = "canonical", batcher = "Expr.dt.offset_by" }
-ordinal_day = { status = "alias", batcher = "Expr.dt.dayofyear" }
+ordinal_day = { status = "canonical", batcher = "Expr.dt.dayofyear" }
 quarter = { status = "canonical", batcher = "Expr.dt.quarter" }
 replace = { status = "gap", need = "Expr.dt.replace (set year/month/.../microsecond fields)", wave = "W6" }
 replace_time_zone = { status = "gap", need = "Expr.dt.replace_time_zone (a time-zone-aware Datetime type)", wave = "W6" }

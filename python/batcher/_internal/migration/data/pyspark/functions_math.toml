@@ -9,7 +9,7 @@ acosh = { status = "canonical", batcher = "Expr.arccosh" }
 asin = { status = "canonical", batcher = "Expr.arcsin" }
 asinh = { status = "canonical", batcher = "Expr.arcsinh" }
 atan = { status = "canonical", batcher = "Expr.arctan" }
-atan2 = { status = "alias", batcher = "bt.arctan2" }
+atan2 = { status = "canonical", batcher = "bt.arctan2" }
 atanh = { status = "canonical", batcher = "Expr.arctanh" }
 bin = { status = "canonical", batcher = "Expr.to_base", template = 'bin(col) -> sem.column(col).to_base(2, twos_complement=True)' }
 bit_count = { status = "canonical", batcher = "Expr.bit_count" }

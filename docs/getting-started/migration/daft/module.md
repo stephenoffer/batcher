@@ -103,17 +103,17 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `planning_config_ctx` | `bt.config_context` | param | Missing: planning knobs (default\_io\_config, strict filter pushdown) as Config fields. Wave W9. |
 | `range` | `bt.range` | mismatch | Differs: Daft partitions= has no Batcher counterpart; the column is named id. Wave W0. |
 | `read_blob` | `bt.read.binary` | mismatch | Differs: Daft read\_blob yields columns (path, size, content) with on\_error=; Batcher read.binary yields (uri, bytes, size, mime). Wave W13. |
-| `read_csv` | `bt.read.csv` | alias |  |
+| `read_csv` | `bt.read.csv` | canonical |  |
 | `read_deltalake` | `bt.read.delta` | canonical |  |
 | `read_hudi` | `bt.read.hudi` | canonical |  |
 | `read_huggingface` | `bt.from_huggingface` | param | Missing: reading an hf:// repo by name (Batcher wraps an already-loaded datasets object). Wave W13. |
 | `read_iceberg` | `bt.read.iceberg` | mismatch | Differs: Daft read\_iceberg takes a PyIceberg Table object or a metadata path (branch=/tag=); Batcher takes a catalog identifier string. Param: accept a PyIceberg Table or metadata path. Wave W13. |
-| `read_json` | `bt.read.json` | alias |  |
+| `read_json` | `bt.read.json` | canonical |  |
 | `read_kafka` | `bt.read.kafka` | mismatch | Differs: Daft read\_kafka is a bounded batch read between start and end offsets; Batcher read.kafka is an unbounded streaming source. Param: bounded start=/end= offsets. Wave W13. |
 | `read_lance` | `bt.read.lance` | canonical |  |
 | `read_mcap` | `bt.read.mcap` | param | Missing: start\_time=/end\_time=/topics= filters and Daft's column layout (not verified against Daft). Wave W13. |
 | `read_paimon` | n/a | gap | Not yet: Apache Paimon reader. Wave W13. |
-| `read_parquet` | `bt.read.parquet` | alias |  |
+| `read_parquet` | `bt.read.parquet` | canonical |  |
 | `read_sql` | `bt.read.sql` | param | Missing: partition\_col=/num\_partitions= parallel range partitioning and a connection factory callable. Wave W13. |
 | `read_table` | `Session.table` | canonical |  |
 | `read_text` | `bt.read.text` | param | Missing: Daft reads each line as a row by default; pass skip\_blank\_lines= to match. Daft read\_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line\_number columns and keeps blank lines. Param: skip\_blank\_lines=True, text column only. Wave W13. |

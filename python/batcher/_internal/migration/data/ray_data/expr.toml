@@ -2,11 +2,11 @@
 
 [Expr]
 abs = { status = "canonical", batcher = "Expr.abs" }
-acos = { status = "alias", batcher = "Expr.arccos" }
+acos = { status = "canonical", batcher = "Expr.arccos" }
 alias = { status = "canonical", batcher = "Expr.alias" }
 arr = { status = "gap", need = "arr namespace for FixedSizeList columns (arr.to_list)", wave = "W7" }
-asin = { status = "alias", batcher = "Expr.arcsin" }
-atan = { status = "alias", batcher = "Expr.arctan" }
+asin = { status = "canonical", batcher = "Expr.arcsin" }
+atan = { status = "canonical", batcher = "Expr.arctan" }
 cast = { status = "canonical", batcher = "Expr.cast" }
 ceil = { status = "canonical", batcher = "Expr.ceil" }
 cos = { status = "canonical", batcher = "Expr.cos" }
@@ -61,7 +61,7 @@ is_printable = { status = "gap", need = "printable-character test (is_printable)
 is_space = { status = "canonical", batcher = "Expr.str.is_space" }
 is_title = { status = "gap", need = "title-case test (is_title)", wave = "W3" }
 is_upper = { status = "canonical", batcher = "Expr.str.is_upper", template = 'is_upper() -> self.is_upper(require_cased=True)' }
-len = { status = "alias", batcher = "Expr.str.len_chars" }
+len = { status = "canonical", batcher = "Expr.str.len_chars" }
 lower = { status = "canonical", batcher = "Expr.str.lower" }
 lpad = { status = "mismatch", batcher = "Expr.str.lpad", note = "Ray never truncates a string longer than width; Batcher truncates it to width (as DuckDB does). The restoring no-truncate parameter does not exist yet.", wave = "W2" }
 lstrip = { status = "mismatch", batcher = "Expr.str.strip_chars_start", note = "Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet.", wave = "W2" }
@@ -82,7 +82,7 @@ split_whitespace = { status = "gap", need = "split on runs of Unicode whitespace
 starts_with = { status = "canonical", batcher = "Expr.str.starts_with" }
 strip = { status = "mismatch", batcher = "Expr.str.trim", note = "Ray strips every Unicode whitespace character by default (tab, newline, U+3000); Batcher's default strips spaces and U+00A0 only, as DuckDB does, so tabs and newlines survive. With explicit characters both agree. The restoring whitespace parameter does not exist yet.", wave = "W2" }
 swapcase = { status = "gap", need = "swap letter case", wave = "W3" }
-title = { status = "alias", batcher = "Expr.str.to_titlecase" }
+title = { status = "canonical", batcher = "Expr.str.to_titlecase" }
 upper = { status = "canonical", batcher = "Expr.str.upper" }
 
 ["Expr.list"]
@@ -95,7 +95,7 @@ sort = { status = "param", batcher = "Expr.list.sort", need = "order='descending
 ["Expr.dt"]
 ceil = { status = "canonical", batcher = "Expr.dt.ceil" }
 day = { status = "canonical", batcher = "Expr.dt.day" }
-floor = { status = "alias", batcher = "Expr.dt.truncate" }
+floor = { status = "canonical", batcher = "Expr.dt.truncate" }
 hour = { status = "canonical", batcher = "Expr.dt.hour" }
 minute = { status = "canonical", batcher = "Expr.dt.minute" }
 month = { status = "canonical", batcher = "Expr.dt.month" }

@@ -32,10 +32,10 @@ min = { status = "canonical", batcher = "Expr.list.min" }
 n_unique = { status = "canonical", batcher = "Expr.list.n_unique", template = 'n_unique() -> self.n_unique(count_nulls=True)' }
 reverse = { status = "canonical", batcher = "Expr.list.reverse" }
 sample = { status = "gap", need = "list.sample", wave = "W8" }
-set_difference = { status = "alias", batcher = "Expr.list.difference" }
-set_intersection = { status = "alias", batcher = "Expr.list.intersect" }
+set_difference = { status = "canonical", batcher = "Expr.list.difference" }
+set_intersection = { status = "canonical", batcher = "Expr.list.intersect" }
 set_symmetric_difference = { status = "gap", need = "list.set_symmetric_difference", wave = "W8" }
-set_union = { status = "alias", batcher = "Expr.list.union" }
+set_union = { status = "canonical", batcher = "Expr.list.union" }
 shift = { status = "gap", need = "list.shift", wave = "W8" }
 slice = { status = "canonical", batcher = "Expr.list.slice" }
 sort = { status = "canonical", batcher = "Expr.list.sort", template = 'sort(*, descending=False, nulls_last=False) -> self.sort(descending=descending, nulls_last=nulls_last)' }

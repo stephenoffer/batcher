@@ -46,7 +46,7 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `gather_every` | `Dataset.gather_every` | canonical |  |
 | `group_by` | `Dataset.group_by` | param | Missing: expression keys. Wave WF. |
 | `group_by_dynamic` | `bt.window` | param | Missing: frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start\_by=, include\_boundaries=. Wave W5. |
-| `head` | `Dataset.limit` | alias |  |
+| `head` | `Dataset.limit` | canonical |  |
 | `inspect` | n/a | gap | Not yet: Dataset.inspect (print the frame mid-plan). Wave W8. |
 | `interpolate` | n/a | gap | Not yet: Dataset.interpolate (every numeric column). Wave W5. |
 | `join` | `Dataset.join` | mismatch | Differs: on how='full' Polars keeps both key columns (key, key\_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=. Wave W0. |
@@ -60,7 +60,7 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `max` | `Dataset.max` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
 | `mean` | `Dataset.mean` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
 | `median` | `Dataset.median` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `melt` | `Dataset.unpivot` | alias |  |
+| `melt` | `Dataset.unpivot` | canonical |  |
 | `merge_sorted` | n/a | gap | Not yet: Dataset.merge\_sorted. Wave W8. |
 | `min` | `Dataset.min` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
 | `null_count` | `Dataset.null_count` | canonical |  |
@@ -89,14 +89,14 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `sink_ipc` | `Dataset.write.arrow` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
 | `sink_ndjson` | `Dataset.write.json` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
 | `sink_parquet` | `Dataset.write.parquet` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
-| `slice` | `Dataset.limit` | alias |  |
+| `slice` | `Dataset.limit` | canonical |  |
 | `sort` | `Dataset.sort` | mismatch | Differs: Polars places nulls first by default (nulls\_last=False); Batcher places them last. Param: nulls\_first=True (exists). Wave W0. |
 | `sql` | `Dataset.sql` | canonical |  |
 | `std` | `Dataset.std` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
 | `sum` | `Dataset.sum` | mismatch | Differs: Polars returns a one-row frame over every column and sums an all-null or empty column to 0; Batcher takes one column and returns null there. Params: all-columns form, empty\_value=0. Wave W0. |
 | `tail` | `Dataset.tail` | canonical |  |
 | `top_k` | `Dataset.top_k` | canonical |  |
-| `unique` | `Dataset.distinct` | alias |  |
+| `unique` | `Dataset.distinct` | canonical |  |
 | `unnest` | `Dataset.unnest` | param | Missing: separator= (prefix the field names). Wave W2. |
 | `unpivot` | `Dataset.unpivot` | canonical |  |
 | `update` | n/a | gap | Not yet: Dataset.update (overwrite values from another frame by key). Wave W8. |
@@ -105,7 +105,7 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `with_columns` | `Dataset.with_columns` | canonical |  |
 | `with_columns_seq` | `Dataset.with_columns` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
 | `with_context` | n/a | out of scope | Declined: deprecated in Polars in favour of horizontal concat. |
-| `with_row_count` | `Dataset.with_row_index` | alias |  |
+| `with_row_count` | `Dataset.with_row_index` | canonical |  |
 | `with_row_index` | `Dataset.with_row_index` | canonical |  |
 
 ## `DataFrame`
@@ -147,8 +147,8 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `group_by` | `Dataset.group_by` | param | Missing: expression keys. Wave WF. |
 | `group_by_dynamic` | `bt.window` | param | Missing: frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start\_by=, include\_boundaries=. Wave W5. |
 | `hash_rows` | `bt.hash_rows` | mismatch | Differs: different hash function: values never agree with Polars. Param: seed= and algorithm choice. Wave W0. |
-| `head` | `Dataset.limit` | alias |  |
-| `height` | `Dataset.count` | alias |  |
+| `head` | `Dataset.limit` | canonical |  |
+| `height` | `Dataset.count` | canonical |  |
 | `hstack` | n/a | gap | Not yet: Dataset.hstack (horizontal concatenation by position). Wave W8. |
 | `insert_column` | `Dataset.with_columns` + `Dataset.select` | canonical |  |
 | `interpolate` | n/a | gap | Not yet: Dataset.interpolate (every numeric column). Wave W5. |
@@ -172,7 +172,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `mean` | `Dataset.mean` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
 | `mean_horizontal` | `bt.mean_horizontal` | param | Missing: frame-level form over every column. Wave W8. |
 | `median` | `Dataset.median` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `melt` | `Dataset.unpivot` | alias |  |
+| `melt` | `Dataset.unpivot` | canonical |  |
 | `merge_sorted` | n/a | gap | Not yet: Dataset.merge\_sorted. Wave W8. |
 | `min` | `Dataset.min` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
 | `min_horizontal` | `bt.least` | param | Missing: frame-level form over every column. Wave W8. |
@@ -204,7 +204,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `shift` | n/a | gap | Not yet: Dataset.shift (every column). Wave W5. |
 | `show` | `Dataset.show` | param | Missing: Polars' default limit of 5 and its formatting options. Wave W2. |
 | `shrink_to_fit` | n/a | out of scope | Declined: memory layout is engine-owned (morsels), not user-visible. |
-| `slice` | `Dataset.limit` | alias |  |
+| `slice` | `Dataset.limit` | canonical |  |
 | `sort` | `Dataset.sort` | mismatch | Differs: Polars places nulls first by default (nulls\_last=False); Batcher places them last. Param: nulls\_first=True (exists). Wave W0. |
 | `sql` | `Dataset.sql` | canonical |  |
 | `std` | `Dataset.std` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
@@ -214,7 +214,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `tail` | `Dataset.tail` | canonical |  |
 | `to_arrow` | `Dataset.to_arrow` | canonical |  |
 | `to_dict` | `Dataset.to_pydict` | mismatch | Differs: Polars to\_dict() defaults to as\_series=True (dict of Series); Batcher returns lists, as as\_series=False does. Wave W0. |
-| `to_dicts` | `Dataset.to_pylist` | alias |  |
+| `to_dicts` | `Dataset.to_pylist` | canonical |  |
 | `to_dummies` | `Dataset.get_dummies` | param | Missing: several columns, separator=, drop\_first=, drop\_nulls=, UInt8 output. Wave W2. |
 | `to_init_repr` | n/a | out of scope | Declined: Python source repr of a frame is a notebook convenience, not engine surface. |
 | `to_jax` | `Dataset.to_jax` | mismatch | Differs: Polars defaults to return\_type='array' (one 2-D array); Batcher returns a dict of arrays. Wave W0. |
@@ -225,18 +225,18 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `to_torch` | `Dataset.ml.iter_torch_batches` | mismatch | Differs: Polars returns a tensor, dict of tensors, or TensorDataset; Batcher yields per-batch tensor dicts. Wave W0. |
 | `top_k` | `Dataset.top_k` | canonical |  |
 | `transpose` | n/a | gap | Not yet: Dataset.transpose. Wave W8. |
-| `unique` | `Dataset.distinct` | alias |  |
+| `unique` | `Dataset.distinct` | canonical |  |
 | `unnest` | `Dataset.unnest` | param | Missing: separator= (prefix the field names). Wave W2. |
 | `unpivot` | `Dataset.unpivot` | canonical |  |
 | `unstack` | n/a | gap | Not yet: Dataset.unstack. Wave W8. |
 | `update` | n/a | gap | Not yet: Dataset.update (overwrite values from another frame by key). Wave W8. |
 | `upsample` | n/a | gap | Not yet: Dataset.upsample (fill a regular time grid). Wave W5. |
 | `var` | `Dataset.var` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
-| `vstack` | `Dataset.union` | alias |  |
+| `vstack` | `Dataset.union` | canonical |  |
 | `width` | `Dataset.width` | canonical |  |
 | `with_columns` | `Dataset.with_columns` | canonical |  |
 | `with_columns_seq` | `Dataset.with_columns` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
-| `with_row_count` | `Dataset.with_row_index` | alias |  |
+| `with_row_count` | `Dataset.with_row_index` | canonical |  |
 | `with_row_index` | `Dataset.with_row_index` | canonical |  |
 | `write_avro` | `Dataset.write.avro` | canonical |  |
 | `write_clipboard` | n/a | out of scope | Declined: clipboard IO is a desktop convenience, not a data engine sink. |

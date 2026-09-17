@@ -87,7 +87,7 @@ def _reversible(engine: str) -> list[tuple[str, str, bool]]:
     out = []
     for (surface, name), count in sorted(owners.items()):
         row = tables(engine).row(surface, name)
-        if row is None or (row.status not in (Status.CANONICAL, Status.ALIAS) and not row.template):
+        if row is None or (row.status is not Status.CANONICAL and not row.template):
             continue
         out.append((surface, name, count == 1))
     return out

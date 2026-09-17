@@ -24,7 +24,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `asTable` | n/a | gap | Not yet: table argument (TableArg with partitionBy/orderBy) for table-valued functions and UDTFs. Wave W11. |
 | `cache` | `Dataset.cache` | canonical |  |
 | `checkpoint` | `Dataset.cache` | param | Missing: eager=True materialization that also truncates the logical plan. Wave W8. |
-| `coalesce` | `Dataset.repartition` | alias |  |
+| `coalesce` | `Dataset.repartition` | canonical |  |
 | `collect` | `Dataset.collect` | mismatch | Differs: Spark returns list\[Row\] eagerly; Batcher returns a pyarrow.Table. Port as: .to\_pylist(). Wave W0. |
 | `colRegex` | `bt.matches` | canonical |  |
 | `columns` | `Dataset.columns` | canonical |  |
@@ -41,23 +41,23 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `describe` | `Dataset.describe` | mismatch | Differs: Spark returns a 'summary' column with count/mean/stddev/min/max rendered as strings; Batcher returns 'statistic' rows with null\_count and quartiles as numbers. Wave W0. |
 | `distinct` | `Dataset.distinct` | canonical |  |
 | `drop` | `Dataset.drop` | param | Missing: silently ignore unknown column names as Spark does (strict=False); Batcher raises. Wave W2. |
-| `drop_duplicates` | `Dataset.distinct` | alias |  |
+| `drop_duplicates` | `Dataset.distinct` | canonical |  |
 | `dropDuplicates` | `Dataset.distinct` | canonical |  |
 | `dropDuplicatesWithinWatermark` | `Dataset.drop_duplicates_within_watermark` | param | Missing: reuse the event time and delay declared by withWatermark instead of passing event\_time=/lateness= again. Wave W10. |
-| `dropna` | `Dataset.drop_nulls` | alias |  |
+| `dropna` | `Dataset.drop_nulls` | canonical |  |
 | `dtypes` | `Dataset.dtypes` | mismatch | Differs: Spark returns \[(name, 'bigint'), ...\] pairs of DDL type strings; Batcher returns a list of pyarrow DataTypes without names. Wave W0. |
 | `exceptAll` | `Dataset.except_` | canonical |  |
 | `executionInfo` | n/a | gap | Not yet: post-execution metrics object on the Dataset (Dataset.stats re-executes instead). Wave W8. |
 | `exists` | n/a | gap | Not yet: EXISTS subquery as a boolean column. Wave W8. |
 | `explain` | `Dataset.explain` | mismatch | Differs: Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str. Wave W0. |
-| `fillna` | `Dataset.fill_null` | alias |  |
+| `fillna` | `Dataset.fill_null` | canonical |  |
 | `filter` | `Dataset.filter` | canonical |  |
 | `first` | `Dataset.first` | mismatch | Differs: Spark returns a Row (or None); Batcher returns a tuple, or a dict with named=True. Wave W0. |
 | `foreach` | n/a | gap | Not yet: distributed per-row side-effect action on a batch Dataset (write.for\_each is streaming only). Wave W11. |
 | `foreachPartition` | n/a | gap | Not yet: distributed per-partition side-effect action on a batch Dataset. Wave W11. |
 | `freqItems` | `Dataset.value_counts` | param | Missing: approximate frequent items over several columns with a support= threshold, returning one row of arrays. Wave W2. |
 | `groupBy` | `Dataset.group_by` | param | Missing: Column-expression grouping keys (Batcher takes column names). Wave WF. |
-| `groupby` | `Dataset.group_by` | alias |  |
+| `groupby` | `Dataset.group_by` | canonical |  |
 | `groupingSets` | `Dataset.grouping_sets` | canonical |  |
 | `head` | `Dataset.limit` + `Dataset.to_pylist` | mismatch | Differs: Spark head(n) eagerly returns list\[Row\] (head() returns one Row); Batcher returns a lazy Dataset. Codemod: .limit(n).to\_pylist(). Wave W0. |
 | `hint` | n/a | out of scope | Declined: no optimizer hint IR; Kyber chooses join strategies from measured statistics (revisit). |
@@ -73,7 +73,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `localCheckpoint` | `Dataset.cache` | param | Missing: eager=True materialization that truncates the logical plan. Wave W8. |
 | `mapInArrow` | `Dataset.map_batches` | mismatch | Differs: Spark passes an iterator of pyarrow.RecordBatch per partition and requires a schema; Batcher calls fn once per batch with no iterator protocol. Wave W11. |
 | `mapInPandas` | `Dataset.map_batches` | mismatch | Differs: Spark passes an iterator of pandas.DataFrame per partition and requires a schema; Batcher calls fn per batch (batch\_format='pandas') with no iterator protocol. Wave W11. |
-| `melt` | `Dataset.unpivot` | alias |  |
+| `melt` | `Dataset.unpivot` | canonical |  |
 | `mergeInto` | `Dataset.write.merge_into` | param | Missing: target table name plus an arbitrary Column match condition (Batcher keys on on= columns). Wave W9. |
 | `metadataColumn` | n/a | gap | Not yet: source metadata columns (\_metadata.file\_path etc.) selectable by name. Wave W8. |
 | `na` | `Dataset.drop_nulls` + `Dataset.fill_null` | canonical |  |
@@ -82,7 +82,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `offset` | `Dataset.limit` | param | Missing: offset without a limit. Wave W2. |
 | `orderBy` | `Dataset.sort` | mismatch | Differs: Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls\_first=True for ascending keys. Wave W0. |
 | `pandas_api` | n/a | out of scope | Declined: pandas-on-Spark API layer; migrate pandas code through the pandas guide instead. |
-| `persist` | `Dataset.cache` | alias |  |
+| `persist` | `Dataset.cache` | canonical |  |
 | `plot` | n/a | out of scope | Declined: plotting accessor, not a data-engine capability. |
 | `printSchema` | `Dataset.schema` | mismatch | Differs: Spark prints a tree; Batcher exposes a pyarrow.Schema to print. Wave W0. |
 | `randomSplit` | `Dataset.ml.random_split` | param | Missing: weights normalized when they do not sum to 1, and an unseeded random default. Wave W2. |
@@ -117,12 +117,12 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `toJSON` | n/a | gap | Not yet: render each row as a JSON string. Wave W7. |
 | `toLocalIterator` | `Dataset.iter_rows` | mismatch | Differs: Spark yields Row objects partition by partition; Batcher yields tuples (or dicts with named=True). Wave W0. |
 | `toPandas` | `Dataset.to_pandas` | canonical |  |
-| `transform` | `Dataset.pipe` | alias |  |
+| `transform` | `Dataset.pipe` | canonical |  |
 | `transpose` | n/a | gap | Not yet: transpose rows into columns keyed by an index column. Wave W8. |
 | `union` | `Dataset.union` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
 | `unionAll` | `Dataset.union` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
 | `unionByName` | `Dataset.union` | param | Missing: match columns by name in any order, and allowMissingColumns= filling absent columns with null. Wave W2. |
-| `unpersist` | `Dataset.uncache` | alias |  |
+| `unpersist` | `Dataset.uncache` | canonical |  |
 | `unpivot` | `Dataset.unpivot` | canonical |  |
 | `where` | `Dataset.filter` | canonical |  |
 | `withColumn` | `Dataset.with_columns` | canonical |  |

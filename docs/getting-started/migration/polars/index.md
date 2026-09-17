@@ -23,7 +23,6 @@ Every row names the Polars spelling, the Batcher spelling, a status, and notes. 
 | Status | Meaning |
 |---|---|
 | canonical | Both engines compute the same thing. Use the Batcher spelling. |
-| alias | Batcher once accepted this name as a second spelling. Batcher keeps one spelling per capability, so use the Batcher spelling instead. |
 | param | The capability exists, but Batcher lacks an option the other engine offers. The notes say which. |
 | mismatch | Both engines have the capability and give different answers. The notes say what differs. Never rename one of these without reading them. |
 | gap | Batcher has no equivalent yet. The notes say what is missing. |

@@ -96,17 +96,17 @@ open_file = { status = "gap", need = "open a (remote) URL as a file object throu
 planning_config_ctx = { status = "param", batcher = "bt.config_context", need = "planning knobs (default_io_config, strict filter pushdown) as Config fields", wave = "W9" }
 range = { status = "mismatch", batcher = "bt.range", template = 'range(start, end=None, step=1, partitions=None) -> bt.range(start, end, step, name="id")', note = "Daft partitions= has no Batcher counterpart; the column is named id", wave = "W0" }
 read_blob = { status = "mismatch", batcher = "bt.read.binary", note = "Daft read_blob yields columns (path, size, content) with on_error=; Batcher read.binary yields (uri, bytes, size, mime)", wave = "W13" }
-read_csv = { status = "alias", batcher = "bt.read.csv" }
+read_csv = { status = "canonical", batcher = "bt.read.csv" }
 read_deltalake = { status = "canonical", batcher = "bt.read.delta" }
 read_hudi = { status = "canonical", batcher = "bt.read.hudi" }
 read_huggingface = { status = "param", batcher = "bt.from_huggingface", need = "reading an hf:// repo by name (Batcher wraps an already-loaded datasets object)", wave = "W13" }
 read_iceberg = { status = "mismatch", batcher = "bt.read.iceberg", note = "Daft read_iceberg takes a PyIceberg Table object or a metadata path (branch=/tag=); Batcher takes a catalog identifier string. Param: accept a PyIceberg Table or metadata path", wave = "W13" }
-read_json = { status = "alias", batcher = "bt.read.json" }
+read_json = { status = "canonical", batcher = "bt.read.json" }
 read_kafka = { status = "mismatch", batcher = "bt.read.kafka", note = "Daft read_kafka is a bounded batch read between start and end offsets; Batcher read.kafka is an unbounded streaming source. Param: bounded start=/end= offsets", wave = "W13" }
 read_lance = { status = "canonical", batcher = "bt.read.lance" }
 read_mcap = { status = "param", batcher = "bt.read.mcap", need = "start_time=/end_time=/topics= filters and Daft's column layout (not verified against Daft)", wave = "W13" }
 read_paimon = { status = "gap", need = "Apache Paimon reader", wave = "W13" }
-read_parquet = { status = "alias", batcher = "bt.read.parquet" }
+read_parquet = { status = "canonical", batcher = "bt.read.parquet" }
 read_sql = { status = "param", batcher = "bt.read.sql", need = "partition_col=/num_partitions= parallel range partitioning and a connection factory callable", wave = "W13" }
 read_table = { status = "canonical", batcher = "Session.table" }
 read_text = { status = "param", batcher = "bt.read.text", need = "Daft reads each line as a row by default; pass skip_blank_lines= to match", note = "Daft read_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line_number columns and keeps blank lines. Param: skip_blank_lines=True, text column only", wave = "W13" }

@@ -19,11 +19,11 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
 | `abs` | `Expr.abs` | canonical |  |
-| `add` | `+` operator | alias |  |
+| `add` | `+` operator | canonical |  |
 | `agg_groups` | n/a | gap | Not yet: agg\_groups (group row indices as a list). Wave W8. |
 | `alias` | `Expr.alias` | canonical |  |
 | `all` | `Expr.bool_and` | canonical |  |
-| `and_` | `&` operator | alias |  |
+| `and_` | `&` operator | canonical |  |
 | `any` | `Expr.bool_or` | canonical |  |
 | `append` | n/a | gap | Not yet: Expr.append (length-changing concatenation of two expressions). Wave W8. |
 | `approx_n_unique` | `Expr.approx_count_distinct` | canonical |  |
@@ -76,7 +76,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `drop_nulls` | n/a | gap | Not yet: Expr.drop\_nulls (length-changing). Wave W8. |
 | `dt` | `Expr.dt` | canonical |  |
 | `entropy` | `Expr.entropy` | mismatch | Differs: Polars entropy reads the values as a distribution in natural log; the template passes of=values and base e. Polars counts a null as a value. Wave W0. |
-| `eq` | `==` operator | alias |  |
+| `eq` | `==` operator | canonical |  |
 | `eq_missing` | `Expr.eq_missing` | canonical |  |
 | `ewm_mean` | `Expr.ewm_mean` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
 | `ewm_mean_by` | `Expr.ewm_mean_by` | param | Missing: half\_life as a duration string over a temporal by column. Wave W2. |
@@ -93,14 +93,14 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `first` | `Expr.first` | mismatch | Differs: Polars first takes the first row in frame order, nulls included; Batcher needs an explicit order: col.first(order\_by, ignore\_nulls=False) after with\_row\_index. Wave W0. |
 | `flatten` | n/a | gap | Not yet: Expr.flatten (length-changing). Wave W8. |
 | `floor` | `Expr.floor` | canonical |  |
-| `floordiv` | `//` operator | alias |  |
+| `floordiv` | `//` operator | canonical |  |
 | `forward_fill` | `Expr.forward_fill` | param | Missing: limit=; Batcher requires an explicit order\_by (explicit-order policy), Polars uses implicit row order. Wave WF. |
 | `from_json` | n/a | gap | Not yet: Expr.from\_json (deserialize an expression from JSON). Wave W8. |
 | `gather` | n/a | gap | Not yet: Expr.gather (take by index, length-changing). Wave W8. |
 | `gather_every` | n/a | gap | Not yet: Expr.gather\_every (length-changing). Wave W8. |
-| `ge` | `>=` operator | alias |  |
+| `ge` | `>=` operator | canonical |  |
 | `get` | n/a | gap | Not yet: Expr.get (single element by index). Wave W8. |
-| `gt` | `>` operator | alias |  |
+| `gt` | `>` operator | canonical |  |
 | `has_nulls` | n/a | gap | Not yet: Expr.has\_nulls aggregate. Wave W8. |
 | `hash` | `Expr.hash` | mismatch | Differs: Polars documents its hash as unstable across versions, so no Batcher algorithm reproduces it; recompute hashes on both sides. Wave W0. |
 | `head` | n/a | gap | Not yet: Expr.head (length-changing). Wave W8. |
@@ -110,7 +110,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `inspect` | n/a | gap | Not yet: Expr.inspect (print intermediate value). Wave W8. |
 | `interpolate` | `Expr.interpolate` | param | Missing: method= ('linear','nearest'); Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
 | `interpolate_by` | n/a | gap | Not yet: Expr.interpolate\_by. Wave W5. |
-| `is_between` | `Expr.between` | alias |  |
+| `is_between` | `Expr.between` | canonical |  |
 | `is_close` | n/a | gap | Not yet: Expr.is\_close (abs\_tol/rel\_tol/nans\_equal). Wave W3. |
 | `is_duplicated` | `Expr.is_duplicated` | canonical |  |
 | `is_finite` | `Expr.is_finite` | canonical |  |
@@ -126,15 +126,15 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `item` | n/a | gap | Not yet: Expr.item (assert a single value). Wave W8. |
 | `kurtosis` | `Expr.kurtosis` | canonical |  |
 | `last` | `Expr.last` | mismatch | Differs: Polars last takes the last row in frame order, nulls included; Batcher needs an explicit order: col.last(order\_by, ignore\_nulls=False) after with\_row\_index. Wave W0. |
-| `le` | `<=` operator | alias |  |
+| `le` | `<=` operator | canonical |  |
 | `len` | `bt.count` | canonical |  |
 | `limit` | n/a | gap | Not yet: Expr.limit (length-changing). Wave W8. |
 | `list` | `Expr.list` | canonical |  |
-| `log` | `Expr.ln` | alias | Missing: base= argument (Polars log(base=e)); Batcher's log is a second spelling of ln and is removed, then returns as log(base). Wave W2. |
+| `log` | `Expr.ln` | canonical | Missing: base= argument (Polars log(base=e)); Batcher's log is a second spelling of ln and is removed, then returns as log(base). Wave W2. |
 | `log10` | `Expr.log10` | canonical |  |
 | `log1p` | `Expr.log1p` | canonical |  |
 | `lower_bound` | n/a | gap | Not yet: Expr.lower\_bound (dtype minimum). Wave W3. |
-| `lt` | `<` operator | alias |  |
+| `lt` | `<` operator | canonical |  |
 | `map_batches` | n/a | gap | Not yet: Expr.map\_batches (vectorized Python UDF as an expression). Wave W11. |
 | `map_elements` | n/a | gap | Not yet: Expr.map\_elements, only as a batch-vectorized wrapper (per-row Python stays refused). Wave W11. |
 | `max` | `Expr.max` | canonical |  |
@@ -146,23 +146,23 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `min_by` | `Expr.min_by` | canonical |  |
 | `mod` | `%` operator | mismatch | Differs: Polars % takes the sign of the divisor (floored); Batcher % truncates like SQL and DuckDB. Wave W0. |
 | `mode` | `Expr.mode` | mismatch | Differs: with all\_modes=True every tied value is returned as Polars does; Polars also counts null as a mode candidate, Batcher does not. Wave W0. |
-| `mul` | `*` operator | alias |  |
+| `mul` | `*` operator | canonical |  |
 | `n_unique` | `Expr.count_distinct` | canonical |  |
 | `name` | `Selector.name` | param | Missing: .name accessor (keep/prefix/suffix/map/case) on every Expr, not only on selectors. Wave W2. |
 | `nan_max` | n/a | gap | Not yet: Expr.nan\_max (NaN-propagating max). Wave W3. |
 | `nan_min` | n/a | gap | Not yet: Expr.nan\_min (NaN-propagating min). Wave W3. |
-| `ne` | `!=` operator | alias |  |
+| `ne` | `!=` operator | canonical |  |
 | `ne_missing` | n/a | gap | Not yet: Expr.ne\_missing (null-aware inequality). Wave W3. |
-| `neg` | `-` operator | alias |  |
-| `not_` | `~` operator | alias |  |
+| `neg` | `-` operator | canonical |  |
+| `not_` | `~` operator | canonical |  |
 | `null_count` | n/a | gap | Not yet: Expr.null\_count aggregate. Wave W8. |
-| `or_` | `\|` operator | alias |  |
+| `or_` | `\|` operator | canonical |  |
 | `over` | `Expr.over` | param | Missing: mapping\_strategy= join and explode. Wave WF. |
 | `pct_change` | `Expr.pct_change` | canonical |  |
 | `peak_max` | `Expr.peak_max` | canonical |  |
 | `peak_min` | `Expr.peak_min` | canonical |  |
 | `pipe` | `Expr.pipe` | canonical |  |
-| `pow` | `**` operator | alias |  |
+| `pow` | `**` operator | canonical |  |
 | `product` | `Expr.product` | canonical |  |
 | `qcut` | n/a | gap | Not yet: Expr.qcut (quantile binning). Wave W3. |
 | `quantile` | `Expr.quantile` | canonical |  |
@@ -219,7 +219,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `std` | `Expr.std` | param | Missing: ddof=. Wave W2. |
 | `str` | `Expr.str` | canonical |  |
 | `struct` | `Expr.struct` | canonical |  |
-| `sub` | `-` operator | alias |  |
+| `sub` | `-` operator | canonical |  |
 | `sum` | `Expr.sum` | canonical |  |
 | `tail` | n/a | gap | Not yet: Expr.tail (length-changing). Wave W8. |
 | `tan` | `Expr.tan` | canonical |  |
@@ -227,7 +227,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `to_physical` | n/a | gap | Not yet: Expr.to\_physical. Wave W3. |
 | `top_k` | `Expr.top_k` | mismatch | Differs: Polars pads a group with fewer than k non-null values with its nulls; Batcher returns the values it has (DuckDB max(x, k)). Wave W0. |
 | `top_k_by` | n/a | gap | Not yet: Expr.top\_k\_by. Wave W8. |
-| `truediv` | `/` operator | alias |  |
+| `truediv` | `/` operator | canonical |  |
 | `truncate` | `Expr.trunc` | param | Missing: decimals= argument. Wave W2. |
 | `unique` | n/a | gap | Not yet: Expr.unique (length-changing). Wave W8. |
 | `unique_counts` | n/a | gap | Not yet: Expr.unique\_counts. Wave W8. |

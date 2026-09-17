@@ -29,22 +29,22 @@ The following table maps the 38 names on the `polars` module, sorted alphabetica
 | `from_dataframe` | `bt.from_any` | param | Missing: allow\_copy= and rechunk=. Wave W13. |
 | `json_normalize` | n/a | gap | Not yet: json\_normalize (flatten nested JSON records). Wave W13. |
 | `PartitionBy` | `Dataset.write.parquet` | param | Missing: a PartitionBy object (key columns, include\_key, per-partition file names). Wave W13. |
-| `read_avro` | `bt.read.avro` | alias |  |
+| `read_avro` | `bt.read.avro` | canonical |  |
 | `read_clipboard` | n/a | out of scope | Declined: clipboard IO is a desktop convenience, not a data engine source. |
-| `read_csv` | `bt.read.csv` | alias |  |
+| `read_csv` | `bt.read.csv` | canonical |  |
 | `read_csv_batched` | `bt.read.csv` + `Dataset.iter_batches` | canonical |  |
-| `read_database` | `bt.read.sql` | alias |  |
+| `read_database` | `bt.read.sql` | canonical |  |
 | `read_database_uri` | `bt.read.sql` | canonical |  |
-| `read_delta` | `bt.read.delta` | alias |  |
-| `read_excel` | `bt.read.excel` | alias |  |
-| `read_ipc` | `bt.read.arrow` | alias |  |
+| `read_delta` | `bt.read.delta` | canonical |  |
+| `read_excel` | `bt.read.excel` | canonical |  |
+| `read_ipc` | `bt.read.arrow` | canonical |  |
 | `read_ipc_schema` | `bt.read.arrow` | mismatch | Differs: port as bt.read.arrow(path).schema, which reads the footer only and returns an Arrow schema rather than a dict. Wave W13. |
 | `read_ipc_stream` | `bt.read.arrow` | param | Missing: Arrow IPC stream format (not only the file format). Wave W2. |
 | `read_json` | `bt.read.json` | mismatch | Differs: Polars read\_json parses one JSON document (an array of rows); Batcher's read\_json and bt.read.json read newline-delimited JSON. Param: lines=False. Wave W0. |
 | `read_lines` | `bt.read.text` | canonical |  |
-| `read_ndjson` | `bt.read.json` | alias |  |
+| `read_ndjson` | `bt.read.json` | canonical |  |
 | `read_ods` | `bt.read.excel` | param | Missing: OpenDocument spreadsheet (.ods) input. Wave W2. |
-| `read_parquet` | `bt.read.parquet` | alias |  |
+| `read_parquet` | `bt.read.parquet` | canonical |  |
 | `read_parquet_metadata` | n/a | gap | Not yet: read Parquet key-value metadata. Wave W13. |
 | `read_parquet_schema` | `bt.read.parquet` | mismatch | Differs: port as bt.read.parquet(path).schema, which reads the footer only and returns an Arrow schema rather than a dict. Wave W13. |
 | `scan_csv` | `bt.read.csv` | param | Missing: reader options: comment\_prefix=, ignore\_errors=, n\_rows=, row\_index\_name=, include\_file\_paths=, missing\_columns=, infer\_schema\_length=, decimal\_comma=, truncate\_ragged\_lines=, credential\_provider=, retries=. Wave W2. |

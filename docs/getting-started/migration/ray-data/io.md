@@ -59,15 +59,15 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 | `range` | `bt.range` | canonical |  |
 | `range_tensor` | n/a | gap | Not yet: range of fixed-shape tensor rows (range\_tensor(n, shape=)). Wave W11. |
 | `read_audio` | `bt.read.audio` | mismatch | Differs: Ray decodes by default into 'amplitude' and 'sample\_rate' columns; Batcher read.audio defaults decode=False. Pass decode=True; verify output column names. Wave W12. |
-| `read_avro` | `bt.read.avro` | alias |  |
+| `read_avro` | `bt.read.avro` | canonical |  |
 | `read_binary_files` | `bt.read.binary` | mismatch | Differs: Ray yields a 'bytes' column (plus 'path' with include\_paths=True); Batcher yields uri, bytes, size and mime columns. Port as: .select('bytes') or rename uri to path. Wave W0. |
 | `read_clickhouse` | `bt.read.clickhouse` | mismatch | Differs: Ray read\_clickhouse(table=, dsn=, columns=, filter=, order\_by=) builds the query; Batcher read.clickhouse(query, \*\*opts) takes SQL. Wave W13. |
-| `read_csv` | `bt.read.csv` | alias |  |
+| `read_csv` | `bt.read.csv` | canonical |  |
 | `read_datasource` | n/a | gap | Not yet: read through a user Datasource implementation. Wave W11. |
-| `read_delta` | `bt.read.delta` | alias |  |
+| `read_delta` | `bt.read.delta` | canonical |  |
 | `read_delta_sharing_tables` | `bt.read.delta_sharing` | canonical |  |
 | `read_hudi` | `bt.read.hudi` | canonical |  |
-| `read_iceberg` | `bt.read.iceberg` | alias |  |
+| `read_iceberg` | `bt.read.iceberg` | canonical |  |
 | `read_images` | `bt.read.images` | mismatch | Differs: Ray decodes images by default into an 'image' ndarray column (mode=, size=); Batcher read.images defaults decode=False. Pass decode=True. Wave W12. |
 | `read_json` | `bt.read.json` | mismatch | Differs: Ray read\_json defaults lines=False and reads JSON documents (including a top-level array); Batcher read.json reads newline-delimited JSON only and fails on a JSON array file. Wave W2. |
 | `read_kafka` | `bt.read.kafka` | mismatch | Differs: Ray read\_kafka is bounded (trigger='once', start\_offset='earliest', end\_offset='latest'); Batcher read.kafka is an unbounded streaming source. Pass starting\_offsets='earliest', ending\_offsets='latest'. Wave W10. |
@@ -76,7 +76,7 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 | `read_mcap` | `bt.read.mcap` | mismatch | Differs: Both emit one row per message with topic, log\_time, publish\_time, sequence and data; Ray decodes JSON-encoded payloads into Python objects in 'data' and adds channel\_id (include\_metadata=True), while Batcher keeps every payload encoded as bytes. Wave W13. |
 | `read_mongo` | `bt.read.mongo` | canonical |  |
 | `read_numpy` | `bt.read.numpy` | canonical |  |
-| `read_parquet` | `bt.read.parquet` | alias |  |
+| `read_parquet` | `bt.read.parquet` | canonical |  |
 | `read_snowflake` | `bt.read.snowflake` | canonical |  |
 | `read_sql` | `bt.read.sql` | mismatch | Differs: Ray read\_sql(sql, connection\_factory) calls a DB-API connection factory per read task and shards with shard\_keys=; Batcher read.sql(query, uri=/connection=) takes a URI or one connection and has no shard\_keys. Wave W13. |
 | `read_text` | `bt.read.text` | mismatch | Differs: Ray yields a single 'text' column (drop\_empty\_lines=True); Batcher read.text also yields path and line\_number columns. Port as: .select('text'). Wave W0. |

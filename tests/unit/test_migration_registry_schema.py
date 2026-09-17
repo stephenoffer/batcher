@@ -29,7 +29,6 @@ def test_a_well_formed_tree_loads_every_status(tmp_path: Path) -> None:
         """
 [LazyFrame]
 with_columns = { status = "canonical", batcher = "Dataset.with_columns" }
-melt = { status = "alias", batcher = "Dataset.unpivot" }
 join_asof = { status = "param", batcher = "Dataset.join_asof", need = "strategy", wave = "W2" }
 join_where = { status = "gap", need = "inequality join", wave = "W5" }
 sort = { status = "mismatch", batcher = "Dataset.sort", note = "nulls first", wave = "W0" }
@@ -40,7 +39,7 @@ concat = { status = "canonical", batcher = ["Expr.str.join", "op:add"] }
 """,
     )
     registry = load_registry(root)
-    assert len(registry.rows) == 7
+    assert len(registry.rows) == 6
     assert {r.status for r in registry.rows.values()} == set(Status)
     concat = registry.get("polars", "Expr.str", "concat")
     assert concat is not None and concat.batcher == ("Expr.str.join", "op:add")

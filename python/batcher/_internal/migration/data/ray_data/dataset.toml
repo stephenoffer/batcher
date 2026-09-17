@@ -15,7 +15,7 @@ flat_map = { status = "param", batcher = "Dataset.flat_map", template = 'flat_ma
 get_dataset_id = { status = "out_of_scope", reason = "Ray execution-internal dataset id used to tag metrics and logs; Batcher has no per-Dataset registration" }
 get_internal_block_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
 get_stats_summary = { status = "mismatch", batcher = "Dataset.stats", note = "Ray returns a DatasetStatsSummary of a previous execution; Batcher stats() executes the query and returns measured per-operator RunStats.", wave = "W0" }
-groupby = { status = "alias", batcher = "Dataset.group_by", template = 'groupby(key) -> self.group_by(sem.column_names(key))' }
+groupby = { status = "canonical", batcher = "Dataset.group_by", template = 'groupby(key) -> self.group_by(sem.column_names(key))' }
 has_serializable_lineage = { status = "out_of_scope", reason = "lineage serialization of object-store block refs for Ray fault tolerance; a Batcher plan is rebuilt from its JSON IR and sources" }
 input_files = { status = "gap", need = "list the source files a Dataset reads", wave = "W8" }
 iter_batches = { status = "mismatch", batcher = ["Dataset.iter_batches", "Dataset.ml.to_numpy_batches"], note = "Ray iter_batches defaults to batch_format='default' ({col: ndarray}, nulls become NaN) and batch_size=256; Batcher yields pyarrow RecordBatches of engine size. Port as iter_batches(256, batch_format='numpy')", wave = "W2" }
@@ -76,7 +76,7 @@ to_tf = { status = "mismatch", batcher = "Dataset.ml.to_tf", note = "Ray to_tf(f
 train_test_split = { status = "mismatch", batcher = "Dataset.ml.train_test_split", note = "Ray defaults shuffle=False, so the test set is the last test_size rows in dataset order, and test_size may be an int row count; Batcher assigns rows by a seeded hash (seed=0), takes only a fraction, and is lazy rather than materialized.", wave = "W0" }
 union = { status = "canonical", batcher = "Dataset.union" }
 unique = { status = "mismatch", batcher = ["Dataset.select", "Dataset.distinct", "Dataset.to_pylist"], note = "Ray unique(column) is eager and returns a list of the column's distinct values (ignore_nulls=False keeps None); Batcher Dataset.distinct deduplicates rows and returns a Dataset. Port as: [r[c] for r in ds.select(c).distinct().to_pylist()].", wave = "W0" }
-with_column = { status = "alias", batcher = "Dataset.with_columns", template = 'with_column(column_name, expr) -> self.with_columns(**{column_name: expr})' }
+with_column = { status = "canonical", batcher = "Dataset.with_columns", template = 'with_column(column_name, expr) -> self.with_columns(**{column_name: expr})' }
 with_columns = { status = "canonical", batcher = "Dataset.with_columns" }
 write_bigquery = { status = "gap", need = "BigQuery writer (Batcher reads BigQuery via bt.read.bigquery but cannot write it)", wave = "W13" }
 write_clickhouse = { status = "param", batcher = "Dataset.write.clickhouse", need = "creating the table (Ray's CREATE mode); Batcher inserts into an existing table", wave = "W13" }

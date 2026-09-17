@@ -32,7 +32,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `count_rows` | `Dataset.count` | canonical |  |
 | `describe` | `Dataset.describe` | mismatch | Differs: Daft describe() returns the schema as a DataFrame (column\_name, type); Batcher describe() returns summary statistics. Rewrite: Dataset.schema. Wave W0. |
 | `distinct` | `Dataset.distinct` | canonical |  |
-| `drop_duplicates` | `Dataset.distinct` | alias |  |
+| `drop_duplicates` | `Dataset.distinct` | canonical |  |
 | `drop_nan` | n/a | gap | Not yet: drop rows holding NaN in any (or the given) float columns. Wave W8. |
 | `drop_null` | `Dataset.drop_nulls` | canonical |  |
 | `except_all` | `Dataset.except_` | canonical |  |
@@ -41,7 +41,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `explain` | `Dataset.explain` | mismatch | Differs: Daft explain() prints the plan (show\_all= adds the physical plan); Batcher explain() returns the plan as a string. Rewrite: print(ds.explain()). Wave W0. |
 | `explode` | `Dataset.explode` | mismatch | Differs: Daft explode keeps a null or empty list as one row with a null value and accepts several columns at once; Batcher explode drops those rows and takes one column. Param: outer=True, multiple columns. Wave W0. |
 | `filter` | `Dataset.filter` | canonical |  |
-| `groupby` | `Dataset.group_by` | alias |  |
+| `groupby` | `Dataset.group_by` | canonical |  |
 | `intersect` | `Dataset.intersect` | canonical |  |
 | `intersect_all` | `Dataset.intersect` | canonical |  |
 | `into_batches` | `Dataset.repartition` | mismatch | Differs: Daft into\_batches re-chunks execution into batch\_size-row partitions; Batcher sizes morsels itself and repartition only lays out written files. Wave W8. |
@@ -53,7 +53,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `limit` | `Dataset.limit` | canonical |  |
 | `max` | `Dataset.max` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.max takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
 | `mean` | `Dataset.mean` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.mean takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
-| `melt` | `Dataset.unpivot` | alias |  |
+| `melt` | `Dataset.unpivot` | canonical |  |
 | `metrics` | `Dataset.stats` | param | Missing: metrics of the last execution without re-running the query. Wave W8. |
 | `min` | `Dataset.min` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.min takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
 | `num_partitions` | n/a | out of scope | Declined: Batcher plans carry no partition count; execution parallelism is engine-owned. |
@@ -81,19 +81,19 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `to_pydict` | `Dataset.to_pydict` | canonical |  |
 | `to_pylist` | `Dataset.to_pylist` | canonical |  |
 | `to_ray_dataset` | `Dataset.to_ray_dataset` | canonical |  |
-| `to_torch_dataloader` | `Dataset.ml.to_torch_dataloader` | alias |  |
+| `to_torch_dataloader` | `Dataset.ml.to_torch_dataloader` | canonical |  |
 | `to_torch_iter_dataset` | `Dataset.ml.iter_torch_batches` | param | Missing: a row-wise torch IterableDataset with shard\_strategy='file' and world\_size/rank sharding. Wave W12. |
 | `to_torch_map_dataset` | n/a | gap | Not yet: a map-style (random access) torch Dataset. Wave W12. |
-| `transform` | `Dataset.pipe` | alias |  |
+| `transform` | `Dataset.pipe` | canonical |  |
 | `union` | `Dataset.union` | mismatch | Differs: Daft union is UNION DISTINCT; Batcher union is UNION ALL. Param: distinct=True. Wave W0. |
 | `union_all` | `Dataset.union` | canonical |  |
 | `union_all_by_name` | `Dataset.union` | param | Missing: by\_name=True column matching. Wave W2. |
 | `union_by_name` | `Dataset.union` | param | Missing: by\_name=True column matching (with distinct=True). Wave W2. |
-| `unique` | `Dataset.distinct` | alias |  |
+| `unique` | `Dataset.distinct` | canonical |  |
 | `unpivot` | `Dataset.unpivot` | canonical |  |
 | `var` | `Dataset.var` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.var takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=. Wave W0. |
 | `where` | `Dataset.filter` | canonical |  |
-| `with_column` | `Dataset.with_columns` | alias |  |
+| `with_column` | `Dataset.with_columns` | canonical |  |
 | `with_column_renamed` | `Dataset.rename` | canonical |  |
 | `with_columns` | `Dataset.with_columns` | canonical |  |
 | `with_columns_renamed` | `Dataset.rename` | canonical |  |

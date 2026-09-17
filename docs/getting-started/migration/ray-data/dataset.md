@@ -32,7 +32,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `get_dataset_id` | n/a | out of scope | Declined: Ray execution-internal dataset id used to tag metrics and logs; Batcher has no per-Dataset registration. |
 | `get_internal_block_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
 | `get_stats_summary` | `Dataset.stats` | mismatch | Differs: Ray returns a DatasetStatsSummary of a previous execution; Batcher stats() executes the query and returns measured per-operator RunStats. Wave W0. |
-| `groupby` | `Dataset.group_by` | alias |  |
+| `groupby` | `Dataset.group_by` | canonical |  |
 | `has_serializable_lineage` | n/a | out of scope | Declined: lineage serialization of object-store block refs for Ray fault tolerance; a Batcher plan is rebuilt from its JSON IR and sources. |
 | `input_files` | n/a | gap | Not yet: list the source files a Dataset reads. Wave W8. |
 | `iter_batches` | `Dataset.iter_batches` + `Dataset.ml.to_numpy_batches` | mismatch | Differs: Ray iter\_batches defaults to batch\_format='default' (\{col: ndarray\}, nulls become NaN) and batch\_size=256; Batcher yields pyarrow RecordBatches of engine size. Port as iter\_batches(256, batch\_format='numpy'). Wave W2. |
@@ -93,7 +93,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `train_test_split` | `Dataset.ml.train_test_split` | mismatch | Differs: Ray defaults shuffle=False, so the test set is the last test\_size rows in dataset order, and test\_size may be an int row count; Batcher assigns rows by a seeded hash (seed=0), takes only a fraction, and is lazy rather than materialized. Wave W0. |
 | `union` | `Dataset.union` | canonical |  |
 | `unique` | `Dataset.select` + `Dataset.distinct` + `Dataset.to_pylist` | mismatch | Differs: Ray unique(column) is eager and returns a list of the column's distinct values (ignore\_nulls=False keeps None); Batcher Dataset.distinct deduplicates rows and returns a Dataset. Port as: \[r\[c\] for r in ds.select(c).distinct().to\_pylist()\]. Wave W0. |
-| `with_column` | `Dataset.with_columns` | alias |  |
+| `with_column` | `Dataset.with_columns` | canonical |  |
 | `with_columns` | `Dataset.with_columns` | canonical |  |
 | `write_bigquery` | n/a | gap | Not yet: BigQuery writer (Batcher reads BigQuery via bt.read.bigquery but cannot write it). Wave W13. |
 | `write_clickhouse` | `Dataset.write.clickhouse` | param | Missing: creating the table (Ray's CREATE mode); Batcher inserts into an existing table. Wave W13. |

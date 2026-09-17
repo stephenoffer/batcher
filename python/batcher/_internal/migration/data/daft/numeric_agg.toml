@@ -42,7 +42,7 @@ lead = { status = "param", batcher = "bt.lead", need = "default= fill value for 
 list_agg = { status = "canonical", batcher = "Expr.array_agg" }
 list_agg_distinct = { status = "param", batcher = "Expr.array_agg", need = "distinct=True (distinct values, nulls dropped)", wave = "W2" }
 ln = { status = "canonical", batcher = "Expr.ln" }
-log = { status = "alias", batcher = "Expr.ln", need = "base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e)", wave = "W2" }
+log = { status = "canonical", batcher = "Expr.ln", need = "base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e)", wave = "W2" }
 log10 = { status = "canonical", batcher = "Expr.log10" }
 log1p = { status = "canonical", batcher = "Expr.log1p" }
 log2 = { status = "canonical", batcher = "Expr.log2" }
@@ -54,7 +54,7 @@ negate = { status = "canonical", batcher = "op:neg" }
 not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
 over = { status = "param", batcher = ["Expr.over"], need = "a Window spec object", wave = "WF" }
 percentile = { status = "canonical", batcher = "Expr.quantile" }
-pow = { status = "alias", batcher = "op:pow" }
+pow = { status = "canonical", batcher = "op:pow" }
 power = { status = "canonical", batcher = "op:pow" }
 product = { status = "canonical", batcher = "Expr.product" }
 radians = { status = "canonical", batcher = "Expr.radians" }

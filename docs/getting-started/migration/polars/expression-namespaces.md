@@ -33,11 +33,11 @@ The following table maps the 49 names on `Expr.str`, sorted alphabetically.
 | `extract_many` | n/a | gap | Not yet: Expr.str.extract\_many (Aho-Corasick). Wave W3. |
 | `find` | `Expr.str.position` | mismatch | Differs: Polars find is 0-based, regex by default, and returns null when absent; Batcher's position is 1-based, literal, and returns 0 when absent. Wave W0. |
 | `find_many` | n/a | gap | Not yet: Expr.str.find\_many. Wave W3. |
-| `head` | `Expr.str.left` | alias |  |
+| `head` | `Expr.str.left` | canonical |  |
 | `join` | `Expr.str.join` | canonical |  |
 | `json_decode` | n/a | gap | Not yet: Expr.str.json\_decode(dtype) to a typed struct/list. Wave W7. |
 | `json_path_match` | `Expr.json.extract_string` | param | Missing: JSONPath evaluation parity (Polars json\_path\_match) verified across nested/array paths. Wave W7. |
-| `len_bytes` | `Expr.str.octet_length` | alias |  |
+| `len_bytes` | `Expr.str.octet_length` | canonical |  |
 | `len_chars` | `Expr.str.len_chars` | canonical |  |
 | `normalize` | n/a | gap | Not yet: Expr.str.normalize (Unicode NFC/NFKC/NFD/NFKD). Wave W3. |
 | `pad_end` | `Expr.str.rpad` | canonical |  |
@@ -57,15 +57,15 @@ The following table maps the 49 names on `Expr.str`, sorted alphabetically.
 | `strip_prefix` | `Expr.str.strip_prefix` | canonical |  |
 | `strip_suffix` | `Expr.str.strip_suffix` | canonical |  |
 | `strptime` | `Expr.str.to_datetime` + `Expr.str.to_date` | param | Missing: one entry point taking a target dtype, strict=, exact=, cache=. Wave W2. |
-| `tail` | `Expr.str.right` | alias |  |
+| `tail` | `Expr.str.right` | canonical |  |
 | `to_date` | `Expr.str.to_date` | mismatch | Differs: Polars parses strictly by default: str.to\_date(format, strict=True). Format inference (no format) needs a manual port. Wave W0. |
 | `to_datetime` | `Expr.str.to_datetime` | param | Missing: optional format (inference), time\_unit=, time\_zone=, ambiguous=, strict=. Wave W2. |
 | `to_decimal` | `Expr.cast` | param | Missing: inferred precision/scale for decimal parsing (to\_decimal(scale=)). Wave W2. |
 | `to_integer` | `Expr.cast` | param | Missing: base= and strict= for string-to-integer parsing. Wave W2. |
-| `to_lowercase` | `Expr.str.lower` | alias |  |
+| `to_lowercase` | `Expr.str.lower` | canonical |  |
 | `to_time` | n/a | gap | Not yet: Expr.str.to\_time (needs a TIME type). Wave W6. |
 | `to_titlecase` | `Expr.str.to_titlecase` | canonical |  |
-| `to_uppercase` | `Expr.str.upper` | alias |  |
+| `to_uppercase` | `Expr.str.upper` | canonical |  |
 | `zfill` | `Expr.str.zfill` | mismatch | Differs: the sign now stays in front as in Polars; Polars measures width in bytes where Batcher counts characters, so non-ASCII text can differ. Wave W0. |
 
 ## `Expr.dt`
@@ -99,7 +99,7 @@ The following table maps the 47 names on `Expr.dt`, sorted alphabetically.
 | `month_start` | `Expr.dt.month_start` | canonical |  |
 | `nanosecond` | `Expr.dt.nanosecond` | canonical |  |
 | `offset_by` | `Expr.dt.offset_by` | canonical |  |
-| `ordinal_day` | `Expr.dt.dayofyear` | alias |  |
+| `ordinal_day` | `Expr.dt.dayofyear` | canonical |  |
 | `quarter` | `Expr.dt.quarter` | canonical |  |
 | `replace` | n/a | gap | Not yet: Expr.dt.replace (set year/month/.../microsecond fields). Wave W6. |
 | `replace_time_zone` | n/a | gap | Not yet: Expr.dt.replace\_time\_zone (a time-zone-aware Datetime type). Wave W6. |
@@ -157,10 +157,10 @@ The following table maps the 43 names on `Expr.list`, sorted alphabetically.
 | `n_unique` | `Expr.list.n_unique` | canonical |  |
 | `reverse` | `Expr.list.reverse` | canonical |  |
 | `sample` | n/a | gap | Not yet: list.sample. Wave W8. |
-| `set_difference` | `Expr.list.difference` | alias |  |
-| `set_intersection` | `Expr.list.intersect` | alias |  |
+| `set_difference` | `Expr.list.difference` | canonical |  |
+| `set_intersection` | `Expr.list.intersect` | canonical |  |
 | `set_symmetric_difference` | n/a | gap | Not yet: list.set\_symmetric\_difference. Wave W8. |
-| `set_union` | `Expr.list.union` | alias |  |
+| `set_union` | `Expr.list.union` | canonical |  |
 | `shift` | n/a | gap | Not yet: list.shift. Wave W8. |
 | `slice` | `Expr.list.slice` | canonical |  |
 | `sort` | `Expr.list.sort` | canonical |  |

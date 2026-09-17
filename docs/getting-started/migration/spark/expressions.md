@@ -22,7 +22,7 @@ The following table maps the 36 names on `Column`, sorted alphabetically.
 | `asc` | `Dataset.sort` | mismatch | Differs: Spark asc() sorts nulls first; Batcher ascending sorts nulls last. Pass nulls\_first=True. Wave W0. |
 | `asc_nulls_first` | `Dataset.sort` | canonical |  |
 | `asc_nulls_last` | `Dataset.sort` | canonical |  |
-| `astype` | `Expr.cast` | alias |  |
+| `astype` | `Expr.cast` | canonical |  |
 | `between` | `Expr.between` | canonical |  |
 | `bitwiseAND` | `Expr.bitwise_and` | canonical |  |
 | `bitwiseOR` | `Expr.bitwise_or` | canonical |  |
@@ -38,7 +38,7 @@ The following table maps the 36 names on `Column`, sorted alphabetically.
 | `getField` | `Expr.struct.field` | canonical |  |
 | `getItem` | `Expr.list.get` + `Expr.map.get` | mismatch | Differs: Spark getItem(-1) on an array is out of bounds (an error under ANSI, the 4.x default; null otherwise); Expr.list.get(-1) returns the last element. Map keys go through Expr.map.get. Wave W0. |
 | `ilike` | `Expr.str.ilike` | canonical |  |
-| `isin` | `Expr.is_in` | alias |  |
+| `isin` | `Expr.is_in` | canonical |  |
 | `isNaN` | `Expr.is_nan` | mismatch | Differs: Spark isnan(null) is false; Batcher (DuckDB) returns null. Wave W0. |
 | `isNotNull` | `Expr.is_not_null` | canonical |  |
 | `isNull` | `Expr.is_null` | canonical |  |

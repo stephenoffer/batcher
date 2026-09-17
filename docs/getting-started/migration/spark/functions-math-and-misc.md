@@ -24,7 +24,7 @@ The following table maps the 67 names on the `pyspark.sql.functions` module, sor
 | `asin` | `Expr.arcsin` | canonical |  |
 | `asinh` | `Expr.arcsinh` | canonical |  |
 | `atan` | `Expr.arctan` | canonical |  |
-| `atan2` | `bt.arctan2` | alias |  |
+| `atan2` | `bt.arctan2` | canonical |  |
 | `atanh` | `Expr.arctanh` | canonical |  |
 | `bin` | `Expr.to_base` | canonical |  |
 | `bit_count` | `Expr.bit_count` | canonical |  |
