@@ -88,9 +88,10 @@ from batcher.api.terminal import (
     _to_pylist,
 )
 from batcher.io.source import Source
-from batcher.plan.expr_ir import Aliased, Col, Expr
+from batcher.plan.expr_ir import AggExpr, Aliased, CaseBuilder, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector, has_selector
 from batcher.plan.expr_rewrite import is_bare_window
+from batcher.plan.expr_rewrite.naming import output_name
 from batcher.plan.logical import (
     AsofJoin,
     Distinct,
@@ -726,22 +727,38 @@ class Dataset:
         # before a `filter`/`select` still reaches the downstream `group_by().agg()`.
         return Dataset(plan, self._sources, watermark=self._watermark)
 
-    def _named_positionals(self, exprs: tuple[Expr, ...]) -> dict[str, Expr]:
-        """Resolve self-naming positional expressions to an ordered name -> expr map."""
-        out: dict[str, Expr] = {}
+    def _named_positionals(self, exprs: tuple[Expr, ...], api: str) -> dict[str, Expr]:
+        """Resolve positional expressions to an ordered name -> expr map.
+
+        A selector expands to one entry per matched column; anything else is named by
+        `output_name` (its alias, else its leftmost column, else ``"literal"``). Two
+        entries landing on one name are refused rather than silently overwritten.
+        """
+        pairs: list[tuple[str, Expr]] = []
         for e in exprs:
-            if has_selector(e):
-                out.update(expand_selector_expr(self, e))
-            elif isinstance(e, Aliased):
-                out[e.name] = e.inner
-            elif isinstance(e, Col):
-                out[e.name] = e
+            if isinstance(e, str):
+                pairs.append((e, Col(e)))
+            elif has_selector(e):
+                pairs.extend(expand_selector_expr(self, e))
+            elif isinstance(e, (Expr, AggExpr, CaseBuilder)):
+                expr = _as_expr(e)
+                pairs.append((output_name(expr), expr))
             else:
+                # A bare scalar is almost always a mistake (a column *position*), so it is not
+                # lifted to a literal here; `bt.lit(...)` says a constant on purpose.
                 raise PlanError(
-                    "a positional with_columns() argument must name its output: pass a "
-                    "column selector, an aliased expression (expr.alias('total')), or a "
-                    "bare col(...); otherwise use a keyword (with_columns(total=expr))"
+                    f"positional {api}() arguments must be column names, expressions, or "
+                    f"column selectors, got {type(e).__name__}; spell a constant bt.lit(...)"
                 )
+        out: dict[str, Expr] = {}
+        for name, expr in pairs:
+            if name in out:
+                raise PlanError(
+                    f"{api}() would produce the duplicate output column {name!r}: an unnamed "
+                    "expression is named after its leftmost column (or 'literal'), so two "
+                    "can collide -- rename one with .alias('...') or pass it as a keyword"
+                )
+            out[name] = expr.inner if isinstance(expr, Aliased) else expr
         return out
 
     def cache(self, storage_level: StorageLevel | str | None = None) -> Dataset:
@@ -1103,20 +1120,30 @@ class Dataset:
     def select(self, *columns: str | Expr, **named: Expr | int | float | bool | str) -> Dataset:
         """Project to exactly the given columns.
 
-        Positional args are column names (strings), bare ``col(...)`` references,
-        aliased expressions (``expr.alias("name")``), or column selectors
-        (``bt.exclude("id")``, ``bt.numeric() * 2``) which expand to one output per
-        matched column; keyword args bind a new name to an expression:
-        ``ds.select("id", total=col("price") * col("qty"))``.
+        Positional args are column names (strings), expressions, or column selectors
+        (``bt.exclude("id")``, ``bt.numeric() * 2``, ``bt.col("a", "b")``) which expand
+        to one output per matched column; keyword args bind a new name to an
+        expression: ``ds.select("id", total=col("price") * col("qty"))``.
+
+        A positional expression is named the way Polars names it: by its
+        ``.alias(...)`` if it has one, else by its leftmost column, else
+        ``"literal"`` -- so ``select(col("a") + 1)`` yields a column ``a``. Two
+        outputs landing on one name raise rather than overwrite each other.
+
+        An aggregate (``col("x").sum()``) is the whole-frame aggregate. When every
+        output is an aggregate or a constant the result is one row; mixed with
+        row-level outputs it is broadcast to every row, as ``sum(x) OVER ()`` is.
 
         Args:
-            *columns: Column names, ``col(...)`` references, aliased expressions, or
-                column selectors. A list of them is accepted in place of separate
-                arguments, as Polars and PySpark accept one.
+            *columns: Column names, expressions, or column selectors. A list of them is
+                accepted in place of separate arguments, as Polars and PySpark accept one.
             **named: New column names bound to expressions.
 
         Returns:
             A new `Dataset` with exactly the selected columns.
+
+        Raises:
+            PlanError: If two outputs would share a name.
 
         Examples:
             .. doctest::
@@ -1128,25 +1155,19 @@ class Dataset:
 
                 >>> ds.select(bt.exclude("g")).to_pydict()
                 {'x': [1, 2, 3]}
+
+                >>> ds.select(bt.col("x") + 1, bt.col("x").sum().alias("total")).to_pydict()
+                {'x': [2, 3, 4], 'total': [6, 6, 6]}
         """
         columns = flatten_varargs(columns)
-        items: list[Projection] = []
-        for c in columns:
-            if isinstance(c, str):
-                items.append(Projection(c, Col(c)))
-            elif has_selector(c):
-                items.extend(Projection(n, e) for n, e in expand_selector_expr(self, c))
-            elif isinstance(c, Aliased):
-                items.append(Projection(c.name, c.inner))
-            elif isinstance(c, Col):
-                items.append(Projection(c.name, c))
-            else:
-                raise PlanError(
-                    "positional select() arguments must be column names, col(...) "
-                    "references, aliased expressions, or column selectors; name other "
-                    "derived columns via a keyword (select(total=expr)) or .alias('total')"
-                )
+        items = [Projection(n, e) for n, e in self._named_positionals(columns, "select").items()]
+        taken = {p.alias for p in items}
         for alias, expr in named.items():
+            if alias in taken:
+                raise PlanError(
+                    f"select() got the duplicate output column {alias!r} both positionally "
+                    "and as a keyword; give each output column exactly one definition"
+                )
             items.append(Projection(alias, _as_expr(expr)))
         if not items:
             raise PlanError(_empty_projection_message("select", columns))
@@ -1161,18 +1182,21 @@ class Dataset:
         ``with_columns(share=col("x") / col("x").sum().over())`` — and window and
         non-window columns may be mixed freely in one call.
 
-        Positional args must already carry their output name: a column selector
-        (``bt.numeric().round(2)`` replaces each numeric column in place), an aliased
-        expression, or a bare ``col(...)``. Anything else needs a keyword.
+        A positional column selector (``bt.numeric().round(2)``) replaces each matched
+        column in place. Any other positional expression is named as `select` names
+        one: by its alias, else its leftmost column, else ``"literal"`` -- so
+        ``with_columns(col("x") * 2)`` replaces ``x``.
 
         Args:
-            *exprs: Self-naming expressions — column selectors, aliased expressions,
-                or bare ``col(...)`` references. A list of them is accepted in place of
-                separate arguments.
+            *exprs: Column selectors or expressions, named by their alias or leftmost
+                column. A list of them is accepted in place of separate arguments.
             **named: Column names bound to expressions (or scalars) to add or replace.
 
         Returns:
             A new `Dataset` with the columns added or replaced.
+
+        Raises:
+            PlanError: If two outputs would share a name.
 
         Examples:
             .. doctest::
@@ -1187,7 +1211,7 @@ class Dataset:
                 {'a': [1.2], 'b': [5.7], 's': ['x']}
         """
         exprs = flatten_varargs(exprs)
-        positional = self._named_positionals(exprs)
+        positional = self._named_positionals(exprs, "with_columns")
         clashing = sorted(positional.keys() & named.keys())
         if clashing:
             raise PlanError(

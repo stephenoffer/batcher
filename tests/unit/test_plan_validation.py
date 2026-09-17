@@ -20,12 +20,13 @@ def test_select_unknown_column_raises():
         ds.select(total=bt.col("missing") + 1)
 
 
-def test_positional_expr_in_select_rejected():
-    # An unnamed derived expression (not a bare column or .alias()) is still
-    # rejected positionally; it must be named via a keyword or .alias().
+def test_positional_expr_in_select_is_named_after_its_leftmost_column():
+    # An unnamed derived expression takes its leftmost column's name, as in Polars; two that
+    # land on one name are refused rather than silently overwriting each other.
     ds = bt.from_pydict({"x": [1, 2, 3]})
-    with pytest.raises(PlanError, match="derived columns"):
-        ds.select(bt.col("x") + 1)
+    assert ds.select(bt.col("x") + 1).to_pydict() == {"x": [2, 3, 4]}
+    with pytest.raises(PlanError, match="duplicate output column 'x'"):
+        ds.select(bt.col("x") + 1, bt.col("x") * 2)
 
 
 def test_positional_aliased_and_col_in_select_accepted():

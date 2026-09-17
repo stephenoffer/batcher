@@ -160,6 +160,11 @@ def _input_label(expr, alias: str) -> str:
     return f"column {expr.name!r}" if isinstance(expr, Col) else f"the input to {alias!r}"
 
 
+#: The aggregates that pick one row by an order key: `first`/`last` and `min_by`/`max_by`,
+#: each with its null-keeping `_null` form. Without the key they have no defined answer.
+_ORDERED_PICKS = frozenset({"arg_min", "arg_max", "arg_min_null", "arg_max_null"})
+
+
 @dataclass(frozen=True, slots=True)
 class AggregateSpec:
     """One aggregate output: a name, function, and optional input expression."""
@@ -189,6 +194,13 @@ class Aggregate(LogicalPlan):
                     f"unknown aggregate function {spec.agg.func!r} for {spec.alias!r}; "
                     f"expected one of the tags in plan/ir_tags.py::AGG_FNS"
                 )
+            if spec.agg.func in _ORDERED_PICKS and spec.agg.input2 is None:
+                # `first()`/`last()` with no order: the grouped form has no `over` to take one
+                # from, and an arrival-order first is not partition-independent.
+                from batcher.plan.logical.window import missing_order_message
+
+                name = "first" if spec.agg.func.startswith("arg_min") else "last"
+                raise PlanError(missing_order_message(name))
             if spec.agg.input is not None:
                 _validate_refs(spec.agg.input, available, what=f"aggregate {spec.alias!r}")
         _validate_agg_input_types(self.input, self.aggregates)

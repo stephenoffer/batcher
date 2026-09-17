@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1481 Python modules across 217 packages and 293 Rust files across 15 crates.
+Covering 1483 Python modules across 217 packages and 293 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -175,7 +175,7 @@ The public, fluent, lazy, expression-first API surface.
 | `executors.py` | 587 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 807 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
-| `groupby.py` | 1008 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
+| `groupby.py` | 1038 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 254 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `multi_group.py` | 188 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 567 | Per-source statistics collection for the conductor. |
@@ -203,9 +203,9 @@ The `Dataset` builder package.
 | `_export.py` | 349 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
-| `_window.py` | 148 | Lowering of window expressions into the relational `Window` operator. |
+| `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 699 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 6259 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 6283 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2758 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -2345,16 +2345,16 @@ The scalar expression algebra.
 | module | lines | what it is |
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
-| `constructors.py` | 413 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6484 | The scalar expression base class and its core IR nodes. |
+| `constructors.py` | 487 | Module-level expression constructors (the user-facing entry points). |
+| `core.py` | 6580 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 411 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
-| `nodes.py` | 556 | Leaf IR nodes the `Expr` base class does not construct. |
+| `nodes.py` | 643 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 273 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
-| `walk.py` | 412 | Structural traversals over the expression tree. |
+| `walk.py` | 379 | Structural traversals over the expression tree. |
 
 ### `batcher/plan/expr_ir/compat/` — 1 · contract
 
@@ -2386,7 +2386,7 @@ Column selectors — expressions that stand for *many* columns at plan time.
 | module | lines | what it is |
 |---|---|---|
 | `build.py` | 285 | The public selector constructors — ``bt.all()``, ``bt.numeric()``, ``bt.matches(...)``. |
-| `core.py` | 345 | The `Selector` expression leaf and its `.name` rename accessor. |
+| `core.py` | 370 | The `Selector` expression leaf and its `.name` rename accessor. |
 | `expand.py` | 167 | Resolving a selector-bearing expression against a schema. |
 
 ### `batcher/plan/expr_rewrite/` — 1 · contract
@@ -2396,7 +2396,9 @@ Shared traversal for scalar `Expr` trees and for the expressions inside a node.
 | module | lines | what it is |
 |---|---|---|
 | `algebra.py` | 192 | Boolean-connective algebra, column substitution, and window hoisting. |
+| `naming.py` | 137 | The output name a positional expression gets when nothing names it. |
 | `nodes.py` | 141 | Apply an expression rewrite to every expression a *plan node* carries. |
+| `over.py` | 206 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
 | `subtrees.py` | 133 | Structural identity of an expression, and whole-subtree substitution. |
 | `traverse.py` | 291 | The structural ladder for scalar `Expr` trees — child access and rebuilding. |
 
@@ -2415,7 +2417,7 @@ The expression function library, grouped by family.
 | `regression.py` | 263 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
 | `scalar.py` | 425 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
 | `security.py` | 333 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
-| `statistics.py` | 472 | Derived statistical aggregates built as expressions over mergeable primitives. |
+| `statistics.py` | 478 | Derived statistical aggregates built as expressions over mergeable primitives. |
 | `temporal.py` | 424 | Temporal free functions. |
 
 ### `batcher/plan/functions/analysis/` — 1 · contract
@@ -2535,13 +2537,13 @@ String free functions, in two halves: building text and reading structure out of
 | module | lines | what it is |
 |---|---|---|
 | `_setops.py` | 84 | What makes two set-operation branches compatible. |
-| `aggregate.py` | 280 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
+| `aggregate.py` | 292 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
 | `base.py` | 345 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 666 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
 | `transforms.py` | 678 | Plan transforms and predicates over `LogicalPlan` trees. |
-| `window.py` | 449 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
+| `window.py` | 512 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract
 

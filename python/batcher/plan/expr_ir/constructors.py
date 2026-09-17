@@ -7,7 +7,8 @@ free functions users call directly (e.g. `col("x")`, `when(c).then(v)`).
 
 from __future__ import annotations
 
-from typing import Final
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, Final
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import (
@@ -29,19 +30,26 @@ from batcher.plan.expr_ir.nodes import (
     NullIf,
 )
 
+if TYPE_CHECKING:
+    import pyarrow as pa
+
 
 def when(cond: Expr) -> CaseBuilder:
     """Begin a CASE expression.
 
-    Returns a builder you chain with ``.then(value)`` and finish with
+    Returns a builder you chain with ``.then(value)`` and optionally finish with
     ``.otherwise(default)``; add further ``.when(...).then(...)`` pairs for more
     branches. The first matching condition wins, evaluated row by row.
+
+    Without ``.otherwise`` (or with ``.otherwise(None)``) a row no branch matches is
+    NULL, as SQL's ``CASE WHEN ... END`` is. The NULL takes the type of the first
+    non-null branch value.
 
     Args:
         cond: A boolean expression selecting the rows this branch applies to.
 
     Returns:
-        A `CaseBuilder`; call ``.then(...).otherwise(...)`` to produce the expression.
+        A `CaseBuilder`, usable as an expression once it has a ``.then(...)``.
 
     Examples:
         .. doctest::
@@ -51,6 +59,9 @@ def when(cond: Expr) -> CaseBuilder:
             >>> grade = bt.when(bt.col("x") > 0).then(bt.lit("pos")).otherwise(bt.lit("non-pos"))
             >>> ds.select(grade=grade).to_pydict()
             {'grade': ['non-pos', 'non-pos', 'pos']}
+
+            >>> ds.select(pos=bt.when(bt.col("x") > 0).then(bt.col("x"))).to_pydict()
+            {'pos': [None, None, 5]}
     """
     return CaseBuilder().when(cond)
 
@@ -279,29 +290,92 @@ def least(*exprs: IntoExpr) -> Least:
     return Least([_col_or_expr(e) for e in exprs])
 
 
-def col(name: str) -> Col:
-    """Reference an input column by name.
+def col(name: str | pa.DataType | Iterable[str | pa.DataType], *more: str | pa.DataType) -> Expr:
+    """Reference an input column by name, or several columns at once.
 
     ``col`` is the starting point for almost every expression: it names a column in
     the dataset, and the operators (``+``, ``==``, ``&`` …) and methods (``.sum()``,
     ``.cast(...)``, ``.str.upper()`` …) on the result build the computation that
     runs in the Rust engine. It is lazy and does no work itself.
 
+    Given more than one name, a list of names, a regular expression wrapped in ``^...$``,
+    or an Arrow type (or several), it is a column selector, as Polars' ``col`` is: it
+    expands to one expression per matched column when a projection is built
+    (``select``, ``with_columns``, ``group_by().agg``), so ``col("a", "b") * 2`` doubles
+    both. Named columns expand in the order given and must all exist; a pattern or a type
+    matches in the dataset's column order. ``bt.matches`` and ``bt.by_dtype`` are the same
+    selectors under their own names.
+
     Args:
-        name: The name of an existing column.
+        name: A column name, a ``^...$`` pattern, an Arrow type, or a list of them.
+        *more: Further names, patterns or types, selecting several columns.
 
     Returns:
-        An expression that evaluates to that column's values.
+        A column expression, or a selector when several columns may match.
+
+    Raises:
+        PlanError: If names and Arrow types are mixed, or nothing is given.
 
     Examples:
         .. doctest::
 
             >>> import batcher as bt
-            >>> ds = bt.from_pydict({"price": [10, 20], "qty": [2, 3]})
+            >>> import pyarrow as pa
+            >>> ds = bt.from_pydict({"price": [10, 20], "qty": [2, 3], "sku": ["a", "b"]})
             >>> ds.select(total=bt.col("price") * bt.col("qty")).to_pydict()
             {'total': [20, 60]}
+            >>> ds.select(bt.col("qty", "price") * 10).to_pydict()
+            {'qty': [20, 30], 'price': [100, 200]}
+            >>> ds.select(bt.col("^p.*$")).columns, ds.select(bt.col(pa.string())).columns
+            (['price'], ['sku'])
     """
-    return Col(name)
+    items = [*_col_items(name), *(m for x in more for m in _col_items(x))]
+    if not items:
+        raise PlanError("col() requires a column name")
+    if len(items) == 1 and isinstance(items[0], str) and not _is_pattern(items[0]):
+        return Col(items[0])
+    return _col_selector(items)
+
+
+def _col_items(value: Any) -> list[Any]:
+    """One `col` argument as a flat list: a name, pattern or type, or a list of them."""
+    # A plain name is the overwhelmingly common call, and answering it before touching
+    # pyarrow keeps `bt.col` from importing pyarrow at all.
+    if isinstance(value, str):
+        return [value]
+    import pyarrow as pa
+
+    if isinstance(value, pa.DataType):
+        return [value]
+    if isinstance(value, Iterable):
+        return list(value)
+    raise PlanError(f"col() takes column names or Arrow types, got {type(value).__name__}")
+
+
+def _is_pattern(name: str) -> bool:
+    """Polars reads a name wrapped in ``^...$`` as a regular expression, and so does `col`."""
+    return len(name) >= 2 and name.startswith("^") and name.endswith("$")
+
+
+def _col_selector(items: list[Any]) -> Expr:
+    """The selector a multi-column `col` stands for."""
+    import pyarrow as pa
+
+    from batcher.plan.expr_ir.selectors import by_dtype, matches
+    from batcher.plan.expr_ir.selectors.core import _named_columns
+
+    types = [i for i in items if isinstance(i, pa.DataType)]
+    if types:
+        if len(types) != len(items):
+            raise PlanError("col() takes either column names or Arrow types, not both")
+        return by_dtype(*types)
+    if not any(_is_pattern(i) for i in items):
+        return _named_columns(tuple(items))
+    selector = None
+    for item in items:
+        part = matches(item) if _is_pattern(item) else _named_columns((item,))
+        selector = part if selector is None else selector | part
+    return selector
 
 
 def count() -> AggExpr:

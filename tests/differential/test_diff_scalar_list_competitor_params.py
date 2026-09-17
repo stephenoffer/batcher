@@ -65,10 +65,17 @@ def test_polars_boolean_xor(pl):
 def test_polars_running_aggregates_propagate_nulls(pl, method, reverse):
     xs = [3, None, -2, 5, None, 1]
     want = getattr(pl.Series(xs), method)(reverse=reverse).to_list()
+    # Polars' implicit row order is the one `with_row_index` makes explicit; a running value
+    # requires an order, so the port numbers the rows and orders by that number.
+    running = getattr(col("x"), method)(reverse=reverse, propagate_nulls=True)
     got = (
         bt.from_pydict({"x": xs})
-        .select(r=getattr(col("x"), method)(reverse=reverse, propagate_nulls=True))
-        .to_pydict()["r"]
+        .with_row_index("_row")
+        .select("_row", r=running.over(order_by="_row"))
+        .collect()
+        .sort_by("_row")
+        .column("r")
+        .to_pylist()
     )
     assert got == want
 

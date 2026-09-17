@@ -285,7 +285,9 @@ def midrange(column: str | Expr) -> Expr:
     return (col.max() + col.min()) / Lit(2)
 
 
-def first(column: str | Expr, order_by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+def first(
+    column: str | Expr, order_by: IntoExpr | None = None, *, ignore_nulls: bool = True
+) -> AggExpr:
     """The value of `column` at the first row in `order_by` order (SQL ``FIRST``).
 
     A partition-independent first: it picks the row that sorts first by `order_by`, so
@@ -298,6 +300,7 @@ def first(column: str | Expr, order_by: IntoExpr, *, ignore_nulls: bool = True) 
     Args:
         column: The column (or expression) whose value to return.
         order_by: The column (or expression) whose ascending order defines "first".
+            Required, here or through an enclosing ``.over(order_by=...)``.
         ignore_nulls: Whether to skip rows whose value is null.
 
     Returns:
@@ -314,7 +317,9 @@ def first(column: str | Expr, order_by: IntoExpr, *, ignore_nulls: bool = True) 
     return _as_column(column).first(order_by, ignore_nulls=ignore_nulls)
 
 
-def last(column: str | Expr, order_by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+def last(
+    column: str | Expr, order_by: IntoExpr | None = None, *, ignore_nulls: bool = True
+) -> AggExpr:
     """The value of `column` at the last row in `order_by` order (SQL ``LAST``).
 
     The `order_by` companion to :func:`first`; partition-independent for the same reason,
@@ -323,6 +328,7 @@ def last(column: str | Expr, order_by: IntoExpr, *, ignore_nulls: bool = True) -
     Args:
         column: The column (or expression) whose value to return.
         order_by: The column (or expression) whose ascending order defines "last".
+            Required, here or through an enclosing ``.over(order_by=...)``.
         ignore_nulls: Whether to skip rows whose value is null.
 
     Returns:

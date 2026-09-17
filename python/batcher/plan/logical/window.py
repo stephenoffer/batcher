@@ -17,7 +17,6 @@ from batcher.plan.ir_tags import (
     FRAME_UNITS,
     WINDOW_AGGREGATES,
     WINDOW_EWM,
-    WINDOW_FILL,
     WINDOW_FRAMEABLE,
     WINDOW_FUNCS,
     WINDOW_RANKING,
@@ -34,7 +33,13 @@ from batcher.plan.logical.base import (
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type, widen
 
-__all__ = ["Window", "WindowFrame", "WindowFuncSpec"]
+__all__ = [
+    "Window",
+    "WindowFrame",
+    "WindowFuncSpec",
+    "depends_on_row_order",
+    "missing_order_message",
+]
 
 
 def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataType | None:
@@ -304,6 +309,81 @@ class WindowFuncSpec:
         return item
 
 
+def depends_on_row_order(fn: WindowFuncSpec) -> bool:
+    """Whether `fn`'s answer depends on the order of the rows within a partition.
+
+    The ranking, positional (`lag`/`lead`/`first_value`/...), fill and series functions
+    all read a row's neighbours. An aggregate does only when a ``rows`` frame bounds it --
+    ``cum_sum`` is ``sum`` over ``(None, 0)`` -- because a whole-partition aggregate, or a
+    ``range``/``groups`` frame over rows that are all peers, sees the same rows in any order.
+
+    Args:
+        fn: The window function to classify.
+
+    Returns:
+        True when the function needs ``order_by`` keys to have a defined answer.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.plan.logical.window import WindowFuncSpec, WindowFrame
+            >>> from batcher.plan.logical.window import depends_on_row_order
+            >>> from batcher.plan.expr_ir import col
+            >>> depends_on_row_order(WindowFuncSpec("sum", col("x"), "s"))
+            False
+            >>> running = WindowFuncSpec("sum", col("x"), "s", frame=WindowFrame(None, 0))
+            >>> depends_on_row_order(running)
+            True
+    """
+    if fn.func in (WINDOW_RANKING | WINDOW_VALUE | WINDOW_SERIES):
+        return True
+    frame = fn.frame
+    return (
+        frame is not None
+        and frame.units == "rows"
+        and not (frame.start is None and frame.end is None)
+    )
+
+
+#: The user-facing methods an engine window function is reached through, for the refusal.
+_METHODS_BY_FUNC = {
+    "lag": "shift/diff/pct_change (lag)",
+    "lead": "shift (lead)",
+    "row_number": "row_number/is_first_distinct/is_last_distinct",
+}
+
+
+def _order_dependent_label(fn: WindowFuncSpec) -> str:
+    """How a refusal names `fn`: by the method a user wrote rather than the engine tag."""
+    if fn.func in WINDOW_AGGREGATES and fn.frame is not None:
+        return f"running/rolling {fn.func} (cum_*/rolling_*)"
+    return _METHODS_BY_FUNC.get(fn.func, fn.func)
+
+
+def missing_order_message(func: str) -> str:
+    """The refusal every order-dependent expression gives when it has no ``order_by``.
+
+    Args:
+        func: The function or method name to name in the message.
+
+    Returns:
+        The error message, naming ``order_by=`` and the ``with_row_index`` fix.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.plan.logical.window import missing_order_message
+            >>> "with_row_index" in missing_order_message("shift")
+            True
+    """
+    return (
+        f"{func} depends on row order and requires order_by keys: pass order_by=... or "
+        "bind it with .over(order_by=...). Batcher keeps no arrival order across a parallel "
+        "or distributed scan, so if the data has no ordering column, number the rows right "
+        'after reading with .with_row_index("_row") and order by "_row".'
+    )
+
+
 def _key_label(expr: Expr) -> str:
     """How to name a window key in an error: its column, or the expression's rendering."""
     from batcher.plan.expr_ir import Col
@@ -366,33 +446,16 @@ class Window(LogicalPlan):
             operation="over(order_by=...)",
         )
         for fn in self.functions:
-            if fn.func in WINDOW_RANKING and not self.order_keys:
+            if not self.order_keys and depends_on_row_order(fn):
                 # Spark rejects this too (WINDOW_FUNCTION_FRAME_NOT_ORDERED), for the reason
-                # that applies here: without an order there is no "first" row, so the answer
-                # would depend on arrival order, which a morselized or distributed scan does
-                # not fix. DuckDB and Polars accept it because a single-node engine can
-                # define arrival order cheaply; an engine whose contract is
-                # single-node == distributed cannot.
-                #
-                # `row_number()` over the whole relation is the one that ports, because the
-                # thing a migrant wants from it — a positional column, any order — is a
-                # capability Batcher has under another name. Naming it here is what turns a
-                # refusal into a fix. The suggestion is withheld when `partition_by` is set:
-                # `with_row_index` numbers the relation, not each group, so offering it there
-                # would trade a clear refusal for a wrong answer.
-                hint = (
-                    " — for a plain positional column with no ordering, use ds.with_row_index('n')"
-                    if fn.func == "row_number" and not self.partition_keys
-                    else ""
-                )
-                raise PlanError(f"window ranking function {fn.func!r} requires order_by keys{hint}")
-            if fn.func in (WINDOW_FILL | WINDOW_SERIES) and not self.order_keys:
-                # Without an order there is no "previous" row: the result would depend on
-                # arrival order, which a morselized/distributed scan does not fix.
-                raise PlanError(
-                    f"window function {fn.func!r} requires order_by keys — it carries "
-                    "values along a defined row order, and an unordered relation has none"
-                )
+                # that applies here: without an order there is no "first" or "previous" row,
+                # so the answer would depend on arrival order, which a morselized or
+                # distributed scan does not fix. DuckDB and Polars accept it because a
+                # single-node engine can define arrival order cheaply; an engine whose
+                # contract is single-node == distributed cannot. The refusal names the fix
+                # for data with no ordering column: number the rows at the source, which
+                # `with_row_index` does in source order.
+                raise PlanError(missing_order_message(_order_dependent_label(fn)))
             if fn.input is not None:
                 _validate_refs(fn.input, available, what=f"window function {fn.alias!r}")
         _validate_window_input_types(self.input, self.functions)

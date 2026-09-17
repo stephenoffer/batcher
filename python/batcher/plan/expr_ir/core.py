@@ -60,17 +60,12 @@ def _wrap(value: IntoExpr) -> Expr:
     # leaves back out; any that reach `to_ir()` elsewhere raise a clear error there.
     if isinstance(value, (Expr, AggExpr)):
         return value  # type: ignore[return-value]
-    # An unterminated CASE builder is the one non-`Expr` that users hand us on purpose, by
-    # forgetting `.otherwise(...)`. Lifting it to a literal produced `unsupported literal
-    # type: CaseBuilder`, which names an internal class and no remedy. Catch it by name to
-    # avoid importing `nodes` (which imports this module).
+    # A CASE builder is the one non-`Expr` users hand us as an expression on purpose: a
+    # ``when(...).then(...)`` without ``.otherwise`` is SQL's ``CASE ... END``, NULL where
+    # nothing matched. It finishes into a `Case` here. Matched by name to avoid importing
+    # `nodes` (which imports this module).
     if type(value).__name__ == "CaseBuilder":
-        raise PlanError(
-            "when(...).then(...) is an unfinished CASE builder, not an expression: it needs "
-            "a terminating .otherwise(...). SQL's bare `CASE WHEN ... END` yields NULL, which "
-            "has no literal spelling here — give .otherwise() an explicit sentinel and turn "
-            "it into a null with bt.nullif(expr, sentinel) if that is what you want."
-        )
+        return value._finish()  # type: ignore[attr-defined]
     return Lit(value)
 
 
@@ -2052,7 +2047,7 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
-                >>> ds.with_columns(m=bt.col("x").expanding_mean()).to_pydict()["m"]
+                >>> ds.with_columns(m=bt.col("x").expanding_mean(order_by="x")).to_pydict()["m"]
                 [1.0, 1.5, 2.0, 2.5]
         """
         keys, order = list(partition_by), list(order_by)
@@ -2084,7 +2079,8 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
-                >>> ds.with_columns(v=bt.col("x").expanding_var().round(4)).to_pydict()["v"]
+                >>> v = bt.col("x").expanding_var(order_by="x").round(4)
+                >>> ds.with_columns(v=v).to_pydict()["v"]
                 [nan, 0.5, 1.0, 1.6667]
         """
         from batcher.plan.expr_ir.constructors import when
@@ -2130,7 +2126,8 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
-                >>> ds.with_columns(s=bt.col("x").expanding_std().round(4)).to_pydict()["s"]
+                >>> s = bt.col("x").expanding_std(order_by="x").round(4)
+                >>> ds.with_columns(s=s).to_pydict()["s"]
                 [nan, 0.7071, 1.0, 1.291]
         """
         return self.expanding_var(partition_by, order_by, ddof).sqrt()
@@ -2229,12 +2226,14 @@ class Expr:
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
-                >>> ds.with_columns(c=bt.col("x").cumulative_pct()).to_pydict()["c"]
+                >>> ds.with_columns(c=bt.col("x").cumulative_pct(order_by="x")).to_pydict()["c"]
                 [0.1, 0.3, 0.6, 1.0]
         """
         keys = list(partition_by)
         running = self.cum_sum(partition_by=keys, order_by=list(order_by))
-        return running / self.sum().over(partition_by=keys)
+        # Framed over the whole partition, so an order bound later by `.over(order_by=...)`
+        # orders the running numerator without turning the total into a running one too.
+        return running / self.sum().over(partition_by=keys, frame=(None, None))
 
     def normalize_l1(self, partition_by: Iterable[IntoExpr] = ()) -> Expr:
         """Scale by the sum of absolute values — ``x / sum(|x|)`` (L1 normalization).
@@ -2352,17 +2351,17 @@ class Expr:
         """
         return (self - _wrap(other)).abs()
 
-    def is_first_distinct(self, order_by: IntoExpr) -> Expr:
+    def is_first_distinct(self, order_by: IntoExpr | None = None) -> Expr:
         """True on the first occurrence of each distinct value, in `order_by` order.
 
         The de-duplication marker: filtering on it keeps one row per distinct value.
-        `order_by` is required so the choice is deterministic and partition-independent
+        An order is required so the choice is deterministic and partition-independent
         (an arrival-order "first" would differ between a single-node and a distributed
-        run).
+        run); give it here or through ``.over(order_by=...)``.
 
         Args:
             order_by: The expression whose ascending order decides which occurrence
-                counts as first.
+                counts as first. Omit it only when ``.over(order_by=...)`` supplies it.
 
         Returns:
             A Boolean expression, true on each value's first row.
@@ -2377,18 +2376,20 @@ class Expr:
         """
         from batcher.plan.expr_ir.nodes import row_number
 
-        rn = row_number().over(partition_by=[self], order_by=[_col_or_expr(order_by)])
+        order = [] if order_by is None else [_col_or_expr(order_by)]
+        rn = row_number().over(partition_by=[self], order_by=order)
         return rn == Lit(1)
 
-    def is_last_distinct(self, order_by: IntoExpr) -> Expr:
+    def is_last_distinct(self, order_by: IntoExpr | None = None) -> Expr:
         """True on the last occurrence of each distinct value, in `order_by` order.
 
         The mirror of :meth:`is_first_distinct`, useful for keeping the most recent row
-        per key. `order_by` is likewise required for determinism.
+        per key. An order is likewise required for determinism, here or through
+        ``.over(order_by=...)``.
 
         Args:
             order_by: The expression whose ascending order decides which occurrence
-                counts as last.
+                counts as last. Omit it only when ``.over(order_by=...)`` supplies it.
 
         Returns:
             A Boolean expression, true on each value's last row.
@@ -2403,9 +2404,11 @@ class Expr:
         """
         from batcher.plan.expr_ir.nodes import row_number
 
-        key = _col_or_expr(order_by)
-        rn = row_number().over(partition_by=[self], order_by=[key])
-        total = self.count().over(partition_by=[self])
+        order = [] if order_by is None else [_col_or_expr(order_by)]
+        rn = row_number().over(partition_by=[self], order_by=order)
+        # Framed over the whole partition, so an order bound later by `.over(order_by=...)`
+        # cannot turn the group size into a running count.
+        total = AggExpr("count", Lit(1)).over(partition_by=[self], frame=(None, None))
         return rn == total
 
     def label_encode(self) -> Expr:
@@ -3722,7 +3725,7 @@ class Expr:
         """
         return AggExpr("aun", self)
 
-    def first(self, order_by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+    def first(self, order_by: IntoExpr | None = None, *, ignore_nulls: bool = True) -> AggExpr:
         """This expression's value at the first row in `order_by` order (SQL ``first``).
 
         Equivalent to ``arg_min(order_by)``, and that equivalence is the precise
@@ -3733,13 +3736,15 @@ class Expr:
         ``ignore_nulls=False`` is that SQL form, and also Spark's ``first`` and Polars'
         ``first``: the value of the first row, even when it is null.
 
-        An explicit `order_by` is **required**: an arrival-order first/last is not
+        An order is **required**: an arrival-order first/last is not
         partition-independent, so it could not stay identical single-node and
-        distributed. With an order key the result is deterministic and mergeable
+        distributed. Give it here, or through ``.over(order_by=...)`` when the first value
+        is taken per window. With an order key the result is deterministic and mergeable
         (ties on the key break to the smallest value).
 
         Args:
             order_by: The ordering expression; the value at its first row is returned.
+                Omit it only when an enclosing ``.over(order_by=...)`` supplies the order.
             ignore_nulls: Whether to skip rows whose value is null.
 
         Returns:
@@ -3756,11 +3761,15 @@ class Expr:
                 >>> held = bt.from_pydict({"x": [None, 2], "t": [1, 2]})
                 >>> held.agg(r=bt.col("x").first("t", ignore_nulls=False)).to_pydict()
                 {'r': [None]}
+                >>> w = bt.col("x").first().over("g", order_by="t")
+                >>> ds.with_columns(f=w).sort("g", "t").to_pydict()["f"]
+                [2, 2, 10]
         """
         func = "arg_min" if ignore_nulls else "arg_min_null"
-        return AggExpr(func, self, input2=_col_or_expr(order_by))
+        by = None if order_by is None else _col_or_expr(order_by)
+        return AggExpr(func, self, input2=by)
 
-    def last(self, order_by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
+    def last(self, order_by: IntoExpr | None = None, *, ignore_nulls: bool = True) -> AggExpr:
         """This expression's value at the last row in `order_by` order (SQL ``last``).
 
         Equivalent to ``arg_max(order_by)``, which -- as on :meth:`first` -- means it
@@ -3770,6 +3779,7 @@ class Expr:
 
         Args:
             order_by: The ordering expression; the value at its last row is returned.
+                Omit it only when an enclosing ``.over(order_by=...)`` supplies the order.
             ignore_nulls: Whether to skip rows whose value is null.
 
         Returns:
@@ -3784,7 +3794,8 @@ class Expr:
                 {'g': ['a', 'b'], 'r': [1, 10]}
         """
         func = "arg_max" if ignore_nulls else "arg_max_null"
-        return AggExpr(func, self, input2=_col_or_expr(order_by))
+        by = None if order_by is None else _col_or_expr(order_by)
+        return AggExpr(func, self, input2=by)
 
     def min_by(self, by: IntoExpr, *, ignore_nulls: bool = True) -> AggExpr:
         """This expression's value at the row where `by` is minimal (SQL ``min_by``/``arg_min``).
@@ -4089,9 +4100,9 @@ class Expr:
 
     # --- Cumulative / shift (Polars-style window conveniences) ------------------
     # Each returns a window expression (running aggregate / lag-lead), so use it in
-    # `with_columns`/`select`; window expressions do not nest in scalar arithmetic
-    # or `filter`. `partition_by` gives a per-group running value; without `order_by`
-    # the order is the row order (Polars' default), matching `cum_*` semantics.
+    # `with_columns`/`select`. `partition_by` gives a per-group running value. An order is
+    # required -- `order_by=` here or `.over(order_by=...)` -- because Batcher keeps no
+    # arrival order across a parallel scan; `Window` refuses a running value without one.
     def _running(
         self,
         agg: str,
@@ -4131,8 +4142,8 @@ class Expr:
         ``propagate_nulls=True`` gives that reading.
 
         A window expression (one value per row, no row collapse) — use it in
-        ``with_columns``/``select``, not in scalar arithmetic or ``filter``. Without
-        `order_by` the running order is the row order.
+        ``with_columns``/``select``. `order_by` is required, here or through
+        ``.over(order_by=...)``: without it there is no defined running order.
 
         Args:
             partition_by: Restart the running sum per group of these key expressions.
@@ -4149,9 +4160,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
-                >>> ds.with_columns(cs=bt.col("x").cum_sum()).to_pydict()
-                {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [1, 2, 3, 4]})
+                >>> ds.with_columns(cs=bt.col("x").cum_sum(order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10]}
         """
         return self._running(
             "sum", partition_by, order_by, reverse=reverse, propagate_nulls=propagate_nulls
@@ -4190,9 +4201,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1, 5]})
-                >>> ds.with_columns(cm=bt.col("x").cum_min()).to_pydict()
-                {'x': [3, 1, 4, 1, 5], 'cm': [3, 1, 1, 1, 1]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3, 4], "x": [3, 1, 4, 1, 5]})
+                >>> ds.with_columns(cm=bt.col("x").cum_min(order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3, 4], 'x': [3, 1, 4, 1, 5], 'cm': [3, 1, 1, 1, 1]}
         """
         return self._running(
             "min", partition_by, order_by, reverse=reverse, propagate_nulls=propagate_nulls
@@ -4231,9 +4242,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1, 5]})
-                >>> ds.with_columns(cm=bt.col("x").cum_max()).to_pydict()
-                {'x': [3, 1, 4, 1, 5], 'cm': [3, 3, 4, 4, 5]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3, 4], "x": [3, 1, 4, 1, 5]})
+                >>> ds.with_columns(cm=bt.col("x").cum_max(order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3, 4], 'x': [3, 1, 4, 1, 5], 'cm': [3, 3, 4, 4, 5]}
         """
         return self._running(
             "max", partition_by, order_by, reverse=reverse, propagate_nulls=propagate_nulls
@@ -4273,9 +4284,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [2.0, 3.0, 4.0]})
-                >>> ds.with_columns(cp=bt.col("x").cum_prod()).to_pydict()
-                {'x': [2.0, 3.0, 4.0], 'cp': [2.0, 6.0, 24.0]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2], "x": [2.0, 3.0, 4.0]})
+                >>> ds.with_columns(cp=bt.col("x").cum_prod(order_by="t")).to_pydict()
+                {'t': [0, 1, 2], 'x': [2.0, 3.0, 4.0], 'cp': [2.0, 6.0, 24.0]}
 
                 >>> rates = bt.from_pydict(
                 ...     {"fund": ["a", "a", "b", "b"], "r": [1.1, 1.2, 2.0, 0.5]}
@@ -4305,17 +4316,87 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1]})
-                >>> ds.with_columns(cc=bt.col("x").cum_count()).to_pydict()
-                {'x': [3, 1, 4, 1], 'cc': [1, 2, 3, 4]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [3, 1, 4, 1]})
+                >>> ds.with_columns(cc=bt.col("x").cum_count(order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [3, 1, 4, 1], 'cc': [1, 2, 3, 4]}
         """
         return self._running("count", partition_by, order_by)
+
+    def over(
+        self,
+        partition_by: Iterable[IntoExpr] | IntoExpr | None = (),
+        order_by: Iterable[IntoExpr] | IntoExpr | None = (),
+        frame: FrameSpec | None = None,
+        *,
+        descending: bool | Iterable[bool] = False,
+        nulls_last: bool = True,
+        mapping_strategy: str = "group_to_rows",
+    ) -> Expr:
+        """Evaluate this expression per window — Polars ``over``, SQL ``… OVER (…)``.
+
+        Every aggregate inside the expression becomes the aggregate over its partition, and
+        every window function inside it (``shift``, ``cum_sum``, ``rank``, ...) is bound to
+        the partition and order. So ``(col("x") / col("x").sum()).over("g")`` is each
+        row's share of its group, and ``col("x").shift().over("g", order_by="t")`` is the
+        previous value within the group. An expression with no aggregate or window inside
+        is returned unchanged, because a per-row value is the same computed per group.
+
+        `order_by` is what order-dependent expressions (``shift``, ``diff``, ``cum_*``,
+        ``first``/``last``, fills, EWMs) need and require. An inner window keeps its own
+        partition and adds this one; this `order_by`, when given, replaces its own order.
+
+        Unlike Polars, an `order_by` here also makes a plain aggregate *running*, as SQL's
+        ``sum(x) OVER (ORDER BY t)`` is -- Polars ignores the order for an aggregate. Leave
+        `order_by` off an expression whose aggregates should cover the whole partition.
+
+        Args:
+            partition_by: Key expressions or column names the window is computed within;
+                empty for the whole frame.
+            order_by: Key expressions or column names giving the row order.
+            frame: ``(start, end)`` signed row offsets for the aggregates inside, as on
+                :meth:`AggExpr.over`.
+            descending: Order every `order_by` key, or each one, largest first.
+            nulls_last: Sort null keys after the non-null ones (the SQL default; Polars
+                defaults to nulls first).
+            mapping_strategy: How a group's result maps back to rows. Only
+                ``"group_to_rows"`` is supported; ``"join"`` and ``"explode"`` raise.
+
+        Returns:
+            The expression evaluated over the window.
+
+        Raises:
+            PlanError: For an unsupported `mapping_strategy`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "t": [1, 2, 1], "x": [1, 3, 10]})
+                >>> share = (bt.col("x") / bt.col("x").sum()).over("g")
+                >>> ds.with_columns(share=share).sort("g", "t").to_pydict()["share"]
+                [0.25, 0.75, 1.0]
+                >>> prev = bt.col("x").shift(1).over("g", order_by="t")
+                >>> ds.with_columns(prev=prev).sort("g", "t").to_pydict()["prev"]
+                [None, 1, None]
+        """
+        from batcher.plan.expr_rewrite.over import bind_over
+
+        return bind_over(
+            self,
+            partition_by,
+            order_by,
+            frame,
+            descending=descending,
+            nulls_last=nulls_last,
+            mapping_strategy=mapping_strategy,
+        )
 
     def shift(self, n: int = 1) -> WindowExpr:
         """Shift values by `n` rows in row order — Polars ``shift`` (lag/lead).
 
         Positive `n` lags (moves down, vacated leading rows null); negative `n` leads
-        (moves up). A window expression — use in ``with_columns``/``select``.
+        (moves up). A window expression — use in ``with_columns``/``select``, bound to
+        an order with ``.over(order_by=...)``, which is required.
 
         Args:
             n: Number of rows to shift; positive lags, negative leads.
@@ -4327,9 +4408,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
-                >>> ds.with_columns(s=bt.col("x").shift(1)).to_pydict()
-                {'x': [1, 2, 3, 4], 's': [None, 1, 2, 3]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [1, 2, 3, 4]})
+                >>> ds.with_columns(s=bt.col("x").shift(1).over(order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 's': [None, 1, 2, 3]}
         """
         from batcher.plan.expr_ir.nodes import lag, lead
 
@@ -4852,11 +4933,12 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
-                >>> ds.with_columns(r=bt.col("x").rolling_sum(2)).to_pydict()
-                {'x': [1, 2, 3, 4], 'r': [1, 3, 5, 7]}
-                >>> ds.with_columns(r=bt.col("x").rolling_sum(2, min_periods=2)).to_pydict()
-                {'x': [1, 2, 3, 4], 'r': [None, 3, 5, 7]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [1, 2, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_sum(2, order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 'r': [1, 3, 5, 7]}
+                >>> r = bt.col("x").rolling_sum(2, min_periods=2, order_by="t")
+                >>> ds.with_columns(r=r).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 'r': [None, 3, 5, 7]}
         """
         return self._rolling("sum", window_size, min_periods, partition_by, order_by)
 
@@ -4885,9 +4967,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
-                >>> ds.with_columns(r=bt.col("x").rolling_mean(2)).to_pydict()
-                {'x': [1, 2, 3, 4], 'r': [1.0, 1.5, 2.5, 3.5]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [1, 2, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_mean(2, order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 'r': [1.0, 1.5, 2.5, 3.5]}
         """
         return self._rolling("avg", window_size, min_periods, partition_by, order_by)
 
@@ -4916,9 +4998,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1]})
-                >>> ds.with_columns(r=bt.col("x").rolling_min(2)).to_pydict()
-                {'x': [3, 1, 4, 1], 'r': [3, 1, 1, 1]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [3, 1, 4, 1]})
+                >>> ds.with_columns(r=bt.col("x").rolling_min(2, order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [3, 1, 4, 1], 'r': [3, 1, 1, 1]}
         """
         return self._rolling("min", window_size, min_periods, partition_by, order_by)
 
@@ -4947,9 +5029,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1]})
-                >>> ds.with_columns(r=bt.col("x").rolling_max(2)).to_pydict()
-                {'x': [3, 1, 4, 1], 'r': [3, 3, 4, 4]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [3, 1, 4, 1]})
+                >>> ds.with_columns(r=bt.col("x").rolling_max(2, order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [3, 1, 4, 1], 'r': [3, 3, 4, 4]}
         """
         return self._rolling("max", window_size, min_periods, partition_by, order_by)
 
@@ -4978,9 +5060,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, None, 3, 4]})
-                >>> ds.with_columns(r=bt.col("x").rolling_count(2)).to_pydict()
-                {'x': [1, None, 3, 4], 'r': [1, 1, 1, 2]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [1, None, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_count(2, order_by="t")).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [1, None, 3, 4], 'r': [1, 1, 1, 2]}
         """
         return self._rolling("count", window_size, min_periods, partition_by, order_by)
 
@@ -5265,9 +5347,10 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
-                >>> ds.with_columns(v=bt.col("x").rolling_var(2, min_periods=2)).to_pydict()
-                {'x': [1.0, 2.0, 3.0, 4.0], 'v': [None, 0.5, 0.5, 0.5]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2, 3], "x": [1.0, 2.0, 3.0, 4.0]})
+                >>> v = bt.col("x").rolling_var(2, min_periods=2, order_by="t")
+                >>> ds.with_columns(v=v).to_pydict()
+                {'t': [0, 1, 2, 3], 'x': [1.0, 2.0, 3.0, 4.0], 'v': [None, 0.5, 0.5, 0.5]}
         """
         return self._rolling_var(window_size, ddof, min_periods, partition_by, order_by)
 
@@ -5299,9 +5382,10 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [2.0, 4.0, 6.0]})
-                >>> ds.with_columns(s=bt.col("x").rolling_std(2, min_periods=2)).to_pydict()
-                {'x': [2.0, 4.0, 6.0], 's': [None, 1.4142135623730951, 1.4142135623730951]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2], "x": [2.0, 4.0, 6.0]})
+                >>> s = bt.col("x").rolling_std(2, min_periods=2, order_by="t")
+                >>> ds.with_columns(s=s).to_pydict()["s"]
+                [None, 1.4142135623730951, 1.4142135623730951]
         """
         return self._rolling_var(window_size, ddof, min_periods, partition_by, order_by).sqrt()
 
@@ -5329,9 +5413,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [1, 3, 8]})
-                >>> ds.with_columns(d=bt.col("x").diff()).to_pydict()
-                {'x': [1, 3, 8], 'd': [None, 2, 5]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2], "x": [1, 3, 8]})
+                >>> ds.with_columns(d=bt.col("x").diff(order_by="t")).to_pydict()
+                {'t': [0, 1, 2], 'x': [1, 3, 8], 'd': [None, 2, 5]}
         """
         return self - self.shift(n).over(partition_by=partition_by, order_by=order_by)
 
@@ -5359,9 +5443,9 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"x": [10, 15, 30]})
-                >>> ds.with_columns(p=bt.col("x").pct_change()).to_pydict()
-                {'x': [10, 15, 30], 'p': [None, 0.5, 1.0]}
+                >>> ds = bt.from_pydict({"t": [0, 1, 2], "x": [10, 15, 30]})
+                >>> ds.with_columns(p=bt.col("x").pct_change(order_by="t")).to_pydict()
+                {'t': [0, 1, 2], 'x': [10, 15, 30], 'p': [None, 0.5, 1.0]}
         """
         return self / self.shift(n).over(partition_by=partition_by, order_by=order_by) - 1
 
@@ -5575,7 +5659,7 @@ class Expr:
         Counts *rows*, not non-null values: the argument is a literal so a partition of
         nulls still counts its own rows (nulls group together, as in Polars). Counting
         `self` instead would report 0 for every null row."""
-        return AggExpr("count", Lit(1)).over(partition_by=[self])
+        return AggExpr("count", Lit(1)).over(partition_by=[self], frame=(None, None))
 
 
 # Imported here, after `Expr` is defined, to break the import cycle: `node_base`
@@ -6218,14 +6302,19 @@ class AggExpr:
         partition_by: Iterable[IntoExpr] | None = (),
         order_by: Iterable[IntoExpr] | None = (),
         frame: FrameSpec | None = None,
-    ):
+        *,
+        descending: bool | Iterable[bool] = False,
+        nulls_last: bool = True,
+        mapping_strategy: str = "group_to_rows",
+    ) -> WindowExpr:
         """Turn this aggregate into a window expression — SQL ``<agg> OVER (…)``.
 
         ``col("x").sum().over(partition_by=["g"])`` computes the per-partition sum
         broadcast to every row (no grouping/row collapse). With `order_by` it becomes
         a running aggregate; `frame` sets an explicit window. Used inside
-        `with_columns`, which lowers it to the relational `Window` operator. Only the
-        aggregate functions (`sum`/`mean`/`min`/`max`/`count`) support `over`.
+        `with_columns`, which lowers it to the relational `Window` operator. The window
+        aggregates (`sum`/`mean`/`min`/`max`/`count`, ...) and `first`/`last` support
+        `over`; the two-input aggregates (`corr`, `covar_*`) do not.
 
         **The frame bounds are signed offsets, not PRECEDING/FOLLOWING magnitudes.**
         Negative precedes the current row, ``0`` is the current row, positive follows,
@@ -6247,6 +6336,13 @@ class AggExpr:
                 ``None`` or empty leaves the aggregate unordered.
             frame: ``(start, end)`` signed offsets, optionally with a third units element
                 as ``(start, end, units)``; ``None`` for the default frame.
+            descending: Order every `order_by` key, or each one, largest first.
+            nulls_last: Sort null keys after the non-null ones (the SQL default).
+            mapping_strategy: How a group's result maps back to rows; only
+                ``"group_to_rows"`` is supported.
+
+        Returns:
+            A window expression, one value per input row.
 
         Examples:
             .. doctest::
@@ -6262,16 +6358,16 @@ class AggExpr:
                 >>> ds.with_columns(s=trailing).sort("t").to_pydict()["s"]
                 [1.0, 3.0, 6.0, 9.0]
         """
-        from batcher.plan.expr_ir.nodes import WindowExpr
+        from batcher.plan.expr_rewrite.over import bind_over
 
-        # `mean` is the DataFrame spelling; the window engine names the aggregate `avg`.
-        func = "avg" if self.func == "mean" else self.func
-        return WindowExpr(
-            func,
-            self.input,
-            normalize_key_list(partition_by),
-            normalize_key_list(order_by),
+        return bind_over(  # type: ignore[return-value]
+            self,
+            partition_by,
+            order_by,
             frame,
+            descending=descending,
+            nulls_last=nulls_last,
+            mapping_strategy=mapping_strategy,
         )
 
     # --- arithmetic over aggregates ---------------------------------------

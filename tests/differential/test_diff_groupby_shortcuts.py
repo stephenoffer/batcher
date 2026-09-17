@@ -161,7 +161,7 @@ def test_reduction_errors(sales):
     # max() is not numeric-only, so its message is the plain form.
     with pytest.raises(PlanError, match="no value columns to reduce"):
         ds.group_by("dept", "region", "amount", "score").max().collect()
-    with pytest.raises(PlanError, match="must be a single-column aggregate"):
+    with pytest.raises(PlanError, match="must be an aggregate expression"):
         ds.group_by("dept").agg(bt.col("amount") + 1).collect()
     with pytest.raises(PlanError, match="requires at least one aggregate"):
         ds.group_by("dept").agg().collect()

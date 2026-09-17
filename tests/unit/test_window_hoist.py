@@ -67,22 +67,28 @@ def test_is_bare_window_distinguishes_composed_from_bare():
 
 def test_bare_window_keeps_the_window_only_plan_shape(ds):
     """The pre-existing fast path: no `Project` is added on top."""
-    plan = ds.with_columns(cs=bt.col("x").cum_sum())._plan
+    plan = ds.with_columns(cs=bt.col("x").cum_sum(order_by="x"))._plan
     assert isinstance(plan, Window)
 
 
 def test_composed_window_lowers_to_project_over_window(ds):
-    plan = ds.with_columns(d=bt.col("x") - bt.col("x").shift(1))._plan
+    plan = ds.with_columns(d=(bt.col("x") - bt.col("x").shift(1)).over(order_by="x"))._plan
     assert isinstance(plan, Project)
     assert isinstance(plan.input, Window)
 
 
 def test_composed_window_drops_its_synthetic_column(ds):
-    assert ds.with_columns(d=bt.col("x") - bt.col("x").shift(1)).columns == ["g", "x", "d"]
+    assert ds.with_columns(d=(bt.col("x") - bt.col("x").shift(1)).over(order_by="x")).columns == [
+        "g",
+        "x",
+        "d",
+    ]
 
 
 def test_two_windows_lower_to_two_chained_window_nodes(ds):
-    plan = ds.with_columns(z=bt.col("x").shift(1) + bt.col("x").shift(-1))._plan
+    plan = ds.with_columns(
+        z=(bt.col("x").shift(1) + bt.col("x").shift(-1)).over(order_by="x")
+    )._plan
     assert isinstance(plan, Project)
     assert isinstance(plan.input, Window)
     assert isinstance(plan.input.input, Window)

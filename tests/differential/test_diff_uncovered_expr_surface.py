@@ -67,10 +67,10 @@ def strings(duck):
 
 #: `Expr` methods with a SQL equivalent, as (name, batcher expression, SQL, table).
 _NUMERIC_CASES = [
-    ("cum_sum", lambda c: c("a").cum_sum(), "SUM(a) OVER (ORDER BY rowid)"),
-    ("cum_max", lambda c: c("a").cum_max(), "MAX(a) OVER (ORDER BY rowid)"),
-    ("cum_min", lambda c: c("a").cum_min(), "MIN(a) OVER (ORDER BY rowid)"),
-    ("cum_count", lambda c: c("a").cum_count(), "COUNT(a) OVER (ORDER BY rowid)"),
+    ("cum_sum", lambda c: c("a").cum_sum(order_by="rowid"), "SUM(a) OVER (ORDER BY rowid)"),
+    ("cum_max", lambda c: c("a").cum_max(order_by="rowid"), "MAX(a) OVER (ORDER BY rowid)"),
+    ("cum_min", lambda c: c("a").cum_min(order_by="rowid"), "MIN(a) OVER (ORDER BY rowid)"),
+    ("cum_count", lambda c: c("a").cum_count(order_by="rowid"), "COUNT(a) OVER (ORDER BY rowid)"),
     ("between", lambda c: c("a").between(-7, 5), "a BETWEEN -7 AND 5"),
     ("is_null", lambda c: c("a").is_null(), "a IS NULL"),
     ("is_not_null", lambda c: c("a").is_not_null(), "a IS NOT NULL"),
@@ -110,7 +110,9 @@ def test_a_numeric_expression_matches_duckdb(name, build, sql, numbers, duck):
     """Ordered, not `assert_same`. These are per-row expressions, so a result that is right
     as a multiset and wrong per row is exactly the defect worth catching, and the
     order-independent helper cannot see it."""
-    got = numbers.select(r=build(bt.col)).to_arrow()
+    # `rowid` numbers the rows in source order, the same column DuckDB's running cases order
+    # by; the running ones need it, because an order-dependent expression requires an order.
+    got = numbers.with_row_index("rowid").select(r=build(bt.col)).to_arrow()
     assert_same_ordered(got, duck.sql(f"SELECT {sql} AS r FROM n"))
 
 

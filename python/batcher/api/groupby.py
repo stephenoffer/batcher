@@ -15,9 +15,9 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher.api._varargs import flatten_varargs
 from batcher.api.dataset.compat.guidance import groupby_attribute_error
-from batcher.plan.expr_ir import AggExpr, Col, Expr
-from batcher.plan.expr_ir.selectors import Selector
-from batcher.plan.expr_ir.walk import positional_aggregate_name
+from batcher.plan.expr_ir import AggExpr, Aliased, Col, Expr
+from batcher.plan.expr_ir.selectors import Selector, expand_selectors, has_selector
+from batcher.plan.expr_rewrite.naming import output_name
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
@@ -168,10 +168,11 @@ class GroupBy:
         (``salary_min``, ``salary_max``), as pandas does when it flattens.
 
         Keyword args bind an output name to an aggregate (`col("x").sum()`,
-        `count()`, ...). A positional arg is a bare single-column aggregate
-        (``col("x").sum()``) that keeps its source column's name — use a keyword when
-        you want a different output name. The result columns are the group keys
-        followed by the aggregates, in the order given.
+        `count()`, ...). A positional arg is named the way Polars names it: by its
+        ``.alias(...)``, else its leftmost column, so ``col("x").sum()`` keeps ``x`` and
+        ``(col("x").sum() / col("y").sum())`` is ``x``; ``count()`` is ``count``. Use a
+        keyword when you want a different output name. The result columns are the group
+        keys followed by the aggregates, in the order given.
 
         A keyword value may also be a whole **expression over aggregates** —
         ``col("x").sum() / col("y").sum()``, ``col("v").max() - col("v").min()`` — not
@@ -201,10 +202,11 @@ class GroupBy:
                 {'dept': ['eng', 'sales'], 'avg': [110.0, 90.0]}
 
         Args:
-            *aggs: Bare single-column aggregates (``col(name).<agg>()``) that keep
-                ``name`` as the output column, aggregates named by ``.alias(...)``, or a
-                single pandas-style ``{column: reducer}`` / ``{column: [reducers]}``
-                dict. A list of aggregates is accepted in place of separate arguments.
+            *aggs: Aggregates or expressions over aggregates, named by their alias or
+                leftmost column (an aggregate over ``col("a", "b")`` expands to one per
+                column), or a single pandas-style ``{column: reducer}`` /
+                ``{column: [reducers]}`` dict. A list of aggregates is accepted in place
+                of separate arguments.
             **named: Output column name to an aggregate, or an expression over aggregates.
 
         Returns:
@@ -217,7 +219,14 @@ class GroupBy:
         if len(aggs) == 1 and isinstance(aggs[0], dict):
             return self.agg(**{**self._spec_to_aggs(aggs[0]), **named})
         aggs = flatten_varargs(aggs)
-        resolved = {**self._named_aggs(aggs), **named}
+        positional = self._named_aggs(aggs)
+        clashing = sorted(positional.keys() & named.keys())
+        if clashing:
+            raise PlanError(
+                f"agg() got output column(s) {clashing} both positionally and as a keyword; "
+                "give each output column exactly one definition"
+            )
+        resolved = {**positional, **named}
         if not resolved:
             raise PlanError("agg() requires at least one aggregate")
         return self._source._derive(self._lower_aggregates(resolved))
@@ -936,30 +945,51 @@ class GroupBy:
         return self._source._derive(self._lower_aggregates(values))
 
     def _named_aggs(self, aggs: tuple[AggExpr | Expr, ...]) -> dict[str, AggExpr | Expr]:
-        """Resolve bare positional aggregates to an ordered {source_column: agg} map."""
-        out: dict[str, AggExpr | Expr] = {}
-        for item in aggs:
-            a, name, aliased = positional_aggregate_name(item)
-            if name is None:
+        """Resolve positional aggregates to an ordered {output_name: agg} map.
+
+        Each is named as a positional `select` output is (`output_name`): an explicit
+        ``.alias(...)`` wins, else the leftmost column, so ``col("x").sum()`` keeps ``x``
+        and ``count()`` is ``count``. An aggregate over a multi-column selector
+        (``col("a", "b").sum()``) expands to one aggregate per matched column. Two outputs
+        landing on one name are refused, never silently overwritten.
+        """
+        pairs: list[tuple[str, AggExpr | Expr]] = []
+        for a in aggs:
+            if isinstance(a, AggExpr) and a.name is None and has_selector(a.input):
+                pairs.extend(self._expand_selector_agg(a))
+            elif isinstance(a, (AggExpr, Expr)):
+                pairs.append((output_name(a), a.inner if isinstance(a, Aliased) else a))
+            else:
                 raise PlanError(
-                    "a positional agg() argument must be a single-column aggregate that "
-                    "names its output, e.g. col('x').sum(); for a custom name or a "
-                    "count()/multi-column aggregate use .alias('name') or a keyword "
-                    "(agg(total=...))"
+                    f"a positional agg() argument must be an aggregate expression such as "
+                    f"col('x').sum(), got {type(a).__name__}"
                 )
+        out: dict[str, AggExpr | Expr] = {}
+        for name, agg in pairs:
             if name in out:
-                if not aliased:
+                if isinstance(agg, AggExpr) and agg.name is not None:
                     raise PlanError(
-                        f"agg() got two positional aggregates over column {name!r}, which "
-                        "would both be named after it; give one a name, e.g. "
-                        "agg(col('x').sum().alias('total'), col('x').mean().alias('avg'))"
+                        f"agg() got two positional aggregates aliased {name!r}; each "
+                        ".alias(...) must name a distinct output column"
                     )
                 raise PlanError(
-                    f"agg() got two positional aggregates aliased {name!r}; each "
-                    ".alias(...) must name a distinct output column"
+                    f"agg() got two positional aggregates over column {name!r}, which would "
+                    "both be named after it; give one a name, e.g. "
+                    "agg(col('x').sum().alias('total'), col('x').mean())"
                 )
-            out[name] = a
+            out[name] = agg
         return out
+
+    def _expand_selector_agg(self, agg: AggExpr) -> list[tuple[str, AggExpr]]:
+        """One aggregate per column a selector-valued aggregate input matches."""
+        source = self._source
+        expanded = expand_selectors(
+            agg.input, source._plan.available_columns(), source._plan.available_schema()
+        )
+        return [
+            (name, AggExpr(agg.func, expr, input2=agg.input2, param=agg.param))
+            for name, expr in expanded
+        ]
 
     def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:
         return self._source._derive(self._aggregate(specs))

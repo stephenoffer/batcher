@@ -272,16 +272,31 @@ print(ranked.sort("g", "t").to_pydict()["prev"])
 # [None, 10, None]
 ```
 
+{py:meth}`.over(...) <batcher.plan.expr_ir.core.Expr.over>` works on any expression, not only on an aggregate or a window function. Every aggregate and window function inside the expression is bound to the partition and order, and an expression with neither is returned unchanged. `descending=` and `nulls_last=` set the direction of the `order_by` keys. Only `mapping_strategy="group_to_rows"` is supported. An `order_by` makes an aggregate inside the expression a running one, as in SQL, which is where Batcher and Polars differ: Polars ignores the order for an aggregate.
+
+```python
+share = (bt.col("v") / bt.col("v").sum()).over("g")
+prev = bt.col("v").shift(1).over("g", order_by="t", descending=True)
+print(w.with_columns(share=share, prev=prev).sort("g", "t").to_pydict()["prev"])
+# [20, None, None]
+```
+
 Cumulative and shift shorthands (Polars-style) build the same window expressions:
 `col("v").cum_sum()`, `.cum_min()`, `.cum_max()`, `.cum_count()` and
 {py:meth}`.cum_prod() <batcher.plan.expr_ir.core.Expr.cum_prod>` are running
-aggregates in row order (pass `partition_by=`/`order_by=` for a grouped/ordered
-running value), and `col("v").shift(n)` lags (positive `n`) or leads (negative `n`).
+aggregates, and `col("v").shift(n)` lags (positive `n`) or leads (negative `n`).
+
+Every order-dependent expression needs an explicit order. Batcher keeps no arrival order across a parallel or distributed scan, so `shift`, `diff`, `pct_change`, `cum_*`, `rolling_*`, `first`/`last`, the fills, `interpolate`, `rle_id`, the EWMs and `is_first_distinct`/`is_last_distinct` raise a `PlanError` without one. Pass `order_by=` where the method takes it, or bind any of them with `.over(order_by=...)`. When the data has no ordering column, number the rows right after reading with `.with_row_index("_row")` and order by `"_row"`; the index follows source order.
 
 ```python
-c = bt.from_pydict({"x": [1, 2, 3, 4]})
-print(c.with_columns(cs=bt.col("x").cum_sum(), prev=bt.col("x").shift(1)).to_pydict())
-# {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10], 'prev': [None, 1, 2, 3]}
+c = bt.from_pydict({"x": [1, 2, 3, 4]}).with_row_index("_row")
+print(
+    c.with_columns(
+        cs=bt.col("x").cum_sum(order_by="_row"),
+        prev=bt.col("x").shift(1).over(order_by="_row"),
+    ).to_pydict()
+)
+# {'_row': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10], 'prev': [None, 1, 2, 3]}
 ```
 
 `.cum_prod()` returns `Float64` even for an integer input, because a running product
@@ -290,8 +305,9 @@ answer for a compounding factor. Nulls are skipped, as they are for the rest of 
 
 ```python
 rates = bt.from_pydict({"fund": ["a", "a", "b", "b"], "r": [1.1, 1.2, 2.0, 0.5]})
-print(rates.with_columns(growth=bt.col("r").cum_prod(partition_by="fund")).to_pydict()["growth"])
-# [1.1, 1.32, 2.0, 1.0]
+growth = bt.col("r").cum_prod().over("fund", order_by="r", descending=True)
+print(rates.with_columns(growth=growth).sort("fund", "r").to_pydict()["growth"])
+# [1.32, 1.2, 1.0, 2.0]
 ```
 
 A window expression composes with ordinary arithmetic and other windows. The engine lifts it into a `Window` operator and rewrites the surrounding expression to read the result, as described in {doc}`window functions </user-guide/analyze/window-functions>`. The shapes that come up most have their own names:
@@ -317,19 +333,24 @@ partition aggregate a *partial* frame, as SQL does; pass `min_periods=k` to make
 those rows null instead (the Polars default).
 
 ```python
-r = bt.from_pydict({"x": [1, 2, 3, 4]})
+r = bt.from_pydict({"t": [0, 1, 2, 3], "x": [1, 2, 3, 4]})
 print(
     r.with_columns(
-        m=bt.col("x").rolling_mean(2), s=bt.col("x").rolling_sum(2, min_periods=2)
+        m=bt.col("x").rolling_mean(2, order_by="t"),
+        s=bt.col("x").rolling_sum(2, min_periods=2, order_by="t"),
     ).to_pydict()
 )
-# {'x': [1, 2, 3, 4], 'm': [1.0, 1.5, 2.5, 3.5], 's': [None, 3, 5, 7]}
+# {'t': [0, 1, 2, 3], 'x': [1, 2, 3, 4], 'm': [1.0, 1.5, 2.5, 3.5], 's': [None, 3, 5, 7]}
 ```
 
 ```python
-d = bt.from_pydict({"x": [10, 15, 30]})
-print(d.with_columns(chg=bt.col("x").diff(), pct=bt.col("x").pct_change()).to_pydict())
-# {'x': [10, 15, 30], 'chg': [None, 5, 15], 'pct': [None, 0.5, 1.0]}
+d = bt.from_pydict({"t": [0, 1, 2], "x": [10, 15, 30]})
+print(
+    d.with_columns(
+        chg=bt.col("x").diff(order_by="t"), pct=bt.col("x").pct_change(order_by="t")
+    ).to_pydict()
+)
+# {'t': [0, 1, 2], 'x': [10, 15, 30], 'chg': [None, 5, 15], 'pct': [None, 0.5, 1.0]}
 ```
 
 ## Compatibility spellings

@@ -137,7 +137,9 @@ def _agree(dataset_for, order: str) -> None:
 #: bivariate statistic. Built with one argument they raise "requires an input column",
 #: which is not a statement about the column's type: `arg_max` is perfectly happy with an
 #: integer. Naming them here is what gets them exercised rather than skipped.
-_TWO_ARG_AGGS = frozenset({"arg_max", "arg_min", "corr", "covar_pop", "covar_samp"})
+_TWO_ARG_AGGS = frozenset(
+    {"arg_max", "arg_min", "arg_max_null", "arg_min_null", "corr", "covar_pop", "covar_samp"}
+)
 
 
 def _agg_expr(func: str, column: str) -> AggExpr:

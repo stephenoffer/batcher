@@ -19,8 +19,9 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.window_algebra
-from _harness import assert_same
+from _harness import assert_same, assert_same_ordered
 from batcher import col
+from batcher._internal.errors import PlanError
 
 
 @pytest.fixture
@@ -66,16 +67,21 @@ def test_nth_value_at_one_matches_duckdb_over_an_ordered_partition(duck, t):
 
 
 def test_nth_value_at_one_matches_duckdb_without_order_keys(duck, t):
-    out = (
-        bt.from_arrow(t)
-        .with_columns(r=bt.nth_value(col("v"), 1).over(partition_by=["g"]))
-        .collect()
-    )
-    assert_same(
+    """No `order_by` on the window: the frame's own sort is the order, or it is refused.
+
+    A positional function over an unordered partition names an arrival-order row, which a
+    parallel scan does not fix, so the explicit-order policy refuses it. Over a frame the query
+    sorted, the window takes that sort as its order, and the rewrite still has to match DuckDB.
+    """
+    windowed = bt.nth_value(col("v"), 1).over(partition_by=["g"])
+    with pytest.raises(PlanError, match="requires order_by"):
+        bt.from_arrow(t).with_columns(r=windowed)
+    out = bt.from_arrow(t).sort("o").with_columns(r=windowed).sort("g", "o").collect()
+    assert_same_ordered(
         out,
         duck.sql(
-            "SELECT g, v, o, nth_value(v, 1) OVER (PARTITION BY g ROWS BETWEEN "
-            "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS r FROM t"
+            "SELECT g, v, o, nth_value(v, 1) OVER (PARTITION BY g ORDER BY o ROWS BETWEEN "
+            "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS r FROM t ORDER BY g, o"
         ),
     )
 
