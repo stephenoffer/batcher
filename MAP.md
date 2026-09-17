@@ -403,7 +403,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `_metadata.py` | 707 | Post-execution column-statistics learning (Core measures, Kyber persists). |
+| `_metadata.py` | 742 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 1467 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
