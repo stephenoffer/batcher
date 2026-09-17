@@ -5,10 +5,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Int64Array, ListArray, RecordBatch, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, Int64Array, ListArray, PrimitiveArray, RecordBatch, UInt32Array,
+};
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::{concat_batches, take};
-use arrow::datatypes::{DataType, Field, Int64Type};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Float64Type, Int64Type};
 use rayon::prelude::*;
 
 use super::assign_groups;
@@ -540,6 +542,23 @@ pub(crate) fn bucket_values_into_list(
     for b in 0..num_groups {
         offsets[b + 1] += offsets[b];
     }
+    let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+    // A null-free primitive column scatters its **values** straight into place: no `u32` index
+    // per row to write, and no gather through it afterwards. The order within each group is the
+    // same ascending `i` the index scatter below produces, so the list is identical. Measured on
+    // a grouped MEDIAN over TPC-H `lineitem`, the index scatter and its gather were 42% of the
+    // single-threaded profile.
+    if values.null_count() == 0 {
+        let scattered = match values.data_type() {
+            DataType::Float64 => Some(scatter_values::<Float64Type>(values, groups, &offsets)),
+            DataType::Int64 => Some(scatter_values::<Int64Type>(values, groups, &offsets)),
+            _ => None,
+        };
+        if let Some(ordered) = scattered {
+            let list = ListArray::try_new(field, OffsetBuffer::new(offsets.into()), ordered, None)?;
+            return Ok(Arc::new(list));
+        }
+    }
     let mut cursor: Vec<i32> = offsets[..num_groups].to_vec();
     let mut order: Vec<u32> = vec![0; groups.len()];
     for (i, &g) in groups.iter().enumerate() {
@@ -548,9 +567,30 @@ pub(crate) fn bucket_values_into_list(
         cursor[b] += 1;
     }
     let ordered = take(values.as_ref(), &UInt32Array::from(order), None)?;
-    let field = Arc::new(Field::new("item", values.data_type().clone(), true));
     let list = ListArray::try_new(field, OffsetBuffer::new(offsets.into()), ordered, None)?;
     Ok(Arc::new(list))
+}
+
+/// `values` reordered so each group's rows are contiguous, in ascending row order within a
+/// group, given the groups' CSR `offsets`. The value-moving form of the index scatter in
+/// [`bucket_values_into_list`].
+fn scatter_values<T: ArrowPrimitiveType>(
+    values: &ArrayRef,
+    groups: &[i64],
+    offsets: &[i32],
+) -> ArrayRef {
+    let src = values.as_primitive::<T>().values();
+    let mut cursor: Vec<usize> = offsets[..offsets.len() - 1]
+        .iter()
+        .map(|&o| o as usize)
+        .collect();
+    let mut out = vec![T::Native::default(); src.len()];
+    for (&g, &v) in groups.iter().zip(src.iter()) {
+        let slot = &mut cursor[g as usize];
+        out[*slot] = v;
+        *slot += 1;
+    }
+    Arc::new(PrimitiveArray::<T>::new(out.into(), None))
 }
 
 /// Distinct count per group = the length of its distinct-value list.
@@ -561,6 +601,67 @@ pub(crate) fn finalize_count_distinct(state: &ArrayRef) -> ArrayRef {
         .map(|i| i64::from(offsets[i + 1] - offsets[i]))
         .collect();
     Arc::new(Int64Array::from(counts))
+}
+
+#[cfg(test)]
+mod scatter_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, ArrayRef, AsArray, Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{Float64Type, Int64Type};
+
+    use super::bucket_values_into_list;
+
+    /// The value scatter must build the list the index scatter builds: every group's values
+    /// contiguous and in ascending row order. Held to a by-hand oracle for both scattered types,
+    /// with groups that are empty, interleaved and single-row, and a sliced input whose buffer
+    /// does not start at zero — plus a string column, which keeps the index path, as the control.
+    #[test]
+    fn the_value_scatter_orders_each_group_like_the_index_scatter() {
+        let groups = Int64Array::from(vec![2, 0, 2, 3, 0, 0, 2, 3, 3, 0]);
+        let num_groups = 5; // group 1 and 4 are empty
+        let expect = |col: &[usize]| -> Vec<Vec<usize>> {
+            (0..num_groups)
+                .map(|g| {
+                    (0..groups.len())
+                        .filter(|&i| groups.value(i) as usize == g)
+                        .map(|i| col[i])
+                        .collect()
+                })
+                .collect()
+        };
+        let rows: Vec<usize> = (0..groups.len()).collect();
+        let f: ArrayRef = Arc::new(Float64Array::from_iter_values((0..20).map(|i| i as f64)));
+        let f = f.slice(10, 10); // values 10.0..20.0
+        let i: ArrayRef = Arc::new(Int64Array::from_iter_values(100..110));
+        let s: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..10).map(|i| i.to_string()),
+        ));
+        let want = expect(&rows);
+        for (values, read) in [
+            (
+                f,
+                &(|a: &ArrayRef, k| a.as_primitive::<Float64Type>().value(k) as usize - 10)
+                    as &dyn Fn(&ArrayRef, usize) -> usize,
+            ),
+            (i, &|a: &ArrayRef, k| {
+                a.as_primitive::<Int64Type>().value(k) as usize - 100
+            }),
+            (s, &|a: &ArrayRef, k| {
+                a.as_string::<i32>().value(k).parse().unwrap()
+            }),
+        ] {
+            let list = bucket_values_into_list(&groups, &values, num_groups).unwrap();
+            let list = list.as_list::<i32>();
+            let got: Vec<Vec<usize>> = (0..num_groups)
+                .map(|g| {
+                    let v = list.value(g);
+                    (0..v.len()).map(|k| read(&v, k)).collect()
+                })
+                .collect();
+            assert_eq!(got, want, "{:?}", values.data_type());
+        }
+    }
 }
 
 #[cfg(test)]

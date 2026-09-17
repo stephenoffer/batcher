@@ -30,28 +30,25 @@ pub(crate) fn median_state(
     group_ids: &[u32],
     num_groups: usize,
 ) -> Result<ArrayRef, RuntimeError> {
+    // A null-free column keeps every row, so there is nothing to select: bucket it as it is.
+    // Gathering it through `0..n` first was a full copy of the column that reordered nothing —
+    // one of the several per-value copies a grouped MEDIAN over TPC-H `lineitem` paid.
+    //
+    // `values` is an `Arc<dyn Array>`, so `values.is_valid(i)` is a **virtual call per row** —
+    // and one the optimizer cannot see through, so it also blocks inlining the loop body.
+    // Resolving the null buffer once turns the per-row check into an inlinable bit test.
+    let Some(nulls) = values.nulls().filter(|n| n.null_count() > 0) else {
+        let groups = Int64Array::from_iter_values(group_ids.iter().map(|&g| i64::from(g)));
+        return bucket_values_into_list(&groups, values, num_groups);
+    };
     // Bounded by the row count (the kept subset never exceeds it) — pre-size to skip
     // the geometric reallocations these two parallel Vecs would otherwise churn through.
     let mut keep: Vec<u32> = Vec::with_capacity(group_ids.len());
     let mut kept_groups: Vec<i64> = Vec::with_capacity(group_ids.len());
-    // `values` is an `Arc<dyn Array>`, so `values.is_valid(i)` is a **virtual call per row** —
-    // and one the optimizer cannot see through, so it also blocks inlining the loop body.
-    // Resolving the null buffer once turns the per-row check into an inlinable bit test, and
-    // the null-free case (much the commonest) into no check at all.
-    match values.nulls() {
-        None => {
-            for (i, &g) in group_ids.iter().enumerate() {
-                keep.push(i as u32);
-                kept_groups.push(i64::from(g));
-            }
-        }
-        Some(nulls) => {
-            for (i, &g) in group_ids.iter().enumerate() {
-                if nulls.is_valid(i) {
-                    keep.push(i as u32);
-                    kept_groups.push(i64::from(g));
-                }
-            }
+    for (i, &g) in group_ids.iter().enumerate() {
+        if nulls.is_valid(i) {
+            keep.push(i as u32);
+            kept_groups.push(i64::from(g));
         }
     }
     let kept_values = take(values.as_ref(), &UInt32Array::from(keep), None)?;
@@ -183,7 +180,18 @@ fn finalize_select(
 /// One group's non-null values as `f64` (Int64 widened). The list state is Int64 or
 /// Float64 element lists; any other element type is an unsupported aggregate.
 pub(super) fn group_values_f64(vals: &ArrayRef, func: &str) -> Result<Vec<f64>, RuntimeError> {
+    // A null-free group is its value buffer as it stands: one bulk copy (or one widening
+    // pass) rather than a validity test and a push per element.
     match vals.data_type() {
+        DataType::Int64 if vals.null_count() == 0 => Ok(vals
+            .as_primitive::<Int64Type>()
+            .values()
+            .iter()
+            .map(|&x| x as f64)
+            .collect()),
+        DataType::Float64 if vals.null_count() == 0 => {
+            Ok(vals.as_primitive::<Float64Type>().values().to_vec())
+        }
         DataType::Int64 => {
             let a = vals.as_primitive::<Int64Type>();
             Ok((0..a.len())
