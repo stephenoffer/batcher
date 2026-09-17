@@ -129,6 +129,10 @@ The typed namespaces reached as `col("x").str`, {py:class}`.dt <batcher.plan.exp
 .. autoclass:: batcher.plan.expr_ir.namespaces.sequence._SeqNamespace
    :members:
    :member-order: bysource
+
+.. autoclass:: batcher.plan.expr_ir.namespaces.meta._MetaNamespace
+   :members:
+   :member-order: bysource
 ```
 
 ## See also

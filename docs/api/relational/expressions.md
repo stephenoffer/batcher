@@ -467,6 +467,18 @@ here and a silently-wrong alias is worse than a missing one:
 | `str.count` | pandas' `count` is a regex count. Use `str.count_matches(pattern)`. |
 | `str.casefold` | Python's casefold is not lowercase for non-ASCII (`"ß"` folds to `"ss"`). |
 
+## Introspection
+
+The {py:class}`.meta <batcher.plan.expr_ir.namespaces.meta._MetaNamespace>` accessor reads an expression's tree and never a row, so it needs no dataset:
+
+| Method | Returns |
+| --- | --- |
+| `.meta.output_name(raise_if_undetermined=True)` | the column name the expression takes in `select` |
+| `.meta.root_names()` | the input columns it reads, left to right, repeats kept |
+| `.meta.is_column()` | whether it is a bare column reference |
+| `.meta.has_multiple_outputs()` | whether it holds a selector that expands to several columns |
+| `.meta.tree_format(return_as_string=False)` | a drawing of the engine tree, printed or returned |
+
 ## Data science toolkit and evaluation metrics
 
 The feature-engineering, profiling and model-evaluation expressions are tabulated

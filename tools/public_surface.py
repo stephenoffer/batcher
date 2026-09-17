@@ -92,6 +92,7 @@ def _accessor_namespaces() -> list[type]:
         _MapNamespace,
         _StructNamespace,
     )
+    from batcher.plan.expr_ir.namespaces.meta import _MetaNamespace
     from batcher.plan.expr_ir.namespaces.sequence import _SeqNamespace
     from batcher.plan.expr_ir.namespaces.strings import _StrNamespace
     from batcher.plan.expr_ir.namespaces.temporal import _DtNamespace
@@ -109,6 +110,7 @@ def _accessor_namespaces() -> list[type]:
         _AudioNamespace,
         _VideoNamespace,
         _SeqNamespace,
+        _MetaNamespace,
         _SelectorNameNamespace,
         Reader,
         Writer,
@@ -258,6 +260,7 @@ _EXPR_ACCESSORS = (
     ("image", "batcher.plan.expr_ir.image", "_ImageNamespace"),
     ("audio", "batcher.plan.expr_ir.audio", "_AudioNamespace"),
     ("video", "batcher.plan.expr_ir.video", "_VideoNamespace"),
+    ("meta", "batcher.plan.expr_ir.namespaces.meta", "_MetaNamespace"),
 )
 
 

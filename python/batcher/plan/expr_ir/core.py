@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         _StrNamespace,
         _StructNamespace,
     )
+    from batcher.plan.expr_ir.namespaces.meta import _MetaNamespace
     from batcher.plan.expr_ir.namespaces.sequence import _SeqNamespace
     from batcher.plan.expr_ir.nodes import WindowExpr
     from batcher.plan.expr_ir.video import _VideoNamespace
@@ -2732,6 +2733,25 @@ class Expr:
                 {'r': [1, 2]}
         """
         return _accessor("batcher.plan.expr_ir.namespaces", "_StructNamespace")(self)
+
+    @property
+    def meta(self) -> _MetaNamespace:
+        """Introspection accessor — questions about this expression's shape, not its data.
+
+        Returns a namespace with ``.meta.output_name()``, ``.meta.root_names()``,
+        ``.meta.is_column()``, ``.meta.has_multiple_outputs()`` and ``.meta.tree_format()``.
+
+        Returns:
+            The `.meta` introspection accessor namespace.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> (bt.col("a") + bt.col("b")).meta.root_names()
+                ['a', 'b']
+        """
+        return _accessor("batcher.plan.expr_ir.namespaces.meta", "_MetaNamespace")(self)
 
     @property
     def map(self) -> _MapNamespace:
@@ -6616,6 +6636,22 @@ class AggExpr:
                 {'r': [6.0]}
         """
         return Cast(self, dtype)
+
+    @property
+    def meta(self) -> _MetaNamespace:
+        """Introspection accessor for this aggregate, the same one `Expr.meta` returns.
+
+        Returns:
+            The `.meta` introspection accessor namespace.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.col("x").sum().meta.output_name()
+                'x'
+        """
+        return _accessor("batcher.plan.expr_ir.namespaces.meta", "_MetaNamespace")(self)
 
     def __add__(self, other: IntoExpr) -> Expr:
         """Combine this aggregate with `other` by addition (``agg + other``)."""

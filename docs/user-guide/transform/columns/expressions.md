@@ -311,6 +311,28 @@ print(out.to_pydict())
 # {'total': [60.0], 'avg_qty': [2.0], 'rows': [3]}
 ```
 
+## Inspecting an expression
+
+The `.meta` accessor answers questions about an expression's shape without running anything, which helps when a function receives expressions it did not build. {py:meth}`output_name <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.output_name>` is the column name the expression would take in a `select`, {py:meth}`root_names <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.root_names>` lists the columns it reads, {py:meth}`is_column <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.is_column>` tells a bare column from a computation, and {py:meth}`has_multiple_outputs <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.has_multiple_outputs>` is true for a selector that expands to several columns.
+
+```python
+revenue = (bt.col("price") * bt.col("qty")).alias("revenue")
+print(revenue.meta.output_name(), revenue.meta.root_names())
+# revenue ['price', 'qty']
+print(bt.col("price").meta.is_column(), bt.numeric().meta.has_multiple_outputs())
+# True True
+```
+
+{py:meth}`tree_format <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.tree_format>` draws the tree the engine is handed, one node per line.
+
+```python
+revenue.meta.tree_format()
+# alias(revenue)
+# └─ binary(mul)
+#    ├─ col(price)
+#    └─ col(qty)
+```
+
 ## See also
 
 The rest of the expression language continues on two more pages:
