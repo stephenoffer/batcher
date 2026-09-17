@@ -1567,7 +1567,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | `kernel.py` | 466 | The kernel's own view of how close this process is to being OOM-killed. |
 | `learned.py` | 520 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 411 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
-| `pressure.py` | 435 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
+| `pressure.py` | 448 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
 | `probe.py` | 373 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
 | `reclaim.py` | 179 | Handing the allocator's arena back when a query is about to go out of core. |
 
@@ -1586,7 +1586,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `morsel.py` | 328 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
 | `scheduling.py` | 288 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
-| `spill_advice.py` | 441 | Whether a query goes out of core, and what shape its spilled state takes. |
+| `spill_advice.py` | 469 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 176 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
@@ -2067,9 +2067,9 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | `_native_stream.py` | 148 | Native-reader streaming for `ParquetSource._iter_file`, and the rule for when to use it. |
 | `dataset.py` | 700 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
 | `partitions.py` | 219 | What a Hive ``col=value`` directory segment means, and what it proves. |
-| `routing.py` | 122 | How a predicated Parquet read spends its work: skip row groups on the footers, decode the rest. |
+| `routing.py` | 146 | How a predicated Parquet read spends its work: skip row groups on the footers, decode the rest. |
 | `sink.py` | 167 | `ParquetSink` — the Parquet writer. |
-| `source.py` | 623 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
+| `source.py` | 625 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
 
 ### `batcher/io/formats/unstructured/` — 2 · neutral IO
 
