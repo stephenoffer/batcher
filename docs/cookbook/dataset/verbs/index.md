@@ -1,8 +1,6 @@
 # Dataset verbs
 
-The operations that change the shape of a table, plus the two ways to get results back out.
-
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
+The verbs that change a table's shape, and the calls that get a result back out of the engine. Joins and grouping carry most real pipelines, so start there. Reshaping covers pivots, explodes, and set operations, iteration covers what to call at the end, and the SQL recipe shows the same plans written as queries.
 
 | Recipe | What it shows |
 |---|---|

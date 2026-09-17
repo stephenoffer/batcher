@@ -37,29 +37,42 @@ How work is sized and parallelized.
 | `admission_queue_depth` | `1000` | Queries allowed to wait for a slot. A further arrival raises `AdmissionTimeout` rather than joining an unbounded queue, because a queue nobody drains is an outage that presents as slowness. |
 | `admission_timeout_s` | `0.0` | Seconds a query waits for a slot before raising `AdmissionTimeout`. `0` waits indefinitely. |
 | `shrink_output_dtypes` | `False` | Re-narrow a pass-through output column back to its source numeric width, such as `Int32` ids widened on input, halving its footprint. It's lossless but data-dependent, so it's off by default. With it off, output types match {py:obj}`Dataset.schema <batcher.Dataset.schema>` exactly. |
+| `streaming` | `True` | Run plans on the streaming executor, which pulls morsels through linear runs and materializes only at breakers, so peak memory is the breakers' state plus one morsel per worker. A breaker whose state exceeds `memory.max_memory_bytes` hands the query to the materializing executor, which spills. `False` forces that executor for every query, as a bisecting escape hatch. |
+| `auto_offload_blobs` | `False` | Move a `large_binary` column out of line around a sort, so the payload crosses the breaker as a small content-addressed handle and is read back after it. The automatic form of {py:meth}`Dataset.offload_blobs <batcher.Dataset.offload_blobs>`. It pays only for genuinely large payloads, so it's off by default. |
 
-The remaining execution fields are **power-user performance thresholds**: they tune *how* the parallel executor runs an operator and are result-invariant (a query produces the identical result at any setting). Each default equals the Rust constant it replaced, so leaving them untouched is bit-identical to the engine's tuned baseline. Reach for them only to tune a known hot path.
+The remaining execution fields are power-user performance thresholds. They tune how the parallel executor runs an operator, and a query produces the identical result at any setting. Each default equals the Rust constant it replaced, so leaving them untouched is bit-identical to the engine's tuned baseline. Reach for them only to tune a known hot path.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `bloom_fp_rate` | `0.01` | False-positive rate for the hash-join probe-side bloom pre-filter. |
 | `bloom_min_build_rows` | `65536` | Build-row floor above which the probe bloom pays for itself. |
 | `window_parallel_row_threshold` | `32768` | Window row count above which per-partition sorts run across cores. |
-| `radix_parallel_threshold` | `0` | Partial-row count above which aggregate `combine` regroups via parallel hash-radix partitioning. `0` derives it from the machine (partitions × 256), so the crossover scales with the core count; a positive value pins it. Performance only, never a different result. |
+| `radix_parallel_threshold` | `0` | Partial-row count above which aggregate `combine` regroups via parallel hash-radix partitioning. `0` derives it from the machine (partitions x 256), so the crossover scales with the core count; a positive value pins it. Performance only, never a different result. |
 | `sort_merge_fanin` | `16` | Maximum runs merged per pass in the external (spilling) sort's k-way merge. |
 | `skew_bucket_factor` | `4` | A join bucket is "hot" when it exceeds this multiple of the average bucket. |
 | `skew_min_bucket_rows` | `65536` | Absolute row floor below which a join bucket is never treated as skewed. |
 | `skew_min_bucket_bytes` | `4194304` (4 MiB) | Absolute byte floor below which a join bucket is never treated as skewed. |
+### UDF process isolation
+
+These fields decide what a `map_batches` UDF child process inherits from the engine. Isolation is defense in depth, not a sandbox: a UDF is arbitrary Python that can reach any syscall, so untrusted code belongs in a container.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `udf_isolation` | `"env"` | `"none"` lets the child inherit everything. `"env"` rebuilds the child's environment from an allowlist, so it can't read `env:` secret material. `"strict"` adds the resource ceilings and the timeout below. |
+| `udf_env_allowlist` | `()` | Extra environment variables a UDF child keeps, on top of the built-in allowlist of `PATH`, `HOME`, `TMPDIR`, locale, and thread and device pinning. |
+| `udf_timeout_s` | `0.0` | Wall-clock seconds one UDF pool map may take. `0` is no limit. With a limit, a wedged child raises and names the UDF instead of hanging the query. |
+| `udf_cpu_limit_seconds` | `0` | CPU-seconds per UDF child. `0` inherits the parent's limit. |
+| `udf_memory_limit_bytes` | `0` | Address-space ceiling per UDF child. `0` inherits. Under `"strict"` a runaway allocation raises `MemoryError` in the guilty child instead of waking the kernel's OOM killer. |
 
 ## memory
 
-Buffer-pool envelope and the out-of-core spill story. Setting `max_memory_bytes` is what opts the in-memory engine into spilling. The data plane receives a per-operator spill budget of `max_memory_bytes` times `hard_limit`, and the Rust runtime memory pool spills any stateful operator that exceeds it rather than letting the process run out of memory. That covers aggregate, distinct, sort, join, and windowed-by-partition. Leave it `None`, the default, to run fully in memory at the lowest overhead. See the bounded-memory recipe in {doc}`profiles`.
+Buffer-pool envelope and the out-of-core spill story. Spilling is on by default. When `max_memory_bytes` is `None`, each query senses the live memory envelope, host RAM or a container or cgroup limit, and uses that as the cap. The data plane receives a per-operator spill budget of the cap times `hard_limit`, and the Rust runtime memory pool spills any stateful operator that exceeds it rather than letting the process run out of memory. That covers aggregate, distinct, sort, join, and windowed-by-partition. Set `max_memory_bytes` to pin a cap the OS doesn't report, or set `unbounded_memory` to run fully in memory with no spilling. See the bounded-memory recipe in {doc}`profiles`.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `soft_limit` | `0.85` | Throttle new allocations at this fraction of the envelope. Must satisfy `0 < soft_limit <= hard_limit <= 1`. |
 | `hard_limit` | `0.90` | Spill to disk at this fraction; also scales the data-plane spill budget derived from `max_memory_bytes`. |
-| `max_memory_bytes` | `None` | Hard memory cap in bytes. `None` runs fully in memory (no spill); set it to bound memory (honoring a container/cgroup limit) **and enable spilling**. |
+| `max_memory_bytes` | `None` | Hard memory cap in bytes. `None` senses the cap per query from host RAM or a container or cgroup limit. A value you set binds every distributed worker, while a sensed cap binds only the driver. |
 | `default_total_bytes` | `8589934592` (8 GiB) | Fallback total RAM assumed when `max_memory_bytes` is unset and the OS reports no usable figure. |
 | `spill_dir` | `None` | Scratch directory for spill files. `None` uses a per-query temp dir. |
 | `spill_remote_uri` | `None` | fsspec URL, such as `s3://` or `gs://`, that the local spill tier overflows to, so a PB-scale spill doesn't die when local disk fills. |
@@ -69,12 +82,15 @@ Buffer-pool envelope and the out-of-core spill story. Setting `max_memory_bytes`
 | `unbounded_memory` | `False` | Opt out of the auto-sensed spill budget and keep the fully in-memory fast path, with no out-of-core spilling. Set it when you'd rather a query fail fast than spill to disk. |
 | `result_cache_max_bytes` | `268435456` (256 MiB) | Memory budget for the process-wide result cache backing {py:meth}`Dataset.cache() <batcher.Dataset.cache>`, described in {doc}`/user-guide/operate/tuning/caching`. Cached Arrow results are evicted cost-aware to stay within this, so caching never grows the process without bound. |
 | `result_cache_disk_max_bytes` | `4294967296` (4 GiB) | On-disk budget for the result cache's second tier. What the memory budget evicts is written here instead of dropped, so a working set larger than memory costs a read-back rather than a recompute. Scratch, not durable: it sits beside the spill files and is removed at process exit. `0` turns the tier off, making every {py:class}`StorageLevel <batcher.StorageLevel>` behave as `MEMORY_ONLY`. |
-| `shared_cache_uri` | `None` | Opt-in cross-process result cache. `redis://`, `rediss://`, or `unix://` for a server shared across nodes; `rocksdb://<path>` or a bare path for an embedded database shared across runs on one node. A result is written only when every input has a durable identity **and** a content version, so in-memory data never shares. See {doc}`/user-guide/operate/tuning/caching`. |
+| `shared_cache_uri` | `None` | Opt-in cross-process result cache. `redis://`, `rediss://`, or `unix://` for a server shared across nodes; `rocksdb://<path>` or a bare path for an embedded database shared across runs on one node. A result is written only when every input has a durable identity and a content version, so in-memory data never shares. See {doc}`/user-guide/operate/tuning/caching`. |
 | `shared_cache_ttl_seconds` | `86400` (1 day) | Expiry applied to every shared-cache write. The content version in the key already invalidates an entry when its inputs change, so this bounds staleness where that token is coarser than the data, and bounds the store's growth when nobody configured an eviction policy. `0` writes entries without an expiry. |
 | `streaming_state_max_bytes` | `0` | Cap on one streaming operator's in-memory state (window partials, dedup keys, join buffers). Exceeding it raises a clear {py:exc}`ResourceError <batcher.ResourceError>` (a stalled-watermark signal) instead of OOMing. `0` derives the cap from the hard memory budget. |
-| `respect_cgroup_high` | `True` | Budget against the cgroup v2 `memory.high` throttle threshold, not just the `memory.max` kill threshold. Inert wherever `memory.high` is unset. |
+| `respect_cgroup_high` | `True` | Budget against the cgroup v2 `memory.high` throttle threshold, as well as the `memory.max` kill threshold. Inert wherever `memory.high` is unset. |
 | `stall_aware_pressure` | `True` | Let the kernel's memory PSI raise the pressure level, so the engine spills while reclaim is still coping. It can only raise a level, never lower one. |
 | `oom_kill_backoff` | `0.8` | Fraction of the auto-sensed envelope kept when this container's `memory.events` shows it has already been OOM-killed. `1.0` disables the backoff. An explicit `max_memory_bytes` is never scaled. See {doc}`/architecture/deep-dives/memory/buffer-pool` for what these three kernel signals measure. |
+| `file_cache_dir` | `None` | Local-SSD read-through cache for remote (S3, GCS, Azure) file bytes. `None` disables it. A directory caches fetched remote files there. `"auto"` picks each node's fast local disk, and resolves to no cache on a node without one. Local paths are never cached, and a miss re-fetches, so results never change. |
+| `file_cache_max_bytes` | `8589934592` (8 GiB) | LRU byte budget for `file_cache_dir`. Used only when the cache is on. |
+| `max_memory_bytes_sensed` | `False` | Set by Batcher, not by you: records that `max_memory_bytes` was sensed from the driver rather than configured. A sensed cap binds only the driver, while a configured cap binds every distributed worker. |
 
 ## flow_control
 
@@ -86,6 +102,7 @@ Credit-based backpressure for the shuffle, the Carbonite flow-control model.
 | `credit_ceiling_factor` | `4` | Maximum credit window is `default_credits * credit_ceiling_factor`. |
 | `credit_byte_budget` | `268435456` (256 MiB) | Byte ceiling for one shuffle channel's credit window, so wide rows can't buffer GBs even within the count ceiling. |
 | `shuffle_fan_in` | `8` | Maximum inbound streams a shuffle node fans in before the reduce becomes a tree of combiner stages. |
+| `shuffle_fetch_fan_in` | `32` | Maximum mapper buckets a flat gather (a join, sort, or window reduce) streams at once. A flat gather holds every bucket anyway, so this caps how many peers are dialed at once rather than memory, which `credit_byte_budget` governs. |
 | `gather_streams` | `48` | Concurrent Flight streams a reducer runs across all its peers, split between them. Holding this fixed is what keeps a shuffle's transfer rate independent of how finely the cluster's width cuts it into buckets. |
 | `gather_inflight_bytes` | `805306368` (768 MiB) | Decoded bytes a gather may hold in flight across every stream. Divided by the stream count, it decides how many buckets one stream asks for at a time. |
 | `aimd_alpha` | `1` | Additive increase: credits added per round trip. |
@@ -123,6 +140,7 @@ operator's state may hold is `memory.streaming_state_max_bytes`, in the `memory`
 | `backpressure_pid_derivative` | `0.0` | Weight on the error's rate of change, damping overshoot on a bursty source. |
 | `backpressure_min_rate` | `100.0` | Rows per second the derived rate can never fall below. |
 | `backpressure_max_rows_per_trigger` | `0` | Hard ceiling on the derived cap, independent of the source. `0` is unbounded. |
+| `checkpoint_delta_interval` | `10` | Changelog deltas a stateful checkpoint records before it writes a whole snapshot again. Longer chains write less and replay more on recovery. `0` disables incremental checkpointing. |
 
 Lower `idle_poll_seconds` when first-row latency after a quiet stretch matters more than
 the cost of re-listing a directory or re-asking a broker for its partitions. Raise it when
@@ -196,6 +214,16 @@ nests three sub-sections: `cardinality`, `cost_coeffs`, and `cost_weights`.
 | `build_bloom_index` | `False` | On write, build a per-column membership bloom index so a later read can data-skip an equality / `IN` predicate whose value is absent. Opt-in (~1.2 MB per million rows per column). |
 | `target_bytes_per_task` | `268435456` (256 MiB) | Target bytes per distributed task; partition counts take the max of the row- and byte-derived fan-out, so a few wide rows (videos, embeddings) still shard finely enough to fit memory. |
 | `broadcast_max_bytes` | `0` (auto) | Build-side byte threshold below which a join is broadcast, meaning replicated to every worker, rather than shuffled. This is the analog of Spark's `autoBroadcastJoinThreshold`, but it's sized to cache rather than to memory, because a broadcast join wins only while its one hash table stays cache-resident. `0` detects the threshold from the last-level cache. A positive value pins it. Read the effective value from `resolved_broadcast_max_bytes`. The runtime guard falls back to a shuffle if the materialized build side exceeds the threshold. |
+| `locality_max_bytes` | `4194304` (4 MiB) | Shuffle volume below which co-locating a small shuffle's workers beats spreading them. A network decision, kept separate from the cache-sized `broadcast_max_bytes`. |
+| `plan_cache_entries` | `256` | Optimized plans memoized in a bounded LRU, so an identical query skips re-planning. `0` disables the cache. |
+| `common_subplan_max_bytes` | `268435456` (256 MiB) | Largest result held so a subplan appearing more than once in a query runs once. `0` turns the rewrite off. |
+| `filter_split_materialize_cost` | `1.0` | Cost, in `cost_coeffs` work units, of the extra compacted batch paid when a cheap selective predicate is split out ahead of an expensive one. |
+| `filter_split_min_gain` | `1.25` | Cost ratio a filter split must beat before it is taken, so marginal rewrites are left alone. |
+| `cardinality_correction_min_samples` | `2` | Observations an operator signature needs before its learned cardinality correction is trusted. |
+| `cardinality_correction_max_factor` | `32.0` | Clamp on a learned correction, to `[1/max_factor, max_factor]`. `1.0` or below disables the loop. |
+| `cardinality_correction_window` | `8` | Most recent observations averaged per signature, so a correction the estimator has outgrown ages out. `0` disables the loop. |
+| `learned_scalar_alpha_floor` | `0.1` | Floor on the moving-average step for learned per-signature scalars: a running mean while evidence is thin, then an average with a memory of about `1/floor` runs. |
+| `ndv_sketch_max_cells` | `2147483648` | Ceiling on `rows x columns` an in-memory source may be sketched for cold-start distinct counts before planning. Only join, group, and equality columns are sketched. |
 | `cardinality` | {py:class}`CardinalityConfig() <batcher.config.config.CardinalityConfig>` | Selinger-style fallback selectivities (sub-section below). |
 | `cost_coeffs` | {py:class}`CostCoefficients() <batcher.config.config.CostCoefficients>` | Per-unit operator costs (sub-section below). |
 | `cost_weights` | {py:class}`CostWeights() <batcher.config.config.CostWeights>` | Relative weight of CPU, IO, and network when collapsing cost to a scalar (sub-section below). |
@@ -224,6 +252,9 @@ sketch-based values when present.
 | `eq_selectivity` | `0.1` | Selectivity of `col = literal`. |
 | `range_selectivity` | `0.3333...` (1/3) | Selectivity of `col < / <= / > / >= literal`. |
 | `null_selectivity` | `0.05` | Selectivity of `col IS NULL`. |
+| `mcv_min_fraction` | `0.05` | A value in at least this fraction of a column's rows is kept as a most-common value, so an equality on it uses the measured frequency instead of `1/ndv`. |
+| `prefix_selectivity` | `0.1` | Selectivity of a prefix or suffix match: `LIKE 'x%'`, `starts_with`, `ends_with`. |
+| `substring_selectivity` | `0.05` | Selectivity of a substring or regex match: `LIKE '%x%'`, `contains`. |
 
 ### optimizer.cost_coeffs
 
@@ -242,6 +273,7 @@ Per-row and per-byte work units, comparable across operators.
 | `union_row` | `0.2` | Cost per row for union. |
 | `map_row` | `5.0` | Cost per row for an opaque UDF, assumed expensive. |
 | `bytes_per_row` | `64.0` | Rough row width used for the IO and network axes. |
+| `jit_speedup` | `4.0` | Divisor applied to an expression the Cranelift tier compiles. A prior until calibration fits it from measured per-tier timings. |
 
 ### optimizer.cost_weights
 
@@ -353,7 +385,7 @@ What the engine tells you about what it did: the `batcher.*` logger hierarchy an
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `verbosity` | `"normal"` | The one dial most users need. Takes `silent`, `quiet`, `normal`, `verbose`, `debug`, or `trace`, or the equivalent integer `0` to `5`. It sets `log_level` and `progress` together. |
-| `log_level` | `None` | Explicit threshold for the `batcher.*` loggers: `CRITICAL`/`ERROR`/`WARNING`/`INFO`/`DEBUG`. `None` derives it from `verbosity`; setting it overrides just this one. Read the effective value from `resolved_log_level`. |
+| `log_level` | `None` | Explicit threshold for the `batcher.*` loggers: `CRITICAL`/`ERROR`/`WARNING`/`INFO`/`DEBUG`. `None` derives it from `verbosity`; setting it overrides only this one. Read the effective value from `resolved_log_level`. |
 | `console` | `True` | Emit records to stderr. `False` for a file-only setup. |
 | `log_file` | `None` | Path to a rotating log file, or `None` for no file handler. |
 | `log_file_max_bytes` | `10000000` (10 MB) | Bytes per log file before it rotates. |
@@ -367,6 +399,11 @@ What the engine tells you about what it did: the `batcher.*` logger hierarchy an
 | `ui` | `False` | Start the web dashboard automatically on the first query. It's off by default, because binding a port should be asked for. {py:func}`bt.start_ui() <batcher.start_ui>` is the explicit spelling. Use this field for a long-running service that always wants the dashboard. |
 | `ui_host` | `"127.0.0.1"` | Interface the dashboard binds. Loopback by default: it exposes query text, plans, and logs, and Batcher ships no authentication. Set it to a routable address only deliberately. |
 | `ui_port` | `4040` | Dashboard port. `0` asks the OS for any free port. |
+| `openlineage` | `False` | Emit an OpenLineage START and COMPLETE or FAIL event per query, carrying the column-level lineage. Events post from a bounded background queue, so a slow receiver drops events rather than adding latency. |
+| `openlineage_url` | `""` | Receiver base URL. Empty reads `OPENLINEAGE_URL`. |
+| `openlineage_api_key` | `""` | Bearer token. Empty reads `OPENLINEAGE_API_KEY`. Accepts an `env:`, `file:`, or `cmd:` secret reference. |
+| `openlineage_namespace` | `"batcher"` | Namespace jobs and datasets are recorded under, conventionally one per environment. |
+| `openlineage_timeout_s` | `5.0` | Per-request timeout for the lineage POST. It bounds the drain thread, never a query. |
 
 These fields are the
 {py:class}`ObservabilityConfig <batcher.config.config.ObservabilityConfig>` dataclass. Construct
@@ -432,7 +469,7 @@ Batcher validates a config where you install it, not where it's used. Invalid va
 
 The worker fan-out is a terminal-call parameter, {py:meth}`ds.collect(num_workers=...) <batcher.Dataset.collect>`, not a `Config` field. The `distributed` section tunes how the fan-out behaves once chosen, not how wide it is.
 
-This page documents the fields most deployments reach for. The dataclasses carry further power-user thresholds that the API reference enumerates in full.
+Every field of every section except `distributed`, `accelerator`, and `fault_tolerance` is listed here. Those three have pages of their own. `batcher.config.describe_options()` returns the live list with current values.
 
 ## See also
 

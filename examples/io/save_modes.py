@@ -1,7 +1,8 @@
 """Save modes and write manifests: what happens when the target already exists.
 
-The default refuses to clobber, which is the safe choice for a job that might be retried.
-``overwrite`` replaces, ``append`` adds. Every write returns a manifest describing what it
+The default is ``overwrite``, so a retried job replaces its own output rather than
+duplicating it. ``error`` and ``ignore`` protect an existing target, and ``append`` is
+refused on a plain file sink. Every write returns a manifest describing what it
 actually produced, which is what you record for lineage or resume.
 
     python examples/io/save_modes.py
@@ -28,15 +29,9 @@ def main() -> None:
         assert manifest is not None
         assert bt.read.parquet(target).count() == 2
 
-        # Writing again without a mode refuses rather than silently replacing.
-        try:
-            first.write.parquet(target)
-        except Exception as exc:
-            print("default mode refused:", type(exc).__name__)
-        else:
-            # Some builds treat a plain re-write as an overwrite; either way the table
-            # must still hold exactly the rows just written.
-            assert bt.read.parquet(target).count() == 2
+        # Writing again without a mode overwrites, so a retried job replaces its own output.
+        first.write.parquet(target)
+        assert bt.read.parquet(target).count() == 2
 
         # `append` is *not* available on a plain file sink: there is no table to add to,
         # so appending would mean rewriting the whole output. The engine says so rather

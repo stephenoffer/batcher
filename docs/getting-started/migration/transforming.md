@@ -4,7 +4,7 @@ This page maps the transformation verbs and terminal operations you already know
 
 ## Transforming
 
-Transformations are lazy. Each one chains off a {py:class}`Dataset <batcher.Dataset>` and returns a new one, so a whole pipeline reads as a single expression, and only a terminal operation runs it:
+Transformations are lazy. Each one chains off a {py:class}`Dataset <batcher.Dataset>` and returns a new one, so a whole pipeline reads as a single expression. Only a terminal operation runs it:
 
 ```python
 import batcher as bt
@@ -54,7 +54,7 @@ The pandas transformation verbs map across as follows, ordered roughly by how of
 
 pandas has no window expression, so its rolling and ranking idioms become one of two Batcher forms. An aggregate or ranking expression takes {py:meth}`.over(...) <batcher.AggExpr.over>`, such as `bt.rank().over(partition_by=.., order_by=..)`, and {py:meth}`ds.window(partition_by=..., functions=...) <batcher.Dataset.window>` is the table-shaped form.
 
-`mean` is the expression method for an average. The `window()` function table also accepts `"avg"` as a function name.
+An average is `mean` on an expression. The `window()` function table also accepts `"avg"`.
 
 ## Terminal operations
 
@@ -70,13 +70,13 @@ A terminal operation is the call that makes the plan run. The following table li
 
 Several terminals have no pandas counterpart. {py:meth}`ds.iter_batches() <batcher.Dataset.iter_batches>` streams Arrow batches, and {py:meth}`ds.ml.to_numpy_batches() <batcher.api.dataset.ml.DatasetML.to_numpy_batches>` and {py:meth}`ds.ml.iter_torch_batches() <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` stream NumPy arrays or tensors. {py:meth}`ds.explain() <batcher.Dataset.explain>` returns the plan, and {py:meth}`ds.stats() <batcher.Dataset.stats>` runs the query and reports measured per-operator statistics.
 
-{py:obj}`ds.write(path, mode=...) <batcher.Dataset.write>` takes the Spark save modes: `overwrite`, the default, `error`, `ignore`, and `append`, which lakehouse sinks accept. For Delta upserts, {py:meth}`ds.write.delta(uri, merge_on=["id"]) <batcher.api.io_namespace.writer.Writer.delta>` runs a transactional `MERGE INTO` that updates matched rows and inserts new ones. That's the Spark and Delta `MERGE` in one call.
+{py:obj}`ds.write(path, mode=...) <batcher.Dataset.write>` takes the Spark save modes: `overwrite`, the default, `error`, `ignore`, and `append`, which lakehouse sinks accept. For Delta upserts, {py:meth}`ds.write.delta(uri, merge_on=["id"]) <batcher.api.io_namespace.writer.Writer.delta>` runs a transactional `MERGE INTO` that updates matched rows and inserts new ones: the Spark and Delta `MERGE`, in one call.
 
 ## Names that carry over, and names that don't
 
 Batcher keeps one spelling per operation. A familiar name that Batcher spells differently, such as `groupby`, `merge`, `fillna`, `drop_duplicates` or `orderBy`, raises `AttributeError`, and the message names the Batcher spelling to use. `python -m batcher.migrate <paths>` prints the rewrite for a script that still uses a removed Batcher spelling, and `--write` applies it. The generated reference pages list every foreign name with its Batcher spelling.
 
-A few familiar names are real methods, listed here with what they do:
+A few familiar names are real methods:
 
 | You type | What it does |
 |---|---|
@@ -86,15 +86,9 @@ A few familiar names are real methods, listed here with what they do:
 | {py:meth}`ds.info() <batcher.Dataset.info>` / {py:meth}`ds.glimpse() <batcher.Dataset.glimpse>` / {py:meth}`ds.memory_usage() <batcher.Dataset.memory_usage>` | schema-and-count summaries |
 | {py:meth}`ds.iter_rows() <batcher.Dataset.iter_rows>` / {py:meth}`ds.iter_slices() <batcher.Dataset.iter_slices>` | row and slice iterators, alongside {py:meth}`ds.iter_batches() <batcher.Dataset.iter_batches>` |
 
-Argument names follow the Batcher spelling too. `ds.sort()` takes `descending=` and `nulls_first=`, not `by=`, `ascending=` or `na_position=`. `ds.sample()` reads a positional `int` as a row count and a `float` as a fraction, and takes `seed=`. {py:meth}`ds.unpivot() <batcher.Dataset.unpivot>` takes `index=`, `on=`, `variable_name=` and `value_name=`.
-{py:meth}`ds.select_dtypes() <batcher.Dataset.select_dtypes>` accepts a Python type, a dtype name, or a list of either, as `include` or as `exclude=`. {py:meth}`ds.rename() <batcher.Dataset.rename>` accepts a function applied to every column name.
+Argument names follow the Batcher spelling too. `ds.sort()` takes `descending=` and `nulls_first=`, not `by=`, `ascending=` or `na_position=`. `ds.sample()` reads a positional `int` as a row count and a `float` as a fraction, and takes `seed=`. {py:meth}`ds.unpivot() <batcher.Dataset.unpivot>` takes `index=`, `on=`, `variable_name=` and `value_name=`. {py:meth}`ds.select_dtypes() <batcher.Dataset.select_dtypes>` accepts a Python type, a dtype name, or a list of either, as `include` or as `exclude=`. {py:meth}`ds.rename() <batcher.Dataset.rename>` accepts a function applied to every column name.
 
-A list of columns works wherever a verb takes several, which is how Polars, PySpark,
-and Ray Data all spell it. `ds.select(["a", "b"])`, `ds.sort(["a", "b"])` and
-`ds.group_by(["region"])` need no rewrite to positional arguments, and a list mixes with
-bare names in the same call. The verbs that read a list this way are `select`,
-`with_columns`, `filter`, `sort`, `group_by`, `rollup`, `cube`, `agg`, `drop`, `unnest`
-and `union`.
+A list of columns works wherever a verb takes several, which is how Polars, PySpark, and Ray Data all spell it. `ds.select(["a", "b"])`, `ds.sort(["a", "b"])` and `ds.group_by(["region"])` need no rewrite to positional arguments, and a list mixes with bare names in the same call. The verbs that read a list this way are `select`, `with_columns`, `filter`, `sort`, `group_by`, `rollup`, `cube`, `agg`, `drop`, `unnest` and `union`.
 
 ```python
 import batcher as bt
@@ -104,12 +98,9 @@ print(sales.select(["region", "v"]).sort(["region", "v"]).to_pydict())
 # {'region': ['e', 'e', 'w'], 'v': [1, 3, 2]}
 ```
 
-The exception is {py:meth}`ds.grouping_sets() <batcher.Dataset.grouping_sets>`, where each argument *is* a list: one
-grouping level per argument. There the lists carry the meaning, so they are left alone.
+The exception is {py:meth}`ds.grouping_sets() <batcher.Dataset.grouping_sets>`, where each argument *is* a list: one grouping level per argument. There the lists carry meaning and are left alone.
 
-An aggregate names its own output with {py:meth}`.alias() <batcher.AggExpr.alias>`, the Polars and PySpark
-spelling, as an alternative to the keyword form. Only that spelling can name a
-`bt.count()`, which has no input column to be named after:
+An aggregate names its own output with {py:meth}`.alias() <batcher.AggExpr.alias>`, the Polars and PySpark spelling, as an alternative to the keyword form. Only `.alias()` can name a `bt.count()`, which has no input column to be named after:
 
 ```python
 print(
@@ -131,8 +122,7 @@ print(ds.filter(bt.col("amount") > 5, status="paid").to_pydict())
 # {'status': ['paid', 'paid'], 'amount': [10, 30]}
 ```
 
-`ds.group_by(...).agg()` also takes the pandas dict spec, where a list of reducers
-suffixes the output names the way pandas does when it flattens:
+`ds.group_by(...).agg()` also takes the pandas dict spec, where a list of reducers suffixes the output names the way pandas does when it flattens:
 
 ```python
 print(ds.group_by("status").agg({"amount": ["min", "max"]}).sort("status").to_pydict())

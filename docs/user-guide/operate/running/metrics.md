@@ -50,7 +50,7 @@ print(snap["cpu"]["time_ms_total"] > 0, snap["rows"]["scanned_total"] == rows)
 # True True
 ```
 
-The fields worth knowing:
+The following table lists the fields worth knowing:
 
 | Field | Meaning |
 |---|---|
@@ -71,7 +71,7 @@ something else on the machine, and those two have opposite fixes.
 Two conventions matter when reading any of this. `bytes.scanned_total` is the Arrow
 in-memory volume the scans produced, while `io.read_bytes_total` is what actually came off
 a device, so a warm scan and a cold scan of the same file are identical in the first and
-orders of magnitude apart in the second. And **zero means unmeasured, not zero**: not every
+orders of magnitude apart in the second. And zero means unmeasured, not zero: not every
 platform reports every counter, and the engine's streaming executor interleaves its
 operators, so per-operator hardware figures are zero there by design. The `cpu`, `memory`,
 and `io` roll-ups are measured across the whole execution and hold on every tier.
@@ -79,9 +79,8 @@ and `io` roll-ups are measured across the whole execution and hold on every tier
 ## What the job produced
 
 `rows` and `bytes` count what a job read. `writes` counts what it committed, which for an
-ETL pipeline is the thing it exists to do and the thing no counter reported: a run that read
-its inputs correctly and wrote half of them looked, from the metrics, exactly like a healthy
-run.
+ETL pipeline is the thing it exists to do. Without it, a run that read its inputs correctly and
+wrote half of them would look exactly like a healthy one.
 
 | Field | Meaning |
 |---|---|
@@ -105,15 +104,15 @@ print(metrics_snapshot()["writes"]["rows_total"] >= 3)
 # True
 ```
 
-`bytes_total` is **not** comparable with `bytes.scanned_total`. One is size on storage after
-compression, the other is Arrow's in-memory size of what was read, and dividing them gives a
-compression ratio only because the two are labelled apart.
+`writes.bytes_total` isn't comparable with `bytes.scanned_total`. The first is size on storage
+after encoding and compression, the second is Arrow's in-memory size of what was read, so a
+ratio of the two mixes compression with the job's own selectivity.
 
 ## What each execution path reports
 
 Batcher runs a query one of several ways, and they do not all measure the same things. The
-gaps are stated here rather than left for you to infer from a zero, because **a zero in this
-export means unmeasured, not none**.
+table states the gaps rather than leaving you to infer them from a zero, because a zero in this
+export means unmeasured, not none.
 
 | Path | Per-operator detail | Machine cost |
 |---|---|---|
@@ -174,9 +173,9 @@ Carbonite's own readings, grouped by what they measure.
 | `result_cache` | Hits, misses, hit rate, evictions, and fill. |
 
 Each reading replaces the previous one for its group, so differencing successive scrapes
-gives noise rather than a rate. Read them as gauges. In the Prometheus rendering they are
-`batcher_memory_pool_used_bytes`, `batcher_admission_waiting`, `batcher_spill_bytes_written`,
-and so on, with an enumerated level such as memory pressure exposed the conventional way as
+gives noise rather than a rate. Read them as gauges. In the Prometheus rendering each numeric
+field becomes a `batcher_<group>_<field path>` gauge, with nested keys joined by underscores,
+and an enumerated level such as memory pressure is exposed the conventional way, as
 `batcher_memory_pressure_level{state="NORMAL"} 1`.
 
 The pairing is what makes a diagnosis. A query that spilled with an empty pool and a full

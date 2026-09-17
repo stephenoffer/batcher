@@ -1,8 +1,8 @@
 # Scoring generated text
 
-Reference-free monitors first, since they need no labels, then the ones that compare against a reference.
+These metrics turn a column of model output into a scorecard: format compliance, degenerate generations, broken text, length and token cost, tone, PII leaks, and grounding. Each one is an aggregate, so a whole generation run scores in one `select` with no judge model and no GPU.
 
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
+The reference-free monitors come first, since they need no labels and can gate every batch. The last two compare an answer against a reference or against the context it was retrieved from. Each page embeds a self-contained script that asserts on its own output.
 
 | Recipe | What it shows |
 |---|---|
@@ -14,6 +14,13 @@ Each page embeds a complete, self-contained script that builds its own in-memory
 | {doc}`/cookbook/metrics/text/text_pii_safety` | PII leak rates over a text column |
 | {doc}`/cookbook/metrics/text/text_overlap` | Comparing an answer against a reference, without a model |
 | {doc}`/cookbook/metrics/text/text_retrieval` | Whether the answer is supported by the retrieved context |
+
+## See also
+
+- {doc}`/ml/retrieval/llm-evaluation`: the same monitors applied to a generation pipeline.
+- {doc}`/cookbook/ml/pipelines/text/llm-batch-scoring`: producing the output these pages score.
+- {doc}`/cookbook/metrics/embeddings`: the aggregate checks for an embedding column.
+- {doc}`/api/models/metrics`: the complete metric vocabulary.
 
 ```{toctree}
 :hidden:

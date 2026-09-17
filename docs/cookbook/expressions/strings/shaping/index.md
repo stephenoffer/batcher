@@ -1,8 +1,6 @@
 # Shaping text
 
-Changing what a string value looks like, before anything compares or groups on it.
-
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
+Changing what a string value looks like, before anything compares, joins, or groups on it. Case and padding fix the keys that fail to match across systems, slicing takes a fixed piece of every value, and cleaning and chunking prepare scraped text for an embedding or LLM stage.
 
 | Recipe | What it shows |
 |---|---|

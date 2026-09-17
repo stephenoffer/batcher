@@ -1,33 +1,34 @@
 # Distributed training
 
-Batcher does not train models. It feeds them, which at 512 ranks is most of the
-problem. The data path has to give every rank a disjoint slice, give them all the *same
-number* of batches so the fast ranks do not sit at the all-reduce barrier waiting for the
-slow one, reproduce the epoch order after a crash, and do all of that without
-materializing an index list that would not fit in driver RAM.
+This page states the data-side contract for data-parallel training: how Batcher splits one
+corpus across ranks, keeps them balanced, and resumes after a crash. The training loop itself is
+yours.
 
-This page is the data-side contract. The training loop itself is yours.
+Batcher doesn't train models. It feeds them, which at 512 ranks is most of the problem. Every
+rank needs a disjoint slice. They all need the *same number* of batches, or the fast ranks sit at
+the all-reduce barrier waiting for the slow one. The epoch order has to survive a crash, and none
+of it can depend on an index list that wouldn't fit in driver RAM.
 
 ## The four guarantees
 
-{py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` gives each rank a `torch.utils.data.IterableDataset` over its
-slice of one global order, and holds four properties a distributed loop actually needs.
+{py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` gives each rank
+a `torch.utils.data.IterableDataset` over its slice of one global order. It holds four properties
+a distributed loop depends on.
 
-**Balanced.** Every rank yields the same number of batches. The default `drop_last=True`
-trims the epoch's tail to a multiple of `world_size`. `drop_last=False` keeps
-every sample and pads by repeating a few. Neither hands the ranks unequal counts, so no
-rank finishes early and stalls the barrier.
+The ranks are *balanced*. Every rank yields the same number of batches, so none finishes early
+and stalls the barrier. The default `drop_last=True` trims the epoch's tail to a multiple of
+`world_size`, and `drop_last=False` keeps every sample and pads by repeating a few.
 
-**Deterministic and elastic.** The global order is a function of `(seed, epoch)` alone,
-not of `world_size` and not of how the data is partitioned. So a job that dies on 64 GPUs
-can resume on 32 and see the same permutation.
+The order is *deterministic and elastic*. It's a function of `(seed, epoch)` alone, not of
+`world_size` and not of how the data is partitioned, so a job that dies on 64 GPUs can resume on
+32 and see the same permutation.
 
-**Resumable.** Pass `global_consumed`, the sample count already processed this epoch as
-read from your checkpoint, and the rank picks up mid-epoch with no repeated and no
-skipped samples.
+The position is *resumable*. Pass `global_consumed`, the sample count already processed this
+epoch as read from your checkpoint, and the rank picks up mid-epoch with nothing repeated and
+nothing skipped.
 
-**Independent.** Each rank computes its own index slice with no central coordinator, so
-a slow rank never blocks the others.
+And the ranks are *independent*. Each computes its own index slice with no central coordinator,
+so a slow rank never blocks the others.
 
 ```python
 # docs: skip
@@ -71,13 +72,14 @@ computed order, whose memory does not grow with the corpus.
 | --- | --- | --- |
 | 10 M | about 280 MB | constant |
 | 1 B | about 28 GB | constant |
+| 10 B | about 280 GB | constant |
 | 1 T | about 28 TB | constant |
 
 Because the order is a function rather than a table, seeking is O(1). Resuming at sample
 900,000,000,000 of a trillion is a modular-arithmetic step, not a walk.
 
-The two functions the whole contract rests on are usable on their own, which is the
-easiest way to see exactly what a rank will read.
+The two functions the contract rests on also work on their own, which is the easiest way to see
+exactly what a rank will read.
 
 ```python
 from batcher.ml import epoch_order, usable_length
@@ -131,8 +133,8 @@ print(len(resumed), set(seen) & set(resumed))
 # 497 set()
 ```
 
-497 remaining of the rank's 500, and no overlap with what it already saw.
-`set_epoch(n)` reshuffles and rewinds, the `DistributedSampler` protocol.
+That's 497 remaining of the rank's 500, and none of them overlap what it already saw.
+`set_epoch(n)` reshuffles and rewinds, as `DistributedSampler` does.
 
 :::{tip}
 Take the `state_dict` **between steps**, where every rank has consumed the same count. A
@@ -140,20 +142,27 @@ checkpoint written mid-step captures ranks at different offsets, and the resume 
 skewed by exactly that difference.
 :::
 
+The checkpoint is a position in the global order rather than a per-rank offset, which is what lets the resume change size. The figure scales the 64-to-32 case down to 4 ranks and 2 so every position is readable.
+
+![Two strips of the same 24 positions in one epoch's global order, which depends only on the seed and the epoch. Before the crash, with world_size 4, rank r reads positions r, r + 4, and so on, and the first 12 positions have been read when state_dict is taken between steps, recording global_consumed = 12, a multiple of 4. After the resume, with world_size 2, those 12 positions are skipped as consumed and never repeated, and the remaining 12 are strided alternately between rank 0 and rank 1, so none is skipped.](/_static/diagrams/elastic_resume.svg)
+
 Restoring a state from a different corpus size or seed raises rather than silently
 reshuffling, which is the guard against the failure above.
 
 ## Larger than RAM, and unbounded
 
-{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` materializes the dataset once, which is fine up to RAM. Past that, the
-source decides which loader you get.
+{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` reads the corpus as a
+stream and keeps only its own rank's rows, which works while one rank's slice fits in memory. Past
+that, the source decides which loader you get.
 
 ::::{tab-set}
 :::{tab-item} A corpus larger than RAM
 
-Write the corpus into shards with {py:meth}`ds.ml.write_shards <batcher.api.dataset.ml.DatasetML.write_shards>` and read it back with
-`shard_stream_loader`, which keeps a bounded shard cache and holds the *identical*
-sample-order contract.
+Write the corpus into shards with {py:meth}`ds.ml.write_shards <batcher.api.dataset.ml.DatasetML.write_shards>`
+and read it back with `shard_stream_loader`, which keeps a bounded shard cache and the same
+balance, determinism, and resume guarantees. Its default shuffle is blocked, one shard wide, so a
+batch stays inside one cached shard. {doc}`Data loaders </ml/training/data-loaders>` explains that
+trade.
 
 ```python
 # docs: skip
@@ -174,10 +183,10 @@ iterable = shard_stream_loader(
 
 :::{tab-item} An unbounded source
 
-There is no global length to index, so there is nothing to permute. `streaming_split`
-fans a single read out to `world_size` rank iterators instead. The source is read once and
-distributed round-robin, with backpressure. It emits only complete rounds, so the ranks
-stay balanced.
+There's no global length to index, so there's nothing to permute. `streaming_split` fans a
+single read out to `world_size` rank iterators instead, round-robin, with backpressure. It emits
+only complete rounds, so the ranks stay balanced. A trailing partial round is dropped with a
+warning, or completed by repetition with `drop_last=False`.
 
 ```python
 import batcher as bt
@@ -209,18 +218,21 @@ properties a distributed run depends on.
 | `DistributedSampler` | in-RAM index list, O(n) per rank | no | yes, by padding | no |
 | WebDataset | approximate: shard order plus a local buffer | no | heuristic | no |
 | MosaicML Streaming | shard and block shuffle, bounded | yes | yes | yes |
-| Batcher | exact, O(1) memory | yes | yes, by dropping or padding | yes |
+| Batcher `stream_loader` | exact, computed rather than stored | yes | yes, by dropping or padding | yes |
 
-One distinction is worth being precise about. WebDataset and MosaicML shuffle
-*approximately*, with a shard permutation plus a local buffer, so two samples in the same
-shard stay correlated. Batcher's is an exact permutation of the whole corpus, and it uses
-less memory than either, because it is never stored.
+The shuffle column is where the systems differ. WebDataset and MosaicML shuffle *approximately*,
+with a shard permutation plus a local buffer, so two samples in the same shard stay correlated.
+`stream_loader`'s default is an exact permutation of the whole corpus, and the permutation itself
+takes no memory because it's never stored. The loader holds only its own rank's indices, as
+8-byte integers. `shard_stream_loader` makes the MosaicML trade by default,
+since a bounded shard cache can't serve a global shuffle, and `shuffle_block_size=0` restores the
+exact one when the cache covers the corpus.
 
 ## Preparing the data, once
 
-Everything upstream of the loader is a {py:class}`Dataset <batcher.Dataset>`, so the split, the feature transform,
-and the dedup all run as engine stages, distributed and vectorized and out of the
-training process.
+Everything upstream of the loader is a {py:class}`Dataset <batcher.Dataset>`, so the split, the
+feature transform, and the dedup all run as engine stages, vectorized and outside the training
+process.
 
 ```python
 import batcher as bt
@@ -246,9 +258,8 @@ print(train.count() + test.count(), train_ready.columns)
 ```
 
 :::{important}
-Fit on train only. Fitting the scaler on train+test leaks the test distribution into the
-model, and it is the easiest leak in the world to ship without noticing. Every metric
-improves, and the improvement is not real.
+Fit on train only. Fitting the scaler on train and test together leaks the test distribution
+into the model, and nothing flags it: every metric improves, and the improvement isn't real.
 :::
 
 ## See also
@@ -256,7 +267,8 @@ improves, and the improvement is not real.
 - {doc}`Data loaders </ml/training/data-loaders>`: the loader map and the framework converters.
 - {doc}`PyTorch </ml/inference/pytorch>`: DDP and FSDP wiring on the training side.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: the fit and transform contract.
-- {doc}`Streaming for training </ml/inference/streaming>`: the bounded-memory ingest path in depth.
+- {doc}`Streaming for training </ml/inference/streaming>`: which plans `iter_batches` streams in bounded memory.
+- {doc}`Preparing a training corpus </ml/training/training-corpus>`: mixing, filtering, and decontaminating the corpus first.
 - {doc}`Distributed training pipeline </getting-started/tutorials/ml/distributed-training-pipeline>`: the
   tutorial, from raw files to a multi-rank loop.
 - {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>`: what the engine is

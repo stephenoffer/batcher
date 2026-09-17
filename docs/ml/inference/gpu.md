@@ -1,38 +1,20 @@
 # GPU scheduling
 
-GPU work in Batcher is requested per operation, not configured globally. The
-`.ml` methods (`map_batches`, `infer`, `embed`) take two keywords that together
-describe a pool of GPU actors:
+This page describes how Batcher places model stages on GPUs and other accelerators, and how it sizes and refines the actor pool that runs them. GPU work is requested per operation rather than configured globally. The `.ml` methods `map_batches`, `infer`, and `embed` take two keywords that together describe a pool of GPU actors: `num_gpus`, how much of a device each actor reserves, and `concurrency`, how many actors run in parallel.
 
-- `num_gpus`: how much of a device each actor reserves.
-- `concurrency`: how many actors run in parallel.
-
-The engine places those actors on available GPUs, hands each one a stream of Arrow
-batches, and collects the results. Your code requests GPUs and processes batches; it
-never touches device placement.
+The engine places those actors, hands each a stream of Arrow batches, and collects the results. Your code requests devices and processes batches. It never touches placement.
 
 ## How the pool works
 
-Each actor is a worker that holds `num_gpus` of a GPU for its lifetime. A class-based
-function loads its model once when the actor starts, then processes many batches on that
-reserved device. With `concurrency` actors, that many batches are in flight at once.
+Each actor holds `num_gpus` of a GPU for its lifetime. A class-based function loads its model once when the actor starts, then processes many batches on that device, and `concurrency` actors means that many batches in flight at once. The common settings are the following:
 
-- `num_gpus=1, concurrency=4`: four actors, each owning a whole GPU. Use this when
-  one model fills a device.
-- `num_gpus=0.5, concurrency=4`: four actors packed two-per-GPU across two
-  devices. Use this for small models so a single GPU is not underused.
-- `num_gpus=0.0` (the default): CPU only, no GPU reserved.
+- `num_gpus=1, concurrency=4`: four actors, each owning a whole GPU, for a model that fills a device.
+- `num_gpus=0.5, concurrency=4`: four actors packed two per GPU across two devices, for a small model that would leave a whole GPU underused.
+- `num_gpus=0.0`, the default: CPU only.
 
-Fractional packing keeps expensive GPUs busy. Size `num_gpus` to the model's memory
-footprint, then raise `concurrency` until the devices are saturated.
+Size `num_gpus` to the model's memory footprint, then raise `concurrency` until the devices are saturated. Leave `concurrency` unset and the engine starts at one actor per GPU the cluster reports, so a multi-GPU cluster never idles behind a single actor.
 
-Leave `concurrency` unset and the engine sizes the pool automatically at one actor per
-GPU the cluster reports. A multi-GPU cluster is never left idling a single engine, which
-is a common scale-out mistake.
-
-The call shape is the same with or without a device, so the pattern is runnable here on
-CPU. Pass the *class*, not an instance: the engine constructs it once per worker, so a
-multi-gigabyte model loads once rather than once per batch.
+The call shape is the same with or without a device, so the pattern runs here on CPU. Pass the *class*, not an instance. The engine constructs it once per worker, so a multi-gigabyte model loads once rather than once per batch.
 
 ```python
 import pyarrow as pa
@@ -54,8 +36,7 @@ print(ds.map_batches(Scorer, num_gpus=0, concurrency=2).sort("k").to_pydict())
 # {'k': ['a', 'a', 'b'], 'score': [1.5, 1.5, 2.0]}
 ```
 
-Raise `num_gpus` to reserve a device per actor, or a fraction of one. The rest of the
-call is unchanged. Against a real model and a real device, that reads:
+Against a real model and a real device, only `num_gpus` changes:
 
 ```python
 # docs: skip
@@ -89,12 +70,13 @@ ds.map_batches(Model, batch_size=256, num_gpus=0.5, concurrency=4)
 
 Later examples on this page pass that same `Model`.
 
-## Autoscaling the pool
+Past those two keywords, the sections below cover three more layers that size the pool. The following diagram stacks them in the order they act:
 
-Pass `concurrency` as a `(min, max)` tuple to let the pool grow and shrink with the
-backlog instead of holding a fixed actor count. The engine adds actors (up to `max`)
-while batches queue and releases them (down to `min`) once the stage drains, so a
-bursty workload does not pin every GPU for its whole duration.
+![Four tiers size a GPU actor pool. First, you declare any of num_gpus, concurrency, batch_size and model_memory_gb, or none, and a value you set always wins. Kyber fills only what is unset: before the run it picks the GPU fraction from model_memory_gb, several copies per device for a light model and whole GPUs for a model larger than one GPU, and seeds a starting batch_size from the VRAM left over. That starts the pool. During the run, concurrency=(min, max) adds actors while batches queue and drops back to min, and the throughput controller refines batch_size from measured VRAM and throughput. The run records utilization and peak device memory, and when concurrency is unset the next run packs toward 90% utilization, bounded by the measured peak memory and at most 8 actors per device, and holds the density of any device already at 80% or more.](/_static/diagrams/gpu_pool_sizing.svg)
+
+## Autoscale the pool
+
+Pass `concurrency` as a `(min, max)` tuple to let the pool follow the backlog. The engine adds actors, up to `max`, while batches queue, and releases them, down to `min`, once the stage drains. A bursty workload doesn't pin every GPU for its whole duration.
 
 ```python
 # docs: skip
@@ -106,30 +88,20 @@ ds = bt.read.parquet("data/features.parquet")
 ds.ml.infer(Model, batch_size=512, num_gpus=1, concurrency=(1, 8))
 ```
 
-## Pinning a GPU model
+## Pin a GPU model
 
-`accelerator_type` pins the actors to a specific device, a `ray.util.accelerators`
-name such as `"NVIDIA_A100"` or `"NVIDIA_H100"`. Use it when a model needs a
-particular GPU (enough VRAM, a required compute capability) on a heterogeneous
-cluster.
+`accelerator_type` pins the actors to a device model, named as in `ray.util.accelerators`, such as `"NVIDIA_A100"` or `"NVIDIA_H100"`. Use it on a heterogeneous cluster when a model needs enough VRAM or a particular compute capability.
 
 ```python
 # docs: skip
 ds.ml.infer(Model, num_gpus=1, concurrency=4, accelerator_type="NVIDIA_A100")
 ```
 
-## Letting the engine pack by memory
+## Let the engine pack by memory
 
-`model_memory_gb` declares the model's footprint in gigabytes. State the size once and
-Kyber sizes the stage for you. With `num_gpus` and `batch_size` left unset, it picks the
-GPU fraction from the model's size against one GPU's memory (packing several copies of a
-light model onto one device, or reserving whole GPUs for a model larger than one) and
-seeds the initial `batch_size` from the VRAM left over. The online throughput controller
-then refines that batch size from measured VRAM and throughput. Two other consumers read
-the same number: the resource layer, to budget host RAM per worker (OOM protection), and
-Kyber, to cost an inference stage by size.
+`model_memory_gb` declares the model's footprint in gigabytes, and Kyber sizes the stage from it. With `num_gpus` and `batch_size` unset, it picks the GPU fraction from the model's size against one GPU's memory. A light model gets several copies per device, and a model larger than one GPU gets whole GPUs. It seeds the initial `batch_size` from the VRAM left over, and the online throughput controller refines that from measured VRAM and throughput.
 
-Any value you set yourself is always honored. Kyber fills only what you leave unset.
+The same number budgets host RAM per worker in the resource layer and costs the stage in Kyber. A value you set yourself always wins. Kyber fills only what you leave unset.
 
 ```python
 # docs: skip
@@ -142,19 +114,11 @@ ds.ml.infer(Model, num_gpus=0.25, concurrency=8, batch_size=256, model_memory_gb
 
 ## The num_gpus request adapts across runs
 
-GPU placement is also part of Batcher's adaptive loop. Each actor measures how busy
-the device actually was; that utilization is recorded to the MetadataHub keyed by the
-pipeline, and the next run's effective `num_gpus` adapts. It packs more tasks onto a
-fraction of a device that sat idle, or asks for a whole GPU when one saturated. Your
-declared `num_gpus` is the starting point; the measured load refines it. On a host with
-no measurable utilization (Apple MPS, CPU, or no driver) the loop is a no-op and your
-request stands unchanged.
+GPU placement is part of Batcher's adaptive loop. Each actor measures how busy its device was, the utilization is recorded to the `MetadataHub` keyed by the pipeline, and the next run's effective `num_gpus` adapts. A device that sat idle gets more actors, and a saturated one gets a whole GPU per actor. Your declared `num_gpus` is the starting point. On a host with no measurable utilization, such as Apple MPS, a CPU, or a missing driver, the loop does nothing and your request stands.
 
 ## Accelerators that are not GPUs
 
-`num_gpus` covers everything Ray reports as the `GPU` resource, which means NVIDIA, AMD
-(ROCm), Intel, and MetaX. Every other accelerator is a **named resource** instead, so
-request it with `resources=`:
+`num_gpus` covers everything Ray reports as the `GPU` resource: NVIDIA, AMD through ROCm, Intel, and MetaX. Every other accelerator is a *named resource*, requested with `resources=`:
 
 ```python
 # docs: skip
@@ -168,26 +132,15 @@ ds.map_batches(Model, resources={"neuron_cores": 2}, concurrency=4)
 ds.map_batches(Model, resources={"HPU": 8})
 ```
 
-`resources` is a passthrough to Ray, not a fixed vendor list, so it equally requests a
-resource you defined yourself on an on-prem cluster (`resources={"fpga_slot": 1}`).
-`accelerator_type` works alongside it to pin a device generation
-(`resources={"TPU": 4}, accelerator_type="TPU-V6E"`).
+`resources` is a passthrough to Ray rather than a vendor list, so it also requests a resource you defined on an on-prem cluster, such as `resources={"fpga_slot": 1}`. `accelerator_type` works alongside it to pin a device generation: `resources={"TPU": 4}, accelerator_type="TPU-V6E"`.
 
-Do not pass `num_gpus` for these: a TPU or Trainium node advertises no `GPU` resource, so
-the task would wait for a GPU that never appears rather than failing.
+Don't pass `num_gpus` for these. A TPU or Trainium node advertises no `GPU` resource, so the task waits forever for a GPU instead of failing.
 
-On the model side, `batcher.ml.gpu.detect_backend()` resolves `cuda`, `rocm`, `xpu` (Intel),
-`mps` (Apple), `tpu`, `neuron` (Trainium/Inferentia), `hpu` (Gaudi) and `npu` (Ascend), and
-`torch_device()` maps each to the right torch device string (a TPU or Trainium becomes `xla`,
-Gaudi `hpu`, Ascend `npu`). `resources=` adds the *placement* half. It gets the task onto the
-node that holds the device.
+On the model side, `batcher.ml.gpu.detect_backend()` resolves `cuda`, `rocm`, `xpu` for Intel, `mps` for Apple, `tpu`, `neuron` for Trainium and Inferentia, `hpu` for Gaudi, and `npu` for Ascend. `torch_device()` maps each to its torch device string: a TPU or Trainium becomes `xla`, Gaudi `hpu`, and Ascend `npu`. `resources=` is the placement half that gets the task onto the node holding the device.
 
 ### What each accelerator reports
 
-Placement gets a task onto a device; the adaptive loops need to *read* it. Both loops are
-no-ops on a reading they cannot take, and silently so: with no utilization the packing target
-never applies, and with no memory reading the batch-size climb has no ceiling. This is what
-each backend reports:
+Placement gets a task onto a device, and the adaptive loops then need to *read* it. Both loops silently do nothing without a reading: with no utilization the packing target never applies, and with no memory reading the batch-size climb has no ceiling. The table shows what each backend reports:
 
 | Backend | Utilization | Device memory | Fragmentation and per-process cap | Cache release |
 |---|---|---|---|---|
@@ -198,18 +151,11 @@ each backend reports:
 | `mps` (Apple) | none reported | torch (unified budget) | yes | yes |
 | `tpu`, `neuron` | none reported | none (XLA has no caching allocator) | no | graph step |
 
-Apple, Cloud TPU and Trainium expose no stable per-process utilization counter. They are
-absent from the table's first column on purpose rather than by omission: a fabricated number
-would be worse than the no-op, because the packing loop would then repack a fleet from it. A
-stage on one of those keeps the `concurrency` you declared.
+Apple, Cloud TPU, and Trainium expose no stable per-process utilization counter, and Batcher reports none rather than inventing one that the packing loop would repack a fleet from. A stage on one of them keeps the `concurrency` you declared. `tpu` and `neuron` run through XLA, which has no caching allocator to read fragmentation from and no per-process cap to set, and it releases memory by stepping its execution graph.
 
-`tpu` and `neuron` run through XLA, which has no caching allocator to read a fragmentation
-ratio from, no per-process cap to set, and releases memory by stepping its execution graph
-rather than by emptying a cache.
+## Keep GPUs fed
 
-## Keeping GPUs fed
-
-A GPU sits idle while it waits for data. To avoid that:
+A GPU sits idle while it waits for data. To keep it busy, do the following:
 
 - Run input shaping (decode, filter, feature engineering) in the engine with
   expressions and CPU `map_batches`, so GPU actors receive ready batches.
@@ -219,65 +165,43 @@ A GPU sits idle while it waits for data. To avoid that:
   batches amortize per-call overhead.
 - Raise `concurrency`, and use a fractional `num_gpus`, until the devices are saturated.
 
-### The engine does this for you across runs
+### The engine packs across runs
 
-Leave `concurrency` unset and the packing is measured rather than guessed. Each run records
-the utilization its actors sustained and the peak device memory they used; the next run of the
-same pipeline sizes `num_gpus` so the device lands at **80% utilization**, bounded by what that
-measured peak says memory allows.
+Leave `concurrency` unset and the packing is measured rather than guessed. Each run records the utilization its actors sustained and the peak device memory they used. The next run of the same pipeline packs actors toward 90% utilization, bounded by what that measured peak says memory allows.
 
-Both halves matter and they pull in opposite directions. Packing to utilization alone walks a
-fleet into an out-of-memory; packing to memory alone leaves a cheap model at one actor per
-device with most of the card idle. The loop takes the smaller of the two, so it converges to
-the densest packing that fits.
+The two bounds pull in opposite directions. Packing to utilization alone walks a fleet into an out-of-memory error, and packing to memory alone leaves a cheap model at one actor per device with most of the card idle. The loop takes the smaller of the two, so it converges to the densest packing that fits, capped at eight actors per device.
 
-It settles rather than chases. A device at or above 80% is treated as fed and the density is
-held. Every change rebuilds the pool, which is a model reload on every device, and a measured
-step past a fed device came out both slower and less evenly spread than the density it left
-(2,602 img/s at 77/94/95/75% against 2,787 at 95/93/94/93%). A stage that lands exactly on the
-target computes the same density again and stays there.
+It settles rather than chases. A device at or above 80% counts as fed, and its density is held. Every change rebuilds the pool, which reloads the model on every device, and a measured step past a fed device came out slower and less even than the density it left: 2,602 img/s at 77/94/95/75% against 2,787 at 95/93/94/93%.
 
-Nothing is measured on the very first run, so it starts from what you declared and improves
-from the second.
+A first run has nothing measured. It reserves room for up to two actors per device and starts the second only once the loaded model's footprint shows it fits. The measured loop takes over from the second run.
 
 ### Adding devices adds throughput
 
-The actor pool is sized from the cluster's devices: `total_devices / num_gpus` actors, so
-doubling the fleet doubles the pool. That holds for a named accelerator too: a stage asking
-`resources={"TPU": 4}` opens `cluster_TPU / 4` actors.
+The actor pool is sized from the cluster's devices, `total_devices / num_gpus` actors, so doubling the fleet doubles the pool. A named accelerator works the same way: a stage asking `resources={"TPU": 4}` opens `cluster_TPU / 4` actors.
 
-The thing that used to break it was the input's shape. A partition count is sized from *data*,
-and a 2.4 GB corpus takes the four-partition floor whatever the cluster looks like; sizing the
-pool by devices and then clamping it to partitions let the data decide how many accelerators
-were allowed to work. Both execution paths now raise the parallelism to match the devices
-instead: the batch path shards to one partition per actor, and the streaming path does not
-clamp its consumers at all, since a consumer is fed by the Flight hand-off rather than by a
-partition.
+A partition count is sized from *data*, though, and a 2.4 GB corpus takes the four-partition floor whatever the cluster looks like. Clamping the pool to partitions would let the data decide how many accelerators work. So both execution paths raise parallelism to match the devices. The batch path shards to one partition per actor, and the streaming path doesn't clamp its consumers at all, because the Flight hand-off feeds a consumer rather than a partition.
 
-An explicit `concurrency` is always honored as written. The sizing above applies only when you
-leave it to the engine.
+An explicit `concurrency` is always honored as written. This sizing applies only when you leave it to the engine.
 
 ### Reading the pool's own report
 
 {py:class}`InferencePool <batcher.ml.InferencePool>`, which backs
 {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` and the actor-pool paths,
 publishes a per-batch event carrying the model's latency and `blocked_ms`, the time the
-consumer spent waiting on the pool. That second number is the one that tells you which
-problem you have, because a saturated pool and a starved one look identical in rows per
-second and want opposite fixes:
+consumer spent waiting on the pool. A saturated pool and a starved one look identical in rows per second and want opposite fixes, and `blocked_ms` tells them apart:
 
 | `blocked_ms` | What it means | What to change |
 |---|---|---|
 | Large, close to the batch latency | The pool is the bottleneck; the source keeps up. | More workers, a larger batch, or a smaller model. |
 | Near zero | The pool is starved; it finishes before the next batch arrives. | Speed up the source, or widen the read and decode stages. |
 
-The pool reads its source **ahead** on a background thread, so the read and the forward pass
-overlap instead of taking turns. The depth is two batches by default, which bounds the extra
-resident memory to two batches; `prefetch=` raises it for a slow source and `prefetch=0`
-restores the inline pull.
+The pool reads its source ahead on a background thread, so the read and the forward pass overlap instead of taking turns. The default depth of two batches bounds the extra resident memory to two batches. Raise `prefetch=` for a slow source, or set `prefetch=0` to pull inline.
 
 ## See also
 
 - {doc}`Inference </ml/inference/inference>`: the `infer` / `embed` workflow.
 - {doc}`The ML accessor </api/models/ml>`: the full argument reference.
 - {doc}`Streaming </ml/inference/streaming>`: feed actors with a continuous batch stream.
+- {doc}`/ml/inference/batch-scoring`: a full scoring job, with the pool-sizing table.
+- {doc}`/ml/inference/runtimes`: ONNX Runtime providers, TensorRT, and OpenVINO on the same pool.
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: how the actor pool works inside.

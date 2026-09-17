@@ -1,6 +1,8 @@
 # Column profiles
 
-Reach for this before you write a data-quality rule. A guessed threshold is how a check ends up rejecting good rows. Ask the column what it holds, then encode that answer as the rule.
+Reach for this before you write a data-quality rule. A guessed threshold is how a check ends up rejecting good rows, so ask the column what it holds and encode that answer as the rule.
+
+The script profiles single columns through `ds.meta.col(...)`: bounds and midpoint, null fraction and completeness, uniqueness and duplicate count, constancy, and the low-cardinality and binary-valued hints that drive an encoder choice. It then uses the dataset-level null accounting and `is_key` to check a composite key on a table with no single unique column.
 
 The whole script, executed on every test run:
 

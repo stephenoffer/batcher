@@ -23,7 +23,6 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
 
    greatest
    least
-   atan2
    arctan2
    hypot
    great_circle_distance
@@ -165,8 +164,6 @@ These reduce *across* the listed expressions within one row, rather than down a 
    :toctree: generated
    :nosignatures:
 
-   min_horizontal
-   max_horizontal
    sum_horizontal
    mean_horizontal
    count_horizontal
@@ -180,7 +177,7 @@ These reduce *across* the listed expressions within one row, rather than down a 
 ## Aggregate and window functions
 
 Use these in {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` or {py:meth}`.over(...) <batcher.AggExpr.over>` window frames. The ranking and
-value functions are window-only: bind them with `.over(partition_by=…, order_by=…)`.
+value functions are window-only: bind them with `.over(partition_by=..., order_by=...)`.
 
 ```{eval-rst}
 .. autosummary::
@@ -195,10 +192,10 @@ value functions are window-only: bind them with `.over(partition_by=…, order_b
    median
    std
    var
-   n_unique
+   count_distinct
    product
    mode
-   skewness
+   skew
    kurtosis
    bool_and
    bool_or
@@ -209,7 +206,7 @@ value functions are window-only: bind them with `.over(partition_by=…, order_b
    quantile
    approx_quantile
    approx_median
-   approx_n_unique
+   approx_count_distinct
    histogram
    count_if
    corr

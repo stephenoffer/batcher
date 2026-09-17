@@ -1,188 +1,105 @@
 # vs Daft
 
-This page compares Batcher against Daft on single-node and distributed work.
+This page compares Batcher with Daft on single-node analytics, multimodal ingest and distributed pipelines.
 
-Daft is a mature, fast, multi-core Rust engine, roughly DuckDB-class, with about 4 ms of fixed overhead. It is the closest competitor Batcher has on single-node compute. Batcher takes multimodal ingest and top-N by large margins, takes the distributed join by 1.7x to 2.2x, ties on aggregation and single-stage expression ETL, and on 96 cores takes 18 of the 19 TPC-H queries both engines answer.
+Daft is a fast multi-core Rust engine with a strong multimodal story, which makes it Batcher's closest peer on AI data work. Batcher is faster on every analytical suite measured against it, often by 5x to 10x, takes image decode by about 2x, and takes the distributed join by 1.7x to 2.2x on the same Ray cluster.
 
 :::{important}
-Daft computes TPC-H **q6 wrong**: it folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row, and returns 75.2M where
-the correct revenue is 123.1M. The harness declines to time a query whose result does not
-match the oracle, so Daft gets no number on q6 rather than a fast one. Every timing on this
-page passed that gate first.
+Every timing passed the correctness gate first, and the gate catches Daft on several TPC-H queries. Daft returns the wrong revenue on q6, folding `0.06 + 0.01` in IEEE double to `0.06999999999999999` and dropping every `l_discount = 0.07` row, and returns 75.2M where the correct answer is 123.1M. A wrong answer gets no ratio, so Daft's geomeans below cover only the queries it answers correctly.
 :::
 
-## Scorecard
+## The suites
 
-Each row is one workload shape, the engine that won it, and by how much. **The multiples in
-this table are speedups: bigger is a wider win for whoever is named.** Every other table on
-this page states its own convention, and two of them are time ratios where lower is better,
-so check the lead-in before reading a number off one:
+The five-engine board of 2026-08-28 ran on a 92-core box, best of five at sf1 and best of three at sf10, one process per suite. Each cell is a suite geomean of `batcher_ms / daft_ms`, so **below 1.00 means Batcher is faster**:
 
-| Shape | Winner |
-|---|---|
-| Image decode → tensor | Batcher, 1.9×–2.4× (machine-dependent) |
-| Image curation / augmentation | Batcher, 5.7x, against a per-row PIL UDF; Daft has no native equivalent |
-| Audio preprocessing | Batcher; Daft has no native audio surface |
-| Top-N / sort-limit | Batcher, 8x to 10x |
-| In-memory filter / sum kernels | Batcher, 6.7× / 18× |
-| Global aggregate, group-by, expression ETL | Tie |
-| Distributed join (sf1 to sf100) | Batcher, 1.7x to 2.2x |
-| Distributed `filter → count` (sf10, sf100) | Daft, 0.84x to 0.92x |
-| TPC-H multi-join queries | Depends on cores: **Daft up to 2x** at 16, **Batcher on 18 of 19** at 96 |
-| Per-batch Python UDF | **Daft, ~2×** |
+| Suite | vs Daft |
+|---|---:|
+| Semi-structured JSON | **0.04** |
+| Operator mix | **0.07** |
+| ClickBench | **0.11** |
+| TPC-H sf10 | **0.17** |
+| TPC-H sf1 | **0.21** |
+| H2O.ai `join` | **0.34** |
+| H2O.ai `groupby` | **0.38** |
 
-:::{note}
-This page mixes three machines. The multimodal table below is a 96-core node, the kernel and
-TPC-H tables are a 16-core node, and the distributed table is a 128-CPU Ray cluster. Compare
-engines within a table, never a number from one table against a number from another. {doc}`/benchmarks/methodology` has the full list.
-:::
+The 2026-07-28 TPC-H board, on a c5d.24xlarge with 96 vCPU, read the same way per query: Batcher faster on 17 of the 18 queries Daft answers correctly at sf1. An earlier operator sweep put Batcher ahead of Daft on all 11 operators, and Daft couldn't complete any of the four window operators on `lineitem`, where `RANK` over about 1.5M partitions hangs and Batcher returns in about 148 ms.
 
 ## Multimodal ingest
 
-One 96-core node, best-of-3 warm, gated on identical frame counts and output shapes. 2,000
-JPEG frames, 640×480 → 224×224:
+The benchmark decodes 2,000 JPEG frames and resizes them from 640x480 to 224x224, gated on identical frame counts and output shapes. On an idle 96-core node, best of three warm (2026-07-11):
 
 | Engine | Time | Throughput | Batcher's lead |
-|---|---:|---:|:---:|
-| **Batcher** | 351 ms | 5,693 img/s | baseline |
+|---|---:|---:|---:|
+| **Batcher** | 351 ms | 5,693 img/s | |
 | Daft | 838 ms | 2,388 img/s | **2.4x** |
 
-This path started at about 350 img/s, and five fixes took it to 5,693. The one that matters
-for the comparison is the media-decode throttle: the per-row decode kernels ran serially, and
-the parallel executor capped its rayon pool to the morsel count. A small-JPEG corpus is a
-single morsel, so the entire decode ran on one core. See {doc}`/benchmarks/results/multimodal-ingest` for the rest.
+A later run on the same node under load from other sessions, after two read-side fixes, measured Batcher at 4,649 to 4,788 img/s against Daft 0.7.23 at 2,368 to 2,565, a lead of **1.87x to 1.96x**. Contention costs the wider engine more, so read the busy-node figure as a floor. {doc}`/benchmarks/results/multimodal-ingest` has both runs and the fixes behind them.
 
-A later run of the same benchmark on a **busy** 96-core node (18 to 22 competing test
-processes, load average 13) measured 3,041 to 3,427 img/s against Daft's 2,272 to 2,625, so
-**1.3x**. Both numbers are real: contention costs the wider engine more than the narrower
-one, so read the lower figure as a floor.
+Past decode the comparison changes shape. Daft has no native entropy measure, perceptual hash or photometric adjustment, so screening and augmenting a corpus is a per-row Pillow UDF for a Daft user. Batcher's native expressions ran the same three measures on the same 2,000 frames **5.7x** faster than a per-row Pillow loop. `entropy`, `phash`, `ahash`, `colorfulness`, `mean_color`, `is_grayscale`, the photometric adjustments and the geometry family are engine expressions in Batcher and user code in Daft.
 
-Profiling that 1.3x found that most of the remaining gap was not decode. Two things on the
-*read* side cost more than the kernels they fed: the per-file header parse ran regardless of
-whether the projection asked for it, and local file reads were fanned across a thread pool,
-which is right for an object store and **2.5x slower** than a serial loop for a syscall on
-page cache (2,000 local JPEGs: 52 ms serial, 118 ms on 8 threads, 130 ms on 64). Both are
-fixed. On the same busy node, load 13 to 17:
+## Top-N
 
-| Engine | Time | Throughput | Batcher's lead |
-|---|---:|---:|:---:|
-| **Batcher** | 418-430 ms | 4,649-4,788 img/s | baseline |
-| Daft | 780-845 ms | 2,368-2,565 img/s | **1.9x** |
-
-Take the ratio you can reproduce on your own hardware rather than any of ours.
-
-## Curation and augmentation
-
-The comparison changes shape once the pipeline moves past decode. Daft has no native entropy
-measure, perceptual hash, or photometric adjustment, so the screening-and-augmentation pass a
-corpus needs is a per-row PIL UDF for a Daft user. Against that baseline, the same three
-measures on the same bytes, Batcher's native expressions run **5.7x** faster
-(1,298 ms against 7,361 ms for 2,000 frames):
-
-```bash
-python benchmarks/scenarios/image_decode.py --suite curate
-```
-
-This is a vocabulary difference before it is a speed difference. `entropy`, `phash`,
-`ahash`, `colorfulness`, `mean_color`, `is_grayscale`, the eleven photometric adjustments
-and the geometry family are engine expressions here and user code there.
-
-## In-memory kernels
-
-The kernel microbenchmark recorded in `benchmarks/BENCHMARK_RESULTS.md` loads roughly 60M
-TPC-H rows into Arrow once and times each engine's kernels with no I/O in the way. Single
-node, 16 cores. Its driver script is no longer in the tree, so the record is the only source:
-
-| Operator | Batcher | Daft | Batcher's lead |
-|---|---:|---:|:---:|
-| filter | 28 ms | 188 ms | **6.7x** |
-| sum | 10 ms | 181 ms | **18x** |
-| group-by | 359 ms | 487 ms | **1.4x** |
-
-Hold on to this table. It is what makes the next one interesting.
-
-The full 11-case operator mix goes the same way: the latest sweep in `benchmarks/BENCHMARK_RESULTS.md` has **Batcher ahead of Daft on all 11**, and Daft unable to finish `op-window-rank` at all, where `RANK` over roughly 1.5M partitions hangs and Batcher returns in about 148 ms.
-
-## Multi-join SQL
-
-A re-run at scale factor 1 on a 96-core node put **Batcher ahead on 18 of the 19 queries both engines answer**, including q20 at 0.80x, q3 at 0.52x, q17 at 0.20x and q5 at 0.80x. These are `batcher / daft` time ratios, so below 1 means Batcher is faster. The join result is a function of core count, so quote the machine with the number. {doc}`/benchmarks/results/tpch` carries the full per-query table.
-
-The parallel radix join and the whole-partition window kernel are what moved this shape, taking q3 to 1.55x at 16 cores and to 0.52x at 96.
-
-One thing did move by a plan change rather than a kernel change. Kyber's build-side
-selection used to check broadcast eligibility only on the join's *right* input, so when the
-small side arrived on the left the join fell back to shuffling a 6M-row build. Broadcast is
-now decided from `min(left_bytes, right_bytes)`. q3 went from 7.7x to 3.8x, and the q5 `orders` to `lineitem` join from 419 ms to 175 ms.
-
-## Where Batcher wins: top-N
-
-`ORDER BY ... DESC LIMIT 20` over sf1 takes 15 ms against Daft's 121 ms, an **8.1x** lead. A fused top-N heap keeps the running best *k* rows, where Daft sorts the relation and then takes twenty. Sort-limit runs 8x to 10x ahead across the shapes tested.
+`ORDER BY ... LIMIT` is Batcher's widest single-operator margin over Daft. A fused top-N heap keeps only the running best rows, where Daft sorts the relation and then takes the head. Sort-limit ran 8x to 10x ahead at TPC-H sf1 in the record's Daft comparison.
 
 ## Distributed
 
-Both engines on the same live Ray cluster (16 worker nodes x 8 CPUs, 128 CPUs, plus a
-0-CPU head), each reading TPC-H parquet directly from S3, so the distributed read is part of
-the measured work. Daft runs its Ray runner (flotilla), not its local engine. Ratio is
-`daft_ms / batcher_ms`, so **above 1 means Batcher is faster**.
+Both engines attach to the same live Ray cluster, 16 worker nodes of 8 CPUs each (128 CPUs) plus a head node with no CPUs, and read TPC-H Parquet directly from S3, so the distributed read is part of the measured work. Daft runs its Ray runner rather than its local engine (2026-07-12). Ratios here are `daft_ms / batcher_ms`, so **above 1 means Batcher is faster**:
 
 | Pipeline | sf1 | sf10 | sf100 |
 |---|---:|---:|---:|
-| `scan_count` | **162×** | **208×** | **250×** |
-| `join` | **2.23×** | **1.73×** | **1.72×** |
-| `groupby` | 1.03× | **1.18×** | **1.30×** |
-| `filter_count` | 1.18× | 0.92× | 0.84× |
+| `scan_count` | **162x** | **208x** | **250x** |
+| `join` | **2.23x** | **1.73x** | **1.72x** |
+| `groupby` | 1.03x | **1.18x** | **1.30x** |
+| `filter_count` | **1.18x** | 0.92x | 0.84x |
 
-Batcher takes the join, the group-by, and the metadata-only count. `filter_count` is the
-most purely S3-bound shape in the grid: scan one column, filter, count. Both engines read the
-same bytes from the same store, so that row measures object-store read throughput rather than
-execution, and neither engine can pull far ahead once both are near the network's line rate.
-The margins that matter here are on the compute-bound shapes, where the join and the top-N
-results sit.
+Batcher takes the join at every scale, the group-by lead widens with the data, and the metadata count never scans at all. `filter_count` is the most purely S3-bound pipeline in the grid, so that row measures object-store read throughput rather than execution.
 
-:::{dropdown} The superseded diagnosis, and why it was wrong
-An earlier round of this benchmark had Batcher ~10× *behind* Daft at sf100 and diagnosed it
-as a distributed-scan throughput ceiling. That diagnosis was wrong about the depth of the
-problem. The dominant cause was a control-plane bug: the cluster-fill fan-out was dead, so
-any query that ran with Ray already initialized used 2 of 16 workers. Fixing it, with five
-other data-movement bugs, produced the table above. The superseded section is kept in
-`benchmarks/BENCHMARK_RESULTS.md`. {doc}`/benchmarks/results/scaling` tells the whole story.
+GPU inference is measured end to end on a cluster too. Scoring 100,000 images on six single-T4 nodes with the identical seeded network, Batcher finished in 18.72 s against Daft's 101.10 s, **5.40x** faster, with matching checksums (2026-09-06).
+
+:::{dropdown} An earlier diagnosis, and why it was wrong
+An earlier round of the distributed benchmark put Batcher about 10x behind Daft at sf100 and blamed distributed-scan throughput. The dominant cause was a control-plane bug: the cluster-fill fan-out was dead, so any query that ran with Ray already initialized used 2 of 16 workers. Fixing it, with several data-movement bugs, produced the table above. {doc}`/benchmarks/results/scaling` tells the whole story.
 :::
 
 ## Correctness
 
-The harness declines to time a query whose result does not match DuckDB, so a wrong answer
-gets no number rather than a fast one. At sf1 that gate catches Daft on five of the 22:
+At sf1 the gate catches Daft on five of the 22 TPC-H queries. The following table lists what it does:
 
 | Query | What Daft does |
 |---|---|
-| q6 | Folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row: returns 75.2M where the correct revenue is 123.1M |
-| q15 | Returns 0 rows where DuckDB returns 1 |
+| q6 | Folds `0.06 + 0.01` in IEEE double, dropping every `l_discount = 0.07` row: 75.2M where the answer is 123.1M |
+| q15 | Returns 0 rows where the answer has 1 |
 | q18 | Returns `l_quantity` where the query asks for `sum(l_quantity)` |
-| q21 | `DaftError::InternalError: Outer reference columns cannot be bound` |
-| q22 | Cannot parse `SUBSTRING(x FROM a FOR b)` |
+| q21 | Can't plan the correlated subquery: `Outer reference columns cannot be bound` |
+| q22 | Can't parse `SUBSTRING(x FROM a FOR b)` |
 
-Daft also disagrees with SQL on window frames outside TPC-H: `sum(x) OVER (PARTITION BY k
-ORDER BY o)` returns the whole-partition sum where the default frame is `RANGE UNBOUNDED
-PRECEDING TO CURRENT ROW`, so on `v = [10, 20, 30]` it gives `60, 60, 60` against DuckDB's
-and Batcher's `10, 30, 60`.
+Batcher matches DuckDB on all 22.
 
-Batcher matches DuckDB on all 22, and on the window frame. Where this page reports a speed
-loss it means it; correctness is a separate axis and Batcher does not lose on it.
+## Requirements and limitations
+
+The following results are where Daft leads or where a figure needs its context:
+
+- **Distributed `filter_count`** at sf10 and sf100 reads 0.92x and 0.84x, on the shape bound by object-store reads.
+- **A per-batch Python UDF** ran about 2x faster on Daft in the record's single-node comparison.
+- **Multimodal ratios depend on the machine and its load**, from 1.9x on a busy node to 2.4x on an idle one. Reproduce the ratio on your own hardware before quoting one.
 
 ## Reproduce
 
+The following commands rerun each result. `vs_ray_daft.py` takes one scale factor per run:
+
 ```bash
 python benchmarks/run.py --benchmark tpch --engines batcher,daft
+python benchmarks/run.py --benchmark operators --tier multi
 python benchmarks/scenarios/image_decode.py
+python benchmarks/scenarios/image_decode.py --suite curate
 python benchmarks/cluster/vs_ray_daft.py 10
+python benchmarks/gpu_backend/vs_ray_daft_gpu_inference.py
 ```
 
 ## See also
 
 - {doc}`/benchmarks/results/tpch` for the query-by-query picture.
-- {doc}`/benchmarks/results/multimodal-ingest` for the image and point-cloud pipelines.
-- {doc}`/benchmarks/results/scaling` for the full distributed cluster runs.
+- {doc}`/benchmarks/results/multimodal-ingest` for the image, point-cloud, audio and video pipelines.
+- {doc}`/benchmarks/results/scaling` for the full distributed runs.
 - {doc}`/benchmarks/comparisons/vs-duckdb` for the scorecard against the other native engine.
-- {doc}`/architecture/deep-dives/operators/join-algorithms` and {doc}`/architecture/deep-dives/operators/morsel-parallelism` for the two mechanisms the loss lives in.
-- {doc}`/architecture/deep-dives/adaptive/cost-model` for the build-side selection that took q3 from 7.7x to 3.8x.
+- {doc}`/architecture/deep-dives/operators/sort-internals` for the fused top-N heap.
 - {doc}`/user-guide/transform/columns/udfs` for why a per-batch Python callback costs what it costs.

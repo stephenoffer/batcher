@@ -1,10 +1,10 @@
 # Scaling and distributions
 
 Two different problems hide under "scale this column". If features sit on different
-scales and a distance or a gradient step is dominated by the largest one, you want a
-scaler. If a column is heavily skewed, a scaler will not help: it moves the numbers and
-leaves the shape exactly where it was, and you want a distribution reshaper instead.
-This page covers both, plus the row-wise normalizer and the rank and label transforms.
+scales and the largest one dominates a distance or a gradient step, you want a scaler. If a
+column is heavily skewed, a scaler won't help. It moves the numbers and leaves the shape
+where it was, so you want a distribution reshaper instead. This page covers both, plus the
+row-wise normalizer and the rank and label transforms.
 
 ## Scaling numeric columns
 
@@ -23,9 +23,9 @@ print([round(v, 3) for v in scaled.column("age").to_pylist()])
 # [-1.342, -0.447, 0.447, 1.342]
 ```
 
-The fitted statistics live on the object, so the *same* scaler standardizes a held-out
-split with the training mean and standard deviation. Never refit on validation data. The
-two splits then sit on different scales, and nothing tells you:
+The fitted statistics live on the object, so the same scaler standardizes a held-out split
+with the training mean and standard deviation. Never refit on validation data. The two
+splits would then sit on different scales, and nothing would tell you:
 
 ```python
 val = bt.from_pydict({"age": [35.0], "score": [2.5]})
@@ -55,17 +55,18 @@ print(RobustScaler(["x"]).fit_transform(ds).collect().column("x").to_pylist())
 # [-1.0, -0.5, 0.0, 0.5, 1.0]
 ```
 
-A constant column is never divided by zero. Zero variance, zero range, zero IQR: the
-scaler falls back to a scale of 1.0, or maps to the bottom of `feature_range` for
-`MinMaxScaler`, so the column survives the transform unchanged.
+No scaler divides a constant column by zero. `StandardScaler` and `RobustScaler` fall back
+to a scale of 1.0, so the column comes out centered. `MaxAbsScaler` leaves an all-zero
+column as it is, and `MinMaxScaler` maps a constant column to the bottom of
+`feature_range`. You get finite values, never NaN.
 
 ### Normalizing per row
 
 {py:class}`Normalizer <batcher.ml.preprocessors.Normalizer>` is the row-wise scaler. It divides each row by its norm across the
-named columns, so every row comes out a unit vector. Nothing is learned, and this is one
-of the transforms that doesn't enforce the `fit` call, so `transform` straight after
-construction works. The default `norm="l2"` divides by the square root of the sum of
-squares, `"l1"` by the sum of absolute values, and `"max"` by the largest absolute value.
+named columns, so every row comes out a unit vector. Nothing is learned, so `transform`
+works straight after construction with no `fit`. The default `norm="l2"` divides by the
+square root of the sum of squares, `"l1"` by the sum of absolute values, and `"max"` by the
+largest absolute value.
 
 ```python
 import batcher as bt
@@ -81,13 +82,15 @@ print(normalized.column("b").to_pylist())
 
 ## Reshaping a distribution
 
-Scaling changes a column's units. These change its *shape*, which is what a linear model,
-a distance metric, and a neural net actually need. Standardize a log-normal column and it
-comes out just as skewed, with a mean still sitting at the 70th percentile.
+Scaling changes a column's units. The transforms in this section change its *shape*, and
+shape is often what a linear model, a distance metric, or a neural net needs fixed.
+Standardize a log-normal column and it comes out just as skewed as it went in.
 
-{py:class}`QuantileTransformer <batcher.ml.preprocessors.QuantileTransformer>` is the most aggressive and the most reliable: it keeps only the
-*order* of the values, so the output is uniform whatever went in and an outlier cannot
-survive it.
+{py:class}`QuantileTransformer <batcher.ml.preprocessors.QuantileTransformer>` is the most aggressive and the most reliable. It keeps only the
+*order* of the values, learning `n_quantiles` cut points in one aggregate, so the output is
+uniform whatever went in and an outlier can't survive it. Pass
+`output_distribution="normal"` for a standard-normal shape instead. The mapping is a step
+function with `n_quantiles` steps, not an interpolation.
 
 ```python
 import batcher as bt
@@ -97,10 +100,10 @@ ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 1000.0]})
 print(QuantileTransformer("x", n_quantiles=4).fit_transform(ds).to_pydict())
 ```
 
-{py:class}`PowerTransformer <batcher.ml.preprocessors.PowerTransformer>` is the data-driven middle ground. It finds the Yeo-Johnson power
-that makes the column most Gaussian by maximum likelihood, in one pass. The likelihood at
-every candidate lambda is an aggregate, so the whole grid is evaluated together instead of
-one scan per optimizer iteration.
+{py:class}`PowerTransformer <batcher.ml.preprocessors.PowerTransformer>` is the data-driven middle ground. It picks the Yeo-Johnson power
+that makes the column most Gaussian by maximum likelihood. The likelihood at every
+candidate lambda is an aggregate, so one pass evaluates the whole grid rather than one scan
+per optimizer iteration.
 
 ```python
 from batcher.ml.preprocessors import PowerTransformer
@@ -109,7 +112,7 @@ skewed = bt.from_pydict({"x": [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]})
 print(PowerTransformer("x").fit(skewed).lambdas_["x"] < 0.5)
 ```
 
-{py:class}`BoxCoxTransformer <batcher.ml.preprocessors.BoxCoxTransformer>` fits the same way on the Box-Cox family, which is what most statistics tooling means by "the Box-Cox transform". It needs strictly positive values and raises on anything else rather than producing NaNs, so use it when reproducing an existing Box-Cox analysis and `PowerTransformer` when the column can be zero or negative.
+{py:class}`BoxCoxTransformer <batcher.ml.preprocessors.BoxCoxTransformer>` fits the same way on the Box-Cox family. It needs strictly positive values and raises on anything else rather than producing NaNs. Use it to reproduce an existing Box-Cox analysis, and `PowerTransformer` when the column can be zero or negative.
 
 ```python
 from batcher.ml.preprocessors import BoxCoxTransformer
@@ -118,18 +121,16 @@ positive = bt.from_pydict({"x": [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]})
 print(-2.0 <= BoxCoxTransformer("x").fit(positive).lambdas_["x"] <= 2.0)
 ```
 
-{py:class}`LogTransformer <batcher.ml.preprocessors.LogTransformer>` is the version an analyst can defend to a stakeholder: `log1p` is exactly
-right for a multiplicative quantity, it is stateless, and it needs no explanation of what a
-lambda of 0.3 means.
+{py:class}`LogTransformer <batcher.ml.preprocessors.LogTransformer>` is the one you can explain to a stakeholder. `log1p` suits a
+multiplicative quantity, it's stateless, and nobody has to ask what a lambda of 0.3 means.
 
-{py:class}`Clipper <batcher.ml.preprocessors.Clipper>` clamps into a learned quantile range rather than dropping anything, so the row
-count and every join key survive. Applying the *training* cut points to serving data is the
-point: a new record-breaking value is clamped rather than extrapolated into a region the
-model never saw.
+{py:class}`Clipper <batcher.ml.preprocessors.Clipper>` clamps into a learned quantile range instead of dropping rows, so the row count
+and every join key survive. The training cut points apply to serving data too. A new
+record-breaking value gets clamped, not extrapolated into a region the model never saw.
 
 {py:class}`MissingIndicator <batcher.ml.preprocessors.MissingIndicator>` records which values were missing *before* an imputer fills them.
-Missingness is usually a signal. A blank income field means something different from a low
-one, and once the imputer has run there is no way back to the distinction.
+Missingness is often a signal. A blank income field means something different from a low
+one, and once the imputer has run the distinction is gone.
 
 ```python
 from batcher.ml.preprocessors import Chain, MissingIndicator, SimpleImputer
@@ -141,9 +142,13 @@ print(flagged.to_pydict()["income_missing"])
 
 ## Rank and label transforms
 
-{py:class}`RankTransformer <batcher.ml.preprocessors.RankTransformer>` replaces a value with its percentile rank. Like `QuantileTransformer` it
-keeps only the order and is immune to outliers, but it is exact (every distinct value gets its
-own rank) rather than binned, which matters on a small column.
+{py:class}`RankTransformer <batcher.ml.preprocessors.RankTransformer>` replaces a value with its percentile rank in `[0, 1]`. Like
+`QuantileTransformer` it keeps only the order and ignores outliers. Unlike it, the rank is
+exact rather than binned, which matters on a small column.
+
+The rank has no fitted state. It is computed within the frame being transformed, so a
+serving row is ranked against its serving batch, not against the training set. Use it on a
+whole dataset, not as a train/serve transform.
 
 ```python
 import batcher as bt
@@ -153,13 +158,15 @@ ds = bt.from_pydict({"x": [10.0, 40.0, 20.0, 1000.0]})
 print(RankTransformer("x").fit_transform(ds).to_pydict()["x"])
 ```
 
-{py:class}`LabelBinarizer <batcher.ml.preprocessors.LabelBinarizer>` one-vs-rest expands a categorical *label* into a 0/1 column per class. It is the
-target-side counterpart of one-hot encoding, for a per-class metric or a set of binary models.
-{py:class}`MultiLabelBinarizer <batcher.ml.preprocessors.MultiLabelBinarizer>` does the same for a *list* column, where a row can carry many labels at
-once (tags, genres), which is the standard input shaping for a multi-label classifier.
+{py:class}`LabelBinarizer <batcher.ml.preprocessors.LabelBinarizer>` expands a categorical *label* into one 0/1 column per class, one-vs-rest. It is
+the target-side counterpart of one-hot encoding, for a per-class metric or a set of binary
+models. {py:class}`MultiLabelBinarizer <batcher.ml.preprocessors.MultiLabelBinarizer>` does the same for a list column where a row carries
+several labels at once, such as tags or genres. That is the usual input shape for a
+multi-label classifier.
 
 ## See also
 
-- {doc}`/ml/preparing/preprocessors/encoding`: the categorical half of the same job.
+- {doc}`/ml/preparing/preprocessors/encoding`: the categorical half of the same job, plus imputation.
+- {doc}`/ml/preparing/preprocessors/pipelines`: chaining a scaler behind an imputer and saving the fitted state.
 - {doc}`/ml/preparing/preprocessors/index`: the fit/transform contract and the full preprocessor table.
 - {doc}`/ml/evaluation/statistics-and-drift`: the statistics that tell you which transform a column needs.

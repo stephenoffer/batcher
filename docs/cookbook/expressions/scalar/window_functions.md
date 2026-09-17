@@ -1,6 +1,8 @@
 # Window functions
 
-The difference from `group_by` is that the row count is preserved. That is what you want for a running total, a rank within a partition, or a comparison against the previous row.
+A window function computes a value for each row from a set of related rows. The difference from `group_by` is that the row count is preserved, which is what you want for a running total, a rank within a partition, or a comparison against the previous row.
+
+The script uses `.over(...)` to broadcast a partition total back to every row, ranks rows within a region with `row_number` and `dense_rank`, accumulates a running total with `cum_sum`, and reads the previous day's value with `shift` and the change with `diff`. It ends on the classic use of a broadcast aggregate, a share-of-total column.
 
 The whole script, executed on every test run:
 

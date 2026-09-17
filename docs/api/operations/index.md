@@ -1,6 +1,6 @@
 # Running it
 
-The knobs, the guardrails, and what raises when something breaks.
+This section is the reference for running Batcher in production: the tunables and how they're set, continuous queries, access policy, and the typed exceptions a failure raises. Every one subclasses `BatcherError`, and several also subclass the matching Python builtin, so existing `except` clauses keep working.
 
 | Page | Covers |
 |---|---|

@@ -1,8 +1,6 @@
 # Lists, structs, and JSON
 
-The nested types, which the engine handles in place rather than by exploding to rows and regrouping.
-
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
+Lists, structs, maps, and JSON text, all handled in place by the engine rather than by exploding to rows and regrouping. Start with list basics for indexing and `explode`, then list transforms for mapping over elements with an expression. Is your list column an embedding? Read the vectors recipe.
 
 | Recipe | What it shows |
 |---|---|

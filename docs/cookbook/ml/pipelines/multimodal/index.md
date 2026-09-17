@@ -1,8 +1,6 @@
 # Images, audio, and video
 
-These pipelines run a model over media. The decode in front of the model is usually the
-constraint rather than the model itself, so each recipe is mostly about keeping the device
-busy while the CPU turns files into tensors.
+These pipelines run a model over media. The decode in front of the model is usually the constraint rather than the model itself, so each recipe is mostly about keeping the device busy while the CPU turns files into tensors.
 
 | Pipeline | What it builds |
 |---|---|

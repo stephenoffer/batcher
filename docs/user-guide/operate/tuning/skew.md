@@ -1,9 +1,6 @@
 # Skewed keys and hostile data shapes
 
-This page describes what happens when a query's memory use is decided by the *shape* of the
-data rather than its size, and what Batcher does about it. Read it when a job that fits your
-memory budget on paper dies anyway, or when you want to know which shapes still have a hard
-ceiling.
+This page describes what happens when the *shape* of the data, rather than its size, decides a query's memory use, and how Batcher keeps those queries inside their budget. Read it when a job that fits your memory budget on paper dies anyway, or when you want to know which shapes still have a hard ceiling.
 
 ## What key skew is
 
@@ -83,6 +80,16 @@ You do not control this directly, and you should not need to. What you can contr
 estimate it corrects: a source with current statistics gives the planner the right answer
 the first time, which saves the correction rather than the join.
 
+## Hot keys on a cluster
+
+A distributed join adds a second cost to skew: every row of a hot key crosses the shuffle to one reducer. Batcher finds those keys and spreads them. A heavy-hitters sketch marks a value as hot when it covers `distributed.skew_join_fraction` of the rows, 10% by default. The probe side's hot rows then fan out across several reducers, and the build side's matching rows are copied to each of them. Cold keys hash exactly as before, so the joined relation is unchanged.
+
+The figure shows one hot key on a four-reducer shuffle, before and after salting:
+
+![Two panels show a probe side whose customer_id of -1 covers most rows, shuffled to four reducers. Before salting, the shuffle hashes on the key alone, so every -1 row lands on reducer 0, which carries almost all the load while reducers 1 to 3 hold only cold keys; no bucket count or re-hash separates rows that share a key. After salting, the sketch has marked -1 as hot, and its rows are split across reducers 0, 1 and 2, each also receiving a copy of the matching build-side rows, while reducer 3 still holds only cold keys hashed as before, so the joined relation is unchanged. A key counts as hot when it covers distributed.skew_join_fraction of the rows, 10% by default.](/_static/diagrams/skew_hot_key_salting.svg)
+
+Detection is learned, not repeated. The hot-key list for a join shape is stored in the metadata hub, so the next run salts with no detection pass, and a shape measured as uniform never runs the pass again. `distributed.skew_join_salt` controls the fan-out: `0`, the default, leaves both the decision and the fan-out to the measurement, a positive value forces detection and pins the fan-out, and a negative value turns salting off. {doc}`/architecture/deep-dives/distribution/distributed-scheduling` covers the mechanism.
+
 ## Skew in an aggregation
 
 An aggregation is not vulnerable to skew the way a join is. Every row of a group folds into
@@ -122,12 +129,12 @@ sort at all: the join compares each right row against the left key column direct
 table, a set of price bands or a handful of date ranges is therefore the least expensive shape
 to join on, whatever the left side's size.
 
-Every operator that cannot spill refuses the same way, so one `except` covers them:
+Every operator that can't spill refuses the same way. `MemoryBudgetExceededError` is a {py:exc}`bt.ResourceError <batcher.ResourceError>`, so one `except bt.ResourceError` covers all of them:
 
 ```python
 from batcher._internal.errors import MemoryBudgetExceededError
 
-print(issubclass(MemoryBudgetExceededError, Exception))
+print(issubclass(MemoryBudgetExceededError, bt.ResourceError))
 # True
 ```
 
@@ -175,5 +182,7 @@ print(resolved.collect().num_rows)
 
 - {doc}`Performance and memory <performance>`: the memory envelope and the rest of the levers.
 - {doc}`Reading query plans <explain-plans>`: finding which operator is actually costing you.
+- {doc}`large-tables`: bucket counts, and why more buckets don't fix a hot key.
+- {doc}`/user-guide/analyze/joins`: the join flavors and how to choose one.
 - {doc}`/user-guide/operate/running/troubleshooting`: what a query that dies looks like from
   the outside.

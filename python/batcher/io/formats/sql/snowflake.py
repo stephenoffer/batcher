@@ -259,7 +259,9 @@ class SnowflakeSink:
 
     Args:
         connection_kwargs: ``snowflake.connector.connect`` kwargs (never logged).
-        mode: ``"append"`` (default) or ``"overwrite"`` the destination table.
+        mode: ``"append"`` or ``"overwrite"`` the destination table. The field defaults to
+            ``"append"``, but ``ds.write.snowflake`` passes ``"overwrite"`` unless told
+            otherwise.
     """
 
     connection_kwargs: dict[str, Any] = field(repr=False)

@@ -2028,7 +2028,7 @@ class Writer:
             table: Destination Snowflake table name.
             opts: ``connection_kwargs=`` — a dict passed to the Snowflake connector
                 (``account``, ``user``, ``warehouse``, ``database``, …) — plus
-                ``mode=`` (``"append"`` or ``"overwrite"``).
+                ``mode=`` (``"overwrite"``, the default, or ``"append"``).
 
         Returns:
             A `WriteManifest` describing the written rows.

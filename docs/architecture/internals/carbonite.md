@@ -1,11 +1,6 @@
 # Carbonite
 
-Carbonite is the resource manager. It decides whether a plan is feasible, hands
-out memory reservations and shuffle credits, and decides when a query must spill.
-It does nothing else. It never rewrites a plan (that is Kyber) and never
-computes a result (that is the engine). Most users never call it directly; it runs
-underneath every query to keep the engine inside its memory envelope instead of
-running it out of memory.
+Carbonite is Batcher's resource manager. It decides whether a plan is feasible, hands out memory reservations and shuffle credits, and decides when a query must spill. It does nothing else: rewriting a plan is Kyber's job and computing a result is the engine's. Most users never call it directly. It runs underneath every query and keeps the engine inside its memory envelope, so a query too large for memory slows down rather than dying.
 
 Carbonite sits in the contract loop between the optimizer and the executor:
 
@@ -33,18 +28,17 @@ shuffle channel its credit window, clamped so no single channel can starve the r
 
 Carbonite manages one memory envelope and keeps the engine inside it. Allocations
 throttle at the soft limit and the engine begins spilling to disk at the hard
-limit; aggregation, join, and sort all have a spill path, so the failure mode of a
-too-large query is *slower*, not *dead*.
+limit. Aggregation, join and sort all have a spill path, so the failure mode of a
+too-large query is slower, not dead.
 
 | Knob (`config.memory`) | Default | Meaning |
 |------------------------|---------|---------|
 | `soft_limit` | `0.85` | Throttle new allocations at this fraction of the envelope. |
 | `hard_limit` | `0.90` | Begin spilling to disk at this fraction. |
-| `max_memory_bytes` | `None` | Hard cap in bytes. `None` runs fully in memory; set it to bound memory (honoring a container/cgroup limit) and enable out-of-core spilling. |
+| `max_memory_bytes` | `None` | Cap in bytes. `None` is sensed at each terminal from host RAM, honoring a container or cgroup limit, and frozen for the query. |
+| `unbounded_memory` | `False` | Opt out of the sensed spill budget and stay fully in memory, for a query that should fail fast rather than spill. |
 
-The envelope is derived from system RAM by default. In a container, the OS often
-reports the host's memory rather than the cgroup limit, so set `max_memory_bytes`
-to the real ceiling.
+Set `max_memory_bytes` explicitly when the real ceiling is one the OS won't report. A sensed cap describes the driver and binds only the driver, while a cap you set binds every distributed worker too.
 
 ### Why a query went out of core
 
@@ -92,7 +86,7 @@ be streaming to a volume that cannot hold them. Set `memory.spill_remote_uri` to
 somewhere to go. Without it the local tier is all there is, and a full disk fails the
 query with a message naming the volume and the fix.
 
-Which volume that is has one answer, `site.spill_scratch_dir`: the configured
+Which volume that is has one answer, `_internal.site.scratch.spill_scratch_dir`: the configured
 `memory.spill_dir`, else the best measured node-local volume, else the system tempdir. Every
 layer that asks reads it, which matters because a second copy fails quietly. The hardware
 fingerprint that keys every learned spill threshold once described a container's overlay
@@ -160,13 +154,13 @@ one stateful operator.
 The shuffle uses credit-based backpressure: one credit is one in-flight
 `RecordBatch` slot, so a channel's credit window is a direct bound on its memory. A
 producer blocks when its credits reach zero. Carbonite is the authority that grants
-the window and clamps any per-operator request to `default_credits ×
+the window and clamps any per-operator request to `default_credits *
 credit_ceiling_factor`.
 
 | Knob (`config.flow_control`) | Default | Meaning |
 |------------------------------|---------|---------|
 | `default_credits` | `16` | In-flight batch slots when an operator has no estimate. |
-| `credit_ceiling_factor` | `4` | Maximum window is `default_credits × this`. |
+| `credit_ceiling_factor` | `4` | Maximum window is `default_credits` times this factor. |
 | `shuffle_fan_in` | `8` | Inbound streams a shuffle node fans in before the reduce becomes a tree of combiners. |
 | `aimd_alpha` / `aimd_beta` | `1` / `0.5` | Additive increase per round trip; multiplicative decrease on congestion. |
 | `backpressure_high` / `backpressure_low` | `0.70` / `0.40` | Buffer occupancy that throttles, then resumes, the producer. |
@@ -209,16 +203,15 @@ another operator cannot get memory. It is the right first victim: a published bu
 finished work waiting to be collected, so spilling it stalls nobody, where spilling a
 half-built hash table interrupts an operator that is still using it.
 
-### Same-node zero-copy fast path (automatic)
+### Same-node zero-copy fast path
 
-Within a shuffle, a reducer's sources fall into three tiers, and Carbonite picks the
-cheapest for each one with **no configuration**:
+Within a shuffle, a reducer's sources fall into three tiers, and Carbonite picks the cheapest for each one with no configuration:
 
 | Source | Path | Cost |
 |--------|------|------|
-| Same process | `DIRECT_MEMORY`, reading straight from the local store | no copy, no socket |
-| Same node, different process | `SHARED_MEMORY`, mmapping a 64-byte-aligned Arrow IPC file, decoded zero-copy | about a memcpy; roughly 23× a loopback Flight hop |
-| Another node | `NETWORK`, over credit-bounded Arrow Flight | one gRPC stream |
+| Same process | `DIRECT_MEMORY`, reading straight from the local store | No copy and no socket |
+| Same node, different process | `SHARED_MEMORY`, mmapping a 64-byte-aligned Arrow IPC file, decoded zero-copy | About a memcpy |
+| Another node | `NETWORK`, over credit-bounded Arrow Flight | One gRPC stream |
 
 The common GPU-cluster shape packs several worker actors per node, so many of a
 reducer's fetches are same-node-but-cross-process, which is exactly the tier the
@@ -231,40 +224,28 @@ under memory pressure (`PressureLevel.SPILL`+) and the reducer falls back to Fli
 churning spot node, where recompute transiently doubles live state, the fast path steps
 aside rather than risking OOM.
 
-It preserves concurrency. Same-node buckets are read from shared memory *inside* the
-concurrent gather, so cross-node buckets still fan out in parallel, and the same-node
-fraction gets the 23× with no loss of cross-node throughput.
+It preserves concurrency. Same-node buckets are read from shared memory inside the
+concurrent gather, so cross-node buckets still fan out in parallel while the same-node
+fraction skips the socket.
 
 It preserves the result. A shm miss, whether the bucket was not mirrored or sits on another
 node or shared memory is unavailable, falls back to Flight transparently, and the bytes are
 identical either way.
 
-Measured on a real cluster: a single-node multi-actor gather (8 producers → 1 reducer)
-runs at 33.6 GB/s with shared memory against 4.5 GB/s over loopback Flight, which is 7.5×
-through the full concurrent gather and about 23× point to point.
-
 ### Cross-node throughput scales with the cluster
 
-A single reducer's inbound rate is bounded by its NIC (~2.7 GB/s = ~22 Gbps on a T4
-node, i.e. line rate); the 10× is in the *aggregate* all-to-all, where every node
-reduces at once. Measured aggregate shuffle throughput: 2.0 → 6.9 → 15.2 GB/s at 2 → 4
-→ 8 nodes. It grows with the node count, because the mergeable `partial → combine →
-finalize` algebra plus credit flow control keep per-node memory bounded no matter how
-wide the cluster. The shuffle runtime's worker-thread pool is auto-sized to the host's
-cores, clamped to keep concurrent-decode throughput near the NIC without oversubscribing
-many-actor nodes. Override it with `BATCHER_SHUFFLE_RT_THREADS` only for an unusual node
-shape.
+A single reducer's inbound rate is bounded by its NIC. The scaling is in the aggregate all-to-all, where every node reduces at once, so total shuffle throughput grows with the node count. It can, because the mergeable `partial`, `combine` and `finalize` algebra plus credit flow control keep per-node memory bounded however wide the cluster is. The shuffle runtime's worker-thread pool is sized to the host's cores, clamped to keep concurrent decode near the NIC's rate without oversubscribing nodes that pack many actors. Override it with the `BATCHER_SHUFFLE_RT_THREADS` environment variable only for an unusual node shape.
 
 ## Self-tuning from measured metadata
 
 The contract loop does more than protect the current query. It *learns* from it.
-Core measures what every operator actually did (rows in/out, wall time, per-core CPU
-busy fraction, and peak bytes) and records it into the `MetadataHub`; Carbonite then
+Core measures what every operator actually did, its rows in and out, wall time, per-core CPU
+busy fraction and peak bytes, and records it into the `MetadataHub`. Carbonite then
 sizes the next run against that measured reality instead of a cold plan estimate.
-Every decision here is **result-invariant**: it changes how much memory a query
+Every decision here is result-invariant: it changes how much memory a query
 reserves, when it spills, and how big a morsel is, never what the query returns.
-That invariance is property-tested (tuned run == untuned run), which is what lets
-the sizing learn aggressively; the worst a stale learned value can do is cost
+That invariance is property-tested, a tuned run against an untuned one, which is what lets
+the sizing learn aggressively. The worst a stale learned value can do is cost
 throughput.
 
 ### The learned memory model
@@ -274,12 +255,12 @@ Core records each operator's *actual* peak memory (`m_peak_bytes`), but historic
 every sizing decision (admission, spill, reservation, morsel) sized from Kyber's
 plan estimate alone and never consulted what the operator really used. The model is
 the memory analog of Kyber's cost calibration: from the measured peaks it fits a
-per-operator-family **bytes-per-input-row** figure (a *ratio*, not an absolute peak,
-so it is size-general, and a 1M-row aggregate and a 10-row one share one coefficient),
-and each sizing decision blends the plan's byte estimate toward that measured figure,
-clamped so a noisy sample can never wildly move sizing.
+per-operator-family bytes-per-input-row figure. That is a ratio rather than an absolute peak,
+so a 1M-row aggregate and a 10-row one share one coefficient. Each sizing decision blends
+the plan's byte estimate toward the measured figure, clamped so a noisy sample can't move
+sizing far.
 
-That single blended peak feeds every memory decision through one `_peak_bytes(plan)`:
+That single blended peak feeds every memory decision through one `estimated_bytes(plan)`:
 `should_spill` routes a query out-of-core when its *measured* footprint won't fit,
 `recommend_spill_partitions` shards the spilled state so each bucket stays bounded,
 `recommend_spill_compression` compresses a large IO-bound state, and admission and
@@ -298,7 +279,7 @@ that family was learned, and the learner made the plan worse the more it knew.
 
 ### Learned flow control
 
-The credit machinery learns the same way. `grant_credits(signature=…)` warm-starts a
+The credit machinery learns the same way. `grant_credits(requested, signature=...)` warm-starts a
 recurring shuffle channel from the window past runs of that shape converged on (a
 learned credit window), rather than the static `default_credits`. The AIMD controller
 still governs the window actually used from live backpressure, with hysteresis
@@ -317,11 +298,11 @@ the other halves live in their own subsystems and are wired together by `api`:
   broadcast-byte and sort-merge-row thresholds (an OLS line crossover), learned
   build-side and partition priors, and whether partial pre-aggregation pays off. See
   {doc}`/architecture/internals/kyber`.
-- **Core and Dist, in `adaptive_sizing`**, tune *distributed scheduling*: learned
+- **`dist/adaptive_sizing`** tunes distributed scheduling: learned
   UDF/inference actor-pool size, GPU batch caps, source partition count, per-task CPU
   share, shuffle reducer fan-out, and straggler-speculation aggressiveness. Each one is
   a pure scheduling knob under the mergeable algebra.
-- **`api`, in `tuning`**, is the conductor half. It *activates* the read-side decisions
+- **`api/tuning`** is the conductor half. It *activates* the read-side decisions
   each subsystem exposes and *records* the measured outcomes back, closing every
   feedback loop (join bandit, group-reduction, converged credit window) so the
   learning actually accrues. See the adaptive re-optimization loop in

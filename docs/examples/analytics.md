@@ -1,13 +1,10 @@
 # Statistics, time series, geospatial, graph and robotics
 
-This page covers the analytical scripts: summarizing distributions, working with time, and
-the geospatial, graph and rigid-body surfaces.
+This page covers the analytical scripts: summarizing distributions, working with time, and the geospatial, graph and rigid-body surfaces.
 
 ## Statistics
 
-Centre, spread, shape and extremes in one pass. The order matters for interpretation: the
-skew tells you whether to report the mean or the median, so compute both before deciding
-which goes in the summary.
+Centre, spread, shape and extremes in one pass. The order matters for interpretation: the skew tells you whether to report the mean or the median, so compute both before deciding which goes in the summary.
 
 ```python
 import batcher as bt
@@ -19,7 +16,7 @@ summary = values.agg(
     mean=col("x").mean(),
     median=bt.median(col("x")),
     iqr=bt.iqr(col("x")),
-    skew=bt.skewness(col("x")),
+    skew=bt.skew(col("x")),
 ).to_pydict()
 
 # Right-skewed, so the mean sits above the median and the median is the honest number.
@@ -27,17 +24,11 @@ assert summary["skew"][0] > 0
 assert summary["mean"][0] > summary["median"][0]
 ```
 
-Two habits the scripts enforce. A difference between groups is not a finding until you know
-the spread and the sample size, so the standard error comes out of the same pass as the mean.
-And with enough rows every difference is significant. An effect size is what makes the
-comparison informative.
+Two habits the scripts enforce. A difference between groups is not a finding until you know the spread and the sample size, so the standard error comes out of the same pass as the mean. And with enough rows every difference is significant. An effect size is what makes the comparison informative.
 
 ## Time series
 
-Resampling is a truncation used as a group key, and the one thing to watch is that periods
-with no events are simply absent. Joining against a generated calendar is what turns a sparse
-series into a dense one, and the rows the join adds are exactly the periods nothing happened
-in.
+Resampling is a truncation used as a group key, and the one thing to watch is that periods with no events are simply absent. Joining against a generated calendar is what turns a sparse series into a dense one, and the rows the join adds are exactly the periods nothing happened in.
 
 ```python
 import batcher as bt
@@ -56,43 +47,27 @@ daily = events.group_by("day").agg(total=col("amount").sum()).sort("day")
 assert daily.count() == 2
 ```
 
-Growth needs a previous value, and the first period has none. A null there is correct. A zero
-is a lie, and it shows up as a spike on every chart.
+Growth needs a previous value, and the first period has none. A null there is correct. A zero is a lie, and it shows up as a spike on every chart.
 
 ## Geospatial
 
-Longitude first, then latitude. That is what WKT, GeoJSON and PostGIS all use, and reversing
-it puts the data in the wrong hemisphere without raising anything.
+Longitude first, then latitude. That is what WKT, GeoJSON and PostGIS all use, and reversing it puts the data in the wrong hemisphere without raising anything.
 
-A spatial join cannot hash, so the pattern is to bound the candidates cheaply with an
-envelope or a grid key and evaluate the exact predicate only on what survives. A geohash
-turns the join into an equality join, and the precision is the trade: coarser cells mean more
-candidates to check, finer cells mean more cells to enumerate.
+A spatial join cannot hash, so the pattern is to bound the candidates cheaply with an envelope or a grid key and evaluate the exact predicate only on what survives. A geohash turns the join into an equality join, and the precision is the trade: coarser cells mean more candidates to check, finer cells mean more cells to enumerate.
 
 ## Graph
 
-A graph is an edge table with two columns you have chosen to call source and target, which is
-what makes graph analytics available to any dataset with a foreign key. Degree and connected
-components cost one pass each and tell you whether an expensive algorithm will mean anything.
+A graph is an edge table with two columns you have chosen to call source and target, which is what makes graph analytics available to any dataset with a foreign key. Degree and connected components cost one pass each and tell you whether an expensive algorithm will mean anything.
 
-Materialize the edge list first. The iterative algorithms re-read the edges once per
-iteration, so handing them a join-and-distinct plan re-executes that plan every time.
+Materialize the edge list first. The iterative algorithms re-read the edges once per iteration, so handing them a join-and-distinct plan re-executes that plan every time.
 
 ## Robotics and autonomous driving
 
-A robotics log is measurements taken in different coordinate frames, one per sensor plus one
-for the vehicle and one for the world. A quaternion is four numbers in `(x, y, z, w)` order,
-scalar last, and a pose is a translation followed by that rotation. Reading a scalar-first
-quaternion as a scalar-last one is a different, plausible rotation that nothing can detect,
-so the component order is written at every call site.
+A robotics log is measurements taken in different coordinate frames, one per sensor plus one for the vehicle and one for the world. A quaternion is four numbers in `(x, y, z, w)` order, scalar last, and a pose is a translation followed by that rotation. Reading a scalar-first quaternion as a scalar-last one is a different, plausible rotation that nothing can detect, so the component order is written at every call site.
 
-Collapse a frame chain once per frame with {py:func}`se3_compose <batcher.se3_compose>` and
-apply the single result per point. A sweep is a hundred thousand points, so the difference
-between one transform per point and three is the whole cost of the job.
+Collapse a frame chain once per frame with {py:func}`se3_compose <batcher.se3_compose>` and apply the single result per point. A sweep is a hundred thousand points, so the difference between one transform per point and three is the whole cost of the job.
 
-Interpolate a pose with {py:func}`pose_interpolate <batcher.pose_interpolate>` rather than
-blending quaternion components and renormalizing. The second sweeps the angle at a
-non-constant rate, which shows up as a lidar sweep that bends.
+Interpolate a pose with {py:func}`pose_interpolate <batcher.pose_interpolate>` rather than blending quaternion components and renormalizing. The second sweeps the angle at a non-constant rate, which shows up as a lidar sweep that bends.
 
 ## Every script on this page
 
@@ -148,3 +123,9 @@ The table below lists the analytical scripts in path order.
 | `examples/robotics/pose_interpolation.py` | Lining up sensors that sample at different rates |
 | `examples/robotics/rotations.py` | Building, cleaning, composing and scoring rotations |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/cookbook/metrics/statistics/index`: statistics recipes with the whole script on the page.
+- {doc}`/cookbook/analytics/index`: cohorts, funnels, sessions, and rankings.
+- {doc}`/user-guide/analyze/time-series`, {doc}`/user-guide/analyze/geospatial`, {doc}`/user-guide/analyze/graphs`, and {doc}`/user-guide/analyze/robotics`: the guides behind each section.

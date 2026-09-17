@@ -1,13 +1,8 @@
 # Reading a very large table
 
-This page covers what changes when a table is large enough that *planning* it costs real
-time: hundreds of thousands of files, a directory per day going back years, more rows than
-any single machine will hold. The levers on {doc}`performance` all still apply. What is
-different here is that the work you most want to avoid happens before a single row is read.
+This page covers what changes when a table is large enough that *planning* it costs real time: hundreds of thousands of files, a directory per day going back years, more rows than any single machine will hold. The levers on {doc}`performance` all still apply. The difference is that the work you most want to avoid happens before a single row is read.
 
-Three things decide how a table of this size behaves, and all three are settled at plan
-time: how much of it the engine can rule out without opening it, how well it can estimate
-what is left, and how finely it divides the work that survives.
+Three things decide how a table of this size behaves, and Batcher settles all of them at plan time: how much of the table it can rule out without opening it, how well it estimates what is left, and how finely it divides the work that survives.
 
 ## What "plan time" costs
 
@@ -19,8 +14,8 @@ Batcher refuses that sweep past a ceiling. Above `BATCHER_MAX_FOOTER_PLAN_FILES`
 default) it stops reading a footer per file for split planning, exact row counts, and column
 bounds, and falls back to something whose cost does not grow with the file count.
 
-Nothing about this is a correctness question. Every fallback reads *more* data, never less,
-and the engine's own filter re-checks every row.
+None of this affects correctness. Every fallback reads *more* data, never less, and the
+engine's own filter re-checks every row.
 
 ## Partition pruning happens before the tasks exist
 
@@ -33,8 +28,8 @@ events/
   ...
 ```
 
-Batcher enumerates only the top-level `day=` directories on the driver — one cheap,
-non-recursive listing — and hands each one to a worker, which lists only its own subtree. So
+Batcher enumerates only the top-level `day=` directories on the driver, in one cheap,
+non-recursive listing, and hands each one to a worker, which lists only its own subtree. So
 the listing cost is `O(subtree)` per worker rather than `O(whole table)` on the driver.
 
 A filter on the partition column is then applied to that directory list *before* the splits
@@ -53,10 +48,14 @@ one_day = events.filter(bt.col("day") == datetime.date(2024, 1, 2))
 Over a table with a directory per day for ten years, that filter is the difference between
 3,650 tasks and one. Both return the same rows.
 
+The figure traces that plan-time work in order:
+
+![A four-step flow that runs at plan time, before any task exists. Step 1: the driver lists only the top-level day= directories, in one cheap listing. Step 2: the directory list is pruned by a predicate on the partition column, which comes either from a filter you wrote on day or, through dynamic partition pruning, from the smaller join side's key range; pruning is exact because the directory name records the partition value. Step 3: each surviving directory goes to a worker, which lists only its own subtree. Step 4: splits, and so tasks, are built from the survivors only. A directory the predicate rules out is never listed, opened, or turned into a task. With a directory per day for ten years, 3,650 tasks become one with the same rows, and where the layout can't decide, every directory survives and the rows are filtered as usual.](/_static/diagrams/partition_pruning_flow.svg)
+
 Pruning is decided from the directory name, which records the partition value exactly, so it
-is exact rather than approximate. Where it cannot decide — a predicate over a data column, or
-one side of an `OR` that nothing in the layout can rule on — every directory survives and the
-engine filters the rows as usual.
+is exact rather than approximate. Where it cannot decide, such as a predicate over a data column or one side of an `OR` that
+nothing in the layout can rule on, every directory survives and the engine filters the rows as
+usual.
 
 Both spellings of a date predicate prune. These are equivalent:
 
@@ -86,19 +85,19 @@ facts.join(recent, on="day", how="inner")
 
 The join reads four partitions, not 3,650, and nobody wrote a `filter`. This is *dynamic
 partition pruning*, and it works because the partition column carries min/max bounds derived
-from the directory names — bounds that cost nothing, since the directory listing already
+from the directory names. Those bounds cost nothing, since the directory listing already
 happened.
 
 It applies in both directions: the fact table's own range equally rules out dimension rows
 whose key falls outside every partition.
 
 Two things stop it. The join key has to *be* the partition column, and the smaller side's
-range has to be genuinely narrower than the partitioned side's — a dimension spanning the
+range has to be genuinely narrower than the partitioned side's. A dimension spanning the
 whole table's date range implies nothing. `explain()` shows the filter when it fires.
 
 ```{note}
 The bounds are deliberately not treated as exact. A partition directory can outlive its rows:
-deleting a day's files leaves `day=…` standing, so the lowest directory name may name a day
+deleting a day's files leaves `day=...` standing, so the lowest directory name may name a day
 that holds nothing. That is harmless for pruning, which may only ever keep too much, but it
 means an exact `MIN(day)` still reads data rather than answering from the layout.
 ```
@@ -162,9 +161,9 @@ its hash table from one bucket, a sort sorts one, a window materializes one part
 one. Fixing that count to the size of the cluster makes the working set grow with the data,
 so the same query on the same cluster spills once the table doubles.
 
-Batcher sizes buckets from the volume being exchanged — measured for a shape that has run
-before, estimated from source statistics on its first run — and never below one bucket per
-worker, since a bucket is reduced by exactly one of them. The surplus buckets cost
+Batcher sizes buckets from the volume being exchanged. For a shape that has run before that
+volume is measured, and on a first run it is estimated from source statistics. The count never
+drops below one bucket per worker, since a bucket is reduced by exactly one of them. The surplus buckets cost
 scheduling, not memory: they are queued across the same workers.
 
 Any bucket count returns the same rows. The mergeable algebra makes partial states
@@ -183,7 +182,7 @@ Two settings control the depth, shared with the map stage:
 | Setting | Meaning |
 |---|---|
 | `distributed.max_pending_tasks` | A hard cap on outstanding tasks. `0` (the default) derives one instead. |
-| `distributed.pending_window_factor` | How many tasks per worker may be outstanding when no cap is set. Default `4`. |
+| `distributed.pending_window_factor` | When no cap is set, the window is this multiple of the tasks the cluster's schedulable cores can run at once. Default `4`. |
 
 A stage smaller than the window submits everything before its first wait, so ordinary queries
 are unaffected.
@@ -192,7 +191,7 @@ are unaffected.
 More buckets do not fix skew. A hash bucket is the unit a key cannot be split below, so a
 single dominant key stays on one reducer however fine the hash. Splitting one key across
 reducers is salting, which Batcher applies from measured hot keys. See
-{doc}`/user-guide/analyze/joins`.
+{doc}`skew` and `distributed.skew_join_salt` in {doc}`/configuration/distributed-options`.
 ```
 
 ## Requirements and limitations

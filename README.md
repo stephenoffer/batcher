@@ -40,7 +40,8 @@ print(revenue.to_pydict())  # nothing runs until here
 
 ## Install
 
-Prebuilt wheels ship for Linux, macOS, and Windows on Python 3.11+ — no Rust needed.
+Prebuilt wheels ship for Linux (x86_64 and aarch64, glibc and musl/Alpine), macOS (Apple
+silicon and Intel), and Windows x86_64 on Python 3.11+ — no Rust needed.
 Batcher is on PyPI as `batcher-engine` and imported as `batcher` (the bare `batcher`
 name belongs to an unrelated project):
 
@@ -57,6 +58,15 @@ print(ds.select(doubled=bt.col("x") * 2).to_pydict())
 ```
 
 Optional features are extras, e.g. `pip install "batcher-engine[ray,cloud]"`.
+
+Other ways to install, each with its own guide in
+[Choose how to install](https://stephenoffer.github.io/batcher/getting-started/install/index.html):
+
+| Where it runs | How |
+|---|---|
+| uv, Poetry, conda/mamba/pixi, Jupyter | [Python environments](https://stephenoffer.github.io/batcher/getting-started/install/python-environments.html) |
+| Docker, Kubernetes, Alpine | `docker run ghcr.io/stephenoffer/batcher:latest` — [containers](https://stephenoffer.github.io/batcher/getting-started/install/containers.html) |
+| Ray clusters, KubeRay, Slurm, air-gapped networks | `ghcr.io/stephenoffer/batcher:latest-ray` — [servers and clusters](https://stephenoffer.github.io/batcher/getting-started/install/clusters-and-servers.html) |
 
 ## What it does
 

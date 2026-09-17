@@ -2,7 +2,7 @@
 
 This page describes how Batcher decides where distributed work runs, how many pieces it runs in, and what does and doesn't travel through Ray.
 
-A cluster gives you more cores and more RAM. It also gives you a scheduler, a serialization boundary, and a network, none of which a single-node engine pays for. Batcher's distributed path exists to buy the cores and the RAM without paying much for the rest, and the way it does that is by refusing to be a second engine.
+A cluster brings more cores and more RAM. It also brings a scheduler, a serialization boundary, and a network, none of which a single-node engine pays for. Batcher's distributed path buys the cores and the RAM without paying much for the rest, and it does that by refusing to be a second engine.
 
 :::{important}
 There is one set of operator semantics. `dist/` decides *where* work runs and *how many pieces* it runs in. It doesn't decide what an aggregate means. The mergeable algebra of `partial -> combine -> finalize`, described in {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`, already guarantees that a result assembled from partitions equals the single-node result, so distribution is a scheduling problem and nothing else.
@@ -36,7 +36,7 @@ There is one set of operator semantics. `dist/` decides *where* work runs and *h
 
 Ray schedules tasks and actors, and it carries control-plane metadata. The bulk shuffle bytes don't go through the Ray object store. Mapper output is written to Arrow IPC files or served from a Flight endpoint, and what crosses Ray is paths, addresses, tickets, row counts, and a metrics JSON string. You can see it in the return types. The shuffle map task in `python/batcher/dist/executors/aggregate.py` returns a `list[str]` of file paths, and the Flight worker in `python/batcher/dist/flight_worker.py` returns an address, not batches.
 
-The short slogan overstates it slightly, so here is the precise version. The table lists each kind of traffic against whether it transits the object store.
+The short slogan overstates it slightly. The following table lists each kind of traffic against whether it transits the object store:
 
 | Path | Through the Ray object store? |
 |---|---|
@@ -48,7 +48,7 @@ Both of the latter are bounded. A map result is the query's output, and a map-th
 
 ## The fan-out decision
 
-The default worker count used to be the *driver's* `os.cpu_count()`, so a 16-core driver attached to a 128-CPU cluster fanned out to 16. Worse, when Ray was already initialized the cluster-fill was skipped entirely and queries ran on 2 of 16 workers. Both were control-plane bugs, both are fixed, and fixing them was worth more than every kernel optimization in the same period.
+The default worker count used to be the *driver's* `os.cpu_count()`, so a 16-core driver attached to a 128-CPU cluster fanned out to 16. Worse, when Ray was already initialized the cluster-fill was skipped entirely and queries ran on 2 of 16 workers. Both were control-plane bugs, and both are fixed.
 
 `dist/executor.py::_cluster_fill_workers` sizes the fan-out from cluster topology instead. `num_cpus` is the smallest worker node's core count, so a worker is placeable on any node, and the worker count is the sum of `floor(node_cores / num_cpus)` across nodes. One worker lands per core-slice, so a heterogeneous node gets proportionally more. A 64-core node next to 32-core nodes used to run at half utilization under a uniform one-worker-per-node grant.
 
@@ -72,7 +72,7 @@ A stage's partition count comes from data volume, not from `cpu_count`. `optimiz
 
 Per-task CPU is adaptive rather than a flat `1.0`. `dist/executors/map.py::_adaptive_task_cpus` asks for `descriptor_rows * weight / rows_per_cpu` cores, clamped to `[_MIN_TASK_CPU, node_cores]` with `_MIN_TASK_CPU` at 0.125. `rows_per_cpu` is half `target_rows_per_task`, so a full target-sized partition asks for roughly two cores. A tiny partition gets a fraction of a core and Ray packs many onto one. A UDF stage carries `_MAP_COMPUTE_WEIGHT`, which defaults to 4.0, because a single-threaded Python UDF can only be parallelized by *more tasks*, not by more cores per task. That weight is then scaled by a measured per-core busy fraction learned for the plan family, so a family that ran CPU-underutilized reserves fewer cores next run. Because the share is per-partition, a heavier partition gets proportionally more CPU, which absorbs the residual skew that split-balancing leaves behind. Reserving more or fewer cores only changes packing, never the rows a task processes.
 
-Measured at sf10 on the 8-node cluster, a UDF-plus-aggregate pipeline went from 1.89 s to 0.88 s, and cluster utilization rose from 9% to 52% mean across 9 nodes.
+Measured at sf10 on the project cluster, a UDF-plus-aggregate pipeline went from 1.89 s to 0.88 s, and mean cluster utilization rose from 9% to 52%.
 
 A Flight shuffle's *map* stage sizes itself separately, because what it is choosing is a unit of recovery as much as a unit of work. `dist/executors/ray_runtime/reducers.py::map_partitions` cuts the input into `workers x distributed.map_partition_multiplier` partitions, four times the worker count by default, and `map_barrier` hands them to actors as they go idle with exactly `workers` tasks in flight. One partition per worker, the older shape, makes the task unit a node's whole share of the input, so a worker running at half speed holds the barrier open on a full partition and a worker that dies loses a full partition for one survivor to replay. Neither cost is about data volume. Both are about the unit being indivisible.
 
@@ -98,9 +98,9 @@ That window **slides**: one completion launches one new task, exactly as `map_ba
 
 ## Skew
 
-Two mechanisms handle skew, and they're separate.
+Two separate mechanisms handle skew, one for the read and one for the join.
 
-Scan splits are balanced up front. Parquet `splits()` returns one split per row group, and `dist/executors/partition_io/_sources.py::_balance` greedily bin-packs them by row count. That evens the *read*.
+Scan splits are balanced up front. Parquet `splits()` returns one split per row group, and `dist/executors/partition_io/assignment.py::_balance` greedily bin-packs them by row count. That evens the *read*.
 
 Join skew is different, because it's a property of the key distribution and you can't see it in the file layout. `dist/executors/join.py::_detect_hot_keys` runs a Misra-Gries heavy-hitters pass per partition using `nat.heavy_hitters`, which is backed by `bc-sketches`, and a value is hot when its summed count clears `distributed.skew_join_fraction` (0.10) of the rows. Hot keys are then salted. `nat.salted_partition_batches` fans the probe-side hot rows across `salt` reducers and *replicates* the build-side hot rows to all of them. Cold keys hash exactly as before, so the joined relation is unchanged.
 
@@ -124,25 +124,11 @@ Some shapes shouldn't distribute at all. When a plan has no distributed path and
 
 ## Staging a UDF so the operator above it can shuffle
 
-A `map_batches` pipeline is opaque. It runs in Python, it has no engine IR, and no shuffle can
-see through it, so a breaker sitting on top of one has nothing to co-partition. Batcher deals
-with that by cutting the query in two rather than by giving the breaker a second
-implementation: the UDF pipeline runs as its own distributed stage, lands its output as
-Parquet on cluster-shared scratch, and the breaker is then dispatched over a plain scan of
-that scratch. What runs afterwards is the ordinary distributed operator, with the shuffle,
-the broadcast decision, the skew handling and the spill it always had.
+A `map_batches` pipeline is opaque. It runs in Python, it has no engine IR, and no shuffle can see through it, so a breaker sitting on top of one has nothing to co-partition. Batcher deals with that by cutting the query in two rather than by giving the breaker a second implementation: the UDF pipeline runs as its own distributed stage, lands its output as Parquet on cluster-shared scratch, and the breaker is then dispatched over a plain scan of that scratch. What runs afterwards is the ordinary distributed operator, with the shuffle, the broadcast decision, the skew handling and the spill it always had.
 
-The staging follows the plan's operands rather than a single chain, and that is what makes it
-cover the shape most inference jobs actually have. Embedding a table and then joining the
-embeddings to something bottoms out at a node with two operands, and so does a union of two
-inference branches. Each operand that contains a UDF is staged on its own; operands with no
-UDF are left exactly as they are, so a join of an inference branch against a plain Parquet
-table stages only the branch. `map_batches(...).join(other).group_by(...)` then reaches the
-fused join-aggregate reducer, the same one a join over two tables reaches.
+The staging follows the plan's operands rather than a single chain, and that is what makes it cover the shape most inference jobs actually have. Embedding a table and then joining the embeddings to something bottoms out at a node with two operands, and so does a union of two inference branches. Each operand that contains a UDF is staged on its own; operands with no UDF are left exactly as they are, so a join of an inference branch against a plain Parquet table stages only the branch. `map_batches(...).join(other).group_by(...)` then reaches the fused join-aggregate reducer, the same one a join over two tables reaches.
 
-An operand whose staged output turns out empty is declined rather than folded away. A breaker
-is not uniformly empty-preserving. An outer join with an empty right side still emits every
-left row, so "empty" there would be a wrong answer rather than a missing route.
+An operand whose staged output turns out empty is declined rather than folded away. A breaker is not uniformly empty-preserving. An outer join with an empty right side still emits every left row, so "empty" there would be a wrong answer rather than a missing route.
 
 ## What never reaches the driver
 
@@ -170,7 +156,7 @@ Two shapes decline and collect instead, both for the same reason. There is no pa
 
 ## Cost, and when not to use it
 
-Distribution is for scale-out and for larger-than-memory. It isn't free and it isn't always faster.
+Distribution is for scale-out and for larger-than-memory data. It isn't free, and on small inputs it isn't faster.
 
 ::::{tab-set}
 :::{tab-item} Single-node
@@ -197,8 +183,7 @@ The warm session fleet (`distributed.reuse_session_fleet`, on by default) exists
 
 ## Code map
 
-Each scheduling concern below lives in one file, so you can follow a task from submission
-to result in the source:
+Each scheduling concern below lives in one file, so you can follow a task from submission to result in the source:
 
 | Concern | File |
 |---|---|
@@ -206,7 +191,7 @@ to result in the source:
 | Partition-count sizing | `python/batcher/api/tuning/decisions.py` |
 | Per-operator executors | `python/batcher/dist/executors/{aggregate,join,sort,map,window,union,distinct}.py` |
 | Ray tasks/actors, placement, autoscale, fault policy | `python/batcher/dist/executors/ray_runtime/` |
-| Split balancing | `python/batcher/dist/executors/partition_io/_sources.py` |
+| Split balancing | `python/batcher/dist/executors/partition_io/assignment.py` |
 | Learned sizing (partitions, actor pool, straggler factor) | `python/batcher/dist/adaptive_sizing/sizing.py` |
 | Join-skew learning | `python/batcher/dist/skew.py` |
 | Rust mergeable primitives | `crates/bc-interp/src/dist.rs` |

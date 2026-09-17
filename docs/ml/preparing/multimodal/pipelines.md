@@ -1,15 +1,10 @@
 # Media in a pipeline
 
-What changes once media is a column: what it costs to move, how it reaches a model, and how it is retrieved.
+This page covers what changes once media is a column: the cost of moving large payloads through a plan, the path from a table of references to predictions, and searching the embeddings that come out.
 
 ## Keep large payloads out of shuffles and spills
 
-A multi-GB payload such as a video, an audio file, or a PDF carried inline in a column is
-copied through every sort and join and spill buffer it crosses, even when those
-operators only touch other columns. {py:meth}`offload_blobs <batcher.Dataset.offload_blobs>` writes each payload to a
-content-addressed store and leaves a tiny URI handle in its place. {py:meth}`materialize_blobs <batcher.Dataset.materialize_blobs>`
-reads it back right before you need the bytes. In between, only the short handle string
-rides through the pipeline.
+A multi-GB payload such as a video, an audio file, or a PDF, carried inline in a column, is copied through every sort, join and spill buffer it crosses, even when those operators only touch other columns. {py:meth}`offload_blobs <batcher.Dataset.offload_blobs>` writes each payload to a content-addressed store and leaves a tiny URI handle in its place. {py:meth}`materialize_blobs <batcher.Dataset.materialize_blobs>` reads it back right before you need the bytes. In between, only the short handle string rides through the pipeline.
 
 ```python
 import tempfile
@@ -31,14 +26,13 @@ print(out.column("id").to_pylist(), out.column("payload").to_pylist())
 # [1, 2, 3] [b'a', b'b', b'c']
 ```
 
-Offload is content-addressed with SHA-256, so identical payloads are written once and
-deduped, and a re-read after a spill fetches the same bytes. The store defaults to
-the configured spill location. That is `spill_remote_uri` when it is set, so handles are
-reachable cluster-wide, and the local spill directory otherwise.
+Offload is content-addressed with SHA-256, so identical payloads are written once, and a re-read after a spill fetches the same bytes. The store defaults to the configured spill location: `spill_remote_uri` when it's set, which makes handles reachable cluster-wide, and the local spill directory otherwise.
 
-To place this automatically around a sort, set `auto_offload_blobs`. The engine then
-offloads any `large_binary` column the sort does not key on and reads it back after,
-with no plan changes on your side:
+The following diagram compares the payload carried inline with the payload offloaded:
+
+![Two paths through the same sort and join. Inline, an id and payload row carries gigabytes of bytes, the sort by id copies the payload, the join copies it again, and only the next step reads the bytes, so every copy and every spill buffer carries the full payload although sort and join only touch id. Offloaded, offload_blobs writes each payload once per SHA-256 hash to a content-addressed store at root/sha256, which is spill_remote_uri when set and the local spill directory otherwise, and replaces it with a uri handle. The sort moves only short handle strings. materialize_blobs then reads the bytes back from the store just in time for the next step. auto_offload_blobs=True places this pair around a sort for large_binary columns, and it is off by default.](/_static/diagrams/blob_offload.svg)
+
+To place the pair automatically around a sort, set `auto_offload_blobs`. The engine then offloads any `large_binary` column the sort doesn't key on and reads it back afterward, with no change to your plan:
 
 ```python
 # docs: skip
@@ -48,13 +42,11 @@ with config_context(Config().replace(execution=ExecutionConfig(auto_offload_blob
     ds.sort("id").collect()  # large_binary columns ride the sort as handles
 ```
 
-It is off by default, because the round-trip to the store is a win only for genuinely
-large payloads, which the `large_binary` type signals.
+It's off by default. The round trip to the store only pays off for genuinely large payloads, which is what the `large_binary` type signals.
 
 ## From references to predictions
 
-The steps compose into one lazy pipeline of fetch, decode, then a GPU model stage, where
-preprocessing stays on CPU workers and only the model holds a GPU:
+Fetch, decode and a GPU model stage compose into one lazy pipeline. Preprocessing stays on CPU workers, and only the model holds a GPU:
 
 ```python
 # docs: skip
@@ -87,17 +79,11 @@ captioned = (
 captioned.write.parquet("s3://bucket/captioned.parquet")
 ```
 
-Passing the `Captioner` **class**, rather than an instance or a function, loads the model
-once per GPU actor. A plain function would rebuild it on every batch. See
-{doc}`GPU scheduling </ml/inference/gpu>` for sizing the actor pool.
+Pass the `Captioner` **class**, not an instance or a function. Batcher then loads the model once per GPU actor, where a plain function would rebuild it on every batch. {doc}`GPU scheduling </ml/inference/gpu>` covers sizing the actor pool.
 
 ## Chunking documents for RAG ingest
 
-A document is usually longer than an embedding model's context, so the ingest chain is
-load, split, embed, index. {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` is the split stage. It
-slices text into fixed-size overlapping windows as a `List<Utf8>`, which `explode` turns
-into one row per chunk. Sizes are in characters, and a chunk boundary never splits a
-Unicode codepoint.
+A document is usually longer than an embedding model's context, so the ingest chain is load, split, embed, index. {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` is the split stage. It slices text into overlapping windows as a `List<Utf8>`, and `explode` turns that into one row per chunk. Sizes are in characters, so a boundary never splits a Unicode codepoint.
 
 ```python
 import batcher as bt
@@ -108,27 +94,13 @@ print(chunks.select("id", "chunk").to_pydict())
 # {'id': [1, 1, 2], 'chunk': ['abcd', 'def', 'xyz']}
 ```
 
-`overlap` carries context across a boundary, so a sentence cut in half still appears
-whole in one chunk. Chunks stop once one reaches the end of the text, so the last chunk
-is never a redundant suffix of its predecessor. From here, {py:meth}`ds.ml.embed(...) <batcher.api.dataset.ml.DatasetML.embed>` produces
-the vectors and the section below indexes them.
+`overlap` carries context across a boundary, so a sentence cut in half still appears whole in one chunk. Chunking stops once a chunk reaches the end of the text, so the last chunk is never a redundant suffix of its predecessor. The default `boundary="char"` cuts at exactly `size` characters and can split a word, and a half word embeds as something a query won't match. Pass `boundary="word"`, `"sentence"` or `"line"` to back each cut off to the last such separator. From here, {py:meth}`ds.ml.embed(...) <batcher.api.dataset.ml.DatasetML.embed>` produces the vectors, and the next section searches them.
 
-The whole chain of scan, chunk, explode, and embed is a linear row-wise pipeline, so it
-distributes across workers and streams over an unbounded source with no breaker. The
-one thing no static rule can know is how many chunks a document yields. Kyber estimates
-a fan-out of 1 on the first run, Core measures the real fan-out, and the next plan sizes
-the downstream GPU stage for it. See {doc}`adaptive re-optimization </architecture/internals/kyber>`.
+Scan, chunk, explode and embed form a linear row-wise pipeline with no breaker, so the chain distributes across workers. The one thing no static rule can know is how many chunks a document yields. On the first run Kyber's estimate passes the input row count through, Core measures the real fan-out, and later runs correct the estimate for every stage below the explode. {doc}`/architecture/deep-dives/adaptive/cardinality-estimation` explains the learned correction.
 
 ## Vector search over the embeddings
 
-`ds.ml.embed` produces the vectors on a {py:class}`Dataset <batcher.Dataset>`. Over a bare batch stream, such as
-chunks coming out of a reader or a stage you are composing by hand, {py:func}`batcher.ml.embed <batcher.ml.embed>`
-does the same work and takes an `EncoderFactory`. That is a zero-argument callable
-returning an encoder, which is any callable mapping `list[str]` to one equal-length
-vector per string. The factory is called once per worker, so the embedding model loads a
-single time and every batch that worker handles reuses it. It has the same shape as the
-`WorkerFactory` in {doc}`inference </ml/inference/inference>`, which is the reason a sentence-transformers
-model, a local ONNX encoder, and a hosted embedding API are interchangeable here.
+`ds.ml.embed` produces the vectors on a {py:class}`Dataset <batcher.Dataset>`. For a bare batch stream, such as chunks coming out of a reader or a stage you compose by hand, {py:func}`batcher.ml.embed <batcher.ml.embed>` does the same work. It takes an `EncoderFactory`, a zero-argument callable returning an encoder, where an encoder is any callable mapping `list[str]` to one vector per string. The factory runs once per worker, so the model loads once and every batch on that worker reuses it. It has the same shape as the `WorkerFactory` in {doc}`inference </ml/inference/inference>`, which is why a sentence-transformers model, a local ONNX encoder and a hosted embedding API are interchangeable here.
 
 ```python
 # docs: skip
@@ -145,12 +117,7 @@ def encoder_factory():  # an EncoderFactory: one model per worker
 vectors = embed(chunks.iter_batches(), encoder_factory, text_column="chunk", num_workers=4)
 ```
 
-The embedding is appended as `output_column`, which defaults to `"embedding"`, and the
-batches come back in input order. Write them to Lance, then index and search.
-
-After embedding text or images and writing them to a Lance dataset, retrieve the
-nearest rows to a query vector with `vector_search`, optionally building an ANN index
-first so it scales:
+The embedding is appended as `output_column`, which defaults to `"embedding"`, and batches come back in input order. Once the vectors are in a Lance dataset, `vector_search` retrieves the rows nearest a query vector, and `build_vector_index` builds an ANN index first so the search scales:
 
 ```python
 # docs: skip
@@ -161,16 +128,9 @@ hits = vector_search("s3://bucket/vectors.lance", query_vector, column="embeddin
 top = hits.collect()  # k rows nearest to the query, with a _distance column
 ```
 
-Vector search needs `batcher-engine[lance]`. See {doc}`embeddings </ml/retrieval/embeddings>` for the
-compute side and {doc}`LLM inference </ml/retrieval/llm/index>` for generation over retrieved context.
+Vector search needs `batcher-engine[lance]`. {doc}`/ml/retrieval/vector-search` covers it in depth.
 
-Sometimes the embeddings already ride in a column, as in a reranking pass or a small
-candidate set that does not warrant an index. Score them against a query vector in-engine
-with the {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` distance expressions, and no Lance is required. {py:meth}`.list.cosine_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>`
-is `1 - cosine_similarity`, so it reads 0 for identical direction, 1 for orthogonal, and 2
-for opposite. That is the standard embedding metric. {py:meth}`.list.l2_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_distance>` is the
-Euclidean distance. Each takes the query as another column or an {py:func}`array(...) <batcher.array>` literal and
-returns a Float64 that sorts ascending, so the nearest rows come first:
+Sometimes the embeddings already ride in a column, as in a reranking pass or a candidate set too small to warrant an index. Score them in the engine with the {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` distance expressions, with no Lance required. {py:meth}`.list.cosine_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>` is `1 - cosine_similarity`, the standard embedding metric: 0 for identical direction, 1 for orthogonal, and 2 for opposite. {py:meth}`.list.l2_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_distance>` is the Euclidean distance. Each takes the query as another column or an {py:func}`array(...) <batcher.array>` literal and returns a Float64 that sorts ascending, so the nearest rows come first:
 
 ```python
 import batcher as bt
@@ -186,13 +146,7 @@ print(out["id"], [round(d, 4) for d in out["dist"]])
 # [1, 2, 3] [0.0, 0.2, 1.0]
 ```
 
-A dot product is a cheaper kernel than a full cosine, and on **unit-length** vectors
-the two rank identically. Cosine similarity is the dot product divided by both
-magnitudes, and those are 1 once the vectors are normalized. So normalize once, up front
-at embedding time, with {py:meth}`.list.normalize() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.normalize>`, which L2-normalizes each vector to unit
-length, and retrieve with the plain {py:meth}`.list.dot(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>` against a likewise-normalized query.
-{py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` reports a vector's Euclidean magnitude, which confirms a vector is
-already unit-length before you skip the normalization:
+A dot product is cheaper than a full cosine, and on **unit-length** vectors the two rank identically, because cosine similarity is the dot product divided by both magnitudes. So normalize once at embedding time with {py:meth}`.list.normalize() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.normalize>`, which L2-normalizes each vector to unit length, and retrieve with the plain {py:meth}`.list.dot(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>` against a likewise-normalized query. {py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` reports a vector's Euclidean magnitude, which confirms a vector is already unit-length before you skip the normalization:
 
 ```python
 import batcher as bt
@@ -209,3 +163,11 @@ unit = vecs.with_columns(u=col("vec").list.normalize())
 print(unit.select("id", score=col("u").list.dot(array(1.0, 0.0))).to_pydict())
 # {'id': [1, 2, 3], 'score': [0.6, 0.0, 1.0]}
 ```
+
+## See also
+
+- {doc}`/ml/preparing/multimodal/decoding`: fetching bytes and decoding them into tensor columns.
+- {doc}`/ml/preparing/multimodal/video`: sampling frames from clips, the largest payloads a pipeline carries.
+- {doc}`/ml/retrieval/embeddings`: producing embeddings at scale with `ds.ml.embed`.
+- {doc}`/ml/retrieval/rag`: the full retrieval-augmented generation pipeline.
+- {doc}`/ml/inference/gpu`: sizing GPU actor pools for the model stage.

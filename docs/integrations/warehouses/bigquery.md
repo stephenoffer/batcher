@@ -1,176 +1,101 @@
 # BigQuery
 
-BigQuery is read-only in Batcher. {py:meth}`bt.read.bigquery(...) <batcher.api.io_namespace.reader.Reader.bigquery>` pulls a table or a query result
-through the Storage Read API as parallel Arrow streams. There is no BigQuery sink; to land
-results in BigQuery, write Parquet to GCS and load it, or use `bq load`.
+This page covers reading BigQuery tables and query results. {py:meth}`bt.read.bigquery(...) <batcher.api.io_namespace.reader.Reader.bigquery>` reads through the BigQuery Storage Read API, which serves a table as parallel Arrow streams, and pushes both your filters and your column selection into the read session so BigQuery scans only what the query uses.
+
+The following table summarizes the connector:
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.bigquery(query, project=...)` or `bt.read.bigquery(table=..., project=...)` |
-| **Write** | Not supported |
-| **Extra** | `pip install 'batcher-engine[bigquery]'` |
-| **Parallelism** | One split per Storage Read API stream; `max_streams` defaults to 8 |
-| **Pushdown** | Predicates become `row_restriction`. Projection only via `selected_fields=`. |
-| **Credentials** | The ambient `google.auth` environment. Nothing is passed as a keyword. |
+| Read | `bt.read.bigquery(query, project=...)` or `bt.read.bigquery(table=..., project=...)` |
+| Write | No sink. Write Parquet to Cloud Storage and load it with `bq load`. |
+| Extra | `pip install 'batcher-engine[bigquery]'` |
+| Parallelism | One split per Storage Read API stream, `max_streams=8` by default |
+| Pushdown | Predicates become the session's `row_restriction`. Projection becomes `selected_fields`. |
+| Statistics | Exact row count and size from `__TABLES__` for a table read |
+| Credentials | The ambient `google.auth` environment |
 
-```bash
-pip install 'batcher-engine[bigquery]'
-```
+The extra installs `google-cloud-bigquery-storage` and `google-cloud-bigquery`. Credentials come from `GOOGLE_APPLICATION_CREDENTIALS`, an application-default login, or the service account attached to the node. Nothing credential-bearing is passed as a keyword or logged.
 
-That brings in `google-cloud-bigquery-storage` and `google-cloud-bigquery`. Credentials come
-from the ambient `google.auth` environment: `GOOGLE_APPLICATION_CREDENTIALS`, an
-application-default login, or the service account attached to the node. Nothing
-credential-bearing is passed as a keyword.
+## Read a table
 
-## Reading
-
-The source needs a billing project *and* a table or a query. The reliable spelling passes both
-as keywords:
-
-::::{tab-set}
-
-:::{tab-item} A table
+A table read needs a billing project and a fully-qualified `project.dataset.table`:
 
 ```python
 # docs: skip
 import batcher as bt
 from batcher import col
 
-events = bt.read.table(
-    "bigquery",
-    project="acme-billing",
+events = bt.read.bigquery(
     table="acme-data.analytics.events",
-    selected_fields=("user_id", "event_type", "ts"),
+    project="acme-billing",
     max_streams=32,
 )
-recent = events.filter(col("event_type") == "purchase").collect()
+purchases = events.filter(col("event_type") == "purchase").select("user_id", "ts").collect()
 ```
 
-`table` is the fully-qualified `project.dataset.table` of the data. `project` is the project the
-read session is billed and quota'd against, which is often a different one.
-:::
+`project` is the project the read session is billed and rate-limited against, which is often not the project that owns the data. The `filter` and the `select` both reach BigQuery: the session opens with `row_restriction` set to the pushed predicate and `selected_fields` set to the columns the plan needs, so the other columns and rows never leave the service.
 
-:::{tab-item} A query
+A table read is also cheap to plan. The schema comes back in the `create_read_session` response before any stream is read, and the row count and byte size come from the dataset's `__TABLES__` metadata view, which scans no bytes. Kyber gets an exact cardinality for the table before execution starts.
+
+## Read a query
+
+The positional argument is the query:
 
 ```python
 # docs: skip
-top = bt.read.table(
-    "bigquery",
-    project="acme-billing",
-    query="""
-        SELECT user_id, COUNT(*) AS n
-        FROM `acme-data.analytics.events`
-        WHERE _PARTITIONDATE >= '2026-01-01'
-        GROUP BY user_id
+top = bt.read.bigquery(
+    """
+    SELECT user_id, COUNT(*) AS n
+    FROM `acme-data.analytics.events`
+    WHERE _PARTITIONDATE >= '2026-01-01'
+    GROUP BY user_id
     """,
+    project="acme-billing",
     max_streams=16,
 )
 ```
 
-The Storage Read API cannot read a query, only a table. So a query read runs the SQL as a job
-into an anonymous destination table, then opens a read session on *that*. You pay for the query
-job, then read its result in parallel.
-:::
-
-::::
-
-:::{note}
-The positional argument to `bt.read.bigquery(...)` is the **query**, so
-`bt.read.bigquery("SELECT ...", project="acme-billing")` reads exactly what it appears to read.
-To read a whole table instead, pass `table=` and leave the positional slot empty:
-`bt.read.bigquery(table="acme-data.analytics.events", project="acme-billing")`.
-:::
+The Storage Read API reads tables, not queries. A query read therefore runs the SQL as a job into BigQuery's anonymous destination table and opens a read session on that table. A pushable predicate is wrapped around your SQL before the job runs.
 
 :::{important}
-A query read is paid for more than once. Constructing the {py:class}`Dataset <batcher.Dataset>` needs a schema, and the
-source gets one by opening a read session and reading the first stream, which for a query read
-means running the query. {py:meth}`collect() <batcher.Dataset.collect>` then runs it again. **Read tables, not queries,** wherever
-you can.
+A query read runs its job more than once. Building the dataset opens a read session to learn the schema, which for a query means running the query, and `collect()` runs it again. Read a table wherever you can, or materialize the result into a table with your own job and read that.
 :::
-
-When you cannot, materialize the result into a real table with your own job and point Batcher
-at the table.
 
 ## How it parallelizes
 
-A {py:class}`Source <batcher.io.Source>` divides into {py:class}`Split <batcher.io.Split>`s, and a split is the unit of read parallelism. One
-`create_read_session(data_format=ARROW, max_stream_count=N)` call returns up to `N` independent
-read streams over the table, and `splits()` returns one split per stream. Each split is nothing
-but a stream name, a string, so it ships to a worker cleanly, and the worker builds its own read
-client and pulls Arrow batches straight from the API.
+A {py:class}`Source <batcher.io.Source>` divides into {py:class}`Split <batcher.io.Split>` objects, and a split is the unit of read parallelism. One `create_read_session(data_format=ARROW, max_stream_count=N)` call returns up to `N` independent streams, and `splits()` returns one split per stream. Each split carries only the stream name, so it ships to any worker, which builds its own read client and pulls Arrow pages straight from the API.
 
-`max_streams` defaults to 8, which is low for a large table and pointless for a small one.
+The server decides how many streams to return based on table size and capacity, so it may return fewer than you ask for. Near your worker count is the right target for a large scan, and more streams than readers buys nothing. Streams read roughly equal shares of the table, not exactly equal ones.
 
-:::{dropdown} Three things to know before you raise `max_streams`
-1. The server may return *fewer* streams than you ask for. It decides based on table size and
-   available capacity; asking for a thousand does not get you a thousand.
-1. Somewhere near your worker count is the right target for a big scan. 32 to 64 is a sane range
-   for a wide table on a real cluster.
-1. Streams read approximately equal shares, not exactly equal ones. Expect stragglers.
-:::
+## Choose the columns yourself
 
-## Push the projection down, or pay for the columns
-
-The two pushdowns here do not behave alike, and the asymmetry is what costs money.
-
-Predicates are pushed. A `filter` that Kyber can translate becomes the read session's
-`row_restriction`, evaluated server-side before a byte moves. You can also set `row_restriction=`
-yourself; the two are combined with `AND`.
-
-Column projection is not pushed automatically. A `select` after the read is applied to the Arrow
-table once it arrives. The server-side column prune is `selected_fields=`, which you pass to the
-source. It is the difference between scanning three columns and scanning ninety, and BigQuery
-charges you for the difference.
-
-| What you write | Where it runs |
-| --- | --- |
-| `selected_fields=(...)` | The server, before a byte moves |
-| `row_restriction="..."`, or a `filter` Kyber can push | The server, as the session's `row_restriction` |
-| {py:meth}`.select(...) <batcher.Dataset.select>` after the read | Your process, on the Arrow table that already arrived |
+Kyber's projection covers the common case. When you want to pin the column set explicitly, or pass a filter in BigQuery's own syntax, set the session options on the source:
 
 ```python
 # docs: skip
-narrow = bt.read.table(
-    "bigquery",
-    project="acme-billing",
+narrow = bt.read.bigquery(
     table="acme-data.analytics.events",
-    selected_fields=("user_id", "ts"),  # scanned server-side
-    row_restriction="event_type = 'purchase'",  # filtered server-side
+    project="acme-billing",
+    selected_fields=("user_id", "ts"),
+    row_restriction="event_type = 'purchase'",
 )
 ```
 
-## Quotas, and the failure modes they produce
+An explicit `selected_fields` replaces the pushed projection rather than intersecting with it. An explicit `row_restriction` is combined with a pushed predicate using `AND`. Nested and repeated fields arrive as Arrow structs and lists. Use the {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>` and {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` accessors to reach into them.
 
-The Storage Read API is metered per project, and the quotas that bite are on read throughput and
-concurrent streams, not on the number of sessions. A job that fans out to a few hundred streams
-across a big Ray cluster can exhaust the project's read quota, and the symptom is
-`ResourceExhausted` on `ReadRows` inside a worker, halfway through a scan, rather than a clean
-failure at planning time.
+## Requirements and limitations
 
-Keep `max_streams` proportionate to the workers that will actually consume them. There is no
-benefit to more streams than readers.
+The Storage Read API is metered per project, on read throughput and concurrent streams. A job that fans out to hundreds of streams across a large cluster can exhaust the quota, and the symptom is `ResourceExhausted` on `ReadRows` inside a worker partway through a scan, not a failure at planning time. Keep `max_streams` proportionate to the workers that consume the streams.
 
-The other one to know is that a read session expires, and streams belonging to an expired session
-fail. Batcher creates the session at planning time and the splits are consumed later, so a scan
-whose workers sit behind a long queue, on a busy cluster or an autoscaler that is still warming
-up, can find its streams dead by the time they run. Short queues, or a re-plan.
+Read sessions expire. Batcher creates the session at planning time, so a scan whose splits wait behind a long queue, on a busy cluster or an autoscaler still warming up, can find its streams gone. A stream that fails mid-read is re-read from its start by the retry, not resumed at the offset it reached.
 
-Two smaller ones. A stream that fails mid-read is re-read from the start of that stream by
-whatever retry runs it, not resumed at the offset it reached. And nested or repeated fields come
-back as Arrow structs and lists, so use the {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>` and {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` accessors; nothing is flattened
-for you.
-
-A {py:exc}`BackendError <batcher.BackendError>` at construction means the client libraries are missing, or that you supplied
-neither `query=` nor `table=`.
+There's no BigQuery sink. A {py:exc}`BackendError <batcher.BackendError>` at construction means the client libraries are missing, or that neither `query` nor `table` was supplied. A governance policy matches a `table=` read by its table name. A query read has no table name to match.
 
 ## See also
 
-- {doc}`Reading data </user-guide/moving-data/reading-data>`: the guided tour of the reader surface.
-- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: a BigQuery table
-  joined against the lake without staging either side.
-- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: reading only the
-  new partitions, which is the cheapest read there is.
-- {doc}`Reading and writing </api/relational/io>`: the full reader/writer surface.
-- {doc}`Snowflake </integrations/warehouses/snowflake>`: the other big warehouse, and the only one Batcher writes.
-- {doc}`Databricks </integrations/warehouses/databricks>`: also read-only, also credential-vended, but the read lands on Delta
-  files rather than a proprietary API.
+- {doc}`Snowflake </integrations/warehouses/snowflake>`: the warehouse connector that also writes.
+- {doc}`Databricks </integrations/warehouses/databricks>`: Unity Catalog tables read straight from their Delta files.
+- {doc}`Reading data </user-guide/moving-data/reading-data>`: the reader surface.
+- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: a BigQuery table joined against the lake without staging either side.
+- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: reading only new partitions.
+- {doc}`Reading and writing </api/relational/io>`: the full API reference.

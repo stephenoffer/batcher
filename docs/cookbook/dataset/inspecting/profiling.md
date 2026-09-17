@@ -2,6 +2,8 @@
 
 The first thing to do with unfamiliar data is measure it, not query it. These are the one-liners that answer "what is in here" before you write a single business rule.
 
+The script runs them in the order you would reach for them: `describe` for per-column statistics, null counts, exact and approximate distinct counts and quantiles, `value_counts` for a categorical, correlation and covariance matrices, `drop_constant_columns`, an emptiness check, and `glimpse` and `info` for a compact overview.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/dataset/profiling.py

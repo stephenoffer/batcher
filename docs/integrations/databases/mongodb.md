@@ -1,7 +1,6 @@
 # MongoDB
 
-Read a collection into Arrow, write a dataset back as bulk upserts. Both directions need
-`pip install 'batcher-engine[mongo]'`, which brings `pymongo` and `pymongoarrow`.
+This page covers reading a MongoDB collection into Arrow and writing a dataset back as bulk upserts. Both directions need `pip install 'batcher-engine[mongo]'`, which brings `pymongo` and `pymongoarrow`.
 
 | | |
 | --- | --- |
@@ -10,12 +9,10 @@ Read a collection into Arrow, write a dataset back as bulk upserts. Both directi
 | **Extra** | `pip install 'batcher-engine[mongo]'` |
 | **Parallelism** | Off by default. `PartitionSpec(segments=N)` splits the `_id` range. |
 | **Pushdown** | Predicates become a Mongo filter document, AND-merged into the `find` |
-| **Credentials** | In the URI, which is never logged |
+| **Credentials** | In the URI, which is never logged. The whole URI may be an `env:`/`file:` reference |
 
 Reads go through `pymongoarrow.api.find_arrow_all`, which builds an Arrow table directly from the
-wire. No per-row Python, no `dict` per document. That is the only reason a Mongo scan is worth
-doing at analytical scale, and it is why this connector cares about your documents having a
-*stable* shape.
+wire, with no `dict` per document and no per-row Python. That is what makes a Mongo scan practical at analytical scale, and it is also why this connector needs your documents to have a stable shape.
 
 ## Reading
 
@@ -54,13 +51,9 @@ recent = bt.read.mongo(
 
 ::::
 
-The URI carries the credentials. It is stored verbatim on the source and never logged. The
-connector's `identity()`, which is the key its learned statistics live under, is
-`mongo:<database>.<collection>:<fingerprint>`, where the fingerprint is a `sha256` over the
-connection options with the credential-ish keys excluded. So a plan dump or a log line cannot
-leak your password, the same collection on staging and on production does not share one
-statistics entry, and rotating the password neither leaks into the key nor orphans what has
-already been learned.
+The URI carries the credentials and is never logged. Pass `uri="env:MONGO_URI"` to keep it out of the driver process entirely. The reference is resolved where the connection is dialed.
+
+Learned statistics live under the connector's `identity()`, which is `mongo:<database>.<collection>:<fingerprint>`. The fingerprint is a `sha256` over the connection options with the URI's password masked. The same collection on staging and on production therefore keeps separate statistics, and rotating the password neither leaks into the key nor orphans what has already been learned.
 
 ## Predicate pushdown
 
@@ -157,32 +150,17 @@ Rows do cross into Python for the write ({py:meth}`to_pylist() <batcher.Dataset.
 the driver's shape, and it makes Mongo a fine sink for a serving or feature collection and a poor
 one for dumping a billion analytical rows. Write those to Parquet or Delta.
 
-## Failure modes worth knowing
+## Requirements and limitations
 
-:::{warning}
-**Schema inference reads one document.** The Arrow schema comes from a `limit=1` sample. A
-collection whose documents disagree, where a field is an `int` in some rows and a `string` in
-others, or missing entirely from the first document, gives you a schema that does not describe the
-collection, and later batches then fail to convert or arrive null. Fix it with an explicit `query=`
-that constrains the shape, or project the fields you actually need. Mongo's freedom of shape is
-exactly the thing an Arrow reader cannot absorb.
-:::
+Schema inference reads one document. The Arrow schema comes from a `limit=1` sample, so a collection whose documents disagree gives a schema that does not describe it. A field that is an `int` in some documents and a `string` in others, or one missing from the sampled document, makes later batches fail to convert or arrive null. Constrain the shape with an explicit `query=`, or project the fields you need.
 
-**`_id` is an ObjectId.** It arrives as its Arrow-mapped type, and range splitting assumes `_id` is
-ordered and comparable. A collection with a custom, unordered `_id` (a random UUID string) still
-splits, but the ranges will not be balanced.
+Range splitting assumes `_id` is ordered and comparable, as an ObjectId is. A collection with a custom, unordered `_id` such as a random UUID string still splits, but the ranges will not be balanced.
 
-**Cursor timeouts.** A slow downstream pipeline holds each split's cursor open while the engine
-consumes it. If you see cursor-not-found errors on a long job, the fix is a smaller `segments`
-count with a faster drain, not a bigger timeout.
+A slow downstream pipeline holds each split's cursor open while the engine consumes it. If a long job hits cursor-not-found errors, lower `segments` so each cursor drains faster rather than raising the server timeout.
 
-**No transactions.** The bulk write is `ordered=False` and there is no commit phase. A write that
-fails halfway leaves the documents it already applied in place. Idempotency on the key is your
-recovery story; there is no rollback.
+The bulk write is `ordered=False` with no commit phase. A write that fails halfway leaves the documents it already applied in place, so recovery means re-running it, which a keyed `upsert` makes safe.
 
-**`overwrite` is single-node only.** Past the first shard of a distributed write it is refused,
-because every shard would empty the one collection they all target and so discard the shards before
-it. Distribute an `upsert` instead, which only ever touches the keys its own rows name.
+`overwrite` is single-node only. Past the first shard of a distributed write it is refused, because every shard would empty the one collection they all target and discard the shards before it. Distribute an `upsert` instead, which only touches the keys its own rows name.
 
 ## See also
 

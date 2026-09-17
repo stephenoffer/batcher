@@ -1,15 +1,14 @@
 # Running on unstable nodes
 
 This page describes how Batcher keeps a job alive on a GPU cluster whose nodes and devices
-fail underneath it, and what you configure when the defaults are not what your fleet needs.
+fail underneath it, and what to configure when the defaults don't suit your fleet.
 
 At fleet scale a node rarely fails by disappearing. It fails by staying up and being wrong: a
 GPU that reports uncorrectable memory errors and keeps accepting work, a filesystem remounted
 read-only under the spill directory, a driver that no longer matches its CUDA runtime, a
 container image that half-deployed. In every one of those cases the scheduler still sees a
 healthy node with a free slot, so it keeps placing work there. One bad machine then walks the
-whole queue onto itself, and what you observe is not "a node was broken" but "the job never
-finished".
+whole queue onto itself. You don't see a broken node. You see a job that never finishes.
 
 ## What Batcher already does
 
@@ -42,7 +41,7 @@ device that has since been repaired, and a fleet then shrinks over its lifetime 
 in any log to explain it.
 
 The same applies to the outcome ledger. Recorded failures decay over a half-life, a quarantine
-expires into probation rather than into a permanent verdict, and a success is what clears one.
+expires into probation rather than into a permanent verdict. Only a success clears one.
 
 ## Check the fleet before you trust it
 
@@ -113,7 +112,7 @@ model file, and condemning more nodes replaces an error message with an outage.
 
 ## When a device corrupts rather than loses
 
-Almost every failure loses work, and losing work is what a retry is for. A double-bit ECC
+Almost every failure loses work, and a retry exists to redo lost work. A double-bit ECC
 error and an uncontained ECC fault do something else: the device kept running and returned a
 number, and the number is wrong. The tasks that already succeeded on that device are as
 suspect as the one that failed.
@@ -123,6 +122,10 @@ default and it is not a performance trade: a job that retries past a corrupting 
 successfully and writes the corruption out, which is worse than the crash it avoided. Turn it
 off with `fault_tolerance.fail_on_untrusted_results` only where something downstream verifies
 the results independently.
+
+Corruption is one of three verdicts Batcher reaches before it decides whether to retry at all, as the figure shows:
+
+![How a distributed run recovers when a map or reduce task raised or its worker stopped answering. Batcher classifies the failure before retrying, and only one of three verdicts retries. Lost data, such as a Ray error that is not a task error because an actor, worker or node died, an unreachable peer, or a spill file on an ephemeral disk, is recomputed. A deterministic bug, such as a UDF exception, a bad cast, a schema mismatch or a broken runtime environment, is re-raised, because every retry would re-run it and burn the job-wide budget. Untrusted results, such as an uncontained ECC fault where the device kept running and answered wrongly, stop the run, because work already finished on that device is as suspect as the task that failed. A recompute then costs one of three things: re-reading the source partition and re-running the map by default, fetching an off-node replica when shuffle_replication is above 1, or migrating the data while the worker is still alive when there was advance notice such as spot metadata, SIGTERM or a Slurm deadline. Recovery brings its own hazard, a worker presumed dead that is not, so each round carries a higher epoch and a reducer discards any batch arriving under a stale one.](/_static/diagrams/fault_recovery.svg)
 
 ## Requirements and limitations
 

@@ -1,8 +1,12 @@
 # Reading data
 
-A pipeline starts by building a {py:class}`Dataset <batcher.Dataset>` from a source. Sources come in two groups:
+This page covers building a {py:class}`Dataset <batcher.Dataset>` from a source, the first step of every pipeline. Sources come in two groups:
 in-memory constructors, which wrap data already in the process, and path readers,
 which load from disk or object storage. Both are lazy.
+
+The first question is where the data sits right now, and the answer picks the family. The rows under each family then name the constructor or reader for the input you hold.
+
+![Choosing a reader starts from where the data is. Data already in the Python process goes through the bt.from_* constructors: a column dict to from_pydict, an Arrow table or batches to from_arrow, a NumPy array to from_numpy, a pandas or Polars frame to from_pandas or from_polars, a list of Python items to from_items, and a factory that yields batches to from_batches. None of them needs files or credentials. Data at a path goes through bt.read: bt.read(path) when the extension names the format, bt.read on a directory holding one format, read.parquet or read.csv when you name the format yourself, read.delta or read.iceberg for a lakehouse table, read.images or read.video for media, and read.sql or read.snowflake for a database or warehouse. A directory holding two formats needs format= passed explicitly. Every answer returns a lazy Dataset, so nothing is read until a terminal operation such as collect runs.](/_static/diagrams/reader_choice.svg)
 
 ## In-memory constructors
 
@@ -90,8 +94,7 @@ Python types do not, and each has a one-line answer:
 | A torch `Tensor` | `tensor.cpu().numpy()` |
 
 Anything else raises a {py:class}`PlanError <batcher.PlanError>` naming the column and what
-it holds. Nothing is silently pickled into an object column: an opaque Python object costs
-10 to 100 times more on every transfer downstream, and a failure you can read beats a
+it holds. Nothing is silently pickled into an object column, because a failure you can read beats a
 slowdown you have to go looking for.
 
 ```python
@@ -372,6 +375,7 @@ print(isinstance(bt.engine_version(), str))
 - {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: read Delta and Iceberg tables, and travel back
   through their versions.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate inputs as they arrive.
+- {doc}`/user-guide/moving-data/streaming`: the same readers over unbounded sources.
 - {doc}`IO API </api/relational/io>`: the full `bt.read` reader reference.
 - {doc}`Agent skills </agents>`: `read-and-write-data` covers picking a reader or
   sink, cloud paths, globs, schema evolution, and error tolerance.

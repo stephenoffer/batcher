@@ -1,21 +1,13 @@
 # Image captioning
 
-Captioning a product catalog is a vision-language model over a URL column. The model is
-the easy part. Everything on the way to it is where the job dies: a million HTTPS fetches
-run one at a time, images decoded on the same thread that should be feeding the GPU, and a
-single 404 that takes down a job five hours in.
+Captioning a product catalog is a vision-language model over a URL column. The model is the easy part. Everything on the way to it is where the job dies: a million HTTPS fetches run one at a time, images decoded on the same thread that should be feeding the GPU, and a single 404 that takes down a job five hours in.
 
 ## Fetch, decode, caption
 
-{py:meth}`ds.ml.download <batcher.api.dataset.ml.DatasetML.download>` fetches each URL's bytes into a column (`s3://`, `gs://`, `az://`,
-`http(s)://`, or a local path), fetching a batch's rows concurrently and parallelizing
-across workers.
+{py:meth}`ds.ml.download <batcher.api.dataset.ml.DatasetML.download>` fetches each URL's bytes into a column (`s3://`, `gs://`, `az://`, `http(s)://`, or a local path), fetching a batch's rows concurrently and parallelizing across workers.
 
 :::{warning}
-`on_error="null"` turns a dead link into a null instead of an exception. On a catalog of
-any age some fraction of the links are dead, and that is a property of the data, not a bug to
-crash on. Leave it at the default and a single 404 takes down a job that has been running for
-five hours.
+`on_error="null"` turns a dead link into a null instead of an exception. On a catalog of any age some fraction of the links are dead, and that is a property of the data, not a bug to crash on. Leave it at the default and a single 404 takes down a job that has been running for five hours.
 :::
 
 ::::{tab-set}
@@ -48,10 +40,7 @@ captions.select("sku", "caption").write.parquet("s3://bucket/captions.parquet")
 
 :::{tab-item} A stub engine, no GPU
 
-An engine is a zero-argument callable returning `requests -> list[str]`. With an
-`image_column`, each request is a `{"prompt": str, "image": PIL.Image}` dict. So a stub
-engine exercises the whole path (fetch, decode, request assembly, column append) with no GPU
-and no weights.
+An engine is a zero-argument callable returning `requests -> list[str]`. With an `image_column`, each request is a `{"prompt": str, "image": PIL.Image}` dict. So a stub engine exercises the whole path (fetch, decode, request assembly, column append) with no GPU and no weights.
 
 ```python
 import io
@@ -91,26 +80,19 @@ print(captioned.select("sku", "caption").to_pydict())
 # {'sku': [1, 2], 'caption': ['dark 16x16 product photo', 'bright 32x32 product photo']}
 ```
 
-Swap `stub_vlm` for `vllm_engine("llava-hf/llava-1.5-7b-hf")` and add `num_gpus=1`, and this
-is the production job. That is the whole point of the engine contract being one callable:
-the pipeline you can test on a laptop is the pipeline that runs on eight GPUs.
+Swap `stub_vlm` for `vllm_engine("llava-hf/llava-1.5-7b-hf")` and add `num_gpus=1`, and this is the production job. That is the whole point of the engine contract being one callable: the pipeline you can test on a laptop is the pipeline that runs on eight GPUs.
 :::
 ::::
 
-`image_column` takes raw image bytes or a decoded `(H, W, 3)` tensor; the engine receives
-one request per row carrying both the prompt and the image. A null image falls back to a
-text-only request rather than failing the batch.
+`image_column` takes raw image bytes or a decoded `(H, W, 3)` tensor; the engine receives one request per row carrying both the prompt and the image. A null image falls back to a text-only request rather than failing the batch.
 
 :::{note}
-Vision models go through the completion path, so `chat=True` is rejected for an
-`image_column`. That is a real constraint of how vLLM carries multimodal input, not a
-Batcher preference.
+Vision models go through the completion path, so `chat=True` is rejected for an `image_column`. That is a real constraint of how vLLM carries multimodal input, not a Batcher preference.
 :::
 
 ## Prompts that are worth sending
 
-A caption model does what the prompt tells it. `template` builds the prompt from the row's
-other columns, in the engine, with no Python loop of yours anywhere:
+A caption model does what the prompt tells it. `template` builds the prompt from the row's other columns, in the engine, with no Python loop of yours anywhere:
 
 ```python
 # docs: skip
@@ -124,16 +106,11 @@ captions = catalog.ml.generate(
 )
 ```
 
-A shared prefix across rows costs almost nothing: `vllm_engine` enables prefix caching by
-default, so the fixed part of the instruction is encoded once rather than a million times.
+A shared prefix across rows costs almost nothing: `vllm_engine` enables prefix caching by default, so the fixed part of the instruction is encoded once rather than a million times.
 
 ## Resize before the model, not inside it
 
-A 4000×3000 product photo is 36 MB decoded, and a batch of them will exhaust host memory
-before the GPU sees anything. {py:meth}`.image.resize(w, h) <batcher.plan.expr_ir.image._ImageNamespace.resize>` decodes, resizes, and re-encodes to
-PNG bytes, so the column stays a compact blob that is cheap to ship, spill, and shuffle.
-{py:meth}`.image.to_tensor(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` is the other half of the pair: it produces a tensor column, which
-is what you want when the next stage is a model that takes pixels directly.
+A 4000×3000 product photo is 36 MB decoded, and a batch of them will exhaust host memory before the GPU sees anything. {py:meth}`.image.resize(w, h) <batcher.plan.expr_ir.image._ImageNamespace.resize>` decodes, resizes, and re-encodes to PNG bytes, so the column stays a compact blob that is cheap to ship, spill, and shuffle. {py:meth}`.image.to_tensor(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` is the other half of the pair: it produces a tensor column, which is what you want when the next stage is a model that takes pixels directly.
 
 ```python
 from batcher import col
@@ -148,32 +125,22 @@ print(small.schema.field("thumb").type, small.column("thumb")[0].as_py()[:4] == 
 | `.image.resize(w, h)` | PNG bytes: a compact blob | the column has to be shipped, spilled, shuffled, or written back out |
 | `.image.to_tensor(w, h)` | a fixed-shape `(H, W, 3)` tensor column | the next stage is a model that takes pixels directly |
 
-Both run natively in the data plane, SIMD-decoded and SIMD-resized across every core, which
-is why image decode and resize runs at 5,693 img/s on a 96-core node, 2.4x Daft. Do it in a
-Python UDF instead and that stage becomes the bottleneck the GPU waits on.
+Both run natively in the data plane, SIMD-decoded and SIMD-resized across every core, which is why image decode and resize runs at 5,693 img/s on a 96-core node, 2.4x Daft. Do it in a Python UDF instead and that stage becomes the bottleneck the GPU waits on.
 
 ## Keep the GPU fed
 
-The decode is CPU work and the forward pass is GPU work, and running them in lockstep idles
-whichever one is not running. Batcher overlaps them, decoding morsel *k+1* on the CPU while
-the GPU is still on morsel *k*, which took a two-stage ResNet-50 pipeline from 942 to
-2,504 img/s and utilization from ~30% to 81%. You inherit that by expressing the decode as an
-engine stage rather than doing it inside the model's `__call__`.
+The decode is CPU work and the forward pass is GPU work, and running them in lockstep idles whichever one is not running. Batcher overlaps them, decoding morsel *k+1* on the CPU while the GPU is still on morsel *k*, which took a two-stage ResNet-50 pipeline from 942 to 2,504 img/s and utilization from ~30% to 81%. You inherit that by expressing the decode as an engine stage rather than doing it inside the model's `__call__`.
 
 Two things to check when the GPU is idle anyway:
 
-- The engine factory is passed as a class or a factory, never an instance or a plain
-  function. A function rebuilds the engine, reloading the model, on every batch.
-- `max_concurrency` on the download is high enough that the fetch is not the bottleneck. A
-  million sequential HTTPS round trips at 50 ms each is fourteen hours of nothing.
+- The engine factory is passed as a class or a factory, never an instance or a plain function. A function rebuilds the engine, reloading the model, on every batch.
+- `max_concurrency` on the download is high enough that the fetch is not the bottleneck. A million sequential HTTPS round trips at 50 ms each is fourteen hours of nothing.
 
 ## Writing media back out
 
 :::{dropdown} Uploading the resized column back to object storage
 
-{py:meth}`ds.ml.upload <batcher.api.dataset.ml.DatasetML.upload>` is the counterpart to `download`: it writes a bytes column back to object
-storage and appends the written paths, with concurrent writes and a content hash for a name
-when you do not supply one.
+{py:meth}`ds.ml.upload <batcher.api.dataset.ml.DatasetML.upload>` is the counterpart to `download`: it writes a bytes column back to object storage and appends the written paths, with concurrent writes and a content hash for a name when you do not supply one.
 
 ```python
 # docs: skip
@@ -186,16 +153,11 @@ written = catalog.with_columns(thumb=col("photo").image.resize(256, 256)).ml.upl
 ## See also
 
 - {doc}`Image classification </cookbook/ml/pipelines/multimodal/image-classification>`: the discriminative version of this pipeline.
-- {doc}`Audio transcription </cookbook/ml/pipelines/multimodal/audio-transcription>`: the same fetch → decode → model shape, for
-  sound.
+- {doc}`Audio transcription </cookbook/ml/pipelines/multimodal/audio-transcription>`: the same fetch → decode → model shape, for sound.
 - {doc}`LLM inference </ml/retrieval/llm/index>`: vision engines, guided decoding, token accounting.
 - {doc}`Multimodal </ml/preparing/multimodal/index>`: decode expressions, tensor columns, blob offload.
 - {doc}`GPU scheduling </ml/inference/gpu>`: `num_gpus`, `concurrency`, and accelerator placement.
 - {doc}`ML API reference </api/models/ml>`: {py:meth}`ds.ml.download <batcher.api.dataset.ml.DatasetML.download>`, {py:meth}`ds.ml.upload <batcher.api.dataset.ml.DatasetML.upload>`, {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`.
-- {doc}`Multimodal-ingest benchmarks </benchmarks/results/multimodal-ingest>` and
-  {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the decode and overlap numbers
-  quoted here.
-- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: how the decode stage and the model stage
-  overlap.
-- {doc}`HuggingFace integration </integrations/compute/huggingface>`: where the vision model comes
-  from.
+- {doc}`Multimodal-ingest benchmarks </benchmarks/results/multimodal-ingest>` and {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the decode and overlap numbers quoted here.
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: how the decode stage and the model stage overlap.
+- {doc}`HuggingFace integration </integrations/compute/huggingface>`: where the vision model comes from.

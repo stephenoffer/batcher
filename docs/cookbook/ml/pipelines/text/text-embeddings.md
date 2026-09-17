@@ -1,18 +1,10 @@
 # Text embeddings
 
-Embedding a corpus is the cheapest way to make a GPU look bad. The forward pass over a
-MiniLM-sized model is milliseconds. Everything around it is where the wall clock goes:
-reloading the weights, reading columns nobody asked for, shipping raw HTML to the
-tokenizer. This page takes a table of documents to a normalized vector column ready for
-retrieval.
+Embedding a corpus is the cheapest way to make a GPU look bad. The forward pass over a MiniLM-sized model is milliseconds. Everything around it is where the wall clock goes: reloading the weights, reading columns nobody asked for, shipping raw HTML to the tokenizer. This page takes a table of documents to a normalized vector column ready for retrieval.
 
 ## Clean the text first
 
-Scraped text carries markup, and a tokenizer will happily spend its context on
-`<script>` bodies and `&nbsp;`. {py:meth}`.str.strip_html() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.strip_html>` extracts the prose (it drops script
-and style contents, decodes entities, and separates block elements), and
-{py:meth}`.str.normalize_whitespace() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.normalize_whitespace>` collapses what is left. Both run in the engine, so this
-costs a scan, not a Python loop.
+Scraped text carries markup, and a tokenizer will happily spend its context on `<script>` bodies and `&nbsp;`. {py:meth}`.str.strip_html() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.strip_html>` extracts the prose (it drops script and style contents, decodes entities, and separates block elements), and {py:meth}`.str.normalize_whitespace() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.normalize_whitespace>` collapses what is left. Both run in the engine, so this costs a scan, not a Python loop.
 
 ```python
 import batcher as bt
@@ -32,23 +24,20 @@ docs = bt.from_pydict(
 
 clean = (
     docs.with_columns(text=col("html").str.strip_html().str.normalize_whitespace())
-    .filter(col("text").str.len() > 10)
+    .filter(col("text").str.len_chars() > 10)
     .select("id", "text")
 )
 print(clean.to_pydict()["text"])
 # ['Refund policy Returns accepted within 30 days.', 'Shipping is free over $50.', 'Our support team answers within one business day.']
 ```
 
-The `filter` matters more than it looks. An empty or near-empty document still costs a
-full forward pass, and its vector is noise that will show up in every retrieval. Drop
-those rows before they reach the GPU, not after.
+The `filter` matters more than it looks. An empty or near-empty document still costs a full forward pass, and its vector is noise that will show up in every retrieval. Drop those rows before they reach the GPU, not after.
 
 ## The model loads once per worker
 
 ::::{tab-set}
 :::{tab-item} A model id
-The model-id path is the short version: pass a sentence-transformers id and the column,
-and the model loads once per worker and appends a vector column.
+The model-id path is the short version: pass a sentence-transformers id and the column, and the model loads once per worker and appends a vector column.
 
 ```python
 # docs: skip
@@ -67,8 +56,7 @@ vectors.write.parquet("s3://bucket/vectors.parquet")
 :::
 
 :::{tab-item} Your own encoder class
-For any other encoder, pass a class. `map_batches`, `infer`, and `embed` instantiate
-it once per worker, and the constructor is where the weights load.
+For any other encoder, pass a class. `map_batches`, `infer`, and `embed` instantiate it once per worker, and the constructor is where the weights load.
 
 ```python
 # docs: skip
@@ -99,31 +87,20 @@ vectors = clean.ml.embed(
 ::::
 
 :::{warning}
-Pass a plain function instead and the model is rebuilt on every batch: a 2-second load per
-256 rows, which is the single most common way an embedding job ends up slower than the CPU
-baseline. The engine warns (`PerformanceWarning`) when a GPU stage gets a bare function, but
-it cannot fix it for you.
+Pass a plain function instead and the model is rebuilt on every batch: a 2-second load per 256 rows, which is the single most common way an embedding job ends up slower than the CPU baseline. The engine warns (`PerformanceWarning`) when a GPU stage gets a bare function, but it cannot fix it for you.
 :::
 
-Batcher's pools are session-warm: the model loads once per session and is reused across
-calls, worth about 2× on repeated inference. That is only true if the load lives in the
-constructor.
+Batcher's pools are session-warm: the model loads once per session and is reused across calls, worth about 2× on repeated inference. That is only true if the load lives in the constructor.
 
 :::{tip}
-`select` down to the columns the encoder reads before the stage. The optimizer cannot see
-inside a Python function, so an embedding stage over one column of a 41-column Parquet
-file reads all 41 unless you project first.
+`select` down to the columns the encoder reads before the stage. The optimizer cannot see inside a Python function, so an embedding stage over one column of a 41-column Parquet file reads all 41 unless you project first.
 :::
 
 ## Normalize once, at write time
 
-Cosine similarity is a dot product divided by two magnitudes. On unit-length vectors
-those magnitudes are 1, so a normalized corpus retrieves with the cheaper {py:meth}`.list.dot <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>`
-kernel and ranks identically. Normalizing at query time instead pays for it on every
-search, forever.
+Cosine similarity is a dot product divided by two magnitudes. On unit-length vectors those magnitudes are 1, so a normalized corpus retrieves with the cheaper {py:meth}`.list.dot <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>` kernel and ranks identically. Normalizing at query time instead pays for it on every search, forever.
 
-The encoder below is a deterministic bag-of-words hash, with no weights and no GPU, so the
-whole shape runs here. Swap it for the `Embedder` above and nothing else changes.
+The encoder below is a deterministic bag-of-words hash, with no weights and no GPU, so the whole shape runs here. Swap it for the `Embedder` above and nothing else changes.
 
 ```python
 import zlib
@@ -161,10 +138,7 @@ print([round(v, 3) for v in embedded.to_pydict()["embedding"][1][:4]])
 
 ## Retrieve
 
-With the corpus normalized, a query is one more embedding and a sort. `.list.dot` scores
-every row in the engine; `top_k` keeps the nearest without materializing the corpus.
-(A token-hash encoder has no semantics, so it only matches on literal overlap. The ranking
-here proves the plumbing, not the recall.)
+With the corpus normalized, a query is one more embedding and a sort. `.list.dot` scores every row in the engine; `top_k` keeps the nearest without materializing the corpus. (A token-hash encoder has no semantics, so it only matches on literal overlap. The ranking here proves the plumbing, not the recall.)
 
 ```python
 query = bt.from_pydict({"id": [0], "text": ["returns accepted within 30 days"]})
@@ -179,12 +153,9 @@ print(hits.to_pydict()["id"])
 # [1, 4]
 ```
 
-{py:meth}`.list.cosine_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>` is the equivalent for a corpus you have *not* normalized; it
-sorts ascending (0 is identical). Reach for it in a reranking pass over a small candidate
-set, where the extra kernel cost is irrelevant.
+{py:meth}`.list.cosine_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>` is the equivalent for a corpus you have *not* normalized; it sorts ascending (0 is identical). Reach for it in a reranking pass over a small candidate set, where the extra kernel cost is irrelevant.
 
-At corpus scale, write the vectors to Lance and let an ANN index do the search instead of
-scanning every row:
+At corpus scale, write the vectors to Lance and let an ANN index do the search instead of scanning every row:
 
 ```python
 # docs: skip
@@ -206,24 +177,19 @@ Three ways to score, and the corpus size decides which:
 ## What to check when it is slow
 
 :::{dropdown} The four things to check before you blame the GPU
-- The stage got a class, not a function or an instance. A `PerformanceWarning` on a GPU
-  stage means the model is reloading per batch.
+- The stage got a class, not a function or an instance. A `PerformanceWarning` on a GPU stage means the model is reloading per batch.
 - The scan reads only the columns the encoder needs (`select` before the stage).
 - Empty and junk rows are filtered before the model, not after.
-- `batch_size` is as large as device memory allows; the pool halves and retries a batch
-  that OOMs rather than failing the job.
+- `batch_size` is as large as device memory allows; the pool halves and retries a batch that OOMs rather than failing the job.
 :::
 
 ## See also
 
 - {doc}`RAG index </cookbook/ml/pipelines/text/rag-index>`: chunk long documents before embedding them.
-- {doc}`Training-data dedup </cookbook/ml/pipelines/features/training-data-dedup>`: the near-duplicate pass to run before you
-  spend a GPU-hour embedding the same document twice.
-- {doc}`Embeddings </ml/retrieval/embeddings>` and {doc}`vector search </ml/retrieval/vector-search>`: the
-  encoder surface and the index it feeds.
+- {doc}`Training-data dedup </cookbook/ml/pipelines/features/training-data-dedup>`: the near-duplicate pass to run before you spend a GPU-hour embedding the same document twice.
+- {doc}`Embeddings </ml/retrieval/embeddings>` and {doc}`vector search </ml/retrieval/vector-search>`: the encoder surface and the index it feeds.
 - {doc}`Inference </ml/inference/inference>`: the pool and stage-overlap mechanics.
 - {doc}`Multimodal </ml/preparing/multimodal/index>`: the {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` vector expressions in full.
 - {doc}`ML API reference </api/models/ml>`: {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`, `build_vector_index`, `vector_search`.
-- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: where the 33,611 text/s on text
-  embeddings comes from.
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: where the 33,611 text/s on text embeddings comes from.
 - {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how a vector column is laid out.

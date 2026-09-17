@@ -1,25 +1,34 @@
 # Making it fast
 
-These pages cover the levers that change how long a correct query takes. Work them in the
-order below: read the plan before you tune anything, because the operator you would have
-guessed at is usually not the one costing the time.
+These pages cover the levers that change how long a correct query takes, and the tools that tell you which lever to pull.
 
-| Page | What it covers |
+Most queries need none of them. Batcher already pushes filters and columns into the scan, sizes its shuffle from the data volume, spills to disk instead of running out of memory, and remembers what each query measured so its next plan starts from facts rather than guesses. A top-N that ran once starts from the cut it learned, so its second run skips the row groups that cannot hold a winner and decodes the other columns only for the rows that survive. The pages below are for the query that still isn't fast enough, and for the shapes where knowing the engine pays off.
+
+## Where to start
+
+Read the plan before you tune anything. The operator you would have guessed at is usually not the one costing the time, and `explain(analyze=True)` names the one that is. Then work outward from what it shows:
+
+| If the plan shows | Read |
 |---|---|
-| {doc}`Performance and memory <performance>` | The levers that matter most, and the memory envelope they run inside |
-| {doc}`Caching results <caching>` | Why a plan runs twice, and when to make it run once |
-| {doc}`Reading query plans <explain-plans>` | `explain()`, what each operator line means, and how to find the expensive one |
-| {doc}`Best practices <best-practices>` | The patterns that follow from keeping per-row work out of Python |
-| {doc}`Reading a very large table <large-tables>` | What changes once planning a table costs more than reading it |
-| {doc}`Skewed keys and hostile data shapes <skew>` | Why a job that fits your budget on paper dies anyway, and which shapes still have a ceiling |
-| {doc}`Filter and column pushdown <pushdown>` | Which parts of a query the data source runs itself, and what stops that happening |
-| {doc}`Object storage and worker locality <object-storage>` | How many reads a scan keeps in flight, what the planner caches, and how a worker meets its own data twice |
-| {doc}`Running a query on the GPU <gpu>` | Asking for the device backend, what it does with several, and what it declines |
+| Nothing unexpected, and you want the general levers | {doc}`Performance and memory <performance>` |
+| The same expensive subtree running for several consumers | {doc}`Caching results <caching>` |
+| A filter that stayed above the join, or a scan with no `pushed[...]` note | {doc}`Filter and column pushdown <pushdown>` |
+| Time spent planning a huge table before any row moves | {doc}`Reading a very large table <large-tables>` |
+| One key carrying most of the rows, or a job that dies inside its budget | {doc}`Skewed keys and hostile data shapes <skew>` |
+| A cluster scan bound by object-store latency | {doc}`Object storage and worker locality <object-storage>` |
+| A large reducing query and a GPU on the cluster | {doc}`Running a query on the GPU <gpu>` |
+
+{doc}`Reading query plans <explain-plans>` teaches the output itself, line by line, and {doc}`Best practices <best-practices>` collects the habits that keep a pipeline in the engine's fast path from the start.
+
+## What stays the same while you tune
+
+Every lever in this section changes *how* a query runs, never *what* it returns. Caching, morsel size, spilling, bucket counts, the fast path, and the GPU backend are all result-invariant, and the runnable examples for spilling and caching print the comparison that proves it. That's what makes it safe to turn a knob and measure: if the numbers move, the plan moved, not the answer.
 
 ## See also
 
 - {doc}`/user-guide/operate/running/index`: keeping a job healthy once it is fast enough.
-- {doc}`/benchmarks/index`: what these levers measure out at against other engines.
+- {doc}`/benchmarks/index`: what these levers measure out at against DuckDB, Polars, and Daft.
+- {doc}`/configuration/options`: the `Config` settings named in this section, with their defaults.
 
 ```{toctree}
 :hidden:

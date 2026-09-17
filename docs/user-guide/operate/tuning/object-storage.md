@@ -1,9 +1,6 @@
 # Object storage and worker locality
 
-This page covers what changes when the data is in object storage and the query runs on more
-than one machine: how many reads a scan keeps in flight, what the planner and the workers
-cache, and why a per-worker cache only pays for itself when the same worker sees the same
-partition twice.
+This page covers what changes when the data is in object storage and the query runs on more than one machine: how many reads a scan keeps in flight, what the planner and the workers cache, and how Batcher routes a partition back to the worker that already holds it.
 
 For the levers that apply on one machine, see {doc}`performance`.
 
@@ -58,8 +55,8 @@ underneath you misses and is read again. A file the filesystem cannot stat is ne
 because there would be no way to notice it changing.
 
 A file's schema is held the same way. Reading it means opening the file, and a strict read
-opens two of them — the first file, whose schema stands for the rest, and the last, checked so
-a column a later file added cannot be dropped without warning. Both are kept against file
+opens two of them: the first file, whose schema stands for the rest, and the last, checked so
+a column a later file added can't be dropped without warning. Both are kept against file
 identity, so building a second `Dataset` over the same files opens nothing.
 
 A worker also keeps the batches it decoded, so a repeated query against the same files
@@ -67,6 +64,10 @@ skips both the fetch and the decode. That cache is per worker process and bounde
 `BATCHER_SCAN_CACHE_FRACTION` of the worker's memory (0.3 by default), or set outright with
 `BATCHER_SCAN_CACHE_BYTES`. It is why a second run of the same query is faster than the
 first, and why a benchmark that reports only its best-of-N is measuring a warm read.
+
+The figure puts those pieces on one read path:
+
+![The read path of a distributed scan. On the driver, reading footers and schemas gives row counts, byte sizes and column bounds, and the result is cached per file identity, meaning path, size and modification time, so a second query over the same files reuses it. The driver hands splits to a scan task on a worker. The task first looks up the worker scan cache of decoded batches, sized at 0.3 of worker memory. On a hit, the batches go straight to the downstream operators with no fetch and no decode. On a miss, the task keeps up to 32 reads in flight, set by BATCHER_SCAN_PREFETCH, sending GET requests to object storage such as S3, GCS or Azure and receiving bytes back. The bytes are decoded and yielded in file order, so downstream operators can't tell the reads overlapped, and the decoded batches are also kept in the scan cache for the next run. Latency, not bandwidth, caps the scan, and the window keeps a task to a few files in memory.](/_static/diagrams/object_storage_read_path.svg)
 
 ## Meeting the worker that holds your cache
 
@@ -112,14 +113,14 @@ print(scored.agg(total=bt.col("score").sum()).to_pydict())
 Add `distributed=True` to that `agg` and the pool is what runs it. The workers outlive the
 call, so a second `collect()` of the same pipeline reuses them.
 
-Three things are worth knowing before you rely on it.
+Three behaviors matter before you rely on it.
 
-The pool holds **one pipeline at a time**. A different `map_batches` function replaces it
+The pool holds one pipeline at a time. A different `map_batches` function replaces it
 rather than joining it, because these workers hold general-purpose cores that every other
 stage also wants, and a session that alternates between two pipelines pays a rebuild each
 time rather than reserving the cluster twice over.
 
-The pool **gives its cores back when the session goes idle**, after
+The pool gives its cores back when the session goes idle, after
 `distributed.session_fleet_idle_s` of no use, which is 30 seconds by default and the same
 setting the shuffle fleet's own idle release reads. A CPU pool this size is most of a
 cluster, and it earns those cores from the scan cache of the query that filled it, so a
@@ -129,19 +130,20 @@ than the window keeps its own workers. Measured on a 65-node, 1,024-core cluster
 `map_batches` and aggregate held 960 cores at 25 seconds after the query returned and 0 at
 33 seconds.
 
-A **GPU** pool gives its devices back on its own window, `distributed.warm_inference_idle_s`,
+A GPU pool gives its devices back on its own window, `distributed.warm_inference_idle_s`,
 120 seconds by default. It is longer because a model load costs far more than an actor
 respawn, and it is bounded because a reserved idle GPU stops another tenant dead where a
 reserved idle core only slows one down. Set it to `0` for whole-session residency.
 
 The whole behavior is under `distributed.warm_inference_pools`, on by default. Turn it off
 and every stage runs on stateless tasks released as soon as they finish. To hand the cluster
-to something else immediately, rather than waiting out the idle window, release the pools
-yourself. The call is a no-op when nothing is warm, so it is safe at the end of any script:
+to something else immediately, rather than waiting out the idle window, call
+{py:func}`bt.release_cluster() <batcher.release_cluster>`, which releases the warm shuffle fleet
+and the inference pools together. It's a no-op when nothing is warm and never raises, so it's
+safe at the end of any script:
 
 ```python
 from batcher.config import Config
-from batcher.dist.executors.map import release_inference_pools
 
 cfg = Config()
 print(cfg.distributed.warm_inference_pools, cfg.distributed.session_fleet_idle_s)
@@ -149,7 +151,7 @@ print(cfg.distributed.warm_inference_pools, cfg.distributed.session_fleet_idle_s
 print(cfg.distributed.warm_inference_idle_s)
 # 120.0
 
-release_inference_pools()
+bt.release_cluster()
 ```
 
 ## See also
@@ -157,3 +159,5 @@ release_inference_pools()
 - {doc}`performance`: morsels, the memory envelope, spilling, and the adaptive loop.
 - {doc}`caching`: caching a *result* rather than the bytes a scan read.
 - {doc}`large-tables`: what changes once planning a table costs more than reading it.
+- {doc}`/user-guide/moving-data/cloud-storage`: paths, credentials, and filesystems for S3, GCS, and Azure.
+- {doc}`/configuration/distributed-options`: every `distributed.*` setting named here.

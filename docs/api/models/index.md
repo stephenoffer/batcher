@@ -1,6 +1,6 @@
 # Models and measurement
 
-This section is the reference for everything that fits a model or scores one, from the `.ml` accessor down to the individual metric functions. Five pages split it by task:
+This section is the reference for everything that fits a model or scores one, from the `.ml` accessor down to the individual metric functions. Preprocessors fit over a `Dataset` and transform any other, and most metrics are ordinary aggregates, so scoring per segment is one `group_by(...).agg(...)` away. Five pages split it by task:
 
 | Page | Covers |
 |---|---|

@@ -1367,11 +1367,13 @@ class Reader:
     def snowflake(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a Snowflake SQL query, fetching result chunks in parallel as Arrow.
 
-        Connection credentials are passed as keyword options.
+        Connection credentials go in ``connection_kwargs``, a dict passed to
+        ``snowflake.connector.connect``.
 
         Args:
             query: SQL text to execute against Snowflake.
-            opts: Connection credentials (account, user, warehouse, …) as keywords.
+            opts: ``connection_kwargs=`` (``account``, ``user``, ``warehouse``, ...) plus
+                any other source options.
 
         Returns:
             A lazy `Dataset` over the Snowflake query result.
@@ -1382,9 +1384,7 @@ class Reader:
                 >>> import batcher as bt
                 >>> ds = bt.read.snowflake(  # doctest: +SKIP
                 ...     "SELECT * FROM sales.orders",
-                ...     account="acme",
-                ...     user="bob",
-                ...     warehouse="wh",
+                ...     connection_kwargs={"account": "acme", "user": "bob", "warehouse": "wh"},
                 ... )
         """
         return _read_table("snowflake", query, **opts)
@@ -1528,10 +1528,11 @@ class Reader:
     def elasticsearch(self, **opts: Any) -> Dataset:
         """Read an Elasticsearch index via ES|QL Arrow output (or a sliced scroll fallback).
 
-        Pass the host, index, and query as keyword options.
+        Pass the hosts, index, and query as keyword options.
 
         Args:
-            opts: ``host=``, ``index=``, and query options passed as keywords.
+            opts: ``hosts=``, ``index=``, and query options (``esql=`` or ``query=``)
+                passed as keywords.
 
         Returns:
             A lazy `Dataset` over the Elasticsearch index.
@@ -1541,7 +1542,7 @@ class Reader:
 
                 >>> import batcher as bt
                 >>> ds = bt.read.elasticsearch(  # doctest: +SKIP
-                ...     host="http://localhost:9200", index="events"
+                ...     hosts="http://localhost:9200", index="events"
                 ... )
         """
         return _read_table("elasticsearch", **opts)

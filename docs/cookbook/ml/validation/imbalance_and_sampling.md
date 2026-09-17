@@ -1,6 +1,8 @@
 # Class imbalance
 
-Resampling changes the data; weighting changes the loss. Prefer weights when the model supports them, because oversampling duplicates rows (and any leakage in them) while undersampling throws information away.
+Resampling changes the data. Weighting changes the loss. Prefer weights when the model supports them, because oversampling duplicates rows, and any leakage in them, while undersampling throws information away.
+
+The script measures a 3:1 imbalance with `class_counts` and `class_weights` and attaches a per-row `sample_weight` column. Then it compares seeded oversampling, undersampling, and balanced sampling with a stratified sample that keeps the original ratio.
 
 The whole script, executed on every test run:
 

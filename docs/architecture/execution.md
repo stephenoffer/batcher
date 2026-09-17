@@ -8,10 +8,11 @@ optimizes it, and decides resource bounds, but never touches a row in the hot pa
 Rust is the data plane, where every per-row and per-batch computation runs over
 Apache Arrow. The two meet at a single boundary, a JSON plan IR plus zero-copy
 Arrow `RecordBatch`es carried over the Arrow C Data Interface, and nothing else
-crosses it. The Python entry point is Core handing the plan to the native engine:
+crosses it. The Python entry point is Core handing the plan to the native engine, in
+`core/executor.py`:
 
 ```python
-out, metrics = _native.execute_plan_metered(plan.to_json(), sources, cfg.engine_config_json())
+out, metrics_json = _native.execute_plan_metered(plan.to_json(), sources, engine_cfg, query_id)
 ```
 
 For the contributor's view, which crate runs which scale, the thresholds with their
@@ -62,8 +63,11 @@ distinct, or a window.
 Breakers are where the model does its real work. Data materializes there, spills
 there under memory pressure, shuffles there when a query is distributed, and gets
 re-optimized there once real numbers are known. The unit of work flowing through a
-pipeline is the morsel, a `RecordBatch` of 16,384 rows by default, which keeps
-scheduling granular and the working set in cache.
+pipeline is the *morsel*, a `RecordBatch` of 16,384 rows or 1 MiB, whichever limit it
+reaches first. The row bound keeps scheduling granular and the working set in cache. The
+byte bound is the one that fires on wide data such as images or embeddings, where a
+single row can outweigh a whole default morsel. The two bounds are
+`execution.morsel_rows` and `execution.morsel_bytes`.
 
 ## Execution paths
 
@@ -81,10 +85,12 @@ and reuses that across every morsel. On anything it doesn't support, the JIT fal
 to the interpreter rather than diverge, so it stays bit-for-bit identical to the
 interpreter on its subset.
 
-A compiled pipeline can drop back to the interpreter at any breaker. That is how
-compilation and adaptivity coexist: an abandoned pipeline costs a compiled artifact, not
-a correctness guarantee, because the relational state it was working on lives in the
-runtime library rather than in generated code.
+The JIT compiles scalar expressions, never relational state. Hash tables, partial
+aggregates and sort buffers live in `bc-runtime`, so re-planning a query at a breaker
+throws away at most a compiled expression, and a compiled artifact is cached
+process-wide, so the next plan that needs the same expression over the same column types
+reuses it. The compiled subset covers fixed-width numeric and temporal arithmetic,
+comparisons, boolean logic and `CASE`. Everything else runs on the interpreter.
 
 ## One algebra, single node to cluster
 
@@ -110,22 +116,23 @@ continuing.
 
 This is stage-boundary re-optimization, the same granularity Spark AQE works at, and
 Batcher runs it single-node as well as distributed. DuckDB, by contrast, optimizes once
-before it runs. The loop is gated, and the gate is strict. `adaptive="auto"` is the
-default, and it engages only on a query that contains a join, that clears a size floor
-charged per pipeline breaker the loop would cut at, and where measuring could still flip
-a downstream decision. A query with no join never qualifies at any size. Most queries
-therefore never reach the loop at all, which
-{doc}`/architecture/internals/execution` states with the exact thresholds. A separate
-cross-query loop feeds sketch-backed statistics from each run into the next, so estimates
-sharpen the more a query runs.
+before it runs. `adaptive="auto"` is the default, and it spends the loop only where it
+can pay for itself. On a single node it engages on a query that contains a join, whose
+join inputs are still sized by a guess, and that clears a floor of 5 million rows or
+about 320 MB for each pipeline breaker the loop would cut at. The simplest joined shape
+qualifies at about 10 million rows. A query with no join never qualifies on one node,
+so most queries take the one-shot plan. On a cluster, a plan the one-shot dispatcher
+can't run correctly, such as a breaker nested under another breaker, takes the staged
+path at any size. A separate cross-query loop feeds sketch-backed statistics from each
+run into the next, so estimates sharpen the more a query runs, at any size.
 
 ## Memory and spilling
 
-Carbonite owns the memory envelope. It throttles new allocations as the budget fills and
-begins spilling to disk before the budget is exhausted, and because aggregation, join and
-sort all have a spill path, a query too large for memory keeps running on a slower one.
-It gets slower. It doesn't die. Spilling is a property of the runtime primitive rather
-than a separate operator, so the plan doesn't change when a query goes out of core.
+Carbonite owns the memory envelope. It throttles at the soft limit,
+`memory.soft_limit` (85% of the envelope by default), and spills to disk before the
+budget is exhausted. Aggregation, join, sort and window all have a spill path, so a query
+too large for memory keeps running on a slower one. It gets slower. It doesn't die.
+Spilling changes where state lives and never what the query computes.
 
 ## Distribution
 
@@ -144,4 +151,6 @@ disk and network are two sinks for one mechanism.
 - {doc}`Execution engine </architecture/internals/execution>`: the tiers, the crate map, and the exact thresholds.
 - {doc}`Architecture overview <overview>`: the two planes and the control-plane subsystems.
 - {doc}`Fault tolerance <fault-tolerance>`: what happens when a worker or a task fails.
+- {doc}`Morsel parallelism </architecture/deep-dives/operators/morsel-parallelism>`: how morsels are cut and scheduled.
+- {doc}`JIT compilation </architecture/deep-dives/query/jit-compilation>`: the compiled subset and its parity guard.
 - {doc}`Configuration options <../configuration/options>`: every execution knob.

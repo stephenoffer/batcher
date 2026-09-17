@@ -1,8 +1,8 @@
 # Measurement cookbook
 
-This section holds 20 runnable recipes that compute metrics and statistics as aggregate expressions, so both describing a column and scoring a model are a `select` over the table rather than a pull into pandas.
+In Batcher, a metric is an aggregate expression. Describing a column, scoring a classifier, and checking a batch of LLM output are all a `select` over the table rather than a pull into pandas, and the same report per segment is that expression under a `group_by`, still in one pass.
 
-A metric written as an aggregate runs in one pass over a billion scored rows, and the same report *per segment* is that same expression under a `group_by`.
+These 20 recipes cover model scores, generated-text monitors, embedding health checks, and the statistics you run before trusting a summary.
 
 Every page embeds a complete, self-contained script, from [`examples/metrics/`](https://github.com/stephenoffer/batcher/tree/main/examples/metrics) for the model and text groups and [`examples/statistics/`](https://github.com/stephenoffer/batcher/tree/main/examples/statistics) for the statistics group. `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 

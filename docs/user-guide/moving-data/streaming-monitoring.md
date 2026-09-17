@@ -6,11 +6,13 @@ told about each batch instead of polling for it.
 
 A streaming query runs for as long as you let it, so the two questions that matter are
 whether it is keeping up and whether it is quietly dropping rows. Throughput answers
-neither. The fields below do.
+neither. The fields below do, and both failures show up as a trend across batches rather than in any single reading:
 
-## Managing a query
+![Two panels over the same seven micro-batches of one query on a processing-time trigger, with illustrative shapes rather than measurements. The top panel asks whether the query is keeping up. Each bar is a batch's duration against a dashed line at the trigger interval. Batches 1, 2 and 4 finish under the interval, so behind_by_ms is 0. Batch 3 runs over once, which is normal. Batches 5, 6 and 7 run over by a larger amount each time, so behind_by_ms is above 0 and growing and is_behind is True for each: the query is falling behind its source. The bottom panel asks whether its state is bounded, plotting the rows a stateful operator retains as reported in state_operators. On the bounded line, evictions offset what arrives and the count rises and falls around a level. On the stalled line nothing is evicted, the count only grows, and the query ends in a ResourceError.](/_static/diagrams/streaming_health.svg)
 
-`start`-style writes return a `StreamingQuery`:
+## Manage a query
+
+A streaming write returns a `StreamingQuery`:
 
 ```python
 # docs: skip
@@ -120,7 +122,7 @@ what the driver read, so for these queries:
 The state is still bounded, and still raises a {py:exc}`ResourceError <batcher.ResourceError>` naming the stall when a
 watermark stops advancing. What is missing is the per-batch reporting, not the guard.
 
-## Reacting to batches as they happen
+## React to batches as they happen
 
 Polling `recent_progress` on a timer misses batches, because the window is bounded, and
 cannot see a query start at all. Register a {py:class}`StreamingQueryListener <batcher.StreamingQueryListener>` and each event arrives
@@ -152,7 +154,7 @@ print(bt.remove_streaming_listener(alarm))
 ```
 
 Every query in the process reports to every registered listener, whether it started before
-or after the registration. Override only the callbacks you need; the rest do nothing. The
+or after the registration. Override only the callbacks you need. The rest do nothing. The
 PySpark spellings (`onQueryStarted`, `onQueryProgress`, `onQueryTerminated`) work too, so a
 ported listener keeps working.
 
@@ -191,7 +193,7 @@ last `progress_history` micro-batches, not every batch since the query started.
 Apply it for one query with {py:func}`bt.config_context(cfg) <batcher.config_context>`, or process-wide with
 {py:func}`bt.set_config(cfg) <batcher.set_config>`.
 
-## Shipping progress somewhere else
+## Ship progress to a log or metrics system
 
 A progress record's destination is usually a log line or a metrics system, and both want
 data rather than a dataclass. `to_dict()` and `json()` produce Spark's shape, keyed in its
@@ -209,9 +211,9 @@ the source what is available), `addBatch` (running the plan and writing the sink
 A total alone cannot tell a slow query from a slow *checkpoint*, and those have opposite
 remedies.
 
-## Identifying a query across restarts
+## Identify a query across restarts
 
-`q.id` is stable across restarts of the same query; `q.run_id` is fresh on every start.
+`q.id` is stable across restarts of the same query, and `q.run_id` is fresh on every start.
 Keying a dashboard only on `id` cannot tell a query that has been up for a week from one
 that has crash-looped every ten minutes. Both have Spark's camelCase spellings too.
 
@@ -222,6 +224,7 @@ terminated and keeps doing so until the record is cleared, so a loop that forget
 ## See also
 
 - {doc}`streaming`: sources, sinks, triggers, output modes, and checkpoints.
+- {doc}`streaming-stateful`: the operators whose retained state `state_operators` reports.
 - {doc}`/cookbook/streaming/late-data-watermarks`: what the allowed lateness costs.
 - {doc}`/configuration/options`: the `streaming` section's idle cadence and history bound.
 - {doc}`/user-guide/operate/running/metrics`: the same per-batch numbers as scrapeable counters, so a chart sees the lag a single reading cannot.

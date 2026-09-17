@@ -1,10 +1,8 @@
 # Getting data in
 
-These recipes cover the arrival path: a source drops records somewhere, and you have to pick
-them up exactly once, in the right order, including the ones that show up late.
+These recipes cover the arrival path: a source drops records somewhere, and you have to pick them up exactly once, in the right order, including the ones that show up late.
 
-Start from the complete ETL pipeline if you are building the path from nothing. The other
-three are the problems that appear once it is running.
+Start from the complete ETL pipeline if you are building the path from nothing. The other three are the problems that appear once it is running.
 
 | Recipe | The problem |
 |---|---|

@@ -1,6 +1,8 @@
 # List aggregates
 
-These are per-row reductions, not group-by aggregates: `.list.sum()` sums *within* each row's list and leaves the row count unchanged. That is the difference between "total per basket" and "total across baskets".
+These are per-row reductions, not group-by aggregates. `.list.sum()` sums *within* each row's list and leaves the row count unchanged, which is the difference between "total per basket" and "total across baskets".
+
+The script reduces a list column with `sum`, `mean`, `min`, `max`, `median`, `product`, `std`, and `n_unique`, finds the index of the extreme element with `arg_min` and `arg_max`, sorts, reverses, and de-duplicates within a row, and computes running totals and deltas inside each list.
 
 The whole script, executed on every test run:
 

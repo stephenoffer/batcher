@@ -1,14 +1,9 @@
 # Synthetic data generation
 
-Build test datasets in memory with plain Python and {py:obj}`bt.from_pydict <batcher.from_pydict>`. This is the
-simplest way to produce inputs for trying out a pipeline at a chosen size and shape.
-Everything here runs as written. `pip install batcher-engine` covers all of it except the
-numpy section, which also wants `numpy`.
+Build test datasets in memory with plain Python and {py:obj}`bt.from_pydict <batcher.from_pydict>`. It's the simplest way to produce inputs for trying out a pipeline at a chosen size and shape. Everything here runs as written. `pip install batcher-engine` covers all of it except the numpy section, which also wants `numpy`.
 
 :::{tip}
-Seed the generator. `random.seed(0)` or `np.random.default_rng(0)` is the difference between
-a test that fails reproducibly and a test that fails on Tuesdays. Every example below is
-seeded for exactly that reason.
+Seed the generator. `random.seed(0)` or `np.random.default_rng(0)` is the difference between a test that fails reproducibly and a test that fails on Tuesdays. Every example below is seeded for that reason.
 :::
 
 ## A small fixed dataset
@@ -31,8 +26,7 @@ print(ds.to_pydict())
 
 ## Random columns
 
-Use the standard library `random` module to build columns of arbitrary size. Seed
-it for reproducible data.
+Use the standard library `random` module to build columns of arbitrary size. Seed it.
 
 ```python
 import random
@@ -62,8 +56,7 @@ print(by_region.to_pydict()["region"])
 
 ## numpy columns
 
-When numpy is available, vectorized column generation is faster and reads cleanly.
-Convert arrays to lists for {py:func}`from_pydict <batcher.from_pydict>`.
+When numpy is available, vectorized column generation is faster and reads cleanly. Convert arrays to lists for {py:func}`from_pydict <batcher.from_pydict>`.
 
 ```python
 import numpy as np
@@ -84,8 +77,7 @@ print(numeric.columns)
 
 ## Joinable tables
 
-Generate a fact table and a small dimension table that share a key, to exercise
-joins.
+To exercise joins, generate a fact table and a small dimension table that share a key.
 
 ```python
 random.seed(1)
@@ -106,8 +98,7 @@ print(sorted(set(joined.to_pydict()["label"])))
 
 ## Which generator to reach for
 
-The right generator depends on how many rows you need and how much realism the data has to
-carry. Match your case to a row:
+The right generator depends on how many rows you need and how much realism the data has to carry. Match your case to a row:
 
 | You want | Use |
 |---|---|
@@ -118,10 +109,7 @@ carry. Match your case to a row:
 | A file on disk instead of memory | Generate, then {py:meth}`ds.write.parquet(path) <batcher.api.io_namespace.writer.Writer.parquet>` |
 
 :::{warning}
-Generated data is uniform, and real data is not. A pipeline that is fast on
-`random.choice(["north", "south", "east", "west"])` may be slow on a production key with one
-value in ten million rows and a million values with one row each. Skew is the thing your
-synthetic corpus will not reproduce unless you build it in on purpose.
+Generated data is uniform. Real data isn't. A pipeline that is fast on `random.choice(["north", "south", "east", "west"])` may be slow on a production key with one value in ten million rows and a million values with one row each. Your synthetic corpus won't reproduce that skew unless you build it in on purpose.
 :::
 
 ## Where to go next

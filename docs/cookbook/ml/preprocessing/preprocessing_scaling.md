@@ -1,6 +1,8 @@
 # Feature scaling
 
-Every scaler follows the `fit` / `transform` split for a reason: the statistics come from the training set and are then *applied* to validation and production data. Fitting on everything is the classic leak, and the API makes the correct thing the easy thing.
+Every scaler splits `fit` from `transform`. The statistics come from the training set and are then *applied* to validation and production data. Fitting on everything is the classic leak, and the API makes the correct order the easy one.
+
+The script compares `StandardScaler` and `MinMaxScaler` with `RobustScaler`, which a single outlier of 100.0 barely moves, and `MaxAbsScaler`. Then `Normalizer` scales each row, rather than each column, to unit length.
 
 The whole script, executed on every test run:
 

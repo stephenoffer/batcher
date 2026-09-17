@@ -1,6 +1,8 @@
 # Sampling and splits
 
-An unseeded split is one you cannot reproduce when the result looks wrong. Pass `seed` to every call that takes one. `sample_per_group` does not: it caps each group by an ordering rather than at random, so it is already deterministic. `stratified_split` preserves class balance where a plain random split does not, and on an imbalanced problem that matters.
+An unseeded split is one you cannot reproduce when the result looks wrong, so pass `seed` to every call that takes one. `sample_per_group` doesn't take one. It caps each group by an ordering rather than at random, so it is already deterministic.
+
+The script samples a fraction and proves the same seed returns the same rows, splits train, validation, and test on a key so no group leaks across the boundary, and checks that `stratified_split` keeps an 80/20 label balance on both sides. It also covers `sample_per_group`, `balance_classes`, a seeded `shuffle`, and `with_random` for a hand-rolled split.
 
 The whole script, executed on every test run:
 

@@ -1,30 +1,25 @@
 # Kinesis
 
-{py:meth}`bt.read.kinesis(stream_name) <batcher.api.io_namespace.reader.Reader.kinesis>` consumes an AWS Kinesis Data Stream as an unbounded {py:class}`Dataset <batcher.Dataset>`,
-over `boto3` and the classic `GetRecords` API. Read only. There is no Kinesis sink.
+This page covers reading AWS Kinesis Data Streams. {py:meth}`bt.read.kinesis(stream_name) <batcher.api.io_namespace.reader.Reader.kinesis>` consumes a stream as an unbounded {py:class}`Dataset <batcher.Dataset>` over `boto3` and the `GetRecords` API, with one reader per shard, exact resume from the stored sequence number, and resharding followed without a restart.
+
+The following table summarizes the connector:
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.kinesis(stream_name)` |
-| **Write** | Not supported |
-| **Extra** | `pip install 'batcher-engine[kinesis]'` |
-| **Parallelism** | One split per shard |
-| **Credentials** | The ambient `boto3` chain. There is no credential keyword. |
-| **Restart** | The raw sequence number per shard, re-obtained with `AFTER_SEQUENCE_NUMBER` |
+| Read | `bt.read.kinesis(stream_name)` |
+| Write | No sink. Write the stream to Delta or another streaming sink. |
+| Extra | `pip install 'batcher-engine[kinesis]'` |
+| Parallelism | One split per shard |
+| Credentials | The ambient `boto3` chain. There is no credential keyword. |
+| Restart | The raw sequence number per shard, re-obtained with `AFTER_SEQUENCE_NUMBER` |
 
 ```bash
 pip install 'batcher-engine[kinesis]'
 ```
 
-## `poll_size`
+## Read a stream
 
-:::{note}
-Kinesis caps the `GetRecords` `Limit` at 10,000 records, so that is the default and it is also
-a ceiling: a larger `poll_size` is clamped to it rather than sent, because AWS would reject it.
-:::
-
-A smaller value is passed through untouched, and is worth setting when you want tighter
-micro-batches:
+Kinesis caps the `GetRecords` `Limit` at 10,000 records, so `poll_size` defaults to 10,000 and a larger value is clamped rather than sent. A smaller value passes through untouched, and is worth setting when you want tighter micro-batches:
 
 ```python
 # docs: skip
@@ -38,23 +33,23 @@ payments = bt.read.kinesis(
 )
 ```
 
-5,000 is a reasonable starting point. `GetRecords` also caps a single response at 10 MB, so
-with fat records you will get fewer rows than you asked for regardless.
+`GetRecords` also caps a single response at 10 MB, so large records return fewer rows than you asked for.
 
 Credentials come from the ambient `boto3` chain: environment, profile, instance role, IRSA.
-There is no credential keyword. If `boto3` can find them, so can Batcher.
+There's no credential keyword. If `boto3` can find them, so can Batcher.
+
+Pass `value_format=` to decode the `Data` blob in the source, as described in {doc}`/integrations/streams/payload-formats`.
 
 ## The rows you get
 
-Every broker source shares one fixed schema: `key`, `value`, `partition`, `offset`,
-`timestamp`, `topic`. For Kinesis the columns carry the following.
+Every broker source shares one fixed schema: `key`, `value`, `partition`, `offset`, `timestamp`, `topic`. The following table shows what each column holds for Kinesis:
 
 | Column | What Kinesis puts there |
 | --- | --- |
 | `key` | The record's partition key, UTF-8 encoded |
 | `value` | The record `Data` blob, raw bytes, undecoded |
 | `partition` | The shard's own number, parsed out of its `ShardId` |
-| `offset` | The sequence number, reduced modulo 2^63 |
+| `offset` | An int64 projection of the sequence number |
 | `timestamp` | `ApproximateArrivalTimestamp`, in milliseconds |
 | `topic` | The stream name |
 
@@ -62,11 +57,7 @@ The two that surprise people are `partition` and `offset`. `partition` is the nu
 in the shard's `ShardId`, so `shardId-000000000005` reads as `5`. Kinesis assigns that number
 once and never reuses it, which is what keeps a checkpointed position pointing at the same shard
 across a reshard. A `ShardId` that does not fit the format falls back to a `sha256` digest,
-stable across processes and workers. `offset` is the sequence number, which
-is a large decimal string, reduced modulo 2^63 so it fits an int64 column. It stays monotonic
-within a shard, but it is not the sequence number and you cannot hand it back to AWS. The
-real sequence number is kept out of band as the resume token, which is what recovery uses. It
-does not appear as a column.
+stable across processes and workers. `offset` is the sequence number, a large decimal string, reduced modulo 2^63 so it fits an int64 column. It's stable across runs and workers, but it isn't the sequence number, you can't hand it back to AWS, and it isn't safe to sort by. The real sequence number is kept out of band as the resume token that recovery uses, and doesn't appear as a column.
 
 ```python
 import batcher as bt
@@ -105,28 +96,18 @@ print(sorted(zip(d["partition"], d["records_read"], strict=True)))
 [(0, 2), (1, 1)]
 ```
 
-Grouping by `partition` that way is the cheapest way to see whether your producer's partition
+Grouping by `partition` is the cheapest way to see whether your producer's partition
 key is spreading traffic or piling one shard high.
 
 ## How it parallelizes
 
-A shard is a split. `splits()` calls `ListShards` and returns one `BrokerSplit` per shard;
-each worker rebuilds a source scoped to its shard index and drives a shard iterator of its
-own. Parallelism is therefore exactly your shard count, and the per-shard read ceiling (2 MB
-per second, five `GetRecords` calls per second, shared across every consumer of that shard) is
-the ceiling for a Batcher worker too.
+A shard is a split. `splits()` calls `ListShards` and returns one split per shard, and each worker drives a shard iterator of its own. Parallelism is your shard count. A single reader that owns several shards fetches them concurrently, up to 16 threads.
 
-:::{important}
-That last point deserves emphasis. This is the *shared-throughput* API, not enhanced fan-out.
-If a Lambda and a Firehose delivery stream are already reading the shard, you are splitting
-2 MB/s with them, and `ProvisionedThroughputExceededException` is what you will see when the
-budget runs out. Add shards, or move the other consumers to enhanced fan-out.
-:::
+The per-shard read ceiling is AWS's: 2 MB per second and five `GetRecords` calls per second, shared across every consumer of that shard. Batcher reads through the shared-throughput API, not enhanced fan-out, so a Lambda or Firehose on the same shard splits that budget with it. When the budget runs out, `ProvisionedThroughputExceededException` is treated as back-pressure and the shard is retried on the next poll rather than failing the query. Add shards, or move the other consumers to enhanced fan-out, if the throttling persists.
 
 ## Resharding
 
-`ListShards` is paginated, so every shard is discovered however many there are, and the list is
-cached. A reshard invalidates it rather than outliving it: a shard closes when its children
+`ListShards` is paginated, so every shard is discovered however many there are, and the listing is cached. A reshard invalidates it rather than outliving it: a shard closes when its children
 replace it, `GetRecords` says so by returning no next iterator, and the reader retires the
 parent, drops the cached listing, and reads the fresh one's lineage to adopt the children. So a
 running query follows a split or a merge without a restart, and it costs one `ListShards` per
@@ -136,11 +117,9 @@ That works because `partition` is the shard's own number rather than its positio
 checkpointed sequence number therefore still names the shard it was taken from, whatever the
 listing looks like afterwards.
 
-## Restart semantics
+## Choose a starting position and restart
 
-`iterator_type` defaults to `"TRIM_HORIZON"`: a fresh query replays the entire retention
-window (24 hours by default, up to 365 days if you have paid for it). `"LATEST"` starts at the
-tip and drops the backlog. Neither is right for every job; pick deliberately. `starting_position`
+`iterator_type` defaults to `"TRIM_HORIZON"`, so a fresh query replays the stream's whole retention window. `"LATEST"` starts at the tip and drops the backlog. Pick deliberately. `starting_position`
 is accepted as well, with `"earliest"` and `"latest"` mapping onto those two, so a pipeline that
 reads several brokers can spell the choice one way throughout.
 
@@ -180,28 +159,20 @@ q = bt.read.kinesis("payments", region="us-east-1", poll_size=5_000).write.delta
 ```
 :::
 
-The checkpoint directory is SQLite plus Arrow IPC on a local filesystem, not an S3 URI. The
-`query_name` is the Delta transaction id prefix, so keep it stable across restarts or a
-replayed micro-batch will write twice.
+The checkpoint can be a local path or an `s3://` URI. The `query_name` is the Delta transaction id prefix, so keep it stable across restarts or a replayed micro-batch writes twice.
 
-## Failure modes worth knowing
+A shard iterator expires after five minutes. A trigger interval longer than that, or a shard that goes quiet while its siblings are polled, gets `ExpiredIteratorException`, and the reader re-obtains the iterator from the last delivered sequence number instead of failing the query.
 
-:::{warning}
-A shard iterator is valid for five minutes. A worker that stalls longer than that (a slow
-sink, a long GC pause, backpressure from a downstream credit stall) gets
-`ExpiredIteratorException` on its next call. Keep micro-batches short.
-:::
+## Requirements and limitations
 
-Empty polls are normal. `GetRecords` returns an empty record list constantly on a quiet shard;
-the poll loop skips those and keeps going. An idle stream produces no batches. It is not an
-end-of-stream.
+Empty polls are normal. `GetRecords` returns an empty record list constantly on a quiet shard, and the poll loop skips those and keeps going. An idle stream produces no batches, which isn't an end-of-stream.
 
 {py:meth}`collect() <batcher.Dataset.collect>` raises, because the source is unbounded. Use {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` or a triggered
 write, or bound the read with {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>`.
 
-Records are bytes, and that includes KPL aggregation. Producers using the Kinesis Producer
-Library pack several user records into one Kinesis record inside a protobuf envelope. Batcher
-hands you that envelope undecoded; de-aggregate it in `map_batches` if your producers use it.
+KPL aggregation isn't unpacked. Producers using the Kinesis Producer Library pack several user records into one Kinesis record inside a protobuf envelope, and Batcher hands you that envelope as the `value`. De-aggregate it in `map_batches` if your producers use it.
+
+Only the ambient `boto3` credential chain and the `region` option reach the client. There's no endpoint override or credential keyword.
 
 ## See also
 
@@ -212,4 +183,5 @@ hands you that envelope undecoded; de-aggregate it in `map_batches` if your prod
   the write above depends on.
 - {doc}`Reading and writing </api/relational/io>`: the full reader/writer surface.
 - {doc}`Kafka </integrations/streams/kafka>`: the same broker schema and the same decode pattern.
-- {doc}`Pub/Sub </integrations/streams/pubsub>`: the other cloud broker, and the one that does not split.
+- {doc}`Pub/Sub </integrations/streams/pubsub>`: the Google Cloud broker.
+- {doc}`Payload formats </integrations/streams/payload-formats>`: decoding Avro, JSON, and Protobuf in the source.

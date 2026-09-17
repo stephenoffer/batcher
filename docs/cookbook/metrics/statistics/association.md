@@ -1,6 +1,8 @@
 # Association
 
-Correlation is for two numeric columns. When one side is a category or a binary outcome you need a different measure, and reaching for Pearson anyway is how a "no signal" result gets reported on a variable that clearly has signal.
+Correlation is for two numeric columns. When one side is a binary outcome, such as churn, the point-biserial correlation and the signal ratio are the measures built for it.
+
+The script covers both cases, adds weighted correlation and covariance for rows of unequal importance, and fits an ordinary least-squares line with the `regr_*` aggregates. It all runs as aggregates, with no model object and no pull into Python.
 
 The whole script, executed on every test run:
 

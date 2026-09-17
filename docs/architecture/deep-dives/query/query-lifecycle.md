@@ -41,7 +41,7 @@ Drawn with the boundary in it, and with the loop that closes back on the optimiz
         │           │ Kyber optimize │  logical → physical + ResourceBounds │
         │           └───────┬────────┘                                      │
         │        3  ┌───────▼────────┐                                      │
-        │           │ Carbonite admit│  fits the envelope? narrow it if not │
+        │           │ Carbonite admit│  fits the envelope? spill if not     │
         │           └───────┬────────┘                                      │
         │        4  ┌───────▼────────┐                                      │
         │           │ to_json()      │                                      │
@@ -87,7 +87,7 @@ See `python/batcher/api/terminal/metadata_answer/` and
 
 ### 2 and 3. Optimize, then admit
 
-Kyber rewrites the logical plan by pushing down predicates and projections, fusing operators, and choosing a join order. It lowers the result to a `PhysicalPlan` carrying per-operator `ResourceBounds` and cardinality estimates tagged with provenance. Carbonite reads those bounds and decides whether the plan fits the memory envelope. If it doesn't, Carbonite narrows the envelope the executor is handed rather than letting the process walk into an OOM, by enabling spill, lowering parallelism, or shrinking the credit window.
+Kyber rewrites the logical plan by pushing down predicates and projections, fusing operators, and choosing a join order. It lowers the result to a `PhysicalPlan` carrying per-operator `ResourceBounds` and cardinality estimates tagged with provenance. Carbonite reads those bounds and decides whether the plan's dominant materializing operator fits the memory envelope. If memory is what doesn't fit, the verdict is a spill-friendly counter-offer: the query is routed out of core instead of walking into an OOM. Any other binding constraint has no spill remedy, so `run.py` raises a `PlanError` before anything executes.
 
 Neither subsystem touches data. Kyber decides, Carbonite protects, Core measures. The verbs
 stay in their lanes because the subsystems cannot import one another.
@@ -101,11 +101,11 @@ Drawn as the ring it is, with the outcome of admission the list above flattens:
 `PhysicalPlan.to_json()` serializes the relational IR. Core calls the one FFI entry point:
 
 ```text
-out, metrics = _native.execute_plan_metered(plan.to_json(), sources, engine_config_json)
+out, metrics_json = _native.execute_plan_metered(plan.to_json(), sources, engine_cfg, query_id)
 ```
 
 `sources[i]` is the relation bound to `Scan { source_id: i }`, a list of pyarrow
-`RecordBatch`es. Two very different things cross here, and it is worth separating them:
+`RecordBatch`es. `query_id` makes the execution cancellable. Two very different things cross here:
 
 ::::{tab-set}
 :::{tab-item} The plan
@@ -134,7 +134,7 @@ Everything else stays on its own side of the boundary.
 ### 6. Feed back
 
 `execute_plan_metered` returns a metrics side-channel alongside the data: per-operator row
-counts in and out, elapsed milliseconds, result bytes, whether the operator spilled and by how much. Core records those into the `MetadataHub`, keyed by a *structural plan signature*. That signature is stable across executions, unlike an operator's position in one plan walk. Kyber reads the measurements on the next run, and at a pipeline breaker during this one. That loop is what makes the optimizer improve the more a query shape is run.
+counts in and out, elapsed and CPU nanoseconds, peak and result bytes, and whether the operator spilled and by how much. Core records those into the `MetadataHub`, keyed by a *structural plan signature*. That signature is stable across executions, unlike an operator's position in one plan walk. Kyber reads the measurements on the next run, and, when the query runs in adaptive stages, at the next pipeline breaker during this one. That loop is what makes the optimizer improve the more a query shape is run.
 
 ## What the user can see
 
@@ -172,7 +172,7 @@ filled in after an `analyze=True` run.
 
 ## What it costs
 
-The fixed cost of a small query is the thing this design most easily gets wrong, so it's worth being exact about which side of the line each cost falls on.
+A small query's fixed cost is where this design most easily goes wrong. The table says when each cost is paid.
 
 | Cost | Paid | Why |
 |---|---|---|
@@ -182,7 +182,7 @@ The fixed cost of a small query is the thing this design most easily gets wrong,
 | Arrow handoff | once per input relation | Zero-copy through the C Data Interface. |
 | The metrics walk | once per metered run | Only on the metered entry point. |
 
-On the operator benchmarks a global sum over TPC-H `lineitem` at scale factor 1, 6M rows on 16 cores, completes in 0.5 ms end to end against DuckDB's 2.7 ms. That is the honest measure of the fixed overhead. See {doc}`the analytics benchmarks </benchmarks/results/analytics>` for the full table and the hardware.
+On the operator benchmarks a global sum over TPC-H `lineitem` at scale factor 1, 6M rows on 16 cores, completes in 0.5 ms end to end against DuckDB's 2.7 ms. A query that does almost no work is the cleanest measure of the fixed overhead. See {doc}`the analytics benchmarks </benchmarks/results/analytics>` for the full table and the hardware.
 
 ## Where the code lives
 
@@ -195,14 +195,16 @@ reading path through the control plane:
 | The contract loop | `python/batcher/api/orchestration/run.py` |
 | Metadata shortcut | `python/batcher/api/terminal/metadata_answer/` |
 | Logical plan + `to_ir()` | `python/batcher/plan/logical/`, `python/batcher/plan/ir_tags.py` |
-| Physical plan + {py:meth}`to_json() <batcher.Dataset.to_json>` | `python/batcher/plan/physical.py` |
+| Physical plan + `PhysicalPlan.to_json()` | `python/batcher/plan/physical.py` |
 | Core's call into the engine | `python/batcher/core/executor.py` |
 | The FFI boundary | `crates/bc-py/src/lib.rs` |
-| The executor | `crates/bc-interp/src/lib.rs` (sequential), `par.rs` (multi-core) |
+| The executor | `crates/bc-interp/src/lib.rs` (sequential), `par.rs` and `stream/` (multi-core) |
 
 ## Adaptive stages
 
-One thing the diagram above flattens: a query with a pipeline breaker may run steps 2 through 5 more than once. At a breaker the engine has *measured* the data it just processed. If an estimate was off by more than `optimizer.reoptimize_error`, which defaults to 2.0, the remainder of the plan is re-optimized on the measured numbers and executed as a new stage. The stateful operator's state lives in `bc-runtime`, not in generated code, so a compiled pipeline can be thrown away and rebuilt at a breaker without losing progress.
+One thing the diagram above flattens: a query can run steps 2 through 5 more than once. With `adaptive="auto"`, the default, a single-node query runs in stages only when it contains a join whose inputs are still sized by a guess and it clears a floor of 5 million rows or about 320 MB per pipeline breaker the loop would cut at. On a cluster, a plan the one-shot dispatcher can't run correctly stages at any size. Everything else runs the steps once.
+
+Inside a staged run, each breaker's output is materialized and *measured*. If an estimate was off by more than `optimizer.reoptimize_error`, which defaults to 2.0, the remainder of the plan is re-optimized on the measured numbers and executed as the next stage. Relational state lives in `bc-runtime` and the JIT compiles only scalar expressions, from a process-wide cache, so re-planning loses no finished work.
 
 ## See also
 

@@ -6,8 +6,7 @@ controls each layer of recovery.
 A distributed query runs across many workers, and at scale something is always failing.
 A node is preempted, a task hits a transient error, or a network connection drops
 mid-shuffle. Batcher's distributed path is built so those failures slow a query down
-rather than killing it, and so a recovered result is identical to one that never
-failed.
+rather than kill it, and a recovered result is identical to one that never failed.
 
 Two invariants make recovery sound:
 
@@ -33,8 +32,8 @@ budget, so a fleet broken in some way no probe catches fails quickly with the fi
 error rather than slowly with the last one. Both are configured in
 {doc}`../configuration/fault-tolerance`.
 
-The figure below shows that classification, the three verdicts it reaches, and what each price
-of a recompute depends on having been arranged beforehand.
+The figure below shows that classification, the three verdicts it reaches, and the three
+prices a recompute can cost depending on what was arranged beforehand.
 
 ![Recovery classifies a failure before it retries, and only one of the three verdicts is a retry. A task that raised, or whose worker stopped answering, is classified as lost data to be recomputed when it is a RayError that is not a RayTaskError, meaning an actor, a worker or a node died, and likewise for a RetryableShuffleError from an unreachable peer or a ResourceError from a spill file on an ephemeral disk. A deterministic bug, such as a UDF exception, a bad cast, a schema mismatch or a broken runtime environment, is re-raised instead, because every retry re-runs it, burns the job-wide budget, and reports a resource error for a Python bug. An uncontained ECC fault, where the device kept running and answered wrongly, leaves results untrusted and recovery refuses to continue at all, since work already finished there is as suspect as the task that failed. A recompute then costs one of three prices: re-read the source partition and re-run the map by default, usually the longest phase; fetch an off-node replica when shuffle_replication is above 1 and the copy was acknowledged before the bucket was advertised; or migrate while the worker is still alive, given advance notice from spot metadata, a SIGTERM or a Slurm deadline. Recovery introduces its own hazard, a worker presumed dead that is not, so each round carries a higher epoch and a reducer discards any batch arriving under a stale one.](/_static/diagrams/fault_recovery.svg)
 
@@ -103,14 +102,14 @@ Recovery introduces a hazard: a worker presumed dead may not actually be dead, a
 recomputed partition must not be double-counted with a straggling original. Each
 recovery round runs under a monotonically increasing *epoch*. A reducer accepts a
 partition tagged with the current epoch and fences out any batch arriving under a stale
-epoch, discarding it. A zombie producer that wakes up after its work was reassigned
-therefore can't corrupt the result, because its late bytes are ignored. Fencing and the
+epoch, discarding it. A zombie producer can wake up after its work was reassigned. It
+can't corrupt the result. Its late bytes are ignored. Fencing and the
 deterministic-task invariant together make a recomputed partition safe to merge back in.
 
 ## Straggler mitigation
 
-A node that is degraded but alive is worse than a dead one. It can't be recomputed
-because it never failed, yet it stalls a shuffle barrier. Speculative execution backs
+A node that is degraded but alive is worse than a dead one. It never failed, so
+nothing recomputes it. It still stalls a shuffle barrier. Speculative execution backs
 up a slow survivor and takes whichever copy finishes first. Because shuffle tasks are
 deterministic, the two copies are identical, so the result is unchanged.
 
@@ -145,14 +144,14 @@ and clamps any request to `default_credits` times `credit_ceiling_factor`.
 cfg = base.replace(
     flow_control=dataclasses.replace(
         base.flow_control,
-        default_credits=4,  # in-flight batch slots per channel
+        default_credits=16,  # in-flight batch slots per channel (the default)
         credit_ceiling_factor=4,  # max window = default_credits x this
     )
 )
 ```
 
-By default the window is the static grant. `config.distributed.adaptive_credits`, on by
-default, turns on a TCP-like AIMD controller that grows the window by
+The grant is a starting point rather than a fixed window. `config.distributed.adaptive_credits`,
+on by default, runs a TCP-like AIMD controller that grows the window by
 `config.flow_control.aimd_alpha` per round trip and multiplicatively shrinks it by
 `config.flow_control.aimd_beta` when it sees memory backpressure, so the shuffle backs
 off under pressure instead of holding a fixed window. Flow control never changes the
@@ -240,8 +239,8 @@ profile automatically. A Slurm job submitted with no time limit is not: Slurm ex
 saturated sentinel rather than omitting the variable, and Batcher rejects a deadline more
 than a year out, so an unlimited job is left on the default budgets.
 
-Draining only changes *where* a partial result lives, never what it holds, so none of
-this changes a query's output.
+Draining changes *where* a partial result lives, never what it holds. The output is
+unchanged.
 
 ## Not scheduling onto capacity that is leaving
 
@@ -306,8 +305,10 @@ Fault tolerance applies to the distributed path, which needs the optional `[ray]
 extra. Single-node execution has none of the machinery on this page and none of the
 overhead.
 
-- Shuffle output is held in memory. `bc-transport`'s partition store has no disk tier,
-  so a lost worker's buckets are gone unless replication placed a copy elsewhere.
+- Shuffle output lives on the worker that produced it. `bc-transport`'s partition store
+  holds it in memory and spills to that worker's local disk under pressure. There is no
+  external shuffle service, so a lost worker's buckets are gone and are recomputed unless
+  replication placed a copy elsewhere.
 - `shuffle_replication` defaults to 1, meaning no replica. Only the `"spot"` profile
   raises it, which a preemptible environment selects automatically.
 - Draining runs only under the `"spot"` profile, so a stable cluster starts no monitor

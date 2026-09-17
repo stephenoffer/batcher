@@ -370,6 +370,10 @@ def resident_inference_pools():
 
 
 def _shutdown_pools(registry: dict[tuple, list]) -> None:
+    # An empty registry never touched Ray, and this runs at exit for every process that
+    # imported the module: importing `ray` first printed a traceback on installs without it.
+    if not registry:
+        return
     import ray
 
     for actors in registry.values():

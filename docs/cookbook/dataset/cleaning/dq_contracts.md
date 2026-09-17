@@ -1,6 +1,8 @@
 # Data-quality contracts
 
-The four terminal calls are the whole design. `validate()` reports without changing the data, `fail()` raises, `drop()` silently removes bad rows, and `quarantine()` splits them out so you can inspect them. Choosing between them is a decision about who is responsible for the bad rows.
+A data-quality contract is a list of checks plus a decision about what happens to the rows that fail them. The four terminal calls are that decision. `validate()` reports without changing the data, `fail()` raises, `drop()` removes bad rows, and `quarantine()` splits them out so you can inspect them. Choosing between them is choosing who is responsible for the bad rows.
+
+The script builds one contract from `not_null`, `unique`, `in_range`, `matches`, `accepted_values`, and a custom `check`, runs it through all four terminal calls against the same five orders, and asserts which rows each keeps. It ends with `foreign_key`, the referential-integrity check against another dataset.
 
 The whole script, executed on every test run:
 

@@ -1,25 +1,21 @@
 # Data scientist learning path
 
-This path is for interactive analysis. You shape data with expressions, ask questions
-in SQL or through the DataFrame API, and summarize the answers with aggregations.
-Nothing runs while you compose: the API is lazy and immutable, and a terminal operation
-is what materializes the result.
+This path is for interactive analysis. You shape data with expressions, ask questions in SQL or through the DataFrame API, and summarize the answers with aggregations. Nothing runs while you compose. The API is lazy and immutable, and a terminal operation materializes the result.
 
 ## Reading order
 
 1. {doc}`Getting started </getting-started/index>`: install and run a first query.
 1. {doc}`Concepts </getting-started/concepts/index>`: datasets, laziness, expressions.
-1. {doc}`Expressions </user-guide/transform/columns/expressions>`: column math, conditionals, string
-   and date accessors.
+1. {doc}`Expressions </user-guide/transform/columns/expressions>`: column math, conditionals, string and date accessors.
 1. {doc}`Filtering </user-guide/transform/rows/filtering>`: predicates and `is_in` / `between`.
 1. {doc}`Aggregations </user-guide/analyze/aggregations>`: `group_by`, `.agg`, quantiles.
 1. {doc}`SQL </user-guide/analyze/sql>`: query a dataset with {py:obj}`bt.sql <batcher.sql>`.
-1. {doc}`Window functions </user-guide/analyze/window-functions>`: ranking and rolling
-   aggregates.
-1. {doc}`Expression API reference </api/relational/expressions>` and
-   {doc}`SQL API reference </api/relational/sql>`.
+1. {doc}`Window functions </user-guide/analyze/window-functions>`: ranking and rolling aggregates.
+1. {doc}`Expression API reference </api/relational/expressions>` and {doc}`SQL API reference </api/relational/sql>`.
 
 ## Example: derive and summarize
+
+Bucket each price as high or low, then average each bucket:
 
 ```python
 import batcher as bt
@@ -45,8 +41,7 @@ print(summary.to_pydict())
 
 ## Example: ask the same question in SQL
 
-{py:obj}`bt.sql <batcher.sql>` binds a dataset to a table name, runs the query, and hands
-back a new dataset.
+{py:obj}`bt.sql <batcher.sql>` binds a dataset to a table name, runs the query, and hands back a new dataset.
 
 ```python
 counts = bt.sql(
@@ -61,21 +56,15 @@ print(counts.to_pydict())
 
 Run any of these directly with `python examples/<name>.py`:
 
-- `feature_engineering.py` scales columns, buckets them, encodes categories, imputes
-  what is missing, all with expressions.
-- `preprocessors.py` builds the same features from fit/transform preprocessor objects
-  and {py:class}`Chain <batcher.ml.preprocessors.Chain>`.
-- `timeseries.py` covers date-part extraction and resampling, plus period-over-period
-  change.
+- `feature_engineering.py` scales columns, buckets them, encodes categories, and imputes what is missing, all with expressions.
+- `preprocessors.py` builds the same features from fit/transform preprocessor objects and {py:class}`Chain <batcher.ml.preprocessors.Chain>`.
+- `timeseries.py` covers date-part extraction and resampling, plus period-over-period change.
 - `window_functions.py` ranks rows and computes rolling aggregates with {py:meth}`.over(...) <batcher.AggExpr.over>`.
 - `sql.py` asks the same questions in SQL, composed with the DataFrame API.
 
 ## Recipes
 
-The {doc}`analytics cookbook </cookbook/analytics/index>` works through the queries you
-actually write, and the trap in each one: the cohort query that puts one user in three
-cohorts, the 3-sigma rule that never fires because the outlier inflates its own sigma, the
-funnel self-join that cross-products inside each user.
+The {doc}`analytics cookbook </cookbook/analytics/index>` works through the queries you write, and the trap in each one: the cohort query that puts one user in three cohorts, the 3-sigma rule that never fires because the outlier inflates its own sigma, the funnel self-join that cross-products inside each user.
 
 ::::{grid} 1 2 2 2
 :gutter: 3

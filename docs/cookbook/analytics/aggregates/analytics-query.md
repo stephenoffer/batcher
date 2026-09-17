@@ -1,9 +1,6 @@
 # Analytics query
 
-Aggregate, join, then window, over a small orders table. Five rows here, but the same
-pipeline runs unchanged on millions: Kyber plans the joins and aggregates up front,
-then re-plans at each pipeline breaker once it has measured what the row counts really
-were. Nothing about the code changes.
+Aggregate, join, then window, over a small orders table. Five rows here, but the same pipeline runs unchanged on millions. Kyber plans the joins and aggregates up front from the statistics it has, and on a joined query large enough to clear the adaptive size floor it re-plans at pipeline breakers once it has measured what the row counts really were. Nothing about the code changes.
 
 ```python
 import batcher as bt
@@ -47,9 +44,7 @@ print(by_name.to_pydict())
 
 ## Window
 
-A running total within each region, ordered by amount. Any aggregate becomes a window
-function once you hang {py:meth}`.over(...) <batcher.AggExpr.over>` off it, with the partition and the ordering given as
-keyword arguments rather than a separate window object to declare first.
+A running total within each region, ordered by amount. Any aggregate becomes a window function once you hang {py:meth}`.over(...) <batcher.AggExpr.over>` off it, with the partition and the ordering given as keyword arguments rather than a separate window object to declare first.
 
 ```python
 running = orders.with_columns(
@@ -59,8 +54,7 @@ print(running.to_pydict()["running"])
 # [20, 60, 10, 40, 90]
 ```
 
-Ranking functions take the same shape: `rank().over(partition_by=..., order_by=...)`
-numbers rows within each partition.
+Ranking functions take the same shape: `rank().over(partition_by=..., order_by=...)` numbers rows within each partition.
 
 ```python
 ranked = orders.with_columns(position=rank().over(partition_by=["region"], order_by=["amt"])).sort(
@@ -72,8 +66,7 @@ print(ranked.to_pydict()["position"])
 
 ## The same query in SQL
 
-SQL builds the identical plan and hands back a lazy {py:class}`Dataset <batcher.Dataset>`, so the two spellings
-mix freely.
+SQL builds the identical plan and hands back a lazy {py:class}`Dataset <batcher.Dataset>`, so the two spellings mix freely.
 
 ```python
 out = bt.sql(
@@ -88,20 +81,14 @@ print(out.to_pydict())
 
 Three edits turn this into a real query, and each one is a single line:
 
-1. Swap {py:func}`from_pydict <batcher.from_pydict>` for {doc}`a reader </user-guide/moving-data/reading-data>`, such as
-   {py:meth}`bt.read.parquet("s3://bucket/orders/") <batcher.api.io_namespace.reader.Reader.parquet>`. Nothing below it changes.
-1. Add a `filter` before the `group_by`. The optimizer pushes it toward the scan, so a
-   partitioned or statistics-carrying source skips files rather than reading them. Confirm
-   it did with {doc}`ds.explain() </user-guide/operate/tuning/explain-plans>`.
-1. End with a write instead of a print: `out.write.parquet(...)`. See
-   {doc}`/user-guide/moving-data/writing-data`.
+1. Swap {py:func}`from_pydict <batcher.from_pydict>` for {doc}`a reader </user-guide/moving-data/reading-data>`, such as {py:meth}`bt.read.parquet("s3://bucket/orders/") <batcher.api.io_namespace.reader.Reader.parquet>`. Nothing below it changes.
+1. Add a `filter` before the `group_by`. The optimizer pushes it toward the scan, so a partitioned or statistics-carrying source skips files rather than reading them. Confirm it did with {doc}`ds.explain() </user-guide/operate/tuning/explain-plans>`.
+1. End with a write instead of a print: `out.write.parquet(...)`. See {doc}`/user-guide/moving-data/writing-data`.
 
 ## See also
 
-- {doc}`/cookbook/analytics/index`: the focused recipes for cohorts, funnels, sessions, and top-k, each
-  with the trap that makes it harder than it looks.
-- {doc}`/user-guide/analyze/aggregations` and {doc}`/user-guide/analyze/window-functions`: the two
-  operators this page leans on, in full.
+- {doc}`/cookbook/analytics/index`: the focused recipes for cohorts, funnels, sessions, and top-k, each with the trap that makes it harder than it looks.
+- {doc}`/user-guide/analyze/aggregations` and {doc}`/user-guide/analyze/window-functions`: the two operators this page leans on, in full.
 - {doc}`/user-guide/analyze/joins`: join types, and which side gets built.
 - {doc}`/cookbook/data-engineering/ingest/etl-pipeline`: the same treatment for an ingest pipeline, ending in a written table.
 - {doc}`/getting-started/tutorials/foundations/optimizing-a-slow-query`: what to do when this shape meets real data.

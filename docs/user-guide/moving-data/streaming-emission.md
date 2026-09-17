@@ -8,7 +8,7 @@ Every relational shape that works on a bounded dataset also runs on an unbounded
 `iter_batches()` will drive all of them. What differs is *when* a shape produces output,
 and over a source that never ends that difference decides whether you see anything at all.
 
-Two groups, and the split is not about memory:
+The shapes fall into two groups, and the split isn't about memory:
 
 | Shape | When it emits |
 |-------|---------------|
@@ -16,7 +16,7 @@ Two groups, and the split is not about memory:
 | `limit(n)` | As rows arrive, and stops reading at `n`. |
 | `distinct().limit(n)` | As rows arrive, and stops reading at `n` distinct rows. |
 | `with_watermark(...)` + a `window(...)` group key | Per window, as the watermark closes each one. |
-| `drop_duplicates_within_watermark(...)` | Per batch; the seen-key set is watermark-bounded. |
+| `drop_duplicates_within_watermark(...)` | Per batch. The seen-key set is watermark-bounded. |
 | A stream-static join, a `join_stream` interval join, a session window | Per batch. |
 | `group_by(...).agg(...)` with no watermark | Once, at end of input. |
 | `distinct()` with no cap | Once, at end of input. |
@@ -24,9 +24,9 @@ Two groups, and the split is not about memory:
 | `sort(...)` with no limit | Refused: it cannot bound its memory either. |
 
 This table is about {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`. A
-*materializing* terminal such as `head()` or `to_pydict()` is stricter, because it has to
+*materializing* terminal such as `to_pydict()` is stricter, because it has to
 return one finished result: it refuses a top-N or a keyed `distinct(subset=...)` over a
-stream outright. {doc}`streaming` has the detail, under "Looking at a stream before you
+stream outright. {doc}`streaming` has the detail, under "Look at a stream before you
 build on it".
 
 The second group folds its input into one running state and finalizes when the input
@@ -35,6 +35,10 @@ source that drains, such as an incremental file read under
 {py:meth}`Trigger.available_now() <batcher.Trigger.available_now>`. Over a source that
 genuinely never ends, such as a Kafka topic, "at end of input" never arrives and the query
 consumes without emitting.
+
+Put one shape from each row of the table side by side on the same four triggers and the difference is entirely one of timing:
+
+![A grid of three shapes against four triggers of one unbounded stream, plus a final column for when the input ends, with illustrative event times, a one-hour window, and ten minutes of allowed lateness. The highest event time seen at each trigger is 10:40, 11:05, 11:25 and 11:50, so the watermark is 10:30, 10:55, 11:15 and 11:40. A row-wise shape such as filter, select, with_columns or map_batches emits each trigger's own rows as they arrive, and has nothing left to emit when the input ends. A with_watermark plus window aggregate emits nothing on triggers 1 and 2, emits the 10:00 to 11:00 window on trigger 3 because 11:15 is the first watermark at or past that window's end, and emits nothing on trigger 4 because the 11:00 to 12:00 window is still open; that window is emitted when the input ends. A group_by().agg() with no watermark emits nothing on any trigger and emits the whole result only when the input ends. A draining source reaches that last column. A Kafka topic never does.](/_static/diagrams/streaming_emission.svg)
 
 Memory is not the signal to watch here, and top-N is the case that shows why: it keeps only
 the running best `n` rows, so it is perfectly bounded and still produces nothing until the

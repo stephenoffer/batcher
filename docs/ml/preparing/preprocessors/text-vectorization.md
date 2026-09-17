@@ -1,10 +1,12 @@
 # Text vectorization
 
+This page covers the three vectorizers that turn a text column into bag-of-words features,
+and how to pick between them.
+
 A bag of words represents a document as counts over a fixed feature space, ignoring word
-order. It's a weak model of language and a strong set of features: on a labelled corpus of
+order. It's a weak model of language and a strong set of features. On a labelled corpus of
 short documents, a linear model over TF-IDF features is still competitive with an embedding
-model, trains in seconds, and produces coefficients you can read. This page covers the three
-vectorizers that build those features and how to pick between them.
+model, and its coefficients can be read.
 
 ## What the vectorizers produce
 
@@ -17,11 +19,11 @@ aligned list columns. For `output_column="features"`, the default, `transform` a
 `features_values`
 : The value at each of those positions, element-for-element aligned with the indices.
 
-Together they're one row of a compressed sparse row matrix. Pass `dense=True` instead and
-you get a single fixed-width `List<Float64>` column named `features`, which is what a
-trainer reading through {py:func}`iter_torch_batches <batcher.ml.iter_torch_batches>` wants.
-Keep dense for a small vocabulary only. Every row then carries one value per term whether
-or not the document uses it.
+Together they're one row of a compressed sparse row matrix. Pass `dense=True` for a single
+fixed-width `List<Float64>` column named `features` instead, which is what a trainer reading
+through {py:func}`iter_torch_batches <batcher.ml.iter_torch_batches>` wants. Keep dense for a
+small vocabulary, because every row then carries one value per term whether the document
+uses it or not.
 
 ```python
 import batcher as bt
@@ -53,9 +55,9 @@ corpus to learn one:
 ## TF-IDF weighting
 
 A raw count says a document uses *the* forty times. True, and no signal at all. TF-IDF
-divides that out: a term's weight rises with its frequency inside the document and falls
-with the number of documents that contain it, so the terms that survive are the ones that
-set this document apart from the rest.
+divides that out. A term's weight rises with its frequency inside the document and falls
+with the number of documents containing it, so the heavy terms are the ones that set this
+document apart.
 
 ```python
 from batcher.ml.preprocessors import TfidfVectorizer
@@ -75,12 +77,11 @@ distance between two documents. Pass `norm="l1"` or `norm=None` to change that, 
 times shouldn't count fifty times as much as one appearing once.
 
 The IDF formula is `ln((1 + n) / (1 + df)) + 1`, matching scikit-learn's smoothed default.
-The smoothing is what makes a term the transform set has and the fit set doesn't safe to
-weight rather than a division by zero.
+The `+ 1` terms keep a zero document frequency from dividing by zero.
 
 ## Controlling the vocabulary
 
-Four settings decide which terms become features. Use them in this order:
+Four settings decide which terms become features. Consider them in the following order:
 
 1. `stop_words` drops words by name. Pass `"english"` for the built-in list, or your own
    sequence for a domain that has its own filler words.
@@ -98,7 +99,7 @@ print(len(tuned.fit(docs).vocabulary_))
 ```
 
 Prefer `min_df` and `max_df` over a stop-word list where you can. They're measured against
-the corpus in front of you, and a list that suits news text will discard signal in clinical
+the corpus in front of you, while a list that suits news text can discard signal in clinical
 notes.
 
 ## N-grams
@@ -117,12 +118,11 @@ The vocabulary grows quickly, so pair a wide `ngram_range` with `min_df` or `max
 
 ## Hashing, for streams and for serving
 
-{py:class}`HashingVectorizer <batcher.ml.preprocessors.HashingVectorizer>` decides a term's
-feature index arithmetically, as `str.hash64().abs() % n_features` evaluated in the engine.
-The hash is the engine's own, not Python's `hash()`, which varies between processes and
-would put training and serving on different feature spaces. Nothing is learned, so `fit`
-does nothing and exists only so the step composes into a
-{py:class}`Chain <batcher.ml.preprocessors.Chain>` like every other preprocessor.
+{py:class}`HashingVectorizer <batcher.ml.preprocessors.HashingVectorizer>` computes a term's
+feature index as `str.hash64().abs() % n_features`, evaluated in the engine. The hash is the
+engine's own, not Python's `hash()`, which varies between processes and would put training
+and serving on different feature spaces. Nothing is learned. `fit` exists only so the step
+composes into a {py:class}`Chain <batcher.ml.preprocessors.Chain>`.
 
 ```python
 from batcher.ml.preprocessors import HashingVectorizer
@@ -132,19 +132,18 @@ print(len(hashed.to_pydict()["features_indices"][0]))
 # 2
 ```
 
-That buys what a learned vocabulary can't. There is no fit pass, so the vectorizer works
-on an unbounded stream, and no state to ship to a serving process, so training and serving
-cannot disagree. The feature space is fixed before you start, so the memory is too.
+With no fit pass, the vectorizer works on an unbounded stream. With no state to ship,
+training and serving can't disagree. The feature space is fixed before you start, and so is
+the memory.
 
-The cost is collisions and interpretability. Two terms can land on one feature, and no
-feature can be named. Make `n_features` generous, a few hundred thousand is ordinary, and a
-linear model tolerates the rest.
+You pay in collisions and interpretability. Two terms can land on one feature, and no
+feature has a name. Make `n_features` generous. A few hundred thousand is ordinary.
 
 ## Fitting on the training split only
 
-A vectorizer is fitted state, so it belongs to the training split. Fit on the whole frame
-and the held-out documents contribute to the vocabulary and to every IDF weight, which
-inflates your validation score by an amount you can't measure.
+A vectorizer is fitted state, so fit it on the training split. Fit on the whole frame and
+the held-out documents shape the vocabulary and every IDF weight, which inflates your
+validation score by an amount you can't measure.
 
 ```python
 train, test = docs.ml.train_test_split(0.3, seed=0)
@@ -155,28 +154,27 @@ print(train_features.count() + test_features.count())
 # 3
 ```
 
-A term the test split uses and the training split didn't is ignored rather than bucketed,
-matching scikit-learn: the fitted vocabulary *is* the feature space, and a document using
-new words sets fewer features.
+A term the test split uses and the training split didn't is ignored, not bucketed, as in
+scikit-learn. The fitted vocabulary is the feature space, so a document full of new words
+sets fewer features.
 
 ## How the fit scales
 
 `fit` is a relational aggregate, not a dictionary built on the driver. The term column is
-an ordinary expression, so the vocabulary comes from an `explode` into a `group_by`. That
-is mergeable: the same fit runs on one core, on every core, or across a cluster, and spills
+an ordinary expression, so the vocabulary comes from an `explode` into a `group_by`. That's
+mergeable, so the same fit runs on one core, on every core, or across a cluster, and spills
 rather than failing on a corpus larger than memory.
 
-The result is materialized on the driver and broadcast to every worker, though, so the
-vocabulary itself is bounded. Past `max_vocabulary` the fit fails and names the ways out
-rather than quietly building a plan nobody can run. Set `max_features`, raise `min_df`, or
-switch to `HashingVectorizer`.
+The resulting vocabulary is held on the driver and broadcast to every worker, so it is
+bounded. Past `max_vocabulary`, one million terms by default, the fit raises and names the
+ways out: set `max_features`, raise `min_df`, or switch to `HashingVectorizer`.
 
 ## Requirements and limitations
 
 - A null document is read as an empty one. It keeps its row and produces no features,
   rather than being dropped from the output.
 - Tokenization is regex-based and language-agnostic. There's no stemming, lemmatization, or
-  subword tokenization; for those, use
+  subword tokenization. For those, use
   {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` with a real tokenizer, or an
   embedding model.
 - `max_features` breaks a frequency tie alphabetically so the fitted vocabulary is
@@ -187,7 +185,9 @@ switch to `HashingVectorizer`.
 
 ## See also
 
-- {doc}`encoding` for categorical columns, including the hashing trick applied to a single
-  categorical value rather than a document.
-- {doc}`pipelines` for composing a vectorizer with the rest of a feature pipeline.
-- {doc}`/api/models/preprocessors` for the full reference.
+- {doc}`/ml/preparing/preprocessors/encoding`: categorical columns, including the hashing trick applied to one categorical value rather than a document.
+- {doc}`/ml/preparing/preprocessors/feature-generation`: `TextStatFeaturizer`, for cheap surface statistics of the same text.
+- {doc}`/ml/preparing/tokenization`: subword tokenization for a language model.
+- {doc}`/ml/retrieval/embeddings`: dense vectors when a bag of words plateaus.
+- {doc}`/ml/preparing/preprocessors/pipelines`: composing a vectorizer with the rest of a feature pipeline.
+- {doc}`/api/models/preprocessors`: the full reference.

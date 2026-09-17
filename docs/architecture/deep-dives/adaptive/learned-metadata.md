@@ -1,5 +1,7 @@
 # Learned metadata
 
+This page describes what Batcher measures on every run, where it keeps it, and how the optimizer, the resource manager and the scheduler read it back on the next run.
+
 A query that has run once is not the same query as one that has never run. The engine
 knows how many rows that join really produced, how much memory that aggregate really
 peaked at, which build side really won, how fast that source really reads. A static
@@ -19,7 +21,7 @@ The hub is what the return arrow is made of. The rest of this page is what trave
               ┌───────────────────────────────────────────────────────────┐
               │                      MetadataHub                          │
               │   op_stats                     learned_params             │
-              │   (bounded at 4,096 rows)      (keyed by plan signature)  │
+              │   (pruned at 65,536 rows)      (keyed by plan signature)  │
               └───▲───────────────────────────────────┬──────────────────┘
                   │  hub.record(feedback)             │  read
                   │  WRITE ONLY                       │  READ ONLY
@@ -62,6 +64,7 @@ pub struct OpMetric {
     pub rows_build: u64,
     pub rows_out: u64,
     pub elapsed_ns: u64,
+    pub wall_span_ns: u64,
     pub cpu_ns: u64,
     pub threads: u32,
     pub peak_bytes: u64,     // input held + result being built
@@ -70,6 +73,7 @@ pub struct OpMetric {
     pub spill_bytes: u64,
     pub peak_rss_bytes: u64,
     pub backend: &'static str, // "interp" | "jit" | "interp+jit"
+    pub hw: HwCounters,
 }
 ```
 
@@ -136,7 +140,9 @@ hub.put_keyed_param(namespace, key, value)
 about *different* query shapes must not clobber each other.
 
 The derived views (`_by_kind`, `_signed`) are maintained incrementally and bounded at 4,096
-rows each, so the backend is scanned exactly once per view per process.
+rows each, so the backend is scanned exactly once per view per process. The `op_stats` table
+beneath them is pruned to 65,536 rows on any backend that supports deletes, so a store written
+for months still opens quickly.
 :::
 
 ## Signatures

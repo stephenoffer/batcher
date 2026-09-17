@@ -1,17 +1,12 @@
 # Geospatial
 
-This page covers working with geometry in Batcher: getting it in, measuring it, joining
-on it, and turning positions into keys you can group by.
+This page covers working with geometry in Batcher: getting it in, measuring it, joining on it, and turning positions into keys you can group by.
 
 ## What a geometry is here
 
-A geometry column is **WKB in a Binary column**. Don't skip past that as an internal
-detail. GeoParquet, PostGIS, GeoPackage and DuckDB spatial all store WKB, so a geometry
-column round-trips through any of them with no conversion, and every operator, spill path
-and shuffle the engine already has moves it without a new physical type.
+A geometry column is WKB in a Binary column. Don't skip past that as an internal detail. GeoParquet, PostGIS, GeoPackage and DuckDB spatial all store WKB, so a geometry column round-trips through any of them with no conversion, and every operator, spill path and shuffle the engine already has moves it without a new physical type.
 
-You do not have to build one to start. Every `st_*` function accepts a text column and
-parses it, detecting WKT, EWKT, GeoJSON and hex WKB by content:
+You do not have to build one to start. Every `st_*` function accepts a text column and parses it, detecting WKT, EWKT, GeoJSON and hex WKB by content:
 
 ```python
 import batcher as bt
@@ -31,9 +26,7 @@ print(parcels.select("id", area=bt.st_area(col("geom"))).to_pydict())
 # {'id': [1, 2, 3], 'area': [16.0, 16.0, 16.0]}
 ```
 
-Most tables do not store geometry at all, they store two float columns. {py:func}`st_point <batcher.st_point>`
-is the bridge, and its argument order is **x then y**, which for geographic data means
-longitude first:
+Most tables do not store geometry at all. They store two float columns. {py:func}`st_point <batcher.st_point>` is the bridge, and its argument order is x then y, which for geographic data means longitude first:
 
 ```python
 sightings = bt.from_pydict(
@@ -49,20 +42,14 @@ print(located.select("city", wkt=bt.st_as_text(col("geom"))).to_pydict()["wkt"])
 ```
 
 :::{warning}
-WKT, GeoJSON and PostGIS all put longitude first, which is the opposite of the order
-latitude and longitude are usually spoken in. Reversing them puts Zurich in the Indian
-Ocean and raises no error, because both orderings are valid coordinates.
-{py:func}`st_flip_coordinates <batcher.st_flip_coordinates>` is the fix once you notice.
+WKT, GeoJSON and PostGIS all put longitude first, which is the opposite of the order latitude and longitude are usually spoken in. Reversing them puts Zurich in the Indian Ocean and raises no error, because both orderings are valid coordinates. {py:func}`st_flip_coordinates <batcher.st_flip_coordinates>` is the fix once you notice.
 :::
 
 ## Check validity before you trust anything
 
-Real geometry columns are full of invalid polygons: rings that cross themselves from a
-digitizing error, holes poking outside their shell, rings with two vertices. Every areal
-predicate produces nonsense on those and none of them complains.
+Real geometry columns are full of invalid polygons: rings that cross themselves from a digitizing error, holes poking outside their shell, rings with two vertices. Every areal predicate produces nonsense on those and none of them complains.
 
-{py:func}`st_is_valid_reason <batcher.st_is_valid_reason>` returns null for a valid geometry and a sentence for an invalid one,
-which makes finding the broken rows a single filter:
+{py:func}`st_is_valid_reason <batcher.st_is_valid_reason>` returns null for a valid geometry and a sentence for an invalid one, which makes finding the broken rows a single filter:
 
 ```python
 mixed = bt.from_pydict(
@@ -79,18 +66,11 @@ print(broken.select("id", why=bt.st_is_valid_reason(col("geom"))).to_pydict())
 # {'id': [2], 'why': ['exterior ring self-intersects near (2, 2)']}
 ```
 
-A geometry that will not parse at all becomes null rather than raising the query. That
-is deliberate: one corrupt row in a hundred million should not abort a scan that is
-otherwise fine. A query *bug*, such as a negative radius or an unsupported EPSG code,
-does raise, because it is wrong on every row rather than on one.
+A geometry that will not parse at all becomes null rather than raising the query. That is deliberate: one corrupt row in a hundred million should not abort a scan that is otherwise fine. A query *bug*, such as a negative radius or an unsupported EPSG code, does raise, because it is wrong on every row rather than on one.
 
-## Degrees are not metres
+## Degrees are not meters
 
-This is the single most important thing on the page.
-
-{py:func}`st_area <batcher.st_area>`, {py:func}`st_length <batcher.st_length>` and {py:func}`st_distance <batcher.st_distance>` are **planar**. They treat coordinates as
-points on a flat plane and answer in whatever unit the coordinates are stated in. On
-EPSG:4326 that unit is degrees, and a degree is not a distance:
+{py:func}`st_area <batcher.st_area>`, {py:func}`st_length <batcher.st_length>` and {py:func}`st_distance <batcher.st_distance>` are *planar*, and this is the most important thing on the page. They treat coordinates as points on a flat plane and answer in whatever unit the coordinates are stated in. On EPSG:4326 that unit is degrees, and a degree is not a distance:
 
 ```python
 pair = bt.from_pydict({"a": ["POINT(-122.4194 37.7749)"], "b": ["POINT(-0.1278 51.5074)"]})
@@ -103,20 +83,17 @@ print(
 # {'planar': [123.06], 'km': [8616.0]}
 ```
 
-The planar answer is not wrong, it is an answer to a different question, and it is
-exactly what PostGIS's `geometry` type does. It exists because the planar metric is the
-one a bounding box can bound, which is what makes spatial joins affordable.
+The planar answer is not wrong. It answers a different question, and it is exactly what PostGIS's `geometry` type does. It exists because the planar metric is the one a bounding box can bound, which is what makes spatial joins affordable.
 
 You have three options, in increasing order of how much they cost:
 
 | You need | Use |
 | --- | --- |
 | To rank or filter by proximity | The planar functions, on lon/lat |
-| A distance in metres, occasionally | {py:func}`st_distance_sphere <batcher.st_distance_sphere>` or {py:func}`st_distance_spheroid <batcher.st_distance_spheroid>` |
-| Metres everywhere in a pipeline | {py:func}`st_transform <batcher.st_transform>` once, then the planar functions |
+| A distance in meters, occasionally | {py:func}`st_distance_sphere <batcher.st_distance_sphere>` or {py:func}`st_distance_spheroid <batcher.st_distance_spheroid>` |
+| Meters everywhere in a pipeline | {py:func}`st_transform <batcher.st_transform>` once, then the planar functions |
 
-The third is usually right. Project into the local UTM zone and every planar function
-afterwards answers in metres, accurate to better than a tenth of a percent:
+The third is usually right. Project into the local UTM zone and every planar function afterwards answers in meters, accurate to better than a tenth of a percent:
 
 ```python
 sf = bt.from_pydict({"lon": [-122.4194], "lat": [37.7749]})
@@ -131,21 +108,17 @@ print(projected.to_pydict())
 # {'m': [551131.0]}
 ```
 
-`st_transform` supports a deliberately small set of systems and **refuses an unsupported
-EPSG code** rather than silently returning the input: WGS 84 lon/lat (4326), Web Mercator
-(3857), the UTM zones (326xx and 327xx), and a cylindrical equal-area system (6933) for
-density comparisons across latitudes. Every one of them is on the WGS 84 datum, so
-converting between them loses nothing.
+`st_transform` supports a deliberately small set of systems and refuses an unsupported EPSG code rather than silently returning the input: WGS 84 lon/lat (4326), Web Mercator (3857), the UTM zones (326xx and 327xx), and a cylindrical equal-area system (6933) for density comparisons across latitudes. Every one of them is on the WGS 84 datum, so converting between them loses nothing.
 
 ## Spatial joins, and the filter that makes them affordable
 
-A spatial join is an ordinary join with a spatial predicate. The predicate is expensive:
-{py:func}`st_intersects <batcher.st_intersects>` decodes both geometries and walks their segments.
+A spatial join is an ordinary join with a spatial predicate. The predicate is expensive: {py:func}`st_intersects <batcher.st_intersects>` decodes both geometries and walks their segments.
 
-{py:func}`st_intersects_extent <batcher.st_intersects_extent>` compares four numbers instead, and it is **exact in the negative
-direction**: a false means the geometries certainly do not intersect. That makes it a
-sound prefilter, producing false positives the exact test then removes and never false
-negatives.
+{py:func}`st_intersects_extent <batcher.st_intersects_extent>` compares four numbers instead, and it is exact in the negative direction: a false means the geometries certainly do not intersect. That makes it a sound prefilter, producing false positives the exact test then removes and never false negatives.
+
+The example below runs both filters in that order, and each one removes pairs in only one direction:
+
+![A spatial join drawn as a flow with two exits, using the example below. A cross join of 3 points and 2 regions produces 6 pairs. st_intersects_extent compares 4 numbers per pair: 4 pairs come back false and leave as certainly disjoint, which is never a false negative. They are point 3 with both regions, point 1 with east and point 2 with west. The 2 pairs that come back true go on to st_intersects, which decodes both geometries and walks their segments. Any false positive the box test let through would be removed there, and in this example there are none, so both pairs come back true: 2 hits, point 1 in west and point 2 in east. Faster still, materialize st_xmin, st_ymin, st_xmax and st_ymax once beside the geometry. They are plain Float64, so a range predicate on them pushes down to the scan and to Parquet statistics.](/_static/diagrams/spatial_join_prefilter.svg)
 
 ```python
 regions = bt.from_pydict(
@@ -171,16 +144,12 @@ print(hits.to_pydict())
 ```
 
 :::{tip}
-Better still, materialize the four bound columns once beside the geometry.
-{py:func}`st_xmin <batcher.st_xmin>`/{py:func}`st_ymin <batcher.st_ymin>`/{py:func}`st_xmax <batcher.st_xmax>`/{py:func}`st_ymax <batcher.st_ymax>` are plain Float64, so a range predicate on them
-pushes down to the scan and to Parquet statistics, which a geometry predicate cannot do.
+Better still, materialize the four bound columns once beside the geometry. {py:func}`st_xmin <batcher.st_xmin>`/{py:func}`st_ymin <batcher.st_ymin>`/{py:func}`st_xmax <batcher.st_xmax>`/{py:func}`st_ymax <batcher.st_ymax>` are plain Float64, so a range predicate on them pushes down to the scan and to Parquet statistics, which a geometry predicate cannot do.
 :::
 
 ## `contains` is not `covers`
 
-The two differ exactly on the boundary. A polygon *covers* a point sitting on its edge;
-it does not *contain* it, because `contains` also requires the point to meet the
-polygon's interior.
+The two differ exactly on the boundary. A polygon *covers* a point sitting on its edge. It does not *contain* it, because `contains` also requires the point to meet the polygon's interior.
 
 ```python
 edge = bt.from_pydict({"poly": ["POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))"], "pt": ["POINT(0 2)"]})
@@ -193,22 +162,16 @@ print(
 # {'covers': [True], 'contains': [False]}
 ```
 
-If a spatial join is dropping rows that sit exactly on a border, and border cases are
-never rare in real data, this is usually why. {py:func}`st_covers <batcher.st_covers>` is also the cheaper of the two.
+If a spatial join is dropping rows that sit exactly on a border, and border cases are never rare in real data, this is usually why. {py:func}`st_covers <batcher.st_covers>` is also the cheaper of the two.
 
 Two more pairs worth keeping straight:
 
-- {py:func}`st_touches <batcher.st_touches>` means they meet but do not overlap, which is the adjacency predicate:
-  neighbouring parcels, bordering countries.
-- {py:func}`st_overlaps <batcher.st_overlaps>` means they partially overlap. A polygon entirely inside another does not
-  overlap it, it is contained by it.
+- {py:func}`st_touches <batcher.st_touches>` means they meet but do not overlap, which is the adjacency predicate: neighboring parcels, bordering countries.
+- {py:func}`st_overlaps <batcher.st_overlaps>` means they partially overlap. A polygon entirely inside another does not overlap it. It is contained by it.
 
 ## Grids: turning positions into group keys
 
-Latitude and longitude are floats, so no two observations share a value and
-`GROUP BY lat, lon` returns the input. A grid function turns a position into a discrete
-cell id, and the engine then hashes, sorts, shuffles and joins that at full speed with
-no spatial index at all.
+Latitude and longitude are floats, so no two observations share a value and `GROUP BY lat, lon` returns the input. A grid function turns a position into a discrete cell id, and the engine then hashes, sorts, shuffles and joins that at full speed with no spatial index at all.
 
 ```python
 pickups = bt.from_pydict(
@@ -229,11 +192,9 @@ The four grids differ in what the id gives you beyond grouping:
 | {py:func}`geohash_encode <batcher.geohash_encode>` | base-32 string | prefix containment: `LIKE 'u09%'` is a region filter |
 | {py:func}`st_quadkey <batcher.st_quadkey>`, {py:func}`st_tile_x <batcher.st_tile_x>`/{py:func}`st_tile_y <batcher.st_tile_y>` | tile address | the exact grid map tiles are served on |
 | {py:func}`st_s2_cell <batcher.st_s2_cell>` | `Int64` Hilbert index | near-equal-area cells, and a region as a `BETWEEN` |
-| {py:func}`st_hex_bin <batcher.st_hex_bin>` | packed `Int64` | six equidistant neighbours, for unbiased density |
+| {py:func}`st_hex_bin <batcher.st_hex_bin>` | packed `Int64` | six equidistant neighbors, for unbiased density |
 
-Two of these have prefix structure, which is what makes a rollup across zoom levels a
-string operation rather than a recomputation. A geohash nests by character and a quadkey
-by digit:
+Two of these have prefix structure, which is what makes a rollup across zoom levels a string operation rather than a recomputation. A geohash nests by character and a quadkey by digit:
 
 ```python
 zoom = bt.from_pydict({"lon": [-122.4194], "lat": [37.7749]})
@@ -242,11 +203,7 @@ print(zoom.select(fine=fine, coarse=fine.str.substr(1, 4)).to_pydict())
 # {'fine': ['9q8yyk8y'], 'coarse': ['9q8y']}
 ```
 
-`st_s2_cell` is the one to reach for when the grid has to be fair across latitudes. A
-degree grid's cells shrink to nothing at the poles, so a density comparison on one is
-comparing rectangles of different sizes; S2's cells are near-equal-area anywhere on
-Earth. Its ids also sort spatially, so sorting a table by one clusters neighbours onto
-the same pages, and rolling up to a coarser level is a bit mask:
+`st_s2_cell` is the one to reach for when the grid has to be fair across latitudes. A degree grid's cells shrink to nothing at the poles, so a density comparison on one is comparing rectangles of different sizes. S2's cells are near-equal-area anywhere on Earth. Its ids also sort spatially, so sorting a table by one clusters neighbors onto the same pages, and rolling up to a coarser level is a bit mask:
 
 ```python
 cells = bt.from_pydict({"lon": [-122.4194, -122.4190], "lat": [37.7749, 37.7751]})
@@ -257,16 +214,12 @@ print(rolled.group_by("parent").agg(n=bt.count()).to_pydict()["n"])
 ```
 
 :::{note}
-`st_hex_bin` is a **planar** hex grid, not H3. H3's cells live on an icosahedron and its
-indexes are not these, so do not join one against the other. Project with `st_transform`
-before binning, since the function bins whatever coordinates it is given.
+`st_hex_bin` is a planar hex grid, not H3. H3's cells live on an icosahedron and its indexes are not these, so do not join one against the other. Project with `st_transform` before binning, since the function bins whatever coordinates it is given.
 :::
 
 ## Simplify before you shuffle
 
-Vertex count drives the cost of every predicate, every byte written and every byte
-shuffled. {py:func}`st_simplify <batcher.st_simplify>` is usually the single biggest win available on a large
-geometry column, and {py:func}`st_hausdorff_distance <batcher.st_hausdorff_distance>` measures what the tolerance cost you:
+Vertex count drives the cost of every predicate, every byte written and every byte shuffled. {py:func}`st_simplify <batcher.st_simplify>` is usually the single biggest win available on a large geometry column, and {py:func}`st_hausdorff_distance <batcher.st_hausdorff_distance>` measures what the tolerance cost you:
 
 ```python
 detailed = bt.from_pydict({"g": ["LINESTRING(0 0, 1 0.001, 2 0, 3 0.002, 4 0, 5 0)"]})
@@ -283,49 +236,33 @@ print(
 
 ## What it costs
 
-Every `ST_*` function is a scalar expression evaluated per row in Rust, so the cost is
-linear in the row count and the price per row doesn't move as that count grows.
-`benchmarks/geospatial.py` measures it. On a 16-core machine at 200k and 800k rows the
-throughput is flat, which is what linear scaling looks like:
+Every `ST_*` function is a scalar expression evaluated per row in Rust over the WKB buffer, with no Python in the loop and no conversion to a separate geometry type. `benchmarks/geospatial.py` runs the functions on 2 million real places from Overture Maps, in Batcher and in DuckDB's spatial extension over the same Arrow table, and checks each result for correctness before timing either engine. The ratio is DuckDB's time over Batcher's, so above 1.00x means Batcher is faster:
 
-| Expression | Throughput |
-| --- | --- |
-| `st_area` over a constructed point | ~6 M rows/s |
-| `geohash_encode` | ~6 M rows/s |
-| `st_s2_cell` | ~6 M rows/s |
-| `st_transform` to UTM | ~1.6 M rows/s |
-| `st_intersects` against a box | ~0.8 M rows/s |
+| Expression, 2M rows | Batcher | DuckDB spatial | Ratio |
+| --- | --- | --- | --- |
+| `st_x` of a constructed point | 13.7 ms | 46.4 ms | 3.39x |
+| `st_intersects` against a box | 64.9 ms | 329.5 ms | 5.08x |
+| `st_distance` to a point | 37.7 ms | 50.8 ms | 1.35x |
+| `st_transform` to EPSG:3857 | 22.2 ms | 287.3 ms | 12.93x |
+| `st_as_text` | 40.5 ms | 492.0 ms | 12.15x |
+| `geohash_encode`, precision 8 | 17.9 ms | not available | |
+| `st_s2_cell`, level 15 | 15.2 ms | not available | |
 
-The ordering is the useful part. The grid and accessor functions are cheap. The predicates
-are roughly an order of magnitude dearer, because each row decodes two geometries and walks
-their segments, which is exactly why `st_intersects_extent` in front of `st_intersects` is
-worth the extra clause and why materializing the four bound columns is worth the storage.
+The run used a 96-core Xeon 8275CL with DuckDB 1.5.5 on a box shared with other work, so read the ratios rather than the absolute times. At 250,000 rows the same cases range from 0.89x to 6.43x, because fixed per-query overhead weighs more on a small input. The full record is in `benchmarks/BENCHMARK_RESULTS.md`.
+
+The ordering inside Batcher's column is the useful part. The grid encoders and accessors are cheap. A predicate costs several times more per row, because each row decodes two geometries and walks their segments, which is exactly why `st_intersects_extent` in front of `st_intersects` is worth the extra clause and why materializing the four bound columns is worth the storage.
 
 ## Requirements and limitations
 
-- **{py:func}`st_buffer <batcher.st_buffer>` is an approximation and over-estimates for a concave input.** It buffers
-  each vertex and takes the convex hull, which is exact for a convex geometry up to the
-  arc discretization and is the buffer of the hull otherwise. It is sound as a candidate
-  filter and wrong as a number to report. When the question is "is this within X", use
-  {py:func}`st_dwithin <batcher.st_dwithin>`, which is exact and cheaper.
-- **The geodesic distances are measured vertex to vertex**, not between the nearest
-  points of two shapes. For point pairs, which is most proximity work, those coincide
-  exactly. For extended geometries they over-report by at most a segment length, so they
-  are an upper bound; run {py:func}`st_segmentize <batcher.st_segmentize>` first when the answer must be tight.
-- `st_transform` covers the four families of reference system listed above and rejects
-  everything else by EPSG code. Reprojecting between datums such as NAD 27 or OSGB 36
-  needs a grid shift that is not built in.
-- **There is no polygon overlay.** `st_intersection`, `st_union` and `st_difference` do
-  not exist. {py:func}`st_collect <batcher.st_collect>` concatenates without computing one, which is what you want
-  before a single {py:func}`st_envelope <batcher.st_envelope>` or {py:func}`st_convex_hull <batcher.st_convex_hull>`.
-- A geometry with a NaN coordinate is treated as unparseable and yields null, because
-  every predicate is a chain of comparisons and NaN makes all of them false in both
-  directions.
+- {py:func}`st_buffer <batcher.st_buffer>` is an approximation and over-estimates for a concave input. It buffers each vertex and takes the convex hull, which is exact for a convex geometry up to the arc discretization and is the buffer of the hull otherwise. It is sound as a candidate filter and wrong as a number to report. When the question is "is this within X", use {py:func}`st_dwithin <batcher.st_dwithin>`, which is exact and cheaper.
+- The geodesic distances are measured vertex to vertex, not between the nearest points of two shapes. For point pairs, which is most proximity work, those coincide exactly. For extended geometries they over-report by at most a segment length, so they are an upper bound. Run {py:func}`st_segmentize <batcher.st_segmentize>` first when the answer must be tight.
+- `st_transform` covers the four families of reference system listed above and rejects everything else by EPSG code. Reprojecting between datums such as NAD 27 or OSGB 36 needs a grid shift that is not built in.
+- There is no polygon overlay. `st_intersection`, `st_union` and `st_difference` do not exist. {py:func}`st_collect <batcher.st_collect>` concatenates without computing one, which is what you want before a single {py:func}`st_envelope <batcher.st_envelope>` or {py:func}`st_convex_hull <batcher.st_convex_hull>`.
+- A geometry with a NaN coordinate is treated as unparseable and yields null, because every predicate is a chain of comparisons and NaN makes all of them false in both directions.
 
 ## See also
 
 - {doc}`/api/relational/geospatial`: every `ST_*` function, grouped and enumerated.
-- {doc}`/cookbook/analytics/geospatial-binning`: snapping coordinates to a grid by hand,
-  and why `floor` is the only correct way to do it.
+- {doc}`/cookbook/analytics/geospatial-binning`: snapping coordinates to a grid by hand, and why `floor` is the only correct way to do it.
 - {doc}`/user-guide/analyze/joins`: the join mechanics a spatial join composes with.
 - {doc}`/user-guide/analyze/aggregations`: the {py:meth}`group_by <batcher.Dataset.group_by>` a grid key feeds.

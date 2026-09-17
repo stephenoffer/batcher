@@ -18,11 +18,9 @@ print(class_counts(undersample(ds, "y"), "y"))  # exactly balanced by discarding
 print(class_counts(oversample(ds, "y"), "y"))  # exactly balanced by duplicating
 ```
 
-`undersample` discards majority rows. `oversample` duplicates minority rows
-deterministically, and `balanced_sample` moves every class to the median count. When the model supports it, prefer
-{py:meth}`class_weights <batcher.Dataset.class_weights>` (a `{class: weight}` dict for the model's ``class_weight``) or `sample_weights`
-(a per-row weight column). Both rebalance the *loss* without discarding or duplicating a
-single row. `class_counts` is the first thing to look at.
+Look at `class_counts` first. `undersample` discards majority rows, `oversample` duplicates minority rows deterministically, and `balanced_sample` moves every class to the median count, so big classes lose a little and small ones gain a little.
+
+When the model supports weights, prefer them. `batcher.ml.sampling.class_weights` returns a `{class: weight}` dict for the model's `class_weight`, and `sample_weights` appends a per-row weight column. Both rebalance the *loss* without discarding or duplicating a single row. {py:meth}`Dataset.class_weights <batcher.Dataset.class_weights>` computes the same inverse-frequency weights as a `Dataset` to join back on the label.
 
 {py:func}`smote <batcher.ml.smote>` is the alternative to duplicating. `oversample` repeats
 minority rows, so a model can still memorize the exact points and tighten its boundary around
@@ -92,7 +90,11 @@ folds = ds.ml.kfold(5, key="value")
 print(sum(validate.count() for _, validate in folds))
 ```
 
-Two options select the variant your data needs, and choosing correctly is usually the difference between a trustworthy score and a misleading one:
+The following figure sets the hashed folds beside the one split that can't be hashed. On the left, pair `i` validates on fold `i` and trains on the other four. On the right, a time series is cut at quantiles of its time column and each split trains only on windows before the one it validates.
+
+![Two panels. Left, k-fold with five folds: a hash of each row picks a fold index from 0 to 4, pair i validates on fold i and trains on the other four, so every row validates exactly once however the data is partitioned. stratify= deals each label's rows round-robin across the folds, and group= hashes the group value so an entity stays in one fold. Right, time_series_split with four splits: the time column is cut into five windows at its quantiles, split 0 trains on window 1 and validates on window 2, split 1 trains on windows 1 and 2 and validates on window 3, and so on, so training never sees the future. With expanding=False, only the single window just before the validation window trains.](/_static/diagrams/cv_folds.svg)
+
+Two options select the variant your data needs, and picking the right one is usually the difference between a trustworthy score and a misleading one.
 
 `stratify=` keeps each label's proportion identical in every fold. Use it whenever the label is imbalanced, or the fold-to-fold variance in the score measures the split rather than the model.
 
@@ -102,7 +104,7 @@ folds = ds.ml.kfold(5, key="x", stratify="y")
 print([v.filter(bt.col("y") == 1).count() for _, v in folds])
 ```
 
-`group=` keeps every row of a group in the same fold. Use it whenever rows repeat an entity such as a user, a patient, a session, or a document. Without it the model memorizes the entity rather than the pattern, cross-validation looks excellent, and production does not. This is the most common silent leak in applied ML.
+`group=` keeps every row of a group in the same fold. Use it whenever rows repeat an entity such as a user, a patient, a session, or a document. Without it the model memorizes the entity rather than the pattern, cross-validation looks excellent, and production doesn't. Nothing raises, which is what makes this leak easy to ship.
 
 For a time series, neither applies: a random fold puts next week's rows in the training set, so the model sees the future and the validation score is one no deployment will reproduce.
 
@@ -113,18 +115,13 @@ print([(train.count(), validate.count()) for train, validate in ds.ml.time_serie
 
 `expanding=True`, the default, grows the training window with each split, matching a model retrained on all history. `expanding=False` slides a fixed-width window, matching one that deliberately forgets.
 
-`batcher.ml.model_selection` runs the loop end to end. `cross_val_score` fits and scores a
-model on each fold, and the spread across those folds is the honesty a single number hides.
-`cross_val_predict` gives every row its out-of-fold prediction, which is the unbiased input
-a stacking ensemble needs. `learning_curve` scores against training-set size, to answer
-whether more data would help. Each takes a `fit` and a `predict` callable, so any
-scikit-learn-style model composes.
+`batcher.ml.model_selection` runs the fit-and-score loop over these folds. `cross_val_predict` gives every row its out-of-fold prediction, which is the unbiased input a stacking ensemble needs. {doc}`model-selection` covers `cross_val_score`, the searches, and `learning_curve`.
 
 {py:func}`batcher.ml.splitting.fold_column <batcher.ml.splitting.fold_column>` is the primitive underneath. Reach for it when the split should outlive the pipeline that created it: it writes one column that every downstream job can filter on without re-deriving the assignment.
 
 ## Requirements and limitations
 
-Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed split, and `group_kfold`'s folds vary further because groups differ in size.
+Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed split. Grouped folds (`group=`, or `batcher.ml.splitting.group_kfold`) vary further, because groups differ in size.
 
 ## See also
 

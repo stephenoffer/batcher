@@ -1,8 +1,6 @@
 # Environment variables
 
-Batcher reads two environment-driven config layers once when the package is
-imported: `BATCHER_*` variables and an optional JSON file at `BATCHER_CONFIG_FILE`.
-Both overlay onto the built-in defaults and can be reproduced explicitly with
+Batcher reads two environment-driven config layers once when the package is imported: `BATCHER_*` variables and an optional config file at `BATCHER_CONFIG_FILE`. Both overlay onto the built-in defaults and can be reproduced explicitly with
 {py:meth}`Config.from_env <batcher.Config.from_env>` and {py:meth}`Config.from_file <batcher.Config.from_file>`.
 
 ## BATCHER_ variables
@@ -55,8 +53,7 @@ print(cfg.optimizer.cardinality.eq_selectivity)
 
 ## BATCHER_CONFIG_FILE
 
-Set `BATCHER_CONFIG_FILE` to the path of a JSON document whose structure mirrors the
-section layout. It is overlaid below the `BATCHER_*` variables.
+Set `BATCHER_CONFIG_FILE` to the path of a document whose structure mirrors the section layout. The suffix picks the parser: `.toml` is TOML, `.yaml` or `.yml` is YAML and needs PyYAML, and anything else is read as JSON. The file is overlaid below the `BATCHER_*` variables.
 
 ```bash
 # docs: skip
@@ -170,7 +167,7 @@ The two layers here sit in the middle of the resolution order, highest first:
 1. {py:func}`config_context(...) <batcher.config_context>`.
 1. {py:func}`set_config(...) <batcher.set_config>`.
 1. `BATCHER_*` environment variables.
-1. `BATCHER_CONFIG_FILE` JSON.
+1. The `BATCHER_CONFIG_FILE` document.
 1. Built-in defaults.
 
 So a `BATCHER_*` variable overrides a value set in `BATCHER_CONFIG_FILE`, and a

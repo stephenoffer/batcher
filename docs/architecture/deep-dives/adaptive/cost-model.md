@@ -1,5 +1,7 @@
 # The cost model
 
+This page describes how Kyber turns row counts into a cost it can compare, how the coefficients are calibrated from measured runs, and how hard it searches for a join order.
+
 Given two plans that produce the same answer, which one runs faster? Every cost-based
 decision in Kyber (join order, build side, broadcast versus shuffle, whether to split a
 filter) reduces to comparing two numbers. The cost model produces those numbers.
@@ -76,6 +78,12 @@ The interesting ones:
 | `Sort` | `sort_row × n × log2(max(2, heap))` | `row_bytes × heap` |
 | `Join` | `hash_build_row × \|R\| + hash_probe_row × \|L\| + output_row × out_rows` | `row_bytes(right) × \|R\|` |
 | `Window` | `sort_row × in_rows × log2(in_rows)` | `row_bytes × in_rows` |
+
+The table shows the base terms. In `kyber/cost/model.py` the hash probe of a join and the hash
+state of an aggregate or distinct are also multiplied by `cache_factor` from
+`kyber/cost/terms.py`, which is 1.0 while the table fits the last-level cache of the node that
+will run it and grows by a fixed penalty per doubling past it. The same operators carry an `io`
+term from `spill_io` for the state that won't fit the memory budget, priced by the spill device.
 
 `Sort`'s `heap = min(limit, n)` when there is a limit. A top-N heap can never hold more
 rows than exist, so a `LIMIT` above the input degenerates to a full sort rather than being
@@ -297,7 +305,7 @@ So the budget is a share of the region's own estimated execution cost. Kyber pri
 region as written, converts that to seconds through a measured ~1.7e-10 seconds per cost unit,
 grants a tenth of it back as search time, and divides by the measured cost of a pair. The
 result is clamped to `[512, 200000]` pairs. The floor covers the full search for every star up
-to 8 leaves and every chain past 15, so small queries keep the plans they already get. The
+to 7 leaves and every chain up to 15, so small queries keep the plans they already get. The
 ceiling is the same number as the flat cap it replaces, so no query that could afford a search
 before gets a smaller one now. What changed is that the ceiling has to be earned, and only a
 query estimated to run for minutes earns it.
@@ -340,9 +348,10 @@ which reordering stops.
 
 ## Limits
 
-The model has no notion of cache, NUMA, or memory bandwidth. `hash_build_row = 2.0` is a
-single number for an operation whose real cost varies by an order of magnitude with hash
-table size. What partly rescues this is that the decisions it drives are comparative, and
+The per-row coefficients have no notion of NUMA or memory bandwidth, and cache enters only
+through the broadcast threshold and `cache_factor`.
+`hash_build_row = 2.0` is still a single number for an operation whose real cost varies by an
+order of magnitude with hash table size. What partly rescues this is that the decisions it drives are comparative, and
 the errors are usually in the same direction on both sides of the comparison.
 
 It is only as good as the cardinalities feeding it. A cost model applied to a row count that

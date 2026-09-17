@@ -5,14 +5,14 @@ describing the output. Every join type, every strategy, and both the parallel an
 paths are built on that one primitive. This page describes it, the algorithms layered over it,
 and where its remaining headroom is.
 
-The join is where single-node scaling has the most left to give. On TPC-H at scale factor 1 on
-16 cores, Batcher matches DuckDB's result on all 22 queries and, against DuckDB reading the same
-Arrow input, wins all 22. Against DuckDB's own native store the join- and subquery-heavy shapes
-are where it trails: q17 at 7.9x, q20 at 2.8x, q3 at 2.6x, q21 at 2.4x, and the operator
-microbenchmark `join → aggregate` at 98.3 ms against 85.6 ms. The cause isn't the join kernel.
-Single-node parallelism on these shapes reaches only about 1.7x to 3.8x on 16 cores, because
-serial prefixes such as materialize, gather, and shuffle run before the parallel per-bucket
-join. Distributed, where those prefixes are spread across workers, the same operator leads.
+On TPC-H at scale factor 1, the four-engine board of 2026-09-13 in
+`benchmarks/BENCHMARK_RESULTS.md` puts Batcher at a 0.72 geomean ratio against DuckDB on its own
+native storage, a win overall, with 6 of the 22 cases recorded as losing on that board. Against
+DuckDB reading the same Arrow input Batcher reads, the ratio is 0.25
+({doc}`TPC-H benchmarks </benchmarks/results/tpch>`). Distributed, Batcher's join beats
+Daft's Ray runner by 1.7x to 2.2x at every scale measured. The headroom that remains on a single
+node is in the serial work around the parallel per-bucket join rather than in the join kernel,
+which is what the later sections of this page follow.
 
 ## One primitive: index pairs
 
@@ -136,9 +136,11 @@ the following:
 1. A left-driven join type: `Inner`, `Left`, `Semi`, or `Anti`. `Right` and `Full` must
    reconcile unmatched build rows across every morsel, so they can't be decided one morsel at a
    time.
-1. Integer keys, one or two `Int64` columns. A row-encoded key would need its `RowConverter`
-   shared across morsels.
-1. A build side under a fixed row ceiling.
+1. Integer keys, any number of `Int64` columns, or a single `Utf8`, `LargeUtf8`, `Binary` or
+   `LargeBinary` column. A row-encoded key would need its `RowConverter` shared across morsels,
+   while a single byte column is hashed and compared on its raw bytes and carries no state.
+1. A build side under a row ceiling (`RADIX_MIN_BUILD_ROWS_BROADCAST`), which is a cost
+   comparison against the partitioned radix join rather than a correctness limit.
 
 `BroadcastProbe::new` returns `None` for anything else and the caller keeps the materialized
 path. Nothing silently changes shape.
@@ -148,12 +150,37 @@ path. Nothing silently changes shape.
 There is no hash table. Batcher sorts both sides by key and merges them. `join/sort_merge.rs`
 skips the sort when the indices already arrive in ascending key order, which it establishes in
 one linear pass. That saving is real, but it is not what selects this strategy: `SORT_MERGE_MIN_ROWS`
-(50 M rows per worker) is. Kyber notes at `kyber/rules/selection.py:479` that preferring sort-merge
+(50 M rows per worker) is. A note in `kyber/rules/selection.py` records that preferring sort-merge
 for already-ordered inputs "was tried and reverted", because its encoding overhead loses to hash
 even when the sort is skipped. Only a build side genuinely too big to hash keeps it. Output order differs from the hash
 join, because these are unordered relations.
 :::
 ::::
+
+## Making the build side cheap
+
+The build is the join's sequential prefix, and three pieces of `bc-runtime/src/join/` exist to
+shrink it.
+
+A surrogate key such as `o_orderkey`, `p_partkey` or `c_custkey` is a near-contiguous run of
+integers, and for those `dense.rs` replaces the hash table with a direct map: `map[key - lo]`
+holds the chain head, so neither side hashes and no collision chain is walked. It is gated on
+the key's observed value range, the same way the aggregate's dense group map is. On
+`lineitem` joined to `orders` at 6M to 1.5M rows the shared build took about 29.5 ms against 6.7 ms for the whole
+probe, which is the cost this removes.
+
+When the table must be hashed, `build.rs` shards it by a slice of the hash so every core builds
+at once. A key's shard is a pure function of its hash, so build and probe agree without
+communicating, and because each shard receives its rows in ascending order and chains prepend,
+every chain comes out in the order the serial loop produced.
+
+Once the build side exists, its key set is a superset filter on the probe side: a probe row
+whose key is absent can produce nothing. `key_filter.rs` digests that set into a `KeyFilter`
+the streaming executor sinks down the probe pipeline to the scan, so a dropped row also skips
+every predicate and projection above it. On TPC-H q21, 411 of 10,000 suppliers survive
+`n_name = 'SAUDI ARABIA'`, and the 6M-row `lineitem` probe is cut about 24x before its date
+predicate runs. The filter is the literal key set bounded by the build side's `[lo, hi]`, never
+a sketch, so it has no false negatives.
 
 ## Radix partitioning
 
@@ -244,6 +271,30 @@ keys, so the union of per-bucket joins is the full join for every join type.
 The admission test, the fan-out, and what a single bucket pair costs are below.
 
 ![The grace hash join, from admission to one bucket pair. admit sizes the build side as its Arrow bytes plus 12 bytes per build row; if it fits, one hash table is built on the right and probed by the left. If it does not, both sides are partitioned by the same hash of the join key, one batch at a time so neither side is ever fully materialized, and written to disk as join-left/part-i.arrow and join-right/part-i.arrow, with the bucket count sized from the larger side divided by the budget, from 2 to 256. Each bucket pair is then joined on its own, and only the build bucket is resident: the probe bucket streams past it in chunks, so the cost is one bucket rather than two. A build bucket still over budget is re-partitioned with a fresh salt, at most three deep, because a re-split is a re-hash and so cannot separate rows that share a key, which leaves one hot key in one bucket at every level.](/_static/diagrams/hash_join_spill.svg)
+
+## Range joins
+
+An inequality, interval-containment or band join is `RelOp::RangeJoin`, and
+`crates/bc-runtime/src/join/range/` answers it without materializing the cartesian product. It
+emits the same `JoinIndices` the hash join does, so every join type and the caller's gather are
+unchanged. The algorithm follows the shape of the condition:
+
+| Condition | Algorithm |
+|---|---|
+| one inequality | sort the right side once; each left row's matches are a contiguous suffix found by binary search |
+| a band, two inequalities bounding one right key (`L.a <= R.y AND R.y <= L.b`) | the matches are a slice of one sorted array whose bounds move monotonically with the left key (`band.rs`) |
+| two general inequalities | IEJoin, the algorithm behind DuckDB's `PhysicalIEJoin`: sort both axes, sweep one, and read matches off a mark array |
+| a right side of at most 32 rows | no sort at all: `|R|` vectorized comparisons over the left key column (`small.rs`) |
+
+The sorts and the sweep fan out across cores, and the slices fold back in order, so the parallel
+output is identical to the sequential sweep rather than merely equivalent. The competitive
+scorecard records the result: a win against DuckDB below about 1M rows, parity at 1M, a loss
+above it, and a win at any left size against a right side under 32 rows.
+
+Distributed, a range join broadcasts its right side and range-joins each left partition against
+it, which is exact for the left-driven join types. An inequality has no key to co-partition on,
+so there is no shuffle fallback: a right side over `optimizer.broadcast_max_bytes` raises a
+`PlanError` naming the fixes rather than running the whole join on one node.
 
 ## ASOF
 
@@ -337,15 +388,16 @@ The `None` in the left join is the null index in the index-pair builder, made vi
 
 Join throughput is set by how much of the operator runs in parallel, and the profile says
 exactly where that is decided: the serial prefixes around the parallel per-bucket join. The
-radix scatter is now parallel, and the probe side is gathered once instead of concatenated and
-re-gathered. Both changes are measured in `benchmarks/BENCHMARK_RESULTS.md`.
-
-Scale-out is the strong axis: on the operator-mix benchmarks Batcher's distributed join beats
-Daft's by 1.7x to 2.2x at every scale measured.
+radix scatter and the hash build are parallel, and the probe side is gathered once instead of
+concatenated and re-gathered. The measurements are in `benchmarks/BENCHMARK_RESULTS.md`, and
+{doc}`vs Daft </benchmarks/comparisons/vs-daft>` carries the distributed join against Daft.
 
 ## Code map
 
 - `crates/bc-runtime/src/join/mod.rs`: `hash_join_indices`, the bloom gate, `JoinIndices`
+- `crates/bc-runtime/src/join/dense.rs`, `build.rs`: the direct-map build and the sharded parallel build
+- `crates/bc-runtime/src/join/key_filter.rs`: the build-side key set pushed to the probe scan
+- `crates/bc-runtime/src/join/range/`: range, band and IEJoin inequality joins
 - `crates/bc-runtime/src/join/radix.rs`: the parallel three-phase partition
 - `crates/bc-runtime/src/join/stream.rs`: `BroadcastProbe`, the streaming probe
 - `crates/bc-runtime/src/join/sort_merge.rs`, `asof.rs`: the other two algorithms
@@ -359,7 +411,7 @@ Daft's by 1.7x to 2.2x at every scale measured.
 - {doc}`Kyber </architecture/internals/kyber>`: the pass that picks the strategy and the build side.
 - {doc}`Joins </user-guide/analyze/joins>`: the API, and how to help the planner.
 - {doc}`Reading a plan </user-guide/operate/tuning/explain-plans>`: the decisions block above, explained.
-- {doc}`vs DuckDB </benchmarks/comparisons/vs-duckdb>`: the multi-join gap this page opens with.
+- {doc}`vs DuckDB </benchmarks/comparisons/vs-duckdb>`: the join-heavy queries against DuckDB's native store.
 - {doc}`TPC-H benchmarks </benchmarks/results/tpch>`: q5, q7, q8, q17 in context.
 - {doc}`Morsel parallelism </architecture/deep-dives/operators/morsel-parallelism>`: the shuffle-into-buckets schedule.
 - {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why per-partition joins union to the whole join.

@@ -1,11 +1,8 @@
 # Cohort analysis
 
-Do customers acquired in January spend more in their third month than customers
-acquired in March? That is a cohort question, and the whole thing turns on one
-column: which cohort a row belongs to.
+Do customers acquired in January spend more in their third month than customers acquired in March? That is a cohort question, and the whole thing turns on one column: which cohort a row belongs to.
 
-Rows do not have cohorts. *Users* have cohorts. A row's cohort is the month of its
-user's **first** order, which is not a property of the row you are looking at.
+Rows do not have cohorts. *Users* have cohorts. A row's cohort is the month of its user's **first** order, which is not a property of the row you are looking at.
 
 ## The data
 
@@ -38,18 +35,15 @@ print(orders.count())
 ## The trap
 
 :::{warning}
-Grouping by the order's own month puts one user in three different cohorts. `u1` bought
-in January, February and April, so it lands in all three, and every retention number
-computed on top of that inflates.
+Grouping by the order's own month puts one user in three different cohorts. `u1` bought in January, February and April, so it lands in all three, and every retention number computed on top of that inflates.
 :::
 
-Group by the order's own month and you get a monthly sales report, not a cohort
-report:
+Group by the order's own month and you get a monthly sales report, not a cohort report:
 
 ```python
 naive = (
     orders.group_by(month=col("order_date").dt.strftime("%Y-%m"))
-    .agg(users=col("user").n_unique(), revenue=col("amount").sum())
+    .agg(users=col("user").count_distinct(), revenue=col("amount").sum())
     .sort("month")
 )
 print(naive.to_pydict())
@@ -57,8 +51,7 @@ print(naive.to_pydict())
 #  'revenue': [130.0, 70.0, 100.0, 20.0]}
 ```
 
-Four cohorts, seven user-slots, four actual users. Sum the `users` column and you get 7,
-which is more people than exist.
+Four cohorts, seven user-slots, four actual users. Sum the `users` column and you get 7, which is more people than exist.
 
 Follow `u1`'s three orders through both labellings and the difference is the whole page:
 
@@ -71,14 +64,10 @@ Follow `u1`'s three orders through both labellings and the difference is the who
 ## Label the user, not the row
 
 :::{tip}
-The cohort is `min(order_date)` **per user**, which is a window aggregate rather than a
-group aggregate. You want the label attached back to every row of that user instead of
-collapsed, and {py:meth}`.over(partition_by=["user"]) <batcher.AggExpr.over>` does exactly that.
+The cohort is `min(order_date)` **per user**, which is a window aggregate rather than a group aggregate. You want the label attached back to every row of that user instead of collapsed, and {py:meth}`.over(partition_by=["user"]) <batcher.AggExpr.over>` does exactly that.
 :::
 
-`month_idx` is the month as a single integer, `year * 12 + month`. Subtract two of them and
-you have the number of months between. No calendar arithmetic, and no December-to-January
-wraparound bug.
+`month_idx` is the month as a single integer, `year * 12 + month`. Subtract two of them and you have the number of months between. No calendar arithmetic, and no December-to-January wraparound bug.
 
 ```python
 labelled = (
@@ -99,22 +88,18 @@ print(labelled.sort("user", "order_date").select("user", "month", "cohort", "per
 #  'period': [0, 1, 3, 0, 2, 0, 0, 0]}
 ```
 
-Now each user carries one cohort for its whole life, and `period` is months since
-acquisition. `u1`'s April order sits at period 3 of the January cohort, where it
-belongs.
+Now each user carries one cohort for its whole life, and `period` is months since acquisition. `u1`'s April order sits at period 3 of the January cohort, where it belongs.
 
 ## The cohort table
 
-Batcher lowers SQL and the DataFrame API to one logical plan, so the two tabs below are
-the same query, not a second implementation of it. The SQL cohort label is `YYYYMM` as an
-integer, which sorts the same way the string does and needs no format function.
+Batcher lowers SQL and the DataFrame API to one logical plan, so the two tabs below are the same query, not a second implementation of it. The SQL cohort label is `YYYYMM` as an integer, which sorts the same way the string does and needs no format function.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
 ```python
 cells = (
     labelled.group_by("cohort", "period")
-    .agg(users=col("user").n_unique(), revenue=col("amount").sum())
+    .agg(users=col("user").count_distinct(), revenue=col("amount").sum())
     .sort("cohort", "period")
 )
 print(cells.to_pydict())
@@ -156,14 +141,11 @@ print(sql_cells.to_pydict())
 :::
 ::::
 
-The January cohort has two users and keeps one of them alive through month 3. The
-February and March cohorts have not had time to show anything yet, a fact the flat list hides
-and the triangle makes obvious.
+The January cohort has two users and keeps one of them alive through month 3. The February and March cohorts have not had time to show anything yet, a fact the flat list hides and the triangle makes obvious.
 
 ## The triangle
 
-`pivot` spreads `period` across the columns, which is how anyone actually reads a
-cohort report:
+`pivot` spreads `period` across the columns, which is how anyone actually reads a cohort report:
 
 ```python
 triangle = cells.pivot(index=["cohort"], on="period", values="users", aggregate="sum").sort(
@@ -175,40 +157,26 @@ print(triangle.to_pydict())
 ```
 
 :::{important}
-Do not fill the nulls in the lower-right with zeros. A zero means "nobody came back". A
-null means "not known yet", and averaging a column that mixes the two is how a
-retention chart starts trending down for no reason.
+Do not fill the nulls in the lower-right with zeros. A zero means "nobody came back". A null means "not known yet", and averaging a column that mixes the two is how a retention chart starts trending down for no reason.
 :::
 
-The nulls are the shape of the thing: the March cohort has no month-3 number because
-month 3 has not happened.
+The nulls are the shape of the thing: the March cohort has no month-3 number because month 3 has not happened.
 
-`pivot` runs an eager pre-pass to discover the distinct values of `period`. Pass
-`columns=[0, 1, 2, 3]` to fix them yourself and skip it. Worth doing when the period range is
-known and the input is large.
+`pivot` runs an eager pre-pass to discover the distinct values of `period`. Pass `columns=[0, 1, 2, 3]` to fix them yourself and skip it. Worth doing when the period range is known and the input is large.
 
 :::{dropdown} Scaling notes: the shuffle that decides whether this fits in memory
-The `min().over(partition_by=["user"])` is a hash shuffle on `user`. It is the expensive step,
-and the one that decides whether this query fits in memory. Two things keep it bounded:
+The `min().over(partition_by=["user"])` is a hash shuffle on `user`. It is the expensive step, and the one that decides whether this query fits in memory. Two things keep it bounded:
 
-- Project first. `orders` here has three columns, while a real event table has forty. Select
-  the three you need *before* the window, so the shuffle moves bytes you will use.
-- If `user` is skewed (one bot account with a million orders), the window partition for
-  that key is what spills. Batcher's aggregates and windows spill to disk rather than
-  dying, but a skewed key is still slow. `col("user").n_unique()` on the raw table tells
-  you before you find out the hard way.
+- Project first. `orders` here has three columns, while a real event table has forty. Select the three you need *before* the window, so the shuffle moves bytes you will use.
+- If `user` is skewed (one bot account with a million orders), the window partition for that key is what spills. Batcher's aggregates and windows spill to disk rather than dying, but a skewed key is still slow. `orders.value_counts("user")` on the raw table tells you before you find out the hard way.
 :::
 
 ## See also
 
-- {doc}`Retention curves </cookbook/analytics/behavior/retention-curves>`: the same cohort skeleton, measured in days
-  and normalized to a rate.
-- {doc}`Funnel analysis </cookbook/analytics/behavior/funnel-analysis>`: the other one-row-per-user collapse, and the
-  self-join it replaces.
+- {doc}`Retention curves </cookbook/analytics/behavior/retention-curves>`: the same cohort skeleton, measured in days and normalized to a rate.
+- {doc}`Funnel analysis </cookbook/analytics/behavior/funnel-analysis>`: the other one-row-per-user collapse, and the self-join it replaces.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: `over` in full.
-- {doc}`Aggregations </user-guide/analyze/aggregations>`: `n_unique` and the approximate
-  variant for large inputs.
+- {doc}`Aggregations </user-guide/analyze/aggregations>`: `count_distinct` and the approximate variant for large inputs.
 - {doc}`Pivoting </user-guide/analyze/pivoting>`: `pivot`, `unpivot`, and fixing the column set.
-- {doc}`Window internals </architecture/deep-dives/operators/window-internals>`: what the partition-by shuffle
-  actually costs, and when it spills.
+- {doc}`Window internals </architecture/deep-dives/operators/window-internals>`: what the partition-by shuffle actually costs, and when it spills.
 - {doc}`Expressions API </api/relational/expressions>`: `dt.strftime`, `dt.year`, `min().over(...)`.

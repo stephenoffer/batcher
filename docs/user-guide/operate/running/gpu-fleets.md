@@ -5,9 +5,11 @@ actually is, budgeting the power a job may draw, keeping a multi-device stage on
 interconnect, taking a sick device out of rotation, and constraining where regulated data may
 be computed.
 
-Everything here is off or unbounded by default. A deployment that configures none of it
-schedules exactly as it did before, which is what makes each control safe to turn on one at a
-time.
+Two of these controls are on by default. Fabric-aware placement keeps a collective on the fast
+interconnect, and does nothing on a fleet without the node labels it reads. The MIG preference
+gives a small model a hardware partition rather than a whole device. The rest, the power budget, device health checking,
+efficiency-first placement and data residency, are off or unbounded until you set them, so you
+can turn each one on separately.
 
 ## What Batcher knows about a device
 
@@ -54,8 +56,7 @@ spans.
 
 ## Whether a device is worth using at all
 
-The question most engines answer with a heuristic. Batcher answers it with a time model, and
-the term that decides it is the one a data engine is most tempted to leave out: every byte of a
+Batcher answers this with a time model rather than a heuristic, and the term that decides it is the one a data engine is most tempted to leave out: every byte of a
 relational stage crosses the host link before a kernel sees it, and on PCIe that link is slower
 than a server's own memory.
 
@@ -138,8 +139,8 @@ print(energy.total_joules >= 0.0)
 # True
 ```
 
-A CPU-only run records nothing, which is why the ledger above is empty: only accelerator
-stages draw device power. The figures a datacenter cares about are efficiency ratios rather
+A CPU-only run such as the one above records nothing, because only accelerator stages draw
+device power, so `total_joules` stays at zero. The figures a datacenter cares about are efficiency ratios rather
 than totals: tokens per joule for a generative stage, rows per joule for a relational one, and
 the share of energy spent holding devices that were not computing.
 
@@ -332,7 +333,9 @@ A clamped device is derated rather than removed, because the clamp is often your
 working as intended and a power-bound fleet cannot afford to drop the slot. A device reporting
 uncorrectable ECC errors is quarantined outright, whatever it costs in throughput.
 
-Health checking needs `pynvml` on every worker, which is why it is off by default. Install it
+Health checking needs `pynvml` on every worker, which is why it is off by default.
+{doc}`Running on unstable nodes <unstable-nodes>` covers the fault detection and quarantine that
+run without it. Install it
 with `pip install 'batcher-engine[nvml]'`. Without it every device is assumed healthy.
 
 ```{important}
@@ -341,7 +344,7 @@ scheduling, because the alternative is a cluster that goes offline the day a dep
 being installed.
 ```
 
-## Diagnose a slow GPU stage
+## Check whether the devices are fed
 
 Before tuning a kernel, check whether the devices were ever busy. The most common GPU pipeline
 problem is a device waiting on the stage in front of it, and the fix for that is the opposite
@@ -446,6 +449,7 @@ that is merely busy.
 ## See also
 
 - {doc}`/user-guide/operate/running/gpu-diagnosis`: why a GPU stage was slow, once it is correct.
+- {doc}`/user-guide/operate/running/unstable-nodes`: Xid and kernel-log faults, quarantine, and corrupting devices.
 - {doc}`/ml/inference/gpu`: choosing devices and batch sizes for a model, from the pipeline side.
 - {doc}`/user-guide/trust/governance`: the row and column half of the same policy layer.
 - {doc}`/configuration/options`: every accelerator field with its default and unit.

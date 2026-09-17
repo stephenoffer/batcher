@@ -1,6 +1,8 @@
 # Fuzzy matching
 
-Edit distances count operations (lower is closer); the Jaro family returns a similarity in [0, 1] (higher is closer). Pick by the error you expect: typos favor Levenshtein, transposed characters favor Damerau.
+Fuzzy matching finds the values that are almost a known string. Edit distances count operations, so lower is closer. The Jaro family returns a similarity between 0 and 1, so higher is closer. Pick by the error you expect: typos favor Levenshtein, transposed characters favor Damerau.
+
+The comparison target is a plan-time literal, not another column. That makes these a fast screen against a known value such as a canonical name or a search term. The script compares `levenshtein`, `damerau_levenshtein`, `jaro_similarity`, `jaro_winkler_similarity`, and `hamming` against one name, keeps the near-matches above a threshold, and for two-table record linkage blocks on a `soundex` code and joins on that instead.
 
 The whole script, executed on every test run:
 

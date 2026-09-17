@@ -1,16 +1,16 @@
 # Data loaders
 
-This page maps the training data loaders: which one to reach for in which situation, and what
+This page maps Batcher's training data loaders: which one fits which training setup, and what
 each one guarantees.
 
-A training loop that waits on data is an expensive GPU sitting idle, and the usual cause is a
+A training loop that waits on data is an expensive GPU sitting idle. The usual cause is a
 loader doing per-row Python work that should have been a columnar operator. Shape the data in
-the engine. Let the loader do nothing but hand tensors to the step function.
+the engine, and let the loader do nothing but hand tensors to the step function.
 
 ## Which loader
 
-Find the row that matches your training setup. Each loader hands batches to a different
-consumer, and picking the wrong one is what puts Python back on the hot path:
+Each loader hands batches to a different consumer, and picking the wrong one is what puts
+Python back on the hot path. Find the row that matches your training setup:
 
 | Situation | Reach for |
 | --- | --- |
@@ -24,20 +24,20 @@ consumer, and picking the wrong one is what puts Python back on the hot path:
 | TensorFlow | {py:func}`batcher.ml.to_tf_dataset(...) <batcher.ml.to_tf_dataset>` |
 | The whole result in memory as NumPy / JAX arrays | {py:meth}`ds.to_numpy() <batcher.Dataset.to_numpy>` / {py:meth}`ds.to_jax() <batcher.Dataset.to_jax>` |
 
-`ds.to_numpy()` and `ds.to_jax()` materialize the *entire* result as a
-`{column: array}` dict, where a tensor or embedding column comes back shaped
-`(n, *shape)`. Use them when the result fits in memory and you want arrays rather than a
-streaming loader.
+`ds.to_numpy()` and `ds.to_jax()` materialize the *entire* result as a `{column: array}` dict,
+and a tensor or embedding column comes back shaped `(n, *shape)`. Use them when the result fits
+in memory and you want arrays rather than a stream.
 
-The three that get confused with each other are worth stating plainly.
-{py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` is the single-process loop, and it owns the read, the device
-transfer, and the batching. {py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` is the multi-rank one, and it owns the
-*shard*, which is why nothing else may. `to_torch_iterable` owns nothing at all. It is a
-converter you hand an existing batch iterator, for a pipeline you assembled yourself.
+Three of these get confused with each other.
+{py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` is the
+single-process loop, and it owns the read, the device transfer, and the batching.
+{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` is the multi-rank
+one. It owns the *shard*, which is why nothing else may. `to_torch_iterable` owns nothing. It's
+a converter you hand an existing batch iterator, for a pipeline you assembled yourself.
 
 ## iter_batches: the base
 
-Everything else is built on this. It yields ordinary `pyarrow.RecordBatch`es as they are
+Everything else is built on this. It yields ordinary `pyarrow.RecordBatch`es as they're
 produced, so memory stays bounded and the loop starts before the read finishes.
 
 ```python
@@ -58,10 +58,11 @@ for batch in ds.iter_batches(batch_size=2):
 # 2 ['f0', 'f1', 'label']
 ```
 
-A breaker-free pipeline is delivered incrementally. A plan that must materialize, such as
-one containing a sort or a global aggregate, does that first. So {py:meth}`iter_batches <batcher.Dataset.iter_batches>` over a
-filter-and-project chain streams a 10 TB source in bounded memory, and over a sort it does
-not. That is a property of the plan, not of the loader.
+Whether the stream starts at once is a property of the plan, not of the loader. A filter and
+project chain streams a 10 TB source in bounded memory. A top-level sort, join, or window over
+a bounded source consumes its input to disk first and then yields one bucket at a time.
+{doc}`Streaming for training </ml/inference/streaming>` lists which plans stream and which
+materialize.
 
 `iter_batches` also shapes the stream for a loop that wants no framework. `batch_format` converts each batch with the same conversions `map_batches` uses, `drop_last` drops a ragged final batch, `local_shuffle_buffer_size` and `local_shuffle_seed` shuffle rows within blocks of that many rows, and `prefetch_batches` prepares batches ahead on a background thread. Every one defaults to off, so the plain call above is unchanged.
 
@@ -73,9 +74,9 @@ for batch in ds.iter_batches(4, batch_format="numpy", drop_last=True, local_shuf
 
 ## iter_torch_batches: tensors, single process
 
-It folds the tensor conversion into the stream and yields `{column: tensor}` dicts over
-the numeric columns. `device="auto"` picks CUDA, ROCm, XPU, MPS, or CPU. Here it is CPU
-so the example runs with no GPU.
+It folds the tensor conversion into the stream and yields `{column: tensor}` dicts over the
+numeric columns. `device="auto"` picks CUDA, ROCm, XPU, MPS, or CPU. Here it's CPU, so the
+example runs with no GPU.
 
 ```python
 batches = list(ds.ml.iter_torch_batches(batch_size=2, device="cpu"))
@@ -85,18 +86,14 @@ print(batches[0]["f0"].shape, batches[0]["label"].dtype)
 # torch.Size([2]) torch.int64
 ```
 
-Non-numeric columns are dropped, since a string column has no tensor. `columns=[...]`
-selects explicitly, which is what you want anyway, because it lets projection pushdown
-prune the scan.
+Non-numeric columns are dropped, with a warning, since a string column has no tensor. Pass
+`columns=[...]` anyway: it lets projection pushdown prune the scan.
 
-Three options matter in a real loop. `pin_memory=True` page-locks the host tensors so the
-copy to the device can be asynchronous. `prefetch_batches`, which is 2 by default,
-overlaps that copy with the next batch's host work, so the GPU is not waiting on the PCIe
-bus. `local_shuffle_buffer_size` is a streaming approximation of a shuffle, and it is a block
-permutation rather than a reservoir. The loader fills a block to that row count or to
-256 MiB, whichever binds first, permutes the whole block once, and emits it. That costs
-nothing extra to read, and it is not a global permutation: a row never crosses a block
-boundary, so a corpus written in label order stays clumped.
+A real loop sets three more options. `pin_memory=True` page-locks host tensors so the device
+copy can be asynchronous, `prefetch_batches` overlaps that copy with the next batch's host work,
+and `local_shuffle_buffer_size` shuffles within blocks as the stream goes by.
+{doc}`PyTorch </ml/inference/pytorch>` covers each option, including why the local shuffle
+leaves a label-ordered corpus clumped.
 
 ```python
 # docs: skip
@@ -117,9 +114,9 @@ for batch in ds.ml.iter_torch_batches(
 ## stream_loader: one shard per rank
 
 For DDP, each rank needs a disjoint slice of a single global order. `ds.ml.stream_loader`
-returns a `torch.utils.data.IterableDataset` for one rank, already batched.
-
-The shard is a stride over the global order rather than a contiguous slice of it, which is what makes the order independent of the cluster size:
+returns a `torch.utils.data.IterableDataset` for one rank, already batched. The shard is a
+stride over the global order rather than a contiguous slice of it, which is what makes the order
+independent of the cluster size:
 
 ![How one global order becomes one shard per rank. ds.ml.stream_loader computes a seeded permutation of every row the same way on every rank, independent of the cluster size. A rank's shard is a stride over that order rather than a contiguous split: rank 0 takes rows 0, W, 2W and so on, rank 1 takes 1, W+1, 2W+1, and the order is trimmed or padded to a multiple of world_size so every rank yields the same count. What one rank then does with its stride is three steps. It fills a shuffle block, to the requested row window or 256 MiB, whichever comes first, and permutes it once; that is not a reservoir, because a row never crosses a block boundary, so a corpus written in label order stays clumped. It converts the numeric columns to tensors, dropping non-numeric ones with a single announcement, and zero_copy views the Arrow buffer through dlpack where it can rather than copying. It then moves the batch to the device on its own copy stream, holding the pinned staging tensor for the next few batches so an in-flight copy cannot read memory that was already freed. Resume works because global_consumed counts positions in the global order, not in a rank's shard, which is why a run resumes on a differently sized cluster; it must land on a multiple of world_size at a synchronized step boundary or the ranks come back with unequal counts.](/_static/diagrams/data_loader_shards.svg)
 
@@ -142,26 +139,25 @@ for batch in DataLoader(iterable, batch_size=None):  # already sized
 ```
 
 :::{warning}
-Wrapping this in a `DistributedSampler` shards an already-sharded stream, so each rank
-sees a fraction of its fraction and most of your corpus is never read. The job runs, the
-loss falls, and you are training on a quarter of the data. `stream_loader` is the only
-shard authority. While you are there, remember that passing `batch_size` to the `DataLoader`
+Wrapping this in a `DistributedSampler` shards an already-sharded stream, so each rank sees a
+fraction of its fraction. The job runs, the loss falls, and you're training on a quarter of the
+data. Passing `batch_size` to the `DataLoader` is the smaller version of the same mistake: it
 re-batches batches that are already the right size.
 :::
 
-See {doc}`distributed training </ml/training/distributed-training>` for the balance, determinism, and
-resume guarantees.
+{doc}`Distributed training </ml/training/distributed-training>` states the balance, determinism,
+and resume guarantees in full.
 
 ## shard_stream_loader: a corpus larger than RAM
 
-`stream_loader` keeps one rank's whole slice of the corpus resident. That is a factor of
-`world_size` better than materializing the corpus per rank, and it still stops working once
+`stream_loader` reads the corpus as a stream and keeps only one rank's rows resident. That's a
+factor of `world_size` better than holding the corpus per rank, and it still stops working once
 a rank's slice exceeds memory. Past that point the corpus goes to storage in a layout that
 supports random access by row, and the loader reads only the rows a batch needs.
 
 Write it once with {py:meth}`ds.ml.write_shards <batcher.api.dataset.ml.DatasetML.write_shards>`.
-Rows stream out of the engine into fixed-size Arrow IPC shards plus an `index.json`, so
-writing a corpus larger than memory needs no more memory than one shard:
+Rows stream out of the engine into fixed-size Arrow IPC shards plus an `index.json`, so writing a
+corpus larger than memory needs no more memory than one shard:
 
 ```python
 import batcher as bt
@@ -175,8 +171,12 @@ print(index.total_rows, index.shard_rows)
 # 100 (32, 32, 32, 4)
 ```
 
-Then stream it. The loader holds at most `cache_size` decoded shards, whatever the corpus
-size, and gives the same deterministic, balanced, resumable per-rank order `stream_loader`
+`distributed=True` produces the rows on a Ray cluster. The writing itself stays in the calling
+process and stays sequential, because shard boundaries must be deterministic for a global row
+index to mean anything.
+
+Then stream it. The loader holds at most `cache_size` decoded shards, 4 by default, whatever the
+corpus size, and gives the same deterministic, balanced, resumable per-rank order `stream_loader`
 does:
 
 ```python
@@ -187,8 +187,8 @@ print(len(loader), sorted(next(iter(loader))))
 # 10 ['f', 'label']
 ```
 
-The corpus also reads back as an ordinary relation. That is what the questions asked *around*
-a training run need: class balance, null labels, a join against the source table, a check that
+The corpus also reads back as an ordinary relation, which is what the questions asked *around* a
+training run need: class balance, null labels, a join against the source table, a check that
 this corpus is the one the features were fitted on.
 
 ```python
@@ -199,24 +199,22 @@ print(corpus.group_by("label").agg(n=bt.col("f").count()).sort("label").to_pydic
 # {'label': [0, 1], 'n': [50, 50]}
 ```
 
-The row count comes from the corpus index, so `count()` is answered without reading a shard.
-Each shard is its own read task, so a scan fans out across a cluster the same way any other
-source does. The shards are plain Arrow IPC underneath, so `bt.read.arrow(f"{path}/*.arrow")`
-works too. This is a layout, not a private format.
+`count()` is answered from the corpus index without reading a shard. Each shard is its own read
+task, so a scan fans out across a cluster like any other source. The shards are plain Arrow IPC,
+so `bt.read.arrow(f"{path}/*.arrow")` works too. This is a layout, not a private format.
 
 ### Why the shuffle is blocked, not global
 
-A globally shuffled epoch and a bounded shard cache cannot both work. Every sample of a
-global shuffle is uniform over the whole corpus, so a batch of 1,024 samples lands in up to
-1,024 different shards. The cache misses on nearly all of them, and each miss reads a whole
-shard to use one row of it. Over a corpus of ten thousand shards the epoch reads the data
-thousands of times over. The cache is not too small; a global shuffle has no working set for
-it to hold.
+A globally shuffled epoch and a bounded shard cache can't both work. Every sample of a global
+shuffle is uniform over the whole corpus, so a batch of 1,024 samples lands in up to 1,024
+different shards. The cache misses on nearly all of them, and each miss reads a whole shard to
+use one row. Over ten thousand shards the epoch reads the data thousands of times over. The
+cache isn't too small. A global shuffle has no working set for it to hold.
 
-So the default shuffle is *blocked*: the shards are shuffled, and the rows inside each shard
-are shuffled, which keeps a batch inside one shard while still giving a different seeded
-order every epoch. This is the trade MosaicML Streaming makes with its `py1s`/`py1b`
-algorithms and the reason WebDataset pairs a shard shuffle with a sample buffer.
+So the default shuffle is *blocked*. The shards are shuffled and the rows inside each shard are
+shuffled, which keeps a batch inside one shard while still giving a different seeded order every
+epoch. MosaicML Streaming makes the same trade with its `py1s` and `py1b` algorithms, and
+WebDataset pairs a shard shuffle with a sample buffer for the same reason.
 
 `shuffle_block_size` sets the window. It defaults to one shard, and widening it decorrelates
 further at a proportional cost in `cache_size`:
@@ -235,24 +233,22 @@ loader = shard_stream_loader(
 )
 ```
 
-The window is deliberately **not** derived from `cache_size`. The sample order must be a
-property of the corpus and the seed alone, or two ranks whose caches were sized differently
-would silently train on different orders. When a requested block is wider than the cache can
-hold, the loader says so rather than quietly picking one for you.
+The window is deliberately *not* derived from `cache_size`. The sample order must depend on the
+corpus and the seed alone, or two ranks whose caches were sized differently would silently train
+on different orders. When a requested block is wider than the cache can hold, the loader says so.
 
-Pass `shuffle_block_size=0` for a true global shuffle. It is correct, and it is only
-affordable when `cache_size` covers the whole corpus.
+Pass `shuffle_block_size=0` for a true global shuffle. It's correct, and it's only affordable
+when `cache_size` covers the whole corpus.
 
 ### Epochs and resume
 
-Both indexed loaders carry the two conventions a training loop already knows.
-`set_epoch(n)` is `torch.utils.data.DistributedSampler`'s: call it once per epoch, on every
-rank, with the same value. Skip it and every epoch replays one order, which costs
-convergence without ever failing.
+Both indexed loaders speak the two protocols a training loop already knows. `set_epoch(n)` is
+`torch.utils.data.DistributedSampler`'s: call it once per epoch, on every rank, with the same
+value. Skip it and every epoch replays one order, which costs convergence without ever failing.
 
-`state_dict()` and `load_state_dict()` are MosaicML Streaming's. Take the state between
-steps, where every rank has consumed the same count, and a resumed run continues the same
-epoch with no sample repeated and none skipped:
+`state_dict()` and `load_state_dict()` are MosaicML Streaming's. Take the state between steps,
+where every rank has consumed the same count, and a resumed run continues the same epoch with no
+sample repeated and none skipped:
 
 ```python
 loader = shard_stream_loader(path, batch_size=10, seed=42)
@@ -275,32 +271,29 @@ print(len(resumed))  # the batches this rank had not reached
 # 7
 ```
 
-Because the global order is independent of `world_size`, that checkpoint also restores onto
-a **differently sized cluster**: `global_consumed` is a position in the global order, not a
-per-rank one.
+`global_consumed` is a position in the global order, not a per-rank one, and the global order
+doesn't depend on `world_size`. So the checkpoint also restores onto a differently sized cluster.
 
 :::{warning}
-Read `state_dict()` from the object your loop iterates. Under `DataLoader(num_workers=k)`
-the loader is pickled into *k* worker processes, so the copy left in the parent never
-advances and reports a resume point of zero. That resumes by replaying the whole epoch.
-Checkpoint from a loop over the loader itself, or use `num_workers=0`.
+Read `state_dict()` from the object your loop iterates. Under `DataLoader(num_workers=k)` the
+loader is pickled into *k* worker processes, so the copy left in the parent never advances and
+reports a resume point of zero. That resumes by replaying the whole epoch. Checkpoint from a loop
+over the loader itself, or use `num_workers=0`.
 :::
 
-:::{note}
-`set_epoch` on {py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` re-reads the corpus, because a new epoch is a new
-permutation and *which rows belong to this rank* changes with it. On `shard_stream_loader` it
-is arithmetic. That difference is one more reason to write shards once the corpus is large.
-:::
+`set_epoch` on {py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` re-reads
+the corpus, because a new epoch is a new permutation and *which rows belong to this rank* changes
+with it. On `shard_stream_loader` it's arithmetic, which is one more reason to write shards once
+the corpus is large.
 
 ### Surviving a crash, and scaling past a million shards
 
-A corpus write is hours of work and a training read is days of it, so both are built to
-lose as little as possible when something fails.
+A corpus write takes hours and a training read takes days, so both are built to lose as little
+as possible when something fails.
 
-The manifest is republished **as the write proceeds**, not once at the end, so the corpus on
-disk is readable at every moment. A write that dies leaves a shorter but complete corpus
-rather than a directory of orphaned shards, and `resume=True` continues it. The rows already
-written are skipped from the source rather than re-encoded:
+The manifest is republished as the write proceeds, so the corpus on disk is readable at every
+moment. A write that dies leaves a shorter but complete corpus, and `resume=True` continues it,
+skipping the rows already written rather than re-encoding them:
 
 ```python
 try:
@@ -317,40 +310,36 @@ print(index.total_rows)
 # 100
 ```
 
-Only whole shards count as written. A partial one from the previous attempt is redone, so a
-corpus never ends up with a short shard in the middle. That would break global indexing
-without failing.
+Only whole shards count as written. A partial one from the previous attempt is redone, because a
+short shard in the middle of a corpus would break global indexing without failing.
 
-Shards are published concurrently, which is what makes a large corpus write in reasonable
-time against object storage: each shard is a round trip of tens of milliseconds, so
-publishing them one at a time left the encoder idle and the write latency-bound. The number
-in flight is sized from the destination and the measured shard size, so the memory held is a
-few shards rather than a function of the corpus. Override it with `write_concurrency` if you
-need to.
+Shards are published concurrently. Against object storage each shard is a round trip of tens of
+milliseconds, and publishing them one at a time left the encoder idle. The number in flight is
+sized from the destination and the measured shard size, so the memory held is a few shards
+rather than a function of the corpus. `write_concurrency` overrides it.
 
 Reads and writes both retry the failures worth retrying. A throttle, a 503, or a dropped
-connection is a blip that ends a multi-day training run if nothing catches it; a 404 or a 403
-is a fact, and is surfaced immediately rather than backed off.
+connection is a blip that would otherwise end a multi-day run. A 404 or a 403 is a fact, and it
+surfaces immediately.
 
-The manifest also does not grow with the shard count. A petabyte corpus in 256 MB shards is
-around four million shards, and naming each one would be a 170 MB JSON document parsed on
-every rank at startup plus four million resident strings. Because `write_shards` produces
-shards of a known width under generated names, the manifest records a *count*: locating a row
-is integer division, and the file is a few hundred bytes whatever the corpus size.
+The manifest doesn't grow with the shard count either. A petabyte corpus in 256 MB shards is
+around four million shards, and naming each one would be a 170 MB JSON document parsed on every
+rank at startup. Because `write_shards` produces shards of a known width under generated names,
+the manifest records a count. Locating a row is integer division, and the file is a few hundred
+bytes whatever the corpus size.
 
 :::{note}
-A checkpoint records the corpus size and the seed it came from, and `load_state_dict`
-refuses one that does not match. Resuming against a corpus that has since grown keeps
-`global_consumed` meaningful as a *position* while making the order something else, so the
-samples it records as consumed are not the ones the run actually saw. That is invisible in a
-loss curve, so it is refused rather than discovered later.
+A checkpoint records the corpus size and seed it came from, and `load_state_dict` refuses one
+that doesn't match. Against a corpus that has since grown, `global_consumed` stays meaningful as
+a position while the order becomes something else, so the samples it records as consumed aren't
+the ones the run saw. No loss curve shows that, so it's refused up front.
 :::
 
 ## streaming_split: an unbounded source
 
-A stream has no length, so there is no index to shard on. `streaming_split` fans a
-*single* read of the source out to `world_size` rank iterators, round-robin, with
-bounded queues. The data is read once total, not once per rank.
+A stream has no length, so there's no index to shard on. `streaming_split` fans a *single* read
+of the source out to `world_size` rank iterators, round-robin, through bounded queues. The data
+is read once in total, not once per rank.
 
 ```python
 from batcher.ml import streaming_split
@@ -362,18 +351,20 @@ print([b["f"].tolist() for b in rank0])
 # [[1.0], [3.0], [5.0]]
 ```
 
-Called without `rank` it returns a list of `world_size` iterators instead, and those must
-be consumed **concurrently**, because one reader is feeding all of them through bounded
-queues. Consume them serially and the first one blocks forever waiting for a queue the
-others are not draining.
+Called without `rank`, it returns a list of `world_size` iterators, and those must be consumed
+*concurrently*. One reader feeds all of them through bounded queues, so draining them serially
+blocks the first one forever on a queue nobody else is emptying.
 
-Only complete rounds of `world_size` batches are emitted; a trailing partial round is
-dropped, so every rank yields the same count and none of them stalls the all-reduce.
+Batches go out in complete rounds of `world_size`, so every rank yields the same count and none
+stalls the all-reduce. A trailing partial round is dropped with a warning that says how many
+batches it cost. Pass `drop_last=False` to complete that round by repeating batches from its
+front instead.
 
 ## Framework converters
 
-The converters take a batch iterator and yield framework-native batches. {py:meth}`to_numpy_batches <batcher.api.dataset.ml.DatasetML.to_numpy_batches>`
-is the NumPy one:
+The converters take any batch iterator and yield framework-native batches, so they compose with
+anything upstream that yields Arrow, including a hand-built pipeline.
+{py:func}`to_numpy_batches <batcher.ml.to_numpy_batches>` is the NumPy one:
 
 ```python
 from batcher.ml import to_numpy_batches
@@ -384,14 +375,14 @@ for arrays in to_numpy_batches(ds.iter_batches(batch_size=3), columns=["f0", "la
 # ['f0', 'label'] (3,)
 ```
 
-`to_torch_iterable` and `to_tf_dataset` are the same idea for the other two frameworks.
-All three take a batch iterator, so they compose with anything upstream that yields
-batches, including a hand-built pipeline.
+`to_torch_iterable` and `to_tf_dataset` do the same for PyTorch and TensorFlow.
+{doc}`PyTorch </ml/inference/pytorch>` shows both.
 
 ### TensorFlow
 
-{py:meth}`ds.ml.to_tf <batcher.api.dataset.ml.DatasetML.to_tf>` returns a `tf.data.Dataset` and takes the same stream options the
-PyTorch loader does, because it prepares its stream with the same code:
+{py:meth}`ds.ml.to_tf <batcher.api.dataset.ml.DatasetML.to_tf>` returns a `tf.data.Dataset` and
+takes the same stream options the PyTorch loader does, because it prepares its stream with the
+same code:
 
 ```python
 tf_ds = ds.ml.to_tf(
@@ -406,25 +397,20 @@ print(sorted(first), first["f0"].dtype.name, int(first["f0"].shape[0]))
 # ['f0', 'f1', 'label'] float32 2
 ```
 
-`drop_last` matters more here than under PyTorch: a fixed-shape Keras graph cannot take a
-short final batch. Add `.prefetch(tf.data.AUTOTUNE)` to the returned dataset for the overlap
-`prefetch_batches` gives the torch path. That knob belongs to `tf.data`, so Batcher does not
-duplicate it.
+`drop_last` matters more here than under PyTorch, because a fixed-shape Keras graph can't take a
+short final batch. For the overlap `prefetch_batches` gives the torch path, add
+`.prefetch(tf.data.AUTOTUNE)` to the returned dataset. That knob belongs to `tf.data`, and Batcher
+doesn't duplicate it.
 
-:::{note}
-`dtypes` is applied in NumPy, before TensorFlow sees the batch, which halves what has to
-be copied when you narrow a float64 column. That also means it accepts only dtypes NumPy
-represents numerically: `bfloat16` is refused with a `PlanError` rather than silently
-producing an opaque column. Cast to bf16 inside the model instead.
-:::
+`dtypes` is applied in NumPy before TensorFlow sees the batch, which halves the bytes copied when
+you narrow a float64 column. It accepts only dtypes NumPy represents numerically, so `bfloat16`
+raises `PlanError` rather than producing an opaque column. Cast to bf16 inside the model.
 
 ## Do the work upstream
 
-:::{tip}
-Anything you can express as an operator should be an operator. Filters, projections,
-feature arithmetic, casts, and a fitted preprocessor's transform all run inside the
-engine, vectorized and parallel, and out of the training process entirely.
-:::
+Anything you can express as an operator should be one. Filters, projections, feature arithmetic,
+casts, and a fitted preprocessor's transform all run inside the engine, vectorized and parallel,
+and entirely outside the training process:
 
 ```python
 from batcher import col
@@ -440,14 +426,14 @@ print(first.schema.names, first.num_rows)
 ```
 
 For learned statistics such as standardization, one-hot encoding, or imputation, fit a
-{doc}`preprocessor </ml/preparing/preprocessors/index>` on the train split and `transform` the stream. The fit
-is one mergeable pass over the data, and the transform is an engine stage. Neither one
-runs in the training loop.
+{doc}`preprocessor </ml/preparing/preprocessors/index>` on the train split and `transform` the
+stream. The fit is one mergeable pass and the transform is an engine stage. Neither runs in the
+training loop.
 
 ## Diagnosing an idle GPU
 
-If the GPU is starved, the loader is rarely the culprit. The stage feeding it usually is.
-In order of frequency:
+When the GPU is starved, the loader is rarely the culprit. The stage feeding it usually is. The
+table lists the causes, most frequent first:
 
 | What is actually happening | What to do about it |
 | --- | --- |
@@ -459,14 +445,11 @@ In order of frequency:
 
 ## See also
 
-- {doc}`PyTorch </ml/inference/pytorch>`: device transfer, collate, zero-copy, and DDP in full.
-- {doc}`Distributed training </ml/training/distributed-training>`: the multi-rank sharding contract.
-- {doc}`Streaming for training </ml/inference/streaming>`: the bounded-memory ingest path.
+- {doc}`PyTorch </ml/inference/pytorch>`: every `iter_torch_batches` option, the converters, and DDP wiring.
+- {doc}`Distributed training </ml/training/distributed-training>`: the multi-rank ordering, balance, and resume contract.
+- {doc}`Streaming for training </ml/inference/streaming>`: which plans `iter_batches` streams and which it materializes.
+- {doc}`Preparing a training corpus </ml/training/training-corpus>`: mixing, filtering, and decontaminating before you write shards.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: the fit-on-train, transform-the-stream contract.
-- {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how a fixed-shape tensor reaches the
-  loop with its shape intact.
-- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: what the device is waiting on when it
-  is waiting.
-- {doc}`Distributed training pipeline </getting-started/tutorials/ml/distributed-training-pipeline>`: the
-  whole path, from files to a loop.
+- {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how a fixed-shape tensor reaches the loop with its shape intact.
+- {doc}`Distributed training pipeline </getting-started/tutorials/ml/distributed-training-pipeline>`: the whole path, from files to a loop.
 - {doc}`ML API </api/models/ml>`: the loader and converter reference.

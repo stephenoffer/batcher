@@ -44,7 +44,7 @@ reproducible shard and split assignment.
 ### Activations and shape
 
 {py:meth}`.sigmoid() <batcher.plan.expr_ir.core.Expr.sigmoid>`, {py:meth}`.logit() <batcher.plan.expr_ir.core.Expr.logit>`, {py:meth}`.relu() <batcher.plan.expr_ir.core.Expr.relu>`, {py:meth}`.softplus() <batcher.plan.expr_ir.core.Expr.softplus>`, {py:meth}`.silu() <batcher.plan.expr_ir.core.Expr.silu>`
-(Swish, `x·sigmoid(x)`), {py:meth}`.gelu() <batcher.plan.expr_ir.core.Expr.gelu>` (the transformer default, tanh approximation), {py:meth}`.mish() <batcher.plan.expr_ir.core.Expr.mish>`,
+(Swish, `x*sigmoid(x)`), {py:meth}`.gelu() <batcher.plan.expr_ir.core.Expr.gelu>` (the transformer default, tanh approximation), {py:meth}`.mish() <batcher.plan.expr_ir.core.Expr.mish>`,
 {py:meth}`.hardsigmoid() <batcher.plan.expr_ir.core.Expr.hardsigmoid>` / {py:meth}`.hardswish() <batcher.plan.expr_ir.core.Expr.hardswish>` (the cheap piecewise-linear MobileNet variants),
 {py:meth}`.leaky_relu(negative_slope=0.01) <batcher.plan.expr_ir.core.Expr.leaky_relu>`, {py:meth}`.elu(alpha=1.0) <batcher.plan.expr_ir.core.Expr.elu>`, {py:meth}`.hardtanh() <batcher.plan.expr_ir.core.Expr.hardtanh>`, {py:meth}`.softsign() <batcher.plan.expr_ir.core.Expr.softsign>`,
 {py:meth}`.tanhshrink() <batcher.plan.expr_ir.core.Expr.tanhshrink>`, and
@@ -77,7 +77,7 @@ predicate).
 
 ### Calendar features
 
-On `.dt`: {py:meth}`.is_weekend() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_weekend>` / {py:meth}`.is_weekday() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_weekday>`,
+On `.dt`: {py:meth}`.is_weekend() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_weekend>` / {py:meth}`.is_business_day() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_business_day>`,
 {py:meth}`.is_month_start() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_month_start>` / {py:meth}`.is_month_end() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_month_end>`, {py:meth}`.is_quarter_start() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_quarter_start>` / {py:meth}`.is_quarter_end() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_quarter_end>`,
 {py:meth}`.is_year_start() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_year_start>` / {py:meth}`.is_year_end() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_year_end>`, {py:meth}`.quarter_start() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.quarter_start>`, {py:meth}`.year_start() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.year_start>`,
 {py:meth}`.days_in_year() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.days_in_year>`, and {py:meth}`.week_of_month() <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.week_of_month>`.

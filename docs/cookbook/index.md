@@ -1,12 +1,18 @@
 # Cookbook
 
-This section holds 145 runnable recipes, grouped by domain. The bigger domains carry two kinds: focused recipes for one API surface, and complete pipelines that solve a whole problem. If you came looking for a method name, the focused recipes are what you want. If you came with a problem, start from the pipeline at the top of the domain and specialise down.
+The cookbook is 145 runnable recipes, each one a working answer you can copy into a pipeline. They're grouped by domain, and the larger domains carry two kinds. A focused recipe demonstrates one API surface, such as the `.str` accessor or the join types. A complete pipeline solves a whole problem, such as sessionizing a click stream or applying a change feed to a table. Came looking for a method name? Browse the focused recipes. Came with a problem? Start from the pipeline at the top of the domain and work down.
 
-Every recipe is a complete script you can run unchanged. Each builds its own in-memory data and asserts on its own output, so there are no fixtures to set up. The test suite runs all of it on every pass, `tests/docs/test_doc_examples.py` for the blocks written into a page and `tests/docs/test_examples.py` for the scripts a page embeds from `examples/`, so a recipe that stops matching the engine fails the build instead of rotting.
+The figure maps the ten domains onto the four groups this page is organized by, with each domain's recipe count.
 
-:::{tip}
-No listing on the way down runs past a dozen entries, and the deepest recipe is four clicks from here. If a group feels long, it has sub-groups.
-:::
+![The 145 recipes in four groups. The relational core, 59 recipes: Dataset with 14 (joins, grouping, reshaping), Expressions with 39 (strings, dates, nested types), and I/O with 6 (Parquet, text formats, Arrow). Building and running pipelines, 29 recipes: Data engineering with 11 (ingest, reconcile, repair), Analytics with 11 (cohorts, funnels, sessions), and Streaming with 7 (time and restarts). Models and measurement, 47 recipes: ML with 27 (preprocessing to inference) and Metrics with 20 (metrics and statistics). Running it safely, 10 recipes: Governance with 3 (masks, row filters, lineage) and Operations with 7 (configuration, plans, memory).](/_static/diagrams/cookbook_map.svg)
+
+Every recipe is a complete script you can run unchanged. Each builds its own in-memory data and asserts on its own output, so there are no fixtures to download. The test suite runs all of it on every pass, `tests/docs/test_doc_examples.py` for the code written into a page and `tests/docs/test_examples.py` for the scripts a page embeds from `examples/`. A recipe that stops matching the engine fails the build rather than going stale.
+
+If you're not sure where to begin, start with any of the following:
+
+- {doc}`/cookbook/data-engineering/ingest/etl-pipeline`: raw records in, deduplicated and rolled up, Parquet out.
+- {doc}`/cookbook/analytics/aggregates/analytics-query`: aggregate, join, and window over one orders table, as SQL and as DataFrame code.
+- {doc}`/cookbook/dataset/inspecting/profiling`: the first measurements to take on a table you've just been handed.
 
 ## The relational core
 

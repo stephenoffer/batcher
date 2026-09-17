@@ -71,7 +71,7 @@ def main() -> None:
         # way -- the comparison casts.
         assert set(one_day["day"]) == {datetime.date(2024, 1, 2)}
 
-        # Save modes: `overwrite` replaces, the default refuses to clobber.
+        # Save modes: `overwrite`, the default, replaces the existing output.
         events.write.parquet(str(flat), mode="overwrite")
         assert bt.read.parquet(str(flat)).count() == 4
 

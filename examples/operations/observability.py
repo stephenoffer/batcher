@@ -83,7 +83,7 @@ def main() -> None:
     print(stats.wall_clock_summary())
     assert stats.wall_clock_summary().startswith("operators:")
 
-    # Profiling a plan reports per-operator detail.
+    # Profiling a dataset summarizes its columns; `explain(analyze=True)` has per-operator detail.
     profile = ds.profile()
     print("profile:", type(profile).__name__)
     assert profile is not None

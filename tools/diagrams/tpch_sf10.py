@@ -1,30 +1,28 @@
-#!/usr/bin/env python3
 """Draw `tpch_sf10.svg` -- the TPC-H scale-factor-10 standing on like-for-like input.
 
 Every figure here is quoted from `benchmarks/BENCHMARK_RESULTS.md`, the entry dated
-2026-07-27 ("Three things the join path could not do"). Provenance, in full, because
-the charts rule requires it:
+2026-08-28 ("The single-node board, re-measured against five engines"). Provenance, in
+full, because the charts rule requires it:
 
-* **Suite**: TPC-H, all 22 queries, **scale factor 10**.
-* **Hardware**: single node, 96 cores, release build.
-* **Gate**: correctness-gated, all 22 reported `OK`. A query whose result disagrees
-  with the oracle produces no timing at all.
-* **Batcher's own total**: 4,453 ms (down from 4,993 ms in the same entry).
+* **Suite**: TPC-H, all 22 queries, **scale factor 10**, local mirror.
+* **Hardware**: single node, 92 cores, best of 3, one process per suite.
+* **Gate**: correctness-gated. A query whose result disagrees with the oracle produces no
+  timing at all.
 
 The two comparisons plotted are the like-for-like ones, where every engine reads the
-same Arrow, and both are stated directly by the entry:
+same Arrow. The entry records them as `b/x` suite ratios:
 
-    duckdb_arrow    Batcher 1.89x faster overall, wins 21 of 22 (q9 is 1.01x, a tie)
-    polars          Batcher 2.26x faster overall, wins 17 of 22
+    duckdb_arrow    0.33   (Batcher about 3.0x faster)
+    polars          0.35   (Batcher about 2.9x faster)
 
-Only Batcher's and duckdb_arrow's absolute totals (4,453 ms and 8,436 ms) are recorded,
-so this chart plots the **ratios**, which are all stated, rather than back-solving
-totals that were never measured. That is deliberate: a derived number presented as a
-measured one is exactly what the documentation contract forbids.
+The entry records no per-query win counts for this board, so the bars carry none. The same
+board reads 1.10 against DuckDB's native compressed store at sf10, a loss this chart does
+not plot because it is a storage comparison rather than an execution one; the docs that
+embed the chart say so.
 
 Form: bars anchored on a 1.0x parity line, so the magnitude of each margin is read
 against a fixed reference rather than against each other. Bars are direct-labelled with
-the ratio and the win count, so no legend is needed.
+the speedup, so no legend is needed.
 """
 
 from __future__ import annotations
@@ -35,7 +33,7 @@ W, H = 980, 334
 
 AXIS_Y = 234  # baseline for the bars
 MID_X = 500  # the 1.0x parity line
-PX_PER_X = 150  # horizontal pixels per 1x of ratio
+PX_PER_X = 120  # horizontal pixels per 1x of ratio
 BAR_H = 44
 ROW_Y = (120, 186)
 
@@ -81,8 +79,8 @@ parts = [
     f'<text x="40" y="50" font-family="{FONT}" font-size="19" font-weight="700" class="t-head">'
     f"TPC-H scale factor 10, all 22 queries</text>",
     f'<text x="40" y="74" font-family="{FONT}" font-size="13" class="t-sub">'
-    f"Batcher total 4,453 ms on 96 cores, correctness-gated. Bars show the suite ratio "
-    f"against each engine.</text>",
+    f"92 cores, best of 3, correctness-gated. Bars show the suite speedup against each "
+    f"engine on the same Arrow input.</text>",
     # the parity rule, drawn behind the bars
     f'<line x1="{MID_X}" y1="100" x2="{MID_X}" y2="{AXIS_Y + 4}" class="parity" '
     f'stroke-width="1.6" stroke-dasharray="5 4"/>',
@@ -94,20 +92,20 @@ parts = [
 
 parts += bar(
     ROW_Y[0],
-    1.89,
+    1 / 0.33,
     "DuckDB on the same Arrow",
     "like-for-like: identical zero-copy input",
-    "wins 21 of 22 (q9 a tie at 1.01x)",
+    "suite ratio 0.33",
 )
-parts += bar(ROW_Y[1], 2.26, "Polars", "same Arrow input", "wins 17 of 22")
+parts += bar(ROW_Y[1], 1 / 0.35, "Polars", "same Arrow input", "suite ratio 0.35")
 
 parts += [
     f'<text x="40" y="{H - 44}" font-family="{FONT}" font-size="11.5" class="t-sub">'
-    f"Source: benchmarks/BENCHMARK_RESULTS.md, 2026-07-27. Ratios are suite totals; only "
-    f"Batcher (4,453 ms) and DuckDB-on-Arrow (8,436 ms) have</text>",
+    f"Source: benchmarks/BENCHMARK_RESULTS.md, 2026-08-28. Ratios are suite ratios of "
+    f"Batcher's time over the other engine's.</text>",
     f'<text x="40" y="{H - 26}" font-family="{FONT}" font-size="11.5" class="t-sub">'
-    f"recorded absolute totals, so the Polars bar is plotted from its stated ratio. "
-    f"The box was shared during the run, and the entry notes totals swing about 25%.</text>",
+    f"Against DuckDB's own compressed store the same board reads 1.10, a storage "
+    f"comparison this chart does not plot.</text>",
 ]
 
 svg = (

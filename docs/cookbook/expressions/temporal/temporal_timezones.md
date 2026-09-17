@@ -2,6 +2,8 @@
 
 Store UTC, convert at the edge. A daily rollup computed in UTC and labeled as local time is wrong by up to a day at the boundary, and it fails quietly: the numbers look plausible, and only the day they land on is off.
 
+The script converts late-evening UTC timestamps to New York and Tokyo with `convert_timezone`, then buckets the same three rows by day in UTC and in New York and asserts that the daily totals differ. It shows a round trip returning the original instant, and formats for a report only after the conversion.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/temporal_timezones.py

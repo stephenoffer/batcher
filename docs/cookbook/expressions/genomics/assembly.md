@@ -2,6 +2,8 @@
 
 An assembler hands back a pile of contigs. How good is the assembly? Total sequence does not say, because two assemblies of the same genome hold the same bases whether they are in five pieces or five thousand. What distinguishes them is *contiguity*, and the statistics that measure it are base-weighted rather than item-weighted.
 
+The script builds three assemblies with identical total sequence and shows N50, L50, and N90 ranking them where the median misleads, then uses auN to separate two assemblies that differ by one contig. It checks that the statistics survive scaling and streaming, and computes them straight from a FASTA file.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/genomics_assembly_stats.py
@@ -52,7 +54,7 @@ The test suite pins it across `collect()`, `collect(spill=True)`, and `iter_batc
 
 - Null, negative, and non-finite lengths are excluded rather than summed. A negative length would cancel real sequence out of the total every statistic divides by, quietly lowering all four.
 - A group with no usable length is null rather than zero, so an empty assembly fails a `n50() >= 1000` threshold instead of sliding under it.
-- These read a *length column*. From a FASTA that is one expression: `bt.col("sequence").str.len()`.
+- These read a *length column*. From a FASTA that is one expression: `bt.col("sequence").str.len_chars()`.
 - There is no `l90()`. It is rarely cited, and the four here cover what is. If you need it, the shape is the same walk at a different threshold.
 
 ## See also

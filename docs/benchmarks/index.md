@@ -1,155 +1,132 @@
 # Benchmarks
 
-This page summarizes Batcher's measured results across analytics, I/O, and AI workloads, and links to the per-engine and per-workload detail.
-
-Numbers, not adjectives. Every figure here comes from a run that was correctness-gated first. The harness executes the query on every engine, checks they return the identical result as a sorted row multiset within float tolerance, and only then records a time. A fast wrong answer is a bug, not a win. A benchmark that disagrees with the oracle reports `FAILED` and produces no number at all.
-
-:::{important}
-That gate is not decoration. On TPC-H q6 it caught Daft returning 75,207,768.19 where the official TPC-H answer is 123,141,078.23. Daft folds the predicate bound `0.06 + 0.01` in IEEE double, getting `0.06999999999999999`, and so drops every `l_discount = 0.07` row. Polars made the same mistake in earlier sweeps and no longer does. Batcher returns the official answer exactly, and the harness declines to time a wrong result. Read every table on this site knowing that a missing number means a wrong answer, not a slow one.
-:::
+This section publishes Batcher's measured performance: analytics against DuckDB, Polars, Daft, Spark and PyArrow, and GPU and multimodal pipelines against Ray Data and Daft. Every figure passed a correctness gate before it was timed, and each one names the machine, the date and the script that reproduces it.
 
 ::::{grid} 1 3 3 3
 :gutter: 3
 
-:::{grid-item-card} {octicon}`zap;1.1em` AI & GPU workloads
-:link: /benchmarks/results/ai-and-gpu
-:link-type: doc
-Ten workload families on 8xT4, real models, correctness-gated. 33,611 text/s embedding, 2,504 img/s at 81% GPU.
-:::
-
-:::{grid-item-card} {octicon}`database;1.1em` Analytics & I/O
+:::{grid-item-card} {octicon}`database;1.1em` Analytics and I/O
 :link: /benchmarks/results/analytics
 :link-type: doc
-Operators, TPC-H, ClickBench, and the connectors, against DuckDB, Polars, Daft, PyArrow and Spark on the same Arrow.
+Operators, TPC-H, ClickBench and the connectors, on identical Arrow input.
+:::
+
+:::{grid-item-card} {octicon}`zap;1.1em` AI and GPU workloads
+:link: /benchmarks/results/ai-and-gpu
+:link-type: doc
+Ten model families on 8xT4 with real models: 33,611 text/s embedding, 2,504 img/s inference.
 :::
 
 :::{grid-item-card} {octicon}`beaker;1.1em` Methodology
 :link: methodology
 :link-type: doc
-Hardware, correctness gating, and the commands to reproduce every number.
+The correctness gate, the hardware, and the commands behind every number.
 :::
 ::::
 
-## The short version
+## The single-node board
 
-Batcher leads the classical analytics suites against DuckDB reading the same Arrow: 22 of 22 TPC-H at scale factor 1, 43 of 43 ClickBench, 5 of 5 JSON. Since 2026-08-15 it also leads against DuckDB's own native compressed store on TPC-H sf1, TPC-DS, ClickBench, JSON, the operator mix and the H2O.ai join task. That second bar is the harder one and the one worth arguing about, because it puts DuckDB's storage engine *and* its execution engine against Batcher's execution engine alone.
+Batcher is faster than Polars on every suite, faster than DuckDB reading the same Arrow on every suite, and faster than DuckDB on its own compressed storage on five suites of six. That is the most recent full sweep, taken 2026-09-13 on a quiet 48-core (24 physical plus SMT), 92 GiB box with four engines, best of five, one process per case.
 
-Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
+Each ratio is the suite's geometric mean of `batcher_ms / engine_ms`, so lower is better and anything below 1.00 is a Batcher win. The last column counts the cases where any engine, DuckDB's native store included, beat Batcher's time:
 
-Coverage is **373 benchmarks across ten suites** (`python benchmarks/run.py --list` prints the live count), including the full 99-query TPC-DS set, all 113 Join Order Benchmark queries against the real IMDb dataset, and the H2O.ai db-benchmark group-by and join sweeps. Registered is not the same as timed: TPC-DS publishes 98 of its 99 and the Join Order Benchmark 109 of its 113, because the rest do not clear the correctness gate. {doc}`methodology` says why.
-
-For the standing against every engine at once, read {doc}`the full engine matrix </benchmarks/results/engine-matrix>`. It publishes the gaps as well as the wins, and labels which kind each gap is: an engine that cannot express a suite, one that did not finish it, and one that could not be held in memory beside Batcher are three different things and none of them is a ratio.
-
-Suite geometric means at scale factor 1 on 96 cores / 184 GiB, measured 2026-08-15. `duckdb`
-is DuckDB on its native compressed store (the harder bar); `duckdb_arrow` is DuckDB over the
-same zero-copy Arrow Batcher runs on (the like-for-like one). Lower is better and **below
-1.0x means Batcher is faster**:
-
-| Suite | vs `duckdb` | vs `duckdb_arrow` | vs Polars | vs Daft |
+| Suite | DuckDB, native store | DuckDB, same Arrow | Polars | Cases slower than the fastest engine |
 |---|---:|---:|---:|---:|
-| **Semi-structured JSON** (5) | **0.25x**, 5 of 5 | **0.04x**, 5 of 5 | **0.01x** | **0.02x** |
-| **ClickBench** (43) | **0.64x**, 28 of 43 | **0.07x**, 43 of 43 | **0.33x**, 36 of 40 | **0.26x**, 41 of 41 |
-| **Operator mix** (19) | **0.66x**, 11 of 19 | **0.36x**, 15 of 19 | **0.12x**, 19 of 19 | **0.12x**, 15 of 15 |
-| **TPC-H sf1** (22) | **0.79x**, 16 of 22 | **0.26x**, 22 of 22 | **0.43x**, 20 of 22 | **0.35x**, 20 of 20 |
-| **H2O.ai `join`** (5) | **0.93x**, 3 of 5 | **0.24x**, 5 of 5 | **0.69x** | — |
-| **TPC-DS sf1** (98 of 99 timed) | **0.96x**, 38 of 98 | — | — | — |
-| **H2O.ai `groupby`** (10) | 1.19x, 4 of 10 | **0.09x**, 10 of 10 | **0.42x** | — |
-| **TPC-H sf10** (22) | 1.29x, 8 of 22 | — | **0.37x**, 18 of 22 | **0.42x**, 16 of 20 |
-| **Join Order Benchmark** (113) | 1.29x, 35 of 109 | — | — | — |
+| Semi-structured JSON | **0.35** | **0.32** | **0.01** | **0 of 5** |
+| H2O.ai `join` | **0.63** | **0.58** | **0.51** | **0 of 5** |
+| ClickBench | **0.65** | **0.16** | **0.37** | 15 of 43 |
+| TPC-H sf1 | **0.72** | **0.25** | **0.54** | 6 of 22 |
+| Operator mix | **0.75** | **0.47** | **0.16** | 13 of 46 |
+| H2O.ai `groupby` | 1.05 | **0.83** | **0.53** | 6 of 10 |
 
-A `—` in that table means no figure exists, never a tie. DuckDB over registered Arrow views
-is killed on TPC-DS q64, and the Join Order Benchmark measures join *ordering*, which a
-planner reading Arrow views has no storage statistics to do.
+Across the board that is 40 slower cases of 131, and 19 of the 40 are storage rather than execution: both Arrow-native engines trail Batcher and only DuckDB reading its own compressed store is ahead, by one to four milliseconds. `benchmarks/results/LOSS_BACKLOG.md` lists all forty.
 
-One row has moved since the sweep. TPC-H sf10 read **0.963x** on 2026-08-25, a win, measured
-as a same-day A/B against the tree on the same 96-core node: q9 456 to 233 ms, q13 325 to
-174, q5 189 to 122, and a suite total of 2,938 ms down to 2,323. The row above is left at its
-2026-08-15 value because the rest of the table was taken that day and a mixed-date row is
-worse than a stale one.
+The two DuckDB columns answer different questions. *DuckDB on the same Arrow* runs over the identical zero-copy buffers Batcher reads, so it compares two execution engines. *DuckDB on its native store* ingests the data into its compressed, dictionary-encoded format first, so it puts DuckDB's storage engine and execution engine together against Batcher's execution engine alone. That is the harder bar, and Batcher leads it on five suites.
 
-| Other workloads | Measured |
-|---|---|
-| **Sort → top-N, window functions** | **5x to 50x** Polars |
-| **Image decode → tensor** | 5,693 img/s, **2.4x** Daft |
-| **TPC-H sf10 q6, cluster against cluster** | **2.4x** Daft, and Daft's answer is wrong |
-| **Text embeddings** (MiniLM, 8xT4) | **33,611 text/s** |
-| **Batch inference** (ResNet-50, 8xT4) | **2,504 img/s at 81% GPU utilization** |
-| **Training ingest** ({py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`) | **1.06 M rows/s**, zero-copy DLPack |
-| **Parquet read → aggregate** | 20M rows across 64 files in **72 ms** |
-| **`count()` after a transform chain** | **0.05 ms**, answered from metadata |
+## Larger data and harder planning
 
-:::{warning}
-That last row is honest about *what it measures* and the same caveat applies inside the suite
-table: five of the 43 ClickBench queries and two of the 19 operator cases are **answered from
-recorded column statistics rather than executed**. An unfiltered `SUM`, `AVG` or
-`COUNT(DISTINCT)` over an immutable in-memory relation is served from a statistic the first
-run computed. The answers are exact and match DuckDB, but the timing is a memo lookup rather than
-a scan. Excluding those cases, ClickBench is **0.77x over 38 queries** and the operator mix
-**0.76x over 17**. Use those figures when the claim is about execution speed.
-:::
+Three suites stress what a scale-factor-1 board can't: ten times the rows, the full TPC-DS set, and the many-way joins of the Join Order Benchmark over the real IMDb dataset. All three are measured against DuckDB on its native store:
 
-:::{note}
-Those rows were not all measured on the same machine, because the workload families were not. The suite table above and the ingest work ran on a 96-core / 184 GiB node, some older per-operator figures on a 16-core node, and the model work on an 8xT4 cluster. A figure is meaningful within its row. A number lifted out of one row and set against a number from another is not. {doc}`methodology` lists the hardware per family.
-:::
+| Suite | Result | Measured |
+|---|---|---|
+| TPC-H sf10 (60M-row `lineitem`) | **0.963x**, suite total down from 2,938 ms to 2,323 ms | 2026-08-25, 96 cores, 184 GiB |
+| TPC-DS sf1 (99) | **0.98x**, all 99 correctness checks passing | 2026-09-11, 48 cores, 92 GiB |
+| Join Order Benchmark (113) | Total **8,131 ms against DuckDB's 8,885 ms**, geomean 1.11x | 2026-08-25, 96 cores, 184 GiB |
 
-## Where the wins come from
+The Join Order Benchmark's two statistics point in different directions, and both are worth quoting. Batcher wins the large queries by wide margins, such as q17f at 75 ms and q10c at 46 ms, and still loses many small ones. Its total is lower and its geomean sits above 1.
 
-**Execution over the same bytes.** DuckDB reading the identical zero-copy Arrow input is the like-for-like execution comparison, and Batcher wins 22 of 22 TPC-H queries on it at sf1 and 21 of 22 at sf10. A filtered count is 5x DuckDB because it fuses to a {py:func}`count_if <batcher.count_if>` over the one column the predicate touches and never materializes the rest.
+## Against the rest of the field
 
-**A control plane that answers what it can without scanning.** `count()` after a transform chain returns in 0.05 ms from Parquet footer statistics and plan-level reasoning. Seven ClickBench queries return in about 0.2 ms for the same reason. Those are excluded from the ranges above, so the headline reflects execution rather than planning.
+The margins over the other analytical engines are wider. Each row below comes from a separate sweep, so compare within a row rather than across rows:
 
-**Stage overlap on the GPU path.** Stage-overlapped streaming runs the CPU decode of morsel *k+1* while the GPU forward of morsel *k* is still in flight, which lifted a two-stage ResNet-50 pipeline from 942 to 2,504 img/s and GPU utilization from about 30% to 81%. Session-warm pools then load a model once per session rather than once per job, which is worth about 2x on iterative inference and far more when the model is large.
+| Engine | Result | Measured |
+|---|---|---|
+| Daft | TPC-H sf1 **0.21x**, sf10 **0.17x**, ClickBench **0.11x**, operators **0.07x** | 2026-08-28, 92-core box |
+| Spark | TPC-H sf1 **20x to 50x** faster than local-mode Spark | 2026-08-15, 96-core box |
+| PyArrow | Operator mix **0.03x** | 2026-08-28, 92-core box |
 
-**Native, in-process I/O.** Reading 20M rows across 64 Parquet files and summing a column takes 72 ms, CSV 98 ms, JSON 302 ms. Files decode concurrently in-process, and Parquet, CSV, and JSON decode all release the GIL.
+GPU inference is measured end to end on a cluster. Scoring 100,000 images on six single-T4 nodes, Batcher finished in **18.72 s against Ray Data's 44.19 s and Daft's 101.10 s**, which is 2.36x and 5.40x faster, with all three engines agreeing on the checksum (2026-09-06).
 
-## Reading the comparisons
+## AI, GPU and multimodal
 
-Every table on this site is a like-for-like execution comparison: the same Arrow buffers, the same queries, and a correctness gate before any timing is recorded. Every ratio is a ratio of times, so lower is better.
+Model work runs on the same engine as the SQL and is measured the same way: real models, identical predictions across engines, and a throughput figure only after they agree. The following highlights ran on an 8xT4 cluster unless the row says otherwise:
 
-One comparison on these pages is deliberately not like-for-like, and it is published anyway because it is what you get from `duckdb` at a prompt. Measured against DuckDB's own compressed format rather than shared Arrow, DuckDB decompresses its own layout as it scans and never pays an Arrow ingest, so it measures a storage engine plus an execution engine against an execution engine alone. Batcher trades that storage format away on purpose, because the same operators that read that Arrow also run distributed, stream, and carry tensors. Give both engines the same Arrow buffers and the same queries go to Batcher by 2.8x on the operator mix and 25x on JSON, which is the right-hand column of the table above.
-
-Correctness is not part of that trade: Batcher matches DuckDB on all 22 TPC-H queries.
-
-## Scaling out
-
-The same mergeable operators run distributed, so scale-out is a scheduling decision rather than a rewrite, and the distributed result is identical to the single-node one: the same row multiset, the same column names, the same column types. A floating-point reduction is identical up to reassociation, because `combine` is associative in exact arithmetic and IEEE addition is not, so the partition count moves the last bits. That also means distribution is cheap to decline. At TPC-H scale factor 1, where the network shuffle costs more than it saves, the distributed path stays within about 7% of the single node rather than falling off a cliff:
-
-| Path | Time |
+| Workload | Batcher |
 |---|---:|
-| Batcher, single node | 86 ms |
-| Batcher, distributed (4 workers) | 92 ms |
+| Text embeddings, sentence-transformers MiniLM | **33,611 text/s** |
+| Audio features, torchaudio mel plus ResNet-18 | **38,546 clip/s** |
+| Fractional-GPU packing, EfficientNet-B0 two per GPU | **6,764 img/s at 89% GPU** |
+| ResNet-50 batch inference | **2,504 img/s at 81% GPU** |
+| Image decode and resize, one 96-core node | **5,693 img/s, 2.4x Daft** |
 
-At scale the picture inverts. On an 8-node, 128-CPU cluster reading TPC-H parquet from S3, Batcher takes the join by 1.7x to 2.2x over Daft's Ray runner and answers a metadata count 162x to 250x faster. {doc}`/benchmarks/results/scaling` has the full grid.
+Stage overlap does most of the work. The CPU decode of the next morsel runs while the GPU forward of the current one is still in flight, which took a two-stage ResNet-50 pipeline from 942 to 2,504 img/s and its GPU utilization from about 30% to 81%. Session-warm model pools help most on short jobs: on a compute-bound pipeline of 125,000 rows, Batcher finished in 1.2 s against Ray Data's 10.5 s (2026-09-11). {doc}`/benchmarks/results/ai-and-gpu` has all ten families.
 
-## Reproduce it
+## A number means the answer was right
 
-Every number here is regenerated by the harness in `benchmarks/`, and the complete engineering record lives in `benchmarks/BENCHMARK_RESULTS.md`. See {doc}`methodology` for the hardware each family was measured on and the exact commands.
+The harness runs each query on every engine, compares the results as a sorted row multiset within float tolerance, and times only the engines that agree. An ordered result is also checked for order. A fast wrong answer gets no ratio.
+
+The gate has caught other engines more than once. On TPC-H q6, Daft and the Polars SQL frontend fold the bound `0.06 + 0.01` in IEEE double to `0.06999999999999999`, drop every `l_discount = 0.07` row, and return 75,207,768 where the official sf1 answer is 123,141,078.23. Batcher returns the official answer. {doc}`methodology` describes the gate in full, including how the suite handles a case where the oracle itself is wrong.
+
+## Requirements and limitations
+
+These boards report steady-state timings of queries run on a single node unless a row says otherwise. The following results are where Batcher does not lead, or where a figure needs its context:
+
+- **H2O.ai `groupby` against DuckDB's native store** reads 1.05x. Its remaining losses are low-cardinality string keys that DuckDB holds dictionary-encoded and Batcher reads as full Arrow strings. On the same Arrow the suite is a win at 0.83x.
+- **TPC-H at sf100** (600M rows) is still recorded as a loss to DuckDB on a single node.
+- **A shuffle-free GPU pipeline at scale** favors Ray Data past about 2 million rows, reaching 0.76x at 4 million, because Batcher's throughput plateaus near 134,000 rows/s with the devices at 48%.
+- **A query seen for the first time** costs Batcher about 2.6x its steady state on TPC-H sf1, against 1.15x for DuckDB, until its plan cache and learned statistics fill. The boards time a query's repeats, not its first run.
+- **An unfiltered `SUM`, `AVG` or `COUNT(DISTINCT)` over an in-memory table** is answered from statistics Batcher recorded on an earlier run. The answer is exact, and on the ClickBench and operator-mix cases of that shape the timing measures a lookup rather than a scan.
+
+## Reproduce
+
+Every number here is regenerated by the harness in `benchmarks/`, and `benchmarks/BENCHMARK_RESULTS.md` carries the full record of each run. `python benchmarks/run.py --list` prints all 373 registered benchmarks. The following commands reproduce the boards above, one suite per invocation:
 
 ```bash
-python benchmarks/run.py --benchmark tpch --tier single     # vs DuckDB / Polars
-python benchmarks/run.py --benchmark tpcds                  # 99 queries, 98 timed
-python benchmarks/run.py --benchmark job                    # all 113 queries, real IMDb
-python benchmarks/run.py --benchmark operators --tier multi # the data-plane lineup
-python benchmarks/scenarios/image_decode.py                 # multimodal ingest
+python benchmarks/run.py --benchmark tpch --engines batcher,duckdb,duckdb_arrow,polars --isolate
+python benchmarks/run.py --benchmark tpch --scale 10 --engines batcher,duckdb
+python benchmarks/run.py --benchmark tpcds --engines batcher,duckdb
+python benchmarks/run.py --benchmark job --engines batcher,duckdb
+python benchmarks/gpu_backend/vs_ray_daft_gpu_inference.py
+python benchmarks/scenarios/image_decode.py
 ```
 
 ## Head to head
 
-{doc}`One page per engine </benchmarks/comparisons/index>`, each measured on the same Arrow input.
+Each engine has a page with the full standing and the architectural reason behind it:
 
-::::{grid} 1 2 2 2
+::::{grid} 1 2 2 3
 :gutter: 3
 
 :::{grid-item-card} {octicon}`database;1.1em` DuckDB
 :link: /benchmarks/comparisons/vs-duckdb
 :link-type: doc
-Batcher takes the operators and the shared-Arrow suite, all 22 TPC-H queries at sf1.
+Faster on every suite over the same Arrow, and on five of six against DuckDB's own storage.
 :::
 
 :::{grid-item-card} {octicon}`zap;1.1em` Polars
 :link: /benchmarks/comparisons/vs-polars
 :link-type: doc
-50x on top-N, 1.26x on the TPC-H suite.
+Faster on every suite on the current board, and 50x on top-N.
 :::
 
 :::{grid-item-card} {octicon}`git-merge;1.1em` Daft
@@ -161,40 +138,24 @@ Batcher takes the operators and the shared-Arrow suite, all 22 TPC-H queries at 
 :::{grid-item-card} {octicon}`stack;1.1em` Spark
 :link: /benchmarks/comparisons/vs-spark
 :link-type: doc
-Architecture and design comparison.
+20x to 50x on TPC-H sf1, and the architecture behind it.
+:::
+
+:::{grid-item-card} {octicon}`table;1.1em` PyArrow
+:link: /benchmarks/comparisons/vs-pyarrow
+:link-type: doc
+The same Arrow kernels underneath, with a scheduler and a planner on top.
 :::
 ::::
 
-And {doc}`one page per workload family </benchmarks/results/index>`.
-
-::::{grid} 1 3 3 3
-:gutter: 3
-
-:::{grid-item-card} {octicon}`table;1.1em` TPC-H
-:link: /benchmarks/results/tpch
-:link-type: doc
-All 22 queries, both comparisons.
-:::
-
-:::{grid-item-card} {octicon}`image;1.1em` Multimodal ingest
-:link: /benchmarks/results/multimodal-ingest
-:link-type: doc
-Images, point clouds, audio, video.
-:::
-
-:::{grid-item-card} {octicon}`cloud;1.1em` Scaling out
-:link: /benchmarks/results/scaling
-:link-type: doc
-The distributed runs, and the full scale-out grid.
-:::
-::::
+{doc}`/benchmarks/results/index` arranges the same measurements by workload instead: TPC-H query by query, the engine matrix, multimodal ingest, and scaling out.
 
 ## See also
 
 - {doc}`/user-guide/operate/tuning/performance` for making your own query faster, with the levers these numbers come from.
 - {doc}`/architecture/deep-dives/operators/morsel-parallelism` and {doc}`/architecture/deep-dives/query/jit-compilation` for the two mechanisms behind most of the operator wins.
-- {doc}`/architecture/deep-dives/operators/mergeable-algebra` for why the distributed result matches the single-node one, and for the one place floating-point reassociation shows through.
-- {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization` for the stage-boundary re-optimization and the cross-query learned-stats loop, which no number on this page captures.
+- {doc}`/architecture/deep-dives/operators/mergeable-algebra` for why a distributed result matches the single-node one.
+- {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization` for stage-boundary re-optimization and the cross-query learned-stats loop.
 - {doc}`/getting-started/tutorials/foundations/optimizing-a-slow-query` for the diagnosis loop.
 
 ```{toctree}

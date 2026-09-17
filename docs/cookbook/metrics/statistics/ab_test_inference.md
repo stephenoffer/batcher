@@ -1,6 +1,8 @@
 # A/B test inference
 
-The whole test is aggregate expressions over the assignment table, so it runs where the data is instead of pulling a sample into SciPy. `welch_*` does not assume equal variances, which is the right default for a real experiment.
+An A/B test in Batcher is a set of aggregate expressions over the assignment table, so it runs where the data is instead of pulling a sample into SciPy.
+
+The script computes Cohen's d and Hedges' g for effect size, Welch's t-statistic and degrees of freedom, confidence half-widths, and a proportion z-statistic for the conversion rate. Then it repeats the means and intervals per arm under a `group_by`. Welch's test doesn't assume equal variances, which is the right default for a real experiment.
 
 The whole script, executed on every test run:
 

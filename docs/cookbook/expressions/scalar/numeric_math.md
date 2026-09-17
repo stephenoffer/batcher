@@ -1,6 +1,8 @@
 # Numeric math
 
-All of these are columnar and fuse into a single pass, so a chain of ten of them is not ten scans. Watch the division operators. `/` is true division, and `floordiv` (the `//` operator) rounds toward negative infinity rather than toward zero, so `-7 // 2` is `-4` where SQL integer division would give `-3`. Mixing the two up is a quiet source of off-by-one bugs.
+All of these are columnar and fuse into a single pass, so a chain of ten of them is not ten scans. Watch the division operators. `/` is true division, and `//` rounds toward negative infinity rather than toward zero, so `-7 // 2` is `-4` where SQL integer division gives `-3`. Mixing the two up is a quiet source of off-by-one bugs on negative values.
+
+The script covers `abs`, `sign`, rounding, `floor` and `ceil`, `sqrt`, `exp`, and `**`, then `clip` for bounding a column without a branch, division and modulo, the `between` and `is_in` range and membership predicates, and bitwise operations on integers.
 
 The whole script, executed on every test run:
 

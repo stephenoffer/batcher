@@ -1,14 +1,12 @@
 # Architecture
 
-This section describes how a query flows from the Python control plane to the Rust data
-plane. Python builds and optimizes the plan but never touches a row. Rust runs every
-per-row operation over Apache Arrow. The two planes meet at one typed, zero-copy
-boundary, which is also why a result is identical on one core or a hundred.
+This section describes how Batcher is built: a Python control plane that plans every query, and a Rust data plane that executes it over Apache Arrow.
+
+The split is the design. Python builds and optimizes the plan but never touches a row, which keeps the optimizer easy to extend and lets it learn from every run. Rust does all per-row work over Arrow batches at native speed. The two meet at one boundary, a JSON plan plus zero-copy Arrow batches. Every stateful operator is written once as mergeable algebra, which is why a query returns the same rows, column names and column types on one core, many cores, or a cluster.
 
 ![Batcher's two planes: a Python control plane hands a JSON IR plus zero-copy Arrow batches to the Rust data plane.](/_static/diagrams/two_planes.svg)
 
-The engine is described at three zoom levels, nested inside this section and meant to be
-read in this order:
+The section describes the engine at three zoom levels. Read them in this order:
 
 | Level | Zoom | Read it when |
 |---|---|---|

@@ -23,8 +23,9 @@ that is taking longer than you expected says *where* it is:
 ⠏  aggregate         learning stats  ▕░░░░▒▓█▓▒░░░░░░░░░░░░░░░░▏  6.35s
 ```
 
-That is the answer to the question a slow small query actually raises: 23 ms optimizing
-against 4 ms executing is a different problem from the reverse. The same phases are recorded
+A slow small query raises one question first: did the time go to planning or to executing?
+The phase answers it, because a query stuck on `optimizing` has a different problem from one
+stuck on `on cluster`. The same phases are recorded
 with their durations at `debug` verbosity, under `run phase`, when you want the numbers
 rather than the live view.
 
@@ -57,9 +58,8 @@ scrolls away from its result is a caveat nobody connects to it:
 ✔  wrote parquet      24 files  ·  12.4M rows  ·  3.1 GiB
 ```
 
-That line is the difference between a run that read every file and one that quietly read
-98% of its corpus, and between a job that was four times too slow and one that
-transparently survived losing two workers.
+That line separates a run that read every file from one that skipped part of its corpus,
+and a job that was merely slow from one that survived losing workers.
 
 A commit gets its own line. It lands after the query that produced the rows has finished,
 because only then is there a manifest to report.
@@ -73,7 +73,7 @@ Both print an immediate `!` line naming what happened and where.
 Several shapes never reach the executor. A keyless `sum` or `count` can be read from a
 source's own statistics, a `limit(n)` stops reading once it has `n` rows, a contradictory
 predicate is provably empty, and a repeated small query can replay a prepared plan. These
-are among the largest wins Batcher has, and the summary says which one fired, in place of a
+are among the largest wins Batcher has. The summary says which one fired, in place of a
 throughput figure it has no basis for:
 
 ```text
@@ -88,16 +88,14 @@ replaces the rate because dividing one output row by the time taken to fetch it 
 something like `12 rows/s`, which is the width of the answer rather than the speed of the
 engine.
 
-These count in the metrics export and appear in the dashboard like any other, so a job built
-out of `count()` and `agg()` no longer reports that it ran no queries, and they carry a
-pipeline signature so repeated runs group rather than filing a row each.
+These count in the metrics export and appear in the dashboard like any other query, so a job
+built out of `count()` and `agg()` reports the queries it ran. Each carries a pipeline
+signature, so repeated runs group together rather than filing a row each.
 {py:meth}`explain(analyze=True) <batcher.Dataset.explain>` and {py:meth}`stats() <batcher.Dataset.stats>` report the same way: both
 run the query for real, so both leave a summary line, a dashboard row, a span and an
 event-log document.
 
 ## Why the display behaves as it does
-
-Each of the following is a decision rather than an accident.
 
 The bar advances in eighth-cells, which gives it eight times the resolution of its width
 and is what makes it read as motion rather than as stepping blocks. Throughput is measured
@@ -109,8 +107,8 @@ Live row counts only exist on the streaming path. {py:meth}`iter_batches <batche
 batch in Python, so counting rows there is free. `collect` measures inside Rust and returns
 the profile at the end, so its bar shows an indeterminate sweep, the phase carries what is
 happening, and the counts appear in the summary line. No row count is drawn until one has
-been observed. A standing `0 rows` is the absence of a reading rather than a reading of
-zero, and it read as the most alarming number it could have been.
+been observed, because a standing `0 rows` would look like a reading of zero when it is the
+absence of one.
 
 Nothing else is invented either. With no row estimate and no partition count, the bar shows
 an honest indeterminate sweep instead of a fabricated percentage, and the ETA is omitted
@@ -155,5 +153,6 @@ set_config(
 - {doc}`Observability <observability>`: the event channel this line is one sink of, and the
   other three that read it.
 - {doc}`Troubleshooting <troubleshooting>`: what the failure lines mean, by symptom.
+- {doc}`Metrics <metrics>`: the process-wide counters behind the summary line.
 - {doc}`Configuration </configuration/index>`: the full `observability` block, including
   `progress` and `verbosity`.

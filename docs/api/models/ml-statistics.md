@@ -14,54 +14,58 @@ reference-versus-current comparisons a deployed model needs. See the
 ```{eval-rst}
 .. currentmodule:: batcher.ml.stats
 
-.. autofunction:: spearman_corr
-.. autofunction:: entropy
-.. autofunction:: gini_impurity
-.. autofunction:: herfindahl_index
-.. autofunction:: mode_share
-.. autofunction:: chi_square
-.. autofunction:: cramers_v
-.. autofunction:: mutual_information
-.. autofunction:: anova_f
-.. autofunction:: theils_u
-.. autofunction:: eta_squared
-.. autofunction:: epsilon_squared
-.. autofunction:: omega_squared
-.. autofunction:: cohens_f
-.. autofunction:: correlation_matrix
-.. autofunction:: covariance_matrix
-.. autofunction:: partial_correlation
-.. autofunction:: variance_inflation_factor
-.. autofunction:: trimmed_mean
-.. autofunction:: winsorized_mean
-.. autofunction:: median_abs_deviation
-.. autofunction:: outlier_mask
-.. autofunction:: population_stability_index
-.. autofunction:: kl_divergence
-.. autofunction:: js_divergence
-.. autofunction:: categorical_drift
-.. autofunction:: woe_table
-.. autofunction:: information_value
-.. autofunction:: drift_report
-.. autoclass:: TestResult
-.. autofunction:: t_test_1samp
-.. autofunction:: t_test_ind
-.. autofunction:: anova_test
-.. autofunction:: chi_square_test
-.. autofunction:: normality_test
-.. autofunction:: pearson_test
-.. autofunction:: spearman_test
-.. autofunction:: proportion_ztest
-.. autofunction:: binomial_test
-.. autofunction:: mcnemar_test
-.. autofunction:: bartlett_test
-.. autofunction:: levene_test
-.. autofunction:: mann_whitney_u
-.. autofunction:: wilcoxon_signed_rank
-.. autofunction:: kruskal_wallis
-.. autofunction:: friedman_test
-.. autofunction:: cliffs_delta
-.. autofunction:: common_language_effect_size
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   spearman_corr
+   entropy
+   gini_impurity
+   herfindahl_index
+   mode_share
+   chi_square
+   cramers_v
+   mutual_information
+   anova_f
+   theils_u
+   eta_squared
+   epsilon_squared
+   omega_squared
+   cohens_f
+   correlation_matrix
+   covariance_matrix
+   partial_correlation
+   variance_inflation_factor
+   trimmed_mean
+   winsorized_mean
+   median_abs_deviation
+   outlier_mask
+   population_stability_index
+   kl_divergence
+   js_divergence
+   categorical_drift
+   woe_table
+   information_value
+   drift_report
+   TestResult
+   t_test_1samp
+   t_test_ind
+   anova_test
+   chi_square_test
+   normality_test
+   pearson_test
+   spearman_test
+   proportion_ztest
+   binomial_test
+   mcnemar_test
+   bartlett_test
+   levene_test
+   mann_whitney_u
+   wilcoxon_signed_rank
+   kruskal_wallis
+   friedman_test
+   cliffs_delta
+   common_language_effect_size
 ```
 
 ## Fairness
@@ -72,15 +76,19 @@ treating a protected group differently, each a single grouped aggregate.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.metrics
 
-.. autofunction:: demographic_parity_difference
-.. autofunction:: disparate_impact_ratio
-.. autofunction:: equal_opportunity_difference
-.. autofunction:: equalized_odds_difference
-.. autofunction:: predictive_parity_difference
-.. autofunction:: group_fairness_report
-.. autofunction:: d2_tweedie_score
-.. autofunction:: d2_absolute_error_score
-.. autofunction:: d2_pinball_score
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   demographic_parity_difference
+   disparate_impact_ratio
+   equal_opportunity_difference
+   equalized_odds_difference
+   predictive_parity_difference
+   group_fairness_report
+   d2_tweedie_score
+   d2_absolute_error_score
+   d2_pinball_score
 ```
 
 ## Resampling for imbalanced learning
@@ -91,13 +99,17 @@ content-hashed filter or concatenation, never a driver-side shuffle.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.sampling
 
-.. autofunction:: class_counts
-.. autofunction:: class_weights
-.. autofunction:: sample_weights
-.. autofunction:: undersample
-.. autofunction:: oversample
-.. autofunction:: balanced_sample
-.. autofunction:: stratified_sample
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   class_counts
+   class_weights
+   sample_weights
+   undersample
+   oversample
+   balanced_sample
+   stratified_sample
 ```
 
 ## Cross-validated scoring
@@ -108,10 +120,14 @@ loop, and each fold's data runs through the engine rather than a driver-held arr
 ```{eval-rst}
 .. currentmodule:: batcher.ml.model_selection
 
-.. autofunction:: cross_val_score
-.. autofunction:: cross_val_predict
-.. autofunction:: learning_curve
-.. autofunction:: validation_curve
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   cross_val_score
+   cross_val_predict
+   learning_curve
+   validation_curve
 ```
 
 ## Hyperparameter search
@@ -123,13 +139,15 @@ fold-assignment luck.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.model_selection
 
-.. autofunction:: param_grid
-.. autofunction:: param_samples
-.. autofunction:: grid_search
-.. autofunction:: random_search
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: SearchResult
-   :members:
+   param_grid
+   param_samples
+   grid_search
+   random_search
+   SearchResult
 ```
 
 ## Cross-validation splits
@@ -141,12 +159,16 @@ however the data is partitioned.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.splitting
 
-.. autofunction:: kfold
-.. autofunction:: stratified_kfold
-.. autofunction:: stratified_split
-.. autofunction:: group_kfold
-.. autofunction:: time_series_split
-.. autofunction:: fold_column
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   kfold
+   stratified_kfold
+   stratified_split
+   group_kfold
+   time_series_split
+   fold_column
 ```
 
 ## Model interpretation
@@ -157,8 +179,12 @@ sample, because both techniques re-score through the engine.
 ```{eval-rst}
 .. currentmodule:: batcher.ml.interpret
 
-.. autofunction:: permutation_importance
-.. autofunction:: partial_dependence
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   permutation_importance
+   partial_dependence
 ```
 
 ## See also

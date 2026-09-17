@@ -1,14 +1,8 @@
 # Fault-tolerance options
 
-This page documents the `fault_tolerance` configuration section: what Batcher does when nodes
-and devices fail underneath a running job. The rest of the `distributed` section tunes a
-cluster that mostly works; this one tunes what happens when it doesn't.
+This page documents the `fault_tolerance` configuration section: what Batcher does when nodes and devices fail underneath a running job. The `distributed` section tunes a cluster that mostly works. This one tunes what happens when it doesn't.
 
-Every default is chosen so that turning nothing on changes nothing. The quarantine thresholds
-are permissive enough that a healthy fleet never trips them, and the retry budget is generous
-enough that only a systematically broken run exhausts it.
-{doc}`/user-guide/operate/running/unstable-nodes` is the task-oriented walkthrough; this page is the
-field reference.
+Both mechanisms are on by default and sized so a healthy fleet never notices them. The quarantine thresholds are permissive enough that ordinary noise never trips them, and the retry budget is generous enough that only a systematically broken run exhausts it. {doc}`/user-guide/operate/running/unstable-nodes` is the task-oriented walkthrough, and this page is the field reference.
 
 ```python
 import dataclasses

@@ -4,7 +4,7 @@ A port isn't finished when the verbs translate. This page covers the concepts th
 
 ## A dataset is lazy
 
-A {py:class}`Dataset <batcher.Dataset>` is a plan, not data. Transformations such as `filter`, `with_columns`, and `join` return a new `Dataset` and run nothing, and the plan runs only at a terminal operation such as `collect`, `to_arrow`, `to_pandas`, `count`, `iter_batches`, or a write. This is the Polars `LazyFrame` and Spark `DataFrame` model. Coming from pandas or an eager Polars `DataFrame`, a line that used to compute a value now extends a plan, so a print that relied on an eager value needs an explicit terminal call.
+A {py:class}`Dataset <batcher.Dataset>` is a plan, not data. Transformations such as `filter`, `with_columns`, and `join` return a new `Dataset` and run nothing, and the plan runs only at a terminal operation such as `collect`, `to_arrow`, `to_pandas`, `count`, `iter_batches`, or a write. This is the Polars `LazyFrame` and Spark `DataFrame` model. If you come from pandas or an eager Polars `DataFrame`, a line that used to compute a value now only extends a plan. A print that relied on that value needs an explicit terminal call.
 
 ```python
 import batcher as bt
@@ -17,7 +17,7 @@ print(plan.count())
 
 ## One spelling per capability
 
-Batcher keeps one spelling for each capability. Where another engine uses a different name, Batcher doesn't add that name as a second spelling. Where two engines give one name different meanings, the generated reference records the difference as a mismatch, and the planned fix is a parameter on the Batcher spelling rather than a second function. Batcher also removed the second spellings it used to accept, such as `groupby` for `group_by` and `fillna` for `fill_null`.
+Batcher doesn't add another engine's name as a second spelling of a capability it already has. Where two engines give one name different meanings, the generated reference records the difference as a mismatch, and the planned fix is a parameter on the Batcher spelling rather than a second function. Batcher also removed the second spellings it used to accept, such as `groupby` for `group_by` and `fillna` for `fill_null`.
 
 A removed spelling raises `AttributeError`, and so does another engine's spelling typed on a Batcher object. When the migration registry knows the name, the message names the spelling to use. The codemod rewrites a script that still uses a removed Batcher spelling. It prints a diff and changes nothing unless you pass `--write`, and `--check` exits 1 when any file would change:
 
@@ -50,8 +50,7 @@ print(big.select(y=bt.col("x") + 1).to_pydict())
 # {'y': [-9223372036854775808]}
 ```
 
-An integer `sum` that overflows raises an `ExecutionError` instead, with a message telling you to cast the column to a wider type first. Spark's `try_add`, `try_subtract`, and `try_multiply`, which return null on overflow, have no Batcher equivalent yet. Batcher also stores unsigned 64-bit integers as signed 64-bit integers, so a `UInt64` value above `2**63 - 1` overflows on the way in.
-
+An integer `sum` that overflows raises an `ExecutionError` instead, with a message telling you to cast the column to a wider type first. Spark's `try_add`, `try_subtract`, and `try_multiply`, which return null on overflow, have no Batcher equivalent. Batcher also stores unsigned 64-bit integers as signed 64-bit integers, so a `UInt64` value above `2**63 - 1` overflows on the way in.
 
 ## What Batcher deliberately does not have
 
@@ -67,16 +66,11 @@ Some familiar APIs are absent by design. You don't need this table to find out w
 | `df.resample` | Time bucketing is a grouping. | {py:meth}`ds.group_by(bucket=bt.window(bt.col("t"), "1h")).agg(...) <batcher.Dataset.group_by>` |
 | Looping over a {py:class}`GroupBy <batcher.GroupBy>` | It materializes one frame per key in Python and caps the job at one machine. | `.agg(...)`, or `.window(partition_by=[...])` to keep every row |
 
-Column attribute access such as `df.amount` is absent for a subtler reason. A column
-named `filter` or `join` would shadow a method, which is a real source of pandas bugs.
-Use `ds["amount"]` for the expression, or {py:func}`bt.col("amount") <batcher.col>` to build one.
+Column attribute access such as `df.amount` is absent for a subtler reason: a column named `filter` or `join` would shadow a method, which is a real source of pandas bugs. Use `ds["amount"]` for the expression, or {py:func}`bt.col("amount") <batcher.col>` to build one.
 
 ## The error messages teach you the mapping
 
-You don't have to memorize the translation tables. Type the method you already know, and
-the traceback tells you the Batcher spelling. This works at every level: on a
-{py:class}`Dataset <batcher.Dataset>`, on an expression, on a `GroupBy`, and on the `bt`
-package itself.
+Type the method you already know, and the traceback names the Batcher spelling. That holds on a {py:class}`Dataset <batcher.Dataset>`, on an expression, on a `GroupBy`, and on the `bt` package itself.
 
 ```python
 import batcher as bt
@@ -111,12 +105,11 @@ print("every wrong spelling names its Batcher replacement")
 # every wrong spelling names its Batcher replacement
 ```
 
-A near miss on a real method gets a `Did you mean ...?` suggestion instead, so a typo
-such as `ds.filtr` or `bt.col("x").meen` points straight at `filter` and `mean`.
+A near miss on a real method gets a `Did you mean ...?` suggestion instead, so a typo such as `ds.filtr` or `bt.col("x").meen` points straight at `filter` and `mean`.
 
 ## Checking a port
 
-{py:meth}`ds.equals(other) <batcher.Dataset.equals>` compares *results* rather than plans, which is the question a migration raises. Both sides execute and their rows are compared. Two queries built from completely different verbs count as equal when they agree, and a plan-shape comparison can't tell you that.
+{py:meth}`ds.equals(other) <batcher.Dataset.equals>` compares *results* rather than plans, which is the question a migration raises. Both sides execute and their rows are compared. Two queries built from completely different verbs count as equal when their rows agree. A plan-shape comparison can't tell you that.
 
 Column names and types must match. Row order is ignored by default, because a relation is unordered. After a `sort`, pass `ordered=True` when the emitted order is part of the contract.
 
@@ -131,16 +124,12 @@ print(ported.equals(expected))
 
 ## Requirements and limitations
 
-- {py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_daft <batcher.from_daft>`, {py:func}`from_dask <batcher.from_dask>`, {py:func}`from_ray_dataset <batcher.from_ray_dataset>`,
-  {py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>` each need the source framework
-  installed. Batcher doesn't depend on any of them.
+- {py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_daft <batcher.from_daft>`, {py:func}`from_dask <batcher.from_dask>`, {py:func}`from_ray_dataset <batcher.from_ray_dataset>`, {py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>` each need the source framework installed. Batcher doesn't depend on any of them.
 - Dask and HuggingFace have a constructor but no exporter. To hand a result back to one of them, go through {py:meth}`to_arrow <batcher.Dataset.to_arrow>` or {py:meth}`to_pandas <batcher.Dataset.to_pandas>`.
 - `append` mode is accepted by lakehouse sinks only.
-- `merge_on` is a `write.delta` parameter. It has no equivalent on a plain Parquet
-  write.
+- `merge_on` is a `write.delta` parameter. It has no equivalent on a plain Parquet write.
 - Distributed execution and the GPU actor pools need the optional `[ray]` extra.
-- LLM generation needs a text-generation engine you install separately, such as
-  `batcher-engine[vllm]`.
+- LLM generation needs a text-generation engine you install separately, such as `batcher-engine[vllm]`.
 
 ## See also
 

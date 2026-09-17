@@ -1,8 +1,6 @@
 # Best practices
 
-These patterns get the most out of the engine. They follow from one fact: Python
-builds and optimizes a plan, and Rust runs it over Arrow. The closer your code
-stays to describing a plan, the more the engine can do for you.
+This page collects the habits that get the most out of Batcher. They all follow from one fact: Python builds and optimizes a plan, and Rust runs it over Arrow. The closer your code stays to describing a plan, the more the engine can do for you.
 
 ```python
 import batcher as bt
@@ -70,7 +68,8 @@ print(early.to_pydict())
 ```
 
 Select only the columns you need as early as possible. Projection pushdown then
-keeps unused columns from being read at all.
+keeps unused columns from being read at all. {doc}`pushdown` lists which predicate shapes each
+source accepts.
 
 ## Read the plan with explain
 
@@ -82,36 +81,25 @@ plan = ds.filter(bt.col("price") > 20).select("category").explain()
 print(plan)
 ```
 
-The filter sits directly above the scan, and the projection is above it. That is the shape
-you wanted. Each line carries the row estimate and its provenance: `exact` from the source,
-`default` from a heuristic, `learned` from a previous run.
+The filter sits directly above the scan, the projection above it, and `pushed[price > 20]` on the scan says the source applies the predicate itself. That's the shape you want. Each line carries the row estimate and its provenance: `exact` from the source, `default` from a heuristic, `learned` from a previous run.
 
 ```text
-query plan (planned)                             3 operators
-────────────────────────────────────────────────────────────
-OPERATOR                      ESTIMATE  NOTES
-project                          est≈4  (default)
-└─ filter  [amount > 15]         est≈4  (default)
-   └─ scan  [source 0]           est≈5  (exact)  pushed[amount > 15]
-
-decisions:
-  - [core/io] source read at 6 MB/s (learned)
+query plan (planned)                               3 operators
+──────────────────────────────────────────────────────────────
+OPERATOR                 ESTIMATE  NOTES
+project                     est≈4  (default)
+└─ filter  [price > 20]     est≈4  (default)
+   └─ scan  [source 0]      est≈5  (exact)  pushed[price > 20]
 ```
 
-The read throughput under `decisions:` is measured, so expect a different figure.
+{doc}`explain-plans` covers the rest of the output, including `explain(analyze=True)`.
 
-## Use distributed and spill deliberately
+## Leave distribution and spilling on their defaults
 
-`collect` runs single-node and in-memory by default, which is the fastest path for
-data that fits. Reach for the flags when the workload calls for them:
+`collect()` decides both for you. With `distributed="auto"` it runs on Ray on a multi-node cluster and single-node otherwise, and spilling engages on its own under memory pressure. The explicit flags are overrides:
 
-- `distributed=True` (with `num_workers=`) spreads execution across Ray workers. Use
-  it when one machine cannot hold the data, or cannot process it in reasonable time.
-  The result is identical to single-node execution, because the same mergeable
-  operators run in both modes.
-- `spill=True` lets stateful operators (aggregation, join, sort) spill to disk under
-  memory pressure instead of failing. Reach for it when an in-memory run risks running
-  out of memory.
+- `distributed=True`, with `num_workers=`, forces execution across Ray workers. The result is the same as single-node execution, because the same mergeable operators run in both modes.
+- `spill=True` forces stateful operators such as aggregation, join, and sort onto the out-of-core path even without pressure.
 
 ```python
 # docs: skip
@@ -122,14 +110,14 @@ out = (
 )
 ```
 
-Don't turn these on by default. Distribution adds scheduling and shuffle overhead
-that hurts small queries, and spill trades memory for disk I/O. Both earn their cost
-only on a big job.
+Don't force either one by default. Distribution adds scheduling and shuffle overhead that hurts small queries, and spilling trades memory for disk I/O. Both earn their cost only on a big job. To bound memory, set `memory.max_memory_bytes` to the real ceiling instead, as {doc}`performance` shows.
 
 ## See also
 
 - {doc}`Performance and memory </user-guide/operate/tuning/performance>`: caching, spill, and the adaptive knobs.
+- {doc}`explain-plans`: reading the plan and its measurements in full.
+- {doc}`caching`: reusing a result without collecting it into Python.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and enforce a contract on inputs.
 - {doc}`Distributed fault tolerance </architecture/fault-tolerance>`: how the engine
   recovers from node and task failures.
-- {doc}`/cookbook/index`: 100 runnable recipes, one per API surface.
+- {doc}`/cookbook/index`: runnable recipes grouped by domain, each asserting on its own output.

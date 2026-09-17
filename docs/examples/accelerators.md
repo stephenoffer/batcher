@@ -1,17 +1,12 @@
 # Accelerators
 
-This page covers the scripts that use a GPU when one is present and the CPU engine when it is
-not, and the ones that verify the two agree.
+This page covers the scripts that use a GPU when one is present and the CPU engine when it is not, and the ones that verify the two agree.
 
 ## Why these scripts run without a GPU
 
-The device tier is the one tier that cannot share the Rust `Expr` the other tiers consume,
-because cuDF has no Rust binding. It is a translator: a second statement of the engine's
-semantics against another library. That is what makes verifying it against the CPU oracle
-necessary rather than optional.
+The device tier is the one tier that cannot share the Rust `Expr` the other tiers consume, because cuDF has no Rust binding. It is a translator: a second statement of the engine's semantics against another library. That is what makes verifying it against the CPU oracle necessary rather than optional.
 
-CI has no GPU, so a suite whose accelerator scripts skipped themselves would check nothing.
-Every script here takes a device flag instead and falls back:
+CI has no GPU, so a suite whose accelerator scripts skipped themselves would check nothing. Every script here takes a device flag instead and falls back:
 
 ```bash
 python examples/gpu/device_selection.py               # auto
@@ -19,14 +14,11 @@ python examples/gpu/device_selection.py --device cpu  # forced
 python examples/gpu/device_selection.py --device gpu  # errors with no accelerator
 ```
 
-Asking for `--device gpu` where there is none is an error rather than a silent downgrade,
-because that is the one time you typed it deliberately.
+Asking for `--device gpu` where there is none is an error rather than a silent downgrade, because that is the one time you typed it deliberately.
 
 ## The contract
 
-The device changes where a plan runs, never what it computes. Same rows, same column names,
-same column types. Anything outside the translated subset is declined with a reason and the
-stage runs on the CPU engine, so `backend="gpu"` stays safe.
+The device changes where a plan runs, never what it computes. Same rows, same column names, same column types. Anything outside the translated subset is declined with a reason and the stage runs on the CPU engine, so `backend="gpu"` stays safe.
 
 ```python
 import batcher as bt
@@ -49,15 +41,9 @@ assert on_device.schema == on_cpu.schema
 assert on_device.to_pydict() == on_cpu.to_pydict()
 ```
 
-Compare the schema before the values. The two defects this tier has actually shipped were
-both *type* bugs with correct values: a DATE column returning a timestamp on a real device,
-and an integer `abs` widening to double. A value-only comparison would have passed both, which
-is why `examples/gpu/shadow_verification.py` and `examples/gpu/cpu_gpu_parity_matrix.py`
-check names and types first.
+Compare the schema before the values. The defects this tier has shipped were *type* bugs with correct values: a DATE column returning a timestamp on a real device, an integer `abs` widening to double, and an empty string column converting to Arrow `null`. A value-only comparison would have passed all three, which is why `examples/gpu/shadow_verification.py` and `examples/gpu/cpu_gpu_parity_matrix.py` check names and types first.
 
-A green run of these scripts on a CPU-only machine says the harness works. It does not say
-the device agrees, and only a recorded run with `distributed.gpu_shadow_verify=True` on real
-hardware does.
+A green run of these scripts on a CPU-only machine says the harness works. It does not say the device agrees, and only a recorded run with `distributed.gpu_shadow_verify=True` on real hardware does.
 
 ## Every script on this page
 
@@ -75,3 +61,9 @@ The table below lists the accelerator scripts in path order.
 | `examples/gpu/shadow_verification.py` | Verifying a device result against the CPU engine |
 | `examples/gpu/torch_inference.py` | Batch inference with a torch model, on whatever device is available |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/ml/inference/gpu`: GPU scheduling, stage overlap, and fractional packing.
+- {doc}`/architecture/deep-dives/distribution/gpu-execution`: how the device tier translates and verifies a plan.
+- {doc}`/benchmarks/results/ai-and-gpu`: what these shapes sustain on real hardware.

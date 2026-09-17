@@ -6,7 +6,7 @@ as written.
 
 You need `pip install batcher-engine`. No cluster, no GPU, no files on disk. The closing
 block swaps the in-memory source for a Parquet path and changes nothing else, which is
-the point of the whole tutorial. It wants a real file, so it is shown rather than run.
+the point of the whole tutorial. It needs a real file, so it's shown rather than run.
 
 ## Build a dataset
 
@@ -86,6 +86,10 @@ print(table.num_rows)
 # 2
 ```
 
+Each call you chained added one node to the plan, and only the terminal call ran it:
+
+![Code on the left beside the plan node each line adds on the right. bt.from_pydict adds a scan of source 0. with_columns adds a project that computes total. group_by then agg adds an aggregate by category with sum and count_star. sort by revenue, descending, adds a sort. Data flows down that column from scan to project to aggregate to sort. The last line, to_pydict, adds no node: it executes the plan and returns a column dict. explain prints the same tree upside down, with sort on top and scan at the bottom.](/_static/diagrams/first_pipeline_plan.svg)
+
 The whole pipeline reads as one expression because every step returns a new
 `Dataset`:
 
@@ -118,24 +122,19 @@ print(isinstance(result.explain(), str))
 ```
 
 :::{dropdown} What a plan looks like, and how to read one
-The plan renders bottom-up: the scan is at the bottom, the terminal operator at the top.
-Each line carries the operator's estimated row count and where the estimate came from, so
-you can see whether the optimizer pushed the filter down to the scan and which columns
-survived pruning.
+The plan renders as a tree with the scan at the bottom and the terminal operator at the top. Each line carries the operator's estimated row count and where the estimate came from. This is the plan for `result`:
 
 ```text
-query plan (planned)                                       5 operators
-──────────────────────────────────────────────────────────────────────
-OPERATOR                              ESTIMATE  NOTES
-sort  [revenue]                        est≈2,000  (default)
-└─ aggregate  [by region · sum]        est≈2,000  (default)
-   └─ project                         est≈20,000  (default)
-      └─ filter  [status = paid]      est≈20,000  (default)
-         └─ scan  [source 0]         est≈200,000  (exact)  pushed[status = paid]
+query plan (planned)                                   4 operators
+──────────────────────────────────────────────────────────────────
+OPERATOR                                       ESTIMATE  NOTES
+sort  [revenue]                                   est≈1  (default)
+└─ aggregate  [by category · sum, count_star]     est≈1  (default)
+   └─ project                                     est≈5  (exact)
+      └─ scan  [source 0]                         est≈5  (exact)
 ```
 
-That example is from {doc}`optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`, which is the
-tutorial that teaches you to read one properly.
+`(exact)` means the optimizer knows the count, because an in-memory source has five rows. `(default)` is a prior, used because it has no statistics on how many distinct categories there are. A filter, when there is one, shows up pushed into the scan's notes. {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>` teaches you to read a plan properly.
 :::
 
 ## The same pipeline over files
@@ -167,10 +166,7 @@ because it took no time.
 :::
 
 :::{tip}
-Column work belongs in an expression, not in a Python callback. `bt.col("price") *
-bt.col("qty")` runs in Rust across every core and the optimizer can see through it. The same
-arithmetic in a `map_batches` blocks predicate pushdown and roughly halves throughput. The
-{doc}`slow query tutorial </getting-started/tutorials/foundations/optimizing-a-slow-query>` measures exactly that.
+Column work belongs in an expression, not in a Python callback. `bt.col("price") * bt.col("qty")` runs in Rust, and the optimizer can see through it. The same arithmetic in a `map_batches` blocks predicate pushdown and costs throughput on every batch. The {doc}`slow query tutorial </getting-started/tutorials/foundations/optimizing-a-slow-query>` shows exactly that.
 :::
 
 ## Where to go next

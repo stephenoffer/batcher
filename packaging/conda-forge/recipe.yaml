@@ -1,0 +1,79 @@
+# conda-forge recipe for batcher-engine, in the rattler-build v1 format.
+#
+# This file is a submission, not a build this repository runs. conda-forge builds from the
+# PyPI sdist, so the steps are: publish the release to PyPI, set `version` and `sha256` below to
+# that sdist, and open a pull request adding this directory to conda-forge/staged-recipes.
+# RELEASING.md has the full procedure. Once merged, conda-forge creates a feedstock whose bot
+# opens a version-bump PR for every later PyPI release, so this file is only needed once.
+
+context:
+  name: batcher-engine
+  version: "0.1.0"
+  # The sha256 of batcher_engine-<version>.tar.gz on PyPI. It cannot be known before the
+  # release is uploaded; a wrong value fails the build at download rather than shipping.
+  sha256: REPLACE_WITH_THE_PYPI_SDIST_SHA256
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  url: https://pypi.org/packages/source/${{ name[0] }}/${{ name }}/${{ name | replace("-", "_") }}-${{ version }}.tar.gz
+  sha256: ${{ sha256 }}
+
+build:
+  number: 0
+  # One build per Python, not abi3: conda-forge's Python pinning expects a per-version package.
+  skip:
+    - match(python, "<3.11")
+  script:
+    # conda-forge requires the licenses of every statically linked Rust crate to ship.
+    - cargo-bundle-licenses --format yaml --output THIRDPARTY.yml
+    - ${{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+
+requirements:
+  build:
+    - if: build_platform != target_platform
+      then:
+        - python
+        - cross-python_${{ target_platform }}
+        - maturin >=1.7,<2
+    - ${{ compiler("c") }}
+    - ${{ stdlib("c") }}
+    - ${{ compiler("rust") }}
+    - cargo-bundle-licenses
+  host:
+    - python
+    - pip
+    - maturin >=1.7,<2
+  run:
+    - python
+    # Mirrors [project].dependencies in pyproject.toml; keep the two in step.
+    - pyarrow >=16
+    - numpy >=1.24
+    - typing_extensions >=4.7
+    - psutil >=5.9
+    - sqlglot >=23
+
+tests:
+  - python:
+      imports:
+        - batcher
+      pip_check: true
+  - script:
+      - |
+        python -c "import batcher as bt; assert bt.from_pydict({'a': [1, 2, 3]}).agg(s=bt.col('a').sum()).to_pydict() == {'s': [6]}"
+
+about:
+  homepage: https://github.com/stephenoffer/batcher
+  documentation: https://stephenoffer.github.io/batcher/
+  repository: https://github.com/stephenoffer/batcher
+  summary: A native, JIT-compiling, adaptive data engine on Apache Arrow.
+  license: Apache-2.0
+  license_file:
+    - LICENSE
+    - THIRDPARTY.yml
+
+extra:
+  recipe-maintainers:
+    - stephenoffer

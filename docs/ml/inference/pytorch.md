@@ -1,35 +1,18 @@
 # PyTorch
 
-Batcher feeds PyTorch's data loading rather than replacing it. The engine produces
-Arrow `RecordBatch`es through `iter_batches` and `map_batches`, and you convert
-those batches to tensors at the edge of your training code. The heavy work of
-reading, filtering, joining, and feature engineering runs in the engine, so PyTorch
-sees ready batches.
+This page covers feeding PyTorch from Batcher: the tensor loader and its options, the
+converters for a batch stream you built yourself, and the wiring for DDP and FSDP.
 
-Two entry points on the `.ml` accessor turn a dataset straight into tensor batches, so
-most training loops never write a {py:class}`Dataset <batcher.Dataset>` or `DataLoader` wrapper of their own.
+Batcher feeds PyTorch's training loop rather than replacing it. The engine reads, filters,
+joins, and computes features, then hands the loop batches that are already shaped. The torch
+side does nothing but convert and step. {doc}`Data loaders </ml/training/data-loaders>` is the
+map of every loader, including the TensorFlow and larger-than-RAM ones. This page is the PyTorch
+detail behind it.
 
-{py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` is the bounded-memory streaming path. It consumes
-{py:meth}`iter_batches() <batcher.Dataset.iter_batches>` incrementally and yields `{column: tensor}` dicts, handling the device
-transfer and the prefetch, with an optional local shuffle. Use it for single-process
-training and for larger-than-memory or streaming sources.
+## Shape the data before the stream
 
-{py:meth}`ds.ml.stream_loader(...) <batcher.api.dataset.ml.DatasetML.stream_loader>` returns a `torch.utils.data.IterableDataset` for
-*distributed* training under DDP, FSDP, or DeepSpeed, with a deterministic, balanced,
-resumable global sample order across ranks. {doc}`Streaming for training </ml/inference/streaming>`
-covers it.
-
-## The pattern
-
-A training loop on Batcher follows the same three steps every time:
-
-1. Build and shape the dataset with the DataFrame API and `map_batches`.
-1. Stream batches with `iter_batches()`, or directly as tensors with
-   {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`.
-1. Convert each Arrow batch to tensors inside an `IterableDataset` or directly in
-   the loop.
-
-Shaping runs in the engine and is runnable here. The torch conversion is not.
+Feature work belongs in expressions and `map_batches`, where the engine vectorizes it and runs
+it in parallel, not in a `__getitem__`. This step needs no torch:
 
 ```python
 import batcher as bt
@@ -56,9 +39,12 @@ print(prepared.to_pydict())
 
 ## Tensors straight from the engine
 
-`ds.ml.iter_torch_batches` yields a `{column: tensor}` dict per batch, converting the
-numeric columns and dropping the rest. The conversion is the only torch dependency, so
-this runs here on CPU with no GPU and no model:
+{py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`
+is the single-process training path. It consumes
+{py:meth}`iter_batches() <batcher.Dataset.iter_batches>` incrementally, in bounded memory, and
+yields one `{column: tensor}` dict per batch over the numeric columns. Other columns are dropped
+with a warning. The conversion is the only torch dependency, so this runs on CPU with no GPU and
+no model:
 
 ```python
 import batcher as bt
@@ -73,11 +59,9 @@ print(sorted(first), first["label"].shape[0])
 # ['f0', 'f1', 'label'] 2
 ```
 
-In real training you leave `device="auto"`, which is the default. It picks the best
-available accelerator, whether CUDA, ROCm, Intel XPU, or Apple MPS, falls back to CPU
-when there is none, and moves each batch there. The device move overlaps the next batch's
-host work when `prefetch_batches > 0`, which is the default, and `pin_memory=True`
-page-locks the CPU tensors for faster copies to the device.
+In real training, leave `device="auto"`, the default. It picks CUDA, ROCm, Intel XPU, or Apple
+MPS when one is available, falls back to CPU, and moves each batch there. MPS has no 64-bit
+tensors, so on a Mac the loader downcasts 64-bit columns rather than crashing.
 
 ```python
 # docs: skip
@@ -87,7 +71,7 @@ ds = bt.read.parquet("s3://bucket/train/*.parquet")
 loader = ds.ml.iter_torch_batches(
     batch_size=256,
     device="auto",  # CUDA / ROCm / XPU / MPS / CPU
-    pin_memory=True,  # faster async host→device copies
+    pin_memory=True,  # faster async host-to-device copies
     prefetch_batches=2,  # overlap the device move with compute
     local_shuffle_buffer_size=8192,  # streaming approximation of a shuffle
 )
@@ -99,59 +83,44 @@ for batch in loader:
     optimizer.zero_grad()
 ```
 
-`local_shuffle_buffer_size` shuffles within a rolling window of that many rows before
-batching. It is a streaming approximation of a global shuffle that keeps memory bounded.
-For full control over batch assembly, pass a `collate_fn`, which receives the
-`{column: ndarray}` batch and whose return is yielded in place of the default dict.
-For read-only **inference**, set `zero_copy=True` to hand the Arrow buffer to torch via
-DLPack and save a CPU copy before the device move. Never set it for training, which
-mutates batches in place.
+### The options that matter
 
-## Feeding a DataLoader
+`pin_memory=True` page-locks the host tensors so the copy to the device can be asynchronous. On
+CUDA the copy runs on its own stream. `prefetch_batches`, 2 by default, prepares batches on a
+background thread so the device move overlaps the next batch's host work. Two to four is the
+useful band: one batch of look-ahead can't cover a device copy plus the next read, and past four
+the extra batches sit in memory no budget accounts for.
 
-When you want torch's own machinery, meaning its batching, its shuffling buffer, and its
-multi-worker prefetch, wrap the batch stream in an `IterableDataset`. Each Arrow batch
-becomes a tensor, and the `DataLoader` handles the rest. This needs torch, so it is shown
-but not run.
+`local_shuffle_buffer_size` is a streaming approximation of a shuffle, and it's a block
+permutation rather than a reservoir. The loader fills a block to that row count or to 256 MiB,
+whichever binds first, permutes the block once, and emits it. That costs nothing extra to read.
+It's also not a global permutation. A row never crosses a block boundary, so a corpus written in
+label order stays clumped. Pass `epoch` each epoch, together with a fixed `seed`, or every epoch
+replays the same order.
 
-```python
-# docs: skip
-import torch
-from torch.utils.data import IterableDataset, DataLoader
+`dtypes` casts the yielded tensors, either one name for every column (`"float16"`, or an
+abbreviation such as `"bf16"`) or a `{column: dtype}` mapping. `drop_last=True` drops a final
+batch narrower than `batch_size`, so a ragged tail never reaches DDP. It needs an explicit
+`batch_size`.
 
-
-class BatcherDataset(IterableDataset):
-    def __init__(self, dataset, batch_size):
-        self.dataset = dataset
-        self.batch_size = batch_size
-
-    def __iter__(self):
-        for batch in self.dataset.iter_batches(batch_size=self.batch_size):
-            features = torch.tensor([batch.column(c).to_pylist() for c in ("f0", "f1")]).T
-            labels = torch.tensor(batch.column("label").to_pylist())
-            for i in range(batch.num_rows):
-                yield features[i], labels[i]
-
-
-loader = DataLoader(BatcherDataset(prepared, batch_size=256), batch_size=64)
-for features, labels in loader:
-    # forward, loss, backward, step ...
-    pass
-```
+Two options change what comes back. `collate_fn` receives the `{column: ndarray}` batch, with
+every column included, and its return value is yielded in place of the default dict. It's the
+way through for string labels and ragged sequences. `zero_copy=True` hands the Arrow buffer to
+torch through DLPack and saves a CPU copy before the device move. Use it only for read-only
+inference, because training mutates batches in place.
 
 ## The framework converters
 
-The wrapper above is boilerplate, and Batcher ships it. Three converters sit over *any*
-iterable of Arrow batches rather than over a `Dataset`, so they work wherever the batches
-come from, whether `iter_batches()`, a reader, or the output of {py:class}`InferencePool <batcher.ml.InferencePool>` or
-`run_pipeline`. Use them when you drive the loop yourself. Use
+When you drive the loop yourself, the converters sit over *any* iterable of Arrow batches rather
+than over a `Dataset`: `iter_batches()`, a reader, or the output of
+{py:class}`InferencePool <batcher.ml.InferencePool>` or `run_pipeline`. Use
 `ds.ml.iter_torch_batches` when you want tensors straight out of a dataset.
 
-{py:func}`to_numpy_batches(batches, columns=...) <batcher.ml.to_numpy_batches>` is the base of the other two. It yields one
-`{column: ndarray}` dict per batch, with numeric non-null columns converted zero-copy. A
-tensor column, or a fixed-size list of numbers, comes back with its real `(n, width...)`
-shape rather than an object array, so an embedding or image column feeds a model as a
-matrix. It needs nothing but NumPy, so it runs here:
+{py:func}`to_numpy_batches(batches, columns=...) <batcher.ml.to_numpy_batches>` is the base of
+the other two. It yields one `{column: ndarray}` dict per batch, and numeric non-null columns
+convert zero-copy. A tensor column, or a fixed-size list of numbers, comes back with its real
+`(n, width...)` shape rather than as an object array, so an embedding or image column reaches the
+model as a matrix. It needs nothing but NumPy:
 
 ```python
 from batcher.ml import to_numpy_batches
@@ -162,10 +131,12 @@ print({name: array.tolist() for name, array in arrays.items()})
 ```
 
 {py:func}`to_torch_iterable(batches, columns=...) <batcher.ml.to_torch_iterable>` wraps that in a
-`torch.utils.data.IterableDataset` yielding `{column: tensor}` dicts. It is the class
-from the previous section, minus the writing. Non-numeric columns are skipped, so keep
-text and ids in the engine rather than in the trainer's hot path. It is single-pass unless
-`batches` is itself re-iterable.
+`torch.utils.data.IterableDataset` of `{column: tensor}` dicts, which replaces the hand-written
+wrapper class most projects start with. Under `DataLoader(num_workers=k)` it strides the batches
+across the workers, so each batch comes from exactly one worker. A naive `IterableDataset` runs in
+full in every worker and trains on each sample *k* times per epoch. Non-numeric columns are
+skipped, so keep text and ids in the engine. The dataset is single-pass unless `batches` is
+itself re-iterable.
 
 ```python
 # docs: skip
@@ -179,9 +150,8 @@ for batch in DataLoader(stream, batch_size=None):  # batches are already sized
     loss.backward()
 ```
 
-{py:func}`to_tf_dataset(batches, columns=...) <batcher.ml.to_tf_dataset>` is the TensorFlow equivalent. It returns a
-`tf.data.Dataset` of `{column: tensor}` dicts, with the output signature derived from the
-first batch.
+{py:func}`to_tf_dataset(batches, columns=...) <batcher.ml.to_tf_dataset>` is the TensorFlow
+equivalent. It returns a `tf.data.Dataset` of `{column: tensor}` dicts.
 
 ```python
 # docs: skip
@@ -191,32 +161,18 @@ tf_ds = to_tf_dataset(prepared.iter_batches(batch_size=256), columns=["f0", "f1"
 model.fit(tf_ds.map(lambda row: (row["f0"], row["label"])), epochs=3)
 ```
 
-## Per-batch tensors without the wrapper
-
-For full-batch training steps you can skip the per-row `IterableDataset` and
-convert a whole Arrow batch to a tensor directly, which is faster.
-
-```python
-# docs: skip
-import torch
-
-for batch in prepared.iter_batches(batch_size=256):
-    features = torch.tensor([batch.column(c).to_pylist() for c in ("f0", "f1")]).T
-    labels = torch.tensor(batch.column("label").to_pylist())
-    # forward, loss, backward, step ...
-```
-
 ## Distributed training with DDP and FSDP
 
-For data-parallel training across ranks, use `ds.ml.stream_loader`, which gives each
-rank a `torch.utils.data.IterableDataset` over its slice of a single, seed-reproducible
-global order. It is the one shard authority, so **disable any framework auto-sharding**,
-including a `DistributedSampler` or a DataLoader sampler, or the splits will overlap.
-Every rank yields the *same* number of batches, so no rank finishes early and stalls the
-others at the all-reduce barrier. DDP and FSDP both depend on that. `drop_last` only
-chooses how the epoch's tail is made divisible by `world_size`. The default `True` drops
-the remainder, and `False` keeps it and pads by repeating a few samples, exactly as
-`torch.utils.data.DistributedSampler` does. Neither mode hands the ranks unequal counts.
+For data-parallel training, use
+{py:meth}`ds.ml.stream_loader(...) <batcher.api.dataset.ml.DatasetML.stream_loader>`. It gives
+each rank a `torch.utils.data.IterableDataset` over its slice of one seed-reproducible global
+order, and it's the only shard authority. Disable any framework auto-sharding, including a
+`DistributedSampler`, or the splits overlap.
+
+Every rank yields the *same* number of batches, so none finishes early and stalls the others at
+the all-reduce barrier. `drop_last` only chooses how the epoch's tail becomes divisible by
+`world_size`. The default `True` drops the remainder, and `False` pads by repeating a few samples,
+as `DistributedSampler` does. A `collate_fn` here receives each batch as a `pyarrow.Table`.
 
 ```python
 # docs: skip
@@ -246,31 +202,20 @@ for batch in DataLoader(iterable, batch_size=None):  # batches are already sized
     optimizer.zero_grad()
 ```
 
-The same iterator drives FSDP unchanged. Sharding the *model*, which is what FSDP does,
-is orthogonal to sharding the *data*, which is what the loader does. The loader owns only
-the data split. Because the
-global order is deterministic in `(seed, epoch)` and independent of `world_size`, a job
-can checkpoint `global_consumed` and resume mid-epoch on a differently-sized cluster
-with no repeated or skipped samples. See {doc}`Streaming for training </ml/inference/streaming>` for the
-ordering contract and resumption in detail.
+The same iterator drives FSDP unchanged. FSDP shards the *model* and the loader shards the
+*data*, and the two don't interact. The global order depends on `(seed, epoch)` and not on
+`world_size`, so a job can checkpoint `global_consumed` and resume mid-epoch on a differently
+sized cluster. {doc}`Distributed training </ml/training/distributed-training>` covers the
+ordering and resume contract.
 
-## Behavior worth knowing
-
-Four details of this path surprise people often enough to state outright:
-
-- `iter_batches()` pulls batches incrementally for a breaker-free pipeline, so
-  memory stays bounded for datasets larger than RAM, with no flag needed.
-- Do feature engineering in `map_batches` and expressions, not in `__getitem__`.
-  The engine vectorizes it and runs it in parallel.
-- `iter_torch_batches` returns CPU 64-bit tensors as-is, but downcasts 64-bit columns
-  to 32-bit when targeting Apple MPS, which has no 64-bit dtype, so `device="auto"`
-  works on a dev box without a crash.
-- For inference rather than training, use {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>`. See
-  {doc}`Inference </ml/inference/inference>`.
+For inference rather than training, use
+{py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>`, described in
+{doc}`Inference </ml/inference/inference>`.
 
 ## See also
 
-- {doc}`Streaming </ml/inference/streaming>`: the `iter_batches()` contract and distributed
-  {py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>`.
+- {doc}`Data loaders </ml/training/data-loaders>`: which loader to use, larger-than-RAM shards, and TensorFlow.
+- {doc}`Distributed training </ml/training/distributed-training>`: balanced, deterministic, resumable ranks.
+- {doc}`Streaming for training </ml/inference/streaming>`: which plans `iter_batches` streams.
 - {doc}`GPU scheduling </ml/inference/gpu>`: run transforms on GPU workers.
-- {doc}`The ML accessor </api/models/ml>`: `map_batches` / `infer` / `embed`.
+- {doc}`The ML accessor </api/models/ml>`: `map_batches`, `infer`, and `embed`.

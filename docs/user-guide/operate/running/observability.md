@@ -12,8 +12,12 @@ bus:
 | Web dashboard | plans, per-operator timings, throughput, live logs | off ({py:func}`bt.start_ui() <batcher.start_ui>`) |
 | JSON event log | the durable per-query artifact, on disk | on |
 
-Because they share one source, they can never disagree: the timeline in the dashboard and
-the profile in the on-disk event log are the same measurements, under the same query id.
+Because they share one source, they can't disagree. The timeline in the dashboard and the
+profile in the on-disk event log are the same measurements, under the same query id.
+
+The event log takes one step more than the live surfaces. The per-query profile is assembled once, when the query finishes. Batcher publishes it onto the bus, which is how the dashboard gets it, and writes the same document to the event log. OpenTelemetry spans, when you turn them on, come from that same profile:
+
+![While a query runs, Kyber, Carbonite, Core, the distributed scheduler and the engine's log records all publish to one event bus, which carries a single query id. Three surfaces subscribe to it: the terminal progress bar for the live phase, the web dashboard started by bt.start_ui() for runs, plans and logs, and the process-wide metrics counters for throughput and durations. When the query ends, one measured query profile holding the plans, decisions and per-operator measurements is published back onto the bus as stages, written as the same document to the JSON event log on disk, which is on by default, and emitted from the same profile as OpenTelemetry spans when otel_traces is on. Because the profile is measured once, the dashboard and the event log can't disagree.](/_static/diagrams/observability_bus.svg)
 
 ## Verbosity, the one dial
 
@@ -149,15 +153,12 @@ number's meaning never depends on surrounding prose.
  "thread": "MainThread", "fields": {"tables": 3, "cost": 1.25}}
 ```
 
-That is why the same record is greppable at the terminal *and* queryable in your log
-platform without anyone re-parsing prose.
-
 Four fields are attached for you rather than by the call site:
 
 `query_id` names the query in flight. It is read from the ambient scope when the record is
 formatted rather than passed in, so a plain `logger.warning` deep inside a subsystem is
-correlated too. It is the same id the {doc}`event log <observability>` document, the plan
-DAG, and the dashboard row use, which is what makes a log line joinable to the plan and the
+correlated too. It is the same id the event log document, the plan DAG, and the dashboard
+row use, which is what makes a log line joinable to the plan and the
 profile that describe the same run.
 
 `time` is RFC 3339 in UTC. Log platforms reject a local-time, comma-separated stamp and
@@ -235,8 +236,7 @@ useful number when a query is slow for a reason the plan did not predict.
   "Show the plan as written" to see the plan before the optimizer touched it.
 - **What the optimizer changed**: the two plans compared. A pushdown is reported as one
   rewrite, with the steps it dragged past it listed separately rather than as four equal
-  findings. This has no direct equivalent in other engines' UIs, which show one plan at
-  a time.
+  findings.
 - **Plan document**: the exact JSON IR that crossed into the Rust engine, for when the
   rendering is the thing under suspicion.
 
@@ -373,9 +373,30 @@ these spans would silently exclude every timeout.
 | `batcher.op.spill_bytes` | operator | present only when the operator spilled, because a 1 GiB spill and a 100 GiB one are the same boolean |
 | `batcher.op.scope` | operator | `driver` or `worker`, distinguishing the driver tree from the distributed map sub-plan |
 
+## OpenLineage
+
+Column-level lineage leaves the process the same way. Set `openlineage=True` and Batcher posts
+one OpenLineage run event per query, a `START` before execution and a `COMPLETE` or `FAIL`
+after, carrying the column-level lineage the governance layer already computes:
+
+```python
+# docs: skip
+set_config(
+    active_config().replace(
+        observability=ObservabilityConfig(openlineage=True, openlineage_url="http://marquez:5000")
+    )
+)
+```
+
+An empty `openlineage_url` reads the standard `OPENLINEAGE_URL` variable, and an empty
+`openlineage_api_key` reads `OPENLINEAGE_API_KEY`. Events are posted from a bounded background
+queue, so a slow receiver costs a dropped event rather than query latency.
+{doc}`/integrations/observability/lineage` covers the receiver side.
+
 ## See also
 
 - {doc}`Explain plans </user-guide/operate/tuning/explain-plans>`: reading a plan before you run it.
 - {doc}`Performance </user-guide/operate/tuning/performance>`: turning what you saw here into a faster query.
 - {doc}`Troubleshooting </user-guide/operate/running/troubleshooting>`: symptom-first debugging.
+- {doc}`The terminal <terminal>` and {doc}`Metrics <metrics>`: the live line and the process-wide counters in depth.
 - {doc}`/cookbook/operations/observability`: verbosity, logging, and execution statistics, as a script.

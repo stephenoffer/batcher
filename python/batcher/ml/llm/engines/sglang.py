@@ -60,8 +60,7 @@ def sglang_engine(
     SGLang's RadixAttention prefix cache is on by default and is the reason to pick this
     backend for templated batch work: the shared opening of every row's prompt is prefilled
     once for the batch rather than once per row. Sorting a batch so that rows sharing a
-    prefix are adjacent makes the tree hit more often, which is what
-    ``llm_generate(sort_by_length=...)`` already does for a different reason.
+    prefix are adjacent makes the tree hit more often.
 
     Examples:
         .. doctest::

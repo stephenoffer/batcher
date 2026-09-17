@@ -1,21 +1,12 @@
 # Image classification
 
-The GPU is not the bottleneck in an image-classification job. Decoding JPEGs is. Run the
-decode and the forward pass in lockstep and the device sits idle through every decode,
-which is how a ResNet-50 pipeline ends up at 942 img/s and ~30% utilization. Overlap them
-so the CPU decodes morsel *k+1* while the GPU is still on morsel *k*, and the same hardware
-does 2,504 img/s at 81%. Batcher overlaps stages by default. The job of this page is to not
-get in its way.
+The GPU is not the bottleneck in an image-classification job. Decoding JPEGs is. Run the decode and the forward pass in lockstep and the device sits idle through every decode, which is how a ResNet-50 pipeline ends up at 942 img/s and ~30% utilization. Overlap them so the CPU decodes morsel *k+1* while the GPU is still on morsel *k*, and the same hardware does 2,504 img/s at 81%. Batcher overlaps stages by default. The job of this page is to not get in its way.
 
 ## Read, decode, classify
 
-{py:meth}`bt.read.images(..., decode=True, size=(h, w)) <batcher.api.io_namespace.reader.Reader.images>` lists the files, decodes and resizes in
-the data plane (SIMD JPEG, SIMD resize, fanned out across every core), and hands you a
-fixed-shape `(h, w, 3)` tensor column. Always pass a `size`: a batch of full-resolution
-frames will exhaust host memory long before it reaches the model.
+{py:meth}`bt.read.images(..., decode=True, size=(h, w)) <batcher.api.io_namespace.reader.Reader.images>` lists the files, decodes and resizes in the data plane (SIMD JPEG, SIMD resize, fanned out across every core), and hands you a fixed-shape `(h, w, 3)` tensor column. Always pass a `size`: a batch of full-resolution frames will exhaust host memory long before it reaches the model.
 
-The same pipeline shape runs with a real network on GPUs, or with a stand-in on a laptop.
-Only the model stage changes.
+The same pipeline shape runs with a real network on GPUs, or with a stand-in on a laptop. Only the model stage changes.
 
 ::::{tab-set}
 :::{tab-item} ResNet-50 on GPUs
@@ -55,18 +46,12 @@ scored = images.ml.infer(
 scored.drop("image").write.parquet("s3://bucket/labels.parquet")
 ```
 
-`ResNet` is passed as a class, not an instance and not a function. `map_batches` (and
-`infer`, which lowers to it) constructs it once per worker; a function would rebuild the
-model on every batch.
+`ResNet` is passed as a class, not an instance and not a function. `map_batches` (and `infer`, which lowers to it) constructs it once per worker; a function would rebuild the model on every batch.
 :::
 
 :::{tab-item} No GPU, no weights
 
-The decode half runs anywhere, with no GPU and no weights, because it is an engine
-expression.
-{py:meth}`.image.to_tensor(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` decodes and resizes natively; the classifier below is a
-brightness threshold standing in for a forward pass, with exactly the shape a real one
-has.
+The decode half runs anywhere, with no GPU and no weights, because it is an engine expression. {py:meth}`.image.to_tensor(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` decodes and resizes natively; the classifier below is a brightness threshold standing in for a forward pass, with exactly the shape a real one has.
 
 ```python
 import io
@@ -110,40 +95,25 @@ print(scored.to_pydict())
 # {'path': ['dark.jpg', 'bright.jpg'], 'label': ['night', 'day']}
 ```
 
-Everything before `.ml.infer` is a lazy plan the engine runs on CPU workers while the
-model stage holds the GPU. That separation is the whole trick: shape the input in the
-engine, hand the actor a ready batch.
+Everything before `.ml.infer` is a lazy plan the engine runs on CPU workers while the model stage holds the GPU. That separation is the whole trick: shape the input in the engine, hand the actor a ready batch.
 :::
 ::::
 
 :::{warning}
-A GPU stage handed a bare function raises a `PerformanceWarning`, and that warning is nearly
-always a real 10× on the table. The weights belong in `__init__`, which runs once per worker,
-not in the call the engine makes on every batch.
+A GPU stage handed a bare function raises a `PerformanceWarning`, and that warning is nearly always a real 10× on the table. The weights belong in `__init__`, which runs once per worker, not in the call the engine makes on every batch.
 :::
 
 :::{tip}
-Leave `batch_size` unset if you do not have a number in mind. The pool starts from
-`model_memory_gb` and the free VRAM, then hill-climbs the batch size against measured
-throughput. Zero-config (`map_batches(Model, num_gpus=1)` with no `batch_size`) runs at
-2,451 img/s and 82% utilization, within 2% of the hand-tuned batch size.
+Leave `batch_size` unset if you do not have a number in mind. The pool starts from `model_memory_gb` and the free VRAM, then hill-climbs the batch size against measured throughput. Zero-config (`map_batches(Model, num_gpus=1)` with no `batch_size`) runs at 2,451 img/s and 82% utilization, within 2% of the hand-tuned batch size.
 :::
 
 ## One corrupt JPEG should cost you one JPEG
 
 :::{important}
-Real corpora contain truncated files, HTML error pages saved with a `.jpg` extension, and
-CMYK JPEGs that decode to four channels. A six-hour job that dies at hour five on one of
-them is the default outcome in most engines. Batcher's error tolerance is per row rather
-than per block, so with about 1% corrupt rows injected across 200k rows it keeps 99% of the
-data and loses only the bad rows.
+Real corpora contain truncated files, HTML error pages saved with a `.jpg` extension, and CMYK JPEGs that decode to four channels. A six-hour job that dies at hour five on one of them is the default outcome in most engines. Batcher's error tolerance is per row rather than per block, so with about 1% corrupt rows injected across 200k rows it keeps 99% of the data and loses only the bad rows.
 :::
 
-Two knobs get you there. `on_error="null"` on the fetch turns a failed download into a
-null instead of an exception. `max_errored_rows` on the model stage bisects a batch whose
-`fn` raised, drops the offending rows (up to that budget, per worker), and carries on. A
-corrupt image costs one row, while a genuine bug on clean data still fails fast once the
-budget is spent.
+Two knobs get you there. `on_error="null"` on the fetch turns a failed download into a null instead of an exception. `max_errored_rows` on the model stage bisects a batch whose `fn` raised, drops the offending rows (up to that budget, per worker), and carries on. A corrupt image costs one row, while a genuine bug on clean data still fails fast once the budget is spent.
 
 :::{dropdown} The fetch → decode → score pipeline, error-tolerant end to end
 
@@ -168,19 +138,9 @@ scored = (
 )
 ```
 
-{py:meth}`.image.to_tensor_f32(w, h, mean=, std=, channels_first=) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor_f32>` does the full torchvision
-`ToTensor` + `Normalize` step natively: it decodes, resizes, scales to `[0, 1]`, applies
-the per-channel ImageNet mean/std, and emits a channel-first `float32` tensor. The
-whole preprocessing chain stays in the engine, and the model receives a ready tensor with
-no per-batch Python (`/255`, `Normalize`, `permute`). Use the plain `.image.to_tensor(w, h)`
-when the model wants raw `uint8` HWC pixels instead.
+{py:meth}`.image.to_tensor_f32(w, h, mean=, std=, channels_first=) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor_f32>` does the full torchvision `ToTensor` + `Normalize` step natively: it decodes, resizes, scales to `[0, 1]`, applies the per-channel ImageNet mean/std, and emits a channel-first `float32` tensor. The whole preprocessing chain stays in the engine, and the model receives a ready tensor with no per-batch Python (`/255`, `Normalize`, `permute`). Use the plain `.image.to_tensor(w, h)` when the model wants raw `uint8` HWC pixels instead.
 
-When the model was trained with the classic *resize-then-crop* recipe (`Resize(256)` then
-`CenterCrop(224)`), {py:meth}`.image.center_crop(w, h) <batcher.plan.expr_ir.image._ImageNamespace.center_crop>` is the crop half. It decodes and takes the
-centered `(w, h)` window, zero-padding a too-small image the way torchvision `CenterCrop`
-does, so you can chain it with the tensor step to match the model's exact eval
-transform. For a model that takes a single-channel input, {py:meth}`.image.to_grayscale(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_grayscale>` decodes,
-resizes, and reduces to one Rec.601 luminance channel (`(h, w, 1)`) in the same native pass.
+When the model was trained with the classic *resize-then-crop* recipe (`Resize(256)` then `CenterCrop(224)`), {py:meth}`.image.center_crop(w, h) <batcher.plan.expr_ir.image._ImageNamespace.center_crop>` is the crop half. It decodes and takes the centered `(w, h)` window, zero-padding a too-small image the way torchvision `CenterCrop` does, so you can chain it with the tensor step to match the model's exact eval transform. For a model that takes a single-channel input, {py:meth}`.image.to_grayscale(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_grayscale>` decodes, resizes, and reduces to one Rec.601 luminance channel (`(h, w, 1)`) in the same native pass.
 :::
 
 Count what you dropped rather than trusting that you dropped nothing:
@@ -194,17 +154,11 @@ print(fetched.filter(col("bytes").is_null()).count())
 # 1
 ```
 
-If that number is not roughly what you expect, the problem is upstream and no amount of
-error tolerance will fix it.
+If that number is not roughly what you expect, the problem is upstream and no amount of error tolerance will fix it.
 
 ## Sizing the pool
 
-`num_gpus` is how much of a device each actor holds; `concurrency` is how many actors
-run. A ResNet-50 fills a T4, so `num_gpus=1, concurrency=4` across four devices. A small
-model does not: `num_gpus=0.5, concurrency=8` packs two actors per GPU and roughly
-doubles throughput on an EfficientNet-B0-sized network. Or state `model_memory_gb` and
-let Kyber pick the fraction. Anything you set explicitly is honored, and only what you leave
-unset is chosen for you.
+`num_gpus` is how much of a device each actor holds; `concurrency` is how many actors run. A ResNet-50 fills a T4, so `num_gpus=1, concurrency=4` across four devices. A small model does not: `num_gpus=0.5, concurrency=8` packs two actors per GPU and roughly doubles throughput on an EfficientNet-B0-sized network. Or state `model_memory_gb` and let Kyber pick the fraction. Anything you set explicitly is honored, and only what you leave unset is chosen for you.
 
 | Argument | What it means | Leave it unset when |
 | --- | --- | --- |
@@ -230,11 +184,9 @@ Pin a device model with `accelerator_type="NVIDIA_A100"` on a heterogeneous clus
 - {doc}`Image captioning </cookbook/ml/pipelines/multimodal/image-captioning>`: the same pipeline with a vision-language model.
 - {doc}`Audio transcription </cookbook/ml/pipelines/multimodal/audio-transcription>`: the same decode → model shape, for sound.
 - {doc}`GPU scheduling </ml/inference/gpu>`: fractional packing and autoscaling pools in full.
-- {doc}`Inference </ml/inference/inference>` and {doc}`batch scoring </ml/inference/batch-scoring>`: the
-  `map_batches` / `ml.infer` surface these calls lower to.
+- {doc}`Inference </ml/inference/inference>` and {doc}`batch scoring </ml/inference/batch-scoring>`: the `map_batches` / `ml.infer` surface these calls lower to.
 - {doc}`Multimodal </ml/preparing/multimodal/index>`: the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>` decode expressions.
 - {doc}`ML API reference </api/models/ml>`: every argument of {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.download <batcher.api.dataset.ml.DatasetML.download>`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: where the numbers above come from.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: how the CPU and GPU stages overlap.
-- {doc}`PyTorch integration </integrations/compute/pytorch>`: handing these tensors to a training
-  loop.
+- {doc}`PyTorch integration </integrations/compute/pytorch>`: handing these tensors to a training loop.

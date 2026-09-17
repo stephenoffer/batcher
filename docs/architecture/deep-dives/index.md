@@ -1,11 +1,12 @@
 # Deep dives
 
-This section explains how the engine works, one mechanism at a time: what it is for, how it
-works, what it costs, and where the code lives. Each page names real files, so you can stop
+This section explains the engine one mechanism at a time: what each mechanism is for, how it
+works, what it costs, and where the code lives. Every page names real files, so you can stop
 reading and go look.
 
-The engine is described at three zoom levels, all nested under the Architecture section, and
-they are meant to be read in this order:
+Read these pages when a query surprised you and you want the reason, or when you want to know
+exactly what a claim on the {doc}`differentiators </architecture/differentiators>` page rests
+on. They sit in the middle of three zoom levels:
 
 | Level | Zoom | Read it when |
 |---|---|---|

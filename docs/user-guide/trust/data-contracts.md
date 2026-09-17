@@ -13,10 +13,15 @@ and the schema itself. For the row-level vocabulary and the fail/drop/quarantine
 
 A relation-level constraint is one number over the whole table, compared against bounds. It
 lives on the same {py:obj}`ds.dq <batcher.Dataset.dq>` accessor and mixes freely with row-level checks in one
-chain. It parts company at the terminal. There is no violating row, so `drop` and
-`quarantine` refuse a relation-level constraint rather than quietly enforcing the subset of
-your contract that happens to have rows attached to it. Check these with `validate` or
-`fail`.
+chain. It parts company at the terminal. There is no violating row, so `drop`,
+`quarantine` and `annotate` refuse a relation-level constraint with a `PlanError` rather
+than quietly enforcing the subset of your contract that happens to have rows attached to it.
+Check these with `validate` or `fail`.
+
+Schema constraints, covered under "Schema contracts" below, are a third kind with a third answer at
+the same terminals:
+
+![A matrix of three kinds of check against what each costs and which terminals accept it. Row-level checks such as not_null, in_range and not_in_future decide whether each row is valid; validate counts them in one keyless aggregate, with unique and references adding a pass apiece. Relation-level checks such as row_count_between, mean_between and fresh_within decide one number for the whole table, measured in that same keyless aggregate. Schema checks such as has_columns and column_types decide column names and types, and cost nothing because the schema is known before anything runs. All three work with validate and fail: a row-level result counts violations, a relation-level result carries the measured value, and a schema result names the mismatch. drop, quarantine and annotate act on individual rows. They accept row-level checks, refuse a relation-level check with PlanError because no violating row exists, and treat a schema check as a gate, raising DataQualityError before any row work when the schema is not met.](/_static/diagrams/dq_contract_matrix.svg)
 
 ```python
 import batcher as bt
@@ -99,9 +104,8 @@ print(report.ok, round(report.result("null_rate_below(customer_id, 0.25)").value
 # True 0.2
 ```
 
-One of the five customer ids is NULL, so the null rate is 0.2 and a 0.25 bound holds. Read
-`result(...).value` whenever a bound surprises you: the measured number is carried on the
-result, so you never have to re-derive it by hand.
+One of the five customer ids is NULL, so the null rate is 0.2 and a 0.25 bound holds. When a
+bound surprises you, read `result(...).value` before re-deriving anything by hand.
 
 ## Freshness
 
@@ -166,9 +170,9 @@ that would be wrong for a reason the error would not name.
 
 ## Publishing the result
 
-`ValidationReport.to_dict` renders the whole report as plain data, the summary counts plus
-one entry per constraint carrying its severity, tolerance, pass rate and measured value,
-which is the shape a metrics sink or a run log wants. The mapping is JSON-serializable.
+`ValidationReport.to_dict` renders the whole report as JSON-serializable data: the summary
+counts, plus one entry per constraint carrying its severity, tolerance, pass rate and
+measured value. A metrics sink or a run log takes it as is.
 
 ```python
 payload = orders.dq.row_count_between(1).mean_between("amount", 1.0, 500.0).validate().to_dict()
@@ -178,12 +182,12 @@ print(sorted(payload["constraints"][1]))
 # ['kind', 'mostly', 'name', 'ok', 'pass_rate', 'rows', 'severity', 'value', 'violations']
 ```
 
-Pair it with `severity="warn"` to chart a contract before enforcing it: the constraint is
+Pair it with `severity="warn"` to chart a contract before enforcing it. The constraint is
 measured and reported on every run, and never fails one.
 
 ## Profiling before you write the contract
 
-Writing bounds without profiling first is guessing. {py:meth}`describe <batcher.Dataset.describe>`,
+Bounds written without profiling are guesses. {py:meth}`describe <batcher.Dataset.describe>`,
 {py:meth}`null_count <batcher.Dataset.null_count>`, and {py:meth}`count_distinct <batcher.Dataset.count_distinct>` give you the numbers the
 bounds should be built from, and {doc}`/user-guide/analyze/metadata-shortcuts` answers many of
 them from file footers without reading the data at all.

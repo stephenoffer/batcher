@@ -1,15 +1,10 @@
 # Embeddings
 
-Three things around the forward pass cost more than the forward pass: loading the model once
-per worker instead of once per batch, keeping the GPU fed, and not embedding the same document
-three times because the corpus has duplicates. Get those right and a 100M-document embed job is
-a scan with a GPU stage bolted to it.
+This page covers computing, cleaning, storing and evaluating embeddings with Batcher. The forward pass is rarely what makes an embed job expensive. Loading the model once per batch instead of once per worker is, and so is a GPU left waiting for data, and so is embedding the same document three times because the corpus has duplicates. Get those right and a large embed job is a scan with a GPU stage attached.
 
 ## Embed a column
 
-{py:meth}`ds.ml.embed(model, column=...) <batcher.api.dataset.ml.DatasetML.embed>` takes a model identifier and resolves a
-`sentence-transformers` model, loading it once per worker. Pass a **class** instead when
-the encoder is yours: a local ONNX model, a fine-tuned checkpoint, a non-text modality.
+{py:meth}`ds.ml.embed(model, column=...) <batcher.api.dataset.ml.DatasetML.embed>` takes a `sentence-transformers` model identifier and loads the model once per worker. It needs the `batcher-engine[st]` extra. Pass a class instead when the encoder is yours, such as a local ONNX model, a fine-tuned checkpoint, or a non-text modality.
 
 ::::{tab-set}
 :::{tab-item} A model identifier
@@ -23,7 +18,7 @@ vectors = docs.ml.embed("sentence-transformers/all-MiniLM-L6-v2", column="text")
 vectors.write.parquet("s3://bucket/vectors.parquet")
 ```
 
-That appends an `embedding` column and is the whole job for the common case.
+That appends an `embedding` column, and for the common case it's the whole job. On this path, `normalize=True` L2-normalizes in the same pass and `fp16=True` runs the encoder in half precision on a GPU.
 
 :::
 
@@ -54,33 +49,27 @@ vectors = docs.ml.embed(
 )
 ```
 
-The class is constructed once per worker, and you declare the output schema.
+The class is constructed once per worker, and `output_columns` declares the result schema. The options that only configure the identifier path, such as `column`, `normalize` and `output_type`, are rejected in this shape rather than ignored.
 
 :::
 ::::
 
 :::{tip}
-Pass the class, not a function. A bare function would rebuild the model on every batch,
-which is the single most expensive mistake in this API: on a 5,000-batch job it is 5,000
-model loads instead of one per worker.
+Pass the class, not a function. A plain function that builds the model runs on every batch, so a 5,000-batch job does 5,000 model loads instead of one per worker. Batcher warns when a GPU stage gets a plain function.
 :::
 
-Sizing the actor pool is the other half of keeping the device busy.
+Sizing the actor pool is the other half of keeping the device busy. The following table shows the two usual shapes:
 
 | Encoder | Pool | What you get |
 | --- | --- | --- |
 | Large enough to fill a device | `num_gpus=1, concurrency=4` | four actors, each holding a whole GPU |
-| Small (MiniLM is 90 MB) | `num_gpus=0.25, concurrency=8` | several packed onto each device, usually double the throughput |
+| Small (MiniLM is 90 MB) | `num_gpus=0.25, concurrency=8` | several actors packed onto each device |
 
 See {doc}`GPU scheduling </ml/inference/gpu>`.
 
 ## Embed via a served endpoint
 
-The embedding model can also run behind a service, such as a HuggingFace
-Text-Embeddings-Inference (TEI) server on a GPU box or a hosted API such as OpenAI.
-The worker then calls it instead of
-loading weights. Two load-once encoders speak the two common wire shapes and drop into
-`ds.ml.embed` exactly like a local model:
+The model can also run behind a service, such as a HuggingFace Text-Embeddings-Inference (TEI) server or a hosted API such as OpenAI. The worker calls the service instead of loading weights. Two load-once encoders speak the two common wire shapes and drop into `ds.ml.embed` like a local model:
 
 ```python
 # docs: skip
@@ -97,14 +86,9 @@ tei = tei_encoder("text", base_url="http://tei-host:8080")
 vectors = docs.ml.embed(tei, output_columns=["id", "text", "embedding"])
 ```
 
-Each batch's texts are sent in concurrent, size-bounded requests, so a served endpoint is
-saturated rather than called one row at a time. The `dimensions` argument asks a Matryoshka
-model (the `text-embedding-3-*` family) for a shorter vector, trading a little recall for a
-smaller index. The output column is a `fixed_size_list<float32>`, the shape Lance ANN
-indexing expects, so the served and local paths are interchangeable downstream.
+Each batch's texts go out in size-bounded requests, up to `concurrency` in flight (8 by default), so the endpoint stays busy instead of being called one row at a time. `dimensions` asks a Matryoshka model such as the `text-embedding-3-*` family for a shorter vector, trading a little recall for a smaller index. TEI normalizes and truncates server-side. Both encoders default to `output_type="fixed_size_list"`, the shape Lance ANN indexing expects.
 
-The mechanics run without a GPU, which is worth seeing once. The encoder here is a toy,
-but the pipeline shape is the real one.
+The mechanics run without a GPU. The encoder in the following example is a toy, but the pipeline shape is the real one:
 
 ```python
 import pyarrow as pa
@@ -130,10 +114,7 @@ print(vectors.to_pydict())
 
 ## Normalize once, at write time
 
-Cosine similarity is a dot product divided by both magnitudes. On unit-length vectors
-those magnitudes are 1, so cosine and dot rank identically, and dot is the cheaper
-kernel. Normalize at ingest with {py:meth}`.list.normalize() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.normalize>` and every query afterwards gets to
-use the cheap one.
+Cosine similarity is a dot product divided by both magnitudes. On unit-length vectors those magnitudes are 1, so cosine and dot rank identically and dot is the cheaper kernel. Normalize once at ingest, either with `normalize=True` on the embed call or with {py:meth}`.list.normalize() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.normalize>` afterwards, and every later query can use dot.
 
 ```python
 from batcher import col
@@ -143,16 +124,11 @@ print(unit.select(norm=col("embedding").list.l2_norm()).to_pydict())
 # {'norm': [1.0, 1.0, 1.0]}
 ```
 
-Check an unfamiliar source with {py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` before spending a pass normalizing vectors
-that are already normalized. Many hosted embedding APIs return unit vectors. Many local models
-do not.
+Check an unfamiliar source with {py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` before spending a pass on vectors that are already unit length. Many hosted APIs return unit vectors. Many local models don't.
 
 ## Binarize for cheap Hamming search
 
-When a small recall loss is acceptable, a binary embedding is far cheaper to search: each
-dimension becomes one bit by its sign, and distance is a bit count rather than a float dot
-product. {py:meth}`ds.ml.binarize_embeddings <batcher.api.dataset.ml.DatasetML.binarize_embeddings>` produces the sign code, and {py:meth}`nearest_neighbors <batcher.api.dataset.ml.DatasetML.nearest_neighbors>` ranks
-it with `metric="hamming"`.
+When a small recall loss is acceptable, a binary embedding is far cheaper to search. Each dimension becomes one bit by its sign, and distance is a bit count instead of a float dot product. {py:meth}`ds.ml.binarize_embeddings <batcher.api.dataset.ml.DatasetML.binarize_embeddings>` produces the sign code, and {py:meth}`nearest_neighbors <batcher.api.dataset.ml.DatasetML.nearest_neighbors>` ranks it with `metric="hamming"`.
 
 ```python
 coded = vectors.ml.binarize_embeddings("embedding", output_column="code")
@@ -162,10 +138,7 @@ print(coded.select(col("code")).to_pydict()["code"][0])
 
 ## Shrink and screen the vectors
 
-A Matryoshka-trained model (the `text-embedding-3-*` family, Nomic, mxbai) packs the most
-signal into the leading dimensions, so a prefix is a smaller, faster index for a small
-recall cost. Take the prefix with {py:meth}`ds.ml.truncate_embeddings <batcher.api.dataset.ml.DatasetML.truncate_embeddings>`, which re-normalizes it. A
-raw slice is no longer unit length, and a cosine index silently assumes it is:
+A Matryoshka-trained model such as the `text-embedding-3-*` family, Nomic or mxbai packs the most signal into the leading dimensions, so a prefix makes a smaller, faster index at a small recall cost. Take the prefix with {py:meth}`ds.ml.truncate_embeddings <batcher.api.dataset.ml.DatasetML.truncate_embeddings>`, which re-normalizes it by default. A raw slice is no longer unit length, and a cosine index silently assumes it is:
 
 ```python
 short = unit.ml.truncate_embeddings("embedding", 2)
@@ -173,9 +146,11 @@ print(short.select(norm=col("embedding").list.l2_norm()).to_pydict())
 # {'norm': [1.0, 1.0, 1.0]}
 ```
 
-Before indexing, drop rows whose vector is the zero vector or null. A zero vector has no
-direction, so an index returns it as a garbage neighbor; it usually means an empty input
-or a failed encode. {py:meth}`ds.ml.drop_degenerate_embeddings <batcher.api.dataset.ml.DatasetML.drop_degenerate_embeddings>` removes both:
+The following diagram sets normalizing, binarizing and shrinking side by side:
+
+![Three ways to make a vector cheaper. Normalize, with normalize=True on the embed call or .list.normalize() afterwards, makes each vector unit length with the same dimensions, so a dot product ranks like cosine with no recall lost. Binarize, with ml.binarize_embeddings, turns each dimension into a 0 or a 1 by its sign and searches by Hamming distance with metric="hamming", at a small recall loss. Shrink, with ml.truncate_embeddings and a dimension count, keeps the first dim values and re-normalizes them for a smaller, faster index, at a small recall cost, and applies only to a Matryoshka-trained model such as text-embedding-3-*, Nomic or mxbai.](/_static/diagrams/embedding_compaction.svg)
+
+Before indexing, drop rows whose vector is null or all zeros. A zero vector has no direction, so an index returns it as a garbage neighbor. It usually means an empty input or a failed encode. {py:meth}`ds.ml.drop_degenerate_embeddings <batcher.api.dataset.ml.DatasetML.drop_degenerate_embeddings>` removes both:
 
 ```python
 with_holes = bt.from_pydict({"id": [1, 2, 3], "embedding": [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]]})
@@ -186,11 +161,7 @@ print(clean.to_pydict()["id"])
 
 ## Deduplicate before you embed, not after
 
-Embedding is the expensive stage. Every duplicate document is a full forward pass you did
-not need, and web corpora are full of them: the same article under three headers, the
-same product blurb from four suppliers. `distinct` removes byte-identical rows, and
-{py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` removes the ones that are the same document with a different
-header.
+Every duplicate document is a forward pass you didn't need, and web corpora are full of them: the same article under three headers, the same product blurb from four suppliers. `distinct` removes byte-identical rows, and {py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` removes the same document with a different header.
 
 ```python
 corpus = bt.from_pydict(
@@ -209,17 +180,11 @@ print(sorted(deduped.to_pydict()["id"]))
 # [1, 4]
 ```
 
-Two of the four documents were going to cost a forward pass each for nothing. On a real
-crawl the near-duplicate rate is routinely 20% to 40%, and that is the same fraction off
-your GPU bill. See {doc}`preprocessors </ml/preparing/preprocessors/index>` for the MinHash and LSH tuning.
+Two of the four documents would have cost a forward pass each for nothing, and every row dropped here comes straight off the GPU bill. See {doc}`deduplication </ml/preparing/preprocessors/deduplication>` for the MinHash and LSH tuning.
 
 ## Fuse dense and lexical rankings
 
-Dense embedding search and lexical (BM25) search miss different things: the embedding finds
-paraphrases, the keyword match finds exact terms and rare tokens. Hybrid retrieval runs both
-and fuses the rankings. {py:meth}`ds.ml.reciprocal_rank_fusion <batcher.api.dataset.ml.DatasetML.reciprocal_rank_fusion>` does the fusing without asking you to
-put the two score scales into agreement. Each list contributes `1 / (k + rank)` per key, and
-a document ranked highly by either retriever floats up.
+Dense and lexical (BM25) search miss different things. The embedding finds paraphrases, and the keyword match finds exact terms and rare tokens. Hybrid retrieval runs both and fuses the rankings. {py:meth}`ds.ml.reciprocal_rank_fusion <batcher.api.dataset.ml.DatasetML.reciprocal_rank_fusion>` fuses them without putting the two score scales into agreement. Each list contributes `1 / (k + rank)` per key, with `k=60` by default, and a document ranked highly by either retriever floats up.
 
 ```python
 dense = bt.from_pydict({"id": [1, 2, 3], "score": [0.9, 0.5, 0.1]})
@@ -229,15 +194,11 @@ print(fused.to_pydict()["id"])
 # [2, 3, 1, 4]
 ```
 
-Documents 2 and 3, ranked by both retrievers, win; 1 and 4, each ranked by only one, follow.
-Pass more result sets as extra arguments to fuse three or more retrievers.
+Documents 2 and 3, ranked by both retrievers, win. Documents 1 and 4, each ranked by only one, follow. Pass more result sets as extra arguments to fuse three or more retrievers.
 
 ## Score a whole query set at once
 
-Evaluating retrieval means running many queries against the corpus, not one.
-{py:meth}`ds.ml.batched_nearest_neighbors <batcher.api.dataset.ml.DatasetML.batched_nearest_neighbors>` scores a query set against this corpus and keeps each
-query's top `k` in one pass. It is an exact, index-free brute force that is right for an eval set
-and honest about being `O(queries x corpus)`.
+Evaluating retrieval means running many queries, not one. {py:meth}`ds.ml.batched_nearest_neighbors <batcher.api.dataset.ml.DatasetML.batched_nearest_neighbors>` scores a query set against the corpus and keeps each query's top `k` in one pass. It's exact, index-free brute force at `O(queries x corpus)`: right for an eval set, wrong for production serving.
 
 ```python
 corpus = bt.from_pydict({"cid": [1, 2, 3], "emb": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]})
@@ -249,11 +210,9 @@ print(sorted(zip(hits.to_pydict()["qid"], hits.to_pydict()["cid"])))
 # [(10, 1), (11, 2)]
 ```
 
-For a large corpus queried in production, build an ANN index instead, as described below.
+For a large corpus queried in production, build an ANN index instead. See {doc}`vector search </ml/retrieval/vector-search>`.
 
-Once you have the retrieved neighbors and a set of ground-truth relevant pairs,
-{py:meth}`ds.ml.recall_at_k <batcher.api.dataset.ml.DatasetML.recall_at_k>` scores the retrieval: of the documents that should have come back for
-each query, what fraction did, averaged over queries.
+With the retrieved neighbors and a set of ground-truth relevant pairs, {py:meth}`ds.ml.recall_at_k <batcher.api.dataset.ml.DatasetML.recall_at_k>` scores the retrieval: of the documents that should have come back for each query, the fraction that did, averaged over queries.
 
 ```python
 retrieved = bt.from_pydict({"qid": [1, 1, 2, 2], "cid": [10, 11, 20, 21]})
@@ -262,9 +221,7 @@ print(round(retrieved.ml.recall_at_k(relevant, query_key="qid", corpus_key="cid"
 # 0.75
 ```
 
-Recall asks whether the right documents came back; {py:meth}`ds.ml.mrr <batcher.api.dataset.ml.DatasetML.mrr>` asks how *high* the first
-right one ranked. Ask for the rank alongside the neighbors (`rank_column="rank"` on
-{py:meth}`batched_nearest_neighbors <batcher.api.dataset.ml.DatasetML.batched_nearest_neighbors>`), then:
+Recall asks whether the right documents came back. {py:meth}`ds.ml.mrr <batcher.api.dataset.ml.DatasetML.mrr>` asks how *high* the first right one ranked. Pass `rank_column="rank"` to {py:meth}`batched_nearest_neighbors <batcher.api.dataset.ml.DatasetML.batched_nearest_neighbors>` to get the rank alongside the neighbors, then score it:
 
 ```python
 ranked = bt.from_pydict({"qid": [1, 1, 2, 2], "cid": [10, 11, 20, 21], "rank": [1, 2, 1, 2]})
@@ -275,14 +232,10 @@ print(ranked.ml.mrr(relevant, query_key="qid", corpus_key="cid"))
 ## Chunk long documents first
 
 :::{warning}
-An embedding model has a context limit, and text past it is silently truncated. You get a
-vector for the first 512 tokens and a false belief that it represents the document.
-Nothing raises, nothing warns, and the retrieval quality quietly is not what you
-think it is.
+An embedding model has a context limit, and text past it is silently truncated. You get a vector for the first few hundred tokens and a false belief that it represents the document. Nothing raises and nothing warns.
 :::
 
-Split first with {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>`, then `explode` into one row per chunk, and
-each chunk gets its own vector.
+Split first with {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>`, then `explode` into one row per chunk so each chunk gets its own vector.
 
 ```python
 long_docs = bt.from_pydict({"id": [1], "body": ["abcdefghij"]})
@@ -291,17 +244,13 @@ print(chunks.to_pydict()["chunk"])
 # ['abcd', 'defg', 'ghij']
 ```
 
-`overlap` keeps a sentence cut across a boundary whole in one of the two chunks. Sizes
-are in characters, so pick one comfortably under the model's token limit. A rough rule is
-4 characters per token. Keep the document id on the row so you can attribute a retrieved
-chunk back to its source. {doc}`RAG </ml/retrieval/rag>` walks the full ingest.
+`overlap` keeps a sentence cut across a boundary whole in one of the two chunks. Sizes are in characters, so pick one comfortably under the model's token limit, using about 4 characters per token as a rough rule. Keep the document id on the row so a retrieved chunk can be traced to its source. {doc}`RAG </ml/retrieval/rag>` walks the full ingest.
 
-## Storing vectors
+If you want one vector per document instead, the lower-level `batcher.ml.embed` takes `chunk_size` and `chunk_overlap`. It encodes every window in the same batched call and averages a row's windows back into one vector.
 
-An embedding is a `List<Float64>` column. It is Arrow like any other column, so it writes
-to Parquet, joins, and filters without ceremony. Write to Lance instead when you intend
-to build an ANN index over it, which is what {doc}`vector search </ml/retrieval/vector-search>` needs at
-scale.
+## Store the vectors
+
+An embedding is an Arrow column like any other, so it writes to Parquet, joins and filters with no special handling. The model-id path appends a fixed-shape tensor column by default. Pass `output_type="fixed_size_list"` when you intend to build a Lance ANN index, because {py:func}`build_vector_index <batcher.ml.build_vector_index>` checks the column type up front and refuses a tensor column. Write to Lance when you need the index, which is what {doc}`vector search </ml/retrieval/vector-search>` needs at scale.
 
 ```python
 # docs: skip
@@ -309,18 +258,12 @@ unit.write.lance("s3://bucket/vectors.lance")
 ```
 
 :::{note}
-A 1024-dimension float64 vector is 8 KB per row, so a million rows is 8 GB. Cast to
-`float32` before writing if the recall loss is acceptable, and keep the vector column out
-of any sort or join that does not need it. {py:meth}`offload_blobs <batcher.Dataset.offload_blobs>` exists for exactly that. See
-{doc}`multimodal </ml/preparing/multimodal/index>`.
+A 1024-dimension float64 vector is 8 KB per row, so a million rows is 8 GB. Cast to `float32` before writing if the recall loss is acceptable, and keep the vector column out of any sort or join that doesn't need it. {py:meth}`offload_blobs <batcher.Dataset.offload_blobs>` moves a large payload column to a content-addressed store and leaves a handle behind. See {doc}`multimodal </ml/preparing/multimodal/index>`.
 :::
 
-## Driving the pool yourself
+## Drive the pool yourself
 
-Sometimes you are composing a stage rather than executing a {py:class}`Dataset <batcher.Dataset>`, inside a custom
-loop or a serving process. {py:func}`batcher.ml.embed <batcher.ml.embed>` does the same work over a bare batch iterator. It
-takes an `EncoderFactory`: a zero-argument callable returning an encoder, which is any
-callable from `list[str]` to one vector per string. The factory runs once per worker.
+Inside a custom loop or a serving process you may be composing a stage rather than executing a {py:class}`Dataset <batcher.Dataset>`. {py:func}`batcher.ml.embed <batcher.ml.embed>` does the same work over a bare batch iterator. It takes an `EncoderFactory`, a zero-argument callable returning an encoder, which is any callable from `list[str]` to one vector per string. The factory runs once per worker.
 
 ```python
 # docs: skip
@@ -337,12 +280,11 @@ def encoder_factory():
 batches = embed(chunks.iter_batches(), encoder_factory, text_column="chunk", num_workers=4)
 ```
 
-Same contract as the `WorkerFactory` in {doc}`inference </ml/inference/inference>`, which is why a local
-model, an ONNX runtime, and a hosted embedding API are interchangeable at this seam.
+It's the same contract as the `WorkerFactory` in {doc}`inference </ml/inference/inference>`, so a local model, an ONNX runtime and a hosted embedding API are interchangeable here.
 
-## Scoring embedding quality
+## Score embedding quality
 
-Each of these aggregates a per-row vector operation to a corpus score in one scan. {py:func}`bt.mean_cosine_similarity(query, doc) <batcher.mean_cosine_similarity>` is the headline retrieval-alignment number. {py:func}`bt.mean_euclidean_distance <batcher.mean_euclidean_distance>` and {py:func}`bt.mean_dot_product <batcher.mean_dot_product>` are the magnitude-sensitive and inner-product variants a distance-thresholded or MIPS index ranks by.
+Each metric in this section aggregates a per-row vector operation to a corpus score in one scan. {py:func}`bt.mean_cosine_similarity(query, doc) <batcher.mean_cosine_similarity>` is the headline retrieval-alignment number. {py:func}`bt.mean_euclidean_distance <batcher.mean_euclidean_distance>` and {py:func}`bt.mean_dot_product <batcher.mean_dot_product>` are the magnitude-sensitive and inner-product variants a distance-thresholded or MIPS index ranks by.
 
 ```python
 import batcher as bt
@@ -363,11 +305,7 @@ print(vecs.agg(drift=bt.mean_cosine_distance("a", "b")).to_pydict())
 # {'drift': [0.5]}
 ```
 
-Run {py:func}`bt.embedding_dim_drift <batcher.embedding_dim_drift>` on ingest, before the index build. A vector index is built for one
-dimension, and a column that mixes two is not a degraded index but a broken one: the mismatched
-rows either fail to insert or are silently dropped, and the queries that should have matched them
-return the next-nearest thing with a confident-looking distance. Nothing downstream notices,
-because both dimensions are valid embeddings.
+Run {py:func}`bt.embedding_dim_drift <batcher.embedding_dim_drift>` on ingest, before the index build. A vector index is built for one dimension, and a column that mixes two breaks it. The mismatched rows fail to insert or are silently dropped, and the queries that should have matched them return the next-nearest thing at a confident-looking distance. Nothing downstream notices, because both dimensions are valid embeddings.
 
 ```python
 mixed = bt.from_pydict({"v": [[1.0, 2.0, 3.0], [1.0, 2.0], [0.0, 1.0, 0.0]]})
@@ -375,21 +313,15 @@ print(round(mixed.agg(bad=bt.embedding_dim_drift("v", 3)).to_pydict()["bad"][0],
 # 0.3333
 ```
 
-The usual cause is a re-embed with a different model, or a read that spans a corpus embedded in
-two passes. `bt.mean_cosine_similarity` catches the same failure from the other side: score both
-populations against one fixed reference vector and compare the distributions. Two vector spaces
-mixed into one index look identical row by row. In aggregate they separate immediately.
+The usual cause is a re-embed with a different model, or a read spanning a corpus embedded in two passes. `bt.mean_cosine_similarity` catches the same failure from the other side: score both populations against one fixed reference vector and compare. Two vector spaces mixed into one index look identical row by row. In aggregate they separate immediately.
 
 ## See also
 
 - {doc}`Vector search </ml/retrieval/vector-search>`: retrieving against the vectors you built.
-- {doc}`RAG </ml/retrieval/rag>`: the full chunk → embed → retrieve → generate pipeline.
+- {doc}`RAG </ml/retrieval/rag>`: the full chunk, embed, retrieve and generate pipeline.
 - {doc}`GPU scheduling </ml/inference/gpu>`: sizing the actor pool that runs the encoder.
-- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: how a GPU stage is scheduled, and what
-  "once per worker" means underneath.
-- {doc}`Text embeddings recipe </cookbook/ml/pipelines/text/text-embeddings>`: the job, end to end, on a
-  real corpus.
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: how a GPU stage is scheduled, and what "once per worker" means underneath.
+- {doc}`Text embeddings recipe </cookbook/ml/pipelines/text/text-embeddings>`: the job end to end on a real corpus.
 - {doc}`RAG index recipe </cookbook/ml/pipelines/text/rag-index>`: the same vectors, written and indexed.
-- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what an embed job costs against
-  the alternatives.
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what an embed job costs against the alternatives.
 - {doc}`ML API </api/models/ml>`: the `ml.embed` and `EncoderFactory` reference.

@@ -1,6 +1,8 @@
 # Nulls and casting
 
-Null is not zero and not empty string, and every column aggregate skips it. Casting is where a schema mismatch between two sources gets resolved, and the strictness is a choice: `cast` raises on a value it cannot parse, while `try_cast` turns that value into a null instead. The second one fails silently. That is the point, and the risk.
+Null is not zero and not the empty string, and every column aggregate skips it. With one null present, `col("a").count()` is 2 where `bt.count()` is 3. Casting is where a schema mismatch between two sources gets resolved, and the strictness is a choice: `cast` raises on a value it cannot parse, while `try_cast` turns that value into a null. The second one fails silently. That is the point, and the risk.
+
+The script pins each of those behaviors with an assertion, uses `coalesce` as a multi-fallback `fill_null`, counts the nulls a `try_cast` introduced, and checks the float edge cases with `is_nan` and `is_finite`.
 
 The whole script, executed on every test run:
 

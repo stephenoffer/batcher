@@ -1,16 +1,12 @@
 # Working with video
 
-This page covers turning video clips into columns: sampling frames for a model, pulling a
-single still out of a clip, and reading a clip's metadata without decoding it.
+This page covers turning video clips into columns: sampling frames for a model, pulling a single still out of a clip, and reading a clip's metadata without decoding it.
 
-Video is the modality where the difference between decoding in the engine and decoding in
-Python matters most, because a clip is large and a frame is larger. The {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>` accessor
-runs in the data plane, so a video pipeline is a lazy expression like any other rather
-than a loop over rows.
+Video is where decoding in the engine instead of in Python matters most, because a clip is large and its decoded frames are far larger. The {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>` accessor runs in the data plane, so a video pipeline is a lazy expression like any other, not a loop over rows.
 
 ## What the accessor does
 
-Four operations, covering the three things a pipeline asks of a clip:
+The accessor has four operations, summarized in the following table:
 
 | Call | Result | Use it for |
 | --- | --- | --- |
@@ -19,16 +15,11 @@ Four operations, covering the three things a pipeline asks of a clip:
 | {py:meth}`.video.thumbnail(max_size) <batcher.plan.expr_ir.video._VideoNamespace.thumbnail>` | PNG bytes of the middle frame | review, curation, contact sheets |
 | {py:meth}`.video.frame_at(second, max_size) <batcher.plan.expr_ir.video._VideoNamespace.frame_at>` | PNG bytes of the frame at `second` | a row that already carries a timestamp |
 
-A clip that will not decode yields null rather than failing the batch, the same convention
-the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>` and {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>` accessors follow. Null is deliberate rather than a black frame:
-zeros are indistinguishable from a legitimately black clip, so they put blank samples into
-a training set with nothing to detect them by.
+A clip that won't decode yields null instead of failing the batch, the same convention the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>` and {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>` accessors follow. Null beats a black frame. Zeros are indistinguishable from a clip that really is black, so they'd put blank samples into a training set with nothing to detect them by.
 
 ## Read the metadata before you decode
 
-`decode()` parses the container header and stops. It never touches a frame, so it is cheap
-enough to run over a whole corpus, and it is how you drop the clips you did not want before
-paying to decode them:
+`decode()` parses the container header and stops. It never touches a frame, so it's cheap enough to run over a whole corpus, and it's how you drop unwanted clips before paying to decode them:
 
 ```python
 # docs: skip
@@ -42,19 +33,13 @@ usable = clips.filter(
 )
 ```
 
-The engine computes the struct once and reuses it, so naming two fields off it costs one
-header read rather than two.
+The engine computes the struct once and reuses it, so naming two fields costs one header read, not two.
 
 ## Triaging a clip corpus from the listing alone
 
-`read.video` also emits per-file metadata columns from the container header, without
-opening a clip a second time and without decoding a frame: `fps`, `frames`, `width`,
-`height`, `duration`, `codec`, and `has_audio`.
+`bt.read.video` also emits per-file metadata columns from the container header, without opening a clip a second time or decoding a frame: `fps`, `frames`, `width`, `height`, `duration`, `codec`, and `has_audio`.
 
-The last two are what a mixed corpus is actually split on. `codec` decides whether a
-hardware decoder can take a clip, so a directory mixing H.264 and VP9 partitions on it;
-`has_audio` decides whether a speech stage runs at all, and a clip with no soundtrack sent
-to one is a wasted GPU minute per row:
+A mixed corpus splits on the last two. `codec` decides whether a hardware decoder can take a clip, so a directory mixing H.264 and VP9 partitions on it. `has_audio` decides whether a speech stage runs at all, since a clip with no soundtrack sent to one wastes a GPU minute per row:
 
 ```python
 # docs: skip
@@ -66,15 +51,11 @@ transcribe = clips.filter(col("has_audio"))
 gpu_decodable = clips.filter(col("codec").is_in(["h264", "hevc"]))
 ```
 
-Some containers hold no video stream at all: an audio-only `.mp4`, an `.mkv` holding only
-subtitles. Those report `width`, `height` and `codec` as null and `has_audio` as true,
-which is what tells them apart from a truncated file. A truncated file nulls everything.
+Some containers hold no video stream at all, such as an audio-only `.mp4` or an `.mkv` holding only subtitles. Those report `width`, `height` and `codec` as null and `has_audio` as true. A truncated file nulls everything, which is how you tell the two apart.
 
 ## Sample frames for a model
 
-`frames` is the video counterpart of {py:meth}`.image.to_tensor <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>`. It samples evenly-spaced frames
-and resizes each to a fixed size, which is what makes every row the same shape whatever
-the source clip's resolution or length was:
+`frames` is the video counterpart of {py:meth}`.image.to_tensor <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>`. It samples evenly spaced frames and resizes each to a fixed size, so every row has the same shape whatever the source clip's resolution or length:
 
 ```python
 # docs: skip
@@ -84,28 +65,17 @@ from batcher import col
 tensors = bt.read.video("s3://bucket/clips/").with_columns(x=col("bytes").video.frames(8, 224, 224))
 ```
 
-The result is a fixed-shape tensor column of `(8, 224, 224, 3)` uint8, tagged with the
-canonical `arrow.fixed_shape_tensor` extension type. The shape travels with the data, so
-the column reaches a model already shaped and the planner knows the row is 1.2 MB wide
-rather than guessing.
+The result is a fixed-shape tensor column of `(8, 224, 224, 3)` uint8, tagged with the canonical `arrow.fixed_shape_tensor` extension type. The shape travels with the data. The column reaches a model already shaped, and the planner knows each row is 1.2 MB wide instead of guessing.
 
-The frames are the indices `numpy.linspace(0, num_frames - 1, n)` names, which is what the
-reference preprocessing of the common video models uses, and they are found by decoding
-the clip in order, so the *n*-th frame really is the *n*-th. The clip is never decoded
-past the last wanted frame, and only the wanted frames are kept, so peak memory is the
-output plus one frame rather than the whole clip. That distinction is worth the sentence:
-a minute of 1080p at 30 fps is about 11 GB decoded, for eight frames of output.
+The sampled frames are the indices `numpy.linspace(0, num_frames - 1, n)` names, which matches the reference preprocessing of the common video models. They're found by decoding the clip in order, so the *n*-th frame really is the *n*-th. Decoding stops at the last wanted frame, and only the wanted frames are kept, so peak memory is the output plus one frame. For scale, a minute of 1080p at 30 fps is about 11 GB decoded, for eight frames of output.
 
-A clip with fewer frames than you asked for repeats frames rather than yielding a shorter
-row, because a ragged row would not be a fixed-shape tensor.
+A clip with fewer frames than you asked for repeats frames instead of yielding a shorter row, because a ragged row wouldn't be a fixed-shape tensor.
 
-{py:meth}`bt.read.video(..., decode=True, size=(h, w), num_frames=n) <batcher.api.io_namespace.reader.Reader.video>` is the same thing spelled as a
-reader argument, and it appends the column as `frames`.
+{py:meth}`bt.read.video(..., decode=True, size=(h, w), num_frames=n) <batcher.api.io_namespace.reader.Reader.video>` is the same operation spelled as reader arguments. It appends the column as `frames`.
 
 ## Pull a single still
 
-`thumbnail` and `frame_at` hand back PNG bytes rather than a tensor, because a still is
-something a person or another tool looks at:
+`thumbnail` and `frame_at` hand back PNG bytes rather than a tensor, because a still is something a person or another tool looks at:
 
 ```python
 # docs: skip
@@ -121,29 +91,13 @@ sheet = bt.read.video("s3://bucket/clips/").select(
 stills = detections.with_columns(still=col("clip").video.frame_at(col("t"), 640))
 ```
 
-Both scale the frame so its longest side is `max_size`, keeping the clip's aspect ratio
-and never upscaling. That is the rule the whole media surface follows: an operation that
-hands back an **encoded still** takes a longest side and keeps the shape, while one that
-hands back a **tensor** takes exact dimensions. A tensor feeds a model that needs every
-row identical; a still is looked at, and a squashed 16:9 frame is a distortion nothing
-downstream can see. It is also what makes `.image.thumbnail` and `.video.thumbnail` the
-same operation rather than two methods that share a name.
+Both scale the frame so its longest side is `max_size`, keep the clip's aspect ratio, and never upscale. The whole media surface follows that rule. An operation that hands back an encoded still takes a longest side and keeps the shape, and one that hands back a tensor takes exact dimensions. A tensor feeds a model that needs every row identical. A still gets looked at, and a squashed 16:9 frame is a distortion nothing downstream can detect. The rule is also why `.image.thumbnail` and `.video.thumbnail` are the same operation, not two methods sharing a name.
 
-`thumbnail` takes the frame halfway through the clip, not the first one. The first frame of
-a real clip is very often black, a title card, or a fade-in, which makes a corpus of
-first-frame thumbnails useless for the review work thumbnails exist for.
+`thumbnail` takes the frame halfway through the clip. The first frame of a real clip is very often black, a title card, or a fade-in, and a corpus of first-frame thumbnails is useless for review.
 
-Both seek to the keyframe before the target and decode forward from there, so the cost is
-bounded by the keyframe interval rather than by how far into the clip the target is.
-`frame_at` takes its timestamp from a **column** as readily as from a constant, which is
-the usual case rather than the exotic one: a detection, a caption, or a scene boundary
-already carries the moment it refers to. A row whose timestamp is null or negative is
-null, and only that row. Timestamps come from something that does not answer for
-every row, and one missing moment should not cost the batch it traveled in.
+Both seek to the keyframe before the target and decode forward, so the cost is bounded by the keyframe interval, not by how far into the clip the target sits. `frame_at` takes its timestamp from a column as readily as from a constant, and that's the usual case: a detection, a caption, or a scene boundary already carries the moment it refers to. A row whose timestamp is null or negative comes back null, and only that row. Timestamps come from sources that don't answer for every row, and one missing moment shouldn't cost the whole batch.
 
-`frame_at` returns the frame a player displays at that instant. A `second` past the end of
-a clip whose duration is known yields null rather than the last frame, because handing back
-a frame under a timestamp that does not exist invents data.
+`frame_at` returns the frame a player displays at that instant. A `second` past the end of a clip whose duration is known yields null, not the last frame, because a frame under a timestamp that doesn't exist is invented data.
 
 The output is an image column, so the `.image` accessor reads it back:
 
@@ -156,8 +110,7 @@ sheet.with_columns(dims=col("thumb").image.decode())
 
 ## Which decoder is running
 
-Native video decode links the system FFmpeg, so it is an optional build. The engine
-reports what it was compiled with:
+Native video decode links the system FFmpeg, so it's an optional build feature. The engine reports what it was compiled with:
 
 ```python
 from batcher._internal.native import engine_features
@@ -165,36 +118,25 @@ from batcher._internal.native import engine_features
 print("video" in engine_features())
 ```
 
-On a build that reports `True`, `.video` expressions and `bt.read.video(decode=True)` run
-in the data plane, row-parallel, with no Python in the loop. On a build that reports
-`False`:
+On a build that reports `True`, `.video` expressions and `bt.read.video(decode=True)` run in the data plane, row-parallel, with no Python in the loop. On a build that reports `False`, the two behave differently:
 
-- `bt.read.video(decode=True)` falls back to a per-row `PyAV` loop, which needs the
-  `batcher-engine[video]` extra. It returns the same frames.
-- A bare `.video` expression raises rather than falling back, because an expression names
-  the native kernel directly and silently substituting a different implementation for it
-  would be worse than saying so.
+- `bt.read.video(decode=True)` falls back to a `PyAV` decode, which needs the `batcher-engine[video]` extra. It returns the same frames.
+- A bare `.video` expression raises. An expression names the native kernel directly, and silently substituting a different implementation would be worse than saying so.
 
-The fallback decodes `decode_concurrency` clips at once, and the work genuinely overlaps
-because PyAV releases the GIL inside the codec. The cost is memory. Peak residency is that
-many clips rather than one, so lower it to `1` for GB-sized clips.
+The fallback lives in `batcher.ml.decode.video_dataset`, which decodes `decode_concurrency` clips at once. That's 4 when `bt.read.video` calls it. The work overlaps for real, because PyAV releases the GIL inside the codec. The cost is memory: peak residency is that many clips, so call `video_dataset` with `decode_concurrency=1` for GB-sized clips.
 
 ## Requirements and limitations
 
-- Native decode requires an engine built with the `video` cargo feature and the system
-  FFmpeg development libraries present at build time.
+- Native decode requires an engine built with the `video` cargo feature, with the system FFmpeg development libraries present at build time.
 - The Python fallback requires `pip install 'batcher-engine[video]'`.
-- `frames` decodes the clip up to its last sampled frame. Sampling the final frame of a
-  long clip therefore costs a full decode; sampling from the first half does not.
-- `thumbnail` and `frame_at` are keyframe-bounded, not free: a clip encoded as one long
-  GOP decodes from its single keyframe to the target.
-- FFmpeg reads from a path, so each clip is written to a temp file for the duration of its
-  decode. Size the node's temp filesystem for `clip size x concurrent rows`.
+- `frames` decodes the clip up to its last sampled frame. Sampling the final frame of a long clip therefore costs a full decode, and sampling from the first half doesn't.
+- `thumbnail` and `frame_at` are keyframe-bounded, not free. A clip encoded as one long GOP decodes from its single keyframe to the target.
+- FFmpeg reads from a path, so each clip is written to a temp file for the duration of its decode. Size the node's temp filesystem for `clip size x concurrent rows`.
 
 ## See also
 
 - {doc}`/ml/preparing/multimodal/decoding`: fetching bytes, and decoding images and audio.
-- {doc}`/ml/preparing/multimodal/curating`: dropping the rows that decode perfectly and
-  teach a model nothing.
-- {doc}`/api/relational/expression-accessors`: the full `.video`, `.image`, and `.audio`
-  method reference.
+- {doc}`/ml/preparing/multimodal/audio`: preparing the soundtrack a `has_audio` filter keeps.
+- {doc}`/ml/preparing/multimodal/curating`: dropping the rows that decode perfectly and teach a model nothing.
+- {doc}`/ml/preparing/multimodal/pipelines`: keeping multi-GB payloads out of shuffles and spills.
+- {doc}`/api/relational/expression-accessors`: the full `.video`, `.image`, and `.audio` method reference.

@@ -1,16 +1,10 @@
 # Funnel analysis
 
-How many people who viewed a product went on to add it to a cart, then to check out,
-then to pay? A funnel is four counts, and getting them right is harder than it looks
-for two reasons: the steps have to happen *in order*, and the obvious way to enforce
-that order is a self-join that blows up.
+How many people who viewed a product went on to add it to a cart, then to check out, then to pay? A funnel is four counts, and getting them right is harder than it looks for two reasons: the steps have to happen *in order*, and the obvious way to enforce that order is a self-join that blows up.
 
 ## The data
 
-Four users, four steps, timestamps in minutes past 10:00. Note `u3`: it has a
-`purchase` event that lands *before* its `view`. That is a real thing, and it happens when
-events arrive from two different clients, or when someone comes back to a page after
-buying.
+Four users, four steps, timestamps in minutes past 10:00. Note `u3`: it has a `purchase` event that lands *before* its `view`. That is a real thing, and it happens when events arrive from two different clients, or when someone comes back to a page after buying.
 
 ```python
 import datetime as dt
@@ -49,22 +43,18 @@ print(events.count())
 ## The trap, part one: counting steps instead of paths
 
 :::{warning}
-`GROUP BY step` has no idea what order anything happened in, so it produces a funnel that
-*widens*: two purchases and one checkout. A funnel that widens is measuring the wrong
-thing.
+`GROUP BY step` has no idea what order anything happened in, so it produces a funnel that *widens*: two purchases and one checkout. A funnel that widens is measuring the wrong thing.
 :::
 
 ```python
-naive = events.group_by("step").agg(users=col("user").n_unique()).sort("users", descending=True)
+naive = events.group_by("step").agg(users=col("user").count_distinct()).sort("users", descending=True)
 print(naive.to_pydict())
 # {'step': ['view', 'cart', 'purchase', 'checkout'], 'users': [4, 2, 2, 1]}
 ```
 
-Two purchases, one checkout. `u3` purchased at minute 0 and viewed at minute 1, so its
-`purchase` belongs to some earlier journey, not this one.
+Two purchases, one checkout. `u3` purchased at minute 0 and viewed at minute 1, so its `purchase` belongs to some earlier journey, not this one.
 
-Here is what the two funnels on this page produce, side by side. The ordered one is the
-answer built further down:
+Here is what the two funnels on this page produce, side by side. The ordered one is the answer built further down:
 
 | Step | `GROUP BY step` | Ordered funnel |
 | --- | --- | --- |
@@ -84,20 +74,13 @@ carts = events.filter(col("step") == "cart").rename({"ts": "t_cart"})
 # ...and so on, then join views to carts to checkouts to purchases on user.
 ```
 
-That works on four users. On real data it does not. A user with 12 views and 3 carts
-produces 36 rows out of the first join before you have filtered anything. Add two more
-steps and the intermediate blows past the size of the input by orders of magnitude.
-The join is doing a cross product inside each user, and then you throw almost all of it
-away.
+That works on four users. On real data it does not. A user with 12 views and 3 carts produces 36 rows out of the first join before you have filtered anything. Add two more steps and the intermediate blows past the size of the input by orders of magnitude. The join is doing a cross product inside each user, and then you throw almost all of it away.
 
-You do not need the cross product. You need one number per (user, step): the earliest
-time that user reached that step.
+You do not need the cross product. You need one number per (user, step): the earliest time that user reached that step.
 
 ## One pass, then a pivot
 
-Timestamps do not aggregate directly, so carry the event time as epoch seconds: an `Int64`,
-which `min` is happy to reduce. `pivot` then spreads the steps across columns, giving one row
-per user with a null wherever a step never happened.
+Timestamps do not aggregate directly, so carry the event time as epoch seconds: an `Int64`, which `min` is happy to reduce. `pivot` then spreads the steps across columns, giving one row per user with a null wherever a step never happened.
 
 ```python
 per_user = (
@@ -113,22 +96,17 @@ print(per_user.to_pydict())
 #  'view': [1709287200, 1709287200, 1709287260, 1709287380]}
 ```
 
-One shuffle on `user`, one row per user out. Memory is bounded by the number of users
-times the number of steps, not by the number of events.
+One shuffle on `user`, one row per user out. Memory is bounded by the number of users times the number of steps, not by the number of events.
 
 ## Counting the funnel
 
-Now every step condition is an ordinary comparison on that one row, and a step only
-counts if the whole prefix ahead of it happened in order.
+Now every step condition is an ordinary comparison on that one row, and a step only counts if the whole prefix ahead of it happened in order.
 
 :::{tip}
-Nulls do the work for free: `None > 1709287200` is null, which {py:func}`count_if <batcher.count_if>` does not count.
-A user who never carted therefore drops out of every downstream step without a single
-explicit null check.
+Nulls do the work for free: `None > 1709287200` is null, which {py:func}`count_if <batcher.count_if>` does not count. A user who never carted therefore drops out of every downstream step without a single explicit null check.
 :::
 
-The two tabs build the same plan, the same shuffle, and the same answer. The
-`MIN(CASE WHEN ...)` idiom in the SQL tab is what `pivot` lowers to.
+The two tabs build the same plan, the same shuffle, and the same answer. The `MIN(CASE WHEN ...)` idiom in the SQL tab is what `pivot` lowers to.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -178,13 +156,11 @@ print(sql_funnel.to_pydict())
 :::
 ::::
 
-Four viewed, two carted, one checked out, one purchased. Monotonically non-increasing, which a funnel must be. `u3` is gone from
-the purchase count, because its purchase preceded its view.
+Four viewed, two carted, one checked out, one purchased. Monotonically non-increasing, which a funnel must be. `u3` is gone from the purchase count, because its purchase preceded its view.
 
 ## Reading it as a table
 
-`unpivot` turns the one wide row back into one row per step, which is what a chart
-wants:
+`unpivot` turns the one wide row back into one row per step, which is what a chart wants:
 
 ```python
 long = funnel.unpivot(
@@ -197,14 +173,9 @@ print(long.to_pydict())
 ```
 
 :::{dropdown} Variations worth knowing: expiry windows and last-touch funnels
-Real funnels expire: a cart three weeks after a view is not a conversion. Add the bound to
-the comparison rather than filtering the events. `(col("cart") > col("view")) &
-(col("cart") - col("view") < 3600)` restricts the step to an hour, and because the times are
-epoch seconds the arithmetic is just arithmetic.
+Real funnels expire: a cart three weeks after a view is not a conversion. Add the bound to the comparison rather than filtering the events. `(col("cart") > col("view")) & (col("cart") - col("view") < 3600)` restricts the step to an hour, and because the times are epoch seconds the arithmetic is just arithmetic.
 
-`aggregate="max"` in the pivot gives the *last* time a user hit each step instead of the
-first, which measures a different (and usually less flattering) funnel. Pick one and say
-which.
+`aggregate="max"` in the pivot gives the *last* time a user hit each step instead of the first, which measures a different (and usually less flattering) funnel. Pick one and say which.
 :::
 
 ## See also

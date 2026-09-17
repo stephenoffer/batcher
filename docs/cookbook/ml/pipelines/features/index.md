@@ -1,8 +1,6 @@
 # Training data and features
 
-These pipelines produce the table a model trains on. Between them they cover the four ways
-that table usually goes wrong: unfitted transforms, a leaky split, duplicated documents, and
-features computed after the label they are supposed to predict.
+These pipelines produce the table a model trains on. Between them they cover the four ways that table usually goes wrong: unfitted transforms, a leaky split, duplicated documents, and features computed after the label they are supposed to predict.
 
 | Pipeline | What it builds |
 |---|---|

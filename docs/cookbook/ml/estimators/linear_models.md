@@ -1,6 +1,8 @@
 # Regularized linear models
 
-Every estimator follows the same two-step shape: `fit(ds)` returns a fitted model and `predict(ds)` returns a new Dataset with the prediction column appended. Fitting reads the data through the engine, so the training set never has to fit in memory as a NumPy array.
+`Ridge`, `Lasso`, and `ElasticNet` follow the two-step shape every Batcher estimator uses. `fit(ds)` returns a fitted model, and `predict(ds)` returns a new Dataset with a `prediction` column appended. Fitting reads the data through the engine, so the training set never has to fit in memory as a NumPy array.
+
+The script recovers known coefficients, renames the output with `output_column=` to put two models side by side, and scores the fit with the `r2` and `rmse` aggregates.
 
 The whole script, executed on every test run:
 

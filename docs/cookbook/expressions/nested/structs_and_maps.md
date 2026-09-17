@@ -2,6 +2,8 @@
 
 A struct column holds a fixed set of named fields per row. A map column holds variable key/value pairs. Neither needs flattening: both are read with an accessor rather than by exploding the table, so a nested field stays one projection away.
 
+The script reads struct fields with `.struct.field` and feeds one into an ordinary string expression. For maps it builds a real map column through Arrow, because `from_pydict` on a column of dicts infers a struct, and then reads `keys`, `values`, `get`, `contains`, and `len`.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/structs_and_maps.py

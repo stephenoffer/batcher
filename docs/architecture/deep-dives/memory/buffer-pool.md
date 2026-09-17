@@ -1,10 +1,8 @@
 # The buffer pool
 
 The *buffer pool* is the process-wide account of how many bytes the engine has
-outstanding. Every allocation of consequence reserves against it before allocating. This
-page describes the reservation contract, the two pool instances a process actually runs,
-the pressure levels every backpressure mechanism reads, cooperative spilling, how
-concurrent queries divide the envelope, and where the limit comes from.
+outstanding. This page describes how Batcher reserves against it, how pressure is read from
+it, and how concurrent queries share it.
 
 Two operators, each estimating its own memory, each deciding independently that it has
 room, will together exceed the machine. That's the whole problem, and one shared counter
@@ -122,7 +120,7 @@ The finer ladder lives in `carbonite/memory/pressure.py`:
 | `PressureLevel` | Trigger (fraction of budget) | Default |
 |---|---|---|
 | `NORMAL` | below everything | |
-| `ELEVATED` | `soft_limit × 0.9` | 0.765 |
+| `ELEVATED` | `soft_limit * 0.9` | 0.765 |
 | `SPILL` | `memory.soft_limit` | 0.85 |
 | `CRITICAL` | `memory.hard_limit` | 0.90 |
 
@@ -141,7 +139,7 @@ is the one holding operator state, and reading only the control plane's classifi
 holding 90% of the engine's envelope as `NORMAL` until RSS caught up.
 
 :::{warning}
-The Flight `PartitionStore` and any off-pool pyarrow buffer are real memory the pool has never
+A pyarrow buffer allocated on the Python side, or a UDF's tensors, is real memory the pool has never
 heard of. Taking the maximum against the process footprint is what stops the monitor reporting
 NORMAL while the kernel OOM-kills you.
 :::
@@ -194,7 +192,7 @@ a refused reservation can end.
 `memory.max_memory_bytes` is `None` by default, and `api` auto-senses it once at the
 terminal-op boundary from the live envelope (host RAM, honoring a cgroup limit), then
 freezes it for the query. The data-plane budget shipped to Rust is
-`cap × memory.hard_limit`, as `EngineConfig.memory_budget_bytes`.
+`cap * memory.hard_limit`, as `EngineConfig.memory_budget_bytes`.
 
 A `memory_budget_bytes` of `0` means unbounded. `ExecOptions.agg_spill` stays `None` and
 the engine runs fully in memory with zero spill machinery. Set
@@ -234,7 +232,7 @@ with bt.config_context(cfg):
     print(out.num_rows)
 ```
 
-The data-plane budget under that context is `512 MiB × 0.90`, about 461 MiB, and any
+The data-plane budget under that context is `512 MiB * 0.90`, about 461 MiB, and any
 stateful operator whose estimated footprint exceeds it goes out of core instead of OOMing.
 
 ## What the kernel says
@@ -310,13 +308,9 @@ model, in two steps. The result cache behind {py:meth}`Dataset.cache() <batcher.
 `memory.result_cache_max_bytes`, is *storage*. An operator building a hash table is
 *execution*. Execution wins.
 
-Before reserving, the manager calls `CacheStore.on_pressure` to trim the cache against the
-current pressure level: three-quarters of the budget at `ELEVATED`, half at `SPILL`, and
-everything at `CRITICAL`. If a shortfall remains, it evicts exactly the deficit,
-lowest-value entries first. Only then does it reserve. Caching therefore can't grow the
-process without bound, and it hands RAM back rather than pushing a query out to disk. The
-trim reads `classify()` rather than `level()`, so it doesn't consume the AIMD round's
-sample. Evicting a cache only costs a recompute, so none of this can change an answer.
+Before reserving, the manager calls `CacheStore.on_pressure` to trim the cache against the current pressure level: to three-quarters of its budget at `ELEVATED`, half at `SPILL`, and nothing at `CRITICAL`. If a shortfall remains, it evicts exactly the deficit, lowest-value entries first. Only then does it reserve.
+
+What the trim sheds isn't necessarily lost. Under the default `MEMORY_AND_DISK` storage level an evicted result is demoted to the cache's disk tier (`carbonite/cache_disk.py`, bounded by `memory.result_cache_disk_max_bytes`), which writes through the same tiered spill store the operators use, and a later read promotes it back. `CRITICAL` is the one rung that clears without demoting, because encoding hundreds of megabytes of Arrow is the wrong use of memory the process doesn't have. The trim reads `classify()` rather than `level()`, so it doesn't consume the AIMD round's sample. Evicting a cache entry costs at most a recompute, so none of this can change an answer.
 
 ## Costs and limits
 
@@ -325,8 +319,7 @@ contention point at high reservation rates. That's why reservations are per-*ope
 not per-morsel: one reserve for a hash table build, not one per batch.
 
 It only accounts what's routed through it. Arrow buffers allocated by pyarrow on the
-Python side, the Flight in-memory partition store, and a UDF's torch tensors are all
-invisible to `used`. The pressure monitor's RSS and cgroup floor is the mitigation, and
+Python side and a UDF's torch tensors are invisible to `used`. The Flight partition store is visible only where `ShuffleSpiller` registers it, which is a distributed worker with a bound Flight server. The pressure monitor's RSS and cgroup floor is the mitigation, and
 it's a floor, not a ledger.
 
 A reservation is also an *estimate* accepted in advance. The pool can't tell you that the

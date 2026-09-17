@@ -87,6 +87,7 @@ _AUTO_DIRECTIVE = re.compile(
 _AUTOSUMMARY = re.compile(r"^\s*\.\. autosummary::(.*?)(?=^\s*\.\. |\Z)", re.DOTALL | re.MULTILINE)
 _CURRENTMODULE = re.compile(r"^\s*\.\. currentmodule:: ([\w.]+)", re.MULTILINE)
 _BARE_NAME = re.compile(r"^[\w.]+$")
+_MEMBERS_OPTION = re.compile(r"^\s*:members:", re.MULTILINE)
 
 
 def _doc_files() -> list[Path]:
@@ -129,6 +130,15 @@ def _resolve(dotted: str) -> object:
     raise ImportError(dotted)
 
 
+def _qualify(target: str, prefix: str) -> str:
+    """Resolve an autodoc target the way Sphinx does: as written, then under currentmodule."""
+    try:
+        _resolve(target)
+    except (ImportError, AttributeError):
+        return prefix + target
+    return target
+
+
 def _rendered_names() -> set[str]:
     """Bare names Sphinx will emit a reference entry for, across all doc pages."""
     rendered: set[str] = set()
@@ -144,17 +154,28 @@ def _rendered_names() -> set[str]:
                 prefix = f"{scope.group(1)}."
             for kind, target, body in _AUTO_DIRECTIVE.findall(block):
                 rendered.add(target.rsplit(".", 1)[-1])
-                if kind == "class" and ":members:" in body:
+                # Match the option on its own line: `:no-members:` contains `:members:` as a
+                # substring, and a class split into per-member tables must not count as having
+                # rendered every member (tests/docs/test_api_reference_shape.py checks those).
+                if kind == "class" and _MEMBERS_OPTION.search(body):
                     documented_classes.append(target if "." in target else prefix + target)
             for body in _AUTOSUMMARY.findall(block):
+                # A class listed under `:toctree:` gets a generated page from
+                # `docs/_templates/autosummary/class.rst`, whose `autoclass` documents members
+                # by default (`autodoc_default_options`), so its members are rendered too.
+                stubbed = ":toctree:" in body
                 for line in body.splitlines():
-                    entry = line.strip()
+                    entry = line.strip().lstrip("~")
                     if entry and not entry.startswith(":") and _BARE_NAME.match(entry):
                         rendered.add(entry.rsplit(".", 1)[-1])
+                        if stubbed:
+                            documented_classes.append(_qualify(entry, prefix))
 
     # `:members:` renders every public method/property of the class.
     for dotted in documented_classes:
         cls = _resolve(dotted)
+        if not inspect.isclass(cls):
+            continue
         for name, member in vars(cls).items():
             if name.startswith("_"):
                 continue

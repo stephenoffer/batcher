@@ -1,6 +1,8 @@
 # Character-class ratios
 
-These are the filters that keep junk out of a training set. A row that is 60% digits is probably a table dump; one that is 90% uppercase is probably a shouting header; one with a high non-ASCII ratio may be the wrong language or mojibake. Each ratio is a float in [0, 1] computed in one pass.
+Character-class ratios are the cheap filters that keep junk out of a training set. A row that is mostly digits is probably a table dump. One that is mostly uppercase is probably a shouting header. One with a high non-ASCII ratio may be the wrong language or mojibake.
+
+The script computes the alpha, alphanumeric, digit, uppercase, lowercase, whitespace, punctuation, and non-ASCII ratios, each a float between 0 and 1, over three rows chosen to trip them: prose, a number dump, and a shouted header. It then filters out the last two.
 
 The whole script, executed on every test run:
 

@@ -61,12 +61,10 @@ Each method returns a new `Dataset`. They chain.
 | `.filter(predicate)` | Keep rows where the boolean expression is true. |
 | {py:meth}`.select(*names, **derived) <batcher.Dataset.select>` | Choose existing columns by name and derive new ones as keywords. |
 | {py:meth}`.with_columns(**named) <batcher.Dataset.with_columns>` | Add or replace columns, keeping the rest. |
-| {py:meth}`.with_column(name, expr) <batcher.Dataset.with_column>` | Add or replace a single column. |
 | `.drop(*names)` | Remove columns. |
 | `.rename(mapping)` | Rename columns via `{"old": "new"}`. |
 | `.sort(*by, descending=False, nulls_first=False)` | Order rows. `by` is a name or expression. |
 | {py:meth}`.limit(n, offset=0) <batcher.Dataset.limit>` | Take `n` rows after skipping `offset`. |
-| `.head(n=5)` | Take the first `n` rows. |
 | `.tail(n=5)` | Take the last `n` rows (executes a `count` first). |
 | {py:meth}`.sample(fraction=None, *, n=None, seed=None) <batcher.Dataset.sample>` | Sample a `fraction` of rows or a fixed count `n`. Deterministic and partition-independent (a stable seeded content hash), so identical single-node or distributed. |
 | {py:meth}`.split_at_indices(indices) <batcher.Dataset.split_at_indices>` | Cut into consecutive row ranges at the given positions (Ray Data's spelling). Every part stays lazy. |
@@ -115,7 +113,7 @@ print(ds.select("category", total=bt.col("price") * bt.col("qty")).to_pydict())
 print(ds.with_columns(total=bt.col("price") * bt.col("qty")).columns)
 # ['category', 'price', 'qty', 'total']
 
-print(ds.with_column("price_plus_one", bt.col("price") + 1.0).columns)
+print(ds.with_columns(price_plus_one=bt.col("price") + 1.0).columns)
 # ['category', 'price', 'qty', 'price_plus_one']
 ```
 
@@ -150,7 +148,7 @@ print(
 print(ds.limit(2, offset=1).select("category").to_pydict())
 # {'category': ['b', 'a']}
 
-print(ds.head(2).select("category").to_pydict())
+print(ds.limit(2).select("category").to_pydict())
 # {'category': ['a', 'b']}
 
 print(ds.select("category").distinct().sort("category").to_pydict())
@@ -254,7 +252,7 @@ is an aggregate expression. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; 
 aggregate; the keyword is the name.
 
 For reducing every value column the same way, `GroupBy` also has the shortcut
-methods `sum`, `mean`, `min`, `max`, `median`, `quantile(q)`, `n_unique`, `std`,
+methods `sum`, `mean`, `min`, `max`, `median`, `quantile(q)`, `count_distinct`, `std`,
 `var`, `count` for non-null values per column, and `len` for the per-group row count. Each reduces all non-key columns by default, or the column names or selector you pass. `agg` also accepts a bare positional aggregate such as `agg(col("x").sum())`, which keeps its source column name.
 
 ```python
@@ -301,10 +299,10 @@ A terminal operation executes the plan.
 | {py:meth}`.to_pydict() <batcher.Dataset.to_pydict>` | A `dict[str, list]`. |
 | {py:meth}`.to_pylist() <batcher.Dataset.to_pylist>` | A `list[dict]`, one dict per row. |
 | `.count()` | Row count as an `int`. |
-| `.min(column)`, `.max(column)`, `.sum(column)`, `.mean(column)`, `.std(column)`, `.var(column)`, `.n_unique(column)` | A single-column reduction as a scalar (nulls ignored). |
+| `.min(column)`, `.max(column)`, `.sum(column)`, `.mean(column)`, `.std(column)`, `.var(column)`, `.count_distinct(column)` | A single-column reduction as a scalar (nulls ignored). |
 | `.median(column)` / `.quantile(column, q)` | The exact median / `q`-quantile as a scalar. |
 | {py:meth}`.product(column) <batcher.Dataset.product>` / {py:meth}`.mode(column) <batcher.Dataset.mode>` | The product of the values / the most frequent value. |
-| {py:meth}`.skewness(column) <batcher.Dataset.skewness>` / {py:meth}`.kurtosis(column) <batcher.Dataset.kurtosis>` / {py:meth}`.mad(column) <batcher.Dataset.mad>` | Shape and spread: lopsidedness, tail weight, and the outlier-tolerant mean absolute deviation. |
+| {py:meth}`.skew(column) <batcher.Dataset.skew>` / {py:meth}`.kurtosis(column) <batcher.Dataset.kurtosis>` / {py:meth}`.mad(column) <batcher.Dataset.mad>` | Shape and spread: lopsidedness, tail weight, and the outlier-tolerant mean absolute deviation. |
 | {py:meth}`.any(column) <batcher.Dataset.any>` / {py:meth}`.all(column) <batcher.Dataset.all>` | Reduce a boolean column (SQL `BOOL_OR` / `BOOL_AND`); an empty column is `None`, not `False`/`True`. |
 | `.corr(x, y)` / `.cov(x, y, ddof=1)` | Pearson correlation / covariance of two columns. |
 | {py:meth}`.iter_batches(batch_size=None) <batcher.Dataset.iter_batches>` | An iterator of pyarrow `RecordBatch`es. |

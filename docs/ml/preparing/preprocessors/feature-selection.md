@@ -1,17 +1,18 @@
 # Feature selection
 
-Cutting a wide feature table down is not an aesthetic preference. A column that carries no
-signal still costs memory, still costs a shuffle when you join, and still gives a model one
-more chance to fit noise. Two columns that duplicate each other are worse: a linear fit has
-to split one effect between them, so the coefficients come out large, opposite in sign, and
-unstable under resampling. This page covers the selectors that do the cutting, and how to
-do it without leaking the validation split into the choice.
+This page covers the selectors that cut a wide feature table down, and how to use them
+without leaking the validation split into the choice.
+
+A column with no signal still costs memory, still costs a shuffle when you join, and still
+gives a model one more chance to fit noise. Two columns that duplicate each other are worse.
+A linear fit has to split one effect between them, so the coefficients come out large,
+opposite in sign, and unstable under resampling.
 
 ## Selection is fitted state
 
-A selector is an object, and that is the point of it. Choose features on the whole frame,
-or re-choose them per split, and the held-out rows have participated in the decision. Your
-validation score is then optimistic by an amount nothing measures and no test catches.
+A selector is an object that holds its decision. Choose features on the whole frame, or
+re-choose them per split, and the held-out rows have taken part in the choice. Your
+validation score is then optimistic by an amount nothing measures.
 
 ```python
 import batcher as bt
@@ -39,11 +40,12 @@ split's decision, whatever the test rows would have scored on their own.
 
 ## Choosing a selector
 
-Work down this list, stopping when the table is small enough. Each row costs more than the
-one above it:
+Work down this table, stopping when the feature set is narrow enough. Each row costs
+more than the one above it:
 
 | Selector | Cost | Sees interaction |
 |---|---|---|
+| {py:class}`VarianceThreshold <batcher.ml.preprocessors.VarianceThreshold>` | One variance aggregate, no target | No |
 | {py:class}`SelectKBest <batcher.ml.preprocessors.SelectKBest>` | One aggregate per feature | No |
 | {py:class}`SelectPercentile <batcher.ml.preprocessors.SelectPercentile>` | One aggregate per feature | No |
 | {py:class}`DropCorrelated <batcher.ml.preprocessors.DropCorrelated>` | One correlation pass | Pairwise only |
@@ -90,9 +92,8 @@ print(SelectPercentile("y", percentile=50, score_func="f_regression").fit(regres
 Use `SelectPercentile` when the feature count varies between runs. A fixed `k` that suited
 a fifty-column table keeps almost nothing from a five-hundred-column one.
 
-A univariate score is blind to interaction by construction. A feature that only matters
-alongside another scores as noise, so treat this as a way to remove obvious dead weight
-rather than as the final word.
+A univariate score is blind to interaction. A feature that only matters alongside another
+scores as noise, so use this to remove obvious dead weight, not to have the final word.
 
 Columns the selector never scored are kept. Only a scored-and-rejected feature is dropped,
 so the target, an id column, and anything `features` excluded all survive:
@@ -107,8 +108,8 @@ print(sorted(kept.columns))
 ## Removing redundant columns
 
 {py:class}`DropCorrelated <batcher.ml.preprocessors.DropCorrelated>` removes one column
-from every pair correlated above a threshold. Which one goes is decided by position, not by
-dict ordering, so two runs over the same table produce the same feature set:
+from every pair correlated above `threshold`. Position in the column list decides which one
+goes, so two runs over the same table produce the same feature set:
 
 ```python
 from batcher.ml.preprocessors import DropCorrelated
@@ -120,12 +121,33 @@ print(DropCorrelated(threshold=0.95).fit(duplicated).dropped_)
 # ['a_copy']
 ```
 
-Pass `keep` for a column that must survive whatever it correlates with. Its partner is
-dropped instead, rather than the pair being left standing:
+Pass `keep` for a column that must survive whatever it correlates with. Its partner goes
+instead, and the pair isn't left standing:
 
 ```python
 print(DropCorrelated(keep=["a_copy"]).fit(duplicated).dropped_)
 # ['a']
+```
+
+## Dropping columns without a target
+
+{py:class}`VarianceThreshold <batcher.ml.preprocessors.VarianceThreshold>` needs no target. It drops each column whose variance is at or
+below `threshold`, which removes constant columns for the price of one aggregate.
+{py:class}`ColumnSelector <batcher.ml.preprocessors.ColumnSelector>` and {py:class}`ColumnDropper <batcher.ml.preprocessors.ColumnDropper>` are plain projections as pipeline
+stages, for when a hand-picked selection has to sit inside a {py:class}`Chain <batcher.ml.preprocessors.Chain>`:
+
+```python
+from batcher.ml.preprocessors import ColumnDropper, ColumnSelector, VarianceThreshold
+
+table = bt.from_pydict(
+    {"a": [1.0, 2.0, 3.0, 4.0], "b": [10.0, 20.0, 30.0, 40.0], "const": [5.0, 5.0, 5.0, 5.0]}
+)
+print(VarianceThreshold("const").fit_transform(table).collect().column_names)
+# ['a', 'b']
+print(ColumnSelector(["a", "b"]).fit_transform(table).collect().column_names)
+# ['a', 'b']
+print(ColumnDropper(["const"]).fit_transform(table).collect().column_names)
+# ['a', 'b']
 ```
 
 ## Reading a model's own choice
@@ -145,16 +167,15 @@ print(SelectFromModel(model).fit(regression).selected_)
 # ['a']
 ```
 
-The estimator must already be fitted, deliberately. Refitting inside the selector would
-hide which rows the selection saw, and which rows it saw decides whether it leaks.
+The estimator must already be fitted. Refitting inside the selector would hide which rows
+the selection saw, and that decides whether it leaks.
 
 `threshold` also accepts `"mean"` or `"median"` to cut at that statistic of the
 importances, and `max_features` caps the count regardless.
 
-{py:func}`feature_importances <batcher.ml.feature_importances>` is what the selector reads,
-and it is worth calling directly when you want to see the magnitudes rather than just the
-survivors. It understands Batcher's estimators, scikit-learn's `feature_importances_` and
-`coef_`, and a plain dict:
+{py:func}`feature_importances <batcher.ml.feature_importances>` is what the selector reads.
+Call it directly to see the magnitudes rather than only the survivors. It understands
+Batcher's estimators, scikit-learn's `feature_importances_` and `coef_`, and a plain dict:
 
 ```python
 from batcher.ml.preprocessors import feature_importances
@@ -168,9 +189,9 @@ Scale first, then fit the model you read.
 
 ## Recursive elimination
 
-Dropping a feature changes what the survivors are worth, so ranking once and cutting is not
+Dropping a feature changes what the survivors are worth, so ranking once and cutting isn't
 the same as cutting one at a time. {py:class}`RFE <batcher.ml.preprocessors.RFE>` refits
-after every elimination, which is the more faithful answer and costs one fit per round.
+after every elimination. That's the more faithful answer, at one fit per round.
 
 `fit_model` is a `(dataset, features) -> estimator` callable, so this works with a Batcher
 estimator, a scikit-learn one, or a closure that fits a whole pipeline:
@@ -192,8 +213,8 @@ print(rfe.ranking_["a"])
 
 `ranking_` gives rank 1 to the survivors and a higher rank the earlier a feature was
 eliminated, matching scikit-learn's convention. Raise `step` to drop several features per
-round when the table is wide enough that one-at-a-time is too many fits; a float is read as
-a fraction of the features still in play.
+round when one at a time is too many fits. A float is read as a fraction of the features
+still in play.
 
 ## Composing into a pipeline
 
@@ -208,8 +229,7 @@ print(sorted(pipeline.transform(test).columns))
 # ['signal', 'weak', 'y']
 ```
 
-Put selection early. Everything downstream then runs on a narrower table, and that is
-where the saving comes from.
+Put selection early, so everything downstream runs on the narrower table.
 
 ## Requirements and limitations
 
@@ -224,7 +244,8 @@ where the saving comes from.
 
 ## See also
 
-- {doc}`/ml/evaluation/statistics-and-drift` for the scoring functions themselves and the
-  wider feature-profiling report.
-- {doc}`pipelines` for composing selection with the rest of a feature pipeline.
-- {doc}`/api/models/preprocessors` for the full reference.
+- {doc}`/ml/evaluation/statistics-and-drift`: the scoring functions themselves and the wider feature-profiling report.
+- {doc}`/ml/preparing/preprocessors/feature-generation`: the steps that widen the table this page narrows.
+- {doc}`/ml/preparing/preprocessors/pipelines`: composing selection with the rest of a feature pipeline.
+- {doc}`/ml/evaluation/model-selection`: cross-validating the pipeline a selector sits in.
+- {doc}`/api/models/preprocessors`: the full reference.

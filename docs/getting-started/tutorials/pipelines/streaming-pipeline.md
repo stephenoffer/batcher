@@ -12,6 +12,10 @@ Everything here runs as written, with a generator standing in for Kafka.
 | `pip install batcher-engine` | Every runnable block on this page |
 | A Kafka broker | Only the final block, which is shown and not run |
 
+Each step below adds one stage, and the numbers in the diagram are the step numbers on this page:
+
+![Five stages run top to bottom. Step 1 is an unbounded source built with from_batches and bounded=False, which never ends, so you consume it with a sink or iter_batches rather than collect(). It passes Arrow batches to step 3, drop_duplicates_within_watermark, which keeps the first row per key and forgets keys the watermark has passed, so its state stays bounded. Step 4 sets with_watermark and groups by bt.window. The watermark is max(event_time) minus lateness, and a window closes once the watermark passes its end. The window aggregates go to step 5, a write with a trigger, where available_now drains what is there and stops and processing_time runs on a clock. Its micro-batches reach step 6, a memory, Parquet, or Delta sink with a checkpoint, which resumes at the last committed offset after a restart.](/_static/diagrams/streaming_tutorial_flow.svg)
+
 ## 1. A stream
 
 An unbounded source is any function yielding Arrow batches. `bounded=False` is what tells
@@ -57,8 +61,8 @@ line changes when you swap it.
 
 ## 2. Transform it exactly like a table
 
-There is no streaming dialect. `filter`, `select`, `with_columns`, `group_by`, `join` are the
-same operators.
+There is no streaming dialect. `filter`, `select`, `with_columns`, `group_by`, and `join` are
+the operators you already use on a table.
 
 ```python
 big = events.filter(bt.col("amount") > 4)
@@ -68,9 +72,8 @@ print(sum(batch.num_rows for batch in big.iter_batches()))
 
 :::{warning}
 An unbounded dataset cannot {py:meth}`collect() <batcher.Dataset.collect>`. It would never finish, and it raises a clear
-{py:exc}`PlanError <batcher.PlanError>` if you try. Consume it with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` or write it to a sink. This is the
-first thing everyone hits, and the error message is telling you the truth rather than being
-awkward.
+{py:exc}`PlanError <batcher.PlanError>` if you try. Consume it with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, take a bounded peek with `limit(n)`, or
+write it to a sink.
 :::
 
 ## 3. Deduplicate, in bounded memory

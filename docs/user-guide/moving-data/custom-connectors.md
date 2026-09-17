@@ -1,6 +1,6 @@
 # Custom connectors
 
-Batcher reads and writes through two small contracts. A {py:class}`Source <batcher.io.Source>` says what its
+This page shows how to plug your own format or system into `bt.read` and `ds.write`. Batcher reads and writes through two small contracts. A {py:class}`Source <batcher.io.Source>` says what its
 schema is and how it divides into {py:class}`Split <batcher.io.Split>`s. A {py:class}`Sink <batcher.io.Sink>` consumes Arrow tables and
 reports the files it produced. Everything the engine ships (Parquet, CSV, JSON,
 Delta, Kafka) is written against those contracts and registered by name, and your
@@ -34,11 +34,15 @@ batch you already have in hand.
 
 ## Splits are the unit of read parallelism
 
-The sixth method is the interesting one. `splits()` returns the independently
+The sixth `Source` method, `splits()`, returns the independently
 readable slices of the source, and a slice is what one worker gets. A split carries
 *locators* only (a format name, a path, a set of row-group ids), never data, so it
 pickles cheaply and the worker opens storage directly instead of receiving bytes
 from the driver.
+
+The format name is what ties the pieces together. It finds your class in the registry on the driver, travels inside every split, and finds the class again on the worker. A write resolves its sink through the same name.
+
+![How a registered custom format fans out. On the read side, importing a module that decorates PSVSource with @SOURCES.register("psv") puts it in the SOURCES registry. bt.read(path, format="psv") looks the name up, and the source's splits() returns one FileSplit per file for a directory of files. Each FileSplit carries the format name, the path and the constructor kwargs, which are locators and never data, and each becomes one task on a worker that rebuilds PSVSource and reads storage directly. On the write side, ds.write(path, format="psv") looks the same name up in SINKS to find PSVSink, each shard returns a list of WrittenFile entries holding path, rows and bytes, and those lists merge into one WriteManifest that is committed once.](/_static/diagrams/connector_splits.svg)
 
 Three split types cover almost everything:
 
@@ -105,7 +109,7 @@ split ships the format *name*, not the object.
 
 Registration is a decorator, and it happens as a side effect of importing your
 module, so import it once before you read. Extension-based autodetection
-(`bt.read("data/events.parquet")`) uses a fixed table of the built-in extensions;
+(`bt.read("data/events.parquet")`) uses a fixed table of the built-in extensions, so
 a custom format is addressed by passing `format=` explicitly.
 
 ## A custom format, end to end
@@ -170,7 +174,7 @@ the manifest.
 :::
 ::::
 
-Both are now first-class. The read is lazy and the projection reaches the parser;
+Both are now first-class. The read is lazy and the projection reaches the parser, and
 the write is atomic and returns a manifest:
 
 ```python
@@ -205,7 +209,7 @@ instead of a scan, and `_reader_kwargs()` must return any non-path constructor
 arguments your source needs (a message class, a sheet name).
 
 :::{warning}
-`_reader_kwargs()` is not optional bookkeeping. A `FileSplit` rebuilds the reader on the
+Implement `_reader_kwargs()` for any source with constructor arguments beyond the path. A `FileSplit` rebuilds the reader on the
 worker as `SOURCES.get(format_name)(path, **kwargs)`, so an argument your constructor
 needs and the split did not carry either raises on the worker, or, when the constructor
 has a default, silently reads the wrong thing. A source configured with the wrong schema,
@@ -268,7 +272,7 @@ streams).
 
 ## Reference points in the tree
 
-Read the built-ins before you write your own; each is small, and each demonstrates a
+Read the built-ins before you write your own. Each is small, and each demonstrates a
 different split strategy.
 
 | Format | Source / sink | Splits into |
@@ -286,7 +290,7 @@ and the base buffers a table for you.
 :::{tip}
 Media sources can hand back *reference* rows (a URI, a size, some metadata) rather
 than the payload itself. Filter and sample those rows first, then materialize only the
-survivors. A predicate over a reference column costs nothing; the same predicate after
+survivors. A predicate over a reference column costs nothing. The same predicate after
 the bytes are resident has already paid for every row it drops.
 :::
 

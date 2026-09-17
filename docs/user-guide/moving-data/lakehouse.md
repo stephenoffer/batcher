@@ -9,9 +9,8 @@ runs all of this on one core or across a cluster, with an identical result.
 
 ## Setup
 
-The Delta examples below need the optional extra (`pip install 'batcher-engine[delta]'`),
-already installed in this environment. Each block writes into a fresh temp directory
-so the page is self-contained.
+The Delta examples below need the optional extra, `pip install 'batcher-engine[delta]'`.
+Each block writes into a fresh temp directory, so the page runs on its own.
 
 ```python
 import os
@@ -286,8 +285,7 @@ orders.write.iceberg("db.orders", mode="append")
 snapshot = bt.read.iceberg("db.orders", catalog="prod", snapshot_id=1234567890)
 ```
 
-Hudi is supported read-only, via `pip install 'batcher-engine[hudi]'`. Writes require
-the Spark/Flink write stack.
+Batcher reads Hudi tables with `pip install 'batcher-engine[hudi]'`. It doesn't write them: `write.hudi` raises with the reason, so use the Spark or Flink write stack for Hudi writes.
 
 ```python
 # docs: skip
@@ -329,8 +327,7 @@ print(len(source.splits()), "->", len(source.splits(predicate=predicate)))
 # 4 -> 1
 ```
 
-This is not merely a row filter that runs earlier. The pruning happens *before* I/O, so
-the files it eliminates cost nothing at all: no footer read, no split, no task. On a
+The pruning happens *before* I/O, so the files it eliminates cost nothing at all: no footer read, no split, no task. On a
 distributed read that is the difference between one worker task per file in the table and
 one per file that can actually contribute. Projection pushdown prunes columns the same
 way, and whatever survives is then row-group and page pruned inside the file.
@@ -347,7 +344,7 @@ log's own record counts are exact.
 
 Each surviving data file is an independent split carrying its row count from the log, so
 a table larger than any single node is read file by file across workers and never
-materialized on the driver. One mergeable read path, single-node and distributed.
+materialized on the driver. The same mergeable read path serves a single node and a cluster.
 
 ## Writes leave the index the next read uses
 
@@ -370,6 +367,8 @@ version per logical write, not one per worker.
 
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and quarantine before you commit.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: save modes, partitioning, atomic writes.
+- {doc}`/user-guide/moving-data/streaming`: exactly-once streaming appends into a Delta table.
+- {doc}`/user-guide/moving-data/cloud-storage`: credentials for a table on object storage.
 - {doc}`I/O API </api/relational/io>`: the full `read`/`write` reference.
 - {doc}`Agent skills </agents>`: `manage-a-lakehouse-table` is this page as a
   procedure for a coding agent, covering merge, SCD, CDC, backfill, and compaction.

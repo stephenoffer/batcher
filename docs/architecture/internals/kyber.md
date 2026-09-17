@@ -1,22 +1,8 @@
 # Kyber query optimizer
 
-Kyber turns a logical plan into a better logical plan, then into a physical one. It
-is an ordered list of rule- and cost-based passes (plan in, plan out), grouped by
-family in `kyber/rules/` (and its `kyber/rules/extra/` subpackage) and registered
-through a `@rule` decorator into a `RuleRegistry`. Every rule is proven
-semantics-preserving in isolation, and the *combination* is property-tested for
-result-invariance and confluence. Kyber decides; it never executes and never
-collects runtime metadata.
+Kyber is Batcher's optimizer. It turns a logical plan into a better logical plan, then into a physical one, as an ordered list of rule-based and cost-based passes: plan in, plan out. Rules are grouped by family under `kyber/rules/` and registered through a `@rule` decorator into `kyber.registry.DEFAULT_REGISTRY`. Every rule is proven semantics-preserving on its own, and the combination is property-tested for result-invariance and confluence. Kyber decides. It never executes and never collects runtime metadata.
 
-This is a deliberate reaction to what the rewrite replaced: a "127 passes, 519
-rules" optimizer whose sprawl was the problem rather than the achievement, with a
-god-pass in one place and a one-file-per-rule catalog in another. The roughly 390
-rules Kyber ships are *not* a return to that bloat. They are the sanctioned "many
-small things" pattern: small, node-local rewrites grouped by family, one module per
-family a user names in one breath, discovered by a registry, each earning its place
-by making a query measurably better. Unlike v1, each is individually proven correct
-and the whole set is proven not to interfere. *Correctness of the rule set*, below,
-is where that proof lives.
+The registry holds more than 700 rules, and the count drifts as rules land, so read it from `DEFAULT_REGISTRY.rules()` rather than from a page. That size is deliberate. The optimizer this rewrite replaced had a god-pass in one place and a one-file-per-rule catalog in another, and its sprawl was the problem. Kyber's rules follow the "many small things" pattern instead: small node-local rewrites, one module per family a user names in one breath, discovered by a registry, each individually proven correct and the whole set proven not to interfere. *Correctness of the rule set*, below, is where that proof lives.
 
 ## The phased pipeline
 
@@ -28,7 +14,7 @@ decision rather than converge to one.
 | Phase | Runs | What it does |
 |-------|------|--------------|
 | `NORMALIZE` | to fixpoint | constant folding, expression simplification, canonicalization |
-| `REWRITE` | to fixpoint | algebraic rewrites (e.g. redundant-distinct removal) |
+| `REWRITE` | to fixpoint | subquery decorrelation, set-operation rewrites, CTE handling, redundant-distinct removal |
 | `PUSHDOWN` | to fixpoint | predicate, projection, and limit pushdown; column pruning |
 | `JOIN_REORDER` | once | cost-based multi-table join ordering |
 | `FUSION` | to fixpoint | operator and top-N fusion, late materialization, empty-relation collapse |
@@ -51,11 +37,11 @@ By then the canonicalizer has run and nothing runs it a second time, so the redu
 operator reaches the engine.
 
 Measured across the 99 TPC-DS queries, 46 of them optimized to a plan that a second pass of
-the optimizer would still shrink. The round closes most of that: total plan size falls from
+the optimizer would still shrink. The round closes most of that. Total plan size falls from
 4,561 operator nodes to 4,491, and the count of queries whose plan a second pass still
 changes falls from 46 to 21.
 
-Only rules that declare `Rule.recanonicalize` take part. The flag means two things at once,
+Only rules that declare `Rule.recanonicalize` take part, such as `merge_projections`, `merge_projection_renames`, `merge_adjacent_filters` and `skip_sort_of_single_row`. The flag means two things at once,
 and a rule needs both: the rewrite is semantics-preserving, and it is *contracting*, so it
 can never hand the engine a larger plan than it was given. Re-running the rewrite phases
 wholesale instead is both slower and worse: it costs 18.6% more planning time and removes
@@ -90,7 +76,7 @@ at once. The core families live in `kyber/rules/`:
   `push_filter_through_aggregate`, `push_filter_through_sort`, `push_filter_into_union`,
   `push_limit_through_project`, `push_limit_into_union`.
 - `algebraic`: `remove_redundant_distinct`.
-- `join_order`: cost-based multi-table ordering by DP over connected subsets of the join
+- `joins`: `join_reorder`, cost-based multi-table ordering by dynamic programming over connected subsets of the join
   graph, with a greedy fallback. How much search the DP may spend is a per-query budget
   derived from the region's own estimated cost (`rules/joins/order_budget.py`), not a fixed
   table count.
@@ -100,18 +86,13 @@ at once. The core families live in `kyber/rules/`:
 
 ### The `extra/` families
 
-The bulk of the rule count lives in `kyber/rules/extra/`, a subpackage of
-grouped-by-family modules. It exists because the parent `rules/` directory hit the
-12-files-per-directory structure cap. The subpackage keeps each family a small,
-self-contained module, allowlisted in `tools/lint_structure.py` as the sanctioned
-large-rule-set pattern, rather than flattening names into a god file. Each rule is
-node-local and individually differential-tested against DuckDB.
+Much of the rule count lives in `kyber/rules/extra/`, a subpackage of grouped-by-family modules. It exists because the parent `rules/` directory hit the 12-files-per-directory structure cap, and it is allowlisted in `tools/lint_structure.py` as the sanctioned large-rule-set pattern rather than flattened into a god file. Each rule is node-local and individually differential-tested against DuckDB.
 
-Each row below is one module, named for the shape it rewrites:
+The subpackage holds more modules than this page lists. The following rows are the families a new contributor meets first, each named for the shape it rewrites:
 
 | Family module | What it rewrites |
 |---|---|
-| `boolean_algebra` | boolean / CASE / COALESCE / NULL algebra: annihilators (`x AND FALSE`), idempotence, absorption, complementation on total predicates, `NOT` through a comparison, `x = TRUE → x`, single/duplicate `IN` lists |
+| `boolean_algebra` | boolean / CASE / COALESCE / NULL algebra: annihilators (`x AND FALSE`), idempotence, absorption, complementation on total predicates, `NOT` through a comparison, `x = TRUE` to `x`, single/duplicate `IN` lists |
 | `sargable` | strips arithmetic wrappers so `col + k = lit` becomes a bare `col = lit - k` that zone-map pruning and source pushdown can use |
 | `arith_algebra` | integer constant reassociation and factoring inside a `Filter`/`Project` |
 | `temporal_sargable` | rewrites temporal-extraction predicates such as `year(ts) = 2020` into sargable `[lo, hi)` ranges on the raw column |
@@ -124,7 +105,7 @@ Each row below is one module, named for the shape it rewrites:
 | `window_rules` | canonicalize a `Window`'s partition/order keys and prune dead window output |
 | `empty_relation` | fold a provably-empty subtree (constant-`FALSE` filter, empty input to `Project`/grouped `Aggregate`/`Window`) to the canonical `Limit(x, 0)` marker |
 | `adaptive_meta` | simplifications a provably-EXACT *cardinality* unlocks (dead limits, empty inputs) |
-| `metadata_adaptive` | simplifications EXACT per-column metadata unlocks: skip a `Sort` over ≤ 1 row, prune constant sort keys, drop a `Distinct` over a proven-unique column, decide a `col OP col` filter from both columns' bounds |
+| `metadata_adaptive` | simplifications EXACT per-column metadata unlocks: skip a `Sort` over at most one row, prune constant sort keys, drop a `Distinct` over a proven-unique column, decide a `col OP col` filter from both columns' bounds |
 
 The two metadata families are gated on `Provenance.EXACT` proof only. A learned or
 sketch estimate can never drive them, because dropping a `Distinct` or `Sort` on a
@@ -132,11 +113,7 @@ wrong guess is silent data corruption.
 
 ### The `exprs/` and `relational/` families
 
-Two later subpackages sit beside `extra/`. `kyber/rules/exprs/` holds expression
-algebra grouped by the value domain it rewrites, and `kyber/rules/relational/` holds
-rewrites that move a plan node rather than change an expression. The split keeps each
-directory inside the file-count cap and makes a rule findable from the shape it acts
-on. The modules and what each one rewrites:
+Further subpackages sit beside `extra/`. `kyber/rules/exprs/` holds expression algebra grouped by the value domain it rewrites, `kyber/rules/relational/` holds rewrites that move a plan node rather than change an expression, and `kyber/rules/streaming/` holds the rules for unbounded plans. The split keeps each directory inside the file-count cap and makes a rule findable from the shape it acts on. The following table lists a representative module from each:
 
 | Family module | What it rewrites |
 |---|---|
@@ -206,7 +183,7 @@ rules are written to respect them:
 - **Three-valued (Kleene) logic.** `NULL AND FALSE = FALSE`, `NULL OR TRUE = TRUE`,
   and a null comparison is null. `boolean_algebra` proves each law under all three
   values (`T`, `F`, and `N`) and guards anything that would hold only for non-null
-  operands. `x AND NOT x → FALSE`, for instance, fires only on never-null predicates
+  operands. Rewriting `x AND NOT x` to `FALSE`, for instance, fires only on never-null predicates
   such as {py:meth}`is_null <batcher.plan.expr_ir.core.Expr.is_null>`.
 
 ## Cost and cardinality
@@ -257,7 +234,7 @@ MetadataHub supersede those defaults and sharpen across runs.
 This is the part static optimizers cannot do. An estimate is only a guess until the
 query runs. At a pipeline breaker, the engine has *measured* the real size of what it
 just processed. Core records those measurements, and when an estimate was off by more
-than `optimizer.reoptimize_error` (default 2×), Kyber re-plans the rest of the query
+than `optimizer.reoptimize_error` (default 2x), Kyber re-plans the rest of the query
 on the measured numbers. The same mechanism works single-node and distributed.
 
 DuckDB optimizes once, before execution, and cannot revise the plan afterwards.
@@ -283,7 +260,7 @@ query without decoding what it excludes. The rewrite is safe under any staleness
 removes only rows strictly worse than the bound, so if `k` rows survive they are the true
 top-k regardless of where the bound came from. Too few survivors is the one failure mode, it
 is visible in the row count, and the conductor re-runs the plan as written. That verification
-is why the seeding is a Kyber decision but the fallback is `api`'s: a plan → plan pass cannot
+is why the seeding is a Kyber decision but the fallback is `api`'s: a plan-to-plan pass cannot
 express "run it, look at the answer, run something else".
 
 A **distributed sort remembers its range boundaries** (`dist/sort_boundaries.py`). The sample
@@ -311,9 +288,7 @@ To see the optimized plan without running it, use `explain`:
 print(ds.explain())
 ```
 
-The public optimizer surface (`batcher.kyber`) is small. `optimize` and
-`optimize_traced` run the pipeline, and the second one also returns the per-rule
-decision log. The learning entry points `record_execution`, `record_column_stats`,
+The optimizer's entry points live in `batcher.kyber`. `optimize` runs the pipeline and returns the physical plan, reusing a cached plan when one exists, and `optimize_traced` also returns the build-side decisions it made. The learning entry points `record_execution`, `record_column_stats`,
 `record_selectivity`, and `load_learned_stats` feed the MetadataHub that later plans
 read from.
 

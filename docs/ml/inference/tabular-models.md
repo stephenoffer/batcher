@@ -1,20 +1,24 @@
 # Score a tabular model
 
-This page describes how to run a fitted XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model over a Batcher {py:class}`Dataset <batcher.Dataset>`.
+This page describes how to run a fitted XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model over a Batcher {py:class}`Dataset <batcher.Dataset>`, and how to fit the classical estimators in `batcher.ml` without leaving the engine.
 
-Tabular models are the ones most production ML actually runs, and they have a different shape from a language model. The input is dozens of numeric columns rather than one text column, the model is megabytes rather than gigabytes, and the bottleneck is feeding the model rather than the model itself. {py:meth}`ds.ml.predict <batcher.api.dataset.ml.DatasetML.predict>` is the entry point built for that shape.
+Tabular models are what most production ML runs, and their shape differs from a language model's. The input is dozens of numeric columns, the model is megabytes, and the bottleneck is feeding the model rather than the model itself. {py:meth}`ds.ml.predict <batcher.api.dataset.ml.DatasetML.predict>` is built for that shape.
 
 ## How it works
 
-`ds.ml.predict` builds a load-once class UDF. The model is constructed once per worker, and each Arrow batch is assembled into one dense `(rows, features)` matrix that goes to the model in a single call. Nothing crosses the boundary a row at a time, and nothing is materialized on the driver.
+`ds.ml.predict` builds a load-once class UDF. The model is constructed once per worker, and each Arrow batch is assembled into one dense `(rows, features)` matrix that reaches the model in a single call. Nothing crosses the boundary a row at a time, and nothing is materialized on the driver.
 
-Three consequences are worth knowing before you use it:
+The following diagram splits that work into what happens once and what happens per batch:
 
-The feature order is the contract. A tabular model scores by *position*, not by name, so passing the right columns in the wrong order produces confident nonsense with no error anywhere. Where the model records its own feature names, Batcher compares them and raises at plan time rather than letting the query run.
+![When the query is built, on the driver, ds.ml.predict takes a fitted object or a path. It checks the features against the model's feature names where the model recorded them and raises on a mismatch, then resolves the output columns from the model's class or tree count. On each worker the model loads once, in the constructor, with its thread pool capped, and a path is fetched once per worker. Then each Arrow batch becomes one dense matrix in features= order with a null becoming NaN, the matrix goes to one model call with the chosen method=, and the output is appended as prediction columns before the next Arrow batch arrives. Nothing crosses the boundary a row at a time, and nothing is materialized on the driver.](/_static/diagrams/tabular_predict_flow.svg)
 
-A null feature becomes NaN, which is what XGBoost and LightGBM treat as missing and what they learned a default direction for during training. Pass `missing=` when your model was trained with a different sentinel.
+Three consequences follow.
 
-The output schema is resolved before the query runs. Batcher reads the model's own class count or tree count to decide how many columns the prediction produces; if the model is given as a path, it is opened once (cached) to be measured rather than assumed to be single-output.
+The feature order is the contract. A tabular model scores by *position*, so the right columns in the wrong order produce confident nonsense with no error. Where the model records its own feature names, Batcher compares them and raises at plan time.
+
+A null feature becomes NaN. XGBoost and LightGBM treat NaN as missing and learned a default direction for it during training. Pass `missing=` when your model was trained with a different sentinel.
+
+The output schema is resolved before the query runs. Batcher reads the model's class count or tree count to decide how many columns the prediction produces. A model given as a path is opened once, and cached, to be measured.
 
 ## Score a fitted model
 
@@ -31,7 +35,7 @@ scored = ds.ml.predict(model, features=["a", "b"])
 print(scored.to_pydict()["prediction"])
 ```
 
-The prediction is appended as an ordinary column, so everything downstream composes:
+The prediction is an ordinary column, so everything downstream composes:
 
 ```python
 high_risk = scored.filter(bt.col("prediction") == 1)
@@ -40,7 +44,7 @@ print(high_risk.count())
 
 ## Choose what the model computes
 
-`method=` is uniform across every framework, so switching model libraries does not mean rewriting the call:
+`method=` means the same thing in every framework, so switching libraries doesn't mean rewriting the call. The table lists each value, what it returns, and which models support it:
 
 | `method` | What you get | Available on |
 |---|---|---|
@@ -57,11 +61,11 @@ probabilities = ds.ml.predict(model, features=["a", "b"], method="predict_proba"
 print(sorted(probabilities.columns))
 ```
 
-Set `as_list=True` when you would rather have a single `List<Float64>` column, which is usually what you want before writing the result out.
+Set `as_list=True` to get a single `List<Float64>` column instead, which is usually what you want before writing the result out.
 
 ## Load a model from storage
 
-A path or cloud URI works wherever a model object does. The framework is detected from the file extension, and the file is fetched once per worker:
+A path or cloud URI works wherever a model object does. The framework is detected from the file extension, and the file is fetched once per worker. Pass `framework=` when the extension is ambiguous or absent.
 
 ```python
 # docs: skip
@@ -71,24 +75,22 @@ scored = ds.ml.predict(
 )
 ```
 
-Pass `framework=` when the extension is ambiguous or absent.
-
 ## Explanations at batch scale
 
-`method="contrib"` gives per-feature SHAP contributions for every row. That is the query a row-at-a-time explanation call cannot answer, and it is what turns "the model said 0.83" into "because tenure was low":
+`method="contrib"` gives per-feature SHAP contributions for every row. A row-at-a-time explanation call can't answer that query over a whole table, and it is what turns "the model said 0.83" into "because tenure was low":
 
 ```python
 # docs: skip
 explained = ds.ml.predict(booster, features=feature_names, method="contrib")
 top_driver = explained.select(
     *feature_names,
-    driver=bt.max_horizontal(*[bt.col(f"prediction_{i}") for i in range(len(feature_names))]),
+    driver=bt.greatest(*[bt.col(f"prediction_{i}") for i in range(len(feature_names))]),
 )
 ```
 
 ## Scale it out
 
-The scheduling keywords are the same ones {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` takes, because it is the same operator underneath:
+`ds.ml.predict` takes the same scheduling keywords as {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>`, because it is the same operator underneath:
 
 ```python
 # docs: skip
@@ -102,13 +104,13 @@ scored = ds.ml.predict(
 scored.write.parquet("s3://bucket/scored/", distributed=True)
 ```
 
-`batch_size` matters more here than for a GPU model: a tabular model's per-call overhead is fixed and small, so larger batches amortize it, and 100,000 rows of 50 float32 features is only 20 MB.
+`batch_size` matters more here than for a GPU model. A tabular model's per-call overhead is fixed and small, so larger batches amortize it, and 100,000 rows of 50 float32 features is only 20 MB.
 
-`threads` caps the model's own thread pool inside one worker. Leave it unset and Batcher sizes it to the cores the worker may actually use. A booster's own default is the *host* core count, so several co-located workers would otherwise each grab every core and thrash.
+`threads` caps the model's own thread pool inside one worker. Left unset, Batcher sizes it to the cores the worker may use. A booster defaults to the *host* core count, so co-located workers would otherwise each grab every core and thrash.
 
-## A linear baseline for free
+## Fit a baseline in the engine
 
-Before reaching for a boosted tree, a linear baseline is worth having, and `batcher.ml.linear` fits one without leaving the engine: {py:class}`LinearRegression <batcher.ml.linear.LinearRegression>` and {py:class}`Ridge <batcher.ml.linear.Ridge>` build their normal equations from the feature and target moments, so the whole fit is a single scan and prediction is a linear-combination expression. Both reproduce scikit-learn's coefficients exactly.
+A linear baseline is worth having before a boosted tree, and `batcher.ml` fits one without leaving the engine. {py:class}`LinearRegression <batcher.ml.linear.LinearRegression>` and {py:class}`Ridge <batcher.ml.linear.Ridge>` build their normal equations from the feature and target moments. The fit is a single scan, prediction is a linear-combination expression, and both reproduce scikit-learn's coefficients exactly.
 
 ```python
 import batcher as bt
@@ -120,21 +122,19 @@ print(round(model.coef_[0], 1), round(model.intercept_, 1))
 # 2.0 1.0
 ```
 
-`Ridge(alpha=...)` adds an L2 penalty that stabilizes the fit when features are collinear, which is the case where ordinary least squares is unreliable. Encode categorical columns to numbers first, as for every other model here.
+`Ridge(alpha=...)` adds an L2 penalty, which stabilizes the fit when features are collinear. {py:class}`batcher.ml.sparse_linear.Lasso <batcher.ml.sparse_linear.Lasso>` and {py:class}`ElasticNet <batcher.ml.sparse_linear.ElasticNet>` go further and drive irrelevant coefficients to *exactly* zero, so they select features on a wide, correlated table. Their coordinate descent needs only the centered Gram matrix and the feature-target covariances, one scan, and the strictly convex objective means the coefficients match scikit-learn's.
 
-Where ridge shrinks every coefficient, {py:class}`batcher.ml.sparse_linear.Lasso <batcher.ml.sparse_linear.Lasso>` and {py:class}`ElasticNet <batcher.ml.sparse_linear.ElasticNet>` drive the irrelevant ones to *exactly* zero, so the fit selects features as it trains. That makes them the tool for a wide, correlated table. Their coordinate descent needs only the centered Gram matrix and the feature-target covariances (one scan), and because the objective is strictly convex the coefficients match scikit-learn's.
+The generalized linear models in `batcher.ml.glm` cover targets least squares handles badly. {py:class}`batcher.ml.glm.PoissonRegressor <batcher.ml.glm.PoissonRegressor>` fits a log-link model for a count, such as arrivals or claim frequencies, by IRLS Newton steps, keeping the predicted rate positive and matching scikit-learn's {py:class}`PoissonRegressor <batcher.ml.glm.PoissonRegressor>` across penalty strengths. {py:class}`GammaRegressor <batcher.ml.glm.GammaRegressor>` suits a positive, right-skewed amount such as a claim size or a duration. {py:class}`TweedieRegressor <batcher.ml.glm.TweedieRegressor>` is the general form of both: a `power` between 1 and 2 fits a target that is exactly zero for many rows and positive for the rest, such as an insurance pure premium.
 
-For a count target such as events, arrivals, or claim frequencies, {py:class}`batcher.ml.glm.PoissonRegressor <batcher.ml.glm.PoissonRegressor>` fits a log-link generalized linear model by the same IRLS Newton steps, keeping the predicted rate positive where least squares would predict a negative count. It matches scikit-learn's {py:class}`PoissonRegressor <batcher.ml.glm.PoissonRegressor>` across penalty strengths. For a positive, right-skewed *amount* such as a claim size, a duration, or a spend, {py:class}`GammaRegressor <batcher.ml.glm.GammaRegressor>` is the matching GLM, with a variance that grows with the mean. {py:class}`TweedieRegressor <batcher.ml.glm.TweedieRegressor>` is the general form these two specialize: a `power` between 1 and 2 fits the compound distribution of a target that is exactly zero for many rows and positive for the rest, such as an insurance pure premium.
+For classification, {py:class}`RidgeClassifier <batcher.ml.linear.RidgeClassifier>` regresses on one-vs-rest targets in a closed-form single scan. {py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits the probabilistic model by iteratively reweighted least squares, one scan per Newton step, and reproduces scikit-learn's unpenalized coefficients. Its `predict_proba` appends the positive-class probability, and `predict` thresholds that to a 0/1 label.
 
-For classification, {py:class}`RidgeClassifier <batcher.ml.linear.RidgeClassifier>` casts it as regression on one-vs-rest targets (a closed-form single-scan fit), while {py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits the probabilistic model by iteratively reweighted least squares, one scan per Newton step, and reproduces scikit-learn's unpenalized coefficients. `predict_proba` appends the positive-class probability, and `predict` thresholds it to a 0/1 label.
+{py:class}`batcher.ml.naive_bayes.GaussianNB <batcher.ml.naive_bayes.GaussianNB>` is cheaper still. Its whole fit, a per-class prior, mean, and variance, is one {py:meth}`group_by(target) <batcher.Dataset.group_by>` aggregate, and it reproduces scikit-learn's predictions. {py:class}`MultinomialNB <batcher.ml.naive_bayes.MultinomialNB>` and {py:class}`BernoulliNB <batcher.ml.naive_bayes.BernoulliNB>` are the count-feature and binary-feature variants for text classification, fitted the same way from grouped sums.
 
-{py:class}`batcher.ml.naive_bayes.GaussianNB <batcher.ml.naive_bayes.GaussianNB>` is the even cheaper baseline. Its whole fit, a per-class prior, mean, and variance, is a single {py:meth}`group_by(target) <batcher.Dataset.group_by>` aggregate, and it reproduces scikit-learn's predictions. It is naive by assumption but a strong instant baseline in high dimensions. {py:class}`MultinomialNB <batcher.ml.naive_bayes.MultinomialNB>` and {py:class}`BernoulliNB <batcher.ml.naive_bayes.BernoulliNB>` are the count-feature and binary-feature variants that do the text-classification work, fitted the same way from grouped sums.
-
-When the features are correlated within a class, the `batcher.ml.discriminant` classifiers model that covariance instead of assuming independence: {py:class}`LinearDiscriminantAnalysis <batcher.ml.discriminant.LinearDiscriminantAnalysis>` shares one covariance across classes for a stable linear boundary, and {py:class}`QuadraticDiscriminantAnalysis <batcher.ml.discriminant.QuadraticDiscriminantAnalysis>` gives each class its own for a quadratic one. Both reproduce scikit-learn exactly.
+When features are correlated within a class, the `batcher.ml.discriminant` classifiers model that covariance. {py:class}`LinearDiscriminantAnalysis <batcher.ml.discriminant.LinearDiscriminantAnalysis>` shares one covariance across classes for a linear boundary, and {py:class}`QuadraticDiscriminantAnalysis <batcher.ml.discriminant.QuadraticDiscriminantAnalysis>` gives each class its own. Both reproduce scikit-learn exactly.
 
 ## When a few rows are wrong
 
-Squared error grows with the square of the residual, so one row that is off by a hundred counts as much as ten thousand rows off by one. A single mistyped price or a stuck sensor visibly tilts an ordinary fit, and nothing reports it. {py:class}`HuberRegressor <batcher.ml.glm.HuberRegressor>` uses a loss that is squared near zero and linear past a threshold, so a far-away row keeps a bounded influence:
+Squared error grows with the square of the residual, so one row off by a hundred counts as much as ten thousand rows off by one. A mistyped price or a stuck sensor tilts an ordinary fit and nothing reports it. {py:class}`HuberRegressor <batcher.ml.glm.HuberRegressor>` uses a loss that is squared near zero and linear past a threshold, which bounds a far-away row's influence:
 
 ```python
 import batcher as bt
@@ -153,17 +153,17 @@ print(round(HuberRegressor(["hours"], "wear").fit(readings).coef_[0], 1))
 # 2.0
 ```
 
-Seven readings sit on a slope of about 2 and the eighth is nonsense. Least squares splits the difference at 8.2; the robust fit reports the slope the seven agree on.
+Seven readings sit on a slope of about 2 and the eighth is nonsense. Least squares splits the difference at 8.2. The robust fit reports the slope the seven agree on.
 
-The fit is the same iteratively reweighted least squares the GLMs use, so each pass is a handful of aggregates and the whole thing distributes. `epsilon` sets where the loss turns linear, in units of the residual scale: smaller is more robust and less efficient on clean data, and the default of 1.35 keeps about 95% of least squares' efficiency when the errors really are normal. On data with no outliers it returns what least squares returns.
+The fit uses the same iteratively reweighted least squares as the GLMs, so each pass is a handful of aggregates and the whole thing distributes. `epsilon` sets where the loss turns linear, in units of the residual scale. Smaller is more robust and less efficient on clean data. The default of 1.35 keeps about 95% of least squares' efficiency when the errors really are normal, and on data with no outliers the result is what least squares returns.
 
-The residual scale is re-estimated on every pass rather than fixed from the starting fit, because those starting residuals are already stretched by the rows being guarded against. That can hit the iteration cap on a degenerate input, where the retained rows fit exactly and the scale chases zero; the fit warns when it stops on the cap rather than presenting the last iterate as an optimum.
+The residual scale is re-estimated on every pass, because the starting residuals are already stretched by the rows being guarded against. On a degenerate input, where the retained rows fit exactly and the scale chases zero, that can hit the iteration cap. The fit warns when it stops there.
 
-## Choosing a penalty without paying for it
+## Choose a penalty without paying for it
 
-A ridge penalty has to be chosen, and the usual way costs a fit per candidate per fold. {py:class}`RidgeCV <batcher.ml.linear.RidgeCV>` does not need that. Ridge builds its normal equations from the first and second moments of the features and the target, and those moments do not depend on the penalty, so every candidate is solved from the same numbers. The held-out squared error expands into the same moments, so scoring a candidate on a fold reads no rows either.
+Choosing a ridge penalty the usual way costs a fit per candidate per fold. {py:class}`RidgeCV <batcher.ml.linear.RidgeCV>` avoids that. Ridge's normal equations come from the first and second moments of the features and target, which don't depend on the penalty, and the held-out squared error expands into the same moments. So every candidate is solved, and scored, from the same numbers.
 
-One grouped aggregate remains: the moments per fold. Each fold's training moments are the total minus that fold's, because moments add, and every combination is then arithmetic on small matrices:
+One grouped aggregate remains: the moments per fold. Each fold's training moments are the total minus that fold's, because moments add, and everything after that is arithmetic on small matrices:
 
 ```python
 import batcher as bt
@@ -186,7 +186,7 @@ print(round(model.predict(ds).to_pydict()["prediction"][0], 1))
 # 150.4
 ```
 
-The same saving applies to the L1 models, for the same reason: coordinate descent works from the centered Gram matrix and the feature-target covariances, which are moments too. {py:class}`LassoCV <batcher.ml.sparse_linear.LassoCV>` and {py:class}`ElasticNetCV <batcher.ml.sparse_linear.ElasticNetCV>` search a penalty path in one pass, and because the penalty is L1 the search selects features as it goes:
+The L1 models get the same saving, since coordinate descent also works from moments. {py:class}`LassoCV <batcher.ml.sparse_linear.LassoCV>` and {py:class}`ElasticNetCV <batcher.ml.sparse_linear.ElasticNetCV>` search a penalty path in one pass and select features as they go:
 
 ```python
 import batcher as bt
@@ -207,19 +207,15 @@ print([round(c, 2) for c in model.coef_])
 # [12.0, 0.0]
 ```
 
-The uninformative column comes back at exactly zero rather than merely small, which is what separates L1 from a ridge penalty. `ElasticNetCV` takes an `l1_ratio` to blend the two, and `LassoCV` is that class with the ratio fixed at 1.0.
+The uninformative column comes back at exactly zero, not merely small. `ElasticNetCV` takes an `l1_ratio` to blend L1 and L2, and `LassoCV` is that class with the ratio fixed at 1.0. `scores_` holds the mean held-out squared error per candidate, and the model is refitted over all the data at `alpha_` once the search ends.
 
-`scores_` holds the mean held-out squared error per candidate, and the model is refitted over all the data at `alpha_` once the search is done.
-
-Five folds against twenty candidates is one pass rather than a hundred, and adding candidates costs nothing extra: on 200,000 rows with five features, the search runs one terminal operation where refitting each combination runs 125. The additivity that makes this work is the same property that makes the operator distributable, so the search behaves identically on one node and across a cluster, and folds are assigned by hashing each row's own values so a row lands in the same fold however the data is partitioned.
-
-Candidates that are statistically indistinguishable can tie. When two penalties score the same to within floating-point noise, which one wins is arbitrary, and the fix is a wider spread of candidates rather than a closer reading of `scores_`.
+The whole search is one terminal operation, however many folds and candidates you give it. The additivity that makes this work also makes it distributable: folds are assigned by hashing each row's own values, so a row lands in the same fold however the data is partitioned. Candidates that score the same to within floating-point noise tie arbitrarily. Widen the spread of candidates rather than reading `scores_` more closely.
 
 ## More than two classes
 
-{py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits one weight vector, so it can only answer one yes-or-no question. Given a target with three labels it rejects the fit and names the column, rather than returning a model that predicts a single class for every row.
+{py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits one weight vector and answers one yes-or-no question. Given a three-label target it rejects the fit and names the column.
 
-{py:class}`OneVsRestClassifier <batcher.ml.multiclass.OneVsRestClassifier>` is the way to fit that target. It trains one binary model per class, each asking whether a row belongs to that class, and predicts whichever scores highest. Pass the estimator as a class rather than an instance, because each sub-model needs its own target column:
+{py:class}`OneVsRestClassifier <batcher.ml.multiclass.OneVsRestClassifier>` fits that target. It trains one binary model per class and predicts whichever scores highest. Pass the estimator as a class rather than an instance, because each sub-model needs its own target column:
 
 ```python
 import batcher as bt
@@ -249,9 +245,7 @@ print(model.predict(ds).to_pydict()["prediction"])
 # ['small', 'small', 'small', 'medium', 'medium', 'medium', 'large', 'large', 'large']
 ```
 
-The labels can be of any type, and `classes_` is sorted so that the sub-model order does not depend on the order the scan returned the labels in. That is what lets a model fitted across a cluster be saved and loaded against one fitted on a laptop.
-
-Prediction stays a single pass however many classes there are. Each sub-model's score is staged as a column and the choice between them is folded into one `argmax` expression, so classifying against a hundred classes reads the data once rather than a hundred times.
+Labels can be any type. `classes_` is sorted, so the sub-model order doesn't depend on the order the scan returned labels in, and a model fitted on a cluster loads against one fitted on a laptop. Prediction stays a single pass: each sub-model's score is staged as a column and the choice is one `argmax` expression, so a hundred classes still read the data once.
 
 Pass hyperparameters for every sub-model through `params`:
 
@@ -263,16 +257,13 @@ print(len(model.estimators_))
 # 3
 ```
 
-The base estimator must expose `predict_proba`. Ranking classes means comparing their scores, which a hard 0/1 label cannot support, so an estimator without it is rejected when you construct the wrapper rather than when you predict.
+The base estimator must expose `predict_proba`, because ranking classes means comparing scores. An estimator without it is rejected when you construct the wrapper. {py:class}`RidgeClassifier <batcher.ml.linear.RidgeClassifier>` already decomposes a multiclass target internally and is cheaper when a closed-form fit is enough: one scan instead of one per Newton step.
 
-{py:class}`RidgeClassifier <batcher.ml.linear.RidgeClassifier>` already does this decomposition internally and takes a multiclass target directly. It is the cheaper option when a closed-form fit is enough, since it needs one scan rather than one per Newton step.
-
-A fitted classifier's scores are not probabilities until they are calibrated; see
-{doc}`/ml/inference/calibration` for when that matters and how to fix it.
+A classifier's scores aren't probabilities until they're calibrated. See {doc}`/ml/inference/calibration`.
 
 ## Clustering without labels
 
-Not every tabular job has a target. {py:class}`batcher.ml.cluster.KMeans <batcher.ml.cluster.KMeans>` segments rows by similarity, learning its centroids in the engine: each Lloyd iteration is one nearest-centroid assignment expression and one grouped mean, so the fit is a handful of scans and labeling any dataset is a single streaming pass. The `inertia_` it learns is the total squared distance to the centroids, which is the number an elbow plot uses to choose the cluster count.
+{py:class}`batcher.ml.cluster.KMeans <batcher.ml.cluster.KMeans>` segments rows by similarity with no target. Each Lloyd iteration is one nearest-centroid assignment expression and one grouped mean, so the fit is a handful of scans and labeling is a single streaming pass. `inertia_` is the total squared distance to the centroids, the number an elbow plot uses to choose the cluster count.
 
 ```python
 import batcher as bt
@@ -285,18 +276,13 @@ print(labels[0] == labels[1], labels[2] == labels[3], labels[0] != labels[2])
 # True True True
 ```
 
-The centroids are seeded from a reproducible content-hash sample, so a fit is identical however the data is partitioned. Encode categorical columns to numbers first, exactly as for the predictors above.
+Centroids are seeded from a reproducible content-hash sample, so a fit is identical however the data is partitioned.
 
-When clusters overlap or the goal is a density rather than a partition, {py:class}`batcher.ml.mixture.GaussianMixture <batcher.ml.mixture.GaussianMixture>` models the data as a blend of Gaussians fitted by expectation-maximization: `predict` gives soft-clustering labels, `predict_proba` the membership probabilities, and `score_samples` a per-row log-likelihood that turns the fitted model into an anomaly detector.
-
-When the groups *are* the labels, {py:class}`batcher.ml.cluster.NearestCentroid <batcher.ml.cluster.NearestCentroid>` is the supervised counterpart: it fits one centroid per class and labels a row by the nearest, reproducing scikit-learn's {py:class}`NearestCentroid <batcher.ml.cluster.NearestCentroid>`.
+When clusters overlap or you want a density, {py:class}`batcher.ml.mixture.GaussianMixture <batcher.ml.mixture.GaussianMixture>` fits a blend of Gaussians by expectation-maximization. `predict` gives soft-clustering labels, `predict_proba` the membership probabilities, and `score_samples` a per-row log-likelihood you can use as an anomaly score. When the groups *are* the labels, {py:class}`batcher.ml.cluster.NearestCentroid <batcher.ml.cluster.NearestCentroid>` fits one centroid per class and labels a row by the nearest, reproducing scikit-learn's {py:class}`NearestCentroid <batcher.ml.cluster.NearestCentroid>`.
 
 ## Save a model Batcher fitted
 
-The estimators in `batcher.ml` fit *on* the engine, so a model can be trained across a
-cluster. {py:func}`save_model <batcher.ml.save_model>` and
-{py:func}`load_model <batcher.ml.load_model>` move it afterwards. Without them the only
-route from a fitted model to a prediction is to fit again, which is not a serving story.
+The estimators in `batcher.ml` fit *on* the engine, so a model can be trained across a cluster. {py:func}`save_model <batcher.ml.save_model>` and {py:func}`load_model <batcher.ml.load_model>` move it to wherever it serves, and the path may be a cloud URI:
 
 ```python
 import os
@@ -316,12 +302,7 @@ print(served.predict(bt.from_pydict({"x": [10.0]})).to_pydict()["prediction"])
 # [20.0]
 ```
 
-The path may be a cloud URI, because a fitted model belongs next to the data it scores
-rather than on the machine that fitted it.
-
-The file is JSON, not a pickle, for the same reasons the preprocessors use JSON:
-you can read what the model will do, a reviewer can diff it, it survives a class moving or a
-slot being renamed, and it is safe to load from a store you do not fully control.
+The file is JSON, not a pickle. You can read what the model will do, a reviewer can diff it, it survives a class moving or a slot being renamed, and it is safe to load from a store you don't fully control.
 
 ```python
 import json
@@ -330,11 +311,7 @@ print(sorted(json.loads(open(target).read())))
 # ['class', 'params', 'state', 'version']
 ```
 
-`state` holds what `fit` learned, under scikit-learn's trailing-underscore names, and
-{py:func}`model_to_dict <batcher.ml.model_to_dict>` and
-{py:func}`model_from_dict <batcher.ml.model_from_dict>` are the same conversion without the
-file, for when the model travels inside something else: a config blob, a registry row, or a
-message payload.
+`state` holds what `fit` learned, under scikit-learn's trailing-underscore names. `params` holds the constructor arguments, read from the constructor's signature, so a parameter an estimator keeps privately, such as the `alpha` that `Ridge` stores as `_alpha`, is recorded under the name that rebuilds it. {py:func}`model_to_dict <batcher.ml.model_to_dict>` and {py:func}`model_from_dict <batcher.ml.model_from_dict>` do the same conversion without the file, for a model that travels inside a config blob, a registry row, or a message payload:
 
 ```python
 from batcher.ml import model_from_dict, model_to_dict
@@ -346,22 +323,11 @@ print(model_from_dict(document).coef_)
 # [2.0]
 ```
 
-`params` holds the constructor arguments, read from the constructor's own signature. A
-parameter an estimator keeps privately, such as the `alpha` that `Ridge` stores as
-`_alpha`, is still recorded under the name that rebuilds it.
+## Fit on a reshaped target
 
-## Fitting on a reshaped target
+Squared error assumes symmetric, roughly constant noise. A price, a duration, a claim amount, and a count all violate that: they're non-negative, right-skewed, and their spread grows with their level. A regression fitted directly on them spends its capacity on the long tail and under-predicts the body.
 
-Squared error assumes the target's noise is symmetric and roughly constant. A price, a
-duration, a claim amount and a count all violate that: they are non-negative, right-skewed,
-and their spread grows with their level, so a regression fitted directly on them spends its
-capacity on the long tail and under-predicts the body.
-
-Fitting on `log1p(y)` and exponentiating back is the standard fix. The third step,
-remembering to invert at serving time, is the one that gets forgotten. Predictions are then
-wrong by a factor of *e*, with the right shape and no error.
-{py:class}`TransformedTargetRegressor <batcher.ml.TransformedTargetRegressor>` wraps the pair
-so the inverse cannot be lost:
+Fitting on `log1p(y)` and exponentiating back is the standard fix, and forgetting to invert at serving time is the standard mistake. The predictions then have the right shape, no error, and the wrong scale. {py:class}`TransformedTargetRegressor <batcher.ml.TransformedTargetRegressor>` wraps the pair so the inverse can't be lost:
 
 ```python
 import math
@@ -379,25 +345,13 @@ print([round(v, 3) for v in model.predict(skewed).to_pydict()["prediction"]])
 # [1.718, 6.389, 19.086, 53.598]
 ```
 
-The prediction comes back on the original scale, so a metric computed against the
-untransformed truth means what it says. Comparing a model fitted on `log1p(y)` against one
-fitted on `y` is otherwise comparing two different quantities and calling the smaller number
-better.
+The prediction comes back on the original scale, so a metric against the untransformed truth means what it says. `log1p` is the default because it is defined at zero, where a count or an amount often sits. `log` and `sqrt` are also available.
 
-`log1p` is the default because, unlike a bare `log`, it is defined at zero, which is where a
-count or an amount most often sits. `log` and `sqrt` are also available.
+Inverting a mean in log space gives a median-like estimate on the original scale. That is usually what you want on a skewed target, but it biases the result low if you need an expectation.
 
-One property worth knowing: inverting a mean in log space gives a median-like estimate on
-the original scale, not a mean. That is the accepted behaviour of the technique and usually
-what you want on a skewed target, but it biases the result low if you need an expectation.
+## Predict from the nearest training rows
 
-## Predicting from the nearest training rows
-
-{py:class}`KNeighborsRegressor <batcher.ml.KNeighborsRegressor>` and
-{py:class}`KNeighborsClassifier <batcher.ml.KNeighborsClassifier>` assume nothing about the
-shape of the relationship: to predict a row, they find the training rows most like it and
-average what happened to them. That makes them the natural first check on whether a problem
-has local structure, and the right tool when a boundary is genuinely irregular.
+{py:class}`KNeighborsRegressor <batcher.ml.KNeighborsRegressor>` and {py:class}`KNeighborsClassifier <batcher.ml.KNeighborsClassifier>` assume nothing about the shape of the relationship. To predict a row, they find the most similar training rows and average what happened to them. That makes them the first check on whether a problem has local structure.
 
 ```python
 import batcher as bt
@@ -409,30 +363,13 @@ print(model.predict(bt.from_pydict({"x": [0.5, 10.5]})).to_pydict()["prediction"
 # ['low', 'high']
 ```
 
-A k-NN model has no parameters. It *is* its training data, so `fit` keeps a reference set
-and `predict` measures against it. Batcher folds that reference set into the prediction as
-literals, exactly the way a fitted linear model folds in its coefficients, so scoring is one
-arithmetic expression over the feature columns with no join and no shuffle.
+A k-NN model *is* its training data. Batcher folds the reference set into the prediction as literals, the way a linear model folds in its coefficients, so scoring is one arithmetic expression over the feature columns with no join and no shuffle. It distributes unchanged.
 
-That is what makes it distribute unchanged. It is also why the reference set is capped.
-Exact k-NN costs one distance per scored row per reference row, and nothing removes that:
-measured on this engine, scoring the reference set against itself takes about 0.4s at 200
-rows and 4s at 1,000. Past `max_reference` the fit fails and names the ways out rather than
-building a query nobody wants to wait for.
+That is also why the reference set is capped. Exact k-NN costs one distance per scored row per reference row: scoring the reference set against itself took about 0.4s at 200 rows and 4s at 1,000 on this engine. Past `max_reference` the fit fails and names the ways out. For a large corpus, use {py:func}`build_vector_index <batcher.ml.build_vector_index>`, the approximate route.
 
-Two habits matter more here than for most models. Scale the features first, because
-distance treats every column alike: a column measured in millions decides every neighbour,
-and one measured in fractions is ignored. Then reach for an index once the corpus is large.
-{py:func}`build_vector_index <batcher.ml.build_vector_index>` is the approximate route, and
-a broadcast reference set is not one.
+Scale the features first. Distance treats every column alike, so a column measured in millions decides every neighbour. Ties at the k-th distance all count as neighbours, so a row can have more than `k`, rather than letting arrival order break the tie.
 
-Ties at the k-th distance all count as neighbours, so a row can have more than `k` of them.
-The alternative would be to break the tie by reference-set order, which makes a prediction
-depend on the order rows happened to arrive in.
-
-{py:class}`KNNImputer <batcher.ml.KNNImputer>` applies the same idea to missing values: it
-matches a row on the columns that *are* present and fills the gap with what similar rows
-had there.
+{py:class}`KNNImputer <batcher.ml.KNNImputer>` applies the same idea to missing values. It matches a row on the columns that *are* present and fills the gap with what similar rows had:
 
 ```python
 from batcher.ml import KNNImputer
@@ -444,17 +381,15 @@ print(round(KNNImputer(["size", "price"], k=2).fit_transform(homes).to_pydict()[
 # 1.1
 ```
 
-The column mean there is about 5.15, so the gap between the two is the whole reason to use
-it. Unlike scikit-learn's, a donor row must be complete across the imputed columns; the two
-agree wherever the neighbourhood is unambiguous.
+The column mean is about 5.15, which is the whole reason to use it. Unlike scikit-learn's imputer, a donor row must be complete across the imputed columns. The two agree wherever the neighbourhood is unambiguous.
 
 ## Requirements and limitations
 
 Each framework is an optional extra: `pip install 'batcher-engine[xgboost]'`, `[lightgbm]`, `[catboost]`, `[onnx]`, or `[sklearn]`. `[tabular]` installs all of them.
 
-Feature columns must be numeric, boolean, or decimal. Encode a categorical column first, with {py:class}`OrdinalEncoder <batcher.ml.preprocessors.OrdinalEncoder>`, {py:class}`TargetEncoder <batcher.ml.preprocessors.TargetEncoder>`, or one of the cardinality-tolerant encoders on {doc}`/ml/preparing/preprocessors/index`. A string column raises an error naming the column rather than failing deep inside the model.
+`ds.ml.predict` feature columns must be numeric, boolean, or decimal. Encode a categorical column first, with {py:class}`OrdinalEncoder <batcher.ml.preprocessors.OrdinalEncoder>`, {py:class}`TargetEncoder <batcher.ml.preprocessors.TargetEncoder>`, or one of the encoders on {doc}`/ml/preparing/preprocessors/index`. A string column raises an error naming the column.
 
-The estimators Batcher fits itself are stricter than `ds.ml.predict` on one point: a feature column must be an integer, a float, or a decimal. They fit through engine aggregates, which are not defined on a boolean, so a flag column has to be cast before it can be used as a feature:
+The estimators Batcher fits itself are stricter: a feature must be an integer, a float, or a decimal. They fit through engine aggregates, which aren't defined on a boolean, so cast a flag column first:
 
 ```python
 import batcher as bt
@@ -468,16 +403,18 @@ print(len(LinearRegression(["flag", "z"], "y").fit(numeric).coef_))
 # 2
 ```
 
-A string, boolean, date, or all-null feature raises an error naming the column, the type, and the fix, rather than surfacing as an aggregate or cast failure from inside the engine. The same applies to the target of a regressor, which must also be a number. A classifier's target is unrestricted, because a class label is legitimately a string.
+A string, boolean, date, or all-null feature raises an error naming the column, the type, and the fix. A regressor's target must also be a number. A classifier's target is unrestricted, because a class label can be a string.
 
-The feature-name guard only fires where the model recorded its training feature names. A booster fitted from a bare NumPy matrix records generic `f0…fN`, which match no real column, so nothing can be checked. Fit from a DataFrame, or keep the feature list beside the model.
+The feature-name guard only fires where the model recorded its training feature names. A booster fitted from a bare NumPy matrix records generic `f0` to `fN`, which match no real column. Fit from a DataFrame, or keep the feature list beside the model.
 
-Under `distributed=True` a preempted worker's partition is recomputed, so scoring must be idempotent. A pure prediction is; a `fn` that also writes to an external store is not.
+Under `distributed=True` a preempted worker's partition is recomputed, so scoring must be idempotent. A pure prediction is. A model wrapper that also writes to an external store is not.
 
 ## See also
 
-- {doc}`/ml/evaluation/evaluation`: score the predictions you just produced, per segment, in one pass.
-- {doc}`/ml/preparing/preprocessors/index`: the fit and transform steps that produce the feature columns.
-- {doc}`/ml/evaluation/statistics-and-drift`: check that today's features still look like the training ones.
 - {doc}`/ml/inference/inference`: the deep-learning and HuggingFace path.
+- {doc}`/ml/inference/runtimes`: ONNX Runtime, OpenVINO, and TensorRT predictors for exported models.
+- {doc}`/ml/inference/calibration`: turn a classifier's scores into calibrated probabilities.
+- {doc}`/ml/evaluation/evaluation`: score the predictions you just produced, per segment, in one pass.
+- {doc}`/ml/evaluation/statistics-and-drift`: check that today's features still look like the training ones.
+- {doc}`/ml/preparing/preprocessors/index`: the fit and transform steps that produce the feature columns.
 - {doc}`/cookbook/ml/index`: short runnable recipes for each model family.

@@ -1,13 +1,10 @@
 # Machine learning
 
-This page covers the scripts that build features, fit models, evaluate them, and run
-inference, plus the retrieval and metric scripts that sit alongside them.
+This page covers the scripts that build features, fit models, evaluate them, and run inference, plus the retrieval and metric scripts that sit alongside them.
 
 ## Fit and transform are separate for a reason
 
-Every preprocessor follows the same split. The statistics come from the training set and are
-then applied to validation and production data. Fitting on everything is the classic leak,
-and the API makes the correct thing the easy thing.
+Every preprocessor follows the same split. The statistics come from the training set and are then applied to validation and production data. Fitting on everything is the classic leak, and the API makes the correct thing the easy thing.
 
 ```python
 import batcher as bt
@@ -24,16 +21,11 @@ assert abs(scaler.transform(train).to_pydict()["x"][0] + 1.0) < 0.6
 assert scaler.transform(holdout).count() == 2
 ```
 
-A `Chain` fits its stages in order and applies them as a unit, which is the only way to be
-sure the same transformations with the same fitted statistics reach production.
-`examples/ml/pipeline_serving_parity.py` asserts that a single row through the chain matches
-what the batch produced for that row.
+A `Chain` fits its stages in order and applies them as a unit, which is the only way to be sure the same transformations with the same fitted statistics reach production. `examples/ml/pipeline_serving_parity.py` asserts that a single row through the chain matches what the batch produced for that row.
 
 ## Evaluation
 
-On an imbalanced problem a model that always predicts the majority class scores well on
-accuracy and finds nothing. Precision and recall separate the two. Both need the confusion
-counts rather than a single number.
+On an imbalanced problem a model that always predicts the majority class scores well on accuracy and finds nothing. Precision and recall separate the two. Both need the confusion counts rather than a single number.
 
 ```python
 import batcher as bt
@@ -58,13 +50,9 @@ assert recall == 0.5
 
 ## Inference
 
-`map_batches` hands your function a whole Arrow batch, never a row, which is what keeps a
-Python model call from costing a Python function call per row. Using a class rather than a
-closure lets an expensive model load once per worker rather than once per batch.
+`map_batches` hands your function a whole Arrow batch, never a row, which is what keeps a Python model call from costing a Python function call per row. Using a class rather than a closure lets an expensive model load once per worker rather than once per batch.
 
-One consequence to plan for. A Python callback's output schema is not known until it runs, so
-the new column exists in the result but not in `Dataset.columns`. Materialize before you
-project it.
+One consequence to plan for. A Python callback's output schema is not known until it runs, so the new column exists in the result but not in `Dataset.columns`. Materialize before you project it.
 
 ## Every script on this page
 
@@ -131,3 +119,9 @@ The table below lists the ML and metric scripts in path order.
 | `examples/metrics/text_retrieval.py` | RAG groundedness: is the answer actually supported by the retrieved context? |
 | `examples/metrics/text_tone_and_script.py` | Tone and writing-system rates: style drift and language mix |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/cookbook/ml/index`: ML recipes with the whole script on the page, plus complete GPU pipelines.
+- {doc}`/cookbook/metrics/index`: metrics and statistics as aggregate expressions.
+- {doc}`/ml/index`: the machine learning guide.

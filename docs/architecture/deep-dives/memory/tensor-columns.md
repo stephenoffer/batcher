@@ -31,8 +31,7 @@ def to_tensor_column(ndarray: np.ndarray) -> pa.Array:
     return pa.FixedShapeTensorArray.from_numpy_ndarray(ndarray)  # leading axis = rows
 ```
 
-That whole module is 98 lines. The shape rides with the data, which means it crosses the FFI
-boundary for free. The C Data Interface carries field metadata, so a shaped column
+The shape rides with the data, which means it crosses the FFI boundary for free. The C Data Interface carries field metadata, so a shaped column
 reconstructs on the pyarrow side with no conversion and no copy.
 
 Two conventions coexist, and it is worth knowing which you have:
@@ -40,7 +39,7 @@ Two conventions coexist, and it is worth knowing which you have:
 | Per-row rank | Arrow type | Produced by |
 |---|---|---|
 | 1 (an embedding) | plain `FixedSizeList<T, dim>` | {py:func}`bt.from_numpy <batcher.from_numpy>` on an `(n, dim)` array |
-| ≥ 2 (image, clip, point cloud) | `arrow.fixed_shape_tensor` extension | native decode; a UDF returning `ndim >= 2` |
+| 2 or more (image, clip, point cloud) | `arrow.fixed_shape_tensor` extension | native decode; a UDF returning `ndim >= 2` |
 
 Both read back as `(n, *shape)` through the numpy and torch converters, so it is invisible
 in practice, though the Arrow schema differs, and if you are inspecting {py:obj}`ds.schema() <batcher.Dataset.schema>` you will
@@ -89,12 +88,13 @@ to its plain storage type, and the shape would be gone by the time anything noti
 // downgrading a tensor column to its plain storage type.
 ```
 
-And a native image decode *emits* the metadata directly:
+And a native decode *emits* the metadata directly. The same file tags an image decode with a 3-D shape and a sampled video clip with a 4-D one, through one helper so the two spellings cannot drift:
 
 ```rust
-fn tensor_field(alias: &str, dtype: DataType, h: u32, w: u32) -> Field {
+// crates/bc-interp/src/ops/project_field.rs
+fn tensor_field(alias: &str, dtype: DataType, shape: &[i64]) -> Field {
     // ARROW:extension:name     = "arrow.fixed_shape_tensor"
-    // ARROW:extension:metadata = {"shape":[h,w,3]}
+    // ARROW:extension:metadata = {"shape":[h,w,3]}  or  {"shape":[n,h,w,3]}
 }
 ```
 
@@ -117,6 +117,7 @@ is a downstream Rust *expression*, never a read-time side effect:
 col("bytes").image.to_tensor(width, height)   -> FixedSizeList<UInt8> + tensor metadata
 col("bytes").image.decode()                   -> struct {width, height, channels, mode}  (header only)
 col("bytes").audio.to_waveform()              -> list<float32>  (variable length: NOT a tensor)
+col("bytes").video.frames(n, width, height)   -> FixedSizeList<UInt8> + tensor metadata [n,h,w,3]
 ```
 
 :::{note}
@@ -124,9 +125,7 @@ Audio waveforms are deliberately *not* fixed-shape tensors. Clip lengths vary, s
 variable-length list and there is no shape to carry.
 :::
 
-The decode kernels live in `crates/bc-expr/src/eval/media/`. They are interpreter-only (the
-JIT cannot compile a library-backed decode), and they fan out per *row* over rayon above a
-threshold of 8 rows. That per-row fan-out exists because a 2,000-JPEG corpus is a single
+The decode kernels live in `crates/bc-expr/src/eval/media/`. They are interpreter-only, because the JIT cannot compile a library-backed decode, and they fan out per *row* over rayon above a threshold of 8 rows (`PAR_ROW_THRESHOLD`). That per-row fan-out exists because a 2,000-JPEG corpus is a single
 morsel, and the parallel executor capped its thread pool at the morsel count, so the entire decode
 ran on one core. `Expr::contains_media_decode()` lifts the pool to every core for a media plan,
 which made decode alone 17x to 22x faster.
@@ -146,14 +145,9 @@ if fixed_size_list_of_primitives(arr):
 return arr.to_numpy(zero_copy_only=False)
 ```
 
-`arrays_to_torch` handles numeric columns only; string columns are dropped rather than
-silently mangled. By default it makes a **writable copy**, because Arrow buffers are
-read-only and handing one to torch is undefined behavior the moment anything writes in place.
-`zero_copy=True` opts into `torch.from_dlpack`, with a copy as fallback.
+`arrays_to_torch` converts numeric columns only, and drops string columns rather than mangling them. By default it makes a **writable copy**, because Arrow buffers are read-only and handing one to torch is undefined behavior the moment anything writes in place. `zero_copy=True` opts into `torch.from_dlpack`, with a copy as the fallback, and {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` takes the same flag.
 
-That default is a real cost, and it is the honest kind: correctness first. The
-zero-copy DLPack path is what {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` uses for training ingest, where it streams
-1.76 M rows/s on 10M rows by 32 features, well above what most training loops consume.
+The copy is a deliberate trade of speed for safety, and the loader still outruns most training loops: the training-ingest benchmark streams 1.76 M rows/s through `iter_torch_batches` on 10M rows by 32 features.
 
 ```python
 import numpy as np
@@ -202,9 +196,7 @@ struct<data: binary, shape: list<int32>, dtype: string>
 Both halves of that layout are doing work. It is a **plain struct**, so it crosses the FFI,
 writes to Parquet, shuffles, and passes through every operator with no engine change, no IR
 tag, and no wire-contract change. An extension type would have had to be taught to the Rust
-side. And `data` is a **binary buffer rather than a list of elements**, because the
-boundary widens narrow numerics: a `list<uint8>` image column arrives as `list<int64>`, eight
-bytes per pixel, for the one workload the representation exists to carry.
+side. And `data` is a **binary buffer rather than a list of elements**, so one layout carries every dtype at its native width, with the `dtype` string saying how to read it back.
 
 Nothing asks for it. A `map_batches` returning arrays of differing shape, or a `from_pydict`
 given them, produces one automatically, and `to_numpy` and `batch_format="numpy"` decode it
@@ -226,7 +218,7 @@ pipeline rather than a precondition for entering it.
 
 ## Costs and limits
 
-A fixed-shape tensor column is dense. Every row pays the full `prod(shape) × sizeof(dtype)`
+A fixed-shape tensor column is dense. Every row pays the full `prod(shape) * sizeof(dtype)`
 bytes whether it needs them or not, which is why
 {py:meth}`.image.to_tensor() <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` takes a width and height rather than inferring one.
 The variable-shape form above lifts the shape restriction but not the density: it stores the
@@ -239,25 +231,26 @@ its flat storage and a `(3, 3)` image arrives as a 9-element list. The values ar
 the shape is not. Use `numpy` or `pandas` when the function needs it.
 
 The bytes are real, and they are what `execution.morsel_bytes` (1 MiB) exists for: a morsel is
-split at whichever bound trips first, rows or bytes, so a column of 224×224×3 images produces
+split at whichever bound trips first, rows or bytes, so a column of 224x224x3 images produces
 morsels of ~7 rows rather than 16,384. Without the byte bound, one morsel of images is 2.4 GB.
 
-Video is the weak spot, and the two decode paths are worth seeing side by side.
+Video decode depends on how the engine was built. Clip decode links the system FFmpeg, so it sits behind the optional `video` cargo feature, and `ml/decode/video.py::video_dataset` checks `engine_features()` to pick a path.
 
 ::::{tab-set}
-:::{tab-item} Native decode (image, audio, .npy)
+:::{tab-item} Native decode
 ```text
-crates/bc-expr/src/eval/media/{image/, audio.rs}
+crates/bc-expr/src/eval/media/{image/, audio.rs, video/}
 
   a Rust expression in the plan
   interpreter-only (the JIT cannot compile a library-backed decode)
   per-row rayon fan-out above 8 rows
   emits the tensor field metadata directly
   stays on the fully-parallel native path
+  video: only in an engine built with the `video` feature
 ```
 :::
 
-:::{tab-item} Python decode (video)
+:::{tab-item} Python fallback (video without the feature)
 ```text
 python/batcher/ml/decode/video.py::video_dataset
 
@@ -279,9 +272,9 @@ handed to a model:
 | The type helpers | `python/batcher/io/formats/ml/tensor.py` |
 | The variable-shape representation | `python/batcher/io/formats/ml/ragged.py` |
 | Metadata preservation in projection | `crates/bc-interp/src/ops/project_field.rs` |
-| Decode kernels | `crates/bc-expr/src/eval/media/` |
+| Decode kernels, including FFmpeg video | `crates/bc-expr/src/eval/media/` |
 | Decode orchestration | `python/batcher/ml/decode/` |
-| Arrow → numpy / torch | `python/batcher/interop/arrays.py` (re-exported by `ml/converters.py`), `loader/` |
+| Arrow to numpy and torch | `python/batcher/interop/arrays.py` (re-exported by `ml/converters.py`), `loader/` |
 | UDF output tensorization | `python/batcher/core/udf/call.py` |
 
 ## See also

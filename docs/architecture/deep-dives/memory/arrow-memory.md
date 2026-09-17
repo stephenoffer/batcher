@@ -66,14 +66,18 @@ re-exports rather than on `arrow` directly, so an Arrow bump is a one-line chang
 ::::{tab-set}
 :::{tab-item} On the way in
 ```text
-Int8 / Int16 / Int32            ──►  Int64
+Int8 / Int16 / Int32             ──►  Int64
 UInt8 / UInt16 / UInt32 / UInt64 ──►  Int64
-Float16 / Float32               ──►  Float64
-Dictionary<K, V>                ──►  V   (decoded to its normalized value type)
+Float16 / Float32                ──►  Float64
+Dictionary<K, V>                 ──►  V   (decoded, then normalized)
+LargeUtf8 / Utf8View             ──►  Utf8
+BinaryView                       ──►  Binary
+ListView / LargeListView         ──►  List
+RunEndEncoded                    ──►  its value type (runs expanded)
 ```
-So no operator special-cases a narrow or dictionary input, and the kernel surface stays small
-enough to test exhaustively. This is value-preserving, and it is why the JIT can assume `Int64`
-and `Float64` columns.
+No operator special-cases a narrow, dictionary, or view-layout input, so the kernel surface stays small enough to test exhaustively, and the JIT can assume `Int64` and `Float64` columns. The rules recurse into `struct`, `list` and `map` children, so an `int32` buried in a struct widens exactly as a top-level one does.
+
+Two exceptions keep the boundary honest. A numeric leaf reached through a list keeps its width, because a `FixedSizeList<Float32>` or `FixedSizeList<UInt8>` is a tensor rather than a column, and doubling it would force a full cast on an otherwise zero-copy path. A column carrying an Arrow extension type passes through untouched. Widening is value-preserving everywhere except `UInt64` above `i64::MAX`, which has no `Int64` spelling, and there the boundary refuses the batch with an error naming the column rather than turning the value into a null.
 :::
 
 :::{tab-item} On the way out
@@ -135,46 +139,27 @@ then spills, or outright rejects, plans that fit comfortably.
    total        3.9 GB        122 times  total          32 MB
 ```
 
-So `bc-interp`'s `batch_bytes` uses `get_slice_memory_size()`:
+So every size decision measures slices instead:
 
 ```rust
-// crates/bc-interp/src/lib.rs
-pub(crate) fn batch_bytes(batches: &[RecordBatch]) -> u64 {
-    batches.iter()
-        .flat_map(|b| b.columns().iter())
-        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
-        .sum()
+// crates/bc-arrow/src/lib.rs
+pub fn slice_bytes(array: &ArrayRef) -> u64 {
+    let data = array.to_data();
+    data.get_slice_memory_size()
+        .map_or_else(|_| array.get_array_memory_size() as u64, |b| b as u64)
 }
 ```
+
+`bc_arrow::slice_bytes` is the one definition of a column's own footprint, shared by the sketches, the spill stores, and `bc-interp`. The relation measure `bc_interp::batch_bytes` builds on it and fixes the same bug one level down: morsels of a dictionary-encoded column share one values array, and each slice's size includes all of it. Measured on 600 morsels over a 50,000-entry string dictionary, the naive sum reported 609 MB for 40 MB resident. So `batch_bytes` counts each distinct dictionary once, by buffer address.
 
 The morselizer's average-width guard deliberately keeps the over-counting version, because there
 it only makes the guard conservative, and it never skips a per-row byte walk that was needed.
 
 ## The memory pool
 
-`crates/bc-resource/src/lib.rs` is Carbonite's enforcement primitive inside the data plane: one
-process-wide `MemoryPool` with RAII `MemoryReservation`s. The contract is **reserve before you
-allocate**. A stateful breaker reserves its footprint before it builds or merges state, and a
-reservation the pool cannot grant (because other live reservations have filled the envelope)
-forces that operator to spill instead of pushing the process toward OOM.
+`crates/bc-resource/src/lib.rs` is Carbonite's enforcement primitive inside the data plane: one process-wide `MemoryPool` with RAII `MemoryReservation`s. The contract is **reserve before you allocate**. A stateful breaker reserves its footprint before it builds or merges state, and a reservation the pool cannot grant forces that operator to spill instead of pushing the process toward OOM.
 
-The pool is policy-free. It accounts and admits; it does not decide. What it exposes is a coarse
-pressure level derived from `used / limit`:
-
-| Pressure | Meaning |
-|---|---|
-| `Nominal` | below the soft line: no throttling |
-| `Elevated` | at/above the soft line: spill proactively, narrow the in-flight window |
-| `Critical` | at/above the hard cap: a new reservation succeeds only after something spills |
-
-One signal, read by every backpressure mechanism the engine has: proactive spill, the morsel
-admission gate, and the distributed credit window. Single-node and distributed throttle off the
-same envelope rather than each inventing a threshold. Carbonite sets the limit and the soft
-fraction (soft 85% / hard 90% of the budget by default) and drives the pool through `bc-py`.
-
-The design follows DataFusion's `MemoryPool`/`MemoryReservation`, adopted rather than
-re-derived, and kept dependency-light (std + `thiserror`) so it can sit at the bottom of the crate
-DAG.
+The pool accounts and admits. It does not decide. It exposes a coarse `Pressure` level, `Nominal`, `Elevated` at 80% of the limit, or `Critical` at the limit, and Carbonite's finer Python ladder reads the configured `memory.soft_limit` and `memory.hard_limit` (0.85 and 0.90) on top of it. The design follows DataFusion's `MemoryPool` and `MemoryReservation`, adopted rather than re-derived, and kept to `std` plus `thiserror` so it can sit at the bottom of the crate DAG. {doc}`The buffer pool </architecture/deep-dives/memory/buffer-pool>` covers both ladders, cooperative spilling, and where the limit comes from.
 
 ## The allocator is a correctness-adjacent choice
 
@@ -194,45 +179,15 @@ allocator and keep the system one.
 
 ### Retention, and the valve that makes it safe
 
-Recycling pages instead of returning them is the point, so Batcher lengthens mimalloc's purge
-delay from its 10 ms default to 10 s. Consecutive queries then reuse the same regions instead of
-receiving fresh zero pages the kernel must clear on first touch, which was 9.3% of a 9M-row,
-13-column hash join.
+Recycling pages is the point, so `bc-py` lengthens mimalloc's purge delay from its 10 ms default to 10 s, unless `MIMALLOC_PURGE_DELAY` is set. Consecutive queries then reuse the same regions instead of receiving fresh zero pages the kernel must clear on first touch, which was 9.3% of a 9M-row, 13-column hash join.
 
-The cost is that the process's resident set keeps counting memory the engine has finished with,
-and the amount is not small. Three 8M-row Parquet group-bys whose results were dropped left a
-1,397 MiB resident set of which 1,289 MiB was the engine's arena, and one forced trim handed
-**408 MiB** of it back.
+The cost is a resident set that keeps counting memory the engine has finished with. Three 8M-row Parquet group-bys whose results were dropped left a 1,397 MiB resident set, 1,289 MiB of it the engine's arena, and one forced trim handed **408 MiB** back.
 
-So the retention has a release valve, and the valve is now pulled. The moment a query commits to
-the out-of-core path, and before the first bucket is written, Carbonite hands the retained arena
-back. A query that is spilling is a query on a box where memory is scarce, and holding a third of
-a gigabyte that nothing will use is a third of a gigabyte closer to an OOM kill, which on a
-swapless node is fatal rather than slow. The unmapping it costs is tens of milliseconds against a
-spill measured in seconds.
+So the retention has a release valve. Once a query commits to the out-of-core path, and before the first bucket is written, Carbonite trims the arena (`carbonite/memory/reclaim.py`, called through `ResourceManager.going_out_of_core`). A spilling query runs on a box where memory is scarce, and a third of a gigabyte nothing will use is a third of a gigabyte closer to an OOM kill. The unmapping costs tens of milliseconds against a spill measured in seconds.
 
-The valve sits at the executor rather than at the decision, and the difference matters. Three
-independent signals route a query to disk: admission's counter-offer, the plan's estimated peak,
-and the resident size of the input. Only the second passes through a live pressure reading.
-A trim hung off that reading covers one route of the three and misses the estimate, which is the
-ordinary way a large query spills.
+The valve sits at the executor rather than at the spill decision. Three independent signals route a query to disk: admission's counter-offer, the plan's estimated peak, and the resident size of the input. Only the second reads live pressure, so a trim hung off that reading would miss the ordinary way a large query spills. It doesn't try to avoid the spill either. The pressure level is the maximum of two pool utilizations and the process footprint, a trim moves only the footprint, and the de-escalation average is built not to fall on one good reading.
 
-It does **not** try to avoid the spill, and that is deliberate. By the time it runs the decision
-is already made. Even taken earlier it could not change one: the pressure level is the maximum
-of two buffer-pool utilizations and the process footprint, and a trim moves only the footprint.
-A level driven by reservation accounting cannot come down however much arena is returned, and
-what is left is smoothed by a de-escalation average whose purpose is not to fall on one good
-reading. Re-reading it would pay a forced walk of every heap for an answer that mostly cannot
-change.
-
-Two details the measurements forced. The trim must be *forced*: a plain collect walks only the
-calling thread's heap and the engine allocates on rayon workers, so an unforced call from the
-control plane returned 0 MiB where the forced one returned 408. And the bytes released are
-measured against the kernel's own figure, because mimalloc's committed figure does not move on a
-collect at all. Bracketing with it reported zero released, always, on precisely the occasions the
-valve gave the most. `ResourceManager.stats()["reclaim"]` reports the attempts and the bytes, and
-a rising attempt count with no bytes is the signature of a box that is genuinely full rather than
-an engine sitting on memory.
+Two details the measurements forced. The trim is *forced*, because an unforced collect walks only the calling thread's heap while the engine allocates on rayon workers: it returned 0 MiB where the forced one returned 408. And the release is measured against the kernel's resident figure, because mimalloc's committed figure doesn't move on a collect at all. `ResourceManager.stats()["reclaim"]` reports attempts and bytes. A rising attempt count with no bytes means the box is genuinely full rather than the engine sitting on memory.
 
 ## The 2 GiB offset ceiling
 
@@ -257,7 +212,8 @@ per-chunk `concat` (~3 GB/s) does not. The result is byte-identical to `concat_b
 - `crates/bc-py/src/normalize.rs`: narrow/dictionary normalization in and out
 - `crates/bc-resource/src/lib.rs`: `MemoryPool`, `MemoryReservation`, `Pressure`
 - `crates/bc-interp/src/ops/materialize.rs`: parallel concat and offset widening
-- `crates/bc-interp/src/lib.rs`: slice-aware byte accounting
+- `crates/bc-arrow/src/lib.rs` (`slice_bytes`) and `crates/bc-interp/src/lib.rs` (`batch_bytes`): slice- and dictionary-aware byte accounting
+- `python/batcher/carbonite/memory/reclaim.py`: the arena release valve
 
 ## See also
 
@@ -269,4 +225,5 @@ per-chunk `concat` (~3 GB/s) does not. The result is byte-identical to `concat_b
 - {doc}`Analytics benchmarks </benchmarks/results/analytics>`: where the 6M-row filter figures come from.
 - {doc}`Morsel parallelism </architecture/deep-dives/operators/morsel-parallelism>`: what the byte budget is for.
 - {doc}`Query lifecycle </architecture/deep-dives/query/query-lifecycle>`: where the zero-copy handoff happens.
-- {doc}`The buffer pool </architecture/deep-dives/memory/buffer-pool>`: the pressure ladder above, in full.
+- {doc}`The buffer pool </architecture/deep-dives/memory/buffer-pool>`: the reservation contract and both pressure ladders, in full.
+- {doc}`Spilling </architecture/deep-dives/memory/spilling>`: where Arrow IPC turns memory into disk.

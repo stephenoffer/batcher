@@ -1,50 +1,10 @@
 # Prompts and conversations
 
-Building the input, and reading a conversation column back out.
-
-## Rows with no prompt
-
-A null in `prompt_column` renders as empty text and is sent to the engine like any other row.
-That costs a decode slot on a GPU engine, and a billed request on a hosted one. Worse, the
-answer that comes back is indistinguishable from a real one, because an engine given an empty
-prompt still generates something.
-
-Pass `skip_null_prompts=True` to leave those rows out of the request and give them a null
-output instead:
-
-```python
-import batcher as bt
-
-
-def echo():
-    return lambda prompts: [p.upper() for p in prompts]
-
-
-rows = bt.from_pydict({"prompt": ["summarize this", None]})
-kept = rows.ml.generate(echo, prompt_column="prompt", skip_null_prompts=True)
-print(kept.to_pydict()["response"])
-# ['SUMMARIZE THIS', None]
-```
-
-Every appended column follows, so the token counts, the finish reason, and the
-log-probabilities are null on that row too and a cost report sums only what was generated.
-
-It is off by default, so an existing pipeline's output does not change under it. It applies to
-the prompt column itself. With a `template` the prompt is built from other columns, so a null
-*field* renders as empty text and the row is still sent: the row does have a prompt. Filtering
-is always available and needs no flag:
-
-```python
-# docs: skip
-answered = ds.filter(bt.col("question").is_not_null()).ml.generate(engine, prompt_column="question")
-```
+This page covers the text on either side of a generation call: building prompts from row columns, keeping them inside the model's context window, handling rows with no prompt, and reading a stored conversation column back out. The column helpers on this page are expressions, so prompt assembly runs in the data plane with no per-row Python loop.
 
 ## Building prompts from columns
 
-When the prompt is more than a single column, pass a `template`, which is a `str.format`
-string over the row's columns. `prompt_column` is then ignored, and each row's prompt
-is `template.format(**row)`, so any combination of columns assembles the request
-without a per-row Python loop in your code.
+When the prompt is more than a single column, pass a `template`: a `str.format` string over the row's columns. Each row's prompt is then `template.format(**row)`, and `prompt_column` is ignored. A null in a referenced column renders as empty text rather than the word `None`.
 
 ```python
 # docs: skip
@@ -54,20 +14,18 @@ engine = vllm_engine("meta-llama/Llama-3-8B", sampling={"max_tokens": 128})
 summaries = llm_generate(
     ds.iter_batches(),
     engine,
+    prompt_column="text",  # required, and ignored once a template is set
     template="Summarize the following {category} review in one sentence:\n\n{text}",
     output_column="summary",
 )
 ```
 
-A shared instruction prefix, whether a system prompt baked into the template or the same
-leading text on every row, is encoded once by the engine when prefix caching is on.
-`vllm_engine` enables prefix caching by default, so a long fixed preamble costs little
-across millions of rows.
+Put the fixed text first. A shared instruction prefix, whether a system prompt baked into the template or the same leading text on every row, is encoded once when prefix caching is on, and `vllm_engine` turns it on by default. A long fixed preamble then costs little across millions of rows.
 
 To build the prompt column as its own expression before generation, {py:func}`bt.render_template <batcher.render_template>` fills
 named `{placeholder}` slots from columns, {py:func}`bt.wrap_tag <batcher.wrap_tag>` surrounds a field in `<tag>...</tag>` for a
 structured prompt, and {py:func}`bt.truncate_to_token_budget <batcher.truncate_to_token_budget>` trims a column to fit the context window. They
-are row-wise string builders that run in the data plane.
+are row-wise string builders, so the assembled prompt is an ordinary column you can inspect before any generation runs.
 
 ```python
 import batcher as bt
@@ -101,9 +59,79 @@ print(
 ```
 
 For a completions endpoint or a local engine that wants a rendered string rather than a message
-list, {py:func}`bt.chatml_prompt <batcher.chatml_prompt>` renders a row's turns in the ChatML format and {py:func}`bt.instruction_prompt <batcher.instruction_prompt>`
-in the Alpaca instruction layout. Check which template your model was trained on: a mismatch
+list, {py:func}`bt.chatml_prompt <batcher.chatml_prompt>` renders a user message, with an optional system message, in the ChatML format, and {py:func}`bt.instruction_prompt <batcher.instruction_prompt>`
+renders an instruction and optional context in the Alpaca layout, ending at the response header. Check which template your model was trained on: a mismatch
 degrades quality quietly rather than raising.
+
+## Staying inside the context window
+
+Overrunning a context window rarely raises. The serving stack truncates the prompt, or leaves
+so few tokens that the answer stops mid-sentence, and the run finishes looking successful. You
+find out from the outputs.
+
+{py:func}`bt.prompt_token_estimate <batcher.prompt_token_estimate>` prices an assembled prompt from its parts before the concatenation
+exists as a column, which is what you want to route long rows to a larger-window model or to
+sort a batch by length so a continuous-batching engine packs it well. {py:func}`bt.fits_context <batcher.fits_context>` is the
+filter, and its `reserve_output` is the part a bare length check misses: a prompt that fills the
+window exactly cannot be answered at all.
+
+```python
+docs = bt.from_pydict({"sys": ["Be brief."], "body": ["a" * 4000]})
+print(
+    docs.select(
+        tokens=bt.prompt_token_estimate(bt.col("sys"), bt.col("body")),
+        ok=bt.fits_context("body", window=1000, reserve_output=256),
+    ).to_pydict()
+)
+```
+
+When a row does not fit, `bt.truncate_to_token_budget` cuts the tail and {py:func}`bt.truncate_middle <batcher.truncate_middle>`
+keeps both ends, replacing the middle with a marker. Prefer the middle cut for a contract, a
+transcript, or a log, where the last paragraph is often the one holding the answer.
+
+```python
+long_doc = bt.from_pydict({"body": ["START " + "x" * 200 + " END"]})
+trimmed = long_doc.select(t=bt.truncate_middle("body", budget=8)).to_pydict()["t"][0]
+print(trimmed.startswith("START"), trimmed.endswith("END"))
+# True True
+```
+
+## Rows with no prompt
+
+A null in `prompt_column` renders as empty text and is sent to the engine like any other row.
+That costs a decode slot on a GPU engine, and a billed request on a hosted one. Worse, the
+answer that comes back is indistinguishable from a real one, because an engine given an empty
+prompt still generates something.
+
+Pass `skip_null_prompts=True` to leave those rows out of the request and give them a null
+output instead:
+
+```python
+import batcher as bt
+
+
+def echo():
+    return lambda prompts: [p.upper() for p in prompts]
+
+
+rows = bt.from_pydict({"prompt": ["summarize this", None]})
+kept = rows.ml.generate(echo, prompt_column="prompt", skip_null_prompts=True)
+print(kept.to_pydict()["response"])
+# ['SUMMARIZE THIS', None]
+```
+
+Every appended column follows, so the token counts, the finish reason, and the
+log-probabilities are null on that row too and a cost report sums only what was generated.
+
+It is off by default, so an existing pipeline's output doesn't change. It applies to the prompt
+column itself. With a `template` the prompt is built from other columns, so a null
+*field* renders as empty text and the row is still sent: the row does have a prompt. Filtering
+is always available and needs no flag:
+
+```python
+# docs: skip
+answered = ds.filter(bt.col("question").is_not_null()).ml.generate(engine, prompt_column="question")
+```
 
 ## Reading a conversation column
 
@@ -160,35 +188,10 @@ The `role` and `content` field names are parameters, because the convention is n
 and renaming a struct field to fit a hard-coded assumption is a materialization nobody should
 have to pay for.
 
-## Staying inside the context window
+## See also
 
-Overrunning a context window rarely raises. The serving stack truncates the prompt, or leaves
-so few tokens that the answer stops mid-sentence, and the run finishes looking successful. You
-find out from the outputs.
-
-{py:func}`bt.prompt_token_estimate <batcher.prompt_token_estimate>` prices an assembled prompt from its parts before the concatenation
-exists as a column, which is what you want to route long rows to a larger-window model or to
-sort a batch by length so a continuous-batching engine packs it well. {py:func}`bt.fits_context <batcher.fits_context>` is the
-filter, and its `reserve_output` is the part a bare length check misses: a prompt that fills the
-window exactly cannot be answered at all.
-
-```python
-docs = bt.from_pydict({"sys": ["Be brief."], "body": ["a" * 4000]})
-print(
-    docs.select(
-        tokens=bt.prompt_token_estimate(bt.col("sys"), bt.col("body")),
-        ok=bt.fits_context("body", window=1000, reserve_output=256),
-    ).to_pydict()
-)
-```
-
-When a row does not fit, `bt.truncate_to_token_budget` cuts the tail and {py:func}`bt.truncate_middle <batcher.truncate_middle>`
-keeps both ends, replacing the middle with a marker. Prefer the middle cut for a contract, a
-transcript, or a log, where the last paragraph is often the one holding the answer.
-
-```python
-long_doc = bt.from_pydict({"body": ["START " + "x" * 200 + " END"]})
-trimmed = long_doc.select(t=bt.truncate_middle("body", budget=8)).to_pydict()["t"][0]
-print(trimmed.startswith("START"), trimmed.endswith("END"))
-# True True
-```
+- {doc}`calling`: the generation call these prompts feed.
+- {doc}`engines`: which engine applies a chat template, and how the context window is sized.
+- {doc}`/ml/retrieval/rag`: retrieval that produces the context `bt.join_context` folds in.
+- {doc}`/ml/retrieval/llm-evaluation`: the metrics the request and answer pairs feed.
+- {doc}`/ml/preparing/tokenization`: exact token counts when the estimate isn't enough.

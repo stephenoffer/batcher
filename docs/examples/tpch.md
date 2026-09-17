@@ -1,19 +1,12 @@
 # TPC-H
 
-This page covers the scripts that run the TPC-H benchmark queries over the real sf1 dataset,
-plus the scripts that measure what those queries cost.
+This page covers the scripts that run the TPC-H benchmark queries over the real sf1 dataset, plus the scripts that measure what those queries cost.
 
-Every table comes from the public mirror in `s3://ray-benchmark-data`, cached locally with
-its canonical column names restored. The fact tables are read as a bounded prefix, so the
-suite stays a release check rather than a benchmark. The results are correct for the slice
-and not equal to the published TPC-H answers. The scripts assert on structural properties
-that hold at any scale, never on magic numbers.
+Every table comes from the public mirror in `s3://ray-benchmark-data`, cached locally with its canonical column names restored. The fact tables are read as a bounded prefix, so the suite stays a release check rather than a benchmark. The results are correct for the slice and not equal to the published TPC-H answers. The scripts assert on structural properties that hold at any scale, never on magic numbers.
 
 ## The query shapes
 
-The 22 queries between them cover the shape vocabulary a relational engine has to answer:
-one filtered scan, several multi-table joins, a correlated minimum, a correlated average,
-two set-difference queries, and a handful that need conditional aggregation.
+The 22 queries between them cover the shape vocabulary a relational engine has to answer: one filtered scan, several multi-table joins, a correlated minimum, a correlated average, two set-difference queries, and a handful that need conditional aggregation.
 
 ```python
 # docs: skip
@@ -40,21 +33,13 @@ report = (
 )
 ```
 
-Two rewrites recur across the suite and are worth recognizing. A correlated subquery becomes
-a grouped aggregate joined back to the rows it came from, which is what Q2 and Q17 do with a
-minimum and an average. And an `EXISTS` becomes a semi join, which is what keeps Q4 counting
-orders rather than lines.
+Two rewrites recur across the suite and are worth recognizing. A correlated subquery becomes a grouped aggregate joined back to the rows it came from, which is what Q2 and Q17 do with a minimum and an average. And an `EXISTS` becomes a semi join, which is what keeps Q4 counting orders rather than lines.
 
 ## Cost
 
-Q6 is the query with no joins and no grouping, so it isolates the read path. Comparing a
-wide read against a projected one, and a filtered one against an unfiltered one, shows what
-projection and predicate pushdown actually buy.
+Q6 is the query with no joins and no grouping, so it isolates the read path. Comparing a wide read against a projected one, and a filtered one against an unfiltered one, shows what projection and predicate pushdown actually buy.
 
-Q9 is the opposite. Its filter is a substring match no statistic can help with, so the only
-way to cut work is to apply the expensive predicate to the smallest relation first.
-`examples/tpch/join_order_matters.py` runs the same five-table query in two orders and
-asserts they return identical rows.
+Q9 is the opposite. Its filter is a substring match no statistic can help with, so the only way to cut work is to apply the expensive predicate to the smallest relation first. `examples/tpch/join_order_matters.py` runs the same five-table query in two orders and asserts they return identical rows.
 
 ## Every script on this page
 
@@ -94,3 +79,9 @@ The table below lists the TPC-H scripts in path order.
 | `examples/tpch/query_suite_smoke.py` | Running every TPC-H example's core query in one pass, as a smoke check |
 | `examples/tpch/scan_and_project_costs.py` | What each TPC-H table costs to scan, and how much a projection saves |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/benchmarks/results/tpch`: measured TPC-H results against other engines.
+- {doc}`relational`: the individual operators these queries compose.
+- {doc}`/user-guide/operate/tuning/explain-plans`: reading the plans behind the cost scripts.

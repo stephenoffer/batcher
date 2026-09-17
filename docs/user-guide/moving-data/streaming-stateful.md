@@ -30,6 +30,8 @@ print(base.year)
 # 2024
 ```
 
+(streaming-dedup)=
+
 ## Deduplication within a watermark
 
 {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` keeps the first row per key seen inside the
@@ -182,7 +184,7 @@ rather than the length of the stream. A source whose event time stalls never clo
 session, so the retained rows are checked against `memory.streaming_state_max_bytes` and a
 {py:exc}`ResourceError <batcher.ResourceError>` names the stall instead of the process dying on memory.
 
-A late event cannot reopen a session already emitted; it is dropped, exactly as a late row
+A late event can't reopen a session already emitted. It is dropped, exactly as a late row
 is dropped from a closed window. Use `with_watermark` to buy a straggler room, and expect
 every session to close that much later in exchange.
 
@@ -232,10 +234,10 @@ a `ResourceError` against `memory.streaming_state_max_bytes`. Loudly, but hours 
 :::
 
 :::{note}
-There is no distributed implementation yet. Its mergeable form is a shuffle by the group
-keys, so each key's state lives on exactly one worker and the partitions' key sets are
-disjoint; the distributed runner does not do that shuffle, so `distributed=True` is refused
-rather than quietly answered by one machine.
+`transform_with_state` runs single-node. Its mergeable form is a shuffle by the group keys,
+so each key's state lives on exactly one worker and the partitions' key sets are disjoint.
+The distributed runner doesn't do that shuffle, so `distributed=True` is refused rather than
+quietly answered by one machine.
 :::
 
 ## Unioning streams
@@ -290,7 +292,7 @@ is cheap. A running aggregate with no watermark finalizes every group on every m
 so its state has no cold end to shed. Making that spill needs a keyed store with point
 lookups, which Batcher does not have.
 
-You do not configure any of this. Spilling starts when the cap is reached and stops when
+There is nothing to configure. Spilling starts when the cap is reached and stops when
 resident state is back under it, splitting at the median window start so the newest windows,
 the ones incoming rows land in, stay in memory:
 
@@ -323,8 +325,8 @@ is too wide for the envelope, or the watermark has stopped closing anything.
 
 ### What spilling costs
 
-Latency, on the micro-batch that spills and on the one that reads a run back. Nothing else:
-the answer is unchanged, which
+Spilling costs latency, on the micro-batch that spills and on the one that reads a run back.
+Nothing else: the answer is unchanged, which
 `tests/integration/test_streaming_state_spill.py::test_a_spilled_run_matches_the_unspilled_answer_exactly`
 pins against the same query run entirely in memory.
 
@@ -382,9 +384,10 @@ replay combines the partials and re-applies it.
 | 40 | 1,092,754 B | 367,754 B | 3.0x |
 | 80 | 4,040,834 B | 908,834 B | 4.4x |
 
-**Deduplication and keyed state still snapshot whole.** Their TTL expires arbitrary keys at
-arbitrary times, so there is no bound that describes what went; they would need a real
-tombstone per key, which this changelog has no way to carry.
+**Keyed state still snapshots whole.** Its TTL expires arbitrary keys at arbitrary times, so
+no bound describes what went. It would need a real tombstone per key, which this changelog
+has no way to carry. Watermark deduplication takes no `checkpoint=` at all, as described
+under {ref}`deduplication <streaming-dedup>`.
 
 `streaming.checkpoint_delta_interval` bounds how many changelog entries accumulate before a
 whole snapshot is written again, which is what bounds recovery: a longer chain writes less
@@ -424,4 +427,5 @@ cluster run. The single-node behaviour is unaffected either way.
 - {doc}`streaming`: sources, sinks, triggers, output modes, windows, and checkpoints.
 - {doc}`streaming-monitoring`: the state each of these operators reports per micro-batch.
 - {doc}`/cookbook/streaming/stream-join`: the interval join end to end.
+- {doc}`streaming-emission`: which of these shapes emit per batch.
 - {doc}`/configuration/options`: `memory.streaming_state_max_bytes`, the cap they share.

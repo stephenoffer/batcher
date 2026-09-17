@@ -1,6 +1,8 @@
 # PII transforms
 
-Masking, hashing and encryption are ordinary expressions here. They run in Rust over whole columns and compose with everything else. Pick by what you need back: masking is one-way and readable, hashing is one-way and joinable, encryption is reversible with the key.
+Masking and hashing are ordinary expressions in Batcher. They run in Rust over whole columns and compose with everything else, so protecting a column is one `with_columns` call.
+
+Pick by what you need back. `bt.mask` keeps a readable tail for a human to recognize the record. `.str.sha256()` is one-way but deterministic, so the script joins two tables on the hashed email. `bt.hmac_sha256` adds a key, so the same value hashes differently in another system. The key is passed as an `env:` reference that resolves at execution time, and the script asserts the secret never appears in `explain()` output.
 
 The whole script, executed on every test run:
 

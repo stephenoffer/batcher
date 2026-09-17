@@ -5,10 +5,7 @@ Batcher cannot discover for itself. A rack's power budget, the local price of a 
 the grid's carbon intensity, the point at which a device stops being worth scheduling on, and
 how inference stages are sized against their KV cache.
 
-Every default is inert. A deployment that sets none of these places work exactly as it did
-before, which is what makes each control safe to turn on one at a time.
-{doc}`/user-guide/operate/running/gpu-fleets` is the task-oriented walkthrough; this page is the field
-reference.
+The budget, pricing, and health controls do nothing until you set them, so you can adopt them one at a time. {doc}`/user-guide/operate/running/gpu-fleets` is the task-oriented walkthrough, and this page is the field reference.
 
 ## Placement and sizing
 
@@ -23,6 +20,8 @@ reference.
 | `kv_cache_dtype` | `"fp16"` | KV-cache element type used to size inference concurrency. `"fp8"` halves the cache. |
 | `kv_cache_headroom` | `0.1` | Fraction of a device left free when sizing an inference stage. |
 | `max_context_tokens` | `0` | Context length to size the cache for. 0 means the model's own maximum. |
+| `profiling` | `False` | Emit NVTX or ROCTX ranges around operators and stages, so a Nsight Systems or `rocprof` capture shows the plan, and time device work with CUDA events. Free when nothing captures, but each range costs a CUDA event pair. |
+| `telemetry_sampling` | `False` | Sample device telemetry into a rolling per-device window during a run, so a stage gets a bottleneck verdict rather than one reading. {py:func}`bt.start_ui() <batcher.start_ui>` and the accelerator report turn it on for their own duration. |
 
 These fields are the {py:class}`AcceleratorConfig <batcher.config.AcceleratorConfig>`
 dataclass, with the two nested sections below.
@@ -65,11 +64,11 @@ served.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `allocator` | `"default"` | Allocator strategy: `default`, `pool`, `async`, or `managed`. |
+| `allocator` | `"async"` | Allocator strategy: `default`, `pool`, `async`, or `managed`. |
 | `pool_initial_fraction` | `0.5` | Fraction of the device's reservable memory the pool reserves at startup. |
 | `pool_max_fraction` | `1.0` | Fraction the pool may grow to. Below `1.0` leaves the remainder to a co-tenant. |
 | `spill_to_host` | `False` | Let cuDF move columns to host memory rather than fail when the device fills. |
-| `statistics` | `False` | Track allocation counts and the device high-water mark. |
+| `statistics` | `True` | Track allocation counts and the device high-water mark, so a stage reports the device memory it actually peaked at. |
 | `torch_expandable_segments` | `True` | Back PyTorch's allocator segments with growable virtual reservations, so a workload with varying tensor sizes stops fragmenting. |
 | `torch_memory_fraction` | `True` | Cap each process at its share of its device through PyTorch's own allocator, so one stage's overrun cannot take down its co-tenants. |
 | `torch_gc_threshold` | `0.0` | Share of the per-process cap past which PyTorch reclaims cached blocks proactively. `0.0` keeps the allocator's reactive default. |
@@ -101,23 +100,15 @@ Both are skipped when `PYTORCH_CUDA_ALLOC_CONF` is already set: an operator who 
 allocator by hand outranks these defaults, and the settings interact, so merging would be worse
 than either.
 
-Unconfigured, RAPIDS asks the CUDA driver for every intermediate column a query produces, and
-a driver allocation is a synchronizing call. A translated chain of a dozen operators over a
-hundred shards makes thousands of them, so `allocator="pool"` is the setting with the largest
-constant-factor effect on GPU query time. It is off by default because a pool reserves memory
-that a co-tenant on the same device can then no longer see.
+Unconfigured, RAPIDS asks the CUDA driver for every intermediate column a query produces, and a driver allocation is a synchronizing call. A translated chain of a dozen operators over a hundred shards makes thousands of them, so the allocator is the setting with the largest constant-factor effect on GPU query time. The default, `async`, uses the driver's stream-ordered pool, which pays the allocation once and returns freed memory to the driver, so a co-tenant on the same device still sees it. `pool` suballocates from one reservation that it holds until the process exits.
 
 Carbonite sizes the pool from what it calls reservable: the device's capacity less
 `vram_headroom` and less whatever another process already holds. A device that cannot report
 its memory gets no pool at all rather than one sized from a guess.
 
-`managed` backs the pool with unified memory, so a working set larger than the device migrates
-over the bus instead of failing. `async` uses the driver's own stream-ordered pool where the
-installed RMM offers one.
+`managed` backs the pool with unified memory, so a working set larger than the device migrates over the bus instead of failing.
 
-Turn on `spill_to_host` where a shard occasionally misjudges its size: it turns a class of hard
-out-of-memory into a slowdown. With `statistics` on, a shard that does overflow is subdivided
-by the factor its own high-water mark says will clear it, rather than being halved repeatedly.
+`spill_to_host` stays off because the fan-out has a better answer to the same event. A shard that overflows is subdivided and rerun on the device, which is exact because the stage is mergeable. Spilling pre-empts that: the shard no longer raises, so it finishes by paging columns across PCIe instead. Turn it on for a plan with no mergeable reducer to subdivide, where the choice is between slow and failed. With `statistics` on, an overflowing shard is subdivided by the factor its own high-water mark says will clear it, rather than being halved repeatedly.
 
 ```python
 from batcher import Config

@@ -1,6 +1,6 @@
 # Model and AI functions in SQL
 
-Batcher's SQL surface carries two kinds of table function that call a model: `ML_PREDICT` for a fitted traditional model, and `AI_GENERATE` and `AI_EXTRACT` for a language model. This page covers both, including why each is written in the `FROM` clause rather than in the `SELECT` list. For the rest of the SQL surface, see {doc}`sql`.
+This page covers calling a model from Batcher SQL. Two kinds of table function do it: `ML_PREDICT` scores a fitted traditional model, and `AI_GENERATE` and `AI_EXTRACT` call a language model. Both keep inference inside the query plan, so a prediction or a generated field is one more column the statement can filter, join, and aggregate. For the rest of the SQL surface, see {doc}`sql`.
 
 Every example here runs against a {py:obj}`bt.Session <batcher.Session>`, which holds the catalog a query resolves names against:
 
@@ -27,18 +27,13 @@ print(
 # {'n': [1]}
 ```
 
-Scoring stays inside the plan, so the model runs where the data is rather than pulling rows back to the driver. A saved model can be named by quoted path instead of registering it first; see the {doc}`SQL API </api/relational/sql>`.
+Scoring stays inside the plan, so the model runs where the data is rather than pulling rows back to the driver. A saved model can be named by quoted path instead of registering it first. See the {doc}`SQL API </api/relational/sql>`.
 
 ## Generative AI functions
 
-`ML_PREDICT` covers the *traditional* model. `AI_GENERATE` is the generative half: a language
-model asked to write from a text column, with `ai_query` and `ai_complete` accepted as aliases
-so a query ported from Databricks or Snowflake runs as written. `AI_EXTRACT` is the same shape
-for pulling typed fields out of the text.
+`ML_PREDICT` covers the *traditional* model. `AI_GENERATE` is the generative half: a language model asked to write from a text column, with `ai_query` and `ai_complete` accepted as aliases so a query ported from Databricks or Snowflake runs as written. `AI_EXTRACT` is the same shape for pulling typed fields out of the text.
 
-An engine is registered in Python and named in SQL, never written inline. It carries an
-endpoint, credentials and sampling settings, so a quoted engine argument is refused rather than
-becoming a way to put an API key in query text:
+An engine is registered in Python and named in SQL, never written inline. It carries an endpoint, credentials and sampling settings, so a quoted engine argument is refused rather than becoming a way to put an API key in query text:
 
 ```python
 s = bt.Session()
@@ -63,10 +58,7 @@ print(
 # {'id': [1, 2, 3], 'response': ['LOVE IT', 'BROKE FAST', 'IT IS FINE']}
 ```
 
-The relation and the engine are positional; everything that changes the answer is a named
-setting. `AI_GENERATE` takes `prompt_column` (required), `template` and `output_column`.
-`AI_EXTRACT` takes `prompt_column` and a `schema` written as a column definition list, and
-appends one typed column per field:
+The relation and the engine are positional. Everything that changes the answer is a named setting. `AI_GENERATE` takes `prompt_column` (required), `template` and `output_column`. `AI_EXTRACT` takes `prompt_column` and a `schema` written as a column definition list, and appends one typed column per field:
 
 ```python
 import json
@@ -90,36 +82,21 @@ print(
 # {'label': ['negative', 'positive'], 'n': [2, 1]}
 ```
 
-The generated column is an ordinary column, so the rest of the statement groups, filters and
-joins over it without leaving SQL.
+The generated column is an ordinary column, so the rest of the statement groups, filters and joins over it without leaving SQL.
 
-### Why these read as tables rather than as functions in the SELECT list
+## Why these are table functions
 
-Every warehouse writes its AI call in the `SELECT` list and this does not, for the reason that
-also makes `ML_PREDICT` a table function. A Batcher scalar function lowers to an expression
-evaluated per row in Rust, and a language-model call is neither expressible there nor wanted
-per row: the whole point of the inference path is that an engine loads once per worker and
-sees a batch at a time. Writing the call in `FROM` says that rather than hiding it.
+Every warehouse writes its AI call in the `SELECT` list and this does not, for the reason that also makes `ML_PREDICT` a table function. A Batcher scalar function lowers to an expression evaluated per row in Rust, and a language-model call is neither expressible there nor wanted per row. The whole point of the inference path is that an engine loads once per worker and sees a batch at a time. Writing the call in `FROM` says that rather than hiding it.
 
-### What is not translated
+## What SQL does not translate
 
-`AI_CLASSIFY` is not. Its grammar is fixed at three arguments, and a relational form needs
-four: the relation, the engine, the text column and the labels. Use `AI_EXTRACT` with a
-one-field schema, or {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>` on
-the `Dataset`. `AI_EMBED`, `AI_SIMILARITY`, `AI_AGG` and `AI_FORECAST` are likewise
-DataFrame-side; each reports where its capability lives rather than failing as an unknown
-table.
+`AI_CLASSIFY` is not. Its grammar is fixed at three arguments, and a relational form needs four: the relation, the engine, the text column and the labels. Use `AI_EXTRACT` with a one-field schema, or {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>` on the `Dataset`. `AI_EMBED`, `AI_SIMILARITY`, `AI_AGG` and `AI_FORECAST` are likewise DataFrame-side. Each reports where its capability lives rather than failing as an unknown table.
 
-The full set is always available on the `Dataset`, where these lower to anyway:
-{py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`,
-{py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>`,
-{py:meth}`ds.ml.extract <batcher.api.dataset.ml.DatasetML.extract>` and
-{py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`. See
-{doc}`the LLM engines page </ml/retrieval/llm/engines>` for the engines they take, and
-{doc}`batch inference </ml/inference/index>` for batching, GPU sizing and error handling.
+The full set is always available on the `Dataset`, where these lower to anyway: {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`, {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>`, {py:meth}`ds.ml.extract <batcher.api.dataset.ml.DatasetML.extract>` and {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`. See {doc}`the LLM engines page </ml/retrieval/llm/engines>` for the engines they take, and {doc}`batch inference </ml/inference/index>` for batching, GPU sizing and error handling.
 
 ## See also
 
 - {doc}`SQL </user-guide/analyze/sql>`: the rest of the SQL surface, the supported subset, and the deliberate differences from DuckDB.
 - {doc}`SQL API </api/relational/sql>`: the {py:class}`Session <batcher.Session>` methods, including naming a saved model by path.
 - {doc}`Batch inference </ml/inference/index>`: the same models scored from the DataFrame API.
+- {doc}`LLM engines </ml/retrieval/llm/engines>`: the engines `register_engine` accepts.

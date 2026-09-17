@@ -1,6 +1,8 @@
 # String search
 
-Every predicate here is a columnar expression, so the whole column is tested in Rust rather than one Python call per row. `contains_any`/`contains_all` take an iterable of patterns and fold to a single boolean column, which is what you want for a keyword screen: one pass, not one pass per keyword.
+Every predicate here is a columnar expression, so the whole column is tested in Rust rather than one Python call per row. `contains_any` and `contains_all` take a list of patterns and fold to a single boolean column, which is what you want for a keyword screen: one pass, not one pass per keyword.
+
+The script runs plain substring, prefix, and suffix tests, the multi-keyword tests, and counts occurrences with `count_matches` for a pattern and `count_char` for a single character.
 
 The whole script, executed on every test run:
 

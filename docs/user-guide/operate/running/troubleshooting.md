@@ -10,6 +10,10 @@ it.
 If your problem is not an exception message, find the row that matches what you are seeing
 and follow it. The rest of this page covers the exceptions themselves.
 
+The six symptoms people hit most often each have a usual cause and a first move, shown here before the full table:
+
+![A decision tree that starts from what you see and branches into six symptoms, each with its usual cause and what to do. Nothing ran, or a Dataset repr came back: a Dataset is lazy and no terminal operation was called, so call collect(). ColumnNotFoundError: a typo, or an earlier step dropped or renamed the column, so check .columns. PlanError on filter(): a string was passed where an expression belongs, so use bt.col() or ds.sql(). Correct but slow: a filter didn't push, the build side is the wrong way round, or an estimate missed, so read the plan with explain-plans. Recomputes each time: a Dataset is a plan and every terminal runs it again, so cache() it. Out of memory: state is held in memory and spilling is off by default, so pass spill=True and read about spilling.](/_static/diagrams/troubleshooting_tree.svg)
+
 | Symptom | Read this |
 |---|---|
 | Nothing ran, or the result is a {py:class}`Dataset <batcher.Dataset>` repr | "Nothing happened when I called a transformation", below |
@@ -46,15 +50,16 @@ Terminal operations are `collect`, `to_pydict`, `to_pylist`, `count`,
 
 ## Unknown column
 
-Referencing a column that is not in the input raises {py:exc}`PlanError <batcher.PlanError>` with the available
-names. Check for typos and confirm earlier steps did not drop or rename the column.
+Referencing a column that is not in the input raises {py:exc}`ColumnNotFoundError <batcher.ColumnNotFoundError>`, a
+subclass of {py:exc}`PlanError <batcher.PlanError>`, with the available names. Check for typos and confirm earlier
+steps did not drop or rename the column.
 
 ```python
 try:
     ds.select("nope").to_pydict()
 except Exception as exc:
     print(type(exc).__name__, "-", exc)
-# PlanError - projection 'nope' references unknown column(s) ['nope']; available: ['x', 'y']
+# ColumnNotFoundError - projection 'nope' references unknown column(s) ['nope'] Available columns: 'x', 'y'
 ```
 
 `.columns` shows the current schema names at any point in the chain.
@@ -74,14 +79,14 @@ try:
     ds.filter("x > 1")
 except Exception as exc:
     print(type(exc).__name__, "-", exc)
-# PlanError - filter() requires an expression, e.g. col('x') > 0
+# PlanError - filter() requires an expression, e.g. col('x') > 0; got str. A SQL string goes to ds.sql(...) instead, ...
 
 ok = ds.filter(bt.col("x") > 1)
 print(ok.to_pydict())
 # {'x': [2, 3], 'y': [20, 30]}
 ```
 
-To filter with SQL syntax instead, use {py:obj}`bt.sql <batcher.sql>`.
+To filter with SQL syntax instead, use {py:meth}`ds.sql <batcher.Dataset.sql>` or {py:obj}`bt.sql <batcher.sql>`.
 
 ## The keyword to `agg` is the output name
 
@@ -138,18 +143,8 @@ print(type(table).__module__, type(table).__name__)
 
 ## Catching errors by type
 
-Every Batcher failure subclasses {py:exc}`bt.BatcherError <batcher.BatcherError>`, so one `except` catches them all
-without importing anything internal:
-
-```python
-try:
-    ds.select("nope").to_pydict()
-except bt.BatcherError as exc:
-    print(type(exc).__name__, "-", exc)
-# ColumnNotFoundError - projection 'nope' references unknown column(s) ['nope'] Available columns: 'x', 'y'
-```
-
-A near miss on a real column names the one you meant, whichever verb you typed it into:
+Every Batcher failure subclasses {py:exc}`bt.BatcherError <batcher.BatcherError>`, so one `except bt.BatcherError`
+catches them all without importing anything internal. A near miss on a real column names the one you meant, whichever verb you typed it into:
 
 ```python
 try:
@@ -171,30 +166,30 @@ reachable as `bt.<Name>`:
 | Type | Catch it for | Also a |
 |------|--------------|--------|
 | {py:exc}`bt.PlanError <batcher.PlanError>` | an invalid plan or schema, raised eagerly at build time | `ValueError` |
-| {py:exc}`bt.ColumnNotFoundError <batcher.ColumnNotFoundError>` | a reference to a column that isn't there (carries `.column`) | `KeyError` |
+| {py:exc}`bt.ColumnNotFoundError <batcher.ColumnNotFoundError>` | a reference to a column that isn't there (carries `.column`) | `PlanError`, `ValueError`, `KeyError` |
 | {py:exc}`bt.ConfigError <batcher.ConfigError>` | an out-of-range or inconsistent configuration value | `ValueError` |
-| {py:exc}`bt.MissingDependencyError <batcher.MissingDependencyError>` | an optional extra that isn't installed (carries `.install`) | `ImportError` |
-| {py:exc}`bt.AccessDeniedError <batcher.AccessDeniedError>` | a governed table or column the principal can't read | `PermissionError` |
-| {py:exc}`bt.ExecutionError <batcher.ExecutionError>` | an operator failing at runtime in the engine | |
+| {py:exc}`bt.MissingDependencyError <batcher.MissingDependencyError>` | an optional extra that isn't installed (carries `.install`) | `RuntimeError`, `ImportError` |
+| {py:exc}`bt.AccessDeniedError <batcher.AccessDeniedError>` | a governed table or column the principal can't read | `PermissionError`, `OSError` |
+| {py:exc}`bt.ExecutionError <batcher.ExecutionError>` | an operator failing at runtime in the engine | `RuntimeError` |
 | {py:exc}`bt.OptimizationError <batcher.OptimizationError>` | the optimizer failing to produce a physical plan | |
-| {py:exc}`bt.CompileError <batcher.CompileError>` | JIT compilation failing (the interpreter still runs) | |
+| {py:exc}`bt.CompileError <batcher.CompileError>` | JIT compilation failing (the interpreter still runs) | `RuntimeError` |
 | {py:exc}`bt.ResourceError <batcher.ResourceError>` | the resource manager unable to grant memory or credit | |
 | {py:exc}`bt.IOError <batcher.IOError>` | a source or sink failing to read, write, list, or open | |
 | {py:exc}`bt.FormatError <batcher.FormatError>` | an unknown format, or a file malformed for its format | |
 | {py:exc}`bt.CommitError <batcher.CommitError>` | an atomic write commit failing (a concurrent-writer conflict) | |
 | {py:exc}`bt.SchemaError <batcher.SchemaError>` | schemas that can't be reconciled across files or against an expected one | |
 | {py:exc}`bt.DataQualityError <batcher.DataQualityError>` | a `ds.dq...fail()` expectation with violating rows (carries the counts) | `ValueError` |
-| {py:exc}`bt.BackendError <batcher.BackendError>` | a specific execution backend failing | |
+| {py:exc}`bt.BackendError <batcher.BackendError>` | a specific execution backend failing | `RuntimeError` |
 | {py:exc}`bt.TransportError <batcher.TransportError>` | the distributed data plane (shared memory / Flight) failing | |
 
-Because several also subclass a builtin, existing `except ValueError` /
+Because several also subclass a builtin, existing `except ValueError` and
 `except ImportError` handlers keep working unchanged.
 
 ## Stopping a query that is taking too long
 
-Ctrl-C during a long `collect()` stops it. That is worth stating because it did not always.
-The engine releases the interpreter lock while it runs, so Python had no opportunity to
-deliver the signal until the query finished on its own, and Ctrl-C appeared to do nothing.
+Ctrl-C during a long `collect()` stops it, even though the engine releases the interpreter
+lock while it runs and Python would otherwise have no chance to deliver the signal until the
+query finished.
 
 Cancellation is *cooperative*. The engine checks between morsels, between operators, and
 between the merge passes of a spilling sort, so a query stops at the next such point rather
@@ -204,7 +199,8 @@ complete and are not are worse than an error.
 
 What it raises depends on who cancelled it. Ctrl-C comes back as `KeyboardInterrupt`, which
 is what pressing it is supposed to produce. A cancel from another thread raises
-`QueryCancelledError` instead, because nobody pressed anything. A second Ctrl-C reaches
+`QueryCancelledError` instead, a subclass of {py:exc}`bt.ExecutionError <batcher.ExecutionError>`, because nobody
+pressed anything. A second Ctrl-C reaches
 Python's previous handler, so the usual hard interrupt still escapes a query that will not
 stop.
 
@@ -230,8 +226,8 @@ print(bt.cancel_query("q-already-finished"))
 # False
 ```
 
-`False` means the query had already finished. That is not an error. A cancel and a
-completion racing has no correct loser.
+`False` means the query had already finished. That isn't an error, because a cancel racing a
+completion has no correct loser.
 
 ```{note}
 This covers a query running in *this* process. On a distributed run the driver cancels its

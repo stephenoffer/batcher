@@ -1,14 +1,10 @@
 # Relational operations
 
-This page covers the scripts that exercise the relational core in both of its spellings:
-choosing columns, filtering rows, joining, aggregating, computing over windows, and running
-the same plans as SQL.
+This page covers the scripts that exercise the relational core in both of its spellings: choosing columns, filtering rows, joining, aggregating, computing over windows, and running the same plans as SQL.
 
 ## Projections and filters
 
-`select` decides the entire output shape, so anything it does not name is gone.
-`with_columns` keeps every existing column and adds or replaces. Confuse the two and a column
-quietly disappears three steps later.
+`select` decides the entire output shape, so anything it does not name is gone. `with_columns` keeps every existing column and adds or replaces. Confuse the two and a column quietly disappears three steps later.
 
 ```python
 import batcher as bt
@@ -29,16 +25,11 @@ widened = orders.with_columns(price_in_thousands=col("o_totalprice") / 1000.0)
 assert widened.columns == [*orders.columns, "price_in_thousands"]
 ```
 
-Predicates combine with `&`, `|` and `~`. The parentheses are mandatory, because Python binds
-those tighter than the comparisons. Three-valued logic is the subtler point: a comparison
-against null is null rather than false, so a row with a null key survives neither `x == 1`
-nor `x != 1`.
+Predicates combine with `&`, `|` and `~`. The parentheses are mandatory, because Python binds those tighter than the comparisons. Three-valued logic is the subtler point: a comparison against null is null rather than false, so a row with a null key survives neither `x == 1` nor `x != 1`.
 
 ## Joins
 
-The join type decides what happens to rows with no partner. Semi and anti are the filtering
-joins. Both return only left-hand columns and neither can increase the row count, which makes
-them the right tool for a membership test.
+The join type decides what happens to rows with no partner. Semi and anti are the filtering joins. Both return only left-hand columns and neither can increase the row count, which makes them the right tool for a membership test.
 
 ```python
 orders = bt.from_pydict({"id": [1, 2, 3], "cid": [10, 20, 99]})
@@ -51,15 +42,11 @@ assert with_customer.count() + orphans.count() == orders.count()
 assert with_customer.columns == orders.columns
 ```
 
-Fan-out is the trap. An inner join emits one row per matching pair, so a right side with
-three rows for a key turns one left row into three. Check the key's uniqueness first; it is
-one count. Aggregating the many side before the join removes the problem entirely.
+Fan-out is the trap. An inner join emits one row per matching pair, so a right side with three rows for a key turns one left row into three. Check the key's uniqueness first; it is one count. Aggregating the many side before the join removes the problem entirely.
 
 ## Aggregation
 
-`agg` on a Dataset collapses it to one row; the same expressions after a `group_by` collapse
-each group. That symmetry is deliberate, and it means there is no separate grouped spelling
-to learn.
+`agg` on a Dataset collapses it to one row; the same expressions after a `group_by` collapse each group. That symmetry is deliberate, and it means there is no separate grouped spelling to learn.
 
 ```python
 lineitem = bt.from_pydict(
@@ -81,14 +68,11 @@ assert sum(result["lines"]) == lineitem.count()
 assert result["l_shipmode"] == sorted(result["l_shipmode"])
 ```
 
-Two distinctions are worth holding onto. `bt.count()` counts rows while `col(x).count()`
-counts non-null values of x, and they differ the moment a column has nulls. The other is
-emptiness: an empty sum is null, an empty count is zero.
+Two distinctions are worth holding onto. `bt.count()` counts rows while `col(x).count()` counts non-null values of x, and they differ the moment a column has nulls. The other is emptiness: an empty sum is null, an empty count is zero.
 
 ## Windows
 
-A group-by replaces the rows with one row per group. A window adds a column and keeps every
-row. Reach for the window when downstream steps still need the detail.
+A group-by replaces the rows with one row per group. A window adds a column and keeps every row. Reach for the window when downstream steps still need the detail.
 
 ```python
 sales = bt.from_pydict(
@@ -107,18 +91,13 @@ assert all(0.0 < value <= 1.0 for value in values)
 assert abs(sum(values) - 2.0) < 1e-9  # the shares within each region sum to one
 ```
 
-Two behaviours differ from SQL and are worth knowing. `order_by` takes `(column, descending)`
-pairs, so the ranking direction is part of the window rather than a separate argument. And
-with an `order_by` the default frame ends at the current row, as in SQL, so `last_value`
-returns the current row's value unless you pass `frame=(None, None)` for the whole partition.
+Two behaviours differ from SQL and are worth knowing. `order_by` takes `(column, descending)` pairs, so the ranking direction is part of the window rather than a separate argument. And with an `order_by` the default frame ends at the current row, as in SQL, so `last_value` returns the current row's value unless you pass `frame=(None, None)` for the whole partition.
 
 ## SQL
 
 ### SQL and the DataFrame API are the same thing
 
-A query is parsed into the logical plan the DataFrame API builds, so `bt.sql` returns a lazy
-Dataset rather than a materialized table. That means the two spellings interoperate freely
-and you can move between them mid-pipeline.
+A query is parsed into the logical plan the DataFrame API builds, so `bt.sql` returns a lazy Dataset rather than a materialized table. That means the two spellings interoperate freely and you can move between them mid-pipeline.
 
 ```python
 import batcher as bt
@@ -136,24 +115,13 @@ biggest = summary.filter(col("total") > 15).sort("total", descending=True)
 assert biggest.to_pydict()["region"] == ["west", "east"]
 ```
 
-`ds.sql` is the same thing scoped to one Dataset, which it calls `self`. `bt.Session` gives a
-query its own catalog, which is what you want when two parts of a process register tables
-under the same names.
+`ds.sql` is the same thing scoped to one Dataset, which it calls `self`. `bt.Session` gives a query its own catalog, which is what you want when two parts of a process register tables under the same names.
 
 ### Where SQL surprises people
 
-Group and order by the alias, not by an ordinal. `ORDER BY 1` against a computed projection
-does not resolve, and the error names the column it could not find.
+Three-valued logic behaves as the standard requires, which is to say it catches people out. `COUNT(*)` counts rows while `COUNT(column)` counts non-nulls; a comparison against null is null, so neither `= 10` nor `<> 10` keeps a null row; and `IS NULL` is the only test that finds them. `examples/sql_queries/null_semantics_in_sql.py` asserts all three against a real left join.
 
-Three-valued logic behaves as the standard requires, which is to say it catches people out.
-`COUNT(*)` counts rows while `COUNT(column)` counts non-nulls; a comparison against null is
-null, so neither `= 10` nor `<> 10` keeps a null row; and `IS NULL` is the only test that
-finds them. `examples/sql_queries/null_semantics_in_sql.py` asserts all three against a real
-left join.
-
-The parser takes a dialect, so a query written for another engine runs before it is ported.
-That matters for a migration. Prove the old query still returns the same rows here, and only
-then rewrite it.
+The parser takes a dialect, so a query written for another engine runs before it is ported. That matters for a migration. Prove the old query still returns the same rows here, and only then rewrite it.
 
 ## Every script on this page
 
@@ -278,3 +246,10 @@ The table below lists the relational and SQL scripts in path order.
 | `examples/sql_queries/window_frames_in_sql.py` | Window frames spelled out in SQL |
 | `examples/sql_queries/window_functions.py` | Window functions in SQL, with the frame spelled out |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/cookbook/dataset/index`: focused recipes for joins, grouping, reshaping, and deduplication.
+- {doc}`/user-guide/analyze/sql`: the SQL entry points and the supported syntax.
+- {doc}`/user-guide/analyze/window-functions`: partitions, ordering, and frames in depth.
+- {doc}`tpch`: the same operators composed into all 22 TPC-H queries.

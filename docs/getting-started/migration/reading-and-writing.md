@@ -35,12 +35,11 @@ If your fingers already type `pd.read_csv` or `pl.read_parquet`, the Batcher spe
 | Iceberg tables | {py:meth}`bt.read.iceberg(t) <batcher.api.io_namespace.reader.Reader.iceberg>` |
 | any SQL database | {py:meth}`bt.read.sql(q, uri=...) <batcher.api.io_namespace.reader.Reader.sql>` |
 
-For a source that isn't a file at all, {py:meth}`bt.read.table(name, ...) <batcher.api.io_namespace.reader.Reader.table>` constructs any
-registered connector by name, which is the escape hatch behind the typed readers.
+For a source that isn't a file at all, {py:meth}`bt.read.table(name, ...) <batcher.api.io_namespace.reader.Reader.table>` constructs any registered connector by name. It's the escape hatch behind the typed readers.
 
 ## Getting data in from another library
 
-Whatever object you're holding, there's a constructor for it:
+Pick the constructor for the object you're holding:
 
 | You have | Call |
 |----------|------|
@@ -64,9 +63,7 @@ print(bt.sql("SELECT x * 2 AS y FROM t", t={"x": [1, 2, 3]}).to_pydict())
 
 ## Concatenating and generating
 
-{py:func}`bt.concat <batcher.concat>` means frame concatenation, exactly as `pd.concat` and `pl.concat` do, and
-takes Polars' `how` vocabulary. The string-building `concat` keeps its own explicit
-name, {py:func}`bt.concat_str <batcher.concat_str>`:
+{py:func}`bt.concat <batcher.concat>` means frame concatenation, exactly as `pd.concat` and `pl.concat` do, and takes Polars' `how` vocabulary. The string-building `concat` keeps its own explicit name, {py:func}`bt.concat_str <batcher.concat_str>`:
 
 ```python
 import batcher as bt
@@ -85,12 +82,9 @@ print(ds.select(name=bt.concat_str(bt.col("first"), bt.lit(" "), bt.col("last"))
 # {'name': ['ada lovelace']}
 ```
 
-`how` is `"vertical"` (the default), `"vertical_relaxed"` to deduplicate,
-`"diagonal"` to stack over the union of the columns, or `"horizontal"` to place frames
-side by side by row position.
+`how` is `"vertical"` (the default), `"vertical_relaxed"` to deduplicate, `"diagonal"` to stack over the union of the columns, or `"horizontal"` to place frames side by side by row position.
 
-{py:func}`bt.range <batcher.range>` follows `builtins.range`, single-argument form included, and {py:func}`bt.date_range <batcher.date_range>`
-follows `pandas.date_range` and `polars.date_range`:
+{py:func}`bt.range <batcher.range>` follows `builtins.range`, single-argument form included, and {py:func}`bt.date_range <batcher.date_range>` follows `pandas.date_range` and `polars.date_range`:
 
 ```python
 import batcher as bt
@@ -101,8 +95,7 @@ print(bt.date_range("2024-01-01", periods=3, interval="1mo").count())
 # 3
 ```
 
-Pass `end=` or `periods=`, the stride as `interval=` (Polars) or `freq=` (pandas), and
-`closed=` to drop an endpoint the way pandas' `inclusive=` does.
+Pass `end=` or `periods=`, the stride as `interval=` (Polars) or `freq=` (pandas), and `closed=` to drop an endpoint the way pandas' `inclusive=` does.
 
 ## Moving data in and out
 
@@ -136,8 +129,7 @@ Each row pairs a source system with its constructor and, where one exists, its e
 | PyTorch | {py:func}`bt.from_torch(ds) <batcher.from_torch>` | {py:meth}`ds.ml.iter_torch_batches() <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` / {py:meth}`ds.ml.to_torch_dataloader() <batcher.api.dataset.ml.DatasetML.to_torch_dataloader>` |
 | TensorFlow | {py:func}`bt.from_tf(ds) <batcher.from_tf>` | {py:meth}`ds.ml.to_tf() <batcher.api.dataset.ml.DatasetML.to_tf>` |
 
-The `ml.iter_torch_batches` and `ml.to_tf` loaders stream per-batch tensor dicts, and each
-pass runs the query again, so a multi-epoch training loop streams in bounded memory.
+The `ml.iter_torch_batches` and `ml.to_tf` loaders yield a re-iterable dataset of per-batch tensor dicts, so a multi-epoch training loop streams the query in bounded memory.
 
 ## See also
 

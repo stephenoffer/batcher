@@ -1,6 +1,8 @@
 # Machine learning cookbook
 
-This section holds 27 recipes for the `batcher.ml` surface, ordered the way a model gets built: prepare the features, fit something, check it, then run it. The last group is complete pipelines rather than single calls.
+Batcher runs the data half of machine learning where the data already is. Preprocessors, estimators, cross-validation, batch inference, and vector search all read through the engine, and the GPU pipelines load a model once per worker and keep the device busy while the CPU decodes.
+
+The 27 recipes follow the order a model gets built: prepare the features, fit something, check it, then run it. The last group is complete pipelines rather than single calls.
 
 The first four groups each embed one self-contained script that builds its own in-memory data and asserts on its own output, run end to end by `tests/docs/test_examples.py`. A pipeline page is a sequence of shorter blocks instead, executed in document order by `tests/docs/test_doc_examples.py`, with the stages that need a GPU or a cloud bucket shown but not run. Either way a page that stops matching the engine fails the suite rather than drifting.
 

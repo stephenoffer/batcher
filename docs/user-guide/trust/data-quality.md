@@ -163,7 +163,7 @@ failure counts by rule are one aggregation away.
 `fail` is the data-contract gate at a pipeline boundary. It raises
 {py:exc}`DataQualityError <batcher.DataQualityError>` if any constraint is violated, and otherwise returns the
 dataset unchanged so the chain continues. The exception carries the per-constraint counts,
-and the message it carries names every rule that broke and how many rows broke it.
+and its message names every rule that broke and how many rows broke it.
 
 ```python
 from batcher._internal.errors import DataQualityError
@@ -235,8 +235,8 @@ print(str(dupes.dq.unique("id").validate()))
 
 Referential integrity comes in two shapes. {py:meth}`references <batcher.api.dataset.dq.DatasetDQ.references>` is a constraint, so orphans
 can be counted, dropped, or quarantined alongside every other check in the chain.
-{py:meth}`foreign_key <batcher.api.dataset.dq.DatasetDQ.foreign_key>` is a terminal that hands back the orphan rows themselves, which is
-what you want when the orphans are the answer. A NULL key is not an orphan in either: it
+{py:meth}`foreign_key <batcher.api.dataset.dq.DatasetDQ.foreign_key>` is a terminal that hands back the orphan rows themselves, for
+when the orphans are the answer. A NULL key is not an orphan in either: it
 means "no reference", not "a broken reference".
 
 ```python
@@ -287,7 +287,7 @@ print(contract.on(other_day).validate().ok)
 ## Deduplication
 
 `distinct` removes duplicate rows. With no argument it deduplicates over all
-columns; with a `subset` it keeps one row per key combination. Pass
+columns. With a `subset` it keeps one row per key combination. Pass
 `keep="first"`/`"last"` with `order_by` to pick which row survives. That is the
 "latest record per key" pattern.
 

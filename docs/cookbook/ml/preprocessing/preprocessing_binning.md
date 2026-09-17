@@ -2,6 +2,8 @@
 
 Binning turns a continuous variable into a categorical one, which is how you let a linear model express a non-monotonic effect. Clipping and power transforms attack the other problem: a long tail that dominates the loss.
 
+The script runs `KBinsDiscretizer` over a column with one extreme value, where equal-frequency bins behave and equal-width bins crowd every ordinary value into bin 0. Then it thresholds, clips, log-transforms, power-transforms, and rank-transforms the same column.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/ml/preprocessing_binning.py

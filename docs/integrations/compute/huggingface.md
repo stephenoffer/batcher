@@ -1,20 +1,20 @@
 # Hugging Face
 
-Two separate integrations share a name. The **datasets** side is ingestion: a `datasets.Dataset` is
-an Arrow table underneath, so {py:func}`bt.from_huggingface <batcher.from_huggingface>` takes that table directly and no data is
-converted. The **models** side is inference: {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` take a Hub model id
+This page covers Hugging Face datasets and models. Two separate integrations share the name. The datasets side is ingestion: a `datasets.Dataset` is an Arrow table underneath, so {py:func}`bt.from_huggingface <batcher.from_huggingface>` takes that table directly and no data is
+converted. The models side is inference: {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` take a Hub model id
 and load it once per worker.
 
-Ingestion needs `pip install 'batcher-engine[huggingface]'`. The model paths need `transformers` or
-`sentence-transformers` (`batcher-engine[st]`) respectively.
+Ingestion needs `pip install 'batcher-engine[huggingface]'`. `ds.ml.infer` needs `batcher-engine[transformers]`, and `ds.ml.embed` with a model id needs `batcher-engine[st]` for sentence-transformers.
+
+The following table summarizes the integration:
 
 | | |
 | --- | --- |
-| **Datasets in** | {py:func}`bt.from_huggingface(hf) <batcher.from_huggingface>`, or {py:meth}`bt.read.parquet("hf://...") <batcher.api.io_namespace.reader.Reader.parquet>` |
-| **Models** | `ds.ml.infer(model_id, ...)`, `ds.ml.embed(model_id, ...)` |
-| **Write** | Not supported. Batcher does not push datasets to the Hub. |
-| **Extra** | `pip install 'batcher-engine[huggingface]'`; `transformers` or `batcher-engine[st]` for models |
-| **Parallelism** | {py:func}`from_huggingface <batcher.from_huggingface>` is one in-memory source. `hf://` Parquet splits per row group. |
+| Datasets in | {py:func}`bt.from_huggingface(hf) <batcher.from_huggingface>`, or {py:meth}`bt.read.parquet("hf://...") <batcher.api.io_namespace.reader.Reader.parquet>` |
+| Models | `ds.ml.infer(model_id, ...)`, `ds.ml.embed(model_id, ...)` |
+| Write | Not supported. Batcher does not push datasets to the Hub. |
+| Extra | `batcher-engine[huggingface]` for datasets, `[transformers]` or `[st]` for models |
+| Parallelism | {py:func}`from_huggingface <batcher.from_huggingface>` is one in-memory source. `hf://` Parquet splits per row group. |
 
 ## Datasets in
 
@@ -29,8 +29,7 @@ print(reviews.filter(bt.col("label") == 1).count())
 ```
 
 `from_huggingface` reaches for the dataset's underlying `pa.Table` (`hf.data.table`) and wraps it
-as an in-memory source. That is genuinely zero-copy: the same buffers, no re-encoding. It is
-exactly what {py:func}`bt.from_arrow <batcher.from_arrow>` does with a table you already have, which is how the path can be
+as an in-memory source. It's zero-copy: the same buffers, with no re-encoding. It's exactly what {py:func}`bt.from_arrow <batcher.from_arrow>` does with a table you already have, which is how the path can be
 demonstrated without the Hub:
 
 ```python
@@ -46,12 +45,11 @@ print(reviews.filter(bt.col("label") == 1).select("text").to_pydict())
 ```
 
 :::{important}
-The consequence of "it takes the table" is that the corpus is **already in memory**. `datasets`
-memory-maps its Arrow files, so this is cheaper than it sounds, but it is still a single-process
-handle to the whole thing, not a streaming, larger-than-memory, distributable source.
+Taking the table means the corpus is already in memory. `datasets`
+memory-maps its Arrow files, so this is cheaper than it sounds, but it's still a single-process handle to the whole corpus, not a streaming, distributable source.
 :::
 
-For a corpus that size, land it once and read it back:
+For a large corpus, land it once as Parquet and read it back:
 
 ```python
 import os
@@ -68,7 +66,7 @@ print(bt.read.parquet(corpus).count())
 
 That Parquet directory is what you point a training job at. A `bt.read.parquet` scan splits per row
 group, prunes columns and predicates at the file level, and fans out across a cluster. An
-in-memory HF table can do none of it.
+in-memory Hugging Face table can do none of that.
 
 ## Hub datasets are mostly Parquet
 
@@ -156,27 +154,17 @@ tokens = Tokenizer("text", hf_tok, output_column="input_ids").fit_transform(revi
 ```
 :::
 
-## Failure modes worth knowing
+## Requirements and limitations
 
-:::{warning}
-**`load_dataset(..., streaming=True)` is not a streaming source here.** An HF `IterableDataset` has
-no materialized Arrow table, so the adapter falls back to iterating it into one, which materializes
-the whole thing. If you wanted streaming, you did not get it. Read the Parquet files instead.
-:::
+`load_dataset(..., streaming=True)` isn't a streaming source here. An `IterableDataset` has no materialized Arrow table, so the adapter iterates it into one, which materializes the whole dataset. Read the Parquet files instead.
 
-**Nested and non-Arrow-native features.** Image, Audio, and `ClassLabel` features are Arrow structs
-of paths or bytes, not decoded tensors. They arrive as structs, and decoding is a `map_batches`
-stage (or {py:meth}`bt.read.images <batcher.api.io_namespace.reader.Reader.images>` if you have the paths). Nothing decodes implicitly.
+`Image` and `Audio` features are Arrow structs of paths or bytes, not decoded tensors, and they arrive as structs. Decoding is a `map_batches` stage, or {py:meth}`bt.read.images <batcher.api.io_namespace.reader.Reader.images>` if you have the paths. Nothing decodes implicitly. A `ClassLabel` arrives as its integer ids.
 
-**A model id per worker is a download per worker.** The first batch on a cold cluster pulls the
+A model id is a download per worker. The first batch on a cold cluster pulls the
 weights on every worker. Pre-bake the model into the image or warm the HF cache on a shared volume;
-otherwise your job's first minute is a rate-limited stampede on `huggingface.co`. Set `HF_TOKEN`
-for gated models. Every worker needs it, so it belongs in the `runtime_env`.
+otherwise the job's first minute is a rate-limited rush of downloads from `huggingface.co`. Set `HF_TOKEN` for gated models. Every worker needs it, so it belongs in the `runtime_env`.
 
-:::{important}
-**Do not pass a plain function to a GPU stage.** A function is rebuilt per batch, so the weights
-reload per batch. Pass a class, or a model id, which becomes one. Batcher warns; heed the warning.
-:::
+Don't pass a plain function to a GPU stage. A function is rebuilt per batch, so the weights reload per batch. Pass a class, or a model id, which becomes one.
 
 ## See also
 

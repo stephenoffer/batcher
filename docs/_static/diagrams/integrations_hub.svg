@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 524" role="img" width="980" height="524"><defs><style>
+  .surface { fill: #ffffff; stroke: #cbd5e1; }
+  .band-blue { fill: #eff6ff; stroke: #3b82f6; }
+  .band-amber { fill: #fffbeb; stroke: #f59e0b; }
+  .band-grey { fill: #f8fafc; stroke: #cbd5e1; }
+  .t-title { fill: #1e293b; }
+  .t-sub { fill: #5b6675; }
+  .t-arrow { fill: #475569; }
+  .t-code { fill: #1e40af; }
+  .code-bg { fill: #f1f5f9; stroke: #e2e8f0; }
+  .pill-blue { fill: #dbeafe; } .pill-amber { fill: #fef3c7; } .pill-grey { fill: #e2e8f0; }
+  .pt-blue { fill: #1d4ed8; } .pt-amber { fill: #b45309; } .pt-grey { fill: #334155; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1e293b; stroke: #334155; }
+    .band-blue { fill: #172554; stroke: #3b82f6; }
+    .band-amber { fill: #2c1f06; stroke: #f59e0b; }
+    .band-grey { fill: #131c31; stroke: #334155; }
+    .t-title { fill: #e2e8f0; }
+    .t-sub { fill: #94a3b8; }
+    .t-arrow { fill: #cbd5e1; }
+    .t-code { fill: #93c5fd; }
+    .code-bg { fill: #0f172a; stroke: #334155; }
+    .pill-blue { fill: #1e3a8a; } .pill-amber { fill: #78350f; } .pill-grey { fill: #334155; }
+    .pt-blue { fill: #bfdbfe; } .pt-amber { fill: #fde68a; } .pt-grey { fill: #e2e8f0; }
+    #tintBlue stop[offset="0"] { stop-color: #16233d; }
+    #tintBlue stop[offset="1"] { stop-color: #1e3a8a; }
+    #tintAmber stop[offset="0"] { stop-color: #2a1e07; }
+    #tintAmber stop[offset="1"] { stop-color: #78350f; }
+  }
+</style>
+<filter id="sh" x="-20%" y="-30%" width="140%" height="180%">
+  <feDropShadow dx="0" dy="2.5" stdDeviation="4.5" flood-color="#0f172a" flood-opacity="0.18"/>
+</filter>
+<filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+  <feDropShadow dx="0" dy="4" stdDeviation="9" flood-color="#2563eb" flood-opacity="0.35"/>
+</filter>
+<linearGradient id="hero" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="0.5" stop-color="#2563eb"/><stop offset="1" stop-color="#4f46e5"/></linearGradient>
+<linearGradient id="heroAmber" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+<linearGradient id="tintBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="tintAmber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="ribbonBlue" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#93c5fd"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+<linearGradient id="ribbonAmber" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+<marker id="arB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/></marker>
+<marker id="arA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#d97706"/></marker>
+<marker id="arG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/></marker>
+</defs><text x="30" y="40" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="800" letter-spacing="1.8" fill="#5b6675">WHERE DATA LIVES</text><text x="716" y="40" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="800" letter-spacing="1.8" fill="#5b6675">AROUND THE ENGINE</text><path d="M 280 102.0 C 345.0 102.0, 345.0 207.0, 410 207.0" fill="none" stroke="url(#ribbonBlue)" stroke-width="3.5" stroke-linecap="round" opacity="0.85"/><path d="M 280 186.0 C 345.0 186.0, 345.0 223.0, 410 223.0" fill="none" stroke="url(#ribbonBlue)" stroke-width="3.5" stroke-linecap="round" opacity="0.85"/><path d="M 280 270.0 C 345.0 270.0, 345.0 239.0, 410 239.0" fill="none" stroke="url(#ribbonBlue)" stroke-width="3.5" stroke-linecap="round" opacity="0.85"/><path d="M 280 354.0 C 345.0 354.0, 345.0 255.0, 410 255.0" fill="none" stroke="url(#ribbonBlue)" stroke-width="3.5" stroke-linecap="round" opacity="0.85"/><g filter="url(#sh)"><rect x="30" y="70" width="250" height="64" rx="10" class="surface" stroke-width="1.2"/></g><text x="155.0" y="102.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Streams</text><text x="155.0" y="121.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">Kafka, Kinesis, Pulsar, Pub/Sub</text><g filter="url(#sh)"><rect x="30" y="154" width="250" height="64" rx="10" class="surface" stroke-width="1.2"/></g><text x="155.0" y="186.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Warehouses</text><text x="155.0" y="205.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">Snowflake, BigQuery, Databricks</text><g filter="url(#sh)"><rect x="30" y="238" width="250" height="64" rx="10" class="surface" stroke-width="1.2"/></g><text x="155.0" y="270.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Lakehouse</text><text x="155.0" y="289.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">Delta Lake, Iceberg, Hudi</text><g filter="url(#sh)"><rect x="30" y="322" width="250" height="64" rx="10" class="surface" stroke-width="1.2"/></g><text x="155.0" y="354.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Databases</text><text x="155.0" y="373.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">SQL, key-value, MongoDB</text><g filter="url(#glow)"><rect x="410" y="176" width="180" height="110" rx="16" fill="url(#hero)"/></g><text x="500.0" y="229.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="19" font-weight="800" fill="#ffffff">Batcher</text><text x="500.0" y="251.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" fill="#ffffff" fill-opacity="0.88">Arrow in, Arrow out</text><rect x="436.05" y="147" width="127.9" height="20" rx="10" class="pill-blue"/><text x="500.0" y="161" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" font-weight="700" letter-spacing="0.4" class="pt-blue">parallel reads in</text><rect x="442.75" y="299" width="114.5" height="20" rx="10" class="pill-amber"/><text x="500.0" y="313" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" font-weight="700" letter-spacing="0.4" class="pt-amber">writes back out</text><g filter="url(#sh)"><rect x="716" y="132" width="244" height="72" rx="10" class="surface" stroke-width="1.2"/></g><text x="838.0" y="168.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Compute and ML</text><text x="838.0" y="187.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">Ray, schedulers, PyTorch</text><g filter="url(#sh)"><rect x="716" y="248" width="244" height="72" rx="10" class="surface" stroke-width="1.2"/></g><text x="838.0" y="284.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13.5" font-weight="700" class="t-title">Observability</text><text x="838.0" y="303.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11" class="t-sub">metrics, traces, lineage</text><path d="M 596 213.0 L 708 168" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="624" y="182" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">scheduling</text><path d="M 596 249.0 L 708 284" fill="none" stroke="#d97706" stroke-width="2.4" marker-end="url(#arA)"/><text x="624" y="280" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" class="t-arrow">signals</text><rect x="20" y="420" width="940" height="84" rx="16" class="band-grey" stroke-width="1.5"/><text x="38" y="444" font-family="Helvetica,Arial,sans-serif" font-size="12.5" font-weight="700" letter-spacing="1.5" fill="#94a3b8">EVERY CONNECTOR</text><text x="44" y="466" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">Built on the same public contracts, Source, Sink and Split, so an unlisted system</text><text x="44" y="486" text-anchor="start" font-family="Helvetica,Arial,sans-serif" font-size="11.5" class="t-sub">plugs in the same way. Not every connector writes: BigQuery and Databricks have no sink.</text></svg>

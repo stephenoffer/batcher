@@ -1,9 +1,7 @@
 # Filter and column pushdown
 
 This page describes which parts of a query Batcher hands to the data source itself, so the
-rows and columns you don't need are never read, decoded, or sent over the network. It
-covers the predicate shapes that push, what each source backend can express, and why a
-predicate that doesn't push still returns the right answer.
+rows and columns you don't need are never read, decoded, or sent over the network.
 
 ## What pushdown is
 
@@ -20,15 +18,16 @@ the database, that work never happens.
 Column pushdown works the same way and is why `select` before a wide read matters: a
 columnar source reads only the columns the plan still needs.
 
+The figure shows both on one plan, as written and as Kyber leaves it:
+
+![Two plan trees for the same query, a join of orders and customers on c_id, then a filter on o_date, then a projection of o_id and c_name. As written, both scans read every row and every column, the join sees every matching row, and the filter runs above the join. As Kyber leaves it, the filter has moved below the join onto the orders side, so non-matching rows are gone before the join build; the orders scan reads only o_id, c_id and o_date and is offered the predicate, so the source may skip row groups, and the customers scan reads only c_id and c_name. The filter node is still in the plan after the rewrite, because the predicate handed to the source is a hint and a connector that translates none or only part of it is still correct. Only a conjunct that names one side of the join moves below it; one that names both sides stays above.](/_static/diagrams/pushdown_before_after.svg)
+
 ## Pushdown never changes your results
 
 The engine keeps its own filter operator regardless of what the source did with the
-predicate. That single rule is what makes pushdown safe to reason about:
-
-- A source that ignores the predicate entirely returns more rows, and the engine's filter
-  removes them.
-- A source that applies only part of it returns more rows, and the engine's filter removes
-  them.
+predicate. That one rule makes pushdown safe to reason about. A source that ignores the
+predicate entirely, or applies only part of it, returns more rows, and the
+engine's filter removes them.
 
 So a predicate that fails to push is a performance question, never a correctness one. You
 never need to check whether a filter "worked".
@@ -167,7 +166,7 @@ print(bounded.collect().num_rows)
 A disjunction is all-or-nothing. Dropping one side of an `OR` would *narrow* the filter and
 lose rows, so if either side can't be expressed, neither is pushed.
 
-Negation follows from the same rule and is the subtlest case. `NOT` of a widened filter is
+Negation follows from the same rule. It is the subtlest case. `NOT` of a widened filter is
 a *narrowed* one, so a partially-translated operand under a `NOT` would drop rows that
 match. Batcher therefore requires an exact translation beneath a negation and declines
 otherwise, which costs some pruning and never a row.
@@ -194,7 +193,7 @@ Two rules decide whether the cap reaches the source at all.
 projection passes it through, because the *n*th projected row is the *n*th scanned row.
 Everything else blocks it, and `filter` is the case worth understanding: `limit(n)` after
 a filter means the first *n* rows *that pass*, while capping the source at *n* would mean
-the passing rows of the first *n* — fewer rows, or none at all if the first *n* all fail.
+the passing rows of the first *n*. That is fewer rows, or none at all if the first *n* all fail.
 Sorting, aggregation, distinct, and sampling block it for the same kind of reason.
 
 **Only a database whose dialect spells the cap `LIMIT n` receives one.** Batcher emits it
@@ -261,7 +260,7 @@ print(latest.collect().to_pydict()["user"])
 [53, 52, 51]
 ```
 
-The bound is derived on the query's first run, from the files being read, so it can't be
+The bound is derived on the query's first run, from the files being read. It can't be
 stale. It applies to `collect()`, `collect(spill=True)`, and `iter_batches()` alike. On a
 table whose sort key is clustered across row groups, such as an event log written in time
 order, the read shrinks to the few groups that hold the answer. A table whose row groups all
@@ -325,7 +324,7 @@ column named `order`, `user`, or `end date` be pushed at all. A connection whose
 Batcher cannot identify, such as an ODBC DSN, sends names undelimited, so a reserved-word
 column there is still best renamed or aliased in your own query.
 
-A prefix filter is worth calling out separately. Before any of this, Kyber rewrites
+Prefix filters get one more step. Before any of this, Kyber rewrites
 `starts_with(col, "abc")` into the equivalent range `col >= "abc" AND col < "abd"`, which
 every backend already pushes and which a sorted or clustered column can range-prune.
 The string translation above is what handles the cases that rewrite declines.

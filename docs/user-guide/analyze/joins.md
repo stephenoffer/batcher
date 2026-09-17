@@ -1,9 +1,6 @@
 # Joins
 
-A join combines rows from two datasets on matching key values. Batcher supports the
-standard relational join types, plus the set operations: union, intersect, except.
-Joins are mergeable, so the same operator runs on one core or across a cluster with an
-identical result.
+This page covers combining two datasets in Batcher: the relational joins, the set operations, the as-of join that matches time series on the nearest key, and the lookup join that enriches a stream from a key-value store without reading the store. The join operator is mergeable, so the same code runs on one core or across a cluster and returns the same rows.
 
 ## Setup
 
@@ -20,10 +17,9 @@ orders = bt.from_pydict(
 dim = bt.from_pydict({"category": ["a", "b"], "region": ["west", "east"]})
 ```
 
-## join
+## Inner joins
 
-`join` defaults to an inner join on the column named by `on`. Inner joins keep
-only rows with a match in both inputs.
+{py:meth}`join <batcher.Dataset.join>` defaults to an inner join on the column named by `on`. Inner joins keep only rows with a match in both inputs.
 
 ```python
 out = orders.join(dim, on="category").select("id", "category", "region").sort("id")
@@ -34,13 +30,15 @@ print(out.to_pydict())
 
 ## Join types
 
-The `how` argument selects the join type: `"inner"`, `"left"`, `"right"`,
-`"full"` (also `"outer"`), `"semi"`, and `"anti"`.
+The `how` argument selects the join type: `"inner"`, `"left"`, `"right"`, `"full"` (also `"outer"`), `"semi"`, and `"anti"`.
+
+What separates them is what happens to a key found on only one side. The figure joins a left input with keys 1, 2 and 3 to a right input with keys 2, 3 and 4, and underneath it traces the as-of join example from later on this page.
+
+![A matrix of which rows each join type keeps, for left keys 1, 2, 3 and right keys 2, 3, 4. inner keeps only keys 2 and 3, which are on both sides. left keeps key 1 with its right columns null, plus keys 2 and 3. right keeps keys 2 and 3, plus key 4 with its left columns null. full keeps all four keys, null-filling whichever side is missing. All four of those output left and right columns. semi keeps only the left rows for keys 2 and 3, and anti keeps only the left row for key 1, and both output the left columns alone. "outer" is the same as "full". Below, an as-of join on sym A matches the trade at t=10 to the quote at t=8, price 1.0, and the trade at t=40 to the quote at t=38, price 1.1, each the last quote at or before the trade. On sym B the trade at t=10 reaches back 9 units to the quote at t=1 and takes price 9.0, or null with tolerance=5. by="sym" keeps one symbol's quotes away from another's trades.](/_static/diagrams/join_types_kept.svg)
 
 ### Left, right, and full
 
-A left join keeps every left row, filling right columns with null where there is
-no match. Right and full are the mirror and the union of both sides.
+A left join keeps every left row, filling right columns with null where there is no match. Right and full are the mirror and the union of both sides.
 
 ```python
 left = bt.from_pydict({"id": [1, 2, 3], "category": ["a", "b", "c"]})
@@ -51,8 +49,7 @@ print(out.to_pydict())
 
 ### Semi and anti
 
-A semi join keeps left rows that have a match, and an anti join keeps left rows
-that do not. Neither adds columns from the right input. They filter by existence.
+A semi join keeps left rows that have a match, and an anti join keeps left rows that do not. Neither adds columns from the right input. They filter by existence.
 
 ```python
 print(orders.join(dim, on="category", how="semi").select("id").sort("id").to_pydict())
@@ -64,8 +61,7 @@ print(left.join(dim, on="category", how="anti").sort("id").to_pydict())
 
 ## Join keys
 
-Use `on` when both sides share the key name. Use `left_on` and `right_on` when the
-key columns are named differently.
+Use `on` when both sides share the key name. Use `left_on` and `right_on` when the key columns are named differently.
 
 ```python
 a = bt.from_pydict({"k": [1, 2], "v": [10, 20]})
@@ -74,8 +70,7 @@ print(a.join(b, left_on="k", right_on="kk").sort("k").to_pydict())
 # {'k': [1, 2], 'v': [10, 20], 'w': [100, 200]}
 ```
 
-When both inputs carry a non-key column of the same name, the right side's column
-gets the `suffix` (default `"_right"`).
+When both inputs carry a non-key column of the same name, the right side's column gets the `suffix` (default `"_right"`).
 
 ## Set operations
 
@@ -93,8 +88,7 @@ print(s1.union(s2, distinct=True).sort("x").to_pydict())
 # {'x': [1, 2, 3, 4]}
 ```
 
-`intersect` keeps rows present in both inputs. `except_` keeps rows in the first but not
-the second.
+`intersect` keeps rows present in both inputs. `except_` keeps rows in the first but not the second.
 
 ```python
 print(s1.intersect(s2).sort("x").to_pydict())
@@ -106,8 +100,7 @@ print(s1.except_(s2).sort("x").to_pydict())
 
 ## Enrichment pattern
 
-A common use is a left join that attaches lookup columns to a fact table while
-keeping every fact row.
+The most common join in a pipeline is a left join that attaches lookup columns to a fact table while keeping every fact row.
 
 ```python
 enriched = orders.join(dim, on="category", how="left").sort("id")
@@ -118,15 +111,9 @@ print(enriched.to_pydict())
 
 ## As-of joins
 
-Two time series rarely share a clock. A trade lands at 10:31:07.412 and the quote it should
-be priced against arrived at 10:31:07.198, so an equi-join on the timestamp finds nothing.
-{py:meth}`join_asof <batcher.Dataset.join_asof>` matches each left row to the *nearest* right
-row instead, which is the join every market-data, sensor-fusion, and slowly-changing-dimension
-pipeline is built on.
+Two time series rarely share a clock. A trade lands at 10:31:07.412 and the quote it should be priced against arrived at 10:31:07.198, so an equi-join on the timestamp finds nothing. {py:meth}`join_asof <batcher.Dataset.join_asof>` matches each left row to the *nearest* right row instead, which is the join every market-data, sensor-fusion, and slowly-changing-dimension pipeline is built on.
 
-It is left-style: every left row survives, with null right columns when nothing matched. Pass
-`by=` for columns that must match exactly, so one instrument's quotes never price another's
-trades.
+It is left-style: every left row survives, with null right columns when nothing matched. Pass `by=` for columns that must match exactly, so one instrument's quotes never price another's trades.
 
 ```python
 trades = bt.from_pydict({"sym": ["A", "A", "B"], "t": [10, 40, 10], "size": [100, 200, 50]})
@@ -137,9 +124,7 @@ print(trades.join_asof(quotes, on="t", by="sym").sort("sym", "t").to_pydict())
 #  'price': [1.0, 1.1, 9.0]}
 ```
 
-The `B` trade at `t=10` matched a quote from `t=1`. That is the correct nearest earlier
-quote, and it may also be badly stale. `tolerance` is how you say so: beyond it, the row is
-left unmatched rather than carrying a value nobody would stand behind.
+The `B` trade at `t=10` matched a quote from `t=1`. That is the correct nearest earlier quote, and it may also be badly stale. `tolerance` is how you say so: beyond it, the row is left unmatched rather than carrying a value nobody would stand behind.
 
 ```python
 print(trades.join_asof(quotes, on="t", by="sym", tolerance=5).sort("sym", "t").to_pydict())
@@ -147,15 +132,9 @@ print(trades.join_asof(quotes, on="t", by="sym", tolerance=5).sort("sym", "t").t
 #  'price': [1.0, 1.1, None]}
 ```
 
-Give `tolerance` a number for a numeric key, and a duration such as `"5m"` (or a
-`datetime.timedelta`) for a timestamp or date key. Reach for it whenever a missing match is
-more useful than a stale one, which in practice is most of the time.
+Give `tolerance` a number for a numeric key, and a duration such as `"5m"` (or a `datetime.timedelta`) for a timestamp or date key. Reach for it whenever a missing match is more useful than a stale one, which in practice is most of the time.
 
-`direction` chooses which way to look. The default `"backward"` takes the last value at or
-before the left row, which is the causal reading and the one you almost always want.
-`"forward"` looks the other way, for questions like "what happened next". `"nearest"` takes
-whichever is closer and is right when the two clocks drift either side of each other, as with
-two sensors sampling the same physical event.
+`direction` chooses which way to look. The default `"backward"` takes the last value at or before the left row, which is the causal reading and the one you almost always want. `"forward"` looks the other way, for questions like "what happened next". `"nearest"` takes whichever is closer and is right when the two clocks drift either side of each other, as with two sensors sampling the same physical event.
 
 ```python
 print(trades.join_asof(quotes, on="t", by="sym", direction="nearest").sort("sym", "t").to_pydict())
@@ -163,8 +142,17 @@ print(trades.join_asof(quotes, on="t", by="sym", direction="nearest").sort("sym"
 #  'price': [1.0, 1.1, 9.0]}
 ```
 
-Both `tolerance` and `"nearest"` have to subtract two keys, so they need a numeric or
-temporal `on` column. A string key still orders fine for a plain backward or forward search.
+A backward search accepts a right row stamped at exactly the left row's time. In a backtest that row is information the trade did not have, and matching it is look-ahead bias. Pass `allow_exact_matches=False` for the strict form, which takes the last row strictly before the left key.
+
+```python
+fill = bt.from_pydict({"sym": ["A"], "t": [38]})
+print(fill.join_asof(quotes, on="t", by="sym").to_pydict()["price"])
+# [1.1]
+print(fill.join_asof(quotes, on="t", by="sym", allow_exact_matches=False).to_pydict()["price"])
+# [1.0]
+```
+
+Both `tolerance` and `"nearest"` have to subtract two keys, so they need a numeric or temporal `on` column. A string key still orders fine for a plain backward or forward search.
 
 ## Joins on predicates
 
@@ -212,13 +200,9 @@ The datasets must hold the same number of rows. `zip` counts them before it buil
 
 ## Lookup joins against a key-value store
 
-Every join above reads its right side as a dataset, which means reading all of it. That is
-the right thing when the dimension is small enough to broadcast or when you need a
-consistent snapshot of it. It is the wrong thing when the dimension is a hundred million
-rows in Redis and the data touches ten thousand of them.
+Every join above reads its right side as a dataset, which means reading all of it. That is the right thing when the dimension is small enough to broadcast or when you need a consistent snapshot of it. It is the wrong thing when the dimension is a hundred million rows in Redis and the data touches ten thousand of them.
 
-{py:meth}`lookup_join() <batcher.Dataset.lookup_join>` asks the store for the keys each
-batch actually contains, instead of reading the store:
+{py:meth}`lookup_join() <batcher.Dataset.lookup_join>` asks the store for the keys each batch actually contains, instead of reading the store:
 
 ```python
 # docs: skip
@@ -230,58 +214,33 @@ enriched = orders.lookup_join(
 )
 ```
 
-The cost scales with the distinct keys in your data rather than with the size of the store,
-which is the only reason a store far larger than memory can be joined at all. It works
-unchanged single-node, distributed, and over an unbounded source, because the enrichment
-happens per batch. `rocksdb:///path/to/db` reads an embedded database instead of a server.
+The cost scales with the distinct keys in your data rather than with the size of the store, which is the only reason a store far larger than memory can be joined at all. It works unchanged single-node, distributed, and over an unbounded source, because the enrichment happens per batch. `rocksdb:///path/to/db` reads an embedded database instead of a server.
 
-`how="left"` keeps every row and null-fills the misses; `how="inner"` drops them. A right or
-full outer join is not offered, because producing one would mean enumerating the store,
-which is the scan this exists to avoid.
+`how="left"`, the default, keeps every row and null-fills the misses. `how="inner"` drops them. A right or full outer join is not offered, because producing one would mean enumerating the store, which is the scan this exists to avoid.
 
 ### Why it is fast, and what it costs
 
-Repeated keys are the whole mechanism. Each worker keeps an LRU of what it has looked up,
-so a fact stream that hits the same few thousand customers over and over pays for a few
-thousand lookups rather than a few million. It also caches **absences**, which is what stops
-an unmatched key from costing a round trip on every batch. On a dirty join key that is the
-larger of the two wins.
+Repeated keys are the whole mechanism. Each worker keeps an LRU of what it has looked up, so a fact stream that hits the same few thousand customers over and over pays for a few thousand lookups rather than a few million. It also caches *absences*, which is what stops an unmatched key from costing a round trip on every batch. On a dirty join key that is the larger of the two wins.
 
 | Option | Meaning |
 | --- | --- |
-| `cache_size` | Entries each worker holds, hits and absences together. `0` disables the cache, which is how you measure what it is buying. |
+| `cache_size` | Entries each worker holds, hits and absences together, `100_000` by default. `0` disables the cache, which is how you measure what it is buying. |
 | `cache_ttl` | How long an entry stays usable (`"30s"`, `"5m"`). `None` keeps it for the life of the worker. |
-| `batch_size` | Rows per lookup batch. `None`, the default, is right unless you have measured otherwise. Larger batches mean fewer round trips and cheaper assembly; see the warning below. |
-| `num_workers` | How many workers issue lookups at once. This is what hides the store's latency, at the cost of one cache per worker. |
+| `batch_size` | Rows per lookup batch. `None`, the default, is right unless you have measured otherwise. Larger batches mean fewer round trips and cheaper assembly. See the warning below. |
+| `num_workers` | How many workers issue lookups at once. The default, `"auto"`, fans across local cores. This is what hides the store's latency, at the cost of one cache per worker. |
+| `hash_values` | Read each Redis key as a hash whose fields are the columns, rather than as a string holding a JSON object. Match how the dimension was written. |
 
-The cache is **per worker**, not shared between them, because sharing one would put a lock
-in front of the thing the workers exist to do concurrently. So `num_workers=8` warms eight
-caches and issues up to eight times the round trips for the same distinct keys. That is the
-right trade against a store whose latency you are hiding, and the wrong one against a store
-you are close to rate-limiting. Flink's lookup join has the same property.
+The cache is per worker, not shared between them, because sharing one would put a lock in front of the thing the workers exist to do concurrently. So `num_workers=8` warms eight caches and issues up to eight times the round trips for the same distinct keys. That is the right trade against a store whose latency you are hiding, and the wrong one against a store you are close to rate-limiting.
 
 :::{warning}
-Setting `batch_size` small is the one way to make a lookup join slow. The per-batch cost is
-one unit of work per *distinct key in the batch*, so a batch smaller than the distinct-key
-count pays for the same keys over and over. On a two-million-row probe over five thousand
-distinct keys, `batch_size=16384` runs seven times slower than the engine's own batching.
-Leave it alone unless you have measured a reason not to.
+Setting `batch_size` small is the one way to make a lookup join slow. The per-batch cost is one unit of work per *distinct key in the batch*, so a batch smaller than the distinct-key count pays for the same keys over and over. Leave it alone unless you have measured a reason not to.
 :::
 
-You give up a consistent snapshot. The store is read as it stands when each batch arrives, and `cache_ttl` bounds how stale a cached row may be. Where a point-in-time answer
-is what you meant, read the dimension as a dataset and use `join`.
+You give up a consistent snapshot. The store is read as it stands when each batch arrives, and `cache_ttl` bounds how stale a cached row may be. Where a point-in-time answer is what you meant, read the dimension as a dataset and use `join`.
 
-On a 96-core box, against an in-process store, a lookup join runs about twice as slow as the
-hash join it replaces while reading 0.25% of the dimension. That ratio is the mechanism's
-overhead, not its benefit: the case it is for is a store the hash join cannot read at all
-without pulling every row of it over the network. Reach for it when the dimension lives
-somewhere else, not to beat a join over data you already have. See
-`benchmarks/internals/cache_bench.py`.
+Against an in-process store, where the hash join has no network to pay, a lookup join is slower than the hash join it replaces. That gap is the mechanism's overhead, not its benefit. The case it is for is a store the hash join cannot read without pulling every row over the network. Reach for it when the dimension lives somewhere else, not to beat a join over data you already have. `benchmarks/internals/cache_bench.py` measures that overhead.
 
-`schema` is required and cannot be inferred. A join's output columns cannot depend on which
-keys the first batch happened to contain, or a batch that matched nothing would have a
-different shape from the batch before it, and two workers would disagree about the shape of
-the same result.
+`schema` is required and cannot be inferred. A join's output columns cannot depend on which keys the first batch happened to contain, or a batch that matched nothing would have a different shape from the batch before it, and two workers would disagree about the shape of the same result.
 
 ## See also
 
@@ -289,4 +248,5 @@ the same result.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: per-row computations over partitions.
 - {doc}`Dataset API </api/relational/dataset>`: the `join`, `join_asof`, `join_where`, `update`, `zip` and `lookup_join` reference.
 - {doc}`Caching results </user-guide/operate/tuning/caching>`: the other place a key-value store speeds a query up, by holding whole results.
+- {doc}`Time series </user-guide/analyze/time-series>`: as-of alignment alongside bucketing and gap filling.
 - {doc}`/cookbook/dataset/verbs/joins`: join types, key spellings, and the as-of join, as a script.

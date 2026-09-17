@@ -1,39 +1,23 @@
 # Late data and watermarks
 
-A phone goes through a tunnel. It buffers events locally, comes back online eight minutes
-later, and flushes them. Your hourly window for 00:00 closed at 01:10, because you set the
-lateness to ten minutes and an event stamped 01:20 came through. The tunnel events land at
-01:25 with an event time of 00:47. They belong to a window that no longer exists.
+A phone goes through a tunnel. It buffers events locally, comes back online eight minutes later, and flushes them. Your hourly window for 00:00 closed at 01:10, because you set the lateness to ten minutes and an event stamped 01:20 came through. The tunnel events land at 01:25 with an event time of 00:47. They belong to a window that no longer exists.
 
 :::{warning}
-Batcher drops them. There is no side output and no dead-letter, so your hourly total is
-quietly, permanently 3% low. What there *is* is a count: every micro-batch's
-`num_late_rows` says how many rows it discarded, so the shortfall is measurable rather
-than merely suspected.
+Batcher drops them. There is no side output and no dead-letter, so your hourly total is quietly, permanently 3% low. What there *is* is a count: every micro-batch's `num_late_rows` says how many rows it discarded, so the shortfall is measurable rather than merely suspected.
 :::
 
-This page is about choosing that tradeoff on purpose instead of discovering it in a
-reconciliation ticket.
+This page is about choosing that tradeoff on purpose instead of discovering it in a reconciliation ticket.
 
 ## What the watermark is
 
-The watermark is a single number, and it is a claim: no event older than this will be
-accepted. It advances only when event time advances, and it never goes backward.
+The watermark is a single number, and it is a claim: no event older than this will be accepted. It advances only when event time advances, and it never goes backward.
 
-The number comes from the stream's **slowest partition**, not from the stream as a whole.
-Batcher tracks the highest event time each partition has delivered and takes the minimum,
-less the lateness. That matters because a maximum would be a claim the stream cannot
-support: a Kafka topic whose partition 0 has reached 10:00 says nothing about partition 1,
-which may still be replaying 09:00, and treating 10:00 as the frontier makes every row
-partition 1 then delivers late. A source that cannot say which partition a row came from is
-one partition, where the minimum and the maximum agree.
+The number comes from the stream's **slowest partition**, not from the stream as a whole. Batcher tracks the highest event time each partition has delivered and takes the minimum, less the lateness. That matters because a maximum would be a claim the stream cannot support: a Kafka topic whose partition 0 has reached 10:00 says nothing about partition 1, which may still be replaying 09:00, and treating 10:00 as the frontier makes every row partition 1 then delivers late. A source that cannot say which partition a row came from is one partition, where the minimum and the maximum agree.
 
 It does two things, and they are the same thing seen from either side:
 
-- a window whose end is at or below the watermark is **closed**, meaning finalized,
-  emitted, evicted from state;
-- a row whose event time is below the watermark is **late**, dropped before it is folded
-  into any window.
+- a window whose end is at or below the watermark is **closed**, meaning finalized, emitted, evicted from state;
+- a row whose event time is below the watermark is **late**, dropped before it is folded into any window.
 
 `lateness` is the dial between those:
 
@@ -44,8 +28,7 @@ It does two things, and they are the same thing seen from either side:
 
 ## Watch a row get dropped
 
-Three micro-batches. The third carries a straggler: an event at 00:20, arriving after the
-stream's event time has already jumped to 02:10.
+Three micro-batches. The third carries a straggler: an event at 00:20, arriving after the stream's event time has already jumped to 02:10.
 
 :::{dropdown} The fixture: three micro-batches, and an hourly window over them
 
@@ -84,9 +67,7 @@ Same fixture, same query, one number changed:
 ::::{tab-set}
 :::{tab-item} lateness = 10 minutes
 
-With ten minutes of lateness, the second micro-batch (event time 02:10) pushes the
-watermark to 02:00, which closes and emits the 00:00 window. The straggler that follows is
-below the watermark:
+With ten minutes of lateness, the second micro-batch (event time 02:10) pushes the watermark to 02:00, which closes and emits the 00:00 window. The straggler that follows is below the watermark:
 
 ```python
 for emitted in hourly("10m"):
@@ -100,8 +81,7 @@ for emitted in hourly("10m"):
 
 :::{tab-item} lateness = 3 hours
 
-The watermark after the 02:10 event is 23:10 of the previous day, which
-closes nothing, so the 00:00 window is still open when the straggler arrives:
+The watermark after the 02:10 event is 23:10 of the previous day, which closes nothing, so the 00:00 window is still open when the straggler arrives:
 
 ```python
 for emitted in hourly("3h"):
@@ -109,42 +89,21 @@ for emitted in hourly("3h"):
 # {'w': [datetime.datetime(2024, 1, 1, 0, 0), datetime.datetime(2024, 1, 1, 2, 0)], 'total': [108, 1]}
 ```
 
-`total: 108`. The straggler counted. Note what else changed: nothing was emitted *during*
-the stream. Both windows came out in the end-of-stream flush, because the watermark never
-got far enough to close either one. That is the cost, made concrete: a three-hour lateness
-means an hourly window is three hours late to your dashboard, and its state sits in memory
-the whole time.
+`total: 108`. The straggler counted. Note what else changed: nothing was emitted *during* the stream. Both windows came out in the end-of-stream flush, because the watermark never got far enough to close either one. That is the cost, made concrete: a three-hour lateness means an hourly window is three hours late to your dashboard, and its state sits in memory the whole time.
 :::
 ::::
 
 ## Picking the number
 
-Measure it, don't guess it. Land the raw events first (see
-{doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`), then look at the distribution of
-`processing_time - event_time` in the bronze table. The p99 of that lag is a defensible
-lateness. The max is not: one pathological device should not hold every window open.
+Measure it, don't guess it. Land the raw events first (see {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`), then look at the distribution of `processing_time - event_time` in the bronze table. The p99 of that lag is a defensible lateness. The max is not: one pathological device should not hold every window open.
 
 Two failure shapes to keep in mind:
 
-**A stalled watermark.** The frontier is the minimum over partitions, so one silent
-partition holds the whole stream back: no window closes and state grows. Batcher releases a
-partition that has delivered nothing for `streaming.watermark_idle_timeout_seconds` (60 by
-default), which is the same trade Flink's `withIdleness` makes and is worth making on
-purpose. Raise it when a partition is legitimately bursty and you would rather wait than
-drop its rows; set it to zero to keep the fully conservative frontier that never advances
-past a silent partition.
+**A stalled watermark.** The frontier is the minimum over partitions, so one silent partition holds the whole stream back: no window closes and state grows. Batcher releases a partition that has delivered nothing for `streaming.watermark_idle_timeout_seconds` (60 by default), which is the same trade Flink's `withIdleness` makes and is worth making on purpose. Raise it when a partition is legitimately bursty and you would rather wait than drop its rows; set it to zero to keep the fully conservative frontier that never advances past a silent partition.
 
-If nothing advances anyway, because every partition is idle or the source stopped
-producing, Batcher does not let it end in an OOM: retained state is checked against
-`memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>`
-names the column whose watermark is not advancing. Read it as a diagnosis, not a budget
-request.
+If nothing advances anyway, because every partition is idle or the source stopped producing, Batcher does not let it end in an OOM: retained state is checked against `memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>` names the column whose watermark is not advancing. Read it as a diagnosis, not a budget request.
 
-**A clock from the future.** One device with a badly-set clock emits an event stamped next
-Tuesday. `max(event_time)` jumps to next Tuesday, the watermark jumps with it, and every
-window you have is closed and emitted at once, while every subsequent real event is now
-"late" and dropped. Sanitize event time at the edge; a `filter` on a plausible range is
-cheap, and it runs in Rust:
+**A clock from the future.** One device with a badly-set clock emits an event stamped next Tuesday. `max(event_time)` jumps to next Tuesday, the watermark jumps with it, and every window you have is closed and emitted at once, while every subsequent real event is now "late" and dropped. Sanitize event time at the edge; a `filter` on a plausible range is cheap, and it runs in Rust:
 
 ```python
 sane = bt.from_batches(feed, schema, bounded=False).filter(
@@ -156,10 +115,7 @@ print(sane.is_streaming)
 
 ## Bounded state for deduplication
 
-The same mechanism bounds a dedup. {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` keeps the first row
-per key inside the watermark window and forgets keys the watermark has passed, so the
-seen-key set does not grow forever. An at-least-once producer that re-sends on a timeout is
-exactly what this is for:
+The same mechanism bounds a dedup. {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` keeps the first row per key inside the watermark window and forgets keys the watermark has passed, so the seen-key set does not grow forever. An at-least-once producer that re-sends on a timeout is exactly what this is for:
 
 ```python
 dedup_schema = pa.schema(
@@ -187,40 +143,25 @@ for batch in unique.iter_batches():
 # ['z']
 ```
 
-The second `x` was dropped. Its retry arrived inside the watermark, which is the deal: a
-duplicate that arrives *after* the watermark has passed its key will not be caught, because
-the key is gone.
+The second `x` was dropped. Its retry arrived inside the watermark, which is the deal: a duplicate that arrives *after* the watermark has passed its key will not be caught, because the key is gone.
 
 :::{important}
-Your lateness is therefore also your deduplication window. Size it to
-your producer's retry behavior, not only to your window latency.
+Your lateness is therefore also your deduplication window. Size it to your producer's retry behavior, not only to your window latency.
 :::
 
 ## What you don't get
 
 :::{important}
-There is no late-data side output. A dropped row is counted but not routed anywhere: each
-{py:class}`StateOperatorProgress <batcher.StateOperatorProgress>` in a micro-batch's
-`state_operators` carries `num_late_inputs_dropped` and the `watermark_micros` it was
-measured against, so you can see stragglers being lost, and you cannot get them back. If
-losing one is unacceptable for your use case, the honest options are: set a lateness that
-actually covers your lag distribution; raise
-`streaming.watermark_idle_timeout_seconds` if the loss is a bursty partition being treated
-as idle; or land raw events and recompute the affected windows in a batch job, which is a
-reconciliation pipeline, not a streaming one.
+There is no late-data side output. A dropped row is counted but not routed anywhere: each {py:class}`StateOperatorProgress <batcher.StateOperatorProgress>` in a micro-batch's `state_operators` carries `num_late_inputs_dropped` and the `watermark_micros` it was measured against, so you can see stragglers being lost, and you cannot get them back. If losing one is unacceptable for your use case, the honest options are: set a lateness that actually covers your lag distribution; raise `streaming.watermark_idle_timeout_seconds` if the loss is a bursty partition being treated as idle; or land raw events and recompute the affected windows in a batch job, which is a reconciliation pipeline, not a streaming one.
 :::
 
 ## See also
 
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: the windows this watermark closes.
 - {doc}`Joining two streams </cookbook/streaming/stream-join>`: the same watermark, evicting join buffers.
-- {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`: landing the raw events you measure the lag distribution
-  on.
+- {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`: landing the raw events you measure the lag distribution on.
 - {doc}`Streaming </user-guide/moving-data/streaming>`: watermarks, triggers, and output modes in full.
-- {doc}`Late-arriving data </cookbook/data-engineering/ingest/late-arriving-data>`: the batch reconciliation
-  pipeline this page keeps pointing at.
+- {doc}`Late-arriving data </cookbook/data-engineering/ingest/late-arriving-data>`: the batch reconciliation pipeline this page keeps pointing at.
 - {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: dedup without a watermark to bound it.
-- {doc}`Data quality </user-guide/trust/data-quality>`: catching the clock-from-the-future row at
-  the edge.
-- {doc}`Spilling </architecture/deep-dives/memory/spilling>`: what bounded state buys you, and where it goes when
-  it does not fit.
+- {doc}`Data quality </user-guide/trust/data-quality>`: catching the clock-from-the-future row at the edge.
+- {doc}`Spilling </architecture/deep-dives/memory/spilling>`: what bounded state buys you, and where it goes when it does not fit.

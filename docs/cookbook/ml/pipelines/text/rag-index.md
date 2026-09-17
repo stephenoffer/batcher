@@ -1,22 +1,13 @@
 # RAG index
 
-The retrieval half of a RAG system is a data pipeline: load → chunk → embed → index. It
-is also where most of the quality lives. A retriever that returns the wrong 800 characters
-cannot be rescued by a better generator, and the usual cause is a chunking decision made
-in thirty seconds.
+The retrieval half of a RAG system is a data pipeline: load → chunk → embed → index. It is also where most of the quality lives. A retriever that returns the wrong 800 characters cannot be rescued by a better generator, and the usual cause is a chunking decision made in thirty seconds.
 
 ## Chunk with overlap
 
-A document is longer than the embedding model's context, so it has to be cut.
-{py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` slices text into fixed-size windows as a `List<Utf8>`, and
-`explode` turns that into one row per chunk. Sizes are in characters, and a boundary never
-splits a codepoint.
+A document is longer than the embedding model's context, so it has to be cut. {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` slices text into fixed-size windows as a `List<Utf8>`, and `explode` turns that into one row per chunk. Sizes are in characters, and a boundary never splits a codepoint.
 
 :::{warning}
-Overlap is not optional. Cut at a hard boundary and the sentence that answers the question
-is half in chunk 3 and half in chunk 4, so neither embeds close to the query and neither is
-retrieved. An overlap of 10 to 20% of the chunk size costs a little storage and buys back the
-straddling sentences.
+Overlap is not optional. Cut at a hard boundary and the sentence that answers the question is half in chunk 3 and half in chunk 4, so neither embeds close to the query and neither is retrieved. An overlap of 10 to 20% of the chunk size costs a little storage and buys back the straddling sentences.
 :::
 
 ```python
@@ -48,14 +39,10 @@ print(chunks.to_pydict()["chunk"][0])
 ```
 
 :::{tip}
-Keep `doc_id` and `title` on every chunk. Without them, retrieval returns a paragraph you
-cannot cite and cannot filter. Metadata filtering (by tenant, by product, by date) is what
-makes a RAG index usable in production rather than a demo.
+Keep `doc_id` and `title` on every chunk. Without them, retrieval returns a paragraph you cannot cite and cannot filter. Metadata filtering (by tenant, by product, by date) is what makes a RAG index usable in production rather than a demo.
 :::
 
-Chunk fan-out is the one thing no static optimizer can know. Kyber estimates 1× on the
-first run; Core measures the real ratio and the next plan sizes the downstream embedding
-stage for it.
+Chunk fan-out is the one thing no static optimizer can know. Kyber estimates 1× on the first run; Core measures the real ratio and the next plan sizes the downstream embedding stage for it.
 
 ## Embed the chunks
 
@@ -80,9 +67,7 @@ vectors.write.lance("s3://bucket/chunks.lance")
 
 :::{tab-item} A stub, so the page runs
 
-The stub below is a token-hash encoder: deterministic, no weights, so the rest of the page
-runs. Normalizing at index time means retrieval is a dot product rather than a cosine,
-and the two rank identically on unit vectors.
+The stub below is a token-hash encoder: deterministic, no weights, so the rest of the page runs. Normalizing at index time means retrieval is a dot product rather than a cosine, and the two rank identically on unit vectors.
 
 ```python
 import zlib
@@ -121,8 +106,7 @@ print(index.collect().schema.field("embedding").type)
 
 ## Retrieve
 
-At corpus scale, write the vectors to Lance and search an ANN index. A scan over ten million
-chunks per query is not a retrieval system.
+At corpus scale, write the vectors to Lance and search an ANN index. A scan over ten million chunks per query is not a retrieval system.
 
 ```python
 # docs: skip
@@ -137,10 +121,7 @@ hits = vector_search("s3://bucket/chunks.lance", query_vector, column="embedding
 | {py:meth}`.list.dot <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>` + `top_k` in the engine | a scan of the candidate rows | the candidates are already narrowed: one tenant, one product, a reranking pass |
 | `build_vector_index` + `vector_search` over Lance | an ANN lookup | the corpus is large enough that a scan per query is not a retrieval system |
 
-Below the index-is-worth-it threshold (a per-tenant index, a reranking pass, a candidate set
-already narrowed by a filter) score in the engine instead: `.list.dot` against the
-normalized query, `top_k` for the nearest, and a metadata filter in front of the scan so it
-only touches the rows the tenant may see.
+Below the index-is-worth-it threshold (a per-tenant index, a reranking pass, a candidate set already narrowed by a filter) score in the engine instead: `.list.dot` against the normalized query, `top_k` for the nearest, and a metadata filter in front of the scan so it only touches the rows the tenant may see.
 
 ```python
 from batcher import array
@@ -170,15 +151,11 @@ print(hits.to_pydict()["doc_id"])
 # [1, 2]
 ```
 
-The top hit is the refunds document, and `doc_id` rides along with it. That is the point of
-keeping it: you can deduplicate hits by document, cite the source, or pull the neighboring
-chunks. (A token-hash encoder only matches literal overlap, so treat the
-ranking here as proof of the plumbing, not of recall. A real encoder is the block above.)
+The top hit is the refunds document, and `doc_id` rides along with it. That is the point of keeping it: you can deduplicate hits by document, cite the source, or pull the neighboring chunks. (A token-hash encoder only matches literal overlap, so treat the ranking here as proof of the plumbing, not of recall. A real encoder is the block above.)
 
 ## Generate over the retrieved context
 
-The generation half is the same engine and the same operators. Retrieved chunks are rows;
-a prompt is a `template` over their columns.
+The generation half is the same engine and the same operators. Retrieved chunks are rows; a prompt is a `template` over their columns.
 
 :::{dropdown} The generation stage, over the rows retrieval just produced
 
@@ -202,14 +179,11 @@ answers = hits.ml.generate(
 ```
 :::
 
-RAG is retrieval plus an LLM, and Batcher runs both halves on one engine: 33,611 text/s
-embedding with MiniLM and 814.8 prompt/s generating with gpt2 on 8xT4, with one model load per
-worker and stage overlap between them.
+RAG is retrieval plus an LLM, and Batcher runs both halves on one engine: 33,611 text/s embedding with MiniLM and 814.8 prompt/s generating with gpt2 on 8xT4, with one model load per worker and stage overlap between them.
 
 ## Keeping the index fresh
 
-Re-embedding a corpus every night because 0.1% of it changed is the most common waste in a
-RAG pipeline. The chunks are rows in a table; the fix is a filter.
+Re-embedding a corpus every night because 0.1% of it changed is the most common waste in a RAG pipeline. The chunks are rows in a table; the fix is a filter.
 
 ```python
 # docs: skip
@@ -225,19 +199,16 @@ new_vectors.write.lance("s3://bucket/chunks.lance", mode="append")
 ```
 
 :::{important}
-Delete the stale chunks for those `doc_id`s first, or you will retrieve two versions of the
-same paragraph and the model will pick one at random.
+Delete the stale chunks for those `doc_id`s first, or you will retrieve two versions of the same paragraph and the model will pick one at random.
 :::
 
 ## See also
 
 - {doc}`Text embeddings </cookbook/ml/pipelines/text/text-embeddings>`: the encoder stage in detail.
 - {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: engines, prompt templates, typed outputs.
-- {doc}`RAG </ml/retrieval/rag>` and {doc}`vector search </ml/retrieval/vector-search>`: the retrieval surface
-  end to end.
+- {doc}`RAG </ml/retrieval/rag>` and {doc}`vector search </ml/retrieval/vector-search>`: the retrieval surface end to end.
 - {doc}`Embeddings </ml/retrieval/embeddings>`: encoders, normalization, and the distance kernels.
-- {doc}`Multimodal </ml/preparing/multimodal/index>`: `build_vector_index`, `vector_search`, and the
-  {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` distance expressions.
+- {doc}`Multimodal </ml/preparing/multimodal/index>`: `build_vector_index`, `vector_search`, and the {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` distance expressions.
 - {doc}`ML API reference </api/models/ml>`: `str.chunk`, {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`, {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the throughput figures quoted above.
 - {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how the vectors are stored and shipped.

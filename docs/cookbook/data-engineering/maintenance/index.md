@@ -1,8 +1,6 @@
 # Keeping tables healthy
 
-These recipes cover the work a table needs after it exists: removing what arrived twice,
-rejecting what should never have arrived, repairing a day you got wrong, and stopping a
-million small files from accumulating.
+These recipes cover the work a table needs after it exists: removing what arrived twice, rejecting what should never have arrived, repairing a day you got wrong, and stopping a million small files from accumulating.
 
 | Recipe | The problem |
 |---|---|

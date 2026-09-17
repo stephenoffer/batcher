@@ -8,34 +8,36 @@ SQL session that gives a workload its own catalog.
 Policy is a plan rewrite rather than a runtime check, so a principal who may not read a
 column never causes it to be read.
 
-{py:func}`bt.security <batcher.security>` is a context manager and not a setter, which is
-the one thing about this surface worth reading twice: policy attaches when a table is
-*read*, so a dataset built inside the block stays governed for its whole life, including
+{py:func}`bt.security <batcher.security>` is a context manager, not a setter. Policy
+attaches when a table is *read*. A dataset built inside the block stays governed for its whole life, including
 terminal operations that run after the block has exited. Read a table outside every block
 and it is ungoverned. {doc}`/api/operations/governance` is the fuller reference, with row
 filters, column masks and data residency.
 
 ```{eval-rst}
-.. autoclass:: batcher.SecurityCatalog
-   :members:
+.. currentmodule:: batcher.governance
 
-.. autoclass:: batcher.Principal
-   :members:
+.. autosummary::
+   :nosignatures:
 
-.. autoclass:: batcher.GovernanceEvent
-   :members:
+   SecurityCatalog
+   Principal
+   GovernanceEvent
+```
 
-.. autofunction:: batcher.security
+```{eval-rst}
+.. currentmodule:: batcher
 
-.. autofunction:: batcher.authenticate
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autofunction:: batcher.set_verifier
-
-.. autofunction:: batcher.current_verifier
-
-.. autofunction:: batcher.cancel_query
-
-.. autofunction:: batcher.running_queries
+   security
+   authenticate
+   set_verifier
+   current_verifier
+   cancel_query
+   running_queries
 ```
 
 Two of those names are query control rather than policy.
@@ -57,13 +59,15 @@ that {py:func}`bt.sql <batcher.sql>` and
 session holds is control-plane metadata, so registering a table executes nothing.
 
 ```{eval-rst}
-.. autoclass:: batcher.Session
-   :members:
-   :member-order: groupwise
+.. currentmodule:: batcher
 
-.. autofunction:: batcher.current_session
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autofunction:: batcher.set_session
+   Session
+   current_session
+   set_session
 ```
 
 ## Catalogs and tables
@@ -77,16 +81,15 @@ it has attached through `session.catalog`, a {py:class}`SessionCatalog
 {doc}`/user-guide/moving-data/catalogs-and-tables` is the worked introduction.
 
 ```{eval-rst}
-.. autoclass:: batcher.Catalog
-   :members:
-   :member-order: groupwise
+.. currentmodule:: batcher
 
-.. autoclass:: batcher.api.catalog.SessionCatalog
-   :members:
-   :member-order: groupwise
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
 
-.. autoclass:: batcher.Table
-   :members:
+   Catalog
+   Table
+   api.catalog.SessionCatalog
 ```
 
 ## See also

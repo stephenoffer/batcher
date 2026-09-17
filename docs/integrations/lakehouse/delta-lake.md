@@ -1,22 +1,20 @@
 # Delta Lake
 
-Delta is the connector Batcher supports most completely: read with time travel, write as one
-atomic commit, upsert with `MERGE INTO`, replace a predicate-scoped slice, compact, vacuum.
-It needs `pip install 'batcher-engine[delta]'` and nothing else. No JVM, no Spark. The
-implementation is delta-rs plus Batcher's own commit path.
+This page covers Delta Lake, the table format Batcher supports most completely. You can read with time travel, write as one atomic commit, upsert with `MERGE INTO`, replace a predicate-scoped slice, read the change data feed, compact, and vacuum. It needs `pip install 'batcher-engine[delta]'` and nothing else: no JVM and no Spark. The implementation is delta-rs plus Batcher's own commit path.
+
+The following table summarizes the connector:
 
 | | |
 | --- | --- |
-| **Read** | {py:meth}`bt.read.delta(uri) <batcher.api.io_namespace.reader.Reader.delta>`, with `version=`, `timestamp=`, or `stream=True` |
-| **Write** | {py:meth}`ds.write.delta(uri) <batcher.api.io_namespace.writer.Writer.delta>` with `mode="append"`/`"overwrite"`, `merge_on=`, `replace_where=` |
-| **Extra** | `pip install 'batcher-engine[delta]'` |
-| **Parallelism** | One split per surviving data file, chosen from the log at plan time |
-| **Pushdown** | Predicates skip files by the log's per-file min/max statistics |
-| **Maintenance** | {py:func}`bt.compact <batcher.compact>`, {py:func}`bt.vacuum <batcher.vacuum>` |
+| Read | {py:meth}`bt.read.delta(uri) <batcher.api.io_namespace.reader.Reader.delta>`, with `version=`, `timestamp=`, or `stream=True` |
+| Write | {py:meth}`ds.write.delta(uri) <batcher.api.io_namespace.writer.Writer.delta>` with `mode="append"` (the default) or `"overwrite"`, `merge_on=`, `replace_where=` |
+| Extra | `pip install 'batcher-engine[delta]'` |
+| Parallelism | One split per surviving data file, chosen from the log at plan time |
+| Pushdown | Predicates skip files by the log's per-file min/max statistics |
+| Maintenance | {py:func}`bt.compact <batcher.compact>`, {py:func}`bt.vacuum <batcher.vacuum>` |
 
 :::{important}
-The thing that bites people is not the API. It is treating a Delta table as a directory of
-Parquet files. Every data file the table has ever added is still referenced by *some* version, so
+Don't treat a Delta table as a directory of Parquet files. Every data file the table has ever added is still referenced by *some* version, so
 anything that rewrites or deletes files behind the log destroys time travel silently: a plain
 Parquet writer pointed at the table root, an `rm` of an "old-looking" file, a compaction job that
 isn't transactional. `count()` keeps answering from the log after the data is gone. Use
@@ -39,8 +37,7 @@ table = os.path.join(work, "events")
 
 ## Write and read
 
-`ds.write.delta(uri, mode=...)` is one transaction. `mode` is `"append"` (default) or
-`"overwrite"`. A reader never sees a partial write, and a crash mid-write leaves nothing to clean
+`ds.write.delta(uri, mode=...)` is one transaction, with `mode` set to `"append"` (the default) or `"overwrite"`. A reader never sees a partial write, and a crash mid-write leaves nothing to clean
 up: the files exist, but no commit references them.
 
 ```python
@@ -83,7 +80,7 @@ print(bt.read.delta(table, timestamp="2999-01-01 12:30:00").count())
 # 4
 ```
 
-A timestamp with no UTC offset is read in the **driver's local timezone**, which is what Delta and
+A timestamp with no UTC offset is read in the driver's local timezone, which is what Delta and
 Spark's `timestampAsOf` do. Pass an explicit offset (`"2024-03-01T00:00:00Z"`) when the same query
 must resolve to the same version wherever it runs.
 
@@ -150,7 +147,7 @@ feeds) see the {doc}`lakehouse guide </user-guide/moving-data/lakehouse>`.
 ## How it parallelizes
 
 The transaction log records, for every data file, its partition values and per-column
-min/max/null counts. Batcher reads that at **plan time**: one split per surviving data file, and a
+min/max/null counts. Batcher reads that at plan time: one split per surviving data file, and a
 file whose recorded bounds prove it cannot match is dropped before it is opened. No footer read,
 no worker task.
 
@@ -171,7 +168,9 @@ print(len(source.splits()), "->", len(source.splits(predicate=predicate)))
 The write is the same mechanism run backwards. Each worker writes its shard as a final data file
 and collects that file's column bounds from data it already holds; the driver commits only the add
 actions. Bytes move worker to storage once, the driver's cost is one log write however much the
-cluster wrote, and a distributed write is **one** version, not one per worker.
+cluster wrote, and a distributed write is one version, not one per worker.
+
+Pass `auto_compact=True` to bin-pack the table after the commit once enough small files have accumulated. The check counts small files from the log, and it runs after the commit, so a failed compaction can't fail the write.
 
 ## Compaction and vacuum
 
@@ -246,19 +245,27 @@ print(window.select("id", "_change_type").sort("id").to_pydict())
 # {'id': [3], '_change_type': ['insert']}
 ```
 
-This is the shape an incremental job wants. Record the version you last processed, read the window
-from there, and merge it into the target:
+This is the shape an incremental job wants. Record the version you last processed, read the window from there, and merge the new row images into the target. The latest version comes from delta-rs, which the `delta` extra installs:
 
 ```python
-# docs: skip
-last = read_watermark()
-latest = bt.read.delta(source).meta.version
-changes = bt.read.read_change_feed(source, starting_version=last + 1, ending_version=latest)
-changes.filter(bt.col("_change_type") != "update_preimage").write.merge(
-    target, source=changes, on="id"
-).when_matched_update_all().when_not_matched_insert_all().execute()
-write_watermark(latest)
+from deltalake import DeltaTable
+
+target = os.path.join(work, "target")
+bt.from_pydict({"id": [1, 2], "amount": [10, 20]}).write.delta(target, mode="overwrite")
+
+last = 0  # the version your previous run finished at
+latest = DeltaTable(changes).version()
+upserts = (
+    bt.read.read_change_feed(changes, starting_version=last + 1, ending_version=latest)
+    .filter((bt.col("_change_type") != "update_preimage") & (bt.col("_change_type") != "delete"))
+    .drop("_change_type", "_commit_version", "_commit_timestamp")
+)
+upserts.write.merge(target, on="id")
+print(bt.read.delta(target).sort("id").to_pydict())
+# {'id': [1, 2, 3], 'amount': [10, 20, 30]}
 ```
+
+Store `latest` as the new watermark once the merge returns. The job above ignores `delete` rows. To apply them, use {py:meth}`write.merge_into <batcher.api.io_namespace.writer.Writer.merge_into>` with a conditional `when_matched` clause, covered in the {doc}`lakehouse guide </user-guide/moving-data/lakehouse>`.
 
 Bounding on both ends is what makes that re-runnable: the window is a fixed set of commits, so a
 retry after a crash reads exactly the same rows. `starting_timestamp=` and `ending_timestamp=`
@@ -285,25 +292,33 @@ Without those two, a replayed batch appends its rows a second time. Nothing in t
 it.
 :::
 
-## Failure modes worth knowing
+## Read a Delta Sharing table
 
-**Concurrent writers.** Two writers that commit conflicting versions do not corrupt the table. The
+A table shared with you over the Delta Sharing protocol reads with {py:meth}`bt.read.delta_sharing(url) <batcher.api.io_namespace.reader.Reader.delta_sharing>`, where `url` is `<profile>#<share>.<schema>.<table>` and the profile file holds the sharing server's endpoint and token. It needs `pip install 'batcher-engine[delta-sharing]'`.
+
+```python
+# docs: skip
+shared = bt.read.delta_sharing("/etc/secrets/partner.share#sales.public.orders")
+```
+
+## Requirements and limitations
+
+The following behaviors are worth knowing before a Delta pipeline goes to production.
+
+Two writers that commit conflicting versions do not corrupt the table. The
 loser raises {py:exc}`CommitError <batcher.CommitError>`. Catch it and retry the write; the data files it already staged are
 unreferenced, and vacuum will reclaim them.
 
-**Deletion vectors.** A DV leaves its rows physically in the data file, marked deleted in the log.
+A deletion vector leaves its rows physically in the data file, marked deleted in the log.
 Batcher still reads one split per file, and each split applies its own file's vector before the
 predicate, so the split-parallel read survives. The row count survives too: it is the add actions'
-records less what the vectors delete, which is exact. What a DV table gives up is the
+records less what the vectors delete, which is exact. What a deletion-vector table gives up is the
 whole-dataset scan fast path, since files carrying a vector are read fragment by fragment while
 the untouched ones stay on it.
 
-**Change data feed.** Needs `delta.enableChangeDataFeed = true` on the table *before* the commits
-you want to read. CDF is not retroactive, and turning it on later does not recover the history in
-between. See [Reading changes](#reading-changes) for how to read it.
+The change data feed needs `delta.enableChangeDataFeed = true` on the table before the commits you want to read. It isn't retroactive, and turning it on later doesn't recover the history in between. See {ref}`reading-changes`.
 
-**Schema drift.** An append whose schema does not match the table's fails at commit. Align the
-columns in the plan (`select`, `cast`) rather than hoping the writer coerces.
+An append carrying a column the table doesn't have is refused at commit. Pass `merge_schema=True` to evolve the table to accept the new columns, or align the columns in the plan with `select` and `cast`.
 
 ## See also
 

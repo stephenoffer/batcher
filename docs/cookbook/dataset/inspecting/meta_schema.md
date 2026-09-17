@@ -1,6 +1,8 @@
 # Schema without execution
 
-`ds.meta.schema` never executes. A plan knows its own output types, so every question here is a field read against it, and you can branch on whether a column is numeric before deciding what pipeline to build. Row counts are a different matter: `ds.meta.shape()` is free only when the row count already is.
+`ds.meta.schema` never executes. A plan knows its own output types, so every question here is a field read, and you can branch on whether a column is numeric before deciding what pipeline to build.
+
+The script asks a six-column table about presence and position, runs one type predicate per family, lists the columns of each family, and narrows the dataset to its numeric columns with `select("numeric")`. Row counts are a different matter: `ds.meta.shape()` is free only when the row count already is, and otherwise it counts.
 
 The whole script, executed on every test run:
 

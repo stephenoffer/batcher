@@ -1,9 +1,6 @@
 # Aggregations
 
-Aggregations reduce many rows to summary values, either over the whole dataset or
-per group. Group with `group_by`, then finalize with `agg`. Each aggregate is a
-keyword whose value is an aggregate expression, so the keyword names the output
-column.
+This page covers aggregation in Batcher: reducing many rows to summary values, over the whole dataset or per group. You group with `group_by` and finish with `agg`, and everything from a plain sum to a per-group regression fits that one shape. Every aggregate on this page is built from mergeable parts, so the same code runs on one core or across a cluster.
 
 ## Setup
 
@@ -19,15 +16,13 @@ ds = bt.from_pydict(
 )
 ```
 
-## group_by and agg
+## Group and aggregate
 
-`group_by` takes the grouping keys; `agg` takes the output aggregates. Pass them as
-keywords to name the output, or positionally to keep the source column's name.
-{py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; the column aggregates are methods
-on an expression (`.sum()`, `.mean()`, and so on) or the top-level shorthands
-{py:obj}`bt.sum("x") <batcher.sum>`, {py:func}`bt.mean <batcher.mean>`, {py:func}`bt.min <batcher.min>`, {py:func}`bt.max <batcher.max>`, {py:func}`bt.median <batcher.median>`,
-{py:func}`bt.std <batcher.std>`, {py:func}`bt.var <batcher.var>`, {py:func}`bt.count_distinct <batcher.count_distinct>`. `bt.sum("x")` reads as `col("x").sum()`, the
-Polars `pl.sum` convention.
+A grouped aggregate makes two moves. `group_by` gathers the rows that share a key, and `agg` reduces each group to one output row.
+
+![Five input rows of category and price, a 10.0, b 20.0, a 30.0, b 40.0 and a 50.0, flow through group_by into two groups: a holds 10.0, 30.0 and 50.0, and b holds 20.0 and 40.0. agg then reduces each group to one row, a with total 90.0 and rows 3, and b with total 60.0 and rows 2, from ds.group_by("category").agg(total=bt.col("price").sum(), rows=bt.count()). Below, a group_by with no keys treats the whole dataset as one group and returns one row, total 150.0 and rows 5.](/_static/diagrams/group_by_flow.svg)
+
+`group_by` takes the grouping keys and `agg` takes the output aggregates. Pass an aggregate as a keyword to name the output, or positionally to keep the source column's name. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`. The column aggregates are methods on an expression (`.sum()`, `.mean()`, and so on) or the top-level shorthands {py:obj}`bt.sum("x") <batcher.sum>`, {py:func}`bt.mean <batcher.mean>`, {py:func}`bt.min <batcher.min>`, {py:func}`bt.max <batcher.max>`, {py:func}`bt.median <batcher.median>`, {py:func}`bt.std <batcher.std>`, {py:func}`bt.var <batcher.var>`, {py:func}`bt.count_distinct <batcher.count_distinct>`. `bt.sum("x")` reads as `col("x").sum()`, the Polars `pl.sum` convention.
 
 ```python
 # Positional shorthands keep the column name; keywords rename.
@@ -49,14 +44,7 @@ print(out.to_pydict())
 
 ## Shortcut reductions
 
-When you reduce *every* value column the same way, a shortcut method is shorter
-than spelling out `agg`. The set is `sum`, `mean`, `min`, `max`, `median`,
-`quantile(q)`, `count_distinct`, `std`, `var`, `count` (non-null values per column), and
-`len` (the per-group row count). With no arguments they reduce every non-key
-column, keeping its name. Pass column names or a
-{doc}`selector </user-guide/transform/rows/transformations>` to reduce a subset. The arithmetic reductions
-(`sum`, `mean`, `median`, `quantile`, `std`, `var`) default to numeric columns
-only, matching pandas' `numeric_only`.
+When you reduce *every* value column the same way, a shortcut method is shorter than spelling out `agg`. The set is `sum`, `mean`, `min`, `max`, `median`, `quantile(q)`, `count_distinct`, `std`, `var`, `count` (non-null values per column), and `len` (the per-group row count). With no arguments they reduce every non-key column, keeping its name. Pass column names or a {doc}`selector </user-guide/transform/rows/transformations>` to reduce a subset. The arithmetic reductions (`sum`, `mean`, `median`, `quantile`, `std`, `var`) default to numeric columns only, matching pandas' `numeric_only`.
 
 ```python
 print(ds.group_by("category").sum().sort("category").to_pydict())
@@ -69,19 +57,11 @@ print(ds.group_by("category").len().sort("category").to_pydict())
 # {'category': ['a', 'b'], 'len': [3, 2]}
 ```
 
-`len` counts rows; `count` counts non-null values of each column (they differ only
-when a column has nulls). Reach for `agg` when the reductions differ per column,
-when you want custom output names, or when you need a windowed aggregate or a
-two-column statistic.
+`len` counts rows and `count` counts the non-null values of each column, so the two differ only when a column has nulls. Reach for `agg` when the reductions differ per column, when you want custom output names, or when you need a windowed aggregate or a two-column statistic.
 
 ## Aggregate functions
 
-The aggregate methods available inside `agg` are `sum`, `min`, `max`, `mean`,
-`var`, `std`, `median`, `quantile(q)`, `count`, and
-{py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>`. {py:obj}`bt.count() <batcher.count>` counts rows. Each of these
-builds an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that `agg(...)`
-consumes and that {py:meth}`.over(...) <batcher.AggExpr.over>` lifts into a {doc}`window function </user-guide/analyze/window-functions>`.
-You rarely name it directly.
+The aggregate methods available inside `agg` are `sum`, `min`, `max`, `mean`, `var`, `std`, `median`, `quantile(q)`, `count`, and {py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>`. {py:obj}`bt.count() <batcher.count>` counts rows. Each of these builds an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that `agg(...)` consumes and that {py:meth}`.over(...) <batcher.AggExpr.over>` lifts into a {doc}`window function </user-guide/analyze/window-functions>`. You rarely name it directly.
 
 ```python
 stats = (
@@ -104,12 +84,7 @@ print(stats.to_pydict())
 
 ## Advanced aggregates
 
-Beyond the basics, `agg` supports `mode`, `first`/`last`, `min_by`/`max_by` (the
-value of one column at the row that minimizes/maximizes another), `arg_min`/`arg_max` (the
-position of a column's own extreme), `top_k` and `mode_top_k` (a group's largest and most
-frequent values as a list), the boolean
-reductions `bool_and`/`bool_or`, and `array_agg` (collect a group's values into a
-list).
+Beyond the basics, `agg` supports `mode`, `first`/`last`, `min_by`/`max_by` (the value of one column at the row that minimizes/maximizes another), `arg_min`/`arg_max` (the position of a column's own extreme), `top_k` and `mode_top_k` (a group's largest and most frequent values as a list), the boolean reductions `bool_and`/`bool_or`, and `array_agg` (collect a group's values into a list).
 
 ```python
 adv = (
@@ -126,14 +101,7 @@ print(adv.to_pydict())
 #  'costliest': [50.0, 40.0]}
 ```
 
-Each of these also has a top-level SQL-style spelling that reads `bt.<agg>("col")`,
-the same shorthand `bt.sum("x")` is for `col("x").sum()`:
-{py:obj}`bt.product(x) <batcher.product>`, {py:obj}`bt.mode(x) <batcher.mode>`,
-{py:obj}`bt.skew(x) <batcher.skew>` / {py:obj}`bt.kurtosis(x) <batcher.kurtosis>`,
-{py:obj}`bt.bool_and(x) <batcher.bool_and>` / {py:obj}`bt.bool_or(x) <batcher.bool_or>`,
-{py:obj}`bt.bit_and(x) <batcher.bit_and>` / {py:obj}`bt.bit_or(x) <batcher.bit_or>` /
-{py:obj}`bt.bit_xor(x) <batcher.bit_xor>`, and
-{py:obj}`bt.array_agg(x) <batcher.array_agg>`.
+Each of these also has a top-level SQL-style spelling that reads `bt.<agg>("col")`, the same shorthand `bt.sum("x")` is for `col("x").sum()`: {py:obj}`bt.product(x) <batcher.product>`, {py:obj}`bt.mode(x) <batcher.mode>`, {py:obj}`bt.skew(x) <batcher.skew>` / {py:obj}`bt.kurtosis(x) <batcher.kurtosis>`, {py:obj}`bt.bool_and(x) <batcher.bool_and>` / {py:obj}`bt.bool_or(x) <batcher.bool_or>`, {py:obj}`bt.bit_and(x) <batcher.bit_and>` / {py:obj}`bt.bit_or(x) <batcher.bit_or>` / {py:obj}`bt.bit_xor(x) <batcher.bit_xor>`, and {py:obj}`bt.array_agg(x) <batcher.array_agg>`.
 
 ```python
 shorthand = (
@@ -150,13 +118,7 @@ print(shorthand.to_pydict())
 
 ## Bivariate aggregates
 
-The two-column statistical aggregates summarize how a pair of columns move
-together within each group. {py:obj}`bt.corr(x, y) <batcher.corr>` is the Pearson
-correlation coefficient in `[-1, 1]` (SQL `CORR`); {py:obj}`bt.covar_pop(x, y)
-<batcher.covar_pop>` and {py:obj}`bt.covar_samp(x, y) <batcher.covar_samp>` are the
-population and sample covariance (SQL `COVAR_POP` / `COVAR_SAMP`, dividing by `n`
-and `n - 1` respectively). Reach for `corr` to score the strength and sign of a
-relationship: whether ad spend tracks revenue per region, say.
+The two-column statistical aggregates summarize how a pair of columns move together within each group. {py:obj}`bt.corr(x, y) <batcher.corr>` is the Pearson correlation coefficient in `[-1, 1]` (SQL `CORR`). {py:obj}`bt.covar_pop(x, y) <batcher.covar_pop>` and {py:obj}`bt.covar_samp(x, y) <batcher.covar_samp>` are the population and sample covariance (SQL `COVAR_POP` / `COVAR_SAMP`, dividing by `n` and `n - 1` respectively). Reach for `corr` to score the strength and sign of a relationship: whether ad spend tracks revenue per region, say.
 
 ```python
 market = bt.from_pydict(
@@ -184,12 +146,7 @@ A perfect correlation prints as `0.9999999999999998` rather than `1.0`: the coef
 
 ## Expressions over aggregates
 
-An `agg` keyword takes not just a single aggregate but a whole expression *over*
-aggregates: a ratio, a difference, any arithmetic. `col("price").sum() /
-bt.count()` is an average priced as one aggregate pass; `col("price").max() -
-col("price").min()` is the per-group spread. The engine computes each distinct
-aggregate once and evaluates the surrounding arithmetic in a projection, so the
-result is identical single-node and distributed. Aggregates cannot be nested.
+An `agg` keyword takes not just a single aggregate but a whole expression *over* aggregates: a ratio, a difference, any arithmetic. `col("price").sum() / bt.count()` is an average priced as one aggregate pass; `col("price").max() - col("price").min()` is the per-group spread. The engine computes each distinct aggregate once and evaluates the surrounding arithmetic in a projection, so the result is identical single-node and distributed. Aggregates cannot be nested.
 
 ```python
 derived = (
@@ -207,19 +164,7 @@ print(derived.to_pydict())
 
 ## Linear regression
 
-Built on expressions over aggregates, the `regr_*` family fits a least-squares line
-of a dependent column `y` on an independent column `x` per group, matching the SQL /
-DuckDB / PostgreSQL functions. {py:obj}`bt.regr_slope(y, x) <batcher.regr_slope>` and
-{py:obj}`bt.regr_intercept(y, x) <batcher.regr_intercept>` give the line;
-{py:obj}`bt.regr_r2(y, x) <batcher.regr_r2>` its fit; and
-{py:obj}`bt.regr_count(y, x) <batcher.regr_count>`,
-{py:obj}`bt.regr_avgx(y, x) <batcher.regr_avgx>` /
-{py:obj}`bt.regr_avgy(y, x) <batcher.regr_avgy>`, and
-{py:obj}`bt.regr_sxx(y, x) <batcher.regr_sxx>` /
-{py:obj}`bt.regr_syy(y, x) <batcher.regr_syy>` /
-{py:obj}`bt.regr_sxy(y, x) <batcher.regr_sxy>` the underlying moments. Every function
-uses only rows where both columns are non-null. Because each result is an expression,
-you can round or combine it further.
+The `regr_*` family is built on expressions over aggregates. It fits a least-squares line of a dependent column `y` on an independent column `x` per group, matching the SQL / DuckDB / PostgreSQL functions. {py:obj}`bt.regr_slope(y, x) <batcher.regr_slope>` and {py:obj}`bt.regr_intercept(y, x) <batcher.regr_intercept>` give the line, {py:obj}`bt.regr_r2(y, x) <batcher.regr_r2>` its fit, and {py:obj}`bt.regr_count(y, x) <batcher.regr_count>`, {py:obj}`bt.regr_avgx(y, x) <batcher.regr_avgx>` / {py:obj}`bt.regr_avgy(y, x) <batcher.regr_avgy>`, and {py:obj}`bt.regr_sxx(y, x) <batcher.regr_sxx>` / {py:obj}`bt.regr_syy(y, x) <batcher.regr_syy>` / {py:obj}`bt.regr_sxy(y, x) <batcher.regr_sxy>` the underlying moments. Every function uses only rows where both columns are non-null. Because each result is an expression, you can round or combine it further.
 
 ```python
 market = bt.from_pydict(
@@ -245,19 +190,7 @@ print(fit.to_pydict())
 
 ## Derived statistics
 
-Because an aggregate result is itself an expression, a family of standard statistics that
-the base aggregates don't name directly comes for free. Each is a small formula over the
-mergeable primitives, so it stays identical single-node and distributed.
-{py:obj}`bt.var_pop(x) <batcher.var_pop>` / {py:obj}`bt.stddev_pop(x) <batcher.stddev_pop>`
-are the *population* variance and standard deviation (Batcher's `var`/`std` are the sample
-forms); {py:obj}`bt.geometric_mean(x) <batcher.geometric_mean>`,
-{py:obj}`bt.harmonic_mean(x) <batcher.harmonic_mean>`, and {py:obj}`bt.rms(x) <batcher.rms>`
-are the geometric, harmonic, and quadratic means; and {py:obj}`bt.cv(x) <batcher.cv>`,
-{py:obj}`bt.sem(x) <batcher.sem>`, and {py:obj}`bt.midrange(x) <batcher.midrange>` give the
-coefficient of variation, the standard error of the mean, and the midrange.
-{py:obj}`bt.weighted_mean(value, weight) <batcher.weighted_mean>` averages one column in
-proportion to another. You can also apply a math function to any aggregate yourself, such
-as `col("x").sum().sqrt()` or `col("x").mean().round(2)`.
+Because an aggregate result is itself an expression, a family of standard statistics that the base aggregates don't name directly comes for free. Each is a small formula over the mergeable primitives, so it stays identical single-node and distributed. {py:obj}`bt.var_pop(x) <batcher.var_pop>` / {py:obj}`bt.stddev_pop(x) <batcher.stddev_pop>` are the *population* variance and standard deviation, where Batcher's `var` and `std` are the sample forms. {py:obj}`bt.geometric_mean(x) <batcher.geometric_mean>`, {py:obj}`bt.harmonic_mean(x) <batcher.harmonic_mean>`, and {py:obj}`bt.rms(x) <batcher.rms>` are the geometric, harmonic, and quadratic means. {py:obj}`bt.cv(x) <batcher.cv>`, {py:obj}`bt.sem(x) <batcher.sem>`, and {py:obj}`bt.midrange(x) <batcher.midrange>` give the coefficient of variation, the standard error of the mean, and the midrange. {py:obj}`bt.weighted_mean(value, weight) <batcher.weighted_mean>` averages one column in proportion to another. You can also apply a math function to any aggregate yourself, such as `col("x").sum().sqrt()` or `col("x").mean().round(2)`.
 
 ```python
 stats = (
@@ -276,17 +209,7 @@ print(stats.to_pydict())
 
 ## Approximate aggregates
 
-Exact distinct counts and quantiles get expensive on large inputs. The
-sketch-backed aggregates trade a little accuracy for bounded memory and
-mergeability: `approx_count_distinct` (HyperLogLog), `approx_quantile(q)` and
-`approx_median` (KLL). They merge exactly across partitions, so the estimate is
-identical single-node or distributed. On small inputs it typically matches the
-exact count. Each also has a top-level spelling:
-{py:obj}`bt.approx_count_distinct(x) <batcher.approx_count_distinct>`,
-{py:obj}`bt.approx_quantile(x, q) <batcher.approx_quantile>`, and
-{py:obj}`bt.approx_median(x) <batcher.approx_median>`. They sit alongside the exact
-{py:obj}`bt.quantile(x, q) <batcher.quantile>` and the value-tally
-{py:obj}`bt.histogram(x) <batcher.histogram>`.
+Exact distinct counts and quantiles get expensive on large inputs. The sketch-backed aggregates trade a little accuracy for bounded memory and mergeability: `approx_count_distinct` uses HyperLogLog, and `approx_quantile(q)` and `approx_median` use DDSketch, with roughly 1% relative error. Both merge to the same state in any order: HyperLogLog takes the register-wise max and DDSketch sums fixed logarithmic buckets. So each estimate is identical single-node or distributed, and on small inputs `approx_count_distinct` typically matches the exact count. Each also has a top-level spelling: {py:obj}`bt.approx_count_distinct(x) <batcher.approx_count_distinct>`, {py:obj}`bt.approx_quantile(x, q) <batcher.approx_quantile>`, and {py:obj}`bt.approx_median(x) <batcher.approx_median>`. They sit alongside the exact {py:obj}`bt.quantile(x, q) <batcher.quantile>` and the value-tally {py:obj}`bt.histogram(x) <batcher.histogram>`.
 
 ```python
 approx = (
@@ -303,8 +226,7 @@ print(approx.to_pydict())
 
 ## Grouping keys
 
-A key is a column name or an expression, and there can be any number of them. Pass several
-names to {py:meth}`group_by <batcher.Dataset.group_by>` to group by each unique combination.
+A key is a column name or an expression, and there can be any number of them. Pass several names to {py:meth}`group_by <batcher.Dataset.group_by>` to group by each unique combination.
 
 ```python
 sales = bt.from_pydict(
@@ -324,9 +246,7 @@ print(by_pair.to_pydict())
 #  'total': [20.0, 10.0, 40.0, 30.0], 'n': [1, 1, 1, 1]}
 ```
 
-A derived key works the same way. Define it in
-{py:meth}`with_columns <batcher.Dataset.with_columns>` (or pass the expression straight to
-`group_by`) and group on the result.
+A derived key works the same way. Define it in {py:meth}`with_columns <batcher.Dataset.with_columns>` (or pass the expression straight to `group_by`) and group on the result.
 
 ```python
 buckets = (
@@ -382,9 +302,7 @@ print(ds.count())
 # 5
 ```
 
-Each single-column reduction also has a **scalar terminal** that skips the one-row frame and
-hands back the value itself. `min`, `max`, `sum`, `mean`, `median`, `quantile`, `std`, `var`
-and `count_distinct` are joined by the distribution's shape and by the boolean reductions:
+Each single-column reduction also has a **scalar terminal** that skips the one-row frame and hands back the value itself. `min`, `max`, `sum`, `mean`, `median`, `quantile`, `std`, `var` and `count_distinct` are joined by the distribution's shape and by the boolean reductions:
 
 ```python
 print(ds.product("price"), ds.mode("category"))
@@ -394,13 +312,9 @@ print(ds.skew("price"), ds.kurtosis("price"), ds.mad("price"))
 # 0.0 -1.2000000000000004 10.0
 ```
 
-{py:meth}`mad <batcher.Dataset.mad>` is the mean absolute deviation. It does not square the
-deviations the way the standard deviation does, so one far-out value moves it far less.
-Prefer it when outliers are expected rather than exceptional.
+{py:meth}`mad <batcher.Dataset.mad>` is the mean absolute deviation. It does not square the deviations the way the standard deviation does, so one far-out value moves it far less. Prefer it when outliers are expected rather than exceptional.
 
-{py:meth}`any <batcher.Dataset.any>` and {py:meth}`all <batcher.Dataset.all>` reduce a
-boolean column. Both return `None` for an empty or all-null column rather than `False` or
-`True`, so a vacuous answer never passes for a checked one:
+{py:meth}`any <batcher.Dataset.any>` and {py:meth}`all <batcher.Dataset.all>` reduce a boolean column. Both return `None` for an empty or all-null column rather than `False` or `True`, so a vacuous answer never passes for a checked one:
 
 ```python
 flags = bt.from_pydict({"ok": [True, True, False]})
@@ -412,8 +326,6 @@ print(flags.any("ok"), flags.all("ok"))
 
 - {doc}`Joins </user-guide/analyze/joins>`: combine grouped results with other datasets.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: per-row aggregates that keep the rows.
-- {doc}`Performance and memory </user-guide/operate/tuning/performance>`: cache a rollup you reuse, and spill the
-  aggregations too big for memory.
-- {doc}`Expressions API </api/relational/expressions>`: every aggregate and approximate-aggregate
-  method in one place.
+- {doc}`Performance and memory </user-guide/operate/tuning/performance>`: cache a rollup you reuse, and spill the aggregations too big for memory.
+- {doc}`Expressions API </api/relational/expressions>`: every aggregate and approximate-aggregate method in one place.
 - {doc}`/cookbook/dataset/verbs/grouping`: a runnable script for `agg`, multi-key rollups, and the cube/rollup variants.

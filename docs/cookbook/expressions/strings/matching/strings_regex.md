@@ -1,6 +1,8 @@
 # Regular expressions
 
-`extract` pulls one capture group, `extract_all` returns a list column of every match, and `replace_all` rewrites every occurrence. The pattern is compiled once per operator rather than per row, which is the whole reason these live in the engine.
+When a substring test isn't enough, a regular expression over the column is the next step. `extract` pulls one capture group, `extract_all` returns a list column of every match, and `replace_all` rewrites every occurrence. The pattern is compiled once per operator rather than per row, which is the whole reason these live in the engine.
+
+The script parses three HTTP log lines: the verb and status code with `extract`, every number with `extract_all`, and the ids in each path anonymized with `replace_all`. It counts digit runs with `count_matches` without materializing them.
 
 The whole script, executed on every test run:
 

@@ -21,3 +21,8 @@
 # and a cross-arch cluster ships a per-arch binary regardless.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+# The musllinux wheel (Alpine and other musl-based images) runs on the same cloud fleet, so it
+# takes the same floor. Without this it silently fell back to plain SSE2 and lost POPCNT.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

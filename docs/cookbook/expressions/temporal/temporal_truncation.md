@@ -1,6 +1,8 @@
 # Truncating timestamps
 
-`truncate`/`floor` round a timestamp down to a unit, which is how you build an hourly or daily rollup key. The `*_start`/`*_end` pairs snap to calendar boundaries, which is what a month-over-month report needs.
+Rollups need a bucket key, and a raw timestamp is never one. `truncate` rounds a timestamp down to a unit, which is how you build an hourly or daily key. The `*_start` and `*_end` pairs snap to calendar boundaries, which is what a month-over-month report needs.
+
+The script truncates to the hour, drops the time of day with `normalize`, snaps to month, quarter, and year boundaries including a leap-year February, and tests boundaries with `is_month_start` and `is_quarter_start`. It ends with the hourly rollup these exist for.
 
 The whole script, executed on every test run:
 

@@ -1,11 +1,10 @@
 # Tokenization
 
-Tokenizing in the training loop is the classic way to leave a GPU idle. The tokenizer is
-CPU work, it is embarrassingly parallel, and it produces a column, so it belongs in the
-data pipeline. Run it once, write it out, and never run it again. Do it as an engine
-stage and the loop reads token ids straight off disk.
+This page covers turning text into token ids, packing them for pretraining, and encoding text that is really a category.
 
-Which tool you reach for depends on what the text actually is:
+Tokenizing in the training loop is the classic way to leave a GPU idle. A tokenizer is CPU work, embarrassingly parallel, and it produces a column, so it belongs in the data pipeline. Run it once as an engine stage, write the result out, and the training loop reads token ids straight off disk.
+
+The right tool depends on what the text actually is, as the following table shows:
 
 | The column holds | Reach for | What you get |
 | --- | --- | --- |
@@ -15,18 +14,9 @@ Which tool you reach for depends on what the text actually is:
 
 ## The Tokenizer preprocessor
 
-`Tokenizer(column, tokenizer, output_column=None)` takes either a plain `str -> list`
-callable or a HuggingFace-style tokenizer, meaning a callable object that also carries
-`.encode`. It is a {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>`, so it has the standard `fit`, `transform`, and
-`fit_transform` contract. There is nothing to learn, so `fit` only marks the object
-fitted, but it still has to be called: `transform` without it raises
-{py:exc}`PlanError <batcher.PlanError>`.
+`Tokenizer(column, tokenizer, output_column=None)` takes either a plain `str -> list` callable or a HuggingFace-style tokenizer, meaning a callable object that also carries `.encode`. It's a {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>` with the standard `fit`, `transform` and `fit_transform` contract. There's nothing to learn, so `fit` only marks the object fitted. You still have to call it: `transform` without it raises {py:exc}`PlanError <batcher.PlanError>`.
 
-Which of the two you pass decides how the tokenizer is driven. A HuggingFace tokenizer is
-called **once per Arrow batch** over the whole list of texts, which is where its Rust fast
-path lives, and that is also what unlocks `max_length`, `truncation`, `padding`, and
-`attention_mask_column`. A plain `str -> list` callable is per string by construction and
-is applied per string, and passing any of those four arguments alongside one raises.
+What you pass decides how the tokenizer is driven. A HuggingFace tokenizer is called **once per Arrow batch** over the whole list of texts, which is where its Rust fast path lives, and that batched call is what unlocks `max_length`, `truncation`, `padding` and `attention_mask_column`. A plain `str -> list` callable is applied per string, and passing any of those four arguments with one raises. Null texts never reach either kind of tokenizer and stay null in the output.
 
 ::::{tab-set}
 :::{tab-item} A whitespace split
@@ -76,9 +66,7 @@ tok.fit_transform(ds).write.parquet("s3://bucket/tokens.parquet")
 
 :::{tab-item} A tokenizer you build yourself
 
-When the tokenizer needs constructor arguments a preprocessor can't carry, or you want to
-tokenize and do something else in the same pass, write the UDF yourself. Make it a class:
-the model loads once per worker rather than once per batch.
+When the tokenizer needs constructor arguments a preprocessor can't carry, or you want to tokenize and do something else in the same pass, write the UDF yourself. Make it a class, so the model loads once per worker instead of once per batch.
 
 ```python
 # docs: skip
@@ -120,23 +108,14 @@ tokens.write.parquet("s3://bucket/tokens.parquet")
 ::::
 
 :::{warning}
-A tokenizer you construct yourself has to be constructed **once per worker**, which means a
-class, not a lambda. A slow tokenizer re-created per batch will be the bottleneck of the
-whole job, and the GPU you were trying to feed ends up waiting on the CPU stage that was
-supposed to feed it.
+A tokenizer you construct yourself has to be constructed **once per worker**, which means a class, not a lambda. A slow tokenizer re-created per batch becomes the bottleneck of the whole job, and the GPU ends up waiting on the CPU stage that was supposed to feed it.
 :::
 
-The parallelism knobs live on {py:meth}`map_batches <batcher.Dataset.map_batches>`, not on the preprocessor.
-`num_workers` defaults to `"auto"`, which fans the calls across every local core, and a fast
-tokenizer releases the GIL, so threads are the right pool. A pure-Python tokenizer needs
-`multiprocessing=True` to get real parallelism. `Tokenizer.transform` calls `map_batches`
-with those defaults, so reach for the UDF directly when you need to change them.
+The parallelism knobs live on {py:meth}`map_batches <batcher.Dataset.map_batches>`, not on the preprocessor. `num_workers` defaults to `"auto"`, which fans the calls across every local core. A fast tokenizer releases the GIL, so threads are the right pool, while a pure-Python tokenizer needs `multiprocessing=True` for real parallelism. `Tokenizer.transform` calls `map_batches` with the defaults, so write the UDF yourself when you need to change them.
 
 ## Token ids are a list column
 
-The output is `List<Int64>`, an ordinary Arrow column. So the whole expression surface
-applies, and length statistics are one aggregate rather than a pass over the corpus in
-Python.
+The output is `List<Int64>`, an ordinary Arrow column. The whole expression surface applies, so length statistics are one aggregate instead of a Python pass over the corpus.
 
 ```python
 from batcher import col
@@ -150,10 +129,7 @@ print(lengths.describe().to_pydict()["n"][:4])
 ```
 
 :::{important}
-Look at that distribution before you set `max_length`. Truncation is silent. Nothing
-raises, and a corpus where a large share of the documents lost their tail trains
-perfectly happily on the first 512 tokens of each. That is a decision you want to have
-made deliberately.
+Look at that distribution before you set `max_length`. Truncation is silent. Nothing raises, and a corpus where many documents lost their tail trains happily on the first 512 tokens of each. Make that decision deliberately.
 :::
 
 Filtering by length is a predicate:
@@ -165,10 +141,7 @@ print(tokenized.filter(col("tokens").list.len() >= 3).to_pydict()["id"])
 
 ## Sequence packing for pretraining
 
-A causal LM trains on fixed-length sequences. Padding each document up to `seq_len`
-wastes exactly as much GPU time as the padding fraction, and on a corpus of short
-documents that is most of it. `pack_sequences` concatenates documents end to end, inserts
-an EOS token between them, and cuts the stream into `seq_len` blocks.
+A causal LM trains on fixed-length sequences. Padding each document up to `seq_len` wastes GPU time in proportion to the padding, and on a corpus of short documents that's most of it. `pack_sequences` concatenates documents end to end, inserts an EOS token after each, and cuts the stream into `seq_len` blocks.
 
 ```python
 from batcher.ml import pack_sequences
@@ -187,22 +160,19 @@ print(packed[0].to_pydict())
 # {'tokens': [[1, 2, 3, 0], [4, 5, 0, 6], [7, 8, 9, 0]]}
 ```
 
-Three documents of 3, 2, and 4 tokens, plus one EOS each, became three dense sequences of
-exactly 4 tokens, with nothing padded. The second sequence holds the end of document 2
-and the start of document 3. That is the point, and it is also the problem the next
-section solves.
+Three documents of 3, 2 and 4 tokens, plus one EOS each, became three dense sequences of exactly 4 tokens with nothing padded. The second sequence holds the end of document 2 and the start of document 3. That's the point of packing, and it's also the problem the next section solves.
 
-`drop_remainder=True` discards the tail that does not fill a block. Set it `False` and
-pass `pad_token` to keep the tail, padded. `rows_per_batch` controls how many packed
-sequences come back per output batch.
+The following diagram sets that result beside padding the same three documents, with the segment lengths the next section adds:
+
+![Three documents of 3, 2 and 4 tokens: 1, 2, 3, then 4, 5, then 6, 7, 8, 9. Padding each document to 4 gives the rows 1, 2, 3, pad, then 4, 5, pad, pad, then 6, 7, 8, 9, so 3 of the 12 slots are padding. pack_sequences with seq_len=4 and eos_token=0 gives the rows 1, 2, 3, EOS, then 4, 5, EOS, 6, then 7, 8, 9, EOS, with no padding and an EOS at each seam. The segment lengths are 4 for the first row, 3 and 1 for the second, where document 2 and its EOS end and document 3 begins, and 4 for the third.](/_static/diagrams/sequence_packing.svg)
+
+`drop_remainder=True`, the default, discards the tail that doesn't fill a block, because that tail is the one place padding would enter the run. Set it to `False` to keep the tail, padded with `pad_token`, which defaults to `eos_token` or to 0 when there's none. `rows_per_batch` controls how many packed sequences come back per output batch. The packed column is a `FixedSizeList<Int64>[seq_len]`, which {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` turns into an `(n, seq_len)` tensor with no reshape.
+
+Packing carries state across batches: a document cut at the end of one sequence continues into the next. So consume the result sequentially, and don't run packing as a parallel `map_batches`, which would cut the stream at nondeterministic places. Order matters too. Shuffle documents *before* packing, not after.
 
 ### Telling the model where the documents end
 
-A packed sequence holds several unrelated documents, and plain causal attention lets every
-token attend straight across the joins. The cost is invisible in the data and shows up in the
-model, because the packed column is exactly as wide either way and nothing in it says which
-token started a document. The EOS token marks the seams to a reader, not to the attention
-mask.
+A packed sequence holds several unrelated documents, and plain causal attention lets every token attend straight across the joins. The data can't show the cost, because the packed column is exactly as wide either way and nothing in it says which token started a document. The EOS token marks the seams for a reader, not for the attention mask. The model pays instead.
 
 `boundaries_column` emits the segment lengths inside each sequence:
 
@@ -221,24 +191,13 @@ print(packed[0].to_pydict())
 #  'seq_lens': [[4], [3, 1], [4]]}
 ```
 
-The lengths of each row sum to `seq_len`, so a cumulative sum of one row is the `cu_seqlens`
-FlashAttention's variable-length path takes, and the same list restarts position ids per
-document. A document that straddles a cut contributes a segment on each side, which is what a
-block-diagonal mask wants: inside a sequence the piece really is contiguous. When
-`drop_remainder=False`, the final sequence's padding is its own segment, so every row still
-sums to its width and the padding can be masked by length rather than by scanning for a pad
-token.
+The lengths in each row sum to `seq_len`. A cumulative sum of one row is the `cu_seqlens` that FlashAttention's variable-length path takes, and the same list restarts position ids per document. A document that straddles a cut contributes a segment on each side, which is what a block-diagonal mask wants, since inside one sequence the piece really is contiguous. With `drop_remainder=False`, the final sequence's padding is its own segment, so every row still sums to its width and the padding can be masked by length instead of by scanning for a pad token. Omit `boundaries_column` and the output schema doesn't change.
 
-Omit the argument and the emitted schema is exactly what it was.
-
-It operates on a batch iterator rather than a {py:class}`Dataset <batcher.Dataset>`, so it composes with anything
-that yields batches, and it holds one buffer of tokens at a time, so a trillion-token
-corpus packs in bounded memory.
+`pack_sequences` operates on a batch iterator rather than a {py:class}`Dataset <batcher.Dataset>`, so it composes with anything that yields batches. It holds one buffer of tokens at a time, so even a trillion-token corpus packs in bounded memory.
 
 ## Encoding labels and categories
 
-Text that is a *label* rather than a document does not want a tokenizer. `LabelEncoder`
-maps each distinct value to an integer, learned by a `fit` over the training split.
+Text that is a *label* rather than a document doesn't want a tokenizer. `LabelEncoder` maps each distinct value to an integer, learned by a `fit` over the training split.
 
 ```python
 from batcher.ml import LabelEncoder
@@ -251,16 +210,11 @@ print(enc.classes_)
 # ['neg', 'neu', 'pos']
 ```
 
-A value unseen at fit time maps to `unknown_value`, which is `-1` by default, rather than
-raising, so a category appearing in production does not take the job down. Fit on train only.
-Fitting on train+test leaks the test distribution into the encoding.
+A value unseen at fit time maps to `unknown_value`, `-1` by default, instead of raising, so a new category in production doesn't take the job down. Fit on the training split only. Fitting on train and test together leaks the test distribution into the encoding.
 
 ## Where the work runs
 
-Tokenization is CPU work and inference is GPU work, so they want different pools. Split
-them into two stages. Tokenize with the default CPU fan-out, then hand the token column
-to a GPU stage with its own `concurrency`. The engine overlaps them, so the tokenizer for
-batch *n+1* runs while the GPU chews on batch *n*.
+Tokenization is CPU work and inference is GPU work, so they want different pools. Split them into two stages: tokenize with the default CPU fan-out, then hand the token column to a GPU stage with its own `concurrency`. The engine prefetches between stages, so the tokenizer for batch *n+1* runs while the GPU works on batch *n*.
 
 ```python
 # docs: skip
@@ -272,22 +226,18 @@ scored = (
 ```
 
 :::{tip}
-Better still, tokenize once, write the token ids to Parquet, and let every subsequent
-epoch and every subsequent experiment read them. Tokenization is deterministic, so
-running it every epoch is pure waste.
+Better still, tokenize once, write the token ids to Parquet, and let every later epoch and experiment read them. Tokenization is deterministic, so running it every epoch is pure waste.
 :::
 
 ## See also
 
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: the fit and transform contract, and the rest of the family.
-- {doc}`LLM inference </ml/retrieval/llm/index>`: generation over the tokens, and sequence packing in context.
+- {doc}`LLM inference </ml/retrieval/llm/index>`: generating text with a model once the corpus is ready.
 - {doc}`Data loaders </ml/training/data-loaders>`: getting the token column into a training loop.
-- {doc}`Distributed training </ml/training/distributed-training>`: the loader that reads the tokens you
-  wrote out.
-- {doc}`UDFs </user-guide/transform/columns/udfs>`: the class-per-worker contract the tokenizer stage rests
-  on.
-- {doc}`Arrow memory </architecture/deep-dives/memory/arrow-memory>`: what a `List<Int64>` column costs, and
-  why the boundary stays zero-copy.
-- {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: tokenization inside a larger
-  preprocessing job.
+- {doc}`Preparing a training corpus </ml/training/training-corpus>`: mixing, filtering, and decontaminating text before you tokenize it.
+- {doc}`Chunking documents for RAG </ml/preparing/multimodal/pipelines>`: splitting long documents into windows before embedding.
+- {doc}`Distributed training </ml/training/distributed-training>`: the loader that reads the tokens you wrote out.
+- {doc}`UDFs </user-guide/transform/columns/udfs>`: the class-per-worker contract the tokenizer stage rests on.
+- {doc}`Arrow memory </architecture/deep-dives/memory/arrow-memory>`: what a `List<Int64>` column costs, and why the boundary stays zero-copy.
+- {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: tokenization inside a larger preprocessing job.
 - {doc}`ML API </api/models/ml>`: the `Tokenizer`, `pack_sequences`, and `LabelEncoder` reference.

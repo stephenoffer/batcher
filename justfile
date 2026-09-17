@@ -266,6 +266,9 @@ docs:
     # consecutive `just docs` runs that way.
     python tools/check_doctests.py docs/_build/doctest/output.txt
     sphinx-build -b html -E -W --keep-going docs docs/_build/html
+    # The source-line cap cannot see an autodoc directive that renders a whole class, so
+    # measure the built pages.
+    python tools/check_page_size.py docs/_build/html
     @echo "docs built -> docs/_build/html/index.html"
 
 # Regenerate the architecture diagram PNGs from their Graphviz sources (needs

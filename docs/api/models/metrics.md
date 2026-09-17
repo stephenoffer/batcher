@@ -254,8 +254,8 @@ for: valid JSON, an extractable JSON object, or an answer inside a named tag.
 
 ### Retrieval grounding
 
-The RAG grounding metrics compare a generated answer column against its retrieved context column,
-measuring how much of the answer the context supports and how much is unsupported.
+The RAG grounding metrics compare a generated answer column against its retrieved context column
+and measure how much of the answer the context supports.
 
 ```{eval-rst}
 .. autosummary::

@@ -1,8 +1,8 @@
 # Planning on the layout a table already has
 
-This page describes how Batcher skips a shuffle entirely when the table on disk is already partitioned by the columns a query groups on, why that decision is verified rather than assumed, and what it does not yet cover.
+This page describes how Batcher skips a shuffle entirely when the table on disk is already partitioned by the columns a query groups on, why that decision is verified rather than assumed, and which shapes it covers.
 
-## What a partitioned table already did for you
+## What does a partitioned table already do?
 
 A partitioned table stores each value's rows apart from the others. A Hive-partitioned Parquet tree uses a directory per value:
 
@@ -39,17 +39,13 @@ Nothing in the query says so. The decision is made by the scheduler from the lay
 
 ## The three conditions
 
-The elimination applies when all three hold. Each one is load-bearing, and the third is a scheduling judgment rather than a correctness one.
+The elimination applies when three conditions hold. The first two are correctness conditions, and the third is a scheduling judgment.
 
-Every split declares the same clustering columns. A set where one split names `day` and the next names nothing has no column every row can be located by, and guarantees nothing. This is the half that is *checked*, by `io/splits/clustering.py::declared_clustering`.
+**The layout guarantees co-location.** This condition has two halves. First, every split declares the same clustering columns. A set where one split names `day` and the next names nothing has no column every row can be located by, and guarantees nothing. This is the half that is *checked*, by `io/splits/clustering.py::declared_clustering`. Second, splits sharing a value are assigned together. This is the half that is *established*, by `group_by_clustering`, and it's the one that matters. No individual split can promise it: two splits at `day=2026-08-01` on two different workers would make a query that skipped its shuffle report the day twice.
 
-Splits sharing a value are assigned together. This is the half that is *established*, by grouping. It is the one that matters. No individual split can promise it: two splits at `day=2026-08-01` on two different workers would make a query that skipped its shuffle report the day twice.
+**Every clustering column is a group key.** Grouping by a *superset* is fine, because `(day, region)` groups are inside `day` groups, which are inside one directory. Grouping by a column the table is not partitioned by is not. `region` repeats in every directory, so its groups straddle every worker.
 
-Every clustering column is a group key. Grouping by a *superset* is fine, because `(day, region)` groups are inside `day` groups, which are inside one directory. Grouping by a column the table is not partitioned by is not. `region` repeats in every directory, so its groups straddle every worker.
-
-The grouping keeps enough of the read's parallelism to be worth the exchange it saves.
-
-This is the only thing the aligned plan gives up, and how much it gives up depends entirely on the reader. A Hive tree already splits one-per-partition, so grouping changes nothing and the aligned plan runs exactly the tasks the shuffle would have. A Delta or Iceberg table splits per data file, so a partition of eight files becomes one assignable unit, and a table with fewer partitions than the fleet has workers ends up running on a fraction of it while the shuffle uses all of it.
+**The grouping keeps enough of the read's parallelism to be worth the exchange it saves.** This is the only thing the aligned plan gives up, and how much it gives up depends entirely on the reader. A Hive tree already splits one-per-partition, so grouping changes nothing and the aligned plan runs exactly the tasks the shuffle would have. A Delta or Iceberg table splits per data file, so a partition of eight files becomes one assignable unit, and a table with fewer partitions than the fleet has workers ends up running on a fraction of it while the shuffle uses all of it.
 
 So the test is written against the two task counts the plans would actually run: `min(groups, workers)` for the aligned plan, `min(splits, workers)` for the shuffle. Both are capped by the fleet because neither plan can use more workers than exist, which is why the same layout can be aligned on a small fleet and shuffled on a large one. The floors come from measurement rather than taste, and the section below shows what they were set from.
 
@@ -93,7 +89,7 @@ A window computes each partition independently, so co-locating a partition's row
 
 That is what the chain check is for, and it is also where the clustering property alone would mislead. A `Limit` between the scan and the aggregate does not move a row between workers, so the relation is still clustered by every measure this page has given. But `limit(100).group_by(day)` run per partition keeps a hundred rows on *each* of them, which is a different query. Clustering says where rows are. It does not say that a per-partition computation is complete. Only `Filter`, `Project` and an unlimited `Distinct` are allowed in the chain.
 
-Because nothing is combined across partitions, a **non-mergeable** aggregate is correct here too. `median` and `n_unique` carry per-group partial state that a shuffle has to merge; aligned, each group is finalized where it was read and there is nothing to merge.
+Because nothing is combined across partitions, a **non-mergeable** aggregate is correct here too. `median` and `count_distinct` carry per-group partial state that a shuffle has to merge; aligned, each group is finalized where it was read and there is nothing to merge.
 
 ## Seeing that it fired
 
@@ -103,7 +99,7 @@ The shuffle path returns exactly the same rows, so nothing about a result tells 
 core / exchange   aggregate needs no shuffle: the table is already partitioned by day
 ```
 
-If you expect the line and it isn't there, work down the three conditions. The most common reason is the third. Check it before the others. A lakehouse table with many small files per partition and few partitions relative to the fleet is the shape where shuffling genuinely wins, and the scheduler chose it.
+If you expect the line and it isn't there, work down the three conditions, starting with the third, because it's the most common reason. A lakehouse table with many small files per partition and few partitions relative to the fleet is the shape where shuffling genuinely wins, and the scheduler chose it.
 
 ## Measured
 
@@ -151,3 +147,4 @@ Joins do not use it yet. A join whose both sides are partitioned by the join key
 - {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>`: the fan-out, task sizing and skew decisions this one sits beside.
 - {doc}`Shuffle over Arrow Flight </architecture/deep-dives/distribution/shuffle-flight>`: what the eliminated exchange would have cost.
 - {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why a partitioned result equals the single-node one when a combine *is* needed.
+- {doc}`Physical properties </architecture/deep-dives/query/physical-properties>`: the partitioning and ordering properties `satisfies` compares.

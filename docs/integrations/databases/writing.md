@@ -1,6 +1,6 @@
 # Writing to a database
 
-This page covers writing rows back into a SQL database: appending a load, and maintaining an operational table one key at a time with upserts, updates, and deletes. It takes the same connection URI as {doc}`reading </integrations/databases/databases>`, so a read and the write that follows it are spelled the same way.
+This page covers writing rows back into a SQL database: appending a load, and maintaining an operational table one key at a time with upserts, updates and deletes. The write takes the same connection URI as {doc}`the read </integrations/databases/databases>`, and reaches MySQL, Oracle and SQL Server through their Python drivers as well as the databases ADBC covers.
 
 | | |
 | --- | --- |
@@ -9,7 +9,7 @@ This page covers writing rows back into a SQL database: appending a load, and ma
 | **Backends** | ADBC for a bulk append where a driver exists, any PEP 249 driver otherwise |
 | **Extra** | the per-database driver, such as `pip install psycopg` or `pip install pymysql` |
 | **Transactions** | one per write call, and one per shard of a distributed write |
-| **Credentials** | `password="env:VAR"` or `"file:/path"`, resolved on the worker |
+| **Credentials** | A secret reference such as `password="env:VAR"`, resolved on the worker |
 
 ## What each mode does
 
@@ -83,8 +83,7 @@ Writing into a table you created yourself needs none of this. Batcher creates a 
 
 ## Semantics the mode name does not show
 
-Three behaviors decide whether the result is right, and none of them is visible from the
-word you passed to `mode`.
+Three behaviors decide whether the result is right, and the mode name shows none of them.
 
 An upsert of a subset of columns is a column-level merge rather than a row replacement.
 Write `id` and `status` into a table that also has `amount`, and only `status` changes;
@@ -98,7 +97,7 @@ A repeated key inside one write behaves differently per mode. `upsert`, `update`
 order, which a distributed write does not fix. `delete_insert` deletes the key once and then
 inserts every row, so a repeated key becomes a repeated row and the target's own key
 constraint rejects it. Deduplicate first with
-{py:meth}`ds.drop_duplicates(subset=...) <batcher.Dataset.drop_duplicates>` when the source
+{py:meth}`ds.distinct(subset=...) <batcher.Dataset.distinct>` when the source
 can carry more than one row per key.
 
 A column the frame does not have is not written at all. For `append` that means the column
@@ -108,7 +107,7 @@ because both are ordinary SQL. If the frame's shape is meant to match the table,
 
 ## Which backend serves the write
 
-You do not choose. Two things decide it, and neither is a preference.
+You do not choose. Two things decide it.
 
 Row-level DML is not expressible as an Arrow ingest: `adbc_ingest` appends a table and has no disposition meaning "update the rows holding these keys". Reach is the other half, because ADBC has drivers for PostgreSQL, SQLite, DuckDB, Snowflake, BigQuery and FlightSQL, which leaves MySQL, MariaDB, Oracle and SQL Server with a PEP 249 driver and nothing else.
 
@@ -150,7 +149,7 @@ For anything else, name the driver yourself with `module=` and `connect_kwargs=`
 
 A dialect outside those three is refused rather than guessed at, and the error names `mode="delete_insert"`: the same intent built from ANSI SQL alone, run inside one transaction.
 
-One semantic difference is worth knowing because it is invisible in the SQL. `ON DUPLICATE KEY` has no conflict target: MySQL matches on **any** unique index, not on the columns you named. A table with a second unique index will therefore update rows a PostgreSQL `ON CONFLICT (id)` would have inserted. That is MySQL's semantics, not a translation defect.
+One semantic difference is worth knowing because it is invisible in the SQL. `ON DUPLICATE KEY` has no conflict target: MySQL matches on **any** unique index, not on the columns you named. A table with a second unique index will therefore update rows a PostgreSQL `ON CONFLICT (id)` would have inserted. That is how MySQL defines it.
 
 ## Transactions
 
@@ -158,7 +157,7 @@ One `write` call is one transaction. Every chunk of every statement runs, then a
 
 `overwrite` empties the table with `DELETE FROM` rather than `TRUNCATE`, deliberately. Truncation is DDL on several engines and commits the surrounding transaction implicitly, which would publish the empty table before the new rows were written. A crash between the two would have destroyed the table's contents.
 
-A **distributed** write is one transaction per shard, not one across the cluster. That is safe for `append`, `upsert`, `update` and `delete`, because a shard only ever touches the keys its own rows name. `overwrite` is refused past the first shard: every shard would empty the one table they all target, so each would discard the shards before it. It is invisible single-node and appears at cluster scale as missing rows rather than an error.
+A distributed write is one transaction per shard, not one across the cluster. That is safe for `append`, `upsert`, `update` and `delete`, because a shard only ever touches the keys its own rows name. `overwrite` is refused past the first shard: every shard would empty the one table they all target, so each would discard the shards before it. It is invisible single-node and appears at cluster scale as missing rows rather than an error.
 
 Where you need cluster-wide atomicity, write to a staging table and swap, or use a {doc}`lakehouse table </user-guide/moving-data/lakehouse>`, whose commit is atomic by construction.
 
@@ -234,7 +233,7 @@ conn.close()
 
 Pass `commit_writes=True` to have Batcher commit a borrowed connection instead. A connection cannot be shipped to a worker, so `connection=` is single-node; `uri=` is what scales out.
 
-**The table must already exist** on this path, which is why the example creates it. Batcher creates a missing table by asking whether it exists first, and on PostgreSQL a statement that fails aborts the entire transaction. Asking about a table that is not there would therefore destroy work the caller did before handing the connection over. Batcher will not do that to a connection it does not own. Use `uri=` if you want the table created for you.
+The table must already exist on this path, which is why the example creates it. Batcher creates a missing table by asking whether it exists first, and on PostgreSQL a statement that fails aborts the entire transaction. Asking about a table that is not there would therefore destroy work the caller did before handing the connection over. Batcher will not do that to a connection it does not own. Use `uri=` if you want the table created for you.
 
 ## What this costs
 
@@ -254,13 +253,13 @@ A row whose key column is null matches no row on any database, because SQL equal
 
 There is no cross-shard transaction. There is no cross-*call* transaction either, so two `write` calls are two transactions unless you pass your own `connection=` and commit it yourself.
 
-Each write opens and closes its own connection. For a batch job that is one connect; for a streaming query it is one per micro-batch, so a one-second trigger dials the database once a second and a distributed stream does so once per shard. Check the server's connection limit before running a short trigger interval across many workers, or hold the connection yourself with `connection=` on a single-node stream.
+Each write opens and closes its own connection. For a batch job that is one connect. For a streaming query it is one per micro-batch, so a one-second trigger dials the database once a second and a distributed stream does so once per shard. Check the server's connection limit before running a short trigger interval across many workers, or hold the connection yourself with `connection=` on a single-node stream.
 
 The MySQL type map uses `TEXT` for string columns, and MySQL cannot index a `TEXT` column without a prefix length. A table with a string primary key therefore has to be created by hand there. An integer or date key is unaffected.
 
 ## The operational stores use the same vocabulary
 
-MongoDB, DynamoDB, Cassandra, Redis and Elasticsearch are maintained the same way a SQL table is, so they take the same `mode` words. What differs is which of them each store can actually express, and a store declines the rest by name rather than approximating it.
+MongoDB, Elasticsearch, DynamoDB, Cassandra, Redis and HBase take the same `mode` words a SQL table does. Each store implements the modes it can express and declines the rest by name rather than approximating them.
 
 | Sink | Modes | Bulk primitive |
 | --- | --- | --- |
@@ -269,19 +268,9 @@ MongoDB, DynamoDB, Cassandra, Redis and Elasticsearch are maintained the same wa
 | {py:meth}`ds.write.dynamodb <batcher.api.io_namespace.writer.Writer.dynamodb>` | `upsert`, `delete` | `BatchWriteItem`, 25 requests per call |
 | {py:meth}`ds.write.cassandra <batcher.api.io_namespace.writer.Writer.cassandra>` | `upsert`, `delete` | one prepared statement, run concurrently |
 | {py:meth}`ds.write.redis <batcher.api.io_namespace.writer.Writer.redis>` | `upsert`, `delete` | one pipeline per batch |
+| {py:meth}`ds.write.hbase <batcher.api.io_namespace.writer.Writer.hbase>` | `upsert`, `delete` | one happybase batch per Arrow batch |
 
-The refusals are about the stores, not about unfinished work. DynamoDB has no `append`, because `PutItem` replaces the item holding the same key and no batch operation inserts only when the key is absent; Cassandra has none because a CQL `INSERT` is an upsert. Redis has no `overwrite`, because emptying a keyspace means `FLUSHDB`, which discards keys the write knows nothing about; DynamoDB and Cassandra have none because emptying those means a full scan-and-delete or a cluster-wide `TRUNCATE`. Reaching an operation of that reach by passing a string to `mode` is not something a write API should offer.
-
-All five default to `upsert` rather than to `ds.write`'s usual `overwrite`, for the same reason: these stores are maintained rather than replaced, and a destructive default would empty one on a call that never said so.
-
-Each of these APIs reports partial failure inside a success, and each sink reads the response rather than the status code. `BatchWriteItem` returns the requests it did not apply under `UnprocessedItems` with a 200; those are retried with backoff, and a remainder that survives raises. `_bulk` reports per-document failures inside an HTTP 200. Cassandra's concurrent execution returns a success flag per statement. A sink that trusted the call would have written some of its rows and reported success, which is the quietest kind of data loss there is.
-
-```python
-# docs: skip
-scores.write.dynamodb("user_scores", region_name="us-east-1")
-sessions.write.redis("session", host="cache.internal", ttl_seconds=3600)
-features.write.cassandra("features", contact_points=["c1"], keyspace="serving")
-```
+All six default to `upsert` rather than to `ds.write`'s usual `overwrite`. These stores are maintained rather than replaced, and a destructive default would empty one on a call that never asked for it. DynamoDB, Elasticsearch and Cassandra can each report a partial failure inside a successful call, so their sinks read the response item by item rather than trusting the status. {doc}`Key-value stores </integrations/databases/key-value-stores>`, {doc}`MongoDB </integrations/databases/mongodb>` and {doc}`Elasticsearch </integrations/databases/elasticsearch>` cover the details per store.
 
 ## See also
 

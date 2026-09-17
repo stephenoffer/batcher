@@ -1,6 +1,8 @@
 # Conditionals
 
-`bt.when(...).then(...).otherwise(...)` is the columnar `if`. Chain `.when()` for more branches; the first matching branch wins, exactly like SQL `CASE`. Because it is an expression it runs in Rust, so a five-way bucketing is still one pass.
+`bt.when(...).then(...).otherwise(...)` is the columnar `if`. Chain `.when()` for more branches and the first matching branch wins, exactly like SQL `CASE`. Because it is an expression it runs in Rust, so a five-way bucketing is still one pass.
+
+The script builds a multi-branch bucket and a two-branch flag, then the SQL null helpers `coalesce` and `nullif` and the row-wise `greatest` and `least`. `.otherwise(...)` is required and takes a real value, so the script also shows the pattern for an unmatched row that should end up null: give it a sentinel, then turn the sentinel into a null with `nullif`.
 
 The whole script, executed on every test run:
 

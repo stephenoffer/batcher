@@ -1,13 +1,10 @@
 # Operating the engine
 
-This page covers the scripts that read plans, measure queries, configure the engine, and
-handle its failures.
+This page covers the scripts that read plans, measure queries, configure the engine, and handle its failures.
 
 ## Read the plan before you guess
 
-The plan is the ground truth about what will run, and reading it costs nothing because
-`explain` never executes. Two things to look for: whether the filter sits directly on the
-scan, and whether the projection narrowed before the join.
+The plan is the ground truth about what will run, and reading it costs nothing because `explain` never executes. Two things to look for: whether the filter sits directly on the scan, and whether the projection narrowed before the join.
 
 ```python
 import batcher as bt
@@ -23,26 +20,17 @@ assert "scan" in plan.lower()
 assert query.count() == 2
 ```
 
-`profile` is the executed counterpart and reports per-operator timings, which is the only way
-to know whether the join or the scan is the problem. Guessing from the plan shape is how
-people end up optimizing the cheap half.
+`explain(analyze=True)` is the executed counterpart. It runs the query and prints each operator's measured row count beside the estimate, plus its share of the engine's time, which is how you learn whether the join or the scan is the problem. Guessing from the plan shape is how people end up optimizing the cheap half.
 
 ## Measure honestly
 
-Four rules, and the last one matters most. Warm the cache, run more than once, verify the
-result before timing it, and report the distribution rather than the best number. A minimum
-is not a measurement, it is the luckiest sample.
+Four rules, and the last one matters most. Warm the cache, run more than once, verify the result before timing it, and report the distribution rather than the best number. A minimum is not a measurement, it is the luckiest sample.
 
-The scripts here also pin the invariants that a performance change must not break. Morsel
-size, partition count and spill are scheduling choices, so sweeping each and asserting the
-result is unchanged is the cheapest test that an operator is not accidentally order- or
-batch-dependent.
+The scripts here also pin the invariants that a performance change must not break. Morsel size, partition count and spill are scheduling choices, so sweeping each and asserting the result is unchanged is the cheapest test that an operator is not accidentally order- or batch-dependent.
 
 ## Errors are typed
 
-Every failure mode has its own class, so a caller can distinguish "you wrote the query wrong"
-from "the data is not what you promised" from "the file is not there". Catching bare
-`Exception` throws that away.
+Every failure mode has its own class, so a caller can distinguish "you wrote the query wrong" from "the data is not what you promised" from "the file is not there". Catching bare `Exception` throws that away.
 
 ```python
 import batcher as bt
@@ -61,9 +49,7 @@ assert issubclass(ColumnNotFoundError, PlanError)
 
 ## Configuration has a scope
 
-A global `set_option` outlives the function that made it. `option_context` is the same
-setting with a lifetime, and it is what library code should use, because the caller's
-configuration is not yours to keep.
+A global `set_option` outlives the function that made it. `option_context` is the same setting with a lifetime, and it is what library code should use, because the caller's configuration is not yours to keep.
 
 ## Every script on this page
 
@@ -113,3 +99,10 @@ The table below lists the operations and performance scripts in path order.
 | `examples/perf/streaming_versus_collect.py` | When to stream and when to collect |
 | `examples/perf/wide_versus_narrow_tables.py` | What column count costs, and why a projection is the first optimization |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/cookbook/operations/index`: operations recipes with the whole script on the page.
+- {doc}`/user-guide/operate/tuning/explain-plans`: reading a plan and its measured profile.
+- {doc}`/configuration/index`: every option and the environment variable that sets it.
+- {doc}`/user-guide/operate/running/troubleshooting`: symptom to cause when something goes wrong.

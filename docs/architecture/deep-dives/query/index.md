@@ -1,6 +1,6 @@
 # The query, end to end
 
-Follow one query from Python down to Arrow and back.
+This group follows one query from Python down to Arrow and back: how the plan is built and shipped, how the engine evaluates its expressions, and what the optimizer knows about the shape of the rows.
 
 - {doc}`Query lifecycle </architecture/deep-dives/query/query-lifecycle>`: what happens between {py:meth}`collect() <batcher.Dataset.collect>` and your rows.
 - {doc}`The plan IR </architecture/deep-dives/query/plan-ir>`: the JSON wire contract between the control plane and the engine.

@@ -4,6 +4,8 @@ Four things are done to a nucleotide column before anything else: read the other
 
 Two of these have a trap that only shows up on real data. {py:meth}`reverse_complement <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.reverse_complement>` must complement the IUPAC ambiguity codes as IUPAC defines them, which is invisible on a test of pure ACGT and wrong on any variant call. {py:meth}`gc_content <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.gc_content>` must exclude ambiguous bases from its denominator, or a run of `N` reads as an AT-rich region instead of as no data.
 
+The script runs all four over a small column that includes a soft-masked fragment and an assembly gap written as `N`s: reverse complement, complement and transcription, GC content, skew and base counts, translation in three frames, and IUPAC motif search. It ends with the relational payoff, a filter for GC-rich fragments that contain a restriction site.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/genomics_sequences.py

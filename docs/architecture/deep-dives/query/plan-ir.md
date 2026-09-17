@@ -4,7 +4,7 @@ Python builds the plan; Rust runs it. They meet at one JSON document, and that d
 a wire contract in the ordinary sense: two independent programs agree on a set of tags, and
 a disagreement is a bug that no compiler will catch for you.
 
-The document sits at the one point in the engine where a decision about work becomes the work itself.
+It is the one point in the engine where a decision about work becomes the work itself.
 
 ![The lowering chain with the plane boundary drawn across it. Above the line, in Python, nothing touches a row: a lazy immutable Dataset returns a new node per operation, those nodes form a validated LogicalPlan, Kyber rewrites plan to plan through seven phases from NORMALIZE to ENFORCE, and the rewritten tree lowers through to_ir() into a PhysicalPlan carrying the IR and its resource bounds. Below the line, in Rust, nothing chooses a plan: bc-py's execute_plan is the one FFI entry, serde deserializes the document into a bc-ir RelOp tree and hard-errors on an unknown tag, and bc-interp and bc-runtime walk that tree once over 16,384-row Arrow morsels. Exactly one edge crosses the boundary, carrying to_json() output plus the Arrow input batches, and nothing else crosses at all.](/_static/diagrams/plan_lowering.svg)
 
@@ -145,7 +145,7 @@ Some fields are the optimizer talking to the executor, not the user talking to e
 | `Window { rank_limit }` | fusing `QUALIFY rn <= k` | a per-partition top-N instead of a full ranking |
 | `Aggregate { group_keys: [] }` | the planner | an empty key list is a global aggregate, not an error |
 
-A wrong `strategy` is slow, never wrong. Each field has a `#[serde(default)]`, so a Python
+A wrong `strategy` is slow, never wrong. Each hint field has a `#[serde(default)]`, so a Python
 side that does not emit it still produces a valid document, which is what lets the optimizer
 learn to emit a new hint without a coordinated flag day.
 
@@ -199,10 +199,12 @@ Arrow input, which already has them, and stages are composed in Python out of or
 so the engine sees the same document shape whether it is running one node or a hundred.
 :::
 
-The IR is a tree, not a DAG with sharing. A common sub-plan referenced twice is serialized
-twice and executed twice; there is no `WITH`-style CTE node and no result reuse. For the
-shapes the engine targets that has not been worth the machinery, but it is a real limit and
-it is the first thing to look at if you find yourself scanning a source twice.
+The IR is a tree, not a DAG with sharing, and it has no `WITH`-style CTE node. Sharing is
+handled one level up instead. `kyber/common_subplan.py` picks the repeated subtrees worth
+computing once, and `api/subplan_reuse.py` runs each one and rewrites every appearance into a
+`Scan` over the result, so the engine still receives a plain tree. That reuse applies on the
+single-node relational path. A distributed plan that references a subplan twice still
+computes it twice, which is the first thing to check if a cluster job scans a source twice.
 
 The IR also has no notion of a *stage*. The distributed path composes stages in Python
 (`python/batcher/dist/`) out of the same mergeable primitives, shipping a sub-plan per task.

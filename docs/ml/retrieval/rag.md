@@ -1,27 +1,20 @@
 # RAG pipelines
 
-Most of a RAG system is a data pipeline, and most RAG failures are data failures: HTML
-tags embedded in the corpus, chunks that cut a sentence in half, the same document
-indexed four times so every retrieval returns four copies of it, and a chunk that came
-back with no way to trace it to a source. None of that is a model problem. All of it is
-fixed on the ingest side, in operators.
+This page builds a retrieval-augmented generation (RAG) pipeline on Batcher, from a raw crawl to a cited answer. Most of a RAG system is a data pipeline, and most RAG failures are data failures: markup left in the corpus, chunks that cut a sentence in half, one document indexed four times, a chunk with no way back to its source. None of that is a model problem, and all of it is fixed at ingest.
 
-The chain is **load → clean → chunk → dedupe → embed → index**, then at query time
-**embed → retrieve → prompt → generate**. Ingest is a batch job over a {py:class}`Dataset <batcher.Dataset>`.
-Retrieval is a query. Keep them separate.
+Ingest runs load, clean, chunk, dedupe, embed and index as a batch job over a {py:class}`Dataset <batcher.Dataset>`. Query time runs embed, retrieve, prompt and generate. Keep the two separate.
+
+The following diagram shows both halves and the one thing they share:
+
+![Ingest is a batch job over the corpus. Load and clean with str.strip_html() passes text to chunk, which runs str.chunk and explode. Chunks go to dedupe, exact duplicates first and then near duplicates, and the unique chunks go to embed and index, ml.embed written to Lance. Every ingest stage is an engine operator, so the job streams and distributes. The chunk vectors are the only thing query time reads from ingest. Per question, embed the question with the same model, and pass the vector to retrieve, a top_k scan on a small corpus or vector_search against the Lance index at scale. Retrieve passes the top 100 to rerank, where a cross-encoder keeps 20 by relevance and MMR then keeps 5 by diversity. The top 5 go to generate, which assembles the context with array_agg and calls ml.generate. Carry url and chunk_id from ingest through retrieval so the answer can cite its sources.](/_static/diagrams/rag_ingest_query.svg)
 
 ## Ingest
 
-Ingest turns a raw corpus into an indexed set of chunks. Each of the four stages below
-runs as engine operators over a {py:class}`Dataset <batcher.Dataset>`, so the whole chain streams and distributes.
+Ingest turns a raw corpus into an indexed set of chunks. Every stage below is an engine operator, so the chain streams and distributes like any other query.
 
 ### Clean the markup
 
-A scraped page is markup. The {py:meth}`regexp_replace('<[^>]*>', '') <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_replace>` idiom that everyone
-reaches for is wrong in three ways. It leaves the body of `<script>` in the corpus as
-prose, it leaves `&amp;` undecoded, and it welds `<p>a</p><p>b</p>` into `ab`.
-{py:meth}`.str.strip_html() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.strip_html>` is a text extractor instead. It drops script and style bodies,
-decodes entities, and separates block elements.
+The {py:meth}`regexp_replace('<[^>]*>', '') <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_replace>` idiom is wrong in three ways. It leaves the body of `<script>` in the corpus as prose, leaves `&amp;` undecoded, and welds `<p>a</p><p>b</p>` into `ab`. {py:meth}`.str.strip_html() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.strip_html>` is a text extractor. It drops script and style bodies, decodes entities, and turns element boundaries into a single space.
 
 ```python
 import batcher as bt
@@ -41,14 +34,11 @@ print(docs.to_pydict()["text"])
 # ['Cats & dogs are pets', 'Trains run on rails']
 ```
 
-It never raises on malformed markup, so one bad row in a crawl of ten million cannot
-abort the scan.
+Malformed markup never raises, so one bad row in a large crawl can't abort the scan.
 
 ### Chunk, and keep the provenance
 
-{py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` slices text into overlapping windows, and `explode` turns the
-list into one row per chunk. Carry the source id through, and add a chunk index. A
-retrieved chunk that cannot name its source document is a citation you cannot render.
+{py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` slices text into overlapping windows, and `explode` turns the list into one row per chunk. Carry the source id through and add a chunk index. A retrieved chunk that can't name its source is a citation you can't render.
 
 ```python
 chunks = (
@@ -62,19 +52,14 @@ print(chunks.select("url", "chunk_id", "chunk").to_pydict())
 ```
 
 :::{warning}
-Sizes are in characters. Pick one comfortably under the embedding model's token limit,
-using about 4 characters per token as a rough conversion. Text past the limit is
-silently truncated, and a vector for the first half of a chunk is worse than no vector.
-`overlap` is what keeps a sentence split across a boundary whole in one of the two
-chunks.
+Sizes are in characters. Pick one comfortably under the embedding model's token limit, using about 4 characters per token as a rough conversion. Text past the limit is silently truncated, and a vector for the first half of a chunk is worse than no vector. `overlap` keeps a sentence split across a boundary whole in one of the two chunks.
 :::
+
+The default cut can land mid-word. Pass `boundary="word"`, `"sentence"` or `"line"` to back each cut off to the last such separator inside the window.
 
 ### Deduplicate before embedding, not after
 
-Chunk-level duplicates are the reason a RAG system returns the same paragraph three
-times in a top-5. They come from the same document being crawled twice, from boilerplate
-headers and footers repeating across every page, and from near-identical product blurbs.
-Drop them before you pay for the forward pass.
+Chunk-level duplicates are why a RAG system returns the same paragraph three times in a top-5. They come from a document crawled twice, from headers and footers repeated on every page, and from near-identical product blurbs. Drop them before you pay for the forward pass.
 
 ```python
 corpus = bt.from_pydict(
@@ -93,10 +78,7 @@ print(sorted(clean.to_pydict()["chunk_id"]))
 # [1, 4]
 ```
 
-`distinct` gets the byte-identical ones cheaply. {py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>`, built on MinHash
-and LSH, gets the ones that differ by a header or a trailing exclamation mark. On a web
-corpus the near-duplicate rate is routinely 20% to 40%, and every one of them is a wasted
-GPU forward pass and a polluted retrieval.
+`distinct` removes the byte-identical ones cheaply. {py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>`, built on MinHash and LSH, catches the ones that differ by a header or a trailing exclamation mark. Every duplicate it drops is a GPU forward pass you don't pay for and a retrieval slot it can't pollute.
 
 ### Embed and index
 
@@ -116,27 +98,21 @@ vectors.write.lance("s3://bucket/chunks.lance")
 build_vector_index("s3://bucket/chunks.lance", "embedding")
 ```
 
-The whole ingest chain of scan, strip, chunk, explode, dedupe, and embed is row-wise
-apart from the dedup, so it streams and distributes with no breaker before the GPU stage.
-The one thing no static estimate can know is how many chunks a document yields. The
-engine measures the real fan-out on the first run and sizes the downstream GPU stage for
-it on the next. See {doc}`adaptive re-optimization </architecture/internals/kyber>`.
+Scan, strip, chunk, explode and embed are all row-wise, so they stream. The dedup steps are the only operators in the chain that have to see many rows at once. How many chunks a document yields is the one number no static estimate knows. The optimizer treats an explode's fan-out as correctable: it measures the real one on the first run and uses it for the estimate on the next. See {doc}`Kyber </architecture/internals/kyber>`.
 
 ## Retrieval
 
-Embed the question with the *same* model, then rank. Both forms return a `Dataset`, so
-everything downstream of them is identical.
+Embed the question with the *same* model, then rank. Both forms below return a `Dataset`, so everything downstream is identical.
 
 ::::{tab-set}
 :::{tab-item} Brute force
 
-On a corpus small enough to scan, this is a projection and a top-n. No index and no
-service are involved.
+On a corpus small enough to scan, retrieval is a projection and a top-n, with no index and no service.
 
 ```python
 from batcher import array
 
-# Vectors already in a column (a toy 2-d space; a real one is 384–1536 dims).
+# Vectors already in a column (a toy 2-d space; a real one is 384 to 1536 dims).
 indexed = bt.from_pydict(
     {
         "chunk_id": [1, 2, 3],
@@ -167,21 +143,18 @@ from batcher.ml import vector_search
 hits = vector_search("s3://bucket/chunks.lance", question_vec, k=5, filter="tenant = 'acme'")
 ```
 
-Metadata scoping is a predicate here, not a post-filter.
+`filter` is a SQL predicate applied with the search. It isn't a post-filter.
 
 :::
 ::::
 
 :::{tip}
-That `filter` runs against the index rather than against the k rows it returned. The
-difference is "5 results, all from this tenant" against "5 results, 2 of which you have to
-throw away". See {doc}`vector search </ml/retrieval/vector-search>`.
+Because `filter` runs with the search rather than over the k rows it returned, you get "5 results, all from this tenant" instead of "5 results, 2 of which you have to throw away". See {doc}`vector search </ml/retrieval/vector-search>`.
 :::
 
-## Building the prompt
+## Build the prompt
 
-Concatenate the retrieved chunks into one context string per question. This is a
-{py:meth}`group_by <batcher.Dataset.group_by>` with `array_agg` and a list join. It is an aggregate, not a Python loop.
+Concatenate the retrieved chunks into one context per question with a {py:meth}`group_by <batcher.Dataset.group_by>` and `array_agg`. It's an aggregate, not a Python loop.
 
 ```python
 prompt = retrieved.group_by().agg(context=col("chunk").array_agg())
@@ -190,15 +163,11 @@ print(" | ".join(context))
 # cats are pets | kittens are small cats
 ```
 
-Keep the `url` / `chunk_id` alongside, so the answer can cite what it used. A RAG system
-that cannot show its sources cannot be debugged, and it cannot be trusted by anyone who
-has to sign off on its output.
+Keep `url` and `chunk_id` alongside so the answer can cite what it used. A RAG system that can't show its sources can't be debugged, and nobody who signs off on its output can trust it.
 
-## Generation
+## Generate the answer
 
-{py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` runs the LLM stage over batches. An engine is any callable
-from a list of prompts to a list of completions, which is why a local vLLM engine and a
-hosted OpenAI-compatible endpoint are interchangeable at this seam.
+{py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` runs the LLM stage over batches. `engine` is a zero-argument factory that returns a callable from a list of prompts to a list of completions, so a local vLLM engine and a hosted OpenAI-compatible endpoint are interchangeable here.
 
 ```python
 # docs: skip
@@ -214,26 +183,15 @@ answers = questions.ml.generate(
 answers.write.parquet("s3://bucket/answers.parquet")
 ```
 
-`template` builds the prompt from columns, so the context you assembled above lands in
-the prompt without a per-row Python string format. For a JSON answer, `parse_json=True`
-with a `guided_json` schema gets typed columns back instead of a string you have to
-regex. See {doc}`LLM inference </ml/retrieval/llm/index>`.
+`template` is a `str.format` template over the row's columns, so the context you assembled lands in the prompt with no string formatting of your own. For a JSON answer, `parse_json=True` with a `vllm_engine(guided_json=...)` schema returns a struct column instead of a string you have to regex. See {doc}`LLM inference </ml/retrieval/llm/index>`.
 
-## Reranking for relevance
+## Rerank for relevance
 
-Retrieval is two stages, and a vector search is only the first. A bi-encoder embeds each passage
-once, offline, without knowing what will be asked of it, so the vector cannot encode anything
-about how the passage relates to a particular query. That ignorance is what makes it fast
-enough to run over a whole corpus, and it is also its ceiling.
+A vector search is only the first stage of retrieval. A bi-encoder embeds each passage once, offline, without knowing the question, so the vector can't encode how the passage relates to any particular query. That blindness is what makes it fast enough to run over a whole corpus. It's also the ceiling.
 
-A **cross-encoder** reads the query and one passage together and scores that pair. It sees the
-interaction the bi-encoder had to discard, and it is substantially more accurate for it. It also
-cannot be precomputed, so it only ever runs over a candidate set the first stage already
-narrowed. Retrieve 100 with vectors, rerank to 5 with a cross-encoder, and the 5 that reach the
-model are meaningfully better than the top 5 the vector search alone returns.
+A *cross-encoder* reads the query and one passage together and scores the pair. It sees the interaction the bi-encoder discarded and is more accurate for it. It can't be precomputed, so it only runs over a candidate set the first stage already narrowed: retrieve 100 with vectors, rerank to 5.
 
-`bt.ml.cross_encoder_rerank_udf` is that stage. It takes the grouped shape a vector search
-leaves behind: one row per query, whose candidate columns are lists.
+`bt.ml.cross_encoder_rerank_udf` is that stage. It takes the shape a vector search leaves behind, one row per query with the candidates in list columns.
 
 ```python
 import batcher as bt
@@ -283,30 +241,17 @@ reranked = hits.map_batches(
 )
 ```
 
-Every `(query, passage)` pair in the batch is scored in **one** model call. A batch of 64
-queries with 100 candidates each is 6,400 pairs, which fills a GPU; scoring them row by row
-would be 64 forwards of 100 and leave the device mostly idle. Anything you list in
-`rerank_columns` is reordered alongside the passages, so ids and first-stage scores stay
-aligned, and the reranker's own scores land in `score_column`.
+Every `(query, passage)` pair in the batch is scored in one model call. A batch of 64 queries with 100 candidates each is 6,400 pairs, enough to fill a GPU, where row-by-row scoring would run 64 small forwards and leave the device mostly idle. Columns in `rerank_columns` are reordered alongside the passages so ids and first-stage scores stay aligned. The reranker's own scores land in `score_column`, which defaults to `rerank_score`.
 
-`activation="sigmoid"` maps the raw logits into `[0, 1]`, which is what a threshold wants. It
-never changes the ordering, so leave it off if you only care about the ranking.
+`activation="sigmoid"` maps the raw logits into `[0, 1]`, which is what a threshold wants. The ordering is identical either way.
 
-Any callable works in place of a model id. `scorer` above is a zero-argument function returning
-a `CrossEncoderScorer`, and that is the whole contract: a list of `(query, passage)` pairs in,
-one score per pair out, in order. Use the seam for a hosted reranking API, for a model this
-package does not know about, or for testing a pipeline with no GPU.
+A zero-argument factory works in place of a model id. `scorer` above returns a `CrossEncoderScorer`, and the whole contract is a list of `(query, passage)` pairs in and one score per pair out, in order. Use it for a hosted reranking API, a model the package doesn't know, or a test with no GPU.
 
-## Reranking for diversity
+## Rerank for diversity
 
-A vector search returns the `k` nearest passages, and nearest is not the same as useful. On a
-real corpus several of the `k` are the same passage: documents get republished, chunks overlap
-by design, and a boilerplate paragraph matches everything. The context window then holds one
-fact repeated four times, and the model reads that repetition as emphasis.
+Nearest isn't the same as useful. On a real corpus several of the `k` nearest passages say the same thing: documents get republished, chunks overlap by design, and a boilerplate paragraph matches everything. The context window then holds one fact four times, and the model reads repetition as emphasis.
 
-`bt.ml.mmr_rerank_udf` is the standard fix. It builds the result greedily, penalizing each
-candidate for resembling what has already been chosen, so the context covers more of the answer
-space for the same number of tokens.
+`bt.ml.mmr_rerank_udf` applies maximal marginal relevance. It builds the result greedily, penalizing each candidate for resembling what's already chosen, so the same token budget covers more of the answer.
 
 ```python
 import batcher as bt
@@ -332,32 +277,15 @@ print(reranked.to_pydict()["passages"])
 # [['a fact', 'a different fact']]
 ```
 
-`lambda_mult` is the dial. At `1.0` it returns the relevance ranking you already had, duplicates
-included; at `0.0` it optimizes for spread alone. Between 0.5 and 0.8 is the useful range. Every
-column you list in `rerank_columns` is reduced to the selected candidates in selection order, so
-the passages, their scores, and their embeddings stay aligned.
+`lambda_mult` is the dial. At `1.0` you get back the relevance ranking you had, duplicates included. At `0.0` it optimizes for spread alone. The useful range is 0.5 to 0.8. Every column in `rerank_columns` is cut to the selected candidates in selection order, and similarity is cosine on normalized copies, so an unnormalized index needs no separate pass.
 
-Similarity between candidates is cosine on normalized copies, so an unnormalized index works
-without a separate pass.
+Run the two rerankers in that order. The cross-encoder costs a model call and decides relevance. MMR costs nothing beyond the vectors you already hold and drops the near-duplicates among the survivors. Narrow 100 to 20 by relevance, then 20 to 5 by diversity.
 
-The two rerankers compose, in that order. The cross-encoder decides which candidates are
-relevant and costs a model call; MMR then drops the near-duplicates among the survivors and
-costs nothing but the vectors you already have. Narrowing 100 to 20 by relevance and 20 to 5 by
-diversity spends the model on the stage where it changes the answer.
+## Measure the pipeline
 
-## Measuring the pipeline
+The failures in the next section are easier to fix than to notice. Each metric here is an aggregate over a column, so a whole eval set is one scan, and any of them breaks down by index version, tenant or day with {py:meth}`group_by <batcher.Dataset.group_by>`.
 
-The failures below are easier to fix than to notice, so measure them. Each of these is an
-aggregate over a column, so a whole eval set is one scan and every one breaks down by index
-version, tenant, or day with {py:meth}`group_by <batcher.Dataset.group_by>`.
-
-Start on the retrieval side, because a grounding score computed over a context that was never
-retrieved is measuring nothing. {py:func}`bt.empty_retrieval_rate <batcher.empty_retrieval_rate>` counts the queries that got no
-passages at all, which is the failure that presents as unexplained hallucination: with no
-context the model answers from its parameters, fluently and without a citation.
-{py:func}`bt.duplicate_context_rate <batcher.duplicate_context_rate>` catches the same chunk arriving twice, which spends the window
-twice on one passage, and {py:func}`bt.mean_retrieved_passages <batcher.mean_retrieved_passages>` shows when the retriever is quietly
-returning fewer than the `k` you asked for.
+Start with retrieval, because a grounding score over a context that was never retrieved measures nothing. {py:func}`bt.empty_retrieval_rate <batcher.empty_retrieval_rate>` counts the queries that got no passages. That failure looks like unexplained hallucination: with no context, the model answers from its parameters, fluently and without a citation. {py:func}`bt.duplicate_context_rate <batcher.duplicate_context_rate>` counts queries whose passages contain an exact repeat. {py:func}`bt.mean_retrieved_passages <batcher.mean_retrieved_passages>` shows a retriever quietly returning fewer than the `k` you asked for.
 
 ```python
 import batcher as bt
@@ -380,15 +308,9 @@ print(
 )
 ```
 
-{py:func}`bt.context_token_estimate <batcher.context_token_estimate>` sizes what the retrieval is about to cost. Retrieved context is
-usually the largest part of a RAG prompt and the part that grows silently: raising `k` from 5
-to 10 doubles the input bill of every request, and nothing in the pipeline says so.
+{py:func}`bt.context_token_estimate <batcher.context_token_estimate>` sizes what retrieval is about to cost, dividing characters by `chars_per_token` (4.0 by default) rather than running a tokenizer. Retrieved context is usually the largest part of a RAG prompt and grows silently: raising `k` from 5 to 10 doubles every request's input bill.
 
-On the answer side, {py:func}`bt.answer_groundedness <batcher.answer_groundedness>` measures how much of the answer its context backs
-at the vocabulary level, and {py:func}`bt.phrase_groundedness <batcher.phrase_groundedness>` does the same at the phrase level. Read
-them together. An answer built from the context's own words, rearranged into a claim the
-context never made, scores perfectly on the first and badly on the second. That gap is what a
-confident hallucination looks like.
+On the answer side, {py:func}`bt.answer_groundedness <batcher.answer_groundedness>` measures how much of the answer its context backs word by word, and {py:func}`bt.phrase_groundedness <batcher.phrase_groundedness>` does the same for phrases. Read them together. An answer that rearranges the context's own words into a claim the context never made scores perfectly on the first and badly on the second. That gap is what a confident hallucination looks like.
 
 ```python
 answers = bt.from_pydict(
@@ -405,40 +327,31 @@ print(
 )
 ```
 
-{py:func}`bt.unsupported_phrase_rate <batcher.unsupported_phrase_rate>` is the same signal inverted, which is the direction a dashboard
-wants: it rises as the system gets worse, so a threshold and an alert read the way you expect.
+{py:func}`bt.unsupported_phrase_rate <batcher.unsupported_phrase_rate>` is the same signal inverted. It rises as the system gets worse, which is the direction a dashboard alert wants.
 
-## The failure modes, in order
+## Common failure modes
 
-Every one of these is a data bug that presents as a model bug, which is why they survive
-so long.
+Each failure in the following table is a data bug that looks like a model bug, which is why it survives so long:
 
 | What you see | Where it comes from | The fix |
 | --- | --- | --- |
-| Answers that ignore the end of a document | chunks larger than the model's context, silently cut | check the length distribution first: {py:meth}`ds.select(n=col("chunk").str.len()).describe() <batcher.Dataset.select>` |
+| Answers that ignore the end of a document | chunks larger than the model's context, silently cut | check the length distribution first: {py:meth}`ds.select(n=col("chunk").str.len_chars()).describe() <batcher.Dataset.select>` |
 | The same paragraph three times in a top-5 | deduping at the document level while boilerplate repeats across pages | dedupe at the chunk level |
 | An answer nobody can attribute | the source id dropped somewhere in ingest | carry `url` and `chunk_id` from ingest all the way through retrieval |
 | Retrieval that is subtly, consistently poor | model skew: the query embedded by a different model than the corpus | store the model name alongside the vectors |
 | Results from another tenant | a permission filter applied to the k rows the search returned | push the filter into the search |
 
 :::{warning}
-Model skew is the subtle one. The query must be embedded by the same model as the corpus,
-and nothing enforces that. Store the model name alongside the vectors, so a re-embed with
-a new model cannot silently mix two vector spaces. A mixed index does not fail. It
-retrieves nonsense with confident-looking distances.
+Model skew is the subtle one. Nothing enforces that the query and the corpus share a model. Store the model name alongside the vectors so a re-embed can't silently mix two vector spaces. A mixed index doesn't fail. It retrieves nonsense at confident-looking distances.
 :::
 
 ## See also
 
 - {doc}`Embeddings </ml/retrieval/embeddings>`: the encode stage in detail.
-- {doc}`Vector search </ml/retrieval/vector-search>`: brute force vs an ANN index.
-- {doc}`LLM inference </ml/retrieval/llm/index>`: engines, chat templates, structured output.
-- {doc}`Governance </user-guide/trust/governance>`: row filters and column masks, if the corpus
-  is not all one tenant's.
-- {doc}`RAG from scratch </getting-started/tutorials/ml/rag-from-scratch>`: the tutorial, built up step by
-  step.
+- {doc}`Vector search </ml/retrieval/vector-search>`: brute force against an ANN index.
+- {doc}`LLM inference </ml/retrieval/llm/index>`: engines, chat templates and structured output.
+- {doc}`LLM evaluation </ml/retrieval/llm-evaluation>`: grounding, retrieval and judge metrics over a whole eval set.
+- {doc}`Governance </user-guide/trust/governance>`: row filters and column masks for a multi-tenant corpus.
+- {doc}`RAG from scratch </getting-started/tutorials/ml/rag-from-scratch>`: the same pipeline as a step-by-step tutorial.
 - {doc}`RAG index recipe </cookbook/ml/pipelines/text/rag-index>`: the ingest half as a runnable job.
-- {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`: how the engine
-  learns the chunk fan-out no static estimate could know.
-- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what the embed and generate
-  stages cost.
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what the embed and generate stages cost.

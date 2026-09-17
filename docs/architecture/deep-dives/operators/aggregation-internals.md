@@ -14,13 +14,13 @@ those three functions do, and the one decision the executor refuses to take on f
 aggregate, `DISTINCT`, and partitioned window. It maps each row to a `u32` group id and
 returns the group count and the distinct key columns in first-seen order.
 
-Which strategy runs depends on the key, and the dispatch falls into three families:
+Which strategy runs depends on the key, and the dispatch tries four families in order:
 
 | Family | Taken when | How the group id is found | Cost |
 |---|---|---|---|
 | Sorted runs | tried first, on any key the engine can prove arrives in sorted order | compare each row with its predecessor; equal keys are adjacent, so a run is a group | no hashing and no table |
 | Dense direct map | a non-nullable integer-like key whose value span fits the dense budget: dictionary codes, dense ids, enums, and the canonical bits of a non-null `Float64` | one linear pass for `(min, max)`, then `value - min` through a direct-indexed table | no hashing at all |
-| Typed hash | a single `Int64`, `Utf8`/`Binary`, or non-null `Float64` key, and multi-column keys the engine can pack natively | hash the native values or bytes directly | one hash, no encode |
+| Typed hash | a single integer, `Utf8`/`Binary`, or non-null `Float64` key, and null-free multi-column integer and byte keys the engine can pack or rank | hash the native values or bytes directly | one hash, no encode |
 | Row encoding | everything else: nullable floats, and mixed multi-column keys the packers decline | Arrow's `RowConverter` into a comparable byte string, then hash | a per-row encode and an allocation |
 
 The dense budget is `4 × rows`, clamped to between 1,024 and 2^20 slots. The upper cap keeps
@@ -203,7 +203,7 @@ operator.
 
 The threshold is `radix_parallel_threshold`, set on `RuntimeTuning` in `bc-arrow` and mirrored on
 `EngineConfig` in `bc-ir`. Its default, `0`, derives the crossover from the machine as
-`partitions × 256`, because the parallel path's overhead is per *partition* (a bucket list, a gather, a hash
+`partitions × 256` (`MIN_ROWS_PER_RADIX_PARTITION`), because the parallel path's overhead is per *partition* (a bucket list, a gather, a hash
 table) while the serial path's is per *row*, so the turn is a fixed number of rows per partition,
 not one absolute count that is too high on a large box and too low on a small one. A positive
 value pins it. Group *order* differs from the serial path either way, which callers already treat
@@ -286,7 +286,7 @@ inherits nearly the whole relation. `GROUP BY l_orderkey, l_linenumber` reduces 
 every partial row survives, and `combine` concatenates 60M rows of keys and states, hashes
 them, bins them, and gathers them again. Measured at scale factor 10: the entire per-morsel
 hash build (~60M inserts) is thrown away, and `combine` costs ~35 ns per *partial row*:
-2.25 s for a group-by DuckDB answers in 396 ms.
+2.25 s for a group-by DuckDB answers in 429 ms.
 
 So there is a second shape, `partition → partial → finalize`
 (`crates/bc-interp/src/agg_par.rs`): hash-partition the input morsels by group key first, then
@@ -448,7 +448,8 @@ state instead, and merge in constant space.
 
 - `crates/bc-runtime/src/agg/mod.rs`: `AggFunc`, `partial`, `combine`
 - `crates/bc-runtime/src/agg/dispatch.rs`: `accumulate` and `finalize`, the per-function tables
-- `crates/bc-runtime/src/agg/group/assign.rs`: dense ids, the three key paths
+- `crates/bc-runtime/src/agg/group/assign.rs`: dense ids and the key dispatch
+- `crates/bc-runtime/src/agg/group/runs.rs`: the sorted-run short-circuit
 - `crates/bc-runtime/src/agg/group/combine.rs`: the parallel radix regroup
 - `crates/bc-runtime/src/agg/fused.rs`: the fused scalar accumulators
 - `crates/bc-runtime/src/agg/spill/mod.rs`: grace aggregation

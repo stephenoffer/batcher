@@ -1,5 +1,7 @@
 # Cardinality estimation
 
+This page describes how Kyber estimates the rows a plan will produce, how it tracks how far to trust each estimate, and how measured runs correct it.
+
 Every cost-based decision the optimizer makes rests on one number: how many rows will this
 subtree produce? Join order, build-side choice, broadcast eligibility, memory admission,
 worker fan-out. All of them are downstream of a row count nobody has counted yet.
@@ -45,9 +47,9 @@ terminal.
    a manifest   quantile sketch  Min, approx   a past run     heuristic
 
 
-        aggregate     est≈200    (learned)   ◄── the weakest input wins
+        aggregate     est≈8      (default)   ◄── the weakest input wins
             │
-        filter        est≈667    (default)   ◄── nobody has measured this predicate
+        filter        est≈1,900  (default)   ◄── derived, so no longer exact
             │
         scan          est≈2,000  (exact)     ◄── an in-memory source: the count is known
 ```
@@ -62,14 +64,19 @@ print(ds.filter(bt.col("x") > 100).group_by("g").agg(n=bt.count()).explain())
 ```
 
 ```text
-aggregate                       est≈200 (learned)
-  filter                        est≈667 (default)
-    scan                        est≈2,000 (exact)
+query plan (planned)                                    3 operators
+───────────────────────────────────────────────────────────────────
+OPERATOR                         ESTIMATE  NOTES
+aggregate  [by g · count_star]      est≈8  (default)
+└─ filter  [x > 100]            est≈1,900  (default)
+   └─ scan  [source 0]          est≈2,000  (exact)  pushed[x > 100]
 ```
 
-The scan is `exact`: an in-memory source with a known row count. The filter is
-`default`, because nobody has measured this predicate. The aggregate is `learned`; the group
-cardinality came from a prior run.
+The scan is `exact`: an in-memory source with a known row count. The filter's number is close,
+because the source's exact `[min, max]` bounds let a range predicate be interpolated, but it is
+derived rather than counted, so it can't inherit `exact`. The aggregate inherits the weakest
+tag below it. On a repeated run of a shape the hub has measured, the same tree shows `sketch`
+or `learned` above the leaves.
 
 ## Cold start: Selinger
 
@@ -229,9 +236,13 @@ worker 7 merges with one built anywhere else:
 
 ```rust
 // crates/bc-sketches/src/lib.rs
-pub(crate) const SEED: ahash::RandomState =
-    ahash::RandomState::with_seeds(0xC0FF_EE01, 0xDEAD_BEEF, 0x1234_5678, 0xABCD_EF01);
+pub(crate) const SEED: bc_arrow::PortableBuildHasher =
+    bc_arrow::PortableBuildHasher::with_seed(0x534B_4554_4348_4553);
 ```
+
+The hasher is portable on purpose. It used to be an `ahash::RandomState`, which picks an AES-NI
+backend from the compile-time target features, so two workers built for different CPUs hashed
+the same value differently and merged their registers into a wrong estimate without complaint.
 
 | Sketch | Answers | Default | Error |
 |---|---|---|---|
@@ -265,12 +276,11 @@ Count-Min and Misra-Gries are used together on purpose. Count-Min never under-co
 Misra-Gries never over-counts and is guaranteed to *contain* every key above `N/(capacity+1)`.
 One sizes a hot key you already know about; the other finds the ones you do not.
 
-One detail in the HLL worth knowing, because it is a deliberate deviation from the paper.
-The handover from linear counting to the HLL estimator sits at load factor **3.5**, not
-Flajolet's 2.5. At 2.5 the discontinuity produced a +2.4% systematic overestimate at 26 to 42
-standard errors. Bias, not noise. Sweeping the threshold at p=14: 2.5 gives 0.915% RMSE and
-2.56% worst bias; **3.5 gives 0.746% and 0.38%**. HLL++'s alternative is roughly 3,000
-empirical bias-correction constants; moving the handover was cheaper and better.
+One detail in the HLL is worth knowing. Its estimator is Ertl's improved maximum-likelihood
+form, with the `sigma` and `tau` corrections. That form is continuous and essentially unbiased
+across the whole range, so the sketch needs neither a handover from linear counting, whose
+discontinuity is where a classic HLL picks up a systematic bias, nor HyperLogLog++'s tables of
+empirical bias-correction constants.
 
 ### The rule that keeps sketches honest
 
@@ -354,7 +364,8 @@ assumes rows pass through unchanged and leaves the learned loop to correct them.
 of an exploding `flat_map` is therefore planned as if it explodes not at all.
 
 And the thing every estimator shares: it is a prediction. What makes it survivable is that
-the engine measures the truth at every pipeline breaker and re-plans on it. See
+Core measures the truth on every run and feeds it back, and that on a query large enough to
+stage, the engine re-plans at a pipeline breaker once it has counted. See
 {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`.
 
 ## Code map

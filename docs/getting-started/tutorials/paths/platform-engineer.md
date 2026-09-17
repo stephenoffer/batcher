@@ -1,8 +1,6 @@
 # Platform engineer learning path
 
-This path is for whoever runs the engine. You control parallelism and memory, inject
-defaults from the environment, and learn what the engine does when a query pushes past
-its budget.
+This path is for whoever runs the engine. You'll set parallelism and memory limits, inject defaults from the environment, and learn what the engine does when a query pushes past its budget.
 
 ## Reading order
 
@@ -56,8 +54,7 @@ print((cfg.execution.parallelism, cfg.memory.soft_limit))
 - `spill.py` runs out-of-core under a bounded memory budget.
 - `adaptive_optimization.py` shows intra-query re-optimization producing an identical
   result.
-- `distributed.py` compares a single node against a cluster and gets identical results.
-  It needs the `[ray]` extra.
+- `distributed.py` runs the same pipeline single-node and on a cluster and compares the results. It needs the `ray` extra and a cluster.
 
 See also {doc}`performance and memory </user-guide/operate/tuning/performance>` and
 {doc}`distributed fault tolerance </architecture/fault-tolerance>`.

@@ -1,8 +1,6 @@
 # Measuring and encoding
 
-Turning a string column into a number, a key, or a checksum.
-
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
+Turning a string column into a number, a key, or a set of columns. Counts and character-class ratios are the cheap quality signals for filtering a text corpus, hashing gives you stable keys and shards, and path parsing turns an object-storage listing into columns you can group by.
 
 | Recipe | What it shows |
 |---|---|

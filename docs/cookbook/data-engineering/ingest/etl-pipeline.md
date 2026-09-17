@@ -1,13 +1,10 @@
 # ETL pipeline
 
-A complete extract-transform-load, small enough to read in one sitting: raw records
-in, deduplicated and rolled up, Parquet out. Every block runs as written. Swap
-{py:func}`from_pydict <batcher.from_pydict>` for {py:obj}`bt.read(...) <batcher.read>` and the same code scales to files or object storage.
+A complete extract-transform-load, small enough to read in one sitting: raw records in, deduplicated and rolled up, Parquet out. Every block runs as written. Swap {py:func}`from_pydict <batcher.from_pydict>` for {py:obj}`bt.read(...) <batcher.read>` and the same code scales to files or object storage.
 
 ## Extract
 
-Start from raw records. Two rows share an `id`, the region keys come in mixed case,
-and one of them is null.
+Start from raw records. Two rows share an `id`, the region keys come in mixed case, and one of them is null.
 
 ```python
 import batcher as bt
@@ -27,9 +24,7 @@ print(raw.count())
 
 ## Transform
 
-Deduplicate to one row per `id` (keeping the earliest by `ts`), normalize the key,
-and fill the missing region. Each step returns a new lazy {py:class}`Dataset <batcher.Dataset>`; nothing runs
-yet.
+Deduplicate to one row per `id` (keeping the earliest by `ts`), normalize the key, and fill the missing region. Each step returns a new lazy {py:class}`Dataset <batcher.Dataset>`; nothing runs yet.
 
 ```python
 clean = (
@@ -55,8 +50,7 @@ print(rollup.to_pydict())
 
 ## Load
 
-Write the result to Parquet and read it back. The write is the terminal operation
-that executes the whole plan above.
+Write the result to Parquet and read it back. The write is the terminal operation that executes the whole plan above.
 
 ```python
 import tempfile, os
@@ -69,18 +63,13 @@ print(back.count())
 # 3
 ```
 
-Only the endpoints change when the data grows. Read with
-`bt.read("s3://bucket/raw/*.parquet")` and write with
-`rollup.write.parquet("s3://bucket/curated/", partition_by=["region"])`. Add
-{py:meth}`collect(distributed=True) <batcher.Dataset.collect>` to spread the work across a cluster. The transform in
-between is untouched.
+Only the endpoints change when the data grows. Read with `bt.read("s3://bucket/raw/*.parquet")` and write with `rollup.write.parquet("s3://bucket/curated/", partition_by=["region"])`. Add {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` to spread the work across a cluster. The transform in between is untouched.
 
 ## See also
 
-- {doc}`Data quality </user-guide/trust/data-quality>`: turn the cleaning step into an
-  enforced contract, so a bad row is quarantined or fails the job instead of
-  slipping through.
-- {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: write to Delta with merge/upsert
-  and slowly-changing dimensions instead of plain Parquet.
-- {doc}`Performance and memory </user-guide/operate/tuning/performance>`: cache and spill as the
-  data grows.
+- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: read only the files that arrived since the last run.
+- {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: choosing which copy survives when the key repeats.
+- {doc}`Analytics query </cookbook/analytics/aggregates/analytics-query>`: the same treatment for aggregate, join, and window.
+- {doc}`Data quality </user-guide/trust/data-quality>`: turn the cleaning step into an enforced contract, so a bad row is quarantined or fails the job instead of slipping through.
+- {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: write to Delta with merge/upsert and slowly-changing dimensions instead of plain Parquet.
+- {doc}`Performance and memory </user-guide/operate/tuning/performance>`: cache and spill as the data grows.

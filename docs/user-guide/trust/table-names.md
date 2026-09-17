@@ -3,8 +3,8 @@
 This page covers the name a governance policy is keyed on: what each source is named by,
 and which spellings of the same object fold together.
 
-It continues {doc}`Governance and security </user-guide/trust/governance>`. Get this wrong
-and the cost is not cosmetic. A policy matched against a name the reader never produces
+It continues {doc}`Governance and security </user-guide/trust/governance>`. Getting the name wrong
+is not cosmetic. A policy matched against a name the reader never produces
 governs nothing at all, silently, and no error says so.
 
 ```python
@@ -54,3 +54,8 @@ print(aliased.visible_columns("s3a://vault/pii.parquet", ["id", "ssn"], analyst)
 The bucket and account are left exactly as written. Case is significant in an S3 key and
 in an ABFS container, so folding it would merge two objects that are genuinely different.
 
+## See also
+
+- {doc}`Governance and security </user-guide/trust/governance>`: the catalog these names key.
+- {doc}`Write privileges </user-guide/trust/write-privileges>`: the same names, matched for a write.
+- {doc}`Hardening a deployment </user-guide/trust/hardening>`: `governance.mode="strict"`, which refuses a source with no durable name.

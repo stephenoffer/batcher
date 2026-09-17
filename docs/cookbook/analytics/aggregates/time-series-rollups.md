@@ -1,12 +1,10 @@
 # Time series rollups
 
-Daily revenue, with a seven-day moving average. It is the first chart anyone builds and
-it has a bug in it, because `GROUP BY day` cannot emit a day it never saw.
+Daily revenue, with a seven-day moving average. It is the first chart anyone builds and it has a bug in it, because `GROUP BY day` cannot emit a day it never saw.
 
 ## The data
 
-Six transactions across five days. Nothing happened on June 3rd: no orders, no rows, nothing
-in the table to tell you so.
+Six transactions across five days. Nothing happened on June 3rd: no orders, no rows, nothing in the table to tell you so.
 
 ```python
 import datetime as dt
@@ -34,9 +32,7 @@ print(events.count())
 
 ## The rollup
 
-`dt.truncate` floors a timestamp to a unit, and {py:meth}`group_by <batcher.Dataset.group_by>` takes the derived key
-directly, with no separate {py:meth}`with_columns <batcher.Dataset.with_columns>` step needed. `DATE_TRUNC` in the SQL tab lowers
-to the same expression.
+`dt.truncate` floors a timestamp to a unit, and {py:meth}`group_by <batcher.Dataset.group_by>` takes the derived key directly, with no separate {py:meth}`with_columns <batcher.Dataset.with_columns>` step needed. `DATE_TRUNC` in the SQL tab lowers to the same expression.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -75,23 +71,16 @@ print(sql_daily.to_pydict()["revenue"])
 ## The trap
 
 :::{warning}
-Four rows for five days. June 3rd is not zero. It is *absent*, and those are not the same
-thing. Both tabs above have the same hole in them: SQL does not save you from this one, the
-spine does.
+Four rows for five days. June 3rd is not zero. It is *absent*, and those are not the same thing. Both tabs above have the same hole in them: SQL does not save you from this one, the spine does.
 :::
 
-Plot this and the line runs straight from June 2nd to June 4th, quietly interpolating
-through the outage. Feed it to {py:meth}`rolling_mean(7) <batcher.plan.expr_ir.core.Expr.rolling_mean>` and it is worse: the window counts seven
-*rows*, and if a fortnight of rows is missing, "the 7-day average" silently becomes the
-average of the last seven days that happened to have data. That is not a moving average,
-it is a moving average of a series you do not have.
+Plot this and the line runs straight from June 2nd to June 4th, quietly interpolating through the outage. Feed it to {py:meth}`rolling_mean(7) <batcher.plan.expr_ir.core.Expr.rolling_mean>` and it is worse: the window counts seven *rows*, and if a fortnight of rows is missing, "the 7-day average" silently becomes the average of the last seven days that happened to have data. That is not a moving average, it is a moving average of a series you do not have.
 
 The fix is not clever. Build the days you expect, and left-join the data onto them.
 
 ## The spine
 
-{py:func}`bt.date_range <batcher.date_range>` generates the calendar. Truncate it the same way you truncated the events
-so the join keys have the same type, then left-join and fill.
+{py:func}`bt.date_range <batcher.date_range>` generates the calendar. Truncate it the same way you truncated the events so the join keys have the same type, then left-join and fill.
 
 ```python
 spine = bt.date_range("2024-06-01", "2024-06-05").select(day=col("date").dt.truncate("day"))
@@ -117,10 +106,7 @@ print(dense.to_pydict())
 Five rows, one per day, and June 3rd says zero out loud.
 
 :::{important}
-Be deliberate about the fill. Zero is right for a count or a sum, because "no orders"
-really is zero revenue. It is wrong for an average, a price, or a gauge: the temperature
-on a day your sensor was offline was not 0 degrees. For those, leave the null, or carry the last
-known value forward with `col("x").forward_fill().over(order_by=["day"])`.
+Be deliberate about the fill. Zero is right for a count or a sum, because "no orders" really is zero revenue. It is wrong for an average, a price, or a gauge: the temperature on a day your sensor was offline was not 0 degrees. For those, leave the null, or carry the last known value forward with `col("x").forward_fill().over(order_by=["day"])`.
 :::
 
 ## Now the moving average means something
@@ -131,9 +117,7 @@ print(smoothed.select("day", "revenue", "ma3").to_pydict()["ma3"])
 # [30.0, 30.0, 20.0, 40.0, 50.0]
 ```
 
-Three rows *is* three days now, because the spine guarantees it. The leading rows average
-a partial frame, which is what SQL does. Pass `min_periods=3` if you would rather they be
-null than half-formed.
+Three rows *is* three days now, because the spine guarantees it. The leading rows average a partial frame, which is what SQL does. Pass `min_periods=3` if you would rather they be null than half-formed.
 
 The whole argument of the page, in one table:
 
@@ -147,8 +131,7 @@ The whole argument of the page, in one table:
 
 ## Rolling up by a second key
 
-Per-region, the spine has to be the cross product of days and regions. Otherwise a region that
-went quiet loses its zeros again, one region at a time.
+Per-region, the spine has to be the cross product of days and regions. Otherwise a region that went quiet loses its zeros again, one region at a time.
 
 ```python
 regions = bt.from_pydict({"region": ["us", "eu"]})
@@ -166,32 +149,20 @@ print(dense_region.filter(col("region") == "eu").to_pydict()["revenue"])
 # [20.0, 0.0, 0.0, 50.0, 0.0]
 ```
 
-`eu` traded on two of the five days. Without the grid you would have got two rows and a
-chart that implies a flat line.
+`eu` traded on two of the five days. Without the grid you would have got two rows and a chart that implies a flat line.
 
 :::{dropdown} Two more things that will bite you: time zones and late data
-Time zones first. `dt.truncate("day")` floors in whatever zone the timestamps are stored in,
-which for most warehouses is UTC. A "day" of revenue for a US business truncated in UTC starts
-at 5pm the previous afternoon. Convert before you truncate:
-`col("ts").dt.convert_timezone("UTC", "America/New_York").dt.truncate("day")`. The function is
-DST-aware, so the 23-hour and 25-hour days come out right.
+Time zones first. `dt.truncate("day")` floors in whatever zone the timestamps are stored in, which for most warehouses is UTC. A "day" of revenue for a US business truncated in UTC starts at 5pm the previous afternoon. Convert before you truncate: `col("ts").dt.convert_timezone("UTC", "America/New_York").dt.truncate("day")`. The function is DST-aware, so the 23-hour and 25-hour days come out right.
 
-Then late data. A rollup run at midnight is a rollup of the events that had arrived by
-midnight. If your pipeline backfills, yesterday's number changes after you published it. Either
-recompute a trailing window of days on every run, or hold the bucket open with a watermark (see
-{doc}`streaming </user-guide/moving-data/streaming>`). Decide, rather than discovering it when finance
-asks why the number moved.
+Then late data. A rollup run at midnight is a rollup of the events that had arrived by midnight. If your pipeline backfills, yesterday's number changes after you published it. Either recompute a trailing window of days on every run, or hold the bucket open with a watermark (see {doc}`streaming </user-guide/moving-data/streaming>`). Decide, rather than discovering it when finance asks why the number moved.
 :::
 
 ## See also
 
 - {doc}`Anomaly detection </cookbook/analytics/inference/anomaly-detection>`: what to do once the series is dense.
-- {doc}`Sessionization </cookbook/analytics/behavior/sessionization>`: the opposite problem, where the buckets have to be
-  derived from the gaps rather than fixed by the calendar.
-- {doc}`Window functions </user-guide/analyze/window-functions>`: `rolling_*`, frames, and
-  {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>`.
+- {doc}`Sessionization </cookbook/analytics/behavior/sessionization>`: the opposite problem, where the buckets have to be derived from the gaps rather than fixed by the calendar.
+- {doc}`Window functions </user-guide/analyze/window-functions>`: `rolling_*`, frames, and {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>`.
 - {doc}`Joins </user-guide/analyze/joins>`: the left join and the cross join used here.
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: what `group_by(...).agg(...)` supports.
-- {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: how the daily rollup
-  merges across partitions.
+- {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: how the daily rollup merges across partitions.
 - {doc}`Dataset API </api/relational/dataset>`: `date_range`, `join`, `cross_join`.

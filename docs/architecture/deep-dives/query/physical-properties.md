@@ -142,6 +142,11 @@ sharing `a` but differing in `b` hash to different buckets, the `a` group stradd
 a reducer that skipped the shuffle emits a partial group. That is a wrong answer, not a slow
 one.
 
+A partitioning can also come from storage rather than a shuffle. A table partitioned on disk
+hands each partition's rows to one worker, which is the same guarantee, so the distributed
+scheduler supplies it as `clustered_on` and `satisfies` treats the two alike. It can't be
+derived from the plan alone, because it depends on the splits the read receives.
+
 An empty partitioning guarantees nothing and satisfies only an empty requirement. Leaving a
 partitioning unclaimed costs at most an unnecessary shuffle, so the safe answer is always to
 claim nothing.
@@ -198,3 +203,7 @@ going to happen anyway.
   is lowered to.
 - {doc}`Query lifecycle </architecture/deep-dives/query/query-lifecycle>`: where in a query the
   optimizer runs.
+- {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`: the
+  other half of what the optimizer knows about a relation.
+- {doc}`Partition-aware planning </architecture/deep-dives/distribution/partition-aware-planning>`:
+  how the distributed path uses a partitioning to skip a shuffle.

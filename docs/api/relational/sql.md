@@ -32,7 +32,7 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 
 | Clause / feature | Notes |
 | --- | --- |
-| `SELECT` | Column lists, derived expressions, `AS` aliases, `*`, the `* EXCLUDE (…)` / `* REPLACE (… AS c)` / `* RENAME (c AS d)` star modifiers, and `COLUMNS(*)` / `COLUMNS('regex')` dynamic columns (including {py:obj}`func(COLUMNS(...)) <batcher.AggExpr.func>`). |
+| `SELECT` | Column lists, derived expressions, `AS` aliases, `*`, the `* EXCLUDE (...)` / `* REPLACE (... AS c)` / `* RENAME (c AS d)` star modifiers, and `COLUMNS(*)` / `COLUMNS('regex')` dynamic columns (including {py:obj}`func(COLUMNS(...)) <batcher.AggExpr.func>`). |
 | `WHERE` | Boolean predicates over scalar expressions. |
 | `GROUP BY` | With aggregates in the projection; `ROLLUP` / `CUBE` / `GROUPING SETS`. Positional `GROUP BY <n>` refers to a `SELECT` item. |
 | `HAVING` | Filters on aggregated results. |
@@ -49,8 +49,8 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 | `CAST` | `CAST(expr AS type)`. |
 | Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates, including the `DISTINCT` forms. See [DISTINCT aggregates](#distinct-aggregates) for what they may be mixed with. |
 | Scalar expressions | Arithmetic, comparison, boolean, and function calls (incl. registered Python functions). |
-| DDL | `CREATE [OR REPLACE] {TABLE,VIEW} … AS …` and `DROP TABLE` register/unregister a lazy table in the session. |
-| DML | `INSERT`, `UPDATE`, `DELETE`, and `MERGE INTO … USING … ON … WHEN …` rebind the target to its new state. |
+| DDL | `CREATE [OR REPLACE] {TABLE,VIEW} ... AS ...` and `DROP TABLE` register/unregister a lazy table in the session. |
+| DML | `INSERT`, `UPDATE`, `DELETE`, and `MERGE INTO ... USING ... ON ... WHEN ...` rebind the target to its new state. |
 | Catalog | `SHOW TABLES` lists the session's tables; `DESCRIBE <table>` returns its columns; `information_schema.tables` and `information_schema.columns` answer both in ANSI form. All come back as ordinary relations. |
 
 ### WHERE and GROUP BY
@@ -178,7 +178,7 @@ print(out.to_pydict())
 column cannot: an average needs a sum and a count, which one column cannot carry. Those raise
 rather than approximate. Compute them in a separate subquery and join.
 
-#### Which aggregates take a DISTINCT argument
+### Which aggregates take a DISTINCT argument
 
 That constraint is about the *other* aggregates in the query. The aggregate wearing the
 `DISTINCT` has a separate and simpler rule: it needs one input column, because the dedup
@@ -291,7 +291,7 @@ Both sides of a correlation must be plain columns. A correlation on an expressio
 Two forms raise rather than translate, both because the honest answer needs SQL's third
 truth value and the natural rewrite cannot express it:
 
-- The inequality quantifiers (`> ANY`, `>= ALL`, …). `x > ALL (S)` is UNKNOWN, not TRUE,
+- The inequality quantifiers (`> ANY`, `>= ALL`, ...). `x > ALL (S)` is UNKNOWN, not TRUE,
   when `S` yields a NULL, and `x > (SELECT max(c) FROM S)` says TRUE because `max` skips
   NULLs.
 - `IN` under `OR`. Write it as the `EXISTS` above, qualifying the outer column.

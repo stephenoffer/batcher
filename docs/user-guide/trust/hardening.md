@@ -22,7 +22,9 @@ So the trust boundary is **the process**, and the deployment pattern that follow
   established into {py:func}`bt.security(...) <batcher.security>`.
 - Treat "who is running this query" as answered before Batcher starts, not by Batcher.
 
-Everything below hardens what happens *inside* that boundary.
+Everything below hardens what happens *inside* that boundary. Each layer is only as strong as the one around it:
+
+![Three nested layers. The outer layer is what your platform provides and Batcher does not: authentication at your network edge, tenant isolation by running one process per trust domain, sandboxing untrusted UDFs in containers, and encryption at rest on an encrypted volume. Inside it, the process is the trust boundary. Within the process Batcher enforces eight things: governance required with governance.mode='strict', a durable audit trail with governance.audit_path, verified identities with require_verified_principal, key references only with BATCHER_REQUIRE_KEY_REFS=1, UDF process ceilings with udf_isolation='strict', admission control with max_concurrent_queries, owner-only artifacts with 0700 directories and 0600 files always, and governed statistics that keep no min or max for masked columns. Even inside the process it cannot guarantee three things: code in the process can construct any Principal, a UDF on a thread reads the engine's environment, and admission bounds one process rather than the cluster. So authenticate at the edge, pass the identity into bt.security(), and run untrusted UDFs in a container.](/_static/diagrams/hardening_boundary.svg)
 
 ## Make governance mandatory
 
@@ -58,9 +60,30 @@ does a source that cannot be governed at all. An in-memory table or a live strea
 durable name to write a policy about, so it is refused rather than silently exempted.
 
 ```{tip}
-Do not skip `advisory`. Switching a live system straight to `strict` fails on the first
+Don't skip `advisory`. Switching a live system straight to `strict` fails on the first
 pipeline that joins in a dict, and you will find out from a pager rather than a warning.
 ```
+
+## Keep a durable audit trail
+
+Every governed read and write emits a `GovernanceEvent`, and by default it goes to the `batcher.governance` logger and to any `audit=` callback you pass to `bt.security(...)`. Neither is an audit trail a reviewer can rely on, because a caller can simply not pass the callback.
+
+Set `governance.audit_path` to make the record unconditional:
+
+```python
+import os
+import tempfile
+
+from batcher import Config, GovernanceConfig
+
+audited = Config().replace(
+    governance=GovernanceConfig(mode="strict", audit_path=os.path.join(tempfile.mkdtemp(), "audit.jsonl"))
+)
+print(audited.governance.audit_path.endswith("audit.jsonl"))
+# True
+```
+
+Batcher appends one JSON line per decision, naming the principal, its roles, the table, the privilege, and the visible, denied, and masked columns. The file is created owner-only and reopened for each record, so `logrotate` can rotate it underneath a running engine. A record that can't be written fails the read or write it describes, rather than letting the access go unrecorded.
 
 ## Require verified identities
 
@@ -157,7 +180,7 @@ arbitrary secrets on request.
 
 `execution.udf_isolation` controls what a worker child inherits. It defaults to `"env"`,
 which rebuilds the child's environment from an allowlist and drops every `BATCHER_*`
-variable. Set it to `"strict"` to add resource ceilings:
+variable. `"none"` lets the child inherit everything, for an embedder whose UDFs are as trusted as its own code. Set it to `"strict"` to add resource ceilings:
 
 ```python
 import dataclasses
@@ -263,9 +286,7 @@ Point `memory.spill_dir` at a volume you control rather than a shared `/tmp`.
 
 Pass keys and credentials by reference, never inline. An inline key is embedded in the
 query plan, and therefore in any plan log, profile, or `explain()` output. See
-{doc}`/user-guide/trust/secrets` for the `env:`, `file:`, and `cmd:` reference schemes. `cmd:` is how you
-reach Vault, AWS Secrets Manager, or Google Secret Manager without Batcher linking a cloud
-SDK.
+{doc}`/user-guide/trust/secrets` for the `env:`, `file:`, and `cmd:` reference schemes, and for the `vault:`, `aws-sm:`, `aws-ssm:`, `gcp-sm:`, and `azure-kv:` schemes that connector credentials accept. Set `BATCHER_REQUIRE_KEY_REFS=1` to refuse an inline key outright.
 
 ## Statistics and governed columns
 
@@ -331,7 +352,8 @@ Before a deployment that matters, complete the following:
    untrusted UDFs in a container.
 1. Set `execution.max_concurrent_queries` if more than one query runs at a time.
 1. Point `memory.spill_dir` at a volume you control, on an encrypted filesystem.
-1. Pass every key and credential by reference.
+1. Set `governance.audit_path` so every decision lands in a file you keep.
+1. Pass every key and credential by reference, and set `BATCHER_REQUIRE_KEY_REFS=1`.
 1. Confirm the `MetadataHub` backend's access controls match the data it will hold
    statistics about.
 1. Size every partial mask against the shortest values in its column, not the longest.
@@ -339,7 +361,7 @@ Before a deployment that matters, complete the following:
 ## Requirements and limitations
 
 - Batcher does not authenticate. It consumes an identity from the layer that did.
-- Batcher is not multi-tenant. The tenant boundary is the process; a process-global result
+- Batcher is not multi-tenant. The tenant boundary is the process, and a process-global result
   cache, plan cache, and UDF pool are shared by everything in it.
 - Batcher does not encrypt artifacts at rest. It makes them owner-only and expects
   filesystem-level encryption underneath.

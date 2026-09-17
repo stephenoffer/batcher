@@ -1,8 +1,6 @@
 # The scalar algebra
 
-The expression core: arithmetic, branching, null and type handling, and the two reductions that are not per-row.
-
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
+The expression core that every other accessor builds on: arithmetic, branching, null and type handling, column selectors, and the reductions that work across columns, down a column, or over a window. If you are new to the expression API, read numeric math and conditionals first. The nulls-and-casting and sorting recipes are the ones that save you from a quietly wrong report.
 
 | Recipe | What it shows |
 |---|---|

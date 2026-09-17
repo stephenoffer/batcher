@@ -1,16 +1,10 @@
 # Batch inference and ML pipelines
 
-This page covers the ML half of a port: running a model over batches, feeding a
-distributed trainer, and writing results back out.
+This page covers the ML half of a port: running a model over batches, feeding a distributed trainer, and writing results back out. The model code you already have keeps working. What changes is that the data work around it runs in the same optimized engine as every other query.
 
 ## Running a model over batches
 
-{py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` runs a function over Arrow batches, and {py:meth}`ds.ml.infer(model) <batcher.api.dataset.ml.DatasetML.infer>` and
-{py:meth}`ds.ml.embed(model) <batcher.api.dataset.ml.DatasetML.embed>` run a model. Pass a class instead of an instance and the model
-loads once per worker, with `num_gpus=` and `concurrency=` for GPU actor pools. The
-relational work around the model goes through the same optimizer (Kyber) and resource
-manager (Carbonite) as any other query, so it's planned and sized for you rather than
-executed as written.
+{py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` runs a function over Arrow batches. {py:meth}`ds.ml.infer(model) <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.embed(model) <batcher.api.dataset.ml.DatasetML.embed>` run a model. Pass a class instead of an instance and the model loads once per worker, with `num_gpus=` and `concurrency=` sizing a GPU actor pool. The relational work around the model goes through Kyber, the optimizer, and Carbonite, the resource manager, like any other query.
 
 The entry points below cover the common ML shapes.
 
@@ -19,17 +13,13 @@ The entry points below cover the common ML shapes.
 | Map a model over batches | {py:meth}`ds.map_batches(Model, ...) <batcher.Dataset.map_batches>` | class = model loaded once per worker |
 | Batch inference | `ds.ml.infer(model, num_gpus=, concurrency=)` | CPU readers feed GPU actors |
 | Embeddings | {py:meth}`ds.ml.embed(model) <batcher.api.dataset.ml.DatasetML.embed>` / {py:func}`batcher.ml.embed(...) <batcher.ml.embed>` | text or image to a vector column |
-| LLM generation | {py:func}`batcher.ml.llm_generate(..., engine=vllm_engine("...")) <batcher.ml.llm_generate>` | engine self-batches; no outer PID |
+| LLM generation | {py:func}`batcher.ml.llm_generate(..., engine=vllm_engine("...")) <batcher.ml.llm_generate>` | the engine does its own continuous batching |
 | Distributed training feed | {py:meth}`ds.ml.stream_loader(world_size=, rank=, ...) <batcher.api.dataset.ml.DatasetML.stream_loader>` | deterministic, balanced, resumable |
 | Per-op metrics | {py:meth}`ds.stats() <batcher.Dataset.stats>` | measured rows, time, bytes, and bottleneck |
 | Bounded output files | {py:meth}`ds.write.parquet(max_rows_per_file=) <batcher.api.io_namespace.writer.Writer.parquet>` | honored even with `partition_by` |
 | Resumable writes | `ds.write.parquet(resume=True)` | skips committed shards on re-run |
 
-Settings other engines make you tune by hand are measured defaults here. Batch size
-adapts toward throughput under a VRAM cap, and `num_gpus` adapts to observed GPU
-utilization. There's no object-store proportion to set, because the data plane bypasses
-it. For timings, run `python benchmarks/run.py`, which checks every result against
-DuckDB and Polars before it reports a number.
+Several settings you tune by hand elsewhere are measured here. Batch size adapts toward throughput under a VRAM cap, and `num_gpus` adapts across runs to observed GPU utilization. There's no object-store fraction to set, because bulk data never enters the Ray object store.
 
 ## Where the time goes
 
@@ -100,3 +90,4 @@ for out in llm_generate(
 - {doc}`/ml/index`: the ML guides in full, from preprocessing to serving.
 - {doc}`/ml/inference/inference`: batch inference, GPU pools, and adaptive batch sizing.
 - {doc}`/ml/training/data-loaders`: `stream_loader` and the distributed training feed.
+- {doc}`/getting-started/migration/ray-data`: the Ray Data verbs, including class-based UDFs.

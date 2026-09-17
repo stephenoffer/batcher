@@ -1,16 +1,18 @@
 # Data engineering
 
-Pipelines that move and reconcile data. The hard part is rarely the transformation. It is
-everything around it. The source moved. The file arrived twice. Yesterday's numbers changed
-overnight and nobody knows why.
+Pipelines that move and reconcile data. The hard part is rarely the transformation. It is everything around it. The source moved. The file arrived twice. Yesterday's numbers changed overnight and nobody knows why.
 
-Each recipe starts from the failure, shows the code that avoids it, and says what it costs.
+These eleven recipes are the fixes for those days, built on the pieces Batcher gives you for them: {py:meth}`files_incremental <batcher.api.io_namespace.reader.Reader.files_incremental>` for exactly-once file discovery, `ds.scd` for change feeds and dimension history, `ds.dq` for quality gates, and atomic `replace_where` and `merge_on` writes for repairs. Each recipe starts from the failure, shows the code that avoids it, and says what it costs.
 
 :::{tip}
-Every recipe on this page runs as written. The code blocks are executed on every docs
-build, so if a snippet claims a result, that result was produced by the engine and not by
-a hopeful author.
+Every recipe in this section runs as written. The code blocks are executed on every docs build, so if a snippet claims a result, that result was produced by the engine and not by a hopeful author.
 :::
+
+## Where to start
+
+{doc}`/cookbook/data-engineering/ingest/etl-pipeline` is the whole arc in one page: raw records in, deduplicated and rolled up, Parquet out. Read it first if you want the shape before the details.
+
+After that, if you are building a pipeline from nothing, the order that tends to work is: get the data in ({doc}`incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`), put a gate in front of the write ({doc}`quality gates </cookbook/data-engineering/maintenance/quality-gates>`), make the write idempotent ({doc}`deduplication </cookbook/data-engineering/maintenance/deduplication>`), and only then worry about the table's shape over time ({doc}`schema evolution </cookbook/data-engineering/modeling/schema-evolution>`, {doc}`file compaction </cookbook/data-engineering/maintenance/file-compaction>`).
 
 ## Getting data in
 
@@ -96,27 +98,12 @@ The small-files problem, and when it is actually worth fixing.
 :::
 ::::
 
-## Where to start
-
-{doc}`/cookbook/data-engineering/ingest/etl-pipeline` is the whole arc in one page: raw records in, deduplicated and rolled
-up, Parquet out. Read it first if you want the shape before the details.
-
-After that, if you are building a pipeline from nothing, the order that tends to work is:
-get the data in ({doc}`incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`), put a gate in front of
-the write ({doc}`quality gates </cookbook/data-engineering/maintenance/quality-gates>`), make the write idempotent
-({doc}`deduplication </cookbook/data-engineering/maintenance/deduplication>`), and only then worry about the table's shape over
-time ({doc}`schema evolution </cookbook/data-engineering/modeling/schema-evolution>`, {doc}`file compaction </cookbook/data-engineering/maintenance/file-compaction>`).
-
 ## See also
 
-- {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: the transactional target most of these
-  recipes write to.
-- {doc}`Reading data </user-guide/moving-data/reading-data>` and
-  {doc}`Writing data </user-guide/moving-data/writing-data>`: the reader and the sink, in full.
-- {doc}`Delta Lake </integrations/lakehouse/delta-lake>` and {doc}`Kafka </integrations/streams/kafka>`:
-  the systems the recipes talk to, and what each guarantees.
-- {doc}`Building a lakehouse </getting-started/tutorials/pipelines/building-a-lakehouse>`: these pieces assembled
-  into one pipeline, end to end.
+- {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: the transactional target most of these recipes write to.
+- {doc}`Reading data </user-guide/moving-data/reading-data>` and {doc}`Writing data </user-guide/moving-data/writing-data>`: the reader and the sink, in full.
+- {doc}`Delta Lake </integrations/lakehouse/delta-lake>` and {doc}`Kafka </integrations/streams/kafka>`: the systems the recipes talk to, and what each guarantees.
+- {doc}`Building a lakehouse </getting-started/tutorials/pipelines/building-a-lakehouse>`: these pieces assembled into one pipeline, end to end.
 - {doc}`Data engineer learning path </getting-started/tutorials/paths/data-engineer>`: a reading order.
 
 ```{toctree}

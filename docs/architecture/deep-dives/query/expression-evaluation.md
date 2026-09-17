@@ -97,7 +97,7 @@ Four rows are enough to watch the validity bitmap travel through those rules and
 which `NaN == NaN`, so the familiar idiom silently returns all-false. Use {py:meth}`is_nan <batcher.plan.expr_ir.core.Expr.is_nan>`, which is
 its own {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` variant for exactly this reason. `is_inf` is likewise a variant rather than a
 comparison, because an infinite literal does not survive a JSON round-trip and so cannot be
-written as one. Both fall back to the interpreter in the JIT.
+written as one. The JIT compiles both over a float column and declines them over anything else.
 :::
 
 ## The function surface
@@ -111,7 +111,8 @@ The variants beyond the arithmetic core are grouped by family, one module each u
 | `cast.rs` | `CAST`, which is strict and errors on a bad value, and `TRY_CAST`, which yields null |
 | `str/` | string functions: `contains`, `replace`, `substr`, regex, JSON, and the rest |
 | `temporal/` | date/time extraction, `date_trunc`, `strftime`/`strptime`, date offsets, timezone conversion |
-| `math.rs` | unary/binary math, `coalesce`, `greatest`/`least`, `is_nan`/`is_inf` |
+| `math.rs` | unary/binary math, `greatest`/`least`, `is_nan`/`is_inf` |
+| `branch/` | `CASE` and `coalesce` |
 | `list.rs`, `list_ops/` | list construction, indexing, slicing, `filter`/`transform` |
 | `map.rs`, `hash.rs`, `in_list.rs` | map lookup, hashing, `IN (...)` |
 | `media/` | image/audio/video decode: library-backed, per-row, heavy |
@@ -161,9 +162,9 @@ a branch on the *result* of {py:meth}`is_null <batcher.plan.expr_ir.core.Expr.is
 
 ## What the intermediate arrays buy
 
-The intermediate-array cost is real and it's why the JIT exists, but consider what the interpreter buys with it. Every sub-expression is a materialized Arrow array, so a batch can be handed to any Arrow kernel and any operator at any point, and an operator's state lives in Arrow rather than in registers. That is what lets a compiled pipeline be abandoned at a pipeline breaker without losing progress.
+The intermediate-array cost is real, and it's why the JIT exists. It also buys something. Every sub-expression is a materialized Arrow array, so any Arrow kernel and any operator can take it at any point. And because relational state lives in `bc-runtime` as Arrow rather than in generated code, the JIT can decline an expression, or a single batch, and the interpreter picks up with nothing lost.
 
-Kernel dispatch is per batch, not per row, so the overhead amortizes over 16,384 rows. On the operator benchmarks a filter-then-project over TPC-H `lineitem` at scale factor 1 runs in 13.9 ms, within a millisecond of both DuckDB and Polars on a shape that is almost pure expression evaluation.
+Kernel dispatch is per batch, not per row, so the overhead amortizes over 16,384 rows. On the operator benchmarks recorded in `benchmarks/BENCHMARK_RESULTS.md`, a filter-then-project over TPC-H `lineitem` at scale factor 1, a shape that is almost pure expression evaluation, runs in 13.9 ms against DuckDB's 12.9 ms and Polars' 9.2 ms. That is close to DuckDB and still behind Polars.
 
 ## The two tiers, side by side
 
@@ -181,7 +182,8 @@ this is the answer everything else is compared against
 
 :::{tab-item} Tier-1 (bc-codegen)
 ```text
-numeric Col/Lit/Binary/Not/Case/Cast only: a small subset on purpose
+numeric and temporal Col/Lit/Binary/Not/Case/Cast/Math: a small subset on purpose
+nullable inputs via a combined validity mask or a Kleene ABI
 one Cranelift-compiled loop, values in registers, only the output allocated
 bit-for-bit identical to Tier-0 on that subset, or it falls back to it
 compiled once per (expr, column types, simd) and reused across every morsel
@@ -203,7 +205,7 @@ compiled once per (expr, column types, simd) and reused across every morsel
 - {doc}`Execution engine </architecture/internals/execution>`: where `eval` is called from.
 - {doc}`Expressions </user-guide/transform/columns/expressions>`: the Python surface that builds these trees.
 - {doc}`Expression reference </api/relational/expressions>`: every `Expr` method and accessor namespace.
-- {doc}`Analytics benchmarks </benchmarks/results/analytics>`: the filter-then-project numbers above, in context.
+- {doc}`Analytics benchmarks </benchmarks/results/analytics>`: the operator benchmarks against DuckDB and Polars.
 - {doc}`JIT compilation </architecture/deep-dives/query/jit-compilation>`: the Tier-1 path and what it can and cannot compile.
 - {doc}`Plan IR </architecture/deep-dives/query/plan-ir>`: how an `Expr` gets here from Python.
 - {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: what the media decode kernels produce.

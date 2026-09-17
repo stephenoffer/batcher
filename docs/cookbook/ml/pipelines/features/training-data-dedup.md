@@ -1,13 +1,8 @@
 # Training-data dedup
 
-Exact deduplication on a web crawl barely moves the number. The duplicates are not
-byte-identical: they are the same article behind a different header, the same product page
-with a changed timestamp, the same README vendored into forty repositories. {py:meth}`distinct() <batcher.Dataset.distinct>`
-keeps all of them, the model sees the same text a dozen times, and the memorization it
-buys shows up as a suspiciously good held-out score.
+Exact deduplication on a web crawl barely moves the number. The duplicates are not byte-identical: they are the same article behind a different header, the same product page with a changed timestamp, the same README vendored into forty repositories. {py:meth}`distinct() <batcher.Dataset.distinct>` keeps all of them, the model sees the same text a dozen times, and the memorization it buys shows up as a suspiciously good held-out score.
 
-Fuzzy dedup is the highest-leverage pass in preparing a pretraining corpus, and it is two
-method calls.
+Fuzzy dedup is the highest-leverage pass in preparing a pretraining corpus, and it is two method calls.
 
 ## Exact dedup does not find them
 
@@ -51,18 +46,12 @@ The punctuation-only twin is gone.
 :::
 ::::
 
-{py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` keeps one representative per cluster (the row minimal among its
-near-duplicates) and drops the rest. The case-changed row survives here because character
-shingles are case-sensitive; lowercase the column first if you want it collapsed too. That
-is a choice you make, not a default that quietly makes it for you.
+{py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` keeps one representative per cluster (the row minimal among its near-duplicates) and drops the rest. The case-changed row survives here because character shingles are case-sensitive; lowercase the column first if you want it collapsed too. That is a choice you make, not a default that quietly makes it for you.
 
 ## See the pairs before you delete anything
 
 :::{tip}
-{py:meth}`near_duplicates <batcher.api.dataset.ml.DatasetML.near_duplicates>` returns the matched pairs with their estimated Jaccard similarity, so you
-can look at what a threshold is about to remove before you remove it. Run this once on a
-sample. A threshold that looks reasonable in a paper often eats an entire legitimate
-category of your corpus.
+{py:meth}`near_duplicates <batcher.api.dataset.ml.DatasetML.near_duplicates>` returns the matched pairs with their estimated Jaccard similarity, so you can look at what a threshold is about to remove before you remove it. Run this once on a sample. A threshold that looks reasonable in a paper often eats an entire legitimate category of your corpus.
 :::
 
 ```python
@@ -74,11 +63,7 @@ print(out["key_a"], out["key_b"], [round(j, 2) for j in out["jaccard"]])
 
 :::{dropdown} How it finds them: MinHash signatures, LSH bands, and an exact verify
 
-MinHash reduces each document to a fixed-length signature whose positional
-agreement estimates Jaccard similarity over character n-gram shingles, and LSH banding turns
-the similarity join into an equi-join on a band hash. Every candidate pair is then
-verified against the threshold, so banding costs recall, never precision. No pair below
-`threshold` is ever returned, but a similar pair can miss every band and be missed.
+MinHash reduces each document to a fixed-length signature whose positional agreement estimates Jaccard similarity over character n-gram shingles, and LSH banding turns the similarity join into an equi-join on a band hash. Every candidate pair is then verified against the threshold, so banding costs recall, never precision. No pair below `threshold` is ever returned, but a similar pair can miss every band and be missed.
 :::
 
 The dials, in the order you should reach for them:
@@ -90,16 +75,11 @@ The dials, in the order you should reach for them:
 | `bands` | Recall/cost. More bands, more candidates, more recall, more work. |
 | `num_perm` | Signature length. Standard error of the estimate is `1 / sqrt(num_perm)`. |
 
-`bands` must divide `num_perm`, and the S-curve's knee sits near
-`(1 / bands) ** (bands / num_perm)`. If you are missing duplicates you know are there,
-raise `bands` before you lower `threshold`. Lowering the threshold changes what a duplicate
-*is*, which is a different decision.
+`bands` must divide `num_perm`, and the S-curve's knee sits near `(1 / bands) ** (bands / num_perm)`. If you are missing duplicates you know are there, raise `bands` before you lower `threshold`. Lowering the threshold changes what a duplicate *is*, which is a different decision.
 
 ## Short documents need a smaller shingle
 
-The default `ngram=5` shingles five characters at a time. On a corpus of one-line titles or
-search queries, a document may be barely longer than a shingle, and everything looks
-different from everything. Drop `ngram` when the documents are short.
+The default `ngram=5` shingles five characters at a time. On a corpus of one-line titles or search queries, a document may be barely longer than a shingle, and everything looks different from everything. Drop `ngram` when the documents are short.
 
 ```python
 titles = bt.from_pydict(
@@ -114,13 +94,7 @@ print(titles.ml.near_duplicates("text", threshold=0.7, ngram=3, key="doc_id").co
 
 ## Matching a short field against a reference value
 
-MinHash/LSH clusters a *column* against itself. When you instead need to score each row
-against one *known* string, reach for the edit metrics on {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`. That covers deduping a
-name column against a canonical spelling, or resolving records to a reference list.
-{py:meth}`.str.jaro_similarity <batcher.plan.expr_ir.namespaces.strings._StrNamespace.jaro_similarity>` and {py:meth}`.str.jaro_winkler_similarity <batcher.plan.expr_ir.namespaces.strings._StrNamespace.jaro_winkler_similarity>` return a `[0, 1]` score, and
-Jaro-Winkler weights a shared prefix, which is what you want for names. {py:meth}`.str.levenshtein <batcher.plan.expr_ir.namespaces.strings._StrNamespace.levenshtein>`
-gives the raw edit distance, and {py:meth}`.str.damerau_levenshtein <batcher.plan.expr_ir.namespaces.strings._StrNamespace.damerau_levenshtein>` counts a swapped-letter typo as
-a single edit:
+MinHash/LSH clusters a *column* against itself. When you instead need to score each row against one *known* string, reach for the edit metrics on {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`. That covers deduping a name column against a canonical spelling, or resolving records to a reference list. {py:meth}`.str.jaro_similarity <batcher.plan.expr_ir.namespaces.strings._StrNamespace.jaro_similarity>` and {py:meth}`.str.jaro_winkler_similarity <batcher.plan.expr_ir.namespaces.strings._StrNamespace.jaro_winkler_similarity>` return a `[0, 1]` score, and Jaro-Winkler weights a shared prefix, which is what you want for names. {py:meth}`.str.levenshtein <batcher.plan.expr_ir.namespaces.strings._StrNamespace.levenshtein>` gives the raw edit distance, and {py:meth}`.str.damerau_levenshtein <batcher.plan.expr_ir.namespaces.strings._StrNamespace.damerau_levenshtein>` counts a swapped-letter typo as a single edit:
 
 ```python
 from batcher import col
@@ -134,13 +108,10 @@ scored = people.with_columns(
 ## Check the test set for contamination
 
 :::{important}
-The dedup pass most people skip: your benchmark rows are on the internet, so they are in
-your crawl. Any near-duplicate of a test document sitting in the training corpus makes the
-evaluation meaningless, and it will not show up as a byte-identical match.
+The dedup pass most people skip: your benchmark rows are on the internet, so they are in your crawl. Any near-duplicate of a test document sitting in the training corpus makes the evaluation meaningless, and it will not show up as a byte-identical match.
 :::
 
-Hunt near-duplicates across the union of the two corpora, then drop the training rows that
-matched a test row.
+Hunt near-duplicates across the union of the two corpora, then drop the training rows that matched a test row.
 
 ```python
 from batcher import col
@@ -172,22 +143,13 @@ print(sorted(clean.to_pydict()["doc_id"]))
 # [11, 12]
 ```
 
-`near_duplicates` emits pairs with `key_a < key_b`, which is why the test IDs join on
-`key_b` here: test rows were numbered above the training rows on purpose. Number them the
-other way and you join on `key_a`. Do this once, before training, and the eval number you
-report is one you can defend.
+`near_duplicates` emits pairs with `key_a < key_b`, which is why the test IDs join on `key_b` here: test rows were numbered above the training rows on purpose. Number them the other way and you join on `key_a`. Do this once, before training, and the eval number you report is one you can defend.
 
 ## Where it runs
 
-Both calls lower to ordinary relational plans (a projection, an `explode`, a join, a filter)
-so they run wherever a join runs: multi-core, distributed, spilled. There is no
-special dedup engine and no driver-side set of hashes. That matters at the scale where
-this pass is worth doing, which is the only scale where it is worth doing.
+Both calls lower to ordinary relational plans (a projection, an `explode`, a join, a filter) so they run wherever a join runs: multi-core, distributed, spilled. There is no special dedup engine and no driver-side set of hashes. That matters at the scale where this pass is worth doing, which is the only scale where it is worth doing.
 
-For dedup on *meaning* rather than on words (two descriptions of the same product, written
-independently), {py:meth}`ds.ml.similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` is the same two-stage recipe over embeddings:
-SimHash bands the candidates, exact cosine verifies them. See
-{doc}`preprocessors </ml/preparing/preprocessors/index>`.
+For dedup on *meaning* rather than on words (two descriptions of the same product, written independently), {py:meth}`ds.ml.similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` is the same two-stage recipe over embeddings: SimHash bands the candidates, exact cosine verifies them. See {doc}`preprocessors </ml/preparing/preprocessors/index>`.
 
 ## See also
 
@@ -195,11 +157,7 @@ SimHash bands the candidates, exact cosine verifies them. See
 - {doc}`Text embeddings </cookbook/ml/pipelines/text/text-embeddings>`: the embedding half of {py:meth}`similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>`.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: MinHash, SimHash, and the LSH banding math.
 - {doc}`Embeddings </ml/retrieval/embeddings>`: the encoder that makes semantic dedup possible.
-- {doc}`Distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`: the exact-match surface, and
-  when it is enough.
-- {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: the same problem on an event stream,
-  where the key is known.
-- {doc}`ML API reference </api/models/ml>`: `near_duplicates`, `drop_near_duplicates`,
-  `similarity_join`.
-- {doc}`Join algorithms </architecture/deep-dives/operators/join-algorithms>`: the equi-join the LSH banding
-  lowers to, and why it distributes.
+- {doc}`Distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`: the exact-match surface, and when it is enough.
+- {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: the same problem on an event stream, where the key is known.
+- {doc}`ML API reference </api/models/ml>`: `near_duplicates`, `drop_near_duplicates`, `similarity_join`.
+- {doc}`Join algorithms </architecture/deep-dives/operators/join-algorithms>`: the equi-join the LSH banding lowers to, and why it distributes.

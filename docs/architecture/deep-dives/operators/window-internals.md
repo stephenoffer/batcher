@@ -39,20 +39,27 @@ input columns. An empty key list is one partition over all rows.
 
 :::{important}
 A window partition never spans buckets, and the final scatter restores positions, so the
-per-row result is bit-identical to the serial kernel. That last step is the one that is easy to
-get wrong: unlike a group-by, every input row survives, and the output columns must land back
-in **original row order**, not partition order.
+per-row result is bit-identical to the serial kernel. The scatter is the step that is easy to
+get wrong, because a result in partition order looks plausible and is not the answer.
 :::
 
-## Three families
+## Four families
 
-`crates/bc-runtime/src/window/mod.rs` implements them, and they have genuinely different costs.
+`crates/bc-runtime/src/window/mod.rs` defines `WindowFn`, and its variants fall into four
+families with genuinely different costs.
 
 | Family | Functions | Needs an ordering | Shape of the work |
 |---|---|---|---|
 | Ranking | `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile` | yes | a sort of each partition |
-| Aggregate | `sum`, `avg`, `min`, `max`, `count` | only with an `ORDER BY` | two very different kernels wear one name (below) |
+| Aggregate | `sum`, `avg`, `min`, `max`, `count`, plus `var`, `stddev`, `product`, `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`, `count_distinct` and `median` | only with an `ORDER BY` | two very different kernels wear one name (below) |
 | Value | `first_value`, `last_value`, `lag`, `lead`, `nth_value`, `forward_fill`, `backward_fill` | yes | *select a row*, so they are type-generic: one pass builds a per-row source-index map and Arrow's `take` does the rest |
+| Series | `ewm_mean`, `ewm_var`, `ewm_std`, `interpolate`, `rle_id` | yes | one sequential recurrence over the ordered partition, so no frame applies |
+
+The ten aggregates past the first five (`window/agg/`) are the ones whose running form costs
+O(1) per row, apart from `median`, which keeps a two-heap at `O(log n)` per row. `var` and
+`stddev` carry the same Welford state a `GROUP BY` does, and a whole-partition `median` is
+the `GROUP BY` median's quickselect, so a window and a group-by over the same rows agree by
+construction.
 
 The aggregate row is where the subtlety is.
 
@@ -96,7 +103,8 @@ Which one-pass structure a function uses depends on its arithmetic. `count`, and
 integers, keep a running accumulator in O(n): drop the leaving row, add the entering one. `sum` and
 `avg` over floats can't do that, because subtracting floats is catastrophically unstable, so they
 use a `FifoSum`, a two-stack sliding aggregate that never subtracts. `min` and `max` keep a
-monotonic deque, O(n) amortized. Only the aggregate functions take a frame at all.
+monotonic deque, O(n) amortized. Only the aggregate functions and the positional value
+functions (`first_value`, `last_value`, `nth_value`) take a frame.
 
 :::{note}
 `FrameBound` and `FrameUnits` here are *mirror* types of `bc_ir::FrameBound`/`FrameUnits`.
@@ -131,6 +139,14 @@ when one bucket dominates.
 Below `window_parallel_row_threshold` (2^15 rows) the serial path runs regardless, so a small
 window stays sub-millisecond instead of paying for pool fan-out.
 
+Bucketing needs partition keys, so a *global* window (no `PARTITION BY`) and a skewed one that
+bailed both land on a single partition. `window/running_par.rs` keeps those off one core for a
+running aggregate: it cuts the ordered partition into chunks on peer-group boundaries, folds
+each chunk, scans the chunk totals, and re-walks each chunk seeded with its prefix. That
+re-associates the fold, which is exact for integer `+`, `min`, `max` and counting and not for
+floating-point `+`, so float `sum` and `avg` keep the serial walk and the result stays
+bit-identical to it.
+
 ## Spilling
 
 `crates/bc-interp/src/window_spill.rs`. Window functions are per-partition independent, and equal
@@ -155,7 +171,7 @@ operator above it. It also **bounds the work**, which it did not always do: `ran
 be a mask applied *after* the ranking, so "top 3 products per category" ordered every partition
 and then discarded almost all of it.
 
-`rank_limit` is now threaded down to `window_serial`, and when the only function is `row_number`
+`rank_limit` is threaded down to `window_serial`, and when the only function is `row_number`
 with a single numeric order key, `bc_runtime::window::topk` selects each partition's best `k` with
 a bounded max-heap instead of ordering it. That is `O(n log k)` against `O(n log n)`, and for the
 usual `k` of one to ten the `log k` is two or three comparisons. Spark and Daft build operators for
@@ -167,7 +183,8 @@ bucketed parallelism for the better complexity, running `O(n log k)` on one core
 `O(n log n)` on ninety-six. Applied inside the per-bucket kernel it inherits that parallelism
 instead, and each worker heaps only the partitions it owns.
 
-Measured on 6M rows, interleaved best-of-three, `QUALIFY row_number() <= k`:
+Measured on 6M rows, interleaved best-of-three, `QUALIFY row_number() <= k`
+(`docs/architecture/internals/competitor_technique_review.md`):
 
 | Partitions | `k` | Ordering | Bounded | |
 |---|---|---|---|---|
@@ -182,10 +199,21 @@ The win grows with partition size, which is what the complexity predicts. `k = 1
 because Kyber sends it down a different route entirely: `row_number() = 1` rewrites onto
 `DISTINCT ON`, a per-key argmin rather than any kind of sort.
 
+The parallel window also stopped doing work for rows it throws away. It used to rank every row, scatter all of those ranks back into input order, and then mask all but `k` per partition. On H2O `groupby` q8's shape (10M rows, 100,000 partitions, `k = 2`), `perf` put 21% of the query in that scatter, spent keeping 200,000 rows. `bc_runtime::window::window_with_rank_limit` runs the same buckets but keeps only each bucket's survivors, named by input row, and orders them once. The interpreter's window then gathers just those rows. The rows, their order and their values are the mask's by construction, and the Rust test `rank_limited_equals_masking_the_full_window` holds the two forms equal across `row_number`, `rank` and `dense_rank`, with ties, null keys, every `k`, and both the parallel and serial paths.
+
+Measured on a 48-core box under load, best of five across four alternating rounds, so the cells are ranges (`benchmarks/BENCHMARK_RESULTS.md`):
+
+| Query | Mask every row | Keep survivors |
+|---|---|---|
+| `row_number() <= 2` over 100,000 partitions (H2O q8's shape) | 121 to 252 ms | **63 to 68 ms** |
+| `row_number() <= 2` over 100 partitions | 126 to 143 ms | **50 to 88 ms** |
+| `row_number() <= 10` over 100,000 partitions | 142 to 182 ms | 84 to 158 ms |
+| `rank() <= 3` per `l_suppkey`, TPC-H sf1 `lineitem` | 306 to 657 ms | 253 to 444 ms |
+
 The bounded path declines to the ordering path on anything it does not cover: more than one
 order key, a non-numeric or nullable one, more than one partition key, or a `groups x k` heap
 large next to the rows it selects from. A non-survivor is marked `k + 1` rather than null or
-zero, because the caller's mask is `rank <= k` and a zero would pass it.
+zero, because each bucket keeps the rows whose rank is `<= k` and a zero would pass that test.
 
 Keep it in proportion: on this shape Batcher was already 10-20x faster than DuckDB and 2.5-10x
 faster than Polars, so this makes a win larger rather than closing a gap.
@@ -257,8 +285,12 @@ dense-group-id shortcut that there's little left to win, which is why it sits at
 Polars. The ranking and value functions land in between, because both need the partition ordered
 and pay a per-partition sort plus the scatter back to row order.
 
-These figures come from the operator-mix sweep in `benchmarks/BENCHMARK_RESULTS.md`, measured on
-a 16-core release build with every correctness check passing.
+These figures come from an operator-mix sweep recorded in `benchmarks/BENCHMARK_RESULTS.md`,
+measured on a 16-core release build with every correctness check passing. The
+{doc}`analytics benchmarks </benchmarks/results/analytics>` page carries the last full published
+sweep, with narrower margins against DuckDB on the running `sum()` (0.71x) and the
+whole-partition `sum()` (0.93x), so read the table for the ordering of the shapes rather than as
+a current ratio.
 
 ## Where the code lives
 
@@ -266,6 +298,9 @@ a 16-core release build with every correctness check passing.
 - `crates/bc-runtime/src/window/frame/`: explicit `ROWS` frames, one-pass accumulator/deque
 - `crates/bc-runtime/src/window/partition_agg.rs`: whole-partition aggregates via dense ids
 - `crates/bc-runtime/src/window/parallel.rs`: bucket-parallel execution and the skew guard
+- `crates/bc-runtime/src/window/running_par.rs`: the parallel prefix scan for a single large partition
+- `crates/bc-runtime/src/window/agg/`, `series.rs`: the extra aggregates, EWM, `interpolate` and `rle_id`
+- `crates/bc-runtime/src/window/topk.rs`: the bounded per-partition top-k behind `QUALIFY`
 - `crates/bc-runtime/src/window/fill.rs`: {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`backward_fill <batcher.plan.expr_ir.core.Expr.backward_fill>`
 - `crates/bc-interp/src/window_spill.rs`: grace partitioning for bounded memory
 

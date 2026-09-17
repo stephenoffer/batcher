@@ -2,9 +2,49 @@
 
 This page describes how to build a Batcher {py:class}`Config <batcher.Config>`, make it active, and load one from the environment or a file.
 
-The pages beneath it are the reference: {doc}`options` is the field-by-field listing, {doc}`distributed-options` covers the cluster and shuffle knobs, {doc}`accelerator` covers the GPU and device settings, {doc}`fault-tolerance` covers what happens when nodes and devices fail underneath a running job, {doc}`environment` covers the `BATCHER_*` variables and the JSON file format, and {doc}`profiles` shows worked configurations for common deployments.
+Most of the time you don't configure Batcher at all. The engine senses its cores, its memory envelope, and the cluster it's attached to, and sizes itself from what it finds. When you do want a memory cap, a thread count, or a different spill directory, every knob lives on one typed, immutable `Config` object with validated fields. It's grouped by concern into `execution`, `memory`, `flow_control`, `streaming`, `optimizer`, `pid`, `metadata`, `distributed`, `observability`, `governance`, `tenant`, `accelerator`, and `fault_tolerance`. There's no dict of loose keys, and a typo fails when you set it rather than being silently ignored.
 
-Most of the time you don't configure Batcher at all. The defaults are tuned to saturate your cores and stay within memory on their own. When you do need to tune a memory limit, the thread count, or how aggressively the engine spills, every knob lives on one `Config` object. It's a typed, immutable dataclass grouped by concern: `execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`, `distributed`, `observability`, `accelerator`, and `fault_tolerance`. There's no global mutable state and no dict of loose keys. You build a `Config`, then make it active.
+The pages in this section are the reference:
+
+::::{grid} 1 2 2 3
+:gutter: 3
+
+:::{grid-item-card} {octicon}`list-unordered;1.1em` Options
+:link: /configuration/options
+:link-type: doc
+Every field of the general sections, with its default.
+:::
+
+:::{grid-item-card} {octicon}`server;1.1em` Distributed options
+:link: /configuration/distributed-options
+:link-type: doc
+Attaching to Ray, the shuffle, inference stages, and the GPU backend.
+:::
+
+:::{grid-item-card} {octicon}`cpu;1.1em` Accelerator
+:link: /configuration/accelerator
+:link-type: doc
+Device placement, energy budgets, device memory, and device health.
+:::
+
+:::{grid-item-card} {octicon}`shield;1.1em` Fault tolerance
+:link: /configuration/fault-tolerance
+:link-type: doc
+Retry budgets and quarantine when nodes and devices fail mid-job.
+:::
+
+:::{grid-item-card} {octicon}`terminal;1.1em` Environment
+:link: /configuration/environment
+:link-type: doc
+The `BATCHER_*` variables, the config file, and what Batcher detects.
+:::
+
+:::{grid-item-card} {octicon}`stack;1.1em` Profiles
+:link: /configuration/profiles
+:link-type: doc
+Worked configurations for common deployments.
+:::
+::::
 
 ```python
 import batcher as bt
@@ -17,9 +57,7 @@ print(cfg.execution.morsel_rows)
 
 ## Building a config
 
-`Config` and its sections are frozen dataclasses, so you derive new ones rather than
-mutating in place. {py:meth}`Config.replace(...) <batcher.Config.replace>` swaps whole sections; `dataclasses.replace`
-changes a field within a section.
+`Config` and its sections are frozen dataclasses, so you derive new ones rather than mutating in place. {py:meth}`Config.replace(...) <batcher.Config.replace>` swaps whole sections, and `dataclasses.replace` changes a field within a section.
 
 ```python
 import dataclasses
@@ -35,8 +73,7 @@ print((cfg.execution.parallelism, cfg.memory.soft_limit))
 # (4, 0.75)
 ```
 
-The individual sections have no `.replace` method of their own; use
-`dataclasses.replace(section, field=value)` for field-level edits.
+The individual sections have no `.replace` method of their own. Use `dataclasses.replace(section, field=value)` for field-level edits.
 
 ## Making a config active
 
@@ -59,7 +96,7 @@ print(result)
 
 ## Setting one option by name
 
-Building a whole `Config` to change one number is a lot of ceremony. Every tunable also has a dotted name, and `set_option` / `get_option` address it directly. This is the same API shape as `pandas.set_option` and `spark.conf.set`, and it goes through the same validation as `set_config`.
+Building a whole `Config` to change one number is a lot of ceremony. Every tunable also has a dotted name, and `set_option` and `get_option` address it directly. This is the same API shape as `pandas.set_option` and `spark.conf.set`, and it goes through the same validation as `set_config`.
 
 ```python
 from batcher.config import get_option, reset_option, set_option
@@ -102,7 +139,7 @@ print("memory.spill_dir" in describe_options("spill"))
 # True
 ```
 
-Finally, {py:meth}`Config.non_defaults() <batcher.Config.non_defaults>` answers "what is actually set here?" when a job behaves differently on two machines. Its `repr` shows the same thing, so printing a config is useful rather than a wall of 180 fields.
+Finally, {py:meth}`Config.non_defaults() <batcher.Config.non_defaults>` answers "what is actually set here?" when a job behaves differently on two machines. Its `repr` shows the same thing, so printing a config is useful rather than a wall of nearly 300 options.
 
 ```python
 import dataclasses
@@ -133,7 +170,7 @@ print(env_var_names()["BATCHER_EXECUTION_MORSEL_ROWS"])
 # execution.morsel_rows
 ```
 
-{py:meth}`Config.from_dict <batcher.Config.from_dict>` and {py:meth}`Config.to_dict <batcher.Config.to_dict>` are the in-memory pair. {py:meth}`to_dict <batcher.Dataset.to_dict>` produces
+{py:meth}`Config.from_dict <batcher.Config.from_dict>` and {py:meth}`Config.to_dict <batcher.Config.to_dict>` are the in-memory pair. {py:meth}`to_dict <batcher.Config.to_dict>` produces
 plain JSON-encodable data, so a config travels as part of a job manifest, and
 `only_non_default=True` emits the smallest document that reproduces it. The
 standalone `config_to_dict` function does the same for callers that would rather not
@@ -151,7 +188,7 @@ print(config_to_dict(Config())["execution"]["morsel_rows"])
 # 16384
 ```
 
-{py:func}`from_dict <batcher.from_dict>` re-runs the same environment resolution every entry point does, which
+{py:meth}`from_dict <batcher.Config.from_dict>` re-runs the same environment resolution every entry point does, which
 auto-detects a spot node or an autoscaling cluster. That means a config captured on
 one machine can legitimately differ from raw defaults when reloaded on another.
 Reloading an already-resolved config is idempotent, which is the property to rely on.
@@ -163,11 +200,15 @@ When the engine resolves the active config, the layers apply highest first:
 1. `config_context(...)`, the innermost active context.
 1. `set_config(...)`, process-wide.
 1. `BATCHER_*` environment variables.
-1. A JSON file named by `BATCHER_CONFIG_FILE`.
+1. A config file named by `BATCHER_CONFIG_FILE`.
 1. Built-in defaults.
 
 The environment and file layers are read once when `batcher` is imported.
 `set_config` and `config_context` override them at runtime.
+
+The following diagram shows the same five layers as a stack, grouped by when each one is set:
+
+![Five layers are stacked from highest precedence at the top to lowest at the bottom. The top two are set at runtime. config_context, which option_context and tenant are built on, applies to the innermost with block and is restored on exit. set_config, which set_option goes through, is process-wide until changed. The bottom three are read once at import. BATCHER_* environment variables, loaded with Config.from_env, overlay the file named by BATCHER_CONFIG_FILE, loaded with Config.from_file, which overlays the built-in defaults. The defaults are the dataclass field values, and they are what reset_option restores rather than the values the environment produced.](/_static/diagrams/config_precedence.svg)
 
 ## See also
 

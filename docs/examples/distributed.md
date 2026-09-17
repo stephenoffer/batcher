@@ -1,14 +1,10 @@
 # Distributed and streaming
 
-This page covers the scripts that check the mergeable algebra, the shuffle, and the streaming
-paths.
+This page covers the scripts that check the mergeable algebra, the shuffle, and the streaming paths.
 
 ## One algebra, two schedules
 
-A stateful operator is built as `partial`, `combine`, `finalize`, so running it on one core
-and across a cluster is the same algebra with a different schedule. There is no second
-distributed semantics, which is what makes the equivalence assertion meaningful rather than
-decorative.
+A stateful operator is built as `partial`, `combine`, `finalize`, so running it on one core and across a cluster is the same algebra with a different schedule. There is no second distributed semantics, which is what makes the equivalence assertion meaningful rather than decorative.
 
 ```python
 import batcher as bt
@@ -34,38 +30,24 @@ assert single.schema == many.schema
 assert single.to_pydict() == many.to_pydict()
 ```
 
-Read that assertion for what it is. `num_partitions` divides the work locally and decides
-whether an operator spills. It does not distribute anything. The check proves the algebra is
-indifferent to how the work is cut, which is necessary and not sufficient: only
-`--distributed` against a real cluster exercises the shuffle.
+Read that assertion for what it is. `num_partitions` divides the work locally and decides whether an operator spills. It does not distribute anything. The check proves the algebra is indifferent to how the work is cut, which is necessary and not sufficient: only `--distributed` against a real cluster exercises the shuffle.
 
-The claim to state carefully is about floating point. The multiset of rows, every column name
-and every column type are exact. Floating-point reductions are identical *up to
-reassociation*: `combine` is associative in exact arithmetic, IEEE addition is not, and the
-partition count changes the summation order. Compensated summation bounds that error to near
-the last bits; it does not remove it. The scripts assert integers exactly and floats to a
-relative tolerance for that reason.
+The claim to state carefully is about floating point. The multiset of rows, every column name and every column type are exact. Floating-point reductions are identical *up to reassociation*: `combine` is associative in exact arithmetic, IEEE addition is not, and the partition count changes the summation order. Compensated summation bounds that error to near the last bits; it does not remove it. The scripts assert integers exactly and floats to a relative tolerance for that reason.
 
 ## Running against a cluster
 
-Bringing up a cluster takes longer than the whole rest of the suite, so these default to
-single node and still exercise the mergeable path across several local partitions. Opt in
-when you have a cluster to point at:
+Bringing up a cluster takes longer than the whole rest of the suite, so these default to single node and still exercise the mergeable path across several local partitions. Opt in when you have a cluster to point at:
 
 ```bash
 python examples/dist/mergeable_equivalence.py --distributed
 BATCHER_EXAMPLES_DISTRIBUTED=1 python -m pytest tests/docs/test_examples.py -q -k dist
 ```
 
-CI installs no Ray, so a green PR gate says nothing about the distributed path. A recorded
-cluster run in `benchmarks/BENCHMARK_RESULTS.md` is the only evidence it works.
+CI installs no Ray, so a green PR gate says nothing about the distributed path. A recorded cluster run in `benchmarks/BENCHMARK_RESULTS.md` is the only evidence it works.
 
 ## Streaming
 
-Batch is the bounded case of streaming over Arrow batches, so the same operators serve both.
-A tumbling window is a truncation of the timestamp used as a group key, and a session window
-is the gaps-and-islands pattern: mark the rows that start a run, then take a running sum of
-those marks as the session id.
+Batch is the bounded case of streaming over Arrow batches, so the same operators serve both. A tumbling window is a truncation of the timestamp used as a group key, and a session window is the gaps-and-islands pattern: mark the rows that start a run, then take a running sum of those marks as the session id.
 
 ## Every script on this page
 
@@ -93,3 +75,9 @@ The table below lists the distributed and streaming scripts in path order.
 | `examples/streams/trigger_and_output_modes.py` | Trigger and output mode: how often a streaming query fires, and what it emits |
 | `examples/streams/windowed_aggregation.py` | Time windows over an event stream, computed as a grouped aggregate |
 <!-- /library-table -->
+
+## See also
+
+- {doc}`/architecture/deep-dives/distribution/index`: scheduling, the Flight shuffle, and credit-based flow control.
+- {doc}`/cookbook/streaming/index`: streaming recipes, from Kafka ETL to exactly-once sinks.
+- {doc}`/user-guide/moving-data/streaming`: sources, sinks, triggers, and output modes.

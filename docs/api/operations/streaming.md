@@ -21,8 +21,8 @@ result reaches the sink. Both spell their values the way Spark does.
    :members:
 ```
 
-The three modes are only distinguishable by what each one emits from the same input, so
-here is the same input three times:
+The three modes differ only in what each one emits from the same input, so the figure runs
+one input through all three:
 
 ![What append, complete and update each emit for one sequence of micro-batches. Three batches of key-value pairs feed a grouped max. Append emits each batch's own rows and is legal only for a pipeline with no aggregate: make_processor raises at start() for append over an unwindowed aggregate, which needs a watermark and a windowed group key. Complete emits the whole running result on every trigger, including a third trigger that changed nothing. Update anti-joins the new result against the one it last emitted, over every column, so a group whose value did not move is not re-sent and that third trigger emits no rows at all. The sink adds its own restriction: a path or Delta sink accepts append only, so complete and update need a memory sink or for_each_batch.](/_static/diagrams/output_modes.svg)
 
@@ -30,9 +30,9 @@ here is the same input three times:
 
 A running query emits one `StreamingQueryProgress` record per completed micro-batch. The
 record carries that batch's row counts and duration, what each source contributed and the
-sink accepted, and one `StateOperatorProgress` per stateful operator holding state. That
-last one is where a late row goes: `num_late_inputs_dropped` counts the inputs that
-arrived behind the watermark and were discarded.
+sink accepted, and one `StateOperatorProgress` per stateful operator holding state. Late
+data shows up there, as `num_late_inputs_dropped`: the inputs that arrived behind the
+watermark and were discarded.
 
 ```{eval-rst}
 .. autoclass:: batcher.StreamingQueryProgress

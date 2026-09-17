@@ -1,6 +1,6 @@
 # Cloud storage
 
-Batcher reads and writes object stores through the same API as local files. A path with a cloud scheme is recognized automatically, so only the path changes and the rest of the pipeline is identical.
+This page covers reading and writing object storage: the schemes Batcher accepts, where credentials come from, and how to point at an on-prem or S3-compatible store. Object stores use the same API as local files. A path with a cloud scheme is recognized automatically, so only the path changes.
 
 The accepted schemes are `s3://` / `s3a://`, `gs://` / `gcs://`, `az://` / `abfs://` / `abfss://`, and `hdfs://`, plus `file://` and bare local paths. Reading and writing both go through one `pyarrow.fs`-backed filesystem. Anything pyarrow does not implement natively falls back to fsspec behind the same interface.
 
@@ -16,11 +16,11 @@ If a cloud scheme is used without the extra installed, the read fails with a mes
 
 Most examples on this page need a real bucket and credentials, so their blocks are shown but not executed. The two that read and write local files run for real, and the prose says so where they appear.
 
-## Reading from object storage
+## Read from object storage
 
 {py:obj}`bt.read <batcher.read>` infers the format from the extension. The format-specific readers ({py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>`, {py:meth}`bt.read.csv <batcher.api.io_namespace.reader.Reader.csv>`, {py:meth}`bt.read.json <batcher.api.io_namespace.reader.Reader.json>`) take the same cloud paths.
 
-Use a typed reader when the path contains a glob. Format inference reads the extension off the literal path and stops at the first `*`, so `bt.read("s3://b/*.parquet")` has nothing to infer from and raises {py:exc}`FormatError <batcher.FormatError>`. `bt.read.parquet(...)` is already explicit. A `*` also matches within one path segment only, so crossing directories in a Hive layout needs `**`.
+A glob works with `bt.read` and the typed readers alike. A `*` matches within one path segment only, so crossing directories in a Hive layout needs `**`. Reading a Hive layout that way returns every row without the partition columns, and Batcher warns about it. Point `bt.read.parquet` at the directory itself, or use `bt.read.parquet_dataset(...)`, when you need those columns back.
 
 ```python
 # docs: skip
@@ -58,6 +58,10 @@ Swap `events/*.parquet` for `s3://bucket/events/*.parquet` and nothing else chan
 ## Credentials
 
 Credentials are read from the environment, following the conventions of each provider's SDK. They are the same variables the AWS, Google Cloud, and Azure tooling already uses. Set them before starting your process.
+
+The environment is the last place Batcher looks, not the first. A filesystem object you pass is used as it is and wins over `storage_options`. Otherwise a scheme pyarrow implements natively is built from the path's query string with your `storage_options` added, and only what those leave unset falls through to the provider SDK's own chain. A scheme pyarrow does not implement goes to fsspec, which takes `storage_options` as keyword arguments. The sections below cover each of these in turn.
+
+![The order a path's filesystem and credentials come from. First, if filesystem= is passed, that pyarrow or fsspec filesystem is used verbatim and wins over storage_options. Second, if the scheme is not native to pyarrow, as with oss, cos, obs, oci, swift and lakefs, an fsspec backend is built with storage_options as keyword arguments. Third, for a native scheme such as s3, gs, abfs or hdfs and their aliases, the backend is built from the URI's query options with storage_options added, so explicit keys, an endpoint_override or a role_arn apply to that path only. Fourth, anything still unset comes from the provider SDK's own chain: environment variables such as AWS_ACCESS_KEY_ID, AZURE_STORAGE_* and GOOGLE_APPLICATION_CREDENTIALS, or instance and role identity. An env:, file: or cmd: value in storage_options resolves on the machine that opens the connection, so a distributed read ships the reference to each worker and never the secret.](/_static/diagrams/credential_resolution.svg)
 
 | Store | Environment variables and settings |
 | --- | --- |
@@ -123,7 +127,7 @@ ds = bt.read.parquet(
 
 An unrecognized option is an error naming the option, rather than being silently ignored.
 
-The legacy Azure Blob schemes `wasb://` and `wasbs://` are **not** supported by either backend. Use the current `abfs://` / `abfss://` spelling, which is. A `wasb://` path fails with an error saying exactly that rather than being silently mis-read.
+Use `abfs://` or `abfss://` for Azure. The legacy Blob schemes `wasb://` and `wasbs://` aren't supported by either backend, and a `wasb://` path fails with an error that says so.
 
 ## Object stores outside the three hyperscalers
 
@@ -149,7 +153,7 @@ Any value there may be an `env:`, `file:` or `cmd:` reference, resolved on the m
 
 ## Bring your own filesystem or credentials
 
-Every reader and writer accepts two optional keywords, so you are never limited to environment variables or a URI query string.
+Every reader and writer accepts two optional keywords, so you aren't limited to environment variables or a URI query string.
 
 `filesystem=` takes an already-constructed `pyarrow.fs.FileSystem` (or `PyFileSystem`), or an fsspec filesystem instance. Batcher uses it verbatim. Reach for it when you have a handle you have already authenticated, a mocked filesystem in a test, or a backend Batcher does not know.
 
@@ -175,17 +179,17 @@ ds = bt.read.parquet(
 )
 ```
 
-## Writing to object storage
+## Write to object storage
 
 Write helpers take cloud paths as well. Combine with `partition_by` to lay out a partitioned dataset, and `distributed=True` to write across workers. Writes to an object store go straight to the destination, because a single PUT is atomic and leaves no truncated-file window. Local and HDFS writes use temp-then-rename for the same guarantee.
 
 ```python
 # docs: skip
 ds.write.parquet("s3://bucket/curated/events.parquet")
-ds.write("s3://bucket/curated/events", fmt="parquet", partition_by=["region"])
+ds.write("s3://bucket/curated/events", format="parquet", partition_by=["region"])
 ```
 
-## Working with a large dataset
+## Read a large dataset
 
 Large cloud datasets are split into tasks so the driver never has to materialize a whole file. For distributed reads, the data plane moves Arrow batches directly between workers over Arrow Flight rather than through a scheduler's object store, which keeps per-node memory bounded.
 

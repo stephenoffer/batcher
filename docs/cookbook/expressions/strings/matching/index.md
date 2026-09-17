@@ -1,8 +1,6 @@
 # Matching and extracting
 
-Finding something in a string column, and pulling it out.
-
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
+Finding something in a string column, and pulling it out. Predicates and search give you boolean screens for a filter, regex and extraction turn matches into new columns, and similarity finds values that are almost, but not exactly, a known string.
 
 | Recipe | What it shows |
 |---|---|

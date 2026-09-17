@@ -1,58 +1,75 @@
 # Getting started
 
-Install Batcher, run a query, then pick up the one idea the whole API rests on. A
-{py:class}`Dataset <batcher.Dataset>` is a lazy handle to a plan. Nothing runs until you ask for results.
+Batcher is one engine for your data work. You write DataFrame code or SQL in Python, and a compiled Rust engine runs it over Apache Arrow, on a laptop or across a Ray cluster, for tables, text, images, audio, and video alike. This section takes you from `pip install` to a working pipeline in a few minutes, then explains the handful of ideas that make it fast.
 
-::::{grid} 1 3 3 3
+## Your first query
+
+Install the package, then run this. It builds a small dataset, aggregates it, and prints the answer:
+
+```bash
+pip install batcher-engine
+```
+
+```python
+import batcher as bt
+
+orders = bt.from_pydict({"region": ["west", "east", "west"], "amount": [120.0, 80.0, 45.0]})
+totals = orders.group_by("region").agg(revenue=bt.col("amount").sum()).sort("region")
+print(totals.to_pydict())
+# {'region': ['east', 'west'], 'revenue': [80.0, 165.0]}
+```
+
+That's the whole shape of a Batcher program: build a dataset, chain lazy steps, ask for the result. Swap `from_pydict` for `bt.read` on a directory of Parquet files and nothing else changes. The engine works through Arrow batches in parallel on every core and spills to disk under memory pressure, so the input can be far larger than RAM. On a Ray cluster, `collect(distributed=True)` runs the same plan across machines.
+
+## Start here
+
+Most readers take these in order. Skip ahead if you already know the part a card covers.
+
+::::{grid} 1 2 2 2
 :gutter: 3
 
 :::{grid-item-card} {octicon}`download;1.1em` Installation
 :link: installation
 :link-type: doc
-`pip install batcher-engine`. Optional extras cover cloud storage, ML backends, and
-file formats.
+One wheel with the compiled engine inside. Add extras for Ray, object stores, lakehouse tables, ML backends, and file formats.
 :::
 
 :::{grid-item-card} {octicon}`rocket;1.1em` Quickstart
 :link: quickstart
 :link-type: doc
-Build a dataset. Filter it, join it, aggregate it: a whole pipeline in a few lines.
+Filter, join, aggregate, switch to SQL, and write Parquet. Every example runs as written.
 :::
 
 :::{grid-item-card} {octicon}`light-bulb;1.1em` Core concepts
 :link: concepts/index
 :link-type: doc
-Why datasets are lazy and immutable, why expressions run in Rust, and where the Python
-control plane hands off to the Rust data plane.
+Lazy plans, expressions that run in Rust, mergeable operators that scale out, and an optimizer that learns from what it measures.
 :::
 
 :::{grid-item-card} {octicon}`arrow-switch;1.1em` Coming from another tool
 :link: migration/index
 :link-type: doc
-Spark, pandas, Polars, DuckDB, and Daft translated verb by verb, ending in a check that
-the port returns the same rows.
+Spark, pandas, Polars, DuckDB, Daft, and Ray Data translated verb by verb, ending in a check that the port returns the same rows.
 :::
 ::::
 
 ## Where to go next
 
-Once a query runs, the docs split by what you are trying to do. Reach for
-{doc}`tutorials/index` if you want to be walked through a complete pipeline,
-{doc}`../user-guide/index` if you want one capability at a time, and
-{doc}`../cookbook/index` if you would rather start from working code and change it.
+Once a query runs, pick the path that matches how you like to learn. The {doc}`tutorials <tutorials/index>` walk you through complete pipelines, from a first ETL job to a lakehouse, a streaming job, and batch inference. The {doc}`user guide </user-guide/index>` takes one capability at a time, and the {doc}`cookbook </cookbook/index>` starts you from working code you can change. If you'd rather follow a reading list, the {doc}`learning paths <tutorials/paths/index>` order the pages for data engineers, data scientists, ML engineers, and platform engineers.
+
+Curious how fast it is? The {doc}`benchmarks </benchmarks/index>` page has the correctness-gated results against DuckDB, Polars, Daft, and Spark, with the hardware and the commands to reproduce each one.
 
 ## See also
 
-- {doc}`/getting-started/tutorials/paths/index`: an ordered reading list for your role.
-- {doc}`/getting-started/migration/index`: the verb-by-verb mapping if you are coming from Spark,
-  pandas, Polars, DuckDB, or Daft.
-- {doc}`../api/reference`: the one-page cheat sheet to keep open while you work.
+- {doc}`/api/reference`: the one-page cheat sheet to keep open while you work.
+- {doc}`/ml/index`: embeddings, batch inference, and training data on the same engine.
 - {doc}`/user-guide/operate/running/troubleshooting`: what to read when the first query misbehaves.
 
 ```{toctree}
 :hidden:
 
 installation
+install/index
 quickstart
 concepts/index
 tutorials/index

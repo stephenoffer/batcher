@@ -180,3 +180,100 @@ on its page is not finished, so this table is the checklist as well as the index
 | `policy_plan_rewrite.svg` | `docs/user-guide/trust/governance.md` |
 | `column_lineage.svg` | `docs/user-guide/trust/governance.md` |
 | `dq_actions.svg` | `docs/user-guide/trust/data-quality.md` |
+
+## Reader-facing diagrams
+
+These sit on the user-facing pages rather than the architecture deep dives: one figure per page, placed where the concept is introduced, so a reader meets the picture before the reference detail. Every script names the page and code its facts came from.
+
+### Getting started and tutorials
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `expression_vs_row_loop.svg` | `docs/getting-started/concepts/expressions.md` |
+| `first_pipeline_plan.svg` | `docs/getting-started/tutorials/foundations/first-pipeline.md` |
+| `install_extras_stack.svg` | `docs/getting-started/installation.md` |
+| `learning_paths_matrix.svg` | `docs/getting-started/tutorials/paths/index.md` |
+| `medallion_layers.svg` | `docs/getting-started/tutorials/pipelines/building-a-lakehouse.md` |
+| `migration_chooser.svg` | `docs/getting-started/migration/index.md` |
+| `model_load_once.svg` | `docs/getting-started/tutorials/ml/batch-inference.md` |
+| `quickstart_lazy_plan.svg` | `docs/getting-started/quickstart.md` |
+| `slow_query_loop.svg` | `docs/getting-started/tutorials/foundations/optimizing-a-slow-query.md` |
+| `sql_dataframe_one_plan.svg` | `docs/getting-started/tutorials/foundations/sql-to-dataframe.md` |
+| `streaming_tutorial_flow.svg` | `docs/getting-started/tutorials/pipelines/streaming-pipeline.md` |
+| `training_data_flow.svg` | `docs/getting-started/tutorials/ml/distributed-training-pipeline.md` |
+| `tutorial_chooser.svg` | `docs/getting-started/tutorials/index.md` |
+
+### User guide
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `cache_reuse.svg` | `docs/user-guide/operate/tuning/caching.md` |
+| `connector_splits.svg` | `docs/user-guide/moving-data/custom-connectors.md` |
+| `credential_resolution.svg` | `docs/user-guide/moving-data/cloud-storage.md` |
+| `dedup_choice.svg` | `docs/user-guide/transform/rows/distinct-and-dedup.md` |
+| `dq_contract_matrix.svg` | `docs/user-guide/trust/data-contracts.md` |
+| `explain_line_anatomy.svg` | `docs/user-guide/operate/tuning/explain-plans.md` |
+| `frame_chain.svg` | `docs/user-guide/analyze/robotics.md` |
+| `graph_isolated_nodes.svg` | `docs/user-guide/analyze/graphs.md` |
+| `group_by_flow.svg` | `docs/user-guide/analyze/aggregations.md` |
+| `hardening_boundary.svg` | `docs/user-guide/trust/hardening.md` |
+| `join_types_kept.svg` | `docs/user-guide/analyze/joins.md` |
+| `metadata_shortcut_decision.svg` | `docs/user-guide/analyze/metadata-shortcuts.md` |
+| `object_storage_read_path.svg` | `docs/user-guide/operate/tuning/object-storage.md` |
+| `observability_bus.svg` | `docs/user-guide/operate/running/observability.md` |
+| `partition_pruning_flow.svg` | `docs/user-guide/operate/tuning/large-tables.md` |
+| `partitioned_write_modes.svg` | `docs/user-guide/moving-data/writing-data.md` |
+| `pivot_long_wide.svg` | `docs/user-guide/analyze/pivoting.md` |
+| `reader_choice.svg` | `docs/user-guide/moving-data/reading-data.md` |
+| `sampling_choice.svg` | `docs/user-guide/transform/rows/sampling.md` |
+| `secret_reference_flow.svg` | `docs/user-guide/trust/secrets.md` |
+| `skew_hot_key_salting.svg` | `docs/user-guide/operate/tuning/skew.md` |
+| `spatial_join_prefilter.svg` | `docs/user-guide/analyze/geospatial.md` |
+| `streaming_emission.svg` | `docs/user-guide/moving-data/streaming-emission.md` |
+| `streaming_health.svg` | `docs/user-guide/moving-data/streaming-monitoring.md` |
+| `time_series_align.svg` | `docs/user-guide/analyze/time-series.md` |
+| `transform_rows_vs_columns.svg` | `docs/user-guide/transform/index.md` |
+| `troubleshooting_tree.svg` | `docs/user-guide/operate/running/troubleshooting.md` |
+| `type_widening.svg` | `docs/user-guide/transform/columns/type-system.md` |
+| `udf_choice.svg` | `docs/user-guide/transform/columns/udfs.md` |
+| `user_guide_areas.svg` | `docs/user-guide/index.md` |
+| `window_vs_group_by.svg` | `docs/user-guide/analyze/window-functions.md` |
+
+### Models and inference
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `blob_offload.svg` | `docs/ml/preparing/multimodal/pipelines.md` |
+| `corpus_prep_order.svg` | `docs/ml/training/training-corpus.md` |
+| `cv_folds.svg` | `docs/ml/evaluation/splits-and-resampling.md` |
+| `drift_psi_bins.svg` | `docs/ml/evaluation/statistics-and-drift.md` |
+| `elastic_resume.svg` | `docs/ml/training/distributed-training.md` |
+| `embedding_compaction.svg` | `docs/ml/retrieval/embeddings.md` |
+| `gpu_pool_sizing.svg` | `docs/ml/inference/gpu.md` |
+| `media_screen_pass.svg` | `docs/ml/preparing/multimodal/index.md` |
+| `ml_one_plan.svg` | `docs/ml/index.md` |
+| `rag_ingest_query.svg` | `docs/ml/retrieval/rag.md` |
+| `sequence_packing.svg` | `docs/ml/preparing/tokenization.md` |
+| `tabular_predict_flow.svg` | `docs/ml/inference/tabular-models.md` |
+
+### Integrations
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `iceberg_snapshot_tree.svg` | `docs/integrations/lakehouse/iceberg.md` |
+| `integrations_hub.svg` | `docs/integrations/index.md` |
+| `kafka_offsets.svg` | `docs/integrations/streams/kafka.md` |
+| `ray_two_lanes.svg` | `docs/integrations/compute/ray.md` |
+
+### Configuration
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `config_precedence.svg` | `docs/configuration/index.md` |
+
+### Cookbook and examples
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `cookbook_map.svg` | `docs/cookbook/index.md` |
+| `example_library_map.svg` | `docs/examples/index.md` |
