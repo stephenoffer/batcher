@@ -78,6 +78,8 @@ all = "bool_and"
 and_ = { operator = "and" }
 any = "bool_or"
 approx_n_unique = "approx_count_distinct"
+arg_max = { to = "max_by", args = 1 }
+arg_min = { to = "min_by", args = 1 }
 asin = "arcsin"
 asinh = "arcsinh"
 astype = "cast"

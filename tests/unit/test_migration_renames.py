@@ -34,7 +34,8 @@ def test_no_removed_spelling_still_resolves(renames) -> None:
         f"{rule.receiver}.{rule.removed}"
         for table in renames.values()
         for rule in table.values()
-        if resolve(f"{rule.receiver}.{rule.removed}") is not None
+        # A spelling kept with a new meaning (`args` set) resolves by design.
+        if rule.args is None and resolve(f"{rule.receiver}.{rule.removed}") is not None
     ]
     assert not alive, f"removed spellings still resolve: {alive}"
 

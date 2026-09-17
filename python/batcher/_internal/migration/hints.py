@@ -137,7 +137,8 @@ def migration_hint(receiver: str, name: str) -> str | None:
             None
     """
     rule = load_renames().get(receiver, {}).get(name)
-    parts = [_removed(rule)] if rule is not None else []
+    # A spelling kept with a new meaning never raises, so only a removed one has a hint.
+    parts = [_removed(rule)] if rule is not None and rule.args is None else []
     seen: set[str] = set()
     for row in _by_receiver().get((receiver, name), ()):
         text = _row_text(row)

@@ -19,7 +19,9 @@ A value in `renames.toml` is either a string (the kept attribute name) or an inl
 Any rule may add `fill = ["<param>@<position>=<literal>"]` when the kept spelling's default
 differs from the removed one's (a call that omits the argument gets it passed explicitly), and
 `keys = ["<param>", ...]` when the kept spelling takes the arguments at other positions (the
-call's positional arguments become those keywords).
+call's positional arguments become those keywords), and `args = <n>` when the spelling stays on
+the surface with another meaning and only a call with exactly `n` arguments is the old one
+(`arg_max(by)` is `max_by(by)`; `arg_max()` is the position and is left alone).
 
 A value in `kwarg_renames.toml`, under a `["<receiver>.<method>"]` table, is one of:
 `"<new_name>"` (rename the keyword), `"*"` (a literal list becomes positional arguments),
@@ -93,6 +95,9 @@ class Rename:
             spelling's default differs from the removed one's.
         keys: Keywords the call's positional arguments become, in order, because the kept
             spelling takes them at other positions (`clip_max(2)` is `clip(upper=2)`).
+        args: For a spelling that stays with a new meaning, the exact argument count of a
+            call in the old meaning; any other call is not rewritten. `None` for a spelling
+            that is gone.
     """
 
     receiver: str
@@ -103,6 +108,7 @@ class Rename:
     transform: str = ""
     fill: tuple[tuple[str, int, str], ...] = ()
     keys: tuple[str, ...] = ()
+    args: int | None = None
 
 
 @dataclass(frozen=True)
@@ -155,7 +161,10 @@ def _rule(receiver: str, removed: str, raw: object) -> Rename:
     keys = raw.get("keys", []) if isinstance(raw, dict) else []
     if not isinstance(keys, list) or not all(isinstance(k, str) and k.isidentifier() for k in keys):
         raise RegistryError(f"renames.toml: {receiver}.{removed}: keys must be a list of names")
-    return dataclasses.replace(rule, fill=fill, keys=tuple(keys))
+    args = raw.get("args") if isinstance(raw, dict) else None
+    if args is not None and (not isinstance(args, int) or isinstance(args, bool) or args < 0):
+        raise RegistryError(f"renames.toml: {receiver}.{removed}: args must be a count")
+    return dataclasses.replace(rule, fill=fill, keys=tuple(keys), args=args)
 
 
 def _base_rule(receiver: str, removed: str, raw: object) -> Rename:
@@ -164,7 +173,7 @@ def _base_rule(receiver: str, removed: str, raw: object) -> Rename:
         return Rename(receiver, removed, "name", to=raw)
     if not isinstance(raw, dict):
         raise RegistryError(f"{where} must be a string or an inline table")
-    unknown = set(raw) - {"to", "call", "operator", "transform", "fill", "keys"}
+    unknown = set(raw) - {"to", "call", "operator", "transform", "fill", "keys", "args"}
     if unknown:
         raise RegistryError(f"{where}: unknown field(s) {sorted(unknown)}")
     if "operator" in raw:

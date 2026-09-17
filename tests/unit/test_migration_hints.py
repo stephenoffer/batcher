@@ -17,7 +17,8 @@ from batcher._internal.migration.hints import SURFACE_RECEIVERS, migration_hint
 
 
 def test_every_rename_rule_renders_a_hint() -> None:
-    rules = [r for table in load_renames().values() for r in table.values()]
+    # A spelling kept with a new meaning (`args` set) never raises, so it has no hint.
+    rules = [r for table in load_renames().values() for r in table.values() if r.args is None]
     assert len(rules) > 100
     for rule in rules:
         hint = migration_hint(rule.receiver, rule.removed)

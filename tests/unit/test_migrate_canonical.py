@@ -513,3 +513,19 @@ def test_a_helper_imported_from_the_project_is_followed(tmp_path) -> None:
         source, load_renames(), load_returns(), load_kwarg_renames(), imported=imported
     )
     assert "rows = tpch('orders').limit(10)" in out
+
+
+def test_a_kept_spelling_with_a_new_meaning_is_renamed_only_at_the_old_arity() -> None:
+    out, report = _run(
+        """
+        import batcher as bt
+
+        by_key = bt.col("x").arg_max(bt.col("t"))
+        position = bt.col("x").arg_max()
+        low = bt.col("x").arg_min("t")
+        """
+    )
+    assert 'by_key = bt.col("x").max_by(bt.col("t"))' in out
+    assert 'position = bt.col("x").arg_max()' in out
+    assert 'low = bt.col("x").min_by("t")' in out
+    assert sorted(e.new for e in report.renamed) == ["max_by", "min_by"]

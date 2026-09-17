@@ -22,6 +22,7 @@ library's object must not change.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 
 from batcher._internal.migration import OPERATORS, KwargRename, Rename
@@ -285,6 +286,14 @@ def _apply_fill(call: object, rule: Rename) -> object:
     return call.with_changes(args=args)  # type: ignore[attr-defined]
 
 
+def _meaning_rename(rule: Rename, call: object) -> Rename | None:
+    """The rule as a plain rename when the call has the old meaning's argument count, else None."""
+    args = list(call.args)  # type: ignore[attr-defined]
+    if any(a.star for a in args) or len(args) != rule.args:
+        return None
+    return dataclasses.replace(rule, args=None)
+
+
 def _replacement(rule: Rename, base: object) -> object:
     node = base
     for segment in rule.to.split("."):
@@ -395,7 +404,7 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
             if receiver is None:
                 self._unresolved(original, name, "receiver unknown")
             return updated
-        if rule.kind in _CALL_KINDS:
+        if rule.kind in _CALL_KINDS or rule.args is not None:
             return updated  # rewritten together with its arguments in `leave_Call`
         self.report.renamed.append(Edit(self._line(original), name, rule.to, receiver))
         return _replacement(rule, updated.value)  # type: ignore[attr-defined]
@@ -411,6 +420,13 @@ class _Canonicalize(cst.CSTTransformer):  # type: ignore[misc]
         if receiver is None:
             return updated
         rule = _rule(self.renames, receiver, name)
+        if rule is not None and rule.args is not None:
+            rule = _meaning_rename(rule, updated)
+            if rule is None:
+                return updated
+            # `leave_Attribute` left the name alone until the argument count was known.
+            self.report.renamed.append(Edit(self._line(original), name, rule.to, receiver))
+            updated = updated.with_changes(func=_replacement(rule, updated.func.value))  # type: ignore[attr-defined]
         failed: list[str] = []
         result = _apply_kwargs(updated, self.kwargs.get(f"{receiver}.{name}", {}), failed)
         if rule is not None and rule.kind in _CALL_KINDS:

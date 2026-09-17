@@ -93,7 +93,9 @@ def test_no_row_points_at_a_spelling_being_removed(registry) -> None:
         f"{r.engine}:{r.surface}.{r.name} -> {t}"
         for r in registry.rows.values()
         for t in r.batcher
-        if t.rpartition(".")[2] in renames.get(t.rpartition(".")[0], {})
+        if (rule := renames.get(t.rpartition(".")[0], {}).get(t.rpartition(".")[2])) is not None
+        # A spelling kept with a new meaning (`args` set) is still a valid target.
+        and rule.args is None
     ]
     assert not doomed, f"{len(doomed)} rows target removed spellings: {doomed}"
 
