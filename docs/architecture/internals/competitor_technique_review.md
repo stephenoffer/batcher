@@ -3468,6 +3468,31 @@ because every suite reports a warm best-of-N. It decides every short script, not
 run, and it is a lazy-import refactor across the reader namespace and the orchestration imports
 rather than an engine change.
 
+### 27j. A predicated Parquet read decodes its surviving row groups whole — **landed, TPC-H sf10 1.54x to 1.38x**
+
+27g ended on "a routing decision, not a literal", and the oracle for that decision came out
+one-sided. Forcing every predicated read to the native reader *unfiltered*, with the engine's
+`Filter` doing all row selection, took TPC-H sf10 from Parquet from 1.526x DuckDB to 1.356x
+with no query meaningfully slower. The mechanism is CPU, not cores: pyarrow's filtered read of
+q1's `lineitem` columns spends 10.6 CPU-seconds where the native decode spends 5.2, and the
+engine's filter is a SIMD comparison over morsels already in parallel. So the 2026-09-08 entry's
+"native batched + engine filter: three of four slower" does not reproduce on a quiet box, and that
+entry had itself withdrawn its per-query numbers as bimodal.
+
+What makes this a routing decision rather than "never filter in the reader" is memory and
+clustering, and `io/formats/structured/parquet/routing.py` handles both:
+
+- **Row groups are still pruned first**, from the footers, through the same NaN-aware rules
+  `io.stats.file_skipping` applies to lakehouse manifests. A clustered table reads only the
+  groups that can match, so 27a's top-N bound keeps its 10x.
+- **Only while the survivors fit a quarter of the memory envelope.** A scattered predicate can
+  leave every row group alive, and a whole file is up to 100x what its matching rows occupy.
+  Past the guard the filtered readers run exactly as before.
+
+Measured, the build with the route against the same build without it, alternating over two
+rounds, every correctness check passing: per-query geomean **0.899**, b/duckdb **1.542 -> 1.379**,
+q12 0.61x, q3 0.66x, q10 0.69x, q6 0.70x, q1 0.79x.
+
 ### What this pass did not do, and where the single-node gap now is
 
 The sf10 decomposition in `BENCHMARK_RESULTS.md` (2026-09-08) put the loss in the Parquet reader,

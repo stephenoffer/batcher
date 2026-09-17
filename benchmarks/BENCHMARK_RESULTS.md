@@ -28878,3 +28878,22 @@ own before-arm varied 970-1,137 ms between rounds.
 A date-literal pushdown into the native reader was built and measured on the same harness in the
 same session (0.994 overall; q6 0.63x, q3 1.35x, q7 1.31x) and reverted. Review item 27g has the
 decomposition.
+
+### A predicated Parquet read decodes its surviving row groups whole
+
+Same box and mirror. `ParquetSource.read` with a predicate now prunes row groups on the footers
+and returns the survivors whole for the engine's `Filter`, when they fit a quarter of the memory
+envelope (`io/formats/structured/parquet/routing.py`). TPC-H sf10 `--scan`, one build with the
+route switched on and off, alternating, two rounds, best of each:
+
+| | b/duckdb, route off | b/duckdb, route on |
+|---|---:|---:|
+| TPC-H sf10 from Parquet | 1.542 | **1.379** |
+
+Per query, on against off: geomean **0.899**; q12 0.61x, q3 0.66x, q10 0.69x, q6 0.70x, q1 0.79x,
+q2 0.81x, q8 0.83x; the slowest movements, q20 1.11x and q22 1.09x, sit inside those queries'
+own round-to-round spread. Every run passed every correctness check.
+
+The oracle that motivated it forced a native unfiltered read for every predicated read with no
+pruning and no memory guard: 1.526 -> 1.356. The shipped route gives up nothing measurable
+against that oracle and keeps both protections.

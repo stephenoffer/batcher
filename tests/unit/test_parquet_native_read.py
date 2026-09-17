@@ -68,13 +68,23 @@ def test_a_projection_reads_the_same_columns_either_way(parquet_path: str):
     assert got == [{"a": 1, "c": "w"}, {"a": 2, "c": "x"}, {"a": 3, "c": "y"}, {"a": 4, "c": "z"}]
 
 
-def test_a_pushed_predicate_reads_the_same_rows_either_way(parquet_path: str):
+def test_a_pushed_predicate_reads_a_superset_and_the_engine_answers_exactly(parquet_path: str):
+    """`read` promises a superset of the matching rows, and no longer filters in practice.
+
+    A predicate whose matches cannot be ruled out of a row group now returns that row group
+    whole and leaves the rows to the engine's `Filter` (`parquet/routing.py`). So the source may
+    hand back rows the predicate rejects, and must never withhold one it accepts; the query
+    through the engine is what answers exactly.
+    """
+    import batcher as bt
     from batcher.plan.expr_ir import col
 
     source = ParquetSource(parquet_path)
     predicate = (col("a") > 2).to_ir()
-    rows = _rows(source.read(projection=["a"], predicate=predicate))
-    assert sorted(r["a"] for r in rows) == [3, 4]
+    rows = {r["a"] for r in _rows(source.read(projection=["a"], predicate=predicate))}
+    assert {3, 4} <= rows <= {1, 2, 3, 4}
+    got = bt.read.parquet(parquet_path).filter(bt.col("a") > 2).select("a").collect()
+    assert sorted(got.column("a").to_pylist()) == [3, 4]
 
 
 def test_a_backend_without_a_native_target_falls_back_to_the_handle(parquet_path: str, table):

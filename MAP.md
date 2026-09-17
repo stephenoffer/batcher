@@ -161,7 +161,7 @@ Batcher — a native, JIT-compiling, adaptive data engine.
 
 | module | lines | what it is |
 |---|---|---|
-| `_exports.py` | 1387 | The routing tables behind Batcher's lazy re-export façades — GENERATED, do not edit. |
+| `_exports.py` | 1384 | The routing tables behind Batcher's lazy re-export façades — GENERATED, do not edit. |
 | `_lazy.py` | 136 | PEP 562 lazy re-export façades, shared by every package that is one. |
 
 ### `batcher/api/` — 5 · conductor
@@ -349,7 +349,7 @@ Session entry points that create `Dataset`s.
 | `frameworks.py` | 419 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
 | `onboarding.py` | 140 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
-| `read.py` | 131 | The generic read dispatch plus the top-level ``read_*`` shorthands. |
+| `read.py` | 129 | The generic read dispatch behind the `bt.read` namespace. |
 | `sql.py` | 165 | The default SQL catalog: `bt.sql`, `bt.register_function` and `bt.register_model`. |
 | `versions.py` | 125 | Version and environment reporting (`engine_version`, `show_versions`). |
 

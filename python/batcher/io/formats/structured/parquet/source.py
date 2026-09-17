@@ -219,6 +219,63 @@ class ParquetSource(FileSource):
             return None
         return [b for batches in per_file for b in batches]  # type: ignore[union-attr]
 
+    def _native_read_pruned(
+        self, projection: list[str] | None, predicate: dict
+    ) -> list[pa.RecordBatch] | None:
+        """The row groups the footers cannot rule out, decoded whole, or ``None``.
+
+        ``None`` hands the read to the filtered paths below: when the files are not
+        addressable by the native reader, when there are too many to walk their footers, and
+        when the surviving row groups are estimated too large to hold unfiltered in a quarter
+        of the query's memory envelope. The result is a superset of the matching rows, which
+        is all `read` promises; `routing` has the measurement behind the choice.
+        """
+        from batcher._internal.hardware.memory import machine_memory_bytes
+        from batcher.config import active_config
+        from batcher.io.formats.structured.parquet import routing
+
+        files = self._files()
+        if not files or self._too_many_files_to_sweep():
+            return None
+        if not all(self._native_uri_is_addressable(f) for f in files):
+            return None
+        schema = self._read_schema_or_none()
+        columns = routing.predicate_columns(predicate)
+        if schema is None or not columns:
+            return None
+        bounds = routing.row_group_bounds_cached(self._fs, files, columns)
+        if not bounds:
+            return None
+        survivors = routing.surviving_row_groups(bounds, predicate, columns)
+        budget = active_config().memory.max_memory_bytes or machine_memory_bytes()
+        rows = sum(rg.num_rows for rg in survivors)
+        if routing.decoded_bytes(schema, projection, rows) > budget * routing.MEMORY_FRACTION:
+            return None
+        by_file: dict[str, list[int]] = {}
+        for rg in survivors:
+            by_file.setdefault(rg.file_path, []).append(rg.row_group)
+
+        def _read_one(f: str) -> list[pa.RecordBatch] | None:
+            groups = by_file.get(f)
+            if not groups:
+                return []
+            batches = _parquet_native.read_row_groups_filtered(
+                f, groups, projection, None, _parquet_native.native_read_batch(schema, projection)
+            )
+            return None if batches is None else list(self._normalize(batches, projection, f))
+
+        wanted = [f for f in files if f in by_file]
+        if len(wanted) <= 1:
+            per_file = [_read_one(f) for f in wanted]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=self._read_concurrency(len(wanted))) as pool:
+                per_file = list(pool.map(_read_one, wanted))
+        if any(batches is None for batches in per_file):
+            return None
+        return [b for batches in per_file for b in batches]  # type: ignore[union-attr]
+
     def _read_by_path(self, path: str, projection: list[str] | None) -> list[pa.RecordBatch] | None:
         """The unfiltered read: native Rust reader when possible, else PyArrow.
 
@@ -313,10 +370,12 @@ class ParquetSource(FileSource):
         engine keeps its `Filter` above the scan (`core.scan_only_result` declines its no-op
         shortcut whenever a predicate was pushed, for exactly this reason), so a filter the
         reader cannot bind never fails the query; it falls back to a coarser reader and reads
-        more rows. In practice both pushdown paths return exactly the matching rows, and they
-        take care to: a pruning-only result is correct but can be the *whole file* when the
-        predicate's matches are scattered across every row-group, which is a 100x memory
-        difference on a large scan. See `_native_read_filtered`.
+        more rows. The first choice skips the row groups the footers rule out and returns the
+        rest whole, leaving the rows to that `Filter`, which is faster than filtering here
+        (`routing`). It is taken only while those row groups fit a quarter of the memory
+        envelope, because a scattered predicate can leave every row group alive and a whole
+        file is up to 100x what the matching rows occupy; past that, the filtered readers
+        return exactly the matching rows. See `_native_read_filtered`.
 
         Examples:
             .. doctest::
@@ -346,6 +405,11 @@ class ParquetSource(FileSource):
         if self._schema_mode != "strict":
             return super().read(projection)
         if predicate is not None:
+            # Prune row groups on the footers and decode the survivors whole, leaving the
+            # rows to the engine's `Filter` -- when that fits in memory. See `routing`.
+            pruned = self._native_read_pruned(projection, predicate)
+            if pruned is not None:
+                return pruned
             # Selective scan: try the native filtered reader first (row-group + page-index
             # pruning in Rust), then PyArrow's `filters=`, then an unfiltered read. Each
             # step down reads more rows and none of them changes the answer.
