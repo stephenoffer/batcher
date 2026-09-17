@@ -3468,6 +3468,13 @@ because every suite reports a warm best-of-N. It decides every short script, not
 run, and it is a lazy-import refactor across the reader namespace and the orchestration imports
 rather than an engine change.
 
+One part of the first `collect()` was Batcher's own and was not an import. The optimizer asked
+each expression type `hasattr(expr, "op")`, and a miss falls through to `Expr.__getattr__`, which
+builds the user-facing migration hint by loading the whole migration registry, 42 files. That cost
+114-186 ms of CPU per process, measured on a loaded box, for a message `hasattr` discards. The
+probe now uses `object.__getattribute__`, which never reaches `__getattr__`, and
+`tests/unit/test_expr_dispatch_probe.py` fails on the old probe.
+
 ### 27j. A predicated Parquet read decodes its surviving row groups whole — **landed, TPC-H sf10 1.54x to 1.38x**
 
 27g ended on "a routing decision, not a literal", and the oracle for that decision came out
