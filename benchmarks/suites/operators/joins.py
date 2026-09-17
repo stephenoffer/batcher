@@ -178,3 +178,20 @@ def join_build_large(ctx: Context):
         ") b ON a.l_orderkey = b.l_orderkey WHERE a.q > 20 AND b.d > 0.02"
     )
     return sql_fanout(ctx, sql)
+
+
+@joins.case("op-join-full-outer")
+def join_full_outer(ctx: Context):
+    """A FULL OUTER JOIN of every third order with every even-keyed line -- both sides unmatched.
+
+    Inner, left, semi and anti joins all emit from the probe side. A full join must also
+    remember which *build* rows were never matched and emit them afterwards, which is the
+    one join type whose result depends on state gathered across the whole probe.
+    """
+    sql = (
+        "SELECT COUNT(*) AS n, COUNT(o.o_orderkey) AS o, COUNT(l.l_orderkey) AS l FROM "
+        "(SELECT o_orderkey FROM orders WHERE o_orderkey % 3 = 0) o FULL OUTER JOIN "
+        "(SELECT l_orderkey FROM lineitem WHERE l_orderkey % 2 = 0) l "
+        "ON o.o_orderkey = l.l_orderkey"
+    )
+    return sql_fanout(ctx, sql)
