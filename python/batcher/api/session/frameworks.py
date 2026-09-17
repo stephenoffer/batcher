@@ -397,6 +397,11 @@ _BY_TYPE: dict[tuple[str, str], str] = {
 def _dispatch_name(obj: Any) -> str | None:
     """The `from_*` function name for `obj`, matched on its type without importing it."""
     for cls in type(obj).__mro__:
+        if ".interchange." in cls.__module__:
+            # pandas' interchange-protocol object subclasses a protocol class that is also
+            # called `DataFrame`, and it is not a pandas frame: `from_any` converts it
+            # through the protocol instead.
+            continue
         key = (cls.__module__.split(".", 1)[0], cls.__name__)
         if key in _BY_TYPE:
             return _BY_TYPE[key]
@@ -410,8 +415,10 @@ def from_any(data: Any) -> Dataset:
     the framework: a `Dataset` passes through, a path string is `read`, an Arrow
     table/batch, dict, list of dicts, list of values, NumPy array, pandas or Polars
     frame, DuckDB relation, HuggingFace/Ray/Dask/Spark/Daft dataset, or anything exporting
-    ``__arrow_c_stream__`` routes to the matching `from_*` constructor. Reach for the
-    specific constructor when you know the type — the error messages are better.
+    ``__arrow_c_stream__`` routes to the matching `from_*` constructor. An object exporting
+    only the DataFrame interchange protocol (``__dataframe__``, what Polars' ``from_dataframe``
+    consumes) is converted through ``pyarrow.interchange``. Reach for the specific
+    constructor when you know the type — the error messages are better.
 
     Args:
         data: The object to ingest.
@@ -448,6 +455,12 @@ def from_any(data: Any) -> Dataset:
         return from_pydict(data)
     if hasattr(data, "__arrow_c_stream__"):
         return from_arrow(data)
+    if hasattr(data, "__dataframe__"):
+        # The DataFrame interchange protocol: the older, column-wise sibling of the Arrow
+        # stream above, and the only one some frame libraries export. pyarrow consumes it.
+        from pyarrow.interchange import from_dataframe
+
+        return from_arrow(from_dataframe(data))
     if isinstance(data, Sequence):
         rows = list(data)
         if rows and all(isinstance(r, pa.RecordBatch) for r in rows):

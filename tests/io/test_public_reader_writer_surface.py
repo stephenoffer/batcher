@@ -214,6 +214,7 @@ def test_every_reader_is_reachable_and_a_typo_is_named(name, call):
 #: The ``ds.write`` connectors, with the smallest call that reaches each.
 WRITERS = [
     ("cassandra", lambda ds: ds.write.cassandra("t")),
+    ("clickhouse", lambda ds: ds.write.clickhouse("t", host="localhost")),
     ("dynamodb", lambda ds: ds.write.dynamodb("t")),
     ("elasticsearch", lambda ds: ds.write.elasticsearch("i")),
     ("hbase", lambda ds: ds.write.hbase("t")),

@@ -130,9 +130,27 @@ class BinarySource:
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         return list(self.iter_batches(projection))
 
+    def _listing_batch(self, files: list[str]) -> pa.RecordBatch:
+        """A file-batch's ``uri`` and ``size`` from the listing, with no payload read.
+
+        A scan that projects neither ``bytes`` nor ``mime`` is a file inventory: which files
+        match, and how big each is. That is what Daft's ``from_glob_path`` answers, and it
+        used to cost a full read of every file, because this source fetched the payloads
+        and then dropped them in `select`. Each size is one stat, taken concurrently, and a
+        stat that fails raises rather than reporting a size the file does not have.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max(1, min(32, len(files)))) as pool:
+            sizes = list(pool.map(self._fs.size, files))
+        return pa.RecordBatch.from_arrays(
+            [pa.array(files, pa.string()), pa.array(sizes, pa.int64())], names=["uri", "size"]
+        )
+
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+        listing_only = projection is not None and not {"bytes", "mime"} & set(projection)
         for chunk in self._chunks():
-            batch = self._batch(chunk)
+            batch = self._listing_batch(chunk) if listing_only else self._batch(chunk)
             yield batch.select(projection) if projection is not None else batch
 
     def row_count(self) -> int | None:

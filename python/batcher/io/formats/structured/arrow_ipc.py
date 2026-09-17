@@ -6,6 +6,11 @@ shape: batches are already Arrow, so read/write are conversion-free. Reads expos
 so a distributed read pulls only its assigned blocks via
 ``ipc.open_file(...).get_batch(i)``. Projection is applied per batch with
 ``batch.select``. Registered under ``arrow``, ``feather`` and ``ipc``.
+
+The IPC *stream* format (what Polars calls ``write_ipc_stream``) carries the same batches
+with no footer, so it has no block index to split on. The reader recognizes it by the
+missing footer and reads it front to back as one split; the writer produces it with
+``ipc_format="stream"``.
 """
 
 from __future__ import annotations
@@ -32,6 +37,33 @@ def _require_ipc() -> Any:
 
 def _select(batch: pa.RecordBatch, projection: list[str] | None) -> pa.RecordBatch:
     return batch.select(projection) if projection is not None else batch
+
+
+def _open_ipc(fh: IO[Any]) -> tuple[Any, bool]:
+    """Open `fh` as an IPC file, or as an IPC stream when it has no file footer.
+
+    Returns:
+        The reader, and whether it is the file format (so its blocks are addressable).
+    """
+    ipc = _require_ipc()
+    start = fh.tell()
+    try:
+        return ipc.open_file(fh), True
+    except pa.ArrowInvalid:
+        fh.seek(start)
+        return ipc.open_stream(fh), False
+
+
+def _ipc_batches(
+    reader: Any, is_file: bool, projection: list[str] | None
+) -> Iterator[pa.RecordBatch]:
+    """Every batch of an open IPC reader, in order, whichever of the two formats it is."""
+    if is_file:
+        for i in range(reader.num_record_batches):
+            yield _select(reader.get_batch(i), projection)
+    else:
+        for batch in reader:
+            yield _select(batch, projection)
 
 
 #: Offset widths for the variable-length layouts, by the predicate that recognizes them.
@@ -138,13 +170,10 @@ class ArrowIPCSource(FileSource):
     __slots__ = ()
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
-        ipc = _require_ipc()
-        return ipc.open_file(fh).schema
+        return _open_ipc(fh)[0].schema
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
-        ipc = _require_ipc()
-        reader = ipc.open_file(fh)
-        return [_select(reader.get_batch(i), projection) for i in range(reader.num_record_batches)]
+        return list(_ipc_batches(*_open_ipc(fh), projection))
 
     def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
         """Stream one IPC file batch by batch rather than holding every batch at once.
@@ -153,16 +182,14 @@ class ArrowIPCSource(FileSource):
         collects them into a list, which is the whole file in memory. Yielding them keeps
         peak memory at one batch.
         """
-        ipc = _require_ipc()
         with self._fs.open(path) as fh:
-            reader = ipc.open_file(fh)
-            for i in range(reader.num_record_batches):
-                yield _select(reader.get_batch(i), projection)
+            yield from _ipc_batches(*_open_ipc(fh), projection)
 
     def _file_row_count(self, path: str) -> int | None:
-        ipc = _require_ipc()
         with self._fs.open(path) as fh:
-            reader = ipc.open_file(fh)
+            reader, is_file = _open_ipc(fh)
+            if not is_file:
+                return None  # a stream has no footer to count from without reading it all
             return sum(reader.get_batch(i).num_rows for i in range(reader.num_record_batches))
 
     def _file_splits(
@@ -192,9 +219,11 @@ class ArrowIPCSource(FileSource):
             or self._errors.mode != "raise"
         ):
             return [FileSplit(self.format_name, path, self._reader_kwargs())]
-        ipc = _require_ipc()
         with self._fs.open(path) as fh:
-            n = ipc.open_file(fh).num_record_batches
+            reader, is_file = _open_ipc(fh)
+            if not is_file:
+                return [FileSplit(self.format_name, path, self._reader_kwargs())]
+            n = reader.num_record_batches
         return [ArrowBlockSplit(path, (i,)) for i in range(n)]
 
 
@@ -202,30 +231,47 @@ class ArrowIPCSource(FileSource):
 @SINKS.register("feather")
 @SINKS.register("ipc")
 class ArrowIPCSink(FileSink):
-    """Write an Arrow IPC (Feather v2) file."""
+    """Write an Arrow IPC (Feather v2) file, or an IPC stream.
+
+    Args:
+        compression: The buffer compression codec, or None.
+        ipc_format: ``"file"`` (the default) writes the IPC file format, whose footer
+            indexes the batches; ``"stream"`` writes the footer-less stream format.
+    """
 
     suffix = ".arrow"
     format_name = "arrow"
 
-    __slots__ = ("compression",)
+    __slots__ = ("compression", "ipc_format")
 
-    def __init__(self, compression: str | None = "zstd", **kwargs: Any) -> None:
+    def __init__(
+        self, compression: str | None = "zstd", ipc_format: str = "file", **kwargs: Any
+    ) -> None:
         super().__init__(**kwargs)  # carries filesystem= / storage_options=
-        self.compression = compression
+        if ipc_format not in ("file", "stream"):
+            from batcher._internal.errors import FormatError
 
-    def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
+            raise FormatError(
+                f"write.arrow ipc_format must be 'file' or 'stream', got {ipc_format!r}"
+            )
+        self.compression = compression
+        self.ipc_format = ipc_format
+
+    def _new_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
         ipc = _require_ipc()
         options = ipc.IpcWriteOptions(compression=self.compression)
-        with ipc.new_file(fh, table.schema, options=options) as writer:
+        new = ipc.new_stream if self.ipc_format == "stream" else ipc.new_file
+        return new(fh, schema, options=options)
+
+    def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
+        with self._new_writer(fh, table.schema) as writer:
             # Per batch rather than `write_table`, so each one passes through the offset
             # rebase. A table assembled from engine batches carries the same chunks.
             for batch in table.to_batches():
                 writer.write_batch(_rebase_offsets(batch))
 
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
-        ipc = _require_ipc()
-        options = ipc.IpcWriteOptions(compression=self.compression)
-        return ipc.new_file(fh, schema, options=options)
+        return self._new_writer(fh, schema)
 
     def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
         writer.write_batch(_rebase_offsets(batch))

@@ -1,4 +1,4 @@
-"""Plain-text source — one row per line or one row per whole file.
+"""Plain-text source and sink — one row per line or per whole file, one line per value.
 
 A text corpus is not one encoding. Scraped pages, exported logs and anything a Windows
 editor touched are a mixture, and the two read modes here used to *disagree* about what
@@ -12,17 +12,19 @@ file costs the corpus.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import IO, Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import FormatError
+from batcher._internal.errors import FormatError, SchemaError
+from batcher.io.base import FileSink
 from batcher.io.base._lines import iter_line_blocks, one_array
 from batcher.io.base._tolerance import ErrorPolicy
 from batcher.io.filesystem import resolve_filesystem
-from batcher.io.formats.base import SOURCES
+from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
 
-__all__ = ["TextSource"]
+__all__ = ["TextSink", "TextSource"]
 
 _LINE_SCHEMA = pa.schema(
     [("path", pa.string()), ("line_number", pa.int64()), ("text", pa.string())]
@@ -66,7 +68,16 @@ class TextSource:
     `mode="file"` → one row per whole file. Each split is a single file.
     """
 
-    __slots__ = ("_encoding", "_errors", "_files_cache", "_fs", "_mode", "_path", "_tolerance")
+    __slots__ = (
+        "_encoding",
+        "_errors",
+        "_files_cache",
+        "_fs",
+        "_mode",
+        "_path",
+        "_skip_blank_lines",
+        "_tolerance",
+    )
 
     def __init__(
         self,
@@ -76,6 +87,7 @@ class TextSource:
         encoding: str = "utf-8",
         errors: str = "replace",
         on_error: str = "raise",
+        skip_blank_lines: bool = False,
     ) -> None:
         """Open a text corpus.
 
@@ -92,12 +104,21 @@ class TextSource:
                 surprising of the two behaviours.
             on_error: ``"raise"`` (default) or ``"skip"``, which drops an unreadable file
                 and records it in `corrupt_files`.
+            skip_blank_lines: Drop lines that are empty or hold only whitespace, the way
+                Daft's ``read_text`` does by default. The kept rows keep their original
+                ``line_number``. Line mode only.
 
         Raises:
-            FormatError: If `mode` is not ``"line"`` or ``"file"``.
+            FormatError: If `mode` is not ``"line"`` or ``"file"``, or `skip_blank_lines`
+                is asked of file mode.
         """
         if mode not in ("line", "file"):
             raise FormatError(f"TextSource mode must be 'line' or 'file', got {mode!r}")
+        if skip_blank_lines and mode != "line":
+            raise FormatError(
+                "TextSource skip_blank_lines=True needs mode='line': in file mode a row is a "
+                "whole file, so there is no blank line to drop"
+            )
         _check_error_handler(errors)
         self._path = path
         self._fs = resolve_filesystem(path)
@@ -107,6 +128,7 @@ class TextSource:
         # A text corpus at scale always holds a few unreadable members — a permissions
         # error, a truncated object, a file that is not text at all under `errors="strict"`.
         self._tolerance = ErrorPolicy(on_error)
+        self._skip_blank_lines = skip_blank_lines
         self._files_cache: list[str] | None = None
 
     def corrupt_files(self) -> list[str]:
@@ -311,6 +333,11 @@ class TextSource:
             ],
             names=["path", "line_number", "text"],
         )
+        if self._skip_blank_lines:
+            import pyarrow.compute as pc
+
+            blank = pc.or_(pc.equal(pc.utf8_length(lines), 0), pc.utf8_is_space(lines))
+            batch = batch.filter(pc.invert(blank))
         return batch.select(projection) if projection is not None else batch
 
     def _build_batch(self, f: str, data: str, projection: list[str] | None) -> pa.RecordBatch:
@@ -384,6 +411,9 @@ class TextSource:
         # the other. Omitting it collided their identities. Kept off the key for the
         # utf-8 default so the common identity is unchanged.
         base = f"text:{self._mode}:{self._path}"
+        if self._skip_blank_lines:
+            # A different row set, so a different relation for learned statistics.
+            base = f"{base}#skip_blank"
         if self._encoding.lower().replace("-", "") != "utf8":
             return f"{base}#enc={self._encoding}"
         return base
@@ -456,15 +486,105 @@ class TextSource:
                 )
             return out
         return [
-            WholeSourceSplit(TextSource(f, mode=self._mode, encoding=self._encoding)) for f in files
+            WholeSourceSplit(
+                TextSource(
+                    f,
+                    mode=self._mode,
+                    encoding=self._encoding,
+                    skip_blank_lines=self._skip_blank_lines,
+                )
+            )
+            for f in files
         ]
 
     def _can_range_split(self, projection: list[str] | None) -> bool:
         """Whether this scan can be served by byte ranges rather than whole files."""
         return (
             self._mode == "line"
+            # A byte range knows nothing of blank-line filtering, so it would keep them.
+            and not self._skip_blank_lines
             and projection is not None
             and "line_number" not in projection
             and bool(projection)
             and self._encoding.lower().replace("-", "").replace("_", "") in ("utf8", "u8", "utf")
         )
+
+
+@SINKS.register("text")
+class TextSink(FileSink):
+    """Write a single string column as plain text, one value per line.
+
+    The writer Spark calls ``DataFrameWriter.text``, with Spark's contract: the dataset must
+    have exactly one column and it must be a string, and a null value is written as an empty
+    line rather than refused. That last rule is lossy on purpose. A text file has no way to
+    say "no value", so reading the file back gives ``""`` where the null was, which is what
+    every engine that writes text does.
+
+    A value that itself contains a line break becomes several lines on disk, for the same
+    reason. Nothing is escaped, because text has no escape convention to follow.
+
+    Each batch is encoded in one Arrow join and written as one buffer, so a streaming write
+    holds a single batch and there is no per-row Python.
+
+    Args:
+        line_sep: The terminator written after every value (Spark's ``lineSep``).
+    """
+
+    suffix = ".txt"
+    format_name = "text"
+
+    __slots__ = ("_line_sep",)
+
+    def __init__(self, *, line_sep: str = "\n", **kwargs: Any) -> None:
+        super().__init__(**kwargs)  # carries filesystem= / storage_options=
+        if not line_sep:
+            raise FormatError("text write line_sep must be a non-empty string")
+        self._line_sep = line_sep
+
+    @staticmethod
+    def _check_schema(schema: pa.Schema) -> None:
+        """Refuse anything but one string column, naming what was found instead."""
+        if len(schema) != 1 or not (
+            pa.types.is_string(schema[0].type) or pa.types.is_large_string(schema[0].type)
+        ):
+            found = ", ".join(f"{f.name}: {f.type}" for f in schema) or "no columns"
+            raise SchemaError(
+                "write.text needs exactly one string column, got "
+                f"[{found}]. Select or concatenate the text first, for example "
+                "ds.select(bt.concat_str(...).alias('value'))."
+            )
+
+    def _encode(self, batch: pa.RecordBatch) -> pa.Buffer | None:
+        """One batch's lines as a single buffer, terminators included, or None if empty."""
+        import pyarrow.compute as pc
+
+        if batch.num_rows == 0:
+            return None
+        values = pc.fill_null(batch.column(0).cast(pa.large_string()), "")
+        # A one-element list over every value, joined by the terminator: the whole batch
+        # becomes one string in C. The trailing terminator is appended as its own write.
+        offsets = pa.array([0, len(values)], pa.int64())
+        separator = pa.scalar(self._line_sep, pa.large_string())
+        joined = pc.binary_join(pa.LargeListArray.from_arrays(offsets, values), separator)
+        return joined[0].as_buffer()
+
+    def _write_encoded(self, fh: IO[Any], batch: pa.RecordBatch) -> None:
+        buffer = self._encode(batch)
+        if buffer is not None:
+            fh.write(buffer)
+            fh.write(self._line_sep.encode("utf-8"))
+
+    def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
+        self._check_schema(table.schema)
+        for batch in table.to_batches():
+            self._write_encoded(fh, batch)
+
+    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
+        self._check_schema(schema)
+        return fh
+
+    def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
+        self._write_encoded(writer, batch)
+
+    def _close_stream_writer(self, writer: Any) -> None:
+        """Nothing to flush: the handle belongs to the atomic writer, which closes it."""

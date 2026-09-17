@@ -119,7 +119,7 @@ protobuf = ["protobuf>=4", "protarrow>=0.3"]
 msgpack = ["ormsgpack>=1"]
 hdf5 = ["h5py>=3.10"]
 zarr = ["zarr>=2.17"]
-tfrecord = ["tfr-reader>=0.1"]
+tfrecord = ["tfr-reader>=0.1", "google-crc32c>=1.5"]
 pdf = ["pypdf>=4"]
 # --- Lakehouse (ACID table formats + catalogs) ---
 delta = ["deltalake>=0.18"]
