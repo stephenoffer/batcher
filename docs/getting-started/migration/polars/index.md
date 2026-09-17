@@ -14,7 +14,7 @@ The codemod rewrites Polars calls onto Batcher spellings:
 python -m batcher.migrate --from polars --to batcher <paths>
 ```
 
-Replace `<paths>` with the files or directories to rewrite. This direction isn't implemented yet, so the command refuses it with a `ConfigError`. The implemented directions are `--from batcher --to batcher`. Until yours lands, port by hand with the tables on these pages.
+Replace `<paths>` with the files or directories to rewrite. This direction is implemented. Without `--write` the command prints a diff and changes nothing, and `--write` applies it.
 
 ## How to read the tables
 

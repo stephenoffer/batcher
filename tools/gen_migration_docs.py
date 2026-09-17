@@ -48,6 +48,7 @@ from batcher._internal.migration import (  # noqa: E402
     Status,
     load_registry,
 )
+from batcher._internal.migration.schema import ENGINES as ENGINE_KEYS  # noqa: E402
 
 MIGRATION_DOCS = REPO / "docs" / "getting-started" / "migration"
 _CLI = REPO / "python" / "batcher" / "migrate" / "__main__.py"
@@ -343,8 +344,41 @@ def _implemented() -> set[tuple[str, str]]:
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == "_IMPLEMENTED" for t in node.targets
         ):
-            return set(ast.literal_eval(node.value))
+            return _directions(node.value)
     raise SystemExit(f"{_CLI}: no `_IMPLEMENTED` assignment to read the directions from")
+
+
+def _directions(node: ast.expr) -> set[tuple[str, str]]:
+    """Read the `_IMPLEMENTED` set: literal pairs, and `*((engine, "x") for engine in ENGINES)`.
+
+    Only those two shapes are understood, so a new spelling of the set fails loudly here
+    instead of the pages silently listing the wrong directions.
+    """
+    if not isinstance(node, ast.Set):
+        raise SystemExit(f"{_CLI}: `_IMPLEMENTED` is not a set display")
+    out: set[tuple[str, str]] = set()
+    for elt in node.elts:
+        if isinstance(elt, ast.Starred) and isinstance(elt.value, ast.GeneratorExp):
+            gen = elt.value
+            loop = gen.generators[0]
+            if not (
+                len(gen.generators) == 1
+                and isinstance(loop.target, ast.Name)
+                and isinstance(loop.iter, ast.Name)
+                and loop.iter.id == "ENGINES"
+                and isinstance(gen.elt, ast.Tuple)
+            ):
+                raise SystemExit(f"{_CLI}: unrecognized generator in `_IMPLEMENTED`")
+            var = loop.target.id
+            for engine in ENGINE_KEYS:
+                pair = tuple(
+                    engine if isinstance(p, ast.Name) and p.id == var else ast.literal_eval(p)
+                    for p in gen.elt.elts
+                )
+                out.add(pair)  # type: ignore[arg-type]
+        else:
+            out.add(tuple(ast.literal_eval(elt)))  # type: ignore[arg-type]
+    return out
 
 
 def _surface_kinds() -> dict[tuple[str, str], tuple[str, str]]:

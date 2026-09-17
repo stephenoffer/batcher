@@ -10,7 +10,7 @@ To rewrite Batcher code the other way, run the codemod in reverse:
 python -m batcher.migrate --from batcher --to daft <paths>
 ```
 
-Replace `<paths>` with the files or directories to rewrite. This direction isn't implemented yet, so the command refuses it with a `ConfigError`. The implemented directions are `--from batcher --to batcher`. Until yours lands, port by hand with the tables on these pages.
+Replace `<paths>` with the files or directories to rewrite. This direction is implemented. Without `--write` the command prints a diff and changes nothing, and `--write` applies it.
 
 ## Batcher to Daft
 

@@ -10,7 +10,7 @@ To rewrite PySpark code onto these spellings, run the codemod:
 python -m batcher.migrate --from pyspark --to batcher <paths>
 ```
 
-Replace `<paths>` with the files or directories to rewrite. This direction isn't implemented yet, so the command refuses it with a `ConfigError`. The implemented directions are `--from batcher --to batcher`. Until yours lands, port by hand with the tables on these pages.
+Replace `<paths>` with the files or directories to rewrite. This direction is implemented. Without `--write` the command prints a diff and changes nothing, and `--write` applies it.
 
 ## `SparkSession`
 
@@ -32,7 +32,7 @@ The following table maps the 37 names on `SparkSession`, sorted alphabetically.
 | `copyFromLocalToFs` | n/a | out of scope | Declined: Spark Connect local-to-server file copy. |
 | `createDataFrame` | `bt.from_pylist` + `bt.from_pandas` + `bt.from_arrow` | param | Missing: one constructor taking rows/tuples/pandas/Arrow with schema= as StructType, DDL string or column-name list. Wave W2. |
 | `dataSource` | `batcher.io.SOURCES` | param | Missing: register a Python DataSource class by name (dataSource.register). Wave W11. |
-| `emptyDataFrame` | `bt.from_pydict` | canonical |  |
+| `emptyDataFrame` | `bt.from_pydict` | param | Missing: an empty Dataset from a Spark StructType schema; bt.from\_pydict(\{\}, schema=...) takes a pyarrow.Schema. Wave W2. |
 | `getActiveSession` | n/a | gap | Not yet: the active session accessor. Wave W9. |
 | `getTags` | n/a | gap | Not yet: session operation tags. Wave W9. |
 | `interruptAll` | `bt.running_queries` + `bt.cancel_query` | canonical |  |

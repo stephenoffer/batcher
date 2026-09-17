@@ -10,11 +10,11 @@ To rewrite Batcher code the other way, run the codemod in reverse:
 python -m batcher.migrate --from batcher --to pyspark <paths>
 ```
 
-Replace `<paths>` with the files or directories to rewrite. This direction isn't implemented yet, so the command refuses it with a `ConfigError`. The implemented directions are `--from batcher --to batcher`. Until yours lands, port by hand with the tables on these pages.
+Replace `<paths>` with the files or directories to rewrite. This direction is implemented. Without `--write` the command prints a diff and changes nothing, and `--write` applies it.
 
 ## Batcher to PySpark
 
-The following table maps 252 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 251 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
@@ -51,7 +51,6 @@ The following table maps 252 Batcher spellings to the PySpark names that compute
 | `bt.dense_rank` | `functions.dense_rank` |
 | `bt.engine_version` | `SparkSession.version` |
 | `bt.from_epoch` | `functions.timestamp_micros`, `functions.timestamp_millis`, `functions.timestamp_seconds` |
-| `bt.from_pydict` | `SparkSession.emptyDataFrame` |
 | `bt.from_unix_date` | `functions.date_from_unix_date` |
 | `bt.greatest` | `functions.greatest` |
 | `bt.hypot` | `functions.hypot` |

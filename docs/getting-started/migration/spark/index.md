@@ -14,7 +14,7 @@ The codemod rewrites PySpark calls onto Batcher spellings:
 python -m batcher.migrate --from pyspark --to batcher <paths>
 ```
 
-Replace `<paths>` with the files or directories to rewrite. This direction isn't implemented yet, so the command refuses it with a `ConfigError`. The implemented directions are `--from batcher --to batcher`. Until yours lands, port by hand with the tables on these pages.
+Replace `<paths>` with the files or directories to rewrite. This direction is implemented. Without `--write` the command prints a diff and changes nothing, and `--write` applies it.
 
 ## How to read the tables
 
@@ -42,7 +42,7 @@ The following table lists the waves that hold PySpark rows, in delivery order:
 | WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 5 |
 | W0 | Silent mismatches: parameters that restore the other engine's semantics | 97 |
 | W1 | Python constructors over SQL functions Batcher already has | 29 |
-| W2 | Missing parameters across all four engines | 68 |
+| W2 | Missing parameters across all four engines | 69 |
 | W3 | Scalar functions | 28 |
 | W4 | Maps, higher-order functions, and list reduction | 16 |
 | W5 | Window functions, including rolling and dynamic group-by | 4 |
@@ -69,7 +69,7 @@ The following table lists the pages in this section with the number of names eac
 | {doc}`functions-strings` | 93 | 38 | 6 | 24 | 25 | 0 |
 | {doc}`functions-temporal` | 88 | 30 | 11 | 15 | 32 | 0 |
 | {doc}`io` | 70 | 23 | 19 | 16 | 12 | 0 |
-| {doc}`session-and-sql` | 101 | 37 | 9 | 2 | 46 | 7 |
+| {doc}`session-and-sql` | 101 | 36 | 10 | 2 | 46 | 7 |
 | {doc}`types-and-data-sources` | 57 | 13 | 34 | 2 | 8 | 0 |
 
 {doc}`leaving-batcher` maps the other way, from Batcher spellings back to PySpark.
