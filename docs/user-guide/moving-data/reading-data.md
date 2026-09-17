@@ -166,6 +166,8 @@ import pandas as pd
 ds = bt.from_pandas(pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}))
 ```
 
+When you don't want to name the library, {py:func}`from_any <batcher.from_any>` dispatches on the object's type. It also accepts an object that exports only the DataFrame interchange protocol (`__dataframe__`), the one Polars' `from_dataframe` consumes, and converts it through `pyarrow.interchange`.
+
 {py:func}`from_torch <batcher.from_torch>` takes a tensor, a `{name: tensor}` mapping, a tuple of tensors, or a map-style
 `Dataset`, and applies the same rank rules as `from_numpy`. See {doc}`PyTorch </integrations/compute/pytorch>` for
 the loader on the way back out, and for how `bfloat16` and the `float8` dtypes are handled.
@@ -220,6 +222,24 @@ format-specific options.
 ds = bt.read.delta("s3://lake/events")
 frames = bt.read.images("s3://bucket/photos/*.jpg")
 ```
+
+`read.arrow` reads both Arrow IPC layouts. A file with the IPC file footer splits by record
+batch, and a footer-less IPC stream, such as one from Polars' `write_ipc_stream`, is read front
+to back as one split.
+
+`read.binary` doubles as a file inventory. A scan that projects only `uri` and `size` answers
+from the file listing and never opens a file, which is the Batcher spelling of Daft's
+`from_glob_path`:
+
+```python
+# docs: skip
+inventory = bt.read.binary("s3://bucket/raw/*.jpg").select("uri", "size")
+large = inventory.filter(bt.col("size") > 10_000_000)
+```
+
+`read.text` keeps blank lines by default. `skip_blank_lines=True` drops lines that are empty
+or hold only whitespace, the way Daft's `read_text` does, and the kept rows keep their original
+`line_number`.
 
 ## Messy input
 

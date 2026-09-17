@@ -298,9 +298,9 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | module | lines | what it is |
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
-| `_write_opts.py` | 336 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
+| `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 1860 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 1992 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `writer.py` | 2170 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -356,7 +356,7 @@ Session entry points that create `Dataset`s.
 | `cache.py` | 109 | Session-level control of the process result cache: what it holds, and dropping it. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 515 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
-| `frameworks.py` | 465 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
+| `frameworks.py` | 478 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
 | `onboarding.py` | 149 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
 | `read.py` | 129 | The generic read dispatch behind the `bt.read` namespace. |
@@ -1874,12 +1874,12 @@ ML / array formats (NumPy, TFRecord, WebDataset, HDF5, Zarr) + training shards
 |---|---|---|
 | `_ndarray.py` | 75 | NumPy-slice → Arrow conversion shared by the HDF5 and Zarr array readers. |
 | `hdf5.py` | 139 | HDF5 format — array-dataset read via `h5py`, sliced to Arrow. |
-| `numpy.py` | 233 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
+| `numpy.py` | 321 | NumPy ``.npy`` / ``.npz`` source and ``.npy`` sink — arrays as Arrow columns. |
 | `point_cloud.py` | 448 | Point-cloud sources — LiDAR / depth sensor frames as Arrow columns. |
 | `ragged.py` | 207 | Variable-shape tensor columns — arrays of differing shape in one Arrow column. |
 | `tensor.py` | 139 | Fixed-shape tensor columns — multi-dimensional arrays as one Arrow column. |
-| `tfrecord.py` | 130 | TFRecord format — TensorFlow record stream → Arrow via manual framing. |
-| `webdataset.py` | 223 | WebDataset format — `.tar` shard reader via stdlib `tarfile` (core, no extra). |
+| `tfrecord.py` | 323 | TFRecord format — TensorFlow record stream ↔ Arrow via manual framing, read and write. |
+| `webdataset.py` | 333 | WebDataset format — `.tar` shard reader and writer via stdlib `tarfile` (core, no extra). |
 | `zarr.py` | 128 | Zarr format — chunked array read via `zarr`, chunk-parallel to Arrow. |
 
 ### `batcher/io/formats/ml/shards/` — 2 · neutral IO
@@ -1948,7 +1948,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `logs.py` | 222 | Log format — line-delimited text logs read as raw lines (core, no extra). |
 | `msgpack.py` | 100 | MessagePack format — row-oriented read + write via `ormsgpack`, to Arrow. |
 | `protobuf.py` | 145 | Protobuf format — length-delimited message stream → Arrow via `protarrow`. |
-| `xml.py` | 61 | XML format — Arrow-native nested read via `xml2arrow`. |
+| `xml.py` | 240 | XML format — Arrow-native nested read via `xml2arrow`, and a row-element writer. |
 
 ### `batcher/io/formats/sql/` — 2 · neutral IO
 
@@ -1959,7 +1959,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `_common.py` | 416 | Shared helpers for SQL/warehouse sources — query rewriting and import guards. |
 | `_source_base.py` | 330 | Template-Method base for a query-backed source the server returns as one result. |
 | `bigquery.py` | 398 | BigQuery source — multi-stream Arrow reads via the Storage Read API. |
-| `clickhouse.py` | 145 | ClickHouse source — Arrow reads via clickhouse-connect. |
+| `clickhouse.py` | 240 | ClickHouse source and sink — Arrow reads and inserts via clickhouse-connect. |
 | `connectorx.py` | 216 | ConnectorX source — the parallel relational reader for the long tail. |
 | `databricks.py` | 320 | Databricks source — direct lakehouse read, warehouse fallback. |
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
@@ -2052,7 +2052,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 |---|---|---|
 | `_csv_diagnostics.py` | 117 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
 | `_parquet_native.py` | 211 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
-| `arrow_ipc.py` | 234 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
+| `arrow_ipc.py` | 280 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
 | `avro.py` | 392 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
 | `csv.py` | 562 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
 | `excel.py` | 103 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
@@ -2089,9 +2089,9 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | module | lines | what it is |
 |---|---|---|
 | `_extract.py` | 300 | Reading prose out of the document formats a corpus actually contains. |
-| `binary.py` | 198 | Binary-blob source — whole files as ``{uri, bytes, size, mime}`` rows. |
+| `binary.py` | 216 | Binary-blob source — whole files as ``{uri, bytes, size, mime}`` rows. |
 | `documents.py` | 241 | Document format — text extraction from PDF, HTML, Word, decks, EPUB and Markdown. |
-| `text.py` | 470 | Plain-text source — one row per line or one row per whole file. |
+| `text.py` | 590 | Plain-text source and sink — one row per line or per whole file, one line per value. |
 | `warc.py` | 319 | WARC source — web-archive records (ISO 28500) as Arrow rows. |
 
 ### `batcher/io/lookup/` — 2 · neutral IO

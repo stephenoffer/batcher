@@ -116,9 +116,14 @@ These write one file per output partition:
 | {py:meth}`ds.write.csv(path) <batcher.api.io_namespace.writer.Writer.csv>` | CSV | |
 | {py:meth}`ds.write.json(path) <batcher.api.io_namespace.writer.Writer.json>` | newline-delimited JSON | |
 | {py:meth}`ds.write.orc(path) <batcher.api.io_namespace.writer.Writer.orc>` | ORC | |
-| {py:meth}`ds.write.arrow(path) <batcher.api.io_namespace.writer.Writer.arrow>` | Arrow/Feather IPC | |
+| {py:meth}`ds.write.arrow(path) <batcher.api.io_namespace.writer.Writer.arrow>` | Arrow/Feather IPC; `ipc_format="stream"` writes the footer-less IPC stream | |
 | {py:meth}`ds.write.avro(path) <batcher.api.io_namespace.writer.Writer.avro>` | Avro | `avro` |
 | {py:meth}`ds.write.msgpack(path) <batcher.api.io_namespace.writer.Writer.msgpack>` | MessagePack | |
+| {py:meth}`ds.write.text(path) <batcher.api.io_namespace.writer.Writer.text>` | one string column as plain text, one value per line | |
+| {py:meth}`ds.write.xml(path, row_tag="ROW", root_tag="ROWS") <batcher.api.io_namespace.writer.Writer.xml>` | XML in Spark's row-element layout | |
+| {py:meth}`ds.write.numpy(path, column=) <batcher.api.io_namespace.writer.Writer.numpy>` | one column as NumPy `.npy` arrays | |
+| {py:meth}`ds.write.webdataset(path) <batcher.api.io_namespace.writer.Writer.webdataset>` | WebDataset `.tar` shards, one sample per row keyed by `__key__` | |
+| {py:meth}`ds.write.tfrecord(path, record_format="example") <batcher.api.io_namespace.writer.Writer.tfrecord>` | TFRecord: a `tf.train.Example` per row, or raw record payloads | `tfrecord` |
 
 ### Lakehouse tables
 
@@ -156,6 +161,7 @@ These load the result into an external system. `mode` says what the write does t
 | Writer | Writes | `mode` |
 | --- | --- | --- |
 | {py:meth}`ds.write.snowflake(table, connection_kwargs=) <batcher.api.io_namespace.writer.Writer.snowflake>` | a Snowflake table | `append` / `overwrite` |
+| {py:meth}`ds.write.clickhouse(table, host=) <batcher.api.io_namespace.writer.Writer.clickhouse>` | an existing ClickHouse table, via `insert_arrow` | `append` / `overwrite` (truncates first) |
 | {py:meth}`ds.write.sql(table, uri=) <batcher.api.io_namespace.writer.Writer.sql>` | a SQL table, via ADBC for a bulk append and any PEP 249 driver otherwise | `append` / `overwrite` / `upsert` / `update` / `delete` / `delete_insert` |
 | {py:meth}`ds.write.mongo(collection, uri=) <batcher.api.io_namespace.writer.Writer.mongo>` | a MongoDB collection | `upsert` / `append` / `overwrite` / `delete` |
 | {py:meth}`ds.write.dynamodb(table, region_name=) <batcher.api.io_namespace.writer.Writer.dynamodb>` | a DynamoDB table, via `BatchWriteItem` | `upsert` / `delete` |
