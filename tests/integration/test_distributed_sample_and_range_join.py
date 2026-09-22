@@ -30,6 +30,7 @@ import pytest
 import batcher as bt
 from _ray_cluster import init_test_ray, shutdown_test_ray
 from batcher._internal.errors import PlanError
+from batcher.config import active_config
 
 pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("batcher._native", reason="native engine not built")
@@ -193,8 +194,15 @@ def test_oversized_build_side_refuses_rather_than_replicating(split_source, monk
     import batcher.dist.executors.join as dj
 
     monkeypatch.setattr(dj, "l3_cache_bytes", lambda: 1)
-    cfg = bt.config()
-    monkeypatch.setattr(type(cfg.optimizer), "resolved_broadcast_max_bytes", lambda self, _c: 1)
+    # `active_config()`, not `bt.config()`: `batcher.config` is the config *package*, so the
+    # call raised `TypeError: 'module' object is not callable` and this test had never once
+    # reached the assertion it exists for. It is the only `bt.config(` in the tree.
+    cfg = active_config()
+    # `(self, l3_cache_bytes=0, workers=1)`; the stub took one argument and raised once the
+    # `TypeError` above stopped masking it.
+    monkeypatch.setattr(
+        type(cfg.optimizer), "resolved_broadcast_max_bytes", lambda self, _c=0, _w=1: 1
+    )
 
     left = bt.read.parquet(split_source)
     right = bt.read.parquet(split_source)
