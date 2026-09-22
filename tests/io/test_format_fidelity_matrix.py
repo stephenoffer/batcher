@@ -106,14 +106,15 @@ NOT_LOCALLY_WRITABLE: dict[str, str] = {
     # written column has no image in the result to compare a value or a type against.
     "tfrecord": "records are opaque on read; payloads round-tripped by "
     "tests/io/test_ml_format_writers.py::test_tfrecord_raw_round_trips_the_record_payloads",
-    # XML is write-only in practice, and that is a defect rather than a property of the
-    # format: `io/formats/semistructured/xml.py::_to_table` calls `xml2arrow.parse`, which no
-    # released xml2arrow provides (0.3.0-0.19.0 all expose only `XmlToArrowParser`, which
-    # needs a structure config). `tests/io/test_optional_formats.py::test_xml_read` fails
-    # whenever the `xml` extra is installed and is skipped when it is not, which is why this
-    # has stayed invisible. The writer alone is covered by tests/io/test_text_and_xml_writers.py.
-    "xml": "the reader is broken (xml2arrow has no module-level `parse`); writer covered by "
-    "tests/io/test_text_and_xml_writers.py",
+    # XML reads back flat, by construction: xml2arrow's table has no list type (a `list_int`
+    # column fails outright), a struct arrives as one column per leaf so `struct` becomes
+    # `struct_a`/`struct_b`, and its type vocabulary is Boolean/Int/Float/Utf8 so `date32`
+    # returns as text. `int64` is the one class here it round-trips exactly. The matrix asks
+    # for the same column back with its type intact, which this format cannot answer for
+    # anything but the scalars -- so it is excluded on the shape of the format, not on a
+    # defect. Verified by writing each type class above through the sink and reading it back.
+    "xml": "reads back flat and text-typed (no list, struct flattens, no temporal); "
+    "covered by tests/io/test_text_and_xml_writers.py",
 }
 
 #: Type class -> a 4-row column carrying that class's hard values.
