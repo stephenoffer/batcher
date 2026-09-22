@@ -38,7 +38,7 @@ from _ray_cluster import init_test_ray, shutdown_test_ray
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import AggExpr
 from batcher.plan.ir_tags import AGG_FNS
-from batcher.plan.logical.window import WINDOW_FUNCS
+from batcher.plan.logical.window import WINDOW_FUNCS, missing_order_message
 
 pytestmark = pytest.mark.integration
 
@@ -146,6 +146,15 @@ def _canonical(table: pa.Table, order: str) -> tuple:
     return (names, types, rows)
 
 
+#: The refusal every order-dependent expression gives when it has no `order_by`, taken from
+#: the engine's own builder rather than restated here: `arg_min`/`arg_max` are *positional*
+#: aggregates whose `order_by` is required and keyword-only (the value-by-key aggregate they
+#: used to be is now `min_by`/`max_by`), so the one-argument `AggExpr` this sweep builds is
+#: refused by that path and not by the arity one below. Sliced at the function name, which is
+#: the only part that varies, so a reworded remedy tracks automatically -- the alternative,
+#: pasting the sentence, is what left twelve `arg_min`/`arg_max` declines reported as failures.
+_MISSING_ORDER = missing_order_message("\x00", over=False).split("\x00", 1)[1].split(":", 1)[0]
+
 #: The engine's own words for "that pair is not a call", as opposed to "that pair is broken".
 #: Three families, and this sweep meets all three because it crosses *every* function with a
 #: fixed set of columns: an arity it cannot satisfy (`arg_max` wants a value *and* an ordering
@@ -153,7 +162,7 @@ def _canonical(table: pa.Table, order: str) -> tuple:
 #: parameter it does not supply (`ewm_mean` needs an alpha or a half-life). The third -- a type
 #: refusal, `bit_and` over a double or `bool_and` over a string -- is matched by shape instead,
 #: so a type the analyzer learns to name later needs no edit here.
-_DECLINED = ("requires an input column", "requires exactly one of")
+_DECLINED = ("requires an input column", "requires exactly one of", _MISSING_ORDER)
 
 
 def _decline_reason(exc: BaseException) -> str | None:
