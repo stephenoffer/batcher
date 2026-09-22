@@ -38,6 +38,8 @@ method no argument shape can build is a failure, not a silent skip.
 
 from __future__ import annotations
 
+import functools
+
 import pyarrow as pa
 import pytest
 
@@ -83,7 +85,7 @@ _LITERAL_ARGS: tuple[tuple, ...] = (
     ("a",), (1,), ("$.a",), ("a", "b"), (1, 2), ("ab",), ("x",), ("y",), (2,), (0,),
     ("upper",), ("snake",), ("gzip",), (0.5,), (True,), ("UTC",), ("%Y-%m-%d",), (_AES_KEY,),
     ("$.b",), ("day",), ("1d",), ("09:00", "17:00"), ("UTC", "UTC"), ("float64",),
-    ([1.0, 3.0],), ("a", 1), (1, "a"), ("int64",),
+    ([1.0, 3.0],), ("a", 1), (1, "a"), ("int64",), ("monday",),
     # A real remap table. `replace` was previously reached only through `replace(0)`,
     # whose falsy-mapping branch returns the receiver unchanged -- so the sweep checked
     # the identity, not the method. Last, so no other method's shape changes.
@@ -120,6 +122,12 @@ def _attempts(namespace: str, name: str, receivers):
         if not callable(method):
             continue
         yield method, ()
+        # The positional aggregates (`arg_min`/`arg_max`) take their ordering key as a
+        # keyword-only `order_by=` and have no window form, so neither the bare call nor
+        # `_built`'s `.over(order_by=...)` fallback can build one. Binding the keyword here
+        # reaches them through the same `(method, args)` shape as everything else; on a
+        # method that takes no `order_by` it raises and `_sweep` moves on.
+        yield functools.partial(method, order_by=col("i")), ()
         for other in _COLUMN_ARGS:
             yield method, (col(other),)
         for args in _LITERAL_ARGS:
@@ -181,11 +189,15 @@ def test_every_accessor_method_declares_what_the_engine_returns(namespace):
 #: The accessor *properties*. Not callables that build an expression, and each is swept by
 #: its own case above (or, for the media ones, needs real files).
 _EXPR_ACCESSORS = frozenset(
-    {"audio", "dt", "image", "json", "list", "map", "seq", "str", "struct", "video"}
+    {"audio", "dt", "image", "json", "list", "map", "meta", "seq", "str", "struct", "video"}
 )
 
 #: Not expressions at all: metadata about the node rather than a column derived from it.
-_EXPR_NOT_EXPRESSIONS = frozenset({"name", "tag", "to_ir", "vocab"})
+#: `pipe` is here for a different reason -- it applies a caller's function and is annotated
+#: `-> Any`, so the column type is the function's to declare and there is nothing of the
+#: engine's for this file to check. Its behaviour is covered by
+#: `tests/unit/test_dataset_ergonomics.py`.
+_EXPR_NOT_EXPRESSIONS = frozenset({"name", "pipe", "tag", "to_ir", "vocab"})
 
 #: Methods that only mean anything inside a window, so `select(v=...)` cannot build them.
 #: Covered by `test_the_window_only_methods_declare_what_they_return` instead, which is why

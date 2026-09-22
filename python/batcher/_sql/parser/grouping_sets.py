@@ -13,7 +13,7 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher._sql.parser.clauses import _is_order_all, _order_all
-from batcher._sql.parser.core_utils import _alias_of, _row_window
+from batcher._sql.parser.core_utils import _alias_of, _row_window, grouping_levels
 from batcher.api.dataset import Dataset
 from batcher.api.multi_group import cube_levels, rollup_levels, stack_levels
 from batcher.plan.expr_ir import col
@@ -56,14 +56,15 @@ def _grouping_factors(group) -> list[list[list]]:
     generic in the level item, so they take sqlglot grouping expressions here and column
     names there.
     """
+    plain, rollups, cubes, sets = grouping_levels(group)
     factors: list[list[list]] = []
-    if group.expressions:  # plain items — present in every level
-        factors.append([list(group.expressions)])
-    for r in group.args.get("rollup") or ():
+    if plain:  # plain items — present in every level
+        factors.append([list(plain)])
+    for r in rollups:
         factors.append([list(level) for level in rollup_levels(tuple(r.expressions))])
-    for cu in group.args.get("cube") or ():
+    for cu in cubes:
         factors.append([list(level) for level in cube_levels(tuple(cu.expressions))])
-    for gs in group.args.get("grouping_sets") or ():
+    for gs in sets:
         factors.append([_grouping_set_members(m) for m in gs.expressions])
     return factors or [[[]]]
 

@@ -32,6 +32,7 @@ statement about the optimizer's current behaviour rather than about what is corr
 from __future__ import annotations
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
@@ -99,8 +100,28 @@ def _reduced_sides(ds) -> frozenset[str]:
     return frozenset()
 
 
-def _joined(how: str):
-    return bt.from_arrow(_LEFT).join(bt.from_arrow(_RIGHT), on="k", how=how)
+@pytest.fixture(scope="module")
+def joined(tmp_path_factory):
+    """Build the join over *Parquet* inputs, which is what lets the rule fire at all.
+
+    `push_is_not_null_from_join_key` declines a **resident** source on purpose: the predicate
+    earns its place by sinking into a scan that answers it from null counts and skips row
+    groups, and Arrow already in memory can do neither, so the push would copy nearly every
+    row to drop rows the join drops anyway (its docstring carries the TPC-DS measurements).
+    `bt.from_arrow` is resident, so a fixture built that way reduces nothing on every join
+    type, and the side table below would read as a uniform "no push" -- passing only if
+    `_REDUCIBLE` were empty for all six, which is exactly the regression it exists to catch.
+    """
+    directory = tmp_path_factory.mktemp("null_key_reduction")
+    pq.write_table(_LEFT, directory / "l.parquet")
+    pq.write_table(_RIGHT, directory / "r.parquet")
+
+    def build(how: str):
+        return bt.read.parquet(str(directory / "l.parquet")).join(
+            bt.read.parquet(str(directory / "r.parquet")), on="k", how=how
+        )
+
+    return build
 
 
 #: Batcher emits ONE key column, coalesced across the sides -- so a right-only row of a
@@ -121,15 +142,15 @@ def test_every_join_type_is_classified():
 
 
 @pytest.mark.parametrize("how", sorted(JOIN_TYPES))
-def test_the_reduction_reaches_exactly_the_sides_the_join_does_not_preserve(how):
-    assert _reduced_sides(_joined(how)) == _REDUCIBLE[how], (
+def test_the_reduction_reaches_exactly_the_sides_the_join_does_not_preserve(joined, how):
+    assert _reduced_sides(joined(how)) == _REDUCIBLE[how], (
         f"a `{how}` join may reduce {sorted(_REDUCIBLE[how]) or 'neither input'}; "
         "reducing a preserved side drops rows the join owes"
     )
 
 
 @pytest.mark.parametrize("how", sorted(JOIN_TYPES))
-def test_the_rows_a_preserved_side_owes_actually_survive(duck, how):
+def test_the_rows_a_preserved_side_owes_actually_survive(duck, joined, how):
     """The consequence, which is what makes the table above a claim about correctness.
 
     Counting only the *null-key* output rows isolates exactly the rows a wrong-side push
@@ -138,7 +159,7 @@ def test_the_rows_a_preserved_side_owes_actually_survive(duck, how):
     """
     duck.register("l", _LEFT)
     duck.register("r", _RIGHT)
-    got = _joined(how).collect().to_pydict()
+    got = joined(how).collect().to_pydict()
     expected = (
         duck.sql(f"SELECT {_cols_sql(how)} FROM l {_SQL_JOIN[how]} r ON l.k = r.k")
         .to_arrow_table()
@@ -150,17 +171,17 @@ def test_the_rows_a_preserved_side_owes_actually_survive(duck, how):
 
 
 @pytest.mark.parametrize("how", sorted(JOIN_TYPES))
-def test_the_whole_result_still_matches_the_oracle(duck, how):
+def test_the_whole_result_still_matches_the_oracle(duck, joined, how):
     """The backstop: the side table must not be bought with a wrong answer elsewhere."""
     duck.register("l", _LEFT)
     duck.register("r", _RIGHT)
     assert_same(
-        _joined(how).collect(),
+        joined(how).collect(),
         duck.sql(f"SELECT {_cols_sql(how)} FROM l {_SQL_JOIN[how]} r ON l.k = r.k"),
     )
 
 
-def test_a_name_only_check_cannot_tell_the_sides_apart():
+def test_a_name_only_check_cannot_tell_the_sides_apart(joined):
     """The control that justifies this file existing beside the name-based helper.
 
     Both inputs name their key `k`, so "is there an `IsNotNull` on `k` in this plan?" is
@@ -170,13 +191,13 @@ def test_a_name_only_check_cannot_tell_the_sides_apart():
     by_name = {
         how: any(
             isinstance(c, IsNotNull) and isinstance(c.input, Col) and c.input.name == "k"
-            for node in walk(_optimized(_joined(how)))
+            for node in walk(_optimized(joined(how)))
             if isinstance(node, Filter)
             for c in split_conjuncts(node.predicate)
         )
         for how in ("left", "anti", "inner")
     }
     assert by_name == {"left": True, "anti": True, "inner": True}
-    assert _reduced_sides(_joined("left")) != _reduced_sides(_joined("inner")), (
+    assert _reduced_sides(joined("left")) != _reduced_sides(joined("inner")), (
         "the positional check separates the two cases the name-only check merges"
     )

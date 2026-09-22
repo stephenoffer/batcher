@@ -584,3 +584,45 @@ def _key_shadows(node, joins, merged_keys: set[str]) -> set[str]:
         if c.table and c.find_ancestor(exp.Select) is node and c.find_ancestor(exp.Join) is None
     }
     return set(merged_keys) if "*" in qualified else merged_keys & qualified
+
+
+#: The GROUP BY node types that expand into several grouping levels, in the order
+#: `grouping_levels` reports them.
+_MULTI_LEVEL = (exp.Rollup, exp.Cube, exp.GroupingSets)
+
+
+def grouping_levels(group) -> tuple[list, list, list, list]:
+    """A `GROUP BY` split into its plain items and its multi-level nodes.
+
+    sqlglot has carried `ROLLUP` / `CUBE` / `GROUPING SETS` two ways. Older versions hang
+    each off its own key on the `Group` node (`group.args["rollup"]`), and current ones put
+    the node inline among the ordinary grouping items (`group.args["expressions"]`), leaving
+    those keys empty. The pin is `sqlglot>=23` with no ceiling, so both shapes are live and
+    reading only the keyed one silently sees a plain `GROUP BY`: the `Rollup` node then falls
+    through to the scalar translator, which refuses it as an unsupported expression. That is
+    what took out every ROLLUP/CUBE/GROUPING SETS query on sqlglot 30.
+
+    Args:
+        group: The `Group` node, or None.
+
+    Returns:
+        `(plain, rollups, cubes, grouping_sets)` — the items that appear in every level,
+        then the nodes of each multi-level kind, whichever shape carried them.
+    """
+    if group is None:
+        return [], [], [], []
+    keyed = [list(group.args.get(k) or ()) for k in ("rollup", "cube", "grouping_sets")]
+    plain, inline = [], ([], [], [])
+    for e in group.args.get("expressions") or ():
+        for i, kind in enumerate(_MULTI_LEVEL):
+            if isinstance(e, kind):
+                inline[i].append(e)
+                break
+        else:
+            plain.append(e)
+    return (plain, *(k + i for k, i in zip(keyed, inline, strict=True)))
+
+
+def has_grouping_levels(group) -> bool:
+    """Whether `group` carries a ROLLUP, CUBE or GROUPING SETS in either sqlglot shape."""
+    return any(grouping_levels(group)[1:])

@@ -1,6 +1,6 @@
 """Ten rows off an unfamiliar topic, which is the first thing anyone types.
 
-`bt.read.kafka(...).head(10).to_pydict()` refused: every materializing terminal guarded on
+`bt.read.kafka(...).limit(10).to_pydict()` refused: every materializing terminal guarded on
 "any source is unbounded", which is right for the general case and wrong for this one. A
 `LIMIT n` over a breaker-free pipeline is finite in both memory and time -- the router
 already stops reading the moment it has n rows -- so the only thing the guard was
@@ -101,9 +101,9 @@ def test_the_refusal_now_points_at_the_peek():
 @pytest.mark.parametrize(
     ("build", "expected"),
     [
-        (lambda ds: ds.head(3), [0, 1, 2]),
-        (lambda ds: ds.slice(2, 5), [2, 3, 4, 5, 6]),
-        (lambda ds: ds.head(3).head(2), [0, 1]),
+        (lambda ds: ds.limit(3), [0, 1, 2]),
+        (lambda ds: ds.limit(5, offset=2), [2, 3, 4, 5, 6]),
+        (lambda ds: ds.limit(3).limit(2), [0, 1]),
     ],
 )
 def test_a_bounded_source_is_unchanged(build, expected):
