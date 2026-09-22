@@ -227,13 +227,18 @@ def _collect_ys(results) -> list[int]:
 def test_streamed_recovers_from_consumer_preemption():
     # A consumer lost mid-stream: its morsel is re-dispatched to a spawned replacement,
     # so every row still lands with the correct value.
-    from batcher.dist.executors.map import _MapActor
     from batcher.dist.flight_worker import new_plan_id
     from batcher.dist.streaming.pipeline import run_streamed
     from batcher.dist.streaming.producers import ProducerActor
 
     rows, credits = 40, 2
     ctx, cpu_stage, gpu_stage, partitions = _stage_setup(rows, credits)
+    # Imported after the setup call, which is what runs `_ensure_ray`: that rebinds
+    # `map._MapActor` to the Ray-wrapped class, and a `from ... import` taken before it
+    # binds the bare one, whose `.remote` does not exist. `pipeline/driver.py` imports it
+    # in this order for the same reason.
+    from batcher.dist.executors.map import _MapActor
+
     producer = ProducerActor.remote(cpu_stage.sub_plan, credits)
     dying = _DyingConsumer.remote()
     alive = {producer, dying}
@@ -268,13 +273,18 @@ def test_streamed_recovers_from_consumer_preemption():
 def test_streamed_recovers_from_producer_preemption():
     # A producer lost while opening its partition: the whole partition re-runs on a
     # spawned replacement and reproduces every morsel deterministically.
-    from batcher.dist.executors.map import _MapActor
     from batcher.dist.flight_worker import new_plan_id
     from batcher.dist.streaming.pipeline import run_streamed
     from batcher.dist.streaming.producers import ProducerActor
 
     rows, credits = 40, 2
     ctx, cpu_stage, gpu_stage, partitions = _stage_setup(rows, credits)
+    # Imported after the setup call, which is what runs `_ensure_ray`: that rebinds
+    # `map._MapActor` to the Ray-wrapped class, and a `from ... import` taken before it
+    # binds the bare one, whose `.remote` does not exist. `pipeline/driver.py` imports it
+    # in this order for the same reason.
+    from batcher.dist.executors.map import _MapActor
+
     dying = _DyingProducer.remote()
     consumer = _MapActor.remote(gpu_stage.sub_plan)
     alive = {dying, consumer}
@@ -351,7 +361,6 @@ def test_a_relay_stage_recovers_from_preemption():
     re-reading the whole partition — and worse, a replay that produced *new* morsel paths
     would leave the results it had already recorded behind as duplicates.
     """
-    from batcher.dist.executors.map import _MapActor
     from batcher.dist.flight_worker import new_plan_id
     from batcher.dist.streaming.pipeline import run_streamed
     from batcher.dist.streaming.producers import ProducerActor
@@ -359,6 +368,12 @@ def test_a_relay_stage_recovers_from_preemption():
 
     rows, credits = 40, 2
     ctx, stages, partitions = _three_stage_setup(rows, credits)
+    # Imported after the setup call, which is what runs `_ensure_ray`: that rebinds
+    # `map._MapActor` to the Ray-wrapped class, and a `from ... import` taken before it
+    # binds the bare one, whose `.remote` does not exist. `pipeline/driver.py` imports it
+    # in this order for the same reason.
+    from batcher.dist.executors.map import _MapActor
+
     cpu_stage, mid_stage, top_stage = stages
     producer = ProducerActor.remote(cpu_stage.sub_plan, credits)
     dying = _DyingRelay.remote()
