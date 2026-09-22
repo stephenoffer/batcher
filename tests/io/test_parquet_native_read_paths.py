@@ -24,11 +24,14 @@ Three properties are load-bearing here and are what these tests pin:
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from batcher.config import Config, config_context
 from batcher.io.formats.structured import _parquet_native
 from batcher.io.formats.structured.parquet import _native_stream
 from batcher.io.formats.structured.parquet._native_stream import row_group_windows
@@ -234,8 +237,17 @@ def test_a_temporal_predicate_declines_native_and_still_prunes_via_pyarrow(tmp_p
     def keep(r):
         return (r["d"] - epoch).days >= cutoff_days
 
-    pushed = _rows(src.read(predicate=predicate))
-    assert _apply(pushed, keep) == _apply(_rows(src.read()), keep)
+    # `survivors_worth_pruning` skips pruning outright when the whole read fits one morsel,
+    # because building the manifest's literals imports pandas through pyarrow's shim. At the
+    # default 16,384 this 1,000-row fixture is under that floor, so the prune never runs and
+    # the assertion below cannot discriminate. Cut the morsel so the path it names engages.
+    base = Config()
+    with config_context(
+        base.replace(execution=dataclasses.replace(base.execution, morsel_rows=100))
+    ):
+        pushed = _rows(src.read(predicate=predicate))
+        unfiltered = _rows(src.read())
+    assert _apply(pushed, keep) == _apply(unfiltered, keep)
     # pyarrow really did prune: this is not just an unfiltered read wearing a predicate.
     assert len(pushed) < 1000
 

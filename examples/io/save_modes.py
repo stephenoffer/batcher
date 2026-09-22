@@ -60,17 +60,17 @@ def main() -> None:
         assert after_overwrite.count() == 1
         assert after_overwrite.to_pydict()["id"] == [3]
 
-        # The convenience spellings write a single file rather than a directory.
+        # A target naming a file rather than a directory writes a single file.
         one_file = str(Path(tmp) / "one.parquet")
-        first.to_parquet(one_file)
+        first.write.parquet(one_file)
         assert bt.read.parquet(one_file).count() == 2
 
         csv_file = str(Path(tmp) / "one.csv")
-        first.to_csv(csv_file)
+        first.write.csv(csv_file)
         assert bt.read.csv(csv_file).count() == 2
 
         json_file = str(Path(tmp) / "one.json")
-        first.to_json(json_file)
+        first.write.json(json_file)
         assert bt.read.json(json_file).count() == 2
 
 

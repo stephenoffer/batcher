@@ -92,6 +92,28 @@ NOT_LOCALLY_WRITABLE: dict[str, str] = {
     "fastq": "fixed record schema; round-tripped by tests/io/test_io_fasta_fastq.py",
     "bed": "fixed record schema; round-tripped by tests/io/test_io_bed_gff_vcf.py",
     "gff": "fixed record schema; round-tripped by tests/io/test_io_bed_gff_vcf.py",
+    "clickhouse": "needs a ClickHouse server; covered by tests/io/test_clickhouse_sink.py",
+    # The next four take a *shape*, not an arbitrary relation, so this matrix's two-column
+    # (id, type-class) table is not something they can be handed. Each was tried against it
+    # and refused; the reason here is the refusal each one raises.
+    "numpy": "writes a single column, not a relation; round-tripped by "
+    "tests/io/test_ml_format_writers.py::test_numpy_round_trips_values_and_types",
+    "text": "needs exactly one string column; round-tripped by "
+    "tests/io/test_text_and_xml_writers.py::test_text_round_trips_values_and_writes_a_null_as_an_empty_line",
+    "webdataset": "needs a string __key__ column naming each sample; round-tripped by "
+    "tests/io/test_ml_format_writers.py::test_webdataset_round_trips_bytes_text_numbers_and_missing_members",
+    # tfrecord writes opaque serialized records and reads back as one `record` column, so a
+    # written column has no image in the result to compare a value or a type against.
+    "tfrecord": "records are opaque on read; payloads round-tripped by "
+    "tests/io/test_ml_format_writers.py::test_tfrecord_raw_round_trips_the_record_payloads",
+    # XML is write-only in practice, and that is a defect rather than a property of the
+    # format: `io/formats/semistructured/xml.py::_to_table` calls `xml2arrow.parse`, which no
+    # released xml2arrow provides (0.3.0-0.19.0 all expose only `XmlToArrowParser`, which
+    # needs a structure config). `tests/io/test_optional_formats.py::test_xml_read` fails
+    # whenever the `xml` extra is installed and is skipped when it is not, which is why this
+    # has stayed invisible. The writer alone is covered by tests/io/test_text_and_xml_writers.py.
+    "xml": "the reader is broken (xml2arrow has no module-level `parse`); writer covered by "
+    "tests/io/test_text_and_xml_writers.py",
 }
 
 #: Type class -> a 4-row column carrying that class's hard values.
