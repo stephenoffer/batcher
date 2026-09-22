@@ -36,11 +36,22 @@ def _learned(hub, ds, stat_key: str = kyber.NDV_KEY) -> dict:
 
 
 def test_udf_path_collects_metadata():
+    """The UDF executor path feeds the loop, for the columns a later plan could read back.
+
+    Grouped rather than a bare `map_batches`, for the reason
+    `test_native_path_still_collects_metadata` records: `learnable_columns` is
+    `ndv_columns | column_bounds_needed`, so a query that names no key, equality predicate
+    or filter column makes nothing learnable and the sketches are skipped on purpose. A
+    bare `map_batches(_identity).collect()` names none of them, so this asserted ndvs that
+    the bounding had already stopped measuring and read 0 for both columns. Both columns
+    are group keys here, which is what puts them in `ndv_columns`; the `map_batches` below
+    is still what routes the query through the UDF executor.
+    """
     # Unique column names so the process-wide hub hasn't already learned them.
     hub = core.default_hub()
     t = pa.table({"mlk": [i % 5 for i in range(500)], "mlv": list(range(500))})
     ds = bt.from_arrow(t)
-    ds.map_batches(_identity).collect()  # UDF executor path
+    ds.map_batches(_identity).group_by("mlk", "mlv").agg(n=bt.count()).collect()  # UDF path
     ndv = _learned(hub, ds)
     assert abs(ndv.get("mlk", 0) - 5) < 1  # ~5 distinct
     assert ndv.get("mlv", 0) > 400  # ~500 distinct
