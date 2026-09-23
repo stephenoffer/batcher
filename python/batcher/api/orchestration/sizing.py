@@ -276,6 +276,6 @@ def _carried_columns(plan) -> frozenset[str] | None:
                 continue
             (source_names if type(node).__name__ == "Scan" else node_names).update(arrow.names)
         return frozenset(supplied | (node_names - source_names))
-    except Exception as exc:  # pragma: no cover - a sizing hint must never fail a query
+    except Exception as exc:  # a sizing hint must never fail a query
         note_suppressed("carbonite", "derive carried columns", exc)
         return None

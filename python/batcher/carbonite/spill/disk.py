@@ -174,7 +174,7 @@ def read_total_disk_bytes(path: str) -> int | None:
     """
     try:
         return shutil.disk_usage(path).total
-    except OSError:  # pragma: no cover - unstat-able volume
+    except OSError:  # unstat-able volume
         return None
 
 

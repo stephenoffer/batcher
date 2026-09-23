@@ -53,7 +53,7 @@ def fleet_zone_selector(workers: int, env: SchedulingEnvelope | None) -> dict[st
         from batcher.dist.executors.ray_runtime.capacity import Demand, preferred_fleet_zone
 
         return preferred_fleet_zone(workers, Demand.from_envelope(env, count=workers))
-    except Exception as exc:  # pragma: no cover - a cost hint never fails a placement
+    except Exception as exc:  # a cost hint never fails a placement
         note_suppressed("dist", "choose an availability zone for the fleet", exc)
         return {}
 
@@ -80,6 +80,6 @@ def fleet_market_selector(workers: int, env: SchedulingEnvelope | None) -> dict[
         return capacity_bundle_selector(
             env.capacity_preference, workers=workers, num_cpus=env.num_cpus
         )
-    except Exception as exc:  # pragma: no cover - a placement hint never fails a placement
+    except Exception as exc:  # a placement hint never fails a placement
         note_suppressed("dist", "choose a capacity market for the fleet", exc)
         return {}

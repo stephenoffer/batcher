@@ -544,7 +544,7 @@ def record_column_row_bytes_batch(
         return
     try:
         merge_column_table(hub, ROW_BYTES_KEY, widths_out)
-    except Exception as exc:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # learning must never break a query
         note_suppressed("kyber", "persist measured column row widths", exc)
 
 

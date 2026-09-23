@@ -113,7 +113,7 @@ def declared_schema(plan: LogicalPlan) -> pa.Schema | None:
     """
     try:
         inferred = plan.available_schema()
-    except Exception as exc:  # pragma: no cover - analysis must never break a query
+    except Exception as exc:  # analysis must never break a query
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("api", "infer the engine's declared schema for the GPU result", exc)

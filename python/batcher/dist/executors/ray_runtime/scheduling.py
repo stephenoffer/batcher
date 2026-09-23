@@ -250,7 +250,7 @@ def probe_options() -> dict:
     """
     try:
         env = worker_runtime_env() or None
-    except Exception as exc:  # pragma: no cover - a shipping failure must not stop the probe
+    except Exception as exc:  # a shipping failure must not stop the probe
         note_suppressed("dist", "resolve the probe runtime_env", exc)
         env = None
     return {"num_cpus": 0, "runtime_env": env} if env else {"num_cpus": 0}
@@ -606,7 +606,7 @@ def _report_placement_timeout(workers: int, env: SchedulingEnvelope | None, stra
 
     try:
         reason = describe_pending_demand(Demand.from_envelope(env, count=workers))
-    except Exception as exc:  # pragma: no cover - a diagnostic never fails a placement
+    except Exception as exc:  # a diagnostic never fails a placement
         note_suppressed("dist", "diagnose the placement timeout", exc)
         reason = None
     log_kv(

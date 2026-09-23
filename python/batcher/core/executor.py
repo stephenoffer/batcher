@@ -130,7 +130,7 @@ def _record_op_feedback(
             _record_one(
                 sink, op, batch_size, planned, local_fingerprint, local_throttled, local_thermal
             )
-        except Exception:  # pragma: no cover - measurement must never break a query
+        except Exception:  # measurement must never break a query
             _log.warning("skipped an unreadable operator metrics entry", exc_info=True)
 
 

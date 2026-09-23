@@ -188,7 +188,7 @@ def reuse_common_subplans(
     """
     try:
         return _reuse(plan, sources, ctx)
-    except Exception as exc:  # pragma: no cover - an optimization must never break a query
+    except Exception as exc:  # an optimization must never break a query
         note_suppressed("api", "reuse common subplans", exc)
         return plan, sources
 
@@ -327,7 +327,7 @@ def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> Lo
         if not keep or len(keep) >= len(carried):
             return target
         return Project(target, tuple(Projection(c, col(c)) for c in keep))
-    except Exception as exc:  # pragma: no cover - narrowing must never break a query
+    except Exception as exc:  # narrowing must never break a query
         note_suppressed("api", "narrow a common-subplan candidate", exc)
         return target
 

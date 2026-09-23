@@ -265,7 +265,7 @@ def _fleet_is_uniform(workers: int) -> bool:
         from batcher.dist.executors.ray_runtime.scheduling import current_envelope
 
         env = current_envelope()
-    except Exception as exc:  # pragma: no cover - a sizing hint never fails a query
+    except Exception as exc:  # a sizing hint never fails a query
         note_suppressed("dist", "read the fleet shape for the map partition count", exc)
         return False
     if env is None:

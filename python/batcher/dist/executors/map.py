@@ -1505,7 +1505,7 @@ def _record_source_rows(hub, source, plan: LogicalPlan, rows: int) -> None:
         from batcher.dist.adaptive_sizing import record_partition_rows
 
         record_partition_rows(_learning_hub(hub), source.identity(), rows)
-    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+    except Exception as exc:  # a learned write must never break a query
         note_suppressed("dist", "record measured source rows", exc)
 
 
@@ -1520,7 +1520,7 @@ def _record_actor_pool_reuse(hub, plan0, partitions: int) -> None:
         from batcher.dist.adaptive_sizing import record_actor_pool_reuse
 
         record_actor_pool_reuse(_learning_hub(hub), _pipeline_signature(plan0), partitions)
-    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+    except Exception as exc:  # a learned write must never break a query
         note_suppressed("dist", "record inference actor-pool reuse", exc)
 
 
@@ -1929,7 +1929,7 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None, task_cpus=N
     if total is None:
         try:
             total = learned_partition_rows(_learning_hub(hub), source.identity())
-        except Exception as exc:  # pragma: no cover - a learned read must never break a query
+        except Exception as exc:  # a learned read must never break a query
             # The read half of the same loop. `None` here is "never measured", which is what a
             # broken read also produces — and the caller then takes the `fallback`, so a
             # persistently failing read looks exactly like a source nothing has learned about.

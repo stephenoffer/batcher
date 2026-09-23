@@ -188,7 +188,7 @@ def _fleet_demand_reason() -> str | None:
         from batcher.dist.executors.ray_runtime.scheduling import current_envelope
 
         return describe_pending_demand(Demand.from_envelope(current_envelope()))
-    except Exception as exc:  # pragma: no cover - a diagnosis never replaces the failure
+    except Exception as exc:  # a diagnosis never replaces the failure
         note_suppressed("dist", "diagnose the unplaceable fleet", exc)
         return None
 
@@ -217,7 +217,7 @@ def _warn_degraded_fleet(placed: int, wanted: int, timeout: float) -> None:
             waited_s=round(timeout * 2, 1),
             reason=_fleet_demand_reason() or "workers did not advertise in time",
         )
-    except Exception as exc:  # pragma: no cover - observation must never fail a spawn
+    except Exception as exc:  # observation must never fail a spawn
         note_suppressed("dist", "report the degraded fleet", exc)
 
 

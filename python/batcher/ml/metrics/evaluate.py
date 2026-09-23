@@ -174,7 +174,7 @@ def _infer_task_from_labels(ds: Dataset | None, y_true: str | None, max_classes:
         ):
             return None
         classes = ds.select(__bt_label=col(y_true)).distinct().count()
-    except Exception as exc:  # pragma: no cover - inference must never break the report
+    except Exception as exc:  # inference must never break the report
         note_suppressed("ml", "infer the evaluation task from the labels", exc)
         return None
     if classes <= 1:

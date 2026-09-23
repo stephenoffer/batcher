@@ -560,7 +560,7 @@ def _report_attachment(ray) -> None:
             # and it is also the fact that decides whether workers get the driver's package.
             started_by="batcher" if job_ships_batcher() else "another process",
         )
-    except Exception as exc:  # pragma: no cover - a report must never fail a query
+    except Exception as exc:  # a report must never fail a query
         note_suppressed("dist", "report the Ray attachment", exc)
 
 

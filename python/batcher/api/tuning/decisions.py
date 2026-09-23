@@ -217,7 +217,7 @@ def distributed_grant(
     if derived is None:
         try:
             nodes = int(dist.cluster_topology().get("nodes", 0))
-        except Exception as exc:  # pragma: no cover - topology probe must never break a query
+        except Exception as exc:  # topology probe must never break a query
             note_suppressed("api", "read cluster topology for the distributed grant", exc)
             nodes = 0
         derived = learned_num_workers(ctx.hub, plan, sources, nodes)

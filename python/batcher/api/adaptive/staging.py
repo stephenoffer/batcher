@@ -441,7 +441,7 @@ def _release(what: str, release, *args) -> None:
     """
     try:
         release(*args)
-    except Exception as exc:  # pragma: no cover - a teardown must not mask the real error
+    except Exception as exc:  # a teardown must not mask the real error
         note_suppressed("api", what, exc)
 
 

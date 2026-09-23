@@ -299,7 +299,7 @@ def describe_pending_demand(demand: Demand) -> str | None:
 
     try:
         nodes = node_class_census()
-    except Exception as exc:  # pragma: no cover - a diagnosis never fails its caller
+    except Exception as exc:  # a diagnosis never fails its caller
         note_suppressed("dist", "read node classes for the demand diagnosis", exc)
         return None
     if not nodes:
@@ -370,7 +370,7 @@ def preferred_fleet_zone(workers: int, demand: Demand) -> dict[str, str]:
 
     try:
         nodes = node_class_census()
-    except Exception as exc:  # pragma: no cover - a cost hint never fails a placement
+    except Exception as exc:  # a cost hint never fails a placement
         note_suppressed("dist", "read node classes for zone-aware placement", exc)
         return {}
     zoned = [n for n in nodes if n.get("zone")]
@@ -587,7 +587,7 @@ def fleet_worker_cpus(workers: int) -> list[float] | None:
 
     try:
         env = current_envelope()
-    except Exception as exc:  # pragma: no cover - a sizing hint never fails an assignment
+    except Exception as exc:  # a sizing hint never fails an assignment
         note_suppressed("dist", "read the fleet's per-worker grants", exc)
         return None
     if env is None or len(env.worker_cpus) != workers:

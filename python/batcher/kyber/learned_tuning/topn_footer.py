@@ -157,7 +157,7 @@ def footer_topn_seed(
             seeded_sort if plan is sort else Limit(seeded_sort, plan.n, plan.offset)
         )
         return TopNSeed(plan=seeded, k=key.k, signature="")
-    except Exception as exc:  # pragma: no cover - a hint must never break a query
+    except Exception as exc:  # a hint must never break a query
         note_suppressed("kyber", "seed top-n from row-group statistics", exc)
         return None
 

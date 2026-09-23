@@ -1981,7 +1981,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `bigquery.py` | 398 | BigQuery source — multi-stream Arrow reads via the Storage Read API. |
 | `clickhouse.py` | 240 | ClickHouse source and sink — Arrow reads and inserts via clickhouse-connect. |
 | `connectorx.py` | 216 | ConnectorX source — the parallel relational reader for the long tail. |
-| `databricks.py` | 320 | Databricks source — direct lakehouse read, warehouse fallback. |
+| `databricks.py` | 325 | Databricks source — direct lakehouse read, warehouse fallback. |
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
 | `routing.py` | 137 | Which SQL backend serves this call — the one router the read and the write share. |
@@ -2388,7 +2388,7 @@ Migration-error guidance for `Expr` and its typed accessors.
 | module | lines | what it is |
 |---|---|---|
 | `guidance.py` | 510 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
-| `namespaces.py` | 310 | Ecosystem-compatible spellings on the typed accessor namespaces. |
+| `namespaces.py` | 313 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
 
@@ -2436,7 +2436,7 @@ The expression function library, grouped by family.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 541 | Aggregate free functions that compose existing mergeable aggregates. |
-| `aggregate_semantics.py` | 146 | The aggregate parameters that restore another engine's semantics by composition. |
+| `aggregate_semantics.py` | 144 | The aggregate parameters that restore another engine's semantics by composition. |
 | `collection.py` | 170 | Collection-construction free functions (`struct`, `named_struct`, `map_from_arrays`, `sequence`). |
 | `horizontal.py` | 262 | Row-wise ("horizontal") reductions across several columns. |
 | `partitioning.py` | 204 | Lakehouse partition transforms — the derived value a partitioned table stores. |
@@ -2953,13 +2953,13 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 | module | lines | what it is |
 |---|---|---|
 | `__main__.py` | 174 | `python -m batcher.migrate`: rewrite scripts onto Batcher's API, or off it. |
-| `canonical.py` | 525 | Rewrite Batcher's own removed second spellings to the one spelling that stays. |
+| `canonical.py` | 531 | Rewrite Batcher's own removed second spellings to the one spelling that stays. |
 | `engines.py` | 251 | What the foreign-engine codemod directions know about each engine besides the registry. |
 | `finish.py` | 369 | What both foreign-engine directions share: the site record, markers, and finishing a module. |
 | `outbound.py` | 271 | Rewrite a Batcher script onto PySpark, Polars, Daft or Ray Data: the conservative inverse. |
 | `project.py` | 119 | What the helper functions a script imports from its own project return. |
 | `receivers.py` | 585 | Which expressions in a script are engine objects, and which receiver each one is. |
-| `snippets.py` | 148 | Apply the canonical-name rewrite to code that lives inside text: doctests and Markdown blocks. |
+| `snippets.py` | 151 | Apply the canonical-name rewrite to code that lives inside text: doctests and Markdown blocks. |
 | `templates.py` | 425 | Apply one registry template, or check one call against a signature, on libcst nodes. |
 | `translate.py` | 429 | Rewrite a PySpark, Polars, Daft or Ray Data script onto Batcher, driven by the registry. |
 

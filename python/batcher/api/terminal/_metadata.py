@@ -423,7 +423,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
             if len(_NOTHING_TO_SEED) >= _NOTHING_TO_SEED_MAX:
                 _NOTHING_TO_SEED.clear()
             _NOTHING_TO_SEED[id(plan)] = (plan, verdict)
-    except Exception as exc:  # pragma: no cover - learning must never break execution
+    except Exception as exc:  # learning must never break execution
         note_suppressed("api", "learn column NDV", exc)
 
 

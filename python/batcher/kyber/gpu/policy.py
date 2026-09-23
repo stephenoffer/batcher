@@ -609,7 +609,7 @@ def _device_reads_its_own_input(plan: LogicalPlan, sources: list[Source]) -> boo
         if not scans:
             return False
         return all(reads_on_device(sources[scan.source_id]) for scan in scans)
-    except Exception as exc:  # pragma: no cover - routing must never break a plan
+    except Exception as exc:  # routing must never break a plan
         note_suppressed("kyber", "ask whether the device reads this plan's input", exc)
         return False
 

@@ -107,7 +107,7 @@ def measured_spill_mbps(
         return None
     try:
         by_kind = hub.op_stats_by_kind(hw_fingerprint)
-    except Exception as exc:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # learning must never break a query
         note_suppressed("kyber", "read spill history", exc)
         return None
     rates: list[float] = []
