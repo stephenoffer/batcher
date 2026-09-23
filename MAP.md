@@ -892,7 +892,7 @@ The scalar lowerings big enough to own a module, kept out of the `scalar` dispat
 | `derived.py` | 44 | The dispatches *derived* from the public expression surface, in the order they run. |
 | `dynamic.py` | 140 | String functions whose parameters are columns rather than constants. |
 | `families.py` | 319 | SQL → the public function library, by name. |
-| `intervals.py` | 168 | SQL ``INTERVAL`` literals → the ``(months, days, microseconds)`` triple. |
+| `intervals.py` | 170 | SQL ``INTERVAL`` literals → the ``(months, days, microseconds)`` triple. |
 | `matching.py` | 78 | ``LIKE`` / ``ILIKE`` lowering, including the shapes that skip the pattern matcher. |
 | `membership.py` | 127 | ``IN``, ``BETWEEN`` and ``IS DISTINCT FROM`` — SQL's set and null-safe comparisons. |
 | `nulls.py` | 164 | Typing a bare SQL ``NULL`` from the position it is written in. |
@@ -2421,7 +2421,7 @@ Shared traversal for scalar `Expr` trees and for the expressions inside a node.
 
 | module | lines | what it is |
 |---|---|---|
-| `algebra.py` | 192 | Boolean-connective algebra, column substitution, and window hoisting. |
+| `algebra.py` | 193 | Boolean-connective algebra, column substitution, and window hoisting. |
 | `naming.py` | 96 | The output name a positional expression gets when nothing names it. |
 | `nodes.py` | 129 | Apply an expression rewrite to every expression a *plan node* carries. |
 | `over.py` | 211 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
@@ -2437,7 +2437,7 @@ The expression function library, grouped by family.
 | `aggregate.py` | 541 | Aggregate free functions that compose existing mergeable aggregates. |
 | `aggregate_semantics.py` | 146 | The aggregate parameters that restore another engine's semantics by composition. |
 | `collection.py` | 170 | Collection-construction free functions (`struct`, `named_struct`, `map_from_arrays`, `sequence`). |
-| `horizontal.py` | 261 | Row-wise ("horizontal") reductions across several columns. |
+| `horizontal.py` | 262 | Row-wise ("horizontal") reductions across several columns. |
 | `partitioning.py` | 204 | Lakehouse partition transforms — the derived value a partitioned table stores. |
 | `quantiles.py` | 196 | Quantile, cardinality, and histogram aggregate shorthands. |
 | `regression.py` | 263 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
@@ -2686,7 +2686,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 3207 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3206 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `env.py` | 182 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |

@@ -24,6 +24,7 @@ import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
+from batcher._internal.errors import ConfigError
 from batcher.config.accelerator import AcceleratorConfig
 from batcher.config.env import falsy, truthy
 from batcher.config.fault_tolerance import FaultToleranceConfig
@@ -630,17 +631,17 @@ class StreamingConfig:
     def __post_init__(self) -> None:
         """Reject a cadence or history that cannot mean anything."""
         if self.checkpoint_delta_interval < 0:
-            raise ValueError(
+            raise ConfigError(
                 "streaming.checkpoint_delta_interval must be >= 0 (0 = always snapshot "
                 f"whole state), got {self.checkpoint_delta_interval}"
             )
         if self.idle_poll_seconds <= 0:
-            raise ValueError(
+            raise ConfigError(
                 f"streaming.idle_poll_seconds must be > 0, got {self.idle_poll_seconds}: "
                 "a zero wait spins a core on every idle stream"
             )
         if self.progress_history < 1:
-            raise ValueError(
+            raise ConfigError(
                 f"streaming.progress_history must be >= 1, got {self.progress_history}"
             )
         # A floor at or below zero is the one setting that can stall a stream permanently: a
@@ -648,13 +649,13 @@ class StreamingConfig:
         # progress never revises the cap that stalled it. Rejected rather than clamped,
         # because unlike a transient tunable this one cannot recover on its own.
         if self.backpressure_min_rate <= 0:
-            raise ValueError(
+            raise ConfigError(
                 f"streaming.backpressure_min_rate must be > 0, got "
                 f"{self.backpressure_min_rate}: a floor of zero lets the rate controller "
                 "throttle a stream to a standstill it cannot measure its way out of"
             )
         if self.backpressure_max_rows_per_trigger < 0:
-            raise ValueError(
+            raise ConfigError(
                 "streaming.backpressure_max_rows_per_trigger must be >= 0 (0 = unbounded), "
                 f"got {self.backpressure_max_rows_per_trigger}"
             )
@@ -666,7 +667,7 @@ class StreamingConfig:
             ("derivative", self.backpressure_pid_derivative),
         ):
             if weight < 0:
-                raise ValueError(
+                raise ConfigError(
                     f"streaming.backpressure_pid_{name} must be >= 0, got {weight}: a "
                     "negative weight makes the controller speed up when it falls behind"
                 )
@@ -2452,8 +2453,6 @@ def _check_overrides(caller: str, kind: type, overrides: dict) -> None:
     unknown = sorted(set(overrides) - {f.name for f in dataclasses.fields(kind)})
     if not unknown:
         return
-    from batcher._internal.errors import ConfigError
-
     raise ConfigError(
         f"{caller}(): {unknown} " + ("is not a" if len(unknown) == 1 else "are not") + f" "
         f"{kind.__name__} field{'' if len(unknown) == 1 else 's'}.",
