@@ -204,5 +204,5 @@ print(stamp_strs.select(stamp=bt.col("t").str.to_datetime("%Y-%m-%d %H:%M")).to_
 
 - {doc}`/user-guide/transform/columns/expression-accessors`: the `.dt`, `.list`, `.struct`, `.map` and `.json` namespaces.
 - {doc}`/user-guide/transform/columns/expression-recipes`: task-shaped recipes built from these methods, including text-corpus curation.
-- {doc}`/api/relational/expression-accessors`: every `.str` method, tabulated.
+- {doc}`/api/accessors/strings`: every `.str` method, with signatures and a page each.
 - {doc}`/user-guide/analyze/sql`: calling these methods from SQL, such as `str_slugify(s)`.

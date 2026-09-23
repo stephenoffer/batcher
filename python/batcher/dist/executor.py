@@ -1354,6 +1354,26 @@ def _keys_cover_the_layout(
     return cols if ok else ()
 
 
+def _range_join_distributable(rj: RangeJoin, sources: list[Source]) -> bool:
+    """Whether `rj` can take the broadcast-probe path: the only distributed form it has.
+
+    Asked in two places -- the plain `Aggregate`-free range join, and an aggregate over one
+    -- so it is written once. The three conditions are the ones `_distributed_range_join`'s
+    correctness argument rests on: a `_BROADCAST_SAFE` join type (a right row's matched-ness
+    must not be a global question), map-only sides (each probe task re-runs them), and a
+    genuinely splittable probe side (else partitioning a small input to disk costs orders of
+    magnitude more than running it locally).
+    """
+    from batcher.dist.executors.join import _BROADCAST_SAFE
+
+    probe_ids = scanned_source_ids(rj.left)
+    return (
+        rj.join_type in _BROADCAST_SAFE
+        and _join_sides_are_map_only(rj)
+        and all(i < len(sources) and _is_splittable_source(sources[i]) for i in probe_ids)
+    )
+
+
 def _aggregate_over_join(agg: Aggregate) -> bool:
     """Whether `agg` is an aggregate over a join of two single sources (any join type or
     group keys) — the general case `_fusable_join_aggregate` does not cover.
@@ -1814,12 +1834,18 @@ def _dispatch(
     # source. In-memory/iterator sources stay single-node (shipping them to workers
     # costs more than the parallel CPU saves). Reuses `_distributed_map`'s stateless
     # task path (no UDF/GPU ⇒ one task per partition).
+    #
+    # `preserve_order` so the gathered rows come back in the source's order, as they do
+    # single-node. Kyber drops a `LIMIT` an exact row count proves inert
+    # (`drop_redundant_limit`), which turns `limit(n)` with `n` past the table into this bare
+    # scan -- and with the load-balanced assignment its rows came back interleaved by worker
+    # while every `limit` below the row count, which takes the ordered `LIMIT` path, did not.
     if _is_linear_map_pipeline(plan) and _single_source(plan):
         sid = next(iter(scanned_source_ids(plan)))
         if sid < len(sources) and _is_splittable_source(sources[sid]):
             from batcher.dist.executors.map import _distributed_map
 
-            return _distributed_map(plan, sources, workers, hub)
+            return _distributed_map(plan, sources, workers, hub, preserve_order=True)
 
     # A bare `LIMIT n OFFSET k` over a breaker-free single source (`df.limit(10)`,
     # `df.head()`, `df.filter(...).limit(10)` — the most common interactive shape, and
@@ -2075,6 +2101,14 @@ def _dispatch(
                     metrics_out=metrics_out,
                 )
             return _staged_aggregate_over_join(above, agg, sources, workers, hub, metrics_out)
+        # An aggregate over a RANGE join. `_split_at` walks pass-through nodes only, and an
+        # `Aggregate` is a breaker, so the range-join branch below can never see through one
+        # -- `group_by` over an interval join reached `_unsupported` and raised, while the
+        # identical join without it distributes. The range path applies `above` to the
+        # concatenated result on the driver (`_apply_above`), so the aggregate is computed
+        # over the whole join output, which is what single-node computes.
+        if isinstance(agg.input, RangeJoin) and _range_join_distributable(agg.input, sources):
+            return _distributed_range_join([*above, agg], agg.input, sources, workers, hub)
 
     join_split = _split_at(plan, Join)
     if join_split is not None:
@@ -2131,14 +2165,7 @@ def _dispatch(
     range_split = _split_at(plan, RangeJoin)
     if range_split is not None:
         above, rj = range_split
-        from batcher.dist.executors.join import _BROADCAST_SAFE
-
-        probe_ids = scanned_source_ids(rj.left)
-        if (
-            rj.join_type in _BROADCAST_SAFE
-            and _join_sides_are_map_only(rj)
-            and all(i < len(sources) and _is_splittable_source(sources[i]) for i in probe_ids)
-        ):
+        if _range_join_distributable(rj, sources):
             return _distributed_range_join(above, rj, sources, workers, hub)
 
     # A top-level sort over a scannable input distributes via range partitioning on the

@@ -22,8 +22,16 @@ would never think to look. Advice, not a decision.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from batcher.carbonite.accel.parallelism import ParallelPlan
+
 __all__ = [
     "advise_tensor_parallelism",
+    "allreduce_ms_per_token",
     "group_spread",
     "local_device_count",
     "local_device_name",
@@ -42,6 +50,15 @@ _WEIGHT_BUDGET = 0.55
 _PCIE_ONLY = ("l4", "a10", "l40", "t4", "rtx", "a2000", "a4000", "a5000", "a6000")
 #: Families with NVLink/NVSwitch, where TP is efficient.
 _NVLINK = ("a100", "h100", "h200", "h20", "b200", "v100", "gh200")
+#: Micro-batches in flight the pipeline-bubble figure is quoted at.
+#:
+#: The bubble is `(s - 1) / (m + s - 1)`, so *more* micro-batches make it smaller: four stages
+#: waste 42.9% at four in flight, 8.6% at thirty-two. Quoting at thirty-two is therefore the
+#: **optimistic** end -- a floor on the loss, not a bound on it -- which is the right direction
+#: for an advisory, because a warning that overstates its case is one people learn to skip. The
+#: message says plainly that fewer in flight costs more. Named rather than inlined so the
+#: number in the message is one somebody can reproduce.
+_ADVISED_MICROBATCHES = 32
 
 
 def nvlink_class(device_name: str | None) -> str:
@@ -116,6 +133,7 @@ def warn_about_tensor_parallelism(
     vram_gb: float | None,
     device_name: str | None,
     needed: int | None = None,
+    plan: ParallelPlan | None = None,
 ) -> None:
     """Say once when the declared TP degree looks wrong for this model and this hardware.
 
@@ -159,6 +177,10 @@ def warn_about_tensor_parallelism(
             weights can actually serve. `None` falls back to the footprint arithmetic here,
             which is a bound rather than a configuration: it can name a degree the model's
             head counts do not admit.
+        plan: The whole replica shape from `carbonite.accel.plan_parallelism`, when the
+            caller could derive one. It carries what `needed` cannot: the pipeline stages a
+            model that fits no tensor group has to be cut into, and therefore the devices a
+            replica really occupies. `None` keeps every message keyed on `needed` alone.
     """
     global _TP_WARNED
     if _TP_WARNED:
@@ -209,16 +231,42 @@ def warn_about_tensor_parallelism(
                 f" This node cannot place {declared} devices closer than `{spread}`, so the "
                 f"all-reduce also crosses that boundary on every step."
             )
+        cost = allreduce_ms_per_token(plan, declared, device_name)
+        if cost:
+            message += (
+                f" On this node's wires that all-reduce is about {cost:.2f} ms per token, "
+                f"which is the figure to weigh against the decode step it is added to."
+            )
     elif measured and declared > needed >= 1:
         from batcher.carbonite.accel.parallelism import replicas_for_devices
 
-        replicas = replicas_for_devices(declared, needed)
+        # Against the replica's *whole* width, not its tensor degree. A plan that had to reach
+        # for pipeline stages occupies `tensor x pipeline` devices per replica, and dividing
+        # the budget by the tensor degree alone claims replicas the stage cannot place.
+        per_replica = plan.devices_per_replica if plan is not None else needed
+        replicas = replicas_for_devices(declared, per_replica)
         message = (
             f"tensor_parallel_size={declared}, but this model's head counts and cache fit a "
             f"group of {needed}. The same {declared} devices would run {replicas} replicas, "
             f"each serving its own sequences at full rate, instead of one group paying an "
             f"all-reduce on every layer of every token for memory nobody uses. Set "
             f"tensor_parallel_size={needed} and raise the stage's worker count instead."
+        )
+    elif plan is not None and plan.pipeline_parallel > 1:
+        from batcher.carbonite.accel.parallelism import pipeline_bubble_fraction
+
+        # The case no degree fixes. Tensor parallelism ran out of admissible degrees, so the
+        # replica is cut into pipeline stages, and the bubble is a throughput loss that batching
+        # reduces but never removes. Said last because every message above names a setting to
+        # change and this one names a floor to plan around.
+        bubble = pipeline_bubble_fraction(plan.pipeline_parallel, _ADVISED_MICROBATCHES)
+        message = (
+            f"this model does not fit any tensor-parallel group its head counts admit, so a "
+            f"replica spans {plan.pipeline_parallel} pipeline stages across "
+            f"{plan.devices_per_replica} devices. Pipeline stages idle while the pipeline "
+            f"fills and drains: at {_ADVISED_MICROBATCHES} micro-batches in flight that is "
+            f"about {bubble:.0%} of the stage's time, and fewer in flight costs more. Raise "
+            f"the in-flight batch count, or serve a quantization that fits a tensor group."
         )
     if not message:
         return
@@ -228,6 +276,63 @@ def warn_about_tensor_parallelism(
     from batcher._internal.errors import PerformanceWarning
 
     warnings.warn(message, PerformanceWarning, stacklevel=3)
+
+
+def allreduce_ms_per_token(
+    plan: ParallelPlan | None,
+    declared: int,
+    device_name: str | None,
+    matrix: Sequence[Sequence[str]] | None = None,
+) -> float:
+    """What one token's tensor-parallel all-reduce costs on *this* node's wires, in ms.
+
+    The messages above quote a 30-50% throughput range from the field guides. That range is
+    real and it is a range across hardware, so on any particular node it is a substitute for a
+    number rather than a number. Every term needed to compute the real one is already measured:
+    the plan knows the bytes each device contributes per token (`allreduce_bytes_per_token`),
+    the device table knows the model's link rates, and `carbonite.transfer.device_exchange`
+    knows the standard ring bound and how to order the ring over the node's actual fabric.
+
+    The ring is ordered by the measured peer matrix rather than by device index, because a
+    ring runs at its *worst* hop: an index-ordered ring on a node whose fast pairs are not
+    adjacent reports a rate the hardware would not deliver.
+
+    Args:
+        plan: The replica shape from `carbonite.accel.plan_parallelism`, or `None`.
+        declared: The tensor-parallel degree the caller set.
+        device_name: The card's reported name, for its published link rates.
+        matrix: A `p2p.peer_matrix` describing how the devices are wired, or `None` to read
+            the node's live. Explicit because the matrix is what decides whether a hop runs at
+            the card's NVLink rate or at its host link, and a node whose matrix cannot be read
+            prices every hop on the bus — correct as a floor, and not something to present as
+            a measurement of an NVLink node.
+
+    Returns:
+        Milliseconds per token, or `0.0` when anything needed is unknown — an unreadable
+        topology, an unrecognized card, a degree below two, or a plan that does not
+        all-reduce. Zero is "no opinion", and the caller says nothing rather than quoting a
+        figure derived from a default.
+    """
+    if plan is None or declared < 2 or plan.allreduce_bytes_per_token <= 0:
+        return 0.0
+    from batcher._internal.device_specs.accessors import (
+        device_host_link_gbps,
+        device_nvlink_gbps,
+    )
+    from batcher.carbonite.transfer.device_exchange import (
+        all_reduce_seconds,
+        ring_bandwidth_gbps,
+        ring_order,
+    )
+
+    devices = tuple(range(declared))
+    rate = ring_bandwidth_gbps(
+        ring_order(devices, matrix),
+        matrix,
+        nvlink_gbps=device_nvlink_gbps(device_name),
+        pcie_gbps=device_host_link_gbps(device_name),
+    )
+    return all_reduce_seconds(plan.allreduce_bytes_per_token, declared, rate) * 1e3
 
 
 def group_spread(size: int) -> str:
@@ -344,17 +449,24 @@ def advise_tensor_parallelism(model: str, tensor_parallel: int) -> None:
 
     weights = model_weight_bytes(model)
     device = device_total_bytes()
+    plan = _replica_plan(model, weights, device)
     warn_about_tensor_parallelism(
         tensor_parallel,
         (weights or 0) / (1 << 30),
         device / (1 << 30) if device else None,
         local_device_name(),
-        needed=_smallest_workable_degree(model, weights, device),
+        needed=plan.tensor_parallel or None if plan is not None else None,
+        plan=plan,
     )
 
 
-def _smallest_workable_degree(model: str, weights: int | None, device: int | None) -> int | None:
-    """The smallest tensor-parallel degree that holds `model`, or `None` when unknowable.
+def _replica_plan(model: str, weights: int | None, device: int | None) -> ParallelPlan | None:
+    """The smallest replica that holds `model` on one of this worker's devices, or `None`.
+
+    Carbonite owns this decision — `plan_parallelism` is the arithmetic that chooses between
+    tensor and pipeline parallelism — and this supplies the model's shape to it. Asking for the
+    whole plan rather than the tensor degree alone is what lets the advice above speak about a
+    model that fits no tensor group at all, which is the case a degree cannot express.
 
     Better than the footprint bound it replaces on both counts that matter. It only proposes
     degrees the model's head counts admit, so it cannot name a group vLLM refuses to build —
@@ -363,11 +475,24 @@ def _smallest_workable_degree(model: str, weights: int | None, device: int | Non
     weights just fit leaves no cache, and an engine with no cache does not fail: it admits one
     sequence, preempts it, recomputes it, and serves a fraction of the throughput.
 
-    Returns `None` whenever the shape, the footprint, or the device size is unreadable, which
-    hands the caller back to its own arithmetic rather than to a guess.
+    `devices=0` deliberately: the question is what shape the *model* needs, which must be
+    answerable before this worker's budget is brought to bear, since the two warnings above
+    that read it fire precisely when the declared budget is wrong. `replicas` is therefore 0
+    on the returned plan and nothing reads it; the budget arithmetic stays with the caller.
+
+    Args:
+        model: The model id or path.
+        weights: The model's resident weight bytes, or `None` when unreadable.
+        device: One device's total memory in bytes, or `None` when unreadable.
+
+    Returns:
+        The plan, or `None` whenever the shape, the footprint, or the device size is
+        unreadable, or when no admissible shape holds the model — each of which hands the
+        caller back to its own arithmetic rather than to a guess.
     """
+    from batcher._internal.errors import ResourceError
     from batcher.carbonite.accel.kv_cache import kv_bytes_per_token
-    from batcher.carbonite.accel.parallelism import minimum_tensor_degree
+    from batcher.carbonite.accel.parallelism import plan_parallelism
     from batcher.ml.llm.engines.footprint import model_shape
 
     shape = model_shape(model)
@@ -377,16 +502,21 @@ def _smallest_workable_degree(model: str, weights: int | None, device: int | Non
 
     accel = active_config().accelerator
     context = accel.max_context_tokens or shape.max_context
-    degree = minimum_tensor_degree(
-        weights,
-        int(device * (1.0 - accel.vram_headroom)),
-        bytes_per_token=kv_bytes_per_token(
-            shape.layers, shape.kv_heads, shape.head_dim, accel.kv_cache_dtype
-        ),
-        context_tokens=context,
-        attention_heads=shape.attention_heads,
-        kv_heads=shape.kv_heads,
-    )
-    # `0` means no admissible degree holds it, which is a real answer but not one the
-    # "raise the degree to N" message can carry. Fall back rather than advise a zero.
-    return degree or None
+    try:
+        return plan_parallelism(
+            weight_bytes=weights,
+            usable_bytes=int(device * (1.0 - accel.vram_headroom)),
+            devices=0,
+            bytes_per_token=kv_bytes_per_token(
+                shape.layers, shape.kv_heads, shape.head_dim, accel.kv_cache_dtype
+            ),
+            context_tokens=context,
+            attention_heads=shape.attention_heads,
+            kv_heads=shape.kv_heads,
+            hidden_size=shape.hidden_size,
+            layers=shape.layers,
+        )
+    except ResourceError:
+        # No admissible shape holds it at all. A real answer, and not one any of the messages
+        # above can carry — they all name a setting to change. Fall back rather than advise.
+        return None

@@ -33,7 +33,6 @@ __all__ = [
     "gpu_tree_spec",
     "run_tree",
     "tree_leaves",
-    "tree_scan_ops",
     "tree_size",
 ]
 
@@ -167,17 +166,6 @@ def tree_size(spec: dict) -> int:
     if kind == "join":
         return 1 + tree_size(spec["left"]) + tree_size(spec["right"])
     return 1 + sum(tree_size(child) for child in spec["inputs"])
-
-
-def tree_scan_ops(spec: dict) -> tuple[dict, list[dict]] | None:
-    """`(leaf, ops)` when the whole tree is one leaf, else `None`.
-
-    The linear matcher's shape, recognized on the tree so a caller can keep using the
-    single-source fan-out — which reads its shard on the device and folds a mergeable
-    reducer — rather than paying the tree path's broadcast machinery for a plan with
-    nothing to broadcast.
-    """
-    return (spec, spec["ops"]) if spec["kind"] == "scan" else None
 
 
 def run_tree(spec: dict, frames: dict, be: DfBackend):

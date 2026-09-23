@@ -45,7 +45,7 @@ Avro, JSON, and Protobuf decoded in the source, with Confluent Schema Registry s
 
 ::::
 
-For triggers, watermarks, output modes, and checkpoints, which apply to every broker here, see {doc}`/user-guide/moving-data/streaming`.
+For triggers, watermarks, output modes, and checkpoints, which apply to every broker here, see {doc}`/user-guide/moving-data/streaming/index`.
 
 ```{toctree}
 :hidden:

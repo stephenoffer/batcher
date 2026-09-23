@@ -134,6 +134,15 @@ class FeatureSpec:
                 >>> from batcher.ml import FeatureSpec
                 >>> spec = FeatureSpec(["a", "b"], {"a": "int64", "b": "double"})
                 >>> spec.validate(bt.from_pydict({"a": [1], "b": [2.0]}))
+
+                A frame missing a pinned feature raises rather than scoring:
+
+                >>> from batcher import PlanError
+                >>> try:
+                ...     spec.validate(bt.from_pydict({"a": [1]}))
+                ... except PlanError as exc:
+                ...     print("missing" in str(exc))
+                True
         """
         present = list(ds.columns)
         feature_set = set(self.features)

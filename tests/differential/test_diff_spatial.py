@@ -579,3 +579,127 @@ def test_streaming_agrees_with_collect():
     streamed = [v for batch in ds.iter_batches() for v in batch.column("v").to_pylist()]
     assert collected == streamed
     assert streamed[:3] == [1.0, 2.0, 3.0]
+
+
+# --- wrappers with no test until now, against SciPy ------------------------------------
+#
+# `scipy.spatial.transform.Rotation` is an independent implementation (C, not a port of
+# this crate), which makes it the oracle for the functions DuckDB has no SQL spelling of:
+# matrix-to-quaternion, inverse rotation and pose interpolation.
+
+_Rotation = pytest.importorskip("scipy.spatial.transform").Rotation
+_Slerp = pytest.importorskip("scipy.spatial.transform").Slerp
+
+
+def _random_rotations(n: int, seed: int) -> list:
+    return list(_Rotation.random(n, random_state=seed))
+
+
+def test_quat_from_rotmat_matches_scipy_up_to_sign():
+    rots = [*_random_rotations(50, 7), _Rotation.from_rotvec([math.pi, 0, 0])]
+    names = [f"m{r}{c}" for r in range(3) for c in range(3)]
+    cols = {n: [float(rot.as_matrix()[i // 3][i % 3]) for rot in rots] for i, n in enumerate(names)}
+    got = (
+        bt.from_pydict(cols)
+        .select(**{k: getattr(bt, f"quat_from_rotmat_{k}")(*names) for k in "xyzw"})
+        .to_pydict()
+    )
+    for i, rot in enumerate(rots):
+        ours = [got[k][i] for k in "xyzw"]
+        want = rot.as_quat()
+        # q and -q are the same rotation; compare the one on the same side.
+        sign = 1.0 if sum(a * b for a, b in zip(ours, want, strict=True)) >= 0 else -1.0
+        assert [sign * v for v in ours] == pytest.approx(list(want), abs=1e-12), i
+
+
+@pytest.mark.parametrize(
+    ("label", "matrix"),
+    [
+        ("zero", [0.0] * 9),
+        ("scaled", [2.0, 0, 0, 0, 2.0, 0, 0, 0, 2.0]),
+        ("reflection", [-1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0]),
+        ("sheared", [1.0, 0.5, 0, 0, 1.0, 0, 0, 0, 1.0]),
+        ("nan", [float("nan"), 0, 0, 0, 1.0, 0, 0, 0, 1.0]),
+    ],
+)
+def test_quat_from_rotmat_is_null_for_a_matrix_that_is_not_a_rotation(label, matrix):
+    """Used to return a quaternion anyway: the zero matrix came back as a half turn about z."""
+    names = [f"m{i}" for i in range(9)]
+    ds = bt.from_pydict({n: [float(v)] for n, v in zip(names, matrix, strict=True)})
+    got = ds.select(**{k: getattr(bt, f"quat_from_rotmat_{k}")(*names) for k in "xyzw"})
+    assert got.to_pydict() == {k: [None] for k in "xyzw"}, label
+
+
+def test_quat_from_rotmat_accepts_a_float32_rounded_rotation():
+    """The tolerance is there for calibration files stored as float32."""
+    import numpy as np
+
+    m = _Rotation.from_euler("zyx", [0.3, -0.2, 0.9]).as_matrix().astype(np.float32).astype(float)
+    names = [f"m{i}" for i in range(9)]
+    ds = bt.from_pydict({n: [float(m[i // 3][i % 3])] for i, n in enumerate(names)})
+    w = ds.select(w=bt.quat_from_rotmat_w(*names)).to_pydict()["w"][0]
+    assert w is not None
+    assert abs(w) == pytest.approx(abs(_Rotation.from_matrix(m).as_quat()[3]), abs=1e-6)
+
+
+@pytest.mark.parametrize("component", ["x", "y", "z"])
+def test_quat_inverse_rotate_matches_scipy_inverse_apply(component):
+    rots = _random_rotations(20, 11)
+    cases = [(*rot.as_quat(), *p) for rot in rots for p in POINTS]
+    got = _batcher(
+        getattr(bt, f"quat_inverse_rotate_{component}")(*_Q, *_P), _columns(cases, _Q + _P)
+    )
+    axis = "xyz".index(component)
+    for case, value in zip(cases, got, strict=True):
+        want = _Rotation.from_quat(case[:4]).inv().apply(case[4:])[axis]
+        assert value == pytest.approx(want, abs=1e-9), case
+
+
+def test_pose_interpolate_matches_scipy_slerp_and_linear_translation():
+    rots = _random_rotations(12, 3)
+    rng = __import__("random").Random(5)
+    cases = []
+    for a, b in itertools.pairwise(rots):
+        ta = [rng.uniform(-10, 10) for _ in range(3)]
+        tb = [rng.uniform(-10, 10) for _ in range(3)]
+        for t in (0.0, 0.25, 0.5, 0.9, 1.0):
+            cases.append((ta, a, tb, b, t))
+    names_a = ["ax", "ay", "az", "aqx", "aqy", "aqz", "aqw"]
+    names_b = ["bx", "by", "bz", "bqx", "bqy", "bqz", "bqw"]
+    cols: dict[str, list[float]] = {n: [] for n in [*names_a, *names_b, "t"]}
+    for ta, a, tb, b, t in cases:
+        for n, v in zip(names_a, [*ta, *a.as_quat()], strict=True):
+            cols[n].append(float(v))
+        for n, v in zip(names_b, [*tb, *b.as_quat()], strict=True):
+            cols[n].append(float(v))
+        cols["t"].append(t)
+    got = bt.from_pydict(cols).select(**bt.pose_interpolate(names_a, names_b, "t")).to_pydict()
+    for i, (ta, a, tb, b, t) in enumerate(cases):
+        want_t = [lo + (hi - lo) * t for lo, hi in zip(ta, tb, strict=True)]
+        assert [got[k][i] for k in ("tx", "ty", "tz")] == pytest.approx(want_t, abs=1e-12)
+        want_q = _Slerp([0.0, 1.0], _Rotation.concatenate([a, b]))([t])[0]
+        ours = _Rotation.from_quat([got[k][i] for k in ("qx", "qy", "qz", "qw")])
+        assert (ours.inv() * want_q).magnitude() == pytest.approx(0.0, abs=1e-9), (i, t)
+
+
+def test_a_non_finite_fraction_nulls_every_interpolated_column():
+    """Used to return a NaN quaternion from ``quat_slerp`` and a NaN translation from
+    ``pose_interpolate`` beside it; the family nulls non-finite input everywhere else."""
+    pose = ("tx", "ty", "tz", "qx", "qy", "qz", "qw")
+    ds = bt.from_pydict(
+        {"tx": [0.0, 0.0], "ty": [0.0, 0.0], "tz": [0.0, 0.0],
+         "qx": [0.0, 0.0], "qy": [0.0, 0.0], "qz": [0.0, 0.0], "qw": [1.0, 1.0],
+         "t": [float("nan"), 0.5]}
+    )  # fmt: skip
+    got = ds.select(**bt.pose_interpolate(pose, pose, "t")).to_pydict()
+    assert {k: v[0] for k, v in got.items()} == dict.fromkeys(got)
+    assert got["tx"][1] == 0.0
+    assert got["qw"][1] == 1.0
+
+
+def test_quat_norm_of_a_nan_component_is_null():
+    """Was NaN, while every other function of the same quaternion was null."""
+    ds = bt.from_pydict(
+        {"qx": [float("nan"), 0.0], "qy": [0.0, 0.0], "qz": [0.0, 3.0], "qw": [1.0, 4.0]}
+    )
+    assert ds.select(n=bt.quat_norm(*_Q)).to_pydict()["n"] == [None, 5.0]

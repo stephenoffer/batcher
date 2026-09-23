@@ -278,15 +278,28 @@ def push_filter_through_project(node: Filter, _ctx: OptimizerContext) -> Logical
     behaviour (e.g. a row the filter would drop might now never hit a division that
     errors). Restricting to renames makes `p'` a pure column-renaming of `p`, so no
     computation moves across the filter and the result is identical.
+
+    Decided **per conjunct**: the ones over pass-through columns sink and the rest stay above.
+    Refusing the whole `AND` because one conjunct reads a computed column stranded the others,
+    and the one that mattered is the equality of a comma join. A decorrelated scalar subquery
+    projects its value through a `CASE` (the empty-group rule), so TPC-H q17's
+    `WHERE p_partkey = l_partkey AND ... AND l_quantity < (SELECT ...)` kept its join
+    equality above that projection, out of `derive_join_keys`' reach -- and ran as a cartesian
+    product of `lineitem` and `part`, 1.2e12 rows, OOM-killed at sf1. Sinking a subset is no
+    less safe than sinking the whole: each moved conjunct is a pure renaming of itself.
     """
     inner = node.input
     if not isinstance(inner, Project):
         return None
     passthrough = {it.alias: it.expr for it in inner.items if isinstance(it.expr, Col)}
-    if not referenced_columns(node.predicate) <= set(passthrough):
+    movable, kept = [], []
+    for conj in split_conjuncts(node.predicate):
+        (movable if referenced_columns(conj) <= set(passthrough) else kept).append(conj)
+    if not movable:
         return None
-    new_pred = _substitute_cols(node.predicate, passthrough)
-    return Project(Filter(inner.input, new_pred), inner.items)
+    new_pred = _substitute_cols(combine_conjuncts(movable), passthrough)
+    pushed = Project(Filter(inner.input, new_pred), inner.items)
+    return Filter(pushed, combine_conjuncts(kept)) if kept else pushed
 
 
 @rule(name="push_filter_through_map_batches", phase=Phase.PUSHDOWN, matches=(Filter,))

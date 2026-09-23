@@ -73,7 +73,11 @@ def test_full_outer_join_multi_key(duck):
 
 
 def test_full_outer_join_sql(duck, lr):
-    out = bt.sql("SELECT k, lv, rv FROM l FULL JOIN r ON l.k = r.k", l=lr[0], r=lr[1]).collect()
-    assert_same(
-        out, duck.sql("SELECT coalesce(l.k, r.k) k, lv, rv FROM l FULL OUTER JOIN r ON l.k = r.k")
-    )
+    # The same SQL on both sides. A bare `k` here is ambiguous (either side's key), which
+    # DuckDB refuses with a binder error and so does Batcher now; the query names the merged
+    # key explicitly instead of relying on Batcher having resolved the bare name leniently.
+    query = "SELECT coalesce(l.k, r.k) AS k, lv, rv FROM l FULL OUTER JOIN r ON l.k = r.k"
+    out = bt.sql(query, l=lr[0], r=lr[1]).collect()
+    assert_same(out, duck.sql(query))
+    with pytest.raises(bt.PlanError, match='ambiguous reference to column name "k"'):
+        bt.sql("SELECT k, lv, rv FROM l FULL JOIN r ON l.k = r.k", l=lr[0], r=lr[1])

@@ -19,6 +19,7 @@ from batcher.io.formats.structured._csv_options.dtypes import (
     arrow_type,
     header_and_skip,
 )
+from batcher.io.formats.structured._csv_options.encode import encode_with_null_token
 from batcher.io.formats.structured._csv_options.spec import NO_INDEX, READ_SPEC, WRITE_SPEC
 
 __all__ = ["CSVReadOptions", "CSVWriteOptions", "resolve_read_options", "resolve_write_options"]
@@ -284,9 +285,19 @@ def resolve_read_options(opts: dict[str, Any]) -> CSVReadOptions:
         out.update(_schema(resolved.pop("schema")))
     for name in ("column_names", "null_values", "true_values", "false_values"):
         if name in resolved:
-            out[name] = tuple(resolved.pop(name))
+            value = resolved.pop(name)
+            # One token is a common spelling (`na_values="MISSING"`, as pandas takes it), and
+            # `tuple()` of a string is its characters: "M", "I", "S", ... each became a null.
+            out[name] = (value,) if isinstance(value, str) else tuple(value)
     out.update(resolved)
     options = CSVReadOptions(**out)
+    _check_characters(options, ("delimiter", "quote_char", "escape_char", "decimal_point"))
+    for name in ("skip_rows", "skip_rows_after_header"):
+        if getattr(options, name) < 0:
+            raise FormatError(
+                f"csv: {name}={getattr(options, name)} is negative. It counts lines to skip, "
+                "so pass 0 or more."
+            )
     # Validate here rather than at parse time. `on_bad_lines="Skip"` would otherwise build a
     # source, infer a schema and plan a query before the first byte-range worker raised, and
     # under `on_error="skip"` the raise would be swallowed as an unreadable file — a typo in
@@ -351,50 +362,34 @@ class CSVWriteOptions:
             kwargs["delimiter"] = self.delimiter
         return pacsv.WriteOptions(**kwargs)
 
-    def apply_nulls(self, table: pa.Table) -> pa.Table:
-        """Render nulls as `null_value` rather than as Arrow's empty field.
+    def encode(self, table: pa.Table, *, include_header: bool) -> pa.Buffer | bytes:
+        """`table` as CSV bytes, for a write that encodes chunks in memory.
 
-        Arrow's CSV writer has no null-representation option, so the substitution happens in
-        the data: every column is cast to string and filled. The cast is a vectorized Arrow
-        kernel, not a row loop, and it runs only when `null_value` is set, so an ordinary
-        write costs nothing.
-
-        Casting *every* column, rather than only those that currently hold a null, is
-        deliberate: a streaming write encodes many batches against one schema, and a
-        per-batch decision would give two batches of the same file different schemas.
-
-        The visible consequence is that `null_value=` also quotes every field, because
-        Arrow's writer quotes string values and there is no way to ask it not to without
-        also disabling the quoting that keeps a value containing the delimiter readable.
-        The output is still valid CSV that round-trips to the same values.
+        With `null_value` set this is `encode.encode_with_null_token`, because Arrow's writer
+        cannot write a null as anything but an empty field: it quotes every string, the
+        token included, and a quoted token reads back as text. Without it the Arrow writer
+        is used unchanged.
 
         Args:
-            table: The rows about to be encoded.
+            table: The rows to encode.
+            include_header: Whether this chunk carries the header (ANDed with `header=`).
 
         Returns:
-            The table with nulls replaced, or the same table when there is nothing to do.
+            The encoded bytes.
         """
-        if self.null_value is None:
-            return table
-        import pyarrow.compute as pc
+        if self.null_value is not None:
+            return encode_with_null_token(
+                table,
+                delimiter=self.delimiter or ",",
+                null_token=self.null_value,
+                include_header=include_header and self.header,
+            )
+        import pyarrow.csv as pacsv
 
-        return pa.table(
-            [pc.fill_null(pc.cast(c, pa.string()), self.null_value) for c in table.columns],
-            schema=self.null_schema(table.schema),
-        )
-
-    def null_schema(self, schema: pa.Schema) -> pa.Schema:
-        """The schema `apply_nulls` produces, for an incremental writer opened ahead of time.
-
-        Args:
-            schema: The schema of the batches about to be written.
-
-        Returns:
-            The all-string schema when `null_value` is set, else `schema` unchanged.
-        """
-        if self.null_value is None:
-            return schema
-        return pa.schema([pa.field(f.name, pa.string(), f.nullable) for f in schema])
+        sink = pa.BufferOutputStream()
+        options = self.write_options(include_header=include_header)
+        pacsv.write_csv(table, sink, write_options=options)
+        return sink.getvalue()
 
 
 def resolve_write_options(opts: dict[str, Any]) -> CSVWriteOptions:
@@ -418,4 +413,31 @@ def resolve_write_options(opts: dict[str, Any]) -> CSVWriteOptions:
     # asks for a column that does not exist, which has to be said out loud.
     if resolved.pop("index", False):
         raise FormatError(f"csv: 'index' is not a Batcher option. {NO_INDEX}")
-    return CSVWriteOptions(**resolved)
+    options = CSVWriteOptions(**resolved)
+    _check_characters(options, ("delimiter",))
+    return options
+
+
+def _check_characters(options: object, names: tuple[str, ...]) -> None:
+    """Raise `FormatError` for a separator option that is not exactly one character.
+
+    Arrow's parser takes each of these as a single character and says so only as
+    ``only single character unicode strings can be converted to Py_UCS4``, raised from the
+    first file it opens, where the read wraps it as that *file* being unreadable. The fix is
+    in the option, so it is named at the option, before any file is touched. `False` is how
+    quoting and escaping are switched off, so it is allowed where Arrow allows it.
+    """
+    for name in names:
+        value = getattr(options, name)
+        if value is None or value is False or (isinstance(value, str) and len(value) == 1):
+            continue
+        hint = (
+            " For a multi-character separator, read each line as one column (a delimiter "
+            "that never occurs) and split it with .str.split()."
+            if name == "delimiter"
+            else ""
+        )
+        raise FormatError(
+            f"csv: {name}={value!r} must be a single character; Arrow's CSV parser takes "
+            f"one character here.{hint}"
+        )

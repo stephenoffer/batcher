@@ -173,7 +173,7 @@ Two habits follow, and both are enforced in the test suite:
 
 - claim a property only when it is *proved*, never when it is merely likely;
 - test an ordering with an order-*sensitive* assertion, because the default comparison in
-  `tests/differential/` is order-independent by design.
+  [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential) is order-independent by design.
 
 The sound form of that rewrite matches the consumer whose own output order is unspecified.
 `eliminate_sort_before_aggregate` removes a sort beneath a group-by, looking through an

@@ -246,9 +246,11 @@ def test_an_aggregate_constraint_reports_itself_as_an_aggregate(ds):
     """
     report = ds.dq.median_between("v", 0.0, 1.0).sum_between("v", 0.0, 1.0).validate()
     assert [r.kind for r in report.results] == ["aggregate", "aggregate"]
-    assert all(r.rows == 0 for r in report.results), (
-        "an aggregate check has no offending row count to report"
-    )
+    # A relation-level check is decided over the whole relation, so it reports that relation's
+    # row count (it used to report 0, which read as "checked nothing"), and a failed one has a
+    # pass rate of 0.0 rather than the 1.0 it used to claim.
+    assert all(r.rows == ds.count() for r in report.results)
+    assert all(r.pass_rate == 0.0 for r in report.results)
     assert all(not r.ok for r in report.results)
     assert report.total_violations == 2
 

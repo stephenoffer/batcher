@@ -479,6 +479,6 @@ precondition in full.
   slowly-changing dimensions.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and quarantine before you write.
 - {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: write to an object store.
-- {doc}`/user-guide/moving-data/streaming`: the same `ds.write` with a trigger, as a continuous query.
+- {doc}`/user-guide/moving-data/streaming/index`: the same `ds.write` with a trigger, as a continuous query.
 - {doc}`IO API </api/relational/io>`: the full {py:obj}`ds.write <batcher.Dataset.write>` writer reference.
 - {doc}`/cookbook/io/save_modes`: save modes and write manifests, as a runnable script.

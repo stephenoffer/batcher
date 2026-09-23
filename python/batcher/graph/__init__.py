@@ -22,6 +22,7 @@ triangle counting cost far more than its average degree suggests.
 from __future__ import annotations
 
 from batcher.graph._graph import Graph
+from batcher.graph._iterate import ConvergenceWarning
 from batcher.graph.build import (
     co_occurrence_graph,
     knn_graph,
@@ -97,6 +98,7 @@ from batcher.graph.traversal import (
 )
 
 __all__ = [
+    "ConvergenceWarning",
     "Graph",
     "adamic_adar",
     "aggregate_neighbors",

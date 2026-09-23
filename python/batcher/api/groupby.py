@@ -14,9 +14,8 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.api._varargs import flatten_varargs
-from batcher.api.dataset.compat.guidance import groupby_attribute_error
 from batcher.plan.expr_ir import AggExpr, Aliased, Col, Expr, IntoExpr
-from batcher.plan.expr_ir.selectors import Selector, expand_selectors, has_selector
+from batcher.plan.expr_ir.selectors import Selector, expand_one, expand_selectors, has_selector
 from batcher.plan.expr_rewrite.naming import output_name
 from batcher.plan.logical import (
     Aggregate,
@@ -144,6 +143,14 @@ class GroupBy:
         # Dunder and private probes (copy/pickle/inspect) must fail plainly.
         if name.startswith("_"):
             raise AttributeError(name)
+        # Imported here, not at module scope. `batcher.api.dataset.compat.guidance` pulls in
+        # `batcher.api.dataset`, whose `__init__` imports `frame`, which imports this module
+        # -- so a module-scope import defeated the cycle-avoidance this file's docstring
+        # describes and made `bt.GroupBy` raise ImportError whenever it was the first public
+        # name touched (`bt.Dataset` first happened to work, which is why it hid). It is an
+        # error path reached once per mistake, so the deferred lookup costs nothing.
+        from batcher.api.dataset.compat.guidance import groupby_attribute_error
+
         raise groupby_attribute_error(self, name)
 
     @property
@@ -270,6 +277,9 @@ class GroupBy:
             return self.agg(**{**self._spec_to_aggs(aggs[0]), **named})
         aggs = flatten_varargs(aggs)
         positional = self._named_aggs(aggs)
+        named = {
+            k: self._expand_selector_agg(v, k) if has_selector(v) else v for k, v in named.items()
+        }
         clashing = sorted(positional.keys() & named.keys())
         if clashing:
             raise PlanError(
@@ -1029,7 +1039,7 @@ class GroupBy:
         """
         pairs: list[tuple[str, AggExpr | Expr]] = []
         for a in aggs:
-            if isinstance(a, AggExpr) and a.name is None and has_selector(a.input):
+            if has_selector(a):
                 pairs.extend(self._expand_selector_agg(a))
             elif isinstance(a, (AggExpr, Expr)):
                 pairs.append((output_name(a), a.inner if isinstance(a, Aliased) else a))
@@ -1054,26 +1064,21 @@ class GroupBy:
             out[name] = agg
         return out
 
-    def _expand_selector_agg(self, agg: AggExpr) -> list[tuple[str, AggExpr]]:
-        """One aggregate per column a selector-valued aggregate input matches."""
-        source = self._source
-        expanded = expand_selectors(
-            agg.input, source._plan.available_columns(), source._plan.available_schema()
-        )
-        return [
-            (
-                name,
-                AggExpr(
-                    agg.func,
-                    expr,
-                    input2=agg.input2,
-                    param=agg.param,
-                    interpolation=agg.interpolation,
-                    order_by=agg.order_by,
-                ),
-            )
-            for name, expr in expanded
-        ]
+    def _expand_selector_agg(self, agg: Any, keyword: str | None = None) -> Any:
+        """One aggregate per column a selector inside `agg` matches, group keys excluded.
+
+        As in Polars, the keys are never aggregated over: ``group_by("g").agg(bt.all().sum())``
+        sums every other column. Each output takes the selector's ``.name`` rename, else its
+        column's name; an ``.alias(...)`` over a selector that matched several columns is
+        refused here, at definition, rather than naming one column and failing at execution.
+        With a `keyword` (``agg(total=bt.numeric().sum())``) the selector must match exactly
+        one column, and that one aggregate is returned.
+        """
+        plan, keys = self._source._plan, frozenset(self.keys)
+        args = (agg, plan.available_columns(), plan.available_schema())
+        if keyword is None:
+            return expand_selectors(*args, exclude=keys)
+        return expand_one(*args, exclude=keys, where=f"agg({keyword}=...)")
 
     def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:
         if self._having:

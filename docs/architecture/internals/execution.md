@@ -58,7 +58,7 @@ them. That mapping is the thing to know before touching a stateful operator:
 
 So a new stateful operator that has no mergeable form is not merely un-distributed. It
 is capped at the sequential path, and the failure surfaces at cluster scale as wrong
-results rather than as an error. `tests/integration/test_distributed.py` asserts the
+results rather than as an error. [`tests/integration/test_distributed.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_distributed.py) asserts the
 invariant directly, operator by operator: single-node output must equal multi-worker
 output. It calls `pytest.importorskip("ray")`, and CI installs no Ray, so a green PR gate
 says nothing about that arm. A recorded cluster run is the evidence. See

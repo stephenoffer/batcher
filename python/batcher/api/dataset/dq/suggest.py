@@ -27,6 +27,7 @@ import pyarrow as pa
 
 from batcher.api.dataset.dq.checks import aggregates, strings, values
 from batcher.api.dataset.dq.constraints import Constraint, UniqueConstraint
+from batcher.governance._validate import reject_bare_string
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -71,18 +72,42 @@ def _profile_rows(ds: Dataset, columns: list[str]) -> list[dict[str, Any]]:
     return [dict(zip(table, row, strict=True)) for row in zip(*table.values(), strict=True)]
 
 
-def _numeric_bounds(ds: Dataset, numeric: list[str]) -> dict[str, float | None]:
-    """The minimum of every numeric column, measured in one keyless aggregate."""
-    if not numeric:
-        return {}
-    from batcher.plan.expr_ir import Col
+def _numeric_profile(
+    ds: Dataset, numeric: list[str], floating: list[str]
+) -> tuple[dict[str, float | None], set[str]]:
+    """Every numeric column's minimum and which float columns are finite, in one aggregate.
 
-    row = ds.agg(**{f"__dq_min_{i}": Col(c).min() for i, c in enumerate(numeric)}).to_pydict()
-    out: dict[str, float | None] = {}
+    Finiteness is measured rather than assumed because `suggest` promises that everything it
+    proposes holds on the data it was read from. A float column that already holds a NaN or
+    an infinity would get an `is_finite` that the same relation fails at once. Counting the
+    non-finite rows is one more reduction in the keyless aggregate this already runs, so the
+    check costs no extra pass.
+
+    Args:
+        ds: The dataset to profile.
+        numeric: The numeric columns whose minimum is wanted.
+        floating: The float columns whose finiteness is wanted.
+
+    Returns:
+        The minimum per numeric column (None when it is all-null or empty), and the set of
+        float columns with no NaN and no infinity.
+    """
+    if not numeric and not floating:
+        return {}, set()
+    from batcher.plan.expr_ir import Col, lit, when
+
+    aggs = {f"__dq_min_{i}": Col(c).min() for i, c in enumerate(numeric)}
+    for i, c in enumerate(floating):
+        valid = values.is_finite(c).valid
+        aggs[f"__dq_bad_{i}"] = when(valid).then(lit(0)).otherwise(lit(1)).sum()
+    row = ds.agg(**aggs).to_pydict()
+    minimums: dict[str, float | None] = {}
     for i, c in enumerate(numeric):
         value = row[f"__dq_min_{i}"][0]
-        out[c] = None if value is None else float(value)
-    return out
+        minimums[c] = None if value is None else float(value)
+    # `sum` over an empty relation is NULL, which is zero offending rows.
+    finite = {c for i, c in enumerate(floating) if not row[f"__dq_bad_{i}"][0]}
+    return minimums, finite
 
 
 def _categories(ds: Dataset, column: str, limit: int) -> list[Any] | None:
@@ -113,14 +138,23 @@ def suggest(
             enumeration rather than left unconstrained.
 
     Returns:
-        The proposed constraints, schema-shaped ones first.
+        The proposed constraints, schema-shaped ones first. A float column gets
+        `is_finite` only when it holds no NaN and no infinity, so every proposal holds on
+        the data it was read from.
+
+    Raises:
+        PlanError: If `columns` is a bare string rather than a list of names.
     """
+    reject_bare_string(
+        columns, what="suggest(columns=...)", param="columns", reads_as="one column per character"
+    )
     schema = ds.schema
     names = list(columns) if columns else list(schema.names)
     proposed: list[Constraint] = []
     rows = _profile_rows(ds, names)
     numeric = [c for c in names if _is_numeric(schema.field(c).type)]
-    minimums = _numeric_bounds(ds, numeric)
+    floating = [c for c in names if pa.types.is_floating(schema.field(c).type)]
+    minimums, finite = _numeric_profile(ds, numeric, floating)
     budget = _CATEGORY_BUDGET
     for row in rows:
         column = str(row["column"])
@@ -143,7 +177,7 @@ def suggest(
             low = minimums[column]
             if low >= 0:
                 proposed.append(values.positive(column, strict=low > 0))
-        if pa.types.is_floating(dtype):
+        if column in finite:
             proposed.append(values.is_finite(column))
         # An enumeration is a *small vocabulary each of whose values recurs*. Testing only
         # "few distinct values" makes every short table's free-text column an enum — a

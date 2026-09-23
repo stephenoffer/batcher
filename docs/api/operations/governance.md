@@ -280,6 +280,48 @@ split, not placed.
 .. autodata:: RESIDENCY_MODES
 ```
 
+
+## Entry points and query control
+
+The calls that install a policy context and read back who is asking. {py:obj}`bt.security <batcher.security>` is a context
+manager rather than a setter, because policy attaches when a table is *read*: a dataset built inside
+the block stays governed for its whole life, including terminal operations that run after the block
+has exited, and a table read outside every block is ungoverned.
+
+```{eval-rst}
+.. currentmodule:: batcher
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   security
+   authenticate
+   set_verifier
+   current_verifier
+```
+
+Two more calls govern a running *query* rather than a table, and they sit here because stopping a
+query is the same kind of authority as refusing a column.
+{py:func}`running_queries <batcher.running_queries>` lists the ids executing in this process, one per
+terminal operation, and {py:func}`cancel_query <batcher.cancel_query>` asks one of them to stop.
+
+Cancellation is cooperative. The engine checks the flag between morsels, between operators, and
+between spill merge passes, so a query part-way through building a hash table notices when that
+build finishes rather than the instant you ask.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   cancel_query
+   running_queries
+```
+
+Column-level lineage is not here at all. It hangs off the dataset, at
+{py:obj}`ds.lineage() <batcher.Dataset.lineage>`.
+
 ## See also
 
 - {doc}`Governance guide </user-guide/trust/governance>`: the worked introduction, with a runnable

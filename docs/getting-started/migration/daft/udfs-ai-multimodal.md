@@ -79,7 +79,7 @@ The following table maps the 38 names on the `daft.functions` module, sorted alp
 | `image_mode` | `Expr.image.decode` + `Expr.struct.field` | param | Missing: a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes). Wave W12. |
 | `image_to_tensor` | `Expr.image.to_tensor` | mismatch | Differs: Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type; Daft infers shape from the image, Batcher requires width and height and flattens to RGB8. Wave W12. |
 | `image_width` | `Expr.image.decode` + `Expr.struct.field` | param | Missing: a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes). Wave W12. |
-| `llm_generate` | `batcher.ml.llm_generate` | param | Missing: an Expression-level form taking model=/provider=('vllm'\|'openai'). Wave W12. |
+| `llm_generate` | {py:obj}`batcher.ml.llm_generate <batcher.ml.llm_generate>` | param | Missing: an Expression-level form taking model=/provider=('vllm'\|'openai'). Wave W12. |
 | `prompt` | `Dataset.ml.generate` | param | Missing: an Expression-level prompt with return\_format= structured output and provider/model resolved from the session. Wave W12. |
 | `resample` | `Expr.audio.resample` | param | Missing: AudioFile input (Batcher resamples encoded audio bytes). Wave W12. |
 | `resize` | `Expr.image.resize` | mismatch | Differs: Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type. Wave W12. |
@@ -88,3 +88,11 @@ The following table maps the 38 names on the `daft.functions` module, sorted alp
 | `video_frames` | `Expr.video.frames` | mismatch | Differs: Daft decodes every frame in a \[start\_time, end\_time) range with per-frame metadata; Batcher frames(num\_frames, width, height) samples a fixed count of evenly spaced frames. Param: start\_time=/end\_time=/is\_key\_frame=. Wave W12. |
 | `video_keyframes` | n/a | gap | Not yet: keyframe extraction over a time range. Wave W12. |
 | `video_metadata` | `Expr.video.decode` | param | Missing: VideoFile input and Daft's metadata field names. Wave W12. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

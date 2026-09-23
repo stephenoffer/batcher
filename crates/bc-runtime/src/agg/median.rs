@@ -223,13 +223,13 @@ pub(crate) fn quickselect_median(v: &mut [f64]) -> f64 {
     if n % 2 == 1 {
         *mid
     } else {
-        let lower = lo.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
-            if float_total_cmp(a, b).is_lt() {
-                b
-            } else {
-                a
-            }
-        });
+        // `reduce` rather than a fold seeded with `-inf`, mirroring the upper bracket in
+        // `quickselect_quantile`: the answer must come from the partition, never the seed.
+        let lower = lo
+            .iter()
+            .copied()
+            .reduce(|a, b| if float_total_cmp(a, b).is_lt() { b } else { a })
+            .unwrap_or(*mid);
         // `f64::midpoint`, not `(lower + mid) / 2.0`: the sum of two large finite doubles
         // overflows to infinity, so the naive form reports `inf` as the median of e.g.
         // {1e308, 1.7e308} where the true midpoint (and DuckDB's answer) is 1.35e308.
@@ -272,13 +272,14 @@ fn quickselect_quantile(v: &mut [f64], q: f64, interpolation: QuantileInterpolat
     let hi_val = if frac == 0.0 || greater.is_empty() {
         lo_val
     } else {
-        greater.iter().copied().fold(f64::INFINITY, |a, b| {
-            if float_total_cmp(b, a).is_lt() {
-                b
-            } else {
-                a
-            }
-        })
+        // `reduce`, not a fold seeded with `+inf`: the engine's total order ranks NaN
+        // *above* `+inf`, so when the next rank was NaN the seed won, and `quantile_cont`
+        // over {1, 2, NaN, 4} at 0.75 returned `inf` where DuckDB returns NaN.
+        greater
+            .iter()
+            .copied()
+            .reduce(|a, b| if float_total_cmp(b, a).is_lt() { b } else { a })
+            .unwrap_or(lo_val)
     };
     if interpolation == QuantileInterpolation::Midpoint {
         // Halve before adding only when the sum would overflow, so the common case is the
@@ -296,9 +297,13 @@ fn quickselect_quantile(v: &mut [f64], q: f64, interpolation: QuantileInterpolat
     // returns. This form scales each endpoint by a weight in [0, 1] and never forms their
     // difference, so a finite input cannot produce an infinite quantile.
     //
-    // At `frac == 0` the caller has already set `hi_val = lo_val`, so this is exactly `lo_val`;
-    // at `frac == 1` it is exactly `hi_val`. In between it agrees with the subtractive form
-    // wherever that form does not overflow.
+    // At `frac == 0` the position is exactly an element, which is the answer as-is: the
+    // combination would compute `lo * 1 + lo * 0`, and `inf * 0` is NaN, so `quantile_cont`
+    // over {1, inf} at 1.0 returned NaN where DuckDB returns inf. In between it agrees with
+    // the subtractive form wherever that form does not overflow.
+    if frac == 0.0 {
+        return lo_val;
+    }
     lo_val * (1.0 - frac) + hi_val * frac
 }
 
@@ -797,6 +802,33 @@ mod tests {
         assert_eq!(
             super::quickselect_quantile(&mut v2, 2.0 / 3.0, QuantileInterpolation::Linear),
             3.0
+        );
+    }
+
+    #[test]
+    fn quantile_bracketing_a_nan_interpolates_to_nan_not_inf() {
+        // The upper bracket was a min-fold seeded with `+inf`, and NaN ranks above `+inf`,
+        // so a NaN next rank lost to the seed: q=0.75 over {1, 2, NaN, 4} (sorted
+        // [1, 2, 4, NaN], position 2.25) came back `inf`. DuckDB's `quantile_cont` is NaN.
+        for nan in [f64::NAN, f64::from_bits(0xfff8_0000_0000_0000)] {
+            let mut v = vec![1.0, 2.0, nan, 4.0];
+            let q = super::quickselect_quantile(&mut v, 0.75, QuantileInterpolation::Linear);
+            assert!(q.is_nan(), "expected NaN, got {q}");
+            let mut v = vec![1.0, nan];
+            let q = super::quickselect_quantile(&mut v, 0.5, QuantileInterpolation::Midpoint);
+            assert!(q.is_nan(), "expected NaN, got {q}");
+            // Positions that never reach the NaN stay exact.
+            let mut v = vec![1.0, 2.0, nan, 4.0];
+            assert_eq!(
+                super::quickselect_quantile(&mut v, 0.5, QuantileInterpolation::Linear),
+                3.0
+            );
+        }
+        // An infinite neighbour is still honoured, so the fix is not "skip non-finite".
+        let mut v = vec![1.0, f64::INFINITY];
+        assert_eq!(
+            super::quickselect_quantile(&mut v, 1.0, QuantileInterpolation::Linear),
+            f64::INFINITY
         );
     }
 

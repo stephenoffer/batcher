@@ -1,4 +1,6 @@
-//! Geometries derived from other geometries — hulls, envelopes, buffers, simplification.
+//! Geometries derived from other geometries — hulls, envelopes, simplification.
+//!
+//! `buffer` has its own module, because doing it correctly needs a polygon union.
 //!
 //! These are the constructors a pipeline reaches for between a raw geometry column and
 //! a join or a map: shrink the vertex count before a shuffle, grow a point into a
@@ -97,12 +99,9 @@ pub fn boundary(g: &Geometry) -> Geometry {
                 Geometry::MultiPoint(vec![Some(l[0]), Some(l[l.len() - 1])])
             }
         }
-        Geometry::MultiLineString(ls) => Geometry::MultiPoint(
-            ls.iter()
-                .filter(|l| l.len() >= 2 && !crate::types::is_closed(l))
-                .flat_map(|l| [Some(l[0]), Some(l[l.len() - 1])])
-                .collect(),
-        ),
+        Geometry::MultiLineString(ls) => {
+            Geometry::MultiPoint(mod2_boundary(ls).into_iter().map(Some).collect())
+        }
         // The empty set at dimension -1: a point set's boundary has no type of its own
         // to be empty in, so OGC (and GEOS, and PostGIS) spell it as an empty collection
         // rather than as an empty MULTIPOINT.
@@ -111,6 +110,41 @@ pub fn boundary(g: &Geometry) -> Geometry {
             Geometry::GeometryCollection(gs.iter().map(boundary).collect())
         }
     }
+}
+
+/// The OGC "mod 2" boundary of a set of chains: every endpoint that ends an *odd*
+/// number of member chains.
+///
+/// Two chains meeting end to end at a point are one path through it, so that point is
+/// interior, not boundary: `MULTILINESTRING((0 0, 1 1), (1 1, 2 0))` has the boundary
+/// `MULTIPOINT((0 0), (2 0))`. Listing every member's endpoints, as this used to, put
+/// `(1 1)` in the boundary twice. A closed member contributes its start twice and so
+/// nothing. The points come back sorted by x then y, which is the order GEOS (and so
+/// PostGIS and DuckDB) emits them in.
+fn mod2_boundary(ls: &[LineString]) -> Vec<Coord> {
+    let mut ends: Vec<Coord> = ls
+        .iter()
+        .filter(|l| l.len() >= 2)
+        .flat_map(|l| [l[0], l[l.len() - 1]])
+        .collect();
+    ends.sort_by(|a, b| {
+        a.x.total_cmp(&b.x)
+            .then(a.y.total_cmp(&b.y))
+            .then(a.z.total_cmp(&b.z))
+    });
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < ends.len() {
+        let mut j = i + 1;
+        while j < ends.len() && ends[j].x == ends[i].x && ends[j].y == ends[i].y {
+            j += 1;
+        }
+        if (j - i) % 2 == 1 {
+            out.push(ends[i]);
+        }
+        i = j;
+    }
+    out
 }
 
 /// The convex hull, by monotone chain.
@@ -246,16 +280,33 @@ fn dp_recurse(line: &[Coord], first: usize, last: usize, eps: f64, keep: &mut [b
 
 /// Drop consecutive duplicate positions, optionally merging any pair closer than
 /// `tolerance`. Rings stay closed.
+///
+/// Both endpoints of a chain survive, and a chain never thins below two positions —
+/// GEOS's rule, and so PostGIS's and DuckDB's. `LINESTRING(0 0, 0 0)` stays as it is
+/// rather than becoming a one-position "line", which no encoding treats as a line and
+/// every length and validity function then answered differently.
 #[must_use]
 pub fn remove_repeated_points(g: &Geometry, tolerance: f64) -> Geometry {
     fn thin(l: &LineString, tol: f64) -> LineString {
+        let (Some(&first), Some(&last)) = (l.first(), l.last()) else {
+            return l.clone();
+        };
+        if l.len() < 2 {
+            return l.clone();
+        }
         let mut out: Vec<Coord> = Vec::with_capacity(l.len());
-        for c in l {
-            match out.last() {
-                Some(prev) if dist(*prev, *c) <= tol => {}
-                _ => out.push(*c),
+        out.push(first);
+        for c in &l[1..l.len() - 1] {
+            if out.last().is_some_and(|prev| dist(*prev, *c) > tol) {
+                out.push(*c);
             }
         }
+        // The last position is kept even when it is within tolerance of the one before;
+        // that one gives way instead, so the chain still ends where it ended.
+        if out.len() >= 2 && out.last().is_some_and(|prev| dist(*prev, last) <= tol) {
+            out.pop();
+        }
+        out.push(last);
         out
     }
     fn thin_ring(l: &LineString, tol: f64) -> LineString {
@@ -301,66 +352,6 @@ pub fn remove_repeated_points(g: &Geometry, tolerance: f64) -> Geometry {
         ),
         other => other.clone(),
     }
-}
-
-/// A buffer of `radius` around the geometry, approximated with `quad_segs` segments
-/// per quarter circle.
-///
-/// This is an approximation and says so: it buffers each vertex with a regular polygon
-/// and each segment with its offset rectangle, then takes the convex hull of the union.
-/// For a convex input that is the exact buffer up to the arc discretization. For a
-/// concave one it is the buffer *of the hull*, which is an over-estimate — sound as a
-/// candidate filter for a subsequent exact predicate, and wrong if consumed as an area.
-/// `buffer_error` names the shortfall so a caller can decide.
-pub fn buffer(g: &Geom, radius: f64, quad_segs: usize) -> GeoResult<Geometry> {
-    if radius.is_nan() {
-        return Err(GeoError::invalid("buffer radius must be a number"));
-    }
-    if quad_segs == 0 {
-        return Err(GeoError::invalid(
-            "buffer needs at least one segment per quadrant",
-        ));
-    }
-    if radius <= 0.0 {
-        // A zero or negative buffer of a point set has no area; PostGIS returns an
-        // empty polygon rather than the input, and an eroded polygon needs the overlay
-        // this function deliberately does not use.
-        return Ok(Geometry::Polygon(Polygon::default()));
-    }
-    let coords = g.coords();
-    if coords.is_empty() {
-        return Ok(Geometry::Polygon(Polygon::default()));
-    }
-    let steps = quad_segs * 4;
-    let mut pts = Vec::with_capacity(coords.len() * steps);
-    for c in &coords {
-        for k in 0..steps {
-            let theta = std::f64::consts::TAU * (k as f64) / (steps as f64);
-            pts.push(Coord::new(
-                c.x + radius * theta.cos(),
-                c.y + radius * theta.sin(),
-            ));
-        }
-    }
-    let mut hull_input = Geom::new(Geometry::MultiPoint(pts.into_iter().map(Some).collect()));
-    hull_input.srid = g.srid;
-    Ok(convex_hull(&hull_input))
-}
-
-/// The fraction by which `buffer` over-estimates for this geometry: 0 for a convex
-/// input, positive for a concave one.
-///
-/// Exposed so the approximation is measurable rather than a footnote. A caller running
-/// a candidate filter can ignore it; a caller reporting an area can check it and refuse.
-#[must_use]
-pub fn buffer_error(g: &Geom) -> f64 {
-    let hull = convex_hull(g);
-    let a_hull = crate::algo::measure::area(&hull);
-    let a_geom = crate::algo::measure::area(&g.geometry);
-    if a_hull <= 0.0 {
-        return 0.0;
-    }
-    ((a_hull - a_geom) / a_hull).max(0.0)
 }
 
 /// Force every ring of every polygon to the given winding.
@@ -596,20 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn buffer_contains_the_input_and_reports_its_own_error() {
-        let pt = g("POINT(0 0)");
-        let b = buffer(&pt, 1.0, 8).unwrap();
-        let a = area(&b);
-        // A 32-gon inscribed in the unit circle: slightly under pi, never over.
-        assert!(a < std::f64::consts::PI && a > 3.10, "got {a}");
-        assert_eq!(buffer_error(&pt), 0.0);
-        let c = g("POLYGON((0 0, 10 0, 10 2, 2 2, 2 8, 10 8, 10 10, 0 10, 0 0))");
-        assert!(buffer_error(&c) > 0.3, "a C-shape is far from its hull");
-        assert!(buffer(&pt, 1.0, 0).is_err());
-        assert!(buffer(&pt, f64::NAN, 4).is_err());
-    }
-
-    #[test]
     fn winding_is_forced_consistently_including_holes() {
         let p = g("POLYGON((0 0, 0 4, 4 4, 4 0, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))");
         let ccw = force_winding(&p.geometry, true);
@@ -657,5 +634,48 @@ mod tests {
         let out =
             remove_repeated_points(&g("POLYGON((0 0, 0 0, 4 0, 4 4, 0 4, 0 0))").geometry, 0.0);
         assert_eq!(wkt(out), "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))");
+    }
+
+    #[test]
+    fn a_multiline_boundary_follows_the_mod_2_rule() {
+        // DuckDB: MULTIPOINT (0 0, 2 0), and MULTIPOINT (0 0, 1 1, 1 5, 2 0).
+        let b = |t: &str| write_wkt(&Geom::new(boundary(&read_wkt(t).unwrap().geometry)));
+        assert_eq!(
+            b("MULTILINESTRING((0 0, 1 1), (1 1, 2 0))"),
+            "MULTIPOINT((0 0), (2 0))"
+        );
+        assert_eq!(
+            b("MULTILINESTRING((0 0, 1 1), (1 1, 2 0), (1 1, 1 5))"),
+            "MULTIPOINT((0 0), (1 1), (1 5), (2 0))"
+        );
+        assert_eq!(
+            b("MULTILINESTRING((0 0, 1 1), (1 1, 0 0))"),
+            "MULTIPOINT EMPTY"
+        );
+    }
+
+    #[test]
+    fn thinning_keeps_both_endpoints_and_never_leaves_one_position() {
+        let t = |w: &str, tol: f64| {
+            write_wkt(&Geom::new(remove_repeated_points(
+                &read_wkt(w).unwrap().geometry,
+                tol,
+            )))
+        };
+        // Expected values are DuckDB's ST_RemoveRepeatedPoints.
+        assert_eq!(t("LINESTRING(0 0, 0 0)", 0.0), "LINESTRING(0 0, 0 0)");
+        assert_eq!(t("LINESTRING(0 0, 0 0, 0 0)", 0.0), "LINESTRING(0 0, 0 0)");
+        assert_eq!(
+            t("LINESTRING(0 0, 5 5, 5.1 5)", 1.0),
+            "LINESTRING(0 0, 5.1 5)"
+        );
+        assert_eq!(
+            t("LINESTRING(0 0, 0.1 0, 0.2 0)", 1.0),
+            "LINESTRING(0 0, 0.2 0)"
+        );
+        assert_eq!(
+            t("LINESTRING(0 0, 1 1, 1 1, 2 2)", 0.0),
+            "LINESTRING(0 0, 1 1, 2 2)"
+        );
     }
 }

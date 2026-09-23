@@ -11,7 +11,9 @@ from collections.abc import Callable
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.selectors.core import Selector
+from batcher.plan.types.lattice import widen
 
 __all__ = [
     "all",
@@ -148,17 +150,26 @@ def contains(*substrings: str) -> Selector:
     return Selector(lambda n, _d: any(s in n for s in substrings), f"contains{substrings!r}")
 
 
-def by_dtype(*dtypes: pa.DataType) -> Selector:
-    """Select every column whose Arrow type is one of `dtypes`.
+def by_dtype(*dtypes: pa.DataType | str) -> Selector:
+    """Select every column whose Arrow type is one of `dtypes`, as the engine stores it.
 
-    The precise counterpart of the category selectors (`numeric`, `string`, …): pass
-    the exact `pyarrow` types to match, e.g. ``bt.by_dtype(pa.int32(), pa.int64())``.
+    The precise counterpart of the category selectors (`numeric`, `string`, ...). Batcher
+    widens narrow types once, when data enters the engine: every integer width becomes
+    ``int64``, ``float16``/``float32`` become ``float64``, ``large_string`` and a
+    dictionary-encoded string become ``string``. So a requested type is widened the same
+    way before matching, and ``bt.by_dtype(pa.int32())`` selects the ``int64`` columns,
+    including those that were ``int32`` in the source. The selector cannot tell a source
+    ``int32`` from a source ``int64``, because the engine cannot either.
 
     Args:
-        *dtypes: The Arrow data types to match, as ``pyarrow`` type objects.
+        *dtypes: The Arrow data types to match, as ``pyarrow`` type objects or their
+            names (``"float64"``).
 
     Returns:
-        A selector matching columns of exactly those types.
+        A selector matching columns of those types after widening.
+
+    Raises:
+        PlanError: If an argument is neither a ``pyarrow.DataType`` nor a type name.
 
     Examples:
         .. doctest::
@@ -166,11 +177,31 @@ def by_dtype(*dtypes: pa.DataType) -> Selector:
             >>> import batcher as bt
             >>> import pyarrow as pa
             >>> ds = bt.from_pydict({"a": [1], "b": [2.5], "s": ["x"]})
-            >>> ds.select(bt.by_dtype(pa.int64(), pa.string())).columns
+            >>> ds.select(bt.by_dtype(pa.int64(), "string")).columns
             ['a', 's']
+            >>> narrow = bt.from_arrow(pa.table({"i": pa.array([1], pa.int32()), "s": ["x"]}))
+            >>> narrow.select(bt.by_dtype(pa.int32())).columns
+            ['i']
     """
-    wanted = tuple(dtypes)
-    return _dtype_selector(lambda d: any(d.equals(t) for t in wanted), f"by_dtype{wanted!r}")
+    wanted = tuple(widen(_as_type(t)) for t in dtypes)
+    return _dtype_selector(
+        lambda d: any(widen(d).equals(t) for t in wanted), f"by_dtype{tuple(dtypes)!r}"
+    )
+
+
+def _as_type(dtype: object) -> pa.DataType:
+    """`dtype` as a pyarrow type: a type passes through, a name is looked up."""
+    if isinstance(dtype, pa.DataType):
+        return dtype
+    if isinstance(dtype, str):
+        try:
+            return pa.type_for_alias(dtype)
+        except ValueError:
+            pass
+    raise PlanError(
+        f"by_dtype() takes pyarrow types such as pa.int64() or their names such as 'int64', "
+        f"got {type(dtype).__name__} {dtype!r}"
+    )
 
 
 def _dtype_selector(test: Callable[[pa.DataType], bool], desc: str) -> Selector:

@@ -5,7 +5,7 @@ This path is for whoever runs the engine. You'll set parallelism and memory limi
 ## Reading order
 
 1. {doc}`Getting started </getting-started/index>`: install and verify the build.
-1. {doc}`Installation </getting-started/installation>`: packaging and extras.
+1. {doc}`Installation </getting-started/install/packages-and-extras>`: packaging and extras.
 1. {doc}`Configuration </configuration/index>`: the {py:class}`Config <batcher.Config>` model and precedence.
 1. {doc}`Configuration options </configuration/options>`: every field and default.
 1. {doc}`Environment variables </configuration/environment>`: `BATCHER_*` and
@@ -14,7 +14,7 @@ This path is for whoever runs the engine. You'll set parallelism and memory limi
 1. {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: object-store access.
 1. {doc}`Best practices </user-guide/operate/tuning/best-practices>` and
    {doc}`troubleshooting </user-guide/operate/running/troubleshooting>`.
-1. {doc}`Configuration API reference </api/operations/configuration>`.
+1. {doc}`How configuration resolves </api/operations/configuration>`, then {doc}`the full listing </api/operations/configuration-reference>`.
 
 ## Example: set process-wide defaults
 

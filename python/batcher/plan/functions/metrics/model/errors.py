@@ -13,7 +13,12 @@ cannot express at all.
 Null handling follows the SQL convention the `regr_*` family already uses: a row is
 included only when **both** the actual and the predicted value are present, achieved by
 null-propagating arithmetic rather than an explicit filter, so the pairing survives
-pushdown and partitioning.
+pushdown and partitioning. A NaN is a value, not a null: it propagates into every metric
+here, `medae` included, the way ``numpy.mean`` propagates it.
+
+A metric whose denominator is zero is NaN (`wape` on an all-zero target, `normalized_rmse`
+on a zero-mean one), except the variance ratios `r2` and `explained_variance`, which follow
+scikit-learn's rule for a constant target (1.0 for a perfect prediction, else 0.0).
 """
 
 from __future__ import annotations
@@ -127,7 +132,7 @@ def mae(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     return _residual(y_true, y_pred).abs().mean()
 
 
-def medae(y_true: IntoExpr, y_pred: IntoExpr) -> AggExpr:
+def medae(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     """Median absolute error — ``median(|y - yhat|)``, insensitive to a heavy tail.
 
     Args:
@@ -135,7 +140,9 @@ def medae(y_true: IntoExpr, y_pred: IntoExpr) -> AggExpr:
         y_pred: The predicted values.
 
     Returns:
-        The median absolute error over the group.
+        The median absolute error over the group, and NaN when any paired residual is NaN,
+        as `mae` does. The engine's median sorts NaN last, so without that guard a NaN row
+        silently shifted the median rather than surfacing.
 
     Examples:
         .. doctest::
@@ -145,7 +152,12 @@ def medae(y_true: IntoExpr, y_pred: IntoExpr) -> AggExpr:
             >>> ds.agg(m=bt.medae("y", "p")).to_pydict()
             {'m': [0.0]}
     """
-    return _residual(y_true, y_pred).abs().median()
+    residual = _residual(y_true, y_pred).abs()
+    return (
+        when(count_if(residual.is_nan()) > lit(0))
+        .then(lit(float("nan")))
+        .otherwise(residual.median())
+    )
 
 
 def max_error(y_true: IntoExpr, y_pred: IntoExpr) -> AggExpr:
@@ -261,7 +273,8 @@ def wape(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
         y_pred: The predicted values.
 
     Returns:
-        The total absolute error divided by the total actual magnitude.
+        The total absolute error divided by the total actual magnitude, and NaN when every
+        paired actual is zero.
 
     Examples:
         .. doctest::
@@ -273,7 +286,12 @@ def wape(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     """
     actual = _as_column(y_true)
     paired = (actual + _as_column(y_pred) * Lit(0)).abs()
-    return _residual(y_true, y_pred).abs().sum() / paired.sum()
+    total = paired.sum()
+    return (
+        when(total == lit(0.0))
+        .then(lit(float("nan")))
+        .otherwise(_residual(y_true, y_pred).abs().sum() / total)
+    )
 
 
 def _variance_ratio(unexplained: Expr, total: Expr) -> Expr:
@@ -502,7 +520,8 @@ def normalized_rmse(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
         y_pred: The predicted values.
 
     Returns:
-        The RMSE divided by the mean of the observed values.
+        The RMSE divided by the mean of the observed values over the same paired rows the
+        RMSE uses, and NaN when that mean is zero.
 
     Examples:
         .. doctest::
@@ -512,4 +531,7 @@ def normalized_rmse(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
             >>> round(ds.agg(m=bt.normalized_rmse("y", "p")).to_pydict()["m"][0], 4)
             0.0917
     """
-    return rmse(y_true, y_pred) / _as_column(y_true).mean()
+    # The mean over the *paired* rows: an actual whose prediction is null is not in the RMSE,
+    # and counting it in the level scaled one row set's error by another row set's mean.
+    level = (_as_column(y_true) + _as_column(y_pred) * Lit(0)).mean()
+    return when(level == lit(0.0)).then(lit(float("nan"))).otherwise(rmse(y_true, y_pred) / level)

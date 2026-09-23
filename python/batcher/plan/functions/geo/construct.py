@@ -203,6 +203,7 @@ def st_centroid(geom: Expr | str) -> Expr:
 
     Weighted by the highest dimension present: areas by area, lines by length, point
     sets by count. A collection of a polygon and a point therefore ignores the point.
+    A 3D input keeps its z, weighted the same way, as in DuckDB.
 
     A centroid can fall **outside** its geometry — the centre of a crescent is in the
     gap, and the centre of a ring-shaped polygon is in the hole. When the result must
@@ -231,7 +232,8 @@ def st_envelope(geom: Expr | str) -> Expr:
 
     Degenerate inputs degrade rather than producing a zero-area polygon: a point's
     envelope is a point and a horizontal line's is a line. A zero-area 'polygon' would
-    be accepted by every areal predicate and answer all of them wrongly.
+    be accepted by every areal predicate and answer all of them wrongly. The box is 2D:
+    a 3D input's z is dropped, as in PostGIS and DuckDB.
 
     Args:
         geom: The geometry.
@@ -256,7 +258,10 @@ def st_boundary(geom: Expr | str) -> Expr:
 
     A closed chain has no boundary at all, which is the topological fact that makes
     'closed' mean something — and it is why `st_boundary` of a ring is empty rather
-    than its start vertex.
+    than its start vertex. A multi-chain follows the OGC "mod 2" rule: an endpoint
+    shared by an even number of members is interior, so
+    ``MULTILINESTRING((0 0, 1 1), (1 1, 2 0))`` has the boundary
+    ``MULTIPOINT((0 0), (2 0))``, listed in x-then-y order as GEOS lists it.
 
     Args:
         geom: The geometry.
@@ -329,36 +334,46 @@ def st_point_on_surface(geom: Expr | str) -> Expr:
 
 
 def st_buffer(geom: Expr | str, radius: Expr | float, quad_segs: Expr | int) -> Expr:
-    """An approximate buffer of a geometry.
+    """Every position within a distance of a geometry, as a polygon.
 
-    **This is an approximation and over-estimates for a concave input.** It buffers
-    each vertex with a regular polygon and takes the convex hull of the result, which
-    is exact for a convex geometry up to the arc discretization and is the buffer *of
-    the hull* otherwise.
+    A point grows into a regular polygon with ``4 * quad_segs`` sides, a chain into
+    the union of a capsule around each segment, and a polygon into itself plus a band
+    around its rings. The parts of a multi-geometry are buffered separately and merged
+    only where their buffers actually overlap, so ``MULTIPOINT((0 0), (10 0))`` with
+    radius 1 is two discs, and a concave polygon keeps its notch. The only
+    approximation is the circle drawn as a polygon, as in GEOS: a point's buffer is
+    GEOS's vertex for vertex, and a chain's or polygon's agrees with GEOS's area to a
+    fraction of a percent at the default segment count.
 
-    That makes it sound as a candidate filter feeding an exact `st_dwithin`, and wrong
-    as a number to report. When the answer is 'is this within X', use `st_dwithin`,
-    which is exact and cheaper.
+    A negative radius erodes a polygon, keeping its convex corners sharp, and leaves an
+    empty polygon once the polygon is narrower than twice the radius; ``-1`` on a 4 x 4
+    square is the 2 x 2 square. A radius of 0 returns the polygon unchanged. Points and
+    chains have no area, so their buffer at a radius of 0 or less is an empty polygon,
+    as in PostGIS and DuckDB.
 
     The radius is in the geometry's own units. On EPSG:4326 that is degrees, not
-    metres; project first with `st_transform`.
+    metres; project first with `st_transform`. When the question is only 'is this
+    within X', `st_dwithin` answers it exactly without building the polygon.
 
     Args:
         geom: The geometry.
-        radius: The buffer distance, in the geometry's own units.
+        radius: The buffer distance, in the geometry's own units; negative erodes.
         quad_segs: Segments per quarter circle; higher is smoother and larger.
 
     Returns:
-        The buffered polygon, or an empty polygon for a non-positive radius.
+        The buffered polygon or multipolygon, or an empty polygon when nothing is left.
 
     Examples:
         .. doctest::
 
             >>> import batcher as bt
-            >>> ds = bt.from_pydict({'g': ['POINT(0 0)']})
+            >>> ds = bt.from_pydict({'g': ['POINT(0 0)', 'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))']})
             >>> got = bt.st_area(bt.st_buffer(bt.col("g"), 1.0, 16)).round(3)
             >>> ds.select(v=got).to_pydict()
-            {'v': [3.137]}
+            {'v': [3.137, 35.137]}
+            >>> shrunk = bt.st_as_text(bt.st_buffer(bt.col("g"), -1.0, 8))
+            >>> ds.select(v=shrunk).to_pydict()
+            {'v': ['POLYGON EMPTY', 'POLYGON((1 1, 3 1, 3 3, 1 3, 1 1))']}
     """
     return geo_call("st_buffer", geometry(geom), value(radius), value(quad_segs))
 

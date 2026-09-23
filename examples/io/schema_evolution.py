@@ -1,82 +1,97 @@
-"""Files whose schemas disagree: what the reader does, and what you must do.
+"""Files whose schemas disagree: the three `schema_mode`s, and what each one returns.
 
-The reader takes its schema from the first file it opens. A column that appears only in
-later files is **not** unified in — it is dropped, and the rows still arrive. That is a
-silent narrowing, so a pipeline that gains a column upstream keeps working and keeps
-ignoring it.
+A directory written over months drifts: a column is added, a type widens, a column is
+dropped. `bt.read.parquet(path, schema_mode=...)` decides what the read makes of that.
 
-The reliable handling is to read the generations separately and union them, which forces
-you to say what the missing value means.
+- ``"strict"`` (the default): the first file's schema is the contract. A later file may
+  carry extra columns (they are dropped, with a warning) or a type that converts to
+  the contract's without changing a value, but a missing column or a value that would change
+  raises `bt.SchemaError` naming the file.
+- ``"union"``: every column of every file, each at the narrowest type that holds all of its
+  values. A file without a column reads it as null.
+- ``"latest"``: the newest file's columns and types. Older files are cast toward it, and a
+  value that would not survive the cast raises.
+
+A distributed read (`collect(distributed=True)`) answers exactly as the single-node read
+does in every mode: the same rows, the same types, or the same error.
 
     python examples/io/schema_evolution.py
 """
 
 from __future__ import annotations
 
-import sys
 import tempfile
+import warnings
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import batcher as bt
-from _common import tpch
-from batcher import col
 
 
 def main() -> None:
-    orders = tpch("orders").select("o_orderkey", "o_totalprice")
-
     with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory) / "orders"
-        root.mkdir()
+        root = Path(directory)
 
-        old_file = root / "part-00.parquet"
-        new_file = root / "part-01.parquet"
-
-        # The old generation: two columns.
-        orders.limit(500).write.parquet(str(old_file))
-        # The new generation: a third column was added upstream.
-        orders.limit(500, offset=500).with_columns(o_channel=bt.lit("web")).write.parquet(
-            str(new_file)
+        # The old generation has two columns; upstream later added `channel` and started
+        # sending `amount` as a float.
+        bt.from_pydict({"id": [1, 2], "amount": [10, 20]}).write.parquet(str(root / "p0.parquet"))
+        bt.from_pydict({"id": [3], "amount": [30.5], "channel": ["web"]}).write.parquet(
+            str(root / "p1.parquet")
         )
 
-        # Reading both at once keeps every row and silently drops the new column.
-        combined = bt.read.parquet(str(root / "*.parquet"))
-        print("combined columns:", combined.columns)
-        assert combined.count() == 1_000
-        assert "o_channel" not in combined.columns
+        # strict: file 0 is the contract, and 30.5 cannot become an int64 unchanged.
+        try:
+            bt.read.parquet(str(root)).collect(distributed=False)
+        except bt.SchemaError as error:
+            print("strict refused:", str(error).split(",")[0])
+            assert "p1.parquet" in str(error)
+        else:
+            raise AssertionError("strict mode must refuse a value it would have to truncate")
 
-        # Read each generation on its own to see what is really there.
-        old_side = bt.read.parquet(str(old_file))
-        new_side = bt.read.parquet(str(new_file))
-        assert "o_channel" not in old_side.columns
-        assert "o_channel" in new_side.columns
-
-        # Union them after deciding what the column means where it is absent. `union`
-        # needs both sides to agree, which is exactly the forcing function you want.
-        aligned = old_side.with_columns(o_channel=bt.lit("unknown")).union(
-            new_side.select("o_orderkey", "o_totalprice", "o_channel")
+        # union: every column, `amount` widened to float64, `channel` null where absent.
+        union = (
+            bt.read.parquet(str(root), schema_mode="union").sort("id").collect(distributed=False)
         )
-        print("aligned columns:", aligned.columns)
-        assert aligned.count() == 1_000
-        assert "o_channel" in aligned.columns
-
-        counts = aligned.value_counts("o_channel").sort("o_channel").to_pydict()
-        print(counts)
-        assert dict(zip(counts["o_channel"], counts["count"], strict=True)) == {
-            "unknown": 500,
-            "web": 500,
+        print(union.schema)
+        assert union.column_names == ["id", "amount", "channel"]
+        assert union.schema.field("amount").type == "double"
+        assert union.to_pydict() == {
+            "id": [1, 2, 3],
+            "amount": [10.0, 20.0, 30.5],
+            "channel": [None, None, "web"],
         }
 
-        # The totals are unaffected either way — only the column list narrowed.
-        assert (
-            abs(
-                combined.agg(total=col("o_totalprice").sum()).to_pydict()["total"][0]
-                - aligned.agg(total=col("o_totalprice").sum()).to_pydict()["total"][0]
-            )
-            < 1e-3
+        # latest: the newest file's shape. Its column order is `id, amount, channel` too.
+        latest = (
+            bt.read.parquet(str(root), schema_mode="latest").sort("id").collect(distributed=False)
         )
+        assert latest.to_pydict() == union.to_pydict()
+
+        # strict with only an *added* column reads every row and drops the column, loudly.
+        added = root / "added"
+        added.mkdir()
+        bt.from_pydict({"id": [1]}).write.parquet(str(added / "p0.parquet"))
+        bt.from_pydict({"id": [2], "channel": ["web"]}).write.parquet(str(added / "p1.parquet"))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            narrowed = bt.read.parquet(str(added)).collect(distributed=False)
+        assert narrowed.column_names == ["id"] and narrowed.num_rows == 2
+        dropped_warning = "columns the read will not return: ['channel']"
+        assert any(dropped_warning in str(w.message) for w in caught)
+
+        # A dropped column is the one drift strict mode cannot absorb: the contract
+        # promised it, and a file that lacks it raises.
+        dropped = root / "dropped"
+        dropped.mkdir()
+        bt.from_pydict({"id": [1], "channel": ["web"]}).write.parquet(str(dropped / "p0.parquet"))
+        bt.from_pydict({"id": [2]}).write.parquet(str(dropped / "p1.parquet"))
+        try:
+            bt.read.parquet(str(dropped)).collect(distributed=False)
+        except bt.SchemaError as error:
+            assert "missing column 'channel'" in str(error)
+        else:
+            raise AssertionError("strict mode must refuse a file missing a declared column")
+        filled = bt.read.parquet(str(dropped), schema_mode="union").sort("id")
+        assert filled.to_pydict()["channel"] == ["web", None]
 
 
 if __name__ == "__main__":

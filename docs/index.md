@@ -166,7 +166,7 @@ inside a stream.
 
 ## What it does
 
-Each card is one capability family, linked to the guide that covers it.
+Each card is one capability family, linked to the guide that covers it. {doc}`getting-started/tour` shows one runnable example of each on a single page, if you would rather judge the breadth by running it.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -193,7 +193,7 @@ time travel, schema evolution, and compaction.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
-:link: /user-guide/moving-data/streaming
+:link: /user-guide/moving-data/streaming/index
 :link-type: doc
 Unbounded sources, triggers, watermarks and late data, windowed and stateful aggregation,
 stream joins, checkpointing, and exactly-once delivery into a transactional sink.
@@ -308,8 +308,8 @@ view rather than a benchmark; for timings, read {doc}`benchmarks/index`.
 
 ## Find your way around
 
-The site has ten sections, and they branch by what you are doing rather than by which part of
-the engine you are touching.
+The site has eleven sections, and they branch by what you are doing rather than by which part
+of the engine you are touching.
 
 | Section | What is in it |
 | --- | --- |
@@ -318,8 +318,9 @@ the engine you are touching.
 | {doc}`User guide </user-guide/index>` | One page per capability: moving data, transforming, analyzing, trusting, and operating it |
 | {doc}`ML and inference </ml/index>` | Preparing data for models, batch inference, retrieval and generation, evaluation, and training loaders |
 | {doc}`Integrations </integrations/index>` | Kafka, Snowflake, BigQuery, Delta, Iceberg, Hudi, MongoDB, Elasticsearch, Ray, PyTorch, Hugging Face |
-| {doc}`Cookbook </cookbook/index>` | 145 runnable pages, from a one-method recipe to a complete pipeline, each executed on every test run |
-| {doc}`API reference </api/index>` | Every public name, a one-page quick reference, and the full signature listing |
+| {doc}`Cookbook </cookbook/index>` | 146 runnable pages, from a one-method recipe to a complete pipeline, each executed on every test run |
+| {doc}`Example library </examples/index>` | 533 standalone scripts, indexed by what each one shows, and run on every commit |
+| {doc}`API reference </api/index>` | Every public name three ways: a one-page lookup table, the area guides, and the full signature listing |
 | {doc}`Configuration </configuration/index>` | Profiles, options, environment variables, accelerators, and fault tolerance |
 | {doc}`Benchmarks </benchmarks/index>` | The full grid against DuckDB, Polars, Spark, and Daft, with the methodology and the losses |
 | {doc}`Architecture </architecture/index>` | How the engine works at three zoom levels, from the shape of the system down to one mechanism |

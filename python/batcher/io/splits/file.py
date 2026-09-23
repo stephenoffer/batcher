@@ -439,7 +439,7 @@ class NormalizedFileSplit:
 
         target = self._target(projection)
         for batch in batches:
-            yield normalize_batch(batch, target)
+            yield normalize_batch(batch, target, path=self.path)
 
     def read(
         self,

@@ -108,6 +108,60 @@ scored.write.parquet("s3://bucket/scored/", distributed=True)
 
 `threads` caps the model's own thread pool inside one worker. Left unset, Batcher sizes it to the cores the worker may use. A booster defaults to the *host* core count, so co-located workers would otherwise each grab every core and thrash.
 
+Scoring is a lazy map, so `distributed=` on the terminal decides where it runs. Fitting is different. A `fit` on a Batcher estimator or preprocessor runs its aggregates through a bare `collect()`, with no `distributed=` argument, so it follows the session's `distributed="auto"` routing. To pin every fit to the cluster, set the `distributed.mode` option:
+
+```python
+# docs: skip
+import batcher.config
+from batcher.ml import StandardScaler
+
+with batcher.config.option_context("distributed.mode", "always"):
+    scaler = StandardScaler(feature_names).fit(train)
+```
+
+A fit's aggregates are mergeable, so the learned state is the same on one node or many, up to floating-point reassociation in the last bits. A `Chain` of preprocessors built with the default `cache=True` collects its training split to the driver first, so pass `cache=False` for a large distributed training set.
+
+## Prepare the feature columns
+
+A tabular model sees a missing value as NaN, and so do the preprocessors that usually feed it. `ds.ml.predict` turns a null feature into NaN, or into `missing=`, as it builds the matrix. The preprocessors go the other way and treat a NaN in a float column exactly like a null: every `fit` statistic skips it, `SimpleImputer` and the other imputers fill it, and `MissingIndicator` flags it. One NaN in a Parquet file written by pandas therefore can't turn a learned mean into NaN. {doc}`/ml/preparing/preprocessors/index` states the rule in full.
+
+```python
+import batcher as bt
+from batcher.ml import MissingIndicator, SimpleImputer
+
+raw = bt.from_pydict({"income": [40.0, float("nan"), 60.0, None]})
+filled = SimpleImputer("income").fit_transform(MissingIndicator("income").fit_transform(raw))
+print(filled.to_pydict())
+# {'income': [40.0, 50.0, 60.0, 50.0], 'income_missing': [False, True, False, True]}
+```
+
+## Tabular helpers
+
+`ds.ml.predict` is assembled from a few pieces in `batcher.ml.tabular`, which are useful on their own when you write a custom scorer or debug a feature mismatch. Each framework is a `TabularAdapter`, a protocol that loads a model, reports its feature names and output width, and predicts from a dense matrix. The adapters live in the `FRAMEWORKS` registry, keyed by name, so supporting a new framework means registering an adapter rather than adding a call path. The following table lists the helpers:
+
+| Helper | What it does |
+| --- | --- |
+| {py:func}`detect_framework <batcher.ml.tabular.detect_framework>` | Names the framework a model object or path belongs to, such as `"sklearn"` or `"xgboost"`. |
+| {py:func}`get_adapter <batcher.ml.tabular.get_adapter>` | Returns the registered `TabularAdapter` for a framework name. |
+| {py:func}`resolve_features <batcher.ml.tabular.resolve_features>` | The ordered feature list to score, defaulting to every available column. |
+| {py:func}`feature_matrix <batcher.ml.tabular.feature_matrix>` | Assembles named columns of one Arrow batch into a dense row-major matrix, with null as NaN. |
+| {py:func}`prediction_columns <batcher.ml.tabular.prediction_columns>` | Turns a model's raw output into the Arrow columns appended to the batch. |
+| {py:func}`predicted_column_names <batcher.ml.tabular.predicted_column_names>` | The output column names, resolved before the query runs. |
+| {py:func}`tabular_predictor <batcher.ml.tabular.tabular_predictor>` | The load-once class UDF that `ds.ml.predict` builds, for use with `map_batches` directly. |
+
+The matrix builder shows the two rules that matter most, column order and null handling:
+
+```python
+import pyarrow as pa
+from batcher.ml.tabular import detect_framework, feature_matrix
+
+batch = pa.record_batch({"a": [1.0, None], "b": [2, 3]})
+print(feature_matrix(batch, ["b", "a"]).tolist())
+# [[2.0, 1.0], [3.0, nan]]
+print(detect_framework(model))
+# sklearn
+```
+
 ## Fit a baseline in the engine
 
 A linear baseline is worth having before a boosted tree, and `batcher.ml` fits one without leaving the engine. {py:class}`LinearRegression <batcher.ml.linear.LinearRegression>` and {py:class}`Ridge <batcher.ml.linear.Ridge>` build their normal equations from the feature and target moments. The fit is a single scan, prediction is a linear-combination expression, and both reproduce scikit-learn's coefficients exactly.
@@ -367,7 +421,21 @@ A k-NN model *is* its training data. Batcher folds the reference set into the pr
 
 That is also why the reference set is capped. Exact k-NN costs one distance per scored row per reference row: scoring the reference set against itself took about 0.4s at 200 rows and 4s at 1,000 on this engine. Past `max_reference` the fit fails and names the ways out. For a large corpus, use {py:func}`build_vector_index <batcher.ml.build_vector_index>`, the approximate route.
 
-Scale the features first. Distance treats every column alike, so a column measured in millions decides every neighbour. Ties at the k-th distance all count as neighbours, so a row can have more than `k`, rather than letting arrival order break the tie.
+Scale the features first. Distance treats every column alike, so a column measured in millions decides every neighbour. Ties at the k-th distance all count as neighbours, so a row can have more than `k`, rather than letting arrival order break the tie. That is a deliberate difference from scikit-learn, which keeps exactly `k`. A `k` larger than the reference set is accepted and uses every reference row.
+
+With `weights="distance"`, each neighbour counts `1 / d` for Euclidean distance `d`, the scikit-learn definition. A scored row that coincides with one or more training rows takes their average alone, as scikit-learn does, rather than dividing by zero:
+
+```python
+from batcher.ml import KNeighborsRegressor
+
+points = bt.from_pydict({"x": [1.0, 1.0, 2.0, 5.0], "y": [4.0, 6.0, 100.0, 1000.0]})
+nearest = KNeighborsRegressor(["x"], "y", k=3, weights="distance").fit(points)
+scored = nearest.predict(bt.from_pydict({"x": [1.0, 2.6]})).to_pydict()["prediction"]
+print([round(v, 3) for v in scored])
+# [5.0, 59.286]
+```
+
+The first row sits on two training rows and gets their mean, 5.0. The second is weighted `1 / 0.6` for the row at 2.0 and `1 / 1.6` for each row at 1.0. scikit-learn returns the same two values.
 
 {py:class}`KNNImputer <batcher.ml.KNNImputer>` applies the same idea to missing values. It matches a row on the columns that *are* present and fills the gap with what similar rows had:
 

@@ -8,6 +8,7 @@ What a table already knows about itself. `ds.meta` asks Kyber whether the answer
 | {doc}`/cookbook/dataset/inspecting/meta_columns` | Bounds, uniqueness, nulls, and constancy on one column |
 | {doc}`/cookbook/dataset/inspecting/meta_predicates` | Cheap yes/no questions, and the column-check shorthands |
 | {doc}`/cookbook/dataset/inspecting/meta_comparison` | Sizing a join before running it, and approximate statistics |
+| {doc}`/cookbook/dataset/inspecting/meta_storage_and_approx` | Files and partitions on disk, recorded sketches, and membership checks |
 | {doc}`/cookbook/dataset/inspecting/profiling` | The first pass over a table you have just been handed |
 
 ```{toctree}
@@ -17,5 +18,6 @@ meta_schema
 meta_columns
 meta_predicates
 meta_comparison
+meta_storage_and_approx
 profiling
 ```

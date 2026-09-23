@@ -5,12 +5,12 @@ This page describes how the benchmark numbers on this site are produced and how 
 ## Correctness gates the timer
 
 :::{important}
-The harness in `benchmarks/harness/` runs each query on every engine and compares the results as a sorted row multiset within float tolerance. A query whose result doesn't match reports `FAILED`, and the ratio for the engine that disagreed is withheld and printed as `n/c`. A fast wrong answer never reaches these pages as a ratio.
+The harness in [`benchmarks/harness/`](https://github.com/stephenoffer/batcher/tree/main/benchmarks/harness) runs each query on every engine and compares the results as a sorted row multiset within float tolerance. A query whose result doesn't match reports `FAILED`, and the ratio for the engine that disagreed is withheld and printed as `n/c`. A fast wrong answer never reaches these pages as a ratio.
 :::
 
 The engine that disagreed is still timed, and its milliseconds still appear in the harness output. How fast a wrong answer was is diagnostic, and hiding it would make a failing engine look the same as an absent one. The harness only refuses to divide the two times, because a ratio is a claim about which engine is faster.
 
-A result that asks for an order gets a second check. The multiset comparison sorts both sides first, so on its own it can't tell a sorted result from an unsorted one, and an engine that skipped its `ORDER BY` would pass. Every case with an outermost `ORDER BY` is therefore also checked for monotonicity in its own order, per engine (`benchmarks/harness/order.py`), and an engine that fails that check is disqualified the same way a wrong value is.
+A result that asks for an order gets a second check. The multiset comparison sorts both sides first, so on its own it can't tell a sorted result from an unsorted one, and an engine that skipped its `ORDER BY` would pass. Every case with an outermost `ORDER BY` is therefore also checked for monotonicity in its own order, per engine ([`benchmarks/harness/order.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/harness/order.py)), and an engine that fails that check is disqualified the same way a wrong value is.
 
 This is the discipline the engine itself is built under. Every relational operator is differential-tested against DuckDB, and the Tier-0 interpreter is the oracle that the parallel executor and the JIT must match bit for bit. {doc}`/architecture/internals/testing-strategy` covers that side.
 
@@ -18,7 +18,7 @@ This is the discipline the engine itself is built under. Every relational operat
 
 A difference from DuckDB is evidence about the pair of engines, not a verdict on Batcher. Tightening the comparison to include column order once produced 49 failures on `SELECT * ... USING (k)`, where Batcher follows SQL:2016 section 7.7 and DuckDB does not. Batcher's `var_samp` over values near 2^53 is also more accurate than DuckDB's. Both would have read as Batcher failing.
 
-So the suite records known semantic differences in `benchmarks/harness/divergences.py`, each with a verdict naming which engine is right and a citation. A case whose every difference is recorded reports `DIVERGENT`. It never reads `OK`, its ratio is still withheld, its reason prints beneath the table, and it doesn't fail the run. An unrecorded difference is still `FAILED`. An entry can't excuse a Batcher defect, because each entry names the engine that is the odd one out.
+So the suite records known semantic differences in [`benchmarks/harness/divergences.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/harness/divergences.py), each with a verdict naming which engine is right and a citation. A case whose every difference is recorded reports `DIVERGENT`. It never reads `OK`, its ratio is still withheld, its reason prints beneath the table, and it doesn't fail the run. An unrecorded difference is still `FAILED`. An entry can't excuse a Batcher defect, because each entry names the engine that is the odd one out.
 
 The gate also reports on other engines. On TPC-H q6, Daft and the Polars SQL frontend fold `0.06 + 0.01` in IEEE double to `0.06999999999999999`, which drops every `l_discount = 0.07` row. Their q6 result reports `FAILED` and carries no ratio, so neither is credited with a fast wrong answer.
 
@@ -61,11 +61,11 @@ The following table describes how each engine is configured:
 | Ray Data | Tables written to Parquet once, untimed, then read back with Ray-sized row groups | A one-block dataset runs every operator on a single core |
 | Distributed engines | Attached to the live cluster with `ray.init(address="auto")` | Where they're designed to be strongest |
 
-`duckdb_arrow` isn't in the default lineup. Pass it explicitly with `--engines batcher,duckdb,duckdb_arrow`, and `benchmarks/engines/lineup.py` records why it is opt-in. The memory pinning lives in `benchmarks/engines/duckdb.py::match_batcher_budget`.
+`duckdb_arrow` isn't in the default lineup. Pass it explicitly with `--engines batcher,duckdb,duckdb_arrow`, and [`benchmarks/engines/lineup.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/engines/lineup.py) records why it is opt-in. The memory pinning lives in `benchmarks/engines/duckdb.py::match_batcher_budget`.
 
 ### Which surface each engine runs
 
-TPC-H is the one suite where engines run different surfaces. Ray Data has no SQL surface and runs hand-written `ray.data.Dataset` pipelines. Polars runs native lazy DataFrame pipelines, as its own published TPC-H benchmark does, because its SQL frontend can't parse the suite. Batcher runs DataFrame pipelines on 8 of the 22 queries (`benchmarks/suites/standard/tpch_dataframe.py`) and {py:func}`bt.sql <batcher.sql>` on the other 14. DuckDB and Spark run the SQL text throughout.
+TPC-H is the one suite where engines run different surfaces. Ray Data has no SQL surface and runs hand-written `ray.data.Dataset` pipelines. Polars runs native lazy DataFrame pipelines, as its own published TPC-H benchmark does, because its SQL frontend can't parse the suite. Batcher runs DataFrame pipelines on 8 of the 22 queries ([`benchmarks/suites/standard/tpch_dataframe.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/suites/standard/tpch_dataframe.py)) and {py:func}`bt.sql <batcher.sql>` on the other 14. DuckDB and Spark run the SQL text throughout.
 
 Batcher's two paths plan the same way. Their operator sequences were diffed at sf1-proportional cardinalities and agree exactly on q1, q3, q5 and q6, the six-table join included, and elsewhere differ only in where one or two projection and scan-pushdown nodes sit.
 
@@ -79,9 +79,9 @@ A third decides how many digits it is entitled to. The operator mix measured at 
 
 ### Three asymmetries, stated rather than removed
 
-**Warm-up.** `bench()` discards one execution and reports the best of the next N, so every figure is steady state. The engines don't pay the same price for the discarded run. On TPC-H sf1 a first-seen query costs Batcher 2.60x its steady state against DuckDB's 1.15x (`benchmarks/scenarios/claims/learning_curve.py`, geomean over 22 queries, 8 executions each in a fresh process). DuckDB's 1.15x is the page-cache, JIT and allocator floor both engines pay. The 2.27x excess is Batcher's plan cache and learned statistics filling, and it is gone by the second or third execution.
+**Warm-up.** `bench()` discards one execution and reports the best of the next N, so every figure is steady state. The engines don't pay the same price for the discarded run. On TPC-H sf1 a first-seen query costs Batcher 2.60x its steady state against DuckDB's 1.15x ([`benchmarks/scenarios/claims/learning_curve.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/scenarios/claims/learning_curve.py), geomean over 22 queries, 8 executions each in a fresh process). DuckDB's 1.15x is the page-cache, JIT and allocator floor both engines pay. The 2.27x excess is Batcher's plan cache and learned statistics filling, and it is gone by the second or third execution.
 
-This is the largest of the three. A user who runs a query once sees a number the board never prints, and for Batcher the gap is about 2.3x. The board answers how fast an engine is on a query it has seen before, and `benchmarks/scenarios/claims/cold_start.py` and `learning_curve.py` answer the other question. Neither feeds a headline ratio, and run 1 to run 2 folds the plan cache and the learned statistics together without separating them.
+This is the largest of the three. A user who runs a query once sees a number the board never prints, and for Batcher the gap is about 2.3x. The board answers how fast an engine is on a query it has seen before, and [`benchmarks/scenarios/claims/cold_start.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/scenarios/claims/cold_start.py) and `learning_curve.py` answer the other question. Neither feeds a headline ratio, and run 1 to run 2 folds the plan cache and the learned statistics together without separating them.
 
 **Planning.** Batcher's {py:class}`Session <batcher.Session>` caches the parsed statement, the optimized plan and the prepared physical plan, so across warm-up and repeats it plans once. DuckDB's `con.sql(query)` re-parses and re-plans on every call. Both are the ordinary way each engine is used, so the asymmetry is left in place.
 
@@ -118,11 +118,11 @@ TPC-DS and the Join Order Benchmark exercise planning far harder than TPC-H does
 
 ## Data
 
-TPC-H runs at scale factor 1, where `lineitem` holds 6,001,215 rows, and at scale factor 10 (60M rows) where noted, from `s3://ray-benchmark-data/tpch/parquet/`. TPC-DS is generated locally by the `dsdgen` in DuckDB's `tpcds` extension. The Join Order Benchmark runs on the IMDb snapshot at `https://event.cwi.nl/da/job/imdb.tgz`, converted once to Parquet. The H2O.ai tables come from `benchmarks/datagen/h2o_tables.py`, which reproduces the reference R generators' cardinalities and value ranges with a fixed seed of 108. The draws differ from the published CSVs, so absolute times compare across engines in one run and not against the H2O.ai leaderboard.
+TPC-H runs at scale factor 1, where `lineitem` holds 6,001,215 rows, and at scale factor 10 (60M rows) where noted, from `s3://ray-benchmark-data/tpch/parquet/`. TPC-DS is generated locally by the `dsdgen` in DuckDB's `tpcds` extension. The Join Order Benchmark runs on the IMDb snapshot at `https://event.cwi.nl/da/job/imdb.tgz`, converted once to Parquet. The H2O.ai tables come from [`benchmarks/datagen/h2o_tables.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/datagen/h2o_tables.py), which reproduces the reference R generators' cardinalities and value ranges with a fixed seed of 108. The draws differ from the published CSVs, so absolute times compare across engines in one run and not against the H2O.ai leaderboard.
 
 ## Reproducing
 
-`benchmarks/run.py` drives every analytics suite. The following commands reproduce each family:
+[`benchmarks/run.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/run.py) drives every analytics suite. The following commands reproduce each family:
 
 :::{dropdown} Every command, by workload family
 ```bash
@@ -155,7 +155,7 @@ python benchmarks/scenarios/scaling/ladder.py --rungs 1,2,4
 
 ## The full log
 
-`benchmarks/BENCHMARK_RESULTS.md` is the complete engineering record, and it is what makes the numbers on these pages auditable. Each entry names the change, the measurement method and the result, from the JSON writer that went from over 65 seconds to about one to the image pipeline that five fixes took from 350 img/s to 5,693. `benchmarks/results/` holds the standalone boards, such as `TPCH_SF1_SF10_RESULTS.md` and `LOSS_BACKLOG.md`.
+[`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md) is the complete engineering record, and it is what makes the numbers on these pages auditable. Each entry names the change, the measurement method and the result, from the JSON writer that went from over 65 seconds to about one to the image pipeline that five fixes took from 350 img/s to 5,693. [`benchmarks/results/`](https://github.com/stephenoffer/batcher/tree/main/benchmarks/results) holds the standalone boards, such as `TPCH_SF1_SF10_RESULTS.md` and `LOSS_BACKLOG.md`.
 
 ## See also
 

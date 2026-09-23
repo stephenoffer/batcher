@@ -139,4 +139,4 @@ The fallback lives in `batcher.ml.decode.video_dataset`, which decodes `decode_c
 - {doc}`/ml/preparing/multimodal/audio`: preparing the soundtrack a `has_audio` filter keeps.
 - {doc}`/ml/preparing/multimodal/curating`: dropping the rows that decode perfectly and teach a model nothing.
 - {doc}`/ml/preparing/multimodal/pipelines`: keeping multi-GB payloads out of shuffles and spills.
-- {doc}`/api/relational/expression-accessors`: the full `.video`, `.image`, and `.audio` method reference.
+- {doc}`/api/accessors/media`: the full `.video`, `.image`, and `.audio` method reference.

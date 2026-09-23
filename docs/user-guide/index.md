@@ -19,7 +19,7 @@ Every example in this guide runs like that one. The test suite executes each cod
 
 ## Find your guide
 
-The five sections follow the order a pipeline runs in. Move data brings rows in through `bt.read`, Transform decides which rows and columns you keep, Analyze turns them into answers, and Move data sends the result out through `ds.write`. Trust and Operate aren't steps a row passes through. Checks and policies lower into the same plan as the steps, and operating covers the whole run.
+The five sections follow the order a pipeline runs in. Move data brings rows in through {py:obj}`bt.read <batcher.read>`, Transform decides which rows and columns you keep, Analyze turns them into answers, and Move data sends the result out through `ds.write`. Trust and Operate aren't steps a row passes through. Checks and policies lower into the same plan as the steps, and operating covers the whole run.
 
 ![The five user-guide sections along one pipeline. Move data reads rows in with bt.read and hands a lazy Dataset to Transform, which decides which rows and columns survive. The rows it keeps go to Analyze, for grouping, joins, windows and SQL, and the answers go back out through Move data with ds.write. Above the chain, Trust adds data-quality checks and row and column policies to the same plan the steps run in. Below it, Operate inspects and tunes the whole run: explain() shows the plan before it runs, explain(analyze=True) measures it, tuning and caching make it fast, and progress events and metrics show a run as it happens.](/_static/diagrams/user_guide_areas.svg)
 
@@ -35,7 +35,7 @@ Select, derive, filter, sort, sample, and deduplicate, with an expression langua
 :::{grid-item-card} {octicon}`graph;1.1em` Analyze
 :link: /user-guide/analyze/index
 :link-type: doc
-Aggregations, joins, windows, time series, geospatial, graphs, and full SQL over the same engine.
+Inspect and profile a dataset, then aggregations, joins, windows, time series, geospatial, graphs, and full SQL over the same engine.
 :::
 
 :::{grid-item-card} {octicon}`arrow-switch;1.1em` Move data
@@ -59,16 +59,18 @@ Explain plans, tuning, caching, and running a pipeline you can see into.
 
 ## Where to start
 
-New to Batcher? Read {doc}`/user-guide/transform/columns/expressions` first. Every other guide builds on expressions, and the rest of the section reads quickly once they click. If you already know what you want to compute, jump straight to the guide for that job. Each one opens with a setup block and builds from there.
+New to Batcher? Read {doc}`/user-guide/transform/columns/expressions` first. Every other guide builds on expressions, and the rest of the section reads quickly once they click. If you're handed a table you don't know yet, start with {doc}`/user-guide/analyze/inspecting-data` to see its schema, profile, and null counts before you transform it. If you already know what you want to compute, jump straight to the guide for that job. Each one opens with a setup block and builds from there.
 
 ## See also
 
+- {doc}`/getting-started/tour`: one runnable example of each capability, when you want the shape before the detail.
 - {doc}`../api/index`: the reference behind every method these guides use.
 - {doc}`../cookbook/index`: the same operations as runnable recipes and complete pipelines.
 - {doc}`../ml/index`: the model half of the pipeline, once the relational half is in place.
 - {doc}`../configuration/index`: the settings the performance and memory guides refer to.
 - {doc}`/architecture/deep-dives/index`: why an operator behaves the way these pages describe.
 - {doc}`../integrations/index`: connecting a specific source or sink.
+- {doc}`/getting-started/concepts/glossary`: a one-line definition for any term on these pages that is new to you.
 
 ```{toctree}
 :hidden:

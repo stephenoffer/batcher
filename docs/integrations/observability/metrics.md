@@ -79,7 +79,7 @@ The section stays empty until a query has completed under a resource manager.
 
 ## Install the shipped dashboard
 
-`tools/grafana/batcher-overview.json` is a Grafana dashboard that covers every family above. To install it, open **Dashboards > New > Import** in Grafana, upload the JSON, and pick your Prometheus data source.
+[`tools/grafana/batcher-overview.json`](https://github.com/stephenoffer/batcher/blob/main/tools/grafana/batcher-overview.json) is a Grafana dashboard that covers every family above. To install it, open **Dashboards > New > Import** in Grafana, upload the JSON, and pick your Prometheus data source.
 
 The dashboard has a job picker and an instance picker, both defaulting to `All`. Three panels are worth knowing before you need them.
 
@@ -89,7 +89,7 @@ Bytes spilled sits beside the spill counter because a 1 GB spill and a 100 GB sp
 
 Mean file size committed is the small-files panel. A falling line means a lakehouse table is accumulating fragments that cost every later reader, long before any query gets slow enough for someone to investigate.
 
-`tests/integration/test_grafana_dashboard.py` holds the dashboard to the exporter in both directions. A panel can't name a metric that doesn't exist, and a metric the engine pays to produce can't go unshown.
+[`tests/integration/test_grafana_dashboard.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_grafana_dashboard.py) holds the dashboard to the exporter in both directions. A panel can't name a metric that doesn't exist, and a metric the engine pays to produce can't go unshown.
 
 ## Requirements and limitations
 

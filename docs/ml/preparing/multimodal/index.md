@@ -38,7 +38,7 @@ print(out.column("id").to_pylist(), out.schema.field("image").type)
 # [1] extension<arrow.fixed_shape_tensor[value_type=uint8, shape=[8,8,3]]>
 ```
 
-Swap `bt.from_pydict` for `bt.read.images("s3://<your-bucket>/images/")` or `ds.ml.download("url")` over a table of links, and the rest of the plan is unchanged.
+Swap {py:obj}`bt.from_pydict <batcher.from_pydict>` for `bt.read.images("s3://<your-bucket>/images/")` or `ds.ml.download("url")` over a table of links, and the rest of the plan is unchanged.
 
 The following diagram traces the two rows through that plan:
 
@@ -46,7 +46,7 @@ The following diagram traces the two rows through that plan:
 
 ## What runs natively
 
-The following table summarizes the in-engine surface per modality. {doc}`/api/relational/expression-accessors` lists every method:
+The following table summarizes the in-engine surface per modality. {doc}`/api/accessors/media` lists every method, with signatures:
 
 | Modality | Decode and shape | Measure and curate |
 |---|---|---|
@@ -85,6 +85,7 @@ The following table lists the pages in the order a new media pipeline usually ne
 - {doc}`/ml/retrieval/embeddings`: turn images or text into vectors.
 - {doc}`/ml/preparing/preprocessors/index`: assemble decoded features into a training matrix.
 - {doc}`/getting-started/tutorials/ml/batch-inference`: a scoring pipeline built step by step.
+- {doc}`/examples/multimodal`: image, audio, video, and text-analytics scripts.
 
 ```{toctree}
 :hidden:

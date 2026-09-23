@@ -18,6 +18,7 @@ from __future__ import annotations
 from batcher.plan.expr_ir.constructors import lit
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, corr, covar_pop
+from batcher.plan.functions.metrics.model.errors import _variance_ratio
 
 __all__ = [
     "concordance_correlation",
@@ -81,7 +82,9 @@ def nash_sutcliffe_efficiency(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
         y_pred: The simulated/predicted values.
 
     Returns:
-        The Nash-Sutcliffe efficiency; at most 1.
+        The Nash-Sutcliffe efficiency; at most 1. A constant observed series follows `r2`'s
+        scikit-learn rule, 1.0 for a perfect simulation and 0.0 otherwise, rather than the
+        ``-inf`` the raw formula divides out to.
 
     Examples:
         .. doctest::
@@ -94,7 +97,7 @@ def nash_sutcliffe_efficiency(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     observed, predicted = _paired(y_true, y_pred)
     error = observed - predicted
     total = observed.var() * (observed.count() - lit(1))
-    return lit(1.0) - (error * error).sum() / total
+    return _variance_ratio((error * error).sum(), total)
 
 
 def kling_gupta_efficiency(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:

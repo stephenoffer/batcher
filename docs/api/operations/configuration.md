@@ -1,6 +1,6 @@
-# Configuration API reference
+# How configuration resolves
 
-This page covers the public configuration surface: the {py:class}`Config <batcher.Config>` dataclass, the two entry points that install one, and how the layers combine. For the field-by-field reference, see {doc}`configuration/options </configuration/options>`. The `distributed`, `accelerator`, and `fault_tolerance` sections are large enough to have pages of their own: {doc}`/configuration/distributed-options`, {doc}`/configuration/accelerator`, and {doc}`/configuration/fault-tolerance`.
+This page covers the public configuration surface: the {py:class}`Config <batcher.Config>` dataclass, the two entry points that install one, and how the layers combine. {doc}`configuration-reference` lists every one of those names with its signature. For the field-by-field reference, see {doc}`configuration/options </configuration/options>`. The `distributed`, `accelerator`, and `fault_tolerance` sections are large enough to have pages of their own: {doc}`/configuration/distributed-options`, {doc}`/configuration/accelerator`, and {doc}`/configuration/fault-tolerance`.
 
 ```python
 from batcher import Config, set_config, config_context

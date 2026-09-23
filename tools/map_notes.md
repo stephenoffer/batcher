@@ -72,7 +72,6 @@ All answer a query without scanning; they differ by *what* they can prove and *w
 |---|---|---|
 | `kyber/shortcuts/` | 3 | The `Facts` provable from a plan, plus the pure derivations over them. |
 | `kyber/metadata_filter_count/` | 3 | Filtered counts specifically. Split out only to fit `kyber/`'s file budget. |
-| `kyber/metadata_summary/` | 3 | Per-column summaries. Same split, same reason. |
 | `kyber/metadata_answer.py` | 3 | Decides *whether* a terminal is provable at all. |
 | `api/terminal/metadata_answer/` | 5 | The conductor **using** the above to skip execution. |
 | `api/dataset/meta/` | 5 | The user-facing `ds.meta` accessor over all of it. |

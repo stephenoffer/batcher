@@ -6,9 +6,11 @@ them executes anything, and none of them is exact.
 
 That makes the contract different from the rest of `ds.meta`, and the difference is the whole
 point of the namespace. Elsewhere a missing statistic means "run the query"; here it means
-``None`` — "nobody has measured this yet". A caller that must have an answer uses the exact
-terminal (`ds.n_unique`, `ds.approx_quantile`) and pays for a pass. A caller sizing a buffer,
-picking a join side, or drawing a histogram takes the ``None`` and moves on.
+``None`` — "nobody has measured this yet", or, for the row and byte estimates, "this plan
+cannot be estimated". It is never ``0.0``, which would read as an empty relation. A caller
+that must have an answer uses the exact terminal (`ds.n_unique`, `ds.approx_quantile`) and
+pays for a pass. A caller sizing a buffer, picking a join side, or drawing a histogram takes
+the ``None`` and moves on.
 
 This is the learned-metadata moat at its plainest: these answers do not exist before the
 first run, and after it they are free forever.
@@ -41,15 +43,19 @@ class ApproxMeta(MetaBase):
 
     __slots__ = ()
 
-    def rows(self) -> float:
-        """The estimated row count — always available, never exact.
+    def rows(self) -> float | None:
+        """The estimated row count, or ``None`` when the plan cannot be estimated at all.
 
         The cost model's number: a footer count when there is one, a sketch or a learned prior
         otherwise, and a Selinger default when nothing is known. Use ``ds.count()`` for the
         answer; use this to decide how much memory to ask for.
 
+        ``None`` is not zero. It is what a plan the metadata layer cannot see through returns
+        (a ``map_batches`` stage, a source that cannot read its own footers), and treating it
+        as an empty relation would size every buffer at nothing.
+
         Returns:
-            The estimated number of rows.
+            The estimated number of rows, or ``None`` if the plan cannot be estimated.
 
         Examples:
             .. doctest::
@@ -57,9 +63,11 @@ class ApproxMeta(MetaBase):
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [1, 2, 3]}).meta.approx.rows()
                 3.0
+                >>> bt.from_pydict({"x": [1]}).map_batches(lambda b: b).meta.approx.rows() is None
+                True
         """
         facts = self.facts()
-        return 0.0 if facts is None else facts.estimated_rows
+        return None if facts is None else facts.estimated_rows
 
     def n_unique(self, column: str) -> int | None:
         """An approximate distinct count from a sketch, or ``None`` if none is recorded.
@@ -177,7 +185,7 @@ class ApproxMeta(MetaBase):
         """
         return self.ask(approx.approx_histogram, self.require_column(column), bins)
 
-    def count_where(self, predicate: Expr) -> float:
+    def count_where(self, predicate: Expr) -> float | None:
         """The estimated number of rows a filter would keep — the planner's own guess.
 
         Estimated, so it may be wrong; free, so it costs nothing to ask. It is the number the
@@ -188,26 +196,29 @@ class ApproxMeta(MetaBase):
             predicate: The filter to estimate.
 
         Returns:
-            The estimated surviving row count.
+            The estimated surviving row count, or ``None`` if the plan cannot be estimated.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
-                >>> ds.meta.approx.count_where(bt.col("x") > 2) >= 0
+                >>> 0 <= ds.meta.approx.count_where(bt.col("x") > 2) <= 4
+                True
+                >>> ds.map_batches(lambda b: b).meta.approx.count_where(bt.col("x") > 2) is None
                 True
         """
         return ApproxMeta(self._ds.filter(predicate)).rows()
 
-    def selectivity(self, predicate: Expr) -> float:
+    def selectivity(self, predicate: Expr) -> float | None:
         """The estimated share of rows a filter would keep, in ``[0, 1]``.
 
         Args:
             predicate: The filter to estimate.
 
         Returns:
-            The estimated surviving fraction; ``0.0`` over an empty relation.
+            The estimated surviving fraction; ``0.0`` over a relation estimated empty, and
+            ``None`` if either row count cannot be estimated.
 
         Examples:
             .. doctest::
@@ -218,9 +229,12 @@ class ApproxMeta(MetaBase):
                 True
         """
         total = self.rows()
+        if total is None:
+            return None
         if total <= 0:
             return 0.0
-        return min(1.0, self.count_where(predicate) / total)
+        kept = self.count_where(predicate)
+        return None if kept is None else min(1.0, kept / total)
 
     def column_bytes(self, column: str) -> float | None:
         """The approximate in-memory size of one column, in bytes.
@@ -243,11 +257,11 @@ class ApproxMeta(MetaBase):
         """
         return self.ask(approx.approx_column_bytes, self.require_column(column))
 
-    def row_bytes(self) -> float:
+    def row_bytes(self) -> float | None:
         """The approximate in-memory width of one row, in bytes, summed over every column.
 
         Returns:
-            The estimated bytes per row.
+            The estimated bytes per row, or ``None`` if the plan cannot be estimated.
 
         Examples:
             .. doctest::
@@ -257,9 +271,9 @@ class ApproxMeta(MetaBase):
                 16.0
         """
         facts = self.facts()
-        return 0.0 if facts is None else approx.approx_row_bytes(facts)
+        return None if facts is None else approx.approx_row_bytes(facts)
 
-    def memory_bytes(self) -> float:
+    def memory_bytes(self) -> float | None:
         """The approximate size of the whole relation in memory, in bytes.
 
         The number to size a buffer, a broadcast, or a spill threshold from — never the number
@@ -267,7 +281,7 @@ class ApproxMeta(MetaBase):
         and validity bitmaps, none of which this models.
 
         Returns:
-            The estimated in-memory byte size.
+            The estimated in-memory byte size, or ``None`` if the plan cannot be estimated.
 
         Examples:
             .. doctest::
@@ -277,7 +291,7 @@ class ApproxMeta(MetaBase):
                 24.0
         """
         facts = self.facts()
-        return 0.0 if facts is None else approx.approx_memory_bytes(facts)
+        return None if facts is None else approx.approx_memory_bytes(facts)
 
     def is_measured(self, column: str) -> bool:
         """Whether *any* sketch has been recorded for `column` — has this query run before?

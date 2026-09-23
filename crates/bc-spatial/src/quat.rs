@@ -58,6 +58,12 @@ pub struct Euler {
 /// the components during normalization cannot itself underflow to zero.
 const MIN_NORM: f64 = 1e-150;
 
+/// How far `R * R^T` and `det R` may stray from `I` and 1 before a matrix is refused as
+/// not a rotation. Loose enough for a `float32` calibration matrix (about 1e-7 of error
+/// per entry) and anything re-orthonormalized to four or more digits; tight enough that
+/// a scaled, sheared or reflected matrix is caught.
+pub const ROTMAT_TOL: f64 = 1e-4;
+
 /// Above this dot product two unit quaternions are close enough that `slerp`'s
 /// `sin(theta)` denominator loses its significant digits, and a straight-line
 /// interpolation is both stable and — at this separation — indistinguishable from the
@@ -191,8 +197,14 @@ impl Quat {
     /// `t` is not clamped. Outside `[0, 1]` this extrapolates along the same great
     /// circle, which is what you want when a measurement's timestamp falls just past
     /// the last pose and is a mistake worth being able to make deliberately.
+    ///
+    /// A non-finite `t` has no position on the arc, so it is `None` — a null, like every
+    /// other input with no rotation in it — rather than a quaternion of NaNs.
     #[must_use]
     pub fn slerp(self, other: Self, t: f64) -> Option<Self> {
+        if !t.is_finite() {
+            return None;
+        }
         let a = self.normalize()?;
         let b = other.normalize()?;
         let mut dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
@@ -272,7 +284,8 @@ impl Quat {
         })
     }
 
-    /// The rotation this row-major 3x3 matrix describes.
+    /// The rotation this row-major 3x3 matrix describes, or `None` when the matrix is
+    /// not a rotation.
     ///
     /// Uses Shepperd's method: pick the component the trace says is largest and derive
     /// the other three from it. The textbook single-branch formula divides by
@@ -280,8 +293,13 @@ impl Quat {
     /// before that; a calibration file containing a 180-degree sensor mount is not
     /// unusual.
     ///
-    /// A matrix that is not a rotation is not detected. Feeding one in produces a
-    /// quaternion that is the nearest rotation in no particular sense.
+    /// A rotation matrix is orthonormal with determinant +1. Anything else — a zero
+    /// matrix from a missing calibration, a scaled one, a reflection, a NaN — is
+    /// refused rather than turned into "the nearest rotation in no particular sense",
+    /// which is what this used to return: the zero matrix came back as a half turn
+    /// about z. The check allows `ROTMAT_TOL` of drift in `R * R^T` and in the
+    /// determinant, which admits a matrix stored as `float32` or re-orthonormalized to
+    /// a few digits, and the quaternion it returns is normalized.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn from_rotation_matrix(
@@ -294,9 +312,27 @@ impl Quat {
         m20: f64,
         m21: f64,
         m22: f64,
-    ) -> Self {
+    ) -> Option<Self> {
+        let rows = [[m00, m01, m02], [m10, m11, m12], [m20, m21, m22]];
+        if rows.iter().flatten().any(|v| !v.is_finite()) {
+            return None;
+        }
+        for i in 0..3 {
+            for j in 0..3 {
+                let d: f64 = (0..3).map(|k| rows[i][k] * rows[j][k]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                if (d - want).abs() > ROTMAT_TOL {
+                    return None;
+                }
+            }
+        }
+        let det = m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20)
+            + m02 * (m10 * m21 - m11 * m20);
+        if (det - 1.0).abs() > ROTMAT_TOL {
+            return None;
+        }
         let trace = m00 + m11 + m22;
-        if trace > 0.0 {
+        let q = if trace > 0.0 {
             let s = 0.5 / (trace + 1.0).sqrt();
             Self::new((m21 - m12) * s, (m02 - m20) * s, (m10 - m01) * s, 0.25 / s)
         } else if m00 > m11 && m00 > m22 {
@@ -308,7 +344,8 @@ impl Quat {
         } else {
             let s = 2.0 * (1.0 + m22 - m00 - m11).sqrt();
             Self::new((m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s)
-        }
+        };
+        q.normalize()
     }
 }
 
@@ -596,8 +633,52 @@ mod tests {
             let c1 = q.rotate(Vec3::new(0.0, 1.0, 0.0)).unwrap();
             let c2 = q.rotate(Vec3::new(0.0, 0.0, 1.0)).unwrap();
             let back =
-                Quat::from_rotation_matrix(c0.x, c1.x, c2.x, c0.y, c1.y, c2.y, c0.z, c1.z, c2.z);
+                Quat::from_rotation_matrix(c0.x, c1.x, c2.x, c0.y, c1.y, c2.y, c0.z, c1.z, c2.z)
+                    .unwrap();
             close(back.angular_distance(q).unwrap(), 0.0);
         }
+    }
+
+    #[test]
+    fn a_matrix_that_is_not_a_rotation_has_no_quaternion() {
+        let m = |v: [f64; 9]| {
+            Quat::from_rotation_matrix(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8])
+        };
+        assert_eq!(m([0.0; 9]), None, "zero matrix");
+        assert_eq!(
+            m([2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0]),
+            None,
+            "scaled"
+        );
+        assert_eq!(
+            m([-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            None,
+            "reflection"
+        );
+        assert_eq!(
+            m([f64::NAN, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            None,
+            "NaN"
+        );
+        assert_eq!(
+            m([1.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            None,
+            "sheared"
+        );
+        // A float32-rounded rotation is still a rotation, and comes back unit-length.
+        let c = (0.3f32).cos() as f64;
+        let s = (0.3f32).sin() as f64;
+        let q = m([c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0]).unwrap();
+        close(q.norm(), 1.0);
+        // float32 rounding moves the angle in the eighth digit, and no further.
+        assert!((q.angle().unwrap() - 0.3).abs() < 1e-7);
+    }
+
+    #[test]
+    fn a_nan_interpolation_fraction_is_none_not_a_nan_quaternion() {
+        let a = Quat::IDENTITY;
+        let b = Quat::new(0.0, 0.0, 1.0, 1.0);
+        assert_eq!(a.slerp(b, f64::NAN), None);
+        assert_eq!(a.slerp(b, f64::INFINITY), None);
     }
 }

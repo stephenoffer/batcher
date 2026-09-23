@@ -10,7 +10,7 @@ Against DuckDB reading the same Arrow, Batcher is about four times faster at sf1
 Batcher matches DuckDB's result on all 22 queries, and matches the official TPC-H answer on q6. That result gates every number on this page. The harness compares each engine's result with DuckDB's as a sorted row multiset within float tolerance, checks the order of every query that ends in `ORDER BY`, and refuses to record a ratio when they disagree.
 :::
 
-The gate earns its keep on other engines. The following table lists what it found in the run recorded in `benchmarks/results/TPCH_SF1_SF10_RESULTS.md`:
+The gate earns its keep on other engines. The following table lists what it found in the run recorded in [`benchmarks/results/TPCH_SF1_SF10_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/TPCH_SF1_SF10_RESULTS.md):
 
 | Engine | Correctness on the suite |
 |---|---|
@@ -56,7 +56,7 @@ The chart above is the sf10 board of 2026-08-28 on 92 cores, best of three. Agai
 
 ## Per query
 
-The most recent run published query by query is `benchmarks/results/TPCH_SF1_SF10_RESULTS.md`, taken 2026-07-28 on a c5d.24xlarge (96 vCPU, 184 GiB). It predates the sf10 gains above, so its native-store column reads 0.963x at sf1 and 1.521x at sf10. Batcher's total at sf1 was 617.5 ms against DuckDB's 649.2 ms on its native store, and 1,693.0 ms for DuckDB on the same Arrow.
+The most recent run published query by query is [`benchmarks/results/TPCH_SF1_SF10_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/TPCH_SF1_SF10_RESULTS.md), taken 2026-07-28 on a c5d.24xlarge (96 vCPU, 184 GiB). It predates the sf10 gains above, so its native-store column reads 0.963x at sf1 and 1.521x at sf10. Batcher's total at sf1 was 617.5 ms against DuckDB's 649.2 ms on its native store, and 1,693.0 ms for DuckDB on the same Arrow.
 
 :::{dropdown} Per-query ratios at sf1, 2026-07-28
 Each cell is `batcher / engine`, so **below 1.00x means Batcher is faster**. Daft's `--` marks a wrong result and `n/a` a query it can't plan.
@@ -128,3 +128,4 @@ Spark needs a JVM as well as the `pyspark` wheel. Without one its adapter report
 - {doc}`/architecture/deep-dives/adaptive/cost-model` for how the build side is chosen.
 - {doc}`/user-guide/analyze/sql` for the supported SQL surface.
 - {doc}`/benchmarks/methodology` for the correctness gate in detail.
+- {doc}`/examples/tpch`: all 22 TPC-H queries as standalone scripts.

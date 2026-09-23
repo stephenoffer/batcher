@@ -7,7 +7,7 @@ build-backend = "maturin"
 # first component of `tool.maturin.module-name` below, not from this name.
 [project]
 name = "batcher-engine"
-description = "A native, JIT-compiling, adaptive data engine — single-node sub-second to PB-scale."
+description = "A native, JIT-compiling, adaptive data engine — sub-second on one node, measured to TPC-H sf1000 on a cluster."
 # 3.11, not 3.10: the control plane uses `enum.StrEnum` (in `plan.expr_ir.fn_names`, which
 # every expression import reaches), `datetime.UTC`, `tomllib`, and `BaseException.add_note`,
 # all of which arrived in 3.11. The floor said 3.10 and the release workflow built the abi3

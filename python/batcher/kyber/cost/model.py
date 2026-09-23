@@ -154,6 +154,14 @@ class CostModel:
         # without a hub) keeps the class lookup each term already does.
         self._spill_factor: float | None = spill_device_factor
         self._cost_cache: dict[int, tuple[LogicalPlan, Cost]] = {}
+        # Memoized answer to "does this node's input already sit on an accelerator", keyed by
+        # node identity. `op_cost` runs for every candidate the enumerator considers and the
+        # answer is a walk of the input subtree, so computing it per call is quadratic on a
+        # deep plan. The node is held alongside its answer for the same reason `_cost_cache`
+        # holds one: the enumerator prices *transient* nodes (a `replace`d join orientation it
+        # then discards), and a freed node's `id` is reused, so a bare id key would hand the
+        # next transient node at that address the previous one's verdict.
+        self._device_subtree: dict[int, tuple[LogicalPlan, bool]] = {}
 
     def _rows(self, node: LogicalPlan) -> float:
         return self._est.estimate(node).rows
@@ -340,17 +348,74 @@ class CostModel:
         local = self._local_cost(node)
         if self._workers <= 1:
             return local
-        return replace(
-            local,
-            net=net_cost(
-                node,
-                self._rows,
-                self.row_bytes,
-                self._workers,
-                self._locality,
-                self._est.estimate,
-            ),
+        net = net_cost(
+            node,
+            self._rows,
+            self.row_bytes,
+            self._workers,
+            self._locality,
+            self._est.estimate,
         )
+        if net > 0.0 and self._device_resident(node):
+            net *= self._device_net_factor()
+        return replace(local, net=net)
+
+    @staticmethod
+    def _device_stage(node: LogicalPlan) -> bool:
+        """Whether `node` is a stage whose output is produced on an accelerator.
+
+        The same test `_local_cost` applies when it charges a forward pass at
+        `_GPU_INFERENCE_FACTOR`: any accelerator, not only an NVIDIA one, since a TPU,
+        Trainium, or Gaudi stage carries `num_gpus == 0` plus a custom resource.
+
+        Args:
+            node: The plan node to test.
+
+        Returns:
+            `True` for an accelerator-bound `MapBatches`, `False` for everything else.
+        """
+        return isinstance(node, MapBatches) and bool(
+            node.num_gpus > 0 or getattr(node, "resources", ())
+        )
+
+    def _device_resident(self, node: LogicalPlan) -> bool:
+        """Whether the bytes `node` shuffles start on an accelerator rather than in host memory.
+
+        True when an accelerator-bound stage sits anywhere beneath `node`, because nothing
+        between such a stage and this one brings the data back to the host: the operators that
+        would (a spill, a collect) are not plan nodes. This is deliberately the *subtree* test
+        and not "is my direct input a device stage" — a filter or a projection between the
+        forward pass and the exchange does not move the data off the board.
+
+        Args:
+            node: The plan node being priced.
+
+        Returns:
+            `True` when a device stage is beneath `node`, `False` otherwise — including for
+            every plan with no accelerator stage at all, which is what keeps a CPU-only
+            ranking bit-for-bit unchanged and never reads a device's wires.
+        """
+        cached = self._device_subtree.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        answer = any(self._device_stage(c) or self._device_resident(c) for c in children(node))
+        self._device_subtree[id(node)] = (node, answer)
+        return answer
+
+    @staticmethod
+    def _device_net_factor() -> float:
+        """How much more a byte shuffled off a device costs than the `net` weight charges.
+
+        Delegates to `kyber.gpu.exchange.device_net_factor`, which owns device pricing and
+        memoizes the probe. Imported lazily so a CPU-only optimization never reaches the
+        accelerator modules at all.
+
+        Returns:
+            The multiplier, `1.0` when the device's wires are unreadable.
+        """
+        from batcher.kyber.gpu.exchange import device_net_factor
+
+        return device_net_factor()
 
     def _source_io_factor(self, source_id: int) -> float:
         """What a byte scanned from this source costs, relative to the plan's median source.

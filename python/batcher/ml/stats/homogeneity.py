@@ -16,9 +16,10 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from batcher.ml.stats._shared import complete_rows
 from batcher.ml.stats._special import chi2_sf, f_sf
-from batcher.ml.stats.hypothesis import TestResult
-from batcher.plan.expr_ir.constructors import col, lit, when
+from batcher.ml.stats.hypothesis import TestResult, _require_groups
+from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -26,27 +27,21 @@ if TYPE_CHECKING:
 __all__ = ["bartlett_test", "levene_test"]
 
 
-def _group_stats(ds: Dataset, value: str, group: str):
-    """Per-group ``(label, count, sample_variance)`` rows, and the total count and group count."""
-    from batcher.ml.stats._shared import require_columns
-
-    require_columns(ds, value, group)
+def _group_stats(ds: Dataset, value: str, group: str) -> list[tuple[int, float]]:
+    """Per-group ``(count, sample_variance)``; the variance is NaN for a one-row group."""
     grouped = (
-        ds.filter(col(value).is_not_null())
+        complete_rows(ds, value, group)
         .group_by(group)
         .agg(__bt_n=col(value).count(), __bt_v=col(value).var())
         .collect()
     )
-    rows = [
+    return [
         (
-            grouped.column(group)[i].as_py(),
             int(grouped.column("__bt_n")[i].as_py()),
-            float(grouped.column("__bt_v")[i].as_py() or 0.0),
+            math.nan if (v := grouped.column("__bt_v")[i].as_py()) is None else float(v),
         )
         for i in range(grouped.num_rows)
     ]
-    total = sum(n for _, n, _ in rows)
-    return rows, total, len(rows)
 
 
 def bartlett_test(ds: Dataset, value: str, group: str) -> TestResult:
@@ -64,7 +59,10 @@ def bartlett_test(ds: Dataset, value: str, group: str) -> TestResult:
 
     Returns:
         A `TestResult` with the Bartlett statistic, ``k - 1`` degrees of freedom, and the
-        upper-tail p-value.
+        upper-tail p-value. NaN when a group has one row or every group is constant.
+
+    Raises:
+        PlanError: If fewer than two groups remain after dropping null values and labels.
 
     Examples:
         .. doctest::
@@ -77,16 +75,23 @@ def bartlett_test(ds: Dataset, value: str, group: str) -> TestResult:
             >>> bartlett_test(ds, "x", "g").df
             1.0
     """
-    rows, total, k = _group_stats(ds, value, group)
-    pooled = sum((n - 1) * v for _, n, v in rows) / (total - k)
-    numerator = (total - k) * math.log(pooled) - sum(
-        (n - 1) * math.log(v) for _, n, v in rows if v > 0
-    )
-    correction = 1.0 + (sum(1.0 / (n - 1) for _, n, _ in rows) - 1.0 / (total - k)) / (
-        3.0 * (k - 1)
-    )
-    statistic = numerator / correction
+    rows = _group_stats(ds, value, group)
+    k = len(rows)
+    _require_groups(k, "bartlett_test", group)
     df = float(k - 1)
+    total = sum(n for n, _ in rows)
+    variances = [v for _, v in rows]
+    # A one-row group has no variance, and all-constant groups have no spread to compare:
+    # both are NaN in `scipy.stats.bartlett`. One constant group among varying ones is an
+    # infinitely significant difference, which SciPy also reports.
+    if any(math.isnan(v) for v in variances) or all(v == 0 for v in variances):
+        return TestResult(statistic=math.nan, pvalue=math.nan, df=df)
+    if any(v == 0 for v in variances):
+        return TestResult(statistic=math.inf, pvalue=0.0, df=df)
+    pooled = sum((n - 1) * v for n, v in rows) / (total - k)
+    numerator = (total - k) * math.log(pooled) - sum((n - 1) * math.log(v) for n, v in rows)
+    correction = 1.0 + (sum(1.0 / (n - 1) for n, _ in rows) - 1.0 / (total - k)) / (3.0 * (k - 1))
+    statistic = numerator / correction
     return TestResult(statistic=statistic, pvalue=chi2_sf(statistic, df), df=df)
 
 
@@ -106,7 +111,10 @@ def levene_test(ds: Dataset, value: str, group: str) -> TestResult:
 
     Returns:
         A `TestResult` with the Levene statistic, its ``(df1, df2)`` pair, and the upper-tail
-        p-value.
+        p-value. NaN when no group has any spread, or there are no more rows than groups.
+
+    Raises:
+        PlanError: If fewer than two groups remain after dropping null values and labels.
 
     Examples:
         .. doctest::
@@ -119,32 +127,18 @@ def levene_test(ds: Dataset, value: str, group: str) -> TestResult:
             >>> levene_test(ds, "x", "g").df
             (1.0, 4.0)
     """
-    from batcher.ml.stats._shared import require_columns
-    from batcher.plan.functions.analysis import correlation_ratio
+    from batcher.ml.stats.association import _anova
 
-    require_columns(ds, value, group)
-    present = ds.filter(col(value).is_not_null())
-    medians = present.group_by(group).agg(__bt_median=col(value).median()).collect()
-    center = lit(0.0)
-    for i in range(medians.num_rows):
-        label = medians.column(group)[i].as_py()
-        median = float(medians.column("__bt_median")[i].as_py())
-        center = when(col(group) == lit(label)).then(lit(median)).otherwise(center)
-    spread = (col(value) - center).abs()
-    with_spread = present.with_columns(__bt_z=spread)
-    # Levene's F is the one-way ANOVA F of the spreads; reuse the ANOVA machinery via a group mean.
-    with_means = with_spread.with_columns(
-        __bt_group_mean=col("__bt_z").mean().over(partition_by=[group])
+    present = complete_rows(ds, value, group)
+    # Brown-Forsythe: the ANOVA of each row's distance from its own group's median. A window
+    # median keeps the group label a column, where the per-label `when` chain this replaced
+    # spliced each label in as a literal -- and a null label became an Int64 null compared
+    # against a Utf8 column, which the engine rejects.
+    spread = present.with_columns(
+        __bt_z=(col(value) - col(value).median().over(partition_by=[group])).abs()
     )
-    eta = correlation_ratio("__bt_z", "__bt_group_mean")
-    ratio = float(with_means.agg(__bt_eta=eta).collect().column("__bt_eta")[0].as_py())
-    counts = present.group_by(group).agg(__bt_n=col(value).count()).collect()
-    n = sum(int(counts.column("__bt_n")[i].as_py()) for i in range(counts.num_rows))
-    k = counts.num_rows
-    df1, df2 = float(k - 1), float(n - k)
-    # eta^2 is SS_between / SS_total; F = (eta^2 / df1) / ((1 - eta^2) / df2).
-    if ratio >= 1.0 or ratio <= 0.0:
-        statistic = math.inf if ratio >= 1.0 else 0.0
-    else:
-        statistic = (ratio / df1) / ((1.0 - ratio) / df2)
+    parts = _anova(spread, "__bt_z", group)
+    _require_groups(parts.k, "levene_test", group)
+    df1, df2 = float(parts.k - 1), float(parts.n - parts.k)
+    statistic = parts.f
     return TestResult(statistic=statistic, pvalue=f_sf(statistic, df1, df2), df=(df1, df2))

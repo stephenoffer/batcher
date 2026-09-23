@@ -14,7 +14,6 @@ __all__ = [
     "count",
     "estimated_rows",
     "is_empty",
-    "is_not_empty",
     "num_columns",
     "row_count_is_exact",
     "shape",
@@ -29,11 +28,6 @@ def count(facts: Facts) -> int | None:
 def is_empty(facts: Facts) -> bool | None:
     """Whether the relation has no rows, or None when not provable from metadata."""
     return None if facts.rows is None else facts.rows == 0
-
-
-def is_not_empty(facts: Facts) -> bool | None:
-    """Whether the relation has at least one row, or None when not provable."""
-    return None if facts.rows is None else facts.rows > 0
 
 
 def shape(facts: Facts) -> tuple[int, int] | None:

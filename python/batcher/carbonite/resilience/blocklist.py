@@ -52,7 +52,6 @@ __all__ = [
     "TargetHealth",
     "configured_policy",
     "default_ledger",
-    "reset_default_ledger",
 ]
 
 
@@ -418,12 +417,6 @@ def default_ledger(kind: str = "node") -> FaultLedger:
             ledger = FaultLedger(configured_policy(), label=kind)
             _LEDGERS[kind] = ledger
         return ledger
-
-
-def reset_default_ledger() -> None:
-    """Drop every process-wide ledger, for a new job on a reused process (and for tests)."""
-    with _LEDGER_LOCK:
-        _LEDGERS.clear()
 
 
 def configured_policy() -> QuarantinePolicy:

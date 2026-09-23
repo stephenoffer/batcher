@@ -29,6 +29,7 @@ from batcher._sql.parser.subquery.core import (
     _in_subquery_select,
     _is_in_subquery,
     _not_in_antijoin,
+    exists_in_projection,
 )
 from batcher._sql.parser.subquery.correlation import (
     _correlation_pair,
@@ -55,5 +56,6 @@ __all__ = [
     "_not_in_antijoin",
     "_outer_key_reducer",
     "_reject_correlated",
+    "exists_in_projection",
     "normalize_quantified",
 ]

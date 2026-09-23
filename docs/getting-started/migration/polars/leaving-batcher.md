@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 272 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 273 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -22,9 +22,10 @@ The following table maps 272 Batcher spellings to the Polars names that compute 
 | `&` operator | `Expr.and_` |
 | `**` operator | `Expr.pow` |
 | `*` operator | `Expr.mul` |
-| `*` operator + `Expr.sum` | `Expr.dot` |
+| `*` operator + {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | `Expr.dot` |
 | `+` operator | `Expr.add` |
-| `-` operator | `Expr.neg`, `Expr.sub` |
+| `-` operator | `Expr.neg` |
+| `-` operator | `Expr.sub` |
 | `//` operator | `Expr.floordiv` |
 | `/` operator | `Expr.truediv` |
 | `<=` operator | `Expr.le` |
@@ -34,129 +35,129 @@ The following table maps 272 Batcher spellings to the Polars names that compute 
 | `>` operator | `Expr.gt` |
 | `\|` operator | `Expr.or_` |
 | `^` operator | `Expr.xor` |
-| `batcher.config.reset_option` | `Config.restore_defaults` |
-| `batcher.config.set_option` | `Config.set_streaming_chunk_size` |
-| `batcher.config.set_verbosity` | `Config.set_verbose` |
-| `bt.all` | `selectors.all` |
-| `bt.arctan2` | `polars.arctan2` |
+| {py:obj}`batcher.config.reset_option <batcher.config.reset_option>` | `Config.restore_defaults` |
+| {py:obj}`batcher.config.set_option <batcher.config.set_option>` | `Config.set_streaming_chunk_size` |
+| {py:obj}`batcher.config.set_verbosity <batcher.config.set_verbosity>` | `Config.set_verbose` |
+| {py:obj}`bt.all <batcher.all>` | `selectors.all` |
+| {py:obj}`bt.arctan2 <batcher.arctan2>` | `polars.arctan2` |
 | `bt.BatcherError` | `polars.exceptions` |
-| `bt.boolean` | `selectors.boolean` |
-| `bt.coalesce` | `polars.coalesce` |
-| `bt.col` | `polars.col` |
-| `bt.col` + `Expr.cum_count` | `polars.cum_count` |
-| `bt.concat` | `polars.union` |
-| `bt.contains` | `selectors.contains` |
-| `bt.count` | `Expr.len`, `polars.len` |
-| `bt.covar_samp` | `polars.cov` |
-| `bt.Dataset` | `polars.DataFrame`, `polars.LazyFrame` |
-| `bt.element` | `polars.element` |
-| `bt.ends_with` | `selectors.ends_with` |
-| `bt.exclude` | `polars.exclude` |
+| {py:obj}`bt.boolean <batcher.boolean>` | `selectors.boolean` |
+| {py:obj}`bt.coalesce <batcher.coalesce>` | `polars.coalesce` |
+| {py:obj}`bt.col <batcher.col>` | `polars.col` |
+| {py:obj}`bt.col <batcher.col>` + {py:obj}`Expr.cum_count <batcher.plan.expr_ir.core.Expr.cum_count>` | `polars.cum_count` |
+| {py:obj}`bt.concat <batcher.concat>` | `polars.union` |
+| {py:obj}`bt.contains <batcher.contains>` | `selectors.contains` |
+| {py:obj}`bt.count <batcher.count>` | `Expr.len`, `polars.len` |
+| {py:obj}`bt.covar_samp <batcher.covar_samp>` | `polars.cov` |
+| {py:obj}`bt.Dataset <batcher.Dataset>` | `polars.DataFrame`, `polars.LazyFrame` |
+| {py:obj}`bt.element <batcher.element>` | `polars.element` |
+| {py:obj}`bt.ends_with <batcher.ends_with>` | `selectors.ends_with` |
+| {py:obj}`bt.exclude <batcher.exclude>` | `polars.exclude` |
 | `bt.Expr` | `polars.Expr` |
-| `bt.floating` | `selectors.float` |
-| `bt.fold_horizontal` | `polars.fold` |
-| `bt.from_arrow` | `polars.from_arrow` |
-| `bt.from_pandas` | `polars.from_pandas` |
-| `bt.from_pydict` | `polars.from_dict` |
-| `bt.from_pylist` | `polars.from_dicts` |
-| `bt.from_torch` | `polars.from_torch` |
-| `bt.integer` | `selectors.integer` |
-| `bt.make_date` | `polars.date` |
-| `bt.matches` | `selectors.matches` |
-| `bt.mean` | `polars.mean` |
-| `bt.median` | `polars.median` |
-| `bt.min` | `polars.min` |
-| `bt.numeric` | `selectors.numeric` |
-| `bt.quantile` | `polars.quantile` |
+| {py:obj}`bt.floating <batcher.floating>` | `selectors.float` |
+| {py:obj}`bt.fold_horizontal <batcher.fold_horizontal>` | `polars.fold` |
+| {py:obj}`bt.from_arrow <batcher.from_arrow>` | `polars.from_arrow` |
+| {py:obj}`bt.from_pandas <batcher.from_pandas>` | `polars.from_pandas` |
+| {py:obj}`bt.from_pydict <batcher.from_pydict>` | `polars.from_dict` |
+| {py:obj}`bt.from_pylist <batcher.from_pylist>` | `polars.from_dicts` |
+| {py:obj}`bt.from_torch <batcher.from_torch>` | `polars.from_torch` |
+| {py:obj}`bt.integer <batcher.integer>` | `selectors.integer` |
+| {py:obj}`bt.make_date <batcher.make_date>` | `polars.date` |
+| {py:obj}`bt.matches <batcher.matches>` | `selectors.matches` |
+| {py:obj}`bt.mean <batcher.mean>` | `polars.mean` |
+| {py:obj}`bt.median <batcher.median>` | `polars.median` |
+| {py:obj}`bt.min <batcher.min>` | `polars.min` |
+| {py:obj}`bt.numeric <batcher.numeric>` | `selectors.numeric` |
+| {py:obj}`bt.quantile <batcher.quantile>` | `polars.quantile` |
 | `bt.read.arrow` | `polars.read_ipc` |
 | `bt.read.avro` | `polars.read_avro` |
 | `bt.read.csv` | `polars.read_csv` |
-| `bt.read.csv` + `Dataset.iter_batches` | `polars.read_csv_batched` |
+| `bt.read.csv` + {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | `polars.read_csv_batched` |
 | `bt.read.delta` | `polars.read_delta` |
 | `bt.read.excel` | `polars.read_excel` |
 | `bt.read.json` | `polars.read_ndjson` |
 | `bt.read.parquet` | `polars.read_parquet` |
 | `bt.read.sql` | `polars.read_database_uri`, `polars.read_database` |
 | `bt.read.text` | `polars.read_lines` |
-| `bt.reduce_horizontal` | `polars.reduce` |
+| {py:obj}`bt.reduce_horizontal <batcher.reduce_horizontal>` | `polars.reduce` |
 | `bt.Selector` | `selectors.Selector` |
-| `bt.Session` | `polars.SQLContext` |
-| `bt.show_versions` | `polars.show_versions` |
-| `bt.sql_expr` | `polars.sql_expr` |
-| `bt.starts_with` | `selectors.starts_with` |
-| `bt.temporal` | `selectors.temporal` |
-| `bt.versions` | `polars.build_info` |
+| {py:obj}`bt.Session <batcher.Session>` | `polars.SQLContext` |
+| {py:obj}`bt.show_versions <batcher.show_versions>` | `polars.show_versions` |
+| {py:obj}`bt.sql_expr <batcher.sql_expr>` | `polars.sql_expr` |
+| {py:obj}`bt.starts_with <batcher.starts_with>` | `selectors.starts_with` |
+| {py:obj}`bt.temporal <batcher.temporal>` | `selectors.temporal` |
+| {py:obj}`bt.versions <batcher.versions>` | `polars.build_info` |
 | `Config.from_dict` | `Config.load` |
 | `Config.from_env` | `Config.reload_env_vars` |
 | `Config.from_file` | `Config.load_from_file` |
 | `Config.non_defaults` | `Config.state` |
 | `Config.to_dict` | `Config.save` |
-| `Dataset.bottom_k` | `DataFrame.bottom_k`, `LazyFrame.bottom_k` |
-| `Dataset.cache` | `LazyFrame.cache` |
-| `Dataset.cast` | `DataFrame.cast`, `LazyFrame.cast` |
-| `Dataset.collect_schema` | `DataFrame.collect_schema`, `LazyFrame.collect_schema` |
-| `Dataset.columns` | `DataFrame.columns`, `LazyFrame.columns` |
-| `Dataset.count` | `DataFrame.height` |
-| `Dataset.distinct` | `DataFrame.unique`, `LazyFrame.unique` |
-| `Dataset.drop_nans` | `DataFrame.drop_nans`, `LazyFrame.drop_nans` |
-| `Dataset.drop_nulls` | `DataFrame.drop_nulls`, `LazyFrame.drop_nulls` |
-| `Dataset.dtypes` | `DataFrame.dtypes`, `LazyFrame.dtypes` |
-| `Dataset.filter` | `DataFrame.filter`, `LazyFrame.filter` |
-| `Dataset.gather_every` | `DataFrame.gather_every`, `LazyFrame.gather_every` |
-| `Dataset.glimpse` | `DataFrame.glimpse` |
-| `Dataset.is_empty` | `DataFrame.is_empty` |
-| `Dataset.iter_batches` | `LazyFrame.sink_batches` |
-| `Dataset.iter_rows` | `DataFrame.iter_rows`, `DataFrame.rows` |
-| `Dataset.join_where` | `DataFrame.join_where`, `LazyFrame.join_where` |
-| `Dataset.limit` | `DataFrame.head`, `DataFrame.limit`, `DataFrame.slice`, `LazyFrame.head`, `LazyFrame.limit`, `LazyFrame.slice` |
-| `Dataset.null_count` | `DataFrame.null_count`, `LazyFrame.null_count` |
-| `Dataset.pipe` | `DataFrame.pipe`, `LazyFrame.pipe` |
-| `Dataset.reverse` | `DataFrame.reverse`, `LazyFrame.reverse` |
-| `Dataset.schema` | `DataFrame.schema`, `LazyFrame.schema` |
-| `Dataset.select` | `DataFrame.select`, `LazyFrame.select` |
-| `Dataset.shape` | `DataFrame.shape` |
-| `Dataset.sql` | `DataFrame.sql`, `LazyFrame.sql` |
-| `Dataset.tail` | `DataFrame.tail`, `LazyFrame.tail` |
-| `Dataset.to_arrow` | `DataFrame.to_arrow` |
-| `Dataset.to_pandas` | `DataFrame.to_pandas` |
-| `Dataset.to_pylist` | `DataFrame.to_dicts` |
-| `Dataset.top_k` | `DataFrame.top_k`, `LazyFrame.top_k` |
-| `Dataset.union` | `DataFrame.extend`, `DataFrame.merge_sorted`, `DataFrame.vstack`, `LazyFrame.merge_sorted` |
-| `Dataset.unpivot` | `DataFrame.melt`, `DataFrame.unpivot`, `LazyFrame.melt`, `LazyFrame.unpivot` |
-| `Dataset.width` | `DataFrame.width`, `LazyFrame.width` |
-| `Dataset.with_columns` | `DataFrame.with_columns`, `LazyFrame.with_columns` |
-| `Dataset.with_columns` + `Dataset.select` | `DataFrame.insert_column` |
-| `Dataset.with_row_index` | `DataFrame.with_row_count`, `DataFrame.with_row_index`, `LazyFrame.with_row_count`, `LazyFrame.with_row_index` |
+| {py:obj}`Dataset.bottom_k <batcher.Dataset.bottom_k>` | `DataFrame.bottom_k`, `LazyFrame.bottom_k` |
+| {py:obj}`Dataset.cache <batcher.Dataset.cache>` | `LazyFrame.cache` |
+| {py:obj}`Dataset.cast <batcher.Dataset.cast>` | `DataFrame.cast`, `LazyFrame.cast` |
+| {py:obj}`Dataset.collect_schema <batcher.Dataset.collect_schema>` | `DataFrame.collect_schema`, `LazyFrame.collect_schema` |
+| {py:obj}`Dataset.columns <batcher.Dataset.columns>` | `DataFrame.columns`, `LazyFrame.columns` |
+| {py:obj}`Dataset.count <batcher.Dataset.count>` | `DataFrame.height` |
+| {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | `DataFrame.unique`, `LazyFrame.unique` |
+| {py:obj}`Dataset.drop_nans <batcher.Dataset.drop_nans>` | `DataFrame.drop_nans`, `LazyFrame.drop_nans` |
+| {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | `DataFrame.drop_nulls`, `LazyFrame.drop_nulls` |
+| {py:obj}`Dataset.dtypes <batcher.Dataset.dtypes>` | `DataFrame.dtypes`, `LazyFrame.dtypes` |
+| {py:obj}`Dataset.filter <batcher.Dataset.filter>` | `DataFrame.filter`, `LazyFrame.filter` |
+| {py:obj}`Dataset.gather_every <batcher.Dataset.gather_every>` | `DataFrame.gather_every`, `LazyFrame.gather_every` |
+| {py:obj}`Dataset.glimpse <batcher.Dataset.glimpse>` | `DataFrame.glimpse` |
+| {py:obj}`Dataset.is_empty <batcher.Dataset.is_empty>` | `DataFrame.is_empty` |
+| {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | `LazyFrame.sink_batches` |
+| {py:obj}`Dataset.iter_rows <batcher.Dataset.iter_rows>` | `DataFrame.iter_rows`, `DataFrame.rows` |
+| {py:obj}`Dataset.join_where <batcher.Dataset.join_where>` | `DataFrame.join_where`, `LazyFrame.join_where` |
+| {py:obj}`Dataset.limit <batcher.Dataset.limit>` | `DataFrame.head`, `DataFrame.limit`, `DataFrame.slice`, `LazyFrame.head`, `LazyFrame.limit`, `LazyFrame.slice` |
+| {py:obj}`Dataset.null_count <batcher.Dataset.null_count>` | `DataFrame.null_count`, `LazyFrame.null_count` |
+| {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | `DataFrame.pipe`, `LazyFrame.pipe` |
+| {py:obj}`Dataset.reverse <batcher.Dataset.reverse>` | `DataFrame.reverse`, `LazyFrame.reverse` |
+| {py:obj}`Dataset.schema <batcher.Dataset.schema>` | `DataFrame.schema`, `LazyFrame.schema` |
+| {py:obj}`Dataset.select <batcher.Dataset.select>` | `DataFrame.select`, `LazyFrame.select` |
+| {py:obj}`Dataset.shape <batcher.Dataset.shape>` | `DataFrame.shape` |
+| {py:obj}`Dataset.sql <batcher.Dataset.sql>` | `DataFrame.sql`, `LazyFrame.sql` |
+| {py:obj}`Dataset.tail <batcher.Dataset.tail>` | `DataFrame.tail`, `LazyFrame.tail` |
+| {py:obj}`Dataset.to_arrow <batcher.Dataset.to_arrow>` | `DataFrame.to_arrow` |
+| {py:obj}`Dataset.to_pandas <batcher.Dataset.to_pandas>` | `DataFrame.to_pandas` |
+| {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | `DataFrame.to_dicts` |
+| {py:obj}`Dataset.top_k <batcher.Dataset.top_k>` | `DataFrame.top_k`, `LazyFrame.top_k` |
+| {py:obj}`Dataset.union <batcher.Dataset.union>` | `DataFrame.extend`, `DataFrame.merge_sorted`, `DataFrame.vstack`, `LazyFrame.merge_sorted` |
+| {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | `DataFrame.melt`, `DataFrame.unpivot`, `LazyFrame.melt`, `LazyFrame.unpivot` |
+| {py:obj}`Dataset.width <batcher.Dataset.width>` | `DataFrame.width`, `LazyFrame.width` |
+| {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | `DataFrame.with_columns`, `LazyFrame.with_columns` |
+| {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` + {py:obj}`Dataset.select <batcher.Dataset.select>` | `DataFrame.insert_column` |
+| {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | `DataFrame.with_row_count`, `DataFrame.with_row_index`, `LazyFrame.with_row_count`, `LazyFrame.with_row_index` |
 | `Dataset.write.arrow` | `DataFrame.write_ipc_stream` |
 | `Dataset.write.avro` | `DataFrame.write_avro` |
 | `Dataset.write.iceberg` | `DataFrame.write_iceberg` |
-| `Dataset` | `DataFrame.lazy`, `LazyFrame.lazy` |
-| `Expr.abs` | `Expr.abs` |
-| `Expr.alias` | `Expr.alias` |
-| `Expr.approx_count_distinct` | `Expr.approx_n_unique` |
-| `Expr.arccos` | `Expr.arccos` |
-| `Expr.arccosh` | `Expr.arccosh` |
-| `Expr.arcsin` | `Expr.arcsin` |
-| `Expr.arcsinh` | `Expr.arcsinh` |
-| `Expr.arctan` | `Expr.arctan` |
-| `Expr.arctanh` | `Expr.arctanh` |
-| `Expr.between` | `Expr.is_between` |
-| `Expr.bit_count` | `Expr.bitwise_count_ones` |
-| `Expr.bool_and` | `Expr.all` |
-| `Expr.bool_or` | `Expr.any` |
-| `Expr.cast` | `polars.Binary`, `polars.Boolean`, `polars.Date`, `polars.Decimal`, `polars.Float16`, `polars.Float32`, `polars.Float64`, `polars.Int16`, `polars.Int32`, `polars.Int64`, `polars.Int8`, `polars.String`, `polars.UInt16`, `polars.UInt32`, `polars.UInt8`, `polars.Utf8` |
-| `Expr.cbrt` | `Expr.cbrt` |
-| `Expr.ceil` | `Expr.ceil` |
-| `Expr.clip` | `Expr.clip` |
-| `Expr.cos` | `Expr.cos` |
-| `Expr.cosh` | `Expr.cosh` |
-| `Expr.cot` | `Expr.cot` |
-| `Expr.count_distinct` | `Expr.n_unique` |
-| `Expr.count` | `Expr.count` |
-| `Expr.cum_max` | `Expr.cum_max` |
-| `Expr.cum_min` | `Expr.cum_min` |
-| `Expr.cum_sum` | `Expr.cum_sum` |
-| `Expr.degrees` | `Expr.degrees` |
+| {py:obj}`Dataset <batcher.Dataset>` | `DataFrame.lazy`, `LazyFrame.lazy` |
+| {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | `Expr.abs` |
+| {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | `Expr.alias` |
+| {py:obj}`Expr.approx_count_distinct <batcher.plan.expr_ir.core.Expr.approx_count_distinct>` | `Expr.approx_n_unique` |
+| {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | `Expr.arccos` |
+| {py:obj}`Expr.arccosh <batcher.plan.expr_ir.core.Expr.arccosh>` | `Expr.arccosh` |
+| {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | `Expr.arcsin` |
+| {py:obj}`Expr.arcsinh <batcher.plan.expr_ir.core.Expr.arcsinh>` | `Expr.arcsinh` |
+| {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | `Expr.arctan` |
+| {py:obj}`Expr.arctanh <batcher.plan.expr_ir.core.Expr.arctanh>` | `Expr.arctanh` |
+| {py:obj}`Expr.between <batcher.plan.expr_ir.core.Expr.between>` | `Expr.is_between` |
+| {py:obj}`Expr.bit_count <batcher.plan.expr_ir.core.Expr.bit_count>` | `Expr.bitwise_count_ones` |
+| {py:obj}`Expr.bool_and <batcher.plan.expr_ir.core.Expr.bool_and>` | `Expr.all` |
+| {py:obj}`Expr.bool_or <batcher.plan.expr_ir.core.Expr.bool_or>` | `Expr.any` |
+| {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | `polars.Binary`, `polars.Boolean`, `polars.Date`, `polars.Decimal`, `polars.Float16`, `polars.Float32`, `polars.Float64`, `polars.Int16`, `polars.Int32`, `polars.Int64`, `polars.Int8`, `polars.String`, `polars.UInt16`, `polars.UInt32`, `polars.UInt8`, `polars.Utf8` |
+| {py:obj}`Expr.cbrt <batcher.plan.expr_ir.core.Expr.cbrt>` | `Expr.cbrt` |
+| {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | `Expr.ceil` |
+| {py:obj}`Expr.clip <batcher.plan.expr_ir.core.Expr.clip>` | `Expr.clip` |
+| {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | `Expr.cos` |
+| {py:obj}`Expr.cosh <batcher.plan.expr_ir.core.Expr.cosh>` | `Expr.cosh` |
+| {py:obj}`Expr.cot <batcher.plan.expr_ir.core.Expr.cot>` | `Expr.cot` |
+| {py:obj}`Expr.count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>` | `Expr.n_unique` |
+| {py:obj}`Expr.count <batcher.plan.expr_ir.core.Expr.count>` | `Expr.count` |
+| {py:obj}`Expr.cum_max <batcher.plan.expr_ir.core.Expr.cum_max>` | `Expr.cum_max` |
+| {py:obj}`Expr.cum_min <batcher.plan.expr_ir.core.Expr.cum_min>` | `Expr.cum_min` |
+| {py:obj}`Expr.cum_sum <batcher.plan.expr_ir.core.Expr.cum_sum>` | `Expr.cum_sum` |
+| {py:obj}`Expr.degrees <batcher.plan.expr_ir.core.Expr.degrees>` | `Expr.degrees` |
 | `Expr.dt.century` | `Expr.dt.century` |
 | `Expr.dt.date` | `Expr.dt.date` |
 | `Expr.dt.day` | `Expr.dt.day` |
@@ -180,21 +181,21 @@ The following table maps 272 Batcher spellings to the Polars names that compute 
 | `Expr.dt.week` | `Expr.dt.week` |
 | `Expr.dt.weekday` | `Expr.dt.weekday` |
 | `Expr.dt.year` | `Expr.dt.year` |
-| `Expr.dt` | `Expr.dt` |
-| `Expr.eq_missing` | `Expr.eq_missing` |
-| `Expr.exp` | `Expr.exp` |
-| `Expr.fill_nan` | `Expr.fill_nan` |
-| `Expr.floor` | `Expr.floor` |
-| `Expr.is_duplicated` | `Expr.is_duplicated` |
-| `Expr.is_finite` | `Expr.is_finite` |
-| `Expr.is_in` | `Expr.is_in` |
-| `Expr.is_infinite` | `Expr.is_infinite` |
-| `Expr.is_nan` | `Expr.is_nan` |
-| `Expr.is_not_nan` | `Expr.is_not_nan` |
-| `Expr.is_not_null` | `Expr.is_not_null` |
-| `Expr.is_null` | `Expr.is_null` |
-| `Expr.is_unique` | `Expr.is_unique` |
-| `Expr.kurtosis` | `Expr.kurtosis` |
+| {py:obj}`Expr.dt <batcher.plan.expr_ir.core.Expr.dt>` | `Expr.dt` |
+| {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | `Expr.eq_missing` |
+| {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | `Expr.exp` |
+| {py:obj}`Expr.fill_nan <batcher.plan.expr_ir.core.Expr.fill_nan>` | `Expr.fill_nan` |
+| {py:obj}`Expr.floor <batcher.plan.expr_ir.core.Expr.floor>` | `Expr.floor` |
+| {py:obj}`Expr.is_duplicated <batcher.plan.expr_ir.core.Expr.is_duplicated>` | `Expr.is_duplicated` |
+| {py:obj}`Expr.is_finite <batcher.plan.expr_ir.core.Expr.is_finite>` | `Expr.is_finite` |
+| {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | `Expr.is_in` |
+| {py:obj}`Expr.is_infinite <batcher.plan.expr_ir.core.Expr.is_infinite>` | `Expr.is_infinite` |
+| {py:obj}`Expr.is_nan <batcher.plan.expr_ir.core.Expr.is_nan>` | `Expr.is_nan` |
+| {py:obj}`Expr.is_not_nan <batcher.plan.expr_ir.core.Expr.is_not_nan>` | `Expr.is_not_nan` |
+| {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | `Expr.is_not_null` |
+| {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | `Expr.is_null` |
+| {py:obj}`Expr.is_unique <batcher.plan.expr_ir.core.Expr.is_unique>` | `Expr.is_unique` |
+| {py:obj}`Expr.kurtosis <batcher.plan.expr_ir.core.Expr.kurtosis>` | `Expr.kurtosis` |
 | `Expr.list.arg_max` | `Expr.arr.arg_max`, `Expr.list.arg_max` |
 | `Expr.list.arg_min` | `Expr.arr.arg_min`, `Expr.list.arg_min` |
 | `Expr.list.concat` | `Expr.list.concat` |
@@ -220,35 +221,35 @@ The following table maps 272 Batcher spellings to the Polars names that compute 
 | `Expr.list.sum` | `Expr.arr.sum`, `Expr.list.sum` |
 | `Expr.list.union` | `Expr.list.set_union` |
 | `Expr.list.unique` | `Expr.arr.unique`, `Expr.list.unique` |
-| `Expr.list` | `Expr.arr`, `Expr.list` |
-| `Expr.ln` | `Expr.log` |
-| `Expr.log10` | `Expr.log10` |
-| `Expr.log1p` | `Expr.log1p` |
-| `Expr.max_by` | `Expr.max_by` |
-| `Expr.max` | `Expr.max` |
-| `Expr.mean` | `Expr.mean` |
-| `Expr.median` | `Expr.median` |
+| {py:obj}`Expr.list <batcher.plan.expr_ir.core.Expr.list>` | `Expr.arr`, `Expr.list` |
+| {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | `Expr.log` |
+| {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | `Expr.log10` |
+| {py:obj}`Expr.log1p <batcher.plan.expr_ir.core.Expr.log1p>` | `Expr.log1p` |
+| {py:obj}`Expr.max_by <batcher.plan.expr_ir.core.Expr.max_by>` | `Expr.max_by` |
+| {py:obj}`Expr.max <batcher.plan.expr_ir.core.Expr.max>` | `Expr.max` |
+| {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | `Expr.mean` |
+| {py:obj}`Expr.median <batcher.plan.expr_ir.core.Expr.median>` | `Expr.median` |
 | `Expr.meta.has_multiple_outputs` | `Expr.meta.has_multiple_outputs` |
 | `Expr.meta.is_column` | `Expr.meta.is_column` |
 | `Expr.meta.output_name` | `Expr.meta.output_name` |
 | `Expr.meta.root_names` | `Expr.meta.root_names` |
 | `Expr.meta.tree_format` | `Expr.meta.tree_format` |
-| `Expr.meta` | `Expr.meta` |
-| `Expr.min_by` | `Expr.min_by` |
-| `Expr.min` | `Expr.min` |
-| `Expr.pct_change` | `Expr.pct_change` |
-| `Expr.peak_max` | `Expr.peak_max` |
-| `Expr.peak_min` | `Expr.peak_min` |
-| `Expr.pipe` | `Expr.pipe` |
-| `Expr.product` | `Expr.product` |
-| `Expr.quantile` | `Expr.quantile` |
-| `Expr.radians` | `Expr.radians` |
-| `Expr.rank` | `Expr.rank` |
-| `Expr.round` | `Expr.round` |
-| `Expr.sin` | `Expr.sin` |
-| `Expr.sinh` | `Expr.sinh` |
-| `Expr.skew` | `Expr.skew` |
-| `Expr.sqrt` | `Expr.sqrt` |
+| {py:obj}`Expr.meta <batcher.plan.expr_ir.core.Expr.meta>` | `Expr.meta` |
+| {py:obj}`Expr.min_by <batcher.plan.expr_ir.core.Expr.min_by>` | `Expr.min_by` |
+| {py:obj}`Expr.min <batcher.plan.expr_ir.core.Expr.min>` | `Expr.min` |
+| {py:obj}`Expr.pct_change <batcher.plan.expr_ir.core.Expr.pct_change>` | `Expr.pct_change` |
+| {py:obj}`Expr.peak_max <batcher.plan.expr_ir.core.Expr.peak_max>` | `Expr.peak_max` |
+| {py:obj}`Expr.peak_min <batcher.plan.expr_ir.core.Expr.peak_min>` | `Expr.peak_min` |
+| {py:obj}`Expr.pipe <batcher.plan.expr_ir.core.Expr.pipe>` | `Expr.pipe` |
+| {py:obj}`Expr.product <batcher.plan.expr_ir.core.Expr.product>` | `Expr.product` |
+| {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | `Expr.quantile` |
+| {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | `Expr.radians` |
+| {py:obj}`Expr.rank <batcher.plan.expr_ir.core.Expr.rank>` | `Expr.rank` |
+| {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | `Expr.round` |
+| {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | `Expr.sin` |
+| {py:obj}`Expr.sinh <batcher.plan.expr_ir.core.Expr.sinh>` | `Expr.sinh` |
+| {py:obj}`Expr.skew <batcher.plan.expr_ir.core.Expr.skew>` | `Expr.skew` |
+| {py:obj}`Expr.sqrt <batcher.plan.expr_ir.core.Expr.sqrt>` | `Expr.sqrt` |
 | `Expr.str.contains` | `Expr.bin.contains`, `Expr.str.contains` |
 | `Expr.str.ends_with` | `Expr.bin.ends_with`, `Expr.cat.ends_with`, `Expr.str.ends_with` |
 | `Expr.str.extract_all` | `Expr.str.extract_all` |
@@ -272,21 +273,28 @@ The following table maps 272 Batcher spellings to the Polars names that compute 
 | `Expr.str.to_titlecase` | `Expr.str.to_titlecase` |
 | `Expr.str.trim` | `Expr.str.strip_chars` |
 | `Expr.str.upper` | `Expr.str.to_uppercase` |
-| `Expr.str` | `Expr.str` |
-| `Expr.struct` | `Expr.struct` |
-| `Expr.sum` | `Expr.sum` |
-| `Expr.tan` | `Expr.tan` |
-| `Expr.tanh` | `Expr.tanh` |
-| `GroupBy.agg` | `GroupBy.agg`, `LazyGroupBy.agg` |
-| `GroupBy.array_agg` | `GroupBy.all`, `LazyGroupBy.all` |
-| `GroupBy.having` | `GroupBy.having`, `LazyGroupBy.having` |
-| `GroupBy.len` | `GroupBy.len`, `LazyGroupBy.len` |
-| `GroupBy.mean` | `GroupBy.mean`, `LazyGroupBy.mean` |
-| `GroupBy.median` | `GroupBy.median`, `LazyGroupBy.median` |
-| `GroupBy.min` | `GroupBy.min`, `LazyGroupBy.min` |
+| {py:obj}`Expr.str <batcher.plan.expr_ir.core.Expr.str>` | `Expr.str` |
+| {py:obj}`Expr.struct <batcher.plan.expr_ir.core.Expr.struct>` | `Expr.struct` |
+| {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | `Expr.sum` |
+| {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | `Expr.tan` |
+| {py:obj}`Expr.tanh <batcher.plan.expr_ir.core.Expr.tanh>` | `Expr.tanh` |
+| {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` | `GroupBy.agg`, `LazyGroupBy.agg` |
+| {py:obj}`GroupBy.array_agg <batcher.GroupBy.array_agg>` | `GroupBy.all`, `LazyGroupBy.all` |
+| {py:obj}`GroupBy.having <batcher.GroupBy.having>` | `GroupBy.having`, `LazyGroupBy.having` |
+| {py:obj}`GroupBy.len <batcher.GroupBy.len>` | `GroupBy.len`, `LazyGroupBy.len` |
+| {py:obj}`GroupBy.mean <batcher.GroupBy.mean>` | `GroupBy.mean`, `LazyGroupBy.mean` |
+| {py:obj}`GroupBy.median <batcher.GroupBy.median>` | `GroupBy.median`, `LazyGroupBy.median` |
+| {py:obj}`GroupBy.min <batcher.GroupBy.min>` | `GroupBy.min`, `LazyGroupBy.min` |
 | `Selector.exclude` | `Expr.exclude` |
 | `Session.drop` | `SQLContext.unregister` |
 | `Session.list` | `SQLContext.tables` |
 | `Session.register` | `SQLContext.register` |
 | `Session.sql` | `SQLContext.execute` |
 | `~` operator | `Expr.not_` |
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Polars pages.
+- {doc}`/getting-started/migration/index`: porting the other way, from Polars onto Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

@@ -63,7 +63,7 @@ def test_row_level_split_is_identical_distributed():
     ds = bt.from_arrow(_orders())
     gate = ds.dq.positive("amount").not_null("customer_id")
     local = gate.drop().collect()
-    remote = gate.drop().collect(distributed=True)
+    remote = gate.drop().collect(distributed=True, num_workers=4)
     assert local.num_rows == remote.num_rows
     assert _rows(local) == _rows(remote)
 
@@ -75,7 +75,10 @@ def test_uniqueness_split_is_identical_distributed():
     clean_local, bad_local = gate.quarantine()
     clean_remote, bad_remote = gate.quarantine()
     local = clean_local.collect(), bad_local.collect()
-    remote = clean_remote.collect(distributed=True), bad_remote.collect(distributed=True)
+    remote = (
+        clean_remote.collect(distributed=True, num_workers=4),
+        bad_remote.collect(distributed=True, num_workers=4),
+    )
     assert local[0].num_rows == remote[0].num_rows
     assert local[1].num_rows == remote[1].num_rows
     assert _rows(local[0]) == _rows(remote[0])
@@ -88,7 +91,7 @@ def test_referential_integrity_is_identical_distributed():
     ds = bt.from_arrow(_orders())
     gate = ds.dq.references("customer_id", to=_customers())
     local = gate.drop().collect()
-    remote = gate.drop().collect(distributed=True)
+    remote = gate.drop().collect(distributed=True, num_workers=4)
     assert local.num_rows == remote.num_rows
     assert _rows(local) == _rows(remote)
 
@@ -98,7 +101,7 @@ def test_violation_counts_are_identical_distributed():
     gate = ds.dq.positive("amount").unique("order_id").references("customer_id", to=_customers())
     local = gate.validate()
     # `validate` runs its own aggregates; distribute the same relation and re-measure.
-    remote_source = bt.from_arrow(ds.collect(distributed=True))
+    remote_source = bt.from_arrow(ds.collect(distributed=True, num_workers=4))
     remote = gate.on(remote_source).validate()
     assert local.violations == remote.violations
     assert local.rows == remote.rows
@@ -109,7 +112,7 @@ def test_relation_level_measurements_agree_distributed():
     ds = bt.from_arrow(_orders())
     gate = ds.dq.row_count_between(1).mean_between("amount", 40.0, 60.0)
     local = gate.validate()
-    remote = gate.on(bt.from_arrow(ds.collect(distributed=True))).validate()
+    remote = gate.on(bt.from_arrow(ds.collect(distributed=True, num_workers=4))).validate()
     assert local.ok == remote.ok
     assert local.result("row_count_between(1, None)").value == (
         remote.result("row_count_between(1, None)").value
@@ -123,5 +126,5 @@ def test_annotation_labels_the_same_rows_distributed():
     ds = bt.from_arrow(_orders())
     gate = ds.dq.positive("amount").unique("order_id")
     local = gate.annotate().collect()
-    remote = gate.annotate().collect(distributed=True)
+    remote = gate.annotate().collect(distributed=True, num_workers=4)
     assert _rows(local) == _rows(remote)

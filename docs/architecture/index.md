@@ -60,6 +60,14 @@ The design-level record of Kyber, Carbonite, and the execution engine, plus how 
 :::
 ::::
 
+## See also
+
+- {doc}`/getting-started/concepts/glossary`: morsel, pipeline breaker, mergeable algebra, and the rest, one line each.
+- {doc}`/getting-started/concepts/index`: the same ideas at the level a user needs them.
+- {doc}`/benchmarks/index`: what the design measures out at, against DuckDB, Polars, Spark, and Daft.
+- {doc}`/user-guide/operate/tuning/explain-plans`: reading what the optimizer decided for one query.
+- {doc}`/api/symbols/index`: the surface the control plane exposes over all of this.
+
 ```{toctree}
 :hidden:
 

@@ -11,8 +11,8 @@ use crate::SpatialFunc;
 
 /// One row. `a` is exactly `func.arity()` long.
 ///
-/// `None` is a null result — the only source of one is a quaternion with no rotation in
-/// it. Split by argument shape rather than by function so each group reads its
+/// `None` is a null result — a quaternion with no rotation in it, a matrix that is not a
+/// rotation, or a non-finite interpolation fraction. Split by argument shape rather than by function so each group reads its
 /// arguments once, in the order the vocabulary documents them.
 pub(super) fn apply(func: SpatialFunc, a: &[f64]) -> Option<f64> {
     use SpatialFunc::{
@@ -42,7 +42,10 @@ pub(super) fn apply(func: SpatialFunc, a: &[f64]) -> Option<f64> {
         }
 
         // --- one quaternion --------------------------------------------------
-        QuatNorm => Some(quat(a, 0).norm()),
+        // A NaN component makes the norm NaN; it is a null instead, like every other
+        // function of a quaternion with no rotation in it. Zero stays zero: that is a
+        // measurement worth reporting, not a missing one.
+        QuatNorm => Some(quat(a, 0).norm()).filter(|n| !n.is_nan()),
         QuatNormalizeX | QuatNormalizeY | QuatNormalizeZ | QuatNormalizeW => {
             let q = quat(a, 0).normalize()?;
             Some(match func {
@@ -101,7 +104,7 @@ pub(super) fn apply(func: SpatialFunc, a: &[f64]) -> Option<f64> {
         }
         QuatFromRotmatX | QuatFromRotmatY | QuatFromRotmatZ | QuatFromRotmatW => {
             let q =
-                Quat::from_rotation_matrix(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+                Quat::from_rotation_matrix(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])?;
             Some(match func {
                 QuatFromRotmatX => q.x,
                 QuatFromRotmatY => q.y,

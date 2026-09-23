@@ -48,7 +48,7 @@ A disagreement isn't always an engine's defect, and the difference decides who s
 
 **An engine disagreeing with the rest.** On TPC-H, Daft returns wrong results on q6 and q15 and the wrong columns on q18, where Batcher, DuckDB and Polars agree. Those cases are excluded from Daft's geomean rather than counted for it, so it isn't credited with a fast wrong answer.
 
-**The benchmark's fault.** The three `scan-filter_agg-*` cases disagree for Ray Data and Daft, and the suite predicts it. Its columns are `int64` drawn uniformly from `[0, 2^63)`, so a bare sum overflows 64 bits. DuckDB and Batcher widen before summing and return about 4.6e18, while engines that accumulate in `int64` wrap. The suite bounds every `SUM` for that reason and missed its one `AVG`, which sums before it divides. Those three cases are uncomparable, and the fix belongs in `benchmarks/suites/scan/shapes.py`.
+**The benchmark's fault.** The three `scan-filter_agg-*` cases disagree for Ray Data and Daft, and the suite predicts it. Its columns are `int64` drawn uniformly from `[0, 2^63)`, so a bare sum overflows 64 bits. DuckDB and Batcher widen before summing and return about 4.6e18, while engines that accumulate in `int64` wrap. The suite bounds every `SUM` for that reason and missed its one `AVG`, which sums before it divides. Those three cases are uncomparable, and the fix belongs in [`benchmarks/suites/scan/shapes.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/suites/scan/shapes.py).
 
 ## Reproduce
 

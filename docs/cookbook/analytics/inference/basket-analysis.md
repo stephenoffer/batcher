@@ -155,7 +155,7 @@ Ten rows: five unordered pairs, each in both directions.
 ## See also
 
 - {doc}`Top k per group </cookbook/analytics/aggregates/top-k-per-group>`: keep the best three partners per item rather than the global leaderboard.
-- {doc}`Geospatial binning </cookbook/analytics/geospatial-binning>`: the other recipe whose whole difficulty is choosing a key that groups.
+- {doc}`Geospatial binning </cookbook/analytics/aggregates/geospatial-binning>`: the other recipe whose whole difficulty is choosing a key that groups.
 - {doc}`Joins </user-guide/analyze/joins>`: the join engine, and what a self-join costs.
 - {doc}`Distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`: duplicate line items in a basket will inflate every count on this page, so dedupe `(order_id, item)` first.
 - {doc}`Join algorithms </architecture/deep-dives/operators/join-algorithms>`: how the build side is chosen, and what a self-join's output costs.

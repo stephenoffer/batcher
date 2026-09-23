@@ -137,3 +137,54 @@ def test_the_streaming_driver_still_declines_the_finalized_four(splittable):
     plan = bt.read.parquet(splittable).window(order_by=["x"], functions={"r": "percent_rank"})._plan
     assert supports_ordered_bucket_offsets(plan) is False
     assert supports_ordered_bucket_offsets(plan, assembled=True) is True
+
+
+@pytest.fixture(scope="module")
+def unique_keys(cluster_scratch) -> str:
+    """Three Parquet files whose order key never repeats, so `nth_value` has one answer.
+
+    Under a tie at the k-th position, *which* tied row is the k-th is left open by the
+    `ORDER BY` and may differ between the paths (the window-tie exception in
+    `.claude/rules/python-control-plane.md`), so the value comparison needs no ties at all.
+    """
+    directory = cluster_scratch("global_window_nth")
+    for part in range(3):
+        keys = range(part * _N, (part + 1) * _N)
+        # Interleave the keys across files so no file is one contiguous key range.
+        table = pa.table(
+            {
+                "rid": pa.array([(k * 7919) % (3 * _N) for k in keys], pa.int64()),
+                "v": pa.array([None if k % 11 == 0 else float(k) for k in keys], pa.float64()),
+            }
+        )
+        pq.write_table(table, directory / f"p{part}.parquet")
+    return str(directory)
+
+
+@pytest.mark.parametrize("k", [2, 5, 400, 1199, 1200, 1201])
+def test_nth_value_past_the_first_distributes(unique_keys, k):
+    """`nth_value(v, k)` for `k > 1` -- the one spelling Kyber does not turn into `first_value`.
+
+    The value is the relation's k-th row once a row's frame reaches it and NULL before, so it
+    is decided in whichever bucket holds that row; `k` sweeps early, mid-relation, the last
+    row, and one past it (NULL everywhere). Compared per `rid` against single-node.
+    """
+    functions = {"r": ("nth_value", bt.col("v"), k)}
+    single = _by_rid(
+        bt.read.parquet(unique_keys).window(order_by=["rid"], functions=functions).collect()
+    )
+    distributed = _by_rid(
+        bt.read.parquet(unique_keys)
+        .window(order_by=["rid"], functions=functions)
+        .collect(distributed=True, num_workers=_WORKERS)
+    )
+    assert distributed == single
+    # Not two all-NULL columns agreeing: the last row's frame is the whole relation, so it
+    # holds the k-th row's `v` (NULL only where the fixture put one) -- the single value any
+    # row takes -- and past the relation it is NULL too.
+    last = single["r"][-1]
+    assert {x for x in single["r"] if x is not None} == ({last} - {None})
+    if k > 3 * _N:
+        assert last is None
+    elif k in (2, 5, 400):
+        assert last is not None, "the control needs a non-NULL k-th value"

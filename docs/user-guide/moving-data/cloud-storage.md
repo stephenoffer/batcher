@@ -20,7 +20,7 @@ Most examples on this page need a real bucket and credentials, so their blocks a
 
 {py:obj}`bt.read <batcher.read>` infers the format from the extension. The format-specific readers ({py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>`, {py:meth}`bt.read.csv <batcher.api.io_namespace.reader.Reader.csv>`, {py:meth}`bt.read.json <batcher.api.io_namespace.reader.Reader.json>`) take the same cloud paths.
 
-A glob works with `bt.read` and the typed readers alike. A `*` matches within one path segment only, so crossing directories in a Hive layout needs `**`. Reading a Hive layout that way returns every row without the partition columns, and Batcher warns about it. Point `bt.read.parquet` at the directory itself, or use `bt.read.parquet_dataset(...)`, when you need those columns back.
+A glob works with {py:obj}`bt.read <batcher.read>` and the typed readers alike. A `*` matches within one path segment only, so crossing directories in a Hive layout needs `**`. Reading a Hive layout that way returns every row without the partition columns, and Batcher warns about it. Point `bt.read.parquet` at the directory itself, or use `bt.read.parquet_dataset(...)`, when you need those columns back.
 
 ```python
 # docs: skip

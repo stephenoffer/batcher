@@ -172,7 +172,7 @@ Say out loud which of your tables is which. A dashboard reading the streaming ro
 - {doc}`Partition backfill </cookbook/data-engineering/maintenance/partition-backfill>`: the atomic replace that `rebuild` leans on.
 - {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: late rows are often duplicate rows too.
 - {doc}`CDC pipeline </cookbook/data-engineering/ingest/cdc-pipeline>`: out-of-order changes, sequenced rather than windowed.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, output modes, and the streaming query handle.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, output modes, and the streaming query handle.
 - {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: the raw table the rebuild reads from.
 - {doc}`Kafka </integrations/streams/kafka>`: the stream the stragglers arrive on.
 - {doc}`Dataset API </api/relational/dataset>`: `with_watermark`, `window`, `group_by`.

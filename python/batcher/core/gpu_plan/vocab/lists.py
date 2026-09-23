@@ -41,8 +41,6 @@ __all__ = [
     "eval_list_fn",
     "eval_list_get",
     "eval_list_position",
-    "supported_list_binary",
-    "supported_list_fn",
 ]
 
 #: Private columns the element view carries: the value being reduced, the position of the row
@@ -88,30 +86,6 @@ _ARG_FNS = {"arg_max": "max", "arg_min": "min"}
 _SCALAR_FNS = (
     frozenset(LIST_REDUCTIONS) | frozenset(_TRANSFORMED) | frozenset(_ARG_FNS) | {"len", "n_unique"}
 )
-
-
-def supported_list_fn(fn: str) -> bool:
-    """Whether a one-list function is translatable.
-
-    Args:
-        fn: The `list` node's ``fn`` discriminator.
-
-    Returns:
-        True when this module evaluates it.
-    """
-    return fn in _SCALAR_FNS
-
-
-def supported_list_binary(fn: str) -> bool:
-    """Whether a two-list function is translatable.
-
-    Args:
-        fn: The `list_binary` node's ``fn`` discriminator.
-
-    Returns:
-        True when this module evaluates it.
-    """
-    return fn in LIST_BINARY_FNS
 
 
 def _arrow(name: str):

@@ -10,8 +10,10 @@ estimator half uses too. What is specific to a preprocessor, and therefore lives
 the registry of loadable classes and the handling of a preprocessor nested inside another
 one's parameters.
 
-Round-tripping is exact for every preprocessor in this package, and `to_dict` refuses
-rather than guesses on state it cannot represent, so a silently lossy save is not possible.
+Round-tripping is exact for every preprocessor in this package that holds only data, and
+`to_dict` refuses rather than guesses on anything it cannot represent: a callable argument
+(`FunctionTransformer`, `Tokenizer`, `RFE`) or model object is refused at save time, so a
+silently lossy save, or a file that saves and then cannot load, is not possible.
 """
 
 from __future__ import annotations
@@ -72,7 +74,10 @@ def to_dict(preprocessor: Preprocessor) -> dict[str, Any]:
         A dictionary with ``version``, ``class``, ``params``, ``state``, and ``fitted``.
 
     Raises:
-        PlanError: If any state value is not JSON-representable.
+        PlanError: If any state value is not JSON-representable, or a constructor argument
+            the class needs to be rebuilt is not recorded (a Python callable such as
+            `Tokenizer`'s tokenizer). Refusing here, at save time, is the point: the
+            alternative is a file that writes cleanly and cannot be loaded.
 
     Examples:
         .. doctest::
@@ -83,13 +88,55 @@ def to_dict(preprocessor: Preprocessor) -> dict[str, Any]:
             >>> to_dict(pre)["class"]
             'StandardScaler'
     """
+    name = type(preprocessor).__name__
+    params = preprocessor.get_params()
+    _require_rebuildable(type(preprocessor), params)
+    encoded: dict[str, Any] = {}
+    for key, value in params.items():
+        try:
+            encoded[key] = _encode(value)
+        except PlanError as exc:
+            raise PlanError(
+                f"{name} cannot be saved: its {key!r} argument is a "
+                f"{type(value).__name__}, which has no JSON form ({exc}). Keep the fitted "
+                "object in-process, or pickle it if the callable is importable."
+            ) from exc
     return {
         "version": SCHEMA_VERSION,
-        "class": type(preprocessor).__name__,
-        "params": {k: _encode(v) for k, v in preprocessor.get_params().items()},
+        "class": name,
+        "params": encoded,
         "state": {n: _encode(getattr(preprocessor, n)) for n in state_names(preprocessor)},
         "fitted": bool(preprocessor.is_fitted),
     }
+
+
+def _require_rebuildable(klass: type, params: dict[str, Any]) -> None:
+    """Raise if a required constructor argument is absent from `params`.
+
+    `from_dict` rebuilds an object by calling its constructor with the saved parameters, so a
+    required argument the object does not report (because it holds it privately, as
+    `Tokenizer` holds its tokenizer callable) produces a document that saves without error and
+    then fails on load with a bare ``TypeError``. Checking the signature at save time turns
+    that into an error where the user can still act on it.
+    """
+    import inspect
+
+    try:
+        signature = inspect.signature(klass.__init__)
+    except (TypeError, ValueError):  # a C-level or otherwise unreadable __init__
+        return
+    for parameter in list(signature.parameters.values())[1:]:
+        required = parameter.default is inspect.Parameter.empty and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        if required and parameter.name not in params:
+            raise PlanError(
+                f"{klass.__name__} cannot be saved: it does not record its required "
+                f"{parameter.name!r} argument (typically a Python callable), so a saved copy "
+                "could not be rebuilt. Keep the fitted object in-process, or re-create it "
+                "with the same argument where it is needed."
+            )
 
 
 def _registry() -> dict[str, type]:

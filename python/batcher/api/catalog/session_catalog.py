@@ -28,6 +28,27 @@ if TYPE_CHECKING:
 
 __all__ = ["SessionCatalog"]
 
+#: Where a new session sits; see `SessionCatalog._is_repositioned`.
+_START_CATALOG = "memory"
+_START_NAMESPACE = "main"
+
+
+def _fold(catalog: Catalog, relative: str) -> str:
+    """`relative` as `catalog` spells it when only the case differs, else unchanged.
+
+    Args:
+        catalog: The catalog holding the table.
+        relative: The catalog-relative ``namespace.table`` name as written.
+
+    Returns:
+        The stored spelling of the one table matching case-insensitively, or `relative`.
+    """
+    if catalog.has_table(relative):
+        return relative
+    folded = relative.casefold()
+    matches = [t for t in catalog.list_tables() if t.casefold() == folded]
+    return matches[0] if len(matches) == 1 else relative
+
 
 class SessionCatalog:
     """The catalogs a `Session` has attached, and the current catalog and namespace.
@@ -51,9 +72,9 @@ class SessionCatalog:
 
     def __init__(self) -> None:
         """Start with the in-memory ``memory`` catalog, current namespace ``main``."""
-        default = Catalog.from_pydict({}, name="memory")
+        default = Catalog.from_pydict({}, name=_START_CATALOG)
         self._catalogs: dict[str, Catalog] = {default.name: default}
-        self._current: tuple[str, str] = (default.name, "main")
+        self._current: tuple[str, str] = (default.name, _START_NAMESPACE)
 
     def __repr__(self) -> str:
         """Show the attached catalog names and the current position."""
@@ -241,13 +262,19 @@ class SessionCatalog:
                 'raw'
         """
         parts = _names.split(name, what="catalog or namespace")
-        if parts[0] in self._catalogs:
-            catalog = self._catalogs[parts[0]]
+        head = self._catalog_key(parts[0])
+        if head is not None:
+            catalog = self._catalogs[head]
             namespace = (
                 _names.join(*parts[1:]) if len(parts) > 1 else catalog._backend.default_namespace
             )
         else:
             catalog, namespace = self._catalogs[self._current[0]], name
+        if not catalog.has_namespace(namespace):
+            folded = namespace.casefold()
+            namespace = next(
+                (n for n in catalog.list_namespaces() if n.casefold() == folded), namespace
+            )
         if not catalog.has_namespace(namespace):
             raise PlanError(
                 f"cannot use {name!r}: no namespace {namespace!r} in catalog {catalog.name!r} "
@@ -255,22 +282,39 @@ class SessionCatalog:
                 available=[*self._catalogs, *catalog.list_namespaces()],
                 available_label="Catalogs and namespaces",
             )
-        self._current = (parts[0] if parts[0] in self._catalogs else self._current[0], namespace)
+        self._current = (head if head is not None else self._current[0], namespace)
 
     # --- resolution ------------------------------------------------------------------
     def _current_catalog(self) -> Catalog:
         return self._catalogs[self._current[0]]
 
+    def _is_repositioned(self) -> bool:
+        """Whether `use` has moved this session off its starting ``memory.main``."""
+        return self._current != (_START_CATALOG, _START_NAMESPACE)
+
+    def _catalog_key(self, name: str) -> str | None:
+        """The attached catalog `name` names, matched case-insensitively as SQL does."""
+        if name in self._catalogs:
+            return name
+        folded = name.casefold()
+        return next((k for k in self._catalogs if k.casefold() == folded), None)
+
     def _resolve_table(self, name: str) -> tuple[Catalog, str]:
-        """Resolve a session-level table name to its catalog and catalog-relative name."""
+        """Resolve a session-level table name to its catalog and catalog-relative name.
+
+        Identifiers are case-insensitive, as in SQL: an exact spelling wins, and otherwise a
+        table whose name differs only in case is found (``SALES.ORDERS`` reads
+        ``sales.orders``). Two tables differing only in case stay unresolved by the fold.
+        """
         parts = _names.split(name)
         current = self._current_catalog()
         if len(parts) == 1:
-            return current, _names.join(self._current[1], parts[0])
-        head = parts[0]
-        if head in self._catalogs and (len(parts) > 2 or not current.has_namespace(head)):
-            return self._catalogs[head], _names.join(*parts[1:])
-        return current, name
+            return current, _fold(current, _names.join(self._current[1], parts[0]))
+        head = self._catalog_key(parts[0])
+        if head is not None and (len(parts) > 2 or not current.has_namespace(parts[0])):
+            catalog = self._catalogs[head]
+            return catalog, _fold(catalog, _names.join(*parts[1:]))
+        return current, _fold(current, name)
 
     def _resolve_namespace(self, name: str) -> tuple[Catalog, str]:
         parts = _names.split(name, what="namespace")

@@ -45,6 +45,10 @@ OpenLineage requires a run id that is a UUID; Batcher's `query_id` is not one. T
 is derived from the query id with a fixed-namespace UUID5, so the START event emitted
 before execution and the COMPLETE event emitted after it agree without threading state
 between them, and a re-emitted event is idempotent in the backend.
+
+The job name is the one piece that does need state. It is the plan signature, and the FAIL
+event is emitted from an exception with no plan in reach, so START remembers the name per
+query id (bounded) and COMPLETE and FAIL reuse it. Every event of one run names one job.
 """
 
 from __future__ import annotations
@@ -54,6 +58,7 @@ import os
 import queue
 import threading
 import uuid
+from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -84,6 +89,16 @@ _queue: queue.Queue[_Delivery] | None = None
 _worker: threading.Thread | None = None
 _worker_lock = threading.Lock()
 _dropped = 0
+
+# The job name each open run was STARTed under, keyed by query id. A run's three events must
+# name one job, and only START has the plan: the FAIL path has an exception and nothing else,
+# so without this it fell back to the bare `batcher.query` and a lineage backend recorded the
+# run as open on the real job and failed on a job nothing else ever ran. Bounded because a
+# run that never closes (a killed process) must not hold an entry forever. An entry evicted
+# before its run ends costs that one event its specific name and never costs a query.
+_JOB_NAMES_KEPT = 1024
+_job_names: OrderedDict[str, str] = OrderedDict()
+_job_names_lock = threading.Lock()
 
 
 class _Delivery(NamedTuple):
@@ -220,12 +235,29 @@ def _namespace() -> str:
 def _source_names(sources: list[Source] | None) -> list[str]:
     """The table identifier for each bound source, in scan order.
 
-    Uses the same `table_name` resolution `Dataset.lineage()` renders origins with, so the
-    names in an emitted event and the names a user sees locally are the same names.
+    Uses the same `table_name` resolution `Dataset.lineage()` renders origins with, so a
+    file- or table-backed input has the same name in an emitted event as it has locally.
+    A source with no table name gets `_unnamed_source`, which adds an identity to the
+    positional label `Dataset.lineage()` shows.
     """
     from batcher.api.security import table_name
 
-    return [table_name(s) or f"<source {i}>" for i, s in enumerate(sources or [])]
+    return [table_name(s) or _unnamed_source(s, i) for i, s in enumerate(sources or [])]
+
+
+def _unnamed_source(source: Source, index: int) -> str:
+    """A dataset name for a source with no durable table name, such as in-memory batches.
+
+    The positional `<source N>` alone made every in-memory input of every query the same
+    dataset in a lineage backend, so two unrelated `from_pydict` relations shared one
+    lineage graph node. The statistics key tells them apart and is stable for the life of
+    the object, which is exactly the identity an in-memory relation has: the same object
+    read twice is one dataset, and an equal-looking rebuild is another.
+    """
+    from batcher.plan.source_stats import source_stats_key
+
+    key = source_stats_key(source)
+    return f"<source {index} {key}>" if key else f"<source {index}>"
 
 
 def _column_lineage_facet(plan: LogicalPlan, tables: list[str]) -> dict[str, Any] | None:
@@ -311,7 +343,9 @@ def emit_run_start(query_id: str, plan: LogicalPlan, sources: list[Source] | Non
     if not openlineage_enabled():
         return
     try:
-        _emit(_build(query_id, "START", plan=plan, sources=sources, profile=None))
+        job = _job_name(plan)
+        _remember_job(query_id, job)
+        _emit(_build(query_id, "START", plan=plan, sources=sources, profile=None, job=job))
     except Exception:  # pragma: no cover - telemetry must never fail a query
         from batcher._internal.logging import get_logger
 
@@ -334,7 +368,17 @@ def emit_run_complete(
     if not openlineage_enabled():
         return
     try:
-        _emit(_build(profile.query_id, "COMPLETE", plan=plan, sources=sources, profile=profile))
+        job = _recall_job(profile.query_id)
+        _emit(
+            _build(
+                profile.query_id,
+                "COMPLETE",
+                plan=plan,
+                sources=sources,
+                profile=profile,
+                job=job,
+            )
+        )
     except Exception:  # pragma: no cover - telemetry must never fail a query
         from batcher._internal.logging import get_logger
 
@@ -358,7 +402,8 @@ def emit_run_failure(query_id: str, exc: BaseException) -> None:
     if not openlineage_enabled():
         return
     try:
-        event = _build(query_id, "FAIL", plan=None, sources=None, profile=None)
+        job = _recall_job(query_id)
+        event = _build(query_id, "FAIL", plan=None, sources=None, profile=None, job=job)
         event["run"]["facets"]["errorMessage"] = {
             "_producer": _PRODUCER,
             "_schemaURL": ("https://openlineage.io/spec/facets/1-0-0/ErrorMessageRunFacet.json"),
@@ -379,14 +424,17 @@ def _build(
     plan: LogicalPlan | None,
     sources: list[Source] | None,
     profile: QueryProfile | None,
+    job: str | None = None,
 ) -> dict[str, Any]:
     """Assemble one OpenLineage RunEvent document.
 
     Kept as plain data rather than the client's dataclasses so the shape is inspectable in
     a test without the optional dependency installed, which is the only way the facet
-    contents are checkable in CI.
+    contents are checkable in CI. `job` is the name the run was STARTed under, when known;
+    otherwise it is derived from `plan`.
     """
     namespace = _namespace()
+    job = job or _job_name(plan)
     tables = _source_names(sources)
     event: dict[str, Any] = {
         "eventType": event_type,
@@ -399,7 +447,7 @@ def _build(
         },
         "job": {
             "namespace": namespace,
-            "name": _job_name(plan),
+            "name": job,
             "facets": {},
         },
         "inputs": [{"namespace": namespace, "name": table} for table in tables],
@@ -416,11 +464,28 @@ def _build(
             event["outputs"] = [
                 {
                     "namespace": namespace,
-                    "name": _job_name(plan),
+                    "name": job,
                     "facets": {"columnLineage": facet},
                 }
             ]
     return event
+
+
+def _remember_job(query_id: str, job: str) -> None:
+    """Record the job name `query_id`'s run was STARTed under, evicting the oldest."""
+    if not query_id:
+        return
+    with _job_names_lock:
+        _job_names[query_id] = job
+        _job_names.move_to_end(query_id)
+        while len(_job_names) > _JOB_NAMES_KEPT:
+            _job_names.popitem(last=False)
+
+
+def _recall_job(query_id: str) -> str | None:
+    """The job name `query_id`'s run was STARTed under, forgetting it: the run is closing."""
+    with _job_names_lock:
+        return _job_names.pop(query_id, None)
 
 
 def _job_name(plan: LogicalPlan | None) -> str:

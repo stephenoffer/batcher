@@ -5,6 +5,14 @@ per-row ratio of those units to a corpus number. Both were being written out per
 how `_char_ngrams` came to exist twice and five overlap metrics came to share one body. They live
 here once so a change to the tokenization changes every metric that depends on it.
 
+**Null is scored as the empty string.** Every helper that turns text into units first replaces
+a null with ``""``, so a missing prediction or a missing reference is one more row in the
+corpus mean, scored exactly as an empty one would be (a miss, for every overlap metric). The
+metrics used to disagree: BLEU dropped a row whose reference was null while ROUGE-L scored it
+0, and the brevity penalty scored a null generation as ``e`` -- above its own ceiling of 1.
+The exact-match metrics are the one family that does not route through here, and they keep
+SQL's rule that a null equals nothing.
+
 Nothing here touches a row. Each helper returns an `Expr` the engine evaluates column-wise in
 Rust, which is what lets a million-row eval be one scan rather than a Python loop.
 """
@@ -15,7 +23,15 @@ from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.functions.collection import element
 
-__all__ = ["char_ngrams", "mean_ratio", "normalize", "token_ngrams", "tokens"]
+__all__ = [
+    "char_ngrams",
+    "mean_ratio",
+    "normalize",
+    "null_as_empty",
+    "token_ngrams",
+    "tokens",
+    "whole_ngrams",
+]
 
 
 def normalize(text: Expr) -> Expr:
@@ -31,6 +47,11 @@ def normalize(text: Expr) -> Expr:
     return text.str.squad_normalize()
 
 
+def null_as_empty(text: Expr) -> Expr:
+    """The text with a null read as the empty string -- the package's one null rule."""
+    return text.fill_null(lit(""))
+
+
 def tokens(text: Expr) -> Expr:
     """The normalized whitespace-delimited tokens of a text column, as a list.
 
@@ -41,7 +62,7 @@ def tokens(text: Expr) -> Expr:
     degeneration `distinct_token_ratio` exists to catch. Dropping empty tokens makes the list
     genuinely empty so `mean_ratio`'s zero-denominator guard fires.
     """
-    return normalize(text).str.split(" ").list.filter(element() != lit(""))
+    return normalize(null_as_empty(text)).str.split(" ").list.filter(element() != lit(""))
 
 
 def token_ngrams(text: Expr, n: int) -> Expr:
@@ -54,14 +75,31 @@ def token_ngrams(text: Expr, n: int) -> Expr:
     say so in their own documentation.
 
     A row with fewer than `n` tokens still yields one n-gram of everything it has, so a short
-    reference is scored rather than silently skipped.
+    reference is scored rather than silently skipped. That is right for matching spans (a
+    short question copied whole into a training document is still a copy) and wrong for a
+    clipped-count metric; those use `whole_ngrams`.
     """
-    return normalize(text).str.token_ngrams(n)
+    return normalize(null_as_empty(text)).str.token_ngrams(n)
+
+
+def whole_ngrams(text: Expr, n: int) -> Expr:
+    """`token_ngrams` without the short-row gram: a row of fewer than `n` tokens has none.
+
+    BLEU and ROUGE-N count n-grams of exactly `n` tokens. Padding a short row into one "n-gram"
+    of everything it has let a two-word generation matching its two-word reference score a
+    perfect 4-gram BLEU of 1.0, where the reference definition -- and `bleu`'s own docstring --
+    give 0 because there is no 4-gram to match.
+    """
+    grams = token_ngrams(text, n)
+    if n == 1:
+        return grams
+    words = normalize(null_as_empty(text)).str.word_count()
+    return when(words >= lit(n)).then(grams).otherwise(grams.list.slice(0, 0))
 
 
 def char_ngrams(text: Expr, n: int) -> Expr:
     """The character n-grams of a case-folded, space-collapsed text column, as a list."""
-    normalized = text.str.lower().str.normalize_whitespace().str.trim()
+    normalized = null_as_empty(text).str.lower().str.normalize_whitespace().str.trim()
     return normalized.str.chunk(n, overlap=n - 1)
 
 

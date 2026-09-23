@@ -46,29 +46,31 @@ The table below lists the quality, governance and security scripts in path order
 <!-- library-table: quality,governance,security -->
 | Script | Shows |
 | --- | --- |
-| `examples/quality/anomaly_detection.py` | Flagging rows that do not look like the rest |
-| `examples/quality/completeness_checks.py` | Completeness: did every expected group arrive |
-| `examples/quality/contract_lifecycle.py` | The life of a data contract: watch a rule, tolerate it, then enforce it |
-| `examples/quality/contracts_on_real_data.py` | Asserting a data contract against a real table |
-| `examples/quality/distribution_drift.py` | Detecting that today's data does not look like yesterday's |
-| `examples/quality/end_to_end_gate.py` | A release gate: every check a pipeline should pass before it ships |
-| `examples/quality/freshness_and_ranges.py` | Checking that data is recent and in range |
-| `examples/quality/profiling_columns.py` | Profiling a table before you write any checks |
-| `examples/quality/quarantine_workflow.py` | The full quarantine loop: split, write both sides, and reconcile |
-| `examples/quality/reconciliation_report.py` | Reconciling a transformed dataset against its source |
-| `examples/quality/referential_integrity.py` | Checking that foreign keys point at rows that exist |
-| `examples/quality/rule_engine.py` | A rule engine as a projection: one boolean column per rule |
-| `examples/quality/schema_contracts.py` | Asserting the schema, not just the values |
-| `examples/quality/uniqueness_and_keys.py` | Checking that a key is actually a key |
-| `examples/governance/lineage.py` | Column lineage: which inputs does this output column actually depend on? |
-| `examples/governance/masking_and_filters.py` | Column masking and row filtering as a plan rewrite, not a wrapper |
-| `examples/governance/pii_transforms.py` | Masking, hashing, and keyed hashing of a sensitive column |
-| `examples/security/audit_and_lineage.py` | Proving where a governed column went |
-| `examples/security/audit_trail.py` | Recording who ran what, and proving the policy applied |
-| `examples/security/column_masking.py` | Masking a sensitive column by tag, not by name |
-| `examples/security/data_residency.py` | Data residency: refusing to process a dataset in the wrong region |
-| `examples/security/masking_functions.py` | The masking functions, and what each preserves |
-| `examples/security/row_level_security.py` | Restricting which rows a principal can see |
+| [`examples/quality/anomaly_detection.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/anomaly_detection.py) | Flagging rows that do not look like the rest |
+| [`examples/quality/completeness_checks.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/completeness_checks.py) | Completeness: did every expected group arrive |
+| [`examples/quality/contract_lifecycle.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/contract_lifecycle.py) | The life of a data contract: watch a rule, tolerate it, then enforce it |
+| [`examples/quality/contracts_on_real_data.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/contracts_on_real_data.py) | Asserting a data contract against a real table |
+| [`examples/quality/distribution_drift.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/distribution_drift.py) | Detecting that today's data does not look like yesterday's |
+| [`examples/quality/end_to_end_gate.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/end_to_end_gate.py) | A release gate: every check a pipeline should pass before it ships |
+| [`examples/quality/freshness_and_ranges.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/freshness_and_ranges.py) | Checking that data is recent and in range |
+| [`examples/quality/profiling_columns.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/profiling_columns.py) | Profiling a table before you write any checks |
+| [`examples/quality/quarantine_workflow.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/quarantine_workflow.py) | The full quarantine loop: split, write both sides, and reconcile |
+| [`examples/quality/reconciliation_report.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/reconciliation_report.py) | Reconciling a transformed dataset against its source |
+| [`examples/quality/referential_integrity.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/referential_integrity.py) | Checking that foreign keys point at rows that exist |
+| [`examples/quality/rule_engine.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/rule_engine.py) | A rule engine as a projection: one boolean column per rule |
+| [`examples/quality/schema_contracts.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/schema_contracts.py) | Asserting the schema, not just the values |
+| [`examples/quality/suggest_and_report.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/suggest_and_report.py) | Suggest a contract from the data, validate it, and ship the report as strict JSON |
+| [`examples/quality/trimming_a_text_corpus.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/trimming_a_text_corpus.py) | Trim a text corpus to what a model can actually read, before tokenizing it |
+| [`examples/quality/uniqueness_and_keys.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quality/uniqueness_and_keys.py) | Checking that a key is actually a key |
+| [`examples/governance/lineage.py`](https://github.com/stephenoffer/batcher/blob/main/examples/governance/lineage.py) | Column lineage: which inputs does this output column actually depend on? |
+| [`examples/governance/masking_and_filters.py`](https://github.com/stephenoffer/batcher/blob/main/examples/governance/masking_and_filters.py) | Column masking and row filtering as a plan rewrite, not a wrapper |
+| [`examples/governance/pii_transforms.py`](https://github.com/stephenoffer/batcher/blob/main/examples/governance/pii_transforms.py) | Masking, hashing, and keyed hashing of a sensitive column |
+| [`examples/security/audit_and_lineage.py`](https://github.com/stephenoffer/batcher/blob/main/examples/security/audit_and_lineage.py) | Proving where a governed column went |
+| [`examples/security/audit_trail.py`](https://github.com/stephenoffer/batcher/blob/main/examples/security/audit_trail.py) | Recording who ran what, and proving the policy applied |
+| [`examples/security/column_masking.py`](https://github.com/stephenoffer/batcher/blob/main/examples/security/column_masking.py) | Masking a sensitive column by tag, not by name |
+| [`examples/security/data_residency.py`](https://github.com/stephenoffer/batcher/blob/main/examples/security/data_residency.py) | Data residency: refusing to process a dataset in the wrong region |
+| [`examples/security/masking_functions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/security/masking_functions.py) | The masking functions, and what each preserves |
+| [`examples/security/row_level_security.py`](https://github.com/stephenoffer/batcher/blob/main/examples/security/row_level_security.py) | Restricting which rows a principal can see |
 <!-- /library-table -->
 
 ## See also

@@ -353,7 +353,7 @@ def metadata_approx_n_unique(
 
 
 def metadata_learned_quantile(
-    column: str, q: float, sources: Sequence[object] = ()
+    plan: LogicalPlan, column: str, q: float, sources: Sequence[object] = ()
 ) -> float | None:
     """Approximate quantile `q` of `column` from the hub's learned grid, or None.
 
@@ -366,14 +366,49 @@ def metadata_learned_quantile(
     without it the lookup can only ever match the legacy unqualified shape and misses. Only
     a single-source plan can be attributed unambiguously; anything else stays `None` and
     streams, which is the safe direction.
+
+    `plan` decides whether the grid describes the answer at all. The grid is the *source*
+    column's distribution, so it is the answer only when the plan hands that column through
+    untouched. It used to be consulted whatever sat above the scan, and once a run had
+    learned a grid, ``ds.filter(x > 90_000).approx_quantile("x", 0.5)`` over ``x = 1..100_000``
+    answered 49,899 (the whole column's median) where 95,000 is right, and a derived
+    ``x * 1000`` answered the same 49,899.
     """
     from batcher import core
     from batcher.kyber.metadata_answer import answer_learned_quantile
     from batcher.plan.source_stats import source_stats_key
 
     try:
-        key = source_stats_key(sources[0]) if len(sources) == 1 else None
-        return answer_learned_quantile(column, q, core.default_hub(), key)
+        source_column = _passthrough_scan_column(plan, column)
+        if source_column is None or len(sources) != 1:
+            return None
+        key = source_stats_key(sources[0])
+        return answer_learned_quantile(source_column, q, core.default_hub(), key)
     except Exception as exc:  # the metadata shortcut must never break a runnable query
         note_suppressed("api", "answer a quantile from learned stats", exc)
         return None
+
+
+def _passthrough_scan_column(plan: LogicalPlan, column: str) -> str | None:
+    """The scan column `column` is, unchanged, or None when any operator could alter it.
+
+    Only a projection that forwards a bare column (a `select` or a `rename`) and a sort
+    with no fused top-N `limit` (which reorders rows but keeps the multiset) leave a
+    column's distribution alone. A filter, limit, join, aggregate, or computed expression
+    changes it, so it answers None.
+    """
+    from batcher.plan.expr_ir import Col
+    from batcher.plan.logical import Project, Scan, Sort
+
+    node = plan
+    while not isinstance(node, Scan):
+        if isinstance(node, Sort) and node.limit is None:
+            node = node.input
+            continue
+        if not isinstance(node, Project):
+            return None
+        item = next((i for i in node.items if i.alias == column), None)
+        if item is None or not isinstance(item.expr, Col):
+            return None
+        column, node = item.expr.name, node.input
+    return column

@@ -119,9 +119,38 @@ def available_column_set(plan: LogicalPlan) -> set[str]:
     cache = plan.__dict__
     columns = cache.get(_COLUMN_SET_SLOT)
     if columns is None:
-        columns = set(plan.available_columns())
+        columns = _ColumnSet(plan.available_columns())
+        columns.source = plan
         cache[_COLUMN_SET_SLOT] = columns
     return columns
+
+
+class _ColumnSet(set):
+    """A node's output column set that remembers the node, for the unknown-column hint."""
+
+    __slots__ = ("source",)
+
+
+def _undeclared_udf_hint(source: LogicalPlan | None) -> str:
+    """A next action when an unknown column may come from an undeclared UDF output.
+
+    A `map_batches`/`map` stage with no `output_columns` is assumed to keep its input's
+    columns, so a column its `fn` *adds* is unknown to every node built on top of it. The
+    stage is found by walking the single-input chain from `source`; only the error path
+    pays for the walk.
+    """
+    from batcher.plan.logical.relational import MapBatches
+
+    node = source
+    while node is not None:
+        if isinstance(node, MapBatches) and node.output_columns is None:
+            return (
+                "An upstream map_batches/map stage did not declare output_columns, so the "
+                "plan assumes it keeps its input columns; pass output_columns=[...] naming "
+                "every column its fn returns."
+            )
+        node = getattr(node, "input", None)
+    return ""
 
 
 def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
@@ -155,6 +184,7 @@ def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
             suggestion=_suggestion(names[0], available),
             available=sorted(available),
             available_label="Available columns",
+            hint=_undeclared_udf_hint(getattr(available, "source", None)),
         )
 
 

@@ -4,7 +4,7 @@ These seven recipes cover what you need once a pipeline runs somewhere that matt
 
 They follow the order you meet them in: configure the engine, watch it, then act on what it tells you.
 
-Every page embeds a complete, self-contained script from the [`examples/operations/`](https://github.com/stephenoffer/batcher/tree/main/examples/operations) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every page embeds a complete, self-contained script from the [`examples/operations/`](https://github.com/stephenoffer/batcher/tree/main/examples/operations) directory. The scripts build their own in-memory data and assert on their own output, and [`tests/docs/test_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_examples.py) runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Recipe | What it shows |
 |---|---|

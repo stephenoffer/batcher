@@ -3,7 +3,7 @@
 Preprocessors are scikit-learn-style `fit` and `transform` feature transformers that run on the engine. If you know `sklearn.preprocessing`, you already know the API. What changes is where the work happens. `fit` learns its state with one mergeable aggregate over the data, so fitting a scaler on a billion rows is one distributed, spillable pass rather than a sample pulled into memory. `transform` is a lazy column rewrite that runs inside the plan. Fit on the training set, then `transform` the training **and** validation sets with the same learned state.
 
 Every preprocessor is importable from both `batcher.ml.preprocessors` and `batcher.ml`.
-`tests/unit/test_ml_preprocessing_workflow.py` pins that, so the two paths cannot drift.
+[`tests/unit/test_ml_preprocessing_workflow.py`](https://github.com/stephenoffer/batcher/blob/main/tests/unit/test_ml_preprocessing_workflow.py) pins that, so the two paths cannot drift.
 
 ## Splitting first
 
@@ -133,6 +133,28 @@ Reach for `MissingIndicator` before an encoder when the difference between "abse
 "rare" carries signal for your model. It adds a 0/1 column recording where the nulls were,
 so the information survives whatever the next step does with them.
 
+### NaN counts as missing
+
+In a floating-point column, IEEE NaN is treated exactly like null. That is the rule scikit-learn applies with `missing_values=np.nan`, and it matters because NaN is how pandas, NumPy, and Parquet files written from either spell a missing value. The rule has three parts:
+
+- Every `fit` statistic skips NaN. The scalers, `SimpleImputer`, `IterativeImputer`, `GroupImputer`, `GroupStatEncoder`, the power transforms, `QuantileTransformer`, `KBinsDiscretizer`, `Clipper`, and `SplineTransformer` rewrite NaN to null before their aggregate, so one NaN no longer turns a learned mean or maximum into NaN.
+- `SimpleImputer`, `IterativeImputer`, and `GroupImputer` fill NaN as well as null.
+- `MissingIndicator` flags NaN as well as null.
+
+The rewrite is a lazy `nullif(x, NaN)` projection in the engine, with no per-row Python, and it leaves integer and string columns alone because they can't hold a NaN. A transform that doesn't fill values, such as a scaler, passes a NaN through as NaN, the same way it passes a null through as null.
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import MissingIndicator, SimpleImputer, StandardScaler
+
+raw = bt.from_pydict({"income": [40.0, float("nan"), 60.0, None]})
+print(StandardScaler("income").fit(raw).mean_)
+# {'income': 50.0}
+flagged = MissingIndicator("income").fit_transform(raw)
+print(SimpleImputer("income").fit_transform(flagged).to_pydict())
+# {'income': [40.0, 50.0, 60.0, 50.0], 'income_missing': [False, True, False, True]}
+```
+
 ## What a preprocessor accepts
 
 The arithmetic preprocessors, meaning the scalers, the binners, the power and rank transforms, the projections and the kernel approximations, need a number in every column they name. Given a string one they say so, naming the column and the preprocessor:
@@ -159,6 +181,36 @@ The check reads the schema rather than the data, so it costs no pass over the da
 result is computed by a terminal op such as {py:meth}`collect() <batcher.Dataset.collect>` or `write.parquet(...)`, on one
 node or across a cluster. Use preprocessors before a training loop, covered in
 {doc}`PyTorch integration </ml/inference/pytorch>`, or before batch {doc}`inference </ml/inference/inference>`.
+
+`fit` takes no `distributed=` argument. Its aggregate runs through a bare `collect()`, so it follows the session's `distributed="auto"` routing, which distributes only when Ray is already connected to a multi-node cluster and the input is estimated to be large enough to pay for the fan-out. To pin every fit to the cluster, or keep every fit off it, set the session-wide `distributed.mode` option to `"always"` or `"never"`:
+
+```python
+# docs: skip
+import batcher.config
+
+with batcher.config.option_context("distributed.mode", "always"):
+    scaler = StandardScaler(["amount"]).fit(train)
+```
+
+The learned state is the same either way, up to floating-point reassociation in the last bits of a mean or variance, because every fit is a mergeable aggregate. [`tests/integration/test_ml_preprocessors_distributed.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_ml_preprocessors_distributed.py) checks that on four workers for a representative set of preprocessors.
+
+{py:class}`Chain <batcher.ml.preprocessors.Chain>` needs one more decision. With the default `cache=True`, it collects the whole training set to the driver once and fits every step against that in-memory copy, which saves a source scan per step but holds the data in driver memory and runs the later fits single-node. For a training set that is large or lives on a cluster, pass `cache=False`, so each step's fit is its own aggregate over the source.
+
+## Where results differ from scikit-learn
+
+Most preprocessors match scikit-learn to floating-point precision on the same data. The ones below differ on purpose, usually because the scikit-learn behaviour needs a per-row search or a second pass that the expression language can't express cheaply:
+
+| Preprocessor | Difference |
+| --- | --- |
+| `QuantileTransformer` | A step function that reports each step's midpoint, so outputs run from `0.5 / n_quantiles` to `1 - 0.5 / n_quantiles`. scikit-learn interpolates between quantiles and maps the training extremes to exactly 0 and 1. |
+| `KBinsDiscretizer(strategy="quantile")` | Edges come from a mergeable quantile sketch, so a value near an edge can land one bin from scikit-learn's answer. `strategy="uniform"` is exact. |
+| `HashingVectorizer` | The index is a 64-bit FNV-1a hash of the term. scikit-learn uses signed 32-bit MurmurHash3 with alternating signs, so indices and signs differ. |
+| `PowerTransformer`, `BoxCoxTransformer` | Lambda is found by a coarse grid over `[-2, 2]` plus two zoomed grids, within about 1e-4 of scikit-learn's Brent optimizer. An optimum far outside that bracket gets a boundary value. |
+| `KNeighborsClassifier`, `KNeighborsRegressor`, `KNNImputer` | Every reference row tied with the k-th nearest distance is a neighbour, so a row can use more than `k`. A `k` larger than the reference set uses every row rather than raising. |
+
+No preprocessor has an `inverse_transform`. To recover original units, keep the source column beside the transformed one, or apply the inverse yourself from the learned state, such as `mean_` and `scale_` on a scaler.
+
+Saving is exact for every preprocessor that holds only data. `FunctionTransformer`, `Tokenizer`, and `RFE` take a Python callable, which has no JSON form, so `save` and `to_dict` raise `PlanError` for them rather than write a file that can't be loaded. `pickle` works for them when the callable is importable.
 
 ## The rest of this section
 

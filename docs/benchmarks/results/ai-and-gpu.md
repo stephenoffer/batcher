@@ -8,7 +8,7 @@ The gate on a model workload is prediction agreement, not a row count. Two engin
 
 ## Ten workload families
 
-Each row is a distinct model and modality, run out of the box on 8xT4 with no per-workload tuning and 100% agreement with the oracle. The scripts live in `benchmarks/cluster/`, one per family, such as `gpu_text_embed.py`, `gpu_audio.py`, `gpu_llm.py` and `gpu_video.py`:
+Each row is a distinct model and modality, run out of the box on 8xT4 with no per-workload tuning and 100% agreement with the oracle. The scripts live in [`benchmarks/cluster/`](https://github.com/stephenoffer/batcher/tree/main/benchmarks/cluster), one per family, such as `gpu_text_embed.py`, `gpu_audio.py`, `gpu_llm.py` and `gpu_video.py`:
 
 | Workload | Model | Batcher |
 |---|---|---:|
@@ -65,7 +65,7 @@ Byte-aware morsels make that default safe on wide rows. A morsel splits at 16,38
 
 Two cluster runs measure the same pipelines on other engines.
 
-**Scoring an image corpus.** On six single-T4 nodes, every engine built the identical seeded network, scored the corpus through one actor per GPU, and returned a checksum that gated the timing (`benchmarks/gpu_backend/vs_ray_daft_gpu_inference.py`, 2026-09-06):
+**Scoring an image corpus.** On six single-T4 nodes, every engine built the identical seeded network, scored the corpus through one actor per GPU, and returned a checksum that gated the timing ([`benchmarks/gpu_backend/vs_ray_daft_gpu_inference.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/gpu_backend/vs_ray_daft_gpu_inference.py), 2026-09-06):
 
 | Images | Batcher | Ray Data | Daft |
 |---:|---:|---:|---:|
@@ -74,7 +74,7 @@ Two cluster runs measure the same pipelines on other engines.
 
 At 100,000 images that is 2.36x Ray Data and 5.40x Daft. The model is only 15% of Batcher's time there. The rest is S3 reads, JPEG decode and scheduling, so the margin is the engines' I/O and schedulers rather than their GPU kernels.
 
-**A compute-bound pipeline.** A corpus built so that neither the read nor the page cache can decide the answer ran the same `map(cpu) -> map(gpu) -> agg` pipeline on 17 nodes with 192 cores and 8 T4s (`benchmarks/gpu_backend/compute_bound_inference.py`, 2026-09-11):
+**A compute-bound pipeline.** A corpus built so that neither the read nor the page cache can decide the answer ran the same `map(cpu) -> map(gpu) -> agg` pipeline on 17 nodes with 192 cores and 8 T4s ([`benchmarks/gpu_backend/compute_bound_inference.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/gpu_backend/compute_bound_inference.py), 2026-09-11):
 
 | Rows | Batcher | Ray Data | Batcher GPU | Ray Data GPU |
 |---:|---:|---:|---:|---:|
@@ -87,7 +87,7 @@ Both engines return identical answers at every size. Batcher wins by 8.6x at 125
 
 ## Dirty data
 
-Real corpora contain rows that fail to decode. Batcher's error tolerance is per row. With about 1% corrupt rows injected across 200,000 rows, `max_errored_rows` keeps 198,000 of them (`benchmarks/cluster/robustness/gpu_dirty.py`). One bad image costs one image, not the batch it landed in and not the job. Without the option the query raises, so silent data loss is always opt-in.
+Real corpora contain rows that fail to decode. Batcher's error tolerance is per row. With about 1% corrupt rows injected across 200,000 rows, `max_errored_rows` keeps 198,000 of them ([`benchmarks/cluster/robustness/gpu_dirty.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/robustness/gpu_dirty.py)). One bad image costs one image, not the batch it landed in and not the job. Without the option the query raises, so silent data loss is always opt-in.
 
 ## Requirements and limitations
 

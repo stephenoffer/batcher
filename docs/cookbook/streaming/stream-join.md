@@ -202,7 +202,7 @@ When that error fires, ask which side stopped producing, not whether to raise th
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: the other operator this watermark bounds.
 - {doc}`Exactly-once sinks </cookbook/streaming/exactly-once-sink>`: what you would have had, if this join could reach a sink.
 - {doc}`Joins </user-guide/analyze/joins>`: the bounded join surface, including the outer joins the streaming path does not have.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: sources, sinks, watermarks, and the query handle.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: sources, sinks, watermarks, and the query handle.
 - {doc}`Join algorithms </architecture/deep-dives/operators/join-algorithms>`: what the bounded join does with the build side that the streaming one cannot.
 - {doc}`Kafka integration </integrations/streams/kafka>`: the two topics above.
 - {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: the batch recipe for the same attribution question.

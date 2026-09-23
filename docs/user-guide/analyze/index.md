@@ -1,6 +1,6 @@
 # Analyze
 
-This section covers turning rows into answers with Batcher: grouping and summarizing, joining, ranking and windowing, and the domain analytics built on the same operators, from time series and geospatial to robotics logs and graphs.
+This section covers turning rows into answers with Batcher: inspecting a dataset to see what it holds, grouping and summarizing, joining, ranking and windowing, and the domain analytics built on the same operators, from time series and geospatial to robotics logs and graphs.
 
 Every one of them is an ordinary relational operation, so none of them needs a separate engine. A grouped aggregate, a join, and a window all lower into one plan that the optimizer reorders, prunes, and pushes down before any row is read, and the Rust data plane runs it over Arrow batches. The stateful operators are built from mergeable parts, so the query you write on a laptop runs unchanged across a Ray cluster and spills to disk when a group or a join side outgrows memory. Even a window with no `PARTITION BY` scales out for most functions, split along its ordering. SQL lowers to the same plan, so a query can start in SQL and finish in Python, or the other way round.
 
@@ -10,6 +10,12 @@ The domain pages hold to the same standard. `ST_*` geometry runs natively in Rus
 
 ::::{grid} 1 2 2 3
 :gutter: 3
+
+:::{grid-item-card} {octicon}`search;1.1em` Inspect a dataset
+:link: /user-guide/analyze/inspecting-data
+:link-type: doc
+Schema, previews, `describe`, correlation matrices, approximate quantiles, and what each one costs.
+:::
 
 :::{grid-item-card} {octicon}`graph;1.1em` Aggregations
 :link: /user-guide/analyze/aggregations
@@ -41,22 +47,10 @@ Ranking, running totals, lag and lead.
 Long to wide and back, from Python or SQL.
 :::
 
-:::{grid-item-card} {octicon}`globe;1.1em` Geospatial
-:link: /user-guide/analyze/geospatial
+:::{grid-item-card} {octicon}`globe;1.1em` Domain analytics
+:link: /user-guide/analyze/domains/index
 :link-type: doc
-Geometry, spatial joins, projections, and grid keys.
-:::
-
-:::{grid-item-card} {octicon}`rocket;1.1em` Robotics and AV
-:link: /user-guide/analyze/robotics
-:link-type: doc
-Coordinate frames, poses, sensor alignment, point clouds.
-:::
-
-:::{grid-item-card} {octicon}`share-android;1.1em` Graphs
-:link: /user-guide/analyze/graphs
-:link-type: doc
-PageRank, components, communities, and graph-ML features.
+Geospatial geometry, robotics coordinate frames, and graph algorithms, all on the same operators.
 :::
 
 :::{grid-item-card} {octicon}`database;1.1em` SQL
@@ -83,19 +77,19 @@ Answer from the footer instead of the data, with {py:obj}`ds.meta <batcher.Datas
 - {doc}`/user-guide/transform/index`: select, filter, and shape the rows before you analyze them.
 - {doc}`/api/relational/dataset`: the reference for every method in this section.
 - {doc}`/cookbook/index`: complete analytics pipelines as runnable recipes.
+- {doc}`/examples/analytics`: statistics, time series, geospatial, graph, and robotics as standalone scripts.
 
 ```{toctree}
 :hidden:
 
+inspecting-data
 aggregations
 joins
 time-series
 window-functions
 pivoting
-geospatial
-robotics
-graphs
 sql
 sql-model-functions
 metadata-shortcuts
+domains/index
 ```

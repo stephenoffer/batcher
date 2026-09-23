@@ -13,6 +13,11 @@ SQuAD normalization (lowercase, articles and punctuation dropped), which is what
 word-level metric here comparable — and which is *not* what a reference BLEU implementation
 does, so treat these as stable in-engine scores for ranking runs against each other rather
 than as numbers to publish against a paper's table.
+
+Two conventions hold across the module. A row with fewer than `n` tokens has no n-gram of order
+`n` (it is not padded into one), so it contributes a zero precision at that order. And a null
+prediction or reference is scored as the empty string: the row stays in the corpus mean and
+scores as an empty one does -- 0 for BLEU, ROUGE and the n-gram overlaps.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column
-from batcher.plan.functions.metrics.text._text import token_ngrams, tokens
+from batcher.plan.functions.metrics.text._text import mean_ratio, tokens, whole_ngrams
 
 __all__ = [
     "bleu",
@@ -45,14 +50,9 @@ def _validate_n(n: int, func: str) -> None:
 
 def _clipped(prediction: IntoExpr, reference: IntoExpr, n: int) -> tuple[Expr, Expr, Expr]:
     """The clipped overlap and the two n-gram counts every metric here divides by."""
-    pred = token_ngrams(_as_column(prediction), n)
-    gold = token_ngrams(_as_column(reference), n)
+    pred = whole_ngrams(_as_column(prediction), n)
+    gold = whole_ngrams(_as_column(reference), n)
     return pred.list.multiset_overlap(gold), pred.list.len(), gold.list.len()
-
-
-def _mean_over(numerator: Expr, denominator: Expr) -> Expr:
-    """The corpus mean of a per-row ratio, scoring an empty denominator zero, not null."""
-    return when(denominator > lit(0)).then(numerator / denominator).otherwise(lit(0.0)).mean()
 
 
 def ngram_precision(prediction: IntoExpr, reference: IntoExpr, n: int = 1) -> Expr:
@@ -90,7 +90,7 @@ def ngram_precision(prediction: IntoExpr, reference: IntoExpr, n: int = 1) -> Ex
     """
     _validate_n(n, "ngram_precision")
     overlap, pred_len, _ = _clipped(prediction, reference, n)
-    return _mean_over(overlap, pred_len)
+    return mean_ratio(overlap, pred_len)
 
 
 def ngram_recall(prediction: IntoExpr, reference: IntoExpr, n: int = 1) -> Expr:
@@ -122,7 +122,7 @@ def ngram_recall(prediction: IntoExpr, reference: IntoExpr, n: int = 1) -> Expr:
     """
     _validate_n(n, "ngram_recall")
     overlap, _, gold_len = _clipped(prediction, reference, n)
-    return _mean_over(overlap, gold_len)
+    return mean_ratio(overlap, gold_len)
 
 
 def ngram_f1(prediction: IntoExpr, reference: IntoExpr, n: int = 1) -> Expr:
@@ -189,8 +189,8 @@ def brevity_penalty(prediction: IntoExpr, reference: IntoExpr) -> Expr:
 
 def _per_row_brevity(prediction: IntoExpr, reference: IntoExpr) -> Expr:
     """The per-row brevity penalty, shared by `brevity_penalty` and `bleu`."""
-    pred_len = token_ngrams(_as_column(prediction), 1).list.len()
-    gold_len = token_ngrams(_as_column(reference), 1).list.len()
+    pred_len = whole_ngrams(_as_column(prediction), 1).list.len()
+    gold_len = whole_ngrams(_as_column(reference), 1).list.len()
     # An empty generation is scored 0 rather than left null: it is a real failure, and a null
     # would drop the row out of the corpus mean entirely.
     ratio = when(pred_len > lit(0)).then(gold_len / pred_len).otherwise(lit(0.0))
@@ -230,9 +230,14 @@ def bleu(prediction: IntoExpr, reference: IntoExpr, max_n: int = 4) -> Expr:
         .. doctest::
 
             >>> import batcher as bt
-            >>> ds = bt.from_pydict({"p": ["the cat sat down"], "r": ["the cat sat down"]})
+            >>> ds = bt.from_pydict({"p": ["fox jumps high now"], "r": ["fox jumps high now"]})
             >>> ds.agg(b=bt.bleu("p", "r")).to_pydict()["b"][0]
             1.0
+
+            >>> # Two words have no 4-gram, so even an exact match scores 0 at max_n=4.
+            >>> short = bt.from_pydict({"p": ["cat sat"], "r": ["cat sat"]})
+            >>> short.agg(b4=bt.bleu("p", "r"), b2=bt.bleu("p", "r", max_n=2)).to_pydict()
+            {'b4': [0.0], 'b2': [1.0]}
 
             >>> # A generation sharing no bigram with its reference scores zero.
             >>> miss = bt.from_pydict({"p": ["dog ran"], "r": ["cat sat"]})
@@ -281,8 +286,8 @@ def distinct_ngram_ratio(text: IntoExpr, n: int = 2) -> Expr:
             0.4
     """
     _validate_n(n, "distinct_ngram_ratio")
-    grams = token_ngrams(_as_column(text), n)
-    return _mean_over(grams.list.n_unique(), grams.list.len())
+    grams = whole_ngrams(_as_column(text), n)
+    return mean_ratio(grams.list.n_unique(), grams.list.len())
 
 
 def ngram_novelty(prediction: IntoExpr, reference: IntoExpr, n: int = 4) -> Expr:
@@ -294,8 +299,9 @@ def ngram_novelty(prediction: IntoExpr, reference: IntoExpr, n: int = 4) -> Expr
     n-gram once, so a phrase copied ten times is one copied n-gram rather than ten, which is
     what you want when asking "how much of this is new" rather than "how accurate is it".
 
-    A generation shorter than `n` tokens has no n-gram of that order to compare, and scores a
-    misleading 1.0. Filter short rows out before reading this on a corpus of one-liners.
+    A generation shorter than `n` tokens has no n-gram of that order to compare, and scores 0
+    -- which reads as "copied" when it means "too short to tell". Filter short rows out before
+    reading this on a corpus of one-liners.
 
     Args:
         prediction: The generated-text column.
@@ -328,11 +334,11 @@ def ngram_novelty(prediction: IntoExpr, reference: IntoExpr, n: int = 4) -> Expr
             1.0
     """
     _validate_n(n, "ngram_novelty")
-    pred = token_ngrams(_as_column(prediction), n)
-    gold = token_ngrams(_as_column(reference), n)
+    pred = whole_ngrams(_as_column(prediction), n)
+    gold = whole_ngrams(_as_column(reference), n)
     distinct = pred.list.n_unique()
     shared = pred.list.intersect(gold).list.len()
-    return _mean_over(distinct - shared, distinct)
+    return mean_ratio(distinct - shared, distinct)
 
 
 def _lcs_parts(prediction: IntoExpr, reference: IntoExpr) -> tuple[Expr, Expr, Expr]:
@@ -366,7 +372,7 @@ def rouge_l_precision(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             1.0
     """
     lcs, pred_len, _ = _lcs_parts(prediction, reference)
-    return _mean_over(lcs, pred_len)
+    return mean_ratio(lcs, pred_len)
 
 
 def rouge_l_recall(prediction: IntoExpr, reference: IntoExpr) -> Expr:
@@ -392,7 +398,7 @@ def rouge_l_recall(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             0.5
     """
     lcs, _, gold_len = _lcs_parts(prediction, reference)
-    return _mean_over(lcs, gold_len)
+    return mean_ratio(lcs, gold_len)
 
 
 def rouge_l_f1(prediction: IntoExpr, reference: IntoExpr) -> Expr:

@@ -367,7 +367,7 @@ version per logical write, not one per worker.
 
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and quarantine before you commit.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: save modes, partitioning, atomic writes.
-- {doc}`/user-guide/moving-data/streaming`: exactly-once streaming appends into a Delta table.
+- {doc}`/user-guide/moving-data/streaming/index`: exactly-once streaming appends into a Delta table.
 - {doc}`/user-guide/moving-data/cloud-storage`: credentials for a table on object storage.
 - {doc}`I/O API </api/relational/io>`: the full `read`/`write` reference.
 - {doc}`Agent skills </agents>`: `manage-a-lakehouse-table` is this page as a

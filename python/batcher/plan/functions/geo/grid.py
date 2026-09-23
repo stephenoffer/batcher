@@ -23,10 +23,20 @@ on an `Int64` column.
 `st_hex_bin` is a **planar** hex grid, not H3. H3's cells live on an icosahedron and its
 indexes are not these, so do not join one against the other. Project with
 `st_transform` before binning.
+
+**A bad position nulls its own row; a bad parameter fails the query.** A NaN longitude, a
+latitude of 95 or a longitude of 200 in one row gives that row a null cell id and leaves
+every other row alone, so one corrupt GPS fix cannot abort a scan of a hundred million.
+(DuckDB raises on some of these and PostGIS on most; nulling is this engine's rule for
+every row-local geometry failure, and ``WHERE cell IS NULL`` finds the rows.) A
+precision, zoom or level outside its range is a mistake in the query, not in the data,
+so it raises: a constant is refused with a `PlanError` when the expression is built, and
+a column-valued one when the query runs, both naming the value passed.
 """
 
 from __future__ import annotations
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.functions.geo._build import geo_call, geometry, value
 
@@ -48,6 +58,16 @@ __all__ = [
 ]
 
 
+def _ranged(v: Expr | int, what: str, lo: int, hi: int) -> Expr:
+    """Coerce a grid parameter, refusing a constant outside ``[lo, hi]`` up front.
+
+    A column-valued parameter is checked per row by the engine, with the same message.
+    """
+    if isinstance(v, int) and not isinstance(v, bool) and not lo <= v <= hi:
+        raise PlanError(f"{what} must be {lo}..={hi}, got {v}")
+    return value(v)
+
+
 def st_geohash(geom: Expr | str, precision: Expr | int) -> Expr:
     """The geohash cell of a lon/lat geometry's centroid.
 
@@ -60,7 +80,8 @@ def st_geohash(geom: Expr | str, precision: Expr | int) -> Expr:
         precision: Characters of output, 1 to 12.
 
     Returns:
-        The geohash of the geometry's centroid, or null for an empty geometry.
+        The geohash of the geometry's centroid, or null for an empty geometry or one
+        whose centroid is off the globe.
 
     Examples:
         .. doctest::
@@ -71,7 +92,7 @@ def st_geohash(geom: Expr | str, precision: Expr | int) -> Expr:
             >>> ds.select(v=got).to_pydict()
             {'v': ['9q8yyk']}
     """
-    return geo_call("st_geohash", geometry(geom), value(precision))
+    return geo_call("st_geohash", geometry(geom), _ranged(precision, "geohash precision", 1, 12))
 
 
 def geohash_encode(lon: Expr | float, lat: Expr | float, precision: Expr | int) -> Expr:
@@ -91,7 +112,7 @@ def geohash_encode(lon: Expr | float, lat: Expr | float, precision: Expr | int) 
         precision: Characters of output, 1 to 12.
 
     Returns:
-        The geohash string, or null for a null coordinate.
+        The geohash string, or null for a null, NaN or off-globe coordinate.
 
     Examples:
         .. doctest::
@@ -102,7 +123,8 @@ def geohash_encode(lon: Expr | float, lat: Expr | float, precision: Expr | int) 
             >>> ds.select(v=got).to_pydict()
             {'v': ['9q8yyk']}
     """
-    return geo_call("geohash_encode", value(lon), value(lat), value(precision))
+    precision_ = _ranged(precision, "geohash precision", 1, 12)
+    return geo_call("geohash_encode", value(lon), value(lat), precision_)
 
 
 def geohash_decode_lon(geohash: Expr | str) -> Expr:
@@ -165,7 +187,7 @@ def st_tile_x(lon: Expr | float, lat: Expr | float, zoom: Expr | int) -> Expr:
         zoom: The zoom level, 0 to 30.
 
     Returns:
-        The tile column, or null for a null coordinate.
+        The tile column, or null for a null, NaN or off-globe coordinate.
 
     Examples:
         .. doctest::
@@ -176,7 +198,7 @@ def st_tile_x(lon: Expr | float, lat: Expr | float, zoom: Expr | int) -> Expr:
             >>> ds.select(v=got).to_pydict()
             {'v': [655]}
     """
-    return geo_call("st_tile_x", value(lon), value(lat), value(zoom))
+    return geo_call("st_tile_x", value(lon), value(lat), _ranged(zoom, "tile zoom", 0, 30))
 
 
 def st_tile_y(lon: Expr | float, lat: Expr | float, zoom: Expr | int) -> Expr:
@@ -192,7 +214,7 @@ def st_tile_y(lon: Expr | float, lat: Expr | float, zoom: Expr | int) -> Expr:
         zoom: The zoom level, 0 to 30.
 
     Returns:
-        The tile row, or null for a null coordinate.
+        The tile row, or null for a null, NaN or off-globe coordinate.
 
     Examples:
         .. doctest::
@@ -203,7 +225,7 @@ def st_tile_y(lon: Expr | float, lat: Expr | float, zoom: Expr | int) -> Expr:
             >>> ds.select(v=got).to_pydict()
             {'v': [1583]}
     """
-    return geo_call("st_tile_y", value(lon), value(lat), value(zoom))
+    return geo_call("st_tile_y", value(lon), value(lat), _ranged(zoom, "tile zoom", 0, 30))
 
 
 def st_quadkey(lon: Expr | float, lat: Expr | float, zoom: Expr | int) -> Expr:
@@ -219,7 +241,7 @@ def st_quadkey(lon: Expr | float, lat: Expr | float, zoom: Expr | int) -> Expr:
         zoom: The zoom level, 0 to 30.
 
     Returns:
-        The quadkey string, or null for a null coordinate.
+        The quadkey string, or null for a null, NaN or off-globe coordinate.
 
     Examples:
         .. doctest::
@@ -230,7 +252,7 @@ def st_quadkey(lon: Expr | float, lat: Expr | float, zoom: Expr | int) -> Expr:
             >>> ds.select(v=got).to_pydict()
             {'v': ['02301020']}
     """
-    return geo_call("st_quadkey", value(lon), value(lat), value(zoom))
+    return geo_call("st_quadkey", value(lon), value(lat), _ranged(zoom, "tile zoom", 0, 30))
 
 
 def st_s2_cell(lon: Expr | float, lat: Expr | float, level: Expr | int) -> Expr:
@@ -251,7 +273,7 @@ def st_s2_cell(lon: Expr | float, lat: Expr | float, level: Expr | int) -> Expr:
         level: The S2 level, 0 to 30.
 
     Returns:
-        The S2 cell id, or null for a null coordinate.
+        The S2 cell id, or null for a null, NaN or off-globe coordinate.
 
     Examples:
         .. doctest::
@@ -262,7 +284,7 @@ def st_s2_cell(lon: Expr | float, lat: Expr | float, level: Expr | int) -> Expr:
             >>> ds.select(v=got).to_pydict()
             {'v': [-9185794508988612608]}
     """
-    return geo_call("st_s2_cell", value(lon), value(lat), value(level))
+    return geo_call("st_s2_cell", value(lon), value(lat), _ranged(level, "S2 level", 0, 30))
 
 
 def st_s2_cell_parent(cell: Expr | int, level: Expr | int) -> Expr:
@@ -290,7 +312,7 @@ def st_s2_cell_parent(cell: Expr | int, level: Expr | int) -> Expr:
             >>> ds.select(v=got).to_pydict()
             {'v': [True]}
     """
-    return geo_call("st_s2_cell_parent", value(cell), value(level))
+    return geo_call("st_s2_cell_parent", value(cell), _ranged(level, "S2 level", 0, 30))
 
 
 def st_hex_bin(x: Expr | float, y: Expr | float, size: Expr | float) -> Expr:
@@ -385,7 +407,7 @@ def st_utm_zone(lon: Expr | float) -> Expr:
         lon: Longitude in degrees.
 
     Returns:
-        The zone number from 1 to 60, or null for a null longitude.
+        The zone number from 1 to 60, or null for a null, NaN or off-globe longitude.
 
     Examples:
         .. doctest::
@@ -414,7 +436,7 @@ def st_utm_epsg(lon: Expr | float, lat: Expr | float) -> Expr:
         lat: Latitude in degrees.
 
     Returns:
-        The EPSG code, or null for a null coordinate.
+        The EPSG code, or null for a null, NaN or off-globe coordinate.
 
     Examples:
         .. doctest::

@@ -512,8 +512,12 @@ impl Geometry {
         }
     }
 
-    /// The number of top-level members: 1 for a simple geometry, the member count for
-    /// a multi-geometry or collection (PostGIS `ST_NumGeometries`).
+    /// The number of top-level members: 1 for a simple geometry, 0 for an empty one,
+    /// and the member count for a multi-geometry or collection (PostGIS and DuckDB
+    /// `ST_NumGeometries`).
+    ///
+    /// `POINT EMPTY` has no member, so it is 0 rather than 1; a collection *holding* an
+    /// empty point still has one member, which is why this is not `is_empty`.
     #[must_use]
     pub fn num_geometries(&self) -> usize {
         match self {
@@ -521,7 +525,7 @@ impl Geometry {
             Geometry::MultiLineString(ls) => ls.len(),
             Geometry::MultiPolygon(ps) => ps.len(),
             Geometry::GeometryCollection(gs) => gs.len(),
-            _ => 1,
+            simple => usize::from(!simple.is_empty()),
         }
     }
 
@@ -565,6 +569,12 @@ pub fn close_ring(ring: &mut LineString) {
 /// Positive is counter-clockwise. Returned undoubled-and-unsigned by `ring_area`; the
 /// raw value is what orientation tests want, and halving it first would only cost a
 /// division on a quantity that is about to be compared against zero.
+///
+/// An unclosed ring is closed implicitly, as DuckDB and GEOS measure it. Summing only
+/// the edges that are present made `POLYGON((0 0, 1 0, 1 1))` report an area of 0 —
+/// a plausible number for a shape that encloses half a unit. Such a polygon is still
+/// *invalid* (`st_is_valid_reason` says the ring is not closed); this only stops its
+/// measurement from being silently wrong.
 #[must_use]
 pub fn signed_area2(ring: &[Coord]) -> f64 {
     if ring.len() < 3 {
@@ -573,6 +583,10 @@ pub fn signed_area2(ring: &[Coord]) -> f64 {
     let mut acc = 0.0;
     for w in ring.windows(2) {
         acc += (w[1].x - w[0].x) * (w[1].y + w[0].y);
+    }
+    if !is_closed(ring) {
+        let (a, b) = (ring[ring.len() - 1], ring[0]);
+        acc += (b.x - a.x) * (b.y + a.y);
     }
     // The shoelace above accumulates the *clockwise*-positive trapezoid sum, so negate
     // to make counter-clockwise positive as OGC and GeoJSON both define it.
@@ -689,5 +703,27 @@ mod tests {
         assert_eq!(g.geometry_n(3), None);
         let p = Geometry::Point(Some(Coord::new(2.0, 2.0)));
         assert_eq!(p.geometry_n(1), Some(p));
+    }
+
+    #[test]
+    fn an_empty_simple_geometry_has_no_members_and_an_unclosed_ring_has_its_area() {
+        assert_eq!(Geometry::Point(None).num_geometries(), 0);
+        assert_eq!(Geometry::LineString(Vec::new()).num_geometries(), 0);
+        assert_eq!(Geometry::Polygon(Polygon::default()).num_geometries(), 0);
+        assert_eq!(
+            Geometry::Point(Some(Coord::new(1.0, 1.0))).num_geometries(),
+            1
+        );
+        assert_eq!(
+            Geometry::GeometryCollection(vec![Geometry::Point(None)]).num_geometries(),
+            1
+        );
+        // DuckDB: ST_Area('POLYGON((0 0, 1 0, 1 1))') = 0.5.
+        let open = [
+            Coord::new(0.0, 0.0),
+            Coord::new(1.0, 0.0),
+            Coord::new(1.0, 1.0),
+        ];
+        assert_eq!(ring_area(&open), 0.5);
     }
 }

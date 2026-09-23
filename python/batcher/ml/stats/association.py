@@ -14,9 +14,9 @@ the cells a `group_by` returned halved the statistic on a perfectly associated t
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
-from batcher.ml.stats._shared import require_columns, scalar
+from batcher.ml.stats._shared import complete_rows, require_columns, scalar
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.functions.aggregate import count_if
 from batcher.plan.functions.aggregate import sum as sum_
@@ -177,13 +177,17 @@ def anova_f(ds: Dataset, value: str, group: str) -> float:
     two-sample t test to more than two groups. Large means the group means differ by more
     than the within-group noise explains.
 
+    A row with a null `value` or a null `group` is dropped, so a missing label never forms a
+    group of its own. A NaN value propagates, as in ``scipy.stats.f_oneway``.
+
     Args:
         ds: The dataset holding both columns.
         value: The numeric column.
         group: The grouping column.
 
     Returns:
-        The F statistic.
+        The F statistic: NaN with fewer than two groups or no more rows than groups, and
+        infinite when every group is constant but the groups differ.
 
     Examples:
         .. doctest::
@@ -196,8 +200,49 @@ def anova_f(ds: Dataset, value: str, group: str) -> float:
             >>> anova_f(ds, "v", "g")
             162.0
     """
-    require_columns(ds, value, group)
-    present = ds.filter(col(value).is_not_null() & col(group).is_not_null())
+    return _anova(ds, value, group).f
+
+
+class _Anova(NamedTuple):
+    """The one-way ANOVA sums of squares over the rows where both columns are present.
+
+    Every ANOVA-family number here is a function of these four, so they are computed once and
+    the statistic and each effect size read off them. Reading the effect sizes off the F
+    statistic instead, as this module used to, needed a second scan for ``n`` and ``k`` over
+    the *unfiltered* rows -- so a null group label was counted in ``n`` and every effect size
+    came out wrong by the rows it should have dropped.
+    """
+
+    ss_between: float
+    ss_within: float
+    n: int
+    k: int
+
+    @property
+    def defined(self) -> bool:
+        """Whether there are at least two groups and more rows than groups."""
+        return self.k >= 2 and self.n > self.k
+
+    @property
+    def ms_within(self) -> float:
+        """The within-group mean square, ``SS_within / (n - k)``."""
+        return self.ss_within / (self.n - self.k)
+
+    @property
+    def f(self) -> float:
+        """The F statistic, with SciPy's conventions for a zero within-group spread."""
+        if not self.defined or math.isnan(self.ss_between) or math.isnan(self.ss_within):
+            return float("nan")
+        if self.ss_within == 0:
+            # Every group constant: infinitely significant if the groups differ, undefined if
+            # they do not -- what `scipy.stats.f_oneway` reports for both.
+            return math.inf if self.ss_between > 0 else float("nan")
+        return (self.ss_between / (self.k - 1)) / self.ms_within
+
+
+def _anova(ds: Dataset, value: str, group: str) -> _Anova:
+    """The sums of squares, row count and group count, dropping rows missing either column."""
+    present = complete_rows(ds, value, group)
     with_means = present.with_columns(
         __bt_group_mean=sum_(col(value)).over(partition_by=[group])
         / count_if(col(value).is_not_null()).over(partition_by=[group]),
@@ -213,11 +258,12 @@ def anova_f(ds: Dataset, value: str, group: str) -> float:
     ).collect()
     ss_between = summary.column("ss_between")[0].as_py()
     ss_within = summary.column("ss_within")[0].as_py()
-    n = summary.column("n")[0].as_py()
-    k = summary.column("k")[0].as_py()
-    if k < 2 or n <= k or ss_within == 0:
-        return float("nan")
-    return (ss_between / (k - 1)) / (ss_within / (n - k))
+    return _Anova(
+        ss_between=float("nan") if ss_between is None else float(ss_between),
+        ss_within=float("nan") if ss_within is None else float(ss_within),
+        n=int(summary.column("n")[0].as_py() or 0),
+        k=int(summary.column("k")[0].as_py() or 0),
+    )
 
 
 def theils_u(ds: Dataset, x: str, y: str, *, base: float = 2.0) -> float:
@@ -283,14 +329,11 @@ def eta_squared(ds: Dataset, value: str, group: str) -> float:
             >>> round(eta_squared(ds, "v", "g"), 4)
             0.9846
     """
-    f = anova_f(ds, value, group)
-    if math.isnan(f):
+    parts = _anova(ds, value, group)
+    total = parts.ss_between + parts.ss_within
+    if not parts.defined or not total > 0:
         return float("nan")
-    row = ds.agg(n=col(value).count(), k=col(group).count_distinct()).collect()
-    n = row.column("n")[0].as_py()
-    k = row.column("k")[0].as_py()
-    df1, df2 = k - 1, n - k
-    return df1 * f / (df1 * f + df2)
+    return parts.ss_between / total
 
 
 def epsilon_squared(ds: Dataset, value: str, group: str) -> float:
@@ -319,14 +362,11 @@ def epsilon_squared(ds: Dataset, value: str, group: str) -> float:
             >>> round(epsilon_squared(ds, "v", "g"), 4)
             0.9769
     """
-    f = anova_f(ds, value, group)
-    if math.isnan(f):
+    parts = _anova(ds, value, group)
+    total = parts.ss_between + parts.ss_within
+    if not parts.defined or not total > 0:
         return float("nan")
-    row = ds.agg(n=col(value).count(), k=col(group).count_distinct()).collect()
-    n = row.column("n")[0].as_py()
-    k = row.column("k")[0].as_py()
-    df1, df2 = k - 1, n - k
-    return df1 * (f - 1.0) / (df1 * f + df2)
+    return (parts.ss_between - (parts.k - 1) * parts.ms_within) / total
 
 
 def omega_squared(ds: Dataset, value: str, group: str) -> float:
@@ -354,14 +394,11 @@ def omega_squared(ds: Dataset, value: str, group: str) -> float:
             >>> round(omega_squared(ds, "v", "g"), 4)
             0.9695
     """
-    f = anova_f(ds, value, group)
-    if math.isnan(f):
+    parts = _anova(ds, value, group)
+    total = parts.ss_between + parts.ss_within
+    if not parts.defined or not total > 0:
         return float("nan")
-    row = ds.agg(n=col(value).count(), k=col(group).count_distinct()).collect()
-    n = row.column("n")[0].as_py()
-    k = row.column("k")[0].as_py()
-    df1, df2 = k - 1, n - k
-    return df1 * (f - 1.0) / (df1 * f + df2 + 1.0)
+    return (parts.ss_between - (parts.k - 1) * parts.ms_within) / (total + parts.ms_within)
 
 
 def cohens_f(ds: Dataset, value: str, group: str) -> float:
@@ -389,13 +426,9 @@ def cohens_f(ds: Dataset, value: str, group: str) -> float:
             >>> round(cohens_f(ds, "v", "g"), 4)
             8.0
     """
-    f = anova_f(ds, value, group)
-    if math.isnan(f):
+    parts = _anova(ds, value, group)
+    if not parts.defined or math.isnan(parts.ss_between) or math.isnan(parts.ss_within):
         return float("nan")
-    row = ds.agg(n=col(value).count(), k=col(group).count_distinct()).collect()
-    n = row.column("n")[0].as_py()
-    k = row.column("k")[0].as_py()
-    df1, df2 = k - 1, n - k
-    if df2 <= 0:
-        return float("nan")
-    return math.sqrt(df1 * f / df2)
+    if parts.ss_within == 0:
+        return math.inf if parts.ss_between > 0 else float("nan")
+    return math.sqrt(parts.ss_between / parts.ss_within)

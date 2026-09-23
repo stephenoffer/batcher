@@ -113,5 +113,5 @@ no sample repeated or skipped.
 - {doc}`PyTorch </ml/inference/pytorch>`: tensor batches, device transfer, and DDP and FSDP wiring.
 - {doc}`Distributed training </ml/training/distributed-training>`: the ordering, balance, and resume contract.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: fit feature transforms before the stream.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: continuous queries over unbounded sources.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: continuous queries over unbounded sources.
 - {doc}`Inference </ml/inference/inference>`: batch prediction and embeddings.

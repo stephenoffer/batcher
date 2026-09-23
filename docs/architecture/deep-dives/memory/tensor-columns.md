@@ -76,7 +76,7 @@ There is no `FixedShapeTensor` in the `bc-*` crates. There is a `FixedSizeListAr
 there is field metadata, and the kernels are careful not to drop the latter.
 
 :::{important}
-The kernels must not drop the field metadata. `crates/bc-interp/src/ops/project_field.rs` is the
+The kernels must not drop the field metadata. [`crates/bc-interp/src/ops/project_field.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/project_field.rs) is the
 whole story: a bare `Expr::Col` passthrough **clones the source field**, metadata and all.
 Rebuilding the field from `array.data_type()` instead would silently downgrade a tensor column
 to its plain storage type, and the shape would be gone by the time anything noticed.
@@ -125,7 +125,7 @@ Audio waveforms are deliberately *not* fixed-shape tensors. Clip lengths vary, s
 variable-length list and there is no shape to carry.
 :::
 
-The decode kernels live in `crates/bc-expr/src/eval/media/`. They are interpreter-only, because the JIT cannot compile a library-backed decode, and they fan out per *row* over rayon above a threshold of 8 rows (`PAR_ROW_THRESHOLD`). That per-row fan-out exists because a 2,000-JPEG corpus is a single
+The decode kernels live in [`crates/bc-expr/src/eval/media/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-expr/src/eval/media). They are interpreter-only, because the JIT cannot compile a library-backed decode, and they fan out per *row* over rayon above a threshold of 8 rows (`PAR_ROW_THRESHOLD`). That per-row fan-out exists because a 2,000-JPEG corpus is a single
 morsel, and the parallel executor capped its thread pool at the morsel count, so the entire decode
 ran on one core. `Expr::contains_media_decode()` lifts the pool to every core for a media plan,
 which made decode alone 17x to 22x faster.
@@ -186,7 +186,7 @@ photos, and it used to be where a multimodal pipeline stopped: the only advice w
 before the engine saw the data.
 
 Those columns are carried by a second representation, in
-`python/batcher/io/formats/ml/ragged.py`. Each row is stored as its own row-major buffer
+[`python/batcher/io/formats/ml/ragged.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/io/formats/ml/ragged.py). Each row is stored as its own row-major buffer
 beside its own shape and dtype:
 
 ```text
@@ -269,13 +269,13 @@ handed to a model:
 
 | Concern | File |
 |---|---|
-| The type helpers | `python/batcher/io/formats/ml/tensor.py` |
-| The variable-shape representation | `python/batcher/io/formats/ml/ragged.py` |
-| Metadata preservation in projection | `crates/bc-interp/src/ops/project_field.rs` |
-| Decode kernels, including FFmpeg video | `crates/bc-expr/src/eval/media/` |
-| Decode orchestration | `python/batcher/ml/decode/` |
-| Arrow to numpy and torch | `python/batcher/interop/arrays.py` (re-exported by `ml/converters.py`), `loader/` |
-| UDF output tensorization | `python/batcher/core/udf/call.py` |
+| The type helpers | [`python/batcher/io/formats/ml/tensor.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/io/formats/ml/tensor.py) |
+| The variable-shape representation | [`python/batcher/io/formats/ml/ragged.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/io/formats/ml/ragged.py) |
+| Metadata preservation in projection | [`crates/bc-interp/src/ops/project_field.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/project_field.rs) |
+| Decode kernels, including FFmpeg video | [`crates/bc-expr/src/eval/media/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-expr/src/eval/media) |
+| Decode orchestration | [`python/batcher/ml/decode/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/ml/decode) |
+| Arrow to numpy and torch | [`python/batcher/interop/arrays.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/interop/arrays.py) (re-exported by `ml/converters.py`), `loader/` |
+| UDF output tensorization | [`python/batcher/core/udf/call.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/call.py) |
 
 ## See also
 

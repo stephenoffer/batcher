@@ -183,6 +183,30 @@ ways out: set `max_features`, raise `min_df`, or switch to `HashingVectorizer`.
 - `HashingVectorizer` uses a different hash function from scikit-learn's, so the two agree
   on a document's *values* but not on which index carries them.
 
+
+## Where a vectorizer puts its output
+
+A text vectorizer produces a sparse result, which does not fit one column. Both
+{py:class}`CountVectorizer <batcher.ml.CountVectorizer>` and
+{py:class}`HashingVectorizer <batcher.ml.HashingVectorizer>` write two list columns
+instead: one of positions and one of the values at those positions.
+
+`indices_column` and `values_column` name them, derived from the `output_column` you chose,
+so downstream code reads the names rather than reconstructing the convention.
+
+```python
+from batcher.ml.preprocessors import CountVectorizer
+
+vectorizer = CountVectorizer("review")
+print(vectorizer.indices_column, vectorizer.values_column)
+
+renamed = CountVectorizer("review", output_column="bag")
+print(renamed.indices_column, renamed.values_column)
+```
+
+Reading the names off the instance is what keeps a feature pipeline working when someone
+changes `output_column`, and it is the only way a generic step can find the pair.
+
 ## See also
 
 - {doc}`/ml/preparing/preprocessors/encoding`: categorical columns, including the hashing trick applied to one categorical value rather than a document.

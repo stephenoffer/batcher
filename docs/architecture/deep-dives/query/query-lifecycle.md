@@ -65,7 +65,7 @@ Drawn with the boundary in it, and with the loop that closes back on the optimiz
                         back to step 2 for the rest of the plan  ◄──────┘
 ```
 
-Steps 2 through 6 are sequenced in exactly one place: `run_relational` in `python/batcher/api/orchestration/run.py`. Every relational terminal routes through it, whether single-node, distributed, or an adaptive stage, so the three subsystems are wired together once rather than at each call site. `api` is the only layer permitted to import all of Kyber, Carbonite, and Core. They cannot import each other.
+Steps 2 through 6 are sequenced in exactly one place: `run_relational` in [`python/batcher/api/orchestration/run.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/api/orchestration/run.py). Every relational terminal routes through it, whether single-node, distributed, or an adaptive stage, so the three subsystems are wired together once rather than at each call site. `api` is the only layer permitted to import all of Kyber, Carbonite, and Core. They cannot import each other.
 
 ### 1. The metadata shortcut
 
@@ -82,7 +82,7 @@ terminal: the shortcut returns `None` and the query executes normally. Weaken th
 `count()` starts returning an estimate that looks like a fact.
 :::
 
-See `python/batcher/api/terminal/metadata_answer/` and
+See [`python/batcher/api/terminal/metadata_answer/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/api/terminal/metadata_answer) and
 {doc}`the execution engine page </architecture/internals/execution>`.
 
 ### 2 and 3. Optimize, then admit
@@ -176,7 +176,7 @@ A small query's fixed cost is where this design most easily goes wrong. The tabl
 
 | Cost | Paid | Why |
 |---|---|---|
-| Cranelift compilation | once per distinct `(expr, schema, simd)`, process-wide | Memoized in `crates/bc-codegen/src/cache.rs`, so a small query doesn't pay it repeatedly. |
+| Cranelift compilation | once per distinct `(expr, schema, simd)`, process-wide | Memoized in [`crates/bc-codegen/src/cache.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/cache.rs), so a small query doesn't pay it repeatedly. |
 | Thread pool construction | once per width, cached | `par.rs::pool_for`. A one-row query does not spin up 96 threads; the worker count is capped by the morsels the inputs can produce. |
 | Plan JSON parse | once per `execute_plan` call | Not per batch. |
 | Arrow handoff | once per input relation | Zero-copy through the C Data Interface. |
@@ -191,14 +191,14 @@ reading path through the control plane:
 
 | Step | Code |
 |---|---|
-| Dataset / terminal ops | `python/batcher/api/dataset/frame.py`, `python/batcher/api/terminal/` |
-| The contract loop | `python/batcher/api/orchestration/run.py` |
-| Metadata shortcut | `python/batcher/api/terminal/metadata_answer/` |
-| Logical plan + `to_ir()` | `python/batcher/plan/logical/`, `python/batcher/plan/ir_tags.py` |
-| Physical plan + `PhysicalPlan.to_json()` | `python/batcher/plan/physical.py` |
-| Core's call into the engine | `python/batcher/core/executor.py` |
-| The FFI boundary | `crates/bc-py/src/lib.rs` |
-| The executor | `crates/bc-interp/src/lib.rs` (sequential), `par.rs` and `stream/` (multi-core) |
+| Dataset / terminal ops | [`python/batcher/api/dataset/frame.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/api/dataset/frame.py), [`python/batcher/api/terminal/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/api/terminal) |
+| The contract loop | [`python/batcher/api/orchestration/run.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/api/orchestration/run.py) |
+| Metadata shortcut | [`python/batcher/api/terminal/metadata_answer/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/api/terminal/metadata_answer) |
+| Logical plan + `to_ir()` | [`python/batcher/plan/logical/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/plan/logical), [`python/batcher/plan/ir_tags.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/ir_tags.py) |
+| Physical plan + `PhysicalPlan.to_json()` | [`python/batcher/plan/physical.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/physical.py) |
+| Core's call into the engine | [`python/batcher/core/executor.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/executor.py) |
+| The FFI boundary | [`crates/bc-py/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/lib.rs) |
+| The executor | [`crates/bc-interp/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/lib.rs) (sequential), `par.rs` and `stream/` (multi-core) |
 
 ## Adaptive stages
 

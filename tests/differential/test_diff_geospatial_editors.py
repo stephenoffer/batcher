@@ -9,12 +9,9 @@ component accessors (``st_exterior_ring``, ``st_point_n``, ...), the derived sha
 DuckDB spatial is GEOS underneath, so agreement here is agreement with an independent
 implementation of the same standard rather than a restatement of Batcher's own code.
 
-Three deliberate departures are pinned rather than asserted equal, because in each case
+Two deliberate departures are pinned rather than asserted equal, because in each case
 Batcher answers where GEOS declines or picks a different valid answer:
 
-* ``st_exterior_ring`` of a **multi**-polygon. GEOS nulls; Batcher returns the first
-  member's ring, which is what makes the function usable in a projection over a mixed
-  column without a type guard first.
 * ``st_point_on_surface`` of a **chain**. The contract is "a point on the geometry", and
   both satisfy it: Batcher returns the midpoint by length, GEOS returns a vertex. The
   test asserts the contract instead of the choice.
@@ -376,31 +373,25 @@ def test_point_on_surface_lies_on_the_geometry(spatial):
         assert on_it, f"st_point_on_surface({src}) = {point} is not on the geometry"
 
 
-def test_exterior_ring_of_a_multipolygon_is_the_first_member(spatial):
-    """Batcher's documented departure: GEOS nulls here, Batcher answers.
+def test_exterior_ring_of_a_multipolygon_is_null_as_in_geos(spatial):
+    """A multipolygon has one outer ring per member and no single answer.
 
-    Pinned rather than argued: a projection over a column mixing polygons and
-    multipolygons should not have to type-guard every row, and the first member's ring is
-    the answer PostGIS's ``ST_ExteriorRing(ST_GeometryN(g, 1))`` idiom spells out longhand.
+    This used to be pinned as a departure — Batcher returned the first member's ring
+    where GEOS nulls — and was reversed to agree with PostGIS and DuckDB: answering with
+    whichever member the encoder wrote first is how a mixed column silently measures the
+    wrong shape. ``st_exterior_ring(st_geometry_n(g, 1))`` spells the old answer out.
     """
     multi = "MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))"
-    got = (
-        bt.from_pydict({"g": [multi]})
-        .select(v=bt.st_as_text(bt.st_exterior_ring(bt.col("g"))))
-        .to_pydict()["v"][0]
-    )
-    assert got is not None, "Batcher answers where GEOS nulls"
-    first = spatial.execute(
-        "SELECT ST_AsText(ST_ExteriorRing(unnest(ST_Dump(ST_GeomFromText(?))).geom)) LIMIT 1",
-        [multi],
+    ds = bt.from_pydict({"g": [multi]})
+    got = ds.select(v=bt.st_as_text(bt.st_exterior_ring(bt.col("g")))).to_pydict()["v"][0]
+    want = spatial.execute(
+        "SELECT ST_AsText(ST_ExteriorRing(ST_GeomFromText(?)))", [multi]
     ).fetchone()[0]
-    same = spatial.execute(
-        "SELECT ST_Equals(ST_GeomFromText(?), ST_GeomFromText(?))", [got, first]
-    ).fetchone()[0]
-    assert same, f"{got!r} is not the first member's ring {first!r}"
-    assert spatial.execute(
-        "SELECT ST_ExteriorRing(ST_GeomFromText(?)) IS NULL", [multi]
-    ).fetchone()[0], "the departure is only real while GEOS still nulls"
+    assert got is None and want is None
+    first = ds.select(
+        v=bt.st_as_text(bt.st_exterior_ring(bt.st_geometry_n(bt.col("g"), 1)))
+    ).to_pydict()["v"][0]
+    assert first == "LINESTRING(0 0, 1 0, 1 1, 0 1, 0 0)"
 
 
 def test_num_interior_rings_is_zero_off_its_own_type(spatial):

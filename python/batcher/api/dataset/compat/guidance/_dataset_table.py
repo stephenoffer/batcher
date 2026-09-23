@@ -365,6 +365,100 @@ _MANAGED: dict[str, str] = {
     "sink_ndjson": "Every write already streams: ds.write.json(path).",
 }
 
+# --- pandas' named arithmetic methods; here arithmetic is an expression ----------------
+#
+# pandas gives every operator a method alias (`df.div(other)` for `df / other`) plus a
+# reflected form (`rdiv`) for the operand order `__rtruediv__` would take. Batcher has no
+# frame-level arithmetic at all: a column expression carries it, and Python's own operators
+# drive that, reflected forms included -- `2 / col("a")` works because `Expr` implements
+# `__rtruediv__`. So the answer for the whole family is one sentence, and naming each
+# spelling is what stops a migrant reading "no attribute 'rdiv'" as "Batcher cannot do it".
+_ARITHMETIC_ALIASES: dict[str, str] = {
+    name: (
+        f"Batcher has no frame-level `{name}`: arithmetic is an expression, and Python's "
+        f"operators drive it. Write ds.with_columns(r=bt.col('a') {symbol} bt.col('b')), or "
+        f"bt.col('a') {symbol} 2 against a literal. The reflected order works too "
+        f"(2 {symbol} bt.col('a')), so there is no separate r-prefixed spelling."
+    )
+    for name, symbol in (
+        ("add", "+"),
+        ("radd", "+"),
+        ("sub", "-"),
+        ("rsub", "-"),
+        ("mul", "*"),
+        ("multiply", "*"),
+        ("rmul", "*"),
+        ("div", "/"),
+        ("divide", "/"),
+        ("truediv", "/"),
+        ("rdiv", "/"),
+        ("rtruediv", "/"),
+        ("floordiv", "//"),
+        ("rfloordiv", "//"),
+        ("mod", "%"),
+        ("rmod", "%"),
+        ("pow", "**"),
+        ("rpow", "**"),
+    )
+}
+
+
+# --- remaining pandas-only frame concepts ---------------------------------------------
+_PANDAS_ONLY: dict[str, str] = {
+    "attrs": (
+        "Batcher carries no free-form metadata dict on a frame. To keep a value alongside "
+        "the data make it a column, ds.with_columns(run=bt.lit('2024-01')); for engine "
+        "settings use bt.set_config(...)."
+    ),
+    "axes": (
+        "A Dataset has no axis objects. Its columns are ds.columns and its row count is "
+        "ds.count(); there is no row axis to describe because there is no row index."
+    ),
+    "eq": (
+        "pandas' `eq` compares element by element, which here is an expression: "
+        "ds.with_columns(same=bt.col('a') == bt.col('b')). To compare two whole frames "
+        "for equality use ds.equals(other)."
+    ),
+    "sort_index": (
+        "There is no row index to sort by. Order by a column instead: ds.sort('a'), or "
+        "ds.sort('a', descending=True)."
+    ),
+    "rank": (
+        "Ranking is an expression in Batcher, so it can rank within a group and be "
+        "combined with other columns: ds.with_columns(r=bt.col('x').rank()). Pass "
+        "method=, descending= or partition_by= to shape it."
+    ),
+    "from_records": (
+        "Build a Dataset with the constructor that matches your data's shape: "
+        "bt.from_pylist([{'a': 1}, ...]) for row dicts, bt.from_pydict({'a': [1, ...]}) "
+        "for columns, or bt.from_arrow(table)."
+    ),
+    "ndim": (
+        "A Dataset is always two-dimensional, so there is nothing to ask. For its shape "
+        "use ds.count() and ds.columns."
+    ),
+    "squeeze": (
+        "There is no one-column-becomes-a-Series collapse, because Batcher has no Series. "
+        "To read a single column out use ds.to_pydict()['a']."
+    ),
+    "set_flags": (
+        "Batcher has no per-frame flags. Execution behaviour is configured for the session "
+        "with bt.set_config(...); see the configuration guide."
+    ),
+    "to_period": (
+        "Period arithmetic is a temporal expression: truncate with "
+        "bt.col('t').dt.truncate('month') and format with bt.col('t').dt.strftime(...)."
+    ),
+    "to_timestamp": (
+        "Converting to a timestamp is a cast on the column: "
+        "bt.col('t').cast('timestamp(us)'), or bt.col('t').dt.timestamp() from an epoch."
+    ),
+    "to_gbq": (
+        "Write to BigQuery through the writer façade: ds.write.bigquery(table). "
+        "Every sink lives under ds.write; see the I/O reference."
+    ),
+}
+
 
 def _merge(*tables: dict[str, str]) -> dict[str, str]:
     """Flatten the reason-grouped tables into the one lookup __getattr__ uses."""
@@ -385,6 +479,8 @@ DATASET_UNSUPPORTED: dict[str, str] = _merge(
     _PREDICATES,
     _RESHAPE,
     _MANAGED,
+    _ARITHMETIC_ALIASES,
+    _PANDAS_ONLY,
     DATASET_NAMING,
     DATASET_RAY_DATA,
     DATASET_EXPORTERS,

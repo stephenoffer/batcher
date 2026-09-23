@@ -314,12 +314,26 @@ class Graph:
         """
         if self.symmetrized:
             return self
-        loops = self.edges.filter(bt.col(SRC) == bt.col(DST))
-        non_loops = self.edges.filter(bt.col(SRC) != bt.col(DST))
-        both = non_loops.union(
-            non_loops.select(**{SRC: bt.col(DST), DST: bt.col(SRC), WEIGHT: bt.col(WEIGHT)})
+        # An `explode` over the two endpoints rather than a `union` of the table with its
+        # reverse. The rows are the same, but an aggregate over a union cannot feed a join or
+        # a second aggregate on a cluster, and nearly every algorithm that symmetrizes does
+        # exactly that next: PageRank sums out-weight per node and joins it back.
+        start = bt.col("_start")
+        both = (
+            self.edges.select(SRC, DST, WEIGHT, _start=bt.array(bt.col(SRC), bt.col(DST)))
+            .explode("_start", index="_end")
+            .filter((bt.col("_end") == bt.lit(0)) | (bt.col(SRC) != bt.col(DST)))
+            .select(
+                **{
+                    SRC: start,
+                    DST: bt.when(bt.col("_end") == bt.lit(0))
+                    .then(bt.col(DST))
+                    .otherwise(bt.col(SRC)),
+                    WEIGHT: bt.col(WEIGHT),
+                }
+            )
         )
-        return replace(self, edges=both.union(loops), directed=False, symmetrized=True)
+        return replace(self, edges=both, directed=False, symmetrized=True)
 
     def without_self_loops(self) -> Graph:
         """The graph with every edge from a node to itself removed.
@@ -424,6 +438,54 @@ class Graph:
                 1
         """
         return replace(self, edges=self.edges.cache())
+
+
+def walked(g: Graph) -> Graph:
+    """The graph an edge-following algorithm walks: `g` if directed, both directions if not.
+
+    `from_edges(directed=False)` stores each edge once, in whichever orientation the row was
+    written. An algorithm that follows `src -> dst` over that table walks half the graph:
+    `bfs` from the last node of an undirected chain reached nothing, and `pagerank` ranked
+    the chain as if it were a one-way street. Every algorithm that walks edges asks this
+    function for its edges rather than reading `g.edges`, so the direction flag is honoured
+    in one place. A row listing both directions of one undirected edge is then two parallel
+    edges, which is the same convention `degree` uses.
+    """
+    return g if g.directed else g.to_undirected()
+
+
+def undirected_pairs(g: Graph) -> Dataset:
+    """Each undirected edge once, as `_lo <= _hi`, self-loops included.
+
+    Oriented by a swap rather than filtered on ``src < dst``: which endpoint a row names
+    first carries no information in an undirected graph, so a filter would silently drop
+    every edge written larger-endpoint first. Built from the edge table directly, without
+    `to_undirected`, because that is a `union` and an aggregate over a union cannot feed a
+    further aggregate or join on a cluster.
+    """
+    return g.edges.select(
+        _lo=bt.least(bt.col(SRC), bt.col(DST)), _hi=bt.greatest(bt.col(SRC), bt.col(DST))
+    ).distinct()
+
+
+def ends(pairs: Dataset) -> Dataset:
+    """Both ends of every `(_lo, _hi)` pair as `(node, nbr)`, a self-loop once.
+
+    Written as `explode` over a two-element array rather than as a `union` of the two
+    sides. The two give the same rows, but an aggregate over a union has no distributed
+    path once another aggregate or a join consumes it, and an aggregate over an explode
+    does: this is what lets a degree distribution, a triangle count and a clustering
+    coefficient run on a cluster.
+    """
+    return (
+        pairs.select("_lo", "_hi", **{NODE: bt.array(bt.col("_lo"), bt.col("_hi"))})
+        .explode(NODE, index="_end")
+        .filter((bt.col("_end") == bt.lit(0)) | (bt.col("_lo") != bt.col("_hi")))
+        .select(
+            NODE,
+            nbr=bt.when(bt.col("_end") == bt.lit(0)).then(bt.col("_hi")).otherwise(bt.col("_lo")),
+        )
+    )
 
 
 @dataclass(frozen=True)

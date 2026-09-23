@@ -2,7 +2,7 @@
 
 This page shows how to install Batcher with the Python tools you already use on a laptop, a workstation, or a notebook server: pip, uv, Poetry, conda, mamba, pixi, and Jupyter.
 
-Each tool installs the same `batcher-engine` wheel from PyPI, and none of them needs a Rust toolchain on a {doc}`supported platform <index>`. You need Python 3.11 or newer. Extras use the same bracket syntax everywhere, such as `batcher-engine[ray,cloud]`, and {doc}`../installation` lists what each extra turns on.
+Each tool installs the same `batcher-engine` wheel from PyPI, and none of them needs a Rust toolchain on a {doc}`supported platform <index>`. You need Python 3.11 or newer. Extras use the same bracket syntax everywhere, such as `batcher-engine[ray,cloud]`, and {doc}`packages-and-extras` lists what each extra turns on.
 
 ## pip
 
@@ -81,7 +81,7 @@ print(bt.from_pydict({"x": [1, 2, 3]}).agg(total=bt.col("x").sum()).to_pydict())
 # {'total': [6]}
 ```
 
-`bt.versions()["engine_profile"]` should read `release` for an installed wheel. {doc}`../installation` describes the rest of what {py:func}`bt.versions() <batcher.versions>` reports.
+`bt.versions()["engine_profile"]` should read `release` for an installed wheel. {doc}`packages-and-extras` describes the rest of what {py:func}`bt.versions() <batcher.versions>` reports.
 
 ## Troubleshooting
 
@@ -90,7 +90,7 @@ The following table lists the install failures these tools report most often, wi
 | Symptom | Cause | Fix |
 |---|---|---|
 | `No matching distribution found for batcher-engine` | Python older than 3.11, or a platform with no wheel | Check with the snippet in {doc}`index`, then use Python 3.11 or newer |
-| pip starts compiling Rust, or asks for `cargo` | No wheel matched, so pip fell back to the source package | Same as above. On an unsupported platform, follow the "Build from source" steps in {doc}`../installation` |
+| pip starts compiling Rust, or asks for `cargo` | No wheel matched, so pip fell back to the source package | Same as above. On an unsupported platform, follow the "Build from source" steps in {doc}`packages-and-extras` |
 | `pip install batcher` installs something unrelated | The bare `batcher` name on PyPI belongs to another project | Install `batcher-engine` |
 | `MissingDependencyError` when you call a feature | That feature's extra isn't installed | Install the extra named in the error message |
 

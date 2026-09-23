@@ -2091,7 +2091,9 @@ class DatasetML:
             .. doctest::
 
                 >>> import batcher as bt  # doctest: +SKIP
-                >>> tf_ds = ds.ml.to_tf(batch_size=256, local_shuffle_buffer_size=8192)
+                >>> tf_ds = ds.ml.to_tf(  # doctest: +SKIP
+                ...     batch_size=256, local_shuffle_buffer_size=8192
+                ... )
                 >>> model.fit(tf_ds)  # doctest: +SKIP
         """
         _require_columns(self._ds, columns, param="columns")

@@ -12,6 +12,11 @@ check vacuously and no ``any_*`` check.
 
 When metadata cannot decide, the check runs the filter that decides it — so the answer is
 always the answer, and only the cost moves.
+
+A value the column's type cannot be compared with (``0`` against a string column, ``"1"``
+against an integer one) raises `PlanError` before either path runs. Without that the two
+paths disagreed: bounds over an empty relation answered "vacuously true", and the engine
+refused the comparison.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from batcher.api.dataset.meta._facts import MetaBase, answer
+from batcher.api.dataset.meta._types import require_comparable
 from batcher.kyber.shortcuts import checks
 from batcher.plan.expr_ir import Col, Expr, lit
 
@@ -144,6 +150,7 @@ class ColumnChecks(MetaBase):
                 >>> bt.from_pydict({"age": [31, 44]}).meta.col("age").check.all_between(0, 120)
                 True
         """
+        require_comparable(self._ds, self._column, "all_between", (low, high))
         violating = (Col(self._column) < lit(low)) | (Col(self._column) > lit(high))
         value = self.ask(checks.all_between, self._column, low, high)
         return answer(value, lambda: self._none_survive(violating))
@@ -323,6 +330,7 @@ class ColumnChecks(MetaBase):
                 >>> bt.from_pydict({"x": [1, 5, 9]}).meta.col("x").check.contains(99)
                 False
         """
+        require_comparable(self._ds, self._column, "contains", (value,))
         decided = self.ask(checks.contains, self._column, value)
         return answer(decided, lambda: self._any_survive(Col(self._column) == lit(value)))
 
@@ -347,6 +355,7 @@ class ColumnChecks(MetaBase):
                 >>> bt.from_pydict({"x": [1, 5, 9]}).meta.col("x").check.may_contain(99)
                 False
         """
+        require_comparable(self._ds, self._column, "may_contain", (value,))
         decided = self.ask(checks.may_contain, self._column, value)
         return True if decided is None else decided
 
@@ -391,6 +400,7 @@ class ColumnChecks(MetaBase):
                 False
         """
         candidates = list(values)
+        require_comparable(self._ds, self._column, "any_in", candidates)
         if not candidates:
             return False  # `x IN ()` matches nothing
         if all(self.ask(checks.may_contain, self._column, v) is False for v in candidates):
@@ -423,12 +433,14 @@ class ColumnChecks(MetaBase):
 
     def _all(self, shortcut: Any, value: Any, violating: Expr) -> bool:
         """An `all_*` check: metadata, else "no row violates it"."""
+        require_comparable(self._ds, self._column, shortcut.__name__, (value,))
         return answer(
             self.ask(shortcut, self._column, value), lambda: self._none_survive(violating)
         )
 
     def _any(self, shortcut: Any, value: Any, satisfying: Expr) -> bool:
         """An `any_*` check: metadata, else "some row satisfies it"."""
+        require_comparable(self._ds, self._column, shortcut.__name__, (value,))
         return answer(
             self.ask(shortcut, self._column, value), lambda: self._any_survive(satisfying)
         )

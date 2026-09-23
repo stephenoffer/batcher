@@ -26,7 +26,13 @@ def in_membership(tr, node) -> Expr:
         # still refuses, because the mark join it would need lives at the WHERE level.
         from batcher._sql.parser.subquery.in_set import inline_in_subquery_values
 
-        values = inline_in_subquery_values(tr, node)
+        # Translating the set resets the aggregate bookkeeping, and `node.this` may name an
+        # aggregate of the enclosing query (`HAVING count(*) IN (SELECT …)`), so keep it.
+        saved = tr._agg_map, tr._agg_n
+        try:
+            values = inline_in_subquery_values(tr, node)
+        finally:
+            tr._agg_map, tr._agg_n = saved
         if values is None:
             raise NotImplementedError(
                 "IN (subquery) must be handled at the WHERE level, not as a scalar"

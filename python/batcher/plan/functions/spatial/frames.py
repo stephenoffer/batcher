@@ -21,6 +21,7 @@ once per *frame*, of which a log has thousands, while `se3_transform` runs once 
 
 from __future__ import annotations
 
+from batcher.plan.expr_ir.constructors import when
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.functions.spatial._build import Numeric, Point, Pose, Quaternion, value
 from batcher.plan.functions.spatial.pose import (
@@ -261,7 +262,9 @@ def pose_interpolate(a: Pose, b: Pose, t: Numeric, *, prefix: str = "") -> dict[
 
     `t` is a fraction, not a timestamp: compute it as
     ``(measured_at - a_at) / (b_at - a_at)``. It is not clamped, so a measurement just
-    past the last pose extrapolates rather than pinning to the endpoint.
+    past the last pose extrapolates rather than pinning to the endpoint. A NaN or
+    infinite `t` — two poses logged at the same instant, divided by zero — makes all
+    seven columns null, not a NaN translation beside a null rotation.
 
     Args:
         a: The earlier pose, as ``(tx, ty, tz, qx, qy, qz, qw)``.
@@ -294,8 +297,11 @@ def pose_interpolate(a: Pose, b: Pose, t: Numeric, *, prefix: str = "") -> dict[
     b_t, b_q = _split_pose(b)
     frac = value(t)
     slerp = (*a_q, *b_q, frac)
+    finite = frac.is_finite()
     lerp = {
-        f"{prefix}t{axis}": value(lo) + (value(hi) - value(lo)) * frac
+        f"{prefix}t{axis}": when(finite)
+        .then(value(lo) + (value(hi) - value(lo)) * frac)
+        .otherwise(None)
         for axis, lo, hi in zip("xyz", a_t, b_t, strict=True)
     }
     return {

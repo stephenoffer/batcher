@@ -18,123 +18,123 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `agg` | `Dataset.agg` | param | Missing: dict \{column: function-name\} form, e.g. agg(\{'x': 'max'\}). Wave W2. |
+| `agg` | {py:obj}`Dataset.agg <batcher.Dataset.agg>` | param | Missing: dict \{column: function-name\} form, e.g. agg(\{'x': 'max'\}). Wave W2. |
 | `alias` | n/a | gap | Not yet: DataFrame alias qualifiers for self-joins (df.alias('a') then col('a.x')). Wave W8. |
-| `approxQuantile` | `Dataset.approx_quantile` | param | Missing: list of columns and list of probabilities in one call; relativeError=. Wave W2. |
+| `approxQuantile` | {py:obj}`Dataset.approx_quantile <batcher.Dataset.approx_quantile>` | param | Missing: list of columns and list of probabilities in one call; relativeError=. Wave W2. |
 | `asTable` | n/a | gap | Not yet: table argument (TableArg with partitionBy/orderBy) for table-valued functions and UDTFs. Wave W11. |
-| `cache` | `Dataset.cache` | canonical |  |
-| `checkpoint` | `Dataset.cache` | param | Missing: eager=True materialization that also truncates the logical plan. Wave W8. |
-| `coalesce` | `Dataset.repartition` | canonical |  |
-| `collect` | `Dataset.collect` | mismatch | Differs: Spark returns list\[Row\] eagerly; Batcher returns a pyarrow.Table. Port as: .to\_pylist(). Wave W0. |
-| `colRegex` | `bt.matches` | canonical |  |
-| `columns` | `Dataset.columns` | canonical |  |
-| `corr` | `Dataset.corr` | canonical |  |
-| `count` | `Dataset.count` | canonical |  |
-| `cov` | `Dataset.cov` | canonical |  |
+| `cache` | {py:obj}`Dataset.cache <batcher.Dataset.cache>` | canonical |  |
+| `checkpoint` | {py:obj}`Dataset.cache <batcher.Dataset.cache>` | param | Missing: eager=True materialization that also truncates the logical plan. Wave W8. |
+| `coalesce` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | canonical |  |
+| `collect` | {py:obj}`Dataset.collect <batcher.Dataset.collect>` | mismatch | Differs: Spark returns list\[Row\] eagerly; Batcher returns a pyarrow.Table. Port as: .to\_pylist(). Wave W0. |
+| `colRegex` | {py:obj}`bt.matches <batcher.matches>` | canonical |  |
+| `columns` | {py:obj}`Dataset.columns <batcher.Dataset.columns>` | canonical |  |
+| `corr` | {py:obj}`Dataset.corr <batcher.Dataset.corr>` | canonical |  |
+| `count` | {py:obj}`Dataset.count <batcher.Dataset.count>` | canonical |  |
+| `cov` | {py:obj}`Dataset.cov <batcher.Dataset.cov>` | canonical |  |
 | `createGlobalTempView` | `Session.register` | param | Missing: global\_temp database scope, and raise when the view already exists. Wave W9. |
 | `createOrReplaceGlobalTempView` | `Session.register` | param | Missing: global\_temp database scope shared across sessions. Wave W9. |
 | `createOrReplaceTempView` | `Session.register` | canonical |  |
 | `createTempView` | `Session.register` | canonical |  |
-| `crossJoin` | `Dataset.cross_join` | canonical |  |
-| `crosstab` | `Dataset.crosstab` | mismatch | Differs: Spark names the first column '\<col1\>\_\<col2\>' and fills absent pairs with 0; Batcher keeps the index column name and leaves absent pairs null. Needs fill\_value= and a name parameter. Wave W0. |
-| `cube` | `Dataset.cube` | canonical |  |
-| `describe` | `Dataset.describe` | mismatch | Differs: Spark returns a 'summary' column with count/mean/stddev/min/max rendered as strings; Batcher returns 'statistic' rows with null\_count and quartiles as numbers. Wave W0. |
-| `distinct` | `Dataset.distinct` | canonical |  |
-| `drop` | `Dataset.drop` | param | Missing: silently ignore unknown column names as Spark does (strict=False); Batcher raises. Wave W2. |
-| `drop_duplicates` | `Dataset.distinct` | canonical |  |
-| `dropDuplicates` | `Dataset.distinct` | canonical |  |
-| `dropDuplicatesWithinWatermark` | `Dataset.drop_duplicates_within_watermark` | param | Missing: reuse the event time and delay declared by withWatermark instead of passing event\_time=/lateness= again. Wave W10. |
-| `dropna` | `Dataset.drop_nulls` | canonical |  |
-| `dtypes` | `Dataset.dtypes` | mismatch | Differs: Spark returns \[(name, 'bigint'), ...\] pairs of DDL type strings; Batcher returns a list of pyarrow DataTypes without names. Wave W0. |
-| `exceptAll` | `Dataset.except_` | canonical |  |
+| `crossJoin` | {py:obj}`Dataset.cross_join <batcher.Dataset.cross_join>` | canonical |  |
+| `crosstab` | {py:obj}`Dataset.crosstab <batcher.Dataset.crosstab>` | mismatch | Differs: Spark names the first column '\<col1\>\_\<col2\>' and fills absent pairs with 0; Batcher keeps the index column name and leaves absent pairs null. Needs fill\_value= and a name parameter. Wave W0. |
+| `cube` | {py:obj}`Dataset.cube <batcher.Dataset.cube>` | canonical |  |
+| `describe` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | mismatch | Differs: Spark returns a 'summary' column with count/mean/stddev/min/max rendered as strings; Batcher returns 'statistic' rows with null\_count and quartiles as numbers. Wave W0. |
+| `distinct` | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | canonical |  |
+| `drop` | {py:obj}`Dataset.drop <batcher.Dataset.drop>` | param | Missing: silently ignore unknown column names as Spark does (strict=False); Batcher raises. Wave W2. |
+| `drop_duplicates` | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | canonical |  |
+| `dropDuplicates` | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | canonical |  |
+| `dropDuplicatesWithinWatermark` | {py:obj}`Dataset.drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` | param | Missing: reuse the event time and delay declared by withWatermark instead of passing event\_time=/lateness= again. Wave W10. |
+| `dropna` | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | canonical |  |
+| `dtypes` | {py:obj}`Dataset.dtypes <batcher.Dataset.dtypes>` | mismatch | Differs: Spark returns \[(name, 'bigint'), ...\] pairs of DDL type strings; Batcher returns a list of pyarrow DataTypes without names. Wave W0. |
+| `exceptAll` | {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | canonical |  |
 | `executionInfo` | n/a | gap | Not yet: post-execution metrics object on the Dataset (Dataset.stats re-executes instead). Wave W8. |
-| `exists` | `Dataset.join` | param | Missing: an outer reference in a correlated subquery; port as join(other, how=semi). Wave W8. |
-| `explain` | `Dataset.explain` | mismatch | Differs: Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str. Wave W0. |
-| `fillna` | `Dataset.fill_null` | canonical |  |
-| `filter` | `Dataset.filter` | canonical |  |
-| `first` | `Dataset.first` | mismatch | Differs: Spark returns a Row (or None); Batcher returns a tuple, or a dict with named=True. Wave W0. |
+| `exists` | {py:obj}`Dataset.join <batcher.Dataset.join>` | param | Missing: an outer reference in a correlated subquery; port as join(other, how=semi). Wave W8. |
+| `explain` | {py:obj}`Dataset.explain <batcher.Dataset.explain>` | mismatch | Differs: Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str. Wave W0. |
+| `fillna` | {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | canonical |  |
+| `filter` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | canonical |  |
+| `first` | {py:obj}`Dataset.first <batcher.Dataset.first>` | mismatch | Differs: Spark returns a Row (or None); Batcher returns a tuple, or a dict with named=True. Wave W0. |
 | `foreach` | n/a | gap | Not yet: distributed per-row side-effect action on a batch Dataset (write.for\_each is streaming only). Wave W11. |
 | `foreachPartition` | n/a | gap | Not yet: distributed per-partition side-effect action on a batch Dataset. Wave W11. |
-| `freqItems` | `Dataset.value_counts` | param | Missing: approximate frequent items over several columns with a support= threshold, returning one row of arrays. Wave W2. |
-| `groupBy` | `Dataset.group_by` | param | Missing: Column-expression grouping keys (Batcher takes column names). Wave WF. |
-| `groupby` | `Dataset.group_by` | canonical |  |
-| `groupingSets` | `Dataset.grouping_sets` | canonical |  |
-| `head` | `Dataset.limit` + `Dataset.to_pylist` | mismatch | Differs: Spark head(n) eagerly returns list\[Row\] (head() returns one Row); Batcher returns a lazy Dataset. Codemod: .limit(n).to\_pylist(). Wave W0. |
+| `freqItems` | {py:obj}`Dataset.value_counts <batcher.Dataset.value_counts>` | param | Missing: approximate frequent items over several columns with a support= threshold, returning one row of arrays. Wave W2. |
+| `groupBy` | {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | param | Missing: Column-expression grouping keys (Batcher takes column names). Wave WF. |
+| `groupby` | {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | canonical |  |
+| `groupingSets` | {py:obj}`Dataset.grouping_sets <batcher.Dataset.grouping_sets>` | canonical |  |
+| `head` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` + {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | mismatch | Differs: Spark head(n) eagerly returns list\[Row\] (head() returns one Row); Batcher returns a lazy Dataset. Codemod: .limit(n).to\_pylist(). Wave W0. |
 | `hint` | n/a | out of scope | Declined: no optimizer hint IR; Kyber chooses join strategies from measured statistics (revisit). |
-| `inputFiles` | `Dataset.meta` | param | Missing: port as \[f.path for f in ds.meta.storage.files\]. Wave W8. |
-| `intersect` | `Dataset.intersect` | canonical |  |
-| `intersectAll` | `Dataset.intersect` | canonical |  |
-| `isEmpty` | `Dataset.is_empty` | canonical |  |
+| `inputFiles` | {py:obj}`Dataset.meta <batcher.Dataset.meta>` | param | Missing: port as \[f.path for f in ds.meta.storage.files\]. Wave W8. |
+| `intersect` | {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | canonical |  |
+| `intersectAll` | {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | canonical |  |
+| `isEmpty` | {py:obj}`Dataset.is_empty <batcher.Dataset.is_empty>` | canonical |  |
 | `isLocal` | n/a | out of scope | Declined: Spark driver-local execution flag; Batcher always runs in-process. |
-| `isStreaming` | `Dataset.is_streaming` | canonical |  |
-| `join` | `Dataset.join` | param | Missing: Spark how= spellings (left\_outer, full\_outer, leftsemi, left\_anti, ...) as values; Column/non-equi on= conditions; full-outer key coalescing. Wave W2. |
+| `isStreaming` | {py:obj}`Dataset.is_streaming <batcher.Dataset.is_streaming>` | canonical |  |
+| `join` | {py:obj}`Dataset.join <batcher.Dataset.join>` | param | Missing: Spark how= spellings (left\_outer, full\_outer, leftsemi, left\_anti, ...) as values; Column/non-equi on= conditions; full-outer key coalescing. Wave W2. |
 | `lateralJoin` | n/a | gap | Not yet: correlated lateral join (plan + \_sql). Wave W8. |
-| `limit` | `Dataset.limit` | canonical |  |
-| `localCheckpoint` | `Dataset.cache` | param | Missing: eager=True materialization that truncates the logical plan. Wave W8. |
-| `mapInArrow` | `Dataset.map_batches` | mismatch | Differs: Spark passes an iterator of pyarrow.RecordBatch per partition and requires a schema; Batcher calls fn once per batch with no iterator protocol. Wave W11. |
-| `mapInPandas` | `Dataset.map_batches` | mismatch | Differs: Spark passes an iterator of pandas.DataFrame per partition and requires a schema; Batcher calls fn per batch (batch\_format='pandas') with no iterator protocol. Wave W11. |
-| `melt` | `Dataset.unpivot` | canonical |  |
+| `limit` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
+| `localCheckpoint` | {py:obj}`Dataset.cache <batcher.Dataset.cache>` | param | Missing: eager=True materialization that truncates the logical plan. Wave W8. |
+| `mapInArrow` | {py:obj}`Dataset.map_batches <batcher.Dataset.map_batches>` | mismatch | Differs: Spark passes an iterator of pyarrow.RecordBatch per partition and requires a schema; Batcher calls fn once per batch with no iterator protocol. Wave W11. |
+| `mapInPandas` | {py:obj}`Dataset.map_batches <batcher.Dataset.map_batches>` | mismatch | Differs: Spark passes an iterator of pandas.DataFrame per partition and requires a schema; Batcher calls fn per batch (batch\_format='pandas') with no iterator protocol. Wave W11. |
+| `melt` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
 | `mergeInto` | `Dataset.write.merge_into` | param | Missing: target table name plus an arbitrary Column match condition (Batcher keys on on= columns). Wave W9. |
 | `metadataColumn` | n/a | gap | Not yet: source metadata columns (\_metadata.file\_path etc.) selectable by name. Wave W8. |
-| `na` | `Dataset.drop_nulls` + `Dataset.fill_null` | canonical |  |
+| `na` | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` + {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | canonical |  |
 | `nearestByJoin` | n/a | gap | Not yet: top-K nearest join ranked by an arbitrary expression (Dataset.ml.similarity\_join is an LSH threshold join). Wave W8. |
 | `observe` | n/a | gap | Not yet: named observed metrics collected while a query runs. Wave W8. |
-| `offset` | `Dataset.limit` | param | Missing: offset without a limit. Wave W2. |
-| `orderBy` | `Dataset.sort` | mismatch | Differs: Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls\_first=True for ascending keys. Wave W0. |
+| `offset` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | param | Missing: offset without a limit. Wave W2. |
+| `orderBy` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | mismatch | Differs: Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls\_first=True for ascending keys. Wave W0. |
 | `pandas_api` | n/a | out of scope | Declined: pandas-on-Spark API layer; migrate pandas code through the pandas guide instead. |
-| `persist` | `Dataset.cache` | canonical |  |
+| `persist` | {py:obj}`Dataset.cache <batcher.Dataset.cache>` | canonical |  |
 | `plot` | n/a | out of scope | Declined: plotting accessor, not a data-engine capability. |
-| `printSchema` | `Dataset.schema` | mismatch | Differs: Spark prints a tree; Batcher exposes a pyarrow.Schema to print. Wave W0. |
+| `printSchema` | {py:obj}`Dataset.schema <batcher.Dataset.schema>` | mismatch | Differs: Spark prints a tree; Batcher exposes a pyarrow.Schema to print. Wave W0. |
 | `randomSplit` | `Dataset.ml.random_split` | param | Missing: weights normalized when they do not sum to 1, and an unseeded random default. Wave W2. |
 | `rdd` | n/a | out of scope | Declined: no RDD or JVM context. |
 | `registerTempTable` | `Session.register` | canonical |  |
-| `repartition` | `Dataset.repartition` | param | Missing: hash co-location of rows by columns and a partition count; Batcher's by= lays out the output directory instead. Wave W2. |
-| `repartitionById` | `Dataset.repartition` | param | Missing: partitioning by an integer partition-id expression. Wave W2. |
-| `repartitionByRange` | `Dataset.repartition` | param | Missing: range partitioning by sort keys. Wave W2. |
-| `replace` | `Expr.replace` | param | Missing: Dataset-level replace(to\_replace, value, subset) across columns. Wave W2. |
-| `rollup` | `Dataset.rollup` | canonical |  |
+| `repartition` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | param | Missing: hash co-location of rows by columns and a partition count; Batcher's by= lays out the output directory instead. Wave W2. |
+| `repartitionById` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | param | Missing: partitioning by an integer partition-id expression. Wave W2. |
+| `repartitionByRange` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | param | Missing: range partitioning by sort keys. Wave W2. |
+| `replace` | {py:obj}`Expr.replace <batcher.plan.expr_ir.core.Expr.replace>` | param | Missing: Dataset-level replace(to\_replace, value, subset) across columns. Wave W2. |
+| `rollup` | {py:obj}`Dataset.rollup <batcher.Dataset.rollup>` | canonical |  |
 | `sameSemantics` | n/a | gap | Not yet: compare two logical plans for semantic equality. Wave W8. |
-| `sample` | `Dataset.sample` | param | Missing: withReplacement= (Poisson sampling). Wave W2. |
-| `sampleBy` | `Dataset.sample` | param | Missing: stratified sampling with a per-stratum fractions dict. Wave W2. |
+| `sample` | {py:obj}`Dataset.sample <batcher.Dataset.sample>` | param | Missing: withReplacement= (Poisson sampling). Wave W2. |
+| `sampleBy` | {py:obj}`Dataset.sample <batcher.Dataset.sample>` | param | Missing: stratified sampling with a per-stratum fractions dict. Wave W2. |
 | `scalar` | n/a | gap | Not yet: scalar subquery as a column. Wave W8. |
-| `schema` | `Dataset.schema` | mismatch | Differs: Spark returns a StructType; Batcher returns a pyarrow.Schema. Wave W0. |
-| `select` | `Dataset.select` | canonical |  |
-| `selectExpr` | `Dataset.select` | canonical |  |
+| `schema` | {py:obj}`Dataset.schema <batcher.Dataset.schema>` | mismatch | Differs: Spark returns a StructType; Batcher returns a pyarrow.Schema. Wave W0. |
+| `select` | {py:obj}`Dataset.select <batcher.Dataset.select>` | canonical |  |
+| `selectExpr` | {py:obj}`Dataset.select <batcher.Dataset.select>` | canonical |  |
 | `semanticHash` | n/a | gap | Not yet: semantic hash of the logical plan. Wave W8. |
-| `show` | `Dataset.show` | param | Missing: truncate= and vertical= display options (Spark shows 20 rows by default). Wave W2. |
-| `sort` | `Dataset.sort` | mismatch | Differs: Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls\_first=True for ascending keys. Wave W0. |
+| `show` | {py:obj}`Dataset.show <batcher.Dataset.show>` | param | Missing: truncate= and vertical= display options (Spark shows 20 rows by default). Wave W2. |
+| `sort` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | mismatch | Differs: Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls\_first=True for ascending keys. Wave W0. |
 | `sortWithinPartitions` | n/a | gap | Not yet: sort rows within each partition without a global order. Wave W8. |
 | `sparkSession` | n/a | out of scope | Declined: handle to the owning SparkSession; Batcher datasets carry no session object. |
-| `stat` | `Dataset.corr` + `Dataset.cov` | canonical |  |
+| `stat` | {py:obj}`Dataset.corr <batcher.Dataset.corr>` + {py:obj}`Dataset.cov <batcher.Dataset.cov>` | canonical |  |
 | `storageLevel` | n/a | gap | Not yet: read back the storage level a cached Dataset was persisted with. Wave W8. |
-| `subtract` | `Dataset.except_` | canonical |  |
-| `summary` | `Dataset.describe` | param | Missing: choose statistics by name (count, mean, stddev, min, max, '75%') with string output. Wave W2. |
-| `tail` | `Dataset.tail` | mismatch | Differs: Spark tail(n) eagerly returns list\[Row\]; Batcher returns a lazy Dataset. Port as: .tail(n).to\_pylist(). Wave W0. |
-| `take` | `Dataset.limit` | mismatch | Differs: Spark take(n) eagerly returns list\[Row\]; Batcher limit is lazy. Codemod: .limit(n).to\_pylist(). Wave W0. |
-| `to` | `Dataset.cast` | param | Missing: reconcile to a target schema: reorder, project away and cast nested fields by name. Wave W2. |
-| `toArrow` | `Dataset.to_arrow` | canonical |  |
-| `toDF` | `Dataset.rename` | param | Missing: rename every column positionally from a list of new names. Wave W2. |
+| `subtract` | {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | canonical |  |
+| `summary` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | param | Missing: choose statistics by name (count, mean, stddev, min, max, '75%') with string output. Wave W2. |
+| `tail` | {py:obj}`Dataset.tail <batcher.Dataset.tail>` | mismatch | Differs: Spark tail(n) eagerly returns list\[Row\]; Batcher returns a lazy Dataset. Port as: .tail(n).to\_pylist(). Wave W0. |
+| `take` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | mismatch | Differs: Spark take(n) eagerly returns list\[Row\]; Batcher limit is lazy. Codemod: .limit(n).to\_pylist(). Wave W0. |
+| `to` | {py:obj}`Dataset.cast <batcher.Dataset.cast>` | param | Missing: reconcile to a target schema: reorder, project away and cast nested fields by name. Wave W2. |
+| `toArrow` | {py:obj}`Dataset.to_arrow <batcher.Dataset.to_arrow>` | canonical |  |
+| `toDF` | {py:obj}`Dataset.rename <batcher.Dataset.rename>` | param | Missing: rename every column positionally from a list of new names. Wave W2. |
 | `toJSON` | n/a | gap | Not yet: render each row as a JSON string. Wave W7. |
-| `toLocalIterator` | `Dataset.iter_rows` | mismatch | Differs: Spark yields Row objects partition by partition; Batcher yields tuples (or dicts with named=True). Wave W0. |
-| `toPandas` | `Dataset.to_pandas` | canonical |  |
-| `transform` | `Dataset.pipe` | canonical |  |
-| `transpose` | `Dataset.transpose` | param | Missing: Spark's index column argument; port as transpose(column\_names=idx, include\_header=True, header\_name=key). Wave W8. |
-| `union` | `Dataset.union` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
-| `unionAll` | `Dataset.union` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
-| `unionByName` | `Dataset.union` | param | Missing: match columns by name in any order, and allowMissingColumns= filling absent columns with null. Wave W2. |
-| `unpersist` | `Dataset.uncache` | canonical |  |
-| `unpivot` | `Dataset.unpivot` | canonical |  |
-| `where` | `Dataset.filter` | canonical |  |
-| `withColumn` | `Dataset.with_columns` | canonical |  |
-| `withColumnRenamed` | `Dataset.rename` | param | Missing: no-op when the column is absent (Batcher raises). Wave W2. |
-| `withColumns` | `Dataset.with_columns` | canonical |  |
-| `withColumnsRenamed` | `Dataset.rename` | param | Missing: no-op for absent columns (Batcher raises). Wave W2. |
+| `toLocalIterator` | {py:obj}`Dataset.iter_rows <batcher.Dataset.iter_rows>` | mismatch | Differs: Spark yields Row objects partition by partition; Batcher yields tuples (or dicts with named=True). Wave W0. |
+| `toPandas` | {py:obj}`Dataset.to_pandas <batcher.Dataset.to_pandas>` | canonical |  |
+| `transform` | {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | canonical |  |
+| `transpose` | {py:obj}`Dataset.transpose <batcher.Dataset.transpose>` | param | Missing: Spark's index column argument; port as transpose(column\_names=idx, include\_header=True, header\_name=key). Wave W8. |
+| `union` | {py:obj}`Dataset.union <batcher.Dataset.union>` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
+| `unionAll` | {py:obj}`Dataset.union <batcher.Dataset.union>` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
+| `unionByName` | {py:obj}`Dataset.union <batcher.Dataset.union>` | param | Missing: match columns by name in any order, and allowMissingColumns= filling absent columns with null. Wave W2. |
+| `unpersist` | {py:obj}`Dataset.uncache <batcher.Dataset.uncache>` | canonical |  |
+| `unpivot` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
+| `where` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | canonical |  |
+| `withColumn` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
+| `withColumnRenamed` | {py:obj}`Dataset.rename <batcher.Dataset.rename>` | param | Missing: no-op when the column is absent (Batcher raises). Wave W2. |
+| `withColumns` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
+| `withColumnsRenamed` | {py:obj}`Dataset.rename <batcher.Dataset.rename>` | param | Missing: no-op for absent columns (Batcher raises). Wave W2. |
 | `withMetadata` | n/a | gap | Not yet: per-field metadata on a column. Wave W11. |
-| `withWatermark` | `Dataset.with_watermark` | canonical |  |
-| `write` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
-| `writeStream` | `Dataset.write` | canonical |  |
+| `withWatermark` | {py:obj}`Dataset.with_watermark <batcher.Dataset.with_watermark>` | canonical |  |
+| `write` | {py:obj}`Dataset.write <batcher.Dataset.write>` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
+| `writeStream` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
 | `writeTo` | `Dataset.write.table` | canonical |  |
-| `zipWithIndex` | `Dataset.with_row_index` | mismatch | Differs: Spark appends the index as the last column; Batcher inserts it first. Wave W0. |
+| `zipWithIndex` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | mismatch | Differs: Spark appends the index as the last column; Batcher inserts it first. Wave W0. |
 
 ## `DataFrameNaFunctions`
 
@@ -142,9 +142,9 @@ The following table maps the 3 names on `DataFrameNaFunctions`, sorted alphabeti
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `drop` | `Dataset.drop_nulls` | mismatch | Differs: Dataset.drop removes columns; na.drop drops rows and maps to Dataset.drop\_nulls, which lacks thresh=. Wave W2. |
-| `fill` | `Dataset.fill_null` | canonical |  |
-| `replace` | `Expr.replace` | param | Missing: Dataset-level replace(to\_replace, value, subset) across columns. Wave W2. |
+| `drop` | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | mismatch | Differs: Dataset.drop removes columns; na.drop drops rows and maps to Dataset.drop\_nulls, which lacks thresh=. Wave W2. |
+| `fill` | {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | canonical |  |
+| `replace` | {py:obj}`Expr.replace <batcher.plan.expr_ir.core.Expr.replace>` | param | Missing: Dataset-level replace(to\_replace, value, subset) across columns. Wave W2. |
 
 ## `DataFrameStatFunctions`
 
@@ -152,12 +152,12 @@ The following table maps the 6 names on `DataFrameStatFunctions`, sorted alphabe
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `approxQuantile` | `Dataset.approx_quantile` | param | Missing: list of columns and list of probabilities in one call; relativeError=. Wave W2. |
-| `corr` | `Dataset.corr` | canonical |  |
-| `cov` | `Dataset.cov` | canonical |  |
-| `crosstab` | `Dataset.crosstab` | mismatch | Differs: Spark names the first column '\<col1\>\_\<col2\>' and fills absent pairs with 0; Batcher keeps the index column name and leaves absent pairs null. Needs fill\_value= and a name parameter. Wave W0. |
-| `freqItems` | `Dataset.value_counts` | param | Missing: approximate frequent items over several columns with a support= threshold, returning one row of arrays. Wave W2. |
-| `sampleBy` | `Dataset.sample` | param | Missing: stratified sampling with a per-stratum fractions dict. Wave W2. |
+| `approxQuantile` | {py:obj}`Dataset.approx_quantile <batcher.Dataset.approx_quantile>` | param | Missing: list of columns and list of probabilities in one call; relativeError=. Wave W2. |
+| `corr` | {py:obj}`Dataset.corr <batcher.Dataset.corr>` | canonical |  |
+| `cov` | {py:obj}`Dataset.cov <batcher.Dataset.cov>` | canonical |  |
+| `crosstab` | {py:obj}`Dataset.crosstab <batcher.Dataset.crosstab>` | mismatch | Differs: Spark names the first column '\<col1\>\_\<col2\>' and fills absent pairs with 0; Batcher keeps the index column name and leaves absent pairs null. Needs fill\_value= and a name parameter. Wave W0. |
+| `freqItems` | {py:obj}`Dataset.value_counts <batcher.Dataset.value_counts>` | param | Missing: approximate frequent items over several columns with a support= threshold, returning one row of arrays. Wave W2. |
+| `sampleBy` | {py:obj}`Dataset.sample <batcher.Dataset.sample>` | param | Missing: stratified sampling with a per-stratum fractions dict. Wave W2. |
 
 ## `GroupedData`
 
@@ -165,21 +165,21 @@ The following table maps the 15 names on `GroupedData`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `agg` | `GroupBy.agg` | canonical |  |
-| `apply` | `GroupBy.map_groups` | mismatch | Differs: deprecated grouped-map pandas UDF: fn(pandas.DataFrame) with a declared schema; map\_groups passes a pyarrow.RecordBatch and infers the schema. Wave W11. |
-| `applyInArrow` | `GroupBy.map_groups` | param | Missing: schema= and a key-aware fn(key, table) signature. Wave W11. |
-| `applyInPandas` | `GroupBy.map_groups` | param | Missing: batch\_format='pandas', schema=, and a key-aware fn(key, pdf) signature. Wave W11. |
-| `applyInPandasWithState` | `Dataset.transform_with_state` | param | Missing: GroupState with timeouts and outputMode. Wave W10. |
-| `avg` | `GroupBy.mean` | param | Missing: Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
+| `agg` | {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` | canonical |  |
+| `apply` | {py:obj}`GroupBy.map_groups <batcher.GroupBy.map_groups>` | mismatch | Differs: deprecated grouped-map pandas UDF: fn(pandas.DataFrame) with a declared schema; map\_groups passes a pyarrow.RecordBatch and infers the schema. Wave W11. |
+| `applyInArrow` | {py:obj}`GroupBy.map_groups <batcher.GroupBy.map_groups>` | param | Missing: schema= and a key-aware fn(key, table) signature. Wave W11. |
+| `applyInPandas` | {py:obj}`GroupBy.map_groups <batcher.GroupBy.map_groups>` | param | Missing: batch\_format='pandas', schema=, and a key-aware fn(key, pdf) signature. Wave W11. |
+| `applyInPandasWithState` | {py:obj}`Dataset.transform_with_state <batcher.Dataset.transform_with_state>` | param | Missing: GroupState with timeouts and outputMode. Wave W10. |
+| `avg` | {py:obj}`GroupBy.mean <batcher.GroupBy.mean>` | param | Missing: Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
 | `cogroup` | n/a | gap | Not yet: cogroup two grouped Datasets for applyInPandas/applyInArrow. Wave W10. |
-| `count` | `GroupBy.count` | mismatch | Differs: Spark GroupedData.count counts rows into a column named count; port as group\_by(k).len(name=count). Batcher GroupBy.count counts non-null values. Wave W0. |
-| `max` | `GroupBy.max` | param | Missing: Spark names the output 'max(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
-| `mean` | `GroupBy.mean` | param | Missing: Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
-| `min` | `GroupBy.min` | param | Missing: Spark names the output 'min(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
-| `pivot` | `Dataset.pivot` | param | Missing: groupBy(...).pivot(col, values).agg(\*exprs) chain with expression aggregates and several value columns. Wave W2. |
-| `sum` | `GroupBy.sum` | param | Missing: Spark names the output 'sum(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
-| `transformWithState` | `Dataset.transform_with_state` | param | Missing: StatefulProcessor class protocol: timers, value/list/map state, initial state. Wave W10. |
-| `transformWithStateInPandas` | `Dataset.transform_with_state` | param | Missing: StatefulProcessor class protocol over pandas batches: timers, value/list/map state, initial state. Wave W10. |
+| `count` | {py:obj}`GroupBy.count <batcher.GroupBy.count>` | mismatch | Differs: Spark GroupedData.count counts rows into a column named count; port as group\_by(k).len(name=count). Batcher GroupBy.count counts non-null values. Wave W0. |
+| `max` | {py:obj}`GroupBy.max <batcher.GroupBy.max>` | param | Missing: Spark names the output 'max(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
+| `mean` | {py:obj}`GroupBy.mean <batcher.GroupBy.mean>` | param | Missing: Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
+| `min` | {py:obj}`GroupBy.min <batcher.GroupBy.min>` | param | Missing: Spark names the output 'min(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
+| `pivot` | {py:obj}`Dataset.pivot <batcher.Dataset.pivot>` | param | Missing: groupBy(...).pivot(col, values).agg(\*exprs) chain with expression aggregates and several value columns. Wave W2. |
+| `sum` | {py:obj}`GroupBy.sum <batcher.GroupBy.sum>` | param | Missing: Spark names the output 'sum(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column. Wave W2. |
+| `transformWithState` | {py:obj}`Dataset.transform_with_state <batcher.Dataset.transform_with_state>` | param | Missing: StatefulProcessor class protocol: timers, value/list/map state, initial state. Wave W10. |
+| `transformWithStateInPandas` | {py:obj}`Dataset.transform_with_state <batcher.Dataset.transform_with_state>` | param | Missing: StatefulProcessor class protocol over pandas batches: timers, value/list/map state, initial state. Wave W10. |
 
 ## `Window`
 
@@ -187,13 +187,13 @@ The following table maps the 7 names on `Window`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `currentRow` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
-| `orderBy` | `AggExpr.over` + `WindowExpr.over` | mismatch | Differs: Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row\_number/lag. Pass (col, False, True) keys. Wave W0. |
-| `partitionBy` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
-| `rangeBetween` | `AggExpr.over` + `WindowExpr.over` | param | Missing: RANGE frames with value offsets on the order key (frame units 'range' are unverified for non-zero offsets). Wave W5. |
-| `rowsBetween` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
-| `unboundedFollowing` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
-| `unboundedPreceding` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
+| `currentRow` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | canonical |  |
+| `orderBy` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | mismatch | Differs: Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row\_number/lag. Pass (col, False, True) keys. Wave W0. |
+| `partitionBy` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | canonical |  |
+| `rangeBetween` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | param | Missing: RANGE frames with value offsets on the order key (frame units 'range' are unverified for non-zero offsets). Wave W5. |
+| `rowsBetween` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | canonical |  |
+| `unboundedFollowing` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | canonical |  |
+| `unboundedPreceding` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | canonical |  |
 
 ## `WindowSpec`
 
@@ -201,7 +201,15 @@ The following table maps the 4 names on `WindowSpec`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `orderBy` | `AggExpr.over` + `WindowExpr.over` | mismatch | Differs: Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row\_number/lag. Pass (col, False, True) keys. Wave W0. |
-| `partitionBy` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
-| `rangeBetween` | `AggExpr.over` + `WindowExpr.over` | param | Missing: RANGE frames with value offsets on the order key (frame units 'range' are unverified for non-zero offsets). Wave W5. |
-| `rowsBetween` | `AggExpr.over` + `WindowExpr.over` | canonical |  |
+| `orderBy` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | mismatch | Differs: Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row\_number/lag. Pass (col, False, True) keys. Wave W0. |
+| `partitionBy` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | canonical |  |
+| `rangeBetween` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | param | Missing: RANGE frames with value offsets on the order key (frame units 'range' are unverified for non-zero offsets). Wave W5. |
+| `rowsBetween` | {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

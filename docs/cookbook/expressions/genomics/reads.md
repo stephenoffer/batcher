@@ -64,4 +64,4 @@ A sequence containing any character outside `ACGT` yields null rather than an ap
 
 - {doc}`/cookbook/expressions/genomics/sequences`: strands, composition, translation, and motifs.
 - {doc}`/cookbook/expressions/nested/lists_set_operations`: the list vocabulary a sketch comparison uses.
-- {doc}`/api/relational/expression-accessors`: every {py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>` method, tabulated.
+- {doc}`/api/accessors/sequence`: every {py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>` method, with signatures.

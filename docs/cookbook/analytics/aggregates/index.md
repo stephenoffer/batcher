@@ -7,6 +7,7 @@ These recipes are the shapes most analytical queries actually are: group, join, 
 | {doc}`Analytics query <analytics-query>` | Aggregate, join, then window, in one readable pass |
 | {doc}`Time series rollups <time-series-rollups>` | Daily revenue with a seven-day moving average |
 | {doc}`Top k per group <top-k-per-group>` | The two best sellers in every category, not the two best sellers overall |
+| {doc}`Geospatial binning <geospatial-binning>` | Counting points on a map, when no two coordinates repeat |
 
 ## See also
 
@@ -19,4 +20,5 @@ These recipes are the shapes most analytical queries actually are: group, join, 
 analytics-query
 time-series-rollups
 top-k-per-group
+geospatial-binning
 ```

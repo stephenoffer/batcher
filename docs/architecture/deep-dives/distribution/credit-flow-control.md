@@ -35,7 +35,7 @@ A channel's in-flight memory is at most `credits x batch_bytes`. Not usually bou
                                    v
 ```
 
-The producer blocks in one place, `FlightHandler::do_exchange` in `crates/bc-transport/src/handler.rs`:
+The producer blocks in one place, `FlightHandler::do_exchange` in [`crates/bc-transport/src/handler.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-transport/src/handler.rs):
 
 ```rust
 let gated = async_stream::stream! {
@@ -264,6 +264,6 @@ Even division of the byte budget across a reducer's channels is right when nothi
 - {doc}`The buffer pool </architecture/deep-dives/memory/buffer-pool>`: where `PressureLevel` comes from.
 - {doc}`Carbonite </architecture/internals/carbonite>`: the flow-control knob reference.
 - {doc}`Configuration options </configuration/options>`: `flow_control.*` and `distributed.adaptive_credits`.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: the other place a fast producer meets a slow consumer.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: the other place a fast producer meets a slow consumer.
 - {doc}`Scaling benchmarks </benchmarks/results/scaling>`: what the credited shuffle sustains as nodes are added.
 - `docs/architecture/internals/mathematical_foundations.md`, an in-repo paper rather than a site page: the stability argument for AIMD under a clamp.

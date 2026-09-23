@@ -261,7 +261,7 @@ def quat_slerp_x(
 
     Returns:
         The X component of the interpolated rotation, or null if either input rotation
-        is all zeros.
+        is all zeros or ``t`` is not finite.
 
     Examples:
         .. doctest::
@@ -301,7 +301,7 @@ def quat_slerp_y(
 
     Returns:
         The Y component of the interpolated rotation, or null if either input rotation
-        is all zeros.
+        is all zeros or ``t`` is not finite.
 
     Examples:
         .. doctest::
@@ -341,7 +341,7 @@ def quat_slerp_z(
 
     Returns:
         The Z component of the interpolated rotation, or null if either input rotation
-        is all zeros.
+        is all zeros or ``t`` is not finite.
 
     Examples:
         .. doctest::
@@ -381,7 +381,7 @@ def quat_slerp_w(
 
     Returns:
         The scalar component of the interpolated rotation, or null if either input
-        rotation is all zeros.
+        rotation is all zeros or ``t`` is not finite.
 
     Examples:
         .. doctest::

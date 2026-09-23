@@ -55,10 +55,11 @@ _EXPR_REFERENCE = (
 )
 
 # Public names not yet documented (drain toward empty). Keep each with a reason.
-KNOWN_UNDOCUMENTED: dict[str, str] = {
-    # Not user-facing API names.
-    "__version__": "package version string, not an API symbol",
-}
+# Now empty. `__version__` sat here as "not an API symbol", and the entry was stale in a way
+# only the second assertion below could catch: `_mentioned` matched the `ray.__version__` in
+# an install page, so the name counted as documented while nothing documented *Batcher's*.
+# It is a string a user reads, so the install guide now says what it is and what it isn't.
+KNOWN_UNDOCUMENTED: dict[str, str] = {}
 
 # Public names deliberately absent from the Sphinx autodoc tree, with a reason.
 KNOWN_UNRENDERED: dict[str, str] = {

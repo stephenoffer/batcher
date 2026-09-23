@@ -101,3 +101,32 @@ def test_filter_not_pushed_through_computed_column():
     assert push_filter_through_project(plan, None) is None
     ir = Optimizer().optimize(plan).ir
     assert ir["op"] == "filter"  # filter remains on top
+
+
+def test_mixed_conjuncts_split_across_the_projection():
+    """The pass-through conjuncts sink; only the one over the computed column stays above.
+
+    Refusing the whole `AND` over one computed column is what left TPC-H q17's comma-join
+    equality above a decorrelated subquery's projection and ran it as a cartesian product.
+    """
+    from batcher.plan.expr_rewrite import split_conjuncts
+    from batcher.plan.logical import Filter
+
+    ds = _t().with_columns(s=col("x") + col("y"))
+    plan = ds.filter((col("s") > 5) & (col("x") > 1) & (col("y") < 30))._plan
+    out = push_filter_through_project(plan, None)
+    assert isinstance(out, Filter) and isinstance(out.input, Project)
+    assert [str(c) for c in split_conjuncts(out.predicate)] == [str(col("s") > 5)]
+    below = out.input.input
+    assert isinstance(below, Filter)
+    assert {str(c) for c in split_conjuncts(below.predicate)} == {
+        str(col("x") > 1),
+        str(col("y") < 30),
+    }
+    # Idempotent: the conjunct left above has nothing more to move.
+    assert push_filter_through_project(out, None) is None
+    assert ds.filter((col("s") > 5) & (col("x") > 1) & (col("y") < 30)).collect().to_pydict() == {
+        "x": [2],
+        "y": [20],
+        "s": [22],
+    }

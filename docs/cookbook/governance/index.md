@@ -4,7 +4,7 @@ Batcher enforces data policy inside the query plan. Grants, column masks, and ro
 
 These three recipes cover the day-to-day work: restricting who sees which rows and columns, protecting a sensitive value while keeping it joinable, and tracing which outputs a source column reaches.
 
-Every page embeds a complete, self-contained script from the [`examples/governance/`](https://github.com/stephenoffer/batcher/tree/main/examples/governance) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every page embeds a complete, self-contained script from the [`examples/governance/`](https://github.com/stephenoffer/batcher/tree/main/examples/governance) directory. The scripts build their own in-memory data and assert on their own output, and [`tests/docs/test_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_examples.py) runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Recipe | What it shows |
 |---|---|

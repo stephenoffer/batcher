@@ -14,8 +14,10 @@ many times in one query, because it converts once instead of once per call.
 
 **A geometry that will not parse becomes null, it does not raise.** One corrupt row in
 a hundred million should not abort a scan, and `st_is_valid_reason` names every bad row
-and why. A query bug — a negative radius, an unsupported EPSG code — does raise,
-because that is wrong on every row rather than on one.
+and why. The same goes for a row whose values are outside a function's domain, such as
+a NaN or off-globe coordinate given to a grid or geodesic function. A query bug — a
+negative `st_dwithin` radius, a geohash precision of 13, an unsupported EPSG code — does
+raise, because that is wrong on every row rather than on one.
 """
 
 from __future__ import annotations

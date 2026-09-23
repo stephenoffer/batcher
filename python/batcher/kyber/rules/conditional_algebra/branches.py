@@ -30,8 +30,8 @@ from batcher.kyber.rule import Phase
 from batcher.kyber.rules.exprs.guards import schema_rule
 from batcher.kyber.rules.extra.nullability import _replaceable
 from batcher.kyber.rules.leaf_rewrite import EXPR_NODES, rewrite_node
-from batcher.plan.expr_ir import Binary, Case, Expr
-from batcher.plan.expr_rewrite import expr_key
+from batcher.plan.expr_ir import Case, Expr
+from batcher.plan.expr_rewrite import combine_disjuncts, expr_key
 from batcher.plan.logical import LogicalPlan
 
 __all__ = [
@@ -43,16 +43,19 @@ __all__ = [
 def _merge_equal_branches(expr: Expr) -> Expr:
     if not isinstance(expr, Case) or len(expr.branches) < 2:
         return expr
-    merged: list[tuple[Expr, Expr]] = []
-    changed = False
+    # Collect each run of adjacent branches sharing a value, then combine that run's
+    # conditions in one go. Folding them pairwise as the scan went built
+    # `((c1 OR c2) OR c3) OR ...` -- one level of nesting per branch -- and
+    # `combine_disjuncts` builds the balanced tree instead, at depth log(n).
+    runs: list[tuple[list[Expr], Expr]] = []
     for cond, value in expr.branches:
-        if merged and expr_key(merged[-1][1]) == expr_key(value):
-            previous_cond, previous_value = merged[-1]
-            merged[-1] = (Binary("or", previous_cond, cond), previous_value)
-            changed = True
+        if runs and expr_key(runs[-1][1]) == expr_key(value):
+            runs[-1][0].append(cond)
         else:
-            merged.append((cond, value))
-    return Case(merged, expr.otherwise) if changed else expr
+            runs.append(([cond], value))
+    if all(len(conds) == 1 for conds, _ in runs):
+        return expr
+    return Case([(combine_disjuncts(conds), value) for conds, value in runs], expr.otherwise)
 
 
 @rule(
@@ -74,6 +77,14 @@ def merge_case_branches_with_equal_results(node: LogicalPlan, _ctx) -> LogicalPl
     both branches still falls through the merged one. Merging shrinks the chain the engine
     must evaluate condition by condition, and hands `case_drop_duplicate_conditions` and
     the boolean normalizer a shape they can work on.
+
+    The run's conditions go through `combine_disjuncts`, which builds a **balanced** `OR`
+    tree. Folding them pairwise as the branches were scanned cost one level of nesting per
+    branch, so a merge that shortened a 1,000-branch `CASE` to one branch also deepened the
+    expression to 999 levels — past `bc_ir::MAX_PLAN_DEPTH` (512), which refuses the plan.
+    A generated `CASE` reaches that length easily: `FrequencyEncoder` emits one branch per
+    category against a `max_categories` that defaults to 1,000, and over an evenly
+    distributed column every branch carries the same frequency, so all of them merge.
     """
     return rewrite_node(node, _merge_equal_branches)
 

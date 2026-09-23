@@ -19,7 +19,7 @@ The following table maps the 7 names on `SQLContext`, sorted alphabetically.
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
 | `execute` | `Session.sql` | canonical |  |
-| `execute_global` | `bt.sql` | param | Missing: discover frames from the caller's globals/locals. Wave W2. |
+| `execute_global` | {py:obj}`bt.sql <batcher.sql>` | param | Missing: discover frames from the caller's globals/locals. Wave W2. |
 | `register` | `Session.register` | canonical |  |
 | `register_globals` | n/a | gap | Not yet: Session.register\_globals. Wave W8. |
 | `register_many` | n/a | gap | Not yet: Session.register\_many. Wave W8. |
@@ -35,20 +35,20 @@ The following table maps the 34 names on `Config`, sorted alphabetically.
 | `load` | `Config.from_dict` | canonical |  |
 | `load_from_file` | `Config.from_file` | canonical |  |
 | `reload_env_vars` | `Config.from_env` | canonical |  |
-| `restore_defaults` | `batcher.config.reset_option` | canonical |  |
+| `restore_defaults` | {py:obj}`batcher.config.reset_option <batcher.config.reset_option>` | canonical |  |
 | `save` | `Config.to_dict` | canonical |  |
 | `save_to_file` | n/a | gap | Not yet: Config.save\_to\_file (write the active config to a file). Wave W11. |
 | `set_ascii_tables` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_auto_structify` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_decimal_separator` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_default_credential_provider` | n/a | gap | Not yet: process-wide default credential provider. Wave W13. |
-| `set_engine_affinity` | `batcher.config.set_option` | param | Missing: engine affinity (streaming/in-memory/GPU) as a process-wide option. Wave W2. |
+| `set_engine_affinity` | {py:obj}`batcher.config.set_option <batcher.config.set_option>` | param | Missing: engine affinity (streaming/in-memory/GPU) as a process-wide option. Wave W2. |
 | `set_expr_depth_warning` | n/a | out of scope | Declined: Polars-internal recursion-depth warning for deep expression trees. |
 | `set_float_precision` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_fmt_float` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_fmt_str_lengths` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_fmt_table_cell_list_len` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
-| `set_streaming_chunk_size` | `batcher.config.set_option` | canonical |  |
+| `set_streaming_chunk_size` | {py:obj}`batcher.config.set_option <batcher.config.set_option>` | canonical |  |
 | `set_tbl_cell_alignment` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_tbl_cell_numeric_alignment` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_tbl_cols` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
@@ -63,7 +63,7 @@ The following table maps the 34 names on `Config`, sorted alphabetically.
 | `set_tbl_width_chars` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_thousands_separator` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
 | `set_trim_decimal_zeros` | n/a | gap | Not yet: display/formatting option for printed tables. Wave W11. |
-| `set_verbose` | `batcher.config.set_verbosity` | canonical |  |
+| `set_verbose` | {py:obj}`batcher.config.set_verbosity <batcher.config.set_verbosity>` | canonical |  |
 | `state` | `Config.non_defaults` | canonical |  |
 | `warn_unstable` | n/a | out of scope | Declined: Polars-internal toggle for unstable-API warnings. |
 
@@ -77,3 +77,11 @@ The following table maps the 4 names on the `polars.api` module, sorted alphabet
 | `register_expr_namespace` | n/a | gap | Not yet: user namespace registration on Expr. Wave W11. |
 | `register_lazyframe_namespace` | n/a | gap | Not yet: user namespace registration on Dataset. Wave W11. |
 | `register_series_namespace` | n/a | out of scope | Declined: Batcher has no Series type (user decision). |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Polars pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

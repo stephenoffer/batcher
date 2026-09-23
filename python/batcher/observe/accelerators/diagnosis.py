@@ -10,10 +10,18 @@ because the failure mode of a diagnostic page is that it lists twenty numbers an
 reader to work out which two matter. The numbers are still there — every one of them is a
 Prometheus series exported from `gauges` — and this is the layer that says what they mean.
 
-**Verdicts come from `hardware.telemetry.bottleneck`, not from here.** Two surfaces render them:
-this report and the terminal accelerator report, and a classification that lived in one of them
-would say something subtly different in the other. The classification is one function; this
-module formats it.
+**Verdicts come from `hardware.telemetry.bottleneck`, not from here.** Two surfaces render
+them: `format_bottleneck_report` below, which the GPU-diagnosis guide has readers import
+directly, and `observe.insights.devices`, which folds the fleet verdict into a run's findings.
+A classification living in either would say something subtly different in the other, so it is
+one function and these two modules only format it.
+
+This paragraph named the *terminal accelerator report* as the second surface until 2026-09-22.
+It renders no verdict and never has: `api/session/accelerators/` carries a `throttled` row read
+straight from NVML's throttle reasons, which is a reading rather than a diagnosis. Worth
+correcting rather than deleting, because the sentence is the argument for where the
+classification lives, and an argument resting on a surface that does not exist is one nobody
+can check.
 
 **Nothing is invented when nothing was sampled.** A run with no window says so in one line, and
 a device with too few samples reports `unknown` rather than a verdict derived from two readings.
@@ -24,6 +32,7 @@ diagnosis, because someone acts on it.
 from __future__ import annotations
 
 from batcher._internal.hardware.telemetry.bottleneck import Bottleneck, classify_device
+from batcher._internal.hardware.telemetry.processes import device_shared_with_others
 from batcher._internal.hardware.telemetry.sampler import TelemetrySampler, saturation_shape
 
 __all__ = [
@@ -66,6 +75,13 @@ def device_verdicts(window: TelemetrySampler | None = None) -> tuple[Bottleneck,
                 pcie=window.summary(index, "pcie_utilization"),
                 throttled=window.summary(index, "throttled"),
                 codec=window.summary(index, "codec"),
+                # Whether a neighbour was computing on the board. Nothing supplied this, so
+                # `classify_device` took its `None` default — documented as "treated as not
+                # shared" — and the `contended` verdict could not fire at all. Every other
+                # input here comes from the sampled window; contention is the one signal the
+                # window cannot hold, because it is a fact about *processes* rather than about
+                # the device, so it is read here at classification time.
+                shared=device_shared_with_others(index),
                 # Passed only when DCGM actually contributed. An all-zero occupancy summary
                 # from a host without DCGM would otherwise classify every busy device as
                 # occupancy limited, which is the most expensive wrong answer available here.

@@ -4,7 +4,7 @@ Every pipeline starts with a read and ends with a write. These six recipes cover
 
 They run from the format you will reach for first to the registry of readers and writers behind all of them.
 
-Every page embeds a complete, self-contained script from the [`examples/io/`](https://github.com/stephenoffer/batcher/tree/main/examples/io) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every page embeds a complete, self-contained script from the [`examples/io/`](https://github.com/stephenoffer/batcher/tree/main/examples/io) directory. The scripts build their own in-memory data and assert on their own output, and [`tests/docs/test_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_examples.py) runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Recipe | What it shows |
 |---|---|

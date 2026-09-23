@@ -111,16 +111,6 @@ def _is_self_referential(cte) -> bool:
     return _references(cte.this, cte.alias)
 
 
-def _table_ref_count(root, name: str) -> int:
-    """How many times `name` is referenced as a table anywhere under `root`.
-
-    Counts `FROM name` / `JOIN name` occurrences, including those inside a scalar subquery or a
-    later CTE. A CTE's own `WITH name AS (…)` header is an alias, not an `exp.Table`, so it is
-    not counted — only real references are.
-    """
-    return sum(1 for t in root.find_all(exp.Table) if t.name == name)
-
-
 def _align_setop_by_name(left: Dataset, right: Dataset) -> tuple[Dataset, Dataset]:
     """Align two set-operation branches by column *name* (`UNION ... BY NAME`).
 
@@ -291,29 +281,21 @@ class _Translator:
         self._udf_n = 0
         self._win_arg_n = 0
 
-    def _cte_dataset(self, root, cte) -> Dataset:
-        """The `Dataset` a CTE binds to — *materialized* when it is referenced more than once.
+    def _cte_dataset(self, cte) -> Dataset:
+        """The lazy `Dataset` a CTE binds to, however many times the query references it.
 
-        A CTE is otherwise a lazy plan, so every `FROM cte` inlines it and **re-executes** the
-        whole subtree. TPC-H q15 references its `revenue` CTE twice — once in the join, once in
-        `(SELECT max(total_revenue) FROM revenue)` — and so scanned, filtered and grouped 6M
-        lineitem rows twice: **46.9 ms, against 7.6 ms** computing it once. This is what DuckDB
-        does with a multiply-referenced CTE.
+        Every `FROM cte` reads the same plan object, so a CTE referenced twice is one subtree
+        appearing twice in the query plan. Executing it once is the optimizer's job, not the
+        translator's: `kyber.common_subplan` finds repeated subtrees that contain a pipeline
+        breaker and `api.subplan_reuse` computes each once per run and scans it back. TPC-H
+        q15 references its `revenue` CTE twice, once in the join and once in
+        `(SELECT max(total_revenue) FROM revenue)`, and that is the shape it catches.
 
-        It also forecloses a real hazard rather than one we hit: re-executing a *float* aggregate
-        can legitimately differ in the last ULP between evaluations (different scheduling ⇒
-        different summation order, and float addition is not associative), and q15 compares two
-        evaluations of that sum for **equality**. Batcher happened to agree with DuckDB either
-        way; Daft, which inlines, returns **0 rows instead of 1 on 3 runs in 4** on this exact
-        query. One evaluation makes both references read identical bytes, so the question cannot
-        arise.
-
-        Referenced once ⇒ left lazy, so predicate/projection pushdown still reaches into it.
+        This used to materialize a multiply-referenced CTE here, which executed it while the
+        SQL was being translated: `bt.sql(...)` did work before any terminal op, and a
+        `CREATE VIEW` over such a CTE froze its rows at creation time.
         """
-        ds = from_clause.alias_columns(self.statement(cte.this), cte)
-        if _table_ref_count(root, cte.alias) > 1:
-            return from_arrow(ds.collect())
-        return ds
+        return from_clause.alias_columns(self.statement(cte.this), cte)
 
     def _recursive_cte(self, cte) -> Dataset:
         """Evaluate a `WITH RECURSIVE` CTE to a fixpoint, eagerly.
@@ -409,7 +391,7 @@ class _Translator:
                 if recursive and _is_self_referential(cte):
                     self._registry[cte.alias] = self._recursive_cte(cte)
                 else:
-                    self._registry[cte.alias] = self._cte_dataset(node, cte)
+                    self._registry[cte.alias] = self._cte_dataset(cte)
             # Strip the WITH so the body translates as an ordinary statement.
             node = node.copy()
             node.set("with", None)

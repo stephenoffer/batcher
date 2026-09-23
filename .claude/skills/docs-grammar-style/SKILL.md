@@ -187,7 +187,7 @@ it is currently true.
 
 ## What this doesn't govern
 
-`docs/api/complete/` renders generated signatures and docstrings, so its prose comes
+`docs/api/symbols/` renders generated signatures and docstrings, so its prose comes
 from `python/batcher/` and is governed by the docstring gate in
 `.claude/rules/python-quality.md` instead. The rules here apply to the docstrings
 themselves, at their source.

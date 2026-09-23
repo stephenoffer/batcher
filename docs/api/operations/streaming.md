@@ -4,9 +4,9 @@ This page is the reference for Batcher's streaming surface: the trigger and outp
 values a streaming write takes, what a running query reports, and the listener interface
 that receives those reports as they happen.
 
-For how to use them, see {doc}`/user-guide/moving-data/streaming` and
-{doc}`/user-guide/moving-data/streaming-monitoring`. The handle a streaming write returns
-is documented with the rest of the {py:class}`Dataset <batcher.Dataset>` surface in {doc}`/api/complete/dataset`.
+For how to use them, see {doc}`/user-guide/moving-data/streaming/index` and
+{doc}`/user-guide/moving-data/streaming/monitoring`. The handle a streaming write returns
+is documented with the rest of the {py:class}`Dataset <batcher.Dataset>` surface in {doc}`/api/symbols/dataset-terminal`.
 
 ## Triggers and output modes
 
@@ -89,6 +89,6 @@ destination that needs a connection.
 
 ## See also
 
-- {doc}`/user-guide/moving-data/streaming`: sources, sinks, triggers, and checkpoints.
-- {doc}`/user-guide/moving-data/streaming-monitoring`: reading these records in practice.
+- {doc}`/user-guide/moving-data/streaming/index`: sources, sinks, triggers, and checkpoints.
+- {doc}`/user-guide/moving-data/streaming/monitoring`: reading these records in practice.
 - {doc}`/api/operations/configuration`: the `streaming` config section.

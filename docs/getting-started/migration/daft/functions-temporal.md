@@ -31,10 +31,10 @@ The following table maps the 35 names on `Expression`, sorted alphabetically.
 | `minute` | `Expr.dt.minute` | canonical |  |
 | `month` | `Expr.dt.month` | canonical |  |
 | `nanosecond` | `Expr.dt.nanosecond` | canonical |  |
-| `partition_days` | `bt.partition_days` | canonical |  |
-| `partition_hours` | `bt.partition_hours` | canonical |  |
-| `partition_months` | `bt.partition_months` | canonical |  |
-| `partition_years` | `bt.partition_years` | canonical |  |
+| `partition_days` | {py:obj}`bt.partition_days <batcher.partition_days>` | canonical |  |
+| `partition_hours` | {py:obj}`bt.partition_hours <batcher.partition_hours>` | canonical |  |
+| `partition_months` | {py:obj}`bt.partition_months <batcher.partition_months>` | canonical |  |
+| `partition_years` | {py:obj}`bt.partition_years <batcher.partition_years>` | canonical |  |
 | `quarter` | `Expr.dt.quarter` | canonical |  |
 | `replace_time_zone` | n/a | gap | Not yet: replace\_time\_zone (attach a zone keeping the local time). Wave W6. |
 | `second` | `Expr.dt.second` | canonical |  |
@@ -50,7 +50,7 @@ The following table maps the 35 names on `Expression`, sorted alphabetically.
 | `total_minutes` | n/a | gap | Not yet: Duration total\_minutes. Wave W6. |
 | `total_nanoseconds` | n/a | gap | Not yet: Duration total\_nanoseconds. Wave W6. |
 | `total_seconds` | n/a | gap | Not yet: Duration total\_seconds. Wave W6. |
-| `unix_date` | `bt.partition_days` | canonical |  |
+| `unix_date` | {py:obj}`bt.partition_days <batcher.partition_days>` | canonical |  |
 | `week_of_year` | `Expr.dt.week` | canonical |  |
 | `year` | `Expr.dt.year` | canonical |  |
 
@@ -63,32 +63,32 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | `add_months` | `Expr.dt.offset_by` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (months; offset\_by takes a literal '1mo' string). Wave W2. |
 | `convert_time_zone` | `Expr.dt.convert_timezone` | mismatch | Differs: Daft returns a timezone-aware timestamp in the target zone; Batcher convert\_timezone(from\_tz, to\_tz) rewrites a naive wall-clock and returns a naive timestamp. Needs tz-aware timestamps. Wave W6. |
 | `convert_timezone` | `Expr.dt.convert_timezone` | mismatch | Differs: Daft returns a timezone-aware timestamp in the target zone; Batcher convert\_timezone(from\_tz, to\_tz) rewrites a naive wall-clock and returns a naive timestamp. Needs tz-aware timestamps. Wave W6. |
-| `current_date` | `bt.current_date` | mismatch | Differs: Daft current\_date is the UTC date; Batcher current\_date is the local date bound at plan build, so they differ across midnight in non-UTC zones. Param: tz='UTC'. Wave W6. |
-| `current_timestamp` | `bt.current_timestamp` | mismatch | Differs: Daft current\_timestamp is UTC; Batcher current\_timestamp is a naive local wall clock bound at plan build (22:06 vs 15:06 on a UTC-7 host). Param: tz='UTC'. Wave W6. |
+| `current_date` | {py:obj}`bt.current_date <batcher.current_date>` | mismatch | Differs: Daft current\_date is the UTC date; Batcher current\_date is the local date bound at plan build, so they differ across midnight in non-UTC zones. Param: tz='UTC'. Wave W6. |
+| `current_timestamp` | {py:obj}`bt.current_timestamp <batcher.current_timestamp>` | mismatch | Differs: Daft current\_timestamp is UTC; Batcher current\_timestamp is a naive local wall clock bound at plan build (22:06 vs 15:06 on a UTC-7 host). Param: tz='UTC'. Wave W6. |
 | `current_timezone` | n/a | gap | Not yet: session timezone expression. Wave W6. |
 | `date` | `Expr.dt.date` | canonical |  |
-| `date_add` | `bt.date_add` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
+| `date_add` | {py:obj}`bt.date_add <batcher.date_add>` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
 | `date_diff` | `Expr.dt.days_between` | canonical |  |
 | `date_format` | `Expr.dt.strftime` | param | Missing: optional format (Daft defaults to ISO 8601 with fractional seconds). Wave W2. |
-| `date_from_unix_date` | `bt.from_unix_date` | canonical |  |
-| `date_sub` | `bt.date_sub` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
+| `date_from_unix_date` | {py:obj}`bt.from_unix_date <batcher.from_unix_date>` | canonical |  |
+| `date_sub` | {py:obj}`bt.date_sub <batcher.date_sub>` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
 | `date_trunc` | `Expr.dt.truncate` | param | Missing: multi-unit intervals ('15 minutes') and relative\_to= origin. Wave W6. |
-| `dateadd` | `bt.date_add` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
+| `dateadd` | {py:obj}`bt.date_add <batcher.date_add>` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (days). Wave W2. |
 | `datediff` | `Expr.dt.days_between` | canonical |  |
-| `datepart` | `bt.date_part` | mismatch | Differs: Daft datepart(dayofweek) numbers Monday=0; port it as col.dt.dayofweek(start=monday). Every other part agrees with bt.date\_part. Wave W0. |
+| `datepart` | {py:obj}`bt.date_part <batcher.date_part>` | mismatch | Differs: Daft datepart(dayofweek) numbers Monday=0; port it as col.dt.dayofweek(start=monday). Every other part agrees with bt.date\_part. Wave W0. |
 | `day` | `Expr.dt.day` | canonical |  |
 | `day_of_month` | `Expr.dt.day` | canonical |  |
 | `day_of_week` | `Expr.dt.dayofweek` | canonical |  |
 | `day_of_year` | `Expr.dt.dayofyear` | canonical |  |
 | `dayofmonth` | `Expr.dt.day` | canonical |  |
 | `dayofyear` | `Expr.dt.dayofyear` | canonical |  |
-| `from_unixtime` | `bt.from_epoch` + `Expr.dt.strftime` | canonical |  |
+| `from_unixtime` | {py:obj}`bt.from_epoch <batcher.from_epoch>` + `Expr.dt.strftime` | canonical |  |
 | `from_utc_timestamp` | n/a | gap | Not yet: from\_utc\_timestamp over tz-aware timestamps. Wave W6. |
-| `great_circle_distance` | `bt.great_circle_distance` | mismatch | Differs: Daft returns meters; Batcher defaults to kilometers (157249.4 vs 157.25 for (0,0)-(1,1)), and its docstring wrongly says degrees. Param: unit='m'. Wave W0. |
+| `great_circle_distance` | {py:obj}`bt.great_circle_distance <batcher.great_circle_distance>` | mismatch | Differs: Daft returns meters; Batcher defaults to kilometers (157249.4 vs 157.25 for (0,0)-(1,1)), and its docstring wrongly says degrees. Param: unit='m'. Wave W0. |
 | `hour` | `Expr.dt.hour` | canonical |  |
 | `last_day` | `Expr.dt.last_day` | canonical |  |
-| `make_date` | `bt.make_date` | canonical |  |
-| `make_timestamp` | `bt.make_timestamp` | param | Missing: timezone= argument. Wave W6. |
+| `make_date` | {py:obj}`bt.make_date <batcher.make_date>` | canonical |  |
+| `make_timestamp` | {py:obj}`bt.make_timestamp <batcher.make_timestamp>` | param | Missing: timezone= argument. Wave W6. |
 | `make_timestamp_ltz` | n/a | gap | Not yet: make\_timestamp\_ltz (UTC instant from a zoned wall clock). Wave W6. |
 | `microsecond` | `Expr.dt.microsecond` | canonical |  |
 | `millisecond` | `Expr.dt.millisecond` | canonical |  |
@@ -97,18 +97,18 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | `months_between` | n/a | gap | Not yet: months\_between (fractional months). Wave W6. |
 | `nanosecond` | `Expr.dt.nanosecond` | canonical |  |
 | `next_day` | n/a | gap | Not yet: next\_day(date, day\_of\_week). Wave W6. |
-| `partition_days` | `bt.partition_days` | canonical |  |
-| `partition_hours` | `bt.partition_hours` | canonical |  |
-| `partition_months` | `bt.partition_months` | canonical |  |
-| `partition_years` | `bt.partition_years` | canonical |  |
+| `partition_days` | {py:obj}`bt.partition_days <batcher.partition_days>` | canonical |  |
+| `partition_hours` | {py:obj}`bt.partition_hours <batcher.partition_hours>` | canonical |  |
+| `partition_months` | {py:obj}`bt.partition_months <batcher.partition_months>` | canonical |  |
+| `partition_years` | {py:obj}`bt.partition_years <batcher.partition_years>` | canonical |  |
 | `quarter` | `Expr.dt.quarter` | canonical |  |
 | `replace_time_zone` | n/a | gap | Not yet: replace\_time\_zone (attach a zone keeping the local time). Wave W6. |
 | `second` | `Expr.dt.second` | canonical |  |
 | `strftime` | `Expr.dt.strftime` | param | Missing: optional format (Daft defaults to ISO 8601 with fractional seconds). Wave W2. |
 | `time` | `Expr.dt.time_of_day` | mismatch | Differs: Daft time() returns a TIME value; Batcher time\_of\_day returns microseconds since midnight as Int64. Needs a TIME type. Wave W6. |
-| `timestamp_micros` | `bt.from_epoch` | canonical |  |
-| `timestamp_millis` | `bt.from_epoch` | canonical |  |
-| `timestamp_seconds` | `bt.from_epoch` | canonical |  |
+| `timestamp_micros` | {py:obj}`bt.from_epoch <batcher.from_epoch>` | canonical |  |
+| `timestamp_millis` | {py:obj}`bt.from_epoch <batcher.from_epoch>` | canonical |  |
+| `timestamp_seconds` | {py:obj}`bt.from_epoch <batcher.from_epoch>` | canonical |  |
 | `to_date` | `Expr.str.to_date` | canonical |  |
 | `to_datetime` | `Expr.str.to_datetime` | param | Missing: timezone= for the parsed timestamp. Wave W6. |
 | `to_unix_epoch` | `Expr.dt.timestamp` | canonical |  |
@@ -121,7 +121,15 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | `total_nanoseconds` | n/a | gap | Not yet: Duration total\_nanoseconds. Wave W6. |
 | `total_seconds` | n/a | gap | Not yet: Duration total\_seconds. Wave W6. |
 | `trunc` | `Expr.dt.truncate` | param | Missing: multi-unit intervals ('15 minutes') and relative\_to= origin. Wave W6. |
-| `unix_date` | `bt.partition_days` | canonical |  |
+| `unix_date` | {py:obj}`bt.partition_days <batcher.partition_days>` | canonical |  |
 | `week_of_year` | `Expr.dt.week` | canonical |  |
 | `weekofyear` | `Expr.dt.week` | canonical |  |
 | `year` | `Expr.dt.year` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

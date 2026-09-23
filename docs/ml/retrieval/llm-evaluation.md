@@ -98,6 +98,22 @@ ROUGE-L is the expensive one. Its cost is quadratic in the two token counts wher
 
 Every word-level metric on this page tokenizes with `str.squad_normalize`: lowercase, drop the standalone articles, delete punctuation, collapse whitespace, trim. That shared normalization is what makes the numbers comparable to each other. Two of its rules matter when you read a score. Punctuation is *deleted* rather than replaced, so `cat-dog` is one token and `cat, dog` is two. The articles go entirely, which is right for scoring an answer and wrong for most other cleaning. No reference BLEU implementation does this, so rank runs against each other with these scores and don't publish them against a paper.
 
+### Short rows, empty rows, and nulls
+
+Two rules decide what a reference metric does with an unusual row. The first applies to the word n-gram metrics, and the second to every reference metric above.
+
+A row with fewer than `n` tokens has no n-gram of order `n`. It isn't padded into one, so it scores 0 at that order in {py:func}`bt.ngram_precision <batcher.ngram_precision>`, {py:func}`bt.ngram_recall <batcher.ngram_recall>` and {py:func}`bt.bleu <batcher.bleu>`, and it contributes 0 to {py:func}`bt.distinct_ngram_ratio <batcher.distinct_ngram_ratio>` and {py:func}`bt.ngram_novelty <batcher.ngram_novelty>`. A correct two-word answer therefore has a 4-gram BLEU of 0, which is the unsmoothed definition. Score short answers with `max_n=2`.
+
+A null prediction or a null reference is scored exactly as the empty string would be. The row stays in the corpus mean and counts as a miss: 0 for BLEU, ROUGE, the n-gram overlaps and the token and character set metrics, and a brevity penalty of 0 for a null prediction. So BLEU and ROUGE-L over the same column always average over the same rows. The exact-match metrics keep SQL equality instead, so a null never matches anything, not even another null, and still counts as a miss.
+
+```python
+gaps = bt.from_pydict({"answer": ["cat sat", None, "cat sat"], "gold": ["cat sat", "cat sat", None]})
+print(gaps.agg(bleu=bt.bleu("answer", "gold", max_n=2), rouge=bt.rouge_l_f1("answer", "gold")).to_pydict())
+# {'bleu': [0.3333333333333333], 'rouge': [0.3333333333333333]}
+```
+
+Filter nulls out first with `ds.filter(bt.col("gold").is_not_null())` when a missing reference means the row was never labelled rather than that the model failed it.
+
 For a score this page doesn't spell, build it from the primitives on the expression accessors. `list.lcs_length` returns the longest common subsequence length of two list columns. `str.token_ngrams(n)` turns text into its list of n-grams, and `list.multiset_overlap` counts how many of one list's elements another can account for, capping each at its number of occurrences. Divide either by whichever length your score calls for:
 
 ```python
@@ -118,7 +134,7 @@ print(grams.select(shared=pred.list.multiset_overlap(gold), total=pred.list.len(
 
 Most generations arrive with no gold answer. You still want to know whether the output is diverse or repeating, how long it is, and how often it's empty, a refusal, or cut off. Each of these reads one output column.
 
-`bt.distinct_token_ratio` is the Distinct-1 diversity score, the cheap detector of a model degenerating into repetition. {py:func}`bt.mean_output_tokens <batcher.mean_output_tokens>` tracks verbosity and sizes the token bill. {py:func}`bt.empty_generation_rate <batcher.empty_generation_rate>`, {py:func}`bt.refusal_rate <batcher.refusal_rate>` and {py:func}`bt.truncation_rate <batcher.truncation_rate>` are the failure rates worth a dashboard: silent empty outputs, declined answers, and responses that stop mid-sentence.
+{py:obj}`bt.distinct_token_ratio <batcher.distinct_token_ratio>` is the Distinct-1 diversity score, the cheap detector of a model degenerating into repetition. {py:func}`bt.mean_output_tokens <batcher.mean_output_tokens>` tracks verbosity and sizes the token bill. {py:func}`bt.empty_generation_rate <batcher.empty_generation_rate>`, {py:func}`bt.refusal_rate <batcher.refusal_rate>` and {py:func}`bt.truncation_rate <batcher.truncation_rate>` are the failure rates worth a dashboard: silent empty outputs, declined answers, and responses that stop mid-sentence.
 
 ```python
 gens = bt.from_pydict(
@@ -211,7 +227,9 @@ The following table lists seven more families of single-scan monitors, grouped b
 | Tone | {py:func}`bt.question_rate <batcher.question_rate>` (an answer deflected with a question), {py:func}`bt.exclamation_rate <batcher.exclamation_rate>`, {py:func}`bt.politeness_rate <batcher.politeness_rate>`, {py:func}`bt.hedge_rate <batcher.hedge_rate>`, {py:func}`bt.first_person_rate <batcher.first_person_rate>`, {py:func}`bt.contains_phrase_rate <batcher.contains_phrase_rate>` (a configurable phrase) |
 | Language | {py:func}`bt.cjk_rate <batcher.cjk_rate>`, {py:func}`bt.cyrillic_rate <batcher.cyrillic_rate>`, {py:func}`bt.arabic_rate <batcher.arabic_rate>`, {py:func}`bt.emoji_rate <batcher.emoji_rate>`, {py:func}`bt.latin_only_rate <batcher.latin_only_rate>` (the share of pure-ASCII outputs) |
 
-`bt.distinct_token_ratio` covers word-level degeneration alongside the character-level scores in the table.
+{py:obj}`bt.distinct_token_ratio <batcher.distinct_token_ratio>` covers word-level degeneration alongside the character-level scores in the table.
+
+The reading-level scores count the way their definitions do. The ARI counts letters and digits, not spaces or punctuation, and skips a row with no words rather than grading it `-21.43`, so empty outputs don't drag the corpus grade down. A sentence ends at a run of terminators followed by whitespace or the end of the text, so `Wait... what?` is two sentences, the decimal point in `3.14` ends none, and the CJK full stop ends one without a following space. Word lengths count Unicode letters, so an accented or Cyrillic word is as long as it looks. {py:func}`bt.repeated_line_rate <batcher.repeated_line_rate>` ignores blank lines, so the gaps between paragraphs aren't a repeated line.
 
 ## Grade with a judge model
 
@@ -283,11 +301,11 @@ Wire up {py:func}`bt.hidden_unicode_rate <batcher.hidden_unicode_rate>` first. Z
 
 {py:func}`bt.encoded_payload_rate <batcher.encoded_payload_rate>` finds the other way past a reviewer: a long unbroken base64 run that the model decodes and follows.
 
-Where an agent turns text into actions, {py:func}`bt.code_execution_rate <batcher.code_execution_rate>` counts shell and interpreter calls, {py:func}`bt.sql_injection_rate <batcher.sql_injection_rate>` the textbook query payloads, and {py:func}`bt.unsafe_html_rate <batcher.unsafe_html_rate>` the active markup you must not render. None of the three is automatically a violation, since a coding assistant emits shell commands legitimately. Read them as a volume to review.
+Where an agent turns text into actions, {py:func}`bt.code_execution_rate <batcher.code_execution_rate>` counts shell and interpreter calls, {py:func}`bt.sql_injection_rate <batcher.sql_injection_rate>` the textbook query payloads, and {py:func}`bt.unsafe_html_rate <batcher.unsafe_html_rate>` the active markup you must not render. None of the three is automatically a violation, since a coding assistant emits shell commands legitimately. Read them as a volume to review. A SQL comment counts only after a closing quote or semicolon, as in `admin'--`, so a Markdown rule (`---`) or PEM armor isn't a SQL payload.
 
 ### Monitor what leaves
 
-{py:func}`bt.system_prompt_echo_rate <batcher.system_prompt_echo_rate>` measures whether a prompt-extraction attempt succeeded. It counts generations that reproduce an `n`-token span of the system prompt verbatim, the companion to `bt.instruction_override_rate`, which counts what arrived.
+{py:func}`bt.system_prompt_echo_rate <batcher.system_prompt_echo_rate>` measures whether a prompt-extraction attempt succeeded. It counts generations that reproduce an `n`-token span of the system prompt verbatim, the companion to {py:obj}`bt.instruction_override_rate <batcher.instruction_override_rate>`, which counts what arrived.
 
 ```python
 runs = bt.from_pydict(
@@ -302,6 +320,10 @@ print(runs.agg(leaked=bt.system_prompt_echo_rate("answer", "system")).to_pydict(
 
 {py:func}`bt.credential_leak_rate <batcher.credential_leak_rate>` recognizes public API-token formats, and {py:func}`bt.private_key_rate <batcher.private_key_rate>` recognizes PEM and OpenSSH armor lines. Both are specific enough to alert on directly. {py:func}`bt.url_exfiltration_rate <batcher.url_exfiltration_rate>` and {py:func}`bt.data_uri_rate <batcher.data_uri_rate>` cover the delivery channels. A markdown image whose URL encodes the conversation is fetched on render with no click, and a `data:text/html;base64,` URI is a page you didn't write running in your origin.
 
+## On a cluster
+
+Every metric on this page is an aggregate expression, so it runs wherever the query runs. `collect(distributed=True, num_workers=4)` over a grouped evaluation returns the same scores as `collect(distributed=False)`, up to float reassociation in the last bits, because each metric is a mean of per-row scores that merges like any other mean.
+
 ## Requirements and limitations
 
 The following limits apply to the metrics on this page:
@@ -309,6 +331,8 @@ The following limits apply to the metrics on this page:
 - Every lexical and safety monitor is a surface heuristic. It sizes a problem across a corpus and alerts on a change. It shouldn't be what stands between a retrieved document and a tool call.
 - Word-level scores use SQuAD normalization, so they rank runs against each other but aren't comparable with a reference BLEU or ROUGE implementation.
 - ROUGE-L is quadratic per row in the token counts.
+- A null prediction or reference scores as an empty string, a miss, except in the exact-match metrics, where a null never matches. Filter unlabelled rows out first when a missing reference isn't a failure.
+- A row shorter than `n` tokens has no n-gram of order `n`, so unsmoothed 4-gram BLEU is 0 on short answers.
 - Judge verdicts inherit the judge model's biases, so calibrate them against human labels.
 
 ## See also

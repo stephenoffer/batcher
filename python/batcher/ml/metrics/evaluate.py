@@ -215,9 +215,17 @@ def evaluate(
     here says how many rows survived, so check that yourself when nulls are possible:
     ``ds.filter(bt.col(y_pred).is_null()).count()``.
 
-    A metric that is undefined for the data returns ``nan`` rather than raising — `roc_auc`
-    and `balanced_accuracy` when only one class is present, `precision`/`recall`/`f1` when
-    there are no positives. A `nan` in the report means "not defined here", not "zero".
+    A metric that is undefined for the data returns a value rather than raising, following
+    scikit-learn: `precision`/`recall`/`f1` are 0.0 when their denominator is empty (its
+    ``zero_division=0``), `balanced_accuracy` averages only the classes present, and
+    `roc_auc`/`ks`/`gini` are ``nan`` for a group with only one class, where scikit-learn
+    raises. A ``nan`` in the report means "not defined here", not "zero".
+
+    When the hard prediction is derived from `y_score`, a row scored at or above `threshold`
+    is predicted `positive` and any other row is predicted *the negative class*, so a negative
+    row scored below the threshold counts as correct whatever its label value is (``"no"``,
+    ``2``, ``False``). A null or NaN score yields no prediction, and the row is left out of
+    the label metrics.
 
     Args:
         ds: The dataset holding labels and predictions.
@@ -254,8 +262,6 @@ def evaluate(
             >>> round(evaluate(ds, "y", y_pred="p", task="regression")["mae"], 6)
             0.333333
     """
-    from batcher.plan.expr_ir.constructors import col, lit, when
-
     resolved = _resolve_task(task, y_pred, y_score, ds, y_true, max_classes)
     if metrics is not None:
         requested = list(metrics)
@@ -281,9 +287,9 @@ def evaluate(
         prediction = "__bt_hard_pred"
         frame = ds.with_columns(
             **{
-                prediction: when(col(y_score) >= lit(threshold))
-                .then(lit(positive))
-                .otherwise(lit(_negative_of(positive)))
+                prediction: _hard_prediction(
+                    y_true, y_score, threshold=threshold, positive=positive
+                )
             }
         )
 
@@ -330,12 +336,38 @@ def _rank_metric_names() -> frozenset[str]:
 
 
 def _negative_of(positive: Any) -> Any:
-    """A value distinct from `positive` to use as the derived negative label."""
+    """A value distinct from `positive`, of the same type, for a missed positive's prediction."""
     if isinstance(positive, bool):
         return not positive
     if isinstance(positive, (int, float)):
         return 0 if positive != 0 else 1
     return f"not_{positive}"
+
+
+def _hard_prediction(y_true: str, y_score: str, *, threshold: float, positive: Any) -> Any:
+    """The label predicted from a score: `positive` at or above `threshold`, else the negative.
+
+    A binary task has one negative class, so a row predicted negative is predicted *its*
+    class when the label is negative, and a stand-in non-positive value when it is positive.
+    Predicting a fixed stand-in for every negative row made `accuracy`, which compares values,
+    count every correctly rejected ``"no"`` (or ``2``) as wrong: 0.25 against scikit-learn's
+    0.50 on balanced random scores. The confusion-count metrics were right either way, since
+    they compare against `positive` only.
+
+    A null or NaN score predicts nothing. The engine orders NaN above every number, so
+    ``score >= threshold`` held for it and a NaN score was predicted positive.
+    """
+    from batcher.plan.expr_ir.constructors import col, lit, when
+
+    score, label = col(y_score), col(y_true)
+    negative = (
+        when(label.is_not_null() & (label != lit(positive)))
+        .then(label)
+        .otherwise(lit(_negative_of(positive)))
+    )
+    predicted = when(score >= lit(threshold)).then(lit(positive)).otherwise(negative)
+    # No `otherwise`: an unscored row falls through to null in the label's own type.
+    return when(score.is_not_null() & ~score.is_nan()).then(predicted)
 
 
 def multiclass_averages(

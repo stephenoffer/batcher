@@ -86,6 +86,12 @@ def _resilient_call(
             _empty_cuda_cache()
         if sub.num_rows <= 1:
             if oom or not _claim_dropped_row(budget, exc):
+                if not oom and len(budget) > 1:  # rows were dropped, so this is a spent budget
+                    exc.add_note(
+                        f"map_batches: max_errored_rows exceeded -- {budget[1]} row(s) were "
+                        "already dropped, which spent the allowance, and this row failed too. "
+                        "Raise max_errored_rows, or fix the rows that fail."
+                    )
                 raise  # genuine single-row over-allocation, or the error budget is spent
             return []  # drop the one corrupt row and carry on
         mid = sub.num_rows // 2
@@ -161,7 +167,19 @@ def _formatted(fn: Any, fmt: str) -> Any:
     from batcher.interop.formats import result_to_arrowable, to_format
 
     def _call(batch: pa.RecordBatch) -> object:
-        return result_to_arrowable(fn(to_format(batch, fmt)), fmt)
+        try:
+            result = fn(to_format(batch, fmt))
+        except ValueError as exc:
+            # NumPy's "assignment destination is read-only": the zero-copy conversion hands
+            # the fn views over Arrow memory, and the fix is one keyword away.
+            if "read-only" in str(exc):
+                exc.add_note(
+                    f"map_batches: a batch_format={fmt!r} batch is a zero-copy view of Arrow "
+                    "memory, so it is read-only. Pass zero_copy_batch=False to give the fn a "
+                    "writable copy, or build new arrays instead of writing into the batch."
+                )
+            raise
+        return result_to_arrowable(result, fmt)
 
     return _call
 

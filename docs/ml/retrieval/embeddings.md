@@ -246,7 +246,7 @@ print(chunks.to_pydict()["chunk"])
 
 `overlap` keeps a sentence cut across a boundary whole in one of the two chunks. Sizes are in characters, so pick one comfortably under the model's token limit, using about 4 characters per token as a rough rule. Keep the document id on the row so a retrieved chunk can be traced to its source. {doc}`RAG </ml/retrieval/rag>` walks the full ingest.
 
-If you want one vector per document instead, the lower-level `batcher.ml.embed` takes `chunk_size` and `chunk_overlap`. It encodes every window in the same batched call and averages a row's windows back into one vector.
+If you want one vector per document instead, the lower-level {py:obj}`batcher.ml.embed <batcher.ml.embed>` takes `chunk_size` and `chunk_overlap`. It encodes every window in the same batched call and averages a row's windows back into one vector.
 
 ## Store the vectors
 
@@ -313,7 +313,7 @@ print(round(mixed.agg(bad=bt.embedding_dim_drift("v", 3)).to_pydict()["bad"][0],
 # 0.3333
 ```
 
-The usual cause is a re-embed with a different model, or a read spanning a corpus embedded in two passes. `bt.mean_cosine_similarity` catches the same failure from the other side: score both populations against one fixed reference vector and compare. Two vector spaces mixed into one index look identical row by row. In aggregate they separate immediately.
+The usual cause is a re-embed with a different model, or a read spanning a corpus embedded in two passes. {py:obj}`bt.mean_cosine_similarity <batcher.mean_cosine_similarity>` catches the same failure from the other side: score both populations against one fixed reference vector and compare. Two vector spaces mixed into one index look identical row by row. In aggregate they separate immediately.
 
 ## See also
 

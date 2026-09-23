@@ -190,3 +190,98 @@ def test_no_entry_describes_a_name_that_now_exists(label):
         f"{label} guidance still redirects names that exist: {live}. "
         "Delete the entry — `__getattr__` can no longer reach it."
     )
+
+
+# --- the idioms themselves, executed ---------------------------------------------------
+#
+# The checks above verify that every *name* a suggestion mentions exists, is spelled as a
+# call, and is handed a unit its function accepts. That is not enough, and two suggestions
+# written on one afternoon proved it: both named only real methods and both raised when run.
+#
+# The first suggested an `arg_max` with no `order_by`, which the planner rejects; the second
+# passed a derived expression positionally to `group_by`, which requires a keyword alias.
+#
+# Neither is reachable by inspecting names. What catches them is running the idiom, and the
+# reason the module docstring says these checks are "structural rather than exec the string"
+# still holds -- the strings are prose with placeholder columns, so most of them cannot be
+# executed as written. So this does the tractable half: a curated list of the idioms a
+# migrant is most likely to copy verbatim, executed against a fixture that has the columns
+# they name. It grows when a suggestion is added, which is the point.
+
+_FIXTURE = """bt.from_pydict({
+    'a': [3.0, 1.0, 2.0, 5.0],
+    'b': [1.0, 2.0, 3.0, 4.0],
+    'g': ['x', 'y', 'x', 'y'],
+    't': [_dt(0), _dt(1), _dt(2), _dt(3)],
+})"""
+
+#: Idioms lifted verbatim from the guidance tables. Each must run against `_FIXTURE`.
+_COPYABLE_IDIOMS = [
+    "ds.drop_nulls('a')",
+    "ds.filter(bt.col('a').is_not_null())",
+    "ds.sort('a', descending=True).limit(1)",
+    "ds.with_columns(r=bt.col('a').rank())",
+    "ds.with_columns(filled=bt.col('a').forward_fill().over(order_by='t'))",
+    "ds.with_columns(filled=bt.col('a').backward_fill().over(order_by='t'))",
+    "ds.with_columns(r=bt.col('a').cum_prod().over(partition_by=['g'], order_by='a'))",
+    "ds.with_columns(r=bt.col('a').ewm_mean(alpha=0.5).over(partition_by=['g'], order_by='t'))",
+    "ds.with_columns(s=bt.col('a').sum().over(partition_by=['g']))",
+    "ds.with_columns(same=bt.col('a') == bt.col('b'))",
+    "ds.with_columns(p=bt.col('a').shift(1).over(order_by='t'))",
+    "ds.group_by('g').agg(r=bt.corr(bt.col('a'), bt.col('b')))",
+    "ds.group_by('g').first('a', order_by='a')",
+    "ds.group_by('g').last('a', order_by='a')",
+    "ds.group_by(hour=bt.col('t').dt.truncate('hour')).agg(n=bt.col('a').mean())",
+    "ds.group_by('g', hour=bt.col('t').dt.truncate('hour')).agg(n=bt.col('a').mean())",
+    "ds.group_by('g', bucket=bt.col('a').floor()).agg(n=bt.count())",
+    "ds.filter(bt.col('t').dt.is_between_time('09:00', '17:00'))",
+    "ds.filter(bt.col('t').dt.hour() == 9)",
+    "ds.with_columns(h=bt.col('t').dt.convert_timezone('UTC', 'Europe/Paris'))",
+    "ds.with_columns(m=bt.col('t').dt.truncate('month'))",
+    "ds.with_columns(ts=bt.col('t').cast('timestamp(us)'))",
+    "ds.with_columns(r=bt.col('a').rank().over(partition_by=['g'])).filter(bt.col('r') <= 5)",
+]
+
+
+def _run_idiom(source: str):
+    """Execute one idiom against the fixture, returning its collected result."""
+    import datetime
+
+    namespace = {
+        "bt": bt,
+        "_dt": lambda i: datetime.datetime(2024, 1, 1, 9, 30) + datetime.timedelta(hours=i),
+    }
+    namespace["ds"] = eval(_FIXTURE, namespace)
+    return eval(source, namespace).to_pydict()
+
+
+@pytest.mark.parametrize("idiom", _COPYABLE_IDIOMS)
+def test_a_suggested_idiom_runs(idiom):
+    """A migrant copies the whole line out of the traceback, not just the method name."""
+    result = _run_idiom(idiom)
+    assert result, f"{idiom} produced an empty result, so it proves nothing"
+
+
+@pytest.mark.parametrize("idiom", _COPYABLE_IDIOMS)
+def test_every_listed_idiom_appears_in_the_guidance(idiom):
+    """The list is only worth running while it is drawn from the tables it protects.
+
+    Without this it would drift into a set of idioms nobody suggests, passing forever while
+    the suggestions it was written for went unchecked.
+    """
+    haystack = "\n".join(text for table in TABLES.values() for text in table.values())
+    # Match on the call that makes the idiom distinctive, ignoring the output alias a
+    # `with_columns` wraps it in: the tables name `bt.col('a').rank()`, not `r=...`.
+    inner = re.sub(r"^ds\.with_columns\([a-z_]+=", "", idiom).rstrip(")")
+    needle = max(re.findall(r"[A-Za-z_]+\([^()]*\)", inner) or [inner], key=len)
+    assert needle in haystack, f"{idiom!r} is not suggested anywhere; drop it or add the entry"
+
+
+def test_the_idiom_runner_would_notice_a_broken_suggestion():
+    """The guard on this guard: the two real failures must still fail."""
+    for broken in (
+        "ds.agg(r=bt.col('a').arg_max())",
+        "ds.group_by(bt.col('t').dt.truncate('hour')).agg(n=bt.col('a').mean())",
+    ):
+        with pytest.raises(Exception):  # noqa: B017 - any engine rejection is the point
+            _run_idiom(broken)

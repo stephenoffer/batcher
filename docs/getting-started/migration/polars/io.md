@@ -26,13 +26,13 @@ The following table maps the 38 names on the `polars` module, sorted alphabetica
 | `CredentialProviderFunctionReturn` | `batcher.io.credentials` | param | Missing: credential-provider return type (credentials, expiry). Wave W13. |
 | `CredentialProviderGCP` | `batcher.io.credentials` | param | Missing: Google Cloud credential-provider object. Wave W13. |
 | `FileProviderArgs` | n/a | gap | Not yet: per-partition file-name provider for sinks. Wave W13. |
-| `from_dataframe` | `bt.from_any` | param | Missing: allow\_copy= and rechunk=. Wave W13. |
+| `from_dataframe` | {py:obj}`bt.from_any <batcher.from_any>` | param | Missing: allow\_copy= and rechunk=. Wave W13. |
 | `json_normalize` | n/a | gap | Not yet: json\_normalize (flatten nested JSON records). Wave W13. |
 | `PartitionBy` | `Dataset.write.parquet` | param | Missing: a PartitionBy object (key columns, include\_key, per-partition file names). Wave W13. |
 | `read_avro` | `bt.read.avro` | canonical |  |
 | `read_clipboard` | n/a | out of scope | Declined: clipboard IO is a desktop convenience, not a data engine source. |
 | `read_csv` | `bt.read.csv` | canonical |  |
-| `read_csv_batched` | `bt.read.csv` + `Dataset.iter_batches` | canonical |  |
+| `read_csv_batched` | `bt.read.csv` + {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | canonical |  |
 | `read_database` | `bt.read.sql` | canonical |  |
 | `read_database_uri` | `bt.read.sql` | canonical |  |
 | `read_delta` | `bt.read.delta` | canonical |  |
@@ -56,3 +56,11 @@ The following table maps the 38 names on the `polars` module, sorted alphabetica
 | `scan_parquet` | `bt.read.parquet` | param | Missing: reader options: row\_index\_name=, include\_file\_paths=, allow\_missing\_columns=, cast\_options=, credential\_provider=, retries=. Wave W2. |
 | `scan_pyarrow_dataset` | n/a | gap | Not yet: scan a pyarrow.dataset.Dataset lazily. Wave W13. |
 | `ScanCastOptions` | `bt.read.parquet` | param | Missing: cast\_options= for schema-evolution casts on scan. Wave W2. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Polars pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

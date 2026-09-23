@@ -405,7 +405,7 @@ The result is a lazy {py:class}`Dataset <batcher.Dataset>` rather than an eager 
 
 The connectors on this page are shaped for moving and transforming data: extract, join, aggregate, write back. A point lookup still pushes its predicate all the way down, so the server does an index seek and returns one row. What remains is Batcher's own fixed cost of planning, optimizing and crossing into the engine, which is nothing amortized over a million rows and most of the query at one row.
 
-Measured on a 50,000-row SQLite table with a varying key, a lookup took about 3.5 ms against 0.01 ms through the driver directly, and one process served roughly 260 lookups a second. Turning off `observability.event_log` brought that to 2.93 ms and about 374 a second. Threads do not raise the ceiling, because plan construction and optimization hold the GIL. The figures and the method are in `benchmarks/BENCHMARK_RESULTS.md`. For a lookup behind a request path, call the driver.
+Measured on a 50,000-row SQLite table with a varying key, a lookup took about 3.5 ms against 0.01 ms through the driver directly, and one process served roughly 260 lookups a second. Turning off `observability.event_log` brought that to 2.93 ms and about 374 a second. Threads do not raise the ceiling, because plan construction and optimization hold the GIL. The figures and the method are in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md). For a lookup behind a request path, call the driver.
 
 ## Requirements and limitations
 

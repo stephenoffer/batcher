@@ -268,3 +268,58 @@ def test_a_batch_factory_source_stays_single_node(multinode):
     assert resolve_distributed("auto", None, [src]) is False
     # An explicit request still wins — a caller may have a factory every worker can run.
     assert resolve_distributed(True, None, [src]) is True
+
+
+def _with_mode(monkeypatch, mode: str) -> None:
+    import dataclasses
+
+    from batcher.config import active_config
+
+    base = active_config()
+    pinned = base.replace(distributed=dataclasses.replace(base.distributed, mode=mode))
+    monkeypatch.setattr("batcher.config.active_config", lambda: pinned)
+
+
+def test_mode_always_distributes_what_auto_would_keep_local(multinode, monkeypatch):
+    """`distributed.mode` reaches the terminals that take no `distributed=` argument.
+
+    `ds.meta`, `ds.dq.validate()` and the scalar terminals (`count`, `min`) all run with
+    `"auto"`, so a session pin is the only way to put them on the cluster. The control is
+    the same call without the pin: a tiny input stays single-node on `auto`.
+    """
+    assert resolve_distributed("auto", None, [_Src(10)]) is False
+    _with_mode(monkeypatch, "always")
+    assert resolve_distributed("auto", None, [_Src(10)]) is True
+
+
+def test_mode_never_keeps_what_auto_would_distribute_local(multinode, monkeypatch):
+    assert resolve_distributed("auto", None, [_Src(50_000_000)]) is True
+    _with_mode(monkeypatch, "never")
+    assert resolve_distributed("auto", None, [_Src(50_000_000)]) is False
+
+
+def test_mode_always_needs_no_live_ray(monkeypatch):
+    """`always` must not wait for something else to have imported Ray: the explicit
+    `distributed=True` it stands in for starts one, so the pin does too."""
+    monkeypatch.delitem(__import__("sys").modules, "ray", raising=False)
+    _with_mode(monkeypatch, "always")
+    assert resolve_distributed("auto", None, None) is True
+
+
+@pytest.mark.parametrize("mode", ["always", "never"])
+def test_an_explicit_argument_beats_the_mode(mode, monkeypatch):
+    _with_mode(monkeypatch, mode)
+    assert resolve_distributed(True, None, [_Src(10)]) is True
+    assert resolve_distributed(False, None, [_Src(10)]) is False
+
+
+def test_mode_is_validated_and_scoped():
+    from batcher._internal.errors import ConfigError
+    from batcher.config import active_config, option_context, set_option
+
+    assert active_config().distributed.mode == "auto"
+    with option_context("distributed.mode", "never"):
+        assert active_config().distributed.mode == "never"
+    assert active_config().distributed.mode == "auto"
+    with pytest.raises(ConfigError, match=r"distributed\.mode"):
+        set_option("distributed.mode", "sometimes")

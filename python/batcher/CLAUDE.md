@@ -59,10 +59,14 @@ lists/dicts to move data. Narrow numeric types are normalized once at the bounda
 **Ray is scheduling only.** Bulk Arrow batches move via `bc-transport` (Arrow Flight), never
 through the Ray object store. `dist/` composes the *same* mergeable primitives as single-node
 — a result MUST be identical whether produced on one node or a hundred: same row multiset,
-same column names, same column *types*. The one stated exception is float reassociation (IEEE
-addition is not associative, so partition count moves the last bits); see
-`.claude/rules/python-control-plane.md`. Do not restate this as bit-identity — it is not what
-the code does, and `assert_same` cannot see the difference either way.
+same column names, same column *types*. There are **four** stated exceptions, not one: float
+reassociation (IEEE addition is not associative, so partition count moves the last bits), a
+window tie its `ORDER BY` leaves open, a `LIMIT` over an unordered relation, and a collecting
+aggregate such as `array_agg` with no `order_by`. Each is a place the *query* fixes no answer;
+none licenses a difference anywhere else. `.claude/rules/python-control-plane.md` states the
+bound on each — read it before calling a divergence expected. Do not restate this as
+bit-identity — it is not what the code does, and `assert_same` cannot see the difference
+either way.
 
 ## Quality gates
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
+from batcher.plan.functions.collection import element
 from batcher.plan.functions.metrics.text._text import char_ngrams, mean_ratio, tokens
 from batcher.plan.functions.string import is_refusal
 
@@ -226,7 +227,8 @@ def repeated_line_rate(text: IntoExpr) -> Expr:
     Splits each output on newlines and flags it when it has fewer unique lines than total lines,
     then reports the share of flagged outputs over the corpus. It is the cheapest catch for the
     list- or paragraph-repetition failure, where a model emits the same line twice. An output with
-    all-distinct lines does not count.
+    all-distinct lines does not count, and neither do blank lines: lines are compared with their
+    surrounding whitespace stripped, and empty ones (the gaps between paragraphs) are skipped.
 
     Args:
         text: The generated-text column (name or expression).
@@ -242,8 +244,11 @@ def repeated_line_rate(text: IntoExpr) -> Expr:
             >>> round(ds.agg(r=bt.repeated_line_rate("o")).to_pydict()["r"][0], 4)
             0.5
     """
-    lines = _as_column(text).str.split("\n")
-    has_repeat = lines.list.n_unique() < lines.list.len()
+    # Blank lines are layout, not content: a paragraph break is an empty line, and two of them
+    # in an ordinary three-paragraph answer read as "a repeated line". So are trailing spaces.
+    lines = _as_column(text).str.split("\n").list.transform(element().str.trim())
+    content = lines.list.filter(element() != lit(""))
+    has_repeat = content.list.n_unique() < content.list.len()
     return count_if(has_repeat) / count_if(lit(True))
 
 

@@ -115,4 +115,4 @@ All four average over frames and skip frames with no energy. Counting a silent f
 - {doc}`/ml/preparing/multimodal/curating`: the same triage question for images.
 - {doc}`/ml/preparing/multimodal/video`: the `.video` accessor, which follows the same null-on-failure convention.
 - {doc}`/ml/preparing/multimodal/pipelines`: offloading large payloads and feeding a model stage.
-- {doc}`/api/relational/expression-accessors`: the full `.audio` method list.
+- {doc}`/api/accessors/media`: the full `.audio` method list, with signatures.

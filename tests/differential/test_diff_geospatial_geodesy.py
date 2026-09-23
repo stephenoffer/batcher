@@ -6,13 +6,16 @@ coordinate units, and every one of those answers has an independent oracle:
 * **Reprojection** (``st_transform``) is checked against PROJ, which DuckDB's spatial
   extension links. Web Mercator agrees to the last bits; UTM agrees to under a micrometre
   inside the zone.
-* **Ellipsoidal distance** (``st_distance_spheroid``) is Vincenty on WGS 84 and agrees
-  with PROJ's geodesic solver to eleven significant figures.
-* **Spherical measures** (``st_distance_sphere`` and the ``*_spheroid`` area, length and
-  perimeter, which ``bc_geo::proj::geodesy`` computes on one mean-radius sphere) agree
-  with the ellipsoidal answer only to the **0.5%** that module documents as the price of
-  the sphere. That band is asserted from both sides: too loose and a factor-of-two error
-  passes, too tight and the test is wrong about which model the code uses.
+* **Ellipsoidal measures** (``st_distance_spheroid`` and the ``*_spheroid`` area, length
+  and perimeter) are Karney's algorithm on WGS 84 (``bc_geo::proj::karney``), the same
+  one GeographicLib, PROJ and DuckDB use, and are held to it at nine significant figures
+  or better. They used to be Vincenty (distance) and one mean-radius sphere (the rest),
+  and this file asserted the sphere's 0.5% band from both sides; it said to tighten the
+  file when the implementation moved to the ellipsoid, and that is what happened.
+* **Spherical distance** (``st_distance_sphere``) agrees with the ellipsoidal answer only
+  to the **0.5%** the sphere costs. That band is asserted from both sides: too loose and
+  a factor-of-two error passes, too tight and the test is wrong about which model the
+  code uses.
 
 **The coordinate order is the trap this file exists to pin.** DuckDB's
 ``ST_Distance_Sphere``, ``ST_Distance_Spheroid`` and ``ST_Transform`` read a point as
@@ -36,10 +39,13 @@ pytestmark = pytest.mark.differential
 
 duckdb = pytest.importorskip("duckdb")
 
-#: The mean-radius sphere `bc_geo::proj::geodesy` uses, and the accuracy its module
-#: docstring claims against the ellipsoid. Both are restated here on purpose: this test
-#: is what holds the claim to the code.
+#: The accuracy `bc_geo::proj::geodesy` claims for its mean-radius sphere against the
+#: ellipsoid. Restated here on purpose: this test is what holds the claim to the code.
 SPHERE_TOLERANCE = 5e-3
+
+#: How closely the ellipsoidal measures track GeographicLib (via DuckDB). Karney's
+#: algorithm is accurate to round-off; 1e-9 leaves room for summation order only.
+ELLIPSOID_TOLERANCE = 1e-9
 
 #: Well-known places, as (longitude, latitude). Spread across all four quadrants and
 #: both hemispheres so a sign or a swapped ordinate cannot survive.
@@ -94,7 +100,7 @@ def test_duckdb_still_reads_a_geodesic_point_as_latitude_first(spatial):
 
 
 def test_ellipsoidal_distance_matches_projs_geodesic(spatial):
-    """Vincenty on WGS 84, against PROJ, to eleven significant figures."""
+    """Karney on WGS 84, against GeographicLib, to eleven significant figures."""
     ds = bt.from_pydict({"a": [_wkt(a) for a, _ in PAIRS], "b": [_wkt(b) for _, b in PAIRS]})
     got = ds.select(v=bt.st_distance_spheroid(bt.col("a"), bt.col("b"))).to_pydict()["v"]
     for (a, b), metres in zip(PAIRS, got, strict=True):
@@ -162,13 +168,14 @@ def test_dwithin_sphere_agrees_with_the_distance_it_thresholds():
         assert got["outside"] == [False], f"{a} -> {b} is not within one millimetre less"
 
 
-def test_geodesic_area_length_and_perimeter_track_geos_inside_the_sphere_band(spatial):
-    """The ``*_spheroid`` measures, which Batcher computes on the sphere.
+def test_geodesic_area_length_and_perimeter_match_geographiclib(spatial):
+    """The ``*_spheroid`` measures, on the WGS 84 ellipsoid.
 
-    The name says spheroid and the implementation is spherical excess (see
-    ``bc_geo::proj::geodesy``), so these agree with GEOS's ellipsoidal answer to the
-    documented 0.5% and no better. Asserting equality would be wrong; asserting nothing
-    would let a hemisphere-sized error through. The band is asserted in both directions.
+    These were spherical (spherical excess for area, summed haversine for length and
+    perimeter) and agreed with GeographicLib only to the sphere's 0.5%; this test held
+    them to that band from both sides, with a note to tighten it if the implementation
+    moved to the ellipsoid. It did (``bc_geo::proj::karney``), so the band is now
+    ``ELLIPSOID_TOLERANCE``.
     """
     geometries = [
         "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
@@ -198,11 +205,7 @@ def test_geodesic_area_length_and_perimeter_track_geos_inside_the_sphere_band(sp
             if want == 0.0:
                 assert ours == 0.0, f"{key} of {geom} is not zero off its own type"
                 continue
-            assert ours == pytest.approx(want, rel=SPHERE_TOLERANCE), f"{key} of {geom}"
-            assert ours != want, (
-                f"{key} of {geom} matched the ellipsoid exactly -- if the implementation "
-                "moved to the ellipsoid, tighten this file rather than deleting the check"
-            )
+            assert ours == pytest.approx(want, rel=ELLIPSOID_TOLERANCE), f"{key} of {geom}"
 
 
 def test_project_walks_the_distance_and_bearing_it_was_given():

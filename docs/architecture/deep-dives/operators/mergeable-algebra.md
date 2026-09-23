@@ -114,7 +114,7 @@ bounds, which breaks the guarantee this whole design exists to give. KLL still s
 The list-state aggregates (`median`, `count_distinct`) are **exact and mergeable, at the cost
 of memory linear in the group's values**. That is a real trade. When you can't afford it,
 `approx_count_distinct` and `approx_quantile` give you a bounded-error sketch state instead
-(`crates/bc-sketches/`), which merges in constant space with a fixed seed.
+([`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches)), which merges in constant space with a fixed seed.
 
 Both of those sketches reach the *same state* in any merge order, which is stronger than
 merging correctly and is why they are the two the aggregates use. A HyperLogLog folds
@@ -128,7 +128,7 @@ contrast: they compact and re-cluster as they merge, so they stay on the estimat
 Mergeability is worthless if two code paths disagree about what makes two keys "the same".
 The group assigner, the radix combine, the shuffle, the join, and the window are separate code
 paths for performance reasons, but they answer one semantic question, so the answer lives in
-exactly one place: `crates/bc-runtime/src/keys.rs`.
+exactly one place: [`crates/bc-runtime/src/keys.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/keys.rs).
 
 :::{warning}
 Getting this wrong doesn't reorder rows. It splits a group. If the shuffle disagrees with the
@@ -203,13 +203,13 @@ partition.
 
 This isn't a special spilling algorithm. It's the distributive equivalence property, used
 locally to bound memory. The same grace machinery, on the `PARTITION BY` keys, bounds a window
-(`crates/bc-interp/src/window_spill.rs`).
+([`crates/bc-interp/src/window_spill.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/window_spill.rs)).
 :::
 
 :::{tab-item} Many machines
 `bc-interp::dist` exposes `partial_aggregate`, `partition_batches`, and `combine_finalize` at
 the granularity a Ray orchestrator can map over partitions. The Python side in
-`python/batcher/dist/` composes them. It is the same `bc-runtime` code underneath.
+[`python/batcher/dist/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/dist) composes them. It is the same `bc-runtime` code underneath.
 :::
 ::::
 
@@ -225,13 +225,13 @@ Three layers of test hold this up, and none of them are optional.
    result.
 1. **`seq == par`**. The parallel executor's output must equal the sequential oracle's, as a
    multiset for unordered relations and exactly for ordered ones.
-1. **Differential vs DuckDB**, in `tests/differential/`. If Batcher and DuckDB disagree, Batcher
+1. **Differential vs DuckDB**, in [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential). If Batcher and DuckDB disagree, Batcher
    is wrong until proven otherwise.
 
 The cross-product matters more than any single case. The bugs that got through were not
 "aggregation is broken". They were an operator with a non-default flag on a non-default
 execution path: `sort(descending=True)` under spill, a distributed `GROUP BY` on a float key.
-`tests/differential/test_diff_operator_matrix.py` exists to run
+[`tests/differential/test_diff_operator_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_operator_matrix.py) exists to run
 `{collect, spill, iter_batches, distributed}` x `{nulls, empty, one row, duplicates, -0.0/NaN,
 descending}` for exactly this reason.
 
@@ -278,13 +278,13 @@ If your operator genuinely has no mergeable form, that's a design conversation, 
 
 ## Where the code lives
 
-- `crates/bc-runtime/src/agg/mod.rs`: `partial`, `combine`, `finalize`, `AggFunc`
-- `crates/bc-runtime/src/keys.rs`: the one canonical key policy, re-exporting the float rule
-- `crates/bc-arrow/src/float_ident.rs`: `canon_f64_bits` and `float_total_cmp`
-- `crates/bc-runtime/src/agg/spill/mod.rs`: grace aggregation (the same algebra, bounded)
-- `crates/bc-interp/src/dist.rs`: the distributed primitives
-- `crates/bc-runtime/src/agg/sketch.rs`: the HLL and DDSketch aggregate states
-- `crates/bc-sketches/`: the mergeable sketches (HLL, DDSketch, KLL, TDigest, Count-Min), fixed seed
+- [`crates/bc-runtime/src/agg/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/mod.rs): `partial`, `combine`, `finalize`, `AggFunc`
+- [`crates/bc-runtime/src/keys.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/keys.rs): the one canonical key policy, re-exporting the float rule
+- [`crates/bc-arrow/src/float_ident.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-arrow/src/float_ident.rs): `canon_f64_bits` and `float_total_cmp`
+- [`crates/bc-runtime/src/agg/spill/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/spill/mod.rs): grace aggregation (the same algebra, bounded)
+- [`crates/bc-interp/src/dist.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/dist.rs): the distributed primitives
+- [`crates/bc-runtime/src/agg/sketch.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/sketch.rs): the HLL and DDSketch aggregate states
+- [`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches): the mergeable sketches (HLL, DDSketch, KLL, TDigest, Count-Min), fixed seed
 
 ## See also
 

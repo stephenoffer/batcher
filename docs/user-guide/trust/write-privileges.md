@@ -146,6 +146,69 @@ references, so it never writes a view back. A real vacuum needs `DELETE`. A dry 
 nothing, because it deletes nothing and it is the check you run *before* deciding whether
 the deletion is safe.
 
+
+## Inspecting the catalog before a query runs
+
+A `security()` block applies the catalog as a plan rewrite, so what a principal ends up
+seeing is decided inside the engine. Four read-only methods answer the same questions
+beforehand, which is what an access-review report or a pre-flight check needs.
+
+{py:meth}`SecurityCatalog.denials_on <batcher.governance.SecurityCatalog>` lists the
+denials recorded against a table, optionally narrowed to one privilege.
+{py:meth}`mask_for <batcher.governance.SecurityCatalog>` returns the mask that would apply
+to one column for one principal, or `None` when the principal is exempt.
+{py:meth}`row_filters_for <batcher.governance.SecurityCatalog>` returns the row filters
+that principal would carry.
+
+```python
+import batcher as bt
+from batcher.governance import Principal, SecurityCatalog
+
+catalog = (
+    SecurityCatalog()
+    .deny("contractor", on="events")
+    .mask_column("events", "email", lambda e: e.str.mask_email(), exempt=("admin",))
+    .filter_rows("events", lambda p: bt.col("region") == "eu", exempt=("admin",))
+)
+analyst = Principal("alice", roles=("analyst",))
+admin = Principal("root", roles=("admin",))
+
+print(catalog.denials_on("events"))
+print(catalog.mask_for("events", "email", analyst) is not None)
+print(catalog.mask_for("events", "email", admin) is not None)
+print(len(catalog.row_filters_for("events", analyst)), len(catalog.row_filters_for("events", admin)))
+```
+
+The exemption shows up as an absence in both: the admin gets no mask and no row filter,
+which is the same answer the rewrite would reach, computed without building a plan.
+
+A {py:class}`Principal <batcher.governance.Principal>` answers about its own roles.
+`has_role` tests one, and `has_any_role` tests a set, which is the form most rules need
+because a privilege is usually granted to several roles at once.
+
+```python
+contractor = Principal("temp", roles=("contractor",))
+print(analyst.has_role("analyst"), analyst.has_role("admin"))
+print(contractor.has_any_role(("admin", "analyst")))
+```
+
+## Where a dataset is allowed to live
+
+{py:meth}`ResidencyCatalog.rule_for <batcher.governance.ResidencyCatalog>` returns the
+residency rule recorded for a dataset, or `None` when none is. A dataset with no rule is
+unconstrained, so the `None` is the answer rather than a missing entry.
+
+```python
+from batcher.governance import DataResidency, ResidencyCatalog
+
+rule = DataResidency(
+    dataset="events", allowed_regions=frozenset({"eu-west-1"}), obligation="encrypt-at-rest"
+)
+catalog = ResidencyCatalog(mode="strict", rules={"events": rule})
+print(sorted(catalog.rule_for("events").allowed_regions))
+print(catalog.rule_for("clickstream"))
+```
+
 ## See also
 
 - {doc}`Governance and security </user-guide/trust/governance>`: grants, masks, row filters, and the audit event these decisions share.

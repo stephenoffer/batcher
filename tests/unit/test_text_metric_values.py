@@ -15,11 +15,12 @@ newlines, punctuation-only -- the metric computes what it says.
 Four metrics are checked against their *documented* definition rather than the obvious one,
 because the obvious one is wrong about them and reading the name alone reproduces the error:
 
-* `sentence_count` counts sentence-ending *punctuation*, so ``"Hello World"`` is 0.
-* `avg_word_length` averages *letters* per word, so ``"abc123"`` is 3.0 rather than 6.0.
-* `alnum_ratio` is ASCII, matching `alpha_ratio`, so ``"café"`` is 0.75 rather than 1.0. So
-  is `avg_word_length`: the whole letter-counting family is ASCII-only, and only
-  `alpha_ratio`'s docstring says so.
+* `sentence_count` counts sentence *endings* -- a run of terminators followed by whitespace
+  or the end -- so ``"Hello World"`` is 0 and ``"...!?"`` is 1, not 5.
+* `avg_word_length` averages *letters* per word, so ``"abc123"`` is 3.0 rather than 6.0. The
+  letters are Unicode letters, so ``"café"`` is 4.0; it was ASCII-only until 2026-09-22, which
+  read a Cyrillic word as having no letters at all.
+* `alnum_ratio` is ASCII, matching `alpha_ratio`, so ``"café"`` is 0.75 rather than 1.0.
 * `digit_to_word_ratio` is digits *per word*, so ``"123"`` is 3.0 and not a fraction.
 """
 
@@ -73,6 +74,22 @@ def _ratio(numerator: Callable[[str], int], denominator: Callable[[str], int]):
         return None if below == 0 else numerator(s) / below
 
     return compute
+
+
+def _sentence_endings(s: str) -> int:
+    """Runs of ``.!?`` ending at whitespace or at the end of the string, walked by hand."""
+    count, i = 0, 0
+    while i < len(s):
+        if s[i] in ".!?":
+            j = i
+            while j < len(s) and s[j] in ".!?":
+                j += 1
+            if j == len(s) or s[j].isspace():
+                count += 1
+            i = j
+        else:
+            i += 1
+    return count
 
 
 #: metric name -> an independent implementation of its documented definition.
@@ -137,11 +154,10 @@ INTEROP: dict[str, Callable[[str], object]] = {
 #: The four whose documented definition is not the one the name suggests. Written from the
 #: docstring, and listed apart so the distinction is visible rather than buried in the table.
 DOCUMENTED: dict[str, Callable[[str], object]] = {
-    "sentence_count": lambda s: sum(c in ".!?" for c in s),
-    # ASCII letters, like `alpha_ratio` and `alnum_ratio`. The whole letter-counting family
-    # is ASCII-only; using Python's unicode-aware `isalpha` here reports "café" as 4.0.
+    "sentence_count": _sentence_endings,
+    # Unicode letters: Python's `isalpha`, so "café" is four letters, not three.
     "avg_word_length": _ratio(
-        lambda s: sum(sum(c.isalpha() and c.isascii() for c in w) for w in s.split()),
+        lambda s: sum(sum(c.isalpha() for c in w) for w in s.split()),
         lambda s: len(s.split()),
     ),
     "alnum_ratio": _ratio(lambda s: sum(c.isalnum() and c.isascii() for c in s), len),
@@ -209,12 +225,11 @@ class TestTheFourThatLookWrong:
         assert by_value["abc123"] == pytest.approx(3.0)
         assert len("abc123") == 6, "the point is that the character count is not the answer"
 
-    def test_the_letter_family_is_ascii_throughout(self):
-        """`avg_word_length` counts ASCII letters too, so an accented word is short by one.
-        Grouped with the others because the restriction is family-wide and stated on only
-        one member of the family."""
+    def test_avg_word_length_counts_unicode_letters(self):
+        """An accented letter is a letter. This pinned 3.0 for "café" while the family was
+        ASCII-only; the ASCII class also read every Cyrillic or Greek word as zero letters."""
         by_value = dict(zip(VALUES, _engine("avg_word_length"), strict=True))
-        assert by_value["café"] == pytest.approx(3.0)
+        assert by_value["café"] == pytest.approx(4.0)
 
     def test_alnum_ratio_is_ascii_only(self):
         by_value = dict(zip(VALUES, _engine("alnum_ratio"), strict=True))

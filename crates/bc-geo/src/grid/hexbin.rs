@@ -43,7 +43,7 @@ fn check_size(size: f64) -> GeoResult<()> {
 pub fn hex_of(x: f64, y: f64, size: f64) -> GeoResult<Hex> {
     check_size(size)?;
     if !x.is_finite() || !y.is_finite() {
-        return Err(GeoError::invalid("hex binning needs finite coordinates"));
+        return Err(GeoError::domain("hex binning needs finite coordinates"));
     }
     const SQRT3: f64 = 1.732_050_807_568_877_2;
     let q = (2.0 / 3.0 * x) / size;

@@ -30,6 +30,7 @@ import inspect
 import pytest
 
 import batcher as bt
+from batcher._sql.parser.expressions.lowering.accessors import accessor_namespaces
 
 pytestmark = pytest.mark.unit
 
@@ -103,13 +104,27 @@ def _every_zero_argument_accessor() -> list[tuple[str, str]]:
     return out
 
 
-_NAMESPACES = ("str", "dt", "list", "struct", "json", "map", "image", "audio", "video")
+#: Read off `Expr` rather than written down. The hardcoded nine this replaced omitted
+#: `.seq` and `.meta`, so 14 zero-argument accessors -- `.seq`'s 11 and `.meta`'s 3 -- were
+#: never called by the sweep below while it reported itself complete. That is the same
+#: failure `accessor_namespaces` was written to fix in the SQL vocabulary, one file over,
+#: and the fix is to use it here too rather than to keep a second list in step by hand.
+_NAMESPACES = accessor_namespaces()
 _ALL_ZERO_ARG = _every_zero_argument_accessor()
 
 
 def test_the_sweep_found_the_surface():
-    """A sweep that enumerates nothing passes while checking nothing."""
+    """A sweep that enumerates nothing passes while checking nothing.
+
+    The floor is a ratchet and it has already fired once for real: removing the duplicate
+    spellings of each capability took the count from 377 to 291, below the 300 written when
+    the sweep was nine namespaces wide. Deriving the namespace list restores the margin by
+    covering `.seq` and `.meta`, which is the right way to clear it -- lowering the floor
+    would have left those 14 accessors uncalled.
+    """
     assert len(_ALL_ZERO_ARG) >= 300, f"only {len(_ALL_ZERO_ARG)} zero-argument accessors found"
+    # And the namespaces themselves, so a derivation that silently returns () is not a pass.
+    assert {"seq", "meta"} <= set(_NAMESPACES), _NAMESPACES
 
 
 def test_no_zero_argument_accessor_accepts_a_positional_argument():

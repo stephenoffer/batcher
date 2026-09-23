@@ -60,17 +60,17 @@ The table below lists the multimodal and text scripts in path order.
 <!-- library-table: multimodal,text_analytics -->
 | Script | Shows |
 | --- | --- |
-| `examples/multimodal/audio_and_video_metadata.py` | Reading audio and video without decoding the media |
-| `examples/multimodal/image_decode_and_resize.py` | Decoding image bytes, and resizing on the way in |
-| `examples/multimodal/image_metadata.py` | Filtering images on metadata before paying to decode them |
-| `examples/multimodal/image_pipeline.py` | An end-to-end multimodal pipeline: read, filter, decode, score, write |
-| `examples/text_analytics/corpus_statistics.py` | Profiling a text corpus before deciding what to do with it |
-| `examples/text_analytics/deduplicating_documents.py` | Finding near-duplicate text with a similarity hash |
-| `examples/text_analytics/language_shape.py` | Classifying text by shape before classifying it by meaning |
-| `examples/text_analytics/ngrams_and_collocations.py` | Word pairs: the bigrams that appear together more than chance |
-| `examples/text_analytics/readability_signals.py` | Cheap readability signals over a text column |
-| `examples/text_analytics/topic_keywords.py` | Keywords that distinguish one group from the rest |
-| `examples/text_analytics/word_frequencies.py` | A word-frequency table over real text, entirely in the engine |
+| [`examples/multimodal/audio_and_video_metadata.py`](https://github.com/stephenoffer/batcher/blob/main/examples/multimodal/audio_and_video_metadata.py) | Reading audio and video without decoding the media |
+| [`examples/multimodal/image_decode_and_resize.py`](https://github.com/stephenoffer/batcher/blob/main/examples/multimodal/image_decode_and_resize.py) | Decoding image bytes, and resizing on the way in |
+| [`examples/multimodal/image_metadata.py`](https://github.com/stephenoffer/batcher/blob/main/examples/multimodal/image_metadata.py) | Filtering images on metadata before paying to decode them |
+| [`examples/multimodal/image_pipeline.py`](https://github.com/stephenoffer/batcher/blob/main/examples/multimodal/image_pipeline.py) | An end-to-end multimodal pipeline: read, filter, decode, score, write |
+| [`examples/text_analytics/corpus_statistics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/text_analytics/corpus_statistics.py) | Profiling a text corpus before deciding what to do with it |
+| [`examples/text_analytics/deduplicating_documents.py`](https://github.com/stephenoffer/batcher/blob/main/examples/text_analytics/deduplicating_documents.py) | Finding near-duplicate text with a similarity hash |
+| [`examples/text_analytics/language_shape.py`](https://github.com/stephenoffer/batcher/blob/main/examples/text_analytics/language_shape.py) | Classifying text by shape before classifying it by meaning |
+| [`examples/text_analytics/ngrams_and_collocations.py`](https://github.com/stephenoffer/batcher/blob/main/examples/text_analytics/ngrams_and_collocations.py) | Word pairs: the bigrams that appear together more than chance |
+| [`examples/text_analytics/readability_signals.py`](https://github.com/stephenoffer/batcher/blob/main/examples/text_analytics/readability_signals.py) | Cheap readability signals over a text column |
+| [`examples/text_analytics/topic_keywords.py`](https://github.com/stephenoffer/batcher/blob/main/examples/text_analytics/topic_keywords.py) | Keywords that distinguish one group from the rest |
+| [`examples/text_analytics/word_frequencies.py`](https://github.com/stephenoffer/batcher/blob/main/examples/text_analytics/word_frequencies.py) | A word-frequency table over real text, entirely in the engine |
 <!-- /library-table -->
 
 ## See also

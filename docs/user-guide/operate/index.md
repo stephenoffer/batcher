@@ -51,6 +51,7 @@ The table below lists every page in both halves, tuning first.
 - {doc}`/configuration/fault-tolerance`: the retry and recovery settings the running half refers to.
 - {doc}`/benchmarks/index`: how the engine measures up against other engines, and how those numbers were produced.
 - {doc}`/user-guide/moving-data/index`: the readers and writers whose scans most of these levers act on.
+- {doc}`/examples/operations`: configuration, plans, and observability as standalone scripts.
 
 ```{toctree}
 :hidden:

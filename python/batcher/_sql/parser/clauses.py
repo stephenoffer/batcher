@@ -208,6 +208,9 @@ def _select(tr, node) -> Dataset:
     ds = tr._decorrelate_scalar_subqueries(
         ds, [*node.expressions, residual, node.args.get("having")], node
     )
+    # `SELECT EXISTS (…)` reads the existence bit as a value: the marker column the
+    # under-OR rewrite builds, joined on before the projection reads it.
+    ds = subquery.exists_in_projection(tr, ds, node)
     if residual is not None:
         # A registered scalar function in WHERE becomes a materialized column
         # before the predicate references it.

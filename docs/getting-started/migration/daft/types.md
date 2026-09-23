@@ -18,21 +18,21 @@ The following table maps the 98 names on `DataType`, sorted alphabetically.
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `binary` | `Expr.cast` | canonical |  |
-| `bool` | `Expr.cast` | canonical |  |
-| `date` | `Expr.cast` | canonical |  |
-| `decimal128` | `Expr.cast` | canonical |  |
+| `binary` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `bool` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `date` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `decimal128` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `dtype` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
-| `duration` | `Expr.cast` | param | Missing: a type-string grammar for duration (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `duration` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for duration (Batcher's cast names only primitive and decimal types). Wave W2. |
 | `embedding` | n/a | gap | Not yet: embedding logical type. Wave W12. |
 | `extension` | n/a | gap | Not yet: extension types. Wave W11. |
 | `fields` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `file` | n/a | gap | Not yet: file logical type. Wave W12. |
-| `fixed_size_binary` | `Expr.cast` | param | Missing: a type-string grammar for fixed\_size\_binary (Batcher's cast names only primitive and decimal types). Wave W2. |
-| `fixed_size_list` | `Expr.cast` | param | Missing: a type-string grammar for fixed\_size\_list (Batcher's cast names only primitive and decimal types). Wave W2. |
-| `float16` | `Expr.cast` | canonical |  |
-| `float32` | `Expr.cast` | canonical |  |
-| `float64` | `Expr.cast` | canonical |  |
+| `fixed_size_binary` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for fixed\_size\_binary (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `fixed_size_list` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for fixed\_size\_list (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `float16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `float32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `float64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `from_arrow_type` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers). Wave W11. |
 | `from_numpy_dtype` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers). Wave W11. |
 | `from_sql` | n/a | gap | Not yet: parse a SQL/DDL type string into a type. Wave W2. |
@@ -40,10 +40,10 @@ The following table maps the 98 names on `DataType`, sorted alphabetically.
 | `image_mode` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `infer_from_object` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers). Wave W11. |
 | `infer_from_type` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers). Wave W11. |
-| `int16` | `Expr.cast` | canonical |  |
-| `int32` | `Expr.cast` | canonical |  |
-| `int64` | `Expr.cast` | canonical |  |
-| `int8` | `Expr.cast` | canonical |  |
+| `int16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `int32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `int64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `int8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `interval` | n/a | gap | Not yet: interval (month-day-nano) type. Wave W6. |
 | `is_binary` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema). Wave W11. |
 | `is_boolean` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema). Wave W11. |
@@ -88,31 +88,39 @@ The following table maps the 98 names on `DataType`, sorted alphabetically.
 | `is_union` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema). Wave W11. |
 | `is_uuid` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema). Wave W11. |
 | `key_type` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
-| `list` | `Expr.cast` | param | Missing: a type-string grammar for list (Batcher's cast names only primitive and decimal types). Wave W2. |
-| `map` | `Expr.cast` | param | Missing: a type-string grammar for map (Batcher's cast names only primitive and decimal types). Wave W2. |
-| `null` | `Expr.cast` | param | Missing: a type-string grammar for null (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `list` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for list (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `map` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for map (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `null` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for null (Batcher's cast names only primitive and decimal types). Wave W2. |
 | `precision` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `python` | n/a | out of scope | Declined: Python object dtype: per-row Python objects cannot cross the Arrow data plane. |
 | `scale` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `shape` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `size` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `sparse_tensor` | n/a | gap | Not yet: sparse\_tensor logical type. Wave W12. |
-| `string` | `Expr.cast` | canonical |  |
-| `struct` | `Expr.cast` | param | Missing: a type-string grammar for struct (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `string` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `struct` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for struct (Batcher's cast names only primitive and decimal types). Wave W2. |
 | `tensor` | n/a | gap | Not yet: tensor logical type. Wave W12. |
-| `time` | `Expr.cast` | param | Missing: a type-string grammar for time (Batcher's cast names only primitive and decimal types). Wave W2. |
-| `timestamp` | `Expr.cast` | param | Missing: a type-string grammar for timestamp (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `time` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for time (Batcher's cast names only primitive and decimal types). Wave W2. |
+| `timestamp` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: a type-string grammar for timestamp (Batcher's cast names only primitive and decimal types). Wave W2. |
 | `timeunit` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `timezone` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `to_arrow_dtype` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers). Wave W11. |
 | `type_ids` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
-| `uint16` | `Expr.cast` | canonical |  |
-| `uint32` | `Expr.cast` | canonical |  |
-| `uint64` | `Expr.cast` | canonical |  |
-| `uint8` | `Expr.cast` | canonical |  |
+| `uint16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `uint32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `uint64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `uint8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `union` | n/a | gap | Not yet: union type. Wave W11. |
 | `union_fields` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `union_mode` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `use_offset_indices` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
 | `uuid` | n/a | gap | Not yet: UUID logical type. Wave W11. |
 | `value_type` | n/a | gap | Not yet: a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors). Wave W11. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

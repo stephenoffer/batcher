@@ -26,14 +26,18 @@ from batcher.io.filesystem import resolve_filesystem
 from batcher.io.manifest import WrittenFile
 
 __all__ = [
-    "cleanup_staging",
     "stage_shard",
     "stage_stream",
     "staging_root",
 ]
 
-# Subdirectory (under the table root) that holds shard Parquet files until they are
-# committed. Left in place only if a commit fails, so a retry finds the staged data.
+# Subdirectory (under the table root) that holds shard Parquet files. The name says
+# "staging" but the files are **permanent**: `IcebergSink.commit` calls `add_files`,
+# which registers each staged path as the table's own data file rather than copying it
+# (`iceberg/sink.py::commit`). So this directory holds live table data after a successful
+# commit, and deleting its contents destroys the table. A failed commit leaves the same
+# files behind unregistered, where the deterministic `part-{shard}-{chunk}.parquet` name
+# lets a retry overwrite them in place.
 _STAGING = "_batcher_staging"
 
 
@@ -120,20 +124,3 @@ def stage_stream(
                         writer.write_batch(batch)
                         rows += batch.num_rows
     return WrittenFile(path=name, rows=rows, bytes=_safe_size(fs, name))
-
-
-def cleanup_staging(files: list[WrittenFile], staging: str) -> None:
-    """Delete the staged shard files and the staging directory (best-effort).
-
-    Committed data lives in the table's own layout, so the staging copies are pure
-    scratch; a failure to remove them is a tidiness issue, never a correctness one.
-    """
-    fs = resolve_filesystem(staging)
-    for f in files:
-        with contextlib.suppress(OSError, ValueError, NotImplementedError):
-            fs.remove(f.path)
-    # Remove the now-empty staging directory via the underlying pyarrow filesystem.
-    inner = getattr(fs, "_fs", None)
-    if inner is not None:
-        with contextlib.suppress(Exception):
-            inner.delete_dir(fs._p(staging))

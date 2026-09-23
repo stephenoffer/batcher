@@ -20,15 +20,15 @@ The following table maps the 14 names on `DataFrameReader`, sorted alphabeticall
 |---|---|---|---|
 | `changes` | `bt.read.read_change_feed` | param | Missing: change feeds from non-Delta tables and Spark's startingVersion/endingVersion option names. Wave W13. |
 | `csv` | `bt.read.csv` | mismatch | Differs: Spark defaults to header=false and inferSchema=false (string columns named \_c0, \_c1, ...); Batcher reads the header and infers types. Codemod passes the header and inference options explicitly. Wave W0. |
-| `format` | `bt.read` | canonical |  |
+| `format` | {py:obj}`bt.read <batcher.read>` | canonical |  |
 | `jdbc` | `bt.read.sql` | param | Missing: url + table + properties form, and column/lowerBound/upperBound/numPartitions or predicates partitioning. Wave W13. |
 | `json` | `bt.read.json` | canonical |  |
-| `load` | `bt.read` | canonical |  |
-| `option` | `bt.read` | canonical |  |
-| `options` | `bt.read` | canonical |  |
+| `load` | {py:obj}`bt.read <batcher.read>` | canonical |  |
+| `option` | {py:obj}`bt.read <batcher.read>` | canonical |  |
+| `options` | {py:obj}`bt.read <batcher.read>` | canonical |  |
 | `orc` | `bt.read.orc` | canonical |  |
 | `parquet` | `bt.read.parquet` | canonical |  |
-| `schema` | `bt.read` | param | Missing: schema as a DDL string or StructType (Batcher takes a pyarrow.Schema). Wave W11. |
+| `schema` | {py:obj}`bt.read <batcher.read>` | param | Missing: schema as a DDL string or StructType (Batcher takes a pyarrow.Schema). Wave W11. |
 | `table` | `Session.table` | mismatch | Differs: bt.read.table constructs a registered connector by name; Spark's reader reads a catalog table, which is session.table(name). Wave W9. |
 | `text` | `bt.read.text` | mismatch | Differs: Spark returns a single 'value' column; Batcher returns path, line\_number and text columns. Wave W0. |
 | `xml` | `bt.read.xml` | param | Missing: rowTag= and Spark's XML option names. Wave W13. |
@@ -41,15 +41,15 @@ The following table maps the 14 names on `DataStreamReader`, sorted alphabetical
 |---|---|---|---|
 | `changes` | `bt.read.read_change_feed` | param | Missing: streaming change feed from non-Delta tables. Wave W10. |
 | `csv` | `bt.read.csv` | mismatch | Differs: DataStreamReader.csv is an incremental streaming file source; bt.read.csv is a bounded batch read. Use bt.read.files\_incremental(path, 'csv'). Wave W10. |
-| `format` | `bt.read` | param | Missing: select a streaming source by format name through one builder. Wave W10. |
+| `format` | {py:obj}`bt.read <batcher.read>` | param | Missing: select a streaming source by format name through one builder. Wave W10. |
 | `json` | `bt.read.json` | mismatch | Differs: DataStreamReader.json is an incremental streaming file source; bt.read.json is a bounded batch read. Use bt.read.files\_incremental(path, 'json'). Wave W10. |
 | `load` | `bt.read.files_incremental` | param | Missing: one load() for every streaming source format. Wave W10. |
 | `name` | n/a | gap | Not yet: stable source name for streaming source evolution. Wave W10. |
-| `option` | `bt.read` | canonical |  |
-| `options` | `bt.read` | canonical |  |
+| `option` | {py:obj}`bt.read <batcher.read>` | canonical |  |
+| `options` | {py:obj}`bt.read <batcher.read>` | canonical |  |
 | `orc` | `bt.read.orc` | mismatch | Differs: DataStreamReader.orc is an incremental streaming file source; bt.read.orc is a bounded batch read. Use bt.read.files\_incremental(path, 'orc'). Wave W10. |
 | `parquet` | `bt.read.parquet` | mismatch | Differs: DataStreamReader.parquet is an incremental streaming file source; bt.read.parquet is a bounded batch read. Use bt.read.files\_incremental(path, 'parquet'). Wave W10. |
-| `schema` | `bt.read` | param | Missing: schema as a DDL string or StructType (Batcher takes a pyarrow.Schema). Wave W11. |
+| `schema` | {py:obj}`bt.read <batcher.read>` | param | Missing: schema as a DDL string or StructType (Batcher takes a pyarrow.Schema). Wave W11. |
 | `table` | `bt.read.table` | mismatch | Differs: Spark streams from a catalog table; bt.read.table reads a registered non-file source format. Wave W10. |
 | `text` | `bt.read.text` | mismatch | Differs: DataStreamReader.text is an incremental streaming file source; bt.read.text is a bounded batch read. Use bt.read.files\_incremental(path, 'text'). Wave W10. |
 | `xml` | `bt.read.xml` | mismatch | Differs: DataStreamReader.xml is an incremental streaming file source; bt.read.xml is a bounded batch read. Use bt.read.files\_incremental(path, 'xml'). Wave W10. |
@@ -61,21 +61,21 @@ The following table maps the 18 names on `DataFrameWriter`, sorted alphabeticall
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
 | `bucketBy` | n/a | gap | Not yet: bucketed table writes (bucketBy with sortBy). Wave W13. |
-| `clusterBy` | `Dataset.write` | param | Missing: record clustering columns in table metadata. Wave W13. |
+| `clusterBy` | {py:obj}`Dataset.write <batcher.Dataset.write>` | param | Missing: record clustering columns in table metadata. Wave W13. |
 | `csv` | `Dataset.write.csv` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
-| `format` | `Dataset.write` | canonical |  |
+| `format` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
 | `insertInto` | `Dataset.write.table` | canonical |  |
 | `jdbc` | `Dataset.write.sql` | param | Missing: url + table + properties connection form. Wave W13. |
 | `json` | `Dataset.write.json` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
-| `mode` | `Dataset.write` | canonical |  |
-| `option` | `Dataset.write` | canonical |  |
-| `options` | `Dataset.write` | canonical |  |
+| `mode` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `option` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `options` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
 | `orc` | `Dataset.write.orc` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
 | `parquet` | `Dataset.write.parquet` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Codemod passes mode='error' explicitly. Wave W0. |
-| `partitionBy` | `Dataset.write` | canonical |  |
-| `save` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
+| `partitionBy` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `save` | {py:obj}`Dataset.write <batcher.Dataset.write>` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
 | `saveAsTable` | `Dataset.write.table` | canonical |  |
-| `sortBy` | `Dataset.write` | param | Missing: sort within buckets, paired with bucketBy. Wave W13. |
+| `sortBy` | {py:obj}`Dataset.write <batcher.Dataset.write>` | param | Missing: sort within buckets, paired with bucketBy. Wave W13. |
 | `text` | `Dataset.write.text` | canonical |  |
 | `xml` | `Dataset.write.xml` | canonical |  |
 
@@ -107,12 +107,20 @@ The following table maps the 12 names on `DataStreamWriter`, sorted alphabetical
 | `clusterBy` | n/a | gap | Not yet: clustering columns for a streaming table write. Wave W10. |
 | `foreach` | `Dataset.write.for_each` | canonical |  |
 | `foreachBatch` | `Dataset.write.for_each_batch` | mismatch | Differs: Spark passes each micro-batch as a DataFrame; Batcher passes a pyarrow.Table. Wave W10. |
-| `format` | `Dataset.write` | canonical |  |
-| `option` | `Dataset.write` | canonical |  |
-| `options` | `Dataset.write` | canonical |  |
-| `outputMode` | `Dataset.write` | canonical |  |
-| `partitionBy` | `Dataset.write` | canonical |  |
-| `queryName` | `Dataset.write` | canonical |  |
-| `start` | `Dataset.write` | canonical |  |
-| `toTable` | `Dataset.write` | param | Missing: start a streaming write into a catalog table. Wave W10. |
-| `trigger` | `Dataset.write` + `bt.Trigger` | canonical |  |
+| `format` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `option` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `options` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `outputMode` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `partitionBy` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `queryName` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `start` | {py:obj}`Dataset.write <batcher.Dataset.write>` | canonical |  |
+| `toTable` | {py:obj}`Dataset.write <batcher.Dataset.write>` | param | Missing: start a streaming write into a catalog table. Wave W10. |
+| `trigger` | {py:obj}`Dataset.write <batcher.Dataset.write>` + {py:obj}`bt.Trigger <batcher.Trigger>` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

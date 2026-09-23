@@ -44,13 +44,19 @@ def test_dtype_selectors_match_explicit_lists(wide):
 
 @pytest.mark.differential
 def test_name_selectors(wide):
-    """starts_with / ends_with / contains / by_dtype match by name and exact type."""
+    """starts_with / ends_with / contains match by name; by_dtype by the engine's stored type.
+
+    `by_dtype` widens a requested type the way ingest does (`plan.types.widen`), so
+    ``large_string`` names the ``string`` columns it would be stored as. It used to compare
+    the requested type verbatim and could never match a narrow or large type at all.
+    """
     assert wide.select(bt.starts_with("p")).columns == ["price"]
     assert wide.select(bt.ends_with("e")).columns == ["price", "name"]
     assert wide.select(bt.contains("i")).columns == ["id", "price"]
     assert wide.select(bt.starts_with("i", "q")).columns == ["id", "qty"]
     assert wide.select(bt.by_dtype(pa.int64())).columns == ["id", "qty"]
-    assert wide.select(bt.by_dtype(pa.float64(), pa.large_string())).columns == ["price"]
+    assert wide.select(bt.by_dtype(pa.float64(), pa.large_string())).columns == ["price", "name"]
+    assert wide.select(bt.by_dtype(pa.float64())).columns == ["price"]
 
 
 @pytest.mark.differential

@@ -259,12 +259,27 @@ def _check_pid(pid: PIDConfig) -> None:
     )
 
 
+#: Every `metadata.backend` name, and the one statement of the set. It lives here rather
+#: than beside the factory that builds them because `config` is layer 0 and `metadata` is
+#: layer 1: the factory imports this (`metadata.backends.BACKEND_NAMES`), never the reverse.
+#: Two copies had drifted: the factory built `rocksdb` and `layered`, and validation
+#: rejected both, so two documented backends were unreachable from any config.
+METADATA_BACKENDS: tuple[str, ...] = (
+    "in_process",
+    "sqlite",
+    "rocksdb",
+    "object_storage",
+    "redis",
+    "layered",
+)
+
+
 def _check_metadata(md: MetadataConfig) -> None:
     """Metadata store: the backend name and the per-day decay fraction."""
     _check(
-        md.backend in {"in_process", "sqlite", "redis", "object_storage"},
-        "metadata.backend must be one of {'in_process', 'sqlite', 'redis', "
-        f"'object_storage'}}, got {md.backend!r}",
+        md.backend in METADATA_BACKENDS,
+        f"metadata.backend must be one of {', '.join(map(repr, METADATA_BACKENDS))}, got "
+        f"{md.backend!r}",
     )
     _check(
         0.0 <= md.decay_per_day <= 1.0,

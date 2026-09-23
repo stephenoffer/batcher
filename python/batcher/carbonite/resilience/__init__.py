@@ -29,7 +29,6 @@ from batcher.carbonite.resilience.blocklist import (
     QuarantinePolicy,
     TargetHealth,
     default_ledger,
-    reset_default_ledger,
 )
 from batcher.carbonite.resilience.budget import BudgetState, RetryBudget
 from batcher.carbonite.resilience.classify import (
@@ -95,7 +94,6 @@ __all__ = [
     "must_move",
     "preemption_monitor",
     "preflight_check",
-    "reset_default_ledger",
     "results_untrusted",
     "stability_env",
     "stragglers_to_backup",

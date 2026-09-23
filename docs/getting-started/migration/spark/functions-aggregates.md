@@ -18,36 +18,36 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `any_value` | `Expr.any_value` | canonical |  |
-| `approx_count_distinct` | `bt.approx_count_distinct` | param | Missing: rsd= relative standard deviation. Wave W2. |
-| `approx_percentile` | `Expr.approx_quantile` | param | Missing: a list of percentages, accuracy=, and returning an actual input value. Wave W2. |
-| `array_agg` | `bt.array_agg` | canonical |  |
-| `avg` | `Expr.mean` | canonical |  |
-| `bit_and` | `bt.bit_and` | canonical |  |
-| `bit_or` | `bt.bit_or` | canonical |  |
-| `bit_xor` | `bt.bit_xor` | canonical |  |
+| `any_value` | {py:obj}`Expr.any_value <batcher.plan.expr_ir.core.Expr.any_value>` | canonical |  |
+| `approx_count_distinct` | {py:obj}`bt.approx_count_distinct <batcher.approx_count_distinct>` | param | Missing: rsd= relative standard deviation. Wave W2. |
+| `approx_percentile` | {py:obj}`Expr.approx_quantile <batcher.plan.expr_ir.core.Expr.approx_quantile>` | param | Missing: a list of percentages, accuracy=, and returning an actual input value. Wave W2. |
+| `array_agg` | {py:obj}`bt.array_agg <batcher.array_agg>` | canonical |  |
+| `avg` | {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | canonical |  |
+| `bit_and` | {py:obj}`bt.bit_and <batcher.bit_and>` | canonical |  |
+| `bit_or` | {py:obj}`bt.bit_or <batcher.bit_or>` | canonical |  |
+| `bit_xor` | {py:obj}`bt.bit_xor <batcher.bit_xor>` | canonical |  |
 | `bitmap_and_agg` | n/a | gap | Not yet: DataSketches-binary-compatible bitmap sketch function. Wave W14. |
 | `bitmap_bit_position` | n/a | gap | Not yet: DataSketches-binary-compatible bitmap sketch function. Wave W14. |
 | `bitmap_bucket_number` | n/a | gap | Not yet: DataSketches-binary-compatible bitmap sketch function. Wave W14. |
 | `bitmap_construct_agg` | n/a | gap | Not yet: DataSketches-binary-compatible bitmap sketch function. Wave W14. |
 | `bitmap_count` | n/a | gap | Not yet: DataSketches-binary-compatible bitmap sketch function. Wave W14. |
 | `bitmap_or_agg` | n/a | gap | Not yet: DataSketches-binary-compatible bitmap sketch function. Wave W14. |
-| `bool_and` | `bt.bool_and` | canonical |  |
-| `bool_or` | `bt.bool_or` | canonical |  |
-| `collect_list` | `Expr.array_agg` | canonical |  |
-| `collect_set` | `Expr.array_agg` | param | Missing: distinct=True collection that skips nulls. Wave W2. |
-| `corr` | `bt.corr` | canonical |  |
-| `count` | `Expr.count` + `bt.count` | canonical |  |
-| `count_distinct` | `bt.count_distinct` | param | Missing: several columns counted as one distinct tuple. Wave W2. |
-| `count_if` | `bt.count_if` | canonical |  |
+| `bool_and` | {py:obj}`bt.bool_and <batcher.bool_and>` | canonical |  |
+| `bool_or` | {py:obj}`bt.bool_or <batcher.bool_or>` | canonical |  |
+| `collect_list` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | canonical |  |
+| `collect_set` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | param | Missing: distinct=True collection that skips nulls. Wave W2. |
+| `corr` | {py:obj}`bt.corr <batcher.corr>` | canonical |  |
+| `count` | {py:obj}`Expr.count <batcher.plan.expr_ir.core.Expr.count>` + {py:obj}`bt.count <batcher.count>` | canonical |  |
+| `count_distinct` | {py:obj}`bt.count_distinct <batcher.count_distinct>` | param | Missing: several columns counted as one distinct tuple. Wave W2. |
+| `count_if` | {py:obj}`bt.count_if <batcher.count_if>` | canonical |  |
 | `count_min_sketch` | n/a | gap | Not yet: DataSketches-binary-compatible count-min sketch function. Wave W14. |
-| `covar_pop` | `bt.covar_pop` | canonical |  |
-| `covar_samp` | `bt.covar_samp` | canonical |  |
-| `cume_dist` | `bt.cume_dist` | canonical |  |
-| `dense_rank` | `bt.dense_rank` | canonical |  |
-| `every` | `bt.bool_and` | canonical |  |
-| `first` | `bt.first` | mismatch | Differs: Spark first takes whatever row arrives first and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.first(order\_by, ignore\_nulls=ignorenulls). Wave W0. |
-| `first_value` | `bt.first_value` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.first\_value(x, ignore\_nulls=...). Wave W0. |
+| `covar_pop` | {py:obj}`bt.covar_pop <batcher.covar_pop>` | canonical |  |
+| `covar_samp` | {py:obj}`bt.covar_samp <batcher.covar_samp>` | canonical |  |
+| `cume_dist` | {py:obj}`bt.cume_dist <batcher.cume_dist>` | canonical |  |
+| `dense_rank` | {py:obj}`bt.dense_rank <batcher.dense_rank>` | canonical |  |
+| `every` | {py:obj}`bt.bool_and <batcher.bool_and>` | canonical |  |
+| `first` | {py:obj}`bt.first <batcher.first>` | mismatch | Differs: Spark first takes whatever row arrives first and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.first(order\_by, ignore\_nulls=ignorenulls). Wave W0. |
+| `first_value` | {py:obj}`bt.first_value <batcher.first_value>` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.first\_value(x, ignore\_nulls=...). Wave W0. |
 | `grouping` | n/a | gap | Not yet: GROUPING() indicator inside cube/rollup/grouping sets aggregates. Wave W8. |
 | `grouping_id` | n/a | gap | Not yet: GROUPING\_ID() bit vector inside cube/rollup/grouping sets aggregates. Wave W8. |
 | `histogram_numeric` | n/a | gap | Not yet: approximate numeric histogram with nBins. Wave W14. |
@@ -76,47 +76,47 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `kll_sketch_to_string_bigint` | n/a | gap | Not yet: DataSketches-binary-compatible KLL sketch function. Wave W14. |
 | `kll_sketch_to_string_double` | n/a | gap | Not yet: DataSketches-binary-compatible KLL sketch function. Wave W14. |
 | `kll_sketch_to_string_float` | n/a | gap | Not yet: DataSketches-binary-compatible KLL sketch function. Wave W14. |
-| `kurtosis` | `bt.kurtosis` | canonical |  |
-| `lag` | `bt.lag` | param | Missing: default= value for rows before the partition start. Wave W5. |
-| `last` | `bt.last` | mismatch | Differs: Spark last takes whatever row arrives last and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.last(order\_by, ignore\_nulls=ignorenulls). Wave W0. |
-| `last_value` | `bt.last_value` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.last\_value(x, ignore\_nulls=...). Wave W0. |
-| `lead` | `bt.lead` | param | Missing: default= value for rows past the partition end. Wave W5. |
+| `kurtosis` | {py:obj}`bt.kurtosis <batcher.kurtosis>` | canonical |  |
+| `lag` | {py:obj}`bt.lag <batcher.lag>` | param | Missing: default= value for rows before the partition start. Wave W5. |
+| `last` | {py:obj}`bt.last <batcher.last>` | mismatch | Differs: Spark last takes whatever row arrives last and keeps nulls unless ignorenulls=True; Batcher needs an explicit order: col.last(order\_by, ignore\_nulls=ignorenulls). Wave W0. |
+| `last_value` | {py:obj}`bt.last_value <batcher.last_value>` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.last\_value(x, ignore\_nulls=...). Wave W0. |
+| `lead` | {py:obj}`bt.lead <batcher.lead>` | param | Missing: default= value for rows past the partition end. Wave W5. |
 | `listagg` | `Expr.str.join` | canonical |  |
 | `listagg_distinct` | `Expr.str.join` | param | Missing: distinct=True. Wave W2. |
-| `max` | `bt.max` | canonical |  |
-| `max_by` | `bt.max_by` | param | Missing: k= for the top-k values. Wave W2. |
-| `mean` | `bt.mean` | canonical |  |
-| `median` | `bt.median` | canonical |  |
-| `min` | `bt.min` | canonical |  |
-| `min_by` | `bt.min_by` | param | Missing: k= for the bottom-k values. Wave W2. |
-| `mode` | `bt.mode` | canonical |  |
-| `nth_value` | `bt.nth_value` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.nth\_value(x, n, ignore\_nulls=...). Wave W0. |
-| `ntile` | `bt.ntile` | canonical |  |
-| `percent_rank` | `bt.percent_rank` | canonical |  |
-| `percentile` | `Expr.quantile` | param | Missing: a list of percentages and frequency= weights. Wave W2. |
-| `percentile_approx` | `Expr.approx_quantile` | param | Missing: a list of percentages, accuracy=, and returning an actual input value. Wave W2. |
-| `product` | `bt.product` | canonical |  |
-| `rank` | `bt.rank` | canonical |  |
-| `regr_avgx` | `bt.regr_avgx` | canonical |  |
-| `regr_avgy` | `bt.regr_avgy` | canonical |  |
-| `regr_count` | `bt.regr_count` | canonical |  |
-| `regr_intercept` | `bt.regr_intercept` | canonical |  |
-| `regr_r2` | `bt.regr_r2` | canonical |  |
-| `regr_slope` | `bt.regr_slope` | canonical |  |
-| `regr_sxx` | `bt.regr_sxx` | canonical |  |
-| `regr_sxy` | `bt.regr_sxy` | canonical |  |
-| `regr_syy` | `bt.regr_syy` | canonical |  |
-| `row_number` | `bt.row_number` | canonical |  |
-| `skewness` | `bt.skew` | canonical |  |
-| `some` | `bt.bool_or` | canonical |  |
-| `std` | `bt.std` | canonical |  |
-| `stddev` | `bt.std` | canonical |  |
-| `stddev_pop` | `bt.stddev_pop` | canonical |  |
-| `stddev_samp` | `bt.std` | canonical |  |
+| `max` | {py:obj}`bt.max <batcher.max>` | canonical |  |
+| `max_by` | {py:obj}`bt.max_by <batcher.max_by>` | param | Missing: k= for the top-k values. Wave W2. |
+| `mean` | {py:obj}`bt.mean <batcher.mean>` | canonical |  |
+| `median` | {py:obj}`bt.median <batcher.median>` | canonical |  |
+| `min` | {py:obj}`bt.min <batcher.min>` | canonical |  |
+| `min_by` | {py:obj}`bt.min_by <batcher.min_by>` | param | Missing: k= for the bottom-k values. Wave W2. |
+| `mode` | {py:obj}`bt.mode <batcher.mode>` | canonical |  |
+| `nth_value` | {py:obj}`bt.nth_value <batcher.nth_value>` | mismatch | Differs: the window frame now matches Spark (a running frame when ordered); port ignoreNulls as bt.nth\_value(x, n, ignore\_nulls=...). Wave W0. |
+| `ntile` | {py:obj}`bt.ntile <batcher.ntile>` | canonical |  |
+| `percent_rank` | {py:obj}`bt.percent_rank <batcher.percent_rank>` | canonical |  |
+| `percentile` | {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | param | Missing: a list of percentages and frequency= weights. Wave W2. |
+| `percentile_approx` | {py:obj}`Expr.approx_quantile <batcher.plan.expr_ir.core.Expr.approx_quantile>` | param | Missing: a list of percentages, accuracy=, and returning an actual input value. Wave W2. |
+| `product` | {py:obj}`bt.product <batcher.product>` | canonical |  |
+| `rank` | {py:obj}`bt.rank <batcher.rank>` | canonical |  |
+| `regr_avgx` | {py:obj}`bt.regr_avgx <batcher.regr_avgx>` | canonical |  |
+| `regr_avgy` | {py:obj}`bt.regr_avgy <batcher.regr_avgy>` | canonical |  |
+| `regr_count` | {py:obj}`bt.regr_count <batcher.regr_count>` | canonical |  |
+| `regr_intercept` | {py:obj}`bt.regr_intercept <batcher.regr_intercept>` | canonical |  |
+| `regr_r2` | {py:obj}`bt.regr_r2 <batcher.regr_r2>` | canonical |  |
+| `regr_slope` | {py:obj}`bt.regr_slope <batcher.regr_slope>` | canonical |  |
+| `regr_sxx` | {py:obj}`bt.regr_sxx <batcher.regr_sxx>` | canonical |  |
+| `regr_sxy` | {py:obj}`bt.regr_sxy <batcher.regr_sxy>` | canonical |  |
+| `regr_syy` | {py:obj}`bt.regr_syy <batcher.regr_syy>` | canonical |  |
+| `row_number` | {py:obj}`bt.row_number <batcher.row_number>` | canonical |  |
+| `skewness` | {py:obj}`bt.skew <batcher.skew>` | canonical |  |
+| `some` | {py:obj}`bt.bool_or <batcher.bool_or>` | canonical |  |
+| `std` | {py:obj}`bt.std <batcher.std>` | canonical |  |
+| `stddev` | {py:obj}`bt.std <batcher.std>` | canonical |  |
+| `stddev_pop` | {py:obj}`bt.stddev_pop <batcher.stddev_pop>` | canonical |  |
+| `stddev_samp` | {py:obj}`bt.std <batcher.std>` | canonical |  |
 | `string_agg` | `Expr.str.join` | canonical |  |
 | `string_agg_distinct` | `Expr.str.join` | param | Missing: distinct=True. Wave W2. |
-| `sum` | `bt.sum` | canonical |  |
-| `sum_distinct` | `Expr.sum` | param | Missing: distinct=True. Wave W2. |
+| `sum` | {py:obj}`bt.sum <batcher.sum>` | canonical |  |
+| `sum_distinct` | {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | param | Missing: distinct=True. Wave W2. |
 | `theta_difference` | n/a | gap | Not yet: DataSketches-binary-compatible theta sketch function. Wave W14. |
 | `theta_intersection` | n/a | gap | Not yet: DataSketches-binary-compatible theta sketch function. Wave W14. |
 | `theta_intersection_agg` | n/a | gap | Not yet: DataSketches-binary-compatible theta sketch function. Wave W14. |
@@ -150,6 +150,14 @@ The following table maps the 135 names on the `pyspark.sql.functions` module, so
 | `tuple_union_integer` | n/a | gap | Not yet: DataSketches-binary-compatible tuple sketch function. Wave W14. |
 | `tuple_union_theta_double` | n/a | gap | Not yet: DataSketches-binary-compatible tuple sketch function. Wave W14. |
 | `tuple_union_theta_integer` | n/a | gap | Not yet: DataSketches-binary-compatible tuple sketch function. Wave W14. |
-| `var_pop` | `bt.var_pop` | canonical |  |
-| `var_samp` | `bt.var` | canonical |  |
-| `variance` | `bt.var` | canonical |  |
+| `var_pop` | {py:obj}`bt.var_pop <batcher.var_pop>` | canonical |  |
+| `var_samp` | {py:obj}`bt.var <batcher.var>` | canonical |  |
+| `variance` | {py:obj}`bt.var <batcher.var>` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

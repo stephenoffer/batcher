@@ -2,9 +2,16 @@
 //!
 //! Bundles the cheap, mergeable summaries the optimizer wants for one column:
 //! row/null counts, a distinct-count estimate (HLL), and — for numeric columns —
-//! a quantile sketch (KLL) that yields range selectivity, histogram boundaries,
-//! and exact min/max. One `ColumnStats` per partition merges into the column's
-//! global stats, mirroring the engine's partial→combine discipline.
+//! a quantile sketch (KLL) that yields ranks, quantiles, and exact min/max. One
+//! `ColumnStats` per partition merges into the column's global stats, mirroring
+//! the engine's partial→combine discipline.
+//!
+//! **This type summarizes; it does not estimate.** Turning these summaries into a
+//! predicate's selectivity is Kyber's job and happens in the control plane
+//! (`kyber/stats/selectivity.py`), fed by the scalars and the quantile grid
+//! `bc_py::sketches::column_stats_full` ships. A second selectivity model lived
+//! here for a while, reachable from nothing, quietly disagreeing with the one that
+//! ranks plans — the invariant is one `Expr`, one `RelOp`, and one cost model.
 
 use arrow::array::{Array, ArrayRef};
 
@@ -71,8 +78,8 @@ impl ColumnStats {
     /// same array. The quantile sketch is *not* bit-identical, because KLL compaction depends
     /// on the order values arrive in; accumulating is, if anything, the more accurate of the
     /// two, since it compacts fewer times. Both are approximate summaries whose consumers
-    /// (range selectivity, range-partition boundaries) are estimates and scheduling
-    /// decisions, never results.
+    /// (Kyber's cardinality estimates, range-partition boundaries) are estimates and
+    /// scheduling decisions, never results.
     ///
     /// Merging stays available and stays the right tool for the job it is for: combining
     /// sketches built on *different partitions*, which is what the distributed path does and
@@ -115,7 +122,14 @@ impl ColumnStats {
         self.distinct.estimate()
     }
 
-    /// Estimated selectivity of `col <= x` (fraction of rows kept), if numeric.
+    /// Fraction of the **non-null** values that are `<= x`, if numeric.
+    ///
+    /// Not a row fraction, and not a selectivity. The sketch is fed from the non-null
+    /// iterator while `count` includes nulls, so a caller wanting "rows kept by
+    /// `col <= x`" must scale this by `1 - null_fraction()`. Skipping that scale is a
+    /// silent over-estimate that grows with the null rate — on a column 90% null it
+    /// reported 1.0 where the truth was 0.10 — so the distinction is named here rather
+    /// than left to the caller to rediscover.
     #[must_use]
     pub fn rank(&self, x: f64) -> Option<f64> {
         self.quantiles.as_ref().map(|q| q.rank(x))
@@ -135,93 +149,6 @@ impl ColumnStats {
         self.quantiles.as_ref().and_then(|s| s.max())
     }
 
-    // ---- Selectivity helpers (cost-model building blocks) -----------------
-    //
-    // These wrap the distinct/quantile sketches in the shapes a predicate cost
-    // model wants. Range selectivities need the KLL sketch and so return `None`
-    // for non-numeric columns; equality and null fractions only need the
-    // distinct/count fields and are always available. Every selectivity is
-    // clamped to `[0.0, 1.0]`.
-    //
-    // **NULLs.** Every method here reports a fraction of *rows*, but the inner
-    // sketches only ever saw the **non-null** values (`count` is `array.len()`,
-    // nulls included; the HLL and KLL are fed from the non-null iterator). So the
-    // sketch answers — `rank`, `1/distinct` — are fractions of the *non-null*
-    // values and must be scaled by [`nonnull_fraction`](Self::nonnull_fraction)
-    // to become row fractions. In SQL a comparison against NULL is not true, so a
-    // null row is filtered out by every predicate below; skipping the scale is a
-    // silent over-estimate that grows with the null rate (a 90%-null column
-    // over-reports by 10×) and propagates straight into join ordering.
-
-    /// Fraction of rows that are not null — the ceiling on any comparison
-    /// predicate's selectivity, since `NULL <op> x` is never true.
-    fn nonnull_fraction(&self) -> f64 {
-        (1.0 - self.null_fraction()).clamp(0.0, 1.0)
-    }
-
-    /// Per-value mass **among the non-null values**, under a uniform
-    /// distribution: `1 / distinct`. This is the sketch-space quantity the range
-    /// helpers combine with `rank` before either is scaled to a row fraction.
-    fn eq_among_nonnull(&self) -> f64 {
-        (1.0 / self.distinct_estimate().max(1.0)).clamp(0.0, 1.0)
-    }
-
-    /// Estimated fraction of rows kept by `col = <value>`, under a uniform
-    /// distribution: `1 / distinct` of the non-null values, scaled by the non-null
-    /// row fraction. Independent of the literal (the uniform model assigns every
-    /// distinct value the same mass). Distinct is guarded to be `>= 1`; the result
-    /// is clamped to `[0, 1]` and is 0 for an all-null column.
-    #[must_use]
-    pub fn selectivity_eq(&self) -> f64 {
-        (self.eq_among_nonnull() * self.nonnull_fraction()).clamp(0.0, 1.0)
-    }
-
-    /// Estimated fraction of rows kept by `col <= x` — `rank(x)` scaled to a row
-    /// fraction. `None` for non-numeric columns.
-    #[must_use]
-    pub fn selectivity_le(&self, x: f64) -> Option<f64> {
-        let nn = self.nonnull_fraction();
-        self.rank(x).map(|r| (r * nn).clamp(0.0, 1.0))
-    }
-
-    /// Estimated fraction of rows kept by `col < x`. `None` for non-numeric
-    /// columns.
-    ///
-    /// Approximation: `rank(x)` is the non-null fraction `<= x`; subtracting the
-    /// equality mass (the per-value mass under uniformity) removes the values
-    /// equal to `x`, and the result is then scaled to a row fraction. This is
-    /// exact only when `x` is a value present in the column; for an `x` absent
-    /// from the column it slightly under-counts, but it is the standard
-    /// uniform-model estimate and keeps `lt <= le`.
-    #[must_use]
-    pub fn selectivity_lt(&self, x: f64) -> Option<f64> {
-        let (nn, eq) = (self.nonnull_fraction(), self.eq_among_nonnull());
-        self.rank(x)
-            .map(|r| ((r - eq).max(0.0) * nn).clamp(0.0, 1.0))
-    }
-
-    /// Estimated fraction of rows kept by `col > x` — the non-null complement of
-    /// `rank(x)`, scaled to a row fraction. `None` for non-numeric columns.
-    ///
-    /// Note this is **not** `1 - selectivity_le(x)`: null rows satisfy neither
-    /// predicate, so `le + gt` sums to the non-null fraction, not to 1.
-    #[must_use]
-    pub fn selectivity_gt(&self, x: f64) -> Option<f64> {
-        let nn = self.nonnull_fraction();
-        self.rank(x)
-            .map(|r| ((1.0 - r).max(0.0) * nn).clamp(0.0, 1.0))
-    }
-
-    /// Estimated fraction of rows kept by `col >= x` — the non-null complement of
-    /// `selectivity_lt(x)`, scaled to a row fraction. `None` for non-numeric
-    /// columns.
-    #[must_use]
-    pub fn selectivity_ge(&self, x: f64) -> Option<f64> {
-        let (nn, eq) = (self.nonnull_fraction(), self.eq_among_nonnull());
-        self.rank(x)
-            .map(|r| ((1.0 - (r - eq).max(0.0)).max(0.0) * nn).clamp(0.0, 1.0))
-    }
-
     /// Fraction of rows that are null: `null_count / count` (0.0 when empty).
     #[must_use]
     pub fn null_fraction(&self) -> f64 {
@@ -230,21 +157,6 @@ impl ColumnStats {
         } else {
             (self.null_count as f64 / self.count as f64).clamp(0.0, 1.0)
         }
-    }
-
-    /// Equi-depth histogram boundaries: `buckets + 1` values where boundary `i`
-    /// is the `i / buckets` quantile, so each adjacent pair bounds a bucket
-    /// holding ~`1 / buckets` of the rows. `None` for non-numeric columns or
-    /// when `buckets == 0`.
-    #[must_use]
-    pub fn histogram_boundaries(&self, buckets: usize) -> Option<Vec<f64>> {
-        if buckets == 0 {
-            return None;
-        }
-        let sketch = self.quantiles.as_ref()?;
-        // One sorted pass for all boundaries (vs. re-sorting the sketch per call).
-        let qs: Vec<f64> = (0..=buckets).map(|i| i as f64 / buckets as f64).collect();
-        sketch.quantiles(&qs).into_iter().collect()
     }
 
     /// Serialize to a byte blob composing the inner sketches. Layout (LE):
@@ -417,64 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn selectivity_numeric_column() {
-        let arr: ArrayRef = Arc::new(Int64Array::from((0..10_000).collect::<Vec<_>>()));
-        let stats = ColumnStats::from_array(&arr);
-
-        // col <= 2500 keeps ~25% of rows; col > 2500 keeps the rest.
-        assert!((stats.selectivity_le(2_500.0).unwrap() - 0.25).abs() < 0.02);
-        assert!((stats.selectivity_gt(2_500.0).unwrap() - 0.75).abs() < 0.02);
-
-        // col < 2500 ≈ rank - 1/distinct, essentially the same here.
-        assert!((stats.selectivity_lt(2_500.0).unwrap() - 0.25).abs() < 0.02);
-        assert!(stats.selectivity_lt(2_500.0).unwrap() <= stats.selectivity_le(2_500.0).unwrap());
-
-        // col >= 2500 = 1 - lt, complements col < 2500.
-        let ge = stats.selectivity_ge(2_500.0).unwrap();
-        assert!((ge + stats.selectivity_lt(2_500.0).unwrap() - 1.0).abs() < 1e-9);
-
-        // Equality under uniformity ≈ 1 / 10_000 distinct values.
-        assert!((stats.selectivity_eq() - 1.0 / 10_000.0).abs() < 1e-4);
-
-        // No nulls in this column.
-        assert_eq!(stats.null_fraction(), 0.0);
-
-        // 4 equi-depth buckets → 5 strictly increasing boundaries spanning the range.
-        let bounds = stats.histogram_boundaries(4).unwrap();
-        assert_eq!(bounds.len(), 5);
-        for w in bounds.windows(2) {
-            assert!(
-                w[0] <= w[1],
-                "boundaries must be non-decreasing: {bounds:?}"
-            );
-        }
-        assert!(bounds.first().unwrap().abs() < 100.0);
-        assert!((bounds.last().unwrap() - 9_999.0).abs() < 100.0);
-
-        // buckets == 0 → None.
-        assert!(stats.histogram_boundaries(0).is_none());
-    }
-
-    #[test]
-    fn selectivity_string_column() {
-        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "a"]));
-        let stats = ColumnStats::from_array(&arr);
-
-        // Range selectivities need a numeric sketch → None.
-        assert!(stats.selectivity_le(0.0).is_none());
-        assert!(stats.selectivity_lt(0.0).is_none());
-        assert!(stats.selectivity_gt(0.0).is_none());
-        assert!(stats.selectivity_ge(0.0).is_none());
-        assert!(stats.histogram_boundaries(4).is_none());
-
-        // Equality and null fraction still work on any type.
-        assert!(stats.selectivity_eq() > 0.0 && stats.selectivity_eq() <= 1.0);
-        // ~3 distinct values → ~1/3 each.
-        assert!((stats.selectivity_eq() - 1.0 / 3.0).abs() < 0.1);
-        assert_eq!(stats.null_fraction(), 0.0);
-    }
-
-    #[test]
     fn avg_byte_width_wider_for_strings_than_ints() {
         let ints: ArrayRef = Arc::new(Int64Array::from((0..1_000).collect::<Vec<_>>()));
         let strings: ArrayRef = Arc::new(StringArray::from(
@@ -551,69 +405,6 @@ mod tests {
         let stats = ColumnStats::from_array(&arr);
         let back = ColumnStats::from_bytes(&stats.to_bytes()).expect("valid blob");
         assert!((back.avg_byte_width() - stats.avg_byte_width()).abs() < 1e-9);
-    }
-
-    /// Regression: `count` is `array.len()` (nulls included) but the KLL and HLL
-    /// are fed only non-null values, so `rank` is the fraction of *non-null*
-    /// values ≤ x. The selectivity helpers returned it unscaled as "the fraction
-    /// of ROWS kept", their documented meaning. In SQL a comparison against NULL
-    /// is not true, so those rows are filtered out: with 900 of 1000 rows null and
-    /// the rest in 0..99, `selectivity_le(200.0)` reported 1.0 against a truth of
-    /// 0.10 — a 10× over-estimate feeding Kyber's cost model.
-    #[test]
-    fn selectivity_excludes_nulls() {
-        let vals: Vec<Option<i64>> = (0..1_000)
-            .map(|i| if i < 100 { Some(i % 100) } else { None })
-            .collect();
-        let arr: ArrayRef = Arc::new(Int64Array::from(vals));
-        let stats = ColumnStats::from_array(&arr);
-        assert_eq!(stats.count, 1_000);
-        assert_eq!(stats.null_count, 900);
-        assert!((stats.null_fraction() - 0.9).abs() < 1e-9);
-
-        // Every non-null value is ≤ 200, and they are 10% of the rows.
-        let le = stats.selectivity_le(200.0).unwrap();
-        assert!((le - 0.10).abs() < 0.01, "selectivity_le(200) = {le}");
-        let lt = stats.selectivity_lt(200.0).unwrap();
-        assert!((lt - 0.10).abs() < 0.02, "selectivity_lt(200) = {lt}");
-
-        // Nothing is > 200, and nothing is >= 200 either.
-        let gt = stats.selectivity_gt(200.0).unwrap();
-        assert!(gt < 0.01, "selectivity_gt(200) = {gt}");
-        let ge = stats.selectivity_ge(200.0).unwrap();
-        assert!(ge < 0.02, "selectivity_ge(200) = {ge}");
-
-        // ~half the non-nulls are ≤ 50 ⇒ ~5% of rows.
-        let half = stats.selectivity_le(49.0).unwrap();
-        assert!((half - 0.05).abs() < 0.01, "selectivity_le(49) = {half}");
-
-        // Equality is a row fraction too: 1/100 distinct × 10% non-null.
-        let eq = stats.selectivity_eq();
-        assert!((eq - 0.001).abs() < 0.0005, "selectivity_eq = {eq}");
-
-        // No predicate can keep more rows than there are non-null rows.
-        for x in [-1e9, 0.0, 50.0, 1e9] {
-            assert!(stats.selectivity_le(x).unwrap() <= 0.1 + 1e-9);
-            assert!(stats.selectivity_gt(x).unwrap() <= 0.1 + 1e-9);
-        }
-    }
-
-    /// An all-null column keeps no rows under any comparison.
-    #[test]
-    fn selectivity_all_null_column_keeps_nothing() {
-        let arr: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; 64]));
-        let stats = ColumnStats::from_array(&arr);
-        assert_eq!(stats.null_fraction(), 1.0);
-        assert_eq!(stats.selectivity_eq(), 0.0);
-        for s in [
-            stats.selectivity_le(0.0),
-            stats.selectivity_lt(0.0),
-            stats.selectivity_gt(0.0),
-            stats.selectivity_ge(0.0),
-        ] {
-            // Non-numeric/absent quantiles yield None; if present it must be 0.
-            assert!(s.is_none_or(|v| v == 0.0));
-        }
     }
 
     #[test]

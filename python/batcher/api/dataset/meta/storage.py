@@ -90,8 +90,10 @@ class StorageMeta(MetaBase):
     def total_bytes(self) -> int | None:
         """The total size of the sources, in bytes, or ``None`` if any cannot say.
 
-        A file source reports its *stored* (compressed) size. An in-memory relation reports
-        the retained size of its resident Arrow buffers, which it alone knows for free —
+        A file source reports the size its metadata records: for Parquet that is the sum of
+        the footers' per-row-group ``total_byte_size``, the column data *before* compression.
+        An in-memory relation reports the retained size of its resident Arrow buffers, which
+        it alone knows for free —
         without it every consumer sizing from this figure falls back to a coarse
         ``rows x type-width`` guess that under-sizes wide string columns badly.
 
@@ -129,9 +131,10 @@ class StorageMeta(MetaBase):
     def bytes_per_row(self) -> float | None:
         """The average stored bytes per row, or ``None`` when either total is unknown.
 
-        For a file source this is *compressed* width, so it is the number that predicts scan
-        time. ``ds.meta.approx.row_bytes()`` is the different question — a type-derived
-        estimate of the *materialized* Arrow width, which stays type-derived on purpose.
+        ``total_bytes() / row_count()``, so it inherits that figure's meaning: for Parquet the
+        recorded column-data width per row, for an in-memory relation the Arrow buffers'.
+        ``ds.meta.approx.row_bytes()`` is the different question — an estimate of the
+        *materialized* Arrow width, measured or type-derived.
 
         Returns:
             The average stored bytes per row, or ``None``.
@@ -198,40 +201,51 @@ class StorageMeta(MetaBase):
         return storage.sorted_by(self.source_stats())
 
     def files(self) -> list[str]:
-        """The data files the query would open, in scan order.
+        """The data files the query's sources hold, in scan order.
 
-        Empty for a source with no file backing (an in-memory relation, a streaming source) —
-        the question does not apply to it, rather than being unknown.
+        Every file of every file-backed source: a single Parquet, CSV, or JSON file, each file
+        of a directory or glob, and each leaf file of a hive-partitioned tree. It is the
+        listing the scan plans from, taken before any filter prunes a file away, so it is the
+        upper bound on what the query opens. Listing a directory reads no footer and no data.
+
+        Empty for a source with no file backing (an in-memory relation, a streaming source),
+        because the question does not apply to it. A source whose listing fails also
+        contributes nothing rather than failing the call.
 
         Returns:
-            The paths of the files that would be read.
+            The paths of the sources' data files.
 
         Examples:
             .. doctest::
 
+                >>> import os, tempfile
+                >>> import pyarrow as pa, pyarrow.parquet as pq
                 >>> import batcher as bt
+                >>> root = tempfile.mkdtemp()
+                >>> for i in range(2):
+                ...     pq.write_table(pa.table({"x": [i]}), os.path.join(root, f"{i}.parquet"))
+                >>> sorted(os.path.basename(p) for p in bt.read.parquet(root).meta.storage.files())
+                ['0.parquet', '1.parquet']
                 >>> bt.from_pydict({"x": [1]}).meta.storage.files()
                 []
         """
         found: list[str] = []
         for source in self._ds._sources:
-            paths = getattr(source, "files", None)
-            if callable(paths):
-                try:
-                    found.extend(str(p) for p in paths())
-                except Exception as exc:  # a source that cannot list itself contributes nothing
-                    note_suppressed("api", "list a source's files", exc)
-                    continue
+            try:
+                found.extend(_source_files(source))
+            except Exception as exc:  # a source that cannot list itself contributes nothing
+                note_suppressed("api", "list a source's files", exc)
         return found
 
     def num_files(self) -> int:
-        """How many data files the query would open.
+        """How many data files the query's sources hold — ``len(files())``.
 
         The small-files diagnosis, without a scan: a thousand files for a gigabyte means the
-        query is about to spend its time on footers rather than on data.
+        query is about to spend its time on footers rather than on data. Zero for a source
+        with no file backing, such as an in-memory relation.
 
         Returns:
-            The number of files that would be read.
+            The number of data files.
 
         Examples:
             .. doctest::
@@ -241,3 +255,21 @@ class StorageMeta(MetaBase):
                 0
         """
         return len(self.files())
+
+
+def _source_files(source: object) -> list[str]:
+    """The data files one source reads, from the listing it already keeps, or ``[]``.
+
+    No source exposes a public file list, so this asks each kind for the one it plans its
+    scan from: `FileSource._files()` (Parquet, CSV, JSON, and every other `FileSource`
+    format; memoized, so this is the same listing the read uses) and the fragments of a
+    `ParquetDatasetSource`'s discovered hive dataset. Anything else has no files to name.
+    """
+    from batcher.io import FileSource
+    from batcher.io.formats.structured.parquet import ParquetDatasetSource
+
+    if isinstance(source, FileSource):
+        return [str(path) for path in source._files()]
+    if isinstance(source, ParquetDatasetSource):
+        return [str(path) for path in source._file_paths(source._dataset())]
+    return []

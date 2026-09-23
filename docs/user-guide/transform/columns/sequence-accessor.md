@@ -45,4 +45,4 @@ The rest of the namespace covers composition ({py:meth}`base_counts <batcher.pla
 
 - {doc}`/cookbook/expressions/genomics/index`: the same namespace worked through on real sequence and read data, as runnable scripts.
 - {doc}`/user-guide/transform/columns/expression-accessors`: the general-purpose accessors this sits beside.
-- {doc}`/api/relational/expression-accessors`: every `.seq` method, tabulated.
+- {doc}`/api/accessors/sequence`: every `.seq` method, with signatures and a page each.

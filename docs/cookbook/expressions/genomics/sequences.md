@@ -57,4 +57,4 @@ A motif containing a character that is not an IUPAC code raises rather than matc
 
 - {doc}`/cookbook/expressions/genomics/reads`: quality filtering, sketching, and primer design.
 - {doc}`/cookbook/expressions/strings/index`: the general-purpose text vocabulary.
-- {doc}`/api/relational/expression-accessors`: every {py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>` method, tabulated.
+- {doc}`/api/accessors/sequence`: every {py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>` method, with signatures.

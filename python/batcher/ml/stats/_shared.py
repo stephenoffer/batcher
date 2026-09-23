@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
     from batcher.plan.expr_ir import Expr
 
-__all__ = ["indicator", "require_columns", "require_names", "scalar"]
+__all__ = ["complete_rows", "indicator", "require_columns", "require_names", "scalar"]
 
 
 def indicator(name: str) -> Expr:
@@ -54,6 +54,35 @@ def indicator(name: str) -> Expr:
             {'h': [True, None]}
     """
     return col(name).cast("boolean")
+
+
+def complete_rows(ds: Dataset, *names: str) -> Dataset:
+    """The rows where every named column is non-null, after checking the columns exist.
+
+    The `ml.stats` null rule in one place: a null is a missing observation, so a row missing
+    the value *or the group label* leaves the test. Filtering on the value alone let a null
+    label form a group of its own -- Kruskal-Wallis ranked it as a third sample.
+
+    Args:
+        ds: The dataset to filter.
+        *names: The columns a row must have.
+
+    Returns:
+        The filtered dataset.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.stats._shared import complete_rows
+            >>> ds = bt.from_pydict({"v": [1.0, None, 3.0], "g": ["a", "b", None]})
+            >>> complete_rows(ds, "v", "g").to_pydict()
+            {'v': [1.0], 'g': ['a']}
+    """
+    from functools import reduce
+
+    require_columns(ds, *names)
+    return ds.filter(reduce(lambda a, b: a & b, (col(n).is_not_null() for n in names)))
 
 
 def require_columns(ds: Dataset, *names: str, hint: str = "Pass an existing column.") -> None:

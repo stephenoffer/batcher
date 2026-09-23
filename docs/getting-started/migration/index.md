@@ -193,12 +193,19 @@ Each source system has an agent skill that turns these tables into a procedure: 
 
 ```{toctree}
 :hidden:
+:caption: Port your code
 
-reading-and-writing
 transforming
-ray-data
+reading-and-writing
 ml-pipelines
+ray-data
 differences
+```
+
+```{toctree}
+:hidden:
+:caption: Name-by-name reference
+
 spark/index
 polars/index
 daft/index

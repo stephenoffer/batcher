@@ -435,9 +435,48 @@ def _pool_key(plan0: LogicalPlan, opts: dict) -> tuple:
     actors from the previous run stay alive holding every device while the eight half-GPU
     actors that replaced them wait for a GPU that will never come free. The query does not
     fail; it hangs, with the cluster fully reserved and nothing running.
+
+    The request is the actor's whole grant (`_actor_grant`), not only the stage `opts`: a
+    CPU pool's `opts` is empty and its cores come from the class-level wrap. Keyed on `opts`
+    alone, `collect(distributed=True, num_workers=4)` left four 12-CPU actors holding all
+    48 cores and a following default-width run grew the same pool by 42 one-CPU actors that
+    could never place — the same hang, on cores instead of devices.
+
+    Except the class-level `num_cpus` and `memory`: the envelope sizes those from the capacity
+    that is free *now*, and a resident or warm pool is itself what holds that capacity, so
+    the second run of a pipeline is sized smaller than the first (measured: 12 CPUs then 6)
+    and never found its own pool -- `_evict_stale_configurations` killed it and the model was
+    rebuilt, which is the one thing `resident_inference_pools()` exists to prevent. What they
+    guarded against is growth that cannot place, and `_room_for_actors` now clamps that
+    directly. A `num_cpus` or `memory` the stage asked for explicitly stays in the key.
     """
-    resources = tuple(sorted((k, repr(v)) for k, v in (opts or {}).items()))
+    explicit = opts or {}
+    resources = tuple(
+        sorted(
+            (k, repr(v))
+            for k, v in _actor_grant(opts).items()
+            if k in explicit or k not in _ENVELOPE_SIZED
+        )
+    )
     return (_pipeline_signature(plan0), resources)
+
+
+#: Grant keys the scheduling envelope derives from the cluster's *free* capacity at the
+#: moment a stage starts, so they drift between runs of one pipeline (see `_pool_key`).
+_ENVELOPE_SIZED = frozenset({"num_cpus", "memory"})
+
+
+#: The `ray.remote`/`.options` kwargs that reserve something on the cluster.
+_GRANT_KEYS = ("num_cpus", "num_gpus", "memory", "resources", "accelerator_type")
+
+
+def _actor_grant(opts: dict) -> dict:
+    """What one `_MapActor` spawned with `opts` reserves: `_ensure_ray`'s class-level wrap
+    (`task_options` of the envelope in force) overlaid by `opts`, as `.options` overlays it."""
+    from batcher.dist.executors.ray_runtime import current_envelope, task_options
+
+    merged = {**task_options(current_envelope()), **(opts or {})}
+    return {k: merged[k] for k in _GRANT_KEYS if k in merged}
 
 
 def _kill_pool_keys(keys: list[tuple], registry: dict) -> None:
@@ -467,6 +506,96 @@ def _evict_stale_configurations(key: tuple, registry: dict) -> None:
     _kill_pool_keys([k for k in registry if k[0] == key[0] and k != key], registry)
 
 
+#: How long a short pool waits for just-killed actors' reservations to come back. `ray.kill`
+#: returns before the raylet frees the resources, so a count taken right after an eviction
+#: reads the evicted pool as still resident.
+_EVICTION_SETTLE_S = 10.0
+
+
+def _free_actor_slots(grant: dict, want: int, settle_s: float = 0.0) -> int | None:
+    """Actors of `grant` the cluster's *free* resources host now (summed per node), polled
+    for up to `settle_s` until `want` fit; `None` when unreadable or the grant asks nothing."""
+    asks = {"CPU": grant.get("num_cpus", 0), "GPU": grant.get("num_gpus", 0)}
+    asks |= {"memory": grant.get("memory", 0), **(grant.get("resources") or {})}
+    asks = {k: float(v) for k, v in asks.items() if v and float(v) > 0}
+    if not asks:
+        return None
+    deadline = time.monotonic() + settle_s
+    while True:
+        try:
+            from ray._private.state import available_resources_per_node
+
+            nodes = available_resources_per_node().values()
+        except Exception as exc:  # a private Ray API: degrade to the unclamped pool
+            note_suppressed("dist", "read free resources for a warm actor pool", exc)
+            return None
+        fits = sum(min(int(n.get(k, 0.0) // a) for k, a in asks.items()) for n in nodes)
+        if fits >= want or time.monotonic() >= deadline:
+            return fits
+        time.sleep(0.25)
+
+
+def _evict_foreign_pools(plan0, key: tuple, registry: dict, grant: dict) -> bool:
+    """Kill *other* pipelines' idle warm pools so this one can place; True if any went.
+
+    A warm pool holds its reservation between queries, so a second pipeline sized against
+    the cluster would otherwise wait on cores or devices only an idle neighbour holds. The
+    session registry is left alone while another stage runs on it (its actors may be
+    mid-call); the CPU map/aggregate pools go by `release_foreign_agg_pools`' own rule.
+    """
+    killed = False
+    session_busy = len(_INFER_IN_USE) - (registry is _SESSION_POOLS) > 0
+    for reg in {id(r): r for r in (registry, _SESSION_POOLS)}.values():
+        foreign = [k for k in reg if k[0] != key[0]]
+        if foreign and not (reg is _SESSION_POOLS and session_busy):
+            _kill_pool_keys(foreign, reg)
+            killed = True
+    return release_foreign_agg_pools(plan0, float(grant.get("num_cpus", 0.0))) or killed
+
+
+def _room_for_actors(plan0, key: tuple, registry: dict, grant: dict, want: int, have: int) -> int:
+    """How many of `want` new pool actors to spawn: never more than the cluster can place.
+
+    Evicts idle foreign pools when short. A pool that already has actors runs narrower
+    rather than waiting on replicas that cannot place — pool width is parallelism, so the
+    result is identical. An empty pool that no node could ever host fails fast; one that is
+    merely short of free capacity (a co-tenant, an autoscaler) queues a single actor.
+
+    Raises:
+        ResourceError: When no node's nameplate can host one actor of `grant`.
+    """
+    fits = _free_actor_slots(grant, want, _EVICTION_SETTLE_S)
+    if fits is None or fits >= want:
+        return want
+    if _evict_foreign_pools(plan0, key, registry, grant):
+        fits = _free_actor_slots(grant, want, _EVICTION_SETTLE_S) or 0
+    if fits >= want:
+        return want
+    from batcher.dist.executors.ray_runtime.capacity import Demand, describe_pending_demand
+
+    demand = Demand(
+        num_cpus=float(grant.get("num_cpus", 0.0)),
+        num_gpus=float(grant.get("num_gpus", 0.0)),
+        memory_bytes=int(grant.get("memory", 0)),
+        resources=tuple((grant.get("resources") or {}).items()),
+        count=want,
+    )
+    why = describe_pending_demand(demand) or "the cluster's free capacity is held elsewhere"
+    if have + fits == 0 and why.startswith("no node"):
+        from batcher._internal.errors import ResourceError
+
+        raise ResourceError(f"cannot place a map_batches actor pool: {why}")
+    spawn = max(fits, 0 if have else 1)
+    _log.warning(
+        "warm actor pool placing %d of %d requested new actors (%d already live): %s",
+        spawn,
+        want,
+        have,
+        why,
+    )
+    return spawn
+
+
 def _resident_pool_for(
     plan0: LogicalPlan,
     opts: dict,
@@ -489,19 +618,18 @@ def _resident_pool_for(
     over-pack, because it grows on a measurement rather than on a guess.
     """
     sig = _pool_key(plan0, opts)
+    grant = _actor_grant(opts)
     _evict_stale_configurations(sig, registry)
     pool = registry.get(sig)
     pool = _healthy_actors(pool) if pool else []
     if len(pool) < max(1, size):
-        pool = pool + [
-            _new_map_actor(plan0, opts, cpu_workers) for _ in range(max(1, size) - len(pool))
-        ]
+        grow = _room_for_actors(plan0, sig, registry, grant, max(1, size) - len(pool), len(pool))
+        pool = pool + [_new_map_actor(plan0, opts, cpu_workers) for _ in range(grow)]
     if devices > 0:
         want = devices * _cold_start_density(pool)
         if want > len(pool):
-            pool = pool + [
-                _new_map_actor(plan0, opts, cpu_workers) for _ in range(want - len(pool))
-            ]
+            grow = _room_for_actors(plan0, sig, registry, grant, want - len(pool), len(pool))
+            pool = pool + [_new_map_actor(plan0, opts, cpu_workers) for _ in range(grow)]
     registry[sig] = pool
     _pin_pool_key(sig, plan0)
     return pool
@@ -1272,15 +1400,22 @@ def _distributed_map(
         if r:
             batches.extend(r)
     _record_source_rows(hub, sources[sid], plan, sum(b.num_rows for b in batches))
+    # A task whose rows all filtered away returns one zero-row batch, not nothing, because
+    # that batch is the only record of what the UDF emits (`_udf_output`). It holds no
+    # value, so once any task returned rows it is dropped rather than reconciled, and the
+    # union below sees exactly the batches that carry data.
+    carriers, batches = batches[:1], [b for b in batches if b.num_rows]
     if not batches:
         # A pipeline whose filter matched nothing still has a schema, and the single-node
         # path returns it. Returning a *column-less* table here made `distributed ==
         # single-node` false for every empty result — and broke any caller that went on to
-        # select a column or concat with a non-empty batch. Fall back to the column-less
-        # table only when the plan cannot state its schema (a UDF whose output type is
-        # unknown until it runs).
+        # select a column or concat with a non-empty batch. The plan states it where it
+        # can; a UDF's output type is known only once it has run, so its first task's
+        # zero-row output answers instead, which is the schema single-node returns too.
         schema = plan.available_schema()
-        return pa.table({}) if schema is None else pa.Table.from_batches([], schema=schema.arrow)
+        if schema is not None:
+            return pa.Table.from_batches([], schema=schema.arrow)
+        return pa.Table.from_batches([], schema=carriers[0].schema) if carriers else pa.table({})
     # Reconcile a UDF whose output schema drifts across partitions (e.g. one partition's
     # rows carry extra fields) to one union schema, so the gather concatenates instead of
     # failing — the same schema-drift tolerance the single-node path gives.
@@ -2532,7 +2667,7 @@ class _MapActor:
         # ever reached is what the next run must fit. Utilization is a rate, so it is a mean.
         self._sample_gpu_vram(sample_gpu_vram_fraction)
         if not out or sum(b.num_rows for b in out) == 0:
-            return ([], None) if self._write_spec is not None else None
+            return ([], None) if self._write_spec is not None else _udf_output(out)
         # Writing stage: this actor writes its own inference output straight to the sink and
         # returns only `WrittenFile` locators. That is what keeps a batch-inference job whose
         # RESULT is larger than the driver (a 2B-row embedding write) from OOMing the driver
@@ -2798,6 +2933,17 @@ def _write_udf_output(batches: list, write_spec: dict, idx: int) -> tuple[list, 
     return files, table.schema
 
 
+def _udf_output(out: list[pa.RecordBatch] | None) -> list[pa.RecordBatch] | None:
+    """A task's empty result as one zero-row batch of the UDF's output schema, or None.
+
+    A `map_batches`/`flat_map` UDF's output type is unknown until it runs, so when every
+    row of a partition filtered away, this zero-row batch is the only record of the columns
+    it produces. Returning nothing lost them, and a distributed read whose every partition
+    came back empty returned a column-less table where single-node returned the columns.
+    """
+    return [out[0].slice(0, 0)] if out else None
+
+
 def _map_udf_task(
     plan0,
     partition,
@@ -2817,7 +2963,7 @@ def _map_udf_task(
         _with_map_workers(plan0, workers), [InMemorySource(rows)], engine_config=cfg_json
     )
     if not out or sum(b.num_rows for b in out) == 0:
-        return ([], None) if write_spec is not None else None
+        return ([], None) if write_spec is not None else _udf_output(out)
     # Write in place so the post-UDF rows never travel back through the driver.
     if write_spec is not None:
         return _write_udf_output(out, write_spec, idx)

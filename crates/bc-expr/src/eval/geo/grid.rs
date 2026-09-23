@@ -97,7 +97,7 @@ fn text_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<String>
             let Some(c) = bc_geo::algo::measure::centroid(&g.geometry) else {
                 return Ok(None);
             };
-            row_result(geohash::encode(c.x, c.y, p.max(0) as usize), func)?
+            row_result(geohash::encode(c.x, c.y, geohash_precision(func, p)?), func)?
         }
         GeohashEncode => {
             let Some((lon, lat)) = lonlat(func, cols, i)? else {
@@ -106,7 +106,7 @@ fn text_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<String>
             let Some(p) = i64_at(&cols[2], i, func)? else {
                 return Ok(None);
             };
-            row_result(geohash::encode(lon, lat, p.max(0) as usize), func)?
+            row_result(geohash::encode(lon, lat, geohash_precision(func, p)?), func)?
         }
         StQuadkey => {
             let Some((lon, lat)) = lonlat(func, cols, i)? else {
@@ -115,7 +115,7 @@ fn text_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<String>
             let Some(z) = i64_at(&cols[2], i, func)? else {
                 return Ok(None);
             };
-            let Some(t) = row_result(tile::tile_of(lon, lat, clamp_zoom(z)), func)? else {
+            let Some(t) = row_result(tile::tile_of(lon, lat, zoom(func, z)?), func)? else {
                 return Ok(None);
             };
             row_result(tile::quadkey(t), func)?
@@ -161,7 +161,7 @@ fn int_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<i64>, Ex
             let Some(z) = i64_at(&cols[2], i, func)? else {
                 return Ok(None);
             };
-            let Some(t) = row_result(tile::tile_of(lon, lat, clamp_zoom(z)), func)? else {
+            let Some(t) = row_result(tile::tile_of(lon, lat, zoom(func, z)?), func)? else {
                 return Ok(None);
             };
             Some(if func == StTileX { t.x } else { t.y })
@@ -173,7 +173,7 @@ fn int_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<i64>, Ex
             let Some(level) = i64_at(&cols[2], i, func)? else {
                 return Ok(None);
             };
-            let Some(id) = row_result(s2::cell_id(lon, lat, clamp_level(level)), func)? else {
+            let Some(id) = row_result(s2::cell_id(lon, lat, s2_level(func, level)?), func)? else {
                 return Ok(None);
             };
             // S2 ids fill 64 bits, and Arrow's integer column is signed. The
@@ -188,7 +188,7 @@ fn int_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<i64>, Ex
             else {
                 return Ok(None);
             };
-            Some(match s2::parent(cell as u64, clamp_level(level)) {
+            Some(match s2::parent(cell as u64, s2_level(func, level)?) {
                 Some(p) => p as i64,
                 None => return Ok(None),
             })
@@ -222,18 +222,35 @@ fn int_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<i64>, Ex
     })
 }
 
-/// A zoom level as `u32`, saturating at the module's own maximum.
+/// A grid parameter checked against its range, naming the value the caller passed.
 ///
-/// The clamp is not a silent truncation: `tile_of` rejects anything past its maximum
-/// with a message, so an out-of-range value still reaches the user as an error. This
-/// exists only so a negative `i64` does not wrap to four billion on the cast.
-fn clamp_zoom(z: i64) -> u32 {
-    z.clamp(0, i64::from(tile::MAX_ZOOM) + 1) as u32
+/// These are *parameters*, not row data: a precision of -1 fails on every row, so it is a
+/// query error rather than a null. The check lives here, before the `i64` narrows, because
+/// narrowing first is exactly how `-1` used to arrive downstream as `0` — geohash then
+/// reported "got 0" for a value nobody typed, and a quadkey at zoom `-1` silently became
+/// the zoom-0 empty string.
+fn ranged(func: GeoFunc, what: &str, v: i64, lo: i64, hi: i64) -> Result<i64, ExprError> {
+    if (lo..=hi).contains(&v) {
+        Ok(v)
+    } else {
+        Err(ExprError::InvalidArgument {
+            func: super::fn_name(func),
+            reason: format!("{what} must be {lo}..={hi}, got {v}"),
+        })
+    }
 }
 
-/// An S2 level as `u32`, with the same reasoning as `clamp_zoom`.
-fn clamp_level(level: i64) -> u32 {
-    level.clamp(0, i64::from(s2::MAX_LEVEL) + 1) as u32
+fn geohash_precision(func: GeoFunc, p: i64) -> Result<usize, ExprError> {
+    let max = geohash::MAX_PRECISION as i64;
+    Ok(ranged(func, "geohash precision", p, 1, max)? as usize)
+}
+
+fn zoom(func: GeoFunc, z: i64) -> Result<u32, ExprError> {
+    Ok(ranged(func, "tile zoom", z, 0, i64::from(tile::MAX_ZOOM))? as u32)
+}
+
+fn s2_level(func: GeoFunc, level: i64) -> Result<u32, ExprError> {
+    Ok(ranged(func, "S2 level", level, 0, i64::from(s2::MAX_LEVEL))? as u32)
 }
 
 #[cfg(test)]
@@ -241,12 +258,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn out_of_range_levels_saturate_into_the_error_range_rather_than_wrapping() {
-        assert_eq!(clamp_zoom(-5), 0);
-        assert_eq!(clamp_zoom(1_000), tile::MAX_ZOOM + 1);
-        assert!(tile::tile_of(0.0, 0.0, clamp_zoom(1_000)).is_err());
-        assert_eq!(clamp_level(-1), 0);
-        assert!(s2::cell_id(0.0, 0.0, clamp_level(99)).is_err());
+    fn an_out_of_range_parameter_is_an_error_naming_the_value_passed() {
+        let msg = |r: Result<u32, ExprError>| r.unwrap_err().to_string();
+        assert!(msg(zoom(GeoFunc::StQuadkey, -1)).contains("got -1"));
+        assert!(msg(zoom(GeoFunc::StQuadkey, 31)).contains("got 31"));
+        assert!(msg(s2_level(GeoFunc::StS2Cell, -1)).contains("got -1"));
+        let gh = geohash_precision(GeoFunc::GeohashEncode, -1)
+            .unwrap_err()
+            .to_string();
+        assert!(gh.contains("got -1") && !gh.contains("got 0"), "{gh}");
+        assert!(geohash_precision(GeoFunc::GeohashEncode, 0).is_err());
+        assert_eq!(geohash_precision(GeoFunc::GeohashEncode, 12).unwrap(), 12);
+        assert_eq!(zoom(GeoFunc::StTileX, 0).unwrap(), 0);
     }
 
     #[test]

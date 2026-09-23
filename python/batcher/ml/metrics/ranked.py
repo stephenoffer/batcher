@@ -17,6 +17,16 @@ It is exact, ties included, provided the ranks are *average* ranks over a tie gr
 engine's ``rank`` is the competition rank (the tie group's first position) and ``cume_dist``
 gives its last position over n, so their mean recovers the average rank without a second
 sort. This agrees with scikit-learn's ``roc_auc_score`` to the last bit.
+
+**Rows with a null label, or a null or NaN score, are dropped before anything is ranked.**
+They used to stay in: a null label was left out of the class counts but still took a rank,
+and a null or NaN score sorted to one end and was ranked as the best or worst prediction.
+scikit-learn refuses such input outright, and dropping the row is the aggregate-friendly
+equivalent, the same pairwise-complete rule the expression metrics follow.
+
+**A group with only one class has no ROC curve**, so `roc_auc`, `gini_coefficient`, and
+`ks_statistic` answer NaN there, on every execution path. scikit-learn raises instead; NaN
+is the per-group answer that survives into a `by=` table without failing the other groups.
 """
 
 from __future__ import annotations
@@ -44,6 +54,13 @@ _CUM_POS = "__bt_cum_pos"
 _LABEL = "__bt_label"
 
 
+def _scored(ds: Dataset, y_true: str, y_score: str) -> Dataset:
+    """`ds` without the rows a rank cannot place: a null label, or a null or NaN score."""
+    _require_columns(ds, y_true, y_score)
+    score = col(y_score)
+    return ds.filter(col(y_true).is_not_null() & score.is_not_null() & ~score.is_nan())
+
+
 def _group_keys(by: str | list[str] | None) -> list[str]:
     """Normalize a `by=` argument into a (possibly empty) list of grouping columns."""
     if by is None:
@@ -56,9 +73,8 @@ def _one_or_frame(result: Dataset, groups: list[str], metric: str) -> Any:
     if groups:
         return result
     row = result.collect()
-    if row.num_rows == 0:
-        return float("nan")
-    return row.column(metric)[0].as_py()
+    value = row.column(metric)[0].as_py() if row.num_rows else None
+    return float("nan") if value is None else float(value)
 
 
 def roc_auc(
@@ -85,7 +101,9 @@ def roc_auc(
         metric: The output column name when `by` is used.
 
     Returns:
-        The AUC as a float, or a `Dataset` of one row per group when `by` is given.
+        The AUC as a float, or a `Dataset` of one row per group when `by` is given. NaN for
+        a group holding only one class. Rows with a null label or a null or NaN score are
+        dropped first.
 
     Raises:
         ColumnNotFoundError: If `y_true` or `y_score` is not a column of `ds`.
@@ -99,9 +117,8 @@ def roc_auc(
             >>> roc_auc(ds, "y", "s")
             0.75
     """
-    _require_columns(ds, y_true, y_score)
     groups = _group_keys(by)
-    ranked = ds.with_columns(
+    ranked = _scored(ds, y_true, y_score).with_columns(
         **{
             _RANK: rank().over(partition_by=list(groups), order_by=[y_score]),
             _CUME: cume_dist().over(partition_by=list(groups), order_by=[y_score]),
@@ -110,14 +127,20 @@ def roc_auc(
     is_positive = positive_mask(col(y_true), positive)
     positive_rank = when(is_positive).then(col(_RANK).cast("float64")).otherwise(lit(0.0))
     positive_cume = when(is_positive).then(col(_CUME)).otherwise(lit(0.0))
-    n_total = col(y_true).count()
-    n_positive = count_if(is_positive)
+    n_total = col(y_true).count().cast("float64")
+    n_positive = count_if(is_positive).cast("float64")
+    n_negative = n_total - n_positive
     # The average rank of a tie group is the mean of its first position (`rank`) and its
     # last (`cume_dist * n`), so summing that over the positives is the rank identity's
     # numerator without a second sort.
     rank_sum = (sum_(positive_rank) + n_total * sum_(positive_cume)) / lit(2.0)
-    auc = (rank_sum - n_positive * (n_positive + lit(1.0)) / lit(2.0)) / (
-        n_positive * (n_total - n_positive)
+    area = (rank_sum - n_positive * (n_positive + lit(1.0)) / lit(2.0)) / (n_positive * n_negative)
+    # One class leaves the denominator zero, and the plain quotient came out as +inf, -inf
+    # or NaN depending on which float rounding the plan happened to take.
+    auc = (
+        when((n_positive > lit(0.0)) & (n_negative > lit(0.0)))
+        .then(area)
+        .otherwise(lit(float("nan")))
     )
     aggregated = _aggregate(ranked, groups, {metric: auc})
     return _one_or_frame(aggregated, groups, metric)
@@ -147,7 +170,8 @@ def gini_coefficient(
         metric: The output column name when `by` is used.
 
     Returns:
-        The Gini coefficient as a float, or a `Dataset` when `by` is given.
+        The Gini coefficient as a float, or a `Dataset` when `by` is given. NaN wherever
+        `roc_auc` is.
 
     Examples:
         .. doctest::
@@ -200,7 +224,10 @@ def average_precision(
         metric: The output column name when `by` is used.
 
     Returns:
-        The average precision as a float, or a `Dataset` when `by` is given.
+        The average precision as a float, or a `Dataset` when `by` is given, and 0.0 for a
+        group with no positive rows, which is what scikit-learn's
+        ``average_precision_score`` returns there. Rows with a null label or a null or NaN
+        score are dropped first.
 
     Examples:
         .. doctest::
@@ -211,9 +238,8 @@ def average_precision(
             >>> round(average_precision(ds, "y", "s"), 6)
             0.833333
     """
-    _require_columns(ds, y_true, y_score)
     groups = _group_keys(by)
-    labelled = ds.with_columns(
+    labelled = _scored(ds, y_true, y_score).with_columns(
         **{_LABEL: when(positive_mask(col(y_true), positive)).then(lit(1.0)).otherwise(lit(0.0))}
     )
     running = labelled.with_columns(
@@ -224,7 +250,8 @@ def average_precision(
     )
     precision_at_row = col(_CUM_POS) / col(_POSITION).cast("float64")
     contribution = when(col(_LABEL) == lit(1.0)).then(precision_at_row).otherwise(lit(0.0))
-    value = sum_(contribution) / sum_(col(_LABEL))
+    positives = sum_(col(_LABEL))
+    value = when(positives > lit(0.0)).then(sum_(contribution) / positives).otherwise(lit(0.0))
     aggregated = _aggregate(running, groups, {metric: value})
     return _one_or_frame(aggregated, groups, metric)
 
@@ -255,7 +282,8 @@ def ks_statistic(
         metric: The output column name when `by` is used.
 
     Returns:
-        The KS statistic as a float, or a `Dataset` when `by` is given.
+        The KS statistic as a float, or a `Dataset` when `by` is given. NaN for a group
+        holding only one class, which has no second distribution to compare against.
 
     Examples:
         .. doctest::
@@ -266,10 +294,9 @@ def ks_statistic(
             >>> ks_statistic(ds, "y", "s")
             1.0
     """
-    _require_columns(ds, y_true, y_score)
     groups = _group_keys(by)
     is_positive = positive_mask(col(y_true), positive)
-    labelled = ds.with_columns(
+    labelled = _scored(ds, y_true, y_score).with_columns(
         **{
             _LABEL: when(is_positive).then(lit(1.0)).otherwise(lit(0.0)),
             "__bt_neg": when(is_positive).then(lit(0.0)).otherwise(lit(1.0)),
@@ -289,7 +316,9 @@ def ks_statistic(
         }
     )
     gap = (col(_CUM_POS) / col("__bt_tot_pos") - col("__bt_cum_neg") / col("__bt_tot_neg")).abs()
-    aggregated = _aggregate(running, groups, {metric: gap.max()})
+    both_classes = (col("__bt_tot_pos").max() > lit(0.0)) & (col("__bt_tot_neg").max() > lit(0.0))
+    value = when(both_classes).then(gap.max()).otherwise(lit(float("nan")))
+    aggregated = _aggregate(running, groups, {metric: value})
     return _one_or_frame(aggregated, groups, metric)
 
 

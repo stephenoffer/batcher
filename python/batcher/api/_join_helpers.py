@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Col, Expr
 from batcher.plan.expr_ir.core import _wrap
+from batcher.plan.expr_ir.selectors import has_selector
 from batcher.plan.logical import JoinOutputCol, empty_result_schema
 from batcher.plan.schema import placeholder_schema
 
@@ -56,6 +57,13 @@ def _resolve_join_keys(
     left_on: str | list[str] | None,
     right_on: str | list[str] | None,
 ) -> tuple[list[str], list[str]]:
+    for keys in (on, left_on, right_on):
+        if has_selector(keys) or (isinstance(keys, list) and any(map(has_selector, keys))):
+            raise PlanError(
+                "join keys must be named: a column selector is not accepted in "
+                "join(on=/left_on=/right_on=...), because the two sides would each expand it "
+                "on their own. List the key names instead"
+            )
     if on is not None:
         if left_on is not None or right_on is not None:
             raise PlanError("pass either `on` or `left_on`/`right_on`, not both")

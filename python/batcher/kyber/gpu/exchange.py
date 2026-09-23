@@ -24,18 +24,21 @@ fabric all yield "no opinion", and the caller keeps the figure it had.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 from batcher._internal.hardware.fabric.p2p import fabric_fraction, peer_islands
-from batcher.kyber.cost.fabric import REFERENCE_LOCAL_GBPS
+from batcher.kyber.cost.fabric import REFERENCE_LOCAL_GBPS, fabric_net_weight
 
 __all__ = [
     "DeviceFabric",
     "device_exchange_gbps",
     "device_fabric",
+    "device_net_factor",
     "device_net_gbps",
     "device_net_weight",
     "fabric_bounded_width",
+    "reset_device_net_factor",
     "widest_fabric_island",
 ]
 
@@ -192,6 +195,46 @@ def device_net_weight(
     if rate <= 0.0 or local_gbps <= 0.0:
         return None
     return min(_MAX_WEIGHT, max(_MIN_WEIGHT, local_gbps / rate))
+
+
+@functools.cache
+def device_net_factor() -> float:
+    """How much more a byte shuffled *off a device* costs than the `net` weight already charges.
+
+    `Cost.total` prices every shuffled byte at `cost.fabric.fabric_net_weight` — the node's
+    summed active port rate. That denominator is right for host-resident data and optimistic
+    for device-resident data by the two terms at the top of this module, so a plan whose bytes
+    start on a board is ranked against a fabric it cannot reach. This is the correction, as a
+    multiplier rather than a replacement weight: the `net` axis is a per-operator quantity, and
+    only the operators downstream of a device stage should pay it.
+
+    Memoized because `CostModel.op_cost` runs for every candidate the enumerator considers and
+    the underlying probe answers a question that cannot change under a running process. Clear
+    it with `reset_device_net_factor`.
+
+    Returns:
+        The multiplier, never below `1.0` — a device's own wires are never *wider* than the
+        node's summed fabric, so a ratio under one is a measurement artifact rather than a
+        cheaper byte. Exactly `1.0` when the device's wires are unreadable, when there is no
+        accelerator, or when the host weight is itself unreadable, which is what keeps every
+        CPU-only plan ranked bit-for-bit as it was.
+    """
+    weight = device_net_weight()
+    if weight is None:
+        return 1.0
+    host = fabric_net_weight()
+    if host <= 0.0:
+        return 1.0
+    return max(1.0, weight / host)
+
+
+def reset_device_net_factor() -> None:
+    """Forget the memoized factor, so the next call re-reads the device's wires.
+
+    Returns:
+        None.
+    """
+    device_net_factor.cache_clear()
 
 
 def device_exchange_gbps(devices: int, fabric: DeviceFabric, nvlink_gbps: float = 0.0) -> float:

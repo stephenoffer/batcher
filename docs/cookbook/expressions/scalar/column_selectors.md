@@ -17,6 +17,25 @@ Run it yourself:
 python examples/expressions/column_selectors.py
 ```
 
+
+## Resolving a selector against a schema
+
+A selector is lazy: {py:func}`bt.numeric() <batcher.numeric>` describes a rule, not a column list, and it expands when
+the plan is built. {py:meth}`Selector.matched_columns <batcher.Selector>` runs that
+expansion early, which is what you want when a caller must report or validate the choice
+before any query runs.
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"a": [1], "b": [2.0], "label": ["x"]})
+print(bt.starts_with("a").matched_columns(ds.columns, None))
+```
+
+A name-based selector needs only the column names, so `None` is an acceptable schema. A
+type-based selector such as {py:func}`bt.numeric() <batcher.numeric>` needs the types too, and resolving one without
+them matches nothing rather than raising.
+
 ## See also
 
 - {doc}`/cookbook/expressions/scalar/aggregates`: counts, positions, quantiles, and approximations.

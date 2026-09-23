@@ -35,13 +35,11 @@ one that will not start.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 from batcher._internal.hardware.devices import (
     ALLOC_CONF_ENV,
     allocator_initialized,
-    fragmentation_ratio,
     set_alloc_conf,
     set_memory_fraction,
 )
@@ -51,8 +49,6 @@ __all__ = [
     "TorchAllocatorPlan",
     "configure_torch_allocator",
     "plan_torch_allocator",
-    "reset_torch_allocator_state",
-    "torch_allocator_state",
 ]
 
 _applied: TorchAllocatorPlan | None = None
@@ -230,37 +226,3 @@ def _set_memory_fraction(fraction: float) -> bool:
         RuntimeError("torch is not loaded in this worker, or exposes no usable device"),
     )
     return False
-
-
-def torch_allocator_state() -> dict[str, float | bool | str]:
-    """What this process's PyTorch allocator is configured with and how fragmented it is.
-
-    Returns:
-        `alloc_conf` (the settings string in force, empty when none), `memory_fraction` (the
-        applied cap, `0.0` when uncapped), and `fragmentation` (the live ratio, `0.0` when
-        unmeasurable — never a guess).
-
-    Examples:
-        .. doctest::
-
-            >>> from batcher.carbonite.accel.device import torch_allocator_state
-            >>> torch_allocator_state()["memory_fraction"]
-            0.0
-    """
-    applied = _applied
-    return {
-        "alloc_conf": os.environ.get(ALLOC_CONF_ENV, ""),
-        "memory_fraction": (applied.memory_fraction or 0.0) if applied else 0.0,
-        "expandable_segments": bool(applied and applied.expandable_segments),
-        "fragmentation": fragmentation_ratio() or 0.0,
-    }
-
-
-def reset_torch_allocator_state() -> None:
-    """Forget the applied plan so the next `configure_torch_allocator` acts again.
-
-    For tests, and for a worker deliberately re-pointed between stages. It does not undo the
-    settings: PyTorch parsed them at allocator startup and there is no supported way back.
-    """
-    global _applied
-    _applied = None

@@ -34,6 +34,7 @@ How the engine attaches to a Ray cluster, shuffles across it, and stays correct 
 | `locality_aware_scheduling` | `True` | Host a reducer whose bucket concentrates on one node on that node, turning the bulk of its fetches into same-node hits. Result-preserving; pays off on a multi-node cluster with a skewed / co-partitioned shuffle. A single-node fleet resolves to "nothing to place" from the worker addresses alone, with no remote call. |
 | `persistent_fleet` | `False` | Reserve one placement group and worker fleet for a whole adaptive multi-stage query, keeping each stage's intermediate partitioned on the workers instead of collecting to the driver. Removes per-stage placement churn and the driver funnel. |
 | `distribute_min_rows` | `1000000` | Estimated input rows below which `distributed="auto"` stays single-node even on a cluster, because the Ray fan-out carries a fixed cost a small query never repays. A GPU stage always distributes. `0` always distributes on a cluster. An explicit `distributed=True` or `False` overrides it. |
+| `mode` | `"auto"` | What `distributed="auto"` means for every terminal that doesn't pass `distributed=` itself, which includes `count()`, `min()`, `to_pydict()`, the `ds.meta` fallbacks, `ds.dq.validate()` and `ds.dq.fail()`. `"auto"` is the size- and topology-aware routing above. `"always"` forces the Ray path and starts a local Ray when none is running. `"never"` keeps every such terminal single-node. An explicit `distributed=True` or `False` overrides it. |
 | `cluster_connect_timeout_s` | `30.0` | Retry window, with exponential backoff, for attaching to a cluster whose head isn't answering yet, as when a KubeRay driver pod starts before its head. A detected address that never answers falls back to local Ray. An address you set explicitly raises instead. `0` makes one attempt. |
 | `trust_cluster_image` | `False` | Trust that every worker image already carries a compatible `batcher`. By default the driver ships its own package to a remote cluster when no `runtime_env` is given. Set `True` for a production image that bakes Batcher in. |
 | `object_store_memory_bytes` | `None` | Object store size for a Ray that Batcher starts locally. `None` uses Ray's default. Ignored when attaching to an existing cluster. Bulk data bypasses the object store, so this bounds only control-plane metadata. |
@@ -53,6 +54,24 @@ cfg = Config().replace(distributed=DistributedConfig(namespace="nightly-etl"))
 print(cfg.distributed.namespace)
 # nightly-etl
 ```
+
+### Pin terminals that take no distributed argument
+
+`collect()` and `iter_batches()` accept `distributed=`, but many terminals don't. The scalar terminals such as `count()` and `min()`, `to_arrow()` and `to_pydict()`, the fallbacks behind `ds.meta`, and `ds.dq.validate()` and `ds.dq.fail()` all run with `distributed="auto"`. Set `mode` to decide for all of them at once. Scope it with `option_context` so it covers one block of work:
+
+```python
+import batcher as bt
+from batcher.config import option_context
+
+orders = bt.from_pydict({"order_id": [1, 2, 3], "amount": [10.0, -2.0, 7.5]})
+with option_context("distributed.mode", "never"):
+    report = orders.dq.positive("amount").validate()
+    rows = orders.meta.shape()[0]
+print(report.violations, rows)
+# {'positive(amount)': 1} 3
+```
+
+Use `"always"` inside the block to run the same checks on the cluster. With no `num_workers` to go on, a distributed run places one worker per node, and each worker uses all of its node's cores. So on a single-node Ray, such as a laptop, `"always"` runs one Ray worker, and to split the work into several partitions there you pass `collect(distributed=True, num_workers=N)` on a lazy result. On a cluster, a data-quality gate over a large file-backed table is where this matters most: `"auto"` already distributes it once the input passes `distribute_min_rows`, and `"always"` makes that routing explicit. A result is identical either way, within the stated exceptions in {doc}`../architecture/deep-dives/distribution/index`.
 
 ### Fault tolerance
 

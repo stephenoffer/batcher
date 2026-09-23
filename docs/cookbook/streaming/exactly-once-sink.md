@@ -159,7 +159,7 @@ One more. Under `distributed.resilience="spot"`, a checkpoint path that looks no
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: the stateful query whose snapshots live in the same checkpoint directory.
 - {doc}`Stream join </cookbook/streaming/stream-join>`: the one query shape that cannot reach any of these sinks.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: the batch write surface and Delta commits.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, checkpoints, and the query handle.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, checkpoints, and the query handle.
 - {doc}`Delta Lake integration </integrations/lakehouse/delta-lake>`: the `txn` action that makes the strongest sink strong.
 - {doc}`Fault tolerance </architecture/fault-tolerance>`: the recovery model the offset and commit logs implement.
 - {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: what to do when the sink you are stuck with cannot dedup at all.

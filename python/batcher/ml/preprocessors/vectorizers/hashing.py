@@ -53,6 +53,12 @@ class HashingVectorizer(Preprocessor):
     generous — a few hundred thousand is ordinary. Collisions degrade a model gracefully;
     too narrow a space does not.
 
+    The feature index is ``abs(fnv1a_64(term)) % n_features``, from the engine's
+    ``str.hash64``. scikit-learn's ``HashingVectorizer`` uses signed 32-bit MurmurHash3 and, by
+    default, ``alternate_sign=True``, so the two assign different indices and signs to the
+    same term: the outputs are equivalent as feature spaces but not interchangeable, and a
+    model trained on one cannot score features from the other.
+
     Examples:
         .. doctest::
 

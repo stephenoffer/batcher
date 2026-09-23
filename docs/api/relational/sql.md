@@ -311,7 +311,7 @@ print(out.to_pydict())
 # {'category': ['a', 'b'], 'total': [90.0, 60.0]}
 ```
 
-Pass `dialect=` to either `bt.sql` or `bt.Session(dialect=...)` to select the sqlglot read dialect:
+Pass `dialect=` to either {py:obj}`bt.sql <batcher.sql>` or {py:obj}`bt.Session(dialect=...) <batcher.Session>` to select the sqlglot read dialect:
 
 ```python
 out = bt.sql("SELECT STRPOS(category, 'a') AS p FROM events", events=events, dialect="postgres")

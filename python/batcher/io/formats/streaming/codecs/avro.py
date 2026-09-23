@@ -28,8 +28,9 @@ import pyarrow as pa
 
 from batcher._internal.errors import BackendError, PlanError
 from batcher._internal.optional import require
-from batcher.io.formats.streaming.codecs.base import CODECS, null_mask_from
+from batcher.io.formats.streaming.codecs.base import CODECS, null_mask_from, payloads_of
 from batcher.io.formats.streaming.codecs.wire import (
+    SchemaNotFoundError,
     SchemaRegistry,
     frame_confluent,
     unframe_confluent,
@@ -158,15 +159,30 @@ class AvroCodec:
         """
         return self._arrow_type
 
-    def _writer_for(self, schema_id: int) -> Any:
-        """The parsed writer schema for `schema_id`, fetched from the registry once."""
+    def _writer_for(self, schema_id: int, unknown: dict[int, Exception]) -> Any | None:
+        """The parsed writer schema for `schema_id`, or None when the registry has no such id.
+
+        Fetched once and cached for the codec's lifetime. An id the registry does not know is
+        remembered in `unknown` for the rest of the batch, so a run of messages carrying one
+        bogus id costs one GET rather than one per message. Any other registry failure —
+        unreachable, a 5xx, a schema that will not parse — propagates in every decode mode:
+        it is not a property of the message, and nulling on it would turn an outage into a
+        stream of empty records.
+        """
         cached = self._writer_cache.get(schema_id)
         if cached is not None:
             return cached
+        if schema_id in unknown:
+            return None
         fastavro = _require_fastavro()
         if self._registry is None:  # pragma: no cover - unreachable without framing
             raise BackendError("a Confluent-framed payload needs schema_registry= to decode")
-        parsed = fastavro.parse_schema(_parse_schema_text(self._registry.schema_by_id(schema_id)))
+        try:
+            text = self._registry.schema_by_id(schema_id)
+        except SchemaNotFoundError as exc:
+            unknown[schema_id] = exc
+            return None
+        parsed = fastavro.parse_schema(_parse_schema_text(text))
         self._writer_cache[schema_id] = parsed
         return parsed
 
@@ -182,39 +198,51 @@ class AvroCodec:
 
         Raises:
             BackendError: Under ``mode="fail"``, on the first record that will not decode,
-                naming the row so the offending offset can be found.
+                naming the row so the offending offset can be found — and in every mode
+                when the schema registry itself fails.
         """
         fastavro = _require_fastavro()
-        payloads = column.to_pylist()
         nulls = null_mask_from(column)
+        unknown: dict[int, Exception] = {}
         rows: list[dict[str, Any] | None] = []
-        for index, payload in enumerate(payloads):
+        for index, payload in enumerate(payloads_of(column)):
             if nulls[index] or payload is None:
                 rows.append(None)
                 continue
-            try:
-                if self._registry is not None:
+            writer, body = self._reader_schema, payload
+            if self._registry is not None:
+                try:
                     framed = unframe_confluent(payload)
-                    writer = self._writer_for(framed.schema_id)
-                    body = framed.body
-                else:
-                    writer = self._reader_schema
-                    body = payload
-                rows.append(
-                    fastavro.schemaless_reader(io.BytesIO(body), writer, self._reader_schema)
-                )
-            except Exception as exc:
-                if self._mode == "permissive":
-                    rows.append(None)
+                except BackendError as exc:
+                    rows.append(self._malformed(index, payload, exc))
                     continue
-                raise BackendError(
-                    f"Avro decode failed on row {index} of the batch ({len(payload)} bytes): "
-                    f"{exc}. Pass value_decode_mode='permissive' to null undecodable records "
-                    "instead of failing the query."
-                ) from exc
+                # Outside any handler on purpose: a registry that fails raises here in every
+                # mode. Only an id it does not know comes back as None.
+                writer, body = self._writer_for(framed.schema_id, unknown), framed.body
+                if writer is None:
+                    rows.append(self._malformed(index, payload, unknown[framed.schema_id]))
+                    continue
+            try:
+                buffer = io.BytesIO(body)
+                record = fastavro.schemaless_reader(buffer, writer, self._reader_schema)
+                _require_consumed(buffer, len(body), framed=self._registry is not None)
+            except Exception as exc:
+                rows.append(self._malformed(index, payload, exc))
+                continue
+            rows.append(record)
         if self._union_fields:
             self._place_unions(rows)
         return pa.array(rows, type=self._arrow_type)
+
+    def _malformed(self, index: int, payload: bytes, exc: Exception) -> None:
+        """Answer one undecodable payload: None under ``permissive``, raise under ``fail``."""
+        if self._mode == "permissive":
+            return None
+        raise BackendError(
+            f"Avro decode failed on row {index} of the batch ({len(payload)} bytes): "
+            f"{exc}. Pass value_decode_mode='permissive' to null undecodable records "
+            "instead of failing the query."
+        ) from exc
 
     def _place_unions(self, rows: list[dict[str, Any] | None]) -> None:
         """Rewrite multi-branch union values into the `memberN` struct Arrow holds them as.
@@ -255,13 +283,90 @@ class AvroCodec:
                 "the codec from a subject (schema_registry=<url>) rather than an inline "
                 "value_schema, or drop schema_registry to write bare Avro."
             )
+        named = self._reader_schema.get("__named_schemas", {})
         out: list[bytes | None] = []
         for row in column.to_pylist():
             if row is None:
                 out.append(None)
                 continue
             buffer = io.BytesIO()
-            fastavro.schemaless_writer(buffer, self._reader_schema, row)
+            fastavro.schemaless_writer(
+                buffer, self._reader_schema, _to_datum(row, self._reader_schema, named)
+            )
             body = buffer.getvalue()
             out.append(body if self._schema_id is None else frame_confluent(self._schema_id, body))
         return pa.array(out, type=pa.binary())
+
+
+def _require_consumed(buffer: io.BytesIO, size: int, *, framed: bool) -> None:
+    """Raise if the record did not use every byte of its payload.
+
+    An Avro record carries no length, so a reader handed the wrong bytes can succeed and
+    stop early — which is exactly what a Confluent-framed payload read *without* a registry
+    does: the magic byte and schema id decode as small field values and the real record is
+    left over. Leftover bytes are therefore an error, not slack.
+    """
+    left = size - buffer.tell()
+    if left:
+        hint = (
+            ""
+            if framed
+            else " A payload written by a Confluent serializer leaves exactly this when read "
+            "without schema_registry=; pass it if the topic is registry-framed."
+        )
+        raise BackendError(f"{left} byte(s) remain after the record.{hint}")
+
+
+_PRIMITIVES = frozenset({"null", "boolean", "int", "long", "float", "double", "bytes", "string"})
+
+
+def _branch_name(branch: Any) -> str:
+    """The name fastavro's tuple notation selects a union branch by."""
+    if isinstance(branch, str):
+        return branch
+    kind = branch.get("type")
+    if kind in ("record", "enum", "fixed", "error"):
+        return branch["name"]
+    return kind if isinstance(kind, str) else _branch_name(kind)
+
+
+def _to_datum(value: Any, schema: Any, named: dict[str, Any]) -> Any:
+    """One decoded Arrow value back in the shape fastavro's writer takes for `schema`.
+
+    The inverse of the decode-side mapping, which is not the identity: a map arrives from
+    Arrow as a list of ``(key, value)`` pairs, and a multi-branch union as the
+    ``{memberN: ...}`` struct `io.formats.structured.avro` holds it in. Handed to fastavro
+    as they are, both were rejected, so a record could be read and never written back.
+    A union member is written with tuple notation naming its branch, so the branch the value
+    was read from is the branch it is written to.
+    """
+    if value is None:
+        return None
+    if isinstance(schema, str):
+        return value if schema in _PRIMITIVES else _to_datum(value, named.get(schema), named)
+    if isinstance(schema, list):
+        branches = [b for b in schema if b != "null"]
+        if len(branches) == 1:
+            return _to_datum(value, branches[0], named)
+        members = [f"member{i}" for i in range(len(branches))]
+        if not isinstance(value, dict) or list(value) != members:
+            return value
+        for member, branch in zip(members, branches, strict=True):
+            if value[member] is not None:
+                return (_branch_name(branch), _to_datum(value[member], branch, named))
+        return None
+    if not isinstance(schema, dict):
+        return value
+    kind = schema.get("type")
+    if kind in ("record", "error"):
+        return {
+            f["name"]: _to_datum(value.get(f["name"]), f["type"], named) for f in schema["fields"]
+        }
+    if kind == "array":
+        return [_to_datum(item, schema["items"], named) for item in value]
+    if kind == "map":
+        pairs = value.items() if isinstance(value, dict) else value
+        return {key: _to_datum(item, schema["values"], named) for key, item in pairs}
+    if isinstance(kind, (dict, list)):
+        return _to_datum(value, kind, named)
+    return value

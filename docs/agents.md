@@ -128,7 +128,7 @@ The usage and migration skills apply anywhere Batcher is installed. The extensio
 A skill that describes an API which has since changed is worse than no skill, because an
 agent will trust it. Two things guard against that.
 
-Every skill was written against the live API rather than from memory, with symbols verified by introspection and code blocks executed. And `tests/docs/test_skill_coverage.py` fails if a skill exists that this page doesn't list, if a listed skill has no file, or if a skill is missing its `name` or `description` frontmatter, so the catalog can't quietly fall behind the directory.
+Every skill was written against the live API rather than from memory, with symbols verified by introspection and code blocks executed. And [`tests/docs/test_skill_coverage.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_skill_coverage.py) fails if a skill exists that this page doesn't list, if a listed skill has no file, or if a skill is missing its `name` or `description` frontmatter, so the catalog can't quietly fall behind the directory.
 
 When you change an API, the skill that teaches it is part of the change, exactly as its
 documentation is.

@@ -33,10 +33,16 @@ These pages cover the bounded side: one reader and one writer namespace, from a 
 In-memory constructors, file readers, and tolerance for unreadable files, bad lines and wrong encodings.
 :::
 
-:::{grid-item-card} {octicon}`server;1.1em` Databases and specialized formats
-:link: /user-guide/moving-data/reading-databases
+:::{grid-item-card} {octicon}`server;1.1em` Databases and warehouses
+:link: /integrations/databases/databases
 :link-type: doc
-SQL databases, warehouses, NoSQL stores, web crawls, PDFs, LiDAR, and robot and vehicle logs.
+SQL over a connection URI, where credentials come from, and splitting one extract into parallel queries.
+:::
+
+:::{grid-item-card} {octicon}`beaker;1.1em` Scientific and specialized formats
+:link: /user-guide/moving-data/specialized-formats
+:link-type: doc
+Zarr and HDF5 arrays, web crawls, PDFs, LiDAR point clouds, and robot and vehicle logs.
 :::
 
 :::{grid-item-card} {octicon}`upload;1.1em` Writing data
@@ -78,25 +84,25 @@ A stream is the same `Dataset` over an unbounded source. These pages cover what 
 :gutter: 3
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
-:link: /user-guide/moving-data/streaming
+:link: /user-guide/moving-data/streaming/index
 :link-type: doc
 Brokers and incremental files, triggers, event-time windows, and exactly-once writes to Delta.
 :::
 
 :::{grid-item-card} {octicon}`clock;1.1em` When a stream emits
-:link: /user-guide/moving-data/streaming-emission
+:link: /user-guide/moving-data/streaming/emission
 :link-type: doc
 Which shapes produce rows as data arrives, and what to do about the ones that wait.
 :::
 
 :::{grid-item-card} {octicon}`database;1.1em` Stateful streaming
-:link: /user-guide/moving-data/streaming-stateful
+:link: /user-guide/moving-data/streaming/stateful
 :link-type: doc
 Watermark dedup, interval joins, session windows, keyed state, and state that spills and checkpoints incrementally.
 :::
 
 :::{grid-item-card} {octicon}`pulse;1.1em` Monitoring a stream
-:link: /user-guide/moving-data/streaming-monitoring
+:link: /user-guide/moving-data/streaming/monitoring
 :link-type: doc
 Lag, late rows, retained state, and listeners that fire on every micro-batch.
 :::
@@ -104,23 +110,21 @@ Lag, late rows, retained state, and listeners that fire on every micro-batch.
 
 ## See also
 
-- {doc}`/api/relational/io`: the full `bt.read` and `ds.write` reference.
+- {doc}`/api/relational/io`: the full {py:obj}`bt.read <batcher.read>` and `ds.write` reference.
 - {doc}`/integrations/index`: setup for a specific database, warehouse or service.
 - {doc}`/user-guide/operate/tuning/object-storage`: making object-store reads fast.
 - {doc}`/user-guide/trust/data-quality`: validating data on its way in or out.
+- {doc}`/examples/io`: 39 reader and writer scripts, each run on every commit.
 
 ```{toctree}
 :hidden:
 
 reading-data
-reading-databases
+specialized-formats
 writing-data
 catalogs-and-tables
 cloud-storage
 lakehouse
+streaming/index
 custom-connectors
-streaming
-streaming-emission
-streaming-stateful
-streaming-monitoring
 ```

@@ -17,7 +17,13 @@ from __future__ import annotations
 from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
-from batcher.plan.functions.metrics.text._text import char_ngrams, mean_ratio, normalize, tokens
+from batcher.plan.functions.metrics.text._text import (
+    char_ngrams,
+    mean_ratio,
+    normalize,
+    null_as_empty,
+    tokens,
+)
 
 __all__ = [
     "char_ngram_f1",
@@ -59,7 +65,9 @@ def exact_match(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             >>> round(ds.agg(em=bt.exact_match("p", "r")).to_pydict()["em"][0], 4)
             0.3333
     """
-    return count_if(_as_column(prediction) == _as_column(reference)) / count_if(lit(True))
+    # A null on either side is a miss, never a match: `null == null` is null, not true.
+    matched = (_as_column(prediction) == _as_column(reference)).fill_null(lit(False))
+    return count_if(matched) / count_if(lit(True))
 
 
 def normalized_exact_match(prediction: IntoExpr, reference: IntoExpr) -> Expr:
@@ -87,7 +95,7 @@ def normalized_exact_match(prediction: IntoExpr, reference: IntoExpr) -> Expr:
     """
     predicted = normalize(_as_column(prediction))
     gold = normalize(_as_column(reference))
-    return count_if(predicted == gold) / count_if(lit(True))
+    return count_if((predicted == gold).fill_null(lit(False))) / count_if(lit(True))
 
 
 def token_set_precision(prediction: IntoExpr, reference: IntoExpr) -> Expr:
@@ -231,8 +239,8 @@ def length_ratio(prediction: IntoExpr, reference: IntoExpr) -> Expr:
             >>> ds.agg(lr=bt.length_ratio("p", "r")).to_pydict()["lr"][0]
             2.0
     """
-    predicted_words = _as_column(prediction).str.word_count()
-    gold_words = _as_column(reference).str.word_count()
+    predicted_words = null_as_empty(_as_column(prediction)).str.word_count()
+    gold_words = null_as_empty(_as_column(reference)).str.word_count()
     ratio = when(gold_words > lit(0)).then(predicted_words / gold_words).otherwise(lit(0.0))
     return ratio.mean()
 

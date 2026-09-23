@@ -48,7 +48,7 @@ fn check_precision(precision: usize) -> GeoResult<()> {
 
 fn check_lonlat(lon: f64, lat: f64) -> GeoResult<()> {
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
-        return Err(GeoError::invalid(format!(
+        return Err(GeoError::domain(format!(
             "geohash needs lon in [-180, 180] and lat in [-90, 90], got ({lon}, {lat})"
         )));
     }

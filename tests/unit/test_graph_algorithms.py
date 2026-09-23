@@ -511,7 +511,7 @@ def _ops(ds: bt.Dataset) -> set[str]:
 
 @pytest.mark.parametrize("fn", [bg.degree, bg.out_degree, bg.in_degree, bg.weighted_degree])
 def test_degree_stays_join_free_because_a_join_here_cannot_distribute(fn):
-    """The degree plans must stay `union -> group_by`, with no join anywhere.
+    """The degree plans must stay a single `group_by`, with no join anywhere.
 
     These once restored their zero rows with a left join from `nodes()`, making the plan
     `union -> distinct  LEFT JOIN  union -> group_by`. That shape has no distributed path:
@@ -525,6 +525,25 @@ def test_degree_stays_join_free_because_a_join_here_cannot_distribute(fn):
     g = bg.Graph.from_edges(e, weight="w").with_nodes(bt.from_pydict({"node": [1, 2, 3, 9]}))
     ops = _ops(fn(g))
     assert not {o for o in ops if "join" in o}, f"{fn.__name__} plan has a join: {sorted(ops)}"
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [bg.degree, bg.out_degree, bg.in_degree, bg.weighted_degree, bg.degree_distribution],
+)
+def test_degree_counts_endpoints_without_a_union(fn):
+    """Without a node table the endpoints come from one `explode`, not a two-armed `union`.
+
+    A `group_by` over a union cannot feed a second aggregate or a join on a cluster, and
+    `degree_distribution` is exactly a second aggregate over `degree`: under
+    `distributed.mode="always"` it raised `PlanError` ("did not stage") until the two sides
+    were counted by exploding a two-element array. The positive control is a node-table
+    graph's `degree`, whose extra arm is a real union, so the walker is shown to see one.
+    """
+    e = bt.from_pydict({"src": [1, 1, 2], "dst": [2, 3, 3], "w": [1.0, 2.0, 3.0]})
+    g = bg.Graph.from_edges(e, weight="w")
+    assert "union" not in _ops(fn(g)), f"{fn.__name__} plan unions its endpoints"
+    assert "union" in _ops(bg.degree(g.with_nodes(bt.from_pydict({"node": [9]}))))
 
 
 def test_degree_keeps_the_nodes_that_have_no_edge_on_the_counted_side():

@@ -9,11 +9,14 @@ subsystems, and is split out of `terminal.core` to keep that module within size 
 
 from __future__ import annotations
 
+from batcher.api.orchestration.logical_profile import (
+    _logical_estimates,
+    _logical_op_profiles,
+)
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.profile import (
     Decision,
-    OpProfile,
     ProfileCollector,
     QueryProfile,
     merge_metric_ops,
@@ -386,76 +389,6 @@ def _streaming_decisions(plan: LogicalPlan, sources: list[Source]) -> list:
     return out
 
 
-def _logical_op_profiles(
-    plan: LogicalPlan, metric_ops: list[dict] | None = None
-) -> list[OpProfile]:
-    """`OpProfile`s from the un-lowered LOGICAL plan tree, pre-order.
-
-    The seam a UDF plan takes: a `map_batches`/inference pipeline has no engine IR (its
-    `to_ir()` deliberately raises), so the estimate/measure join `build_op_profiles`
-    performs off the lowered IR cannot run. This walks the logical tree via
-    `logical_preorder`, naming each operator by its node type, so `explain()` renders a
-    readable operator tree — `MapBatches` included — instead of crashing.
-
-    `metric_ops` are the `StageRecorder`'s measurements for the same tree, numbered by the
-    same walk, so `stats()` on an ML pipeline shows measured rows and time per stage rather
-    than refusing. `None` leaves every row planned-only, which is `explain()` without
-    `analyze`.
-    """
-    from batcher.plan.profile import logical_preorder
-
-    measured = {int(m.get("op_id", -1)): m for m in (metric_ops or [])}
-    nodes = list(logical_preorder(plan))
-    out: list[OpProfile] = []
-    for op_id, (depth, node) in enumerate(nodes):
-        m = measured.get(op_id)
-        # Prefer the measured operator name, as `build_op_profiles` does: it is the only
-        # thing that can tell a per-row `map` from a vectorized `map_batches`, which are the
-        # same node type but 10-100x apart in cost.
-        kind = str(m.get("kind")) if m and m.get("kind") else type(node).__name__
-        if m is None:
-            out.append(OpProfile(op_id=op_id, kind=kind, depth=depth))
-            continue
-        out.append(
-            OpProfile(
-                op_id=op_id,
-                kind=kind,
-                depth=depth,
-                measured=True,
-                rows_in=_rows_in(m, op_id, nodes, measured),
-                rows_out=int(m.get("rows_out", 0)),
-                elapsed_ms=float(m.get("elapsed_ns", 0)) / 1e6,
-                result_bytes=int(m.get("result_bytes", 0)),
-                threads=int(m.get("threads", 0)),
-                backend=str(m.get("backend", "")),
-            )
-        )
-    return out
-
-
-def _rows_in(metric: dict, op_id: int, nodes: list, measured: dict) -> int:
-    """A stage's input rows, read off the stage below it when it could not count them.
-
-    The streaming path meters a stage by wrapping its *output* generator, which sees no
-    input — so it reports `rows_in=0` and the tree supplies it instead. In a linear chain
-    (which is the only shape that path takes) a stage's input is exactly the output of the
-    node directly beneath it, i.e. the next entry in the pre-order walk. Without this the
-    table shows `0` for every streamed stage, which reads as "this stage consumed nothing"
-    rather than "this seam could not observe it".
-    """
-    rows_in = int(metric.get("rows_in", 0))
-    if rows_in:
-        return rows_in
-    child_id = op_id + 1
-    if child_id >= len(nodes):
-        return 0
-    depth, _node = nodes[op_id]
-    child_depth, _child = nodes[child_id]
-    if child_depth != depth + 1:  # not this node's child — a sibling or an ancestor's
-        return 0
-    return int(measured.get(child_id, {}).get("rows_out", 0))
-
-
 def _udf_planned_profile(plan: LogicalPlan, sources: list[Source], hub) -> QueryProfile:
     """A planned-only `QueryProfile` for a plan carrying a Python UDF (`map_batches`).
 
@@ -558,6 +491,7 @@ def run_profiled(
         start_query_report,
         write_event_log,
     )
+    from batcher.api.terminal.lineage import emit_run_start
     from batcher.io.source import is_bounded
     from batcher.plan.profile import ProfileCollector
 
@@ -582,6 +516,9 @@ def run_profiled(
     if not query_id:
         query_id = start_query_report(query_label(plan), pipeline_signature(plan))
         announced = query_id
+        # Open the lineage run `write_event_log` closes below, as `collect()` does. Without it
+        # a profiled run reached the lineage backend as a COMPLETE with no START.
+        emit_run_start(announced, plan, sources)
     # Pass plan + sources so the size-aware "auto" decision matches `collect()`. Resolving
     # with neither hit `resolve_distributed`'s `sources is None -> True` fall-through, forcing
     # every profiled run to distribute on a multi-node cluster — measuring a path a small
@@ -626,7 +563,13 @@ def run_profiled(
         budget = 0
     if core.has_map_batches(plan):
         return _udf_measured_profile(
-            plan, sources, collector, total_ms=total_ms, rows=table.num_rows, query_id=query_id
+            plan,
+            sources,
+            collector,
+            total_ms=total_ms,
+            rows=table.num_rows,
+            query_id=query_id,
+            memory_budget_bytes=budget,
         )
     return collector.to_profile(
         total_ms=total_ms, rows=table.num_rows, query_id=query_id, memory_budget_bytes=budget
@@ -641,6 +584,7 @@ def _udf_measured_profile(
     total_ms: float,
     rows: int,
     query_id: str,
+    memory_budget_bytes: int = 0,
 ) -> QueryProfile:
     """A measured `QueryProfile` for a `map_batches`/ML pipeline, off the logical tree.
 
@@ -653,6 +597,14 @@ def _udf_measured_profile(
     workers, in other processes, while the recorder lives on the driver — so it collects
     nothing. The profile says so rather than rendering an empty table that looks like a run
     which did no work, and it still carries any `worker_ops` the workers shipped back.
+
+    **Carbonite's reading is carried, not dropped.** This assembles a `QueryProfile` by hand
+    rather than through `ProfileCollector.to_profile`, because the op list comes from the
+    logical tree instead of the lowered IR, and it used to leave behind everything else
+    `to_profile` carries. That showed up as `memory_budget_bytes: 0` and an empty
+    `carbonite_summary` on every ML pipeline, which reads as "no subsystem admitted this".
+    Until `UdfExecutor` was taught to admit the query there was genuinely nothing to carry,
+    which is what made the empty fields look like the whole story rather than half of it.
     """
     from batcher import core
     from batcher.plan.profile import worker_op_profiles
@@ -674,12 +626,24 @@ def _udf_measured_profile(
         )
     note = Decision(subsystem="core", category="explain", summary=summary)
     return QueryProfile(
-        ops=tuple(_logical_op_profiles(plan, metric_ops)),
+        ops=tuple(_logical_op_profiles(plan, metric_ops, _logical_estimates(plan, sources))),
         total_ms=total_ms,
         rows=rows,
         query_id=query_id,
         measured=bool(metric_ops) or bool(workers),
         distributed=collector.distributed,
-        decisions=(note, *_io_throughput_decisions(sources, core.default_hub())),
+        # The collector's own decisions first: these are what Carbonite and the adaptive
+        # loop appended while the query ran, and dropping them left `explain()` describing
+        # a query no subsystem had touched.
+        decisions=(
+            *collector.decisions,
+            note,
+            *_io_throughput_decisions(sources, core.default_hub()),
+        ),
+        carbonite_summary=collector.carbonite_summary,
+        adaptive_stages=tuple(collector.adaptive_stages),
+        memory_budget_bytes=memory_budget_bytes,
+        logical_ir=collector.logical_ir,
+        usage=collector.usage,
         worker_ops=workers,
     )

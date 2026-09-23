@@ -160,7 +160,7 @@ There is no late-data side output. A dropped row is counted but not routed anywh
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: the windows this watermark closes.
 - {doc}`Joining two streams </cookbook/streaming/stream-join>`: the same watermark, evicting join buffers.
 - {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`: landing the raw events you measure the lag distribution on.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: watermarks, triggers, and output modes in full.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: watermarks, triggers, and output modes in full.
 - {doc}`Late-arriving data </cookbook/data-engineering/ingest/late-arriving-data>`: the batch reconciliation pipeline this page keeps pointing at.
 - {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: dedup without a watermark to bound it.
 - {doc}`Data quality </user-guide/trust/data-quality>`: catching the clock-from-the-future row at the edge.

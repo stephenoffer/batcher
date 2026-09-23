@@ -452,16 +452,21 @@ pub(crate) fn eval_str(
                 .map(|o| o.and_then(json::structure))
                 .collect::<StringArray>(),
         ),
-        // Int → Utf8, handled before the Utf8 downcast above. Reaching here means the
-        // argument was text, which these have no meaning for.
+        // Int → Utf8, handled before the Utf8 downcast above. `numfmt::eval_numeric_input`
+        // now rejects a non-integer argument itself, so this arm is unreachable — it stays
+        // because the match is exhaustive over `StrFunc` and these variants need an arm.
+        // It reports the same error that site does rather than a second, different wording:
+        // it previously said "expected a Utf8 argument, got Utf8 (this function takes an
+        // integer)", which claims it expected exactly what it had just rejected.
         StrFunc::Chr
         | StrFunc::ToBase
         | StrFunc::Bin
         | StrFunc::FormatBytes
         | StrFunc::FormatBytesSi => {
-            return Err(ExprError::ExpectedString {
+            return Err(ExprError::ExpectedType {
                 func: format!("{func:?}"),
-                got: "Utf8 (this function takes an integer)".into(),
+                want: "an integer",
+                got: crate::error::type_name(arr.data_type()),
             })
         }
         StrFunc::JsonExists => {

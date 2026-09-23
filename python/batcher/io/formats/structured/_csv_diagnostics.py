@@ -23,7 +23,13 @@ import pyarrow as pa
 
 from batcher._internal.errors import FormatError, SchemaError
 
-__all__ = ["RAGGED_ROW_MARKER", "invalid_utf8_error", "mismatch_reported", "ragged_row_error"]
+__all__ = [
+    "RAGGED_ROW_MARKER",
+    "duplicate_header_error",
+    "invalid_utf8_error",
+    "mismatch_reported",
+    "ragged_row_error",
+]
 
 #: What pyarrow's ragged-row failure says. Matched rather than parsed: the counts are in
 #: the message and nowhere else, and all this has to decide is which of two opposite fixes
@@ -52,6 +58,37 @@ def invalid_utf8_error(path: str, detail: str) -> FormatError:
         "Re-encode the file as UTF-8, pass on_error='skip' to drop it and read the rest, "
         "or declare the column as binary to keep the raw bytes — "
         'bt.read.csv(path, schema=pa.schema([("col", pa.binary()), ...])).'
+    )
+
+
+def duplicate_header_error(path: str, names: list[str]) -> FormatError | None:
+    """The error for a header that names one column twice, or None when every name is unique.
+
+    Every column is addressed by name downstream, so two columns called ``a`` cannot both be
+    read; the failure used to surface as a bare ``KeyError`` from deep in the parse. DuckDB
+    renames the later ones (``a_1``), and the message offers exactly those names, which
+    `names=` with `skip_rows=1` applies in place of the header line.
+
+    Args:
+        path: The file whose header repeats a name.
+        names: The header's column names, in order.
+
+    Returns:
+        The error to raise, or None when there is no duplicate.
+    """
+    seen: dict[str, int] = {}
+    renamed: list[str] = []
+    for name in names:
+        count = seen.get(name, 0)
+        seen[name] = count + 1
+        renamed.append(name if count == 0 else f"{name}_{count}")
+    repeated = [name for name, count in seen.items() if count > 1]
+    if not repeated:
+        return None
+    return FormatError(
+        f"CSV file {path!r} repeats column name(s) {repeated} in its header, and every column "
+        f"must have a distinct name. Name them yourself, skipping the header line: "
+        f"bt.read.csv(path, names={renamed!r}, skip_rows=1)."
     )
 
 
@@ -103,8 +140,23 @@ def mismatch_reported(path: str):
     """
     try:
         yield
+    except pa.ArrowKeyError as exc:
+        if "include_columns" not in str(exc):
+            raise
+        raise SchemaError(
+            f"CSV file {path!r} lacks a column the source's schema declares: {exc}. The "
+            "files' headers differ, and in schema_mode='strict' (the default) the first "
+            "file's header is the contract. Pass schema_mode='union' to read each file's own "
+            "columns and fill the missing ones with nulls."
+        ) from exc
     except pa.ArrowInvalid as exc:
         lowered = str(exc).lower()
+        if "empty csv file" in lowered:
+            raise FormatError(
+                f"CSV file {path!r} is empty: it has no header line, so it has no columns "
+                "to read. Remove it, pass on_error='skip' to drop it and read the rest, or "
+                "declare the columns with schema=pa.schema([...])."
+            ) from exc
         if "invalid utf8" in lowered:
             raise invalid_utf8_error(path, str(exc)) from exc
         if RAGGED_ROW_MARKER in lowered:

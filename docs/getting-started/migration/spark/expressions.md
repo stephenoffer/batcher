@@ -18,39 +18,47 @@ The following table maps the 36 names on `Column`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `alias` | `Expr.alias` | canonical |  |
-| `asc` | `Dataset.sort` | mismatch | Differs: Spark asc() sorts nulls first; Batcher ascending sorts nulls last. Pass nulls\_first=True. Wave W0. |
-| `asc_nulls_first` | `Dataset.sort` | canonical |  |
-| `asc_nulls_last` | `Dataset.sort` | canonical |  |
-| `astype` | `Expr.cast` | canonical |  |
-| `between` | `Expr.between` | canonical |  |
-| `bitwiseAND` | `Expr.bitwise_and` | canonical |  |
-| `bitwiseOR` | `Expr.bitwise_or` | canonical |  |
-| `bitwiseXOR` | `Expr.bitwise_xor` | canonical |  |
-| `cast` | `Expr.cast` | param | Missing: Spark DataType objects and DDL type strings (array\<int\>, map\<string,int\>, struct\<...\>). Wave W11. |
+| `alias` | {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | canonical |  |
+| `asc` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | mismatch | Differs: Spark asc() sorts nulls first; Batcher ascending sorts nulls last. Pass nulls\_first=True. Wave W0. |
+| `asc_nulls_first` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
+| `asc_nulls_last` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
+| `astype` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `between` | {py:obj}`Expr.between <batcher.plan.expr_ir.core.Expr.between>` | canonical |  |
+| `bitwiseAND` | {py:obj}`Expr.bitwise_and <batcher.plan.expr_ir.core.Expr.bitwise_and>` | canonical |  |
+| `bitwiseOR` | {py:obj}`Expr.bitwise_or <batcher.plan.expr_ir.core.Expr.bitwise_or>` | canonical |  |
+| `bitwiseXOR` | {py:obj}`Expr.bitwise_xor <batcher.plan.expr_ir.core.Expr.bitwise_xor>` | canonical |  |
+| `cast` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: Spark DataType objects and DDL type strings (array\<int\>, map\<string,int\>, struct\<...\>). Wave W11. |
 | `contains` | `Expr.str.contains` | canonical |  |
-| `desc` | `Dataset.sort` | canonical |  |
-| `desc_nulls_first` | `Dataset.sort` | canonical |  |
-| `desc_nulls_last` | `Dataset.sort` | canonical |  |
+| `desc` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
+| `desc_nulls_first` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
+| `desc_nulls_last` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
 | `dropFields` | n/a | gap | Not yet: drop nested struct fields in place. Wave W8. |
 | `endswith` | `Expr.str.ends_with` | canonical |  |
-| `eqNullSafe` | `Expr.eq_missing` | canonical |  |
+| `eqNullSafe` | {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | canonical |  |
 | `getField` | `Expr.struct.field` | canonical |  |
 | `getItem` | `Expr.list.get` + `Expr.map.get` | mismatch | Differs: Spark getItem(-1) on an array is out of bounds (an error under ANSI, the 4.x default; null otherwise); Expr.list.get(-1) returns the last element. Map keys go through Expr.map.get. Wave W0. |
 | `ilike` | `Expr.str.ilike` | canonical |  |
-| `isin` | `Expr.is_in` | canonical |  |
-| `isNaN` | `Expr.is_nan` | mismatch | Differs: Spark isnan(null) is false; Batcher (DuckDB) returns null. Wave W0. |
-| `isNotNull` | `Expr.is_not_null` | canonical |  |
-| `isNull` | `Expr.is_null` | canonical |  |
+| `isin` | {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | canonical |  |
+| `isNaN` | {py:obj}`Expr.is_nan <batcher.plan.expr_ir.core.Expr.is_nan>` | mismatch | Differs: Spark isnan(null) is false; Batcher (DuckDB) returns null. Wave W0. |
+| `isNotNull` | {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
+| `isNull` | {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | canonical |  |
 | `like` | `Expr.str.like` | canonical |  |
-| `name` | `Expr.alias` | canonical |  |
+| `name` | {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | canonical |  |
 | `otherwise` | `CaseBuilder.otherwise` | canonical |  |
 | `outer` | n/a | gap | Not yet: outer column reference for lateral joins and correlated subqueries. Wave W8. |
-| `over` | `Expr.over` | param | Missing: a reusable Window spec object. Wave WF. |
+| `over` | {py:obj}`Expr.over <batcher.plan.expr_ir.core.Expr.over>` | param | Missing: a reusable Window spec object. Wave WF. |
 | `rlike` | `Expr.str.regexp_matches` | canonical |  |
 | `startswith` | `Expr.str.starts_with` | canonical |  |
 | `substr` | `Expr.str.substr` | mismatch | Differs: Spark treats start position 0 as 1 (substr(0, 2) of 'hello' is 'he'); Batcher counts position 0 as before the string ('h'). Wave W0. |
-| `transform` | `Expr.pipe` | canonical |  |
-| `try_cast` | `Expr.try_cast` | canonical |  |
+| `transform` | {py:obj}`Expr.pipe <batcher.plan.expr_ir.core.Expr.pipe>` | canonical |  |
+| `try_cast` | {py:obj}`Expr.try_cast <batcher.plan.expr_ir.core.Expr.try_cast>` | canonical |  |
 | `when` | `CaseBuilder.when` | canonical |  |
 | `withField` | n/a | gap | Not yet: add or replace a nested struct field in place. Wave W8. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

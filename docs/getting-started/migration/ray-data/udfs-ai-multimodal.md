@@ -19,17 +19,17 @@ The following table maps the 12 names on the `ray.data.llm` module, sorted alpha
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
 | `build_processor` | `Dataset.ml.generate` | mismatch | Differs: Ray build\_processor(config, preprocess=, postprocess=) returns a reusable Processor; Batcher builds nothing reusable: call ds.ml.generate(engine, ...) with an EngineFactory (vllm\_engine/sglang\_engine/http\_engine). Wave W12. |
-| `ChatTemplateStageConfig` | `batcher.ml.vllm_engine` | param | Missing: chat\_template= / chat\_template\_kwargs= override and per-stage batch\_size/concurrency/num\_cpus/memory (Batcher applies the model's template through chat=True). Wave W12. |
+| `ChatTemplateStageConfig` | {py:obj}`batcher.ml.vllm_engine <batcher.ml.vllm_engine>` | param | Missing: chat\_template= / chat\_template\_kwargs= override and per-stage batch\_size/concurrency/num\_cpus/memory (Batcher applies the model's template through chat=True). Wave W12. |
 | `DetokenizeStageConfig` | n/a | gap | Not yet: separate CPU detokenize stage with its own batch\_size/concurrency/resources. Wave W12. |
-| `HttpRequestProcessorConfig` | `batcher.ml.http_engine` | param | Missing: arbitrary endpoint url with headers=, qps= (per-second rate; Batcher has requests\_per\_minute), session\_factory=, max\_retries/base\_retry\_wait\_time\_in\_s, non-OpenAI payloads. Wave W12. |
-| `HttpRequestStageConfig` | `batcher.ml.http_engine` | param | Missing: per-stage batch\_size/concurrency/num\_cpus/memory/runtime\_env. Wave W12. |
+| `HttpRequestProcessorConfig` | {py:obj}`batcher.ml.http_engine <batcher.ml.http_engine>` | param | Missing: arbitrary endpoint url with headers=, qps= (per-second rate; Batcher has requests\_per\_minute), session\_factory=, max\_retries/base\_retry\_wait\_time\_in\_s, non-OpenAI payloads. Wave W12. |
+| `HttpRequestStageConfig` | {py:obj}`batcher.ml.http_engine <batcher.ml.http_engine>` | param | Missing: per-stage batch\_size/concurrency/num\_cpus/memory/runtime\_env. Wave W12. |
 | `PrepareMultimodalStageConfig` | `Dataset.ml.generate` | param | Missing: multimodal preparation stage options (chat\_template\_content\_format, model\_config\_kwargs, apply\_sys\_msg\_formatting); Batcher takes image\_column= only. Wave W12. |
 | `Processor` | `Dataset.ml.generate` | mismatch | Differs: Ray Processor is a reusable object applied as processor(ds) with preprocess/postprocess row functions around the engine stages; Batcher ds.ml.generate(engine, prompt\_column=...) is a per-call Dataset verb with columns rather than row functions. Wave W12. |
 | `ProcessorConfig` | `Dataset.ml.generate` | param | Missing: one config object carrying batch\_size, concurrency, accelerator\_type, resources\_per\_bundle (Batcher takes these as generate() keywords, without resources\_per\_bundle). Wave W12. |
-| `ServeDeploymentProcessorConfig` | `batcher.ml.serve_deployment` | mismatch | Differs: Ray ServeDeploymentProcessorConfig calls an existing Serve app by app\_name/deployment\_name (dtype\_mapping, request\_timeout\_s); Batcher serve\_deployment builds a new deployment from a predictor factory. Wave W12. |
-| `SGLangEngineProcessorConfig` | `batcher.ml.sglang_engine` | param | Missing: placement\_group\_config (TP/PP placement bundles), max\_pending\_requests, max\_concurrent\_batches, max\_tasks\_in\_flight\_per\_actor, log\_engine\_metrics, dynamic\_lora\_loading\_path, should\_continue\_on\_error, task\_type (embed/classify), per-stage configs. Wave W12. |
+| `ServeDeploymentProcessorConfig` | {py:obj}`batcher.ml.serve_deployment <batcher.ml.serve_deployment>` | mismatch | Differs: Ray ServeDeploymentProcessorConfig calls an existing Serve app by app\_name/deployment\_name (dtype\_mapping, request\_timeout\_s); Batcher serve\_deployment builds a new deployment from a predictor factory. Wave W12. |
+| `SGLangEngineProcessorConfig` | {py:obj}`batcher.ml.sglang_engine <batcher.ml.sglang_engine>` | param | Missing: placement\_group\_config (TP/PP placement bundles), max\_pending\_requests, max\_concurrent\_batches, max\_tasks\_in\_flight\_per\_actor, log\_engine\_metrics, dynamic\_lora\_loading\_path, should\_continue\_on\_error, task\_type (embed/classify), per-stage configs. Wave W12. |
 | `TokenizerStageConfig` | n/a | gap | Not yet: separate CPU tokenize stage with its own batch\_size/concurrency/resources. Wave W12. |
-| `vLLMEngineProcessorConfig` | `batcher.ml.vllm_engine` | param | Missing: placement\_group\_config (TP/PP placement bundles), max\_pending\_requests, max\_concurrent\_batches, max\_tasks\_in\_flight\_per\_actor, log\_engine\_metrics, dynamic\_lora\_loading\_path, should\_continue\_on\_error, task\_type (embed/classify), per-stage configs. Wave W12. |
+| `vLLMEngineProcessorConfig` | {py:obj}`batcher.ml.vllm_engine <batcher.ml.vllm_engine>` | param | Missing: placement\_group\_config (TP/PP placement bundles), max\_pending\_requests, max\_concurrent\_batches, max\_tasks\_in\_flight\_per\_actor, log\_engine\_metrics, dynamic\_lora\_loading\_path, should\_continue\_on\_error, task\_type (embed/classify), per-stage configs. Wave W12. |
 
 ## The `ray.data.preprocessors` module
 
@@ -78,3 +78,11 @@ The following table maps the 13 names on `Preprocessor`, sorted alphabetically.
 | `stat_computation_plan` | n/a | out of scope | Declined: Ray Preprocessor internals used by its fit planner and batch-format negotiation; Batcher preprocessors compile to Expr projections. |
 | `transform` | `batcher.ml.Preprocessor` | canonical |  |
 | `transform_batch` | n/a | gap | Not yet: apply a fitted preprocessor to one in-memory batch (pandas/numpy/pyarrow) outside a Dataset. Wave W11. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Ray Data pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

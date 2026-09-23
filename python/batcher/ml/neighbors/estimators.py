@@ -127,6 +127,15 @@ class _KNeighbors:
 class KNeighborsRegressor(_KNeighbors):
     """Predict a number by averaging the `k` nearest training rows' targets.
 
+    Two conventions differ from scikit-learn on purpose. Every reference row tied with the
+    `k`-th nearest distance counts as a neighbour, so a row can average more than `k`
+    targets; scikit-learn keeps exactly `k` and breaks the tie by training-row order, which
+    makes the answer depend on how the rows arrived. And a `k` larger than the reference set
+    is accepted rather than refused: every reference row is then a neighbour. With
+    ``weights="distance"`` each neighbour counts ``1 / d`` for Euclidean distance ``d``, and a
+    scored row that coincides with training rows takes their average alone, both exactly as
+    scikit-learn does.
+
     Examples:
         .. doctest::
 
@@ -181,7 +190,11 @@ class KNeighborsClassifier(_KNeighbors):
     """Predict a label by voting among the `k` nearest training rows.
 
     Ties between classes resolve to whichever label sorts first, so the answer is
-    reproducible rather than dependent on the order the reference rows arrived in.
+    reproducible rather than dependent on the order the reference rows arrived in. Ties in
+    *distance* at the `k`-th neighbour all vote, and a `k` above the reference-set size uses
+    every row; both differ from scikit-learn, which keeps exactly `k` neighbours by row
+    order. ``weights="distance"`` weights each vote by ``1 / d`` (Euclidean), with a
+    coincident training row taking the whole vote, as in scikit-learn.
 
     Examples:
         .. doctest::

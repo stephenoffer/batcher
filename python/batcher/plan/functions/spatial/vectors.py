@@ -18,6 +18,10 @@ robotics log means metres and radians. They are not the geodesic functions: a
 
 from __future__ import annotations
 
+import math
+
+from batcher._internal.errors import PlanError
+from batcher.plan.expr_ir.constructors import when
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.functions.scalar import arctan2
 from batcher.plan.functions.spatial._build import Numeric, Point, value
@@ -163,6 +167,12 @@ def voxel_index(point: Point, size: Numeric, *, prefix: str = "") -> dict[str, E
     coordinates and then transforming gives different cells than transforming first,
     because the grid is fixed to the frame you binned in.
 
+    A point with no cell — a NaN or infinite coordinate, or one whose index would not
+    fit in an ``int64`` — gets a null index on that axis rather than failing the query,
+    so one bad lidar return cannot abort a sweep; ``drop_nulls`` removes it before the
+    ``group_by``. A constant `size` that is not a positive finite number is refused when
+    the expression is built; a column-valued one that is zero or negative nulls its row.
+
     Args:
         point: The point, as ``(x, y, z)``.
         size: The cube's edge length, in the coordinates' own units.
@@ -170,7 +180,10 @@ def voxel_index(point: Point, size: Numeric, *, prefix: str = "") -> dict[str, E
 
     Returns:
         A mapping of ``ix``/``iy``/``iz`` (each with `prefix`) to the bin index along
-        that axis.
+        that axis, null where the point has no cell.
+
+    Raises:
+        PlanError: `size` is a constant that is not a positive finite number.
 
     Examples:
         .. doctest::
@@ -182,8 +195,16 @@ def voxel_index(point: Point, size: Numeric, *, prefix: str = "") -> dict[str, E
             >>> ds.select(**bt.voxel_index(("x", "y", "z"), 0.1)).to_pydict()
             {'ix': [0, 1, -1], 'iy': [0, 0, 0], 'iz': [0, 0, 0]}
     """
+    if isinstance(size, int | float) and not (math.isfinite(size) and size > 0):
+        raise PlanError(f"voxel_index size must be a positive finite number, got {size}")
     edge = value(size)
+    # `try_cast`, not `cast`: NaN / size and x / 0 floor to NaN or infinity, which a
+    # strict cast refuses for the whole column ("Can't cast NaN to Int64"). The guard on
+    # `edge` catches a column-valued size of zero or less, which would otherwise invert
+    # or collapse the grid silently.
     return {
-        f"{prefix}i{axis}": (value(c) / edge).floor().cast("int64")
+        f"{prefix}i{axis}": when(edge > 0)
+        .then((value(c) / edge).floor().try_cast("int64"))
+        .otherwise(None)
         for axis, c in zip("xyz", point, strict=True)
     }

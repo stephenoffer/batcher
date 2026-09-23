@@ -17,7 +17,7 @@ against. There is no third option where it is "close enough".
 
 ## What compiles
 
-From `crates/bc-codegen/src/analyze.rs`, which is the authority. The crate docstring in `lib.rs` still lists only null-free `Int64`/`Float64` columns, which predates the temporal and nullable paths below.
+From [`crates/bc-codegen/src/analyze.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/analyze.rs), which is the authority. The crate docstring in `lib.rs` still lists only null-free `Int64`/`Float64` columns, which predates the temporal and nullable paths below.
 
 | Variant | Compiles | Notes |
 |---|---|---|
@@ -104,7 +104,7 @@ Those two refusals leave the compiled path at different heights because they cos
 
 ## SIMD
 
-The scalar loop is the baseline. `crates/bc-codegen/src/simd.rs` emits a vector body when
+The scalar loop is the baseline. [`crates/bc-codegen/src/simd.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/simd.rs) emits a vector body when
 every node is in the vectorizable subset: numeric leaves, integer `+`/`-`/`*` and float
 `+`/`-`/`*`/`/`, the comparisons (the big filter win), `Not`, and exact numeric casts.
 
@@ -123,10 +123,10 @@ of `(expr, the types of the columns it references, the SIMD override)`. The samp
 consulted only for column types, never for values. So the artifact is reusable across every
 morsel, every operator instance, and every `execute_plan` call that shares the triple.
 
-Without a memo, the engine recompiles every filter and projection on *each* `execute_plan`. That cost is fixed, so it doesn't shrink with the input: on a small query it's pure loss, and it's worst on the per-batch streaming path and the per-operator UDF path, both of which call `execute_plan` in a loop. The memo in `crates/bc-codegen/src/cache.rs` is what makes the compile an admission price paid once rather than once per call.
+Without a memo, the engine recompiles every filter and projection on *each* `execute_plan`. That cost is fixed, so it doesn't shrink with the input: on a small query it's pure loss, and it's worst on the per-batch streaming path and the per-operator UDF path, both of which call `execute_plan` in a loop. The memo in [`crates/bc-codegen/src/cache.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/cache.rs) is what makes the compile an admission price paid once rather than once per call.
 
 :::{warning}
-`crates/bc-codegen/src/cache.rs` keys its process-wide `HashMap` on the *full structural
+[`crates/bc-codegen/src/cache.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/cache.rs) keys its process-wide `HashMap` on the *full structural
 rendering* of that triple, compared for equality and never merely hashed. A hash collision
 handing back code compiled for a different expression is a silent wrong answer, and a silent
 wrong answer is the one failure mode this whole tier is built to make impossible.
@@ -196,12 +196,12 @@ disagrees with the oracle.
 
 ## Where the code lives
 
-- `crates/bc-codegen/src/lib.rs`: `CompiledExpr`, the ABI, dispatch between scalar and SIMD
-- `crates/bc-codegen/src/analyze.rs`: subset validation and type inference
-- `crates/bc-codegen/src/emit.rs`: the scalar Cranelift emitter
-- `crates/bc-codegen/src/simd.rs`: the vector emitter and its lane rules
-- `crates/bc-codegen/src/kleene.rs`: `needs_kleene` / `is_null_propagating`
-- `crates/bc-codegen/src/cache.rs`: the process-wide compile memo
+- [`crates/bc-codegen/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/lib.rs): `CompiledExpr`, the ABI, dispatch between scalar and SIMD
+- [`crates/bc-codegen/src/analyze.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/analyze.rs): subset validation and type inference
+- [`crates/bc-codegen/src/emit.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/emit.rs): the scalar Cranelift emitter
+- [`crates/bc-codegen/src/simd.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/simd.rs): the vector emitter and its lane rules
+- [`crates/bc-codegen/src/kleene.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/kleene.rs): `needs_kleene` / `is_null_propagating`
+- [`crates/bc-codegen/src/cache.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/cache.rs): the process-wide compile memo
 
 ## See also
 

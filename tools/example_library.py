@@ -30,6 +30,13 @@ REPO = Path(__file__).resolve().parent.parent
 EXAMPLES = REPO / "examples"
 LIBRARY = REPO / "docs" / "examples"
 
+#: Where a reader goes to read the script a row names. The rows used to be bare code
+#: spans, which is 450 script paths a reader has to copy out and find by hand, on the one
+#: set of pages whose entire job is to point at a file. The branch is pinned to `main`
+#: rather than a tag because these pages describe the tree as it is, and the doc-example
+#: suite executes the same scripts on every run.
+_SOURCE_URL = "https://github.com/stephenoffer/batcher/blob/main/"
+
 _MARKER = re.compile(
     r"(<!-- library-table: (?P<dirs>[^>]*?) -->\n)(?P<body>.*?)(<!-- /library-table -->)",
     re.DOTALL,
@@ -76,7 +83,8 @@ def _table(directories: list[str]) -> str:
         for script in _scripts(directory):
             relative = script.relative_to(REPO).as_posix()
             note = " (needs external setup)" if _needs_setup(script) else ""
-            rows.append(f"| `{relative}` | {_summary(script)}{note} |")
+            link = f"[`{relative}`]({_SOURCE_URL}{relative})"
+            rows.append(f"| {link} | {_summary(script)}{note} |")
     return "\n".join(rows) + "\n"
 
 

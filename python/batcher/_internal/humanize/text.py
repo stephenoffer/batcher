@@ -1,4 +1,4 @@
-"""Display-width-correct text measurement, truncation, padding, and terminal hyperlinks.
+"""Display-width-correct text measurement, truncation, and padding.
 
 Every aligned thing Batcher prints — the progress line's fixed columns, the profile's
 operator table, the log record's level field — is padded to a width. Padding with
@@ -32,8 +32,6 @@ __all__ = [
     "ELLIPSIS",
     "display_width",
     "fit",
-    "hyperlink",
-    "indent_block",
     "pad",
     "strip_ansi",
     "truncate",
@@ -219,34 +217,6 @@ def fit(text: str, width: int, *, align: str = "left") -> str:
     return pad(truncate(text, width), width, align=align)
 
 
-def hyperlink(label: str, url: str, *, enabled: bool = True) -> str:
-    """`label` as an OSC-8 terminal hyperlink to `url`, or plain when not `enabled`.
-
-    Modern terminals (iTerm2, WezTerm, Kitty, VTE, Windows Terminal) render this as a
-    clickable link; every other terminal shows the label unchanged, because the escape is
-    ignored rather than printed. That degradation is why the engine can put a documentation
-    link on an error without a fallback branch — the worst case is the label alone.
-
-    Args:
-        label: The visible text.
-        url: The target URL.
-        enabled: `False` returns the label unchanged, for a non-TTY or a captured stream.
-
-    Returns:
-        The label, hyperlinked when enabled.
-
-    Examples:
-        .. doctest::
-
-            >>> from batcher._internal.humanize import hyperlink
-            >>> hyperlink("docs", "https://example.invalid", enabled=False)
-            'docs'
-    """
-    if not enabled or not url:
-        return label
-    return f"\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\"
-
-
 def wrap(text: str, width: int) -> list[str]:
     """`text` broken into lines of at most `width` display columns, on word boundaries.
 
@@ -282,23 +252,3 @@ def wrap(text: str, width: int) -> list[str]:
             current.append(word)
     lines.append(" ".join(current))
     return lines
-
-
-def indent_block(text: str, prefix: str) -> str:
-    """Every line of `text` prefixed with `prefix` — for nesting a block under a heading.
-
-    Args:
-        text: A possibly multi-line block.
-        prefix: The prefix to apply to each line.
-
-    Returns:
-        The indented block.
-
-    Examples:
-        .. doctest::
-
-            >>> from batcher._internal.humanize import indent_block
-            >>> indent_block("a\\nb", "  ")
-            '  a\\n  b'
-    """
-    return "\n".join(prefix + line for line in text.split("\n"))

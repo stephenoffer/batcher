@@ -1,4 +1,4 @@
-"""The Yeo-Johnson power transform and its one-pass maximum-likelihood fit.
+"""The Yeo-Johnson power transform and its few-pass maximum-likelihood fit.
 
 Split from the other shape transforms because of how it is *fitted*, not what it computes.
 Finding the power that makes a column most Gaussian is a maximum-likelihood problem, and
@@ -6,9 +6,12 @@ every implementation solves it with an optimizer that re-reads the data once per
 
 That is unnecessary here. The profile likelihood at a fixed lambda is
 ``-n/2 * ln(var(transformed)) + (lambda - 1) * sum(sign(x) * ln(|x| + 1))``, and every term
-of it is an aggregate. Evaluating the whole candidate grid is therefore *one* aggregate
+of it is an aggregate. Evaluating a whole candidate grid is therefore *one* aggregate
 carrying forty-one variance terms — one scan, whatever the grid's resolution — after which
-the driver picks the maximum from forty-one numbers.
+the driver picks the maximum from forty-one numbers. A coarse grid at 0.1 spacing finds the
+peak's neighbourhood, and two zoomed grids around the best candidate (spacing 0.005, then
+0.00025) pin it down, so the fit is three scans in total and lands within about 1e-4 of the
+lambda scikit-learn's Brent optimizer finds, without any per-row Python.
 """
 
 from __future__ import annotations
@@ -16,7 +19,12 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
+from batcher.ml.preprocessors.base import (
+    Preprocessor,
+    columns_arg,
+    fit_aggregate,
+    nan_as_null,
+)
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -28,23 +36,34 @@ if TYPE_CHECKING:
 __all__ = ["BoxCoxTransformer", "PowerTransformer", "box_cox", "yeo_johnson"]
 
 
-#: Candidate Yeo-Johnson lambdas. The profile likelihood is evaluated at all of them in one
-#: pass, so the grid's width costs nothing in scans; -2..2 in steps of 0.1 is the range
-#: scikit-learn's optimizer searches and 0.1 is finer than the parameter is identifiable to.
+#: The first, coarse grid of candidate lambdas. The profile likelihood is evaluated at all of
+#: them in one pass, so the grid's width costs nothing in scans; -2..2 is the bracket
+#: scikit-learn starts its optimizer from.
 _LAMBDA_GRID = tuple(round(-2.0 + 0.1 * i, 1) for i in range(41))
 
+#: How many zoomed grids refine the coarse maximum, and how much finer each one is. Each
+#: round spans one step of the previous grid on either side of its best lambda with 41 points,
+#: so two rounds take the spacing from 0.1 to 0.00025.
+_REFINE_ROUNDS = 2
+_REFINE_FACTOR = 20
 
-def _best_lambda(cell: dict[str, float], name: str) -> float:
+#: A lambda this close to 0 (or to 2, on Yeo-Johnson's negative branch) takes the logarithmic
+#: limit, as scikit-learn's ``abs(lmbda) < np.spacing(1.0)`` test does. A refined grid point
+#: that should be exactly 0 can land a rounding error away from it.
+_LOG_LIMIT = 1e-12
+
+
+def _best_lambda(
+    cell: dict[str, float], name: str, grid: Sequence[float], count: int, jacobian: float
+) -> float:
     """The grid lambda maximizing the profile likelihood for one column.
 
     Shared by both transforms because the objective is the same function of the aggregates:
     the family only changes how the variance and the Jacobian terms were *measured*, not how
     the maximum is picked out of them.
     """
-    count = cell.get(f"{name}__n") or 0
-    jacobian = cell.get(f"{name}__jac") or 0.0
     best_lambda, best_score = 0.0, -math.inf
-    for index, lam in enumerate(_LAMBDA_GRID):
+    for index, lam in enumerate(grid):
         variance = cell.get(f"{name}__v{index}")
         if variance is None or variance <= 0.0 or not math.isfinite(variance):
             continue
@@ -52,6 +71,11 @@ def _best_lambda(cell: dict[str, float], name: str) -> float:
         if math.isfinite(score) and score > best_score:
             best_lambda, best_score = lam, score
     return best_lambda
+
+
+def _zoomed(center: float, step: float) -> tuple[float, ...]:
+    """A 41-point grid at spacing `step` centred on `center`."""
+    return tuple(round(center + step * offset, 12) for offset in range(-20, 21))
 
 
 class _GridPowerTransformer(Preprocessor):
@@ -95,31 +119,51 @@ class _GridPowerTransformer(Preprocessor):
         """Reject a column the family is undefined on. The default admits everything."""
 
     def _fit_grid(self, ds: Dataset) -> None:
-        """Evaluate every candidate lambda's likelihood in one pass and keep the maximum."""
+        """Find each column's maximum-likelihood lambda: a coarse grid, then zoomed ones.
+
+        Every grid is one aggregate pass. The count, the Jacobian term and the minimum do not
+        depend on lambda, so they ride along with the first pass only.
+        """
         self._check_numeric(ds)
-        aggregates: dict[str, Expr] = {}
-        for name in self.columns:
-            value = col(name)
-            aggregates[f"{name}__n"] = value.count()
-            aggregates[f"{name}__jac"] = self._jacobian(value)
-            aggregates[f"{name}__min"] = value.min()
-            for index, lam in enumerate(_LAMBDA_GRID):
-                aggregates[f"{name}__v{index}"] = self._transform_expr(value, lam).var()
-        cell = fit_aggregate(ds, aggregates)
-        for name in self.columns:
-            self._validate(cell, name)
-            self.lambdas_[name] = _best_lambda(cell, name)
+        ds = nan_as_null(ds, self.columns)
+        grids = dict.fromkeys(self.columns, _LAMBDA_GRID)
+        fixed: dict[str, tuple[int, float]] = {}
+        step = 0.1
+        for round_index in range(1 + _REFINE_ROUNDS):
+            aggregates: dict[str, Expr] = {}
+            for name in self.columns:
+                value = col(name)
+                if round_index == 0:
+                    aggregates[f"{name}__n"] = value.count()
+                    aggregates[f"{name}__jac"] = self._jacobian(value)
+                    aggregates[f"{name}__min"] = value.min()
+                for index, lam in enumerate(grids[name]):
+                    aggregates[f"{name}__v{index}"] = self._transform_expr(value, lam).var()
+            cell = fit_aggregate(ds, aggregates)
+            step /= _REFINE_FACTOR
+            for name in self.columns:
+                if round_index == 0:
+                    self._validate(cell, name)
+                    count = cell.get(f"{name}__n") or 0
+                    fixed[name] = (int(count), float(cell.get(f"{name}__jac") or 0.0))
+                best = _best_lambda(cell, name, grids[name], *fixed[name])
+                self.lambdas_[name] = best
+                grids[name] = _zoomed(best, step)
         self._fitted = True
         if self.standardize:
             self._fit_standardization(ds)
 
     def _fit_standardization(self, ds: Dataset) -> None:
-        """Learn the transformed columns' mean and standard deviation, in one more pass."""
+        """Learn the transformed columns' mean and population std, in one more pass.
+
+        The population standard deviation (``ddof=0``) is what scikit-learn's
+        `PowerTransformer` standardizes with, through its internal `StandardScaler`.
+        """
         transformed = self.transform(ds, standardize=False)
         aggregates = {}
         for name in self.columns:
             aggregates[f"{name}__m"] = col(name).mean()
-            aggregates[f"{name}__s"] = col(name).std()
+            aggregates[f"{name}__s"] = col(name).std(ddof=0)
         cell = fit_aggregate(transformed, aggregates)
         for name in self.columns:
             mean = cell[f"{name}__m"]
@@ -165,11 +209,11 @@ def yeo_johnson(value: Expr, lam: float) -> Expr:
             [0.0, 0.6931471805599453]
     """
     positive = value >= lit(0.0)
-    if lam == 0.0:
+    if abs(lam) < _LOG_LIMIT:
         upper = (value + lit(1.0)).ln()
     else:
         upper = (((value + lit(1.0)) ** lit(lam)) - lit(1.0)) / lit(lam)
-    if lam == 2.0:
+    if abs(lam - 2.0) < _LOG_LIMIT:
         lower = -(lit(1.0) - value).ln()
     else:
         lower = -(((lit(1.0) - value) ** lit(2.0 - lam)) - lit(1.0)) / lit(2.0 - lam)
@@ -186,10 +230,14 @@ class PowerTransformer(_GridPowerTransformer):
 
     The lambda that maximizes the profile likelihood is normally found by an iterative
     optimizer, one pass over the data per iteration. Here every candidate lambda's
-    likelihood is an aggregate, so the whole grid is evaluated **in a single pass** and the
-    fit costs one scan regardless of how fine the grid is. The likelihood is
+    likelihood is an aggregate, so a whole 41-point grid is evaluated **in a single pass**: a
+    coarse grid over ``[-2, 2]``, then two zoomed grids around its best point, three scans in
+    all, which land within about 1e-4 of scikit-learn's lambda. The likelihood is
     ``-n/2 * ln(var(transformed)) + (lambda - 1) * sum(sign(x) * ln(|x| + 1))``, whose second
-    term is linear in lambda and so is computed once.
+    term is linear in lambda and so is computed once. The search starts from scikit-learn's
+    ``[-2, 2]`` bracket and can step at most about 0.1 outside it, so a column whose optimum
+    lies far outside that range gets a boundary lambda where scikit-learn's unbounded Brent
+    search would keep going. There is no ``inverse_transform``.
 
     Examples:
         .. doctest::
@@ -204,7 +252,7 @@ class PowerTransformer(_GridPowerTransformer):
     Args:
         columns: The numeric columns to transform (replaced in place).
         standardize: Also center and scale the transformed column to zero mean and unit
-            variance, as scikit-learn does by default.
+            (population, ``ddof=0``) variance, as scikit-learn does by default.
     """
 
     __slots__ = ()
@@ -286,7 +334,7 @@ def box_cox(value: Expr, lam: float) -> Expr:
             >>> ds.with_columns(t=box_cox(bt.col("x"), 0.0)).to_pydict()["t"]
             [0.0, 1.0]
     """
-    if lam == 0.0:
+    if abs(lam) < _LOG_LIMIT:
         return value.ln()
     return ((value ** lit(lam)) - lit(1.0)) / lit(lam)
 
@@ -301,9 +349,11 @@ class BoxCoxTransformer(_GridPowerTransformer):
     match when reproducing an existing analysis. It rejects a non-positive column rather than
     silently producing NaNs; reach for `PowerTransformer` when the column can be zero or negative.
 
-    Every candidate lambda's likelihood is an aggregate, so the whole grid is evaluated in a
-    single pass and the fit costs one scan. The likelihood is
-    ``-n/2 * ln(var(transformed)) + (lambda - 1) * sum(ln(x))``.
+    Every candidate lambda's likelihood is an aggregate, so each 41-point grid is evaluated in
+    a single pass: a coarse grid and two zoomed ones, three scans, matching scikit-learn's
+    ``method="box-cox"`` lambda to about 1e-4. The likelihood is
+    ``-n/2 * ln(var(transformed)) + (lambda - 1) * sum(ln(x))``. Standardization uses the
+    population standard deviation, as scikit-learn does.
 
     Examples:
         .. doctest::

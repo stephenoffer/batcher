@@ -18,43 +18,43 @@ The following table maps the 37 names on `Expr`, sorted alphabetically.
 
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
-| `abs` | `Expr.abs` | canonical |  |
-| `acos` | `Expr.arccos` | canonical |  |
-| `alias` | `Expr.alias` | canonical |  |
+| `abs` | {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | canonical |  |
+| `acos` | {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | canonical |  |
+| `alias` | {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | canonical |  |
 | `arr` | n/a | gap | Not yet: arr namespace for FixedSizeList columns (arr.to\_list). Wave W7. |
-| `asin` | `Expr.arcsin` | canonical |  |
-| `atan` | `Expr.arctan` | canonical |  |
-| `cast` | `Expr.cast` | canonical |  |
-| `ceil` | `Expr.ceil` | canonical |  |
-| `cos` | `Expr.cos` | canonical |  |
-| `dt` | `Expr.dt` | canonical |  |
-| `exp` | `Expr.exp` | canonical |  |
-| `floor` | `Expr.floor` | canonical |  |
+| `asin` | {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | canonical |  |
+| `atan` | {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | canonical |  |
+| `cast` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `ceil` | {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | canonical |  |
+| `cos` | {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | canonical |  |
+| `dt` | {py:obj}`Expr.dt <batcher.plan.expr_ir.core.Expr.dt>` | canonical |  |
+| `exp` | {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | canonical |  |
+| `floor` | {py:obj}`Expr.floor <batcher.plan.expr_ir.core.Expr.floor>` | canonical |  |
 | `get_type` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `is_idempotent` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
-| `is_in` | `Expr.is_in` | canonical |  |
-| `is_not_null` | `Expr.is_not_null` | canonical |  |
-| `is_null` | `Expr.is_null` | canonical |  |
-| `list` | `Expr.list` | canonical |  |
-| `ln` | `Expr.ln` | canonical |  |
-| `log10` | `Expr.log10` | canonical |  |
-| `log2` | `Expr.log2` | canonical |  |
-| `map` | `Expr.map` | canonical |  |
+| `is_in` | {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | canonical |  |
+| `is_not_null` | {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
+| `is_null` | {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | canonical |  |
+| `list` | {py:obj}`Expr.list <batcher.plan.expr_ir.core.Expr.list>` | canonical |  |
+| `ln` | {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | canonical |  |
+| `log10` | {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | canonical |  |
+| `log2` | {py:obj}`Expr.log2 <batcher.plan.expr_ir.core.Expr.log2>` | canonical |  |
+| `map` | {py:obj}`Expr.map <batcher.plan.expr_ir.core.Expr.map>` | canonical |  |
 | `name` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `negate` | `-` operator | canonical |  |
-| `not_in` | `Expr.is_in` | canonical |  |
+| `not_in` | {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | canonical |  |
 | `nullable` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `power` | `**` operator | canonical |  |
-| `round` | `Expr.round` | canonical |  |
-| `sign` | `Expr.sign` | canonical |  |
-| `sin` | `Expr.sin` | canonical |  |
-| `str` | `Expr.str` | canonical |  |
-| `struct` | `Expr.struct` | canonical |  |
+| `round` | {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | canonical |  |
+| `sign` | {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | canonical |  |
+| `sin` | {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | canonical |  |
+| `str` | {py:obj}`Expr.str <batcher.plan.expr_ir.core.Expr.str>` | canonical |  |
+| `struct` | {py:obj}`Expr.struct <batcher.plan.expr_ir.core.Expr.struct>` | canonical |  |
 | `structurally_equals` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
-| `tan` | `Expr.tan` | canonical |  |
+| `tan` | {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | canonical |  |
 | `to_field` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
 | `to_pyarrow` | n/a | out of scope | Declined: Ray Expr introspection for its own planner (schema resolution, AST comparison, pyarrow compute export); Batcher plans lower through JSON IR and expose no expression reflection. |
-| `trunc` | `Expr.trunc` | canonical |  |
+| `trunc` | {py:obj}`Expr.trunc <batcher.plan.expr_ir.core.Expr.trunc>` | canonical |  |
 
 ## `Expr.str`
 
@@ -169,25 +169,25 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
 | `abc` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
-| `AbsMax` | `Expr.abs` + `Expr.max` | canonical |  |
+| `AbsMax` | {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` + {py:obj}`Expr.max <batcher.plan.expr_ir.core.Expr.max>` | canonical |  |
 | `AccumulatorType` | n/a | out of scope | Declined: typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API. |
 | `AggOutputType` | n/a | out of scope | Declined: typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API. |
 | `AggregateFn` | n/a | gap | Not yet: user-defined accumulator aggregate (init/accumulate\_row/merge/finalize) usable in agg. Wave W11. |
 | `AggregateFnV2` | n/a | gap | Not yet: user-defined vectorized aggregate over block columns (aggregate\_block/combine/finalize). Wave W11. |
 | `Any` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
-| `ApproximateQuantile` | `Expr.approx_quantile` | param | Missing: a list of quantiles in one aggregate returning a list, quantile\_precision=. Wave W2. |
-| `ApproximateTopK` | `Expr.mode_top_k` | mismatch | Differs: Ray ApproximateTopK(on, k) returns \[\{column: value, count: n\}\] records; Batcher mode\_top\_k returns the values only, exactly, most frequent first. Wave W0. |
+| `ApproximateQuantile` | {py:obj}`Expr.approx_quantile <batcher.plan.expr_ir.core.Expr.approx_quantile>` | param | Missing: a list of quantiles in one aggregate returning a list, quantile\_precision=. Wave W2. |
+| `ApproximateTopK` | {py:obj}`Expr.mode_top_k <batcher.plan.expr_ir.core.Expr.mode_top_k>` | mismatch | Differs: Ray ApproximateTopK(on, k) returns \[\{column: value, count: n\}\] records; Batcher mode\_top\_k returns the values only, exactly, most frequent first. Wave W0. |
 | `ArrowAggSpec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
-| `AsList` | `Expr.array_agg` | canonical |  |
+| `AsList` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | canonical |  |
 | `Block` | n/a | out of scope | Declined: Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime). |
 | `BlockAccessor` | n/a | out of scope | Declined: Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime). |
 | `BlockColumn` | n/a | out of scope | Declined: Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime). |
 | `BlockColumnAccessor` | n/a | out of scope | Declined: Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime). |
 | `Callable` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Collection` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
-| `Count` | `bt.count` + `Expr.count` | mismatch | Differs: Ray Count() counts rows (bt.count()); Count(on, ignore\_nulls=True) is col(on).count(). Ray names the column count() or count(on). Wave W0. |
+| `Count` | {py:obj}`bt.count <batcher.count>` + {py:obj}`Expr.count <batcher.plan.expr_ir.core.Expr.count>` | mismatch | Differs: Ray Count() counts rows (bt.count()); Count(on, ignore\_nulls=True) is col(on).count(). Ray names the column count() or count(on). Wave W0. |
 | `count_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
-| `CountDistinct` | `Expr.count_distinct` | canonical |  |
+| `CountDistinct` | {py:obj}`Expr.count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>` | canonical |  |
 | `Deprecated` | n/a | out of scope | Declined: ray.util.annotations decorator imported into the module, not Ray Data API. |
 | `Dict` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `distinct_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
@@ -197,13 +197,13 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `KeyType` | n/a | out of scope | Declined: typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API. |
 | `List` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `math` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
-| `Max` | `Expr.max` | canonical |  |
-| `Mean` | `Expr.mean` | canonical |  |
+| `Max` | {py:obj}`Expr.max <batcher.plan.expr_ir.core.Expr.max>` | canonical |  |
+| `Mean` | {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | canonical |  |
 | `mean_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
-| `Min` | `Expr.min` | canonical |  |
+| `Min` | {py:obj}`Expr.min <batcher.plan.expr_ir.core.Expr.min>` | canonical |  |
 | `minmax_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `missing_pct_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
-| `MissingValuePercentage` | `bt.null_rate` | mismatch | Differs: Ray returns a percentage and counts NaN as missing: bt.null\_rate(col(x).fill\_nan(None)) \* 100. Wave W0. |
+| `MissingValuePercentage` | {py:obj}`bt.null_rate <batcher.null_rate>` | mismatch | Differs: Ray returns a percentage and counts NaN as missing: bt.null\_rate(col(x).fill\_nan(None)) \* 100. Wave W0. |
 | `np` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Optional` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `pa` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
@@ -211,17 +211,17 @@ The following table maps the 56 names on the `ray.data.aggregate` module, sorted
 | `pickle` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Protocol` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `PublicAPI` | n/a | out of scope | Declined: ray.util.annotations decorator imported into the module, not Ray Data API. |
-| `Quantile` | `Expr.quantile` | canonical |  |
+| `Quantile` | {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | canonical |  |
 | `re` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Set` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
-| `Std` | `Expr.std` | mismatch | Differs: Ray Std(on, ddof) is col(on).std(ddof=ddof), named std(on); Ray returns NaN where a group has no more than ddof rows and Batcher returns null. Wave W0. |
-| `Sum` | `Expr.sum` | canonical |  |
+| `Std` | {py:obj}`Expr.std <batcher.plan.expr_ir.core.Expr.std>` | mismatch | Differs: Ray Std(on, ddof) is col(on).std(ddof=ddof), named std(on); Ray returns NaN where a group has no more than ddof rows and Batcher returns null. Wave W0. |
+| `Sum` | {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | canonical |  |
 | `sum_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `SupportsRichComparisonType` | n/a | out of scope | Declined: typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API. |
 | `TypeVar` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Union` | n/a | out of scope | Declined: module import plumbing, not Ray Data API. |
 | `Unique` | n/a | gap | Not yet: aggregate collecting each group's distinct values into a list (ignore\_nulls=False keeps None). Wave W11. |
-| `ValueCounter` | `Dataset.value_counts` | mismatch | Differs: Ray ValueCounter(on) is an aggregate returning \{'values': \[...\], 'counts': \[...\]\} per group; Batcher value\_counts(column) is a Dataset verb returning one row per value, sorted by count. Wave W0. |
+| `ValueCounter` | {py:obj}`Dataset.value_counts <batcher.Dataset.value_counts>` | mismatch | Differs: Ray ValueCounter(on) is an aggregate returning \{'values': \[...\], 'counts': \[...\]\} per group; Batcher value\_counts(column) is a Dataset verb returning one row per value, sorted by count. Wave W0. |
 | `zero_pct_spec` | n/a | out of scope | Declined: Ray-internal Arrow aggregation kernel spec (ray.data.\_internal.arrow\_aggregation) re-exported by import, not Ray Data API. |
 | `ZeroPercentage` | n/a | gap | Not yet: percentage of zero values in a numeric column (ignore\_nulls=). Wave W11. |
 
@@ -233,23 +233,31 @@ The following table maps the 22 names on the `ray.data.expressions` module, sort
 |---|---|---|---|
 | `AliasExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
 | `BinaryExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
-| `col` | `bt.col` | canonical |  |
+| `col` | {py:obj}`bt.col <batcher.col>` | canonical |  |
 | `ColumnExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
 | `download` | `Dataset.ml.download` | mismatch | Differs: Ray download(uri\_column) is an expression usable in with\_column; Batcher ds.ml.download(url\_column, output\_column='bytes') is a Dataset verb. Wave W12. |
 | `DownloadExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
 | `Expr` | `bt.Expr` | canonical |  |
-| `lit` | `bt.lit` | canonical |  |
+| `lit` | {py:obj}`bt.lit <batcher.lit>` | canonical |  |
 | `LiteralExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
-| `monotonically_increasing_id` | `Dataset.with_row_index` | mismatch | Differs: Ray monotonically\_increasing\_id() is an expression yielding unique, increasing, non-consecutive ids (task id in the upper bits); Batcher with\_row\_index(name) is a Dataset verb yielding consecutive row positions. Wave W8. |
+| `monotonically_increasing_id` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | mismatch | Differs: Ray monotonically\_increasing\_id() is an expression yielding unique, increasing, non-consecutive ids (task id in the upper bits); Batcher with\_row\_index(name) is a Dataset verb yielding consecutive row positions. Wave W8. |
 | `MonotonicallyIncreasingIdExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
 | `Operation` | n/a | out of scope | Declined: enum of binary operators inside Ray's expression AST; Batcher exposes operators as Python operators on Expr. |
 | `pyarrow_udf` | n/a | gap | Not yet: expression-level batch UDF decorator over pyarrow arrays with a declared return type, usable inside with\_columns. Wave W11. |
-| `random` | `Dataset.with_random` | mismatch | Differs: Ray random(seed=None, reseed\_after\_execution=True) is an expression reseeded per execution; Batcher with\_random(name, seed=0) is a Dataset verb that is deterministic by seed and row position. Wave W3. |
+| `random` | {py:obj}`Dataset.with_random <batcher.Dataset.with_random>` | mismatch | Differs: Ray random(seed=None, reseed\_after\_execution=True) is an expression reseeded per execution; Batcher with\_random(name, seed=0) is a Dataset verb that is deterministic by seed and row position. Wave W3. |
 | `RandomExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
-| `star` | `bt.all` | canonical |  |
+| `star` | {py:obj}`bt.all <batcher.all>` | canonical |  |
 | `StarExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
 | `udf` | n/a | gap | Not yet: expression-level batch UDF decorator with a declared return type, usable inside with\_columns (bt.udf wraps a map\_batches transform instead). Wave W11. |
 | `UDFExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
 | `UnaryExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
 | `uuid` | n/a | gap | Not yet: per-row UUID4 expression. Wave W3. |
 | `UUIDExpr` | n/a | out of scope | Declined: expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Ray Data pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

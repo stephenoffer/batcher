@@ -63,7 +63,7 @@ print(back.count())
 # 3
 ```
 
-Only the endpoints change when the data grows. Read with `bt.read("s3://bucket/raw/*.parquet")` and write with `rollup.write.parquet("s3://bucket/curated/", partition_by=["region"])`. Add {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` to spread the work across a cluster. The transform in between is untouched.
+Only the endpoints change when the data grows. Read with {py:obj}`bt.read("s3://bucket/raw/*.parquet") <batcher.read>` and write with `rollup.write.parquet("s3://bucket/curated/", partition_by=["region"])`. Add {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` to spread the work across a cluster. The transform in between is untouched.
 
 ## See also
 

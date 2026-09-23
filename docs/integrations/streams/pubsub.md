@@ -202,7 +202,7 @@ Pub/Sub's own topic schemas aren't read. Name the payload format with `value_for
 
 ## See also
 
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, watermarks, dedup, checkpointing.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, dedup, checkpointing.
 - {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>`: the bounded-state
   dedup above, in a full pipeline.
 - {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the `Source`/`Split` protocol.

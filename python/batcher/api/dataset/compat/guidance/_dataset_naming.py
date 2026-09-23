@@ -97,6 +97,13 @@ DATASET_NAMING: dict[str, str] = {
 
 # --- namespaces and exporters that are a display / foreign-format concern ------------
 DATASET_EXPORTERS: dict[str, str] = {
+    # ORC is a sink Batcher *has*, which is what made the fuzzy fallback here worse than
+    # silence: with no entry, `ds.to_orc(...)` answered "Did you mean 'to_polars'?" and
+    # sent a migrant away from a supported format toward an unrelated conversion. It was
+    # the only `to_*` exporter with no entry.
+    "to_orc": (
+        "Write ORC through the writer facade: ds.write.orc(path). Reading is bt.read.orc(path)."
+    ),
     "to_records": "For a NumPy record array collect first: ds.to_pandas().to_records().",
     "to_feather": (
         "Write Arrow/Feather with ds.write.arrow(path); ds.to_arrow() gives a pyarrow.Table."

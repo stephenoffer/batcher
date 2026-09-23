@@ -35,10 +35,30 @@ def test_positional_aliased_and_col_in_select_accepted():
     assert out == {"x": [1, 2, 3], "y": [2, 3, 4]}
 
 
-def test_filter_requires_expression():
+def test_filter_reads_a_string_as_a_sql_predicate():
+    """A string is the documented second form of a predicate, not a rejected one.
+
+    This test used to assert the opposite -- that `filter("x > 0")` raised "requires an
+    expression" -- and it kept asserting it after `filter` grew the SQL-string form, because
+    nothing ties an error-message test to the docstring that contradicts it. The phrase it
+    matched no longer exists anywhere in `python/`, so the test was pinning a contract the
+    public API documents the reverse of.
+    """
     ds = bt.from_pydict({"x": [1, 2, 3]})
-    with pytest.raises(PlanError, match="requires an expression"):
-        ds.filter("x > 0")  # type: ignore[arg-type]
+    assert ds.filter("x > 1").to_pydict() == {"x": [2, 3]}
+    # ANDed with an expression predicate, which is the mixed form the docstring promises.
+    assert ds.filter("x > 1", bt.col("x") < 3).to_pydict() == {"x": [2]}
+
+
+def test_filter_rejects_a_predicate_that_is_none_of_the_three_forms():
+    """The rejection that survived: an argument that is not an expression, string or callable.
+
+    The positive control for the test above -- without it, "a string is accepted" would be
+    equally true of a `filter` that accepted anything at all.
+    """
+    ds = bt.from_pydict({"x": [1, 2, 3]})
+    with pytest.raises(PlanError, match="expression"):
+        ds.filter(42)  # type: ignore[arg-type]
 
 
 def test_columns_reflect_projection():

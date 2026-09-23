@@ -276,7 +276,7 @@ print(f"dashboard: {bt.ui_url()}")
 
 Passing `port=0` asks the OS for any free port, which is the right choice in tests and in
 any environment where 4040 may already be taken. Read back the actual port from the
-returned URL or from `bt.ui_url()`.
+returned URL or from {py:obj}`bt.ui_url() <batcher.ui_url>`.
 
 Stop it when you are done, or let the process exit and it is cleaned up automatically:
 
@@ -323,6 +323,35 @@ set_config(
 
 `event_log=False` removes the per-query write. That is worth doing when you run many small
 queries and nothing consumes the documents. Otherwise leave it on.
+
+### Query the history as a table
+
+{py:func}`bt.query_history() <batcher.query_history>` reads those documents back as a `Dataset`, one row per completed query, with the measurements rather than the plan: `total_elapsed_ms`, `rows_produced`, `spilled`, `bytes_spilled`, `peak_memory_bytes`, the CPU usage, and a `profile_path` naming the full document. The questions an operator asks of a run history are relational, such as which queries spilled or which ran longer than a second, so the answer is a filter rather than a script over a folder of JSON:
+
+```python
+import dataclasses
+import tempfile
+
+import batcher as bt
+from batcher.config import active_config, config_context
+
+log_dir = tempfile.mkdtemp()
+cfg = active_config().replace(
+    observability=dataclasses.replace(
+        active_config().observability, event_log=True, event_log_dir=log_dir
+    )
+)
+with config_context(cfg):
+    ds = bt.from_pydict({"k": ["a", "b", "a"], "v": [1, 2, 3]})
+    ds.group_by("k").agg(s=bt.col("v").sum()).collect()
+
+history = bt.query_history(log_dir)
+print(history.select("rows_produced", "spilled").to_pydict())
+# {'rows_produced': [2], 'spilled': [False]}
+slow = history.filter(bt.col("total_elapsed_ms") > 1000.0)
+```
+
+With no argument it reads the directory `event_log_dir` names, the same one the engine writes. Only completed queries are recorded. A query that raised writes no document, so failures are found on the event bus, in the trace, or as an OpenLineage `FAIL` event instead.
 
 ## Metrics
 
@@ -392,6 +421,14 @@ An empty `openlineage_url` reads the standard `OPENLINEAGE_URL` variable, and an
 `openlineage_api_key` reads `OPENLINEAGE_API_KEY`. Events are posted from a bounded background
 queue, so a slow receiver costs a dropped event rather than query latency.
 {doc}`/integrations/observability/lineage` covers the receiver side.
+
+## Requirements and limitations
+
+Every surface on this page reports from the process that ran the query, which on a cluster is the driver. That has three consequences for a deployment with more than one driver:
+
+- **The event log and `query_history()` are per driver.** The driver writes each document to its own `event_log_dir`, and `query_history()` reads that directory on the machine it runs on. Two drivers on two nodes keep two histories. Point `event_log_dir` at a mount every driver shares to read one history across them.
+- **Learned statistics follow the `metadata` backend.** The `sqlite` backend's default file is `$BATCHER_HOME/metadata.db`, or `~/.batcher/metadata.db`, on the node that opened it, so each node learns alone. Only `object_storage` and `redis`, or `layered` in front of either, pointed at a location every driver reaches, share what one driver learned with the next. See {doc}`/configuration/options`.
+- **Learning recorded inside a Ray worker stays in that worker.** A distributed `map_batches` stage runs in Ray workers, and the UDF sizing it learns there, such as a function's measured per-row cost and whether it runs in threads or processes, is written to the worker's own metadata store. The worker builds that store from its own process's config, because the driver's `config_context` doesn't cross the process boundary and the driver ships the engine's execution settings, not the `metadata` section. Unless the workers' own environment selects a shared backend through the `BATCHER_METADATA_*` variables, that is the default `in_process` store, so the learning never reaches the driver and is lost when the worker process exits.
 
 ## See also
 

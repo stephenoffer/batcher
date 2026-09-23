@@ -114,7 +114,7 @@ print(
 # {'parts': [2, 1, 3]}
 ```
 
-Use `fn_args` and `fn_kwargs` for arguments that vary per call rather than per worker. They arrive after the batch, as `fn(batch, *fn_args, **fn_kwargs)`.
+Use `fn_args` and `fn_kwargs` for arguments that vary per call rather than per worker. They arrive after the batch, as `fn(batch, *fn_args, **fn_kwargs)`. `fn_args` and `fn_constructor_args` must be a tuple or list and `fn_kwargs` and `fn_constructor_kwargs` a dict with string keys. Any other shape raises a `PlanError` naming the parameter when you define the stage, not in a worker on its first batch. The same holds for `input_columns`, `preserves_columns`, `num_workers` below 1, and a non-numeric `max_concurrency`.
 
 If the class holds a resource that must be released, give it a `close` method. Batcher calls it when the worker is done with the model, which is where a GPU allocation or an HTTP session goes back.
 
@@ -135,11 +135,34 @@ print(
 # {'price': [20.0, 40.0, 60.0], 'qty': [1, 2, 3]}
 ```
 
+A NumPy, pandas, or torch batch is a zero-copy view of Arrow memory, so it is read-only. Writing into it in place raises NumPy's `assignment destination is read-only`, and Batcher adds a note to that error naming the fix. Pass `zero_copy_batch=False` to hand `fn` a writable copy, paid only by the stages that ask for it:
+
+```python
+def cap(batch):
+    batch["price"][batch["price"] > 15] = 15.0  # writes into the batch
+    return batch
+
+
+print(ds.select("price").map_batches(cap, batch_format="numpy", zero_copy_batch=False).to_pydict())
+# {'price': [10.0, 15.0, 15.0]}
+```
+
+`max_concurrency` bounds how many batches an `async def` `fn` has in flight at once. `0` picks a default.
+
 ## Per-row functions, when you must
 
 `map` takes `fn(row_dict) -> row_dict` and `flat_map` returns any number of rows per input row. The rows are built inside the worker, never in the driver, so the hot-path rule holds. But you are paying Python-object cost per row, and it shows.
 
 Declare `input_columns` here if you declare it anywhere. A batch callback pays for an undeclared column once, when it is decoded. A row callback pays twice, because every one of those columns is also boxed into a Python object for every row.
+
+The output columns are every key any row returned, in the order they first appear. A row without a key is null in that column, the same rule `map_batches` applies across batches. A key that an earlier row had and a later one dropped is logged as a warning, because that is usually a rename or a typo rather than an optional field:
+
+```python
+print(ds.map(lambda row: {"short": row["text"]} if len(row["text"]) < 3 else {"long": row["text"]}).to_pydict())
+# {'long': ['a,b', None, 'd,e,f'], 'short': [None, 'c', None]}
+```
+
+A column your callback adds is unknown to the plan until you declare it with `output_columns`, as with `map_batches`. Referencing it downstream without the declaration raises a `ColumnNotFoundError` whose message says to pass `output_columns=[...]`.
 
 ::::{tab-set}
 :::{tab-item} flat_map

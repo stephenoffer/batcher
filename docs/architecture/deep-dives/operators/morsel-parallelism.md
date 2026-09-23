@@ -43,7 +43,7 @@ eats the gain. Cut by row count alone, and a table of 5 MB images blows out memo
 
 Sources don't produce well-sized batches. A Parquet reader emits row groups, a streaming
 reader emits whatever arrived, and a selective upstream filter emits crumbs. `morselize`
-(`crates/bc-interp/src/ops/morsel.rs`) corrects both directions. It splits what is too large into row- and byte-bounded pieces, and coalesces a run of
+([`crates/bc-interp/src/ops/morsel.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/morsel.rs)) corrects both directions. It splits what is too large into row- and byte-bounded pieces, and coalesces a run of
 undersized batches up to the target *before* splitting. A batch already at half the target or
 more counts as standing alone: it's neither buffered nor copied, and it splits or passes
 through zero-copy, so well-sized input pays nothing.
@@ -143,8 +143,8 @@ in the middle of an embarrassingly parallel scan.
 Measured on a 6M-row filter on 96 cores, glibc's allocator scaled only 5.3x and then
 *regressed* past 32 workers. Adding cores made it slower. With mimalloc's per-thread heaps,
 which recycle pages instead of returning them, the same filter scales 15x and doesn't regress
-(`benchmarks/TPCH_FINDINGS.md`). `bc-py` installs mimalloc as the `#[global_allocator]`
-because it's the cdylib every crate links into (`crates/bc-py/src/lib.rs`).
+([`benchmarks/TPCH_FINDINGS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/TPCH_FINDINGS.md)). `bc-py` installs mimalloc as the `#[global_allocator]`
+because it's the cdylib every crate links into ([`crates/bc-py/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/lib.rs)).
 :::
 
 ## Seeing it
@@ -192,12 +192,12 @@ concatenated and then re-gathered.
 
 ## Where the code lives
 
-- `crates/bc-arrow/src/lib.rs`: `Morsel`, `MorselTarget`, `DEFAULT_MORSEL_ROWS`, `DEFAULT_MORSEL_BYTES`, `RuntimeTuning`
-- `crates/bc-arrow/src/hardware.rs`: `usable_cores`, `operator_cores`
-- `crates/bc-interp/src/ops/morsel.rs`: `morselize`, the split/coalesce rules
-- `crates/bc-interp/src/par.rs`: `auto_width`, `pool_for`, the per-operator schedules
-- `crates/bc-interp/src/ops/repartition.rs`: gather-once hash partitioning of morsels
-- `crates/bc-py/src/lib.rs`: the global allocator
+- [`crates/bc-arrow/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-arrow/src/lib.rs): `Morsel`, `MorselTarget`, `DEFAULT_MORSEL_ROWS`, `DEFAULT_MORSEL_BYTES`, `RuntimeTuning`
+- [`crates/bc-arrow/src/hardware.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-arrow/src/hardware.rs): `usable_cores`, `operator_cores`
+- [`crates/bc-interp/src/ops/morsel.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/morsel.rs): `morselize`, the split/coalesce rules
+- [`crates/bc-interp/src/par.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/par.rs): `auto_width`, `pool_for`, the per-operator schedules
+- [`crates/bc-interp/src/ops/repartition.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/repartition.rs): gather-once hash partitioning of morsels
+- [`crates/bc-py/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/lib.rs): the global allocator
 
 ## See also
 

@@ -19,130 +19,130 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
 | `align_frames` | n/a | gap | Not yet: align\_frames (outer-join frames on a key and sort). Wave W8. |
-| `all` | `bt.all` + `bt.bool_and` | mismatch | Differs: pl.all() with no names is the all-columns selector bt.all(); pl.all(name) is col(name).bool\_and(empty\_value=True). Wave W0. |
-| `all_horizontal` | `bt.all_horizontal` | param | Missing: bare string arguments as column names (read as string literals and rejected today). Wave W2. |
-| `any` | `bt.bool_or` | mismatch | Differs: pl.any(names) ignores nulls and is false for an empty column: col(name).bool\_or(empty\_value=False) per name. Wave W0. |
-| `any_horizontal` | `bt.any_horizontal` | param | Missing: bare string arguments as column names (read as string literals and rejected today). Wave W2. |
+| `all` | {py:obj}`bt.all <batcher.all>` + {py:obj}`bt.bool_and <batcher.bool_and>` | mismatch | Differs: pl.all() with no names is the all-columns selector bt.all(); pl.all(name) is col(name).bool\_and(empty\_value=True). Wave W0. |
+| `all_horizontal` | {py:obj}`bt.all_horizontal <batcher.all_horizontal>` | param | Missing: bare string arguments as column names (read as string literals and rejected today). Wave W2. |
+| `any` | {py:obj}`bt.bool_or <batcher.bool_or>` | mismatch | Differs: pl.any(names) ignores nulls and is false for an empty column: col(name).bool\_or(empty\_value=False) per name. Wave W0. |
+| `any_horizontal` | {py:obj}`bt.any_horizontal <batcher.any_horizontal>` | param | Missing: bare string arguments as column names (read as string literals and rejected today). Wave W2. |
 | `api` | `bt.api` | mismatch | Differs: polars.api registers user namespaces; batcher.api is Batcher's internal conductor package. Namespace registration is the gap. Wave W11. |
-| `approx_n_unique` | `bt.approx_count_distinct` | mismatch | Differs: pl.approx\_n\_unique(name) counts null as a distinct value: col(name).approx\_count\_distinct(count\_nulls=True). Wave W0. |
+| `approx_n_unique` | {py:obj}`bt.approx_count_distinct <batcher.approx_count_distinct>` | mismatch | Differs: pl.approx\_n\_unique(name) counts null as a distinct value: col(name).approx\_count\_distinct(count\_nulls=True). Wave W0. |
 | `arange` | n/a | gap | Not yet: arange expression (int range). Wave W6. |
-| `arctan2` | `bt.arctan2` | canonical |  |
+| `arctan2` | {py:obj}`bt.arctan2 <batcher.arctan2>` | canonical |  |
 | `arctan2d` | n/a | gap | Not yet: arctan2d (degrees). Wave W3. |
 | `arg_sort_by` | n/a | gap | Not yet: arg\_sort\_by. Wave W8. |
 | `arg_where` | n/a | gap | Not yet: arg\_where. Wave W8. |
-| `build_info` | `bt.versions` | canonical |  |
+| `build_info` | {py:obj}`bt.versions <batcher.versions>` | canonical |  |
 | `business_day_count` | n/a | gap | Not yet: business\_day\_count. Wave W6. |
-| `Catalog` | `bt.Catalog` | mismatch | Differs: pl.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend. Wave W9. |
-| `coalesce` | `bt.coalesce` | canonical |  |
-| `col` | `bt.col` | canonical |  |
+| `Catalog` | {py:obj}`bt.Catalog <batcher.Catalog>` | mismatch | Differs: pl.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend. Wave W9. |
+| `coalesce` | {py:obj}`bt.coalesce <batcher.coalesce>` | canonical |  |
+| `col` | {py:obj}`bt.col <batcher.col>` | canonical |  |
 | `collect_all` | n/a | gap | Not yet: collect\_all (execute several plans with shared subplans). Wave W8. |
 | `collect_all_async` | n/a | gap | Not yet: collect\_all\_async. Wave W8. |
-| `concat` | `bt.concat` | param | Missing: how='diagonal\_relaxed', 'align', 'horizontal' and relaxed supertype unification. Wave W2. |
+| `concat` | {py:obj}`bt.concat <batcher.concat>` | param | Missing: how='diagonal\_relaxed', 'align', 'horizontal' and relaxed supertype unification. Wave W2. |
 | `concat_arr` | n/a | gap | Not yet: concat\_arr (fixed-size array concatenation). Wave W3. |
 | `concat_list` | `Expr.list.concat` | param | Missing: variadic form that promotes scalar columns to one-element lists. Wave W2. |
-| `concat_str` | `bt.concat_str` | mismatch | Differs: Polars returns null when any input is null (ignore\_nulls=False) and takes separator=; Batcher skips null inputs and has no separator (bt.concat\_ws). Params: ignore\_nulls=False, separator=. Wave W0. |
-| `Config` | `bt.Config` | mismatch | Differs: Polars Config holds display/formatting settings; Batcher's Config is the engine configuration (memory, optimizer, distribution). Wave W11. |
-| `corr` | `bt.corr` | param | Missing: method='spearman', propagate\_nans=. Wave W2. |
-| `count` | `bt.count` | param | Missing: count('a', 'b') per-column non-null counts (Batcher's count() is COUNT(\*)). Wave W2. |
-| `cov` | `bt.covar_samp` | canonical |  |
-| `cum_count` | `bt.col` + `Expr.cum_count` | canonical |  |
+| `concat_str` | {py:obj}`bt.concat_str <batcher.concat_str>` | mismatch | Differs: Polars returns null when any input is null (ignore\_nulls=False) and takes separator=; Batcher skips null inputs and has no separator (bt.concat\_ws). Params: ignore\_nulls=False, separator=. Wave W0. |
+| `Config` | {py:obj}`bt.Config <batcher.Config>` | mismatch | Differs: Polars Config holds display/formatting settings; Batcher's Config is the engine configuration (memory, optimizer, distribution). Wave W11. |
+| `corr` | {py:obj}`bt.corr <batcher.corr>` | param | Missing: method='spearman', propagate\_nans=. Wave W2. |
+| `count` | {py:obj}`bt.count <batcher.count>` | param | Missing: count('a', 'b') per-column non-null counts (Batcher's count() is COUNT(\*)). Wave W2. |
+| `cov` | {py:obj}`bt.covar_samp <batcher.covar_samp>` | canonical |  |
+| `cum_count` | {py:obj}`bt.col <batcher.col>` + {py:obj}`Expr.cum_count <batcher.plan.expr_ir.core.Expr.cum_count>` | canonical |  |
 | `cum_fold` | n/a | gap | Not yet: cum\_fold. Wave W3. |
 | `cum_reduce` | n/a | gap | Not yet: cum\_reduce. Wave W3. |
-| `cum_sum` | `bt.col` + `Expr.cum_sum` | mismatch | Differs: Polars leaves a null row null; Batcher carries the running value through it. Param: skip\_nulls=False. Wave W0. |
+| `cum_sum` | {py:obj}`bt.col <batcher.col>` + {py:obj}`Expr.cum_sum <batcher.plan.expr_ir.core.Expr.cum_sum>` | mismatch | Differs: Polars leaves a null row null; Batcher carries the running value through it. Param: skip\_nulls=False. Wave W0. |
 | `cum_sum_horizontal` | n/a | gap | Not yet: cum\_sum\_horizontal. Wave W3. |
-| `DataFrame` | `bt.Dataset` | canonical |  |
-| `date` | `bt.make_date` | canonical |  |
-| `date_range` | `bt.date_range` | mismatch | Differs: Polars date\_range is an expression (or eager Series); Batcher's returns a one-column Dataset. Wave W6. |
+| `DataFrame` | {py:obj}`bt.Dataset <batcher.Dataset>` | canonical |  |
+| `date` | {py:obj}`bt.make_date <batcher.make_date>` | canonical |  |
+| `date_range` | {py:obj}`bt.date_range <batcher.date_range>` | mismatch | Differs: Polars date\_range is an expression (or eager Series); Batcher's returns a one-column Dataset. Wave W6. |
 | `date_ranges` | n/a | gap | Not yet: date\_ranges (per-row list of dates). Wave W6. |
-| `datetime` | `bt.make_timestamp` | param | Missing: microsecond=, time\_unit=, time\_zone=, ambiguous=. Wave W2. |
-| `datetime_range` | `bt.date_range` | mismatch | Differs: Polars datetime\_range is an expression; Batcher's date\_range returns a one-column Dataset. Wave W6. |
+| `datetime` | {py:obj}`bt.make_timestamp <batcher.make_timestamp>` | param | Missing: microsecond=, time\_unit=, time\_zone=, ambiguous=. Wave W2. |
+| `datetime_range` | {py:obj}`bt.date_range <batcher.date_range>` | mismatch | Differs: Polars datetime\_range is an expression; Batcher's date\_range returns a one-column Dataset. Wave W6. |
 | `datetime_ranges` | n/a | gap | Not yet: datetime\_ranges (per-row list of datetimes). Wave W6. |
-| `defer` | `bt.from_batches` | param | Missing: port as bt.from\_batches(factory, schema). Wave W8. |
+| `defer` | {py:obj}`bt.from_batches <batcher.from_batches>` | param | Missing: port as bt.from\_batches(factory, schema). Wave W8. |
 | `disable_string_cache` | n/a | out of scope | Declined: no global Categorical string cache: Arrow dictionaries are per batch. |
 | `dtype_of` | n/a | gap | Not yet: dtype\_of (dtype expression). Wave W11. |
 | `duration` | n/a | gap | Not yet: duration expression (needs a Duration kernel family). Wave W6. |
-| `element` | `bt.element` | canonical |  |
+| `element` | {py:obj}`bt.element <batcher.element>` | canonical |  |
 | `enable_string_cache` | n/a | out of scope | Declined: no global Categorical string cache: Arrow dictionaries are per batch. |
 | `escape_regex` | n/a | gap | Not yet: escape\_regex helper for a Python string. Wave W3. |
 | `exceptions` | `bt.BatcherError` | canonical |  |
-| `exclude` | `bt.exclude` | canonical |  |
+| `exclude` | {py:obj}`bt.exclude <batcher.exclude>` | canonical |  |
 | `explain_all` | n/a | gap | Not yet: explain\_all (plans of several frames). Wave W8. |
 | `Expr` | `bt.Expr` | canonical |  |
 | `field` | n/a | gap | Not yet: field (struct field reference inside struct.with\_fields). Wave W3. |
-| `first` | `bt.first` | param | Missing: pl.first() with no argument as the first-column selector. Wave WF. |
-| `fold` | `bt.fold_horizontal` | canonical |  |
-| `format` | `bt.format_string` | mismatch | Differs: Polars format returns null when any input is null; Batcher renders a null as an empty string. Wave W0. |
-| `from_arrow` | `bt.from_arrow` | canonical |  |
-| `from_dict` | `bt.from_pydict` | canonical |  |
-| `from_dicts` | `bt.from_pylist` | canonical |  |
-| `from_epoch` | `bt.from_epoch` | mismatch | Differs: Polars time\_unit=d reads days since 1970; port that as bt.from\_unix\_date(column). Other units map to bt.from\_epoch(column, unit=time\_unit). Wave W0. |
-| `from_numpy` | `bt.from_numpy` | param | Missing: 2-D arrays with schema= and orient=. Wave W2. |
-| `from_pandas` | `bt.from_pandas` | canonical |  |
-| `from_records` | `bt.from_records` | mismatch | Differs: Polars takes schema= and orient= and can read a sequence of sequences as columns; Batcher reads rows with columns=. Wave W0. |
+| `first` | {py:obj}`bt.first <batcher.first>` | param | Missing: pl.first() with no argument as the first-column selector. Wave WF. |
+| `fold` | {py:obj}`bt.fold_horizontal <batcher.fold_horizontal>` | canonical |  |
+| `format` | {py:obj}`bt.format_string <batcher.format_string>` | mismatch | Differs: Polars format returns null when any input is null; Batcher renders a null as an empty string. Wave W0. |
+| `from_arrow` | {py:obj}`bt.from_arrow <batcher.from_arrow>` | canonical |  |
+| `from_dict` | {py:obj}`bt.from_pydict <batcher.from_pydict>` | canonical |  |
+| `from_dicts` | {py:obj}`bt.from_pylist <batcher.from_pylist>` | canonical |  |
+| `from_epoch` | {py:obj}`bt.from_epoch <batcher.from_epoch>` | mismatch | Differs: Polars time\_unit=d reads days since 1970; port that as bt.from\_unix\_date(column). Other units map to bt.from\_epoch(column, unit=time\_unit). Wave W0. |
+| `from_numpy` | {py:obj}`bt.from_numpy <batcher.from_numpy>` | param | Missing: 2-D arrays with schema= and orient=. Wave W2. |
+| `from_pandas` | {py:obj}`bt.from_pandas <batcher.from_pandas>` | canonical |  |
+| `from_records` | {py:obj}`bt.from_records <batcher.from_records>` | mismatch | Differs: Polars takes schema= and orient= and can read a sequence of sequences as columns; Batcher reads rows with columns=. Wave W0. |
 | `from_repr` | n/a | out of scope | Declined: parsing a printed table repr is a notebook convenience, not engine surface. |
-| `from_torch` | `bt.from_torch` | canonical |  |
+| `from_torch` | {py:obj}`bt.from_torch <batcher.from_torch>` | canonical |  |
 | `get_extension_type` | n/a | gap | Not yet: extension type registry. Wave W11. |
 | `get_index_type` | n/a | out of scope | Declined: Polars-internal row-index width; Batcher's row index is always Int64. |
-| `GPUEngine` | `Dataset.collect` | param | Missing: a GPU engine options object (device, memory resource, raise\_on\_fail); backend='gpu' exists. Wave W2. |
+| `GPUEngine` | {py:obj}`Dataset.collect <batcher.Dataset.collect>` | param | Missing: a GPU engine options object (device, memory resource, raise\_on\_fail); backend='gpu' exists. Wave W2. |
 | `groups` | n/a | gap | Not yet: groups (group row indices expression). Wave W8. |
 | `head` | n/a | gap | Not yet: head expression (first n values). Wave W8. |
-| `implode` | `bt.array_agg` | mismatch | Differs: Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array\_agg(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
+| `implode` | {py:obj}`bt.array_agg <batcher.array_agg>` | mismatch | Differs: Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array\_agg(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
 | `int_range` | n/a | gap | Not yet: int\_range expression. Wave W6. |
-| `int_ranges` | `bt.sequence` | mismatch | Differs: Polars int\_ranges excludes the end; Batcher's sequence includes it (int\_ranges(0, n) is sequence(0, n - 1)). Wave W0. |
-| `last` | `bt.last` | param | Missing: pl.last() with no argument as the last-column selector. Wave WF. |
-| `LazyFrame` | `bt.Dataset` | canonical |  |
-| `len` | `bt.count` | canonical |  |
+| `int_ranges` | {py:obj}`bt.sequence <batcher.sequence>` | mismatch | Differs: Polars int\_ranges excludes the end; Batcher's sequence includes it (int\_ranges(0, n) is sequence(0, n - 1)). Wave W0. |
+| `last` | {py:obj}`bt.last <batcher.last>` | param | Missing: pl.last() with no argument as the last-column selector. Wave WF. |
+| `LazyFrame` | {py:obj}`bt.Dataset <batcher.Dataset>` | canonical |  |
+| `len` | {py:obj}`bt.count <batcher.count>` | canonical |  |
 | `linear_space` | n/a | gap | Not yet: linear\_space. Wave W6. |
 | `linear_spaces` | n/a | gap | Not yet: linear\_spaces. Wave W6. |
-| `lit` | `bt.lit` | param | Missing: list and ndarray literals, Polars dtype objects, allow\_object=. Wave W2. |
+| `lit` | {py:obj}`bt.lit <batcher.lit>` | param | Missing: list and ndarray literals, Polars dtype objects, allow\_object=. Wave W2. |
 | `map_batches` | n/a | gap | Not yet: map\_batches over several expressions (vectorized UDF). Wave W11. |
 | `map_groups` | n/a | gap | Not yet: map\_groups over several expressions (UDF per group). Wave W11. |
-| `max` | `bt.max` | mismatch | Differs: pl.max(names) ignores NaN: col(name).max(nan\_policy=ignore) per name. Wave W0. |
-| `max_horizontal` | `bt.greatest` | mismatch | Differs: Polars reads a bare string as a column name and skips NaN; port as bt.greatest(bt.col(a), bt.col(b)), which reads a bare string as a literal. Wave W0. |
-| `mean` | `bt.mean` | canonical |  |
-| `mean_horizontal` | `bt.mean_horizontal` | param | Missing: bare string arguments as column names (rejected today). Wave W2. |
-| `median` | `bt.median` | canonical |  |
-| `merge_sorted` | `Dataset.union` | param | Missing: a list of frames; port as union of each then sort(key). Wave W8. |
-| `min` | `bt.min` | canonical |  |
-| `min_horizontal` | `bt.least` | mismatch | Differs: Polars reads a bare string as a column name and skips NaN; port as bt.least(bt.col(a), bt.col(b)), which reads a bare string as a literal. Wave W0. |
-| `n_unique` | `bt.count_distinct` | mismatch | Differs: pl.n\_unique(name) counts null as a distinct value: col(name).count\_distinct(count\_nulls=True). Wave W0. |
+| `max` | {py:obj}`bt.max <batcher.max>` | mismatch | Differs: pl.max(names) ignores NaN: col(name).max(nan\_policy=ignore) per name. Wave W0. |
+| `max_horizontal` | {py:obj}`bt.greatest <batcher.greatest>` | mismatch | Differs: Polars reads a bare string as a column name and skips NaN; port as bt.greatest(bt.col(a), bt.col(b)), which reads a bare string as a literal. Wave W0. |
+| `mean` | {py:obj}`bt.mean <batcher.mean>` | canonical |  |
+| `mean_horizontal` | {py:obj}`bt.mean_horizontal <batcher.mean_horizontal>` | param | Missing: bare string arguments as column names (rejected today). Wave W2. |
+| `median` | {py:obj}`bt.median <batcher.median>` | canonical |  |
+| `merge_sorted` | {py:obj}`Dataset.union <batcher.Dataset.union>` | param | Missing: a list of frames; port as union of each then sort(key). Wave W8. |
+| `min` | {py:obj}`bt.min <batcher.min>` | canonical |  |
+| `min_horizontal` | {py:obj}`bt.least <batcher.least>` | mismatch | Differs: Polars reads a bare string as a column name and skips NaN; port as bt.least(bt.col(a), bt.col(b)), which reads a bare string as a literal. Wave W0. |
+| `n_unique` | {py:obj}`bt.count_distinct <batcher.count_distinct>` | mismatch | Differs: pl.n\_unique(name) counts null as a distinct value: col(name).count\_distinct(count\_nulls=True). Wave W0. |
 | `nth` | n/a | gap | Not yet: nth (column by position). Wave W8. |
 | `ones` | n/a | gap | Not yet: ones expression. Wave W8. |
 | `plugins` | n/a | gap | Not yet: Rust plugin ABI (register\_plugin\_function). Wave W11. |
-| `quantile` | `bt.quantile` | canonical |  |
-| `QueryOptFlags` | `bt.OptimizerConfig` | param | Missing: per-collect optimization toggles (predicate/projection pushdown, CSE, slice pushdown). Wave W2. |
-| `reduce` | `bt.reduce_horizontal` | canonical |  |
+| `quantile` | {py:obj}`bt.quantile <batcher.quantile>` | canonical |  |
+| `QueryOptFlags` | {py:obj}`bt.OptimizerConfig <batcher.OptimizerConfig>` | param | Missing: per-collect optimization toggles (predicate/projection pushdown, CSE, slice pushdown). Wave W2. |
+| `reduce` | {py:obj}`bt.reduce_horizontal <batcher.reduce_horizontal>` | canonical |  |
 | `register_extension_type` | n/a | gap | Not yet: extension type registry. Wave W11. |
 | `repeat` | n/a | gap | Not yet: repeat expression. Wave W8. |
 | `rolling_corr` | n/a | gap | Not yet: rolling\_corr. Wave W5. |
 | `rolling_cov` | n/a | gap | Not yet: rolling\_cov. Wave W5. |
-| `row_index` | `Dataset.with_row_index` | param | Missing: row\_index() as an expression usable inside select/with\_columns. Wave W8. |
+| `row_index` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | param | Missing: row\_index() as an expression usable inside select/with\_columns. Wave W8. |
 | `select` | n/a | gap | Not yet: top-level select (evaluate expressions without a frame). Wave W8. |
 | `selectors` | `bt.Selector` | param | Missing: a selectors module (bt.cs) holding the full selector family. Wave W11. |
 | `self_dtype` | n/a | gap | Not yet: self\_dtype (dtype expression). Wave W11. |
 | `Series` | n/a | out of scope | Declined: Batcher has no Series type (user decision); a column is an Expr or a one-column Dataset. |
 | `set_random_seed` | n/a | gap | Not yet: set\_random\_seed (global seed for sample/shuffle). Wave W8. |
-| `show_versions` | `bt.show_versions` | canonical |  |
-| `sql` | `bt.sql` | param | Missing: discover frames from the caller's globals, eager= flag. Wave W2. |
-| `sql_expr` | `bt.sql_expr` | canonical |  |
-| `SQLContext` | `bt.Session` | canonical |  |
-| `std` | `bt.std` | param | Missing: ddof=. Wave W2. |
+| `show_versions` | {py:obj}`bt.show_versions <batcher.show_versions>` | canonical |  |
+| `sql` | {py:obj}`bt.sql <batcher.sql>` | param | Missing: discover frames from the caller's globals, eager= flag. Wave W2. |
+| `sql_expr` | {py:obj}`bt.sql_expr <batcher.sql_expr>` | canonical |  |
+| `SQLContext` | {py:obj}`bt.Session <batcher.Session>` | canonical |  |
+| `std` | {py:obj}`bt.std <batcher.std>` | param | Missing: ddof=. Wave W2. |
 | `StringCache` | n/a | out of scope | Declined: no global Categorical string cache: Arrow dictionaries are per batch. |
-| `struct` | `bt.struct` | param | Missing: positional expressions (names inferred) and schema=. Wave W2. |
+| `struct` | {py:obj}`bt.struct <batcher.struct>` | param | Missing: positional expressions (names inferred) and schema=. Wave W2. |
 | `struct_with_fields` | n/a | gap | Not yet: struct\_with\_fields. Wave W3. |
-| `sum` | `bt.sum` | mismatch | Differs: pl.sum(names) sums an empty or all-null column to 0: col(name).sum(empty\_value=0) per name. Wave W0. |
-| `sum_horizontal` | `bt.sum_horizontal` | param | Missing: bare string arguments as column names (rejected today). Wave W2. |
+| `sum` | {py:obj}`bt.sum <batcher.sum>` | mismatch | Differs: pl.sum(names) sums an empty or all-null column to 0: col(name).sum(empty\_value=0) per name. Wave W0. |
+| `sum_horizontal` | {py:obj}`bt.sum_horizontal <batcher.sum_horizontal>` | param | Missing: bare string arguments as column names (rejected today). Wave W2. |
 | `tail` | n/a | gap | Not yet: tail expression (last n values). Wave W8. |
-| `thread_pool_size` | `batcher.config.get_option` | param | Missing: the effective worker-thread count (execution.parallelism is the configured value and may be unset). Wave W2. |
-| `threadpool_size` | `batcher.config.get_option` | param | Missing: the effective worker-thread count (execution.parallelism is the configured value and may be unset). Wave W2. |
+| `thread_pool_size` | {py:obj}`batcher.config.get_option <batcher.config.get_option>` | param | Missing: the effective worker-thread count (execution.parallelism is the configured value and may be unset). Wave W2. |
+| `threadpool_size` | {py:obj}`batcher.config.get_option <batcher.config.get_option>` | param | Missing: the effective worker-thread count (execution.parallelism is the configured value and may be unset). Wave W2. |
 | `time` | n/a | gap | Not yet: time constructor (needs a TIME type). Wave W6. |
 | `time_range` | n/a | gap | Not yet: time\_range (needs a TIME type). Wave W6. |
 | `time_ranges` | n/a | gap | Not yet: time\_ranges (needs a TIME type). Wave W6. |
-| `union` | `bt.concat` | canonical |  |
+| `union` | {py:obj}`bt.concat <batcher.concat>` | canonical |  |
 | `unregister_extension_type` | n/a | gap | Not yet: extension type registry. Wave W11. |
 | `using_string_cache` | n/a | out of scope | Declined: no global Categorical string cache: Arrow dictionaries are per batch. |
-| `var` | `bt.var` | param | Missing: ddof=. Wave W2. |
-| `when` | `bt.when` | param | Missing: several conditions and \*\*constraints in one when(). Wave WF. |
+| `var` | {py:obj}`bt.var <batcher.var>` | param | Missing: ddof=. Wave W2. |
+| `when` | {py:obj}`bt.when <batcher.when>` | param | Missing: several conditions and \*\*constraints in one when(). Wave WF. |
 | `zeros` | n/a | gap | Not yet: zeros expression. Wave W8. |
 
 ## The `polars.selectors` module
@@ -151,40 +151,48 @@ The following table maps the 37 names on the `polars.selectors` module, sorted a
 
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
-| `all` | `bt.all` | canonical |  |
+| `all` | {py:obj}`bt.all <batcher.all>` | canonical |  |
 | `alpha` | n/a | gap | Not yet: cs.alpha (column names by character class). Wave W11. |
 | `alphanumeric` | n/a | gap | Not yet: cs.alphanumeric. Wave W11. |
 | `array` | n/a | gap | Not yet: cs.array (fixed-size list columns). Wave W11. |
 | `binary` | n/a | gap | Not yet: cs.binary. Wave W11. |
-| `boolean` | `bt.boolean` | canonical |  |
-| `by_dtype` | `bt.by_dtype` | param | Missing: Python types and Polars dtype objects (Batcher takes pyarrow types). Wave W2. |
+| `boolean` | {py:obj}`bt.boolean <batcher.boolean>` | canonical |  |
+| `by_dtype` | {py:obj}`bt.by_dtype <batcher.by_dtype>` | param | Missing: Python types and Polars dtype objects (Batcher takes pyarrow types). Wave W2. |
 | `by_index` | n/a | gap | Not yet: cs.by\_index. Wave W11. |
 | `by_name` | n/a | gap | Not yet: cs.by\_name (require\_all=). Wave W11. |
 | `categorical` | n/a | gap | Not yet: cs.categorical. Wave W11. |
-| `contains` | `bt.contains` | canonical |  |
+| `contains` | {py:obj}`bt.contains <batcher.contains>` | canonical |  |
 | `date` | n/a | gap | Not yet: cs.date. Wave W11. |
 | `datetime` | n/a | gap | Not yet: cs.datetime (time\_unit=, time\_zone=). Wave W11. |
 | `decimal` | n/a | gap | Not yet: cs.decimal. Wave W11. |
 | `digit` | n/a | gap | Not yet: cs.digit. Wave W11. |
 | `duration` | n/a | gap | Not yet: cs.duration. Wave W11. |
-| `ends_with` | `bt.ends_with` | canonical |  |
+| `ends_with` | {py:obj}`bt.ends_with <batcher.ends_with>` | canonical |  |
 | `enum` | n/a | gap | Not yet: cs.enum. Wave W11. |
-| `exclude` | `bt.exclude` | param | Missing: exclude by dtype and by selector as well as by name. Wave W2. |
+| `exclude` | {py:obj}`bt.exclude <batcher.exclude>` | param | Missing: exclude by dtype and by selector as well as by name. Wave W2. |
 | `expand_selector` | n/a | gap | Not yet: cs.expand\_selector (resolve against a schema). Wave W11. |
 | `first` | n/a | gap | Not yet: cs.first (first column; bt.first is an aggregate). Wave W11. |
-| `float` | `bt.floating` | canonical |  |
-| `integer` | `bt.integer` | canonical |  |
+| `float` | {py:obj}`bt.floating <batcher.floating>` | canonical |  |
+| `integer` | {py:obj}`bt.integer <batcher.integer>` | canonical |  |
 | `is_selector` | n/a | gap | Not yet: cs.is\_selector. Wave W11. |
 | `last` | n/a | gap | Not yet: cs.last (last column; bt.last is an aggregate). Wave W11. |
 | `list` | n/a | gap | Not yet: cs.list. Wave W11. |
-| `matches` | `bt.matches` | canonical |  |
+| `matches` | {py:obj}`bt.matches <batcher.matches>` | canonical |  |
 | `nested` | n/a | gap | Not yet: cs.nested. Wave W11. |
-| `numeric` | `bt.numeric` | canonical |  |
+| `numeric` | {py:obj}`bt.numeric <batcher.numeric>` | canonical |  |
 | `Selector` | `bt.Selector` | canonical |  |
 | `signed_integer` | n/a | gap | Not yet: cs.signed\_integer. Wave W11. |
-| `starts_with` | `bt.starts_with` | canonical |  |
-| `string` | `bt.string` | param | Missing: include\_categorical=. Wave W2. |
+| `starts_with` | {py:obj}`bt.starts_with <batcher.starts_with>` | canonical |  |
+| `string` | {py:obj}`bt.string <batcher.string>` | param | Missing: include\_categorical=. Wave W2. |
 | `struct` | n/a | gap | Not yet: cs.struct (bt.struct is a constructor). Wave W11. |
-| `temporal` | `bt.temporal` | canonical |  |
+| `temporal` | {py:obj}`bt.temporal <batcher.temporal>` | canonical |  |
 | `time` | n/a | gap | Not yet: cs.time. Wave W11. |
 | `unsigned_integer` | n/a | gap | Not yet: cs.unsigned\_integer. Wave W11. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Polars pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

@@ -22,17 +22,17 @@ The following table maps 111 Batcher spellings to the Ray Data names that comput
 | `-` operator | `Expr.negate` |
 | `batcher.ml.Chain` | `preprocessors.Chain` |
 | `batcher.ml.Preprocessor` | `Preprocessor.fit_transform`, `Preprocessor.fit`, `Preprocessor.transform`, `ray.data.Preprocessor` |
-| `bt.all` | `expressions.star` |
-| `bt.col` | `expressions.col` |
-| `bt.Dataset` | `ray.data.Dataset` |
+| {py:obj}`bt.all <batcher.all>` | `expressions.star` |
+| {py:obj}`bt.col <batcher.col>` | `expressions.col` |
+| {py:obj}`bt.Dataset <batcher.Dataset>` | `ray.data.Dataset` |
 | `bt.Expr` | `expressions.Expr` |
-| `bt.from_daft` | `ray.data.from_daft` |
-| `bt.from_dask` | `ray.data.from_dask` |
-| `bt.from_items` | `ray.data.from_items` |
-| `bt.from_numpy` | `ray.data.from_numpy` |
-| `bt.from_spark` | `ray.data.from_spark` |
-| `bt.lit` | `expressions.lit` |
-| `bt.range` | `ray.data.range` |
+| {py:obj}`bt.from_daft <batcher.from_daft>` | `ray.data.from_daft` |
+| {py:obj}`bt.from_dask <batcher.from_dask>` | `ray.data.from_dask` |
+| {py:obj}`bt.from_items <batcher.from_items>` | `ray.data.from_items` |
+| {py:obj}`bt.from_numpy <batcher.from_numpy>` | `ray.data.from_numpy` |
+| {py:obj}`bt.from_spark <batcher.from_spark>` | `ray.data.from_spark` |
+| {py:obj}`bt.lit <batcher.lit>` | `expressions.lit` |
+| {py:obj}`bt.range <batcher.range>` | `ray.data.range` |
 | `bt.read.avro` | `ray.data.read_avro` |
 | `bt.read.csv` | `ray.data.read_csv` |
 | `bt.read.delta_sharing` | `ray.data.read_delta_sharing_tables` |
@@ -44,28 +44,28 @@ The following table maps 111 Batcher spellings to the Ray Data names that comput
 | `bt.read.numpy` | `ray.data.read_numpy` |
 | `bt.read.parquet` | `ray.data.read_parquet` |
 | `bt.read.snowflake` | `ray.data.read_snowflake` |
-| `Dataset.count` | `Dataset.count` |
-| `Dataset.drop` | `Dataset.drop_columns` |
-| `Dataset.group_by` | `Dataset.groupby` |
-| `Dataset.limit` | `Dataset.limit` |
-| `Dataset.select` | `Dataset.select_columns` |
-| `Dataset.to_daft` | `Dataset.to_daft` |
-| `Dataset.to_spark` | `Dataset.to_spark` |
-| `Dataset.union` | `Dataset.union` |
-| `Dataset.with_columns` | `Dataset.with_column`, `Dataset.with_columns` |
+| {py:obj}`Dataset.count <batcher.Dataset.count>` | `Dataset.count` |
+| {py:obj}`Dataset.drop <batcher.Dataset.drop>` | `Dataset.drop_columns` |
+| {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | `Dataset.groupby` |
+| {py:obj}`Dataset.limit <batcher.Dataset.limit>` | `Dataset.limit` |
+| {py:obj}`Dataset.select <batcher.Dataset.select>` | `Dataset.select_columns` |
+| {py:obj}`Dataset.to_daft <batcher.Dataset.to_daft>` | `Dataset.to_daft` |
+| {py:obj}`Dataset.to_spark <batcher.Dataset.to_spark>` | `Dataset.to_spark` |
+| {py:obj}`Dataset.union <batcher.Dataset.union>` | `Dataset.union` |
+| {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | `Dataset.with_column`, `Dataset.with_columns` |
 | `Dataset.write.numpy` | `Dataset.write_numpy` |
-| `Dataset` | `Dataset.copy` |
-| `Expr.abs` | `Expr.abs` |
-| `Expr.abs` + `Expr.max` | `aggregate.AbsMax` |
-| `Expr.alias` | `Expr.alias` |
-| `Expr.arccos` | `Expr.acos` |
-| `Expr.arcsin` | `Expr.asin` |
-| `Expr.arctan` | `Expr.atan` |
-| `Expr.array_agg` | `aggregate.AsList` |
-| `Expr.cast` | `Expr.cast` |
-| `Expr.ceil` | `Expr.ceil` |
-| `Expr.cos` | `Expr.cos` |
-| `Expr.count_distinct` | `aggregate.CountDistinct` |
+| {py:obj}`Dataset <batcher.Dataset>` | `Dataset.copy` |
+| {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | `Expr.abs` |
+| {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` + {py:obj}`Expr.max <batcher.plan.expr_ir.core.Expr.max>` | `aggregate.AbsMax` |
+| {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | `Expr.alias` |
+| {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | `Expr.acos` |
+| {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | `Expr.asin` |
+| {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | `Expr.atan` |
+| {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | `aggregate.AsList` |
+| {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | `Expr.cast` |
+| {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | `Expr.ceil` |
+| {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | `Expr.cos` |
+| {py:obj}`Expr.count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>` | `aggregate.CountDistinct` |
 | `Expr.dt.ceil` | `Expr.dt.ceil` |
 | `Expr.dt.day` | `Expr.dt.day` |
 | `Expr.dt.hour` | `Expr.dt.hour` |
@@ -76,29 +76,29 @@ The following table maps 111 Batcher spellings to the Ray Data names that comput
 | `Expr.dt.strftime` | `Expr.dt.strftime` |
 | `Expr.dt.truncate` | `Expr.dt.floor` |
 | `Expr.dt.year` | `Expr.dt.year` |
-| `Expr.dt` | `Expr.dt` |
-| `Expr.exp` | `Expr.exp` |
-| `Expr.floor` | `Expr.floor` |
-| `Expr.is_in` | `Expr.is_in`, `Expr.not_in` |
-| `Expr.is_not_null` | `Expr.is_not_null` |
-| `Expr.is_null` | `Expr.is_null` |
+| {py:obj}`Expr.dt <batcher.plan.expr_ir.core.Expr.dt>` | `Expr.dt` |
+| {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | `Expr.exp` |
+| {py:obj}`Expr.floor <batcher.plan.expr_ir.core.Expr.floor>` | `Expr.floor` |
+| {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | `Expr.is_in`, `Expr.not_in` |
+| {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | `Expr.is_not_null` |
+| {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | `Expr.is_null` |
 | `Expr.list.flatten` | `Expr.list.flatten` |
 | `Expr.list.get` | `Expr.list.get` |
 | `Expr.list.len` | `Expr.list.len` |
-| `Expr.list` | `Expr.list` |
-| `Expr.ln` | `Expr.ln` |
-| `Expr.log10` | `Expr.log10` |
-| `Expr.log2` | `Expr.log2` |
+| {py:obj}`Expr.list <batcher.plan.expr_ir.core.Expr.list>` | `Expr.list` |
+| {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | `Expr.ln` |
+| {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | `Expr.log10` |
+| {py:obj}`Expr.log2 <batcher.plan.expr_ir.core.Expr.log2>` | `Expr.log2` |
 | `Expr.map.keys` | `Expr.map.keys` |
 | `Expr.map.values` | `Expr.map.values` |
-| `Expr.map` | `Expr.map` |
-| `Expr.max` | `aggregate.Max` |
-| `Expr.mean` | `aggregate.Mean` |
-| `Expr.min` | `aggregate.Min` |
-| `Expr.quantile` | `aggregate.Quantile` |
-| `Expr.round` | `Expr.round` |
-| `Expr.sign` | `Expr.sign` |
-| `Expr.sin` | `Expr.sin` |
+| {py:obj}`Expr.map <batcher.plan.expr_ir.core.Expr.map>` | `Expr.map` |
+| {py:obj}`Expr.max <batcher.plan.expr_ir.core.Expr.max>` | `aggregate.Max` |
+| {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | `aggregate.Mean` |
+| {py:obj}`Expr.min <batcher.plan.expr_ir.core.Expr.min>` | `aggregate.Min` |
+| {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | `aggregate.Quantile` |
+| {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | `Expr.round` |
+| {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | `Expr.sign` |
+| {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | `Expr.sin` |
 | `Expr.str.capitalize` | `Expr.str.capitalize` |
 | `Expr.str.contains` | `Expr.str.contains` |
 | `Expr.str.count_matches` | `Expr.str.count_regex`, `Expr.str.count` |
@@ -123,9 +123,16 @@ The following table maps 111 Batcher spellings to the Ray Data names that comput
 | `Expr.str.starts_with` | `Expr.str.starts_with` |
 | `Expr.str.to_titlecase` | `Expr.str.title` |
 | `Expr.str.upper` | `Expr.str.upper` |
-| `Expr.str` | `Expr.str` |
+| {py:obj}`Expr.str <batcher.plan.expr_ir.core.Expr.str>` | `Expr.str` |
 | `Expr.struct.field` | `Expr.struct.field` |
-| `Expr.struct` | `Expr.struct` |
-| `Expr.sum` | `aggregate.Sum` |
-| `Expr.tan` | `Expr.tan` |
-| `Expr.trunc` | `Expr.trunc` |
+| {py:obj}`Expr.struct <batcher.plan.expr_ir.core.Expr.struct>` | `Expr.struct` |
+| {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | `aggregate.Sum` |
+| {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | `Expr.tan` |
+| {py:obj}`Expr.trunc <batcher.plan.expr_ir.core.Expr.trunc>` | `Expr.trunc` |
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Ray Data pages.
+- {doc}`/getting-started/migration/index`: porting the other way, from Ray Data onto Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

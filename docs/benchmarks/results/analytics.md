@@ -43,7 +43,7 @@ The operator mix times single data-plane kernels over TPC-H `lineitem` at sf1 (6
 
 A filtered count is the widest DuckDB margin, and it comes from the plan rather than the kernel. `.count()` over a filter compiles to a `COUNT(*)` aggregate, projection pushdown prunes the scan to the one column the predicate reads, and the count fuses into a single {py:func}`count_if <batcher.count_if>` pass. Against Polars, top-N is 50x because a fused top-N heap keeps only the running best rows and never sorts the relation.
 
-The 46-case mix added string functions, set operations, scalar expressions and six more join shapes. Some of the new cases are large wins, such as a semi-join at 0.28x DuckDB and an anti-join at 0.27x. Others are the losses listed in `benchmarks/results/LOSS_BACKLOG.md`, which is where work on them is tracked.
+The 46-case mix added string functions, set operations, scalar expressions and six more join shapes. Some of the new cases are large wins, such as a semi-join at 0.28x DuckDB and an anti-join at 0.27x. Others are the losses listed in [`benchmarks/results/LOSS_BACKLOG.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/LOSS_BACKLOG.md), which is where work on them is tracked.
 
 ## Against Daft
 

@@ -153,11 +153,18 @@ def _distributed_join(
     hub=None,
 ):
     """Run a distributed join: the broadcast path when the planner marked it broadcast
-    on a broadcast-safe join type, else the co-partition shuffle. `materialize=False`
-    lets the co-partition path keep its result partitioned (a `MaterializedSource`) for
-    the next adaptive stage; the broadcast path always collects (caller handles both)."""
+    on a broadcast-safe join type, else the co-partition shuffle. `materialize=False` lets
+    **either** path keep its result partitioned (a `MaterializedSource`) for the next
+    adaptive stage or for a write.
+
+    The broadcast path used to collect unconditionally, which is what made
+    `read.parquet(a).join(read.parquet(b)).write.parquet(...)` route through
+    `_distributed_write` -- the collect-then-reshard fallback -- while the same write after
+    a `distinct`, a `group_by` or a sort stayed partitioned. A small dimension table is the
+    common case, so the shape most likely to be broadcast was the one shape that always
+    round-tripped the driver."""
     if join.strategy == "broadcast" and join.join_type in _BROADCAST_SAFE:
-        return _broadcast_join(above, join, sources, workers, hub=hub)
+        return _broadcast_join(above, join, sources, workers, hub=hub, materialize=materialize)
     return _shuffle_join(above, join, sources, workers, materialize=materialize, hub=hub)
 
 
@@ -418,18 +425,29 @@ def _broadcast_join(
     sources: list[Source],
     workers: int,
     hub=None,
-) -> pa.Table:
+    materialize: bool = True,
+):
     """Broadcast the small (right/build) side of an equi-join, falling back to the
     shuffle join when it will not fit.
 
     The shuffle fallback also covers the empty build side, so left/anti semantics over an
-    empty right stay correct without a hand-built empty schema.
+    empty right stay correct without a hand-built empty schema. `materialize` is passed to
+    both paths, so which one ran is not something the caller has to know to keep its result
+    off the driver.
     """
     result = broadcast_probe_join(
-        above, join, join.left, join.right, _join_reducer_ir(join), sources, workers, hub=hub
+        above,
+        join,
+        join.left,
+        join.right,
+        _join_reducer_ir(join),
+        sources,
+        workers,
+        hub=hub,
+        materialize=materialize,
     )
     if result is None:
-        return _shuffle_join(above, join, sources, workers, hub=hub)
+        return _shuffle_join(above, join, sources, workers, materialize=materialize, hub=hub)
     return result
 
 
@@ -442,7 +460,8 @@ def broadcast_probe_join(
     sources: list[Source],
     workers: int,
     hub=None,
-) -> pa.Table | None:
+    materialize: bool = True,
+):
     """Broadcast the small (right/build) side to every worker and split the big
     (left/probe) side — no shuffle of either side's keys.
 
@@ -470,9 +489,17 @@ def broadcast_probe_join(
         sources: The bound sources for the whole plan.
         workers: Probe-task fan-out.
         hub: Optional metadata hub for worker metrics.
+        materialize: When False (and nothing is stacked `above`), keep each probe task's
+            output where it was written and return a `MaterializedSource` over those files
+            instead of concatenating them on the driver. Each probe task already writes one
+            independent shard -- every left row belongs to exactly one partition and sees
+            the whole build side, which is the argument this whole path rests on -- so the
+            shards *are* the partitioning, and collecting them was the only reason a
+            broadcast join followed by a write had to round-trip the driver.
 
     Returns:
-        The joined table, or None if the build side is empty or too large to broadcast.
+        The joined table, a `MaterializedSource` when `materialize=False`, or None if the
+        build side is empty or too large to broadcast.
     """
     nat = engine()
     from batcher.dist.shuffle_io import read_ipc, write_ipc
@@ -517,6 +544,7 @@ def broadcast_probe_join(
     from batcher.dist.shuffle_io import distributed_work_dir
 
     work_dir = distributed_work_dir("batcher_bcast_")
+    keep_dir = False  # set when a MaterializedSource takes ownership of work_dir
     try:
         right_path = os.path.join(work_dir, "broadcast_right.arrow")
         write_ipc(right_full, right_path)
@@ -546,13 +574,23 @@ def broadcast_probe_join(
 
         refs = [_probe_task(i) for i in range(len(left_parts))]
         probe_results = gather_with_backups(refs, _probe_task, speculation_policy())
-        record_worker_metrics(hub, (m for _path, ms in probe_results for m in ms))
+        record_worker_metrics(hub, (m for _path, ms, _n in probe_results for m in ms))
+        if not materialize and not above:
+            from batcher.dist.executors.partition_io import materialize_reduce_output
+
+            keep_dir = True
+            return materialize_reduce_output(
+                [(p, n) for p, _ms, n in probe_results],
+                work_dir,
+                empty_result_table(node, node.available_columns()).schema,
+            )
         batches: list[pa.RecordBatch] = []
-        for p, _metrics in probe_results:
+        for p, _metrics, _n in probe_results:
             if p is not None:
                 batches.extend(read_ipc(p))
     finally:
-        _rmtree(work_dir)
+        if not keep_dir:
+            _rmtree(work_dir)
 
     if not batches:
         result = empty_result_table(node, node.available_columns())
@@ -581,6 +619,7 @@ def _broadcast_join_task(
     # against the full build side, so each is a legitimate observation for the cost and
     # memory models (peak = broadcast side + one chunk + its output).
     metrics: list[str] = []
+    rows: list[int] = []
     out_path = _stream_broadcast_join(
         left_ir,
         iter_partition(left_part_path),
@@ -590,8 +629,9 @@ def _broadcast_join_task(
         engine_config,
         _BROADCAST_PROBE_CHUNK_BYTES,
         metrics_sink=metrics,
+        rows_sink=rows,
     )
-    return out_path, metrics
+    return out_path, metrics, (rows[0] if rows else 0)
 
 
 def _stream_broadcast_join(
@@ -603,6 +643,7 @@ def _stream_broadcast_join(
     engine_config,
     chunk_bytes,
     metrics_sink: list[str] | None = None,
+    rows_sink: list[int] | None = None,
 ):
     """Join a streamed left side against a resident broadcast `right_full`, writing the
     output incrementally — peak memory is one probe chunk + the broadcast side + that
@@ -610,6 +651,9 @@ def _stream_broadcast_join(
 
     When `metrics_sink` is given, each chunk's join `ExecMetrics` document is appended to
     it, so the broadcast path feeds the cost/memory models the shuffle path already feeds.
+    `rows_sink` takes the row count written, which `materialize=False` needs to describe the
+    partition without re-opening it. Both are out-parameters rather than a wider return so
+    the documented `out_path | None` contract, which a caller tests directly, is unchanged.
     The left sub-plan stays unmetered: it is the map prefix, already measured wherever it
     runs, and metering it here would double-count the same scan against every chunk.
 
@@ -635,6 +679,8 @@ def _stream_broadcast_join(
                     writer.write(b)
     finally:
         writer.close()
+    if rows_sink is not None:
+        rows_sink.append(writer.num_rows)
     return out_path if writer.num_rows else None
 
 

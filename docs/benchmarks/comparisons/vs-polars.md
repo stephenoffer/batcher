@@ -51,7 +51,7 @@ Polars' TPC-H pipelines are written with the join order chosen by hand. Batcher 
 
 ## GPU aggregation
 
-Polars' GPU engine runs on cuDF, so the like-for-like comparison is cuDF itself. The following group-by sum over 1,000 groups ran on an 8xT4 cluster (`benchmarks/gpu_backend/distributed_cudf.py`):
+Polars' GPU engine runs on cuDF, so the like-for-like comparison is cuDF itself. The following group-by sum over 1,000 groups ran on an 8xT4 cluster ([`benchmarks/gpu_backend/distributed_cudf.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/gpu_backend/distributed_cudf.py)):
 
 | Rows | Single-GPU cuDF | Batcher distributed over 8 GPUs |
 |---|---:|---:|

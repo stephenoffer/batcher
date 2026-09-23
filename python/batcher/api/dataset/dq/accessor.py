@@ -1046,10 +1046,10 @@ class DatasetDQ:
         rate with headroom above it.
 
         **Executes.** It profiles the relation (one pass), measures the numeric minimums
-        (one more), and reads the values of up to eight enumeration candidates (one pass
-        each). Everything it proposes is true of *this* data now, which is both the point
-        and the limit — read the chain with `repr`, delete what is coincidence, and keep
-        what is a contract.
+        and counts each float column's NaN and infinite values (one more), and reads the
+        values of up to eight enumeration candidates (one pass each). Everything it
+        proposes is true of *this* data now, which is both the point and the limit — read
+        the chain with `repr`, delete what is coincidence, and keep what is a contract.
 
         Args:
             columns: The columns to consider; defaults to every column.
@@ -1057,7 +1057,11 @@ class DatasetDQ:
                 an enumeration rather than left unconstrained.
 
         Returns:
-            A new `DatasetDQ` with the proposed constraints added to the chain.
+            A new `DatasetDQ` with the proposed constraints added to the chain. A float
+            column gets `is_finite` only when it holds no NaN and no infinity.
+
+        Raises:
+            PlanError: If `columns` is a bare string; pass ``["id"]``, not ``"id"``.
 
         Examples:
             .. doctest::

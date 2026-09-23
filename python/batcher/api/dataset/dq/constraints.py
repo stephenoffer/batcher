@@ -19,6 +19,7 @@ actions can act on one:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -140,6 +141,21 @@ class AggregateConstraint:
     and `high` are inclusive and either may be `None` for an open side. A NULL measured
     value — the aggregate of an empty relation — counts as a violation, because a
     contract that cannot be evaluated has not been met.
+
+    A NaN measurement is a violation for the same reason, whichever sides are bounded.
+    ``avg`` over a column holding a NaN is NaN, and every ordered comparison against NaN
+    is false, so a check written as "not below `low` and not above `high`" used to pass
+    it. On a two-sided bound this agrees with DuckDB's ``avg(x) BETWEEN lo AND hi``. On a
+    one-sided bound it deliberately does not follow DuckDB's ordering of NaN above every
+    number: a NaN mean says the column holds a NaN, not that the mean is at least `low`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> nan = float("nan")
+            >>> bt.from_pydict({"f": [1.0, nan]}).dq.mean_between("f", 0, 10).validate().ok
+            False
     """
 
     name: str
@@ -154,7 +170,7 @@ class AggregateConstraint:
         return self.severity == "error"
 
     def holds(self, measured: float | None) -> bool:
-        """Whether `measured` satisfies the bounds; a NULL measurement never does.
+        """Whether `measured` satisfies the bounds; a NULL or NaN measurement never does.
 
         Args:
             measured: The aggregate's value, or `None` when it evaluated to NULL.
@@ -162,7 +178,7 @@ class AggregateConstraint:
         Returns:
             True when the value lies inside the inclusive bounds.
         """
-        if measured is None:
+        if measured is None or math.isnan(measured):
             return False
         if self.low is not None and measured < self.low:
             return False

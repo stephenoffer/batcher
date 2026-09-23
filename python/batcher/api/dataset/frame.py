@@ -97,7 +97,7 @@ from batcher.api.terminal import (
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import AggExpr, Aliased, CaseBuilder, Col, Expr
-from batcher.plan.expr_ir.selectors import Selector, has_selector
+from batcher.plan.expr_ir.selectors import Selector, has_selector, resolve_names
 from batcher.plan.expr_rewrite import is_bare_window
 from batcher.plan.expr_rewrite.naming import output_name
 from batcher.plan.logical import (
@@ -220,8 +220,19 @@ def _resolve_dtype_family(family: Any) -> Callable[[], Any]:
     return factory
 
 
-def _as_opt_str_list(value: str | list[str] | None) -> list[str] | None:
-    """Accept a single column name where a list is expected, as pandas does."""
+def _as_opt_str_list(
+    value: str | list[str] | Selector | None, ds: Dataset | None = None, where: str = ""
+) -> list[str] | None:
+    """Accept a single column name where a list is expected, as pandas does.
+
+    With `ds`, a column selector (bare or in the list) resolves to the names it matches;
+    without it a selector is refused by name rather than failing as "not iterable".
+    """
+    if ds is not None:
+        plan = ds._plan
+        value = resolve_names(value, plan.available_columns(), plan.available_schema(), where=where)
+    elif has_selector(value) or (isinstance(value, list) and any(map(has_selector, value))):
+        raise PlanError(f"{where or 'this argument'} takes column names, not a column selector")
     return [value] if isinstance(value, str) else value
 
 
@@ -2108,7 +2119,9 @@ class Dataset:
         """
         if subset is None:
             return self._derive(Distinct(self._plan))
-        return build_distinct(self, _as_opt_str_list(subset), keep, order_by)
+        return build_distinct(
+            self, _as_opt_str_list(subset, self, "distinct(subset=...)"), keep, order_by
+        )
 
     def repartition(
         self,
@@ -2211,10 +2224,12 @@ class Dataset:
         """Summary statistics per column (pandas/Polars ``describe``).
 
         **Executes** the query and returns a small `Dataset` with a ``statistic``
-        label column and one Float64 column per input column. Numeric columns report
-        count / null_count / mean / std / min / the requested `percentiles` (default
-        quartiles) / max; non-numeric columns report count and null_count only.
-        Composes the already-tested aggregates — no per-row work in Python.
+        label column and one Float64 column per input column. Numeric (integer, float,
+        decimal) columns report count / null_count / mean / std / min / the requested
+        `percentiles` (default quartiles) / max; other columns report count and
+        null_count only. Composes the already-tested aggregates — no per-row work in
+        Python. An input column named ``statistic`` would overwrite the labels, so it
+        raises `PlanError`; `rename` it first.
 
         Args:
             percentiles: The quantiles to report for numeric columns.
@@ -2235,10 +2250,12 @@ class Dataset:
         return describe(self, percentiles)
 
     def null_count(self) -> Dataset:
-        """A one-row dataset of each column's null count (pandas ``isnull().sum()``).
+        """A one-row dataset of each column's null (missing) value count.
 
         Lazy: lowers to a single global aggregate and a `select`, so it stays
-        mergeable and identical single-node and distributed.
+        mergeable and identical single-node and distributed. It counts Arrow nulls
+        only. A floating-point NaN is a value, not a null, so it is *not* counted,
+        unlike pandas ``isnull().sum()``; count those with ``col(c).is_nan()``.
 
         Returns:
             A one-row `Dataset` of each column's null count.
@@ -2914,9 +2931,9 @@ class Dataset:
                 >>> ds.unpivot(index=["id"]).to_pydict()
                 {'id': [1, 1], 'variable': ['a', 'b'], 'value': [10, 20]}
         """
-        return build_unpivot(
-            self, _as_opt_str_list(index), _as_opt_str_list(on), variable_name, value_name
-        )
+        index = _as_opt_str_list(index, self, "unpivot(index=...)")
+        on = _as_opt_str_list(on, self, "unpivot(on=...)")
+        return build_unpivot(self, index, on, variable_name, value_name)
 
     def transpose(
         self,
@@ -2993,6 +3010,12 @@ class Dataset:
         `subset` limits a strategy fill to specific columns; the `order_by` /
         `partition_by` keys are never filled, being the frame of reference.
 
+        A carrying fill with no `partition_by` is one global series, and that has **no
+        distributed path**: a bucket cannot know the last non-null before it, so
+        ``collect(distributed=True)`` raises rather than quietly running the whole relation
+        on one node. Passing `partition_by` gives the shuffle a key and distributes it. The
+        statistic strategies have no such limit -- they are ordinary aggregates.
+
         Args:
             value: A fill value for every column, or a ``{column: value}`` mapping.
             strategy: ``"zero"``, ``"mean"``, ``"min"``, ``"max"``, ``"forward"``, or
@@ -3063,8 +3086,11 @@ class Dataset:
                 >>> ds.drop_nulls(how="all").to_pydict()
                 {'x': [1], 'y': [None]}
         """
+        subset = _as_opt_str_list(subset, self, "drop_nulls(subset=...)")
+        if subset == []:  # a selector that matched nothing: no column to test
+            return self
         if how == "any":
-            return build_drop_nulls(self, _as_opt_str_list(subset))
+            return build_drop_nulls(self, subset)
         if how != "all":
             raise PlanError(f"drop_nulls(): how must be 'any' or 'all', got {how!r}")
         cols = list(self.columns) if subset is None else list(subset)
@@ -3102,7 +3128,7 @@ class Dataset:
                 >>> ds.drop_nans().to_pydict()
                 {'x': [1.0, None], 's': ['a', 'c']}
         """
-        return build_drop_nans(self, _as_opt_str_list(subset))
+        return build_drop_nans(self, _as_opt_str_list(subset, self, "drop_nans(subset=...)"))
 
     def cast(self, dtypes: str | dict[str, str], *, strict: bool = True) -> Dataset:
         """Cast columns to `dtypes` — one dtype for all, or per-column via a dict.
@@ -3374,7 +3400,7 @@ class Dataset:
     def tail(self, n: int = 5) -> Dataset:
         """Keep the last `n` rows.
 
-        Unlike `head`, this needs to know how many rows there are, so it **executes a
+        Unlike `limit`, this needs to know how many rows there are, so it **executes a
         `count` eagerly** (often answered from metadata with no scan) before building
         the lazy plan that selects the trailing rows. Without a preceding `sort` the
         rows are in an unspecified order.
@@ -5063,7 +5089,7 @@ class Dataset:
         """
         if not isinstance(maintain_order, bool):
             raise PlanError(f"group_by(maintain_order=...) must be a bool, got {maintain_order!r}")
-        keys = flatten_varargs(keys)
+        keys = _as_opt_str_list(list(flatten_varargs(keys)), self, "group_by()")
         available = set(self._plan.available_columns())
         for k in keys:
             if not isinstance(k, str):
@@ -5329,15 +5355,17 @@ class Dataset:
         ``analyze=True`` it runs the query and renders each operator's *estimate vs
         actual* rows, wall time and share, peak memory, spill, and backend (DuckDB's
         ``EXPLAIN ANALYZE``), so you can see where time and memory actually went.
-        ``format="json"`` returns the same profile as a machine-readable document.
+        ``format="json"`` returns the same profile as a machine-readable JSON *string*;
+        parse it with ``json.loads`` to get a dict.
 
         Args:
             analyze: Execute the query and include measured per-operator metrics.
             format: ``"text"`` (or its alias ``"tree"``, as Polars and Spark spell it)
-                for the rendered tree, ``"json"`` for the profile dict.
+                for the rendered tree, ``"json"`` for the profile as a JSON string.
 
         Returns:
-            The plan (and, when ``analyze``, the measured profile) as text or JSON.
+            The plan (and, when ``analyze``, the measured profile) as a text tree or a
+            JSON string.
 
         Examples:
             .. doctest::
@@ -5353,13 +5381,14 @@ class Dataset:
         return _explain(self._plan, self._sources, self.columns, analyze=analyze, fmt=fmt)
 
     def stats(self) -> RunStats:
-        """Execute (single-node) and return measured per-operator `RunStats`.
+        """Execute the query and return its measured per-operator `RunStats`.
 
         Where `explain()` shows the *planned* shape with estimates, `stats()` runs
         the query and reports what the engine *measured* — rows in/out, wall time,
         peak bytes, spill, and backend per operator, plus a bottleneck call (the
-        answer to "where is my time going"). Not available for `map_batches`/ML
-        pipelines (raises `BackendError`).
+        answer to "where is my time going"). It runs through the path `collect()`
+        would take (single-node, spilling, or distributed under ``"auto"``), and a
+        `map_batches`/ML pipeline is measured per stage rather than refused.
 
         Returns:
             The measured per-operator run statistics.
@@ -5895,11 +5924,12 @@ class Dataset:
         """The pairwise Pearson correlation matrix over numeric columns.
 
         **Executes** and returns a small `Dataset`: a ``column`` label column plus one
-        Float64 column per correlated column, forming a symmetric matrix (diagonal ``1.0``,
-        or ``None`` for a constant column). Every pair is computed in a **single** pass —
-        not ``N**2`` separate scans — the standard first step of exploratory data analysis
-        and feature selection. Non-numeric columns are skipped unless named explicitly
-        (which errors).
+        Float64 column per correlated column, forming a symmetric matrix (diagonal exactly
+        ``1.0``, or ``None`` for a constant column). Every pair is computed in a **single**
+        pass — not ``N**2`` separate scans — the standard first step of exploratory data
+        analysis and feature selection. Numeric means integer, float, or decimal; other
+        columns are skipped unless named explicitly (which errors). Naming a column twice,
+        or correlating a column named ``column`` (the label), raises `PlanError`.
 
         Args:
             columns: optional subset of numeric columns to correlate (default: all numeric).
@@ -5926,7 +5956,8 @@ class Dataset:
         The covariance companion to `corr_matrix`: **executes** and returns a small
         symmetric `Dataset` (a ``column`` label plus one Float64 column per column), every
         pair computed in a **single** pass. The diagonal holds each column's variance. The
-        input to PCA / whitening and multivariate-Gaussian modeling.
+        input to PCA / whitening and multivariate-Gaussian modeling. Column selection and
+        the ``column``-label collision rule are those of `corr_matrix`.
 
         Args:
             columns: optional subset of numeric columns (default: all numeric).
@@ -6121,8 +6152,10 @@ class Dataset:
         Opt-in and explicitly approximate. Answered from the hub's learned quantile
         grid (a KLL sketch from a past run) with no scan when available; otherwise a
         TDigest is streamed over the data — tail-accurate (p99/p999) and far cheaper
-        than the exact sort `quantile` would need. Returns ``None`` for a non-numeric
-        or empty column. Use the exact aggregate when precision matters.
+        than the exact sort `quantile` would need. Returns ``None`` for an empty column
+        or a non-numeric one (anything but integer, float, or decimal, so a timestamp,
+        date, or boolean column too), decided from the schema before anything runs. Use
+        the exact aggregate when precision matters.
 
         Args:
             column: The numeric column to summarize.
@@ -6146,17 +6179,21 @@ class Dataset:
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"approx_quantile(q) requires q in [0, 1], got {q}")
         self._require_column(column, "approx_quantile")
+        if not self.meta.schema.is_numeric(column):
+            return None
         from batcher.api.terminal.metadata_answer import metadata_learned_quantile
 
-        learned = metadata_learned_quantile(column, q, self._sources)
+        learned = metadata_learned_quantile(self._plan, column, q, self._sources)
         if learned is not None:
             return learned
         from batcher.api.orchestration import approx_quantile
 
         # Stream just the target column (projected, so only it crosses the boundary)
-        # through the mergeable TDigest — the driver never holds the whole column, and a
-        # distributed plan streams it back one bounded bucket at a time.
-        return approx_quantile(self.select(column).iter_batches(), column, q)
+        # through the mergeable TDigest — the driver never holds the whole column. Routed
+        # like every other terminal (`"auto"`, so `distributed.mode` reaches it); the
+        # `iter_batches` default alone is single-node, which pinned this to the driver.
+        batches = self.select(column).iter_batches(distributed="auto")
+        return approx_quantile(batches, column, q)
 
     def approx_median(self, column: str) -> float | None:
         """Approximate median of a numeric `column` — `approx_quantile(column, 0.5)`.
@@ -6627,7 +6664,10 @@ class Dataset:
         rather than allowed to wrap.
 
         Args:
-            limit: Maximum number of rows to print.
+            limit: Maximum number of rows to print; must be non-negative.
+
+        Raises:
+            PlanError: If `limit` is negative.
 
         Examples:
             .. doctest::
@@ -6643,4 +6683,5 @@ class Dataset:
                 +--------+--------+
                 [2 rows x 2 columns]
         """
+        limit = require_int(limit, func="show", arg="limit", minimum=0)
         _show(self._plan, self._sources, self.columns, limit)

@@ -49,16 +49,15 @@ class NullsMeta(MetaBase):
                 >>> bt.from_pydict({"a": [1, None], "b": [1, 2]}).meta.nulls.counts()
                 {'a': 1, 'b': 0}
         """
-        known = self.ask(nulls.null_counts)
-        columns = self._ds.columns
-        if known is None or any(name not in known for name in columns):
-            return self._counts_by_execution()
-        return {name: int(known[name]) for name in columns}
+        known = self._known_counts()
+        return known if known is not None else self._counts_by_execution()[0]
 
     def fractions(self) -> dict[str, float]:
         """Every column's null count as a share of the rows, in ``[0, 1]``.
 
-        An empty relation reports ``0.0`` for every column rather than dividing by zero.
+        An empty relation reports ``0.0`` for every column rather than dividing by zero. Free
+        when metadata knows every null count and the row count; otherwise one aggregate pass
+        computes all of them together.
 
         Returns:
             The fraction of rows that are null, per column.
@@ -70,8 +69,12 @@ class NullsMeta(MetaBase):
                 >>> bt.from_pydict({"a": [1, None]}).meta.nulls.fractions()
                 {'a': 0.5}
         """
-        counts = self.counts()
-        rows = self._ds.count()
+        from batcher.api.terminal.metadata_answer import metadata_count
+
+        counts = self._known_counts()
+        rows = metadata_count(self._ds._plan, self._ds._sources) if counts is not None else None
+        if counts is None or rows is None:
+            counts, rows = self._counts_by_execution()
         if rows == 0:
             return dict.fromkeys(counts, 0.0)
         return {name: n / rows for name, n in counts.items()}
@@ -153,8 +156,16 @@ class NullsMeta(MetaBase):
         counts = self.counts()
         return [name for name in self._ds.columns if counts.get(name, 0) == 0]
 
-    def _counts_by_execution(self) -> dict[str, int]:
-        """Every column's null count in **one** aggregate pass — never one pass per column."""
+    def _known_counts(self) -> dict[str, int] | None:
+        """Every column's null count from metadata, or None unless all of them are provable."""
+        known = self.ask(nulls.null_counts)
+        columns = self._ds.columns
+        if known is None or any(name not in known for name in columns):
+            return None
+        return {name: int(known[name]) for name in columns}
+
+    def _counts_by_execution(self) -> tuple[dict[str, int], int]:
+        """Every column's null count and the row count, in **one** aggregate pass."""
         columns = self._ds.columns
         aggregates = {f"__bc_nn_{i}__": Col(name).count() for i, name in enumerate(columns)}
         result = self._ds.agg(__bc_rows__=count(), **aggregates).to_pydict()
@@ -164,4 +175,4 @@ class NullsMeta(MetaBase):
             values = result[f"__bc_nn_{i}__"]
             non_null = int(values[0]) if values and values[0] is not None else 0
             counts[name] = rows - non_null
-        return counts
+        return counts, rows

@@ -13,8 +13,8 @@ Three families are deliberately not compared here, with the reason in each case:
 * **Geodesic measures.** DuckDB's `ST_Distance_Sphere` uses a different Earth radius, so
   agreement would be to a tolerance that hides real error rather than exposing it. Those
   are pinned against published distances in `bc_geo::proj::geodesy`.
-* **`st_buffer`.** Batcher's is a documented approximation and GEOS's is exact, so they
-  are not supposed to agree.
+* **`st_buffer`.** Compared by area and part count in `test_diff_geo_edge_semantics.py`,
+  where the tolerance for GEOS's arcs against a regular polygon's chords is stated.
 """
 
 from __future__ import annotations

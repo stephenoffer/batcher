@@ -18,7 +18,7 @@ Don't treat a Delta table as a directory of Parquet files. Every data file the t
 anything that rewrites or deletes files behind the log destroys time travel silently: a plain
 Parquet writer pointed at the table root, an `rm` of an "old-looking" file, a compaction job that
 isn't transactional. `count()` keeps answering from the log after the data is gone. Use
-`bt.compact` and `bt.vacuum`, which go through the log.
+{py:obj}`bt.compact <batcher.compact>` and {py:obj}`bt.vacuum <batcher.vacuum>`, which go through the log.
 :::
 
 ## Setup
@@ -174,7 +174,7 @@ Pass `auto_compact=True` to bin-pack the table after the commit once enough smal
 
 ## Compaction and vacuum
 
-Many small appends make many small files. `bt.compact` bin-packs them into one commit; the old
+Many small appends make many small files. {py:obj}`bt.compact <batcher.compact>` bin-packs them into one commit; the old
 files leave the log but stay on storage, so every earlier version still reads.
 
 ```python
@@ -189,7 +189,7 @@ print(bt.read.delta(clustered).count(), bt.read.delta(clustered, version=0).coun
 and is what makes the *next* query's skipping bite. `where=` scopes the work to a partition, so a
 nightly job compacts today rather than the whole table.
 
-`bt.vacuum` is the only operation that deletes. It defaults to a dry run and to a 7-day retention
+{py:obj}`bt.vacuum <batcher.vacuum>` is the only operation that deletes. It defaults to a dry run and to a 7-day retention
 window, and both defaults matter: the files it removes are exactly the ones time travel and any
 in-flight reader depend on.
 
@@ -326,7 +326,7 @@ An append carrying a column the table doesn't have is refused at commit. Pass `m
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: modes, partitioning, the commit path.
 - {doc}`Partition backfill </cookbook/data-engineering/maintenance/partition-backfill>`: `replace_where=`
   as a re-runnable job.
-- {doc}`File compaction </cookbook/data-engineering/maintenance/file-compaction>`: `bt.compact` and
+- {doc}`File compaction </cookbook/data-engineering/maintenance/file-compaction>`: {py:obj}`bt.compact <batcher.compact>` and
   Z-ordering on a schedule.
 - {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>`: `app_id` and `txn_version`
   in a streaming pipeline.

@@ -18,18 +18,20 @@ what makes "which variants fall in an exon" a relational query rather than a scr
 from __future__ import annotations
 
 from collections.abc import Iterator
+from itertools import chain
 from typing import IO, Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from batcher._internal.errors import FormatError
 from batcher.io.base import FileSink, FileSource
-from batcher.io.base._lines import iter_decoded_lines
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.genomics import _tsv
+from batcher.io.formats.genomics._blocks import iter_blocks, lines_of
 from batcher.io.formats.genomics._tsv import NULL_VALUES
 
-__all__ = ["BED_COLUMNS", "BedSink", "BedSource"]
+__all__ = ["BEDGRAPH_COLUMNS", "BED_COLUMNS", "BedSink", "BedSource"]
 
 #: The twelve BED columns in their fixed order, with the Arrow type each carries. A file
 #: declares its width by how many it writes; the names and order are the specification's, so
@@ -49,14 +51,56 @@ BED_COLUMNS: list[tuple[str, pa.DataType]] = [
     ("block_starts", pa.string()),
 ]
 
-# Lines that carry display instructions for a genome browser rather than data. `track` and
-# `browser` are part of the BED specification and appear *between* data blocks, not only at
-# the top, which is why they are filtered per line rather than skipped as a prefix.
-_COMMENT_PREFIXES = ("#", "track", "browser")
+#: bedGraph's four columns. It shares BED's first three and its coordinate convention, but
+#: the fourth column is a measured *value* (coverage, signal), not a feature name — read as
+#: BED4 it arrives as the string `"0.5"` in a column called `name`.
+BEDGRAPH_COLUMNS: list[tuple[str, pa.DataType]] = [*BED_COLUMNS[:3], ("value", pa.float64())]
+
+# The suffixes that declare a file bedGraph without a `track type=bedGraph` line.
+_BEDGRAPH_SUFFIXES = (".bedgraph", ".bedgraph.gz", ".bdg", ".bdg.gz")
+
+# `track` and `browser` lines carry display instructions for a genome browser rather than
+# data, and appear *between* data blocks, not only at the top, so they are filtered per line.
+# Matched as a whole word followed by a space (or alone): a prefix match dropped every record
+# on a contig whose name merely starts with "track", such as `trackchr1`.
+_DIRECTIVE = r"^(?:track|browser)(?: |$)"
+_BEDGRAPH_TRACK = r"^track .*\btype=bedGraph\b"
 
 
-def _is_comment(line: str) -> bool:
-    return line.startswith(_COMMENT_PREFIXES)
+def _is_comment(lines: pa.Array) -> pa.Array:
+    comment = _tsv.hash_comment(lines)
+    # The prefix test is a memcmp; the regex that confirms a whole word only runs on a block
+    # that has a candidate, which on real files is the first block at most.
+    candidate = pc.or_(pc.starts_with(lines, "track"), pc.starts_with(lines, "browser"))
+    if not pc.any(candidate).as_py():
+        return comment
+    return pc.or_(comment, pc.match_substring_regex(lines, _DIRECTIVE))
+
+
+class _Named:
+    """A read handle that remembers the path it was opened from.
+
+    The read hooks receive a handle, not a path, and a bedGraph is declared by its extension
+    as often as by a `track` line — so the one fact the path carries rides along with it.
+    """
+
+    __slots__ = ("_fh", "bedgraph")
+
+    def __init__(self, fh: Any, path: str) -> None:
+        self._fh = fh
+        self.bedgraph = path.lower().endswith(_BEDGRAPH_SUFFIXES)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._fh.read(size)
+
+    def close(self) -> None:
+        self._fh.close()
+
+    def __enter__(self) -> _Named:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 @SOURCES.register("bed")
@@ -67,34 +111,61 @@ class BedSource(FileSource):
     yields twelve. Reading a directory of mixed widths therefore produces files with
     different schemas — use `schema_mode="union"` to reconcile them, which is the general
     mechanism and not something this format should solve for itself.
+
+    A bedGraph — declared by a `track type=bedGraph` line or a `.bedgraph` / `.bdg` suffix —
+    reads as `chrom/start/end/value` with a float `value`.
     """
 
-    # `.bed` plus the two compressed spellings a browser track is usually shipped as. The
-    # base class decompresses by suffix, so they need no separate path here.
-    suffix = (".bed", ".bed.gz", ".bedgraph")
+    # `.bed` and bedGraph, plain or gzipped. The base class decompresses by suffix, so the
+    # compressed spellings need no separate path here.
+    suffix = (".bed", ".bed.gz", *_BEDGRAPH_SUFFIXES)
     format_name = "bed"
 
-    def _columns_for(self, width: int) -> list[str]:
+    def _open(self, path: str) -> Any:
+        return _Named(super()._open(path), path)
+
+    def _layout(self, fh: Any) -> tuple[list[tuple[str, pa.DataType]], Iterator[bytes]]:
+        """The file's columns, and its blocks from the one holding the first data line on.
+
+        One pass: the header region is scanned block by block until the first data line,
+        whose block is handed back for the parse. The previous version read the first line
+        and then `seek(0)`-ed to re-read, which a decompressing stream refuses — so every
+        `.bed.gz` failed with "only valid on seekable files".
+        """
+        bedgraph = bool(getattr(fh, "bedgraph", False))
+        blocks = iter_blocks(fh)
+        for data in blocks:
+            lines = lines_of(data)
+            is_data = pc.invert(pc.or_(pc.equal(pc.binary_length(lines), 0), _is_comment(lines)))
+            at = _tsv.first_index(is_data)
+            head = lines if at < 0 else lines.slice(0, at)
+            bedgraph = bedgraph or pc.any(pc.match_substring_regex(head, _BEDGRAPH_TRACK)).as_py()
+            if at < 0:
+                continue
+            width = len(lines[at].as_py().split("\t"))
+            return self._columns_for(width, bedgraph=bool(bedgraph)), chain([data], blocks)
+        # A file with no data lines still has a schema; BED3 is the minimum, and it is what
+        # every wider file starts with, so a downstream union widens rather than conflicts.
+        return (BEDGRAPH_COLUMNS if bedgraph else BED_COLUMNS[:3]), iter(())
+
+    def _columns_for(self, width: int, *, bedgraph: bool) -> list[tuple[str, pa.DataType]]:
+        if bedgraph:
+            if width != len(BEDGRAPH_COLUMNS):
+                raise FormatError(
+                    f"bed: a bedGraph record has {width} column(s); bedGraph has exactly 4 "
+                    "(chrom, start, end, value)."
+                )
+            return BEDGRAPH_COLUMNS
         if not 3 <= width <= len(BED_COLUMNS):
             raise FormatError(
                 f"bed: a record has {width} column(s); BED requires 3 to "
                 f"{len(BED_COLUMNS)} (chrom, start, end, then the optional ones)."
             )
-        return [name for name, _ in BED_COLUMNS[:width]]
-
-    def _detect_width(self, fh: IO[Any]) -> int:
-        """The column count of the first data line, which fixes the file's schema."""
-        for raw in iter_decoded_lines(fh):
-            line = raw.rstrip("\r")
-            if line and not _is_comment(line):
-                return len(line.split("\t"))
-        # A file with no data lines still has a schema; BED3 is the minimum, and it is what
-        # every wider file starts with, so a downstream union widens rather than conflicts.
-        return 3
+        return BED_COLUMNS[:width]
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
-        types = dict(BED_COLUMNS)
-        return pa.schema([pa.field(n, types[n]) for n in self._columns_for(self._detect_width(fh))])
+        columns, _ = self._layout(fh)
+        return pa.schema([pa.field(n, t) for n, t in columns])
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         return list(self._iter_records(fh, projection))
@@ -104,17 +175,13 @@ class BedSource(FileSource):
             yield from self._iter_records(fh, projection)
 
     def _iter_records(self, fh: IO[Any], projection: list[str] | None) -> Iterator[pa.RecordBatch]:
-        # The width has to be known before the first block is parsed, and the handle is
-        # already positioned at the start, so it is detected on a separate pass over the
-        # first line rather than by peeking. `_open` hands back a seekable handle.
-        width = self._detect_width(fh)
-        fh.seek(0)
-        names = self._columns_for(width)
+        columns, blocks = self._layout(fh)
         yield from _tsv.iter_record_batches(
-            fh,
+            blocks,
+            markers=(b"#", b"track", b"browser"),
             is_comment=_is_comment,
-            names=names,
-            types=dict(BED_COLUMNS),
+            names=[n for n, _ in columns],
+            types=dict(columns),
             null_values=NULL_VALUES,
             projection=projection,
         )

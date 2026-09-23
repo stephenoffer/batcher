@@ -52,7 +52,7 @@ It is linear to two cores, 85% efficient at four, and reaches a ceiling near 10x
 
 ## Small data shouldn't distribute
 
-Small inputs don't benefit from distribution, and the benchmark shows it. The following UDF map workload over TPC-H sf1 ran on the live Ray cluster, measured by `benchmarks/scenarios/dist_bench.py`:
+Small inputs don't benefit from distribution, and the benchmark shows it. The following UDF map workload over TPC-H sf1 ran on the live Ray cluster, measured by [`benchmarks/scenarios/dist_bench.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/scenarios/dist_bench.py):
 
 | Path | Time |
 |---|---:|

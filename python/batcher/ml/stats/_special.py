@@ -25,6 +25,7 @@ __all__ = [
     "f_sf",
     "normal_sf",
     "normal_two_sided_p",
+    "safe_ratio",
     "students_t_ppf",
     "students_t_sf",
     "students_t_two_sided_p",
@@ -124,24 +125,49 @@ def _gammainc_upper(s: float, x: float) -> float:
     return h * math.exp(-x + s * math.log(x) - math.lgamma(s))
 
 
+def safe_ratio(numerator: float, denominator: float) -> float:
+    """``numerator / denominator`` for a non-negative scale, with SciPy's degenerate conventions.
+
+    A test statistic is an effect over its standard error, and the error can be missing (NaN, from
+    a NaN in the data or a sample too small to have a variance) or exactly zero (constant data).
+    SciPy answers NaN for the first, and for the second ``+-inf`` when the effect is nonzero and
+    NaN when it is zero too. The guard this replaces, ``effect / se if se > 0 else inf``, read a
+    NaN standard error as zero -- ``NaN > 0`` is false -- and so reported an infinitely
+    significant ``p = 0`` for a column holding one NaN.
+    """
+    if math.isnan(numerator) or math.isnan(denominator):
+        return math.nan
+    if denominator > 0:
+        return numerator / denominator
+    return math.nan if numerator == 0 else math.copysign(math.inf, numerator)
+
+
 def students_t_two_sided_p(t: float, df: float) -> float:
     """The two-sided p-value ``P(|T| >= |t|)`` for a Student's t with `df` degrees of freedom."""
-    if df <= 0:
+    if math.isnan(t):
         return math.nan
     if math.isinf(t):
         return 0.0
+    if math.isnan(df) or df <= 0:
+        return math.nan
     return _betai(0.5 * df, 0.5, df / (df + t * t))
 
 
 def normal_two_sided_p(z: float) -> float:
     """The two-sided p-value ``P(|Z| >= |z|)`` for a standard normal, via ``erfc``."""
+    if math.isnan(z):
+        return math.nan
     return math.erfc(abs(z) / math.sqrt(2.0))
 
 
 def f_sf(f: float, df1: float, df2: float) -> float:
     """The upper-tail probability ``P(X >= f)`` for an F distribution with ``(df1, df2)`` d.f."""
+    if math.isnan(f) or math.isnan(df1) or math.isnan(df2):
+        return math.nan
     if f <= 0.0:
         return 1.0
+    if df1 <= 0 or df2 <= 0:
+        return math.nan
     if math.isinf(f):
         return 0.0
     return _betai(0.5 * df2, 0.5 * df1, df2 / (df2 + df1 * f))
@@ -149,8 +175,14 @@ def f_sf(f: float, df1: float, df2: float) -> float:
 
 def chi2_sf(x: float, df: float) -> float:
     """The upper-tail probability ``P(X >= x)`` for a chi-squared with `df` degrees of freedom."""
+    if math.isnan(x) or math.isnan(df):
+        return math.nan
     if x <= 0.0:
         return 1.0
+    if df <= 0:
+        return math.nan
+    if math.isinf(x):
+        return 0.0
     return _gammainc_upper(0.5 * df, 0.5 * x)
 
 

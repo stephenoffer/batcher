@@ -20,18 +20,18 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 |---|---|---|---|
 | `attach` | `Session.catalog.attach` | param | Missing: a DataFrame argument is Session.register instead. Wave W9. |
 | `attach_catalog` | `Session.catalog.attach` | canonical |  |
-| `attach_function` | `bt.register_function` | canonical |  |
+| `attach_function` | {py:obj}`bt.register_function <batcher.register_function>` | canonical |  |
 | `attach_provider` | `Session.register_engine` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `attach_subscriber` | `bt.add_streaming_listener` | param | Missing: subscribers for batch (non-streaming) query events. Wave W9. |
+| `attach_subscriber` | {py:obj}`bt.add_streaming_listener <batcher.add_streaming_listener>` | param | Missing: subscribers for batch (non-streaming) query events. Wave W9. |
 | `attach_table` | `Session.register` | canonical |  |
 | `attach_view` | `Session.register` | canonical |  |
 | `AudioFile` | n/a | gap | Not yet: File logical type (AudioFile). Wave W12. |
-| `Catalog` | `bt.Catalog` | canonical |  |
+| `Catalog` | {py:obj}`bt.Catalog <batcher.Catalog>` | canonical |  |
 | `CheckpointConfig` | n/a | gap | Not yet: per-source checkpointing for resumable reads. Wave W13. |
 | `CheckpointStore` | n/a | gap | Not yet: checkpoint store for resumable reads and idempotent commits. Wave W13. |
 | `cls` | n/a | gap | Not yet: @daft.cls class UDFs usable as Expressions with gpus=/max\_concurrency=/use\_process=/on\_error=/max\_retries=. Wave W11. |
-| `col` | `bt.col` | canonical |  |
-| `concat` | `bt.concat` | canonical |  |
+| `col` | {py:obj}`bt.col <batcher.col>` | canonical |  |
+| `concat` | {py:obj}`bt.concat <batcher.concat>` | canonical |  |
 | `context` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
 | `create_namespace` | `Session.catalog.create_namespace` | canonical |  |
 | `create_namespace_if_not_exists` | `Session.catalog.create_namespace` | param | Missing: port as the base method with if\_not\_exists=True. Wave W9. |
@@ -43,29 +43,29 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `current_model` | `Session.list_models` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
 | `current_namespace` | `Session.catalog.current_namespace` | canonical |  |
 | `current_provider` | `Session.list_engines` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `current_session` | `bt.current_session` | canonical |  |
-| `DataFrame` | `bt.Dataset` | canonical |  |
+| `current_session` | {py:obj}`bt.current_session <batcher.current_session>` | canonical |  |
+| `DataFrame` | {py:obj}`bt.Dataset <batcher.Dataset>` | canonical |  |
 | `datasets` | n/a | out of scope | Declined: bundled sample-dataset loaders (common\_crawl, droid, lerobot), not engine surface. |
 | `DataType` | n/a | gap | Not yet: a DataType object model (Batcher names types with Arrow type strings or pyarrow types). Wave W11. |
 | `detach_catalog` | `Session.catalog.detach` | canonical |  |
 | `detach_function` | `Session.drop_function` | canonical |  |
 | `detach_provider` | n/a | gap | Not yet: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
-| `detach_subscriber` | `bt.remove_streaming_listener` | param | Missing: subscribers for batch (non-streaming) query events. Wave W9. |
+| `detach_subscriber` | {py:obj}`bt.remove_streaming_listener <batcher.remove_streaming_listener>` | param | Missing: subscribers for batch (non-streaming) query events. Wave W9. |
 | `detach_table` | `Session.drop` | param | Missing: Session.drop is silent when the name is absent. Wave W9. |
 | `drop_namespace` | `Session.catalog.drop_namespace` | canonical |  |
 | `drop_table` | `Session.catalog.drop_table` | canonical |  |
-| `element` | `bt.element` | canonical |  |
-| `execution_config_ctx` | `bt.config_context` | param | Missing: Daft execution knob names (morsel size, shuffle algorithm, broadcast threshold) mapped onto Config fields. Wave W9. |
+| `element` | {py:obj}`bt.element <batcher.element>` | canonical |  |
+| `execution_config_ctx` | {py:obj}`bt.config_context <batcher.config_context>` | param | Missing: Daft execution knob names (morsel size, shuffle algorithm, broadcast threshold) mapped onto Config fields. Wave W9. |
 | `Expression` | `bt.Expr` | canonical |  |
 | `File` | n/a | gap | Not yet: File logical type. Wave W12. |
-| `from_arrow` | `bt.from_arrow` | param | Missing: an iterable of Arrow tables or any ArrowStreamExportable. Wave W2. |
-| `from_dask_dataframe` | `bt.from_dask` | canonical |  |
+| `from_arrow` | {py:obj}`bt.from_arrow <batcher.from_arrow>` | param | Missing: an iterable of Arrow tables or any ArrowStreamExportable. Wave W2. |
+| `from_dask_dataframe` | {py:obj}`bt.from_dask <batcher.from_dask>` | canonical |  |
 | `from_files` | n/a | gap | Not yet: DataFrame of File references from a glob. Wave W12. |
 | `from_glob_path` | `bt.read.binary` | mismatch | Differs: port as bt.read.binary(glob).select(uri, size), answered from the listing; the columns are uri and size, not path, size and num\_rows. Wave W13. |
-| `from_pandas` | `bt.from_pandas` | canonical |  |
-| `from_pydict` | `bt.from_pydict` | canonical |  |
-| `from_pylist` | `bt.from_pylist` | canonical |  |
-| `from_ray_dataset` | `bt.from_ray_dataset` | canonical |  |
+| `from_pandas` | {py:obj}`bt.from_pandas <batcher.from_pandas>` | canonical |  |
+| `from_pydict` | {py:obj}`bt.from_pydict <batcher.from_pydict>` | canonical |  |
+| `from_pylist` | {py:obj}`bt.from_pylist <batcher.from_pylist>` | canonical |  |
+| `from_ray_dataset` | {py:obj}`bt.from_ray_dataset <batcher.from_ray_dataset>` | canonical |  |
 | `func` | n/a | gap | Not yet: @daft.func Expression-level UDFs with return\_dtype=, unnest=, gpus=, max\_concurrency=, use\_process=, on\_error=, max\_retries=. Wave W11. |
 | `functions` | `bt` | canonical |  |
 | `get_aggregate_function` | n/a | gap | Not yet: look up a registered aggregate function as an Expression. Wave W9. |
@@ -94,19 +94,19 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `KeyFilteringSettings` | n/a | gap | Not yet: tuning for the skip\_existing key-filtering anti-join. Wave W13. |
 | `list_catalogs` | `Session.catalog.list_catalogs` | canonical |  |
 | `list_tables` | `Session.catalog.list_tables` | canonical |  |
-| `lit` | `bt.lit` | canonical |  |
+| `lit` | {py:obj}`bt.lit <batcher.lit>` | canonical |  |
 | `load_extension` | n/a | out of scope | Declined: loads a Daft native extension library; Batcher extends through Python registries, not dynamic native loading. |
 | `MediaType` | n/a | gap | Not yet: File media-type descriptor. Wave W12. |
 | `method` | n/a | gap | Not yet: @daft.method on @daft.cls UDF classes. Wave W11. |
 | `metrics` | n/a | gap | Not yet: custom counters incremented from inside UDFs. Wave W11. |
 | `open_file` | n/a | gap | Not yet: open a (remote) URL as a file object through the engine's IO layer. Wave W13. |
-| `planning_config_ctx` | `bt.config_context` | param | Missing: planning knobs (default\_io\_config, strict filter pushdown) as Config fields. Wave W9. |
-| `range` | `bt.range` | mismatch | Differs: Daft partitions= has no Batcher counterpart; the column is named id. Wave W0. |
+| `planning_config_ctx` | {py:obj}`bt.config_context <batcher.config_context>` | param | Missing: planning knobs (default\_io\_config, strict filter pushdown) as Config fields. Wave W9. |
+| `range` | {py:obj}`bt.range <batcher.range>` | mismatch | Differs: Daft partitions= has no Batcher counterpart; the column is named id. Wave W0. |
 | `read_blob` | `bt.read.binary` | mismatch | Differs: Daft read\_blob yields columns (path, size, content) with on\_error=; Batcher read.binary yields (uri, bytes, size, mime). Wave W13. |
 | `read_csv` | `bt.read.csv` | canonical |  |
 | `read_deltalake` | `bt.read.delta` | canonical |  |
 | `read_hudi` | `bt.read.hudi` | canonical |  |
-| `read_huggingface` | `bt.from_huggingface` | param | Missing: reading an hf:// repo by name (Batcher wraps an already-loaded datasets object). Wave W13. |
+| `read_huggingface` | {py:obj}`bt.from_huggingface <batcher.from_huggingface>` | param | Missing: reading an hf:// repo by name (Batcher wraps an already-loaded datasets object). Wave W13. |
 | `read_iceberg` | `bt.read.iceberg` | mismatch | Differs: Daft read\_iceberg takes a PyIceberg Table object or a metadata path (branch=/tag=); Batcher takes a catalog identifier string. Param: accept a PyIceberg Table or metadata path. Wave W13. |
 | `read_json` | `bt.read.json` | canonical |  |
 | `read_kafka` | `bt.read.kafka` | mismatch | Differs: Daft read\_kafka is a bounded batch read between start and end offsets; Batcher read.kafka is an unbounded streaming source. Param: bounded start=/end= offsets. Wave W13. |
@@ -122,29 +122,37 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `read_webdataset` | `bt.read.webdataset` | param | Missing: batch\_size= and Daft's column layout (not verified against Daft). Wave W13. |
 | `refresh_logger` | n/a | out of scope | Declined: Daft Rust-logger plumbing; Batcher logging is configured through batcher.config logging functions. |
 | `register_viz_hook` | n/a | out of scope | Declined: notebook HTML visualization hook for Python classes, not engine surface. |
-| `ResourceRequest` | `Dataset.map_batches` | param | Missing: a ResourceRequest object carrying num\_cpus/num\_gpus/memory\_bytes. Wave W11. |
+| `ResourceRequest` | {py:obj}`Dataset.map_batches <batcher.Dataset.map_batches>` | param | Missing: a ResourceRequest object carrying num\_cpus/num\_gpus/memory\_bytes. Wave W11. |
 | `runners` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
 | `Schema` | n/a | gap | Not yet: a Schema object model (Batcher exposes pyarrow.Schema). Wave W11. |
 | `Series` | n/a | out of scope | Declined: a single-column eager array type; Batcher has no Series (columns are Expr, data is Arrow). |
-| `Session` | `bt.Session` | canonical |  |
+| `Session` | {py:obj}`bt.Session <batcher.Session>` | canonical |  |
 | `session` | n/a | gap | Not yet: a process-default session object (current\_session/set\_session/session). Wave W9. |
 | `set_catalog` | `Session.catalog.use` | canonical |  |
-| `set_execution_config` | `bt.set_config` | param | Missing: Daft execution knob names (morsel size, shuffle algorithm, broadcast threshold) mapped onto Config fields. Wave W9. |
+| `set_execution_config` | {py:obj}`bt.set_config <batcher.set_config>` | param | Missing: Daft execution knob names (morsel size, shuffle algorithm, broadcast threshold) mapped onto Config fields. Wave W9. |
 | `set_model` | `Session.register_model` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
 | `set_namespace` | `Session.catalog.use` | canonical |  |
-| `set_planning_config` | `bt.set_config` | param | Missing: planning knobs (default\_io\_config, strict filter pushdown) as Config fields. Wave W9. |
+| `set_planning_config` | {py:obj}`bt.set_config <batcher.set_config>` | param | Missing: planning knobs (default\_io\_config, strict filter pushdown) as Config fields. Wave W9. |
 | `set_provider` | `Session.register_engine` | param | Missing: a session provider/model registry (attach\_provider/set\_provider/set\_model/current\_model) that AI functions resolve against. Wave W12. |
 | `set_runner_native` | n/a | out of scope | Declined: Daft runner internals; Batcher picks single-node or distributed per collect(distributed=...) and has no runner object. |
-| `set_runner_ray` | `Dataset.collect` | param | Missing: a process-wide switch to distributed execution (Batcher opts in per collect(distributed=...)). Wave W9. |
-| `set_session` | `bt.set_session` | canonical |  |
-| `sql` | `bt.sql` | param | Missing: register\_globals= discovery of DataFrames bound to Python variables. Wave W1. |
-| `sql_expr` | `bt.sql_expr` | canonical |  |
-| `Table` | `bt.Table` | canonical |  |
+| `set_runner_ray` | {py:obj}`Dataset.collect <batcher.Dataset.collect>` | param | Missing: a process-wide switch to distributed execution (Batcher opts in per collect(distributed=...)). Wave W9. |
+| `set_session` | {py:obj}`bt.set_session <batcher.set_session>` | canonical |  |
+| `sql` | {py:obj}`bt.sql <batcher.sql>` | param | Missing: register\_globals= discovery of DataFrames bound to Python variables. Wave W1. |
+| `sql_expr` | {py:obj}`bt.sql_expr <batcher.sql_expr>` | canonical |  |
+| `Table` | {py:obj}`bt.Table <batcher.Table>` | canonical |  |
 | `TimeUnit` | n/a | gap | Not yet: time unit enum (Batcher takes unit strings). Wave W11. |
 | `udaf` | n/a | gap | Not yet: user-defined mergeable aggregate functions (partial/combine/finalize) from a class. Wave W11. |
-| `udf` | `bt.udf` | mismatch | Differs: Daft @udf (deprecated) yields a column UDF called with Expressions and sized with num\_gpus=/concurrency=/batch\_size=; bt.udf yields a Dataset-level transform. Param: an Expr-returning UDF form. Wave W11. |
+| `udf` | {py:obj}`bt.udf <batcher.udf>` | mismatch | Differs: Daft @udf (deprecated) yields a column UDF called with Expressions and sized with num\_gpus=/concurrency=/batch\_size=; bt.udf yields a Dataset-level transform. Param: an Expr-returning UDF form. Wave W11. |
 | `UnionMode` | n/a | gap | Not yet: union type mode enum. Wave W11. |
 | `VideoFile` | n/a | gap | Not yet: File logical type (VideoFile). Wave W12. |
 | `Window` | `WindowExpr.over` | mismatch | Differs: A Daft Window with order\_by and no explicit frame applies an aggregate over the whole partition; Batcher's over(order\_by=) uses SQL's running frame. Param: frame=(None, None). Wave W0. |
-| `with_subscriber` | `bt.add_streaming_listener` | param | Missing: subscribers for batch (non-streaming) query events, as a context manager. Wave W9. |
+| `with_subscriber` | {py:obj}`bt.add_streaming_listener <batcher.add_streaming_listener>` | param | Missing: subscribers for batch (non-streaming) query events, as a context manager. Wave W9. |
 | `write_table` | `Dataset.write.table` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

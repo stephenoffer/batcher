@@ -10,20 +10,19 @@ input order. A column leaf gives its own name, a literal gives ``"literal"``, an
 reads as its leftmost input.
 
 The rule is deterministic and purely structural, so two positional expressions can infer
-the same name. That is refused by the caller (`name_positionals`) rather than resolved by
-suffixing, as Polars refuses it: a silent ``a_1`` is a column nobody asked for.
+the same name. That is refused by the caller (`api/dataset/frame.py`, where `select` and
+`with_columns` bind their positionals) rather than resolved by suffixing, as Polars refuses
+it: a silent ``a_1`` is a column nobody asked for.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any
 
-from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import AggExpr, Aliased, Case, Col, Expr, Lit, WindowExpr
 from batcher.plan.expr_rewrite.traverse import _EXPR_KIDS
 
-__all__ = ["LITERAL_NAME", "name_positionals", "output_name"]
+__all__ = ["LITERAL_NAME", "output_name"]
 
 #: The name a projection with no column leaf gets, matching Polars.
 LITERAL_NAME = "literal"
@@ -95,43 +94,3 @@ def output_name(expr: Expr | AggExpr) -> str:
     # A leaf that is neither a column nor a literal reads no column, so it is a constant
     # for naming purposes, as Polars names `int_range`/`lit` alike.
     return LITERAL_NAME
-
-
-def name_positionals(
-    exprs: Iterable[Expr | AggExpr], *, api: str, taken: Iterable[str] = ()
-) -> dict[str, Expr | AggExpr]:
-    """Name each positional expression, refusing two that would share a name.
-
-    Args:
-        exprs: The positional expressions, in call order. Selectors must already be
-            expanded; a top-level ``.alias(...)`` is unwrapped here.
-        api: The calling verb, named in the error.
-        taken: Names already bound by the caller (earlier projections), checked too.
-
-    Returns:
-        An ordered mapping from inferred name to the expression it names.
-
-    Raises:
-        PlanError: If two expressions infer or declare the same output name.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> from batcher.plan.expr_rewrite.naming import name_positionals
-            >>> list(name_positionals([bt.col("a") + 1, bt.col("b")], api="select"))
-            ['a', 'b']
-    """
-    seen = set(taken)
-    out: dict[str, Expr | AggExpr] = {}
-    for expr in exprs:
-        name = output_name(expr)
-        if name in seen:
-            raise PlanError(
-                f"{api}() would produce the output column {name!r} twice; an unnamed "
-                "expression is named after its leftmost column (or 'literal'), so two of "
-                f"them can collide -- rename one with .alias('...') or pass it as a keyword"
-            )
-        seen.add(name)
-        out[name] = expr.inner if isinstance(expr, Aliased) else expr
-    return out

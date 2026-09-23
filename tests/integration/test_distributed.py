@@ -1170,6 +1170,25 @@ def test_distributed_limit_matches_single_node(cluster_tmp_path, transport):
         assert single.to_pydict() == dist.to_pydict()  # ordered: the same first-k rows
 
 
+def test_distributed_bare_scan_keeps_source_order(cluster_tmp_path):
+    """A breaker-free distributed scan returns the source's rows in the source's order.
+
+    `limit(n)` past the row count is dropped by Kyber and lands here, so this is the same
+    guarantee the ordered `LIMIT` path gives, reached without a `Limit` in the plan. Compared
+    element-wise: the claim is the order, and a multiset comparison would hold for any
+    interleaving of the workers' outputs -- which is exactly what the defect returned.
+    """
+    import pyarrow.parquet as pq
+
+    n = 50_000
+    path = str(cluster_tmp_path / "t.parquet")
+    pq.write_table(pa.table({"i": np.arange(n, dtype="int64")}), path, row_group_size=5_000)
+    for q in (lambda ds: ds, lambda ds: ds.filter(col("i") % 3 == 0).select("i")):
+        single = q(bt.read.parquet(path)).collect(distributed=False).column("i").to_pylist()
+        dist = q(bt.read.parquet(path)).collect(distributed=True, num_workers=4)
+        assert dist.column("i").to_pylist() == single
+
+
 def test_distributed_empty_limit_result_keeps_its_schema(cluster_tmp_path):
     """A filter that matches nothing, then a limit, yields zero batches — the result must
     still carry the real column types (not null placeholders), identically on one node and
@@ -1788,9 +1807,11 @@ def test_an_aggregate_over_a_union_cannot_feed_a_join_or_another_aggregate(clust
     materializing the aggregate first (`bt.from_arrow(...collect())`) clears it, which is the
     workaround where the intermediate is small enough to pass through the driver.
 
-    `batcher.graph` hits this in `degree_distribution` and in the link-prediction scores,
-    which is why they raise under `distributed=True`. The degree functions used to hit it too
-    and no longer do.
+    `batcher.graph` used to hit this in `degree_distribution`, `triangle_count`,
+    `clustering_coefficient`, `k_core`, `summarize` and the link-prediction scores. They now
+    count edge endpoints with an `explode` over a two-element array instead of a `union`, or
+    materialize a per-node table before joining it; `tests/integration/test_graph_distributed.py`
+    holds them to single-node's answer.
     """
     import pyarrow.parquet as pq
 
@@ -1864,3 +1885,42 @@ def test_proportional_splits_are_identical_distributed():
         single = part.collect()
         dist = part.collect(distributed=True, num_workers=4, transport="disk")
         assert dist.column("k").to_pylist() == single.column("k").to_pylist(), f"part {i}"
+
+
+@pytest.mark.parametrize("num_workers", [2, 4])
+def test_split_parts_are_identical_distributed(num_workers):
+    """`Dataset.split` returns the same parts on many workers as on one.
+
+    `split` is built from a position column plus one range filter per part. Taking that
+    position from a `row_number` window made the plan a *global* window (no PARTITION BY)
+    that is then filtered, which the distributed executor refuses outright -- so the verb
+    worked single-node and raised `PlanError` under `distributed=True`, alone among the
+    frame verbs built the same way. It takes the position from a sort and `with_row_index`
+    instead, which is the shape `split_at_indices` already used and distributes.
+
+    The parts are compared in order and element-wise rather than with `assert_same`: the
+    whole claim is *which* rows landed in *which* part, and a multiset comparison over the
+    concatenation would hold for any reshuffling of the cut points.
+    """
+    table = pa.table({"i": list(range(50_000)), "v": [float(i % 97) for i in range(50_000)]})
+    ds = bt.from_arrow(table)
+    single = [p.collect(distributed=False).to_pydict() for p in ds.split(3, order_by="i")]
+    many = [
+        p.collect(distributed=True, num_workers=num_workers).to_pydict()
+        for p in ds.split(3, order_by="i")
+    ]
+    assert [len(p["i"]) for p in single] == [16667, 16667, 16666]
+    assert [len(p["i"]) for p in many] == [len(p["i"]) for p in single]
+    for one, lots in zip(single, many, strict=True):
+        assert one == lots
+
+
+def test_split_equal_drops_the_remainder_distributed():
+    """``equal=True`` gives every part the same size on the distributed path too."""
+    ds = bt.from_arrow(pa.table({"i": list(range(10_000))}))
+    parts = [
+        p.collect(distributed=True, num_workers=2).to_pydict()["i"]
+        for p in ds.split(3, order_by="i", equal=True)
+    ]
+    assert [len(p) for p in parts] == [3333, 3333, 3333]
+    assert sorted(x for p in parts for x in p) == list(range(9999))

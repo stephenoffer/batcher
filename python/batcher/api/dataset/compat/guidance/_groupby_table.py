@@ -127,4 +127,69 @@ GROUPBY_UNSUPPORTED: dict[str, str] = {
     ),
     "applyInPandas": _PER_GROUP_PYTHON,
     "cogroup": "Co-grouping two frames is a join on the key: ds.join(other, on='k').",
+    # --- pandas GroupBy names with no Batcher equivalent on the grouped object ---------
+    #
+    # Batcher's GroupBy aggregates and nothing else, so these all answer by pointing at the
+    # expression or the Dataset that does the work. Each was a bare AttributeError with a
+    # fuzzy "did you mean" that pointed somewhere wrong: `idxmax` suggested `max`, which
+    # returns the value rather than the row it came from.
+    "idxmax": (
+        "There is no row index to return. For the row itself, order and take the first "
+        "per group: ds.group_by('g').first('a', order_by='a'). For the value alone, "
+        ".agg(m=bt.col('a').max())."
+    ),
+    "idxmin": (
+        "There is no row index to return. For the row itself: "
+        "ds.group_by('g').last('a', order_by='a'). For the value alone, "
+        ".agg(m=bt.col('a').min())."
+    ),
+    "cumprod": (
+        "A running product is a window, not an aggregate, because it returns one row per "
+        "input row: ds.with_columns(r=bt.col('a').cum_prod().over("
+        "partition_by=['g'], order_by='a'))."
+    ),
+    "ewm": (
+        "Exponentially weighted statistics are window expressions: "
+        "ds.with_columns(r=bt.col('a').ewm_mean(alpha=0.5).over("
+        "partition_by=['g'], order_by='t'))."
+    ),
+    "corrwith": (
+        "Correlating two columns per group is an aggregate over both: "
+        "ds.group_by('g').agg(r=bt.corr(bt.col('a'), bt.col('b')))."
+    ),
+    "resample": (
+        "Resampling is a second grouping key, not a grouped method. Truncate the timestamp "
+        "and name it: ds.group_by('g', hour=bt.col('t').dt.truncate('hour')).agg("
+        "n=bt.col('a').mean())."
+    ),
+    "sample": (
+        "Sampling is a Dataset operation: ds.sample(fraction=0.1). To sample within each "
+        "group, rank inside the group and filter: ds.with_columns(r=bt.col('a').rank()"
+        ".over(partition_by=['g'])).filter(bt.col('r') <= 5)."
+    ),
+    "take": (
+        "There are no row positions to take. Order within the group and limit: "
+        "ds.group_by('g').first('a', order_by='a')."
+    ),
+    "ohlc": (
+        "Open/high/low/close is four aggregates over an ordered column: "
+        "ds.group_by('g').agg(o=bt.col('a').first(order_by='t'), h=bt.col('a').max(), "
+        "lo=bt.col('a').min(), c=bt.col('a').last(order_by='t'))."
+    ),
+    "dtypes": "Column types belong to the frame, not the grouping: read ds.schema.",
+    "ndim": "A grouped relation is always two-dimensional; there is nothing to ask.",
+    "level": (
+        "Batcher has no index levels, so there is no level to group by. Group by the "
+        "column itself: ds.group_by('g')."
+    ),
+    "grouper": (
+        "Batcher exposes no grouper object. The keys you grouped by are the `keys` "
+        "property, ds.group_by('g').keys, and the grouping is only realized by .agg(...)."
+    ),
+    "plot": "Batcher does not plot. Collect the aggregate and hand it to your plotting library.",
+    "boxplot": "Batcher does not plot. Collect the aggregate and hand it to your plotting library.",
+    "hist": (
+        "Batcher does not plot. For the counts a histogram would draw, bucket and "
+        "aggregate: ds.group_by('g', bucket=bt.col('a').floor()).agg(n=bt.count())."
+    ),
 }

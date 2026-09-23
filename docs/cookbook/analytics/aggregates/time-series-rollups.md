@@ -154,7 +154,7 @@ print(dense_region.filter(col("region") == "eu").to_pydict()["revenue"])
 :::{dropdown} Two more things that will bite you: time zones and late data
 Time zones first. `dt.truncate("day")` floors in whatever zone the timestamps are stored in, which for most warehouses is UTC. A "day" of revenue for a US business truncated in UTC starts at 5pm the previous afternoon. Convert before you truncate: `col("ts").dt.convert_timezone("UTC", "America/New_York").dt.truncate("day")`. The function is DST-aware, so the 23-hour and 25-hour days come out right.
 
-Then late data. A rollup run at midnight is a rollup of the events that had arrived by midnight. If your pipeline backfills, yesterday's number changes after you published it. Either recompute a trailing window of days on every run, or hold the bucket open with a watermark (see {doc}`streaming </user-guide/moving-data/streaming>`). Decide, rather than discovering it when finance asks why the number moved.
+Then late data. A rollup run at midnight is a rollup of the events that had arrived by midnight. If your pipeline backfills, yesterday's number changes after you published it. Either recompute a trailing window of days on every run, or hold the bucket open with a watermark (see {doc}`streaming </user-guide/moving-data/streaming/index>`). Decide, rather than discovering it when finance asks why the number moved.
 :::
 
 ## See also

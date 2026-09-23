@@ -157,8 +157,22 @@ def main() -> None:
         .to_pydict()
     )
     print(f"\n{sum(thinned['n'])} returns reduce to {len(thinned['n'])} voxels at 0.5 m")
+    # The four surviving returns are metres apart, so at 0.5 m each is its own voxel...
     assert sum(thinned["n"]) == 4
-    assert len(thinned["n"]) <= 4
+    assert sorted(thinned["n"]) == [1, 1, 1, 1]
+    # ...and at 1 km, where the whole sweep fits in one cube, they collapse to one.
+    coarse = (
+        in_world.group_by(**bt.voxel_index(("wx", "wy", "wz"), 1000.0))
+        .agg(n=bt.count())
+        .to_pydict()
+    )
+    assert coarse["n"] == [4], coarse
+
+    # A return with a NaN coordinate has no voxel: its index is null rather than the
+    # whole query failing, so one bad return cannot abort a sweep. Drop it before binning.
+    noisy = bt.from_pydict({"x": [1.2, float("nan")], "y": [0.0, 0.0], "z": [0.0, 0.0]})
+    indexed = noisy.select(**bt.voxel_index(("x", "y", "z"), 0.5)).to_pydict()
+    assert indexed["ix"] == [2, None]
 
     # --- 6. A sector histogram, which is an ordinary group_by ---------------------
     sectors = (

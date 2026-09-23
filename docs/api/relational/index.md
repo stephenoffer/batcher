@@ -9,12 +9,11 @@ This section is the reference for relational work in Batcher: the `Dataset` verb
 | {doc}`/api/relational/expressions-datascience` | Feature engineering, profiling, and model-evaluation expressions |
 | {doc}`/api/relational/expression-accessors` | Every {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>`, {py:class}`.map <batcher.plan.expr_ir.namespaces.collections._MapNamespace>`, {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`, {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>`, and {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>` methods |
 | {doc}`/api/relational/functions` | Scalar, horizontal, aggregate, and window functions |
-| {doc}`/api/relational/geospatial` | Every `ST_*` function: geometry, predicates, measures, grids |
-| {doc}`/api/relational/spatial` | Rotations, poses and coordinate frames for robotics and AV |
-| {doc}`/api/relational/graph` | Graph analytics and graph-ML features over an edge table |
 | {doc}`/api/relational/sql` | The SQL surface, and how it lowers to the DataFrame API |
 | {doc}`/api/relational/sql-statements` | DDL, `MERGE INTO`, and the catalog statements a client opens with |
+| {doc}`/api/relational/sessions-and-catalogs` | The `Session` a query runs in, and the `Catalog` that names its tables |
 | {doc}`/api/relational/io` | Every reader and writer, with the optional extras |
+| {doc}`/api/relational/domains/index` | Geospatial, rigid-body, and graph functions |
 
 ```{toctree}
 :hidden:
@@ -24,10 +23,9 @@ expressions
 expressions-datascience
 expression-accessors
 functions
-geospatial
-spatial
-graph
 sql
 sql-statements
+sessions-and-catalogs
 io
+domains/index
 ```

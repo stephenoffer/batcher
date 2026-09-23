@@ -34,7 +34,6 @@ __all__ = [
     "count",
     "duration_ms",
     "duration_s",
-    "elapsed_since",
     "ordinal",
     "percent",
     "plural",
@@ -246,34 +245,6 @@ def rate(n: float | None, unit: str = "rows") -> str:
             '1.2M rows/s'
     """
     return UNKNOWN if n is None else f"{count(n)} {unit}/s"
-
-
-def elapsed_since(seconds: float) -> str:
-    """How long ago something happened, as ``just now``/``42s ago``/``3 hr ago``.
-
-    Args:
-        seconds: Seconds elapsed; negative values are treated as zero.
-
-    Returns:
-        The rendered relative time.
-
-    Examples:
-        .. doctest::
-
-            >>> from batcher._internal.humanize import elapsed_since
-            >>> elapsed_since(5), elapsed_since(120)
-            ('just now', '2 min ago')
-    """
-    secs = max(0.0, seconds)
-    if secs < 10:
-        return "just now"
-    if secs < 60:
-        return f"{round(secs)}s ago"
-    if secs < 3600:
-        return f"{round(secs / 60)} min ago"
-    if secs < 86400:
-        return f"{round(secs / 3600)} hr ago"
-    return f"{round(secs / 86400)} d ago"
 
 
 def plural(n: int, singular: str, many: str | None = None) -> str:

@@ -165,3 +165,37 @@ def test_the_engine_can_read_a_union_column_end_to_end(tmp_path) -> None:
     directory = _write(tmp_path, _UNION, _RECORDS)
 
     assert bt.read.avro(directory).count() == 5
+
+
+def test_the_native_reader_declines_a_union_and_the_common_case_still_takes_it(
+    tmp_path,
+) -> None:
+    """The *mechanism*, so re-enabling the native path on a union fails here rather than in IO.
+
+    Every test above passes through `_read_native` returning `None` and the fastavro path
+    doing the mapping. That is invisible in a result comparison: a native decode of
+    ``["null", "long", "string"]`` succeeds and returns a faithful Arrow `dense_union`, and
+    the read then failed one layer up, in `conform_batch`, against the `struct<memberN>`
+    type the source had already advertised. So this asserts the decline directly.
+
+    The second half is the positive control, and it is not optional. Without it "declines a
+    union" would be equally true of a `_read_native` that had stopped decoding anything at
+    all -- and the fastavro fallback would keep every other test in this file green while
+    the native reader was dead. It asserts rather than skips for the same reason: a skip
+    here is invisible to `lint-skips`, which reads module-level guards.
+    """
+    from pathlib import Path
+
+    from batcher.io.formats.structured.avro import _read_native
+
+    union_dir = tmp_path / "union"
+    union_dir.mkdir()
+    union_bytes = (Path(_write(union_dir, _UNION, _RECORDS)) / "a.avro").read_bytes()
+    assert _read_native(union_bytes, 1024) is None, "the native path must decline a union"
+
+    plain_dir = tmp_path / "plain"
+    plain_dir.mkdir()
+    plain = _write(plain_dir, [{"name": "v", "type": ["null", "long"]}], [{"v": 1}, {"v": None}])
+    native = _read_native((Path(plain) / "a.avro").read_bytes(), 1024)
+    assert native is not None, "the native reader decoded nothing, so the decline proves nothing"
+    assert pa.Table.from_batches(native).column("v").to_pylist() == [1, None]

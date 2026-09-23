@@ -51,7 +51,7 @@ print(revenue.to_pydict())
 # {'region': ['us'], 'revenue': [225.0], 'orders': [3]}
 ```
 
-Nothing has executed until {py:meth}`to_pydict() <batcher.Dataset.to_pydict>`. `bt.sql` returns a lazy {py:class}`Dataset <batcher.Dataset>`, exactly like
+Nothing has executed until {py:meth}`to_pydict() <batcher.Dataset.to_pydict>`. {py:obj}`bt.sql <batcher.sql>` returns a lazy {py:class}`Dataset <batcher.Dataset>`, exactly like
 every other operation.
 
 ## 3. Write it as a DataFrame

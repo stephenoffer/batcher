@@ -327,5 +327,8 @@ def _anova_from_moments(counts: list[int], sums: list[float], squares: list[floa
     ss_between = sum(count * (s / count - grand_mean) ** 2 for count, s, _ in groups)
     ss_within = sum(q - s * s / count for count, s, q in groups)
     if ss_within <= 0:
-        return float("nan")
+        # Every group is constant. If the groups differ, the feature separates the classes
+        # perfectly: sklearn's `f_classif` scores that `inf`. It used to be NaN here, which
+        # sorted the single best feature to the bottom and made SelectKBest drop it.
+        return float("inf") if ss_between > 0 else float("nan")
     return (ss_between / (k - 1)) / (ss_within / (n - k))

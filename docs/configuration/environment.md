@@ -173,6 +173,20 @@ The two layers here sit in the middle of the resolution order, highest first:
 So a `BATCHER_*` variable overrides a value set in `BATCHER_CONFIG_FILE`, and a
 runtime `set_config` or `config_context` overrides both.
 
+
+## Reading a resolved log level
+
+{py:obj}`ObservabilityConfig.resolved_native_log_level <batcher.config.ObservabilityConfig>`
+reports the level the Rust data plane will actually use. It is derived, not stored: the
+environment can raise or lower it, so the configured field and the effective level are two
+different things and this is the one the engine reads.
+
+```python
+from batcher.config import ObservabilityConfig
+
+print(ObservabilityConfig().resolved_native_log_level)
+```
+
 ## See also
 
 - {doc}`index`: the runtime entry points these variables are overridden by.

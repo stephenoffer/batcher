@@ -42,12 +42,12 @@ The following table maps the 86 names on `DataContext` fields, sorted alphabetic
 | `enable_pandas_block` | n/a | out of scope | Declined: Ray internal backend toggle for its block/tensor implementation; Batcher is Arrow-only in Rust with no alternate block backend. |
 | `enable_per_node_metrics` | n/a | out of scope | Declined: Ray internal debug/metrics toggle for its executor; Batcher observability is configured through ObservabilityConfig. |
 | `enable_progress_bar_name_truncation` | n/a | out of scope | Declined: progress-bar rendering detail; Batcher's progress reporter is controlled as a whole by batcher.config.set\_progress. |
-| `enable_progress_bars` | `batcher.config.set_progress` | mismatch | Differs: Ray toggles progress bars by assigning a DataContext field; Batcher sets progress reporting with set\_progress (or ObservabilityConfig.progress). Wave W9. |
+| `enable_progress_bars` | {py:obj}`batcher.config.set_progress <batcher.config.set_progress>` | mismatch | Differs: Ray toggles progress bars by assigning a DataContext field; Batcher sets progress reporting with set\_progress (or ObservabilityConfig.progress). Wave W9. |
 | `enable_rich_progress_bars` | n/a | out of scope | Declined: progress-bar rendering detail; Batcher's progress reporter is controlled as a whole by batcher.config.set\_progress. |
 | `enable_tensor_extension_casting` | n/a | out of scope | Declined: Ray internal backend toggle for its block/tensor implementation; Batcher is Arrow-only in Rust with no alternate block backend. |
 | `enforce_schemas` | `Config.execution` | param | Missing: enforce one declared schema across all blocks/batches of an execution (fail rather than unify). Wave W9. |
 | `execution_no_progress_timeout_s` | `Config.distributed` | param | Missing: fail an execution that makes no progress for N seconds (autoscale\_stall\_s governs autoscaling only). Wave W9. |
-| `execution_options` | `bt.ExecutionConfig` | mismatch | Differs: Ray DataContext.execution\_options holds ExecutionOptions (resource\_limits, preserve\_order, verbose\_progress); Batcher's nearest is Config.execution, which has no resource caps or preserve\_order switch. Wave W9. |
+| `execution_options` | {py:obj}`bt.ExecutionConfig <batcher.ExecutionConfig>` | mismatch | Differs: Ray DataContext.execution\_options holds ExecutionOptions (resource\_limits, preserve\_order, verbose\_progress); Batcher's nearest is Config.execution, which has no resource caps or preserve\_order switch. Wave W9. |
 | `gpu_shuffle_num_actors` | n/a | out of scope | Declined: Ray GPU shuffle (RMM pool, actor count, spill) tuning; Batcher's device tier is configured through DistributedConfig.gpu\_\* and routes shuffles differently. |
 | `gpu_shuffle_rmm_pool_size` | n/a | out of scope | Declined: Ray GPU shuffle (RMM pool, actor count, spill) tuning; Batcher's device tier is configured through DistributedConfig.gpu\_\* and routes shuffles differently. |
 | `gpu_shuffle_setup_timeout_s` | n/a | out of scope | Declined: Ray GPU shuffle (RMM pool, actor count, spill) tuning; Batcher's device tier is configured through DistributedConfig.gpu\_\* and routes shuffles differently. |
@@ -117,3 +117,11 @@ The following table maps the 6 names on `ExecutionOptions`, sorted alphabeticall
 | `locality_with_output` | n/a | out of scope | Declined: Ray object-store locality hint for outputs on the driver node; Batcher streams results over Arrow Flight. |
 | `resource_limits` | `Config.execution` | param | Missing: per-execution CPU/GPU/memory/object-store resource caps (ExecutionResources). Wave W9. |
 | `validate` | n/a | out of scope | Declined: internal validation of the ExecutionOptions dataclass; Batcher Config validates in set\_config/config\_context. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Ray Data pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

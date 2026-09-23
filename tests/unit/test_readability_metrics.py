@@ -11,10 +11,12 @@ pytestmark = pytest.mark.unit
 
 
 def test_automated_readability_index() -> None:
-    # chars=36, words=9, sents=2: 4.71*(36/9) + 0.5*(9/2) - 21.43 = 18.84 + 2.25 - 21.43.
+    # ARI counts letters and digits, not spaces and punctuation: chars=26 (the old pin of 36
+    # counted the eight spaces and two full stops), words=9, sents=2:
+    # 4.71*(26/9) + 0.5*(9/2) - 21.43.
     ds = bt.from_pydict({"o": ["The cat sat on the mat. It was warm."]})
     got = ds.agg(m=r.automated_readability_index("o")).to_pydict()["m"][0]
-    assert got == pytest.approx(-0.34)
+    assert got == pytest.approx(4.71 * 26 / 9 + 0.5 * 9 / 2 - 21.43)
 
 
 def test_mean_words_per_sentence() -> None:
@@ -53,10 +55,14 @@ def test_mean_paragraph_count() -> None:
 
 
 def test_empty_string_is_guarded() -> None:
-    # No words, no sentences: guarded terms are 0, so ARI is just the -21.43 constant.
+    # No words means no grade: the row is skipped, not scored as the bare -21.43 constant the
+    # old pin accepted, which dragged a corpus mean down by one empty output per row.
     ds = bt.from_pydict({"o": [""]})
     got = ds.agg(m=r.automated_readability_index("o")).to_pydict()["m"][0]
-    assert got == pytest.approx(-21.43)
+    assert got is None
+    mixed = bt.from_pydict({"o": ["The cat sat on the mat. It was warm.", "", None]})
+    got = mixed.agg(m=r.automated_readability_index("o")).to_pydict()["m"][0]
+    assert got == pytest.approx(4.71 * 26 / 9 + 0.5 * 9 / 2 - 21.43)
     got_wps = ds.agg(m=r.mean_words_per_sentence("o")).to_pydict()["m"][0]
     assert got_wps == pytest.approx(0.0)
 

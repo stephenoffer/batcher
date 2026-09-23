@@ -23,8 +23,6 @@ from batcher._internal.instrument.nvtx import (
     nvtx_backend,
     pop_range,
     push_range,
-    range_decorator,
-    reset_nvtx_backend,
 )
 from batcher._internal.instrument.ranges import (
     DeviceTiming,
@@ -41,7 +39,5 @@ __all__ = [
     "pop_range",
     "profiling_enabled",
     "push_range",
-    "range_decorator",
-    "reset_nvtx_backend",
     "time_device_work",
 ]

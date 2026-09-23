@@ -219,7 +219,7 @@ A binary key distributes like any other. `collect(distributed=True)` range-parti
 
 That holds even when the key is badly skewed. A range partition keeps equal keys together, so one dominant value would otherwise pin its whole share on a single worker no matter how many you add. The engine detects that from the sample and gives the value a bucket of its own, spread across several workers. You do not configure it, and it does not change the result.
 
-`examples/relational/sorting_binary_keys.py` works all of this end to end, including null placement and the fixed-layout record shape.
+[`examples/relational/sorting_binary_keys.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/sorting_binary_keys.py) works all of this end to end, including null placement and the fixed-layout record shape.
 
 ## Sorting large results: spill
 

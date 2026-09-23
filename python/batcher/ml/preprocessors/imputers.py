@@ -5,6 +5,10 @@ each a single aggregate over the engine; `transform` replaces nulls with
 ``coalesce(col, fill)`` — an `Expr`, so the fill happens in the data plane. ``mean``
 and ``median`` cast the column to float (the scikit-learn convention); ``most_frequent``
 and ``constant`` keep the original type.
+
+"Missing" means null or, in a floating-point column, NaN: both are skipped when the fill
+value is learned and both are filled by `transform`. That is scikit-learn's
+``missing_values=np.nan`` behaviour, where a pandas NaN and a None are the same thing.
 """
 
 from __future__ import annotations
@@ -12,7 +16,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
+from batcher.ml.preprocessors.base import (
+    Preprocessor,
+    columns_arg,
+    fit_aggregate,
+    nan_as_null,
+)
 from batcher.plan.expr_ir import coalesce, col, count, lit, when
 
 if TYPE_CHECKING:
@@ -107,6 +116,7 @@ class SimpleImputer(Preprocessor):
             PlanError: If a column has no non-null values to learn a statistic from.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         if self.strategy == "constant":
             self.statistics_ = dict.fromkeys(self.columns, self.fill_value)
         elif self.strategy == "most_frequent":
@@ -126,22 +136,27 @@ class SimpleImputer(Preprocessor):
 
     @staticmethod
     def _mode(ds: Dataset, column: str) -> Any:
-        """The most frequent non-null value of `column` (ties: engine order)."""
+        """The most frequent non-null value of `column`, the smallest one on a tie.
+
+        The tie-break is scikit-learn's, and it is what makes the answer a property of the
+        data: ordering by count alone left a tie to the hash table's walk order, which is not
+        the same on one node as across several.
+        """
         grouped = (
             ds.filter(col(column).is_not_null())
             .group_by(column)
             .agg(__n=count())
-            .sort("__n", descending=True)
+            .sort("__n", column, descending=[True, False])
             .limit(1)
             .collect()
         )
         return grouped.column(column)[0].as_py() if grouped.num_rows else None
 
     def transform(self, ds: Dataset) -> Dataset:
-        """Replace nulls in each fitted column with its learned fill value.
+        """Replace nulls (and NaN, in a float column) with each column's learned fill value.
 
-        Lowered to ``coalesce(col, fill)``; ``"mean"``/``"median"`` first cast the
-        column to float (the scikit-learn convention).
+        Lowered to ``coalesce(nullif(col, NaN), fill)``; ``"mean"``/``"median"`` first cast
+        the column to float (the scikit-learn convention).
 
         Examples:
             .. doctest::
@@ -159,6 +174,7 @@ class SimpleImputer(Preprocessor):
             A new lazy `Dataset` with nulls in the fitted columns filled.
         """
         self._require_fitted()
+        ds = nan_as_null(ds, self.columns)
         cast_float = self.strategy in ("mean", "median")
         new = {}
         for c in self.columns:
@@ -302,6 +318,7 @@ class IterativeImputer(Preprocessor):
             ColumnNotFoundError: If a named column is missing.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         from batcher.ml.linear import Ridge
 
         aggregates = {}
@@ -379,7 +396,7 @@ class IterativeImputer(Preprocessor):
             A new lazy `Dataset` with the imputed columns and no helper columns left behind.
         """
         self._require_fitted()
-        working = self._staged(ds)
+        working = self._staged(nan_as_null(ds, self.columns))
         for step in self.imputations_:
             working = self._apply(working, step)
         return working.drop(*(self._missing_flag(c) for c in self.columns))

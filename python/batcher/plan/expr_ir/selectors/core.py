@@ -4,17 +4,26 @@ A `Selector` is an `Expr` that stands for *many* columns at plan time; it carrie
 match test (name / pattern / dtype) and an optional per-column rename, and composes
 with set algebra. The projection layer (`expand`) resolves it against a schema. The
 public constructors live in `build`; this module is the type they return.
+
+The `.name` accessor is shared: it is reachable on a bare selector, on an expression
+built over one (``(numeric() * 2).name.suffix("_x2")``), and on an aggregate over one
+(``numeric().sum().name.suffix("_sum")``). In each case the rename is recorded on the
+selector leaf, so expansion names every output the same way.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir.core import Expr
+from batcher.plan.expr_ir.core import Expr, IntoExpr
+from batcher.plan.expr_ir.nodes import Col
+
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.core import AggExpr
 
 __all__ = ["Selector", "_Match", "_SelectorNameNamespace", "_by_name", "_named_columns"]
 
@@ -28,28 +37,42 @@ class _SelectorNameNamespace:
 
     A selector expands to many columns, so `Expr.alias` (which names exactly one
     column) cannot name them. These methods derive each output name from the matched
-    input column's name instead.
+    input column's name instead. The accessor works on a bare selector, on an
+    expression over one, and on an aggregate over one; the rename always lands on the
+    selector leaf, which is what names every expanded output.
 
     Examples:
         .. doctest::
 
             >>> import batcher as bt
-            >>> ds = bt.from_pydict({"a": [1], "b": [2.5], "s": ["x"]})
+            >>> ds = bt.from_pydict({"g": ["a", "a"], "a": [1, 2], "b": [2.5, 0.5]})
             >>> ds.select(bt.numeric().name.prefix("n_")).columns
             ['n_a', 'n_b']
+            >>> ds.group_by("g").agg(bt.numeric().sum().name.suffix("_sum")).columns
+            ['g', 'a_sum', 'b_sum']
     """
 
-    __slots__ = ("_s",)
+    __slots__ = ("_owner",)
 
-    def __init__(self, s: Selector) -> None:
-        """Wrap the parent :class:`Selector` so its `.name` methods can build on it."""
-        self._s = s
+    def __init__(self, owner: Expr | AggExpr) -> None:
+        """Bind the accessor to a selector, or to an expression or aggregate over one."""
+        self._owner = owner
 
-    def keep(self) -> Selector:
+    def _rename(self, fn: Callable[[str], str], what: str) -> Expr | AggExpr:
+        owner = self._owner
+        if isinstance(owner, Selector):
+            return owner._with_rename(fn, what)
+        from batcher.plan.expr_ir.selectors.expand import single_selector, substitute
+
+        selector = single_selector(owner)
+        return substitute(owner, selector, selector._with_rename(fn, what))
+
+    def keep(self) -> Expr | AggExpr:
         """Keep each matched column's original name (the default).
 
         Returns:
-            A selector whose expanded columns keep their input names.
+            The selector, expression, or aggregate whose expanded columns keep their
+            input names.
 
         Examples:
             .. doctest::
@@ -59,16 +82,17 @@ class _SelectorNameNamespace:
                 >>> ds.select(bt.numeric().name.keep().round(0)).columns
                 ['a']
         """
-        return self._s._with_rename(lambda c: c, "name.keep()")
+        return self._rename(lambda c: c, "name.keep()")
 
-    def prefix(self, prefix: str) -> Selector:
+    def prefix(self, prefix: str) -> Expr | AggExpr:
         """Prepend `prefix` to each matched column's name.
 
         Args:
             prefix: The string to prepend to every expanded output name.
 
         Returns:
-            A selector whose expanded columns are renamed with the prefix.
+            The selector, expression, or aggregate whose expanded columns are renamed
+            with the prefix.
 
         Examples:
             .. doctest::
@@ -78,16 +102,17 @@ class _SelectorNameNamespace:
                 >>> ds.select(bt.numeric().name.prefix("n_")).columns
                 ['n_a']
         """
-        return self._s._with_rename(lambda c: f"{prefix}{c}", f"name.prefix({prefix!r})")
+        return self._rename(lambda c: f"{prefix}{c}", f"name.prefix({prefix!r})")
 
-    def suffix(self, suffix: str) -> Selector:
+    def suffix(self, suffix: str) -> Expr | AggExpr:
         """Append `suffix` to each matched column's name.
 
         Args:
             suffix: The string to append to every expanded output name.
 
         Returns:
-            A selector whose expanded columns are renamed with the suffix.
+            The selector, expression, or aggregate whose expanded columns are renamed
+            with the suffix.
 
         Examples:
             .. doctest::
@@ -96,14 +121,17 @@ class _SelectorNameNamespace:
                 >>> ds = bt.from_pydict({"a": [1], "s": ["x"]})
                 >>> ds.select(bt.numeric().name.suffix("_n")).columns
                 ['a_n']
+                >>> ds.with_columns((bt.numeric() * 2).name.suffix("_x2")).columns
+                ['a', 's', 'a_x2']
         """
-        return self._s._with_rename(lambda c: f"{c}{suffix}", f"name.suffix({suffix!r})")
+        return self._rename(lambda c: f"{c}{suffix}", f"name.suffix({suffix!r})")
 
-    def to_lowercase(self) -> Selector:
+    def to_lowercase(self) -> Expr | AggExpr:
         """Lowercase each matched column's name.
 
         Returns:
-            A selector whose expanded columns are renamed to lowercase.
+            The selector, expression, or aggregate whose expanded columns are renamed
+            to lowercase.
 
         Examples:
             .. doctest::
@@ -113,13 +141,14 @@ class _SelectorNameNamespace:
                 >>> ds.select(bt.all().name.to_lowercase()).columns
                 ['aa']
         """
-        return self._s._with_rename(str.lower, "name.to_lowercase()")
+        return self._rename(str.lower, "name.to_lowercase()")
 
-    def to_uppercase(self) -> Selector:
+    def to_uppercase(self) -> Expr | AggExpr:
         """Uppercase each matched column's name.
 
         Returns:
-            A selector whose expanded columns are renamed to uppercase.
+            The selector, expression, or aggregate whose expanded columns are renamed
+            to uppercase.
 
         Examples:
             .. doctest::
@@ -129,16 +158,17 @@ class _SelectorNameNamespace:
                 >>> ds.select(bt.all().name.to_uppercase()).columns
                 ['AA']
         """
-        return self._s._with_rename(str.upper, "name.to_uppercase()")
+        return self._rename(str.upper, "name.to_uppercase()")
 
-    def map(self, fn: Callable[[str], str]) -> Selector:
+    def map(self, fn: Callable[[str], str]) -> Expr | AggExpr:
         """Derive each output name by applying `fn` to the matched column's name.
 
         Args:
             fn: A function from the input column name to the output column name.
 
         Returns:
-            A selector whose expanded columns are renamed by `fn`.
+            The selector, expression, or aggregate whose expanded columns are renamed
+            by `fn`.
 
         Examples:
             .. doctest::
@@ -148,7 +178,7 @@ class _SelectorNameNamespace:
                 >>> ds.select(bt.all().name.map(lambda c: c.removesuffix("_raw"))).columns
                 ['a']
         """
-        return self._s._with_rename(fn, "name.map(...)")
+        return self._rename(fn, "name.map(...)")
 
 
 class Selector(Expr):
@@ -156,9 +186,12 @@ class Selector(Expr):
 
     Built by `all`, `exclude`, `matches`, `numeric`, `integer`, `floating`, `string`,
     `boolean`, and `temporal`; combined with ``|`` (union), ``&`` (intersection),
-    ``-`` (difference), and ``~`` (complement). Use it wherever a projection is
-    built — ``select``, ``with_columns``, ``drop`` — and compose the scalar algebra
-    onto it to compute over every matched column at once.
+    ``-`` (difference), ``^`` (symmetric difference), and ``~`` (complement). A plain
+    ``col("x")`` on the other side of a set operator is read as the selector for that
+    one column, as Polars reads it; any other operand (``numeric() - 1``) is ordinary
+    arithmetic or logic over every matched column. Use it wherever a projection is
+    built (``select``, ``with_columns``, ``drop``, ``group_by().agg()``) and compose
+    the scalar algebra onto it to compute over every matched column at once.
 
     Examples:
         .. doctest::
@@ -249,38 +282,69 @@ class Selector(Expr):
             names=self._names,
         )
 
-    def _combine(self, other: Selector, op: Callable[[bool, bool], bool], sym: str) -> Selector:
-        if not isinstance(other, Selector):
-            raise PlanError(
-                f"a column selector can only be combined with another selector using "
-                f"{sym!r}, got {type(other).__name__}"
-            )
+    def _as_selector(self, other: object) -> Selector | None:
+        """`other` as a selector for a set operation, or None when it is a scalar operand."""
+        if isinstance(other, Selector):
+            return other
+        if type(other) is Col:
+            return _by_name((other.name,))
+        return None
+
+    def _set_op(self, other: Selector, op: Callable[[bool, bool], bool], sym: str) -> Selector:
+        for side in (self, other):
+            if side._rename is not None:
+                raise PlanError(
+                    f"cannot combine the renamed selector {side._desc} with {sym!r}: a set "
+                    "operation keeps no rename. Rename after combining, e.g. "
+                    "(numeric() - integer()).name.prefix('p_')"
+                )
         return Selector(
             lambda n, d: op(self._match(n, d), other._match(n, d)),
             f"({self._desc} {sym} {other._desc})",
             needs_dtype=self._needs_dtype or other._needs_dtype,
-            rename=self._rename or other._rename,
         )
 
-    def __or__(self, other: Selector) -> Selector:  # type: ignore[override]
-        """Union: columns matched by either selector."""
-        return self._combine(other, lambda a, b: a or b, "|")
+    def __or__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Union: columns matched by either selector; logical OR over a scalar operand."""
+        sel = self._as_selector(other)
+        if sel is None:
+            return super().__or__(other)
+        return self._set_op(sel, lambda a, b: a or b, "|")
 
-    def __and__(self, other: Selector) -> Selector:  # type: ignore[override]
-        """Intersection: columns matched by both selectors."""
-        return self._combine(other, lambda a, b: a and b, "&")
+    def __and__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Intersection: columns matched by both selectors; logical AND over a scalar."""
+        sel = self._as_selector(other)
+        if sel is None:
+            return super().__and__(other)
+        return self._set_op(sel, lambda a, b: a and b, "&")
 
-    def __sub__(self, other: Selector) -> Selector:  # type: ignore[override]
-        """Difference: columns matched by this selector but not the other."""
-        return self._combine(other, lambda a, b: a and not b, "-")
+    def __sub__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Difference: columns matched by this selector but not the other; else subtraction."""
+        sel = self._as_selector(other)
+        if sel is None:
+            return super().__sub__(other)
+        return self._set_op(sel, lambda a, b: a and not b, "-")
+
+    def __xor__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Symmetric difference: columns matched by exactly one selector; else XOR."""
+        sel = self._as_selector(other)
+        if sel is None:
+            return super().__xor__(other)
+        return self._set_op(sel, lambda a, b: a != b, "^")
 
     def __invert__(self) -> Selector:  # type: ignore[override]
         """Complement: every column this selector does not match."""
+        if self._rename is not None:
+            raise PlanError(
+                f"cannot complement the renamed selector {self._desc}: the columns it "
+                "leaves out have no rename to carry. Complement first, then rename, e.g. "
+                "(~numeric()).name.prefix('p_')"
+            )
         match, desc = self._match, self._desc
         return Selector(lambda n, d: not match(n, d), f"~{desc}", needs_dtype=self._needs_dtype)
 
     def exclude(self, *names: str) -> Selector:
-        """Drop the named columns from this selection.
+        """Drop the named columns from this selection, keeping any rename.
 
         Args:
             *names: Column names to remove from the selection.
@@ -295,8 +359,17 @@ class Selector(Expr):
                 >>> ds = bt.from_pydict({"a": [1], "b": [2], "id": [3]})
                 >>> ds.select(bt.all().exclude("id")).columns
                 ['a', 'b']
+                >>> ds.select(bt.all().name.prefix("p_").exclude("id")).columns
+                ['p_a', 'p_b']
         """
-        return self - _by_name(names)
+        drop = frozenset(names)
+        match = self._match
+        return Selector(
+            lambda n, d: n not in drop and match(n, d),
+            f"{self._desc}.exclude({', '.join(map(repr, names))})",
+            needs_dtype=self._needs_dtype,
+            rename=self._rename,
+        )
 
     def matched_columns(self, columns: list[str], schema: Any | None) -> list[str]:
         """The input columns this selector matches, in the input's column order.

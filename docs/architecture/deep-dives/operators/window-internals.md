@@ -45,7 +45,7 @@ get wrong, because a result in partition order looks plausible and is not the an
 
 ## Four families
 
-`crates/bc-runtime/src/window/mod.rs` defines `WindowFn`, and its variants fall into four
+[`crates/bc-runtime/src/window/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/window/mod.rs) defines `WindowFn`, and its variants fall into four
 families with genuinely different costs.
 
 | Family | Functions | Needs an ordering | Shape of the work |
@@ -149,7 +149,7 @@ bit-identical to it.
 
 ## Spilling
 
-`crates/bc-interp/src/window_spill.rs`. Window functions are per-partition independent, and equal
+[`crates/bc-interp/src/window_spill.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/window_spill.rs). Window functions are per-partition independent, and equal
 `PARTITION BY` keys hash to the same bucket, so the input can be grace-partitioned by those keys
 into disk-backed buckets and the in-memory kernel run one bucket at a time. Each bucket holds
 *complete* partitions, so the result is the same multiset as the single-pass kernel, with peak
@@ -201,7 +201,7 @@ because Kyber sends it down a different route entirely: `row_number() = 1` rewri
 
 The parallel window also stopped doing work for rows it throws away. It used to rank every row, scatter all of those ranks back into input order, and then mask all but `k` per partition. On H2O `groupby` q8's shape (10M rows, 100,000 partitions, `k = 2`), `perf` put 21% of the query in that scatter, spent keeping 200,000 rows. `bc_runtime::window::window_with_rank_limit` runs the same buckets but keeps only each bucket's survivors, named by input row, and orders them once. The interpreter's window then gathers just those rows. The rows, their order and their values are the mask's by construction, and the Rust test `rank_limited_equals_masking_the_full_window` holds the two forms equal across `row_number`, `rank` and `dense_rank`, with ties, null keys, every `k`, and both the parallel and serial paths.
 
-Measured on a 48-core box under load, best of five across four alternating rounds, so the cells are ranges (`benchmarks/BENCHMARK_RESULTS.md`):
+Measured on a 48-core box under load, best of five across four alternating rounds, so the cells are ranges ([`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md)):
 
 | Query | Mask every row | Keep survivors |
 |---|---|---|
@@ -285,7 +285,7 @@ dense-group-id shortcut that there's little left to win, which is why it sits at
 Polars. The ranking and value functions land in between, because both need the partition ordered
 and pay a per-partition sort plus the scatter back to row order.
 
-These figures come from an operator-mix sweep recorded in `benchmarks/BENCHMARK_RESULTS.md`,
+These figures come from an operator-mix sweep recorded in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md),
 measured on a 16-core release build with every correctness check passing. The
 {doc}`analytics benchmarks </benchmarks/results/analytics>` page carries the last full published
 sweep, with narrower margins against DuckDB on the running `sum()` (0.71x) and the
@@ -294,15 +294,15 @@ a current ratio.
 
 ## Where the code lives
 
-- `crates/bc-runtime/src/window/mod.rs`: `WindowFn`, the serial kernel, ranking and value functions
-- `crates/bc-runtime/src/window/frame/`: explicit `ROWS` frames, one-pass accumulator/deque
-- `crates/bc-runtime/src/window/partition_agg.rs`: whole-partition aggregates via dense ids
-- `crates/bc-runtime/src/window/parallel.rs`: bucket-parallel execution and the skew guard
-- `crates/bc-runtime/src/window/running_par.rs`: the parallel prefix scan for a single large partition
-- `crates/bc-runtime/src/window/agg/`, `series.rs`: the extra aggregates, EWM, `interpolate` and `rle_id`
-- `crates/bc-runtime/src/window/topk.rs`: the bounded per-partition top-k behind `QUALIFY`
-- `crates/bc-runtime/src/window/fill.rs`: {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`backward_fill <batcher.plan.expr_ir.core.Expr.backward_fill>`
-- `crates/bc-interp/src/window_spill.rs`: grace partitioning for bounded memory
+- [`crates/bc-runtime/src/window/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/window/mod.rs): `WindowFn`, the serial kernel, ranking and value functions
+- [`crates/bc-runtime/src/window/frame/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/window/frame): explicit `ROWS` frames, one-pass accumulator/deque
+- [`crates/bc-runtime/src/window/partition_agg.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/window/partition_agg.rs): whole-partition aggregates via dense ids
+- [`crates/bc-runtime/src/window/parallel.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/window/parallel.rs): bucket-parallel execution and the skew guard
+- [`crates/bc-runtime/src/window/running_par.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/window/running_par.rs): the parallel prefix scan for a single large partition
+- [`crates/bc-runtime/src/window/agg/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/window/agg), `series.rs`: the extra aggregates, EWM, `interpolate` and `rle_id`
+- [`crates/bc-runtime/src/window/topk.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/window/topk.rs): the bounded per-partition top-k behind `QUALIFY`
+- [`crates/bc-runtime/src/window/fill.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/window/fill.rs): {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`backward_fill <batcher.plan.expr_ir.core.Expr.backward_fill>`
+- [`crates/bc-interp/src/window_spill.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/window_spill.rs): grace partitioning for bounded memory
 
 ## See also
 

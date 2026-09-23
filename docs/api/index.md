@@ -14,25 +14,42 @@ print(out.to_pydict())
 
 That chain is the whole model. The same plan runs on one core, across every core, or on a Ray cluster with {py:meth}`collect(distributed=True) <batcher.Dataset.collect>`, and the pages below document each piece of it.
 
-## Find what you need
+## Three ways in
 
-The surface is written up three ways, for three kinds of question:
+The same surface is written up three ways, because looking a name up, learning what it does, and finding out it exists are three different jobs.
 
-| Start with | When you want |
-|---|---|
-| {doc}`/api/reference` | The one-page cheat sheet of the calls you reach for most |
-| An area page below | A runnable example plus the full surface for one area |
-| {doc}`/api/complete/index` | The generated listing of every symbol without an area page |
+::::{grid} 1 3 3 3
+:gutter: 3
+
+:::{grid-item-card} {octicon}`search;1.1em` Quick reference
+:link: /api/reference
+:link-type: doc
+One page, every call you reach for daily, as a lookup table. Start here when you know the name.
+:::
+
+:::{grid-item-card} {octicon}`book;1.1em` By area
+:link: /api/relational/index
+:link-type: doc
+A runnable example plus the semantics, one page per part of the engine. Start here when you know the job.
+:::
+
+:::{grid-item-card} {octicon}`list-unordered;1.1em` Every symbol
+:link: /api/symbols/index
+:link-type: doc
+The full generated listing, one page per object family, one page per method. Start here when you want the signature.
+:::
+::::
 
 ## Browse by area
 
-The area pages fall into three groups, each with its own index:
+The area pages are grouped by what the call is for. Each group has its own index.
 
 | Group | Pages | Covers |
-|---|---|---|
-| {doc}`/api/relational/index` | 11 | `Dataset`, expressions, accessors, functions, SQL, geospatial, graph, and IO |
+| --- | --- | --- |
+| {doc}`/api/relational/index` | 10 | `Dataset`, expressions, functions, SQL, sessions and catalogs, IO, and the geospatial, rigid-body, and graph libraries |
+| {doc}`/api/accessors/index` | 5 | The typed namespaces an expression carries: `.str`, `.dt`, the nested ones, `.image`/`.audio`/`.video`, and `.seq` |
 | {doc}`/api/models/index` | 5 | The `.ml` accessor, preprocessors, estimators, metrics, and statistics |
-| {doc}`/api/operations/index` | 4 | Configuration, streaming, governance, and the typed exceptions |
+| {doc}`/api/operations/index` | 5 | Configuration, streaming, governance, and the typed exceptions |
 
 Tuning lives next door: {doc}`/configuration/index` covers every `Config` field with its default.
 
@@ -43,13 +60,14 @@ Tuning lives next door: {doc}`/configuration/index` covers every `Config` field 
 - {doc}`/getting-started/migration/index`: the equivalent spelling if you know another engine's API.
 - {doc}`/cookbook/index`: a runnable recipe for the call, when a signature is not enough.
 - {doc}`/agents`: the same surface packaged as instructions for a coding agent.
+- {doc}`/getting-started/concepts/glossary`: the vocabulary these signatures are written in.
 
 ```{toctree}
 :hidden:
 :caption: Reference
 
 reference
-complete/index
+symbols/index
 ```
 
 ```{toctree}
@@ -57,6 +75,7 @@ complete/index
 :caption: By area
 
 relational/index
+accessors/index
 models/index
 operations/index
 ```

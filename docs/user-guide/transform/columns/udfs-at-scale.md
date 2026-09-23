@@ -1,6 +1,6 @@
 # Running a UDF at scale
 
-This page covers what changes when a `map_batches` stage runs over a cluster rather than one machine: how a UDF with a pipeline breaker above it is staged, how to survive a malformed record without losing the job, and the idempotency a distributed retry demands. The callback contract itself is on {doc}`User-defined functions <udfs>`.
+This page covers what changes when a `map_batches` stage runs over a cluster rather than one machine: how a UDF with a pipeline breaker above it is staged, what happens to a device request or a function the cluster cannot take, how to survive a malformed record without losing the job, and the idempotency a distributed retry demands. The callback contract itself is on {doc}`User-defined functions <udfs>`.
 
 The examples run against these imports:
 
@@ -23,6 +23,16 @@ enriched.collect(distributed=True)
 ```
 
 The staging needs a scratch directory every node can reach. On a cluster with no shared mount, point `memory.spill_dir` at a shared filesystem. Without one, Batcher raises rather than writing files a worker cannot open.
+
+## Requesting a GPU the cluster does not have
+
+`num_gpus` and `resources` are Ray resource requests on a cluster. Before a stage is submitted, Batcher checks them against the live cluster, and a request no alive node can meet raises a `PlanError` naming the argument, the amount, and what the cluster offers, instead of leaving a worker waiting forever to be placed. The check applies to a cluster that cannot grow, meaning one this process started with `ray.init()` or one with no autoscaling signal. On an autoscaling cluster the request is passed to the autoscaler, which is what brings a GPU node up.
+
+A single-node run has no scheduler to wait on. There a `num_gpus` stage runs its function in this process, and when this process demonstrably has no accelerator Batcher says so with a `PerformanceWarning`, because the model then runs on CPU. The two paths differ on purpose: locally the request is a hint, and on a cluster it is binding.
+
+## Shipping the function to the workers
+
+On a cluster the function is pickled and sent to every worker. A lambda or a closure pickles by value, but an object it captures has to pickle too. A closure over a lock, a socket, or an open client raises a `PlanError` naming the captured variable. Create that object inside the function, or in a class's `__init__` so each worker builds its own. A function or class defined in a module the workers cannot import, such as a test file, has to be defined inside a function instead, because Ray pickles an importable name by reference.
 
 ## Tolerating dirty data
 
@@ -72,6 +82,8 @@ scored = docs.map_batches(
     timeout=30.0,
 )
 ```
+
+`retry_on=None`, the default, retries any `Exception` once `max_retries` is set. A retry happens inside the worker that saw the failure, so it behaves the same single-node and under `distributed=True`. A failure that survives every retry falls through to `max_errored_rows` if that is set. When the budget is spent the stage raises the function's own exception, with a note saying the `max_errored_rows` allowance was exceeded and how many rows it already dropped.
 
 ## Retries and idempotency
 

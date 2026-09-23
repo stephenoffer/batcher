@@ -5,13 +5,12 @@ cannot skip: pyarrow's reader has no comment-character option, and the lines are
 to a prefix it could `skip_rows` past — a BED file may carry a `track` line between blocks,
 and a VCF's `##` block is followed by exactly one `#CHROM` line that *is* the header.
 
-So the split of labour here is: Python decides which lines are data, and **pyarrow parses
-them**. Clean lines are accumulated into a buffer and handed to `pyarrow.csv.read_csv` a
-batch at a time, so the per-field work — splitting, type conversion, null handling — stays in
-C++ over a whole block rather than becoming a per-row Python loop. That is what keeps a
-20-million-variant VCF a scan.
+So the split of labour is: `_blocks` turns a block of bytes into an Arrow array of lines, a
+vectorized mask decides which of them are data, and **pyarrow parses the survivors** with one
+`read_csv` call per block. No step touches a line in Python, which is what took BED from
+26 MB/s to within reach of `pyarrow.csv` on the same bytes (see `_blocks`).
 
-Reading stays bounded: one batch of text plus one batch of Arrow, never the file.
+Reading stays bounded: one block of text plus one batch of Arrow, never the file.
 """
 
 from __future__ import annotations
@@ -21,8 +20,9 @@ from collections.abc import Callable, Iterator
 from typing import IO, Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
-from batcher.io.base._lines import iter_decoded_lines
+from batcher.io.formats.genomics._blocks import join_lines, lines_of
 from batcher.plan.types import one_batch
 
 #: The "no value" tokens all three formats spell the same way. `.` is each specification's
@@ -33,77 +33,104 @@ from batcher.plan.types import one_batch
 #: the reader below.
 NULL_VALUES = [".", ""]
 
-#: Data lines accumulated before a batch is parsed. One line is at most a few hundred bytes
-#: in these formats, so a plain line count bounds the buffer.
-ROWS_PER_BATCH = 16_384
+#: A vectorized line classifier: one flag per line of a block.
+LineMask = Callable[[pa.Array], pa.Array]
 
 
-def parse_block(
-    lines: list[str],
-    names: list[str],
-    types: dict[str, pa.DataType],
-    null_values: list[str],
+def hash_comment(lines: pa.Array) -> pa.Array:
+    """True for the lines starting with `#` — the comment syntax all three formats share."""
+    return pc.starts_with(lines, "#")
+
+
+def first_index(mask: pa.Array) -> int:
+    """The position of the first True in `mask`, or -1."""
+    return pc.index(mask, True).as_py() if len(mask) else -1
+
+
+def _read_tsv(
+    data: bytes, names: list[str], types: dict[str, pa.DataType], null_values: list[str]
 ) -> pa.RecordBatch:
-    """Parse a block of tab-separated data lines into one `RecordBatch`.
+    """Parse `\n`-separated tab-separated data lines into one `RecordBatch`.
 
-    The conversion is pyarrow's, not this module's: the lines are joined and handed to
-    `read_csv` with an explicit column list and type map, so a malformed field raises there
-    with the column named rather than being coerced to a plausible value here.
+    The conversion is pyarrow's, not this module's: an explicit column list and type map,
+    so a malformed field raises there with the column named rather than being coerced to a
+    plausible value here.
     """
     from pyarrow import csv as pacsv
 
-    schema = pa.schema([pa.field(n, types[n]) for n in names])
-    if not lines:
-        return pa.RecordBatch.from_pylist([], schema=schema)
-    buf = io.BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
     table = pacsv.read_csv(
-        buf,
+        io.BytesIO(data),
         read_options=pacsv.ReadOptions(column_names=names, autogenerate_column_names=False),
         parse_options=pacsv.ParseOptions(delimiter="\t", quote_char=False),
         convert_options=pacsv.ConvertOptions(
             column_types=types,
             # These formats spell "no value" as a literal token rather than as an empty
-            # field: `.` in GFF and VCF, `-1`-style sentinels nowhere. Listing them here is
-            # what turns a missing score into a null instead of a parse error on a float
-            # column.
+            # field: `.` in GFF and VCF. Listing them here is what turns a missing score
+            # into a null instead of a parse error on a float column.
             null_values=null_values,
             strings_can_be_null=True,
         ),
     )
-    # `read_csv` can return several batches for a large block; combine so the caller's
-    # batch boundaries are the ones it asked for. Through `one_batch`, because the
-    # spelling this replaces dropped every row past the 32-bit offset limit — reachable on
-    # a block of long sequence or annotation strings.
+    # `read_csv` can return several batches for a large block; combine so one block is one
+    # batch. Through `one_batch`, because the spelling this replaces dropped every row past
+    # the 32-bit offset limit — reachable on a block of long annotation strings.
     return one_batch(table)
 
 
+def _is_clean(data: bytes, markers: tuple[bytes, ...]) -> bool:
+    """Whether a block provably holds no line to drop, judged on its bytes alone.
+
+    A line is dropped when it is blank or starts with one of `markers`; each such line
+    begins the block or follows a `\n`, so a handful of `find`s in C decide it without
+    splitting. A clean block — nearly every block of a real file — goes to `read_csv` as it
+    was read, which is what brings these formats within reach of a plain CSV parse.
+    """
+    if data.startswith((b"\n", *markers)):
+        return False
+    return not any(b"\n" + marker in data for marker in (b"\n", *markers))
+
+
 def iter_record_batches(
-    fh: IO[Any],
+    blocks: Iterator[bytes],
     *,
-    is_comment: Callable[[str], bool],
+    markers: tuple[bytes, ...],
+    is_comment: LineMask,
     names: list[str],
     types: dict[str, pa.DataType],
     null_values: list[str],
     projection: list[str] | None = None,
+    end_of_data: LineMask | None = None,
 ) -> Iterator[pa.RecordBatch]:
-    """Stream a comment-carrying TSV into batches, parsing each block with pyarrow.
+    """Stream line-aligned byte blocks into batches, parsing each block's data with pyarrow.
 
-    An empty file still yields one empty batch, so the schema is observable rather than
-    something the caller has to infer from nothing.
+    Blank lines and the lines `is_comment` flags are dropped; `markers` are the line
+    prefixes that *might* be dropped (a superset of what `is_comment` and `end_of_data`
+    flag), which is what lets a clean block skip the line split entirely. `end_of_data`,
+    when given, flags a line at which the table ends — GFF3's `##FASTA` — and nothing from
+    it onward is read. An input with no data still yields one empty batch, so the schema is
+    observable rather than something the caller has to infer from nothing.
     """
-    block: list[str] = []
     emitted = False
-    for raw in iter_decoded_lines(fh):
-        line = raw.rstrip("\r")
-        if not line or is_comment(line):
-            continue
-        block.append(line)
-        if len(block) >= ROWS_PER_BATCH:
-            yield _project(parse_block(block, names, types, null_values), projection)
+    for data in blocks:
+        stop = -1
+        if _is_clean(data, markers):
+            batch = _read_tsv(data, names, types, null_values)
+        else:
+            lines = lines_of(data)
+            stop = -1 if end_of_data is None else first_index(end_of_data(lines))
+            if stop >= 0:
+                lines = lines.slice(0, stop)
+            blank = pc.equal(pc.binary_length(lines), 0)
+            kept = lines.filter(pc.invert(pc.or_(blank, is_comment(lines))))
+            batch = _read_tsv(join_lines(kept), names, types, null_values) if len(kept) else None
+        if batch is not None and batch.num_rows:
+            yield _project(batch, projection)
             emitted = True
-            block = []
-    if block or not emitted:
-        yield _project(parse_block(block, names, types, null_values), projection)
+        if stop >= 0:
+            break
+    if not emitted:
+        schema = pa.schema([pa.field(n, types[n]) for n in names])
+        yield _project(pa.RecordBatch.from_pylist([], schema=schema), projection)
 
 
 def _project(batch: pa.RecordBatch, projection: list[str] | None) -> pa.RecordBatch:
@@ -134,11 +161,11 @@ def _formats_like_python(dtype: pa.DataType) -> bool:
       notation at 1e16 and below 1e-4, Arrow at a different threshold, so `880644658031726.2`
       renders as `8.806446580317262e+14`. That is 0.25% of random float64 and **100%** of
       float32 (Arrow uses the shortest float32 repr; Python widens to float64 first).
-    - **bool** disagrees (`true` vs `True`) but is repaired exactly by `_bool_to_string`.
+    - **bool** disagrees (`true` vs `True`) but is repaired exactly in `_to_string`.
     - **timestamp** disagrees on sub-second digits (`...:40` vs `...:40.000`).
 
-    A column of an unlisted type sends the whole block down the row-wise path, which is
-    what these formats did for every column before.
+    A column of an unlisted type is rendered by Python's `str()` — that column only, so a
+    GFF's float `score` no longer sends the other eight columns down the row-wise path.
     """
     return bool(
         pa.types.is_integer(dtype)
@@ -151,32 +178,17 @@ def _formats_like_python(dtype: pa.DataType) -> bool:
 
 
 def _to_string(column: pa.Array, null_token: str) -> pa.Array:
-    """One column as strings, with nulls rendered as `null_token`. Vectorized."""
-    import pyarrow.compute as pc
-
+    """One column as `string`, with nulls rendered as `null_token`, byte-identical to `str()`."""
+    if not _formats_like_python(column.type):
+        return pa.array(
+            [null_token if v is None else str(v) for v in column.to_pylist()], pa.string()
+        )
     if pa.types.is_boolean(column.type):
         # `cast` gives `true`/`false`; Python's `str(True)` is `True`. Map explicitly.
         as_str = pc.if_else(column, "True", "False")
-    elif pa.types.is_string(column.type) or pa.types.is_large_string(column.type):
-        as_str = column
     else:
         as_str = pc.cast(column, pa.string())
     return pc.fill_null(as_str, null_token)
-
-
-def _joined_bytes(lines: pa.Array) -> bytes:
-    """The concatenation of `lines`, read straight off the array's value buffer.
-
-    A dense `string` array stores its values back to back with no separators or padding, so
-    once every line carries its own trailing newline the value buffer **is** the block's
-    text. The offsets buffer says which slice of it belongs to this (possibly sliced) array.
-    """
-    import numpy as np
-
-    offsets = np.frombuffer(
-        lines.buffers()[1], dtype=np.int32, count=len(lines) + 1, offset=lines.offset * 4
-    )
-    return memoryview(lines.buffers()[2])[offsets[0] : offsets[-1]].tobytes()
 
 
 def encode_rows(
@@ -184,10 +196,11 @@ def encode_rows(
 ) -> bytes:
     """Encode `names` of `batch` as tab-separated lines, one per row, each newline-terminated.
 
-    Vectorized through Arrow when every column's type formats identically to Python's
-    `str()` (`_formats_like_python`), and row-wise otherwise, so the bytes are the same
-    either way. Measured on a 2M-row 9-column GFF table: 17.1 s row-wise, 1.06 s vectorized
-    (16x), byte-for-byte identical.
+    Each column is rendered to text through Arrow when its type formats identically to
+    Python's `str()` (`_formats_like_python`) and by `str()` itself otherwise, then the
+    columns are joined in one kernel, so the bytes are the same either way. Measured on a
+    2M-row 9-column GFF table: 17.1 s row-wise, 1.06 s vectorized (16x), byte-for-byte
+    identical.
 
     Args:
         batch: The rows to encode.
@@ -198,22 +211,13 @@ def encode_rows(
     Returns:
         The encoded block, UTF-8.
     """
-    import pyarrow.compute as pc
-
     columns = [batch.column(n) for n in names]
     columns = [c.combine_chunks() if isinstance(c, pa.ChunkedArray) else c for c in columns]
     if not columns or len(columns[0]) == 0:
         return b""
-    if all(_formats_like_python(c.type) for c in columns):
-        lines = pc.binary_join_element_wise(*[_to_string(c, null_token) for c in columns], "\t")
-        lines = pc.binary_join_element_wise(lines, "", "\n")  # trailing newline per line
-        if lines.null_count == 0:
-            return _joined_bytes(lines)
-    values = [c.to_pylist() for c in columns]
-    return "".join(
-        "\t".join(null_token if v is None else str(v) for v in row) + "\n"
-        for row in zip(*values, strict=True)
-    ).encode("utf-8")
+    return join_lines(
+        pc.binary_join_element_wise(*[_to_string(c, null_token) for c in columns], "\t")
+    )
 
 
 def write_rows(fh: IO[Any], table: pa.Table, names: list[str], *, null_token: str = ".") -> None:

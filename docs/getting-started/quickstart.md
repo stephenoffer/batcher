@@ -2,7 +2,7 @@
 
 In the next five minutes you'll build a complete pipeline: filter rows, derive columns, aggregate, join, switch to SQL, inspect the plan, and write Parquet. The data is five rows so every example runs anywhere. The API is the one you'd point at a terabyte of Parquet or a Ray cluster, and none of the code below would change.
 
-You need Batcher installed. If `import batcher` fails, follow {doc}`installation` first.
+You need Batcher installed. If `import batcher` fails, follow {doc}`install/packages-and-extras` first.
 
 ## Build a dataset
 
@@ -145,10 +145,11 @@ Replace `<your-bucket>` with a bucket you can read and write, and install the `c
 
 ## Next steps
 
-Every Batcher pipeline has the shape you just wrote: read, chain lazy steps, and collect once at the end. Growing it changes the source and the machine, not the code. Continue with {doc}`tutorials/foundations/first-pipeline`, which builds the same shape on a realistic dataset, or read the {doc}`concepts/index` to learn why the engine behaves the way it does.
+Every Batcher pipeline has the shape you just wrote: read, chain lazy steps, and collect once at the end. Growing it changes the source and the machine, not the code. Continue with {doc}`tutorials/foundations/first-pipeline`, which builds the same shape on a realistic dataset, or read the {doc}`concepts/index` to learn why the engine behaves the way it does. To see how far the same model stretches, {doc}`tour` runs one small example of each thing Batcher does, from streaming to media to models, on a single page.
 
 ## See also
 
+- {doc}`tour`: one runnable example per capability, on one page.
 - {doc}`concepts/index`: lazy evaluation, expressions, scaling, and the adaptive loop, one short page each.
 - {doc}`migration/index`: the verb-by-verb mapping if you already know pandas, Polars, Spark, DuckDB, or Daft.
 - {doc}`/user-guide/index`: every operator, with runnable examples.

@@ -79,7 +79,7 @@ A parallel scan is the right shape for reading a *table* and the wrong shape for
 
 ### Streaming
 
-These return an unbounded `Dataset`. See {doc}`streaming </user-guide/moving-data/streaming>` for triggers and checkpoints.
+These return an unbounded `Dataset`. See {doc}`streaming </user-guide/moving-data/streaming/index>` for triggers and checkpoints.
 
 | Reader | Reads |
 | --- | --- |
@@ -249,7 +249,7 @@ The concrete implementations behind `bt.read.*` and `ds.write.*`.
 
 ### The registries
 
-Formats register themselves rather than being listed anywhere. Registering a source under a name makes `bt.read(path, format="myfmt")` resolve.
+Formats register themselves rather than being listed anywhere. Registering a source under a name makes {py:obj}`bt.read(path, format="myfmt") <batcher.read>` resolve.
 
 ```{eval-rst}
 .. currentmodule:: batcher.io

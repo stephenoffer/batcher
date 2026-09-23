@@ -73,7 +73,7 @@ with config_context(quiet):
 
 Setting `BATCHER_OBSERVABILITY_EVENT_LOG=false` before the process starts does the same. No result changes. Only the archived profile goes.
 
-The document's cost is roughly fixed while the query's isn't, so it matters in proportion to how small the queries are. Measured on a 50,000-row SQLite table with the release engine, in `benchmarks/BENCHMARK_RESULTS.md`:
+The document's cost is roughly fixed while the query's isn't, so it matters in proportion to how small the queries are. Measured on a 50,000-row SQLite table with the release engine, in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md):
 
 | Workload | Event log on | Off |
 | --- | --- | --- |

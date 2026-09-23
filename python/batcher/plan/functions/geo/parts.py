@@ -142,7 +142,8 @@ def st_exterior_ring(geom: Expr | str) -> Expr:
         geom: A polygon.
 
     Returns:
-        The outer ring as a chain, or null for a non-polygon.
+        The outer ring as a chain, or null for anything but a ``POLYGON`` — including a
+        multipolygon, which has one outer ring per member and no single answer.
 
     Examples:
         .. doctest::
@@ -166,7 +167,8 @@ def st_interior_ring_n(geom: Expr | str, n: Expr | int) -> Expr:
         n: The 1-based hole index.
 
     Returns:
-        The hole as a chain, or null when out of range.
+        The hole as a chain, or null when out of range — ``n`` of 0 or below included —
+        or when the geometry is not a ``POLYGON``.
 
     Examples:
         .. doctest::
@@ -216,6 +218,14 @@ def st_is_valid(geom: Expr | str) -> Expr:
 
     Use `st_is_valid_reason` instead when the answer is no — a boolean tells you a
     row is broken, a reason tells you which vertex to fix.
+
+    The rules are GEOS's, so this agrees with PostGIS and DuckDB: a ring needs four
+    positions *after* consecutive repeats are dropped (``POLYGON((0 0, 0 0, 0 0, 0 0))``
+    is invalid), a chain needs two distinct positions (``LINESTRING(0 0, 0 0)`` is
+    invalid), rings must not self-intersect, holes must lie inside their shell without
+    running along it and must not overlap each other, and the members of a
+    multipolygon may touch but not overlap. An unclosed ring is invalid too; its
+    `st_area` is still measured as if it were closed, as DuckDB does.
 
     Args:
         geom: The geometry.
@@ -329,8 +339,10 @@ def st_is_simple(geom: Expr | str) -> Expr:
     """Whether a geometry has no anomalous self-intersection.
 
     For a chain that means it does not touch or cross itself except at a closing
-    endpoint; for a point set it means no duplicates. Areal geometries are simple once
-    they are valid, so this is not a second validity check on a polygon.
+    endpoint; for a point set it means no duplicates; for a polygon, that every ring is
+    simple, so a bowtie is not. It is not a second validity check: rings crossing *each
+    other* (a hole poking out of its shell) leave each ring simple, and GEOS, PostGIS
+    and DuckDB all call such a polygon simple and invalid.
 
     Args:
         geom: The geometry.

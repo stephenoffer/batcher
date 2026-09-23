@@ -40,6 +40,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import doc_api_links  # noqa: E402  (tools/ is on the path: this file's own directory)
 
 from batcher._internal.migration import (  # noqa: E402
     DATA_DIR,
@@ -310,12 +313,42 @@ def _sentence(text: str) -> str:
 
 
 def _spelling(targets: tuple[str, ...]) -> str:
+    """The Batcher column, as plain code spans.
+
+    Used where the text is a sort key or a dictionary key rather than something rendered;
+    `_spelling_linked` is what a table cell gets.
+    """
+
     def one(target: str) -> str:
         if target.startswith("op:"):
             return f"{_code(OPERATORS.get(target[3:], target[3:]))} operator"
         return _code(target)
 
     return " + ".join(one(t) for t in targets) if targets else "n/a"
+
+
+def _spelling_linked(targets: tuple[str, ...]) -> str:
+    """The Batcher column, cross-referenced to the reference page for each name.
+
+    A migration table is the one page a reader arrives at knowing the *other* engine's
+    name, so the Batcher cell is the only thing on the row they need to look up, and it
+    was the one thing that wasn't clickable. `doc_api_links.link` falls back to a plain
+    code span for a spelling no reference page publishes, which covers the operator rows
+    and the names that are still a gap, so no cell here can become a dead reference.
+    """
+
+    def one(target: str) -> str:
+        if target.startswith("op:"):
+            return f"{_code(OPERATORS.get(target[3:], target[3:]))} operator"
+        return _link(target)
+
+    return " + ".join(one(t) for t in targets) if targets else "n/a"
+
+
+def _link(spelling: str) -> str:
+    """`spelling` as a cross-reference, with the pipe escaped for a Markdown table cell."""
+    markup = doc_api_links.link(spelling)
+    return markup.replace("|", r"\|")
 
 
 def _notes(row: Mapping) -> str:
@@ -486,13 +519,46 @@ class _Renderer:
                     f"| {e.label} | Batcher | Status | Notes |",
                     "|---|---|---|---|",
                     *(
-                        f"| {_code(r.name)} | {_spelling(r.batcher)} | "
+                        f"| {_code(r.name)} | {_spelling_linked(r.batcher)} | "
                         f"{_STATUS_LABEL[r.status]} | {_notes(r)} |"
                         for r in rows
                     ),
                     "",
                 ]
+        lines += self._see_also(leaving=False)
         return "\n".join(lines).rstrip() + "\n"
+
+    def _see_also(self, *, leaving: bool) -> list[str]:
+        """The closing links every generated page carries.
+
+        A lookup table is where a reader lands from a search, so it is the page most likely
+        to be someone's first, and it was the one shape on the site that ended with nothing
+        after it. These are the four hops that follow from "I found my name in the table".
+        """
+        e = self.engine
+        rows = [
+            "",
+            "## See also",
+            "",
+            f"- {{doc}}`index`: the statuses, the waves, and the other {e.label} pages.",
+        ]
+        if leaving:
+            rows.append(
+                f"- {{doc}}`/getting-started/migration/index`: porting the other way, "
+                f"from {e.label} onto Batcher."
+            )
+        else:
+            rows.append(
+                "- {doc}`leaving-batcher`: the rows that agree, read the other way, "
+                "for code moving off Batcher."
+            )
+        rows += [
+            "- {doc}`/getting-started/migration/differences`: what Batcher leaves out on "
+            "purpose, and how to prove a port returns the same rows.",
+            "- {doc}`/api/reference`: every Batcher spelling in one lookup table.",
+            "",
+        ]
+        return rows
 
     def _page_rows(self, page: Page) -> list[Mapping]:
         return [r for stem in page.files for rows in self.by_file[stem].values() for r in rows]
@@ -592,11 +658,14 @@ class _Renderer:
 
     def _leaving(self) -> str:
         e = self.engine
-        back: dict[str, list[str]] = {}
+        # Keyed by the raw spelling tuple rather than its rendered text, because the cell
+        # is now a cross-reference: sorting or grouping on the markup would order the
+        # table by the role name every row shares.
+        back: dict[tuple[str, ...], list[str]] = {}
         for page in e.pages:
             for r in self._page_rows(page):
                 if r.status is Status.CANONICAL and r.batcher:
-                    back.setdefault(_spelling(r.batcher), []).append(_code(f"{r.surface}.{r.name}"))
+                    back.setdefault(r.batcher, []).append(_code(f"{r.surface}.{r.name}"))
         lines = [
             _HEADER.format(engine=e.key),
             "",
@@ -620,11 +689,12 @@ class _Renderer:
             f"| Batcher | {e.label} |",
             "|---|---|",
             *(
-                f"| {spelling} | {', '.join(sorted(set(names)))} |"
-                for spelling, names in sorted(back.items(), key=lambda kv: kv[0].lower())
+                f"| {_spelling_linked(targets)} | {', '.join(sorted(set(names)))} |"
+                for targets, names in sorted(back.items(), key=lambda kv: _spelling(kv[0]).lower())
             ),
+            *self._see_also(leaving=True),
         ]
-        return "\n".join(lines) + "\n"
+        return "\n".join(lines).rstrip() + "\n"
 
     def render(self) -> dict[Path, str]:
         out = MIGRATION_DOCS / self.engine.directory

@@ -9,6 +9,8 @@ algorithms the diagnostics say are worth running.
 
 from __future__ import annotations
 
+import warnings
+
 import batcher as bt
 import batcher.graph as bg
 
@@ -154,7 +156,14 @@ def measure_cohesion(g: bg.Graph) -> None:
     print("transitivity:", round(bg.transitivity(g), 4))
 
     print("--- communities, and whether they mean anything ---")
-    found = bg.label_propagation(g)
+    # Label propagation is not guaranteed to settle: two neighbours can keep trading labels
+    # forever. On this graph it does not settle within its default 20 rounds, and it says so
+    # with a ConvergenceWarning rather than passing the last round off as an answer, which
+    # is exactly why the partition is scored below instead of trusted.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", bg.ConvergenceWarning)
+        found = bg.label_propagation(g)
+    print("label propagation settled:", not caught)
     print(found.sort("node").to_pydict())
     partition_q = bg.modularity(g, found)
     print("modularity of the partition:", round(partition_q, 4))

@@ -120,6 +120,10 @@ def _check_distributed_faults(d: DistributedConfig) -> None:
 def _check_distributed_placement(d: DistributedConfig) -> None:
     """Transport choice, speculation thresholds, and how tasks spread across the cluster."""
     _check(
+        d.mode in {"auto", "always", "never"},
+        f"distributed.mode must be one of {{'auto', 'always', 'never'}}, got {d.mode!r}",
+    )
+    _check(
         d.transport in {"auto", "flight", "disk"},
         f"distributed.transport must be one of {{'auto', 'flight', 'disk'}}, got {d.transport!r}",
     )

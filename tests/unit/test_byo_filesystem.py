@@ -85,7 +85,11 @@ def test_options_force_the_whole_file_split_that_carries_them(parquet_dir):
     from batcher.io.splits import FileSplit, RowGroupSplit
 
     with_opts = ParquetSource(str(parquet_dir / "*.parquet"), storage_options={"region": "x"})
-    assert all(isinstance(s, FileSplit) for s in with_opts.splits())
+    # A strict multi-file read holds a split whose footer it has not read to the declared
+    # schema by wrapping it (`ConformedSplit`); the split doing the reading is still the
+    # whole-file one, carrying the options.
+    inner = [getattr(s, "inner", s) for s in with_opts.splits()]
+    assert all(isinstance(s, FileSplit) and s.kwargs["storage_options"] for s in inner)
     plain = ParquetSource(str(parquet_dir / "*.parquet"))
     assert all(isinstance(s, RowGroupSplit) for s in plain.splits())
 

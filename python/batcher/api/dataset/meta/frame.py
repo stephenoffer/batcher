@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Any
 
 from batcher.api.dataset.meta._facts import MetaBase, answer
 from batcher.kyber.shortcuts import distinct, ordering, rows
+from batcher.plan.expr_ir import Col
+from batcher.plan.expr_ir.constructors import count
+from batcher.plan.functions.aggregate import count_if
 from batcher.plan.stats import SortOrder
 
 if TYPE_CHECKING:
@@ -256,6 +259,9 @@ class DatasetMeta(MetaBase):
         three-valued rule SQL's ``WHERE`` applies, so this agrees with ``count_where`` by
         construction. An empty relation satisfies everything, vacuously.
 
+        Free when metadata knows both counts; otherwise one aggregate computes the row count
+        and the matching count together, rather than two separate queries.
+
         Args:
             predicate: The condition every row must meet.
 
@@ -269,13 +275,22 @@ class DatasetMeta(MetaBase):
                 >>> bt.from_pydict({"x": [1, 2, 3]}).meta.all_match(bt.col("x") > 0)
                 True
         """
-        return self.count_where(predicate) == self._ds.count()
+        from batcher.api.terminal.metadata_answer import metadata_count
+
+        ds = self._ds
+        rows = metadata_count(ds._plan, ds._sources)
+        hits = metadata_count(ds.filter(predicate)._plan, ds._sources)
+        if rows is not None and hits is not None:
+            return hits == rows
+        result = ds.agg(__bc_rows__=count(), __bc_hits__=count_if(predicate)).to_pydict()
+        return _first_int(result["__bc_hits__"]) == _first_int(result["__bc_rows__"])
 
     def is_key(self, columns: str | Sequence[str]) -> bool:
         """Whether `columns` uniquely identify a row and never hold a null — a primary key.
 
         For a single column this is a footer read whenever an exact distinct count is known.
-        A composite key runs one distinct count, because no format records a multi-column one.
+        A composite key runs one grouped count, because no format records a multi-column one;
+        a recorded null in any key column answers ``False`` with no query at all.
 
         Args:
             columns: The column or columns forming the candidate key.
@@ -379,10 +394,32 @@ class DatasetMeta(MetaBase):
         }
 
     def _is_key_by_execution(self, names: tuple[str, ...]) -> bool:
-        """A key check the engine performs: every value present, every combination distinct."""
-        if any(self._ds.has_nulls(name) for name in names):
+        """A key check the engine performs: every value present, every combination distinct.
+
+        One query, not one per column plus two counts: group by the key, then count the
+        groups, the rows they hold, and the groups whose key part is non-null. A key holds
+        exactly when every group is one row and no group has a null in any key column. A
+        null the footers already record decides it before anything runs.
+        """
+        from batcher.api.terminal.metadata_answer import metadata_has_nulls
+
+        ds = self._ds
+        if any(metadata_has_nulls(ds._plan, ds._sources, name) for name in names):
             return False
-        return self._ds.select(*names).distinct().count() == self._ds.count()
+        present = {f"__bc_nn_{i}__": Col(name).count() for i, name in enumerate(names)}
+        groups = ds.group_by(*names).agg(__bc_n__=count())
+        result = groups.agg(
+            __bc_groups__=count(), __bc_rows__=Col("__bc_n__").sum(), **present
+        ).to_pydict()
+        n_groups = _first_int(result["__bc_groups__"])
+        return n_groups == _first_int(result["__bc_rows__"]) and all(
+            _first_int(result[name]) == n_groups for name in present
+        )
+
+
+def _first_int(values: list[Any]) -> int:
+    """The single value of a one-row aggregate column as an int, with NULL read as zero."""
+    return int(values[0]) if values and values[0] is not None else 0
 
 
 def _known_facets(col: Any) -> dict[str, Any]:

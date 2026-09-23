@@ -66,7 +66,14 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MathExpr,
         Not,
     )
-    from batcher.plan.expr_ir.func_nodes import GeoFunc, ListTransform, MakeTemporal, SpatialFunc
+    from batcher.plan.expr_ir.func_nodes import (
+        GeoFunc,
+        ListTransform,
+        MakeTemporal,
+        SpatialFunc,
+        WindowBuckets,
+        WindowStart,
+    )
     from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
     from batcher.plan.expr_ir.namespaces import (
         ConvertTimezone,
@@ -78,6 +85,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         ListFilter,
         ListFunc,
         ListGet,
+        ListGetDyn,
         ListPosition,
         ListSet,
         ListSimhash,
@@ -86,6 +94,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MapFunc,
         Strftime,
         StrFunc,
+        StrFuncDyn,
         Strptime,
         StructField,
     )
@@ -98,6 +107,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         HashRows,
         Least,
         ListJoin,
+        MakeMap,
         MakeStruct,
         NullIf,
         Sequence,
@@ -169,6 +179,11 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return pa.list_(pa.int64())  # one Int64 bit per hyperplane
     if isinstance(expr, StrFunc):
         return strfunc_type(expr.fn)
+    if isinstance(expr, StrFuncDyn):
+        # The dynamic spelling (a per-row `pattern`/`start`/`length`, which the SQL parser
+        # builds for `repeat(s, n)` and friends) computes the same function as `StrFunc`,
+        # so it returns the same type. Only the arguments differ in when they are known.
+        return strfunc_type(expr.fn)
     if isinstance(expr, DateFunc):
         return datefunc_type(expr.fn)
     if isinstance(expr, Strptime):
@@ -218,6 +233,10 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         # An element that becomes a column widens if it is a narrow integer — the boundary
         # stopped doing it, so the op that makes the column does. See `widened_element_out`.
         return widened_element_out(list_element_type(infer_type(expr.input, schema)))
+    if isinstance(expr, ListGetDyn):
+        # Same element type as `ListGet`; the index is per-row rather than constant, which
+        # changes nothing about the type. SQL's `lst[i]` builds this one.
+        return widened_element_out(list_element_type(infer_type(expr.input, schema)))
     if isinstance(expr, ListFunc):
         return listfunc_type(expr.fn, infer_type(expr.input, schema))
     if isinstance(expr, StructField):
@@ -230,7 +249,42 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return make_temporal_type(expr.fn)
     if isinstance(expr, MakeStruct):
         return _make_struct_type(expr.fields, schema)
+    if isinstance(expr, MakeMap):
+        return _make_map_type(expr.keys, expr.values, schema)
+    if isinstance(expr, WindowStart):
+        # A timestamp, whatever the input was -- NOT the input's own type. That reading is
+        # the obvious one and it is false, which `_sql`'s bucket lowering proves: for a DATE
+        # argument it builds `Cast(WindowStart(value, width), "date")`, and that cast is only
+        # there because the window yields a timestamp. Declaring `date32` here made the cast
+        # look redundant, it was eliminated, and `time_bucket(INTERVAL 1 DAY, DATE ...)` came
+        # back `timestamp[us]` -- a wrong declared type turning into a wrong *result*.
+        return pa.timestamp("us")
+    if isinstance(expr, WindowBuckets):
+        # The hopping form puts each instant in every overlapping bucket, so it is a list of
+        # the same window starts.
+        return pa.list_(pa.timestamp("us"))
     return None
+
+
+def _make_map_type(keys: Expr, values: Expr, schema: SchemaRef) -> pa.DataType | None:
+    """Map type of a `MakeMap`: the *element* types of its key and value list arguments.
+
+    `map_from_arrays` pairs a list of keys with a list of values, so the map's key and
+    value types are those lists' element types, not the list types themselves. Without an
+    arm here the cascade fell through to `None`, and `Dataset.schema` reported `null` for a
+    column that comes back `map<string, int64>` -- the silent wrong answer a per-type
+    cascade gives for any node nobody added an arm for, which is why the column walk in
+    `expr_ir/walk.py` is declarative instead.
+
+    Uncertain on either side → `None`, the sound fallback `_make_struct_type` also takes.
+    """
+    key_t = infer_type(keys, schema)
+    value_t = infer_type(values, schema)
+    if key_t is None or value_t is None:
+        return None
+    if not pa.types.is_list(key_t) or not pa.types.is_list(value_t):
+        return None
+    return pa.map_(key_t.value_type, value_t.value_type)
 
 
 def _make_struct_type(fields: list[tuple[str, Expr]], schema: SchemaRef) -> pa.DataType | None:

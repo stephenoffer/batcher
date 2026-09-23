@@ -167,8 +167,11 @@ pub(crate) fn column_ndv(
 /// `ndv` (distinct estimate), `count`, `null_count`, `null_fraction`, `avg_bytes`
 /// (measured per-row byte width), and `min`/`max` (`None` for non-numeric columns).
 /// Mergeable, so it composes across partitions — Core can collect this during
-/// execution and persist it to the MetadataHub for Kyber's `__column_ndv__` /
-/// `__column_avg_bytes__` / range-selectivity to consume.
+/// execution and persist it to the MetadataHub for Kyber's `__column_ndv__` and
+/// `__column_avg_bytes__` to consume. Range selectivity is derived in the control
+/// plane (`kyber/stats/selectivity.py`) from these scalars plus the quantile grid
+/// `column_stats_full` ships; it is deliberately not computed here, so exactly one
+/// implementation decides how a predicate narrows a relation.
 ///
 /// The GIL is released across the sketch build, as `column_ndv` does. Without that the
 /// rayon fold inside `merge_column_stats` cannot actually run in parallel — measured on

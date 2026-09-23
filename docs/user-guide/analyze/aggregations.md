@@ -22,7 +22,7 @@ A grouped aggregate makes two moves. `group_by` gathers the rows that share a ke
 
 ![Five input rows of category and price, a 10.0, b 20.0, a 30.0, b 40.0 and a 50.0, flow through group_by into two groups: a holds 10.0, 30.0 and 50.0, and b holds 20.0 and 40.0. agg then reduces each group to one row, a with total 90.0 and rows 3, and b with total 60.0 and rows 2, from ds.group_by("category").agg(total=bt.col("price").sum(), rows=bt.count()). Below, a group_by with no keys treats the whole dataset as one group and returns one row, total 150.0 and rows 5.](/_static/diagrams/group_by_flow.svg)
 
-`group_by` takes the grouping keys and `agg` takes the output aggregates. Pass an aggregate as a keyword to name the output, or positionally to keep the source column's name. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`. The column aggregates are methods on an expression (`.sum()`, `.mean()`, and so on) or the top-level shorthands {py:obj}`bt.sum("x") <batcher.sum>`, {py:func}`bt.mean <batcher.mean>`, {py:func}`bt.min <batcher.min>`, {py:func}`bt.max <batcher.max>`, {py:func}`bt.median <batcher.median>`, {py:func}`bt.std <batcher.std>`, {py:func}`bt.var <batcher.var>`, {py:func}`bt.count_distinct <batcher.count_distinct>`. `bt.sum("x")` reads as `col("x").sum()`, the Polars `pl.sum` convention.
+`group_by` takes the grouping keys and `agg` takes the output aggregates. Pass an aggregate as a keyword to name the output, or positionally to keep the source column's name. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`. The column aggregates are methods on an expression (`.sum()`, `.mean()`, and so on) or the top-level shorthands {py:obj}`bt.sum("x") <batcher.sum>`, {py:func}`bt.mean <batcher.mean>`, {py:func}`bt.min <batcher.min>`, {py:func}`bt.max <batcher.max>`, {py:func}`bt.median <batcher.median>`, {py:func}`bt.std <batcher.std>`, {py:func}`bt.var <batcher.var>`, {py:func}`bt.count_distinct <batcher.count_distinct>`. {py:obj}`bt.sum("x") <batcher.sum>` reads as `col("x").sum()`, the Polars `pl.sum` convention.
 
 ```python
 # Positional shorthands keep the column name; keywords rename.
@@ -101,7 +101,7 @@ print(adv.to_pydict())
 #  'costliest': [50.0, 40.0]}
 ```
 
-Each of these also has a top-level SQL-style spelling that reads `bt.<agg>("col")`, the same shorthand `bt.sum("x")` is for `col("x").sum()`: {py:obj}`bt.product(x) <batcher.product>`, {py:obj}`bt.mode(x) <batcher.mode>`, {py:obj}`bt.skew(x) <batcher.skew>` / {py:obj}`bt.kurtosis(x) <batcher.kurtosis>`, {py:obj}`bt.bool_and(x) <batcher.bool_and>` / {py:obj}`bt.bool_or(x) <batcher.bool_or>`, {py:obj}`bt.bit_and(x) <batcher.bit_and>` / {py:obj}`bt.bit_or(x) <batcher.bit_or>` / {py:obj}`bt.bit_xor(x) <batcher.bit_xor>`, and {py:obj}`bt.array_agg(x) <batcher.array_agg>`.
+Each of these also has a top-level SQL-style spelling that reads `bt.<agg>("col")`, the same shorthand {py:obj}`bt.sum("x") <batcher.sum>` is for `col("x").sum()`: {py:obj}`bt.product(x) <batcher.product>`, {py:obj}`bt.mode(x) <batcher.mode>`, {py:obj}`bt.skew(x) <batcher.skew>` / {py:obj}`bt.kurtosis(x) <batcher.kurtosis>`, {py:obj}`bt.bool_and(x) <batcher.bool_and>` / {py:obj}`bt.bool_or(x) <batcher.bool_or>`, {py:obj}`bt.bit_and(x) <batcher.bit_and>` / {py:obj}`bt.bit_or(x) <batcher.bit_or>` / {py:obj}`bt.bit_xor(x) <batcher.bit_xor>`, and {py:obj}`bt.array_agg(x) <batcher.array_agg>`.
 
 ```python
 shorthand = (

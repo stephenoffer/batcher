@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from batcher._internal.errors import PlanError
 from batcher.api.dataset.dq.constraints import AggregateConstraint
-from batcher.plan.expr_ir import Col, count
+from batcher.plan.expr_ir import Col, Expr, count, lit, when
 from batcher.plan.functions.aggregate import count_distinct, median, std
 from batcher.plan.functions.quantiles import quantile
 from batcher.plan.functions.statistics import null_rate, nunique_ratio
@@ -152,11 +152,24 @@ def quantile_between(
     )
 
 
+def _per_row_share(share: Expr, empty: float) -> Expr:
+    """`share` over a non-empty relation, and `empty` over an empty one.
+
+    A share of rows is ``something / count()``, which is 0/0 over no rows. The engine
+    evaluates that to NaN, and a NaN measurement fails every bound. The row-level
+    counterparts (`not_null`, `unique`) pass an empty relation with zero violations, so
+    the share takes the value that agrees with them: no row is missing, and no row repeats.
+    Demand rows with `row_count_between(1)`.
+    """
+    return when(count() > 0).then(share).otherwise(lit(empty))
+
+
 def null_rate_below(column: str, max_rate: float) -> AggregateConstraint:
     """`column`'s share of nulls must not exceed `max_rate`.
 
     The tolerated form of `not_null`, for a column that is legitimately sparse but whose
     sparsity is itself the signal: 2% missing is the feed working, 60% is it broken.
+    An empty relation measures 0.0 and passes, as `not_null` does.
 
     Args:
         column: The column to measure.
@@ -170,7 +183,10 @@ def null_rate_below(column: str, max_rate: float) -> AggregateConstraint:
             f"null_rate_below({column!r}): max_rate must be a fraction in [0, 1], got {max_rate!r}"
         )
     return AggregateConstraint(
-        f"null_rate_below({column}, {max_rate})", null_rate(Col(column)), None, max_rate
+        f"null_rate_below({column}, {max_rate})",
+        _per_row_share(null_rate(Col(column)), 0.0),
+        None,
+        max_rate,
     )
 
 
@@ -197,7 +213,8 @@ def unique_ratio_above(column: str, min_ratio: float) -> AggregateConstraint:
     """`column`'s distinct-to-row ratio must be at least `min_ratio`.
 
     The scale-free version of `distinct_count_between`: a bound that stays true as the table
-    grows, which is what a "this is nearly a key" contract actually means.
+    grows, which is what a "this is nearly a key" contract actually means. An empty
+    relation measures 1.0 and passes, as `unique` does.
 
     Args:
         column: The column to measure.
@@ -211,5 +228,8 @@ def unique_ratio_above(column: str, min_ratio: float) -> AggregateConstraint:
             f"unique_ratio_above({column!r}): min_ratio must be in [0, 1], got {min_ratio!r}"
         )
     return AggregateConstraint(
-        f"unique_ratio_above({column}, {min_ratio})", nunique_ratio(Col(column)), min_ratio, None
+        f"unique_ratio_above({column}, {min_ratio})",
+        _per_row_share(nunique_ratio(Col(column)), 1.0),
+        min_ratio,
+        None,
     )

@@ -233,6 +233,21 @@ lint-methodology:
 audit-health args="":
     python tools/audit_health.py {{args}}
 
+# Every API name and repo path in a published docs page is a working link, and every
+# `{doc}` reference points at a page that exists.
+#
+# Two failures, both invisible until now. A `{py:meth}` whose target Sphinx never
+# registered renders as plain text and warns about nothing, because `nitpicky` is off — so
+# a dead reference and an unlinked one look identical in a green `-W` build, and 3,592 code
+# spans naming a public symbol had accumulated as grey text. A dead `{doc}` *does* fail the
+# build, but only at the end of a twenty-minute one, which is the wrong moment to learn that
+# a moved page left a relative reference behind. Both checks run in two seconds here.
+#
+# The resolvable targets are derived from the same autodoc directives that publish them, so
+# this cannot point at a name the site does not carry. `--fix` rewrites what it finds.
+lint-doc-links:
+    python tools/doc_api_links.py --check
+
 # Public-API docstring style: one-line summary, `.. doctest::` examples, typeless
 # Args/Returns. Needs the engine built (it introspects the live objects). The
 # examples it insists on are actually executed by `just docs`.

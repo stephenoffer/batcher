@@ -346,8 +346,9 @@ def st_num_points(geom: Expr | str) -> Expr:
 def st_num_geometries(geom: Expr | str) -> Expr:
     """The number of top-level members of a geometry.
 
-    1 for a simple geometry — it is its own only member — and the member count for a
-    multi-geometry or collection. Pairs with `st_geometry_n` to walk the parts.
+    1 for a simple geometry — it is its own only member — 0 for an empty one such as
+    ``POINT EMPTY``, and the member count for a multi-geometry or collection, as in
+    PostGIS and DuckDB. Pairs with `st_geometry_n` to walk the parts.
 
     Args:
         geom: The geometry.

@@ -20,7 +20,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import BackendError, PlanError
 from batcher._internal.optional import require
-from batcher.io.formats.streaming.codecs.base import CODECS, null_mask_from, scatter
+from batcher.io.formats.streaming.codecs.base import CODECS, null_mask_from, payloads_of, scatter
 from batcher.io.formats.streaming.codecs.wire import (
     SchemaRegistry,
     frame_confluent,
@@ -71,8 +71,9 @@ class ProtobufCodec:
             registry: A `SchemaRegistry` when payloads carry Confluent framing.
             subject: The subject whose id frames encoded payloads.
             mode: ``"fail"`` or ``"permissive"``.
-            message_indexes: The message-index path to write when encoding. Defaults to
-                ``(0,)``, the first message in the descriptor, which is what a
+            message_indexes: The message-index path of `schema` within its ``.proto``:
+                written when encoding, and required of every framed payload when decoding.
+                Defaults to ``(0,)``, the first message in the descriptor, which is what a
                 single-message ``.proto`` always is.
             _: Ignored passthrough.
 
@@ -122,15 +123,24 @@ class ProtobufCodec:
         nulls = null_mask_from(column)
         messages: list[Any] = []
         keep: list[int] = []
-        for index, payload in enumerate(column.to_pylist()):
+        for index, payload in enumerate(payloads_of(column)):
             if nulls[index] or payload is None:
                 continue
             try:
-                body = (
-                    unframe_confluent(payload, protobuf=True).body
-                    if self._registry is not None
-                    else payload
-                )
+                body = payload
+                if self._registry is not None:
+                    framed = unframe_confluent(payload, protobuf=True)
+                    if framed.message_indexes != self._indexes:
+                        # The path names which message of the `.proto` was written. Parsing
+                        # another message's bytes with this class succeeds and returns
+                        # wrong fields, so a mismatch is refused rather than decoded.
+                        raise BackendError(
+                            f"the payload's Confluent message index is "
+                            f"{list(framed.message_indexes)}, but this codec decodes "
+                            f"{list(self._indexes)} ({self._message.__name__}); pass "
+                            "message_indexes= for the message the topic carries."
+                        )
+                    body = framed.body
                 message = self._message()
                 message.ParseFromString(body)
             except Exception as exc:

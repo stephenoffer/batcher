@@ -20,6 +20,6 @@ python examples/ml/vector_search.py
 ## See also
 
 - {doc}`/cookbook/ml/pipelines/text/rag-index`: chunking, embedding, and indexing a corpus to search like this.
-- {doc}`/cookbook/metrics/embeddings`: aggregate health checks for an embedding column.
+- {doc}`/cookbook/metrics/model/embeddings`: aggregate health checks for an embedding column.
 - {doc}`/cookbook/ml/inference/batch_inference`: a model over every row, without a Python loop.
 - {doc}`/ml/retrieval/vector-search`: the engine scan, the ANN index, and which corpus size needs which.

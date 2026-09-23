@@ -385,3 +385,164 @@ def test_the_two_lists_stay_separate_in_the_fleet_record(monkeypatch):
     assert record["xid_application"] == [13]
     # And it is not a drain reason: the device is fine.
     assert fleet_health.unhealthy_nodes(({"node_id": "a", **record},)) == ()
+
+
+# --- the sampled window reaching a scheduling decision --------------------------------------
+#
+# Every other input to a verdict is one NVML reading. Two conditions that cost real throughput
+# are invisible to any single reading — a clamp that followed the load and released with it,
+# and a neighbour computing on the board — and `telemetry.bottleneck` answers both from a
+# window. Those verdicts used to terminate in a report; these pin them to the derate instead.
+
+
+def _window(verdict: str, *, index: int = 0, confidence: float = 0.9):
+    from batcher._internal.hardware.telemetry.bottleneck import Bottleneck
+
+    return Bottleneck(index=index, verdict=verdict, confidence=confidence)
+
+
+def test_a_contended_device_is_derated_rather_than_quarantined():
+    """It is working correctly and delivering less; removing it hands the board to the neighbour."""
+    verdict = health.assess_saturation(health.assess_device(_healthy()), _window("contended"))
+    assert verdict.state == "degraded"
+    assert verdict.derate == 0.5
+    assert "contended" in verdict.reasons
+    assert verdict.schedulable
+
+
+def test_a_window_that_says_the_device_is_busy_doing_its_job_changes_nothing():
+    """The positive control. `compute_bound` is a device at full output, not a sick one."""
+    healthy = health.assess_device(_healthy())
+    assert health.assess_saturation(healthy, _window("compute_bound")) == healthy
+    assert health.assess_saturation(healthy, _window("memory_bound")) == healthy
+    assert health.assess_saturation(healthy, None) == healthy
+
+
+def test_a_narrow_verdict_does_not_move_the_fleet():
+    """Low confidence means the classifier chose between two near-equal limits."""
+    healthy = health.assess_device(_healthy())
+    assert health.assess_saturation(healthy, _window("contended", confidence=0.1)) == healthy
+
+
+def test_saturation_never_re_derates_a_device_already_worse_off():
+    """The derates fold through `min`, so a clamped *and* contended device is charged once."""
+    clamped = DeviceTelemetry(
+        index=0,
+        uuid="GPU-0",
+        temperature_c=45.0,
+        memory_used_bytes=1,
+        memory_total_bytes=100,
+        throttle_reasons=("thermal",),
+    )
+    before = health.assess_device(clamped)
+    assert before.derate == 0.5
+    after = health.assess_saturation(before, _window("contended"))
+    assert after.derate == 0.5, "0.5 and 0.5 compose to 0.5, not to 0.25"
+
+
+def test_a_quarantined_device_has_nothing_left_for_a_window_to_say():
+    ecc = DeviceTelemetry(
+        index=0, uuid="GPU-0", memory_total_bytes=100, memory_used_bytes=1, ecc_uncorrected=99
+    )
+    condemned = health.assess_device(ecc)
+    assert condemned.state == "quarantine"
+    assert health.assess_saturation(condemned, _window("contended")) == condemned
+
+
+def test_assess_fleet_joins_the_window_by_device_index():
+    """And a device the window does not cover keeps the verdict its reading earned."""
+    verdicts = health.assess_fleet(
+        readings=[_healthy(0), _healthy(1)],
+        faults=(),
+        saturation=(_window("contended", index=1),),
+    )
+    assert [v.state for v in verdicts] == ["healthy", "degraded"]
+    assert [v.derate for v in verdicts] == [1.0, 0.5]
+
+
+def test_a_fleet_with_no_sampled_window_schedules_exactly_as_before():
+    """An operator who never started the dashboard must see the fleet they had."""
+    verdicts = health.assess_fleet(readings=[_healthy(0)], faults=(), saturation=())
+    assert verdicts[0].state == "healthy"
+    assert verdicts[0].derate == 1.0
+
+
+def test_the_live_path_reaches_the_sampler_rather_than_its_own_except_clause():
+    """`_sampled_bottlenecks` is best-effort, which is exactly how a wire dies unnoticed.
+
+    A typo in the lazy import would be caught by its own `except Exception`, logged at debug,
+    and return `()` — indistinguishable from "nothing was sampled" at every call site and on
+    every dashboard. So assert the call *lands*, not merely that it returns something empty.
+    """
+    from batcher.observe.accelerators import diagnosis
+
+    reached = []
+    real = diagnosis.device_verdicts
+    diagnosis.device_verdicts = lambda *a, **k: reached.append(1) or ()
+    try:
+        assert health._sampled_bottlenecks() == ()
+        assert reached, "the lazy import was swallowed instead of resolving"
+    finally:
+        diagnosis.device_verdicts = real
+
+
+def test_a_sampler_that_raises_costs_the_window_and_not_the_query():
+    """The other half: scheduling must survive a fleet whose telemetry is broken."""
+    from batcher.observe.accelerators import diagnosis
+
+    real = diagnosis.device_verdicts
+
+    def _boom(*a, **k):
+        raise RuntimeError("no driver")
+
+    diagnosis.device_verdicts = _boom
+    try:
+        assert health._sampled_bottlenecks() == ()
+    finally:
+        diagnosis.device_verdicts = real
+
+
+def test_a_strict_operator_threshold_cannot_turn_contention_into_a_quarantine():
+    """`quarantine_below_derate` is the line for a device that is *wrong*, not a busy one.
+
+    An operator tightening it to 0.6 for ECC reasons would otherwise find every contended
+    board silently condemned — and a contended board removed from the fleet hands the whole
+    device to the neighbour this verdict says is already on it.
+    """
+    strict = health.HealthThresholds(quarantine_below_derate=0.6)
+    healthy = health.assess_device(_healthy(), strict)
+    verdict = health.assess_saturation(healthy, _window("contended"))
+    assert verdict.state == "degraded"
+    assert verdict.schedulable
+    assert verdict.derate == 0.5
+    # The control: the same threshold still condemns a device that is genuinely degraded.
+    hot = DeviceTelemetry(
+        index=0,
+        uuid="GPU-0",
+        temperature_c=45.0,
+        memory_used_bytes=99,
+        memory_total_bytes=100,
+    )
+    assert health.assess_device(hot, strict).state == "quarantine"
+
+
+def test_a_box_with_no_devices_never_reaches_the_observability_layer():
+    """The sampler lives in `observe`, whose package import costs ~220 ms the first time.
+
+    Spending that inside a scheduling decision on a machine with no accelerators is 220 ms of
+    a sub-second query's budget spent learning that a fleet with no devices has no saturated
+    ones. Asserted as "the module was never imported" rather than as a timing, because a
+    timing on a shared box measures the neighbours.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys;"
+        "from batcher.carbonite.accel.health import assess_fleet;"
+        "assess_fleet(readings=[], faults=());"
+        "print('batcher.observe' in sys.modules)"
+    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False", "a device-less fleet pulled in the observability layer"

@@ -45,7 +45,7 @@ To add the function, complete the following steps:
 
 1. Write the function in its family under `plan/functions/`, such as `scalar.py`, `temporal.py`, `aggregate.py`, `collection.py` or the `string/` package. Keep it pure: it returns an `Expr`.
 1. Re-export it from `plan/functions/__init__.py` and `api/functions.py`, adding it to both `__all__` lists, which are the public surface.
-1. Add a differential test against DuckDB in `tests/differential/` covering nulls, empties and type edges.
+1. Add a differential test against DuckDB in [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential) covering nulls, empties and type edges.
 
 ## Add an expression IR node
 
@@ -80,7 +80,7 @@ Three rules apply to every node:
 - The `tag` string must equal the Rust `serde` tag exactly, which is invariant 8 in `CLAUDE.md`. Add the tag to `plan/ir_tags.py::ExprTag` and the Rust variant in the same commit.
 - An irregular shape, such as paired branches, can override `to_ir`. See `Case` in
   `nodes.py`. Keep the node an `@expr_node` so it still gets a generated constructor.
-- Add a representative to `tests/unit/test_ir_snapshot.py`. That snapshot is the byte-for-byte lock on the wire contract.
+- Add a representative to [`tests/unit/test_ir_snapshot.py`](https://github.com/stephenoffer/batcher/blob/main/tests/unit/test_ir_snapshot.py). That snapshot is the byte-for-byte lock on the wire contract.
 
 ## Add a typed-accessor method
 
@@ -137,7 +137,7 @@ def drop_noop_filter(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None
     return None  # or None for "no change"
 ```
 
-Pick the family by what the rule rewrites, such as boolean and `CASE` algebra, sargable normalization, join shape, set operations, aggregates, windows, empty-relation folding, or skips that exact metadata unlocks. The core families sit directly in `kyber/rules/`. More than 30 extended family modules live in the `kyber/rules/extra/` subpackage, which exists because `rules/` reached the 12-files-per-directory structure cap and is allowlisted in `tools/lint_structure.py`. If your family has
+Pick the family by what the rule rewrites, such as boolean and `CASE` algebra, sargable normalization, join shape, set operations, aggregates, windows, empty-relation folding, or skips that exact metadata unlocks. The core families sit directly in `kyber/rules/`. More than 30 extended family modules live in the `kyber/rules/extra/` subpackage, which exists because `rules/` reached the 12-files-per-directory structure cap and is allowlisted in [`tools/lint_structure.py`](https://github.com/stephenoffer/batcher/blob/main/tools/lint_structure.py). If your family has
 no home yet, add a new `extra/<family>.py` and register it with one import line in
 `rules/extra/__init__.py`. Importing that package runs the module's `@rule` decorators.
 
@@ -159,10 +159,10 @@ def rewrite_predicate(plan: LogicalPlan) -> LogicalPlan:
     return transform_up(plan, push)  # children visited and rebuilt generically
 ```
 
-A rule decides and never executes: no engine calls and no metric collection, because that is Core's lane. Every rule needs a `tests/unit/` plan-shape test
-proving the rewrite is *semantics-preserving* and a `tests/differential/` test
+A rule decides and never executes: no engine calls and no metric collection, because that is Core's lane. Every rule needs a [`tests/unit/`](https://github.com/stephenoffer/batcher/tree/main/tests/unit) plan-shape test
+proving the rewrite is *semantics-preserving* and a [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential) test
 showing the optimized query still matches DuckDB. Your rule then joins the whole set
-under `tests/property/test_prop_optimizer_result_invariance.py`, which
+under [`tests/property/test_prop_optimizer_result_invariance.py`](https://github.com/stephenoffer/batcher/blob/main/tests/property/test_prop_optimizer_result_invariance.py), which
 property-tests that the full rule set is result-invariant and converges to a
 deterministic fixpoint. A rule that interferes with another, or fails to reach a
 fixpoint, fails there even when its own tests pass. See the `add-kyber-optimizer-pass`

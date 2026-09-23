@@ -10,7 +10,7 @@ Six decisions account for most of that, and each section below says what the dec
 
 Every stateful operator is written once, in `bc-runtime`, as three functions. `partial(batch)` produces a state, `combine(states)` merges states, and `finalize(state)` emits rows. `combine` is associative and commutative, so partial states merge in any order.
 
-That one implementation runs sequentially on a core, in parallel across many, and across a cluster over Arrow Flight. There is no second distributed operator with semantics of its own. The rows, the column names and the column types come back the same on one node and on a hundred, and a floating-point reduction agrees up to the reassociation a different partition count causes. `tests/integration/test_distributed.py` asserts that operator by operator against a local Ray instance. It skips when Ray isn't installed, which is how CI runs, so the evidence comes from the runs recorded on real clusters.
+That one implementation runs sequentially on a core, in parallel across many, and across a cluster over Arrow Flight. There is no second distributed operator with semantics of its own. The rows, the column names and the column types come back the same on one node and on a hundred, and a floating-point reduction agrees up to the reassociation a different partition count causes. [`tests/integration/test_distributed.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_distributed.py) asserts that operator by operator against a local Ray instance. It skips when Ray isn't installed, which is how CI runs, so the evidence comes from the runs recorded on real clusters.
 
 Scaling out is therefore a scheduling decision, not a rewrite. The script you wrote on a laptop is the script that runs on the cluster. Distribution is also cheap to decline: on the `udf-map` workload at TPC-H sf1, too small for a shuffle to pay, the distributed path took 92 ms against 86 ms on one node.
 
@@ -56,7 +56,7 @@ Batch is the bounded special case of streaming over Arrow batches, not a separat
 
 Model work runs on the same engine rather than beside it. Images, audio, and video decode into tensor columns the relational operators already understand, so one pipeline can filter a table, join it, and feed a model with no hand-off between systems. On the GPU path, stage-overlapped execution runs the CPU decode of the next morsel while the current morsel's forward pass is still in flight.
 
-The measured effect is large. A two-stage ResNet-50 pipeline on 8 T4 GPUs went from 942 to 2,504 images per second, with GPU utilization rising from about 30% to 81% (`benchmarks/BENCHMARK_RESULTS.md`).
+The measured effect is large. A two-stage ResNet-50 pipeline on 8 T4 GPUs went from 942 to 2,504 images per second, with GPU utilization rising from about 30% to 81% ([`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md)).
 
 ## Correctness is checked against an outside oracle
 

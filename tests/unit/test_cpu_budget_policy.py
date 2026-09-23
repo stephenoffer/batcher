@@ -169,3 +169,85 @@ def test_an_unpressured_uncontended_machine_still_gets_no_config(monkeypatch):
         manager, "recommend_morsel_target", lambda families=None, plan=None, carried=None: None
     )
     assert manager.recommended_config() is None
+
+
+# --- the reduction reaching a reader ---------------------------------------------------------
+#
+# `oversubscription_note` was written, per its own docstring, so that `EXPLAIN` and the
+# decision log can say *why* the fan-out narrowed -- "a silently narrowed fan-out is
+# indistinguishable from an engine that failed to parallelize, and the two have opposite
+# fixes". It had no caller, so the engine reduced the budget and explained it nowhere.
+
+
+@pytest.fixture
+def bus():
+    """Every event published during the test, detached afterwards."""
+    from batcher._internal import events
+
+    seen: list = []
+    unsubscribe = events.subscribe(seen.append)
+    try:
+        yield seen
+    finally:
+        unsubscribe()
+
+
+def _parallelism_decisions(seen) -> list:
+    from batcher._internal import events
+
+    return [
+        e for e in seen if e.kind == events.DECISION and e.fields.get("category") == "parallelism"
+    ]
+
+
+def test_a_reduced_fan_out_says_why_on_the_bus(bus, monkeypatch):
+    from batcher.carbonite import manager as mgr
+
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: 3)
+    monkeypatch.setattr(mgr, "oversubscription_note", lambda: "cpu fan-out reduced 8 -> 3 cores")
+    mgr.ResourceManager().recommended_config()
+
+    found = _parallelism_decisions(bus)
+    assert len(found) == 1, "the reduction was applied and never explained"
+    assert found[0].fields["subsystem"] == "carbonite"
+    assert "3 cores" in found[0].fields["summary"]
+
+
+def test_a_quiet_machine_publishes_nothing(bus, monkeypatch):
+    """The control, and the cost argument: the note's second CPU probe must not land on the
+    common path. A machine with no contention never reaches it."""
+    from batcher.carbonite import manager as mgr
+
+    probed = []
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: None)
+    monkeypatch.setattr(mgr, "oversubscription_note", lambda: probed.append(1) or "")
+    mgr.ResourceManager().recommended_config()
+
+    assert _parallelism_decisions(bus) == []
+    assert not probed, "a quiet machine paid for the note's extra CPU probe"
+
+
+def test_a_note_that_says_nothing_publishes_nothing(bus, monkeypatch):
+    """`oversubscription_note` returns `""` when it finds no reduction to explain, and an
+    empty decision on the bus is worse than none: it renders as a blank row."""
+    from batcher.carbonite import manager as mgr
+
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: 3)
+    monkeypatch.setattr(mgr, "oversubscription_note", lambda: "")
+    mgr.ResourceManager().recommended_config()
+    assert _parallelism_decisions(bus) == []
+
+
+def test_a_broken_bus_cannot_fail_a_query(bus, monkeypatch):
+    """Observation is never allowed to take the query with it."""
+    from batcher.carbonite import manager as mgr
+
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: 3)
+
+    def _explode() -> str:
+        raise RuntimeError("no /proc")
+
+    monkeypatch.setattr(mgr, "oversubscription_note", _explode)
+    recommended = mgr.ResourceManager().recommended_config()
+    assert recommended is not None
+    assert recommended.execution.parallelism == 3

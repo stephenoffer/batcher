@@ -12,11 +12,18 @@ The predicate checks (`all_positive`, `contains`, …) live one step further in,
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import TYPE_CHECKING, Any
 
 from batcher.api.dataset.meta._facts import MetaBase, answer
+from batcher.api.dataset.meta._types import (
+    require_numeric,
+    require_numeric_values,
+    require_rangeable,
+)
 from batcher.kyber.shortcuts import bounds, distinct, moments, nulls
 from batcher.plan.expr_ir import Col
+from batcher.plan.expr_ir.constructors import count
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -87,18 +94,31 @@ class ColumnMeta(MetaBase):
         return (self._ds.min(self._column), self._ds.max(self._column))
 
     def range(self) -> Any:
-        """The width of the column's range (``max - min``), for a numeric column.
+        """The width of the column's range (``max - min``), for a numeric or temporal column.
+
+        A numeric column gives a number of its own type. A date, timestamp, time, or duration
+        column gives a ``datetime.timedelta``, the same value Python's subtraction of the two
+        bounds gives.
 
         Returns:
             The range width, or ``None`` for an empty/all-null column.
 
+        Raises:
+            PlanError: If the column is a string, boolean, or other non-orderable-by-distance
+                type, which has no difference to take.
+
         Examples:
             .. doctest::
 
+                >>> import datetime as dt
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [3, 1, 10]}).meta.col("x").range()
                 9
+                >>> days = [dt.date(2024, 1, 1), dt.date(2024, 1, 31)]
+                >>> bt.from_pydict({"d": days}).meta.col("d").range()
+                datetime.timedelta(days=30)
         """
+        require_rangeable(self._ds, self._column)
         return answer(self.ask(bounds.value_range, self._column), self._range_by_execution)
 
     def midpoint(self) -> float | None:
@@ -111,6 +131,9 @@ class ColumnMeta(MetaBase):
         Returns:
             The midpoint, or ``None`` for an empty/all-null column.
 
+        Raises:
+            PlanError: If the column is not an integer, float, or decimal column.
+
         Examples:
             .. doctest::
 
@@ -118,11 +141,15 @@ class ColumnMeta(MetaBase):
                 >>> bt.from_pydict({"x": [0, 0, 0, 100]}).meta.col("x").midpoint()
                 50.0
         """
+        require_numeric(self._ds, self._column, "midpoint")
         value = self.ask(bounds.midpoint, self._column)
         if value is not None:
             return value
         low, high = self.bounds()
-        return None if low is None or high is None else (float(low) + float(high)) / 2.0
+        if low is None or high is None:
+            return None
+        require_numeric_values(self._column, "midpoint", low, high)
+        return (float(low) + float(high)) / 2.0
 
     def abs_max(self) -> float | None:
         """The largest absolute value the column holds, ``max(|min|, |max|)``.
@@ -133,6 +160,9 @@ class ColumnMeta(MetaBase):
         Returns:
             The largest magnitude, or ``None`` for an empty/all-null column.
 
+        Raises:
+            PlanError: If the column is not an integer, float, or decimal column.
+
         Examples:
             .. doctest::
 
@@ -140,11 +170,15 @@ class ColumnMeta(MetaBase):
                 >>> bt.from_pydict({"x": [-9, 2, 5]}).meta.col("x").abs_max()
                 9.0
         """
+        require_numeric(self._ds, self._column, "abs_max")
         value = self.ask(bounds.abs_max, self._column)
         if value is not None:
             return value
         low, high = self.bounds()
-        return None if low is None or high is None else max(abs(float(low)), abs(float(high)))
+        if low is None or high is None:
+            return None
+        require_numeric_values(self._column, "abs_max", low, high)
+        return max(abs(float(low)), abs(float(high)))
 
     def null_fraction(self) -> float:
         """The share of the column that is null, in ``[0, 1]`` — an empty column gives ``0.0``.
@@ -393,8 +427,9 @@ class ColumnMeta(MetaBase):
         """Everything known about the column, as one dictionary.
 
         The per-column ``describe``, assembled from the shortcuts above — so on a Parquet scan
-        it is a footer read and on an arbitrary plan it is a handful of aggregates. Keys:
-        ``dtype``, ``count`` (non-null), ``null_count``, ``min``, ``max``, ``n_unique``.
+        it is a footer read, and whatever metadata cannot answer is computed together in
+        **one** aggregate pass rather than one query per fact. Keys: ``dtype``, ``count``
+        (non-null), ``null_count``, ``min``, ``max``, ``n_unique``.
 
         Returns:
             The column's facts, keyed by name.
@@ -406,15 +441,80 @@ class ColumnMeta(MetaBase):
                 >>> bt.from_pydict({"x": [1, 2, 2]}).meta.col("x").summary()["n_unique"]
                 2
         """
-        low, high = self.bounds()
+        from batcher.api.terminal.core import _declared_schema
+
+        declared = _declared_schema(self._ds._plan, self._ds._sources)
+        dtype = None if declared is None else declared.field(self._column).type
+        facts = self._summary_from_metadata()
+        missing = [name for name, value in facts.items() if value is None]
+        if dtype is None and "min" not in missing:
+            # Static analysis cannot type an opaque stage; the `MIN` column of the pass that
+            # runs anyway carries the column's type, where `Dataset.schema` would run a
+            # second (zero-row) query — and build the stage's UDF — to learn it.
+            missing.append("min")
+        if missing:
+            executed, min_type = self._summary_by_execution(missing)
+            facts.update(executed)
+            dtype = dtype if dtype is not None else min_type
+        return {"dtype": dtype, **facts}
+
+    def _summary_from_metadata(self) -> dict[str, Any]:
+        """Each `summary` fact metadata can prove, None for the rest — never executing.
+
+        The same fast paths the one-fact methods take (`bounds`, `n_null`, `n_unique`, the
+        non-null count), asked without their fallbacks so the misses can share one pass.
+        """
+        from batcher.api.terminal.metadata_answer import (
+            metadata_max,
+            metadata_min,
+            metadata_n_unique,
+            metadata_null_count,
+        )
+
+        column, plan, sources = self._column, self._ds._plan, self._ds._sources
+        pair = self.ask(bounds.bounds, column)
+        low, high = pair if pair is not None else (None, None)
+        n_unique = self.ask(distinct.n_unique, column, ndv=(column,))
         return {
-            "dtype": self._ds.meta.schema.dtype(self._column),
-            "count": self._nonnull_count(),
-            "null_count": self._ds.n_null(self._column),
-            "min": low,
-            "max": high,
-            "n_unique": self.n_unique(),
+            "count": self.ask(nulls.non_null_count, column),
+            "null_count": metadata_null_count(plan, sources, column),
+            "min": low if pair is not None else metadata_min(plan, sources, column),
+            "max": high if pair is not None else metadata_max(plan, sources, column),
+            "n_unique": (
+                n_unique if n_unique is not None else metadata_n_unique(plan, sources, column)
+            ),
         }
+
+    def _summary_by_execution(self, wanted: list[str]) -> tuple[dict[str, Any], Any]:
+        """The `wanted` summary facts from one aggregate — the fallbacks, merged into one pass.
+
+        Each aggregate is the one the single-fact fallback would have run on its own (``MIN``,
+        ``MAX``, ``COUNT(col)``, ``COUNT(*) - COUNT(col)``, ``COUNT(DISTINCT)``), so the answers
+        are the same; only the number of queries changes, from up to five to one. Also
+        returns the Arrow type of the ``MIN`` column when it was computed (else None).
+        """
+        column = Col(self._column)
+        aggregates = {
+            "min": {"__bc_min__": column.min()},
+            "max": {"__bc_max__": column.max()},
+            "count": {"__bc_nn__": column.count()},
+            "null_count": {"__bc_nn__": column.count(), "__bc_rows__": count()},
+            "n_unique": {"__bc_nd__": column.count_distinct()},
+        }
+        exprs: dict[str, Any] = {}
+        for name in wanted:
+            exprs.update(aggregates[name])
+        table = self._ds.agg(**exprs).collect()
+        row = {name: values[0] if values else None for name, values in table.to_pydict().items()}
+        min_type = table.schema.field("__bc_min__").type if "min" in wanted else None
+        derived = {
+            "min": lambda: row["__bc_min__"],
+            "max": lambda: row["__bc_max__"],
+            "count": lambda: int(row["__bc_nn__"] or 0),
+            "null_count": lambda: int(row["__bc_rows__"] or 0) - int(row["__bc_nn__"] or 0),
+            "n_unique": lambda: int(row["__bc_nd__"] or 0),
+        }
+        return {name: derived[name]() for name in wanted}, min_type
 
     def _nonnull_count(self) -> int:
         """The non-null count, from metadata when exact (it usually is) else one pass."""
@@ -424,4 +524,17 @@ class ColumnMeta(MetaBase):
     def _range_by_execution(self) -> Any:
         """`max - min` over the executed bounds, or None when the column has none."""
         low, high = self.bounds()
-        return None if low is None or high is None else high - low
+        if low is None or high is None:
+            return None
+        if isinstance(low, dt.time) and isinstance(high, dt.time):
+            return _since_midnight(high) - _since_midnight(low)
+        if not isinstance(low, (dt.date, dt.timedelta)):
+            require_numeric_values(self._column, "range", low, high)
+        return high - low
+
+
+def _since_midnight(value: dt.time) -> dt.timedelta:
+    """A time of day as the duration since midnight, so two of them can be subtracted."""
+    return dt.timedelta(
+        hours=value.hour, minutes=value.minute, seconds=value.second, microseconds=value.microsecond
+    )

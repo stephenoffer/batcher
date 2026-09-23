@@ -17,7 +17,10 @@ from batcher.api.dataset._udf.checks import (
     normalize_resources,
     normalize_retry,
     require_number,
+    validate_bindings,
+    validate_column_list,
     validate_fn,
+    validate_num_workers,
     validate_output_columns,
     warn_async_combos,
     warn_if_model_reloads,
@@ -157,10 +160,13 @@ def build_map_batches(
     timeout_s, retries, backoff_s, retry_types = normalize_retry(
         timeout, max_retries, retry_backoff, retry_on
     )
-    if max_concurrency < 0:
-        raise PlanError(f"max_concurrency must be >= 0 (0 = a default), got {max_concurrency}")
+    require_number(max_concurrency, param="max_concurrency", minimum=0, whole=True)
+    validate_num_workers(num_workers)
     validate_fn(fn)
     validate_output_columns(output_columns)
+    available = _all_columns(ds)
+    validate_column_list(input_columns, available, param="input_columns", verb=verb)
+    validate_column_list(preserves_columns, available, param="preserves_columns", verb=verb)
     warn_async_combos(fn, multiprocessing, placement.num_gpus)
     warn_if_model_reloads(fn, placement.num_gpus)
     warn_if_pushdown_is_defeated(input_columns, ds.columns, output_columns)
@@ -299,10 +305,7 @@ def _row_concurrency(max_concurrency: int) -> int:
     """The in-flight await bound for an async row callback, validated."""
     from batcher.api.dataset.callbacks import _DEFAULT_ROW_CONCURRENCY
 
-    if max_concurrency < 0:
-        from batcher._internal.errors import PlanError
-
-        raise PlanError(f"max_concurrency must be >= 0, got {max_concurrency}")
+    require_number(max_concurrency, param="max_concurrency", minimum=0, whole=True)
     return max_concurrency or _DEFAULT_ROW_CONCURRENCY
 
 
@@ -329,11 +332,10 @@ def bind_fn(
     `writable` names a batch format whose read-only buffers are copied before each call
     (``zero_copy_batch=False``); `None` hands the batch over as converted.
     """
+    validate_bindings(fn_args, fn_kwargs, fn_constructor_args, fn_constructor_kwargs)
     fargs, fkw = tuple(fn_args or ()), fn_kwargs or {}
     cargs, ckw = tuple(fn_constructor_args or ()), fn_constructor_kwargs or {}
     if (cargs or ckw) and not isinstance(fn, type):
-        from batcher._internal.errors import PlanError
-
         raise PlanError(
             "fn_constructor_args/fn_constructor_kwargs only apply to a class fn (loaded once "
             f"per worker); got {type(fn).__name__}. Pass a class, or move the values into "

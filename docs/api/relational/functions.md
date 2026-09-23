@@ -67,7 +67,7 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
 
 ## SQL expressions and functions by name
 
-A SQL expression string, or a call to any SQL function by its name, becomes an `Expr` through the same function table `bt.sql` reads. `sql_expr("a + 1 AS b")` covers Spark's `expr` and `selectExpr`, and `call_function("pmod", "a", 3)` reaches a function that has no Python constructor.
+A SQL expression string, or a call to any SQL function by its name, becomes an `Expr` through the same function table {py:obj}`bt.sql <batcher.sql>` reads. `sql_expr("a + 1 AS b")` covers Spark's `expr` and `selectExpr`, and `call_function("pmod", "a", 3)` reaches a function that has no Python constructor.
 
 ```{eval-rst}
 .. autosummary::

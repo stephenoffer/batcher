@@ -42,7 +42,7 @@ print(built.to_pydict()["prompt"][0][:24])
 # Summarize comets using <
 ```
 
-{py:func}`bt.tagged_fields <batcher.tagged_fields>` is the multi-field form of `bt.wrap_tag`: one delimited block per column, so
+{py:func}`bt.tagged_fields <batcher.tagged_fields>` is the multi-field form of {py:obj}`bt.wrap_tag <batcher.wrap_tag>`: one delimited block per column, so
 a value containing punctuation or newlines cannot be mistaken for the next section.
 {py:func}`bt.join_context <batcher.join_context>` is the step between retrieval and generation, folding a list column of
 retrieved passages into one block and dropping the empty entries a short retrieval leaves.
@@ -85,7 +85,7 @@ print(
 )
 ```
 
-When a row does not fit, `bt.truncate_to_token_budget` cuts the tail and {py:func}`bt.truncate_middle <batcher.truncate_middle>`
+When a row does not fit, {py:obj}`bt.truncate_to_token_budget <batcher.truncate_to_token_budget>` cuts the tail and {py:func}`bt.truncate_middle <batcher.truncate_middle>`
 keeps both ends, replacing the middle with a marker. Prefer the middle cut for a contract, a
 transcript, or a log, where the last paragraph is often the one holding the answer.
 
@@ -192,6 +192,6 @@ have to pay for.
 
 - {doc}`calling`: the generation call these prompts feed.
 - {doc}`engines`: which engine applies a chat template, and how the context window is sized.
-- {doc}`/ml/retrieval/rag`: retrieval that produces the context `bt.join_context` folds in.
+- {doc}`/ml/retrieval/rag`: retrieval that produces the context {py:obj}`bt.join_context <batcher.join_context>` folds in.
 - {doc}`/ml/retrieval/llm-evaluation`: the metrics the request and answer pairs feed.
 - {doc}`/ml/preparing/tokenization`: exact token counts when the estimate isn't enough.

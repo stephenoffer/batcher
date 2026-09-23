@@ -82,11 +82,11 @@ verbs.
 | `expr_logic/` | 11 | conditionals, nulls, selectors, horizontal folds, coercion |
 | `dist/` | 10 | mergeable equivalence, partitioning, shuffle, transport, fault tolerance |
 | `expr_collections/` | 10 | lists, structs, maps, JSON, nesting |
+| `graph/` | 10 | degree, components, PageRank, shortest paths, projections, undirected graphs |
 | `expr_numeric/` | 9 | rounding, logs, integer arithmetic, safe division, normalization |
 | `gpu/` | 8 | device selection, parity against the CPU oracle, torch inference |
 | `lakehouse/` | 8 | Delta commits, upserts, time travel, CDC, compaction, backfill |
 | `streams/` | 8 | micro-batches, windows, watermarks, exactly-once, sessions |
-| `graph/` | 8 | degree, components, PageRank, shortest paths, projections |
 | `text_analytics/` | 7 | word frequencies, n-grams, deduplication, corpus statistics |
 | `timeseries_real/` | 7 | resampling, growth, seasonality, cohorts, forecast baselines |
 | `security/` | 6 | column masking, row-level security, residency, audit |

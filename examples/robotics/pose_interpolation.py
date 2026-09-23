@@ -102,6 +102,7 @@ def main() -> None:
     # Each sweep sits exactly halfway between two poses, so both the position and the
     # heading are the midpoint of their bracket.
     assert got["at_tx"] == [2.5, 7.5, 12.5]
+    assert got["at_ty"] == [0.0, 0.5, 2.0]
     for got_heading, want in zip(got["heading"], [0.1, 0.3, 0.5], strict=True):
         assert abs(got_heading - want) < 1e-9, (got_heading, want)
 
@@ -120,6 +121,23 @@ def main() -> None:
     for f, angle in zip(swept_rows["f"], swept_rows["angle"], strict=True):
         assert abs(angle - 1.2 * f) < 1e-9, (f, angle)
     print("\nslerp sweeps the angle at a constant rate across the whole arc")
+
+    # The mistake the module docstring warns about, measured rather than asserted:
+    # interpolate the four components linearly (`quat_angle` normalizes the result) and
+    # the angle lags the clock through the first half of the arc and runs ahead of it
+    # through the second. That error, applied to every point of a sweep, is the bend.
+    t = col("f")
+    componentwise = fine.select(
+        "f",
+        angle=bt.quat_angle(*(col(f"a{n}") + (col(f"b{n}") - col(f"a{n}")) * t for n in "xyzw")),
+    )
+    lerp_rows = componentwise.sort("f").to_pydict()
+    worst = max(
+        abs(angle - 1.2 * frac)
+        for frac, angle in zip(lerp_rows["f"], lerp_rows["angle"], strict=True)
+    )
+    print(f"component-wise interpolation is off by up to {worst:.4f} rad on a 1.2 rad turn")
+    assert worst > 1e-3, "component-wise interpolation should visibly lag slerp"
 
 
 if __name__ == "__main__":

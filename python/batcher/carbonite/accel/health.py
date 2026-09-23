@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
     from batcher._internal.hardware.faults import DeviceFaults
     from batcher._internal.hardware.nvml import DeviceTelemetry
+    from batcher._internal.hardware.telemetry.bottleneck import Bottleneck
 
 __all__ = [
     "HealthThresholds",
@@ -40,6 +41,7 @@ __all__ = [
     "assess_device",
     "assess_faults",
     "assess_fleet",
+    "assess_saturation",
     "configured_thresholds",
     "device_reset_candidates",
     "fault_reasons",
@@ -94,8 +96,17 @@ class HealthVerdict:
         device_index: NVML index of the device.
         uuid: Device UUID, the identifier health history should be keyed on.
         state: `"healthy"`, `"degraded"`, or `"quarantine"`.
-        reasons: Short machine-readable reason codes (`"thermal_throttle"`, `"ecc"`,
-            `"power_clamp"`, `"hot"`, `"memory_full"`), empty when healthy.
+        reasons: Short machine-readable reason codes, empty when healthy. One per condition
+            found, in the order the evidence was folded in, and the list is open by
+            construction: `assess_device` contributes the NVML reading's codes
+            (`"thermal_throttle"`, `"power_clamp"`, `"hot"`, `"memory_full"`, `"ecc"`),
+            `assess_faults` and `xid_verdicts` add the driver's fault codes, `amd_health`
+            adds the Instinct equivalents, and `assess_saturation` appends the windowed
+            verdict's own name. The exhaustive list this replaces was already missing
+            `"results_untrusted"` from `xid_verdicts` below, and both Instinct codes
+            `amd_health` produces (`"engine_uncorrectable"`, `"hbm_uncorrectable"`) — which
+            is why it is a rule now and not a list: the producers are the only place it can
+            be right.
         derate: Fraction of a healthy device's throughput this one should be given work for,
             in [0, 1]. `1.0` when healthy, `0.0` when quarantined.
     """
@@ -198,10 +209,104 @@ def assess_device(
     )
 
 
+#: Windowed verdicts that mean a device has less *throughput* to give than its instantaneous
+#: reading suggests, and the share of it a claimant should assume is actually available.
+#:
+#: `assess_device` reads NVML once. That catches a device clamped at the moment it was asked
+#: and misses one that spent most of a run clamped and recovered before the probe, which is the
+#: common shape — the clamp follows the load, and the load stops when the stage ends. It also
+#: cannot see contention at all: a foreign process computing flat out on a device shows up in
+#: neither `throttle_reasons` nor memory residency until it allocates, so a device already
+#: giving half its throughput to someone else reads perfectly healthy and takes a full share of
+#: co-tenants. `telemetry.bottleneck` answers both from a *window*, and this is where its
+#: verdict becomes a scheduling decision rather than a line in a report.
+#:
+#: Half, for both, because both mean the same thing to a scheduler: roughly half the device's
+#: throughput is not available to the next claimant. They fold in through `min` with every
+#: other derate, so a device that is both clamped and contended is not charged twice.
+_SATURATION_DERATE = {"contended": 0.5, "throttled": 0.5}
+
+#: Confidence below which a windowed verdict does not move a scheduling decision. A verdict's
+#: confidence is how far the winning signal separated from the runner-up, so a low one means
+#: the device was near two limits at once and the classifier picked between them narrowly.
+#: Derating a healthy device costs throughput on every stage that follows, which is the more
+#: expensive error here, so the tie goes to leaving the fleet alone.
+_MIN_VERDICT_CONFIDENCE = 0.25
+
+
+def assess_saturation(
+    verdict: HealthVerdict,
+    bottleneck: Bottleneck | None,
+) -> HealthVerdict:
+    """Fold a device's windowed bottleneck verdict into its health verdict.
+
+    The same shape as `assess_faults`: a pure join of one more piece of evidence onto a verdict
+    already formed, so it stays testable without a device. What it adds is *time* — every other
+    input here is a single reading, and the two conditions it can see (a clamp that came and
+    went, a neighbour computing on the board) are invisible to any single reading.
+
+    A saturated device is **degraded, never quarantined**. It is working correctly and
+    delivering less; taking it out of the fleet would hand the whole device to the process this
+    verdict says is already on it.
+
+    Args:
+        verdict: The verdict formed from telemetry and faults.
+        bottleneck: The device's windowed verdict from `telemetry.bottleneck.classify_device`,
+            or `None` when nothing was sampled.
+
+    Returns:
+        The verdict, derated and with the bottleneck's name appended to its reasons when the
+        window says the device is contended or clamped. Returned unchanged for every other
+        verdict, for a low-confidence one, for `None`, and for a device already quarantined —
+        a device that must not be scheduled has nothing left for this to say.
+    """
+    if bottleneck is None or verdict.state == "quarantine":
+        return verdict
+    share = _SATURATION_DERATE.get(bottleneck.verdict)
+    if share is None or bottleneck.confidence < _MIN_VERDICT_CONFIDENCE:
+        return verdict
+    derate = min(verdict.derate, share)
+    if derate >= verdict.derate and verdict.state == "degraded":
+        return verdict
+    # `"degraded"`, and not via `quarantine_below_derate` like every other verdict here.
+    # That threshold is the operator's line for a device that is *wrong*; this one is
+    # about a device that is merely busy, and an operator who tightens the line to 0.6
+    # for ECC reasons would otherwise find contention silently condemning healthy boards.
+    return HealthVerdict(
+        device_index=verdict.device_index,
+        uuid=verdict.uuid,
+        state="degraded",
+        reasons=(*verdict.reasons, bottleneck.verdict),
+        derate=derate,
+    )
+
+
+def _sampled_bottlenecks() -> tuple[Bottleneck, ...]:
+    """This process's windowed device verdicts, or `()` when nothing has been sampled.
+
+    Best-effort by construction. The sampler is the observability layer's, and a fleet whose
+    dashboard was never started must schedule exactly as it did before — so every failure here
+    resolves to "no window", which `assess_saturation` reads as "no opinion".
+
+    Returns:
+        One verdict per sampled device, empty when nothing was sampled.
+    """
+    try:
+        from batcher.observe.accelerators.diagnosis import device_verdicts
+
+        return device_verdicts()
+    except Exception as exc:  # pragma: no cover - a missing window must never block scheduling
+        from batcher._internal.logging import note_suppressed
+
+        note_suppressed("carbonite", "read the sampled device window", exc)
+        return ()
+
+
 def assess_fleet(
     readings: Sequence[DeviceTelemetry] | None = None,
     thresholds: HealthThresholds | None = None,
     faults: Sequence[DeviceFaults] | None = None,
+    saturation: Sequence[Bottleneck] | None = None,
 ) -> tuple[HealthVerdict, ...]:
     """Verdicts for every device on this host.
 
@@ -211,10 +316,15 @@ def assess_fleet(
         faults: Fault counters to fold in, or `None` to read them live alongside the
             telemetry. Pass `()` to judge on telemetry alone, which is what a caller on a hot
             path wants: the counters cost a second round of NVML calls per device.
+        saturation: Windowed bottleneck verdicts to fold in, or `None` to take this process's
+            sampled window. Pass `()` to judge on the instantaneous readings alone. Unlike the
+            counters this costs no device calls — the window is already being accumulated, or
+            it is empty — so the live default is cheap.
 
     Returns:
-        One verdict per device, empty when telemetry is unavailable. Fault counters are joined
-        by device index, and a device the counters do not cover keeps its telemetry verdict.
+        One verdict per device, empty when telemetry is unavailable. Fault counters and
+        bottleneck verdicts are joined by device index, and a device that neither covers keeps
+        its telemetry verdict.
     """
     live = readings is None
     if readings is None:
@@ -235,12 +345,21 @@ def assess_fleet(
         from batcher._internal.hardware.faults import device_faults
 
         faults = device_faults()
+    if saturation is None:
+        # Only where there are devices to have an opinion about. The sampler lives in the
+        # observability layer, and reaching it costs a ~220 ms package import the first time
+        # — which on a CPU-only box would be 220 ms of a sub-second query's budget spent
+        # learning that a fleet with no accelerators has no saturated ones.
+        saturation = _sampled_bottlenecks() if readings else ()
     by_index = {f.index: f for f in faults}
+    limited = {b.index: b for b in saturation}
     verdicts = []
     for reading in readings:
         verdict = assess_device(reading, thresholds, own_bytes=_own_bytes(live, reading.index))
         fault = by_index.get(reading.index)
-        verdicts.append(assess_faults(verdict, fault, thresholds) if fault else verdict)
+        if fault:
+            verdict = assess_faults(verdict, fault, thresholds)
+        verdicts.append(assess_saturation(verdict, limited.get(reading.index)))
     # The driver's own error log last, because it is the only source that can condemn a
     # device every other reading calls healthy.
     return xid_verdicts(tuple(verdicts), tuple(faults))

@@ -72,7 +72,7 @@ Time travel falls out of that log rather than being a backup feature. Each commi
 
 `merge_on` performs a `MERGE INTO` keyed on the columns you name: matched rows update, the rest insert, in one commit. Doing it as a delete followed by an append is two commits with a window in between where readers see neither version.
 
-That also makes a replay idempotent, which is the mechanism behind exactly-once delivery. An append replayed twice duplicates its rows; a keyed merge replayed twice is a no-op, and `examples/streams/exactly_once_semantics.py` asserts both.
+That also makes a replay idempotent, which is the mechanism behind exactly-once delivery. An append replayed twice duplicates its rows; a keyed merge replayed twice is a no-op, and [`examples/streams/exactly_once_semantics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/exactly_once_semantics.py) asserts both.
 
 ### Maintenance
 
@@ -80,7 +80,7 @@ An incremental writer leaves one small file per commit, and the next write canno
 
 ## Verifying
 
-A write that reports success and a file that holds the right rows are two different claims. Read the output back. Comparing row count, schema and a control total against the source is the only version of "the job worked" that means anything, and `examples/io/write_and_verify.py` does exactly that.
+A write that reports success and a file that holds the right rows are two different claims. Read the output back. Comparing row count, schema and a control total against the source is the only version of "the job worked" that means anything, and [`examples/io/write_and_verify.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/write_and_verify.py) does exactly that.
 
 ## Every script on this page
 
@@ -89,53 +89,54 @@ The table below lists the IO and lakehouse scripts in path order.
 <!-- library-table: io,lakehouse -->
 | Script | Shows |
 | --- | --- |
-| `examples/io/arrow_interop.py` | Moving data in and out of other frameworks, zero-copy where possible |
-| `examples/io/arrow_ipc.py` | Arrow IPC: the format with no conversion cost |
-| `examples/io/binary_and_blobs.py` | Carrying binary payloads through a pipeline without materializing them |
-| `examples/io/cloud_paths.py` | Cloud paths: the schemes, the globs, and what format inference can see |
-| `examples/io/compression_tradeoffs.py` | Compression codecs measured on real data |
-| `examples/io/csv_error_tolerance.py` | Reading text that is not entirely well-formed |
-| `examples/io/csv_from_s3.py` | Reading delimited text from S3, including files that carry no header |
-| `examples/io/csv_roundtrip_and_options.py` | Writing and re-reading CSV, and the fidelity you lose on the way |
-| `examples/io/dataframe_interop.py` | Handing data to and from pandas, Polars, NumPy and Arrow |
-| `examples/io/delta_roundtrip.py` | Delta Lake: transactional appends and overwrites over a real table |
-| `examples/io/delta_time_travel.py` | Reading an earlier version of a Delta table |
-| `examples/io/format_round_trip_matrix.py` | Every writable format, round-tripped and compared |
-| `examples/io/globs_and_multiple_files.py` | Reading many files as one dataset, and what the glob can and cannot cross |
-| `examples/io/images_from_s3.py` | Reading real images from object storage as a table of bytes |
-| `examples/io/json_and_ndjson.py` | JSON on the way out and back, and why newline-delimited is the one to write |
-| `examples/io/lance_and_msgpack.py` | Two less common formats: Lance for vectors, MessagePack for interchange |
-| `examples/io/numpy_arrays.py` | Reading a NumPy array file as a Dataset |
-| `examples/io/orc_and_avro.py` | ORC and Avro: the two formats you meet in someone else's warehouse |
-| `examples/io/parquet_from_s3.py` | Reading Parquet straight from S3, with no download step |
-| `examples/io/parquet_pushdown.py` | Projection and predicate pushdown: reading less of a file, not filtering after it |
-| `examples/io/parquet_roundtrip.py` | Writing and reading Parquet, with partitioning and column pruning |
-| `examples/io/parquet_write_options.py` | Writing Parquet: choosing a compression codec and reading the file back |
-| `examples/io/partitioned_writes.py` | Partitioned output: writing a directory tree a reader can prune |
-| `examples/io/reading_a_directory.py` | Reading a directory of files as one relation, and controlling what is included |
-| `examples/io/reading_from_memory.py` | Constructing a Dataset from data already in the process |
-| `examples/io/reading_with_a_declared_schema.py` | Declaring the schema instead of letting the reader infer it |
-| `examples/io/save_modes.py` | Save modes and write manifests: what happens when the target already exists |
-| `examples/io/save_modes_and_transactional_append.py` | Save modes: overwrite, and why a plain file sink has no append |
-| `examples/io/schema_evolution.py` | Files whose schemas disagree: what the reader does, and what you must do |
-| `examples/io/sources_and_sinks.py` | The source and sink registries: what formats exist, and the objects behind them |
-| `examples/io/sql_database.py` | Reading from a SQL database with a connection URI |
-| `examples/io/streaming_reads.py` | Reading in bounded memory: iter_batches, limits, and lazy metadata |
-| `examples/io/streaming_reads_iter_batches.py` | Reading a large result without materializing it: iter_batches |
-| `examples/io/text_and_binary.py` | The two untyped readers: whole-file bytes and line-by-line text |
-| `examples/io/text_formats.py` | CSV, JSON, and Arrow IPC round trips |
-| `examples/io/write_and_verify.py` | Writing a result and proving what landed on disk |
-| `examples/io/write_modes_and_atomicity.py` | A write that either lands completely or not at all |
-| `examples/io/writing_partitioned_reports.py` | Writing a report partitioned by a business key, and reading one partition back |
-| `examples/io/xml_and_excel.py` | Two formats that arrive from outside engineering: XML and Excel |
-| `examples/lakehouse/change_data_capture.py` | Applying a change feed: inserts, updates and deletes in one commit |
-| `examples/lakehouse/compaction.py` | The small-files problem, and compacting a table that has it |
-| `examples/lakehouse/delta_upserts.py` | MERGE INTO: upserting keyed rows into a Delta table |
-| `examples/lakehouse/partition_backfill.py` | Replacing one partition without touching the rest |
-| `examples/lakehouse/scd_type_two.py` | Slowly changing dimensions: keeping the history of a changed row |
-| `examples/lakehouse/schema_evolution_on_write.py` | Adding a column to a table that already has data |
-| `examples/lakehouse/snapshot_isolation.py` | Snapshot isolation: a reader sees one version, whatever the writer is doing |
-| `examples/lakehouse/table_maintenance.py` | Table maintenance: compaction, vacuum, and the version they cost you |
+| [`examples/io/arrow_interop.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/arrow_interop.py) | Moving data in and out of other frameworks, zero-copy where possible |
+| [`examples/io/arrow_ipc.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/arrow_ipc.py) | Arrow IPC: the format with no conversion cost |
+| [`examples/io/binary_and_blobs.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/binary_and_blobs.py) | Carrying binary payloads through a pipeline without materializing them |
+| [`examples/io/cloud_paths.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/cloud_paths.py) | Cloud paths: the schemes, the globs, and what format inference can see |
+| [`examples/io/compression_tradeoffs.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/compression_tradeoffs.py) | Compression codecs measured on real data |
+| [`examples/io/csv_error_tolerance.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/csv_error_tolerance.py) | Reading text that is not entirely well-formed |
+| [`examples/io/csv_from_s3.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/csv_from_s3.py) | Reading delimited text from S3, including files that carry no header |
+| [`examples/io/csv_roundtrip_and_options.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/csv_roundtrip_and_options.py) | Writing and re-reading CSV, and the fidelity you lose on the way |
+| [`examples/io/dataframe_interop.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/dataframe_interop.py) | Handing data to and from pandas, Polars, NumPy and Arrow |
+| [`examples/io/delta_roundtrip.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/delta_roundtrip.py) | Delta Lake: transactional appends and overwrites over a real table |
+| [`examples/io/delta_time_travel.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/delta_time_travel.py) | Reading an earlier version of a Delta table |
+| [`examples/io/format_round_trip_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/format_round_trip_matrix.py) | Every writable format, round-tripped and compared |
+| [`examples/io/genomics_formats.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/genomics_formats.py) | Reading and writing the genomics formats: FASTA, FASTQ, BED, GFF3, and VCF |
+| [`examples/io/globs_and_multiple_files.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/globs_and_multiple_files.py) | Reading many files as one dataset, and what the glob can and cannot cross |
+| [`examples/io/images_from_s3.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/images_from_s3.py) | Reading real images from object storage as a table of bytes |
+| [`examples/io/json_and_ndjson.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/json_and_ndjson.py) | JSON on the way out and back, and why newline-delimited is the one to write |
+| [`examples/io/lance_and_msgpack.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/lance_and_msgpack.py) | Two less common formats: Lance for vectors, MessagePack for interchange |
+| [`examples/io/numpy_arrays.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/numpy_arrays.py) | Reading a NumPy array file as a Dataset |
+| [`examples/io/orc_and_avro.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/orc_and_avro.py) | ORC and Avro: the two formats you meet in someone else's warehouse |
+| [`examples/io/parquet_from_s3.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/parquet_from_s3.py) | Reading Parquet straight from S3, with no download step |
+| [`examples/io/parquet_pushdown.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/parquet_pushdown.py) | Projection and predicate pushdown: reading less of a file, not filtering after it |
+| [`examples/io/parquet_roundtrip.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/parquet_roundtrip.py) | Writing and reading Parquet, with partitioning and column pruning |
+| [`examples/io/parquet_write_options.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/parquet_write_options.py) | Writing Parquet: choosing a compression codec and reading the file back |
+| [`examples/io/partitioned_writes.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/partitioned_writes.py) | Partitioned output: writing a directory tree a reader can prune |
+| [`examples/io/reading_a_directory.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/reading_a_directory.py) | Reading a directory of files as one relation, and controlling what is included |
+| [`examples/io/reading_from_memory.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/reading_from_memory.py) | Constructing a Dataset from data already in the process |
+| [`examples/io/reading_with_a_declared_schema.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/reading_with_a_declared_schema.py) | Declaring the schema instead of letting the reader infer it |
+| [`examples/io/save_modes.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/save_modes.py) | Save modes and write manifests: what happens when the target already exists |
+| [`examples/io/save_modes_and_transactional_append.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/save_modes_and_transactional_append.py) | Save modes: overwrite, and why a plain file sink has no append |
+| [`examples/io/schema_evolution.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/schema_evolution.py) | Files whose schemas disagree: the three `schema_mode`s, and what each one returns |
+| [`examples/io/sources_and_sinks.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/sources_and_sinks.py) | The source and sink registries: what formats exist, and the objects behind them |
+| [`examples/io/sql_database.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/sql_database.py) | Reading from a SQL database with a connection URI |
+| [`examples/io/streaming_reads.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/streaming_reads.py) | Reading in bounded memory: iter_batches, limits, and lazy metadata |
+| [`examples/io/streaming_reads_iter_batches.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/streaming_reads_iter_batches.py) | Reading a large result without materializing it: iter_batches |
+| [`examples/io/text_and_binary.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/text_and_binary.py) | The two untyped readers: whole-file bytes and line-by-line text |
+| [`examples/io/text_formats.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/text_formats.py) | CSV, JSON, and Arrow IPC round trips |
+| [`examples/io/write_and_verify.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/write_and_verify.py) | Writing a result and proving what landed on disk |
+| [`examples/io/write_modes_and_atomicity.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/write_modes_and_atomicity.py) | A write that either lands completely or not at all |
+| [`examples/io/writing_partitioned_reports.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/writing_partitioned_reports.py) | Writing a report partitioned by a business key, and reading one partition back |
+| [`examples/io/xml_and_excel.py`](https://github.com/stephenoffer/batcher/blob/main/examples/io/xml_and_excel.py) | Two formats that arrive from outside engineering: XML and Excel |
+| [`examples/lakehouse/change_data_capture.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse/change_data_capture.py) | Applying a change feed: inserts, updates and deletes in one commit |
+| [`examples/lakehouse/compaction.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse/compaction.py) | The small-files problem, and compacting a table that has it |
+| [`examples/lakehouse/delta_upserts.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse/delta_upserts.py) | MERGE INTO: upserting keyed rows into a Delta table |
+| [`examples/lakehouse/partition_backfill.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse/partition_backfill.py) | Replacing one partition without touching the rest |
+| [`examples/lakehouse/scd_type_two.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse/scd_type_two.py) | Slowly changing dimensions: keeping the history of a changed row |
+| [`examples/lakehouse/schema_evolution_on_write.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse/schema_evolution_on_write.py) | Adding a column to a table that already has data |
+| [`examples/lakehouse/snapshot_isolation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse/snapshot_isolation.py) | Snapshot isolation: a reader sees one version, whatever the writer is doing |
+| [`examples/lakehouse/table_maintenance.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse/table_maintenance.py) | Table maintenance: compaction, vacuum, and the version they cost you |
 <!-- /library-table -->
 
 ## See also

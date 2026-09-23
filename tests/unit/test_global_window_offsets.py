@@ -411,3 +411,106 @@ def test_the_unoffsettable_functions_are_refused():
             rank_limit=None,
         )
     )
+
+
+def _nth_window(k: int, ignore_nulls: bool = False) -> Window:
+    """A global `Window` computing `nth_value(v, k)` over the default running frame."""
+    from batcher.plan.logical import WindowFrame
+
+    base = _window([("first_value", "v", "r")])
+    spec = WindowFuncSpec(
+        func="nth_value",
+        input=Col("v"),
+        alias="r",
+        offset=k,
+        frame=WindowFrame(None, 0, "range"),
+        ignore_nulls=ignore_nulls,
+    )
+    return Window(
+        input=base.input,
+        partition_keys=(),
+        order_keys=base.order_keys,
+        functions=(spec,),
+        rank_limit=None,
+    )
+
+
+def _nth_oracle(rows: list[tuple[int, float | None]], k: int) -> list:
+    """`nth_value(v, k)` over ``RANGE UNBOUNDED PRECEDING TO CURRENT ROW``, by definition.
+
+    A row's frame ends at its peer group's last row, so the value is the run's k-th row once
+    that many rows are in the frame and NULL before it.
+    """
+    out: list = []
+    for i, (t, _v) in enumerate(rows):
+        end = max(j for j in range(i, len(rows)) if rows[j][0] == t) + 1
+        out.append(rows[k - 1][1] if end >= k else None)
+    return out
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 7, 10, 11])
+@pytest.mark.parametrize("cuts", [[25], [15, 35], [10, 30, 50], [5], [99]])
+def test_running_nth_value_equals_the_whole_relation(k, cuts):
+    """`nth_value(v, k)`: bucket-then-offset == the whole relation, for `k` on every side.
+
+    `k` sweeps a position inside the first bucket, one past it, one inside a tied peer group
+    (`t == 30` spans rows 4-6, so every row of the group turns non-NULL at once), the value
+    that is itself NULL (k=3), the last row, and one past the relation (always NULL). The
+    k-th row lands in a different bucket for each `cuts`, which is the case the carried head
+    exists for: a bucket whose prior buckets hold fewer than `k` rows has to find the rest
+    of them in itself.
+    """
+    rows = list(zip(_T, _V, strict=True))
+    win = _nth_window(k)
+    assert supports_ordered_bucket_offsets(win)
+    helpers = inject_window_helpers(win, {"functions": []})
+    offsets = OrderedBucketOffsets(win, helpers)
+    kernels = {"rows": "row_count", "lrn": "row_number"}
+    got: list = []
+    for br in _buckets(rows, cuts):
+        cols = {
+            "t": pa.array([t for t, _ in br], pa.int64()),
+            "v": pa.array([v for _, v in br], pa.float64()),
+            # The kernel's own per-bucket value: wrong for every bucket but the first, and
+            # overwritten by the walk. NULLs make a leak of it visible.
+            "r": pa.nulls(len(br), pa.float64()),
+        }
+        for role, helper in helpers["r"].items():
+            cols[helper] = pa.array(_kernel(br, kernels[role]), pa.int64())
+        out = offsets.apply(pa.table(cols))
+        assert out.column_names == ["t", "v", "r"], "helper columns leaked"
+        got += out.column("r").to_pylist()
+    assert got == _nth_oracle(rows, k)
+
+
+@pytest.mark.unit
+def test_nth_value_ignoring_nulls_is_refused():
+    """`ignore_nulls` skips rows, so "the k-th row" is no position a helper can name."""
+    win = _nth_window(2, ignore_nulls=True)
+    assert not supports_ordered_bucket_offsets(win, assembled=True)
+    assert unoffsettable_functions(win, assembled=True) == ["nth_value"]
+
+
+@pytest.mark.unit
+def test_first_value_survives_an_empty_first_bucket():
+    """Regression: an empty leading bucket recorded NULL as the relation's first value.
+
+    The range partitioner can hand the walk an empty bucket (a cut below the smallest key),
+    and the carry was set from it -- `None`, not "unset" -- so every later bucket was
+    overwritten with NULL. `_offset_answer` skips empty buckets, so this feeds one directly.
+    """
+    rows = list(zip(_T, _V, strict=True))
+    win = _window([("first_value", "v", "r")])
+    offsets = OrderedBucketOffsets(win, inject_window_helpers(win, {"functions": []}))
+    got: list = []
+    for br in _buckets(rows, [5, 25]):  # bucket 0 is empty
+        table = pa.table(
+            {
+                "t": pa.array([t for t, _ in br], pa.int64()),
+                "v": pa.array([v for _, v in br], pa.float64()),
+                "r": pa.array(_kernel(br, "first_value"), pa.float64()),
+            }
+        )
+        got += offsets.apply(table).column("r").to_pylist()
+    assert got == [_V[0]] * len(_V)

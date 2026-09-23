@@ -33,6 +33,8 @@ Call `fit` on the training split only, then `transform` on both. A `Chain` is it
 {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>`, so it nests. Its steps stay introspectable through `chain[0]` and
 `len(chain)`, which is how you read a fitted step's learned state.
 
+By default `Chain` is built with `cache=True`, which collects the whole training split to the driver once and fits every step against that copy. That trades one source scan per step for holding the split in driver memory, and it means the later fits run single-node. For a large or distributed training set, build the chain with `cache=False` so every step's fit is its own aggregate over the source, routed like any other fit.
+
 ## Sequencing by hand
 
 This is what `Chain` does for you, spelled out once. Fit each step on the previous step's
@@ -95,6 +97,8 @@ JSON rather than a pickle is deliberate. You can review and diff the file, read 
 serving stack in another language, and load it from a store you don't fully control without
 running its code. A cloud URI such as `s3://`, `gs://`, or `abfs://` works wherever a local
 path does.
+
+Every preprocessor that holds only data round-trips exactly, including the learned per-group tables of `GroupImputer` and `GroupStatEncoder`. A preprocessor built around a Python callable, meaning `FunctionTransformer`, `Tokenizer`, or `RFE`, has nothing JSON can hold for that argument, so `save` raises `PlanError` at save time rather than writing a file that `load` can't rebuild.
 
 ## Taking the model with it
 
@@ -186,6 +190,35 @@ yes-or-no question with its own model, and there's no argmax across them.
 The wrapper saves bookkeeping, not compute. Two targets need two fits. Where one shared fit
 can serve several answers, prefer it, as {py:class}`RidgeCV <batcher.ml.linear.RidgeCV>`
 does for a penalty path.
+
+
+## Asking a preprocessor about itself
+
+Every preprocessor answers two questions without being run, which is what a pipeline
+builder, a serializer, or a test needs before it calls `transform`.
+
+{py:obj}`Preprocessor.is_fitted <batcher.ml.Preprocessor>` is `False` until `fit` has run
+and `True` afterwards. It is the check to make before handing a preprocessor to something
+that will call `transform`, because an unfitted one raises rather than guessing.
+{py:meth}`get_params <batcher.ml.Preprocessor>` returns the constructor arguments the
+instance is holding, so a fitted preprocessor can be described, logged, or rebuilt.
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import StandardScaler
+
+ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 10.0]})
+scaler = StandardScaler("x")
+print(scaler.is_fitted, scaler.get_params())
+
+scaler = scaler.fit(ds)
+print(scaler.is_fitted)
+```
+
+`get_params` reports the configuration, never the learned state. The learned values live in
+the trailing-underscore attributes (`mean_`, `scale_`, and so on), which is the same split
+scikit-learn uses, so a parameter grid built from `get_params` cannot accidentally carry a
+fitted model's data.
 
 ## See also
 

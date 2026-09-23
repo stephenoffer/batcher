@@ -13,7 +13,10 @@ __all__ = [
     "normalize_resources",
     "normalize_retry",
     "require_number",
+    "validate_bindings",
+    "validate_column_list",
     "validate_fn",
+    "validate_num_workers",
     "validate_output_columns",
     "warn_async_combos",
     "warn_if_model_reloads",
@@ -149,6 +152,71 @@ def validate_output_columns(
         if name in seen:
             raise PlanError(f"{param} has a duplicate column name {name!r}")
         seen.add(name)
+
+
+def validate_bindings(
+    fn_args: object, fn_kwargs: object, ctor_args: object, ctor_kwargs: object
+) -> None:
+    """Reject argument bindings of the wrong shape at the API edge, naming the parameter.
+
+    ``fn_args=5`` raised Python's ``'int' object is not iterable`` from inside the binder,
+    and ``fn_kwargs=[1]`` was accepted and failed only in a worker, on the first batch, as
+    ``argument after ** must be a mapping``. A string is refused as positional arguments
+    even though it is iterable, because ``fn_args="abc"`` binds three one-letter arguments.
+    """
+    from batcher._internal.errors import PlanError
+
+    for param, value in (("fn_args", fn_args), ("fn_constructor_args", ctor_args)):
+        if value is not None and (
+            isinstance(value, str | bytes) or not isinstance(value, tuple | list)
+        ):
+            raise PlanError(
+                f"{param} must be a tuple of positional arguments, e.g. {param}=(10,), got "
+                f"{type(value).__name__} {value!r}"
+            )
+    for param, value in (("fn_kwargs", fn_kwargs), ("fn_constructor_kwargs", ctor_kwargs)):
+        if value is None:
+            continue
+        if not isinstance(value, dict) or not all(isinstance(k, str) for k in value):
+            raise PlanError(
+                f"{param} must be a dict of keyword arguments with string keys, e.g. "
+                f"{param}={{'k': 1}}, got {type(value).__name__} {value!r}"
+            )
+
+
+def validate_column_list(
+    names: object, available: list[str] | None, *, param: str, verb: str
+) -> None:
+    """Reject an `input_columns`/`preserves_columns` value that is not a list of known names.
+
+    Both declarations steer the optimizer, so a wrong one is a wrong plan rather than a
+    harmless hint: an unknown name in `input_columns` prunes nothing it should, and an
+    unknown one in `preserves_columns` claims a column the stage never sees. A bare string
+    is refused rather than iterated, since ``input_columns="ab"`` would read as two columns.
+    `available` is `None` when the input's columns are unknown without IO, and then only
+    the shape is checked.
+    """
+    if names is None:
+        return
+    from batcher._internal.errors import ColumnNotFoundError, PlanError
+
+    if isinstance(names, str) or not isinstance(names, list | tuple):
+        raise PlanError(
+            f"{verb}({param}=...) must be a list of column names, e.g. {param}=['x'], got "
+            f"{type(names).__name__} {names!r}"
+        )
+    for name in names:
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"{verb}({param}=...) must hold non-empty strings, got {name!r}")
+        if available is not None and name not in available:
+            raise ColumnNotFoundError.of(name, sorted(available), where=f"in {verb}({param}=...)")
+
+
+def validate_num_workers(num_workers: object) -> None:
+    """Reject an explicit worker count below one, which used to be clamped to one in silence."""
+    if num_workers == "auto" or isinstance(num_workers, str):
+        return  # "auto", or a string `resolve_num_workers` refuses with its own message
+    require_number(num_workers, param="num_workers", minimum=1, whole=True)
 
 
 def warn_async_combos(fn: object, multiprocessing: bool, num_gpus: float) -> None:

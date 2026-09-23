@@ -18,43 +18,43 @@ The following table maps the 37 names on `SparkSession`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `active` | `bt.current_session` | canonical |  |
+| `active` | {py:obj}`bt.current_session <batcher.current_session>` | canonical |  |
 | `addArtifact` | n/a | out of scope | Declined: Spark Connect artifact upload to a remote server. |
 | `addArtifacts` | n/a | out of scope | Declined: Spark Connect artifact upload to a remote server. |
 | `addTag` | n/a | gap | Not yet: session operation tags. Wave W9. |
-| `Builder` | `bt.Session` + `bt.set_config` | canonical |  |
-| `builder` | `bt.Session` + `bt.set_config` | canonical |  |
+| `Builder` | {py:obj}`bt.Session <batcher.Session>` + {py:obj}`bt.set_config <batcher.set_config>` | canonical |  |
+| `builder` | {py:obj}`bt.Session <batcher.Session>` + {py:obj}`bt.set_config <batcher.set_config>` | canonical |  |
 | `catalog` | `Session.catalog` | canonical |  |
 | `clearProgressHandlers` | n/a | gap | Not yet: query progress handler registry for batch queries. Wave W10. |
 | `clearTags` | n/a | gap | Not yet: session operation tags. Wave W9. |
 | `client` | n/a | out of scope | Declined: Spark Connect client handle. |
-| `conf` | `batcher.config.get_option` + `batcher.config.set_option` | canonical |  |
+| `conf` | {py:obj}`batcher.config.get_option <batcher.config.get_option>` + {py:obj}`batcher.config.set_option <batcher.config.set_option>` | canonical |  |
 | `copyFromLocalToFs` | n/a | out of scope | Declined: Spark Connect local-to-server file copy. |
-| `createDataFrame` | `bt.from_pylist` + `bt.from_pandas` + `bt.from_arrow` | param | Missing: one constructor taking rows/tuples/pandas/Arrow with schema= as StructType, DDL string or column-name list. Wave W2. |
-| `dataSource` | `batcher.io.SOURCES` | param | Missing: register a Python DataSource class by name (dataSource.register). Wave W11. |
-| `emptyDataFrame` | `bt.from_pydict` | param | Missing: an empty Dataset from a Spark StructType schema; bt.from\_pydict(\{\}, schema=...) takes a pyarrow.Schema. Wave W2. |
-| `getActiveSession` | `bt.current_session` | canonical |  |
+| `createDataFrame` | {py:obj}`bt.from_pylist <batcher.from_pylist>` + {py:obj}`bt.from_pandas <batcher.from_pandas>` + {py:obj}`bt.from_arrow <batcher.from_arrow>` | param | Missing: one constructor taking rows/tuples/pandas/Arrow with schema= as StructType, DDL string or column-name list. Wave W2. |
+| `dataSource` | {py:obj}`batcher.io.SOURCES <batcher.io.SOURCES>` | param | Missing: register a Python DataSource class by name (dataSource.register). Wave W11. |
+| `emptyDataFrame` | {py:obj}`bt.from_pydict <batcher.from_pydict>` | param | Missing: an empty Dataset from a Spark StructType schema; bt.from\_pydict(\{\}, schema=...) takes a pyarrow.Schema. Wave W2. |
+| `getActiveSession` | {py:obj}`bt.current_session <batcher.current_session>` | canonical |  |
 | `getTags` | n/a | gap | Not yet: session operation tags. Wave W9. |
-| `interruptAll` | `bt.running_queries` + `bt.cancel_query` | canonical |  |
-| `interruptOperation` | `bt.cancel_query` | canonical |  |
+| `interruptAll` | {py:obj}`bt.running_queries <batcher.running_queries>` + {py:obj}`bt.cancel_query <batcher.cancel_query>` | canonical |  |
+| `interruptOperation` | {py:obj}`bt.cancel_query <batcher.cancel_query>` | canonical |  |
 | `interruptTag` | n/a | gap | Not yet: cancel operations by session tag. Wave W9. |
-| `newSession` | `bt.Session` | canonical |  |
+| `newSession` | {py:obj}`bt.Session <batcher.Session>` | canonical |  |
 | `profile` | n/a | gap | Not yet: UDF performance and memory profiler results. Wave W11. |
-| `range` | `bt.range` | canonical |  |
-| `read` | `bt.read` | canonical |  |
-| `readStream` | `bt.read` | canonical |  |
+| `range` | {py:obj}`bt.range <batcher.range>` | canonical |  |
+| `read` | {py:obj}`bt.read <batcher.read>` | canonical |  |
+| `readStream` | {py:obj}`bt.read <batcher.read>` | canonical |  |
 | `registerProgressHandler` | n/a | gap | Not yet: query progress handler registry for batch queries. Wave W10. |
 | `removeProgressHandler` | n/a | gap | Not yet: query progress handler registry for batch queries. Wave W10. |
 | `removeTag` | n/a | gap | Not yet: session operation tags. Wave W9. |
 | `sparkContext` | n/a | out of scope | Declined: no RDD or JVM context. |
 | `sql` | `Session.sql` | param | Missing: args= parameter markers (named :param and positional ?). Wave W2. |
-| `stop` | `bt.release_cluster` | canonical |  |
-| `streams` | `bt.streams` + `bt.await_any_termination` | canonical |  |
+| `stop` | {py:obj}`bt.release_cluster <batcher.release_cluster>` | canonical |  |
+| `streams` | {py:obj}`bt.streams <batcher.streams>` + {py:obj}`bt.await_any_termination <batcher.await_any_termination>` | canonical |  |
 | `table` | `Session.table` | canonical |  |
 | `tvf` | n/a | gap | Not yet: table-valued function namespace (range, explode, inline, ...). Wave W11. |
-| `udf` | `bt.register_function` | canonical |  |
+| `udf` | {py:obj}`bt.register_function <batcher.register_function>` | canonical |  |
 | `udtf` | `Session.register_function` | param | Missing: UDTF class protocol (eval/terminate/analyze) registered with table=True. Wave W11. |
-| `version` | `bt.engine_version` | canonical |  |
+| `version` | {py:obj}`bt.engine_version <batcher.engine_version>` | canonical |  |
 
 ## `Catalog`
 
@@ -64,7 +64,7 @@ The following table maps the 37 names on `Catalog`, sorted alphabetically.
 |---|---|---|---|
 | `analyzeTable` | n/a | gap | Not yet: catalog API: compute table statistics. Wave W9. |
 | `cacheTable` | `Session.table` | param | Missing: port as session.table(name).cache(). Wave W9. |
-| `clearCache` | `bt.clear_cache` | canonical |  |
+| `clearCache` | {py:obj}`bt.clear_cache <batcher.clear_cache>` | canonical |  |
 | `createDatabase` | `Session.catalog.create_namespace` | canonical |  |
 | `createExternalTable` | `Session.register` | param | Missing: a table over a path is registered as a view of bt.read(path). Wave W9. |
 | `createTable` | `Session.catalog.create_table` | param | Missing: Spark's path= and source= for an external table. Wave W9. |
@@ -93,7 +93,7 @@ The following table maps the 37 names on `Catalog`, sorted alphabetically.
 | `recoverPartitions` | n/a | gap | Not yet: catalog API: recover partitions from storage. Wave W9. |
 | `refreshByPath` | n/a | gap | Not yet: catalog API: invalidate cached data under a path. Wave W9. |
 | `refreshTable` | n/a | gap | Not yet: catalog API: invalidate a table's cached metadata. Wave W9. |
-| `registerFunction` | `bt.register_function` | canonical |  |
+| `registerFunction` | {py:obj}`bt.register_function <batcher.register_function>` | canonical |  |
 | `setCurrentCatalog` | `Session.catalog.use` | canonical |  |
 | `setCurrentDatabase` | `Session.catalog.use` | canonical |  |
 | `tableExists` | `Session.catalog.has_table` | canonical |  |
@@ -106,11 +106,11 @@ The following table maps the 5 names on `RuntimeConfig`, sorted alphabetically.
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `get` | `batcher.config.get_option` | canonical |  |
-| `getAll` | `batcher.config.option_names` + `batcher.config.get_option` | canonical |  |
+| `get` | {py:obj}`batcher.config.get_option <batcher.config.get_option>` | canonical |  |
+| `getAll` | {py:obj}`batcher.config.option_names <batcher.config.option_names>` + {py:obj}`batcher.config.get_option <batcher.config.get_option>` | canonical |  |
 | `isModifiable` | n/a | gap | Not yet: report whether a config key can be changed at runtime. Wave W9. |
-| `set` | `batcher.config.set_option` | canonical |  |
-| `unset` | `batcher.config.reset_option` | canonical |  |
+| `set` | {py:obj}`batcher.config.set_option <batcher.config.set_option>` | canonical |  |
+| `unset` | {py:obj}`batcher.config.reset_option <batcher.config.reset_option>` | canonical |  |
 
 ## `UDFRegistration`
 
@@ -118,7 +118,7 @@ The following table maps the 3 names on `UDFRegistration`, sorted alphabetically
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `register` | `bt.register_function` | canonical |  |
+| `register` | {py:obj}`bt.register_function <batcher.register_function>` | canonical |  |
 | `registerJavaFunction` | n/a | out of scope | Declined: JVM UDF registration; no JVM. |
 | `registerJavaUDAF` | n/a | out of scope | Declined: JVM UDAF registration; no JVM. |
 
@@ -128,7 +128,7 @@ The following table maps the 1 names on `UDTFRegistration`, sorted alphabeticall
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `register` | `bt.register_function` | param | Missing: UDTF class protocol (eval/terminate/analyze) registered with table=True. Wave W11. |
+| `register` | {py:obj}`bt.register_function <batcher.register_function>` | param | Missing: UDTF class protocol (eval/terminate/analyze) registered with table=True. Wave W11. |
 
 ## `StreamingQuery`
 
@@ -155,9 +155,17 @@ The following table maps the 6 names on `StreamingQueryManager`, sorted alphabet
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `active` | `bt.streams` | canonical |  |
-| `addListener` | `bt.add_streaming_listener` | canonical |  |
-| `awaitAnyTermination` | `bt.await_any_termination` | canonical |  |
+| `active` | {py:obj}`bt.streams <batcher.streams>` | canonical |  |
+| `addListener` | {py:obj}`bt.add_streaming_listener <batcher.add_streaming_listener>` | canonical |  |
+| `awaitAnyTermination` | {py:obj}`bt.await_any_termination <batcher.await_any_termination>` | canonical |  |
 | `get` | n/a | gap | Not yet: look up an active streaming query by id. Wave W10. |
-| `removeListener` | `bt.remove_streaming_listener` | canonical |  |
-| `resetTerminated` | `bt.reset_terminated` | canonical |  |
+| `removeListener` | {py:obj}`bt.remove_streaming_listener <batcher.remove_streaming_listener>` | canonical |  |
+| `resetTerminated` | {py:obj}`bt.reset_terminated <batcher.reset_terminated>` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

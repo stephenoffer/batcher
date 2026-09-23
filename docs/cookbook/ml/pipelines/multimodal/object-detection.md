@@ -91,6 +91,48 @@ patches.select("path", "patch").write.parquet("s3://bucket/crops.parquet")
 
 A window that runs past an edge is clipped to what exists rather than padded, because a crop is something you look at and inventing black pixels invents data. A window that is null, negative, empty, or entirely outside the image nulls **that row only**, which is why the `filter` above is a cheap tidy-up rather than a rescue: a detector that declines to predict on some frames costs you those rows and nothing else.
 
+The detector needs a GPU, but that last claim does not, so it is checked here on a 32x32 image and three boxes, the third of which sits entirely outside it:
+
+```python
+import base64
+
+import batcher as bt
+from batcher import col
+
+# A 32x32 PNG, inline so this runs anywhere.
+image = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGO4o6FBU8QwasGoBaMW"
+    "jFowasGoBaMWjFowasGoBaMWDBULAIahsD2ItTF0AAAAAElFTkSuQmCC"
+)
+shots = bt.from_pydict(
+    {
+        "path": ["a.png"],
+        "bytes": [image],
+        "boxes": [
+            [
+                {"x": 0, "y": 0, "w": 8, "h": 8},
+                {"x": 8, "y": 8, "w": 16, "h": 16},
+                {"x": 100, "y": 100, "w": 4, "h": 4},  # entirely outside
+            ]
+        ],
+    }
+)
+cropped = shots.explode("boxes").with_columns(
+    patch=col("bytes").image.crop(
+        col("boxes").struct.field("x"),
+        col("boxes").struct.field("y"),
+        col("boxes").struct.field("w"),
+        col("boxes").struct.field("h"),
+    )
+)
+print(cropped.select(ok=col("patch").is_not_null()).to_pydict())
+# {'ok': [True, True, False]}
+print(cropped.filter(col("patch").is_not_null()).count())
+# 2
+```
+
+One row lost, the other two intact, and no exception.
+
 The result is encoded bytes, because the boxes genuinely differ in size. Feed a second-stage model by putting them back on one shape:
 
 ```python
