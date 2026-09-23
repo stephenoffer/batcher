@@ -840,17 +840,6 @@ pub fn range_part_of_bytes(
     )
 }
 
-/// [`range_part_of_bytes`] for `String` boundaries — see [`range_partition_by_str_key`].
-pub fn range_part_of_str(
-    key_col: &ArrayRef,
-    boundaries: &[String],
-    n_buckets: usize,
-    nulls_first: bool,
-    descending: bool,
-) -> Result<Vec<u32>, RuntimeError> {
-    range_part_of_bytes(key_col, boundaries, n_buckets, nulls_first, descending)
-}
-
 /// Route every row of a byte-key column against ascending `boundaries`.
 ///
 /// `partition_point(|b| b <= v)` routes a value equal to a boundary consistently to the
@@ -1972,7 +1961,7 @@ mod tests {
             let probs: Vec<f64> = (1..buckets).map(|i| i as f64 / buckets as f64).collect();
             let mut bounds = string_quantiles(&key, &probs).unwrap();
             bounds.dedup();
-            let part_of = range_part_of_str(&key, &bounds, buckets, false, false).unwrap();
+            let part_of = range_part_of_bytes(&key, &bounds, buckets, false, false).unwrap();
             // Concatenate the buckets in order, sorting within each, and compare against
             // one global sort of the whole column.
             let mut concat: Vec<&String> = Vec::new();
@@ -2088,7 +2077,7 @@ mod tests {
         let words: Vec<String> = (0..300).map(|i| format!("v{}", i % 5)).collect();
         let key: ArrayRef = Arc::new(StringArray::from(words.clone()));
         let bounds = string_quantiles(&key, &[0.25, 0.5, 0.75]).unwrap();
-        let part_of = range_part_of_str(&key, &bounds, 4, false, false).unwrap();
+        let part_of = range_part_of_bytes(&key, &bounds, 4, false, false).unwrap();
         let mut of_word = std::collections::HashMap::new();
         for (w, b) in words.iter().zip(&part_of) {
             assert_eq!(
@@ -2158,11 +2147,11 @@ mod tests {
         assert!(string_quantiles(&all_null, &[0.5]).unwrap().is_empty());
         let bounds = vec!["b".to_string()];
         assert_eq!(
-            range_part_of_str(&key, &bounds, 4, true, false).unwrap()[1],
+            range_part_of_bytes(&key, &bounds, 4, true, false).unwrap()[1],
             0
         );
         assert_eq!(
-            range_part_of_str(&key, &bounds, 4, false, false).unwrap()[1],
+            range_part_of_bytes(&key, &bounds, 4, false, false).unwrap()[1],
             3
         );
     }
