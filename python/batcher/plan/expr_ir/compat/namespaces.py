@@ -28,14 +28,17 @@ from typing import TYPE_CHECKING
 from batcher._internal.errors import require_int
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from batcher.plan.expr_ir.core import Expr
     from batcher.plan.expr_ir.func_nodes import ListGet, StrFunc
+    from batcher.plan.expr_ir.namespaces import _DtNamespace, _ListNamespace, _StrNamespace
 
 __all__ = ["bind_namespace_compat"]
 
 
 # --- .str: the Python `str` predicate names -----------------------------------------
-def isdigit(self: object) -> Expr:
+def isdigit(self: _StrNamespace) -> Expr:
     """True where every character is a digit — the Python ``str.isdigit`` spelling.
 
     Matches Python exactly, including the empty-string and mixed-content cases.
@@ -51,10 +54,10 @@ def isdigit(self: object) -> Expr:
             >>> ds.select(r=bt.col("s").str.isdigit()).to_pydict()
             {'r': [True, False]}
     """
-    return self.is_numeric()  # type: ignore[attr-defined]
+    return self.is_numeric()
 
 
-def isalpha(self: object) -> Expr:
+def isalpha(self: _StrNamespace) -> Expr:
     """True where every character is a letter — the Python ``str.isalpha`` spelling.
 
     Returns:
@@ -68,10 +71,10 @@ def isalpha(self: object) -> Expr:
             >>> ds.select(r=bt.col("s").str.isalpha()).to_pydict()
             {'r': [True, False]}
     """
-    return self.is_alpha()  # type: ignore[attr-defined]
+    return self.is_alpha()
 
 
-def isalnum(self: object) -> Expr:
+def isalnum(self: _StrNamespace) -> Expr:
     """True where every character is a letter or digit — the Python ``str.isalnum`` spelling.
 
     Returns:
@@ -85,10 +88,10 @@ def isalnum(self: object) -> Expr:
             >>> ds.select(r=bt.col("s").str.isalnum()).to_pydict()
             {'r': [True, False]}
     """
-    return self.is_alnum()  # type: ignore[attr-defined]
+    return self.is_alnum()
 
 
-def isspace(self: object) -> Expr:
+def isspace(self: _StrNamespace) -> Expr:
     """True where every character is whitespace — the Python ``str.isspace`` spelling.
 
     Returns:
@@ -102,10 +105,10 @@ def isspace(self: object) -> Expr:
             >>> ds.select(r=bt.col("s").str.isspace()).to_pydict()
             {'r': [True, False]}
     """
-    return self.is_space()  # type: ignore[attr-defined]
+    return self.is_space()
 
 
-def strip_prefix(self: object, prefix: str) -> StrFunc:
+def strip_prefix(self: _StrNamespace, prefix: str) -> StrFunc:
     """Remove `prefix` if present — the Polars ``strip_prefix`` spelling of `removeprefix`.
 
     Args:
@@ -122,10 +125,10 @@ def strip_prefix(self: object, prefix: str) -> StrFunc:
             >>> ds.select(r=bt.col("s").str.strip_prefix("ab")).to_pydict()
             {'r': ['cd', 'xcd']}
     """
-    return self.removeprefix(prefix)  # type: ignore[attr-defined]
+    return self.removeprefix(prefix)
 
 
-def strip_suffix(self: object, suffix: str) -> StrFunc:
+def strip_suffix(self: _StrNamespace, suffix: str) -> StrFunc:
     """Remove `suffix` if present — the Polars ``strip_suffix`` spelling of `removesuffix`.
 
     Args:
@@ -142,11 +145,11 @@ def strip_suffix(self: object, suffix: str) -> StrFunc:
             >>> ds.select(r=bt.col("s").str.strip_suffix("cd")).to_pydict()
             {'r': ['ab', 'abx']}
     """
-    return self.removesuffix(suffix)  # type: ignore[attr-defined]
+    return self.removesuffix(suffix)
 
 
 # --- .dt: the snake_case spellings ---------------------------------------------------
-def day_of_week(self: object) -> Expr:
+def day_of_week(self: _DtNamespace) -> Expr:
     """Day of week, Sunday=0 to Saturday=6 — the snake_case spelling of `dayofweek`.
 
     This is the DuckDB ``dayofweek`` convention, not the ISO one. For ISO numbering
@@ -164,10 +167,10 @@ def day_of_week(self: object) -> Expr:
             >>> ds.select(r=bt.col("d").dt.day_of_week()).to_pydict()
             {'r': [0]}
     """
-    return self.dayofweek()  # type: ignore[attr-defined]
+    return self.dayofweek()
 
 
-def day_of_year(self: object) -> Expr:
+def day_of_year(self: _DtNamespace) -> Expr:
     """Day of year, 1-366 — the snake_case spelling of `dayofyear`.
 
     Returns:
@@ -182,10 +185,10 @@ def day_of_year(self: object) -> Expr:
             >>> ds.select(r=bt.col("d").dt.day_of_year()).to_pydict()
             {'r': [46]}
     """
-    return self.dayofyear()  # type: ignore[attr-defined]
+    return self.dayofyear()
 
 
-def week_of_year(self: object) -> Expr:
+def week_of_year(self: _DtNamespace) -> Expr:
     """ISO week number, 1-53 — the snake_case spelling of `weekofyear`.
 
     Returns:
@@ -200,11 +203,11 @@ def week_of_year(self: object) -> Expr:
             >>> ds.select(r=bt.col("d").dt.week_of_year()).to_pydict()
             {'r': [7]}
     """
-    return self.weekofyear()  # type: ignore[attr-defined]
+    return self.weekofyear()
 
 
 # --- .list: the Polars/PySpark/numpy spellings ---------------------------------------
-def lengths(self: object) -> Expr:
+def lengths(self: _ListNamespace) -> Expr:
     """Element count per list — the legacy Polars ``lengths`` spelling of `len`.
 
     Returns:
@@ -218,10 +221,10 @@ def lengths(self: object) -> Expr:
             >>> ds.select(r=bt.col("l").list.lengths()).to_pydict()
             {'r': [3, 1]}
     """
-    return self.len()  # type: ignore[attr-defined]
+    return self.len()
 
 
-def element_at(self: object, index: int) -> ListGet:
+def element_at(self: _ListNamespace, index: int) -> ListGet:
     """Element at `index` — the PySpark ``element_at`` spelling of `get`.
 
     Args:
@@ -239,10 +242,10 @@ def element_at(self: object, index: int) -> ListGet:
             {'r': [20]}
     """
     index = require_int(index, func="list.element_at", arg="index")
-    return self.get(index)  # type: ignore[attr-defined]
+    return self.get(index)
 
 
-def argmin(self: object) -> Expr:
+def argmin(self: _ListNamespace) -> Expr:
     """Index of the smallest element — the numpy ``argmin`` spelling of `arg_min`.
 
     Returns:
@@ -256,10 +259,10 @@ def argmin(self: object) -> Expr:
             >>> ds.select(r=bt.col("l").list.argmin()).to_pydict()
             {'r': [1]}
     """
-    return self.arg_min()  # type: ignore[attr-defined]
+    return self.arg_min()
 
 
-def argmax(self: object) -> Expr:
+def argmax(self: _ListNamespace) -> Expr:
     """Index of the largest element — the numpy ``argmax`` spelling of `arg_max`.
 
     Returns:
@@ -273,11 +276,11 @@ def argmax(self: object) -> Expr:
             >>> ds.select(r=bt.col("l").list.argmax()).to_pydict()
             {'r': [0]}
     """
-    return self.arg_max()  # type: ignore[attr-defined]
+    return self.arg_max()
 
 
 # Accessor class attribute on `Expr` → the aliases to bind onto that namespace.
-_BINDINGS: dict[str, tuple[object, ...]] = {
+_BINDINGS: dict[str, tuple[Callable[..., Expr], ...]] = {
     "str": (isdigit, isalpha, isalnum, isspace, strip_prefix, strip_suffix),
     "dt": (day_of_week, day_of_year, week_of_year),
     "list": (lengths, element_at, argmin, argmax),
@@ -303,7 +306,7 @@ def bind_namespace_compat() -> None:
     for accessor, funcs in _BINDINGS.items():
         cls = classes[accessor]
         for func in funcs:
-            func.__qualname__ = f"{cls.__name__}.{func.__name__}"  # type: ignore[attr-defined]
+            func.__qualname__ = f"{cls.__name__}.{func.__name__}"
             # Move `__module__` with `__qualname__`, so Sphinx can resolve the accessor
             # class where it is actually defined. See the note in `compat/binder.py`.
             func.__module__ = cls.__module__

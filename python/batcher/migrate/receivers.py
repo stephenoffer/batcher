@@ -302,7 +302,7 @@ def _dotted(node: cst.BaseExpression) -> str | None:
 
 def _module_statements(module: cst.Module) -> Iterator[cst.BaseSmallStatement]:
     """Every small statement at module level, including inside `if TYPE_CHECKING:`/`try`."""
-    for stmt in _walk_statements(module):  # type: ignore[arg-type]
+    for stmt in _walk_statements(module):
         yield from stmt.body
 
 
@@ -374,8 +374,8 @@ def _seed_from(
     bt_members: frozenset[str],
     seeds: Seeds,
 ) -> None:
-    name = alias.name.value  # type: ignore[union-attr]
-    bound = alias.asname.name.value if alias.asname else name  # type: ignore[union-attr]
+    name = alias.name.value
+    bound = alias.asname.name.value if alias.asname else name
     if f"{source}.{name}" in seeds.modules:
         scope.bind(bound, seeds.modules[f"{source}.{name}"])
     elif not seeds.batcher and source in seeds.modules:
@@ -507,7 +507,7 @@ def infer_module(
     for name, receiver in (imported or {}).items():
         top.bind(name, FunctionRef(receiver))
     top_inference = Inference(returns, top, seeds, members)
-    _bind_body(module, top_inference)  # type: ignore[arg-type]
+    _bind_body(module, top_inference)
     functions = _all_functions(module, seeds)
     # Fixtures and helpers: a same-file function returning one receiver types parameters
     # that share its name.
