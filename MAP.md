@@ -2657,7 +2657,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | module | lines | what it is |
 |---|---|---|
 | `hardware_scope.py` | 184 | Scoping learned parameters to the machine that measured them. |
-| `hub.py` | 466 | `MetadataHub` — the façade over a `MetadataBackend`. |
+| `hub.py` | 465 | `MetadataHub` — the façade over a `MetadataBackend`. |
 | `io_stats.py` | 249 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `params.py` | 352 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
 | `smoothed.py` | 371 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
