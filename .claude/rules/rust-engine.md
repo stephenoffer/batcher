@@ -36,8 +36,6 @@ near-leaves (nothing but `bc-arrow`, the DAG's root, below them), pulled in wher
                   which everything links, so a cloud SDK here would put tokio + a TLS
                   stack into builds that never resolve a secret. External key stores
                   are reached via `cmd:` or a host-registered backend.
-  bc-udf       → (nothing depends on it yet — the UDF/inference plane is not
-                  wired into bc-py; do not assume it is on a live path)
 ```
 
 Two things this picture gets right that the shorter `bc-arrow → bc-expr → bc-ir →

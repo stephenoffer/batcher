@@ -1,9 +1,8 @@
 """ML data plane — actor-pool batch inference, training ingest, and preprocessing.
 
 Control-plane orchestration (model-once-per-worker pools, dynamic batching) over whole
-Arrow batches; the native-pipeline foundation lives in the Rust `bc-udf` crate. Also
-re-exports the sklearn-style `Preprocessor` family, whose `fit` learns state with one
-mergeable aggregate and whose `transform` is a lazy `Expr` projection.
+Arrow batches. Also re-exports the sklearn-style `Preprocessor` family, whose `fit` learns
+state with one mergeable aggregate and whose `transform` is a lazy `Expr` projection.
 """
 
 from __future__ import annotations
