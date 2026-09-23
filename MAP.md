@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1509 Python modules across 217 packages and 301 Rust files across 15 crates.
+Covering 1510 Python modules across 217 packages and 302 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -854,7 +854,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `agg_rewrites.py` | 156 | Aggregate pre-pass rewrites for the SQL translator. |
 | `ai_functions.py` | 263 | Generative AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT``. |
 | `clauses.py` | 634 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
-| `core_utils.py` | 668 | Small stateless AST helpers shared across translator theme modules. |
+| `core_utils.py` | 691 | Small stateless AST helpers shared across translator theme modules. |
 | `from_clause.py` | 635 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 538 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 321 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
@@ -940,7 +940,7 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 3196 | The distributed executor — the dispatcher. |
+| `executor.py` | 3202 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 893 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 560 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
@@ -970,7 +970,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 874 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3293 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3313 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 550 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 715 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1054,10 +1054,11 @@ The *global* (no-``PARTITION BY``) ordered window, in bounded memory and across 
 
 | module | lines | what it is |
 |---|---|---|
+| `admission.py` | 300 | Which global windows the ordered-bucket algebra covers, and why the rest are refused. |
 | `boundary.py` | 123 | The one ordered-bucket correction that reads a *neighbouring* bucket's rows. |
 | `disk.py` | 191 | Distributed *global* ordered window over a disk Arrow-IPC shuffle. |
 | `flight.py` | 303 | Distributed *global* (no-``PARTITION BY``) ordered window over an Arrow Flight shuffle. |
-| `offsets.py` | 775 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
+| `offsets.py` | 596 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
 | `stream.py` | 103 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window, on one node. |
 
 ### `batcher/dist/gpu/` — 4 · backend
@@ -1245,7 +1246,7 @@ Kyber rule modules.
 | `fusion.py` | 396 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
 | `leaf_rewrite.py` | 312 | The shared machinery every leaf-level expression rule is built from. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
-| `projections.py` | 885 | Projection rewrites — collapse stacked projections and prune unread columns. |
+| `projections.py` | 898 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 637 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 574 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
@@ -1837,11 +1838,11 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 
 | module | lines | what it is |
 |---|---|---|
-| `_blocks.py` | 200 | Line blocks as Arrow arrays — the one line splitter every genomics reader shares. |
+| `_blocks.py` | 222 | Line blocks as Arrow arrays — the one line splitter every genomics reader shares. |
 | `_tsv.py` | 234 | The comment-skipping TSV engine BED, GFF, and VCF share. |
 | `bed.py` | 221 | BED format — genomic intervals, the coordinate currency of every annotation track. |
-| `fasta.py` | 237 | FASTA format — the reference-sequence interchange format, as `{id, description, sequence}`. |
-| `fastq.py` | 220 | FASTQ format — sequencing reads as `{id, description, sequence, quality}`. |
+| `fasta.py` | 227 | FASTA format — the reference-sequence interchange format, as `{id, description, sequence}`. |
+| `fastq.py` | 215 | FASTQ format — sequencing reads as `{id, description, sequence, quality}`. |
 | `gff.py` | 127 | GFF3 and GTF format — genome annotations, nine tab-separated columns. |
 | `vcf.py` | 202 | VCF format — variant calls, the output every variant caller agrees to write. |
 
@@ -3027,12 +3028,13 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `par.rs` | 3442 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
-| `stream/breaker.rs` | 624 | The breakers: operators that must see all of their input before they can emit any output. |
+| `stream/breaker.rs` | 631 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 396 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 713 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/mod.rs` | 765 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
 | `stream/parallel.rs` | 1589 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
