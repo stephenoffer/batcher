@@ -19,6 +19,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 
+from batcher._internal.memo import MISSING, IdentityMemo
+
 # `CostCoefficients` / `CostWeights` are defined once in `config` (the single source
 # of truth for tunables) and re-exported here so the cost model's public surface is
 # unchanged.
@@ -153,15 +155,15 @@ class CostModel:
         # per model — it is a property of the machine, not of a node — and `None` (every caller
         # without a hub) keeps the class lookup each term already does.
         self._spill_factor: float | None = spill_device_factor
-        self._cost_cache: dict[int, tuple[LogicalPlan, Cost]] = {}
+        self._cost_cache: IdentityMemo[LogicalPlan, Cost] = IdentityMemo()
         # Memoized answer to "does this node's input already sit on an accelerator", keyed by
         # node identity. `op_cost` runs for every candidate the enumerator considers and the
         # answer is a walk of the input subtree, so computing it per call is quadratic on a
-        # deep plan. The node is held alongside its answer for the same reason `_cost_cache`
-        # holds one: the enumerator prices *transient* nodes (a `replace`d join orientation it
-        # then discards), and a freed node's `id` is reused, so a bare id key would hand the
-        # next transient node at that address the previous one's verdict.
-        self._device_subtree: dict[int, tuple[LogicalPlan, bool]] = {}
+        # deep plan. Identity-keyed and pinning, like `_cost_cache`: the enumerator prices
+        # *transient* nodes (a `replace`d join orientation it then discards), and a freed
+        # node's `id` is reused, so a bare id key would hand the next transient node at that
+        # address the previous one's verdict.
+        self._device_subtree: IdentityMemo[LogicalPlan, bool] = IdentityMemo()
 
     def _rows(self, node: LogicalPlan) -> float:
         return self._est.estimate(node).rows
@@ -395,11 +397,11 @@ class CostModel:
             every plan with no accelerator stage at all, which is what keeps a CPU-only
             ranking bit-for-bit unchanged and never reads a device's wires.
         """
-        cached = self._device_subtree.get(id(node))
-        if cached is not None and cached[0] is node:
-            return cached[1]
+        cached = self._device_subtree.get(node)
+        if cached is not MISSING:
+            return cached
         answer = any(self._device_stage(c) or self._device_resident(c) for c in children(node))
-        self._device_subtree[id(node)] = (node, answer)
+        self._device_subtree.put(node, answer)
         return answer
 
     @staticmethod
@@ -608,11 +610,11 @@ class CostModel:
         quadratic in plan size. The entry holds a strong reference to its keyed node so a
         freed node's reused `id()` cannot produce a stale hit.
         """
-        cached = self._cost_cache.get(id(node))
-        if cached is not None and cached[0] is node:
-            return cached[1]
+        cached = self._cost_cache.get(node)
+        if cached is not MISSING:
+            return cached
         result = self._cost_uncached(node)
-        self._cost_cache[id(node)] = (node, result)
+        self._cost_cache.put(node, result)
         return result
 
     def _cost_uncached(self, node: LogicalPlan) -> Cost:

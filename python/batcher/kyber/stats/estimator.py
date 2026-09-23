@@ -23,6 +23,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.memo import MISSING, IdentityMemo
 from batcher.config import CardinalityConfig, active_config
 from batcher.kyber.column_tables import (
     AVG_BYTES_KEY,
@@ -219,8 +220,8 @@ class StatsEstimator:
         # super-linear in plan depth and `plan_signature` re-hashes whole subtrees.
         # Each entry holds a strong reference to its keyed node alongside the value so
         # a freed node's reused `id()` can never produce a stale hit.
-        self._row_cache: dict[int, tuple[LogicalPlan, RelStats]] = {}
-        self._sig_cache: dict[int, tuple[LogicalPlan, str]] = {}
+        self._row_cache: IdentityMemo[LogicalPlan, RelStats] = IdentityMemo()
+        self._sig_cache: IdentityMemo[LogicalPlan, str] = IdentityMemo()
         # `row_width` memo, same identity discipline and same lifetime as `_row_cache`.
         self._width_cache: dict[tuple[object, float], tuple[LogicalPlan, float]] = {}
         # Per-source learned column stats (`{source_id: {column: ColumnStat}}`), built
@@ -245,11 +246,11 @@ class StatsEstimator:
     def estimate(self, node: LogicalPlan) -> RelStats:
         """Cardinality + column stats for `node`, memoized by node identity for the
         duration of this estimator (one optimize run)."""
-        cached = self._row_cache.get(id(node))
-        if cached is not None and cached[0] is node:
-            return cached[1]
+        cached = self._row_cache.get(node)
+        if cached is not MISSING:
+            return cached
         result = self._corrected(node, self._estimate_uncached(node))
-        self._row_cache[id(node)] = (node, result)
+        self._row_cache.put(node, result)
         return result
 
     def signature_of(self, node: LogicalPlan) -> str:
@@ -376,11 +377,11 @@ class StatsEstimator:
 
     def _sig(self, node: LogicalPlan) -> str:
         """The node's structural signature, memoized by identity (see `estimate`)."""
-        cached = self._sig_cache.get(id(node))
-        if cached is not None and cached[0] is node:
-            return cached[1]
+        cached = self._sig_cache.get(node)
+        if cached is not MISSING:
+            return cached
         sig = _signature(node)
-        self._sig_cache[id(node)] = (node, sig)
+        self._sig_cache.put(node, sig)
         return sig
 
     def _estimate_uncached(self, node: LogicalPlan) -> RelStats:

@@ -85,6 +85,5 @@ def test_signature_is_memoized_by_identity():
     plan, sources = _deep_plan()
     est = StatsEstimator(sources)
     assert est._sig(plan) == est._sig(plan)
-    # The cache holds the node identity, so the same id maps back to the same sig.
-    assert id(plan) in est._sig_cache
-    assert est._sig_cache[id(plan)][0] is plan
+    # The cache is keyed on the node itself, so the same object maps back to the same sig.
+    assert est._sig_cache.get(plan) == est._sig(plan)

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1510 Python modules across 217 packages and 298 Rust files across 14 crates.
+Covering 1512 Python modules across 218 packages and 298 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -352,7 +352,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 268 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
 | `run.py` | 668 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
-| `sizing.py` | 283 | What the conductor needs to know about a plan's size before it runs it. |
+| `sizing.py` | 281 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 418 | The three ways the conductor can execute an admitted plan, plus the source read. |
 | `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
 
@@ -1157,8 +1157,8 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
 | `metadata_answer.py` | 438 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
-| `pass_base.py` | 74 | The optimizer context — shared analysis threaded through every rule. |
-| `plan_cache.py` | 688 | Memoize the optimizer — the same query, planned once. |
+| `pass_base.py` | 75 | The optimizer context — shared analysis threaded through every rule. |
+| `plan_cache.py` | 686 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 281 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 282 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 264 | The Kyber rule abstraction — one small, pure unit of optimization. |
@@ -1176,7 +1176,7 @@ Cost model — what will this plan *cost* to run?
 | `fabric.py` | 185 | What a shuffled byte is worth on *this* cluster's fabric. |
 | `imbalance.py` | 92 | The straggler term — what a shuffle costs when one partition gets most of the rows. |
 | `locality.py` | 315 | What a shuffled byte costs *depending on where it lands* — the interconnect tiers. |
-| `model.py` | 626 | The four-axis cost model and its per-operator closed forms. |
+| `model.py` | 628 | The four-axis cost model and its per-operator closed forms. |
 | `placement.py` | 231 | Should a breaker's workers be packed onto few nodes, or spread across many? |
 | `shuffle.py` | 328 | The `net` axis — what a plan costs to move across a cluster. |
 | `terms.py` | 256 | The machine-shaped multipliers the per-operator cost forms fold in. |
@@ -1232,7 +1232,7 @@ The Kyber optimizer entry point.
 | module | lines | what it is |
 |---|---|---|
 | `driver.py` | 522 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
-| `expr_dispatch.py` | 255 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
+| `expr_dispatch.py` | 253 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
 | `facade.py` | 593 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -1346,7 +1346,7 @@ Extended Kyber rule families.
 | `setops.py` | 388 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
-| `strings.py` | 489 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
+| `strings.py` | 487 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
 | `temporal_date_cast.py` | 186 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
 | `temporal_extra.py` | 462 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
 | `temporal_folds.py` | 185 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
@@ -1371,7 +1371,7 @@ Join elimination — removing a join outright, and the proofs that make it legal
 
 | module | lines | what it is |
 |---|---|---|
-| `evidence.py` | 147 | The proofs a join elimination must clear before it may delete or degenerate a join. |
+| `evidence.py` | 148 | The proofs a join elimination must clear before it may delete or degenerate a join. |
 | `rules.py` | 354 | The join-elimination rewrites — outer, self, cartesian, inner-reduction, disjoint-key. |
 
 ### `batcher/kyber/rules/extra/runtime_filters/` — 3 · subsystem
@@ -1522,7 +1522,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 270 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 488 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 2144 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 2145 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `join_columns.py` | 202 | Join column-statistics propagation. |
 | `skew.py` | 189 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
 
@@ -2863,6 +2863,14 @@ Making this process's device work legible to the tools that measure devices.
 |---|---|---|
 | `nvtx.py` | 161 | Naming this process's work so an external device profiler can see the engine in it. |
 | `ranges.py` | 188 | Timing device work correctly, and labelling it so an external profiler agrees with us. |
+
+### `batcher/_internal/memo/` — 0 · utility
+
+Memoization primitives shared across the layer-3 subsystems.
+
+| module | lines | what it is |
+|---|---|---|
+| `identity.py` | 104 | An identity-keyed memo that pins its keys, optionally bounded by clear-on-full. |
 
 ### `batcher/_internal/migration/` — 0 · utility
 

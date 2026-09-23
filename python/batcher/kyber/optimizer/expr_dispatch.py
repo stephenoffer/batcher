@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 
+from batcher._internal.memo import MISSING, IdentityMemo
 from batcher.config.env import env_flag
 from batcher.kyber.rule import Rule
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
@@ -48,39 +49,38 @@ __all__ = [
 VERIFY_EXPR_MATCHES = env_flag("BATCHER_VERIFY_EXPR_MATCHES")
 
 
-#: `id(rules) -> (rules, {Expr type: rule indices})`, the expression-type inversion of a
+#: `rules -> {Expr type: rule indices}` by identity, the expression-type inversion of a
 #: phase's rule list. Phase rule lists are built once and reused for every plan, so this is
-#: bounded by the number of phases; the list itself is stored alongside to pin the id.
-_EXPR_TYPE_INDEX: dict[int, tuple[list[Rule], dict[type, list[int]]]] = {}
+#: bounded by the number of phases.
+#:
 #: Bounded like its sibling caches. A process only ever has the handful of phase rule lists,
 #: so this never fills in production -- but each entry holds the list alive to pin its id, so
 #: a caller that builds rule lists ad hoc (a test driving one rule) would otherwise accumulate
 #: them for the life of the process.
-_EXPR_TYPE_INDEX_MAX = 64
+_EXPR_TYPE_INDEX: IdentityMemo[list[Rule], dict[type, list[int]]] = IdentityMemo(max_entries=64)
 
 
 def expr_type_index(rules: list[Rule]) -> dict[type, list[int]]:
     """`Expr type -> indices of the rules that declared it`, built once per rule list."""
-    cached = _EXPR_TYPE_INDEX.get(id(rules))
-    if cached is not None and cached[0] is rules:
-        return cached[1]
+    cached = _EXPR_TYPE_INDEX.get(rules)
+    if cached is not MISSING:
+        return cached
     index: dict[type, list[int]] = {}
     for i, r in enumerate(rules):
         if r.expr_matches is None:
             continue
         for t in r.expr_matches:
             index.setdefault(t, []).append(i)
-    if len(_EXPR_TYPE_INDEX) >= _EXPR_TYPE_INDEX_MAX:
-        _EXPR_TYPE_INDEX.clear()
-    _EXPR_TYPE_INDEX[id(rules)] = (rules, index)
+    _EXPR_TYPE_INDEX.put(rules, index)
     return index
 
 
-#: `id(plan) -> (plan, shapes)`. A plan object survives every phase that does not rewrite
+#: `plan -> shapes` by identity. A plan object survives every phase that does not rewrite
 #: it, and the seven phases each ask for its shapes, so without this the walk is repeated
-#: for a plan already known. The plan is stored alongside to pin the id against reuse.
-_SHAPES_CACHE: dict[int, tuple[LogicalPlan, frozenset[tuple[type, object]]]] = {}
-_SHAPES_CACHE_MAX = 512
+#: for a plan already known.
+_SHAPES_CACHE: IdentityMemo[LogicalPlan, frozenset[tuple[type, object]]] = IdentityMemo(
+    max_entries=512
+)
 
 
 def expr_shapes(plan: LogicalPlan) -> frozenset[tuple[type, object]]:
@@ -91,9 +91,9 @@ def expr_shapes(plan: LogicalPlan) -> frozenset[tuple[type, object]]:
     here while being rewritten there. Both are called with an identity rewrite, so this
     reads the plan without rebuilding it.
     """
-    cached = _SHAPES_CACHE.get(id(plan))
-    if cached is not None and cached[0] is plan:
-        return cached[1]
+    cached = _SHAPES_CACHE.get(plan)
+    if cached is not MISSING:
+        return cached
     shapes: set[tuple[type, object]] = set()
 
     def note(expr):
@@ -107,9 +107,7 @@ def expr_shapes(plan: LogicalPlan) -> frozenset[tuple[type, object]]:
     for node in walk(plan):
         map_node_expressions(node, per_node)
     found = frozenset(shapes)
-    if len(_SHAPES_CACHE) >= _SHAPES_CACHE_MAX:
-        _SHAPES_CACHE.clear()
-    _SHAPES_CACHE[id(plan)] = (plan, found)
+    _SHAPES_CACHE.put(plan, found)
     return found
 
 
