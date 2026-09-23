@@ -140,8 +140,10 @@ class DfBackend:
         """Wrap dataframe module `lib` (``cudf`` on a GPU, ``pandas`` for verification)."""
         self.lib = lib
         # cuDF reads Arrow natively and keeps the null mask; pandas needs the ArrowDtype
-        # mapper below to do the same.
-        self._arrow_native = hasattr(lib.DataFrame, "from_arrow")
+        # mapper below to do the same. Decided by the library's name, not by probing for
+        # `DataFrame.from_arrow`: pandas 3 added that classmethod (without cuDF's `to_arrow`),
+        # so the probe classified pandas as a device and every result conversion failed.
+        self._arrow_native = getattr(lib, "__name__", "").partition(".")[0] == "cudf"
         self._date_types: dict[str, Any] = {}
 
     def remember_dates(self, schema) -> None:

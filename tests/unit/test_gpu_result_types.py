@@ -13,6 +13,8 @@ the next one will be found the same way.
 
 from __future__ import annotations
 
+import types
+
 import pyarrow as pa
 import pytest
 
@@ -43,17 +45,21 @@ class _Frame:
         return _Series(self._dtypes[name])
 
 
-class _ArrowNativeLib:
-    """A `lib` whose `DataFrame` has `from_arrow`, which is how `DfBackend` recognises cuDF."""
+def _arrow_native_lib() -> types.ModuleType:
+    """A stand-in module named `cudf`, which is how `DfBackend` recognises the device library."""
 
     class DataFrame:
         @staticmethod
         def from_arrow(table):  # pragma: no cover - never called here
             raise NotImplementedError
 
+    lib = types.ModuleType("cudf")
+    lib.DataFrame = DataFrame
+    return lib
+
 
 def _gpu_backend() -> DfBackend:
-    be = DfBackend(_ArrowNativeLib)
+    be = DfBackend(_arrow_native_lib())
     assert be.is_gpu, "the repair is scoped to the device backend; the stub must look like one"
     return be
 
