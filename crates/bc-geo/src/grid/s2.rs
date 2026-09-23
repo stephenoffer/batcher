@@ -19,7 +19,8 @@
 //! from the reference implementation, which is what the fixtures in this module pin.
 
 use crate::error::{GeoError, GeoResult};
-use crate::types::{Bbox, Coord};
+#[cfg(test)]
+use crate::types::Coord;
 
 /// The finest S2 level.
 pub const MAX_LEVEL: u32 = 30;
@@ -34,6 +35,7 @@ const INVERT_MASK: usize = 2;
 /// `(i, j)` quadrant to Hilbert position, indexed by orientation then `2*i + j`.
 const IJ_TO_POS: [[u64; 4]; 4] = [[0, 1, 3, 2], [0, 3, 1, 2], [2, 3, 1, 0], [2, 1, 3, 0]];
 /// Hilbert position to `(i, j)` quadrant (as `2*i + j`), indexed by orientation.
+#[cfg(test)]
 const POS_TO_IJ: [[usize; 4]; 4] = [[0, 1, 3, 2], [0, 2, 3, 1], [3, 2, 0, 1], [3, 1, 0, 2]];
 /// The orientation change each Hilbert position induces.
 const POS_TO_ORIENTATION: [usize; 4] = [SWAP_MASK, 0, 0, INVERT_MASK | SWAP_MASK];
@@ -54,6 +56,7 @@ fn lonlat_to_xyz(lon: f64, lat: f64) -> [f64; 3] {
     [c * theta.cos(), c * theta.sin(), phi.sin()]
 }
 
+#[cfg(test)]
 fn xyz_to_lonlat(p: [f64; 3]) -> Coord {
     let lat = p[2].atan2((p[0] * p[0] + p[1] * p[1]).sqrt()).to_degrees();
     let lon = p[1].atan2(p[0]).to_degrees();
@@ -82,6 +85,7 @@ fn xyz_to_face_uv(p: [f64; 3]) -> (usize, f64, f64) {
     (face, u, v)
 }
 
+#[cfg(test)]
 fn face_uv_to_xyz(face: usize, u: f64, v: f64) -> [f64; 3] {
     match face {
         0 => [1.0, u, v],
@@ -96,6 +100,7 @@ fn face_uv_to_xyz(face: usize, u: f64, v: f64) -> [f64; 3] {
 /// The quadratic `s → u` transform. S2 offers three; the quadratic one is the default
 /// because it makes cell areas most uniform, and matching it is what makes ids here
 /// comparable with ids from anywhere else.
+#[cfg(test)]
 fn st_to_uv(s: f64) -> f64 {
     if s >= 0.5 {
         (1.0 / 3.0) * (4.0 * s * s - 1.0)
@@ -130,6 +135,7 @@ fn from_face_ij(face: usize, i: u64, j: u64) -> u64 {
     (id << 1) | 1
 }
 
+#[cfg(test)]
 fn to_face_ij(id: u64) -> (usize, u64, u64) {
     let face = (id >> 61) as usize;
     let mut orientation = face & SWAP_MASK;
@@ -210,8 +216,10 @@ pub fn range(id: u64) -> Option<(u64, u64)> {
     Some((id - (lsb - 1), id + (lsb - 1)))
 }
 
-/// The centre of a cell as lon/lat.
-pub fn cell_center(id: u64) -> GeoResult<Coord> {
+/// The centre of a cell as lon/lat: the inverse of [`cell_id`], kept as its round-trip
+/// oracle. Nothing outside the tests reads a cell back to a position.
+#[cfg(test)]
+fn cell_center(id: u64) -> GeoResult<Coord> {
     let level = level_of(id)
         .ok_or_else(|| GeoError::parse("s2", format!("{id} is not a valid S2 cell id")))?;
     let (face, i, j) = to_face_ij(id);
@@ -223,32 +231,6 @@ pub fn cell_center(id: u64) -> GeoResult<Coord> {
     let u = st_to_uv(ci / MAX_SIZE);
     let v = st_to_uv(cj / MAX_SIZE);
     Ok(xyz_to_lonlat(face_uv_to_xyz(face, u, v)))
-}
-
-/// The lon/lat rectangle enclosing a cell.
-///
-/// An S2 cell is a spherical quadrilateral, not a lon/lat rectangle, so this is the
-/// enclosing box and is strictly larger than the cell. Sound as a prefilter, wrong as
-/// a description of the cell's shape — which is why it is named for the box.
-pub fn cell_bbox(id: u64) -> GeoResult<Bbox> {
-    let level = level_of(id)
-        .ok_or_else(|| GeoError::parse("s2", format!("{id} is not a valid S2 cell id")))?;
-    let (face, i, j) = to_face_ij(id);
-    let shift = MAX_LEVEL - level;
-    let base_i = (i >> shift) << shift;
-    let base_j = (j >> shift) << shift;
-    let size = (1u64 << shift) as f64;
-    let mut out: Option<Bbox> = None;
-    for (di, dj) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
-        let u = st_to_uv((base_i as f64 + di * size) / MAX_SIZE);
-        let v = st_to_uv((base_j as f64 + dj * size) / MAX_SIZE);
-        let c = xyz_to_lonlat(face_uv_to_xyz(face, u, v));
-        match &mut out {
-            Some(b) => b.extend(c),
-            None => out = Some(Bbox::from_coord(c)),
-        }
-    }
-    out.ok_or_else(|| GeoError::invalid("cell has no corners"))
 }
 
 #[cfg(test)]
@@ -338,15 +320,6 @@ mod tests {
             }
         }
         assert_eq!(faces.len(), 6, "got {faces:?}");
-    }
-
-    #[test]
-    fn cell_bbox_encloses_the_centre() {
-        let id = cell_id(-122.4194, 37.7749, 12).unwrap();
-        let b = cell_bbox(id).unwrap();
-        let c = cell_center(id).unwrap();
-        assert!(b.contains_coord(c));
-        assert!(b.contains_coord(Coord::new(-122.4194, 37.7749)));
     }
 
     #[test]

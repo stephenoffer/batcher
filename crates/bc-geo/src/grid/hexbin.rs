@@ -8,7 +8,7 @@
 //! square grid leaves.
 //!
 //! This grid is planar and honest about it. It bins whatever coordinates it is given,
-//! so the caller projects first — `grid::tile::to_web_mercator` for a map, an
+//! so the caller projects first — Web Mercator (EPSG:3857, `proj::crs`) for a map, an
 //! equal-area projection for a density comparison across latitudes. It is deliberately
 //! **not** an H3 implementation and does not produce H3 indexes: H3's cells live on an
 //! icosahedron and are not a planar hex grid, so calling this H3 would be wrong in a
@@ -18,7 +18,7 @@
 //! for use as a group key.
 
 use crate::error::{GeoError, GeoResult};
-use crate::types::{Coord, Geometry, Polygon};
+use crate::types::Coord;
 
 /// A hexagon's axial address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,50 +85,6 @@ pub fn hex_center(h: Hex, size: f64) -> GeoResult<Coord> {
     Ok(Coord::new(x, y))
 }
 
-/// The hexagon as a closed six-sided ring.
-pub fn hex_polygon(h: Hex, size: f64) -> GeoResult<Geometry> {
-    let c = hex_center(h, size)?;
-    let mut ring = Vec::with_capacity(7);
-    for k in 0..6 {
-        let angle = std::f64::consts::PI / 3.0 * f64::from(k);
-        ring.push(Coord::new(
-            c.x + size * angle.cos(),
-            c.y + size * angle.sin(),
-        ));
-    }
-    ring.push(ring[0]);
-    Ok(Geometry::Polygon(Polygon {
-        exterior: ring,
-        interiors: Vec::new(),
-    }))
-}
-
-/// The six hexagons sharing an edge with `h`.
-#[must_use]
-pub fn hex_neighbors(h: Hex) -> [Hex; 6] {
-    [
-        Hex { q: h.q + 1, r: h.r },
-        Hex {
-            q: h.q + 1,
-            r: h.r - 1,
-        },
-        Hex { q: h.q, r: h.r - 1 },
-        Hex { q: h.q - 1, r: h.r },
-        Hex {
-            q: h.q - 1,
-            r: h.r + 1,
-        },
-        Hex { q: h.q, r: h.r + 1 },
-    ]
-}
-
-/// The number of steps between two hexagons on the grid.
-#[must_use]
-pub fn hex_distance(a: Hex, b: Hex) -> i64 {
-    let (dq, dr) = (a.q - b.q, a.r - b.r);
-    ((dq.abs() + dr.abs()) + (dq + dr).abs()) / 2
-}
-
 /// The half-width of the packable axial range. Each coordinate is biased by this and
 /// stored in 31 bits, which keeps the packed key inside a *signed* 63-bit value — the
 /// reason the range is ±2^30 rather than the ±2^31 a naive 32-bit split would suggest.
@@ -161,17 +117,51 @@ pub fn hex_from_key(key: i64) -> Hex {
     }
 }
 
-/// The area of one hexagon in the coordinate system's squared units.
-pub fn hex_area(size: f64) -> GeoResult<f64> {
-    check_size(size)?;
-    Ok(3.0 * 1.732_050_807_568_877_2 / 2.0 * size * size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::algo::primitive::PointRing;
     use crate::algo::relate::point_in_polygon;
+    use crate::types::{Geometry, Polygon};
+
+    // Test oracles for `hex_of`: the nearest-centre property is checked against the six
+    // edge neighbours, and containment against the cell's own ring. Nothing outside the
+    // tests needs either, so they live here rather than in the crate's public surface.
+    /// The hexagon as a closed six-sided ring.
+    fn hex_polygon(h: Hex, size: f64) -> GeoResult<Geometry> {
+        let c = hex_center(h, size)?;
+        let mut ring = Vec::with_capacity(7);
+        for k in 0..6 {
+            let angle = std::f64::consts::PI / 3.0 * f64::from(k);
+            ring.push(Coord::new(
+                c.x + size * angle.cos(),
+                c.y + size * angle.sin(),
+            ));
+        }
+        ring.push(ring[0]);
+        Ok(Geometry::Polygon(Polygon {
+            exterior: ring,
+            interiors: Vec::new(),
+        }))
+    }
+
+    /// The six hexagons sharing an edge with `h`.
+    fn hex_neighbors(h: Hex) -> [Hex; 6] {
+        [
+            Hex { q: h.q + 1, r: h.r },
+            Hex {
+                q: h.q + 1,
+                r: h.r - 1,
+            },
+            Hex { q: h.q, r: h.r - 1 },
+            Hex { q: h.q - 1, r: h.r },
+            Hex {
+                q: h.q - 1,
+                r: h.r + 1,
+            },
+            Hex { q: h.q, r: h.r + 1 },
+        ]
+    }
 
     #[test]
     fn a_point_is_binned_to_the_hexagon_whose_centre_is_nearest() {
@@ -232,12 +222,11 @@ mod tests {
     }
 
     #[test]
-    fn neighbours_are_all_one_step_away_and_equidistant() {
+    fn neighbours_are_equidistant() {
         let h = Hex { q: 3, r: -2 };
         let c = hex_center(h, 5.0).unwrap();
         let mut dists = Vec::new();
         for n in hex_neighbors(h) {
-            assert_eq!(hex_distance(h, n), 1);
             let nc = hex_center(n, 5.0).unwrap();
             dists.push(crate::algo::primitive::dist(c, nc));
         }
@@ -245,16 +234,6 @@ mod tests {
         for d in &dists {
             assert!((d - first).abs() < 1e-9, "neighbours must be equidistant");
         }
-    }
-
-    #[test]
-    fn distance_is_a_metric_on_the_grid() {
-        let a = Hex { q: 0, r: 0 };
-        let b = Hex { q: 3, r: -1 };
-        let c = Hex { q: -2, r: 4 };
-        assert_eq!(hex_distance(a, a), 0);
-        assert_eq!(hex_distance(a, b), hex_distance(b, a));
-        assert!(hex_distance(a, c) <= hex_distance(a, b) + hex_distance(b, c));
     }
 
     #[test]
@@ -268,14 +247,6 @@ mod tests {
                 assert_eq!(hex_from_key(k), h);
             }
         }
-    }
-
-    #[test]
-    fn hex_area_matches_the_polygon_it_describes() {
-        let size = 9.0;
-        let poly = hex_polygon(Hex { q: 0, r: 0 }, size).unwrap();
-        let measured = crate::algo::measure::area(&poly);
-        assert!((measured - hex_area(size).unwrap()).abs() < 1e-9);
     }
 
     #[test]

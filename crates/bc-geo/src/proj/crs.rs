@@ -392,20 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn web_mercator_matches_the_tile_module() {
-        let a = transform_coord(
-            Coord::new(-122.4194, 37.7749),
-            EPSG_WGS84,
-            EPSG_WEB_MERCATOR,
-        )
-        .unwrap();
-        // The tile module uses the mean-radius sphere and this uses the WGS 84
-        // semi-major axis; they agree to within that radius ratio, which is 0.13%.
-        let b = crate::grid::tile::to_web_mercator(-122.4194, 37.7749).unwrap();
-        assert!((a.x / b.x - 1.0).abs() < 0.002, "{} vs {}", a.x, b.x);
-    }
-
-    #[test]
     fn equal_area_preserves_area_ratios_where_mercator_does_not() {
         // Two one-degree cells, one at the equator and one at 60N.
         let cell = |lat: f64, epsg: i32| {

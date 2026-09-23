@@ -3356,14 +3356,14 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `codec/wkb.rs` | 478 | WKB — the binary encoding a geometry column is actually stored in. |
 | `codec/wkt.rs` | 484 | WKT — the human-readable geometry spelling, and the one users type. |
 | `error.rs` | 84 | The one error type every `bc-geo` entry point returns. |
-| `grid/geohash.rs` | 192 | Geohash — a lon/lat position as a short base-32 string. |
-| `grid/hexbin.rs` | 169 | Hexagonal binning on a projected plane. |
+| `grid/geohash.rs` | 176 | Geohash — a lon/lat position as a short base-32 string. |
+| `grid/hexbin.rs` | 119 | Hexagonal binning on a projected plane. |
 | `grid/mod.rs` | 20 | Discrete spatial grids — the bridge from continuous coordinates to a group key. |
-| `grid/s2.rs` | 253 | S2 cell identifiers — Google's spherical cell hierarchy, as BigQuery and many geospatial warehouses index by. |
-| `grid/tile.rs` | 202 | Slippy-map tiles and Bing quadkeys — the grid every map tile server is indexed by. |
+| `grid/s2.rs` | 21 | S2 cell identifiers — Google's spherical cell hierarchy, as BigQuery and many geospatial warehouses index by. |
+| `grid/tile.rs` | 119 | Slippy-map tiles and Bing quadkeys — the grid every map tile server is indexed by. |
 | `lib.rs` | 83 | `bc-geo` — the geometry data plane: codecs, planar algorithms, grids, projections. |
 | `proj/crs.rs` | 314 | Coordinate reference system transforms, for a deliberately small set of systems. |
-| `proj/geodesy.rs` | 229 | Distances and areas on the Earth, in metres. |
+| `proj/geodesy.rs` | 177 | Distances and areas on the Earth, in metres. |
 | `proj/karney/area.rs` | 91 | Polygon area on the ellipsoid: GeographicLib's `PolygonArea`, reduced to a ring. |
 | `proj/karney/math.rs` | 231 | The scalar helpers and series coefficients Karney's solver is written in terms of. |
 | `proj/karney/mod.rs` | 653 | Karney's geodesic inverse on the WGS 84 ellipsoid: distance and polygon area. |
