@@ -70,7 +70,7 @@ def emit_query_spans(profile: QueryProfile) -> None:
     tracer = _tracer()
     try:
         _emit(tracer, profile)
-    except Exception:  # pragma: no cover - telemetry must never fail a query
+    except Exception:  # telemetry must never fail a query
         from batcher._internal.logging import get_logger
 
         get_logger("api").debug("otel span emit failed", exc_info=True)

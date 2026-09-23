@@ -462,7 +462,7 @@ def record_selectivity(
         entry["selectivity"] = sel if prior is None else _smooth(prior, sel, n_obs)
         entry["sel_n_obs"] = n_obs + 1
         hub.put_keyed_param(_NAMESPACE, sig, entry)
-    except Exception as exc:  # pragma: no cover - learning must never break execution
+    except Exception as exc:  # learning must never break execution
         note_suppressed("kyber", "persist a learned selectivity", exc)
 
 

@@ -144,7 +144,7 @@ def projected_input_bytes(
             return 0
         try:
             width = projected_row_bytes(src.schema(), projections.get(i))
-        except Exception:  # pragma: no cover - a source that cannot describe itself
+        except Exception:  # a source that cannot describe itself
             return 0
         total += rows * width
     return int(total)
@@ -166,7 +166,7 @@ def _estimated_row_count(src: Source) -> int | None:
     """
     try:
         stats = src.statistics()
-    except Exception:  # pragma: no cover - a source with no statistics at all
+    except Exception:  # a source with no statistics at all
         return None
     rows = getattr(stats, "row_count", None) if stats is not None else None
     if rows is None or rows < 0:

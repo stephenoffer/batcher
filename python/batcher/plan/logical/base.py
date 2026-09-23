@@ -226,7 +226,7 @@ class LogicalPlan:
             if fn is not None and not getattr(fn, "_memoized", False):
                 setattr(cls, name, _memoize_noarg(fn, f"_c_{name}"))
 
-    def to_ir(self) -> dict[str, Any]:  # pragma: no cover - overridden
+    def to_ir(self) -> dict[str, Any]:  # overridden
         raise NotImplementedError
 
     def content_key(self) -> str:

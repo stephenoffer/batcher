@@ -142,7 +142,7 @@ def auto_num_partitions(plan: LogicalPlan, sources: list[Source], hub: MetadataH
         width = est.row_width(plan, opt.row_bytes)
         byte_parts = math.ceil(rows * width / max(1, opt.target_bytes_per_task))
         return _clamp_partitions(max(row_parts, byte_parts))
-    except Exception as exc:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # sizing must never break a query
         note_suppressed("api", "size partitions", exc)
         return DEFAULT_PARTITIONS
 

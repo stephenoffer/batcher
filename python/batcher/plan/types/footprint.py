@@ -123,7 +123,7 @@ def retained_bytes(data: Any) -> int:
         return logical
     try:
         return max(int(total()), logical)
-    except (TypeError, ValueError):  # pragma: no cover - an object with an unusable API
+    except (TypeError, ValueError):  # an object with an unusable API
         return logical
 
 

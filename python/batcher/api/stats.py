@@ -530,7 +530,7 @@ def _findings(profile: QueryProfile) -> list[dict[str, object]]:
         from batcher.observe.insights import derive_insights
 
         return derive_insights(profile.to_dict())
-    except Exception as exc:  # pragma: no cover - commentary must not break a measurement
+    except Exception as exc:  # commentary must not break a measurement
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("api", "derive run findings", exc)

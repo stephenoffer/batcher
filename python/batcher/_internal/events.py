@@ -508,7 +508,7 @@ def publish(kind: str, *, query_id: str = "", name: str = "", **fields: Any) -> 
         for sink in sinks:
             try:
                 sink(event)
-            except Exception as exc:  # pragma: no cover - a sink must never fail a query
+            except Exception as exc:  # a sink must never fail a query
                 _report_sink_failure(sink, exc)
             else:
                 if _failures:

@@ -317,7 +317,7 @@ def release_foreign_agg_pools(plan0, needed_cpus: float) -> bool:
 
         if float(ray.available_resources().get("CPU", 0.0)) >= float(needed_cpus):
             return False
-    except Exception as exc:  # pragma: no cover - a scheduling courtesy, never a failure
+    except Exception as exc:  # a scheduling courtesy, never a failure
         note_suppressed("dist", "read free CPU before releasing a foreign pool", exc)
         return False
     _kill_pool_keys(foreign, _AGG_POOLS)
@@ -1113,7 +1113,7 @@ def _placeable_scheduling(needed_cpus: float) -> dict:
                 needed_cpus=needed_cpus,
             )
         return opts
-    except Exception as exc:  # pragma: no cover - a scheduling courtesy, never a failure
+    except Exception as exc:  # a scheduling courtesy, never a failure
         note_suppressed("dist", "make room for a task stage beside the fleet", exc)
         return {}
 
@@ -1455,7 +1455,7 @@ def _shared_arg(value):
         import ray
 
         return ray.put(value)
-    except Exception as exc:  # pragma: no cover - an optimization, never a requirement
+    except Exception as exc:  # an optimization, never a requirement
         note_suppressed("dist", "share the map plan through the object store", exc)
         return value
 
@@ -1982,7 +1982,7 @@ def _minus_pruned_columns(source, plan, total_rows: int, total_bytes: float) -> 
         return total_bytes
     try:
         schema = source.schema()
-    except Exception as exc:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # sizing must never break a query
         note_suppressed("dist", "read the source schema for byte sizing", exc)
         return total_bytes
     full = schema_row_bytes(schema)

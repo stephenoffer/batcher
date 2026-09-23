@@ -78,7 +78,7 @@ def device_readings() -> tuple[tuple[str, float, float, float, float], ...]:
                         device.busy_percent / 100.0,
                     )
                 )
-    except Exception as exc:  # pragma: no cover - a scrape must never fail a process
+    except Exception as exc:  # a scrape must never fail a process
         note_suppressed("observe", "read the node's device telemetry", exc)
     return tuple(out)
 
@@ -166,7 +166,7 @@ def node_conditions() -> dict[str, int]:
         out["fabric_errors"] = sum(fabric_error_total().values())
         rdma = rdma_summary()
         out["fabric_ports_down"] = max(0, int(rdma["ports"]) - int(rdma["active_ports"]))
-    except Exception as exc:  # pragma: no cover - a scrape must never fail a process
+    except Exception as exc:  # a scrape must never fail a process
         note_suppressed("observe", "read the node's hardware conditions", exc)
     out.update(_device_state_conditions())
     return out
@@ -204,7 +204,7 @@ def _device_state_conditions() -> dict[str, int]:
         out["power_capped_devices"] = len(capped_below_default())
         out["bar1_pressured_devices"] = len(bar1_pressured_devices())
         out["clock_limited_devices"] = len(clock_limited_devices())
-    except Exception as exc:  # pragma: no cover - a scrape must never fail a process
+    except Exception as exc:  # a scrape must never fail a process
         note_suppressed("observe", "read the node's device state conditions", exc)
     try:
         from batcher._internal.hardware.amd import throttled_amd_devices, visible_vram_pressured

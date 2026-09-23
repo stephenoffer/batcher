@@ -297,7 +297,7 @@ def device_total_bytes() -> int | None:
             int(torch.cuda.get_device_properties(i).total_memory)
             for i in range(torch.cuda.device_count())
         ]
-    except Exception as exc:  # pragma: no cover - no driver, no device, or an older torch
+    except Exception as exc:  # no driver, no device, or an older torch
         note_suppressed("ml", "read the device memory size", exc)
         return None
     return min(sizes) if sizes else None

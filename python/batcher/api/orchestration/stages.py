@@ -251,7 +251,7 @@ def _record_distributed_cardinality(hub, plan: LogicalPlan, sources: list[Source
         from batcher.api.orchestration.run import record_cardinality_outcome
 
         record_cardinality_outcome(hub, plan, sources, int(rows))
-    except Exception as exc:  # pragma: no cover - learning must never break a completed run
+    except Exception as exc:  # learning must never break a completed run
         note_suppressed("api", "record distributed cardinality", exc)
 
 

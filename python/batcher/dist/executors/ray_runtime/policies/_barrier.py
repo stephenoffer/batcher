@@ -144,7 +144,7 @@ def _relieve_stall(task_cpus: float, *, pinned: bool) -> bool:
 
         if not yield_session_fleet(task_cpus):
             return False
-    except Exception as exc:  # pragma: no cover - relief must never fail the stage
+    except Exception as exc:  # relief must never fail the stage
         note_suppressed("dist", "yield the idle fleet for a stalled stage", exc)
         return False
     log_kv(

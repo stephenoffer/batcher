@@ -139,7 +139,7 @@ def read_free_disk_bytes(path: str) -> int | None:
     """
     try:
         return shutil.disk_usage(path).free
-    except OSError:  # pragma: no cover - unstat-able volume
+    except OSError:  # unstat-able volume
         return None
 
 
@@ -296,7 +296,7 @@ def scratch_disk_stats() -> dict[str, int | str]:
             "free_bytes": -1 if free is None else free,
             "total_bytes": -1 if total is None else total,
         }
-    except Exception as exc:  # pragma: no cover - a probe must never break a query
+    except Exception as exc:  # a probe must never break a query
         note_suppressed("carbonite", "read the scratch volume", exc)
         return {"path": "", "pressure": "UNKNOWN", "free_bytes": -1, "total_bytes": -1}
 

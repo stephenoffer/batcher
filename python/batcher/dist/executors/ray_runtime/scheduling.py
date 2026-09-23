@@ -470,7 +470,7 @@ def _collective_bundles(
         from batcher.dist.executors.ray_runtime.fabric import plan_collective
 
         placement = plan_collective(workers, cpus_per_device=max(env.num_cpus, 1.0))
-    except Exception as exc:  # pragma: no cover - a placement hint never fails a placement
+    except Exception as exc:  # a placement hint never fails a placement
         note_suppressed("dist", "plan the collective's bundle layout", exc)
         return None
     if not placement.bundles or sum(b.get("GPU", 0.0) for b in placement.bundles) != workers:
@@ -563,7 +563,7 @@ def _report_placement(bundles: int, strategy: str, zone: dict[str, str]) -> None
                 detail={"bundles": bundles, "strategy": strategy, "zone": dict(zone)},
             ).to_dict(),
         )
-    except Exception as exc:  # pragma: no cover - observation must never fail a placement
+    except Exception as exc:  # observation must never fail a placement
         note_suppressed("dist", "report the fleet placement", exc)
 
 

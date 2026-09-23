@@ -217,7 +217,7 @@ def cluster_hardware_profiles() -> tuple[dict, ...]:
             return ()
         _PROFILES_BY_TOPOLOGY[signature] = result
         return result
-    except Exception as exc:  # pragma: no cover - Ray optional / probe unschedulable
+    except Exception as exc:  # Ray optional / probe unschedulable
         note_suppressed("dist", "probe ray node hardware", exc)
         return ()
 

@@ -114,7 +114,7 @@ def _verdict_key(plan: LogicalPlan, sources: list[Source], ctx, config, cfg) -> 
             kind="subplan_reuse",
             learned=False,
         )
-    except Exception as exc:  # pragma: no cover - an unkeyable plan simply is not cached
+    except Exception as exc:  # an unkeyable plan simply is not cached
         note_suppressed("api", "key the common-subplan verdict", exc)
         return None
     if base is None:
@@ -152,7 +152,7 @@ def _record_verdict(key: tuple | None, sources: list[Source], verdict) -> None:
         return
     try:
         held = tuple(weakref.ref(s) for s in sources)
-    except TypeError:  # pragma: no cover - a source that cannot be weakly referenced
+    except TypeError:  # a source that cannot be weakly referenced
         return
     with _VERDICTS_LOCK:
         _VERDICTS[key] = (held, verdict)
