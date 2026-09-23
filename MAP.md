@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1512 Python modules across 218 packages and 298 Rust files across 14 crates.
+Covering 1513 Python modules across 218 packages and 298 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -434,7 +434,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `event_log.py` | 712 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
 | `map_stream.py` | 190 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
-| `otel.py` | 217 | Emit a query's execution profile as OpenTelemetry spans. |
+| `otel.py` | 215 | Emit a query's execution profile as OpenTelemetry spans. |
 | `preview.py` | 186 | Render a small result as a readable table for `Dataset.show`. |
 | `profile.py` | 649 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
 | `routing.py` | 329 | The `distributed="auto"` routing decision for terminal operations. |
@@ -998,7 +998,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 177 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 200 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 595 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `fleet_health.py` | 330 | Live device health across the fleet — every accelerator node, never cached. |
+| `fleet_health.py` | 340 | Live device health across the fleet — every accelerator node, never cached. |
 | `hardware_probe.py` | 568 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 726 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
@@ -1006,7 +1006,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `readiness.py` | 330 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 292 | How finely a shuffle divides its work — on both sides of the exchange. |
-| `scaling.py` | 795 | What the live cluster is, and what of it a query may use. |
+| `scaling.py` | 796 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 769 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 133 | Why this query got the fan-out it got. |
 
@@ -2371,7 +2371,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 487 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6873 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 6874 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2388,6 +2388,7 @@ Migration-error guidance for `Expr` and its typed accessors.
 | module | lines | what it is |
 |---|---|---|
 | `guidance.py` | 510 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
+| `namespaces.py` | 310 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
 

@@ -16,7 +16,7 @@ enterprise's decision, not the engine's.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from batcher.plan.profile import QueryProfile
@@ -30,7 +30,7 @@ _INSTRUMENTATION = "batcher"
 _OTEL_AVAILABLE: bool | None = None
 
 
-def _tracer() -> object | None:
+def _tracer() -> Any | None:  # an `opentelemetry.trace.Tracer`; the package is optional
     """A fresh OTel tracer for this emit, or None if `opentelemetry` is not installed."""
     global _OTEL_AVAILABLE
     if _OTEL_AVAILABLE is False:
@@ -94,7 +94,7 @@ def _emit(tracer: object, profile: QueryProfile) -> None:
     # genuinely interleave, it would be a wrong one.
     end_ns = time.time_ns()
     start_ns = end_ns - _to_ns(profile.total_ms)
-    with tracer.start_as_current_span(  # type: ignore[attr-defined]
+    with tracer.start_as_current_span(
         "batcher.query", start_time=start_ns, end_on_exit=False
     ) as query_span:
         query_span.set_attribute("batcher.query_id", profile.query_id)
@@ -125,7 +125,7 @@ def _to_ns(ms: float) -> int:
     return max(0, int(ms * 1_000_000))
 
 
-def _set_usage(span: object, usage) -> None:
+def _set_usage(span: Any, usage) -> None:
     """Attach what the run cost the machine to the query span.
 
     A trace waterfall shows *where* the time went and cannot show whether the box had the
@@ -139,13 +139,13 @@ def _set_usage(span: object, usage) -> None:
     """
     if not usage.measured:
         return
-    span.set_attribute("batcher.cpu_ms", usage.cpu_ms)  # type: ignore[attr-defined]
-    span.set_attribute("batcher.execution_ms", usage.wall_ms)  # type: ignore[attr-defined]
-    span.set_attribute("batcher.cores_busy", usage.cores_busy)  # type: ignore[attr-defined]
-    span.set_attribute("batcher.peak_rss_bytes", usage.peak_rss_bytes)  # type: ignore[attr-defined]
-    span.set_attribute("batcher.major_faults", usage.major_faults)  # type: ignore[attr-defined]
-    span.set_attribute("batcher.io_read_bytes", usage.io_read_bytes)  # type: ignore[attr-defined]
-    span.set_attribute("batcher.io_write_bytes", usage.io_write_bytes)  # type: ignore[attr-defined]
+    span.set_attribute("batcher.cpu_ms", usage.cpu_ms)
+    span.set_attribute("batcher.execution_ms", usage.wall_ms)
+    span.set_attribute("batcher.cores_busy", usage.cores_busy)
+    span.set_attribute("batcher.peak_rss_bytes", usage.peak_rss_bytes)
+    span.set_attribute("batcher.major_faults", usage.major_faults)
+    span.set_attribute("batcher.io_read_bytes", usage.io_read_bytes)
+    span.set_attribute("batcher.io_write_bytes", usage.io_write_bytes)
 
 
 def _emit_op(tracer: object, op, *, scope: str = "driver", start_ns: int = 0) -> None:
@@ -154,7 +154,7 @@ def _emit_op(tracer: object, op, *, scope: str = "driver", start_ns: int = 0) ->
     `scope` distinguishes the driver-tree operators from the distributed map sub-plan's
     worker operators (a separate op-id space), so a trace consumer can tell them apart.
     """
-    with tracer.start_as_current_span(  # type: ignore[attr-defined]
+    with tracer.start_as_current_span(
         f"batcher.op.{op.kind}", start_time=start_ns, end_on_exit=False
     ) as span:
         span.set_attribute("batcher.op.id", op.op_id)
@@ -202,9 +202,7 @@ def emit_failure_span(query_id: str, total_ms: float, exc: BaseException) -> Non
         from opentelemetry.trace import Status, StatusCode
 
         end_ns = time.time_ns()
-        span = tracer.start_span(  # type: ignore[attr-defined]
-            "batcher.query", start_time=end_ns - _to_ns(total_ms)
-        )
+        span = tracer.start_span("batcher.query", start_time=end_ns - _to_ns(total_ms))
         span.set_attribute("batcher.query_id", query_id)
         span.set_attribute("batcher.total_ms", total_ms)
         span.set_attribute("batcher.ok", False)

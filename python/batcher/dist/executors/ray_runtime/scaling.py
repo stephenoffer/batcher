@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import math
+from typing import Any
 
 from batcher._internal.accelerators import (
     binding_gpu_memory_bytes,
@@ -65,7 +66,7 @@ class _Topology:
         # spent 709 ms of its 1.3 s rebuilding the same list. The snapshot fixes the
         # topology for the length of the scope by construction, so a projection of it is
         # fixed too, and memoizing changes no value any caller sees.
-        self.derived: dict[str, object] = {}
+        self.derived: dict[str, Any] = {}  # heterogeneous memo: each key has its own shape
 
 
 # The topology snapshot in force for the current scheduling phase, if any. A distributed
@@ -312,7 +313,7 @@ def _alive_nodes() -> list[dict]:
         if cached is None:
             cached = _worker_eligible(snap.alive_nodes)
             snap.derived["alive_nodes"] = cached
-        return cached  # type: ignore[return-value]
+        return cached
     return _worker_eligible(_live_alive_nodes())
 
 
@@ -413,7 +414,7 @@ def _class_index() -> dict:
     if snapshot is not None:
         cached = snapshot.derived.get("class_index")
         if cached is not None:
-            return cached  # type: ignore[return-value]
+            return cached
     from batcher.dist.executors.ray_runtime.capacity import free_cpus_by_node
     from batcher.dist.executors.ray_runtime.fabric.census import build_census
     from batcher.dist.executors.ray_runtime.fabric.shape import _zone_label
@@ -585,7 +586,7 @@ def node_classes() -> list[dict]:
     if snapshot is not None:
         cached = snapshot.derived.get("node_classes")
         if cached is not None:
-            return cached  # type: ignore[return-value]
+            return cached
     try:
         out = [
             {**_class_entry(key), "node_id": node_id}

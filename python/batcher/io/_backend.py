@@ -497,7 +497,7 @@ class _ArrowFileSystem:
         # split readers issue into far fewer, larger GETs against object storage — the
         # small-request tax on a high-latency remote path. Matches `_download`'s chunk size.
         return io.BufferedReader(
-            self._fs.open_input_file(in_path),  # type: ignore[arg-type]
+            self._fs.open_input_file(in_path),
             buffer_size=_REMOTE_READ_BUFFER,
         )
 

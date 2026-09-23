@@ -143,7 +143,7 @@ def _rebuild_greedy(
                 best = (score, j, with_res, cand_schema)
         if best is None:
             return None  # disconnected graph → would be a cross join; skip reorder
-        _, j, current, schema = best  # type: ignore[assignment]
+        _, j, current, schema = best
         joined.add(j)
 
     return _final_projection(current, schema, required)

@@ -344,7 +344,7 @@ def _apply_udf_async(
     else:
         from batcher.interop.formats import result_to_arrowable, to_format
 
-        async def call(batch: pa.RecordBatch) -> object:  # type: ignore[misc]
+        async def call(batch: pa.RecordBatch) -> object:
             return result_to_arrowable(await fn(to_format(batch, op.batch_format)), op.batch_format)
 
     try:

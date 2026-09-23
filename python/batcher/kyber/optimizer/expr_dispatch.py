@@ -224,8 +224,8 @@ def apply_expr_leaves(
                 # A leaf may have changed the expression's *type* or its *operator*, and
                 # either moves it into a different bucket, so the leaves after this one must
                 # be re-selected for the new shape — exactly what running the whole chain
-                # unfiltered would do. Re-selecting on the operator matters as much as on the
-                # type: a leaf that mirrors `lt` to `gt` leaves the type alone while making
+                # unfiltered would do. Re-selecting on the operator matters as much as on
+                # the type: a leaf that mirrors `lt` to `gt` leaves the type alone while making
                 # every `gt` leaf newly applicable. `bisect` resumes immediately after this
                 # leaf, so no leaf runs twice and none is skipped.
                 new_shape = (type(rewritten), discriminator(rewritten))

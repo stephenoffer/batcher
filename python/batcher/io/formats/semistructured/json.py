@@ -389,7 +389,7 @@ class JSONSink(FileSink):
                 _disable_json_proc()  # a broken pool must not poison later writes
         self._write_serial(table, fh)
 
-    def _write_parts(self, table, directory, file_index, resume, max_rows_per_file):  # type: ignore[override]
+    def _write_parts(self, table, directory, file_index, resume, max_rows_per_file):
         """Write a directory's part files across PROCESSES (pandas' JSON encoder holds the
         GIL, so the base's thread-per-part write serializes). Each worker encodes and writes
         one part from its IPC chunk — no result IPC, no concat — which is the difference
@@ -419,7 +419,7 @@ class JSONSink(FileSink):
             return base(table, directory, file_index, resume, max_rows_per_file)
         return [WrittenFile(path=p, rows=r, bytes=b) for p, r, b in parts]
 
-    def write_stream(self, batches, path, *, schema=None, resume=False):  # type: ignore[override]
+    def write_stream(self, batches, path, *, schema=None, resume=False):
         """Stream NDJSON to one file, encoding one batch at a time (bounded memory).
 
         The base `write_stream` buffers the whole result into one table before encoding

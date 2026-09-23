@@ -332,7 +332,7 @@ class Selector(Expr):
             return super().__xor__(other)
         return self._set_op(sel, lambda a, b: a != b, "^")
 
-    def __invert__(self) -> Selector:  # type: ignore[override]
+    def __invert__(self) -> Selector:
         """Complement: every column this selector does not match."""
         if self._rename is not None:
             raise PlanError(
