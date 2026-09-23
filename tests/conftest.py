@@ -19,6 +19,7 @@ import importlib.util
 import os
 import re
 import shutil
+import socket
 import sys
 from pathlib import Path
 
@@ -285,6 +286,42 @@ def _shared_base() -> Path | None:
     return None
 
 
+def _process_owner() -> str:
+    """A directory component unique to this pytest process: xdist worker, host and pid.
+
+    Named per *test* or per *worker* alone, two pytest processes running at once — the
+    normal state of a tree several sessions test in — shared one directory, and whichever
+    cleared it first deleted the other's corpus mid-query. Dead processes' directories on
+    this host are pruned here, since a killed run skips its teardown and a pid-named
+    directory would otherwise never be reused or removed.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    host = socket.gethostname()
+    owner = _safe_dirname(f"{worker}-{host}-{os.getpid()}")
+    base = _shared_base()
+    if base is not None:
+        _prune_dead_owners(base, _safe_dirname(host))
+    return owner
+
+
+def _prune_dead_owners(base, host: str) -> None:
+    """Remove scratch left by processes on this host that no longer exist."""
+    candidates = [
+        *base.glob(f"batcher-tests-session-*-{host}-*"),
+        *base.glob(f"batcher-tests/*-{host}-*"),
+    ]
+    for path in candidates:
+        pid = path.name.rsplit("-", 1)[-1]
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            shutil.rmtree(path, ignore_errors=True)
+        except PermissionError:
+            continue  # alive, owned by someone else
+
+
 def _safe_dirname(name: str) -> str:
     """A test id turned into a directory component that is safe to *glob*.
 
@@ -329,7 +366,7 @@ def cluster_tmp_path(tmp_path, request):
     if base is None:
         yield tmp_path
         return
-    scratch = base / "batcher-tests" / _safe_dirname(request.node.name)
+    scratch = base / "batcher-tests" / _process_owner() / _safe_dirname(request.node.name)
     shutil.rmtree(scratch, ignore_errors=True)
     scratch.mkdir(parents=True, exist_ok=True)
     yield scratch
@@ -350,13 +387,17 @@ def cluster_tmp_dir(tmp_path_factory):
     surfaced as `FileNotFoundError` on someone else's parquet, from inside a distributed sort,
     which reads exactly like an engine defect and is not one. Isolated per worker, the
     teardown can only ever remove that worker's own files.
+
+    The same collision exists between separate pytest *processes*, and in a tree several
+    sessions test at once it is the common case: every non-xdist run is worker ``main``, so
+    two concurrent runs shared ``batcher-tests-session-main`` and whichever finished first
+    deleted the other's corpus mid-query. So the name also carries the host and the pid.
     """
     base = _shared_base()
     if base is None:
         yield tmp_path_factory.mktemp("cluster")
         return
-    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
-    scratch = base / f"batcher-tests-session-{_safe_dirname(worker)}"
+    scratch = base / f"batcher-tests-session-{_process_owner()}"
     scratch.mkdir(parents=True, exist_ok=True)
     yield scratch
     shutil.rmtree(scratch, ignore_errors=True)

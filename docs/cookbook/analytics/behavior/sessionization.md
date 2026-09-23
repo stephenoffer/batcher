@@ -188,6 +188,6 @@ Thirty minutes is the web-analytics convention and it is arbitrary. Look at the 
 - {doc}`Funnel analysis </cookbook/analytics/behavior/funnel-analysis>`: scope a funnel to one session by grouping on `(user, session)` instead of `user`.
 - {doc}`Time-series rollups </cookbook/analytics/aggregates/time-series-rollups>`: the other side of the clock, where the bucket is fixed and the gaps are the problem.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: `lag`, frames, and `cum_sum`.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: the same sessions computed incrementally, with a watermark bounding how long a session stays open.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: the same sessions computed incrementally, with a watermark bounding how long a session stays open.
 - {doc}`Window internals </architecture/deep-dives/operators/window-internals>`: the partition-sort-scan the three window expressions above share.
 - {doc}`Expressions API </api/relational/expressions>`: `lag`, `cum_sum`, `dt.epoch`.

@@ -65,11 +65,11 @@ The table below lists the streaming behaviors to design around, with the recipe 
 | Late rows are dropped, not diverted | No side output and no dead-letter: the rows are gone. `num_late_rows` on each micro-batch counts them, so the shortfall is visible. | {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>` |
 | A session only closes when event time moves past it | The gap is measured in event time, so a source whose clock stalls never closes a session and the buffered rows never leave. A `ResourceError` names the stall rather than letting the process die. | {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>` |
 | A runaway backlog is not gradual | A batch that overruns its interval leaves the next one starting later against a larger backlog, so the divergence compounds and ends in an epoch that does not fit in memory. `behind_by_ms` is the early warning; a per-trigger cap is the bound. | {doc}`Backpressure </cookbook/streaming/backpressure>` |
-| A query that retains rows reports no state metrics | The stream-stream join, the stream-static join, the session window, the dedup, a limit and a stream union all run through a driver, so `state_operators` is empty and `num_input_rows` counts what the driver emitted. The memory guard still fires. | {doc}`Monitoring </user-guide/moving-data/streaming-monitoring>` |
+| A query that retains rows reports no state metrics | The stream-stream join, the stream-static join, the session window, the dedup, a limit and a stream union all run through a driver, so `state_operators` is empty and `num_input_rows` counts what the driver emitted. The memory guard still fires. | {doc}`Monitoring </user-guide/moving-data/streaming/monitoring>` |
 
 ## See also
 
-- {doc}`Streaming </user-guide/moving-data/streaming>`: the full source, sink, trigger, and output-mode reference.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: the full source, sink, trigger, and output-mode reference.
 - {doc}`Kafka integration </integrations/streams/kafka>`: brokers, consumer groups, and splits.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: the batch write surface and Delta commits.
 - {doc}`Late-arriving data </cookbook/data-engineering/ingest/late-arriving-data>`: the batch reconciliation half of the same problem.

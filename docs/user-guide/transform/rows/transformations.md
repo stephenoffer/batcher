@@ -71,7 +71,7 @@ print(ds.rename({"qty": "quantity"}).to_pydict())
 
 ## Column selectors
 
-The transforms above name columns one at a time. A *selector* stands for every column matching a rule, such as a name, a name pattern, or an Arrow dtype. One written expression then becomes as many computed columns as match. A {py:class}`Selector <batcher.plan.expr_ir.selectors.Selector>` is an `Expr` leaf, so the whole scalar algebra composes onto it, and it works anywhere a projection is built: `select`, `with_columns`, and `drop`.
+The transforms above name columns one at a time. A *selector* stands for every column matching a rule, such as a name, a name pattern, or an Arrow dtype. One written expression then becomes as many computed columns as match. A {py:class}`Selector <batcher.plan.expr_ir.selectors.Selector>` is an `Expr` leaf, so the whole scalar algebra composes onto it, and it works anywhere a projection is built: `select`, `with_columns`, `drop`, and `group_by().agg()`.
 
 {py:func}`bt.exclude(...) <batcher.exclude>` selects every column except the named ones, the mirror image of listing the ones you want to keep:
 
@@ -80,7 +80,7 @@ print(ds.select(bt.exclude("qty")).columns)
 # ['name', 'price']
 ```
 
-The dtype selectors pick columns by kind. {py:func}`bt.numeric() <batcher.numeric>` covers integer, float, and decimal, and {py:func}`bt.integer() <batcher.integer>`, {py:func}`bt.floating() <batcher.floating>`, {py:func}`bt.string() <batcher.string>`, and {py:func}`bt.boolean() <batcher.boolean>` narrow that to one kind each. {py:func}`bt.temporal() <batcher.temporal>` covers date, time, timestamp, and duration, and {py:func}`bt.by_dtype(pa.int32(), ...) <batcher.by_dtype>` matches exact Arrow types.
+The dtype selectors pick columns by kind. {py:func}`bt.numeric() <batcher.numeric>` covers integer, float, and decimal, and {py:func}`bt.integer() <batcher.integer>`, {py:func}`bt.floating() <batcher.floating>`, {py:func}`bt.string() <batcher.string>`, and {py:func}`bt.boolean() <batcher.boolean>` narrow that to one kind each. {py:func}`bt.temporal() <batcher.temporal>` covers date, time, timestamp, and duration, and {py:func}`bt.by_dtype(pa.float64(), ...) <batcher.by_dtype>` matches Arrow types as the engine stores them, taking a `pyarrow` type or its name.
 
 The name selectors match column *names*. {py:func}`bt.matches(regex) <batcher.matches>` matches by regular expression, and {py:func}`bt.starts_with(...) <batcher.starts_with>`, {py:func}`bt.ends_with(...) <batcher.ends_with>`, and {py:func}`bt.contains(...) <batcher.contains>` match by literal prefix, suffix, and substring. Each of those three accepts several arguments. {py:func}`bt.all() <batcher.all>` matches every column.
 
@@ -116,7 +116,7 @@ print(messy.select(bt.all().name.to_uppercase()).columns)
 # ['USER ID', 'SIGNUP DATE']
 ```
 
-Put `.name` *before* the scalar work. It is an accessor on the selector, not on the computed expression, so read `bt.numeric().name.prefix("n_").round(2)` as "the numeric columns, prefixed, rounded".
+The accessor works on either side of the scalar work. `bt.numeric().name.prefix("n_").round(2)` and `bt.numeric().round(2).name.prefix("n_")` both mean "the numeric columns, rounded, prefixed", because the rename is recorded on the selector inside the expression.
 
 Because renaming happens per matched column, `with_columns` replaces a column in place when the output name is unchanged, and adds a new one when it changes:
 
@@ -126,14 +126,73 @@ print(ds.with_columns(bt.floating() * 2).to_pydict()["price"])  # price replaced
 
 print(ds.with_columns(bt.floating().name.suffix("_x2") * 2).columns)  # a new column added
 # ['name', 'price', 'qty', 'price_x2']
+
+print(ds.with_columns((bt.numeric() * 2).name.suffix("_x2")).columns)  # .name after the work
+# ['name', 'price', 'qty', 'price_x2', 'qty_x2']
 ```
 
-Selectors compose with set algebra: `|` for union, `&` for intersection, `-` for difference, and `~` for complement. Name a group by describing it.
+Selectors compose with set algebra: `|` for union, `&` for intersection, `-` for difference, `^` for the columns in exactly one of the two, and `~` for complement. Name a group by describing it. A plain {py:obj}`bt.col("x") <batcher.col>` on the other side of a set operator is read as the selector for that one column, as Polars reads it. Any other operand is arithmetic or logic over every matched column, so `bt.numeric() - 1` subtracts one from each.
 
 ```python
 print(ds.select(bt.numeric() - bt.floating()).columns)  # numeric columns that are not floats
 # ['qty']
+
+print(ds.select(bt.numeric() ^ bt.floating()).columns)  # in one of the two, not both
+# ['qty']
+
+print(ds.select(bt.numeric() - bt.col("qty")).columns)  # col("qty") as a one-column selector
+# ['price']
+
+print(ds.select(bt.numeric() - 1).to_pydict())  # a scalar operand is arithmetic
+# {'price': [9.0, 19.0, 29.0], 'qty': [0, 1, 2]}
 ```
+
+A set operation keeps no rename, so combining or complementing a selector that already carries `.name` raises a `PlanError`. Rename after combining: `(~bt.numeric()).name.prefix("p_")`. A selector's own `.exclude(...)` is the exception: it only narrows the selection, so it keeps the rename.
+
+### Selectors in aggregations
+
+An aggregate over a selector expands to one aggregate per matched column, in `group_by().agg()` and in a whole-frame `select`. The group keys are never aggregated over. Several aggregates over one selector need distinct names, which `.name` gives them. On an aggregate, `.name` is the same rename accessor, as in Polars:
+
+```python
+sales = bt.from_pydict({"region": ["n", "n", "s"], "price": [10.0, 20.0, 30.0], "qty": [1, 2, 3]})
+summary = sales.group_by("region").agg(
+    bt.numeric().sum().name.suffix("_sum"),
+    bt.numeric().max().name.prefix("max_"),
+)
+print(summary.sort("region").to_pydict())
+# {'region': ['n', 's'], 'price_sum': [30.0, 30.0], 'qty_sum': [3, 3],
+#  'max_price': [20.0, 30.0], 'max_qty': [2, 3]}
+
+print(sales.select(bt.numeric().mean()).to_pydict())
+# {'price': [20.0], 'qty': [2.0]}
+```
+
+`alias(...)` names one column, so an aliased aggregate over a selector that matched several columns raises a `PlanError` when the query is written, and so does a keyword such as `agg(total=bt.numeric().sum())`. A window works the same way: `bt.numeric().sum().over(partition_by=["region"]).name.suffix("_region")` adds one windowed column per numeric column.
+
+### Dtypes are the stored types
+
+Batcher widens narrow types once, when data enters the engine: every integer width becomes `int64`, `float16` and `float32` become `float64`, and `large_string` and a dictionary-encoded string become `string`. A dtype selector matches the stored type, and {py:obj}`bt.by_dtype <batcher.by_dtype>` widens the type you ask for the same way, so {py:obj}`bt.by_dtype(pa.int32()) <batcher.by_dtype>` selects every `int64` column, including one that was `int64` in the source:
+
+```python
+import pyarrow as pa
+
+narrow = bt.from_arrow(pa.table({"small": pa.array([1], pa.int32()), "big": pa.array([2], pa.int64())}))
+print(narrow.select(bt.by_dtype(pa.int32())).columns)
+# ['small', 'big']
+```
+
+The same holds for {py:obj}`bt.col(pa.int32()) <batcher.col>`, and it is why {py:obj}`bt.string() <batcher.string>` also selects a column that was dictionary-encoded, where Polars keeps its categoricals apart.
+
+### Where selectors are accepted
+
+Beyond the projections, `drop_nulls(subset=...)`, `drop_nans(subset=...)`, `distinct(subset=...)`, `unpivot(on=..., index=...)`, and positional `group_by(...)` keys take a selector, bare or inside a list, and resolve it to the columns it matches. A selector that matches nothing contributes no columns anywhere: `drop` and `drop_nulls` leave the data unchanged, and `select` or `with_columns` raise a `PlanError` naming the selector only when nothing at all is left to project.
+
+```python
+print(ds.drop(bt.temporal()).columns)  # nothing matched, nothing dropped
+# ['name', 'price', 'qty']
+```
+
+A selector is refused with a `PlanError` in a filter predicate, as a join key, and in the other verbs that take column names. A join key is refused because the two sides would each expand it on their own. Some Polars selector constructors are not provided. There is no positional selector such as `by_index`, `first`, or `last`, and {py:obj}`bt.first <batcher.first>` and {py:obj}`bt.last <batcher.last>` are aggregates rather than selectors. There is also no finer dtype selector such as `date`, `datetime`, `duration`, `decimal`, `categorical`, `binary`, or `signed_integer`. Use {py:obj}`bt.by_dtype(...) <batcher.by_dtype>` with the Arrow type instead.
 
 ## Casting inside a projection
 

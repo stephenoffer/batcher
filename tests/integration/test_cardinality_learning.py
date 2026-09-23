@@ -38,9 +38,20 @@ def _table() -> pa.Table:
 
 def _query(table: pa.Table):
     # The aggregate is deliberately *not* the plan root: `record_execution` stores an
-    # absolute row count for the root signature only, and that measurement would shadow
-    # (and suppress) the correction this test is about.
-    return bt.from_arrow(table).group_by("g1", "g2").agg(s=col("v").sum()).filter(col("s") >= 0)
+    # absolute row count for the root signature only, and once that measurement exists
+    # `reportable_estimate` returns 0 for the node (a past measurement has nothing to
+    # correct), so the second run contributes no sample and the window never reaches
+    # `cardinality_correction_min_samples`.
+    #
+    # A `Sort` above it rather than a `Filter`, and the difference is not cosmetic. A
+    # `filter` over an aggregate *fuses* with it, so the engine reported one operator of
+    # kind `filter` and no `aggregate` at all -- and `Filter` is not in the estimator's
+    # `_CORRECTABLE` set, so the fused row carried `n_estimated == 0` and was dropped by
+    # `_absorb_q_error`. The trick written to stop the root shadowing the sample was
+    # removing the sample instead. Measured: with the filter, exactly one sample is ever
+    # collected and no correction is derived; with the sort, four runs give four samples
+    # for the aggregate's signature and one correction.
+    return bt.from_arrow(table).group_by("g1", "g2").agg(s=col("v").sum()).sort("g1", "g2")
 
 
 def _root_estimate(dataset, hub: MetadataHub) -> float:

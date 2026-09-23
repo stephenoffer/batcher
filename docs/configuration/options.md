@@ -332,6 +332,10 @@ print(cfg.metadata.backend)
 # sqlite
 ```
 
+`"sqlite"` and `"rocksdb"` are node-local. With no `uri`, `"sqlite"` writes `$BATCHER_HOME/metadata.db`, or `~/.batcher/metadata.db`, on the machine that opened it, so two drivers on two nodes learn separately. To share statistics across drivers, choose `"object_storage"` or `"redis"`, or `"layered"` in front of either, with a `uri` every driver reaches. `"rocksdb"` needs a directory `uri` and the `rocksdict` package.
+
+A known limitation applies to distributed `map_batches` stages. What a UDF learns inside a Ray worker, its measured per-row cost and whether it runs in threads or processes, is written to the store the worker builds from its own process's config. The driver's `config_context` doesn't reach the worker, and the driver ships it the engine's execution settings but not the `metadata` section. So unless the workers' environment selects a shared backend through `BATCHER_METADATA_BACKEND` and `BATCHER_METADATA_URI`, that learning stays in the worker's in-process store and never reaches the driver.
+
 ## governance
 
 Whether the row filters and column masks in a {py:class}`SecurityCatalog <batcher.SecurityCatalog>` are advisory or mandatory.
@@ -469,7 +473,7 @@ Batcher validates a config where you install it, not where it's used. Invalid va
 
 The worker fan-out is a terminal-call parameter, {py:meth}`ds.collect(num_workers=...) <batcher.Dataset.collect>`, not a `Config` field. The `distributed` section tunes how the fan-out behaves once chosen, not how wide it is.
 
-Every field of every section except `distributed`, `accelerator`, and `fault_tolerance` is listed here. Those three have pages of their own. `batcher.config.describe_options()` returns the live list with current values.
+Every field of every section except `distributed`, `accelerator`, and `fault_tolerance` is listed here. Those three have pages of their own. {py:obj}`batcher.config.describe_options() <batcher.config.describe_options>` returns the live list with current values.
 
 ## See also
 

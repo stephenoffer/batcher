@@ -17,13 +17,14 @@ per-contig summary is a group-by, and a per-base measure is a `.seq` expression.
 
 from __future__ import annotations
 
-from batcher.io.formats.genomics.bed import BED_COLUMNS, BedSink, BedSource
+from batcher.io.formats.genomics.bed import BED_COLUMNS, BEDGRAPH_COLUMNS, BedSink, BedSource
 from batcher.io.formats.genomics.fasta import FASTA_SCHEMA, FastaSink, FastaSource
 from batcher.io.formats.genomics.fastq import FASTQ_SCHEMA, FastqSink, FastqSource
 from batcher.io.formats.genomics.gff import GFF_SCHEMA, GffSink, GffSource
 from batcher.io.formats.genomics.vcf import VCF_FIXED_COLUMNS, VcfSource
 
 __all__ = [
+    "BEDGRAPH_COLUMNS",
     "BED_COLUMNS",
     "FASTA_SCHEMA",
     "FASTQ_SCHEMA",

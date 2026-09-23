@@ -15,10 +15,15 @@
 //! Nulling keeps it findable — `WHERE st_is_valid_reason(g) IS NOT NULL` names every bad
 //! row and why — instead of turning a data-quality question into an outage.
 //!
-//! A *caller* error is different and does raise: a negative buffer radius, a grid
-//! precision out of range, an unsupported EPSG code. Those are properties of the query,
-//! not of a row, so nulling them would hide a bug on every row at once. `bc_geo`'s
-//! `GeoError::is_row_local` draws exactly that line.
+//! The same holds for a row whose *value* is outside a function's domain: a NaN or
+//! off-globe coordinate in a grid or geodesic function, an empty chain to interpolate
+//! along. Those are `GeoError::Domain` and null the row.
+//!
+//! A *caller* error is different and does raise: a NaN buffer radius, a grid precision or
+//! zoom out of range (reported with the value the caller passed, not a clamped one), an
+//! unsupported EPSG code. Those are properties of the query, not of a row, so nulling
+//! them would hide a bug on every row at once. `bc_geo`'s `GeoError::is_row_local` draws
+//! exactly that line.
 //!
 //! # Why a geometry argument accepts text
 //!
@@ -41,6 +46,8 @@ use bc_geo::{GeoError, Geom};
 use crate::{Expr, ExprError, GeoFunc};
 
 mod build;
+#[cfg(test)]
+mod edge_tests;
 mod grid;
 mod scalar;
 

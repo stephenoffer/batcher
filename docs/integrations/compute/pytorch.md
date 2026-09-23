@@ -14,11 +14,11 @@ The following table summarizes the integration:
 
 Measured on 10 M rows x 32 float features with `batch_size=1024` and `prefetch=2`, the loader delivers 1.76 M rows/s
 through {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`, and 1.28 Mrows/s on a 4-rank DDP `streaming_split`
-(`benchmarks/BENCHMARK_RESULTS.md`). Ingest throughput is cheap to check, so measure it on your own data too.
+([`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md)). Ingest throughput is cheap to check, so measure it on your own data too.
 
 ## Tensors in
 
-`bt.from_torch` adapts a tensor, a mapping of tensors, a tuple of tensors, or a map-style
+{py:obj}`bt.from_torch <batcher.from_torch>` adapts a tensor, a mapping of tensors, a tuple of tensors, or a map-style
 {py:class}`Dataset <batcher.Dataset>` into the engine. Tensors are moved to CPU and adapted through NumPy in bulk, with
 no per-row Python.
 
@@ -122,7 +122,7 @@ sorted by label, a window will not save you. Shuffle the corpus at write time, o
 
 ## Distributed training
 
-`batcher.ml.streaming_split(ds, world_size, rank=...)` gives each DDP rank a disjoint shard of the
+{py:obj}`batcher.ml.streaming_split(ds, world_size, rank=...) <batcher.ml.streaming_split>` gives each DDP rank a disjoint shard of the
 same stream. It emits only complete rounds of `world_size` batches, so every rank yields the
 same number of batches and none stalls the others at the all-reduce barrier. Slicing the stream yourself doesn't give you that.
 

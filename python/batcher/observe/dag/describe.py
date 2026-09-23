@@ -121,6 +121,17 @@ def _describe_aggregate(node: dict[str, Any]) -> str:
     return f"{by} · {', '.join(aggs)}" if aggs else by
 
 
+def _describe_window(node: dict[str, Any]) -> str:
+    # A window carries `partition_keys`, not `group_keys`. It used to share the aggregate
+    # describer, which read the absent `group_keys` and labelled every partitioned window
+    # "global", so a correctly partitioned `rank().over("g")` read as a whole-table rank.
+    # Partition keys are bare expressions, not the `{alias, expr}` wrappers sort keys are.
+    parts = [expr_text(k) or "?" for k in node.get("partition_keys", [])]
+    funcs = [str(f.get("func", "?")) for f in node.get("functions", [])]
+    over = f"over {', '.join(parts)}" if parts else "global"
+    return f"{over} · {', '.join(funcs)}" if funcs else over
+
+
 def _describe_sort(node: dict[str, Any]) -> str:
     keys = [_alias(k) for k in node.get("keys", [])]
     limit = node.get("limit")
@@ -145,7 +156,7 @@ _DESCRIBERS = {
     "limit": lambda node: f"n = {node.get('n', node.get('limit', ''))}",
     "project": _describe_project,
     "filter": lambda node: expr_text(node.get("predicate")),
-    "window": _describe_aggregate,
+    "window": _describe_window,
     "distinct": lambda node: ", ".join(_alias(k) for k in node.get("keys", [])),
     # The IR field is `distinct` (`Union.to_ir`), not `all`. Reading a key the node does not
     # carry made `.get(...)` return `None` for every union ever rendered, so `explain()` labelled

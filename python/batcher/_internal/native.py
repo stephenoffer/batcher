@@ -26,7 +26,7 @@ from types import ModuleType
 
 from batcher._internal.errors import BackendError
 
-__all__ = ["engine", "engine_features", "engine_or_none", "has_engine"]
+__all__ = ["engine", "engine_features", "engine_or_none"]
 
 
 def engine_or_none() -> ModuleType | None:
@@ -71,15 +71,6 @@ def engine() -> ModuleType:
             "build it into the environment with `just build`"
         )
     return mod
-
-
-def has_engine() -> bool:
-    """Return whether the compiled engine is importable.
-
-    Returns:
-        ``True`` when ``batcher._native`` can be imported, ``False`` otherwise.
-    """
-    return engine_or_none() is not None
 
 
 def engine_features() -> frozenset[str]:

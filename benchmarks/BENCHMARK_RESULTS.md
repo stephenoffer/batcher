@@ -1,5 +1,93 @@
 # Batcher CPU benchmark results
 
+## Two distributed shapes that had no path: a broadcast join's write, and an aggregate over a range join (2026-09-22)
+
+**A correctness record, not a timing one.** Both changes are in `dist/`, which
+`CLAUDE.md` gates on a recorded cluster run, and this is it. The engine under it was a
+**debug** build (`bt.versions()["engine_profile"] == "debug"`, rebuilt by another session
+mid-run), so nothing here is a speed claim -- every number below is a row count or a test
+count. Box: 48 cores, 92 GiB (73 free), Ray 2.58.0, pyarrow 23.0.1, a local Ray instance
+(`RAY_ADDRESS=local`) rather than the shared cluster.
+
+### A broadcast join always collected on the driver
+
+`_distributed_join` threaded `materialize` to the shuffle path and not to the broadcast
+one -- its docstring said so outright: "the broadcast path always collects (caller handles
+both)". So `read.parquet(a).join(read.parquet(b)).write.parquet(...)` routed through
+`_distributed_write`, the collect-then-reshard fallback, while the same write after a
+`distinct`, a `group_by` or a sort stayed partitioned. A small dimension table is the
+common case, so the shape most likely to be *chosen* for broadcast was the one shape that
+always round-tripped the driver.
+
+Each probe task already writes one independent shard -- every left row is in exactly one
+partition and sees the whole build side, which is the argument the whole path rests on --
+so the shards *are* the partitioning. `broadcast_probe_join` now returns a
+`MaterializedSource` over them under `materialize=False`, the same way `_shuffle_join`
+already did.
+
+Measured, 6 Parquet files x 400 rows against a 20-row dimension:
+
+| | rows | shard files |
+|---|---|---|
+| single-node | 2,400 | -- |
+| `num_workers=2` | 2,400 | 2 |
+| `num_workers=4` | 2,400 | 4 |
+
+One file per worker is the point: before, every worker's rows went to the driver and came
+back out as a reshard. A join whose right side matches nothing still writes 0 rows rather
+than failing, and `tests/integration/test_distributed_no_materialize.py` goes 11 passed +
+1 failed to **12 passed**.
+
+### An aggregate over a range join raised
+
+`group_by` over an interval join reached `_unsupported`:
+
+    PlanError: distributed execution runs this plan shape stage by stage ... and it did
+    not stage here.
+
+while the identical join *without* the `group_by` distributed fine. `_split_at` walks
+pass-through nodes only and an `Aggregate` is a breaker, so the range-join branch could
+never see through one; no branch above it claimed the shape either, because
+`_aggregate_over_join` tests `isinstance(j, Join)` and a `RangeJoin` is not one. The plan
+fell between them.
+
+The range path already applies `above` to the concatenated result on the driver
+(`_apply_above`), so an aggregate there is computed over the whole join output -- which is
+what single-node computes. The gate the two call sites share is now
+`_range_join_distributable`, written once so they cannot drift.
+
+`split_source` (4 files x 500 rows) x `bands` (4 rows), `x < lo`, `group_by("tier")`:
+
+| | result |
+|---|---|
+| single-node | `[(1000,'c'), (1500,'d'), (500,'b')]` |
+| `num_workers=2` | identical |
+| `num_workers=4` | identical |
+| `num_workers=8` | identical |
+
+### What was run
+
+| suite | result |
+|---|---|
+| `tests/integration -k "join or write or range or materialize"` | **327 passed**, 5 skipped |
+| `tests/differential -k join` | **1,608 passed**, 4 skipped |
+| `tests/integration/test_distributed_sample_and_range_join.py` | **20 passed** |
+| `tests/integration/test_distributed_no_materialize.py` | **12 passed** |
+
+Equi-join results were compared single-node against 2, 4 and 8 workers on 6 files x 500
+rows joined to a 20-row dimension: 3,000 rows, identical every time.
+
+### One test fixture was wrong, and it hid the range-join gate entirely
+
+`test_oversized_build_side_refuses_rather_than_replicating` put `split_source` on *both*
+sides of a cross join and filtered `col("x") < col("g")`. Both of those columns exist on
+both sides, so the predicate bound to one side and pushdown sank it under the scan: no
+cross-side inequality survived above the join, `derive_range_join` never matched, and the
+plan stayed an ordinary cross join that distributes. The test then asked for a refusal no
+range join was there to give. It uses `bands` on the right now, as every other range-join
+case in that file already did.
+
+
 ## Ten landed changes, a full re-sweep, and what the new cases found (2026-09-16)
 
 A whole-board pass: every suite re-run against the full lineup, the losing cases profiled with

@@ -145,8 +145,17 @@ def test_an_out_of_core_run_reports_the_volume_it_spilled(metrics):
         out = ds.group_by(k=col("a") % 50_000).agg(s=col("b").sum()).collect()
     assert len(out) == 50_000
     snap = metrics_snapshot()
-    if snap["spills"]["out_of_core_phases_total"] == 0:
-        pytest.skip("this host had headroom to keep the query in memory")
+    # The phase counter says the out-of-core *route* ran. It does not say anything reached
+    # disk, and the two are not the same claim: measured here, `collect(spill=True,
+    # num_partitions=64)` over 4M rows into 4M groups at an 8 MB budget runs the phase and
+    # writes zero bytes, with no file ever appearing under `spill_dir`. Skipping on the
+    # phase counter therefore demanded a volume from a run that never had one, which is
+    # what `assert 0 > 0` was -- a guaranteed failure on any host with headroom.
+    assert snap["spills"]["out_of_core_phases_total"] > 0, (
+        "the out-of-core route did not run at all, so nothing below is being measured"
+    )
+    if snap["resources"]["spill"]["buckets_written"] == 0:
+        pytest.skip("this host had headroom: the out-of-core phase wrote nothing to disk")
     assert snap["spills"]["bytes_total"] > 0
     assert snap["resources"]["spill"]["buckets_written"] > 0
     # The store drops each bucket as it reads it back, so the held figures are zero by the

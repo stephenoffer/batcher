@@ -11,6 +11,7 @@ Start with classification for a hard label, then the diagnostic view when positi
 | {doc}`/cookbook/metrics/model/probabilistic_losses` | Scoring a probability or a margin rather than a hard label |
 | {doc}`/cookbook/metrics/model/regression_errors` | Absolute, squared, percentage, and robust error |
 | {doc}`/cookbook/metrics/model/agreement` | How well a prediction tracks the truth, not just how close |
+| {doc}`/cookbook/metrics/model/embeddings` | Corpus-level health checks for a vector column, in aggregate |
 
 ## See also
 
@@ -27,4 +28,5 @@ diagnostic
 probabilistic_losses
 regression_errors
 agreement
+embeddings
 ```

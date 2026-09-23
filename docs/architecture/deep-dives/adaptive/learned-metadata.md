@@ -54,7 +54,7 @@ That loop turns once per query. The hub's other axis runs across runs, and it is
 ## What Core measures
 
 `bc-interp` returns metrics alongside the result batches from `execute_plan_metered`. Per
-operator (`crates/bc-interp/src/metrics.rs`):
+operator ([`crates/bc-interp/src/metrics.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/metrics.rs)):
 
 ```rust
 pub struct OpMetric {
@@ -121,7 +121,7 @@ which never calls the JIT at all. See
 
 ## The hub
 
-`python/batcher/metadata/hub.py`. Two logical tables (`op_stats` and `learned_params`) and a
+[`python/batcher/metadata/hub.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/metadata/hub.py). Two logical tables (`op_stats` and `learned_params`) and a
 deliberately small API.
 
 :::{dropdown} The whole `MetadataHub` surface
@@ -310,14 +310,14 @@ measurement from recording to reuse:
 
 | Concern | File |
 |---|---|
-| The hub | `python/batcher/metadata/hub.py` |
-| Backends | `python/batcher/metadata/backends/` |
-| Metric transcription (Core) | `python/batcher/core/executor.py` |
-| Per-operator metrics (Rust) | `crates/bc-interp/src/metrics.rs` |
+| The hub | [`python/batcher/metadata/hub.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/metadata/hub.py) |
+| Backends | [`python/batcher/metadata/backends/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/metadata/backends) |
+| Metric transcription (Core) | [`python/batcher/core/executor.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/executor.py) |
+| Per-operator metrics (Rust) | [`crates/bc-interp/src/metrics.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/metrics.rs) |
 | Plan/column signatures | `python/batcher/kyber/{signature,learning}.py` |
-| The join bandit and OLS crossovers | `python/batcher/kyber/learned_tuning/` |
-| Learned memory model | `python/batcher/carbonite/memory/learned.py` |
-| Learned distributed sizing | `python/batcher/dist/adaptive_sizing/sizing.py` |
+| The join bandit and OLS crossovers | [`python/batcher/kyber/learned_tuning/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/kyber/learned_tuning) |
+| Learned memory model | [`python/batcher/carbonite/memory/learned.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/carbonite/memory/learned.py) |
+| Learned distributed sizing | [`python/batcher/dist/adaptive_sizing/sizing.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/adaptive_sizing/sizing.py) |
 
 ## See also
 

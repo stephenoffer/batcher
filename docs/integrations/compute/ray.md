@@ -102,7 +102,7 @@ Retries, straggler speculation, skew salting, and adaptive credits are in {doc}`
 
 ## Bring in a Ray Dataset
 
-`bt.from_ray_dataset(rds)` streams a Ray Dataset's Arrow blocks into the engine lazily, one block per batch. Nothing is collected to the driver, so memory stays bounded.
+{py:obj}`bt.from_ray_dataset(rds) <batcher.from_ray_dataset>` streams a Ray Dataset's Arrow blocks into the engine lazily, one block per batch. Nothing is collected to the driver, so memory stays bounded.
 
 ```python
 # docs: skip
@@ -118,7 +118,7 @@ print(events.group_by("region").agg(bt.col("amount").sum()).sort("region").to_py
 Ray Data stores tensor and opaque-Python columns as its own Arrow extension types, `ray.data.arrow_tensor_v2` and `ray.data.arrow_pickled_object`, which standard Parquet tooling, Polars, and DuckDB either reject or skip. Plain columns cross unchanged. Check a tensor column with `rds.schema()` before you rely on it. Batcher's own tensor columns are ordinary Arrow, `FixedSizeList` or a `struct<data, shape, dtype>` for ragged shapes, so the return leg doesn't introduce extension types.
 :::
 
-Treat this as an on-ramp. Whatever built the incoming dataset still costs what it costs. Where the source is a plain read, read it with Batcher instead. {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` reads and sums 20 M rows across 64 files in 72 ms on one node (`benchmarks/BENCHMARK_RESULTS.md`, "Data connectors"), because files decode concurrently in-process with no per-file task and no object-store hop.
+Treat this as an on-ramp. Whatever built the incoming dataset still costs what it costs. Where the source is a plain read, read it with Batcher instead. {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` reads and sums 20 M rows across 64 files in 72 ms on one node ([`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md), "Data connectors"), because files decode concurrently in-process with no per-file task and no object-store hop.
 
 The inference idiom carries over unchanged. {py:meth}`ds.map_batches <batcher.Dataset.map_batches>` takes a class, loads the model once per worker, and runs the batches through an actor pool, so a ported pipeline keeps its shape while picking up warm pools and stage overlap. See {doc}`/ml/inference/inference`.
 

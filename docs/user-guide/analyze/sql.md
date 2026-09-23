@@ -103,6 +103,32 @@ print(out.to_pydict())
 # {'category': ['a', 'b', 'a', 'b', 'a'], 'price': [10.0, 20.0, 30.0, 40.0, 50.0], 'region': ['west', 'east', 'west', 'east', 'west']}
 ```
 
+## Subqueries
+
+Scalar, `IN`, `NOT IN`, `EXISTS` and `NOT EXISTS` subqueries work in `WHERE`, and scalar and `EXISTS` subqueries work in the `SELECT` list. A *correlated* subquery, one that refers to a column of the outer query through an equality such as `o.cust = c.cust`, is rewritten into a join on that key, so it runs in parallel and on a cluster like any other join.
+
+The subquery's own clauses apply per key, the way SQL defines them. `ORDER BY ... LIMIT 1` picks one row for each outer row, an aggregate over no matching rows still has a value, and a `HAVING` inside `EXISTS` is tested for each key:
+
+```python
+people = bt.from_pydict({"cust": [1, 2, 3], "name": ["ana", "bo", "cy"]})
+buys = bt.from_pydict({"cust": [1, 1, 2], "item": ["pen", "ink", "pad"], "price": [3, 9, 5]})
+out = bt.sql(
+    """
+    SELECT name,
+           (SELECT item FROM b WHERE b.cust = p.cust ORDER BY price DESC LIMIT 1) AS priciest,
+           (SELECT count(*) + 1 FROM b WHERE b.cust = p.cust) AS n_plus_one,
+           EXISTS (SELECT 1 FROM b WHERE b.cust = p.cust HAVING count(*) > 1) AS repeat
+    FROM p ORDER BY name
+    """,
+    p=people,
+    b=buys,
+)
+print(out.to_pydict())
+# {'name': ['ana', 'bo', 'cy'], 'priciest': ['ink', 'pad', None], 'n_plus_one': [3, 2, 1], 'repeat': [True, False, False]}
+```
+
+A scalar subquery that finds more than one row for an outer row raises `ExecutionError: More than one row returned by a subquery used as an expression`, as DuckDB does, when the query runs.
+
 ## Mixing SQL and the DataFrame API
 
 A SQL result is an ordinary Dataset, so you can continue with DataFrame methods.
@@ -116,7 +142,7 @@ print(out.to_pydict())
 
 Both paths build one logical plan, push it through one optimizer, and execute it on one Rust data plane. There is no separate SQL engine.
 
-Every method on the expression accessors is callable from SQL too, under the name of the namespace and the method: `col("s").str.slugify()` is `str_slugify(s)`. See {doc}`/api/relational/expression-accessors` for the naming rules and the full surface.
+Every method on the expression accessors is callable from SQL too, under the name of the namespace and the method: `col("s").str.slugify()` is `str_slugify(s)`. See {doc}`/api/relational/expression-accessors` for the naming rules, and {doc}`/api/accessors/index` for the reference page of each namespace.
 
 The other direction works at the level of one expression. {py:func}`bt.sql_expr <batcher.sql_expr>` parses a SQL expression into an `Expr` you can pass to any DataFrame method, and a trailing `AS name` becomes its alias, so a `select` over `sql_expr` strings is Spark's `selectExpr`. {py:func}`bt.call_function <batcher.call_function>` calls a SQL function by name. A string argument is a column name and a number is a literal, which reaches a function that has no Python constructor of its own.
 
@@ -138,7 +164,7 @@ print(top.to_pydict())
 # {'category': ['a', 'b', 'c'], 'top': [50.0, 40.0, 60.0]}
 ```
 
-`sql_expr` refuses a whole query, a subquery and a window function, all of which need a relation. Use `bt.sql` for those.
+`sql_expr` refuses a whole query, a subquery and a window function, all of which need a relation. Use {py:obj}`bt.sql <batcher.sql>` for those.
 
 (sessions-tables-and-python-functions)=
 
@@ -163,13 +189,20 @@ print(s.sql("SELECT discount(price) AS net FROM t ORDER BY price").to_pydict())
 # {'net': [9.0, 18.0, 27.0, 36.0, 45.0, 54.0]}
 ```
 
-`CREATE TABLE/VIEW AS` and `DROP TABLE` register and unregister a lazy table in the session. Nothing materializes until a terminal op:
+`CREATE TABLE ... AS` registers a lazy table in the session, bound to the relations its query named when it was created. `CREATE VIEW` stores the query text instead, and every query that names the view translates it again against the session as it is then. A view therefore sees rows inserted into its base table, or a base table registered again under the same name, after the view was created:
 
 ```python
 s.sql("CREATE VIEW cheap AS SELECT category, price FROM t WHERE price < 30")
 print(s.sql("SELECT * FROM cheap ORDER BY price").to_pydict())
+s.sql("INSERT INTO t VALUES ('d', 5.0)")
+print(s.sql("SELECT * FROM cheap ORDER BY price").to_pydict())
 # {'category': ['a', 'b'], 'price': [10.0, 20.0]}
+# {'category': ['d', 'a', 'b'], 'price': [5.0, 10.0, 20.0]}
 ```
+
+`CREATE VIEW v(a, b) AS ...` names the view's columns. Dropping a table a view reads succeeds, and the view then fails when it is next queried, as in DuckDB. Nothing materializes until a terminal op.
+
+Session names are case-insensitive, as SQL identifiers are, in SQL and in Python: `s.table("T")`, `s.drop("T")` and `FROM T` all find a table registered as `t`, and registering `T` replaces `t` rather than adding a second table. `DROP TABLE` removes a registered or `CREATE TABLE AS` table, or a catalog table, and `DROP VIEW` removes a view. Each refuses the other kind. Catalog names follow the same case rule, and an unqualified column that two joined tables both have is refused as ambiguous unless `USING` or `NATURAL` merges it.
 
 {py:meth}`ds.sql("... FROM self") <batcher.Dataset.sql>` binds the current dataset directly:
 
@@ -302,6 +335,28 @@ print(out.columns)
 # ['id', 'id_1', 'v']
 ```
 
+## When a query does work
+
+{py:obj}`bt.sql <batcher.sql>` and `Session.sql` return a lazy Dataset. Translating the SQL builds a plan, and the plan runs at a terminal op such as `collect()` or `to_pydict()`. That holds for joins, aggregates, windows, CTEs referenced any number of times, correlated subqueries, and `IN (SELECT ...)` in `WHERE`.
+
+A few shapes run part of the query while the SQL is translated, because the plan uses their answer as a constant:
+
+- A `WITH RECURSIVE` CTE runs to its fixpoint.
+- An uncorrelated scalar subquery is collected and inlined as a literal. A literal filters far faster than a join against the subquery's single row would.
+- An uncorrelated `EXISTS` runs its subquery under `LIMIT 1` to learn whether it has a row.
+- An uncorrelated `NOT IN (SELECT ...)` runs two `LIMIT 1` probes of its subquery, to learn whether the set is empty and whether it holds a NULL. The anti join itself stays lazy.
+- An uncorrelated `IN (SELECT ...)` under `OR`, or read as a value, collects its set when the set is small.
+
+A view is translated when a query names it, so none of these values is fixed at `CREATE VIEW` time.
+
+A statement that writes a catalog table writes it immediately. That covers `CREATE TABLE ns.t AS`, and `INSERT`, `DELETE` and `UPDATE` on a catalog table.
+
+## On a cluster
+
+A SQL result is a lazy Dataset, so it runs on a Ray cluster the way any Dataset does: pass `distributed=True` to the terminal, as in `out.collect(distributed=True)`, or set the `distributed.mode` option with `bt.config.option_context("distributed.mode", "always")`. The plan is the same one single-node execution runs.
+
+Workers read the tables themselves, so every table a query reads must be at a path every node can open, such as an object store URI or a shared filesystem. Two catalog kinds are local to the driver process. A memory catalog lives in that process, so another process can't see it and it disappears when the process exits. A directory catalog on a local path is visible only to the node that holds the path, so build a cluster's directory catalog on shared storage, for example `bt.Catalog.from_directory("s3://bucket/warehouse")`.
+
 ## Requirements and limitations
 
 Constructs Batcher rejects rather than approximates. Each raises a clear error, because answering with a different row set and reporting success is the failure nothing downstream can detect.
@@ -312,7 +367,15 @@ Constructs Batcher rejects rather than approximates. Each raises a clear error, 
 | `POSITIONAL JOIN` | Row position is not defined for a Batcher relation, which is morsel-parallel and may span nodes. Join on a key, or number both sides with `row_number() OVER (ORDER BY ...)` first. |
 | `ASOF JOIN` on a strict `>` or `<` | The nearest-match key is inclusive. Use `>=` or `<=`. |
 | A negative list-slice bound, `a[-2:]` | Counts back from the end in DuckDB, while the underlying slice clamps to the start. Index from the front, or reverse the list first. |
-| A correlated subquery whose correlation is an inequality | An equality correlation decorrelates to a join and is supported. An inequality one is not. |
+| A correlated scalar or `IN` subquery whose correlation is an inequality, or goes through an expression such as `outer.c + 1` | An equality between two plain columns decorrelates to a join and is supported. `EXISTS` also takes an inequality correlation. Compute the expression as a column of the outer query first. |
+| A subquery correlated to a query two levels out | Only the immediately enclosing query can be referenced. Join the outer table into the middle query first. |
+| A correlated subquery in `ORDER BY`, `GROUP BY` or `JOIN ... ON` | Move it into the select list under an alias and order or join on the alias. |
+| `EXISTS` in the select list of an aggregating query | A per-row bit has no value per group. Compute it in a subquery and aggregate over that. |
+| `OFFSET` inside a correlated `EXISTS` over `DISTINCT` or `GROUP BY` | Count the groups in a scalar subquery and compare the count. |
+| Frame `EXCLUDE CURRENT ROW` / `GROUP` / `TIES` | Honouring the frame while dropping the exclusion would be a wrong answer. For a `sum` or `count`, subtract the current row from the window result. |
+| `lag` / `lead` with `IGNORE NULLS` | `first_value`, `last_value` and `nth_value` take `IGNORE NULLS` over any frame. |
+| `STRING_AGG`, `ARRAY_AGG` or `LIST` with `OVER (...)` | The window engine has no list- or string-building aggregate. Aggregate with `GROUP BY` in a subquery and join the result back. |
+| `MERGE INTO` a catalog table | `DELETE` and `UPDATE` on a catalog table rewrite it in full. For an upsert, write the merged rows with `mode="overwrite"`, or keep the table in Delta and use `ds.write.delta(uri, merge_on=[...])`. |
 | An inequality quantified subquery, `x > ALL (...)` or `x >= ANY (...)` | Only the equality forms have a faithful rewrite: `= ANY` is `IN` and `<> ALL` is `NOT IN`, by definition. The tempting rewrite of `x > ALL (S)` as `x > (SELECT max(c) FROM S)` is wrong when `S` holds a NULL, because `max` skips it. The rewrite then answers TRUE where SQL says UNKNOWN, which is a silently wrong row rather than an error. Write the `max`/`min` form yourself, with `AND NOT EXISTS (SELECT 1 FROM S WHERE c IS NULL)` to keep the NULL case. |
 | `time_bucket` with a width that doesn't divide a day evenly | Buckets start from the Unix epoch and DuckDB starts them from 2000-01-03, so a width such as `INTERVAL 2 DAY` would put every boundary on a different instant. Use a width that divides a day, such as `1 DAY`, `6 HOUR`, or `15 MINUTE`, or `date_trunc` for calendar buckets. |
 | Two `UNNEST` calls in one `SELECT` list | SQL zips them into one relation. Unnest one list per query, or use `FROM t, UNNEST(...)` for each. |

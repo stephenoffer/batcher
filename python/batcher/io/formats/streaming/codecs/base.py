@@ -36,6 +36,7 @@ __all__ = [
     "PayloadCodec",
     "build_payload_codecs",
     "null_mask_from",
+    "payloads_of",
     "resolve_codec",
     "scatter",
 ]
@@ -127,6 +128,24 @@ def null_mask_from(column: pa.Array) -> list[bool]:
     if column.null_count == 0:
         return [False] * len(column)
     return [not valid for valid in column.is_valid().to_pylist()]
+
+
+def payloads_of(column: pa.Array) -> list[bytes | None]:
+    """A payload column's values as `bytes`, whatever binary or string type it arrived as.
+
+    A broker delivers `binary`, but a test source, a file replay or a `cast` hands over
+    `large_binary` or `string`, and a codec that tested `payload in (b"", None)` or fed a
+    `str` to a binary parser failed on the second kind with an unrelated `TypeError`.
+
+    Args:
+        column: The payload column.
+
+    Returns:
+        One entry per row, None where the payload was null.
+    """
+    if pa.types.is_string(column.type) or pa.types.is_large_string(column.type):
+        column = column.cast(pa.large_binary())
+    return column.to_pylist()
 
 
 def scatter(decoded: pa.Array, keep: list[int], total: int, struct_type: pa.DataType) -> pa.Array:
@@ -249,6 +268,10 @@ def build_payload_codecs(topic: str, config: dict[str, Any]) -> tuple[Any, Any]:
     key and a value schema fetched separately would otherwise open two connections and hold
     two caches for one topic.
 
+    Codec-specific options — Protobuf's ``message_indexes``, the string codec's ``encoding``
+    — travel as a ``"{side}_codec_options"`` dict and reach that side's codec as keyword
+    arguments. They used to be dropped here, so neither could be set from a source.
+
     Args:
         topic: The topic being read, for the default subject names.
         config: The raw codec options as the source received them.
@@ -263,6 +286,12 @@ def build_payload_codecs(topic: str, config: dict[str, Any]) -> tuple[Any, Any]:
         if spec is None:
             codecs.append(None)
             continue
+        options = config.get(f"{side}_codec_options") or {}
+        if not isinstance(options, dict):
+            raise PlanError(
+                f"{side}_codec_options must be a dict of codec keyword arguments, not "
+                f"{type(options).__name__}"
+            )
         codecs.append(
             resolve_codec(
                 spec,
@@ -270,6 +299,7 @@ def build_payload_codecs(topic: str, config: dict[str, Any]) -> tuple[Any, Any]:
                 registry=registry,
                 subject=config.get(f"{side}_subject") or f"{topic}-{side}",
                 mode=config.get(f"{side}_decode_mode", "fail"),
+                **options,
             )
         )
     return codecs[0], codecs[1]

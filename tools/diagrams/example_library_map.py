@@ -15,15 +15,15 @@ from __future__ import annotations
 from _authoring import BLUE_MID, FONT, heading, note, svg, write
 
 SECTIONS = [
-    ("Relational operations", 115),
-    ("Expressions", 101),
-    ("Machine learning", 57),
-    ("Reading and writing", 47),
-    ("Statistics, time series, geo, graph", 46),
-    ("Operating the engine", 40),
+    ("Relational operations", 119),
+    ("Expressions", 102),
+    ("Machine learning", 64),
+    ("Statistics, time series, geo, graph", 49),
+    ("Reading and writing", 48),
+    ("Operating the engine", 41),
     ("TPC-H", 30),
-    ("Data quality and governance", 23),
-    ("Distributed and streaming", 18),
+    ("Data quality and governance", 25),
+    ("Distributed and streaming", 20),
     ("Root tour scripts", 16),
     ("Multimodal and text", 11),
     ("Accelerators", 8),
@@ -38,7 +38,7 @@ H = TOP + ROW * len(SECTIONS) + 52
 PEAK = max(n for _, n in SECTIONS)
 
 body = [
-    heading(40, 40, "512 RUNNABLE SCRIPTS, BY SECTION"),
+    heading(40, 40, "533 RUNNABLE SCRIPTS, BY SECTION"),
     note(40, 60, "Each script runs end to end and asserts on its own output."),
 ]
 for i, (name, n) in enumerate(SECTIONS):

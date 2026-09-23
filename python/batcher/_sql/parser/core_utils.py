@@ -457,15 +457,17 @@ def _disambiguate_columns(tr, node) -> None:
     # join unifies them; flattening would make it drop the right key). Comma joins
     # have no ON, so their WHERE equi is not a key here and is still flattened.
     protected: set[str] = set()
+    merged: set[str] = set()  # USING / NATURAL: one output column, so a bare name is fine
     natural = False
     for j in joins:
-        protected |= {u.name for u in j.args.get("using") or ()}
+        merged |= {u.name for u in j.args.get("using") or ()}
         natural = natural or (j.args.get("method") or "").upper() == "NATURAL"
         on = j.args.get("on")
         for eq in _top_level_equalities(on):
             a, b = eq.this, eq.expression
             if isinstance(a, exp.Column) and isinstance(b, exp.Column) and a.name == b.name:
                 protected.add(a.name)
+    protected |= merged
 
     names = [t.name for t in tables]
     per_source: list[tuple] = []  # (source_node, alias, columns)
@@ -495,6 +497,8 @@ def _disambiguate_columns(tr, node) -> None:
     shared = {c for c, n in counts.items() if n > 1}
     if natural:  # NATURAL merges every shared column; leave them all bare.
         protected |= shared
+        merged |= shared
+    _reject_ambiguous(node, shared - merged, per_source)
     flatten = shared - protected
     shadow_keys = _key_shadows(node, joins, shared & protected)
 
@@ -538,12 +542,71 @@ def _disambiguate_columns(tr, node) -> None:
             p.replace(exp.alias_(exp.column(both[p.table][p.name]), p.name))
     for c in list(node.find_all(exp.Column)):
         if c.find_ancestor(exp.Select) is not node:
+            # An outer reference from a correlated subquery (`... WHERE t2.g = t.g`) names
+            # this join's column too, and was left bare -- so decorrelation keyed on `g`,
+            # which the join had renamed to `t__g`, and the query raised.
+            if c.table in both and c.name in both[c.table] and _binds_outer(c, node):
+                c.replace(exp.column(both[c.table][c.name]))
             continue
         # Inside the join's own ON, a shadowed key must stay bare: it is what the join
         # keys on, and redirecting it would un-merge the pair the shadow exists beside.
         table = alias_map if c.find_ancestor(exp.Join) is not None else both
         if c.name in table.get(c.table, ()):
             c.replace(exp.column(table[c.table][c.name]))
+
+
+def _binds_outer(column: exp.Column, node: exp.Select) -> bool:
+    """Whether `column`'s qualifier reaches `node` rather than a subquery nested inside it.
+
+    A nested SELECT that has its own source under the same alias shadows the outer one, so a
+    `t.g` there is that subquery's column and must not be renamed to the outer join's.
+    """
+    select = column.find_ancestor(exp.Select)
+    while select is not None and select is not node:
+        from_ = select.args.get("from") or select.args.get("from_")
+        sources = [from_, *(select.args.get("joins") or [])]
+        for source in sources:
+            this = getattr(source, "this", None)
+            if this is not None and this.alias_or_name == column.table:
+                return False
+        select = select.find_ancestor(exp.Select)
+    return select is node
+
+
+def _reject_ambiguous(node, ambiguous: set[str], per_source) -> None:
+    """Raise on an unqualified column that more than one FROM source provides.
+
+    DuckDB refuses ``SELECT id FROM a JOIN b ON a.id = b.id`` with a binder error, because
+    ``id`` could be either side's; only ``USING`` / ``NATURAL`` merge the pair into one
+    column. This resolved it silently to one side instead (the join's coalesced key, or the
+    left source's column), which under an outer join is a different value per row. A
+    select-list alias of that name is not a column reference, so it is left alone.
+
+    Args:
+        node: The `Select` being translated.
+        ambiguous: Column names two or more sources expose and no join merges.
+        per_source: `(source, alias, columns)` for every source, for the message.
+
+    Raises:
+        PlanError: An unqualified reference in this SELECT names an ambiguous column.
+    """
+    if not ambiguous:
+        return
+    from batcher._internal.errors import PlanError
+
+    folded = {c.casefold(): c for c in ambiguous}
+    aliases = {e.alias.casefold() for e in node.expressions if isinstance(e, exp.Alias)}
+    for c in node.find_all(exp.Column):
+        if c.table or c.find_ancestor(exp.Select) is not node:
+            continue
+        if not isinstance(c.this, exp.Identifier) or c.find_ancestor(exp.Star) is not None:
+            continue  # a `*`, or a name in a star's EXCLUDE / RENAME / REPLACE list
+        name = folded.get(c.name.casefold())
+        if name is None or c.name.casefold() in aliases:
+            continue
+        owners = [alias for _, alias, cols in per_source if name in cols]
+        spelled = " or ".join(f'"{o}.{name}"' for o in owners)
+        raise PlanError(f'ambiguous reference to column name "{c.name}" (use: {spelled})')
 
 
 def _key_shadows(node, joins, merged_keys: set[str]) -> set[str]:
@@ -584,3 +647,45 @@ def _key_shadows(node, joins, merged_keys: set[str]) -> set[str]:
         if c.table and c.find_ancestor(exp.Select) is node and c.find_ancestor(exp.Join) is None
     }
     return set(merged_keys) if "*" in qualified else merged_keys & qualified
+
+
+#: The GROUP BY node types that expand into several grouping levels, in the order
+#: `grouping_levels` reports them.
+_MULTI_LEVEL = (exp.Rollup, exp.Cube, exp.GroupingSets)
+
+
+def grouping_levels(group) -> tuple[list, list, list, list]:
+    """A `GROUP BY` split into its plain items and its multi-level nodes.
+
+    sqlglot has carried `ROLLUP` / `CUBE` / `GROUPING SETS` two ways. Older versions hang
+    each off its own key on the `Group` node (`group.args["rollup"]`), and current ones put
+    the node inline among the ordinary grouping items (`group.args["expressions"]`), leaving
+    those keys empty. The pin is `sqlglot>=23` with no ceiling, so both shapes are live and
+    reading only the keyed one silently sees a plain `GROUP BY`: the `Rollup` node then falls
+    through to the scalar translator, which refuses it as an unsupported expression. That is
+    what took out every ROLLUP/CUBE/GROUPING SETS query on sqlglot 30.
+
+    Args:
+        group: The `Group` node, or None.
+
+    Returns:
+        `(plain, rollups, cubes, grouping_sets)` — the items that appear in every level,
+        then the nodes of each multi-level kind, whichever shape carried them.
+    """
+    if group is None:
+        return [], [], [], []
+    keyed = [list(group.args.get(k) or ()) for k in ("rollup", "cube", "grouping_sets")]
+    plain, inline = [], ([], [], [])
+    for e in group.args.get("expressions") or ():
+        for i, kind in enumerate(_MULTI_LEVEL):
+            if isinstance(e, kind):
+                inline[i].append(e)
+                break
+        else:
+            plain.append(e)
+    return (plain, *(k + i for k, i in zip(keyed, inline, strict=True)))
+
+
+def has_grouping_levels(group) -> bool:
+    """Whether `group` carries a ROLLUP, CUBE or GROUPING SETS in either sqlglot shape."""
+    return any(grouping_levels(group)[1:])

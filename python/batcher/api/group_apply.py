@@ -94,7 +94,7 @@ class GroupApply:
         if not out:
             # No groups in this batch, so there is no output schema to report. A zero-column
             # empty table unifies with the real batches of the same stage, the way an empty
-            # per-row result does in `dataset.callbacks._to_table`.
+            # per-row result does in `dataset._udf.rows.rows_to_table`.
             return pa.table({})
         return pa.Table.from_batches(out)
 

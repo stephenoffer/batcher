@@ -68,7 +68,7 @@ assert sum(result["lines"]) == lineitem.count()
 assert result["l_shipmode"] == sorted(result["l_shipmode"])
 ```
 
-Two distinctions are worth holding onto. `bt.count()` counts rows while `col(x).count()` counts non-null values of x, and they differ the moment a column has nulls. The other is emptiness: an empty sum is null, an empty count is zero.
+Two distinctions are worth holding onto. {py:obj}`bt.count() <batcher.count>` counts rows while `col(x).count()` counts non-null values of x, and they differ the moment a column has nulls. The other is emptiness: an empty sum is null, an empty count is zero.
 
 ## Windows
 
@@ -97,7 +97,7 @@ Two behaviours differ from SQL and are worth knowing. `order_by` takes `(column,
 
 ### SQL and the DataFrame API are the same thing
 
-A query is parsed into the logical plan the DataFrame API builds, so `bt.sql` returns a lazy Dataset rather than a materialized table. That means the two spellings interoperate freely and you can move between them mid-pipeline.
+A query is parsed into the logical plan the DataFrame API builds, so {py:obj}`bt.sql <batcher.sql>` returns a lazy Dataset rather than a materialized table. That means the two spellings interoperate freely and you can move between them mid-pipeline.
 
 ```python
 import batcher as bt
@@ -115,11 +115,11 @@ biggest = summary.filter(col("total") > 15).sort("total", descending=True)
 assert biggest.to_pydict()["region"] == ["west", "east"]
 ```
 
-`ds.sql` is the same thing scoped to one Dataset, which it calls `self`. `bt.Session` gives a query its own catalog, which is what you want when two parts of a process register tables under the same names.
+`ds.sql` is the same thing scoped to one Dataset, which it calls `self`. {py:obj}`bt.Session <batcher.Session>` gives a query its own catalog, which is what you want when two parts of a process register tables under the same names.
 
 ### Where SQL surprises people
 
-Three-valued logic behaves as the standard requires, which is to say it catches people out. `COUNT(*)` counts rows while `COUNT(column)` counts non-nulls; a comparison against null is null, so neither `= 10` nor `<> 10` keeps a null row; and `IS NULL` is the only test that finds them. `examples/sql_queries/null_semantics_in_sql.py` asserts all three against a real left join.
+Three-valued logic behaves as the standard requires, which is to say it catches people out. `COUNT(*)` counts rows while `COUNT(column)` counts non-nulls; a comparison against null is null, so neither `= 10` nor `<> 10` keeps a null row; and `IS NULL` is the only test that finds them. [`examples/sql_queries/null_semantics_in_sql.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/null_semantics_in_sql.py) asserts all three against a real left join.
 
 The parser takes a dialect, so a query written for another engine runs before it is ported. That matters for a migration. Prove the old query still returns the same rows here, and only then rewrite it.
 
@@ -130,121 +130,125 @@ The table below lists the relational and SQL scripts in path order.
 <!-- library-table: relational,joins,aggregations,windows,dataset,sql_queries -->
 | Script | Shows |
 | --- | --- |
-| `examples/relational/anti_join_reconciliation.py` | Reconciling two datasets: what is in one and not the other, both ways |
-| `examples/relational/append_and_concat.py` | Stacking datasets: vstack, append, and concat |
-| `examples/relational/casting_and_types.py` | Changing types: cast on an expression, astype on a frame |
-| `examples/relational/column_order_and_selection.py` | Controlling the column order of a result |
-| `examples/relational/conditional_updates.py` | Updating a column in place, conditionally |
-| `examples/relational/counting_without_scanning.py` | Counting rows, and the cheapest way to answer each kind of count question |
-| `examples/relational/cross_join_grids.py` | Building a complete grid with a cross join, and filling the gaps |
-| `examples/relational/crosstab_and_value_counts.py` | Frequency tables: value_counts for one column, crosstab for two |
-| `examples/relational/deduplicate_keeping_latest.py` | Keeping the most recent row per key, which `distinct` cannot do |
-| `examples/relational/distinct_and_dedup.py` | Removing duplicates: whole-row distinct versus keyed deduplication |
-| `examples/relational/explode_and_unnest.py` | Nested data: exploding a list column and flattening a struct |
-| `examples/relational/filter_predicates.py` | Filtering: combining predicates, and what nulls do to them |
-| `examples/relational/filtering_by_aggregate.py` | Filtering rows by a property of their group |
-| `examples/relational/grouping_sets_cube_rollup.py` | Several grouping levels in one pass: rollup, cube, and grouping sets |
-| `examples/relational/incremental_processing.py` | Processing only what is new since the last run |
-| `examples/relational/limit_and_slicing.py` | Taking a piece: head, tail, limit, slice, and every-nth |
-| `examples/relational/nulls_across_operators.py` | How nulls travel through each operator |
-| `examples/relational/pipe_and_compose.py` | Composing pipelines: `pipe` for reuse, and why laziness makes it free |
-| `examples/relational/pipeline_composition_patterns.py` | Three ways to structure a long pipeline, and what each costs |
-| `examples/relational/pivot_and_unpivot.py` | Long to wide and back: pivot and unpivot |
-| `examples/relational/rename_and_drop.py` | Reshaping the column list: rename, drop, and selecting by dtype |
-| `examples/relational/renaming_conventions.py` | Keeping column names sane through a multi-join pipeline |
-| `examples/relational/sampling_and_row_index.py` | Sampling a large table, and attaching a row number |
-| `examples/relational/schema_inspection.py` | Reading a dataset's shape without reading its rows |
-| `examples/relational/select_and_project.py` | Choosing columns: `select` replaces the projection, `with_columns` extends it |
-| `examples/relational/self_referential_hierarchies.py` | Walking a hierarchy without recursion |
-| `examples/relational/set_operations.py` | Set operations: union, intersect, and except, with and without duplicates |
-| `examples/relational/sorting.py` | Sorting: direction per key, and where nulls land |
-| `examples/relational/sorting_binary_keys.py` | Sorting by a binary key: hashes, UUIDs, and fixed-layout records |
-| `examples/relational/top_k_per_group.py` | The top N rows within each group, two ways |
-| `examples/relational/wide_to_long_reports.py` | Turning a report into a tidy table, and back |
-| `examples/relational/window_free_top_n_per_group.py` | Top-N per group without a window, using a join against the group's threshold |
-| `examples/joins/aggregate_before_join.py` | Shrinking a side before joining it |
-| `examples/joins/asof_joins.py` | As-of joins: matching the most recent row at or before a timestamp |
-| `examples/joins/column_collisions.py` | When both sides have a column of the same name |
-| `examples/joins/duplicate_keys_and_fanout.py` | Fan-out: what a non-unique join key does to your row count |
-| `examples/joins/inner_and_outer.py` | Inner, left, right and full outer over real tables |
-| `examples/joins/join_hints_and_plans.py` | What a join looks like in the plan, and what the shape of the query tells the optimizer |
-| `examples/joins/join_null_keys.py` | Null join keys, and why they match nothing |
-| `examples/joins/keyless_and_cross.py` | Joining with no key at all, and keeping it safe |
-| `examples/joins/multi_key_joins.py` | Joining on more than one column |
-| `examples/joins/outer_join_reconciliation.py` | A full outer join, and reading the three populations it produces |
-| `examples/joins/range_and_inequality.py` | Joining on a range rather than an equality |
-| `examples/joins/self_joins.py` | Joining a table to itself, and keeping the two sides apart |
-| `examples/joins/semi_and_anti.py` | Filtering joins: semi keeps matches, anti keeps orphans |
-| `examples/joins/star_schema.py` | A star-schema query: one fact table, several small dimensions |
-| `examples/aggregations/aggregate_after_join.py` | Aggregating across a join, and the fan-out that silently doubles your totals |
-| `examples/aggregations/aggregate_over_windows.py` | Aggregating a windowed column: two-stage summaries |
-| `examples/aggregations/approximate_vs_exact.py` | Sketches versus exact aggregates: what you trade and what you keep |
-| `examples/aggregations/argmin_argmax.py` | Finding the row that holds an extreme, not just the extreme value |
-| `examples/aggregations/basic_reductions.py` | The five reductions every report starts with, whole-table and per group |
-| `examples/aggregations/bitwise_and_boolean.py` | Bitwise and boolean folds over a column |
-| `examples/aggregations/conditional_aggregates.py` | Counting and summing subsets without a second query |
-| `examples/aggregations/correlation.py` | Correlation and covariance between two columns |
-| `examples/aggregations/counting_variants.py` | Counting: rows, non-nulls, matches, and distinct values |
-| `examples/aggregations/dispersion.py` | Spread: sample versus population, and the scale-free summaries |
-| `examples/aggregations/distinct_aggregates.py` | Counting distinct values inside a group, and the cost of doing it exactly |
-| `examples/aggregations/distribution_shape.py` | Skewness and kurtosis: is this distribution lopsided, and how heavy are its tails |
-| `examples/aggregations/empty_and_edge_cases.py` | What an aggregate returns when there is nothing to aggregate |
-| `examples/aggregations/filtering_groups.py` | HAVING: filtering groups after the aggregate, and why order matters |
-| `examples/aggregations/first_last_and_mode.py` | Positional and most-common aggregates: first, last, and mode |
-| `examples/aggregations/histograms.py` | Binning a column: the histogram aggregate and explicit width buckets |
-| `examples/aggregations/list_aggregation.py` | Collecting a group's values into a list column |
-| `examples/aggregations/means.py` | Four kinds of average, and when each is the right one |
-| `examples/aggregations/multi_key_grouping.py` | Grouping by several columns, and by an expression |
-| `examples/aggregations/ordered_aggregates.py` | Aggregates that depend on order, and how to make them deterministic |
-| `examples/aggregations/pivot_style_reports.py` | A cross-tab report built from conditional aggregates rather than a pivot |
-| `examples/aggregations/products_and_overflow.py` | Multiplicative folds, and the overflow you get for free |
-| `examples/aggregations/quantiles.py` | Quantiles: exact, named, and sketch-approximated |
-| `examples/aggregations/regression.py` | Least-squares regression as an aggregate, not a model fit |
-| `examples/aggregations/rolling_up_hierarchies.py` | Rolling a fine aggregate up to a coarse one without re-scanning |
-| `examples/aggregations/streaming_safe_aggregates.py` | Which aggregates can be maintained incrementally, and which cannot |
-| `examples/aggregations/weighted_and_ratio_metrics.py` | Ratios of aggregates, not aggregates of ratios |
-| `examples/windows/cumulative_distribution.py` | Building a cumulative share, the Pareto "80% of revenue" chart |
-| `examples/windows/exclude_current_row.py` | Leave-one-out aggregates: the group's total without this row |
-| `examples/windows/first_and_last_value.py` | Reaching the endpoints of a window: first_value, last_value, nth_value |
-| `examples/windows/gaps_and_islands.py` | Finding consecutive runs: the gaps-and-islands pattern |
-| `examples/windows/lag_and_lead.py` | Looking at neighbouring rows: lag, lead, and period-over-period change |
-| `examples/windows/moving_averages.py` | Sliding windows: a moving average over a bounded frame |
-| `examples/windows/multiple_windows.py` | Several different windows in one projection |
-| `examples/windows/ntile_and_quartiles.py` | Splitting an ordered partition into equal buckets with ntile |
-| `examples/windows/percent_rank_and_cume_dist.py` | Relative position: percent_rank and cume_dist |
-| `examples/windows/rank_dense_within_time.py` | Ranking within a time partition, and the ties that dates create |
-| `examples/windows/ranking_functions.py` | Ranking within a partition: row_number, rank, and dense_rank |
-| `examples/windows/rolling_statistics.py` | Rolling statistics beyond the mean: standard deviation, min and max over a frame |
-| `examples/windows/running_totals.py` | Cumulative sums: an ordered window with an unbounded preceding frame |
-| `examples/windows/share_of_partition.py` | Each row's share of its group, without a join back |
-| `examples/windows/window_versus_groupby.py` | Window or group-by: the same aggregate, two different output shapes |
-| `examples/dataset/deduplication.py` | Deduplication: exact keys, whole rows, and keeping a chosen survivor |
-| `examples/dataset/dq_contracts.py` | Data-quality contracts: validate, fail, drop, or quarantine |
-| `examples/dataset/grouping.py` | Grouping: agg, multi-key rollups, and the cube/rollup/grouping-set variants |
-| `examples/dataset/iteration.py` | Getting results out: batches, rows, slices, and the single-value cases |
-| `examples/dataset/joins.py` | Join types, key spellings, and the as-of join for time series |
-| `examples/dataset/meta_columns.py` | Profiling one column: bounds, uniqueness, nulls, and constancy |
-| `examples/dataset/meta_comparison.py` | Asking about a join before running it, and reading approximate statistics |
-| `examples/dataset/meta_predicates.py` | Cheap yes/no questions about the data, and the column-check shorthands |
-| `examples/dataset/meta_schema.py` | Asking about a dataset's shape without executing it |
-| `examples/dataset/null_handling.py` | Dataset-level null handling: dropping, filling, and counting missing values |
-| `examples/dataset/profiling.py` | Profiling a table you have just been handed |
-| `examples/dataset/reading_the_whole_surface.py` | A sweep over the Dataset API: every accessor and metadata method, checked |
-| `examples/dataset/reshaping.py` | Reshaping: pivot, unpivot, explode, unnest, and set operations |
-| `examples/dataset/sampling_and_splits.py` | Sampling and splitting: reproducible subsets that do not leak |
-| `examples/dataset/sql_interface.py` | SQL over the same engine, and mixing SQL with DataFrame verbs |
-| `examples/sql_queries/aggregates_and_having.py` | GROUP BY and HAVING in SQL, and the DataFrame equivalent |
-| `examples/sql_queries/basics.py` | SQL over Datasets: bt.sql with named table bindings |
-| `examples/sql_queries/ctes_and_views.py` | Naming intermediate results: CTEs in a query, views in a catalog |
-| `examples/sql_queries/date_and_string_functions.py` | Date and string functions in SQL over real data |
-| `examples/sql_queries/joins_and_subqueries.py` | Joins, CTEs and subqueries in SQL over real TPC-H tables |
-| `examples/sql_queries/mixing_sql_and_dataframe.py` | Moving between SQL and the DataFrame API mid-pipeline |
-| `examples/sql_queries/null_semantics_in_sql.py` | Three-valued logic in SQL, and where it surprises people |
-| `examples/sql_queries/set_operations_and_cases.py` | UNION, CASE and IN, written as SQL over real tables |
-| `examples/sql_queries/spark_dialect.py` | Reading SQL written for another engine |
-| `examples/sql_queries/sql_over_files.py` | Querying a file directly from SQL |
-| `examples/sql_queries/window_frames_in_sql.py` | Window frames spelled out in SQL |
-| `examples/sql_queries/window_functions.py` | Window functions in SQL, with the frame spelled out |
+| [`examples/relational/anti_join_reconciliation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/anti_join_reconciliation.py) | Reconciling two datasets: what is in one and not the other, both ways |
+| [`examples/relational/append_and_concat.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/append_and_concat.py) | Stacking datasets: vstack, append, and concat |
+| [`examples/relational/casting_and_types.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/casting_and_types.py) | Changing types: cast on an expression, astype on a frame |
+| [`examples/relational/column_order_and_selection.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/column_order_and_selection.py) | Controlling the column order of a result |
+| [`examples/relational/conditional_updates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/conditional_updates.py) | Updating a column in place, conditionally |
+| [`examples/relational/counting_without_scanning.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/counting_without_scanning.py) | Counting rows, and the cheapest way to answer each kind of count question |
+| [`examples/relational/cross_join_grids.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/cross_join_grids.py) | Building a complete grid with a cross join, and filling the gaps |
+| [`examples/relational/crosstab_and_value_counts.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/crosstab_and_value_counts.py) | Frequency tables: value_counts for one column, crosstab for two |
+| [`examples/relational/deduplicate_keeping_latest.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/deduplicate_keeping_latest.py) | Keeping the most recent row per key, which `distinct` cannot do |
+| [`examples/relational/distinct_and_dedup.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/distinct_and_dedup.py) | Removing duplicates: whole-row distinct versus keyed deduplication |
+| [`examples/relational/explode_and_unnest.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/explode_and_unnest.py) | Nested data: exploding a list column and flattening a struct |
+| [`examples/relational/filter_predicates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/filter_predicates.py) | Filtering: combining predicates, and what nulls do to them |
+| [`examples/relational/filtering_by_aggregate.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/filtering_by_aggregate.py) | Filtering rows by a property of their group |
+| [`examples/relational/grouping_sets_cube_rollup.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/grouping_sets_cube_rollup.py) | Several grouping levels in one pass: rollup, cube, and grouping sets |
+| [`examples/relational/incremental_processing.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/incremental_processing.py) | Processing only what is new since the last run |
+| [`examples/relational/limit_and_slicing.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/limit_and_slicing.py) | Taking a piece: head, tail, limit, slice, and every-nth |
+| [`examples/relational/nulls_across_operators.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/nulls_across_operators.py) | How nulls travel through each operator |
+| [`examples/relational/pipe_and_compose.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/pipe_and_compose.py) | Composing pipelines: `pipe` for reuse, and why laziness makes it free |
+| [`examples/relational/pipeline_composition_patterns.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/pipeline_composition_patterns.py) | Three ways to structure a long pipeline, and what each costs |
+| [`examples/relational/pivot_and_unpivot.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/pivot_and_unpivot.py) | Long to wide and back: pivot and unpivot |
+| [`examples/relational/rename_and_drop.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/rename_and_drop.py) | Reshaping the column list: rename, drop, and selecting by dtype |
+| [`examples/relational/renaming_conventions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/renaming_conventions.py) | Keeping column names sane through a multi-join pipeline |
+| [`examples/relational/sampling_and_row_index.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/sampling_and_row_index.py) | Sampling a large table, and attaching a row number |
+| [`examples/relational/schema_inspection.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/schema_inspection.py) | Reading a dataset's shape without reading its rows |
+| [`examples/relational/select_and_project.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/select_and_project.py) | Choosing columns: `select` replaces the projection, `with_columns` extends it |
+| [`examples/relational/self_referential_hierarchies.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/self_referential_hierarchies.py) | Walking a hierarchy without recursion |
+| [`examples/relational/set_operations.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/set_operations.py) | Set operations: union, intersect, and except, with and without duplicates |
+| [`examples/relational/sorting.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/sorting.py) | Sorting: direction per key, and where nulls land |
+| [`examples/relational/sorting_binary_keys.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/sorting_binary_keys.py) | Sorting by a binary key: hashes, UUIDs, and fixed-layout records |
+| [`examples/relational/top_k_per_group.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/top_k_per_group.py) | The top N rows within each group, two ways |
+| [`examples/relational/wide_to_long_reports.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/wide_to_long_reports.py) | Turning a report into a tidy table, and back |
+| [`examples/relational/window_free_top_n_per_group.py`](https://github.com/stephenoffer/batcher/blob/main/examples/relational/window_free_top_n_per_group.py) | Top-N per group without a window, using a join against the group's threshold |
+| [`examples/joins/aggregate_before_join.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/aggregate_before_join.py) | Shrinking a side before joining it |
+| [`examples/joins/asof_joins.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/asof_joins.py) | As-of joins: matching the most recent row at or before a timestamp |
+| [`examples/joins/column_collisions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/column_collisions.py) | When both sides have a column of the same name |
+| [`examples/joins/duplicate_keys_and_fanout.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/duplicate_keys_and_fanout.py) | Fan-out: what a non-unique join key does to your row count |
+| [`examples/joins/inner_and_outer.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/inner_and_outer.py) | Inner, left, right and full outer over real tables |
+| [`examples/joins/join_hints_and_plans.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/join_hints_and_plans.py) | What a join looks like in the plan, and what the shape of the query tells the optimizer |
+| [`examples/joins/join_null_keys.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/join_null_keys.py) | Null join keys, and why they match nothing |
+| [`examples/joins/keyless_and_cross.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/keyless_and_cross.py) | Joining with no key at all, and keeping it safe |
+| [`examples/joins/multi_key_joins.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/multi_key_joins.py) | Joining on more than one column |
+| [`examples/joins/outer_join_reconciliation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/outer_join_reconciliation.py) | A full outer join, and reading the three populations it produces |
+| [`examples/joins/range_and_inequality.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/range_and_inequality.py) | Joining on a range rather than an equality |
+| [`examples/joins/self_joins.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/self_joins.py) | Joining a table to itself, and keeping the two sides apart |
+| [`examples/joins/semi_and_anti.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/semi_and_anti.py) | Filtering joins: semi keeps matches, anti keeps orphans |
+| [`examples/joins/star_schema.py`](https://github.com/stephenoffer/batcher/blob/main/examples/joins/star_schema.py) | A star-schema query: one fact table, several small dimensions |
+| [`examples/aggregations/aggregate_after_join.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/aggregate_after_join.py) | Aggregating across a join, and the fan-out that silently doubles your totals |
+| [`examples/aggregations/aggregate_over_windows.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/aggregate_over_windows.py) | Aggregating a windowed column: two-stage summaries |
+| [`examples/aggregations/approximate_vs_exact.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/approximate_vs_exact.py) | Sketches versus exact aggregates: what you trade and what you keep |
+| [`examples/aggregations/argmin_argmax.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/argmin_argmax.py) | Finding the row that holds an extreme, not just the extreme value |
+| [`examples/aggregations/basic_reductions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/basic_reductions.py) | The five reductions every report starts with, whole-table and per group |
+| [`examples/aggregations/bitwise_and_boolean.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/bitwise_and_boolean.py) | Bitwise and boolean folds over a column |
+| [`examples/aggregations/conditional_aggregates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/conditional_aggregates.py) | Counting and summing subsets without a second query |
+| [`examples/aggregations/correlation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/correlation.py) | Correlation and covariance between two columns |
+| [`examples/aggregations/counting_variants.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/counting_variants.py) | Counting: rows, non-nulls, matches, and distinct values |
+| [`examples/aggregations/dispersion.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/dispersion.py) | Spread: sample versus population, and the scale-free summaries |
+| [`examples/aggregations/distinct_aggregates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/distinct_aggregates.py) | Counting distinct values inside a group, and the cost of doing it exactly |
+| [`examples/aggregations/distribution_shape.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/distribution_shape.py) | Skewness and kurtosis: is this distribution lopsided, and how heavy are its tails |
+| [`examples/aggregations/empty_and_edge_cases.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/empty_and_edge_cases.py) | What an aggregate returns when there is nothing to aggregate |
+| [`examples/aggregations/filtering_groups.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/filtering_groups.py) | HAVING: filtering groups after the aggregate, and why order matters |
+| [`examples/aggregations/first_last_and_mode.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/first_last_and_mode.py) | Positional and most-common aggregates: first, last, and mode |
+| [`examples/aggregations/histograms.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/histograms.py) | Binning a column: the histogram aggregate and explicit width buckets |
+| [`examples/aggregations/list_aggregation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/list_aggregation.py) | Collecting a group's values into a list column |
+| [`examples/aggregations/means.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/means.py) | Four kinds of average, and when each is the right one |
+| [`examples/aggregations/multi_key_grouping.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/multi_key_grouping.py) | Grouping by several columns, and by an expression |
+| [`examples/aggregations/ordered_aggregates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/ordered_aggregates.py) | Aggregates that depend on order, and how to make them deterministic |
+| [`examples/aggregations/pivot_style_reports.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/pivot_style_reports.py) | A cross-tab report built from conditional aggregates rather than a pivot |
+| [`examples/aggregations/products_and_overflow.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/products_and_overflow.py) | Multiplicative folds, and the overflow you get for free |
+| [`examples/aggregations/quantiles.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/quantiles.py) | Quantiles: exact, named, and sketch-approximated |
+| [`examples/aggregations/regression.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/regression.py) | Least-squares regression as an aggregate, not a model fit |
+| [`examples/aggregations/rolling_up_hierarchies.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/rolling_up_hierarchies.py) | Rolling a fine aggregate up to a coarse one without re-scanning |
+| [`examples/aggregations/streaming_safe_aggregates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/streaming_safe_aggregates.py) | Which aggregates can be maintained incrementally, and which cannot |
+| [`examples/aggregations/weighted_and_ratio_metrics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/aggregations/weighted_and_ratio_metrics.py) | Ratios of aggregates, not aggregates of ratios |
+| [`examples/windows/cumulative_distribution.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/cumulative_distribution.py) | Building a cumulative share, the Pareto "80% of revenue" chart |
+| [`examples/windows/exclude_current_row.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/exclude_current_row.py) | Leave-one-out aggregates: the group's total without this row |
+| [`examples/windows/first_and_last_value.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/first_and_last_value.py) | Reaching the endpoints of a window: first_value, last_value, nth_value |
+| [`examples/windows/gaps_and_islands.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/gaps_and_islands.py) | Finding consecutive runs: the gaps-and-islands pattern |
+| [`examples/windows/lag_and_lead.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/lag_and_lead.py) | Looking at neighbouring rows: lag, lead, and period-over-period change |
+| [`examples/windows/moving_averages.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/moving_averages.py) | Sliding windows: a moving average over a bounded frame |
+| [`examples/windows/multiple_windows.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/multiple_windows.py) | Several different windows in one projection |
+| [`examples/windows/ntile_and_quartiles.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/ntile_and_quartiles.py) | Splitting an ordered partition into equal buckets with ntile |
+| [`examples/windows/percent_rank_and_cume_dist.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/percent_rank_and_cume_dist.py) | Relative position: percent_rank and cume_dist |
+| [`examples/windows/rank_dense_within_time.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/rank_dense_within_time.py) | Ranking within a time partition, and the ties that dates create |
+| [`examples/windows/ranking_functions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/ranking_functions.py) | Ranking within a partition: row_number, rank, and dense_rank |
+| [`examples/windows/rolling_statistics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/rolling_statistics.py) | Rolling statistics beyond the mean: standard deviation, min and max over a frame |
+| [`examples/windows/running_totals.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/running_totals.py) | Cumulative sums: an ordered window with an unbounded preceding frame |
+| [`examples/windows/share_of_partition.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/share_of_partition.py) | Each row's share of its group, without a join back |
+| [`examples/windows/window_versus_groupby.py`](https://github.com/stephenoffer/batcher/blob/main/examples/windows/window_versus_groupby.py) | Window or group-by: the same aggregate, two different output shapes |
+| [`examples/dataset/deduplication.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/deduplication.py) | Deduplication: exact keys, whole rows, and keeping a chosen survivor |
+| [`examples/dataset/dq_contracts.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/dq_contracts.py) | Data-quality contracts: validate, fail, drop, or quarantine |
+| [`examples/dataset/grouping.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/grouping.py) | Grouping: agg, multi-key rollups, and the cube/rollup/grouping-set variants |
+| [`examples/dataset/iteration.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/iteration.py) | Getting results out: batches, rows, slices, and the single-value cases |
+| [`examples/dataset/joins.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/joins.py) | Join types, key spellings, and the as-of join for time series |
+| [`examples/dataset/meta_columns.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/meta_columns.py) | Profiling one column: bounds, uniqueness, nulls, and constancy |
+| [`examples/dataset/meta_comparison.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/meta_comparison.py) | Asking about a join before running it, and reading approximate statistics |
+| [`examples/dataset/meta_predicates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/meta_predicates.py) | Cheap yes/no questions about the data, and the column-check shorthands |
+| [`examples/dataset/meta_schema.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/meta_schema.py) | Asking about a dataset's shape without executing it |
+| [`examples/dataset/meta_storage_and_approx.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/meta_storage_and_approx.py) | What a partitioned dataset holds on disk, what the sketches say about it, and membership checks |
+| [`examples/dataset/null_handling.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/null_handling.py) | Dataset-level null handling: dropping, filling, and counting missing values |
+| [`examples/dataset/profiling.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/profiling.py) | Profiling a table you have just been handed |
+| [`examples/dataset/reading_the_whole_surface.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/reading_the_whole_surface.py) | A sweep over the Dataset API: every accessor and metadata method, checked |
+| [`examples/dataset/reshaping.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/reshaping.py) | Reshaping: pivot, unpivot, explode, unnest, and set operations |
+| [`examples/dataset/row_callbacks.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/row_callbacks.py) | Row callbacks: map, flat_map, and filter with a Python function |
+| [`examples/dataset/sampling_and_splits.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/sampling_and_splits.py) | Sampling and splitting: reproducible subsets that do not leak |
+| [`examples/dataset/sql_interface.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dataset/sql_interface.py) | SQL over the same engine, and mixing SQL with DataFrame verbs |
+| [`examples/sql_queries/aggregates_and_having.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/aggregates_and_having.py) | GROUP BY and HAVING in SQL, and the DataFrame equivalent |
+| [`examples/sql_queries/basics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/basics.py) | SQL over Datasets: bt.sql with named table bindings |
+| [`examples/sql_queries/catalogs_and_views.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/catalogs_and_views.py) | A directory catalog, SQL over it, and a view that follows its base table |
+| [`examples/sql_queries/correlated_subqueries.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/correlated_subqueries.py) | Correlated subqueries: per-row questions answered as joins, checked against DuckDB |
+| [`examples/sql_queries/ctes_and_views.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/ctes_and_views.py) | Naming intermediate results: CTEs in a query, views in a catalog |
+| [`examples/sql_queries/date_and_string_functions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/date_and_string_functions.py) | Date and string functions in SQL over real data |
+| [`examples/sql_queries/joins_and_subqueries.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/joins_and_subqueries.py) | Joins, CTEs and subqueries in SQL over real TPC-H tables |
+| [`examples/sql_queries/mixing_sql_and_dataframe.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/mixing_sql_and_dataframe.py) | Moving between SQL and the DataFrame API mid-pipeline |
+| [`examples/sql_queries/null_semantics_in_sql.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/null_semantics_in_sql.py) | Three-valued logic in SQL, and where it surprises people |
+| [`examples/sql_queries/set_operations_and_cases.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/set_operations_and_cases.py) | UNION, CASE and IN, written as SQL over real tables |
+| [`examples/sql_queries/spark_dialect.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/spark_dialect.py) | Reading SQL written for another engine |
+| [`examples/sql_queries/sql_over_files.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/sql_over_files.py) | Querying a file directly from SQL |
+| [`examples/sql_queries/window_frames_in_sql.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/window_frames_in_sql.py) | Window frames spelled out in SQL |
+| [`examples/sql_queries/window_functions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql_queries/window_functions.py) | Window functions in SQL, with the frame spelled out |
 <!-- /library-table -->
 
 ## See also

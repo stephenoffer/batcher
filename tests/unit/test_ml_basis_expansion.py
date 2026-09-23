@@ -44,31 +44,23 @@ def test_the_basis_matches_scipy(degree: int, n_knots: int) -> None:
     pre = SplineTransformer("x", n_knots=n_knots, degree=degree, knots="uniform").fit(ds)
     got = _basis(pre, ds)
 
+    # scikit-learn's knot vector: the fitted knots extended by `degree` more at each end at
+    # the boundary spacing, not the boundary knot repeated (a clamped vector).
     knots = np.asarray(pre.knots_["x"])
-    padded = np.r_[[knots[0]] * degree, knots, [knots[-1]] * degree]
+    low, high = knots[1] - knots[0], knots[-1] - knots[-2]
+    padded = np.r_[
+        knots[0] - low * np.arange(degree, 0, -1),
+        knots,
+        knots[-1] + high * np.arange(1, degree + 1),
+    ]
     count = len(padded) - degree - 1
     identity = np.eye(count)
-    want = np.nan_to_num(
-        np.array(
-            [
-                scipy_interpolate.BSpline(padded, identity[i], degree, extrapolate=False)(XS)
-                for i in range(count)
-            ]
-        ).T
-    )
-    # SciPy's basis is half-open at the right end, so the maximum value evaluates to NaN
-    # there. Batcher closes that last interval on purpose, and the value it gives is the
-    # left-hand limit — which is what this compares against.
-    want[-1] = np.nan_to_num(
-        np.array(
-            [
-                scipy_interpolate.BSpline(padded, identity[i], degree, extrapolate=False)(
-                    XS[-1] - 1e-9
-                )
-                for i in range(count)
-            ]
-        )
-    )
+    want = np.array(
+        [
+            scipy_interpolate.BSpline(padded, identity[i], degree, extrapolate=False)(XS)
+            for i in range(count)
+        ]
+    ).T
     np.testing.assert_allclose(got, want, atol=1e-7)
 
 

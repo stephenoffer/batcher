@@ -30,17 +30,11 @@ __all__ = [
     "row_count",
     "row_group_count",
     "sorted_by",
-    "source_count",
     "total_bytes",
 ]
 
 # A `SourceStatistics | None` per bound source, index-aligned with the sources themselves.
 SourceStats = Sequence[object | None]
-
-
-def source_count(stats: SourceStats) -> int:
-    """How many sources the query is bound to (one per scanned table/dataset)."""
-    return len(stats)
 
 
 def row_count(stats: SourceStats) -> int | None:

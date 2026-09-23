@@ -37,7 +37,7 @@ const E2: f64 = WGS84_F * (2.0 - WGS84_F);
 /// The UTM zone number for a longitude, 1..=60.
 pub fn utm_zone(lon: f64) -> GeoResult<u32> {
     if !(-180.0..=180.0).contains(&lon) {
-        return Err(GeoError::invalid(format!(
+        return Err(GeoError::domain(format!(
             "UTM zone needs lon in [-180, 180], got {lon}"
         )));
     }
@@ -51,7 +51,7 @@ pub fn utm_zone(lon: f64) -> GeoResult<u32> {
 /// UTM code, and that is a property of UTM rather than a limitation here.
 pub fn utm_epsg(lon: f64, lat: f64) -> GeoResult<i32> {
     if !(-90.0..=90.0).contains(&lat) {
-        return Err(GeoError::invalid(format!(
+        return Err(GeoError::domain(format!(
             "UTM zone needs lat in [-90, 90], got {lat}"
         )));
     }
@@ -371,7 +371,8 @@ mod tests {
             let a = transform_coord(Coord::new(lon1, lat1), EPSG_WGS84, epsg).unwrap();
             let b = transform_coord(Coord::new(lon2, lat2), EPSG_WGS84, epsg).unwrap();
             let planar = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
-            let geodesic = crate::proj::geodesy::vincenty(lon1, lat1, lon2, lat2).unwrap();
+            let geodesic =
+                crate::proj::geodesy::ellipsoidal_distance(lon1, lat1, lon2, lat2).unwrap();
             let err = (planar - geodesic).abs() / geodesic;
             assert!(
                 err < 1e-3,
@@ -422,6 +423,7 @@ mod tests {
                     Coord::new(0.0, lat + 1.0),
                     Coord::new(0.0, lat),
                 ])
+                .unwrap()
             };
             g(0.0) / g(60.0)
         };

@@ -19,7 +19,7 @@ The reference-free monitors come first, since they need no labels and can gate e
 
 - {doc}`/ml/retrieval/llm-evaluation`: the same monitors applied to a generation pipeline.
 - {doc}`/cookbook/ml/pipelines/text/llm-batch-scoring`: producing the output these pages score.
-- {doc}`/cookbook/metrics/embeddings`: the aggregate checks for an embedding column.
+- {doc}`/cookbook/metrics/model/embeddings`: the aggregate checks for an embedding column.
 - {doc}`/api/models/metrics`: the complete metric vocabulary.
 
 ```{toctree}

@@ -271,23 +271,23 @@ Each concern below maps to the file that owns it, so the device placement and ba
 
 | Concern | File |
 |---|---|
-| Stage-overlapped streaming, chain detection | `python/batcher/core/udf/stream.py` |
-| UDF dispatch | `python/batcher/core/udf/execute.py` |
-| OOM halving and dirty-row bisection | `python/batcher/core/udf/call.py` |
-| Threads vs processes policy | `python/batcher/core/udf/strategy.py` |
-| Distributed actor pools, warm pools | `python/batcher/dist/executors/map.py` |
-| Latency PID | `python/batcher/ml/inference/pool.py`, mirrored in `crates/bc-udf/src/batch_size.rs` |
-| Throughput hill-climb | `python/batcher/ml/autobatch.py` |
-| Device detection, utilization, VRAM | `python/batcher/ml/gpu.py` |
-| GPU-vs-CPU backend policy | `python/batcher/kyber/gpu/policy.py` |
-| GPU relational backend routing | `python/batcher/api/terminal/gpu_backend/` |
-| Plan and expression translation to cuDF | `python/batcher/core/gpu_plan/` |
-| Mergeable split, shared by the optimizer and the backend | `python/batcher/plan/distribution/` |
-| Multi-device fan-out, shard recovery, worker-side reads | `python/batcher/dist/gpu/` |
-| Per-shard device share, Ray options for a fan-out | `python/batcher/dist/gpu/resources.py` |
-| Co-tenancy admission, MIG preference, health derate | `python/batcher/carbonite/accel/fractional.py` |
-| The packing quanta both of those round against | `python/batcher/_internal/device_share.py` |
-| cuDF and torch scatter-reduce kernels | `python/batcher/core/gpu_transform.py` |
+| Stage-overlapped streaming, chain detection | [`python/batcher/core/udf/stream.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/stream.py) |
+| UDF dispatch | [`python/batcher/core/udf/execute.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/execute.py) |
+| OOM halving and dirty-row bisection | [`python/batcher/core/udf/call.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/call.py) |
+| Threads vs processes policy | [`python/batcher/core/udf/strategy.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/strategy.py) |
+| Distributed actor pools, warm pools | [`python/batcher/dist/executors/map.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/executors/map.py) |
+| Latency PID | [`python/batcher/ml/inference/pool.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/inference/pool.py), mirrored in [`crates/bc-udf/src/batch_size.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-udf/src/batch_size.rs) |
+| Throughput hill-climb | [`python/batcher/ml/autobatch.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/autobatch.py) |
+| Device detection, utilization, VRAM | [`python/batcher/ml/gpu.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/gpu.py) |
+| GPU-vs-CPU backend policy | [`python/batcher/kyber/gpu/policy.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/kyber/gpu/policy.py) |
+| GPU relational backend routing | [`python/batcher/api/terminal/gpu_backend/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/api/terminal/gpu_backend) |
+| Plan and expression translation to cuDF | [`python/batcher/core/gpu_plan/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/core/gpu_plan) |
+| Mergeable split, shared by the optimizer and the backend | [`python/batcher/plan/distribution/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/plan/distribution) |
+| Multi-device fan-out, shard recovery, worker-side reads | [`python/batcher/dist/gpu/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/dist/gpu) |
+| Per-shard device share, Ray options for a fan-out | [`python/batcher/dist/gpu/resources.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/gpu/resources.py) |
+| Co-tenancy admission, MIG preference, health derate | [`python/batcher/carbonite/accel/fractional.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/carbonite/accel/fractional.py) |
+| The packing quanta both of those round against | [`python/batcher/_internal/device_share.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/_internal/device_share.py) |
+| cuDF and torch scatter-reduce kernels | [`python/batcher/core/gpu_transform.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/gpu_transform.py) |
 
 ## See also
 

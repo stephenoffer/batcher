@@ -3,7 +3,9 @@
 A selector is an ``Expr`` leaf standing for *every* matching column, so "round every float"
 is one expression that keeps working when a column is added. Spelling out names is how a
 pipeline silently stops covering a new column. Combine selectors with ``|``, ``&``, ``-``,
-and ``~``.
+``^``, and ``~``, and name what they produce with ``.name.prefix`` / ``.name.suffix``.
+This file is the vocabulary on a small table; ``examples/expr_logic/column_selectors.py``
+applies it to aggregation over TPC-H ``lineitem``.
 
     python examples/expressions/column_selectors.py
 """
@@ -67,6 +69,21 @@ def main() -> None:
     union = wide.select(bt.integer() | bt.boolean()).to_pydict()
     assert sorted(union) == ["active", "id"]
 
+    # Symmetric difference: numeric or starting with "amount_", but not both.
+    either = wide.select(bt.numeric() ^ bt.starts_with("amount_")).columns
+    assert either == ["id"]
+
+    # A plain col("x") on the other side of a set operator is that one column; any other
+    # operand is arithmetic over every matched column.
+    assert wide.select(bt.floating() - bt.col("amount_eur")).columns == ["amount_usd"]
+    assert wide.select(bt.integer() - 1).to_pydict() == {"id": [0, 1]}
+
+    # `.name` renames every expanded output, on a selector or on an expression built over one.
+    doubled = wide.with_columns((bt.floating() * 2).name.suffix("_x2"))
+    print("doubled:", doubled.columns[-2:])
+    assert doubled.columns[-2:] == ["amount_usd_x2", "amount_eur_x2"]
+    assert doubled.to_pydict()["amount_usd_x2"] == [21.0, 41.0]
+
     # The payoff: compute over every matched column at once, in place.
     rounded = wide.with_columns(bt.floating().round(0)).to_pydict()
     print("rounded:", rounded["amount_usd"], rounded["amount_eur"])
@@ -75,6 +92,21 @@ def main() -> None:
     assert rounded["amount_eur"] == [9.0, 19.0]
     # Non-matching columns are untouched.
     assert rounded["name"] == ["a", "b"]
+
+    # An aggregate over a selector is one aggregate per matched column.
+    totals = wide.select(bt.floating().sum().name.prefix("total_")).to_pydict()
+    print("totals:", totals)
+    assert totals == {"total_amount_usd": [31.0], "total_amount_eur": [28.0]}
+
+    # A selector that matches nothing contributes nothing, so `drop` ignores it; a `select`
+    # left with no column at all is refused and names the selector.
+    assert wide.drop(bt.ends_with("_gbp")).columns == wide.columns
+    try:
+        wide.select(bt.ends_with("_gbp"))
+    except bt.PlanError as err:
+        assert "matched no columns" in str(err)
+    else:
+        raise AssertionError("an empty projection must be refused")
 
 
 if __name__ == "__main__":

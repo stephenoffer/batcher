@@ -59,9 +59,9 @@ a serialized protocol.
 - The distributed executor (`dist/`) composes the *same* mergeable primitives
   (`partial_aggregate` / `partition_batches` / `combine_finalize`) the single-node
   path uses. Distributed is a scheduling concern, not a second semantics.
-- **A result MUST be identical whether produced on one node or many — with three stated
+- **A result MUST be identical whether produced on one node or many — with four stated
   exceptions.** The multiset of rows, every column name, and every column *type* are exact.
-  All three are places where the *query itself* does not determine an answer, so none of them
+  All four are places where the *query itself* does not determine an answer, so none of them
   is a licence to differ anywhere else.
 
   **Floating-point reductions are identical up to reassociation.** `combine` is associative in
@@ -106,7 +106,21 @@ a serialized protocol.
   A `LIMIT` that returned four rows where one node returned three, or a row the unlimited
   answer does not contain, is a defect and not this exception.
 
-  A divergence that is **not** of these three kinds is a defect, however plausible its rows
+  **A collecting aggregate with no `order_by` may order its elements differently.** This is
+  a fourth kind, found 2026-09-22 by sweeping every aggregate across worker counts, and the
+  section said "three" until then. `array_agg` gathers a group's values into a list, and
+  which order they land in is not a property of the query any more than a hash table's walk
+  order is. Measured on 100,000 rows over four Parquet files: for the first group the two
+  paths returned **the same 1,031 elements, as the same multiset, in a different order** --
+  not different values, and not a different length. `array_agg(order_by="i")` is identical
+  on both paths, so the determinism is available for the asking, exactly as it is for
+  `row_number`; the unordered form is the one that leaves the order open.
+
+  Read the bound the same way as the others: the multiset of elements is exact, the list
+  length is exact, and the element type matches. A list that gained, lost or changed an
+  element is a defect and not this exception.
+
+  A divergence that is **not** of these four kinds is a defect, however plausible its rows
   look.
 
 ## Streaming and batch

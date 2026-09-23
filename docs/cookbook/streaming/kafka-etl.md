@@ -185,7 +185,7 @@ Landing raw bytes in bronze and decoding downstream is often the better call: a 
 - {doc}`Exactly-once sinks </cookbook/streaming/exactly-once-sink>`: what the checkpoint actually guarantees, and the ways a file sink can silently drop data.
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: the gold layer over this bronze one.
 - {doc}`Streaming inference </cookbook/streaming/streaming-inference>`: scoring these events as they land.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: the full source/sink/trigger reference.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: the full source/sink/trigger reference.
 - {doc}`Kafka integration </integrations/streams/kafka>`: consumer groups, splits, and the broker schema above.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: the sink surface and Delta commits.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: `files_incremental` and the rest of the sources.

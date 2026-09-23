@@ -21,168 +21,168 @@ The following table maps 310 Batcher spellings to the PySpark names that compute
 | `%` operator | `functions.try_mod` |
 | `**` operator | `functions.pow`, `functions.power` |
 | `-` operator | `functions.negate`, `functions.negative` |
-| `AggExpr.over` + `WindowExpr.over` | `Window.currentRow`, `Window.partitionBy`, `Window.rowsBetween`, `Window.unboundedFollowing`, `Window.unboundedPreceding`, `WindowSpec.partitionBy`, `WindowSpec.rowsBetween` |
-| `batcher.config.get_option` | `RuntimeConfig.get` |
-| `batcher.config.get_option` + `batcher.config.set_option` | `SparkSession.conf` |
-| `batcher.config.option_names` + `batcher.config.get_option` | `RuntimeConfig.getAll` |
-| `batcher.config.reset_option` | `RuntimeConfig.unset` |
-| `batcher.config.set_option` | `RuntimeConfig.set` |
-| `batcher.io.Split` | `datasource.InputPartition` |
-| `bt.add_streaming_listener` | `StreamingQueryManager.addListener` |
-| `bt.arctan2` | `functions.atan2` |
-| `bt.array_agg` | `functions.array_agg` |
-| `bt.array` | `functions.array` |
-| `bt.await_any_termination` | `StreamingQueryManager.awaitAnyTermination` |
-| `bt.bit_and` | `functions.bit_and` |
-| `bt.bit_get` | `functions.bit_get`, `functions.getbit` |
-| `bt.bit_or` | `functions.bit_or` |
-| `bt.bit_xor` | `functions.bit_xor` |
-| `bt.bool_and` | `functions.bool_and`, `functions.every` |
-| `bt.bool_or` | `functions.bool_or`, `functions.some` |
-| `bt.cancel_query` | `SparkSession.interruptOperation` |
-| `bt.clear_cache` | `Catalog.clearCache` |
-| `bt.coalesce` | `functions.coalesce` |
-| `bt.col` | `functions.col`, `functions.column` |
-| `bt.concat_ws` | `functions.concat_ws` |
-| `bt.corr` | `functions.corr` |
-| `bt.count_if` | `functions.count_if` |
-| `bt.covar_pop` | `functions.covar_pop` |
-| `bt.covar_samp` | `functions.covar_samp` |
-| `bt.cume_dist` | `functions.cume_dist` |
-| `bt.current_date` | `functions.curdate`, `functions.current_date` |
-| `bt.current_session` | `SparkSession.active`, `SparkSession.getActiveSession` |
-| `bt.current_timestamp` | `functions.current_timestamp`, `functions.now` |
-| `bt.dense_rank` | `functions.dense_rank` |
-| `bt.e` | `functions.e` |
-| `bt.elt` | `functions.elt` |
-| `bt.engine_version` | `SparkSession.version` |
-| `bt.from_epoch` | `functions.timestamp_micros`, `functions.timestamp_millis`, `functions.timestamp_seconds` |
-| `bt.from_unix_date` | `functions.date_from_unix_date` |
-| `bt.greatest` | `functions.greatest` |
-| `bt.hypot` | `functions.hypot` |
-| `bt.kurtosis` | `functions.kurtosis` |
-| `bt.least` | `functions.least` |
-| `bt.lit` | `functions.lit` |
-| `bt.make_date` | `functions.make_date` |
-| `bt.map_from_arrays` | `functions.map_from_arrays` |
-| `bt.mask` | `functions.mask` |
-| `bt.matches` | `DataFrame.colRegex` |
-| `bt.max` | `functions.max` |
-| `bt.mean` | `functions.mean` |
-| `bt.median` | `functions.median` |
-| `bt.min` | `functions.min` |
-| `bt.mode` | `functions.mode` |
-| `bt.named_struct` | `functions.named_struct` |
-| `bt.nanvl` | `functions.nanvl` |
-| `bt.ntile` | `functions.ntile` |
-| `bt.nullif` | `functions.nullif`, `functions.nullifzero` |
-| `bt.partition_days` | `functions.days`, `functions.unix_date` |
-| `bt.partition_hours` | `functions.hours` |
-| `bt.partition_months` | `functions.months` |
-| `bt.partition_years` | `functions.years` |
-| `bt.percent_rank` | `functions.percent_rank` |
-| `bt.pi` | `functions.pi` |
-| `bt.pmod` | `functions.pmod` |
-| `bt.product` | `functions.product` |
-| `bt.range` | `SparkSession.range` |
-| `bt.rank` | `functions.rank` |
+| {py:obj}`AggExpr.over <batcher.AggExpr.over>` + `WindowExpr.over` | `Window.currentRow`, `Window.partitionBy`, `Window.rowsBetween`, `Window.unboundedFollowing`, `Window.unboundedPreceding`, `WindowSpec.partitionBy`, `WindowSpec.rowsBetween` |
+| {py:obj}`batcher.config.get_option <batcher.config.get_option>` | `RuntimeConfig.get` |
+| {py:obj}`batcher.config.get_option <batcher.config.get_option>` + {py:obj}`batcher.config.set_option <batcher.config.set_option>` | `SparkSession.conf` |
+| {py:obj}`batcher.config.option_names <batcher.config.option_names>` + {py:obj}`batcher.config.get_option <batcher.config.get_option>` | `RuntimeConfig.getAll` |
+| {py:obj}`batcher.config.reset_option <batcher.config.reset_option>` | `RuntimeConfig.unset` |
+| {py:obj}`batcher.config.set_option <batcher.config.set_option>` | `RuntimeConfig.set` |
+| {py:obj}`batcher.io.Split <batcher.io.Split>` | `datasource.InputPartition` |
+| {py:obj}`bt.add_streaming_listener <batcher.add_streaming_listener>` | `StreamingQueryManager.addListener` |
+| {py:obj}`bt.arctan2 <batcher.arctan2>` | `functions.atan2` |
+| {py:obj}`bt.array_agg <batcher.array_agg>` | `functions.array_agg` |
+| {py:obj}`bt.array <batcher.array>` | `functions.array` |
+| {py:obj}`bt.await_any_termination <batcher.await_any_termination>` | `StreamingQueryManager.awaitAnyTermination` |
+| {py:obj}`bt.bit_and <batcher.bit_and>` | `functions.bit_and` |
+| {py:obj}`bt.bit_get <batcher.bit_get>` | `functions.bit_get`, `functions.getbit` |
+| {py:obj}`bt.bit_or <batcher.bit_or>` | `functions.bit_or` |
+| {py:obj}`bt.bit_xor <batcher.bit_xor>` | `functions.bit_xor` |
+| {py:obj}`bt.bool_and <batcher.bool_and>` | `functions.bool_and`, `functions.every` |
+| {py:obj}`bt.bool_or <batcher.bool_or>` | `functions.bool_or`, `functions.some` |
+| {py:obj}`bt.cancel_query <batcher.cancel_query>` | `SparkSession.interruptOperation` |
+| {py:obj}`bt.clear_cache <batcher.clear_cache>` | `Catalog.clearCache` |
+| {py:obj}`bt.coalesce <batcher.coalesce>` | `functions.coalesce` |
+| {py:obj}`bt.col <batcher.col>` | `functions.col`, `functions.column` |
+| {py:obj}`bt.concat_ws <batcher.concat_ws>` | `functions.concat_ws` |
+| {py:obj}`bt.corr <batcher.corr>` | `functions.corr` |
+| {py:obj}`bt.count_if <batcher.count_if>` | `functions.count_if` |
+| {py:obj}`bt.covar_pop <batcher.covar_pop>` | `functions.covar_pop` |
+| {py:obj}`bt.covar_samp <batcher.covar_samp>` | `functions.covar_samp` |
+| {py:obj}`bt.cume_dist <batcher.cume_dist>` | `functions.cume_dist` |
+| {py:obj}`bt.current_date <batcher.current_date>` | `functions.curdate`, `functions.current_date` |
+| {py:obj}`bt.current_session <batcher.current_session>` | `SparkSession.active`, `SparkSession.getActiveSession` |
+| {py:obj}`bt.current_timestamp <batcher.current_timestamp>` | `functions.current_timestamp`, `functions.now` |
+| {py:obj}`bt.dense_rank <batcher.dense_rank>` | `functions.dense_rank` |
+| {py:obj}`bt.e <batcher.e>` | `functions.e` |
+| {py:obj}`bt.elt <batcher.elt>` | `functions.elt` |
+| {py:obj}`bt.engine_version <batcher.engine_version>` | `SparkSession.version` |
+| {py:obj}`bt.from_epoch <batcher.from_epoch>` | `functions.timestamp_micros`, `functions.timestamp_millis`, `functions.timestamp_seconds` |
+| {py:obj}`bt.from_unix_date <batcher.from_unix_date>` | `functions.date_from_unix_date` |
+| {py:obj}`bt.greatest <batcher.greatest>` | `functions.greatest` |
+| {py:obj}`bt.hypot <batcher.hypot>` | `functions.hypot` |
+| {py:obj}`bt.kurtosis <batcher.kurtosis>` | `functions.kurtosis` |
+| {py:obj}`bt.least <batcher.least>` | `functions.least` |
+| {py:obj}`bt.lit <batcher.lit>` | `functions.lit` |
+| {py:obj}`bt.make_date <batcher.make_date>` | `functions.make_date` |
+| {py:obj}`bt.map_from_arrays <batcher.map_from_arrays>` | `functions.map_from_arrays` |
+| {py:obj}`bt.mask <batcher.mask>` | `functions.mask` |
+| {py:obj}`bt.matches <batcher.matches>` | `DataFrame.colRegex` |
+| {py:obj}`bt.max <batcher.max>` | `functions.max` |
+| {py:obj}`bt.mean <batcher.mean>` | `functions.mean` |
+| {py:obj}`bt.median <batcher.median>` | `functions.median` |
+| {py:obj}`bt.min <batcher.min>` | `functions.min` |
+| {py:obj}`bt.mode <batcher.mode>` | `functions.mode` |
+| {py:obj}`bt.named_struct <batcher.named_struct>` | `functions.named_struct` |
+| {py:obj}`bt.nanvl <batcher.nanvl>` | `functions.nanvl` |
+| {py:obj}`bt.ntile <batcher.ntile>` | `functions.ntile` |
+| {py:obj}`bt.nullif <batcher.nullif>` | `functions.nullif`, `functions.nullifzero` |
+| {py:obj}`bt.partition_days <batcher.partition_days>` | `functions.days`, `functions.unix_date` |
+| {py:obj}`bt.partition_hours <batcher.partition_hours>` | `functions.hours` |
+| {py:obj}`bt.partition_months <batcher.partition_months>` | `functions.months` |
+| {py:obj}`bt.partition_years <batcher.partition_years>` | `functions.years` |
+| {py:obj}`bt.percent_rank <batcher.percent_rank>` | `functions.percent_rank` |
+| {py:obj}`bt.pi <batcher.pi>` | `functions.pi` |
+| {py:obj}`bt.pmod <batcher.pmod>` | `functions.pmod` |
+| {py:obj}`bt.product <batcher.product>` | `functions.product` |
+| {py:obj}`bt.range <batcher.range>` | `SparkSession.range` |
+| {py:obj}`bt.rank <batcher.rank>` | `functions.rank` |
 | `bt.read.json` | `DataFrameReader.json` |
 | `bt.read.orc` | `DataFrameReader.orc` |
 | `bt.read.parquet` | `DataFrameReader.parquet` |
-| `bt.read` | `DataFrameReader.format`, `DataFrameReader.load`, `DataFrameReader.option`, `DataFrameReader.options`, `DataStreamReader.option`, `DataStreamReader.options`, `SparkSession.readStream`, `SparkSession.read` |
-| `bt.register_function` | `Catalog.registerFunction`, `SparkSession.udf`, `UDFRegistration.register` |
-| `bt.regr_avgx` | `functions.regr_avgx` |
-| `bt.regr_avgy` | `functions.regr_avgy` |
-| `bt.regr_count` | `functions.regr_count` |
-| `bt.regr_intercept` | `functions.regr_intercept` |
-| `bt.regr_r2` | `functions.regr_r2` |
-| `bt.regr_slope` | `functions.regr_slope` |
-| `bt.regr_sxx` | `functions.regr_sxx` |
-| `bt.regr_sxy` | `functions.regr_sxy` |
-| `bt.regr_syy` | `functions.regr_syy` |
-| `bt.release_cluster` | `SparkSession.stop` |
-| `bt.remove_streaming_listener` | `StreamingQueryManager.removeListener` |
-| `bt.reset_terminated` | `StreamingQueryManager.resetTerminated` |
-| `bt.row_number` | `functions.row_number` |
-| `bt.running_queries` + `bt.cancel_query` | `SparkSession.interruptAll` |
-| `bt.Session` | `SparkSession.newSession` |
-| `bt.Session` + `bt.set_config` | `SparkSession.Builder`, `SparkSession.builder` |
-| `bt.skew` | `functions.skewness` |
-| `bt.sql_expr` | `functions.expr` |
-| `bt.st_set_srid` | `functions.st_setsrid` |
-| `bt.st_srid` | `functions.st_srid` |
-| `bt.std` | `functions.std`, `functions.stddev_samp`, `functions.stddev` |
-| `bt.stddev_pop` | `functions.stddev_pop` |
-| `bt.streams` | `StreamingQueryManager.active` |
-| `bt.streams` + `bt.await_any_termination` | `SparkSession.streams` |
-| `bt.sum` | `functions.sum` |
-| `bt.var_pop` | `functions.var_pop` |
-| `bt.var` | `functions.var_samp`, `functions.variance` |
-| `bt.when` + `CaseBuilder.then` + `CaseBuilder.otherwise` + `Expr.is_not_null` | `functions.nvl2` |
-| `bt.width_bucket` | `functions.width_bucket` |
+| {py:obj}`bt.read <batcher.read>` | `DataFrameReader.format`, `DataFrameReader.load`, `DataFrameReader.option`, `DataFrameReader.options`, `DataStreamReader.option`, `DataStreamReader.options`, `SparkSession.readStream`, `SparkSession.read` |
+| {py:obj}`bt.register_function <batcher.register_function>` | `Catalog.registerFunction`, `SparkSession.udf`, `UDFRegistration.register` |
+| {py:obj}`bt.regr_avgx <batcher.regr_avgx>` | `functions.regr_avgx` |
+| {py:obj}`bt.regr_avgy <batcher.regr_avgy>` | `functions.regr_avgy` |
+| {py:obj}`bt.regr_count <batcher.regr_count>` | `functions.regr_count` |
+| {py:obj}`bt.regr_intercept <batcher.regr_intercept>` | `functions.regr_intercept` |
+| {py:obj}`bt.regr_r2 <batcher.regr_r2>` | `functions.regr_r2` |
+| {py:obj}`bt.regr_slope <batcher.regr_slope>` | `functions.regr_slope` |
+| {py:obj}`bt.regr_sxx <batcher.regr_sxx>` | `functions.regr_sxx` |
+| {py:obj}`bt.regr_sxy <batcher.regr_sxy>` | `functions.regr_sxy` |
+| {py:obj}`bt.regr_syy <batcher.regr_syy>` | `functions.regr_syy` |
+| {py:obj}`bt.release_cluster <batcher.release_cluster>` | `SparkSession.stop` |
+| {py:obj}`bt.remove_streaming_listener <batcher.remove_streaming_listener>` | `StreamingQueryManager.removeListener` |
+| {py:obj}`bt.reset_terminated <batcher.reset_terminated>` | `StreamingQueryManager.resetTerminated` |
+| {py:obj}`bt.row_number <batcher.row_number>` | `functions.row_number` |
+| {py:obj}`bt.running_queries <batcher.running_queries>` + {py:obj}`bt.cancel_query <batcher.cancel_query>` | `SparkSession.interruptAll` |
+| {py:obj}`bt.Session <batcher.Session>` | `SparkSession.newSession` |
+| {py:obj}`bt.Session <batcher.Session>` + {py:obj}`bt.set_config <batcher.set_config>` | `SparkSession.Builder`, `SparkSession.builder` |
+| {py:obj}`bt.skew <batcher.skew>` | `functions.skewness` |
+| {py:obj}`bt.sql_expr <batcher.sql_expr>` | `functions.expr` |
+| {py:obj}`bt.st_set_srid <batcher.st_set_srid>` | `functions.st_setsrid` |
+| {py:obj}`bt.st_srid <batcher.st_srid>` | `functions.st_srid` |
+| {py:obj}`bt.std <batcher.std>` | `functions.std`, `functions.stddev_samp`, `functions.stddev` |
+| {py:obj}`bt.stddev_pop <batcher.stddev_pop>` | `functions.stddev_pop` |
+| {py:obj}`bt.streams <batcher.streams>` | `StreamingQueryManager.active` |
+| {py:obj}`bt.streams <batcher.streams>` + {py:obj}`bt.await_any_termination <batcher.await_any_termination>` | `SparkSession.streams` |
+| {py:obj}`bt.sum <batcher.sum>` | `functions.sum` |
+| {py:obj}`bt.var_pop <batcher.var_pop>` | `functions.var_pop` |
+| {py:obj}`bt.var <batcher.var>` | `functions.var_samp`, `functions.variance` |
+| {py:obj}`bt.when <batcher.when>` + `CaseBuilder.then` + `CaseBuilder.otherwise` + {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | `functions.nvl2` |
+| {py:obj}`bt.width_bucket <batcher.width_bucket>` | `functions.width_bucket` |
 | `CaseBuilder.otherwise` | `Column.otherwise` |
 | `CaseBuilder.when` | `Column.when` |
-| `Dataset.cache` | `DataFrame.cache`, `DataFrame.persist` |
-| `Dataset.columns` | `DataFrame.columns` |
-| `Dataset.corr` | `DataFrame.corr`, `DataFrameStatFunctions.corr` |
-| `Dataset.corr` + `Dataset.cov` | `DataFrame.stat` |
-| `Dataset.count` | `DataFrame.count` |
-| `Dataset.cov` | `DataFrame.cov`, `DataFrameStatFunctions.cov` |
-| `Dataset.cross_join` | `DataFrame.crossJoin` |
-| `Dataset.cube` | `DataFrame.cube` |
-| `Dataset.distinct` | `DataFrame.distinct`, `DataFrame.dropDuplicates`, `DataFrame.drop_duplicates` |
-| `Dataset.drop_nulls` | `DataFrame.dropna` |
-| `Dataset.drop_nulls` + `Dataset.fill_null` | `DataFrame.na` |
-| `Dataset.except_` | `DataFrame.exceptAll`, `DataFrame.subtract` |
-| `Dataset.fill_null` | `DataFrame.fillna`, `DataFrameNaFunctions.fill` |
-| `Dataset.filter` | `DataFrame.filter`, `DataFrame.where` |
-| `Dataset.group_by` | `DataFrame.groupby` |
-| `Dataset.grouping_sets` | `DataFrame.groupingSets` |
-| `Dataset.intersect` | `DataFrame.intersectAll`, `DataFrame.intersect` |
-| `Dataset.is_empty` | `DataFrame.isEmpty` |
-| `Dataset.is_streaming` | `DataFrame.isStreaming` |
-| `Dataset.limit` | `DataFrame.limit` |
-| `Dataset.pipe` | `DataFrame.transform` |
-| `Dataset.repartition` | `DataFrame.coalesce` |
-| `Dataset.rollup` | `DataFrame.rollup` |
-| `Dataset.select` | `DataFrame.selectExpr`, `DataFrame.select` |
-| `Dataset.sort` | `Column.asc_nulls_first`, `Column.asc_nulls_last`, `Column.desc_nulls_first`, `Column.desc_nulls_last`, `Column.desc`, `functions.asc_nulls_first`, `functions.asc_nulls_last`, `functions.desc_nulls_first`, `functions.desc_nulls_last`, `functions.desc` |
-| `Dataset.to_arrow` | `DataFrame.toArrow` |
-| `Dataset.to_pandas` | `DataFrame.toPandas` |
-| `Dataset.uncache` | `DataFrame.unpersist` |
-| `Dataset.unpivot` | `DataFrame.melt`, `DataFrame.unpivot` |
-| `Dataset.with_columns` | `DataFrame.withColumn`, `DataFrame.withColumns` |
-| `Dataset.with_row_index` | `functions.monotonically_increasing_id` |
-| `Dataset.with_watermark` | `DataFrame.withWatermark` |
+| {py:obj}`Dataset.cache <batcher.Dataset.cache>` | `DataFrame.cache`, `DataFrame.persist` |
+| {py:obj}`Dataset.columns <batcher.Dataset.columns>` | `DataFrame.columns` |
+| {py:obj}`Dataset.corr <batcher.Dataset.corr>` | `DataFrame.corr`, `DataFrameStatFunctions.corr` |
+| {py:obj}`Dataset.corr <batcher.Dataset.corr>` + {py:obj}`Dataset.cov <batcher.Dataset.cov>` | `DataFrame.stat` |
+| {py:obj}`Dataset.count <batcher.Dataset.count>` | `DataFrame.count` |
+| {py:obj}`Dataset.cov <batcher.Dataset.cov>` | `DataFrame.cov`, `DataFrameStatFunctions.cov` |
+| {py:obj}`Dataset.cross_join <batcher.Dataset.cross_join>` | `DataFrame.crossJoin` |
+| {py:obj}`Dataset.cube <batcher.Dataset.cube>` | `DataFrame.cube` |
+| {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | `DataFrame.distinct`, `DataFrame.dropDuplicates`, `DataFrame.drop_duplicates` |
+| {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | `DataFrame.dropna` |
+| {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` + {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | `DataFrame.na` |
+| {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | `DataFrame.exceptAll`, `DataFrame.subtract` |
+| {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | `DataFrame.fillna`, `DataFrameNaFunctions.fill` |
+| {py:obj}`Dataset.filter <batcher.Dataset.filter>` | `DataFrame.filter`, `DataFrame.where` |
+| {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | `DataFrame.groupby` |
+| {py:obj}`Dataset.grouping_sets <batcher.Dataset.grouping_sets>` | `DataFrame.groupingSets` |
+| {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | `DataFrame.intersectAll`, `DataFrame.intersect` |
+| {py:obj}`Dataset.is_empty <batcher.Dataset.is_empty>` | `DataFrame.isEmpty` |
+| {py:obj}`Dataset.is_streaming <batcher.Dataset.is_streaming>` | `DataFrame.isStreaming` |
+| {py:obj}`Dataset.limit <batcher.Dataset.limit>` | `DataFrame.limit` |
+| {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | `DataFrame.transform` |
+| {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | `DataFrame.coalesce` |
+| {py:obj}`Dataset.rollup <batcher.Dataset.rollup>` | `DataFrame.rollup` |
+| {py:obj}`Dataset.select <batcher.Dataset.select>` | `DataFrame.selectExpr`, `DataFrame.select` |
+| {py:obj}`Dataset.sort <batcher.Dataset.sort>` | `Column.asc_nulls_first`, `Column.asc_nulls_last`, `Column.desc_nulls_first`, `Column.desc_nulls_last`, `Column.desc`, `functions.asc_nulls_first`, `functions.asc_nulls_last`, `functions.desc_nulls_first`, `functions.desc_nulls_last`, `functions.desc` |
+| {py:obj}`Dataset.to_arrow <batcher.Dataset.to_arrow>` | `DataFrame.toArrow` |
+| {py:obj}`Dataset.to_pandas <batcher.Dataset.to_pandas>` | `DataFrame.toPandas` |
+| {py:obj}`Dataset.uncache <batcher.Dataset.uncache>` | `DataFrame.unpersist` |
+| {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | `DataFrame.melt`, `DataFrame.unpivot` |
+| {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | `DataFrame.withColumn`, `DataFrame.withColumns` |
+| {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | `functions.monotonically_increasing_id` |
+| {py:obj}`Dataset.with_watermark <batcher.Dataset.with_watermark>` | `DataFrame.withWatermark` |
 | `Dataset.write.for_each` | `DataStreamWriter.foreach` |
 | `Dataset.write.table` | `DataFrame.writeTo`, `DataFrameWriter.insertInto`, `DataFrameWriter.saveAsTable`, `DataFrameWriterV2.createOrReplace`, `DataFrameWriterV2.create`, `DataFrameWriterV2.overwritePartitions`, `DataFrameWriterV2.overwrite`, `DataFrameWriterV2.partitionedBy`, `DataFrameWriterV2.replace`, `DataFrameWriterV2.tableProperty` |
 | `Dataset.write.text` | `DataFrameWriter.text` |
 | `Dataset.write.xml` | `DataFrameWriter.xml` |
-| `Dataset.write` | `DataFrame.writeStream`, `DataFrameWriter.format`, `DataFrameWriter.mode`, `DataFrameWriter.option`, `DataFrameWriter.options`, `DataFrameWriter.partitionBy`, `DataStreamWriter.format`, `DataStreamWriter.option`, `DataStreamWriter.options`, `DataStreamWriter.outputMode`, `DataStreamWriter.partitionBy`, `DataStreamWriter.queryName`, `DataStreamWriter.start` |
-| `Dataset.write` + `bt.Trigger` | `DataStreamWriter.trigger` |
-| `Expr.abs` | `functions.abs` |
-| `Expr.alias` | `Column.alias`, `Column.name` |
-| `Expr.any_value` | `functions.any_value` |
-| `Expr.arccos` | `functions.acos` |
-| `Expr.arccosh` | `functions.acosh` |
-| `Expr.arcsin` | `functions.asin` |
-| `Expr.arcsinh` | `functions.asinh` |
-| `Expr.arctan` | `functions.atan` |
-| `Expr.arctanh` | `functions.atanh` |
-| `Expr.array_agg` | `functions.collect_list` |
-| `Expr.between` | `Column.between` |
-| `Expr.bit_count` | `functions.bit_count` |
-| `Expr.bitwise_and` | `Column.bitwiseAND` |
-| `Expr.bitwise_or` | `Column.bitwiseOR` |
-| `Expr.bitwise_xor` | `Column.bitwiseXOR` |
-| `Expr.cast` | `Column.astype`, `functions.make_valid_utf8`, `functions.try_validate_utf8`, `functions.validate_utf8`, `types.BinaryType`, `types.BooleanType`, `types.ByteType`, `types.DateType`, `types.DecimalType`, `types.DoubleType`, `types.FloatType`, `types.IntegerType`, `types.LongType`, `types.ShortType`, `types.StringType`, `types.TimestampNTZType` |
-| `Expr.cbrt` | `functions.cbrt` |
-| `Expr.cos` | `functions.cos` |
-| `Expr.cosh` | `functions.cosh` |
-| `Expr.cot` | `functions.cot` |
-| `Expr.count` + `bt.count` | `functions.count` |
-| `Expr.csc` | `functions.csc` |
-| `Expr.degrees` | `functions.degrees` |
+| {py:obj}`Dataset.write <batcher.Dataset.write>` | `DataFrame.writeStream`, `DataFrameWriter.format`, `DataFrameWriter.mode`, `DataFrameWriter.option`, `DataFrameWriter.options`, `DataFrameWriter.partitionBy`, `DataStreamWriter.format`, `DataStreamWriter.option`, `DataStreamWriter.options`, `DataStreamWriter.outputMode`, `DataStreamWriter.partitionBy`, `DataStreamWriter.queryName`, `DataStreamWriter.start` |
+| {py:obj}`Dataset.write <batcher.Dataset.write>` + {py:obj}`bt.Trigger <batcher.Trigger>` | `DataStreamWriter.trigger` |
+| {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | `functions.abs` |
+| {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | `Column.alias`, `Column.name` |
+| {py:obj}`Expr.any_value <batcher.plan.expr_ir.core.Expr.any_value>` | `functions.any_value` |
+| {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | `functions.acos` |
+| {py:obj}`Expr.arccosh <batcher.plan.expr_ir.core.Expr.arccosh>` | `functions.acosh` |
+| {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | `functions.asin` |
+| {py:obj}`Expr.arcsinh <batcher.plan.expr_ir.core.Expr.arcsinh>` | `functions.asinh` |
+| {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | `functions.atan` |
+| {py:obj}`Expr.arctanh <batcher.plan.expr_ir.core.Expr.arctanh>` | `functions.atanh` |
+| {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | `functions.collect_list` |
+| {py:obj}`Expr.between <batcher.plan.expr_ir.core.Expr.between>` | `Column.between` |
+| {py:obj}`Expr.bit_count <batcher.plan.expr_ir.core.Expr.bit_count>` | `functions.bit_count` |
+| {py:obj}`Expr.bitwise_and <batcher.plan.expr_ir.core.Expr.bitwise_and>` | `Column.bitwiseAND` |
+| {py:obj}`Expr.bitwise_or <batcher.plan.expr_ir.core.Expr.bitwise_or>` | `Column.bitwiseOR` |
+| {py:obj}`Expr.bitwise_xor <batcher.plan.expr_ir.core.Expr.bitwise_xor>` | `Column.bitwiseXOR` |
+| {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | `Column.astype`, `functions.make_valid_utf8`, `functions.try_validate_utf8`, `functions.validate_utf8`, `types.BinaryType`, `types.BooleanType`, `types.ByteType`, `types.DateType`, `types.DecimalType`, `types.DoubleType`, `types.FloatType`, `types.IntegerType`, `types.LongType`, `types.ShortType`, `types.StringType`, `types.TimestampNTZType` |
+| {py:obj}`Expr.cbrt <batcher.plan.expr_ir.core.Expr.cbrt>` | `functions.cbrt` |
+| {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | `functions.cos` |
+| {py:obj}`Expr.cosh <batcher.plan.expr_ir.core.Expr.cosh>` | `functions.cosh` |
+| {py:obj}`Expr.cot <batcher.plan.expr_ir.core.Expr.cot>` | `functions.cot` |
+| {py:obj}`Expr.count <batcher.plan.expr_ir.core.Expr.count>` + {py:obj}`bt.count <batcher.count>` | `functions.count` |
+| {py:obj}`Expr.csc <batcher.plan.expr_ir.core.Expr.csc>` | `functions.csc` |
+| {py:obj}`Expr.degrees <batcher.plan.expr_ir.core.Expr.degrees>` | `functions.degrees` |
 | `Expr.dt.convert_timezone` | `functions.from_utc_timestamp`, `functions.to_utc_timestamp` |
 | `Expr.dt.day` | `functions.day`, `functions.dayofmonth` |
 | `Expr.dt.dayname` | `functions.dayname` |
@@ -204,14 +204,14 @@ The following table maps 310 Batcher spellings to the PySpark names that compute
 | `Expr.dt.truncate` | `functions.date_trunc` |
 | `Expr.dt.week` | `functions.weekofyear` |
 | `Expr.dt.year` | `functions.year` |
-| `Expr.eq_missing` | `Column.eqNullSafe`, `functions.equal_null` |
-| `Expr.exp` | `functions.exp` |
-| `Expr.expm1` | `functions.expm1` |
-| `Expr.fill_null` | `functions.ifnull`, `functions.nvl`, `functions.zeroifnull` |
-| `Expr.hash_bucket` | `functions.bucket` |
-| `Expr.is_in` | `Column.isin` |
-| `Expr.is_not_null` | `Column.isNotNull`, `functions.is_valid_utf8`, `functions.isnotnull` |
-| `Expr.is_null` | `Column.isNull`, `functions.isnull` |
+| {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | `Column.eqNullSafe`, `functions.equal_null` |
+| {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | `functions.exp` |
+| {py:obj}`Expr.expm1 <batcher.plan.expr_ir.core.Expr.expm1>` | `functions.expm1` |
+| {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | `functions.ifnull`, `functions.nvl`, `functions.zeroifnull` |
+| {py:obj}`Expr.hash_bucket <batcher.plan.expr_ir.core.Expr.hash_bucket>` | `functions.bucket` |
+| {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | `Column.isin` |
+| {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | `Column.isNotNull`, `functions.is_valid_utf8`, `functions.isnotnull` |
+| {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | `Column.isNull`, `functions.isnull` |
 | `Expr.json.array_length` | `functions.json_array_length` |
 | `Expr.json.extract_string` | `functions.get_json_object` |
 | `Expr.json.keys` | `functions.json_object_keys` |
@@ -230,24 +230,24 @@ The following table maps 310 Batcher spellings to the PySpark names that compute
 | `Expr.list.prepend` | `functions.array_prepend` |
 | `Expr.list.union` | `functions.array_union` |
 | `Expr.list.unique` | `functions.array_distinct` |
-| `Expr.ln` | `functions.ln` |
-| `Expr.log10` | `functions.log10` |
-| `Expr.log1p` | `functions.log1p` |
-| `Expr.log2` | `functions.log2` |
+| {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | `functions.ln` |
+| {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | `functions.log10` |
+| {py:obj}`Expr.log1p <batcher.plan.expr_ir.core.Expr.log1p>` | `functions.log1p` |
+| {py:obj}`Expr.log2 <batcher.plan.expr_ir.core.Expr.log2>` | `functions.log2` |
 | `Expr.map.contains` | `functions.map_contains_key` |
 | `Expr.map.entries` | `functions.map_entries` |
 | `Expr.map.keys` | `functions.map_keys` |
 | `Expr.map.values` | `functions.map_values` |
-| `Expr.mean` | `functions.avg` |
-| `Expr.pipe` | `Column.transform` |
-| `Expr.radians` | `functions.radians` |
-| `Expr.round` | `functions.rint`, `functions.round` |
-| `Expr.safe_divide` | `functions.try_divide` |
-| `Expr.sec` | `functions.sec` |
-| `Expr.sign` | `functions.sign`, `functions.signum` |
-| `Expr.sin` | `functions.sin` |
-| `Expr.sinh` | `functions.sinh` |
-| `Expr.sqrt` | `functions.sqrt` |
+| {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | `functions.avg` |
+| {py:obj}`Expr.pipe <batcher.plan.expr_ir.core.Expr.pipe>` | `Column.transform` |
+| {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | `functions.radians` |
+| {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | `functions.rint`, `functions.round` |
+| {py:obj}`Expr.safe_divide <batcher.plan.expr_ir.core.Expr.safe_divide>` | `functions.try_divide` |
+| {py:obj}`Expr.sec <batcher.plan.expr_ir.core.Expr.sec>` | `functions.sec` |
+| {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | `functions.sign`, `functions.signum` |
+| {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | `functions.sin` |
+| {py:obj}`Expr.sinh <batcher.plan.expr_ir.core.Expr.sinh>` | `functions.sinh` |
+| {py:obj}`Expr.sqrt <batcher.plan.expr_ir.core.Expr.sqrt>` | `functions.sqrt` |
 | `Expr.str.ascii` | `functions.ascii` |
 | `Expr.str.base64` | `functions.base64` |
 | `Expr.str.bit_length` | `functions.bit_length` |
@@ -290,12 +290,12 @@ The following table maps 310 Batcher spellings to the PySpark names that compute
 | `Expr.str.url_decode` | `functions.try_url_decode` |
 | `Expr.str.url_encode` | `functions.url_encode` |
 | `Expr.struct.field` | `Column.getField` |
-| `Expr.tan` | `functions.tan` |
-| `Expr.tanh` | `functions.tanh` |
-| `Expr.to_base` | `functions.bin` |
-| `Expr.try_cast` | `Column.try_cast` |
+| {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | `functions.tan` |
+| {py:obj}`Expr.tanh <batcher.plan.expr_ir.core.Expr.tanh>` | `functions.tanh` |
+| {py:obj}`Expr.to_base <batcher.plan.expr_ir.core.Expr.to_base>` | `functions.bin` |
+| {py:obj}`Expr.try_cast <batcher.plan.expr_ir.core.Expr.try_cast>` | `Column.try_cast` |
 | `Expr` | `functions.positive` |
-| `GroupBy.agg` | `GroupedData.agg` |
+| {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` | `GroupedData.agg` |
 | `lshift` operator | `functions.shiftleft` |
 | `rshift` operator | `functions.shiftright` |
 | `Session.catalog.create_namespace` | `Catalog.createDatabase` |
@@ -328,3 +328,10 @@ The following table maps 310 Batcher spellings to the PySpark names that compute
 | `StreamingQuery.status` | `StreamingQuery.status` |
 | `StreamingQuery.stop` | `StreamingQuery.stop` |
 | `Table.properties` | `Catalog.getTableProperties` |
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`/getting-started/migration/index`: porting the other way, from PySpark onto Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

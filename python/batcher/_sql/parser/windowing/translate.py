@@ -734,4 +734,11 @@ def _window_func(win, order):
     if name in _VALUE_FUNCS:
         return _value_func(name, fn, order)
 
+    if isinstance(fn, (exp.GroupConcat, exp.ArrayAgg)):
+        agg = "STRING_AGG" if isinstance(fn, exp.GroupConcat) else "ARRAY_AGG"
+        raise NotImplementedError(
+            f"{agg} is not supported as a window function (OVER ...): the window engine has "
+            "no list- or string-building aggregate. Aggregate with GROUP BY in a subquery and "
+            f"join the result back, or call {agg.lower()}(...) without OVER."
+        )
     raise NotImplementedError(f"unsupported window function: {name}")

@@ -17,8 +17,6 @@ from batcher.carbonite.accel.device.torch_alloc import (
     TorchAllocatorPlan,
     configure_torch_allocator,
     plan_torch_allocator,
-    reset_torch_allocator_state,
-    torch_allocator_state,
 )
 
 __all__ = [
@@ -27,6 +25,4 @@ __all__ = [
     "configure_torch_allocator",
     "install_rmm_resource",
     "plan_torch_allocator",
-    "reset_torch_allocator_state",
-    "torch_allocator_state",
 ]

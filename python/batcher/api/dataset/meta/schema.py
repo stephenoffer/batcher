@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
 from batcher.api.dataset.meta._facts import MetaBase
 
 if TYPE_CHECKING:
@@ -332,11 +333,16 @@ class SchemaMeta(MetaBase):
             family: One of ``numeric``, ``integer``, ``float``, ``string``, ``boolean``,
                 ``temporal``, ``nested``.
 
+        A dataset needs at least one column, so a family the schema has no column of is an
+        error rather than an empty projection. The error names the families that *are*
+        present; ask `numeric`, `strings`, `temporal`, and the rest first when absence is an
+        expected case rather than a mistake.
+
         Returns:
             A new dataset containing only the columns of that family.
 
         Raises:
-            PlanError: If `family` is not a known type family.
+            PlanError: If `family` is not a known type family, or no column belongs to it.
 
         Examples:
             .. doctest::
@@ -345,13 +351,23 @@ class SchemaMeta(MetaBase):
                 >>> ds = bt.from_pydict({"x": [1], "s": ["a"]})
                 >>> ds.meta.schema.select("numeric").columns
                 ['x']
+                >>> try:
+                ...     ds.meta.schema.select("temporal")
+                ... except bt.PlanError as err:
+                ...     print(str(err).split("; ")[1])
+                the families present are numeric, integer, string
         """
-        return self._ds.select(*self._of_family(family))
+        columns = self._of_family(family)
+        if not columns:
+            present = ", ".join(name for name in _FAMILIES if self._of_family(name))
+            raise PlanError(
+                f"meta.schema.select({family!r}): no {family!r} column in this schema; the "
+                f"families present are {present or 'none'}"
+            )
+        return self._ds.select(*columns)
 
     def _of_family(self, family: str) -> list[str]:
         """The columns whose type belongs to `family`, in schema order."""
-        from batcher._internal.errors import PlanError
-
         predicate = _FAMILIES.get(family)
         if predicate is None:
             known = ", ".join(sorted(_FAMILIES))

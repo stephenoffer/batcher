@@ -16,9 +16,9 @@ state (a mean, a category set, bin edges) that has to be *reused* on held-out da
 Nothing here touches a row in Python.
 
 For the same workflow written as expressions instead of objects (broadcast aggregates,
-`when/then` bucketing, one-hot via boolean casts), see `examples/feature_engineering.py`.
+`when/then` bucketing, one-hot via boolean casts), see [`examples/feature_engineering.py`](https://github.com/stephenoffer/batcher/blob/main/examples/feature_engineering.py).
 This page is the preprocessor-object counterpart. Its runnable script version is
-`examples/preprocessors.py`.
+[`examples/preprocessors.py`](https://github.com/stephenoffer/batcher/blob/main/examples/preprocessors.py).
 
 ## The raw data
 
@@ -334,4 +334,4 @@ The training-loop side: device transfer, prefetch, zero-copy.
 - {doc}`ML API reference </api/models/ml>`: the full `Preprocessor` surface.
 - {doc}`Feature pipeline recipe </cookbook/ml/pipelines/features/feature-pipeline>` and
   {doc}`train/test split recipe </cookbook/ml/pipelines/features/train-test-split>`: the short versions.
-- `examples/preprocessors.py`: this workflow as a runnable, asserted script.
+- [`examples/preprocessors.py`](https://github.com/stephenoffer/batcher/blob/main/examples/preprocessors.py): this workflow as a runnable, asserted script.

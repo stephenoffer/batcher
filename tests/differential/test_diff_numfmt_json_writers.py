@@ -47,6 +47,27 @@ def test_number_formatting_over_a_column(duck):
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
+def test_number_formatting_over_an_all_null_column(duck):
+    """A `Null`-*typed* column answers nulls, as DuckDB does, rather than failing the query.
+
+    Not the case the test above covers. That column is `Int64` and merely *contains* a
+    null, so it takes the integer path and its nulls are handled by the kernel. This one's
+    Arrow type is `null`, which is what `from_pydict({"n": [None, None]})`, a left join
+    that matched nothing, and a batch of failed generations all produce -- the three cases
+    `bc-expr`'s `eval_str` names when it settled that a string function answers `null` for
+    such a column instead of rejecting it.
+
+    The Int -> Utf8 functions sat outside that settlement: they declined the column, the
+    string path cast it to `Utf8`, and they then rejected it as "takes an integer". So
+    `chr`, `to_base` and `format_bytes` raised `ExecutionError` on input where DuckDB
+    returns NULL and where `upper` and `hex` already returned nulls.
+    """
+    t = pa.table({"n": pa.nulls(3)})
+    duck.register("t", t)
+    q = "SELECT chr(n::INTEGER) AS c, to_base(n, 16) AS h, format_bytes(n) AS b FROM t"
+    assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
 def test_the_dataframe_spelling_agrees_with_the_sql_one():
     ds = bt.from_pydict({"n": [15, 255]})
     out = ds.select(

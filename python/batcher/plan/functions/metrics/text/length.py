@@ -43,16 +43,19 @@ def _safe_div(num: Expr, den: Expr) -> Expr:
 def automated_readability_index(text: IntoExpr) -> Expr:
     """Mean automated readability index (ARI) over the corpus — a US-grade readability score.
 
-    ARI scores a row as ``4.71 * chars/words + 0.5 * words/sentences - 21.43`` and approximates
-    the US school grade needed to read it. A higher value means denser, harder text. Rows with no
-    words or no sentences contribute a guarded 0 for that term, so an empty output cannot divide by
-    zero. The corpus score is the mean of the per-row scores, mergeable across partitions.
+    ARI scores a row as ``4.71 * characters/words + 0.5 * words/sentences - 21.43`` and
+    approximates the US school grade needed to read it. A higher value means denser, harder text.
+    The characters are letters and digits only, as the index defines them, so neither spaces nor
+    punctuation lengthen a word. A row with words but no sentence terminator counts as one
+    sentence. A row with no words has no grade and is skipped rather than scored ``-21.43``, so an
+    empty or null output cannot drag the corpus score down. The corpus score is the mean of the
+    per-row scores, mergeable across partitions.
 
     Args:
         text: The generated-text column (name or expression).
 
     Returns:
-        The mean per-row ARI over the corpus.
+        The mean per-row ARI over the rows that have words; null when none do.
 
     Examples:
         .. doctest::
@@ -60,16 +63,16 @@ def automated_readability_index(text: IntoExpr) -> Expr:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"o": ["The cat sat on the mat. It was warm."]})
             >>> round(ds.agg(m=bt.automated_readability_index("o")).to_pydict()["m"][0], 4)
-            -0.34
+            -5.5733
     """
     col = _as_column(text)
-    chars = col.str.len_chars()
+    # `[^\W_]` is a Unicode letter, digit or combining mark: a word character that is not `_`.
+    chars = col.str.count_matches(r"[^\W_]")
     words = col.str.word_count()
-    sentences = col.str.sentence_count()
-    score = (
-        lit(4.71) * _safe_div(chars, words) + lit(0.5) * _safe_div(words, sentences) - lit(21.43)
-    )
-    return score.mean()
+    counted = col.str.sentence_count()
+    sentences = when(counted > lit(0)).then(counted).otherwise(lit(1))
+    score = lit(4.71) * chars / words + lit(0.5) * words / sentences - lit(21.43)
+    return when(words > lit(0)).then(score).mean()
 
 
 def mean_words_per_sentence(text: IntoExpr) -> Expr:

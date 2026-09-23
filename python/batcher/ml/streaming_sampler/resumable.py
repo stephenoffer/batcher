@@ -131,6 +131,15 @@ class ResumableSampler:
                 >>> from batcher.ml import ResumableSampler
                 >>> sampler = ResumableSampler(10)
                 >>> sampler.set_epoch(1)  # every rank passes the same value
+                >>> sampler.epoch
+                1
+
+                Setting it again rewinds, so a resumed run starts the epoch at its
+                first sample rather than where the previous one stopped:
+
+                >>> sampler.set_epoch(2)
+                >>> sampler.epoch, sampler.global_consumed
+                (2, 0)
 
         Args:
             epoch: The epoch to start. The same value on every rank.

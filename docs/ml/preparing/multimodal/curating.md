@@ -129,4 +129,4 @@ Prefer it to the {py:meth}`regexp_replace('<[^>]*>', '') <batcher.plan.expr_ir.n
 - {doc}`/ml/preparing/multimodal/augmenting`: geometry and color transforms, and the three perceptual hashes.
 - {doc}`/ml/preparing/multimodal/audio`: the same triage for recording quality in an audio corpus.
 - {doc}`/ml/preparing/preprocessors/deduplication`: deduplicating tabular and text rows.
-- {doc}`/api/relational/expression-accessors`: the full `.image` and `.str` method lists.
+- {doc}`/api/accessors/media` and {doc}`/api/accessors/strings`: the full `.image` and `.str` method lists.

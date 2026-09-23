@@ -164,6 +164,14 @@ def _resolve_distributed(
     """
     if distributed != "auto":
         return bool(distributed)
+    from batcher.config import active_config
+
+    # The session-wide pin (`distributed.mode`) reaches the terminals that take no
+    # `distributed=` argument — `ds.meta`, `ds.dq.validate()`, `count()` — which is the only
+    # way those can be forced onto (or kept off) the cluster.
+    mode = active_config().distributed.mode
+    if mode != "auto":
+        return mode == "always"
     if not _ray_already_live():
         # Nothing imported Ray, so nothing initialized it — single-node. Which is the right
         # answer on a laptop and a costly surprise inside a sixty-four-node allocation.
@@ -214,7 +222,6 @@ def _resolve_distributed(
         # that is a capability need, not a throughput bet.
         if sources and all(getattr(s, "resident", False) for s in sources):
             return False
-        from batcher.config import active_config
 
         min_rows = active_config().distributed.distribute_min_rows
         # Prefer the *measured* size this exact shape produced on past runs over a first-run

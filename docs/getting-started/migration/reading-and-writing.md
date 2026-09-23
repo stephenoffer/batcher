@@ -52,7 +52,7 @@ Pick the constructor for the object you're holding:
 | An Arrow table, or anything Arrow-exporting | {py:func}`bt.from_arrow(t) <batcher.from_arrow>` |
 | Something whose type you don't know | {py:func}`bt.from_any(obj) <batcher.from_any>` |
 
-Reach for `bt.from_any` in migration code and glue. It dispatches on the type and routes to the right constructor, so a script that accepts "a frame" from a caller doesn't have to branch. {py:func}`bt.sql <batcher.sql>` uses it for every bound table, which is why you can pass a pandas frame or a plain dict straight into a query:
+Reach for {py:obj}`bt.from_any <batcher.from_any>` in migration code and glue. It dispatches on the type and routes to the right constructor, so a script that accepts "a frame" from a caller doesn't have to branch. {py:func}`bt.sql <batcher.sql>` uses it for every bound table, which is why you can pass a pandas frame or a plain dict straight into a query:
 
 ```python
 import batcher as bt

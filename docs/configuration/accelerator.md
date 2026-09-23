@@ -204,6 +204,33 @@ stopped shipping `pynvml`.
 .. autofunction:: batcher.accelerator_problems
 ```
 
+
+## Reading what a GPU setting resolves to
+
+Two accelerator settings are written as a preference and resolved against the machine, so
+the value the engine uses is not always the one in the config. Read them back rather than
+assuming.
+
+{py:meth}`DistributedConfig.resolved_gpu_memory_gb <batcher.config.DistributedConfig>`
+reports the usable memory budget of one GPU, after the configured value is reconciled with
+what the device reports.
+{py:meth}`device_replication_bytes <batcher.config.DistributedConfig>` reports the largest
+build side the planner will replicate to every device, derived from that budget, so a join
+whose build side exceeds it is sharded instead.
+
+```python
+from batcher.config import DistributedConfig
+
+cfg = DistributedConfig()
+budget = cfg.resolved_gpu_memory_gb()
+print(budget > 0)
+print(cfg.device_replication_bytes(budget) > 0)
+```
+
+Both are machine-dependent, which is the reason they exist as methods rather than fields.
+Pass an explicit `gpu_gb` to `device_replication_bytes` to ask what a different device
+would allow, which is how you size a plan for a cluster you are not currently on.
+
 ## See also
 
 - {doc}`/user-guide/operate/running/gpu-fleets`: the same controls in the order you would adopt them.
@@ -211,3 +238,4 @@ stopped shipping `pynvml`.
 - {doc}`environment`: the `BATCHER_ACCELERATOR_*` spelling of these fields.
 - {doc}`/api/operations/governance`: data residency, the placement constraint that pairs with these.
 - {doc}`/ml/inference/gpu`: choosing devices and batch sizes from the pipeline side.
+- {doc}`/examples/accelerators`: accelerator scripts, each run on every commit.

@@ -18,40 +18,48 @@ The following table maps the 37 names on the `polars` module, sorted alphabetica
 
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
-| `Array` | `Expr.cast` | param | Missing: cast target Array (fixed-size list). Wave W2. |
+| `Array` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast target Array (fixed-size list). Wave W2. |
 | `BaseExtension` | n/a | gap | Not yet: extension types. Wave W11. |
-| `Binary` | `Expr.cast` | canonical |  |
-| `Boolean` | `Expr.cast` | canonical |  |
+| `Binary` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Boolean` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `Categorical` | n/a | gap | Not yet: Categorical logical type (dictionary preserved end to end). Wave W11. |
 | `Categories` | n/a | gap | Not yet: Categorical category sets. Wave W11. |
 | `DataType` | n/a | out of scope | Declined: Arrow is the only columnar contract: Batcher accepts and returns pyarrow type objects, so a Polars DataType class has no Batcher counterpart to build. |
 | `DataTypeExpr` | n/a | gap | Not yet: dtype expressions (dtype\_of/self\_dtype). Wave W11. |
-| `Date` | `Expr.cast` | canonical |  |
-| `Datetime` | `Expr.cast` | param | Missing: cast target Datetime with time\_unit ms/ns and time\_zone. Wave W2. |
-| `Decimal` | `Expr.cast` | canonical |  |
-| `Duration` | `Expr.cast` | param | Missing: cast target Duration. Wave W2. |
+| `Date` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Datetime` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast target Datetime with time\_unit ms/ns and time\_zone. Wave W2. |
+| `Decimal` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Duration` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast target Duration. Wave W2. |
 | `Enum` | n/a | gap | Not yet: Enum logical type. Wave W11. |
 | `Extension` | n/a | gap | Not yet: extension types. Wave W11. |
 | `Field` | n/a | out of scope | Declined: Arrow is the only columnar contract: Batcher accepts and returns pyarrow type objects, so a Polars Field class has no Batcher counterpart to build. |
-| `Float16` | `Expr.cast` | canonical |  |
-| `Float32` | `Expr.cast` | canonical |  |
-| `Float64` | `Expr.cast` | canonical |  |
+| `Float16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Float32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Float64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `Int128` | n/a | gap | Not yet: Int128 type. Wave W11. |
-| `Int16` | `Expr.cast` | canonical |  |
-| `Int32` | `Expr.cast` | canonical |  |
-| `Int64` | `Expr.cast` | canonical |  |
-| `Int8` | `Expr.cast` | canonical |  |
-| `List` | `Expr.cast` | param | Missing: cast target List. Wave W2. |
-| `Null` | `Expr.cast` | param | Missing: cast target Null. Wave W2. |
+| `Int16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Int32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Int64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Int8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `List` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast target List. Wave W2. |
+| `Null` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast target Null. Wave W2. |
 | `Object` | n/a | out of scope | Declined: arbitrary Python objects in a column contradict Arrow as the only columnar contract. |
 | `Schema` | n/a | out of scope | Declined: Arrow is the only columnar contract: Batcher accepts and returns pyarrow type objects, so a Polars Schema class has no Batcher counterpart to build. |
-| `String` | `Expr.cast` | canonical |  |
-| `Struct` | `Expr.cast` | param | Missing: cast target Struct. Wave W2. |
+| `String` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `Struct` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast target Struct. Wave W2. |
 | `Time` | n/a | gap | Not yet: TIME type. Wave W6. |
 | `UInt128` | n/a | gap | Not yet: UInt128 type. Wave W11. |
-| `UInt16` | `Expr.cast` | canonical |  |
-| `UInt32` | `Expr.cast` | canonical |  |
-| `UInt64` | `Expr.cast` | mismatch | Differs: a cast to uint64 keeps the type, but a UInt64 input above the Int64 range raises at the engine boundary rather than overflowing. Wave W0. |
-| `UInt8` | `Expr.cast` | canonical |  |
+| `UInt16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `UInt32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `UInt64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | mismatch | Differs: a cast to uint64 keeps the type, but a UInt64 input above the Int64 range raises at the engine boundary rather than overflowing. Wave W0. |
+| `UInt8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `Unknown` | n/a | out of scope | Declined: Polars-internal placeholder dtype for unresolved schemas. |
-| `Utf8` | `Expr.cast` | canonical |  |
+| `Utf8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Polars pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

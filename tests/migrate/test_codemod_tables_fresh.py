@@ -28,10 +28,32 @@ def _installed(module: str) -> bool:
         return False
 
 
+def _missing_surface(engine: str) -> str | None:
+    """The first surface `engine` declares that cannot be resolved here, or None.
+
+    The top-level module being importable is not the same as the table being regenerable.
+    `ray.data` ships with `ray[default]`; `ray.data.llm`, which `surfaces.py` declares and
+    the committed table carries a `params."llm"` section for, needs the `ray[llm]` extra.
+    Guarding on `ray.data` alone therefore ran the regeneration on a box that could not
+    perform it and reported a missing optional extra as a stale table.
+    """
+    from tools.parity.surfaces import SURFACES, _resolve
+
+    for _label, target, _kind in SURFACES.get(engine, ()):
+        try:
+            _resolve(target)
+        except Exception:  # any resolution failure means "not available on this box"
+            return target
+    return None
+
+
 @pytest.mark.parametrize("engine", sorted(_MODULES))
 def test_engine_table_is_fresh(engine: str) -> None:
     if not _installed(_MODULES[engine]):
         pytest.skip(f"{engine} is not installed, so its table cannot be regenerated here")
+    missing = _missing_surface(engine)
+    if missing is not None:
+        pytest.skip(f"{engine}: {missing} is not importable here, so its table is not regenerable")
     committed = (DATA_DIR / "codemod" / f"{engine}.toml").read_text()
     assert committed == render(generate_engine(engine), engine), (
         f"run `python tools/parity/gen_codemod_tables.py {engine}`"

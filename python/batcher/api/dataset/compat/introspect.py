@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.humanize.units import plural
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -67,7 +69,7 @@ def build_info(ds: Dataset) -> None:
     rows = ds.count()
     nulls = ds.null_count().to_pydict() if schema else {}
 
-    print(f"Dataset: {rows} rows x {len(schema)} columns")
+    print(f"Dataset: {plural(rows, 'row')} x {plural(len(schema), 'column')}")
     if not schema:
         return
     name_width = max(len(n) for n in schema)
@@ -100,7 +102,7 @@ def build_glimpse(ds: Dataset, max_items_per_column: int) -> None:
     preview = ds.limit(max_items_per_column).to_pydict()
     name_width = max(len(n) for n in schema)
     type_width = max(len(str(t)) for t in schema.values())
-    print(f"Dataset: {len(schema)} columns")
+    print(f"Dataset: {plural(len(schema), 'column')}")
     for name, dtype in schema.items():
         values = ", ".join(repr(v) for v in preview.get(name, []))
         print(f"$ {name.ljust(name_width)} <{str(dtype).ljust(type_width)}> {values}")

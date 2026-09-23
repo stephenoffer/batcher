@@ -3,9 +3,9 @@
 Subtracting one date column from another gives whole days, which is the direct spelling
 and the one to reach for.
 
-The `*_between` family is the named alternative, and it works on **timestamps**. Handed a
-`date32` column it returns 0 rather than raising, so cast explicitly before using it —
-that silent zero is much harder to notice than an error would be.
+The `*_between` family is the named alternative. It reads a `date32` column as midnight
+UTC, so `days_between` agrees with subtraction on dates and on timestamps alike, and an
+explicit cast changes nothing.
 
     python examples/expr_temporal/date_differences.py
 """
@@ -33,7 +33,7 @@ def main() -> None:
         transit_named=col("l_receiptdate")
         .cast("timestamp")
         .dt.days_between(col("l_shipdate").cast("timestamp")),
-        # On the raw date columns the same call silently answers zero.
+        # The same call on the raw date columns, with no cast.
         transit_uncast=col("l_receiptdate").dt.days_between(col("l_shipdate")),
         lateness=col("l_receiptdate") - col("l_commitdate"),
     )
@@ -43,10 +43,9 @@ def main() -> None:
 
     full = gaps.to_pydict()
 
-    # The two working spellings agree.
+    # All three spellings agree, cast or not.
     assert full["transit_days"] == full["transit_named"]
-    # The uncast one does not, which is the trap this example exists to name.
-    assert set(full["transit_uncast"]) == {0}
+    assert full["transit_days"] == full["transit_uncast"]
 
     # A shipment is always received after it ships, so transit time is positive.
     stats = gaps.agg(

@@ -18,9 +18,11 @@ objects — the same chaining the `Dataset` builder already gives every other tr
 from __future__ import annotations
 
 import abc
+import math
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.plan.expr_ir import col, lit, nullif
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -222,6 +224,73 @@ def fit_aggregate(ds: Dataset, aggs: dict[str, Expr]) -> dict[str, Any]:
     """
     row = ds.agg(**aggs).collect()
     return {name: row.column(name)[0].as_py() for name in row.column_names}
+
+
+def _float_columns(ds: Dataset, columns: Sequence[str]) -> list[str]:
+    """The names in `columns` whose Arrow type is floating point, the only ones that hold NaN."""
+    import pyarrow as pa
+
+    schema = ds.schema
+    return [c for c in columns if c in schema.names and pa.types.is_floating(schema.field(c).type)]
+
+
+def nan_as_null(ds: Dataset, columns: Sequence[str]) -> Dataset:
+    """`ds` with IEEE NaN in each floating-point column of `columns` rewritten to null.
+
+    The missing-value rule every fitted statistic follows. A NaN is how pandas, NumPy and a
+    Parquet file written from either spell "missing", and scikit-learn and Ray Data both skip
+    it when they fit. The engine's aggregates instead treat NaN as a value, so one NaN turned a
+    column's mean, max and variance into NaN and every scaled value after it. Rewriting NaN to
+    null before the aggregate is one lazy projection (``nullif(x, NaN)``), no per-row Python,
+    and it leaves integer and string columns untouched because they cannot hold a NaN.
+
+    Args:
+        ds: The dataset about to be fitted on.
+        columns: The columns the fit reads.
+
+    Returns:
+        A lazy `Dataset` in which those columns carry null wherever they carried NaN.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors.base import nan_as_null
+            >>> ds = bt.from_pydict({"x": [1.0, float("nan"), None]})
+            >>> nan_as_null(ds, ["x"]).to_pydict()
+            {'x': [1.0, None, None]}
+    """
+    floats = _float_columns(ds, columns)
+    if not floats:
+        return ds
+    return ds.with_columns(**{c: without_nan(col(c)) for c in floats})
+
+
+def without_nan(expression: Expr) -> Expr:
+    """`expression` with NaN mapped to null, for a value known to be floating point.
+
+    Args:
+        expression: A floating-point expression.
+
+    Returns:
+        The same expression, null wherever it was NaN.
+    """
+    return nullif(expression, lit(math.nan))
+
+
+def is_missing(ds: Dataset, column: str) -> Expr:
+    """True where `column` is null, or NaN when the column is floating point.
+
+    Args:
+        ds: The dataset whose schema says whether `column` can hold a NaN.
+        column: The column to test.
+
+    Returns:
+        A boolean expression, true on a missing value.
+    """
+    if _float_columns(ds, [column]):
+        return col(column).is_null() | col(column).is_nan()
+    return col(column).is_null()
 
 
 def distinct_values(ds: Dataset, column: str, *, what: str, max_categories: int) -> list[Any]:

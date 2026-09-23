@@ -15,7 +15,12 @@ import operator
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
+from batcher.ml.preprocessors.base import (
+    Preprocessor,
+    columns_arg,
+    fit_aggregate,
+    nan_as_null,
+)
 from batcher.plan.expr_ir import col, when
 
 if TYPE_CHECKING:
@@ -93,6 +98,7 @@ class StandardScaler(Preprocessor):
             ``self``, fitted.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__m"] = col(c).mean()
@@ -210,6 +216,7 @@ class MinMaxScaler(Preprocessor):
             ``self``, fitted.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__min"] = col(c).min()
@@ -303,6 +310,7 @@ class MaxAbsScaler(Preprocessor):
             ``self``, fitted.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__min"] = col(c).min()
@@ -400,6 +408,7 @@ class RobustScaler(Preprocessor):
             ``self``, fitted.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         q_lo, q_hi = self.quantile_range
         aggs = {}
         for c in self.columns:

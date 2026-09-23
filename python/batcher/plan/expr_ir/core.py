@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from batcher.plan.expr_ir.namespaces.meta import _MetaNamespace
     from batcher.plan.expr_ir.namespaces.sequence import _SeqNamespace
     from batcher.plan.expr_ir.nodes import WindowExpr
+    from batcher.plan.expr_ir.selectors.core import _SelectorNameNamespace
     from batcher.plan.expr_ir.video import _VideoNamespace
 
 # A value that can be promoted to an expression: another Expr or a Python scalar.
@@ -214,6 +215,15 @@ class Expr:
         # fail plainly: a decorated failure would turn a routine hasattr into a hard error.
         if name.startswith("_"):
             raise AttributeError(name)
+        if name == "name":
+            # `(numeric() * 2).name.suffix("_x2")`: an expression over a column selector
+            # renames its expanded outputs through the selector's `.name` accessor. Only
+            # `Col` and `Aliased` carry a real `name`, and neither can hold a selector.
+            from batcher.plan.expr_ir.selectors.core import _SelectorNameNamespace
+            from batcher.plan.expr_ir.selectors.expand import has_selector
+
+            if has_selector(self):
+                return _SelectorNameNamespace(self)
         raise _expr_attribute_error(self, name)
 
     # --- comparison operators (yield boolean expressions) ------------------
@@ -3229,7 +3239,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").skew()).to_pydict()
                 {'g': ['a'], 'r': [1.763632614803888]}
                 >>> ds.group_by("g").agg(r=bt.col("x").skew(bias=True).round(6)).to_pydict()
-                {'g': ['a'], 'r': [1.018233]}
+                {'g': ['a'], 'r': [1.018234]}
         """
         return AggExpr("skewness_pop" if bias else "skewness", self)
 
@@ -4625,12 +4635,12 @@ class Expr:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4, 5], "x": [1, 5, 2, 8, 3]})
+                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4, 5], "x": [9, 5, 2, 8, 3]})
                 >>> ds.with_columns(p=bt.col("x").peak_max(order_by=["t"])).to_pydict()["p"]
-                [False, True, False, True, False]
+                [False, False, False, True, False]
                 >>> edges = bt.col("x").peak_max(order_by=["t"], edges=True)
                 >>> ds.with_columns(p=edges).to_pydict()["p"]
-                [False, True, False, True, True]
+                [True, False, False, True, False]
         """
         return self._peak(True, partition_by, order_by, edges, propagate_nulls)
 
@@ -6346,7 +6356,7 @@ class AggExpr:
             {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
-    __slots__ = ("func", "input", "input2", "interpolation", "name", "order_by", "param")
+    __slots__ = ("_alias", "func", "input", "input2", "interpolation", "order_by", "param")
 
     def __init__(
         self,
@@ -6362,11 +6372,12 @@ class AggExpr:
         """Construct an aggregate over an optional input, plus an optional `input2` or `param`."""
         self.func = func
         self.input = input
-        # The output column name set by `.alias(...)`, read by `group_by().agg()` when it
-        # names a *positional* aggregate. It is consumed at the API surface and never
-        # reaches `to_ir`, where the name is carried by `AggregateSpec.alias` instead --
-        # which is why the Kyber rules that rebuild an `AggExpr` may drop it safely.
-        self.name = name
+        # The output column name set by `.alias(...)`, read (through `name`) by
+        # `group_by().agg()` when it names a *positional* aggregate. It is consumed at the
+        # API surface and never reaches `to_ir`, where the name is carried by
+        # `AggregateSpec.alias` instead -- which is why the Kyber rules that rebuild an
+        # `AggExpr` may drop it safely.
+        self._alias = name
         # The second input expression — the ordering key for arg_min/arg_max or the
         # paired column for corr/covar; None for unary and parametric aggregates.
         self.input2 = input2
@@ -6436,10 +6447,40 @@ class AggExpr:
             new_input,
             input2=new_input2,
             param=self.param,
-            name=self.name,
+            name=self._alias,
             interpolation=self.interpolation,
             order_by=new_order,
         )
+
+    @property
+    def name(self) -> str | _SelectorNameNamespace | None:
+        """The output name `.alias(...)` set, or the ``.name`` rename accessor over a selector.
+
+        An aggregate over a column selector (``bt.numeric().sum()``) expands to one output
+        per matched column, so no single name fits it; there ``.name`` is the selector's
+        rename accessor, as in Polars: ``bt.numeric().sum().name.suffix("_sum")``. On any
+        other aggregate it is the alias, or `None` when the output is named after its input.
+
+        Returns:
+            The alias, the rename accessor, or `None`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.col("x").sum().alias("total").name
+                'total'
+                >>> ds = bt.from_pydict({"g": ["a"], "x": [1], "y": [2]})
+                >>> ds.group_by("g").agg(bt.numeric().max().name.prefix("max_")).columns
+                ['g', 'max_x', 'max_y']
+        """
+        if self._alias is None and self.input is not None:
+            from batcher.plan.expr_ir.selectors.core import _SelectorNameNamespace
+            from batcher.plan.expr_ir.selectors.expand import has_selector
+
+            if has_selector(self.input):
+                return _SelectorNameNamespace(self)
+        return self._alias
 
     def __repr__(self) -> str:
         """A source-like rendering, e.g. ``col('x').sum()`` or ``count()``."""
@@ -6456,7 +6497,7 @@ class AggExpr:
             args.append(f"order_by={list(self.order_by)!r}")
         call = f"{self.func}({', '.join(args)})"
         rendered = call if self.input is None else f"{self.input!r}.{call}"
-        return rendered if self.name is None else f"{rendered}.alias({self.name!r})"
+        return rendered if self._alias is None else f"{rendered}.alias({self._alias!r})"
 
     def alias(self, name: str) -> AggExpr:
         """Name this aggregate's output column — the Polars ``.alias(...)`` spelling.

@@ -96,9 +96,9 @@ def test_recall_at_k_matches_the_reference(rankings, k) -> None:
     values = []
     for candidates in _by_user(rows).values():
         total = sum(r for _, r in candidates)
-        if total:
-            hits = sum(r for _, r in sorted(candidates, key=lambda x: -x[0])[:k])
-            values.append(hits / total)
+        # A query with nothing to find scores 0 and stays in the mean (ndcg_score's rule).
+        hits = sum(r for _, r in sorted(candidates, key=lambda x: -x[0])[:k])
+        values.append(hits / total if total else 0.0)
     assert recall_at_k(ds, "user", "s", "rel", k=k) == pytest.approx(np.mean(values))
 
 
@@ -123,8 +123,7 @@ def test_ndcg_at_k_matches_the_reference(rankings, k) -> None:
         gain = sum(r / math.log2(i + 1) for i, (_, r) in enumerate(ordered, 1))
         relevant = sum(r for _, r in candidates)
         ideal = sum(1 / math.log2(i + 1) for i in range(1, min(k, relevant) + 1))
-        if ideal:
-            values.append(gain / ideal)
+        values.append(gain / ideal if ideal else 0.0)
     assert ndcg_at_k(ds, "user", "s", "rel", k=k) == pytest.approx(np.mean(values))
 
 

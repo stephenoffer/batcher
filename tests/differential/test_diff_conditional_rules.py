@@ -332,3 +332,85 @@ def test_constant_condition_over_columns_on_empty_input(duck, empty):
         bt.from_arrow(empty).select(r=when(lit(True)).then(col("a")).otherwise(col("b"))).collect()
     )
     assert_same(out, duck.sql("SELECT CASE WHEN TRUE THEN a ELSE b END AS r FROM empty"))
+
+
+# --- a long run of equal-valued branches ------------------------------------
+#
+# `merge_case_branches_with_equal_results` folds adjacent branches sharing a value into one
+# whose condition is their disjunction. A generated CASE reaches hundreds of such branches
+# -- `FrequencyEncoder` emits one per category, and every category of an evenly distributed
+# column carries the same frequency -- so this is where the merge's Kleene-null claim and
+# the depth of the disjunction it builds are both under real load rather than at n = 2.
+
+
+#: Branches per ladder. Above the ~500 the control plane's recursive `to_ir` could walk
+#: before this was fixed, so each test below fails against the pre-fix rule rather than
+#: merely exercising it -- at 400 all three passed either way.
+_LADDER = 1000
+
+
+@pytest.fixture
+def wide(duck):
+    """One column of `_LADDER` categories, a value no branch claims, and a null."""
+    tbl = pa.table({"s": [f"c{i}" for i in range(_LADDER)] + ["miss", None]})
+    duck.register("wide", tbl)
+    return tbl
+
+
+def _ladder(n: int, value: str) -> str:
+    return " ".join(f"WHEN s = 'c{i}' THEN {value}" for i in range(n))
+
+
+def test_a_thousand_equal_valued_branches_match_duckdb(duck, wide):
+    expr = Case([(col("s") == lit(f"c{i}"), lit(1.0)) for i in range(_LADDER)], lit(0.0))
+    out = bt.from_arrow(wide).select(r=expr).collect()
+    assert_same(out, duck.sql(f"SELECT CASE {_ladder(_LADDER, '1.0')} ELSE 0.0 END AS r FROM wide"))
+
+
+def test_equal_valued_branches_interleaved_with_a_different_one(duck, wide):
+    # NOTE: this one passes against the pre-fix rule too -- capping each run at 100 caps
+    # the left-deep chain at 99 levels. It is here for the adjacency claim, not the depth one.
+    # Only *adjacent* branches may merge. Breaking the run every hundredth branch gives the
+    # rule ten runs to fold and nine barriers it must not fold across, and DuckDB decides
+    # which value each row was entitled to.
+    branches = [
+        (col("s") == lit(f"c{i}"), lit(2.0) if i % 100 == 99 else lit(1.0)) for i in range(_LADDER)
+    ]
+    out = bt.from_arrow(wide).select(r=Case(branches, lit(0.0))).collect()
+    sql = " ".join(f"WHEN s = 'c{i}' THEN {2.0 if i % 100 == 99 else 1.0}" for i in range(_LADDER))
+    assert_same(out, duck.sql(f"SELECT CASE {sql} ELSE 0.0 END AS r FROM wide"))
+
+
+def test_a_null_condition_falls_through_the_merged_branch(duck, wide):
+    # The merge's correctness claim is that `NULL OR false` is `NULL`, which CASE treats as
+    # not-taken exactly as it treats each unmerged branch's `NULL`. `s` is null in one row,
+    # so every `s = 'cN'` is NULL there and the row must reach the ELSE.
+    expr = Case(
+        [(col("s") == lit(f"c{i}"), lit(1.0)) for i in range(_LADDER)],
+        lit(-1.0),
+    )
+    got = bt.from_arrow(wide).select(r=expr).to_pydict()["r"]
+    assert got[-1] == -1.0, "the null row did not fall through to the ELSE"
+    assert got[-2] == -1.0, "the unclaimed row did not fall through to the ELSE"
+    assert_same(
+        bt.from_arrow(wide).select(r=expr).collect(),
+        duck.sql(f"SELECT CASE {_ladder(_LADDER, '1.0')} ELSE -1.0 END AS r FROM wide"),
+    )
+
+
+def test_frequency_encoder_runs_at_its_documented_default(duck):
+    """The user-facing shape the merge was breaking, end to end against DuckDB.
+
+    `FrequencyEncoder`'s `max_categories` defaults to 1000. Over an evenly distributed
+    column every category has the same frequency, so all 1000 branches merged into one --
+    and, folded pairwise, into a 999-level disjunction that `MAX_PLAN_DEPTH` (512) refused.
+    The user saw a bare `RecursionError`, because the control plane's own recursive
+    `to_ir` overflowed before the engine could raise `PlanTooDeepError`.
+    """
+    from batcher.ml.preprocessors import FrequencyEncoder
+
+    n = 1000
+    tbl = pa.table({"c": [f"c{i % n}" for i in range(n * 2)]})
+    duck.register("fe", tbl)
+    out = FrequencyEncoder("c").fit_transform(bt.from_arrow(tbl)).collect()
+    assert_same(out, duck.sql("SELECT count(*) OVER (PARTITION BY c) / 2000.0 AS c FROM fe"))

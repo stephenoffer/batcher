@@ -144,6 +144,247 @@ EXPR_UNSUPPORTED: dict[str, str] = {
 }
 
 
+# --- pandas Series methods -------------------------------------------------------------
+#
+# Every name below comes from `pandas.Series`; Batcher's `Expr` already covers Polars' own
+# `Expr` surface. A pandas migrant is a supported path (`python -m batcher.migrate`), and a
+# bare `AttributeError` there is worse than it looks: `Expr.__getattr__` falls back to a
+# fuzzy "did you mean", which for these produced actively wrong suggestions -- `corr` ->
+# `zscore`, `dtype` -> `dt`. Naming the real answer is the point.
+
+#: pandas gives each operator a method alias plus a reflected form. Arithmetic on an `Expr`
+#: is Python's own operators, reflected order included, so one sentence answers the family.
+_ARITHMETIC = {
+    name: (
+        f"Batcher spells this with the operator: bt.col('a') {symbol} bt.col('b'), or "
+        f"bt.col('a') {symbol} 2 against a literal. The reflected order works too "
+        f"(2 {symbol} bt.col('a')), so there is no r-prefixed spelling to learn."
+    )
+    for name, symbol in (
+        ("multiply", "*"),
+        ("rmul", "*"),
+        ("subtract", "-"),
+        ("rsub", "-"),
+        ("radd", "+"),
+        ("rdiv", "/"),
+        ("rtruediv", "/"),
+        ("rfloordiv", "//"),
+        ("rpow", "**"),
+        ("rdivmod", "//"),
+    )
+}
+
+#: An expression describes a column; it holds no data and has no dtype until a plan gives
+#: it one. These all ask the *value* questions, which a Dataset answers.
+_NOT_DATA = {
+    name: (
+        f"An expression describes a computation, not a column of data, so it has no "
+        f"`{name}`. Build a Dataset and ask it: ds.with_columns(r=bt.col('a') * 2) then "
+        f"ds.schema, ds.count() or ds.to_pydict()."
+    )
+    for name in (
+        "array",
+        "attrs",
+        "axes",
+        "dtype",
+        "dtypes",
+        "empty",
+        "flags",
+        "hasnans",
+        "info",
+        "items",
+        "keys",
+        "memory_usage",
+        "nbytes",
+        "ndim",
+        "shape",
+        "size",
+        "sparse",
+        "values",
+        "view",
+        "ravel",
+        "equals",
+        "copy",
+        "pop",
+        "update",
+        "compare",
+        "convert_dtypes",
+        "infer_objects",
+        "describe",
+        "plot",
+        "aggregate",
+        "combine",
+    )
+}
+
+#: Exporting is a terminal on a Dataset. An expression has nothing to export.
+_EXPORTERS = {
+    name: (
+        f"`{name}` is a Dataset terminal, not an expression method. Put the expression in "
+        f"a plan first: ds.with_columns(r=bt.col('a') * 2), then use ds.write.* to write "
+        f"or ds.to_pydict() / ds.to_arrow() to materialize."
+    )
+    for name in (
+        "to_clipboard",
+        "to_csv",
+        "to_dict",
+        "to_excel",
+        "to_hdf",
+        "to_json",
+        "to_markdown",
+        "to_numpy",
+        "to_pickle",
+        "to_sql",
+        "to_string",
+        "to_xarray",
+    )
+}
+
+#: A relation is an unordered multiset with no row index, exactly as in SQL.
+_NO_INDEX = {
+    name: (
+        f"Batcher relations have no row index, so there is no `{name}`. Keep the key as an "
+        f"ordinary column and select, filter or join on it; for a positional column use "
+        f"ds.with_row_index(), and to order rows use ds.sort(...)."
+    )
+    for name in (
+        "index",
+        "iloc",
+        "loc",
+        "iat",
+        "xs",
+        "reset_index",
+        "sort_index",
+        "reindex",
+        "reindex_like",
+        "droplevel",
+        "swaplevel",
+        "reorder_levels",
+        "rename_axis",
+        "set_axis",
+        "set_flags",
+        "swapaxes",
+        "transpose",
+        "squeeze",
+        "unstack",
+        "drop",
+        "add_prefix",
+        "add_suffix",
+        "first_valid_index",
+        "last_valid_index",
+    )
+}
+
+_SERIES_ONLY: dict[str, str] = {
+    **_ARITHMETIC,
+    **_NOT_DATA,
+    **_EXPORTERS,
+    **_NO_INDEX,
+    # --- statistics that are frame-level, because they read two columns at once --------
+    "corr": (
+        "Correlation reads two columns, so it is a Dataset terminal or an aggregate: "
+        "ds.corr('a', 'b') for the scalar, or ds.agg(r=bt.corr(bt.col('a'), bt.col('b')))."
+    ),
+    "cov": (
+        "Covariance reads two columns: ds.cov('a', 'b') for the scalar, or inside an "
+        "aggregate over a group with ds.group_by('g').agg(...)."
+    ),
+    "autocorr": (
+        "Autocorrelation is correlation against a lagged copy, and the lag needs an "
+        "explicit order: ds.with_columns(prev=bt.col('a').shift(1).over(order_by='t')) "
+        "then ds.corr('a', 'prev')."
+    ),
+    # --- null handling, under Batcher's names -----------------------------------------
+    "dropna": (
+        "Dropping nulls is a row operation: ds.drop_nulls('a'), or filter explicitly with "
+        "ds.filter(bt.col('a').is_not_null())."
+    ),
+    "ffill": (
+        "Forward fill needs an explicit row order, because a relation has none: "
+        "ds.with_columns(filled=bt.col('a').forward_fill().over(order_by='t'))."
+    ),
+    "pad": (
+        "pandas' `pad` is forward fill, and it needs a row order: "
+        "ds.with_columns(filled=bt.col('a').forward_fill().over(order_by='t'))."
+    ),
+    "bfill": (
+        "Backward fill needs an explicit row order: "
+        "ds.with_columns(filled=bt.col('a').backward_fill().over(order_by='t'))."
+    ),
+    # --- ordering and position ---------------------------------------------------------
+    "argsort": (
+        "Batcher has no positional argsort, because a relation has no row positions to "
+        "return. To order rows use ds.sort('a'); for a rank within the values use "
+        "bt.col('a').rank(); for the extreme row itself use "
+        "ds.sort('a', descending=True).limit(1)."
+    ),
+    "searchsorted": (
+        "There are no row positions to search for. Express the comparison instead: "
+        "bt.col('a') >= value, or count with ds.filter(bt.col('a') < value).count()."
+    ),
+    "nlargest": (
+        "The n largest values are bt.col('a').top_k(n), or ds.sort('a', descending=True).limit(n)."
+    ),
+    "nsmallest": "The n smallest values are ds.sort('a').limit(n).",
+    "is_monotonic_decreasing": (
+        "Monotonicity is a property of an ordered frame, not of an expression. Sort and "
+        "compare against the shifted column: ds.sort('t').with_columns("
+        "down=bt.col('a') <= bt.col('a').shift(1).over(order_by='t'))."
+    ),
+    "factorize": (
+        "Assigning each distinct value an integer code is an encoder: "
+        "batcher.ml.preprocessors.OrdinalEncoder('a').fit_transform(ds)."
+    ),
+    # --- grouping and reshaping belong to the Dataset ----------------------------------
+    "groupby": (
+        "Grouping is a Dataset operation: ds.group_by('g').agg(n=bt.col('a').sum()). An "
+        "expression can carry a group with bt.col('a').sum().over(partition_by=['g'])."
+    ),
+    # --- temporal: a calendar unit, a timezone, or a window ----------------------------
+    "tz_localize": (
+        "Attaching a timezone is a cast, and the parametrized name uses parentheses: "
+        "bt.col('t').cast('timestamp(us, UTC)'). To move an already-aware timestamp "
+        "between zones use bt.col('t').dt.convert_timezone('UTC', 'Europe/Paris')."
+    ),
+    "tz_convert": (
+        "Converting between timezones names both ends: "
+        "bt.col('t').dt.convert_timezone('UTC', 'Europe/Paris')."
+    ),
+    "to_period": (
+        "Period arithmetic is truncation to a calendar unit: "
+        "bt.col('t').dt.truncate('month'), then bt.col('t').dt.strftime(...) to label it."
+    ),
+    "to_timestamp": (
+        "Converting to a timestamp is a cast, bt.col('t').cast('timestamp(us)') -- the "
+        "parametrized dtype names use parentheses -- or bt.col('t').dt.timestamp() from "
+        "an epoch value."
+    ),
+    "at_time": (
+        "Selecting a time of day is a predicate on the extracted part: "
+        "ds.filter(bt.col('t').dt.hour() == 9)."
+    ),
+    "between_time": (
+        "A time-of-day range is bt.col('t').dt.is_between_time('09:00', '17:00'), used as "
+        "a filter predicate."
+    ),
+    "asfreq": (
+        "There is no frequency index to conform to. Bucket by a calendar unit and "
+        "aggregate, naming the derived key: "
+        "ds.group_by(hour=bt.col('t').dt.truncate('hour')).agg(n=bt.col('a').mean())."
+    ),
+    "resample": (
+        "Resampling is a truncate plus a group_by, with the derived key named: "
+        "ds.group_by(hour=bt.col('t').dt.truncate('hour')).agg(n=bt.col('a').mean())."
+    ),
+    "asof": (
+        "An as-of lookup is a join: ds.join_asof(other, on='t'), which matches each left "
+        "row to the most recent right row at or before it."
+    ),
+}
+
+EXPR_UNSUPPORTED.update(_SERIES_ONLY)
+
+
 def expr_attribute_error(expr: object, name: str) -> AttributeError:
     """Build the `AttributeError` for a failed `Expr` attribute lookup.
 

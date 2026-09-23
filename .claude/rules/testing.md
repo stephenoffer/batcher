@@ -149,6 +149,40 @@ The general form: before trusting a comparison across a setting, show the settin
 something you can see. If you cannot make the *un*fixed version of the system fail the test,
 the test is not measuring the setting.
 
+### `distributed=True` on its own is the same trap, one layer in
+
+The entry above sends you from `num_partitions` to "use `distributed=True` against a real
+cluster". That is necessary and it is not sufficient, because **`collect(distributed=True)`
+with no `num_workers` defaults to one worker**, and one worker computes what single-node
+computes. A matrix compared across that flag agrees for the reason an unplugged lever agrees.
+
+Measured 2026-09-22 on a local Ray 2.58 cluster, four Parquet files, 200,000 rows, using the
+divergence `.claude/rules/python-control-plane.md` already records -- `LIMIT 3` over an
+unordered `group_by`:
+
+| Run | Groups returned |
+|---|---|
+| `collect(distributed=False)` | 0, 1, 2 |
+| `collect()` (the `'auto'` default) | 0, 1, 2 |
+| `collect(distributed=True)` | 0, 1, 2 |
+| `collect(distributed=True, num_workers=2)` | 3, 5, 8 |
+
+The fourth row reproduces that file's measured numbers exactly, which is what makes it a
+usable control. The first three are the same run three ways. Note the second: `distributed`
+defaults to `'auto'`, so a "single-node" baseline written as a bare `collect()` is not
+pinned to single-node either -- name `distributed=False` rather than letting the default
+decide what you are comparing against.
+
+This was not hypothetical. A verb matrix run across the bare flag reported seven verbs
+agreeing, and `Dataset.split` among them; re-run with `num_workers=2`, the same matrix showed
+`split` raising `PlanError`, because a global window that is then filtered has no distributed
+plan. The vacuous run was the one that looked like a clean pass.
+
+So: a distributed-equivalence test names `distributed=False` on one side and
+`distributed=True, num_workers=N` with `N >= 2` on the other, and carries a control that is
+known to diverge. 230 of the ~290 `distributed=True` call sites under `tests/integration/`
+already pass `num_workers`; the remainder are worth reading before they are trusted.
+
 ## Correctness before timing
 
 The benchmark harness refuses to time a query whose result doesn't match the oracle

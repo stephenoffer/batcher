@@ -77,7 +77,6 @@ __all__ = [
     "blocking_operators",
     "has_unbounded_input",
     "is_blocking_under_stream",
-    "is_unbounded_scan",
     "retains_unbounded_state",
     "unbounded_scan_ids",
     "unbounded_source_ids",
@@ -156,19 +155,6 @@ def unbounded_scan_ids(plan: LogicalPlan, sources: Sequence[object]) -> frozense
         and 0 <= n.source_id < len(bound)
         and not is_bounded(bound[n.source_id])
     )
-
-
-def is_unbounded_scan(node: LogicalPlan, ctx: OptimizerContext) -> bool:
-    """Whether `node` is a `Scan` of a source that never ends.
-
-    Args:
-        node: The plan node to test.
-        ctx: The optimizer context, whose `sources` are the bound inputs.
-
-    Returns:
-        True only when `node` is a scan of a declared-unbounded source.
-    """
-    return isinstance(node, Scan) and bool(unbounded_scan_ids(node, ctx.sources or []))
 
 
 def unbounded_source_ids(plan: LogicalPlan, ctx: OptimizerContext) -> frozenset[int]:

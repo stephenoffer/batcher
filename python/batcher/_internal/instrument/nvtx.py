@@ -37,8 +37,6 @@ __all__ = [
     "nvtx_backend",
     "pop_range",
     "push_range",
-    "range_decorator",
-    "reset_nvtx_backend",
 ]
 
 #: Backends in preference order, as `(module path, push attribute, pop attribute)`. The `nvtx`
@@ -103,17 +101,6 @@ def nvtx_backend() -> str:
     return "" if resolved is None else resolved[0]
 
 
-def reset_nvtx_backend() -> None:
-    """Forget the resolved backend and re-enable annotation after a failure.
-
-    The hook a test faking a backend needs, and the only way to recover a process that disabled
-    itself — which is deliberate, because automatic recovery would re-enter the unbalanced-stack
-    state that caused the disable.
-    """
-    _DISABLED.clear()
-    _backend.cache_clear()
-
-
 def push_range(label: str) -> None:
     """Open a named range on the device profiler's timeline.
 
@@ -172,28 +159,3 @@ def device_range(label: str) -> Iterator[None]:
         yield
     finally:
         pop_range()
-
-
-def range_decorator(label: str):
-    """Wrap a function so every call appears as a named range.
-
-    For the handful of call sites that are a function rather than a block — a UDF entry point, a
-    model's forward pass — where wrapping the body in a `with` would mean editing user code.
-
-    Args:
-        label: What appears on the timeline.
-
-    Returns:
-        A decorator that preserves the wrapped function's name, docstring, and signature, so a
-        wrapped callable stays introspectable by the inference pool's own dispatch.
-    """
-
-    def decorate(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            with device_range(label):
-                return fn(*args, **kwargs)
-
-        return wrapper
-
-    return decorate

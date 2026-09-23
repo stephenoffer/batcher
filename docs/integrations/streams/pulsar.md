@@ -199,7 +199,7 @@ start rejecting producers. Delete the subscription when you retire a pipeline.
 
 ## See also
 
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, watermarks, output modes, checkpoints.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, output modes, checkpoints.
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: the shape most
   Pulsar pipelines end up in.
 - {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the `Source`/`Split` protocol, if

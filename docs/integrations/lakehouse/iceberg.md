@@ -148,7 +148,7 @@ Iceberg's upsert is the two-clause merge: update every matched row, insert every
 
 ## Expire snapshots
 
-Every write leaves a snapshot, and each snapshot pins the data files it references. `bt.vacuum` expires snapshots older than the retention window, 5 days by default, which is what lets storage be reclaimed. Like the Delta version it defaults to a dry run and returns the snapshot ids it would expire:
+Every write leaves a snapshot, and each snapshot pins the data files it references. {py:obj}`bt.vacuum <batcher.vacuum>` expires snapshots older than the retention window, 5 days by default, which is what lets storage be reclaimed. Like the Delta version it defaults to a dry run and returns the snapshot ids it would expire:
 
 ```python
 # docs: skip
@@ -156,7 +156,7 @@ print(bt.vacuum("db.orders", format="iceberg", catalog=catalog))
 bt.vacuum("db.orders", format="iceberg", catalog=catalog, retention_hours=24, dry_run=False)
 ```
 
-`bt.compact` raises on an Iceberg table, because rewriting data files is Spark's `rewrite_data_files` procedure and pyiceberg doesn't implement it. Cluster the data on the way in with `ds.write.iceberg(..., sort_by=[...])` instead.
+{py:obj}`bt.compact <batcher.compact>` raises on an Iceberg table, because rewriting data files is Spark's `rewrite_data_files` procedure and pyiceberg doesn't implement it. Cluster the data on the way in with `ds.write.iceberg(..., sort_by=[...])` instead.
 
 ## Table statistics
 

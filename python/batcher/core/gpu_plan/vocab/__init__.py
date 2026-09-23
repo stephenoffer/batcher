@@ -21,8 +21,6 @@ from batcher.core.gpu_plan.vocab.lists import (
     eval_list_fn,
     eval_list_get,
     eval_list_position,
-    supported_list_binary,
-    supported_list_fn,
 )
 from batcher.core.gpu_plan.vocab.regex import REGEX_FNS, eval_regex, portable
 
@@ -40,6 +38,4 @@ __all__ = [
     "eval_regex",
     "eval_window_start",
     "portable",
-    "supported_list_binary",
-    "supported_list_fn",
 ]

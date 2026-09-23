@@ -1,4 +1,4 @@
-"""Line-delimited decoding, shared by the text, log, and genomics sources.
+"""Line-delimited decoding, shared by the text and log sources.
 
 Both read the same shape — a file of lines becoming one Arrow string column — and both used
 to do it a line at a time in Python: a `decode`, a strip and a list append of interpreted
@@ -31,50 +31,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
-__all__ = ["iter_decoded_lines", "iter_line_blocks", "lines_of", "one_array"]
-
-
-# Bytes pulled per read on the decoded path. Smaller than the Arrow path's block below
-# because its callers are record-oriented rather than column-oriented: a genomics reader
-# holds one record plus one batch, and a 16 MiB text block would dominate that footprint.
-_DECODED_BLOCK_BYTES = 1 << 20  # 1 MiB
-
-
-def iter_decoded_lines(fh: IO[Any], encoding: str = "utf-8") -> Iterator[str]:
-    """Yield the handle's lines as `str`, decoding incrementally and holding no more than a block.
-
-    The line-at-a-time counterpart to `iter_line_blocks`, for a caller whose records span
-    lines and so has to look at them one by one — the FASTA/FASTQ readers, and the
-    comment-skipping TSV engine behind BED, GFF and VCF. Those callers cannot use the
-    Arrow-backed splitter above: they decide per line whether it is data, a comment or a
-    header, which is a `str` decision.
-
-    An incremental decoder rather than `block.decode()` because a multi-byte character can
-    straddle a block boundary. Sequence data is ASCII, but a *description* is free text — a
-    GFF attribute, a VCF description, an accented species name in a FASTA header.
-
-    Args:
-        fh: An open binary handle positioned at the start of the data.
-        encoding: The text encoding to decode with.
-
-    Yields:
-        Each line of the input, in order, without its terminator.
-    """
-    import codecs
-
-    decoder = codecs.getincrementaldecoder(encoding)()
-    carry = ""
-    while True:
-        block = fh.read(_DECODED_BLOCK_BYTES)
-        if not block:
-            break
-        carry += decoder.decode(block)
-        lines = carry.split("\n")
-        carry = lines.pop()
-        yield from lines
-    carry += decoder.decode(b"", True)
-    if carry:
-        yield carry
+__all__ = ["iter_line_blocks", "lines_of", "one_array"]
 
 
 def one_array(blocks: list[pa.Array]) -> pa.Array:

@@ -10,23 +10,34 @@ over them and costs nothing extra to ask for alongside precision and recall.
 The value of naming them explicitly is that the alternative is a reader re-deriving
 ``fp / (fp + tp)`` and getting the direction wrong. A metric with a standard name and a
 standard definition is a metric nobody has to check.
+
+Undefined values follow the one convention stated in the `classification` module: a
+proportion with an empty denominator is 0.0 (scikit-learn's ``zero_division=0``), and a ratio
+of rates or a chance-corrected score is NaN, as scikit-learn's ``class_likelihood_ratios``
+answers. `diagnostic_odds_ratio` is the one plain IEEE quotient: ``inf`` for a perfect test,
+NaN for ``0 / 0``.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from batcher.plan.expr_ir.constructors import lit
+from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, count_if
 from batcher.plan.functions.metrics.model.classification import (
-    false_negatives,
-    false_positives,
-    recall,
-    specificity,
-    true_negatives,
-    true_positives,
+    _confusion,
+    _present_class_mean,
+    _rate,
 )
+
+_NAN = float("nan")
+
+
+def _nan_unless(defined: Expr, value: Expr) -> Expr:
+    """`value` where `defined` holds, NaN elsewhere — the ratio-metric undefined value."""
+    return when(defined).then(value).otherwise(lit(_NAN))
+
 
 __all__ = [
     "diagnostic_odds_ratio",
@@ -59,7 +70,8 @@ def jaccard_score(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> E
         positive: The value that counts as the positive class.
 
     Returns:
-        The Jaccard score in ``[0, 1]``.
+        The Jaccard score in ``[0, 1]``, and 0.0 when neither column has a positive row
+        (scikit-learn's ``jaccard_score`` with its default ``zero_division``).
 
     Examples:
         .. doctest::
@@ -69,10 +81,8 @@ def jaccard_score(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> E
             >>> ds.agg(m=bt.jaccard_score("y", "p")).to_pydict()
             {'m': [0.6666666666666666]}
     """
-    tp = true_positives(y_true, y_pred, positive=positive)
-    fp = false_positives(y_true, y_pred, positive=positive)
-    fn = false_negatives(y_true, y_pred, positive=positive)
-    return tp / (tp + fp + fn)
+    tp, fp, fn, _ = _confusion(y_true, y_pred, positive)
+    return _rate(tp, tp + fp + fn)
 
 
 def false_discovery_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -88,7 +98,7 @@ def false_discovery_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 
         positive: The value that counts as the positive class.
 
     Returns:
-        The false-discovery rate in ``[0, 1]``.
+        The false-discovery rate in ``[0, 1]``, and 0.0 when nothing was predicted positive.
 
     Examples:
         .. doctest::
@@ -98,9 +108,8 @@ def false_discovery_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 
             >>> ds.agg(m=bt.false_discovery_rate("y", "p")).to_pydict()
             {'m': [0.5]}
     """
-    tp = true_positives(y_true, y_pred, positive=positive)
-    fp = false_positives(y_true, y_pred, positive=positive)
-    return fp / (fp + tp)
+    tp, fp, _, _ = _confusion(y_true, y_pred, positive)
+    return _rate(fp, fp + tp)
 
 
 def false_omission_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -116,7 +125,7 @@ def false_omission_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1
         positive: The value that counts as the positive class.
 
     Returns:
-        The false-omission rate in ``[0, 1]``.
+        The false-omission rate in ``[0, 1]``, and 0.0 when nothing was predicted negative.
 
     Examples:
         .. doctest::
@@ -126,9 +135,8 @@ def false_omission_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1
             >>> ds.agg(m=bt.false_omission_rate("y", "p")).to_pydict()
             {'m': [0.3333333333333333]}
     """
-    fn = false_negatives(y_true, y_pred, positive=positive)
-    tn = true_negatives(y_true, y_pred, positive=positive)
-    return fn / (fn + tn)
+    _, _, fn, tn = _confusion(y_true, y_pred, positive)
+    return _rate(fn, fn + tn)
 
 
 def positive_likelihood_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -145,7 +153,9 @@ def positive_likelihood_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: A
         positive: The value that counts as the positive class.
 
     Returns:
-        The positive likelihood ratio, at least 0.
+        The positive likelihood ratio, at least 0. NaN when it is undefined, as
+        scikit-learn's ``class_likelihood_ratios`` reports it: no false positives (the rate
+        it divides by is zero), or no positive or no negative rows at all.
 
     Examples:
         .. doctest::
@@ -155,8 +165,9 @@ def positive_likelihood_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: A
             >>> ds.agg(m=bt.positive_likelihood_ratio("y", "p")).to_pydict()
             {'m': [2.0]}
     """
-    sensitivity = recall(y_true, y_pred, positive=positive)
-    return sensitivity / (lit(1.0) - specificity(y_true, y_pred, positive=positive))
+    tp, fp, fn, tn = _confusion(y_true, y_pred, positive)
+    defined = ((tp + fn) > lit(0.0)) & (fp > lit(0.0))
+    return _nan_unless(defined, (tp / (tp + fn)) / (fp / (fp + tn)))
 
 
 def negative_likelihood_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -172,7 +183,9 @@ def negative_likelihood_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: A
         positive: The value that counts as the positive class.
 
     Returns:
-        The negative likelihood ratio, at least 0.
+        The negative likelihood ratio, at least 0. NaN when it is undefined, as
+        scikit-learn's ``class_likelihood_ratios`` reports it: no true negatives (the
+        specificity it divides by is zero), or no positive or no negative rows at all.
 
     Examples:
         .. doctest::
@@ -182,8 +195,9 @@ def negative_likelihood_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: A
             >>> ds.agg(m=bt.negative_likelihood_ratio("y", "p")).to_pydict()
             {'m': [0.5]}
     """
-    sensitivity = recall(y_true, y_pred, positive=positive)
-    return (lit(1.0) - sensitivity) / specificity(y_true, y_pred, positive=positive)
+    tp, fp, fn, tn = _confusion(y_true, y_pred, positive)
+    defined = ((tp + fn) > lit(0.0)) & (tn > lit(0.0))
+    return _nan_unless(defined, (fn / (tp + fn)) / (tn / (tn + fp)))
 
 
 def diagnostic_odds_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -200,7 +214,8 @@ def diagnostic_odds_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any =
         positive: The value that counts as the positive class.
 
     Returns:
-        The diagnostic odds ratio, at least 0.
+        The diagnostic odds ratio, at least 0: ``inf`` when a test with some true results
+        makes no errors of one kind, and NaN on ``0 / 0``.
 
     Examples:
         .. doctest::
@@ -210,10 +225,7 @@ def diagnostic_odds_ratio(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any =
             >>> ds.agg(m=bt.diagnostic_odds_ratio("y", "p")).to_pydict()
             {'m': [inf]}
     """
-    tp = true_positives(y_true, y_pred, positive=positive)
-    fp = false_positives(y_true, y_pred, positive=positive)
-    fn = false_negatives(y_true, y_pred, positive=positive)
-    tn = true_negatives(y_true, y_pred, positive=positive)
+    tp, fp, fn, tn = _confusion(y_true, y_pred, positive)
     return (tp * tn) / (fp * fn)
 
 
@@ -231,7 +243,10 @@ def informedness(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Ex
         positive: The value that counts as the positive class.
 
     Returns:
-        Informedness in ``[-1, 1]``.
+        Informedness in ``[-1, 1]``, and NaN when `y_true` lacks either class: with no
+        negatives there is no specificity to add, and scoring it 0.0 reported a perfect
+        classifier as no better than chance. (scikit-learn's
+        ``balanced_accuracy_score(adjusted=True)`` answers ``-inf`` there.)
 
     Examples:
         .. doctest::
@@ -241,11 +256,9 @@ def informedness(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Ex
             >>> ds.agg(m=bt.informedness("y", "p")).to_pydict()
             {'m': [0.5]}
     """
-    return (
-        recall(y_true, y_pred, positive=positive)
-        + specificity(y_true, y_pred, positive=positive)
-        - lit(1.0)
-    )
+    tp, fp, fn, tn = _confusion(y_true, y_pred, positive)
+    defined = ((tp + fn) > lit(0.0)) & ((tn + fp) > lit(0.0))
+    return _nan_unless(defined, tp / (tp + fn) + tn / (tn + fp) - lit(1.0))
 
 
 def markedness(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -261,7 +274,8 @@ def markedness(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr
         positive: The value that counts as the positive class.
 
     Returns:
-        Markedness in ``[-1, 1]``.
+        Markedness in ``[-1, 1]``, and NaN when the predictions lack either class, the
+        prediction-side mirror of `informedness`.
 
     Examples:
         .. doctest::
@@ -271,13 +285,9 @@ def markedness(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr
             >>> ds.agg(m=bt.markedness("y", "p")).to_pydict()
             {'m': [0.6666666666666665]}
     """
-    tp = true_positives(y_true, y_pred, positive=positive)
-    fp = false_positives(y_true, y_pred, positive=positive)
-    fn = false_negatives(y_true, y_pred, positive=positive)
-    tn = true_negatives(y_true, y_pred, positive=positive)
-    precision = tp / (tp + fp)
-    npv = tn / (tn + fn)
-    return precision + npv - lit(1.0)
+    tp, fp, fn, tn = _confusion(y_true, y_pred, positive)
+    defined = ((tp + fp) > lit(0.0)) & ((tn + fn) > lit(0.0))
+    return _nan_unless(defined, tp / (tp + fp) + tn / (tn + fn) - lit(1.0))
 
 
 def fowlkes_mallows_index(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -293,7 +303,8 @@ def fowlkes_mallows_index(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any =
         positive: The value that counts as the positive class.
 
     Returns:
-        The Fowlkes-Mallows index in ``[0, 1]``.
+        The Fowlkes-Mallows index in ``[0, 1]``, over precision and recall as the
+        zero-division convention defines them, so 0.0 when either is undefined.
 
     Examples:
         .. doctest::
@@ -303,12 +314,8 @@ def fowlkes_mallows_index(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any =
             >>> round(ds.agg(m=bt.fowlkes_mallows_index("y", "p")).to_pydict()["m"][0], 4)
             0.8165
     """
-    tp = true_positives(y_true, y_pred, positive=positive)
-    fp = false_positives(y_true, y_pred, positive=positive)
-    fn = false_negatives(y_true, y_pred, positive=positive)
-    precision = tp / (tp + fp)
-    sensitivity = tp / (tp + fn)
-    return (precision * sensitivity).sqrt()
+    tp, fp, fn, _ = _confusion(y_true, y_pred, positive)
+    return (_rate(tp, tp + fp) * _rate(tp, tp + fn)).sqrt()
 
 
 def prevalence_threshold(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -326,7 +333,8 @@ def prevalence_threshold(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 
         positive: The value that counts as the positive class.
 
     Returns:
-        The prevalence threshold in ``[0, 1]``.
+        The prevalence threshold in ``[0, 1]``, and NaN when `y_true` lacks either class or
+        the two rates are equal (the formula's ``0 / 0``).
 
     Examples:
         .. doctest::
@@ -336,9 +344,11 @@ def prevalence_threshold(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 
             >>> round(ds.agg(m=bt.prevalence_threshold("y", "p")).to_pydict()["m"][0], 4)
             0.4142
     """
-    tpr = recall(y_true, y_pred, positive=positive)
-    fpr = lit(1.0) - specificity(y_true, y_pred, positive=positive)
-    return ((tpr * fpr).sqrt() - fpr) / (tpr - fpr)
+    tp, fp, fn, tn = _confusion(y_true, y_pred, positive)
+    tpr = tp / (tp + fn)
+    fpr = fp / (fp + tn)
+    defined = ((tp + fn) > lit(0.0)) & ((tn + fp) > lit(0.0)) & (tpr != fpr)
+    return _nan_unless(defined, ((tpr * fpr).sqrt() - fpr) / (tpr - fpr))
 
 
 def hamming_loss(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
@@ -385,7 +395,9 @@ def geometric_mean_score(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 
         positive: The value that counts as the positive class.
 
     Returns:
-        The geometric mean score in ``[0, 1]``.
+        The geometric mean score in ``[0, 1]``, over the classes present in `y_true`: a
+        group with only positive rows scores its recall and one with only negative rows its
+        specificity, the rule `balanced_accuracy` follows. NaN with no labelled rows.
 
     Examples:
         .. doctest::
@@ -395,5 +407,4 @@ def geometric_mean_score(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 
             >>> ds.agg(g=bt.geometric_mean_score("y", "p")).to_pydict()
             {'g': [1.0]}
     """
-    sensitivity = recall(y_true, y_pred, positive=positive)
-    return (sensitivity * specificity(y_true, y_pred, positive=positive)).sqrt()
+    return _present_class_mean(y_true, y_pred, positive, geometric=True)

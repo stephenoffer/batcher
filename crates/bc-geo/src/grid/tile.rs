@@ -54,7 +54,7 @@ pub struct Tile {
 pub fn tile_of(lon: f64, lat: f64, z: u32) -> GeoResult<Tile> {
     check_zoom(z)?;
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
-        return Err(GeoError::invalid(format!(
+        return Err(GeoError::domain(format!(
             "tile lookup needs lon in [-180, 180] and lat in [-90, 90], got ({lon}, {lat})"
         )));
     }

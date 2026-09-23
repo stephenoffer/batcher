@@ -239,3 +239,86 @@ def test_nested_case_still_drops_a_dead_branch_of_the_same_type():
     inner = Case([(condition, lit(2))], lit(3))
     got = _fire("drop_nested_case_on_settled_condition", Case([(condition, lit(1))], inner))
     assert got == Case([(condition, lit(1))], lit(3)).to_ir()
+
+
+# --- the merged disjunction's *shape* ---------------------------------------
+
+
+def _expr_depth(ir: object, level: int = 0) -> int:
+    """How deep the serialized expression nests. Reads the IR, not the Python objects."""
+    if isinstance(ir, dict):
+        return max([level, *(_expr_depth(v, level + 1) for v in ir.values())])
+    if isinstance(ir, list):
+        return max([level, *(_expr_depth(v, level + 1) for v in ir)])
+    return level
+
+
+def _equal_valued_case(n: int) -> Case:
+    """`CASE WHEN s='c0' THEN 1.0 ... WHEN s='c{n-1}' THEN 1.0 ELSE 0.0 END`."""
+    return Case([(col("s") == lit(f"c{i}"), lit(1.0)) for i in range(n)], lit(0.0))
+
+
+def test_merging_equal_branches_builds_a_balanced_disjunction():
+    """The merge must not trade branch *count* for expression *depth*.
+
+    `bc_ir::MAX_PLAN_DEPTH` refuses a plan nesting past 512 levels, so a merge that folds
+    the conditions pairwise as it scans -- `((c1 OR c2) OR c3) OR ...` -- turns a shallow
+    `CASE` into an unexecutable plan at one level per branch. That is not hypothetical:
+    `FrequencyEncoder` fitted on a column whose categories are equally frequent emits
+    exactly this `CASE`, and at 600 categories the merged projection nested 608 levels and
+    the query was refused. Its own documented `max_categories` default is 1000.
+
+    `combine_disjuncts` builds the balanced tree instead, so depth grows with log(n).
+    """
+    n = 600
+    merged = _fire("merge_case_branches_with_equal_results", _equal_valued_case(n))
+    assert merged["e"] == "case"
+    assert len(merged["branches"]) == 1, "the equal-valued branches did not merge into one"
+    assert _expr_depth(merged) < 40, _expr_depth(merged)
+
+
+def test_the_depth_measurement_notices_a_left_deep_chain():
+    """The positive control for the assertion above.
+
+    `_expr_depth` reads a serialized IR, and an assertion that a number is *small* is
+    exactly the shape that passes when the measurement has quietly stopped measuring. This
+    builds the left-deep chain the rule used to produce and shows the same helper reports
+    it as deep, so `< 40` above is discriminating between two shapes rather than restating
+    a property of the serializer.
+    """
+    disjuncts = [col("s") == lit(f"c{i}") for i in range(300)]
+
+    left_deep: Expr = disjuncts[0]
+    for d in disjuncts[1:]:
+        left_deep = Binary("or", left_deep, d)
+    assert _expr_depth(left_deep.to_ir()) > 250
+
+    from batcher.plan.expr_rewrite import combine_disjuncts
+
+    assert _expr_depth(combine_disjuncts(disjuncts).to_ir()) < 40
+
+    # 300 and not 600, because `to_ir` is itself recursive and a 600-deep chain overflows
+    # Python's own stack before it can be measured -- which is the *other* half of the same
+    # defect and is why the failure reached a user as a bare `RecursionError` rather than as
+    # the engine's `PlanTooDeepError`. 300 is deep enough to discriminate and shallow enough
+    # to serialize.
+
+
+@pytest.mark.parametrize("n", [2, 3, 17, 600])
+def test_merging_equal_branches_preserves_the_result(n: int):
+    """Plan shape changes, answer does not -- over every branch, the `ELSE`, and a null.
+
+    The `s` column carries a value each branch claims, a value only the `ELSE` claims, and
+    a null, whose condition is `NULL` at every branch and must therefore fall through to
+    the `ELSE` exactly as a `false` would.
+    """
+    values = [f"c{i}" for i in range(n)] + ["miss", None]
+    ds = bt.from_pydict({"s": values})
+    expr = Case([(col("s") == lit(f"c{i}"), lit(float(i))) for i in range(n)], lit(-1.0))
+    # Every arm distinct: nothing merges, so this is the reference answer.
+    reference = ds.select(r=expr).to_pydict()["r"]
+    assert reference == [*(float(i) for i in range(n)), -1.0, -1.0]
+
+    # Every arm the same: the merge fires, and the answer is unchanged apart from the value.
+    same = ds.select(r=_equal_valued_case(n)).to_pydict()["r"]
+    assert same == [*([1.0] * n), 0.0, 0.0]

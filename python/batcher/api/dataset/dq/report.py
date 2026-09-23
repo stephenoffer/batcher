@@ -9,6 +9,7 @@ what turns a red/green light into something a monitoring dashboard can chart.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 __all__ = ["ConstraintResult", "ValidationReport"]
@@ -22,6 +23,11 @@ class ConstraintResult:
     billion rows tolerates ten million violations and still passes, and a `warn` constraint
     never fails at all — so `violations` alone cannot gate a pipeline, and `ok` alone cannot
     tell you the data got worse.
+
+    `rows` is the number of rows in the relation the constraint was checked against, for
+    every kind that reads the relation, including a relation-level one (a mean, a row count)
+    and a chain that metadata proved clean without executing it. A schema constraint is
+    decided before any row is read, so its `rows` is 0.
 
     Examples:
         .. doctest::
@@ -46,6 +52,10 @@ class ConstraintResult:
     def pass_rate(self) -> float:
         """The fraction of rows satisfying the constraint; 1.0 over an empty relation.
 
+        A relation-level or schema constraint has no violating *row*: it is true or false
+        of the whole relation. Its pass rate is therefore 1.0 when it held and 0.0 when it
+        did not, so a failed `mean_between` never reads as a perfect score on a dashboard.
+
         Returns:
             The share of considered rows that were valid, between 0.0 and 1.0.
 
@@ -57,6 +67,8 @@ class ConstraintResult:
                 >>> ds.dq.in_range("x", 0, 10).validate().results[0].pass_rate
                 0.75
         """
+        if self.kind in ("aggregate", "schema"):
+            return 1.0 if self.violations == 0 else 0.0
         if self.rows <= 0:
             return 1.0
         return max(0.0, (self.rows - self.violations) / self.rows)
@@ -102,6 +114,10 @@ class ConstraintResult:
     def to_dict(self) -> dict[str, object]:
         """This result as a plain dictionary, for logging or a metrics sink.
 
+        The output is strict JSON: a NaN or infinite measured `value` is emitted as `None`,
+        so ``json.dumps(result.to_dict(), allow_nan=False)`` always succeeds. The `value`
+        attribute itself keeps the real measurement.
+
         Returns:
             A JSON-serializable mapping of every field plus the derived rates.
 
@@ -124,7 +140,7 @@ class ConstraintResult:
             "ok": self.ok,
         }
         if self.value is not None:
-            out["value"] = self.value
+            out["value"] = self.value if math.isfinite(self.value) else None
         if self.detail:
             out["detail"] = self.detail
         return out
@@ -242,10 +258,13 @@ class ValidationReport:
 
     @property
     def rows(self) -> int:
-        """How many rows the row-level constraints were evaluated over.
+        """How many rows the relation had when the chain was checked.
+
+        The true row count on every path, including a chain that metadata proved clean
+        without evaluating any constraint.
 
         Returns:
-            The relation's row count, or 0 when no row-level constraint ran.
+            The relation's row count, or 0 when only schema constraints were checked.
 
         Examples:
             .. doctest::
@@ -287,7 +306,8 @@ class ValidationReport:
         """The whole report as plain data, for a log line or a metrics sink.
 
         Returns:
-            A JSON-serializable mapping with the summary counts and every result.
+            A strict-JSON mapping with the summary counts and every result. A non-finite
+            measurement appears as `None`; see `ConstraintResult.to_dict`.
 
         Examples:
             .. doctest::

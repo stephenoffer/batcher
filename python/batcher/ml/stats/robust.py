@@ -8,11 +8,13 @@ rows it is filtering.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.stats._shared import require_columns, scalar
 from batcher.plan.expr_ir.constructors import col, lit
+from batcher.plan.functions.aggregate import count_if
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -42,7 +44,8 @@ def trimmed_mean(ds: Dataset, column: str, *, proportion: float = 0.1) -> float:
         proportion: The fraction to trim from *each* tail, in ``[0, 0.5)``.
 
     Returns:
-        The trimmed mean.
+        The trimmed mean. NaN when the column has no non-null values or holds a NaN, matching
+        ``scipy.stats.trim_mean``; nulls are skipped.
 
     Raises:
         PlanError: If `proportion` is outside ``[0, 0.5)``.
@@ -57,6 +60,8 @@ def trimmed_mean(ds: Dataset, column: str, *, proportion: float = 0.1) -> float:
             3.0
     """
     low, high = _tail_cuts(ds, column, proportion)
+    if math.isnan(low) or math.isnan(high):
+        return math.nan
     kept = ds.filter((col(column) >= lit(low)) & (col(column) <= lit(high)))
     return scalar(kept.agg(m=col(column).mean()), "m")
 
@@ -79,7 +84,8 @@ def winsorized_mean(ds: Dataset, column: str, *, proportion: float = 0.1) -> flo
         proportion: The fraction to clamp at *each* tail, in ``[0, 0.5)``.
 
     Returns:
-        The winsorized mean.
+        The winsorized mean. NaN when the column has no non-null values or holds a NaN; nulls
+        are skipped.
 
     Raises:
         PlanError: If `proportion` is outside ``[0, 0.5)``.
@@ -94,23 +100,31 @@ def winsorized_mean(ds: Dataset, column: str, *, proportion: float = 0.1) -> flo
             5.5
     """
     low, high = _tail_cuts(ds, column, proportion)
+    if math.isnan(low) or math.isnan(high):
+        return math.nan
     clamped = ds.with_columns(**{column: col(column).clip(lit(low), lit(high))})
     return scalar(clamped.agg(m=col(column).mean()), "m")
 
 
 def _tail_cuts(ds: Dataset, column: str, proportion: float) -> tuple[float, float]:
-    """The lower and upper quantile cut points for a trim or a winsorization."""
+    """The lower and upper quantile cut points for a trim or a winsorization.
+
+    NaN for both when the column has no values (a statistic over no rows is undefined, not an
+    error) or holds a NaN, which the quantile would otherwise sort past every number and
+    quietly trim away.
+    """
     require_columns(ds, column)
     if not 0.0 <= proportion < 0.5:
         raise PlanError(f"proportion must be in [0, 0.5), got {proportion}")
     bounds = ds.agg(
         low=col(column).quantile(proportion),
         high=col(column).quantile(1.0 - proportion),
+        nan=count_if(col(column).is_nan()),
     ).collect()
-    return (
-        float(bounds.column("low")[0].as_py()),
-        float(bounds.column("high")[0].as_py()),
-    )
+    low, high = bounds.column("low")[0].as_py(), bounds.column("high")[0].as_py()
+    if low is None or high is None or bounds.column("nan")[0].as_py():
+        return (math.nan, math.nan)
+    return (float(low), float(high))
 
 
 def median_abs_deviation(ds: Dataset, column: str, *, scale: float = 1.4826) -> float:
@@ -128,7 +142,8 @@ def median_abs_deviation(ds: Dataset, column: str, *, scale: float = 1.4826) -> 
         scale: The consistency constant; 1.4826 matches the normal standard deviation.
 
     Returns:
-        The scaled median absolute deviation.
+        The scaled median absolute deviation. NaN when the column has no non-null values or
+        holds a NaN, matching ``scipy.stats.median_abs_deviation``; nulls are skipped.
 
     Examples:
         .. doctest::
@@ -140,7 +155,10 @@ def median_abs_deviation(ds: Dataset, column: str, *, scale: float = 1.4826) -> 
             1.0
     """
     require_columns(ds, column)
-    center = scalar(ds.agg(m=col(column).median()), "m")
+    row = ds.agg(m=col(column).median(), nan=count_if(col(column).is_nan())).collect()
+    center = row.column("m")[0].as_py()
+    if center is None or row.column("nan")[0].as_py():
+        return math.nan
     deviations = ds.with_columns(__bt_dev=(col(column) - lit(center)).abs())
     return scale * scalar(deviations.agg(m=col("__bt_dev").median()), "m")
 

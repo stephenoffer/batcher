@@ -60,8 +60,8 @@ The following table maps the 49 names on `Expr.str`, sorted alphabetically.
 | `tail` | `Expr.str.right` | canonical |  |
 | `to_date` | `Expr.str.to_date` | mismatch | Differs: Polars parses strictly by default: str.to\_date(format, strict=True). Format inference (no format) needs a manual port. Wave W0. |
 | `to_datetime` | `Expr.str.to_datetime` | param | Missing: optional format (inference), time\_unit=, time\_zone=, ambiguous=, strict=. Wave W2. |
-| `to_decimal` | `Expr.cast` | param | Missing: inferred precision/scale for decimal parsing (to\_decimal(scale=)). Wave W2. |
-| `to_integer` | `Expr.cast` | param | Missing: base= and strict= for string-to-integer parsing. Wave W2. |
+| `to_decimal` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: inferred precision/scale for decimal parsing (to\_decimal(scale=)). Wave W2. |
+| `to_integer` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: base= and strict= for string-to-integer parsing. Wave W2. |
 | `to_lowercase` | `Expr.str.lower` | canonical |  |
 | `to_time` | n/a | gap | Not yet: Expr.str.to\_time (needs a TIME type). Wave W6. |
 | `to_titlecase` | `Expr.str.to_titlecase` | canonical |  |
@@ -219,7 +219,7 @@ The following table maps the 5 names on `Expr.struct`, sorted alphabetically.
 | `field` | `Expr.struct.field` | param | Missing: several names and the '\*' wildcard in one call. Wave W2. |
 | `json_encode` | n/a | gap | Not yet: struct.json\_encode. Wave W3. |
 | `rename_fields` | n/a | gap | Not yet: struct.rename\_fields. Wave W3. |
-| `unnest` | `Dataset.unnest` | param | Missing: expression-level unnest (struct fields as separate output columns inside select). Wave W2. |
+| `unnest` | {py:obj}`Dataset.unnest <batcher.Dataset.unnest>` | param | Missing: expression-level unnest (struct fields as separate output columns inside select). Wave W2. |
 | `with_fields` | n/a | gap | Not yet: struct.with\_fields. Wave W3. |
 
 ## `Expr.cat`
@@ -288,8 +288,16 @@ The following table maps the 17 names on `Expr.meta`, sorted alphabetically.
 | `output_name` | `Expr.meta.output_name` | canonical |  |
 | `pop` | n/a | gap | Not yet: meta.pop expression introspection. Wave W8. |
 | `root_names` | `Expr.meta.root_names` | canonical |  |
-| `serialize` | `Expr.to_ir` | param | Missing: a stable serialized form (bytes/JSON string) that round-trips through deserialize. Wave W8. |
+| `serialize` | {py:obj}`Expr.to_ir <batcher.plan.expr_ir.core.Expr.to_ir>` | param | Missing: a stable serialized form (bytes/JSON string) that round-trips through deserialize. Wave W8. |
 | `show_graph` | n/a | gap | Not yet: meta.show\_graph expression introspection. Wave W8. |
 | `tree_format` | `Expr.meta.tree_format` | canonical |  |
 | `undo_aliases` | n/a | gap | Not yet: meta.undo\_aliases expression introspection. Wave W8. |
-| `write_json` | `Expr.to_ir` | param | Missing: JSON string output of the expression IR. Wave W8. |
+| `write_json` | {py:obj}`Expr.to_ir <batcher.plan.expr_ir.core.Expr.to_ir>` | param | Missing: JSON string output of the expression IR. Wave W8. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Polars pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

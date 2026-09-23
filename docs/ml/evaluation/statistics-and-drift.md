@@ -58,6 +58,13 @@ survey = bt.from_pydict({"income": [30.0, 80.0, 55.0], "weight": [3.0, 1.0, 2.0]
 print(survey.agg(m=bt.weighted_mean("income", "weight")).to_pydict())
 ```
 
+Nulls are dropped pairwise. A row missing the value, the weight, or either side of a covariance leaves every sum of that aggregate together, which is what `numpy.average` over the complete rows computes. The row with the missing income below contributes nothing, not even its weight:
+
+```python
+gaps = bt.from_pydict({"income": [1.0, None, 3.0], "weight": [1.0, 1.0, 1.0]})
+assert gaps.agg(v=bt.weighted_var("income", "weight")).to_pydict() == {"v": [1.0]}
+```
+
 ### Two-sample comparison
 
 An A/B test or a cohort comparison is arithmetic over *conditional* aggregates, so both samples are summarized in one pass and neither leaves the engine:
@@ -111,7 +118,7 @@ These expressions return a statistic, not a p-value. To turn one into a decision
 
 ### Statistics that need a second pass
 
-A rank correlation needs an ordering and a trimmed mean needs the quantiles before it can filter on them, so these are functions over a {py:class}`Dataset <batcher.Dataset>` rather than expressions. They are still entirely relational, built from a window, a {py:meth}`group_by <batcher.Dataset.group_by>`, or a second aggregate, so nothing materializes on the driver:
+A rank correlation needs an ordering and a trimmed mean needs the quantiles before it can filter on them, so these are functions over a {py:class}`Dataset <batcher.Dataset>` rather than expressions. They live in the `batcher.ml.stats` module and are not re-exported as `bt.*`, so import them from there and pass the dataset as the first argument. They are still entirely relational, built from a window, a {py:meth}`group_by <batcher.Dataset.group_by>`, or a second aggregate, so nothing materializes on the driver:
 
 ```python
 from batcher.ml.stats import cramers_v, entropy, mutual_information, spearman_corr
@@ -131,7 +138,17 @@ print(entropy(cats, "a"), cramers_v(cats, "a", "b"), mutual_information(cats, "a
 
 Where `cramers_v` is symmetric, `theils_u` is directional: it reports the fraction of one categorical column's uncertainty that knowing the other removes, so `theils_u(ds, "x", "y")` and `theils_u(ds, "y", "x")` differ and answer "does `x` predict `y`" rather than "are they related". For a numeric column against a grouping, `eta_squared` and its bias-corrected sibling `epsilon_squared` are the bounded effect sizes `anova_f` lacks: both read as "this grouping explains 30% of the variance" and stay comparable across sample sizes, which a raw F never is. `omega_squared` corrects the bias furthest for generalizing beyond the sample, and `cohens_f` is the effect-size scale a power analysis is specified on.
 
-`trimmed_mean`, `winsorized_mean`, `median_abs_deviation`, and `outlier_mask` cover robust location and outlier detection. The `|x - median| / MAD > 3` rule that `outlier_mask` implements is what to use instead of a z-score on anything with a tail.
+`trimmed_mean`, `winsorized_mean`, `median_abs_deviation`, and `outlier_mask` cover robust location and outlier detection. The `|x - median| / MAD > 3` rule that `outlier_mask` implements is what to use instead of a z-score on anything with a tail. `mean_abs_deviation` sits between the standard deviation and the MAD: it keeps the mean as its center but weights every deviation linearly, so one outlier moves it far less than it moves the standard deviation.
+
+`normalized_entropy` is `entropy` divided by the entropy of the same number of equally likely values, so it lands in `[0, 1]` whatever the cardinality: 0 for a constant column, 1 for a uniform one. Use it rather than raw `entropy` to rank or threshold columns with different numbers of categories:
+
+```python
+from batcher.ml.stats import mean_abs_deviation, normalized_entropy
+
+spread = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]})
+print(mean_abs_deviation(spread, "x"))  # 1.0
+print(normalized_entropy(cats, "a"))  # 1.0: two values, equally common
+```
 
 ## Profiling features before modeling
 
@@ -331,6 +348,43 @@ When the data itself is too skewed or ordinal for a t-test, `mann_whitney_u` (tw
 Report `cliffs_delta` or `common_language_effect_size` beside a Mann-Whitney result. The test says *whether* two groups differ; these say *how much*, as the probability that a random member of one exceeds a random member of the other.
 
 The tail probabilities come from dependency-free implementations of the Student's t, F, and chi-squared survival functions, which the test suite checks against SciPy. The reduction is a handful of aggregates, so a test scales like every other statistic here.
+
+### Missing values and degenerate input
+
+Every function in `batcher.ml.stats` follows SciPy's defaults on input that is not a clean sample, so a result can be checked against `scipy.stats` directly:
+
+- A null is a missing observation and is dropped. That holds in the group column too, where a row with a null label is left out rather than forming a group of its own.
+- A NaN is a value, and it propagates. The statistic and the p-value are NaN, which is SciPy's `nan_policy="propagate"`. A NaN never reads as `p = 0`.
+- Too little data gives NaN rather than an exception. That covers a group of one row, all-constant data, a paired test whose differences are all zero, and an empty dataset. Constant groups that differ from each other give an infinite statistic with `p = 0`, as SciPy reports.
+- Too few groups for the question raises {py:exc}`PlanError <batcher.PlanError>`, as SciPy raises for it. A between-groups test needs at least two groups after nulls are dropped, and `t_test_ind` and `mann_whitney_u` need exactly two.
+
+```python
+import math
+
+from batcher.ml.stats import kruskal_wallis, t_test_1samp
+
+messy = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 9.0, 10.0], "g": [*"aaabbbbb", None]})
+print(kruskal_wallis(messy, "x", "g").statistic)  # 5.0: the null-label row is not a group
+
+with_nan = bt.from_pydict({"x": [1.0, 2.0, float("nan"), 4.0]})
+assert math.isnan(t_test_1samp(with_nan, 0.0, "x").pvalue)
+```
+
+`variance_inflation_factor` follows the same rule: with no more complete rows than columns the regression behind each VIF is underdetermined, and every value is NaN. A column that is an exact linear combination of the others has an infinite VIF.
+
+### On a cluster
+
+None of these functions takes a `distributed=` argument. Each runs its aggregates through `collect()` with the default `distributed="auto"`, which decides from the input size and the cluster. To force them onto Ray, or keep them off it, set the session pin:
+
+```python
+# docs: skip
+from batcher.config import option_context
+
+with option_context("distributed.mode", "always"):
+    result = kruskal_wallis(big_table, "latency", "region")
+```
+
+The answer is the same either way, up to float reassociation in the last bits.
 
 ## Time-series diagnostics
 

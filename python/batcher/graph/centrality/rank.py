@@ -10,8 +10,8 @@ from __future__ import annotations
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
-from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph
-from batcher.graph._iterate import check_iterations, iterate, max_abs_change
+from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph, walked
+from batcher.graph._iterate import check_iterations, iterate, max_abs_change, settled
 from batcher.graph.degree import degree
 
 __all__ = ["degree_centrality", "pagerank", "personalized_pagerank"]
@@ -68,14 +68,16 @@ def pagerank(
 
     Edge weights are honoured: a node's rank is split in proportion to outgoing weight
     rather than evenly. Run `Graph.simple` first if the edge table has parallel edges,
-    since two copies of an edge otherwise carry twice the mass.
+    since two copies of an edge otherwise carry twice the mass. On a graph built with
+    `directed=False` every edge is walked both ways.
 
     Args:
         g: The graph.
         damping: The probability of following an edge rather than teleporting. The
             conventional 0.85 comes from the original paper; lower values converge faster
             and localize the score more tightly.
-        max_iterations: The cap on rounds.
+        max_iterations: The cap on rounds. Hitting it returns the last iterate and warns
+            with `ConvergenceWarning`.
         tolerance: Stop once no node's rank moves by more than this.
 
     Returns:
@@ -100,6 +102,7 @@ def pagerank(
         raise PlanError(f"damping must be in [0, 1), got {damping}")
     check_iterations(max_iterations, tolerance)
 
+    g = walked(g)
     nodes = g.nodes().cache()
     n = nodes.count()
     if n == 0:
@@ -143,7 +146,7 @@ def pagerank(
         delta=max_abs_change(NODE, "pagerank"),
         tolerance=tolerance,
     )
-    return result.state
+    return settled(result, "pagerank", max_iterations)
 
 
 def personalized_pagerank(
@@ -167,7 +170,8 @@ def personalized_pagerank(
         sources: The nodes to teleport back to. Rank concentrates around these.
         node: The column in `sources` holding the node id.
         damping: The probability of following an edge rather than teleporting.
-        max_iterations: The cap on rounds.
+        max_iterations: The cap on rounds. Hitting it returns the last iterate and warns
+            with `ConvergenceWarning`.
         tolerance: Stop once no node's rank moves by more than this.
 
     Returns:
@@ -191,6 +195,7 @@ def personalized_pagerank(
         raise PlanError(f"damping must be in [0, 1), got {damping}")
     check_iterations(max_iterations, tolerance)
 
+    g = walked(g)
     nodes = g.nodes().cache()
     seeds = (
         sources.select(**{NODE: bt.col(node)}).distinct().join(nodes, on=NODE, how="semi").cache()
@@ -239,7 +244,7 @@ def personalized_pagerank(
         delta=max_abs_change(NODE, "pagerank"),
         tolerance=tolerance,
     )
-    return result.state
+    return settled(result, "personalized_pagerank", max_iterations)
 
 
 def degree_centrality(g: Graph) -> Dataset:

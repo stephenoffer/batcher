@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.stats._shared import require_columns
-from batcher.plan.expr_ir import Expr, array, col, lit
+from batcher.plan.expr_ir import Expr, array, col, lit, when
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -51,6 +51,9 @@ MAX_REFERENCE_ROWS = 1000
 #: columns so the prediction stays linear in the reference size; see `stage_distances`.
 DISTANCE_COLUMN = "__bt_knn_distances"
 THRESHOLD_COLUMN = "__bt_knn_threshold"
+#: The smallest staged distance, which a distance-weighted average reads to detect an exact
+#: match; see `neighbour_weights`.
+NEAREST_COLUMN = "__bt_knn_nearest"
 
 
 def read_reference(
@@ -159,8 +162,9 @@ def stage_distances(
     # `k` may exceed the reference set, in which case every row is a neighbour and the
     # threshold is simply the largest distance.
     position = min(k, len(points)) - 1
+    ordered = col(DISTANCE_COLUMN).list.sort()
     return staged.with_columns(
-        **{THRESHOLD_COLUMN: col(DISTANCE_COLUMN).list.sort().list.get(position)}
+        **{THRESHOLD_COLUMN: ordered.list.get(position), NEAREST_COLUMN: ordered.list.get(0)}
     )
 
 
@@ -175,6 +179,14 @@ def neighbour_weights(count: int, *, distance_weighted: bool) -> tuple[list[Expr
     break the tie by reference-set order and make the prediction depend on the order rows
     happened to arrive in.
 
+    The distance weight is ``1 / d`` with ``d`` the **Euclidean** distance, as scikit-learn
+    defines ``weights="distance"``. The staged distances are squared, so the weight takes their
+    square root; weighting by the squared distance instead would give ``1 / d**2``, which leans
+    much harder on the nearest row than the documented rule. A scored row that coincides with
+    one or more reference rows (``d == 0``) is handled the way scikit-learn handles it: those
+    coincident rows share the vote equally and every other neighbour gets weight zero, rather
+    than dividing by zero.
+
     Args:
         count: How many reference rows there are.
         distance_weighted: Weight each neighbour by ``1 / distance`` rather than equally, so
@@ -183,15 +195,15 @@ def neighbour_weights(count: int, *, distance_weighted: bool) -> tuple[list[Expr
     Returns:
         ``(weights, total)`` — one weight expression per reference row, and their sum.
     """
+    exact_match = col(NEAREST_COLUMN) == lit(0.0)
     weights: list[Expr] = []
     for index in range(count):
         distance = col(DISTANCE_COLUMN).list.get(index)
         inside = (distance <= col(THRESHOLD_COLUMN)).cast("float64")
         if distance_weighted:
-            # A reference row sitting exactly on the scored row would divide by zero, so the
-            # denominator is floored. The floor is far below any distance that matters, so a
-            # coincident row dominates the average, which is what "distance weighted" means.
-            inside = inside / (distance + lit(1e-12))
+            coincident = (distance == lit(0.0)).cast("float64")
+            inverse = inside / distance.sqrt()
+            inside = when(exact_match).then(coincident).otherwise(inverse)
         weights.append(inside)
     return weights, balanced_sum(weights)
 
@@ -231,4 +243,4 @@ def drop_staging(ds: Dataset) -> Dataset:
     Returns:
         `ds` without the helper columns.
     """
-    return ds.drop(DISTANCE_COLUMN, THRESHOLD_COLUMN)
+    return ds.drop(DISTANCE_COLUMN, THRESHOLD_COLUMN, NEAREST_COLUMN)

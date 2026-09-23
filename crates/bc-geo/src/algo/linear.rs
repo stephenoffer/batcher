@@ -20,7 +20,10 @@ use crate::types::{Coord, Geometry, LineString};
 fn require_line<'a>(g: &'a Geometry, op: &'static str) -> GeoResult<&'a LineString> {
     match g {
         Geometry::LineString(l) if l.len() >= 2 => Ok(l),
-        Geometry::LineString(_) => Err(GeoError::invalid(format!(
+        // An empty or one-position chain has no length to measure a fraction of. That
+        // is a property of the row, like a null, so it is `Domain` (nulled) rather than
+        // a query error: one empty route in a table must not abort the scan.
+        Geometry::LineString(_) => Err(GeoError::domain(format!(
             "{op} needs a line with at least two positions"
         ))),
         other => Err(GeoError::Unsupported {

@@ -6,7 +6,7 @@ paths are built on that one primitive. This page describes it, the algorithms la
 and where its remaining headroom is.
 
 On TPC-H at scale factor 1, the four-engine board of 2026-09-13 in
-`benchmarks/BENCHMARK_RESULTS.md` puts Batcher at a 0.72 geomean ratio against DuckDB on its own
+[`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md) puts Batcher at a 0.72 geomean ratio against DuckDB on its own
 native storage, a win overall, with 6 of the 22 cases recorded as losing on that board. Against
 DuckDB reading the same Arrow input Batcher reads, the ratio is 0.25
 ({doc}`TPC-H benchmarks </benchmarks/results/tpch>`). Distributed, Batcher's join beats
@@ -16,7 +16,7 @@ which is what the later sections of this page follow.
 
 ## One primitive: index pairs
 
-`crates/bc-runtime/src/join/mod.rs` computes two row-index vectors, `(left, right)`, that
+[`crates/bc-runtime/src/join/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/mod.rs) computes two row-index vectors, `(left, right)`, that
 describe the output. Output column `c` is `take(side_of_c, indices_of_that_side)`.
 
 That is the whole design. An unmatched row on the null-supplying side gets a **null index**,
@@ -275,7 +275,7 @@ The admission test, the fan-out, and what a single bucket pair costs are below.
 ## Range joins
 
 An inequality, interval-containment or band join is `RelOp::RangeJoin`, and
-`crates/bc-runtime/src/join/range/` answers it without materializing the cartesian product. It
+[`crates/bc-runtime/src/join/range/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/join/range) answers it without materializing the cartesian product. It
 emits the same `JoinIndices` the hash join does, so every join type and the caller's gather are
 unchanged. The algorithm follows the shape of the condition:
 
@@ -389,20 +389,20 @@ The `None` in the left join is the null index in the index-pair builder, made vi
 Join throughput is set by how much of the operator runs in parallel, and the profile says
 exactly where that is decided: the serial prefixes around the parallel per-bucket join. The
 radix scatter and the hash build are parallel, and the probe side is gathered once instead of
-concatenated and re-gathered. The measurements are in `benchmarks/BENCHMARK_RESULTS.md`, and
+concatenated and re-gathered. The measurements are in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md), and
 {doc}`vs Daft </benchmarks/comparisons/vs-daft>` carries the distributed join against Daft.
 
 ## Code map
 
-- `crates/bc-runtime/src/join/mod.rs`: `hash_join_indices`, the bloom gate, `JoinIndices`
-- `crates/bc-runtime/src/join/dense.rs`, `build.rs`: the direct-map build and the sharded parallel build
-- `crates/bc-runtime/src/join/key_filter.rs`: the build-side key set pushed to the probe scan
-- `crates/bc-runtime/src/join/range/`: range, band and IEJoin inequality joins
-- `crates/bc-runtime/src/join/radix.rs`: the parallel three-phase partition
-- `crates/bc-runtime/src/join/stream.rs`: `BroadcastProbe`, the streaming probe
-- `crates/bc-runtime/src/join/sort_merge.rs`, `asof.rs`: the other two algorithms
-- `crates/bc-interp/src/join_par/`: grace join, broadcast join, skew detection
-- `crates/bc-interp/src/ops/repartition.rs`: gather-once bucket construction
+- [`crates/bc-runtime/src/join/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/mod.rs): `hash_join_indices`, the bloom gate, `JoinIndices`
+- [`crates/bc-runtime/src/join/dense.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/dense.rs), `build.rs`: the direct-map build and the sharded parallel build
+- [`crates/bc-runtime/src/join/key_filter.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/key_filter.rs): the build-side key set pushed to the probe scan
+- [`crates/bc-runtime/src/join/range/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/join/range): range, band and IEJoin inequality joins
+- [`crates/bc-runtime/src/join/radix.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/radix.rs): the parallel three-phase partition
+- [`crates/bc-runtime/src/join/stream.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/stream.rs): `BroadcastProbe`, the streaming probe
+- [`crates/bc-runtime/src/join/sort_merge.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/sort_merge.rs), `asof.rs`: the other two algorithms
+- [`crates/bc-interp/src/join_par/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-interp/src/join_par): grace join, broadcast join, skew detection
+- [`crates/bc-interp/src/ops/repartition.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/repartition.rs): gather-once bucket construction
 
 ## See also
 

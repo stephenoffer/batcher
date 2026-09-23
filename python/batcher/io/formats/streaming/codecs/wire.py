@@ -29,6 +29,7 @@ from batcher._internal.errors import BackendError, PlanError
 __all__ = [
     "CONFLUENT_MAGIC",
     "FramedPayload",
+    "SchemaNotFoundError",
     "SchemaRegistry",
     "frame_confluent",
     "unframe_confluent",
@@ -41,6 +42,18 @@ CONFLUENT_MAGIC = 0
 
 #: Bytes of framing before the payload proper: the magic byte plus a 4-byte schema id.
 _HEADER_LEN = 5
+
+
+class SchemaNotFoundError(BackendError):
+    """The registry answered, and has no schema under the id or subject asked for.
+
+    Kept apart from every other registry failure because it means something different to a
+    decoder. An id the registry does not know came out of the *payload*, so it is a property
+    of that message — a corrupt or foreign record, which permissive decoding may null. An
+    unreachable or failing registry is a property of the *deployment*, says nothing about the
+    message, and must fail the query in every mode: nulling on it turns an outage into a
+    stream of empty records.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,9 +258,8 @@ class SchemaRegistry:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:  # pragma: no cover - needs a live registry
             detail = exc.read().decode("utf-8", "replace")[:200]
-            raise BackendError(
-                f"schema registry {self._url}{path} returned {exc.code}: {detail}"
-            ) from exc
+            kind = SchemaNotFoundError if exc.code == 404 else BackendError
+            raise kind(f"schema registry {self._url}{path} returned {exc.code}: {detail}") from exc
         except OSError as exc:  # pragma: no cover - needs a live registry
             raise BackendError(f"schema registry {self._url} is unreachable: {exc}") from exc
 

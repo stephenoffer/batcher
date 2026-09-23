@@ -35,7 +35,6 @@ from batcher.dist.gpu.fabric.placement import (
     adaptive_shard_factor,
     device_shard_counts,
     local_device_group,
-    placement_summary,
     shard_device_assignment,
 )
 
@@ -50,7 +49,6 @@ __all__ = [
     "merge_env",
     "node_collective_env",
     "p2p_disabled",
-    "placement_summary",
     "reset_node_collective_env",
     "shard_device_assignment",
     "socket_ifnames",

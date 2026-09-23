@@ -41,11 +41,17 @@ pub fn is_ring(g: &Geometry) -> bool {
 /// True when the geometry has no anomalous self-intersection.
 ///
 /// For a chain that means it does not cross or touch itself except at a closing
-/// endpoint; for a point set it means no duplicates. Areal geometries are simple by
-/// definition once they are valid, which is why `ST_IsSimple` on a polygon is not a
-/// second validity check.
+/// endpoint; for a point set it means no duplicates. For an areal geometry it means
+/// every ring is simple — the GEOS and DuckDB definition — so a bowtie
+/// `POLYGON((0 0, 2 2, 2 0, 0 2, 0 0))` is not simple. It is deliberately *not* a
+/// second validity check: rings that cross *each other* (a hole poking out of its
+/// shell, two overlapping members of a multipolygon) leave every ring simple, and GEOS
+/// reports such a geometry as simple and invalid. Returning `true` for every polygon,
+/// as this did, answered a bowtie as simple.
 pub fn is_simple(g: &Geometry) -> bool {
     match g {
+        Geometry::Polygon(p) => polygon_rings_simple(p),
+        Geometry::MultiPolygon(ps) => ps.iter().all(polygon_rings_simple),
         Geometry::LineString(l) => !self_intersects(l),
         Geometry::MultiLineString(ls) => {
             ls.iter().all(|l| !self_intersects(l))
@@ -61,6 +67,12 @@ pub fn is_simple(g: &Geometry) -> bool {
         Geometry::GeometryCollection(gs) => gs.iter().all(is_simple),
         _ => true,
     }
+}
+
+fn polygon_rings_simple(p: &Polygon) -> bool {
+    std::iter::once(&p.exterior)
+        .chain(p.interiors.iter())
+        .all(|r| !self_intersects(r))
 }
 
 /// True when two *different* chains of a MULTILINESTRING meet anywhere other than at a
@@ -216,17 +228,19 @@ fn reason_of(g: &Geometry) -> Option<String> {
             }
             None
         }
+        // A chain needs two *distinct* positions: `LINESTRING(0 0, 0 0)` has two
+        // coordinates and no extent, and GEOS, PostGIS and DuckDB all call it invalid.
         Geometry::LineString(l) => {
-            if !l.is_empty() && l.len() < 2 {
-                Some("line has a single position".to_string())
+            if !l.is_empty() && without_repeated_positions(l).len() < 2 {
+                Some("line has fewer than two distinct positions".to_string())
             } else {
                 None
             }
         }
         Geometry::MultiLineString(ls) => ls
             .iter()
-            .position(|l| !l.is_empty() && l.len() < 2)
-            .map(|i| format!("line {} has a single position", i + 1)),
+            .position(|l| !l.is_empty() && without_repeated_positions(l).len() < 2)
+            .map(|i| format!("line {} has fewer than two distinct positions", i + 1)),
         Geometry::GeometryCollection(gs) => gs.iter().find_map(reason_of),
         _ => None,
     }
@@ -249,6 +263,15 @@ fn ring_reason(ring: &LineString, what: &str) -> Option<String> {
             ring[0].y,
             ring[ring.len() - 1].x,
             ring[ring.len() - 1].y
+        ));
+    }
+    // Four coordinates are not four positions: `POLYGON((0 0, 0 0, 0 0, 0 0))` passed
+    // the count above while enclosing nothing. GEOS counts after dropping consecutive
+    // repeats, and so does this.
+    let distinct = without_repeated_positions(ring).len();
+    if distinct < 4 {
+        return Some(format!(
+            "{what} has {distinct} distinct positions; a ring needs at least 4 (3 distinct plus the closing repeat)"
         ));
     }
     if self_intersects(ring) {
@@ -313,6 +336,17 @@ fn polygon_reason(p: &Polygon) -> Option<String> {
                 c.y
             ));
         }
+        // Rings may touch at a point, never along a line. A hole identical to its shell
+        // has no vertex outside it, so the test above passes it — while it removes the
+        // whole interior. GEOS reports the shared edge as a self-intersection.
+        if let Some(c) = shared_segment(&p.exterior, hole) {
+            return Some(format!(
+                "interior ring {} runs along the exterior ring near ({}, {})",
+                i + 1,
+                c.x,
+                c.y
+            ));
+        }
         for (j, other) in p.interiors.iter().enumerate().skip(i + 1) {
             let hole_poly = Polygon {
                 exterior: hole.clone(),
@@ -341,6 +375,13 @@ fn polygons_overlap(a: &Polygon, b: &Polygon) -> bool {
     if a.exterior.iter().any(|c| inside(*c, b)) || b.exterior.iter().any(|c| inside(*c, a)) {
         return true;
     }
+    // Two identical (or boundary-sharing, nested) rings have every vertex on the other's
+    // boundary and no proper crossing, so neither test above fires. One interior point
+    // of each, located in the other, is what sees that they share area.
+    let shares = |x: &Polygon, y: &Polygon| interior_sample(x).is_some_and(|c| inside(c, y));
+    if shares(a, b) || shares(b, a) {
+        return true;
+    }
     // Crossing boundaries that share no vertex: a crossing that is not merely a touch
     // means a strip of one lies inside the other.
     for s in a.exterior.windows(2) {
@@ -356,6 +397,41 @@ fn polygons_overlap(a: &Polygon, b: &Polygon) -> bool {
         }
     }
     false
+}
+
+/// A position where two rings run along each other for a positive length, if any.
+fn shared_segment(a: &LineString, b: &LineString) -> Option<Coord> {
+    use crate::algo::primitive::{orientation, Orientation};
+    for s in a.windows(2) {
+        let (dx, dy) = (s[1].x - s[0].x, s[1].y - s[0].y);
+        let len2 = dx * dx + dy * dy;
+        if len2 == 0.0 {
+            continue;
+        }
+        for t in b.windows(2) {
+            if orientation(s[0], s[1], t[0]) != Orientation::Collinear
+                || orientation(s[0], s[1], t[1]) != Orientation::Collinear
+            {
+                continue;
+            }
+            // Both on the line through `s`: compare the two as intervals along it.
+            let u = |p: Coord| ((p.x - s[0].x) * dx + (p.y - s[0].y) * dy) / len2;
+            let (u0, u1) = (u(t[0]), u(t[1]));
+            let lo = u0.min(u1).max(0.0);
+            let hi = u0.max(u1).min(1.0);
+            if hi > lo {
+                let m = f64::midpoint(lo, hi);
+                return Some(Coord::new(s[0].x + m * dx, s[0].y + m * dy));
+            }
+        }
+    }
+    None
+}
+
+/// A position strictly inside a simple polygon, or `None` for one with no interior.
+fn interior_sample(p: &Polygon) -> Option<Coord> {
+    crate::algo::relate::interior_point(&Geometry::Polygon(p.clone()))
+        .filter(|c| point_in_polygon(*c, p) == PointRing::Inside)
 }
 
 /// True when the geometry satisfies OGC validity.
@@ -503,5 +579,54 @@ mod tests {
     fn a_repeated_vertex_does_not_stop_a_ring_being_one() {
         // The same de-duplication has to reach `is_ring`, which shares `self_intersects`.
         assert!(is_ring(&g("LINESTRING(0 0, 4 0, 4 4, 4 4, 0 0)").geometry));
+    }
+
+    #[test]
+    fn a_polygon_is_simple_exactly_when_its_rings_are() {
+        // Expected values are DuckDB spatial's ST_IsSimple on the same WKT.
+        let simple = |t: &str| is_simple(&g(t).geometry);
+        assert!(!simple("POLYGON((0 0, 2 2, 2 0, 0 2, 0 0))"), "bowtie");
+        assert!(
+            !simple("POLYGON((0 0, 1 1, 2 2, 0 0))"),
+            "collinear ring retraces"
+        );
+        assert!(!simple(
+            "MULTIPOLYGON(((0 0, 2 2, 2 0, 0 2, 0 0)), ((5 5, 6 5, 6 6, 5 5)))"
+        ));
+        assert!(simple("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))"));
+        // Rings crossing each other leave every ring simple: invalid, but simple.
+        assert!(simple(
+            "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 5 1, 5 2, 1 2, 1 1))"
+        ));
+        assert!(simple(
+            "MULTIPOLYGON(((0 0, 2 0, 2 2, 0 2, 0 0)), ((1 1, 3 1, 3 3, 1 3, 1 1)))"
+        ));
+    }
+
+    #[test]
+    fn degenerate_rings_lines_and_duplicate_holes_are_invalid() {
+        // Each of these is ST_IsValid = false in DuckDB and was true here.
+        for t in [
+            "POLYGON((0 0, 0 0, 0 0, 0 0))",
+            "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 1), (1 1, 2 1, 2 2, 1 1))",
+            "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (0 0, 4 0, 4 4, 0 4, 0 0))",
+            "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 1 1, 1 1, 1 1))",
+            "MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)), ((0 0, 1 0, 1 1, 0 0)))",
+            "LINESTRING(0 0, 0 0)",
+            "MULTILINESTRING((0 0, 0 0), (1 1, 2 2))",
+        ] {
+            assert!(!is_valid(&g(t)), "{t} should be invalid");
+        }
+        // ...and these stay valid, as they are in DuckDB.
+        for t in [
+            "LINESTRING(0 0, 0 0, 1 1)",
+            "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 1), (2 2, 3 2, 3 3, 2 2))",
+        ] {
+            assert!(
+                is_valid(&g(t)),
+                "{t} should be valid: {:?}",
+                validity_reason(&g(t))
+            );
+        }
     }
 }

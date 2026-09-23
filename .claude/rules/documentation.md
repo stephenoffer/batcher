@@ -101,8 +101,8 @@ that, and needing the preview usually means the page is too dense to be one page
 - The page needs an opening bullet preview to be navigable → split.
 - The rendered page is enormous even though the source is short → split. An `autoclass`
   with `:members:` is a few lines of source and hundreds of rendered ones, which is how
-  `docs/api/complete/` came to render the whole public surface on one page. Judge the built
-  page, not the Markdown.
+  `docs/api/symbols/` came to render the whole public surface on one page. Judge the built
+  page, not the Markdown. `tools/check_page_size.py` measures it, and `just docs` runs it.
 - Several sections answer the same reader goal → consolidate into one use-case narrative.
 - A parent page carries content *and* nests children → move the content down or the
   children up.

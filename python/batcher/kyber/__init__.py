@@ -46,7 +46,6 @@ from batcher.kyber.metadata_filter_count import (
     answer_filter_count,
     answer_filter_is_empty,
 )
-from batcher.kyber.metadata_summary import answer_column_summary
 from batcher.kyber.optimizer import (
     Optimizer,
     optimize,
@@ -66,7 +65,6 @@ __all__ = [
     "MeasuredColumns",
     "Optimizer",
     "answer_aggregate",
-    "answer_column_summary",
     "answer_count",
     "answer_filter_any",
     "answer_filter_count",

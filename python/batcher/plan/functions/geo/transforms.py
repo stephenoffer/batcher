@@ -132,7 +132,9 @@ def st_force_3d(geom: Expr | str, z: Expr | float) -> Expr:
     """Give a 2D geometry a constant elevation.
 
     The complement of `st_force_2d`, for making a column uniform in the other
-    direction — usually so it can be written to a format that requires 3D.
+    direction — usually so it can be written to a format that requires 3D. A geometry
+    that already has z keeps it: `z` fills in a missing elevation, never overwrites a
+    measured one, as PostGIS ``ST_Force3D`` does.
 
     Args:
         geom: The geometry.
@@ -409,9 +411,11 @@ def st_segmentize(geom: Expr | str, max_length: Expr | float) -> Expr:
 def st_remove_repeated_points(geom: Expr | str, tolerance: Expr | float) -> Expr:
     """Drop consecutive positions closer together than a tolerance.
 
-    A tolerance of 0 drops exact duplicates only. Rings stay closed: thinning that
-    would drop a ring below a triangle leaves it alone rather than producing something
-    no areal predicate can read.
+    A tolerance of 0 drops exact duplicates only. A chain keeps both endpoints and never
+    thins below two positions, so ``LINESTRING(0 0, 0 0)`` stays as it is, as in
+    PostGIS and DuckDB. Rings stay closed: thinning that would drop a ring below a
+    triangle leaves it alone rather than producing something no areal predicate can
+    read.
 
     Args:
         geom: The geometry.

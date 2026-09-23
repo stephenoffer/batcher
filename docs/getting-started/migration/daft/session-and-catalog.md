@@ -113,3 +113,11 @@ The following table maps the 14 names on `Table`, sorted alphabetically.
 | `select` | `Table.read` | param | Missing: port as table.read().select(...). Wave W9. |
 | `show` | `Table.read` | param | Missing: port as table.read().show(). Wave W9. |
 | `write` | `Dataset.write.table` | param | Missing: port as ds.write.table(table.name, mode=...); Table has no write methods. Wave W9. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

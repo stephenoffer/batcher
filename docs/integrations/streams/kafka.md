@@ -347,7 +347,7 @@ Client options such as `sasl_password` go to librdkafka as given. They aren't re
 
 ## See also
 
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, watermarks, output modes, checkpoints.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, output modes, checkpoints.
 - {doc}`Payload formats </integrations/streams/payload-formats>`: decoding Avro, JSON, and Protobuf payloads.
 - {doc}`Kafka ETL </cookbook/streaming/kafka-etl>`: this connector end to end, decode to sink.
 - {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>`: what the stable

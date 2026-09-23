@@ -20,13 +20,15 @@ from batcher import graph as bg
 
 
 def main() -> None:
-    # A real bipartite graph: customers linked to the nations they belong to.
+    # A real bipartite graph: customers linked to the nations they belong to. The ids are
+    # prefixed because customer 5 and nation 5 are different nodes; without it they would
+    # merge, and so would the components below.
     edges = (
         tpch("customer")
         .limit(2_000)
         .select(
-            src=bt.col("c_custkey").cast("string"),
-            dst=bt.col("c_nationkey").cast("string"),
+            src=bt.concat_str(bt.lit("c"), bt.col("c_custkey").cast("string")),
+            dst=bt.concat_str(bt.lit("n"), bt.col("c_nationkey").cast("string")),
         )
     )
 
@@ -48,10 +50,13 @@ def main() -> None:
     # The handshake identity: the degrees sum to twice the edge count.
     assert sum(degrees["degree"]) == 2 * edges.count()
 
+    # Each customer hangs off exactly one nation, and no edge joins two nations, so there is
+    # one component per nation that has a customer, labelled by its smallest node id.
     components = bg.connected_components(graph).to_pydict()
     distinct = len(set(components["component"]))
-    print("connected components:", distinct)
-    assert distinct >= 1
+    nations = edges.select("dst").distinct().count()
+    print("connected components:", distinct, "nations:", nations)
+    assert distinct == nations
     assert len(components["node"]) == len(degrees["node"])
 
 

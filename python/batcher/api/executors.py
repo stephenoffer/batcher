@@ -52,19 +52,31 @@ class DistributedExecutor:
 
         if has_map_batches(plan):
             from batcher import dist
+            from batcher.api.dataset._udf.cluster import (
+                require_placeable_accelerators,
+                unpicklable_udf_error,
+            )
 
+            # A device request no node can meet would wait forever; refuse it up front.
+            require_placeable_accelerators(plan)
             # map/inference pipeline: Kyber doesn't size it relationally, so build a
             # GPU-aware envelope straight from the plan's `map_batches` resource tags,
             # adapted by any GPU utilization measured on a previous run.
             envelope = _map_scheduling_envelope(plan, ctx.num_workers, ctx.hub)
-            table = dist.execute_distributed(
-                plan,
-                sources,
-                ctx.num_workers,
-                transport=ctx.transport,
-                envelope=envelope,
-                hub=ctx.hub,
-            )
+            try:
+                table = dist.execute_distributed(
+                    plan,
+                    sources,
+                    ctx.num_workers,
+                    transport=ctx.transport,
+                    envelope=envelope,
+                    hub=ctx.hub,
+                )
+            except TypeError as exc:
+                clearer = unpicklable_udf_error(plan, exc)
+                if clearer is None:
+                    raise
+                raise clearer from None
             collect_source_metadata(ctx.hub, sources, plan)
             record_udf_cardinality(ctx.hub, plan, table.num_rows)
             return table
@@ -81,10 +93,25 @@ class UdfExecutor:
     `map_batches` is opaque to Kyber, so the pipeline runs as authored; but the
     scanned inputs still feed the metadata loop, so the *relational* queries that
     follow get sketch-driven cardinality from data this pipeline touched.
+
+    All three subsystems are reached from here, and which part of each is what the
+    conductor contract in `.claude/rules/architecture.md` asks for:
+
+    * **Kyber** prunes each source's columns (`required_columns_per_source`). The full
+      optimizer is not run and cannot be: `kyber.optimize` raises `NotImplementedError` on
+      a plan holding a `MapBatches`, because that node has no engine IR to lower.
+    * **Carbonite** admits the query and judges the input against the memory envelope,
+      through the two entry points that need no `PhysicalPlan` (`admit`,
+      `input_exceeds_budget`). `validate` is not among them: it takes a physical plan,
+      which this shape does not have for the same reason.
+    * **Core** executes and measures every stage.
     """
 
     def execute(self, plan: LogicalPlan, sources: list[Source], ctx: ExecutionContext) -> pa.Table:
-        from batcher import core, kyber
+        from batcher import carbonite, core, kyber
+        from batcher.api.orchestration.run import narrowed_to_grant
+        from batcher.api.orchestration.sizing import projected_input_bytes
+        from batcher.plan.visitor import scanned_source_ids
 
         # Kyber decides which columns each source must supply; Core executes with them. A UDF
         # that declared `input_columns` prunes the scan to those (plus what the plan above
@@ -92,14 +119,74 @@ class UdfExecutor:
         # Hand the profiling sink down when this run is being measured, so an ML pipeline
         # gets a per-stage `stats()` tree instead of the "no per-operator metrics" refusal.
         recorder = getattr(ctx.profile, "stage_recorder", None) if ctx.profile else None
-        batches = core.execute_with_udfs(
-            plan, sources, kyber.required_columns_per_source(plan), recorder=recorder
-        )
+        projections = kyber.required_columns_per_source(plan)
+
+        # Carbonite, on the one path that used to skip it entirely. This pipeline
+        # materializes every stage's output in the driver (`execute_with_udfs` returns a
+        # list), so it is the shape whose memory is *least* bounded, and it was the one
+        # running with no admission at all: an audit measured `ResourceManager.validate`
+        # called once for a relational collect and zero times for this one.
+        rm = carbonite.ResourceManager(hub=ctx.hub)
+        input_bytes = projected_input_bytes(sources, projections, scanned_source_ids(plan))
+        # Judged on *every* run, not only a profiled one. Gating the reading on
+        # `ctx.profile` put the protection behind the observer: a query explained with
+        # `analyze=True` was checked against the envelope and the same query collected
+        # normally was not, which is the half of "Carbonite protects" that matters least.
+        over_budget = rm.input_exceeds_budget(input_bytes)
+        _record_udf_admission(ctx, input_bytes, over_budget=over_budget)
+
+        # `admit()` holds the slot for the *duration* of execution, which is why it brackets
+        # the call rather than returning a verdict before it. With the default
+        # `execution.max_concurrent_queries = 0` every query gets an unbounded grant, so an
+        # unconfigured deployment runs exactly as it did before this existed.
+        #
+        # The grant is applied, not discarded: this pipeline runs relational operators on
+        # the engine between its Python stages, so a query admitted against a narrowed pool
+        # must ask the engine for that pool too. `narrowed_to_grant` is the same narrowing
+        # the relational path gets through `run._with_grant`.
+        with rm.admit() as grant, narrowed_to_grant(grant):
+            batches = core.execute_with_udfs(plan, sources, projections, recorder=recorder)
         schema = batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
         table = pa.Table.from_batches(batches, schema=schema)
         collect_source_metadata(ctx.hub, sources, plan)
         record_udf_cardinality(ctx.hub, plan, table.num_rows)
         return table
+
+
+def _record_udf_admission(ctx: ExecutionContext, input_bytes: int, *, over_budget: bool) -> None:
+    """Report Carbonite's reading of a UDF pipeline into the profile, if one is collecting.
+
+    The relational path records an admission verdict from `ResourceManager.validate`, which
+    needs a `PhysicalPlan`. A UDF pipeline has none, so the reading here is the one
+    Carbonite can give without lowering: the projected input against the envelope. Recording
+    it is what makes `explain()` on an ML pipeline say which subsystem judged the query,
+    instead of an empty `carbonite_summary` that reads as "nothing admitted this".
+
+    Best-effort by construction. A profile that cannot be written must never fail a query
+    that is otherwise fine, which is the same stance `run_profiled` takes on the envelope.
+    """
+    if ctx.profile is None:
+        return
+    try:
+        from batcher.plan.profile import Decision
+
+        ctx.profile.carbonite_summary = (
+            "input exceeds the memory envelope" if over_budget else "feasible"
+        )
+        ctx.profile.decisions.append(
+            Decision(
+                subsystem="carbonite",
+                category="admission",
+                summary=ctx.profile.carbonite_summary,
+                detail={
+                    "feasible": not over_budget,
+                    "projected_input_bytes": int(input_bytes),
+                    "validated": False,
+                },
+            )
+        )
+    except Exception:  # pragma: no cover - a profile that cannot be written is not a failure
+        note_suppressed("udf-admission-profile")
 
 
 class DriverExecutor:

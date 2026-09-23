@@ -2,7 +2,7 @@
 
 Expressions are Batcher's column language: `bt.col("price") * 1.2`, `.str.lower()`, `.dt.truncate("hour")`. Python builds them and Rust evaluates them over whole columns, so a transformation written here never touches a row in Python. These 39 recipes cover the expression API, grouped by the column type they operate on.
 
-Each page embeds a complete, self-contained script from the [`examples/expressions/`](https://github.com/stephenoffer/batcher/tree/main/examples/expressions) directory, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Each page embeds a complete, self-contained script from the [`examples/expressions/`](https://github.com/stephenoffer/batcher/tree/main/examples/expressions) directory, and [`tests/docs/test_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_examples.py) runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 Start with {doc}`the scalar algebra </cookbook/expressions/scalar/index>` if the expression API is new to you. Every accessor namespace builds on it.
 

@@ -81,7 +81,7 @@ def truncate_middle(
     reading it can tell the text is not continuous.
 
     Values already within the budget are returned unchanged, marker and all — the marker only
-    appears where something was actually removed.
+    appears where something was actually removed. A null stays null.
 
     Args:
         text: The text column (name or expression) to trim.
@@ -126,7 +126,13 @@ def truncate_middle(
         Lit(marker),
         column.str.right(tail_chars),
     )
-    return when(column.str.len_chars() <= Lit(chars)).then(column).otherwise(shortened)
+    # `concat` skips a null part, so without the guard a null row came back as the bare marker.
+    # A missing text stays missing, as it does in `truncate_to_token_budget`.
+    return (
+        when(column.str.len_chars() <= Lit(chars))
+        .then(column)
+        .otherwise(when(column.is_not_null()).then(shortened))
+    )
 
 
 def prompt_token_estimate(*parts: IntoExpr, chars_per_token: float = 4.0) -> Expr:

@@ -136,6 +136,12 @@ def test_both_routes_produce_the_same_answer(parquet_path, route, monkeypatch):
     with_actors = _global(parquet_path).collect(distributed=True, num_workers=_W).to_pydict()
     assert route["actors"] > 0, "the actor arm did not take the actor route"
 
+    # Hand back the warm pool first. Declining the pool by monkeypatch leaves *this plan's*
+    # actors alive and holding the cluster's cores -- a state production never reaches, since
+    # a pipeline only ever declines a pool it does not hold -- and `release_foreign_agg_pools`
+    # deliberately spares a pipeline's own pool, so the stateless tasks could never place and
+    # the arm hung to the timeout. The idle timer is what returns them in production.
+    M._shutdown_pools(M._AGG_POOLS)
     monkeypatch.setattr(M, "_agg_actor_pool", lambda plan0, workers: None)
     with_tasks = _global(parquet_path).collect(distributed=True, num_workers=_W).to_pydict()
 

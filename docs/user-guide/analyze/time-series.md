@@ -221,5 +221,5 @@ A value that comes back after an interruption opens a *new* run rather than rejo
 
 - {doc}`/user-guide/analyze/window-functions`: frames, ranking, and the full window vocabulary.
 - {doc}`/user-guide/analyze/joins`: as-of joins in full, including `direction` and `tolerance`.
-- {doc}`/user-guide/moving-data/streaming`: the same operations over an unbounded source, with watermarks and triggers.
+- {doc}`/user-guide/moving-data/streaming/index`: the same operations over an unbounded source, with watermarks and triggers.
 - {doc}`/cookbook/analytics/aggregates/time-series-rollups`: these patterns as a runnable script.

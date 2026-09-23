@@ -67,7 +67,7 @@ The operator mix times single kernels over TPC-H `lineitem` at sf1 (6,001,215 ro
 
 The filtered count is the widest margin, and it comes from the plan. `.count()` over a filter compiles to a `COUNT(*)` aggregate, so projection pushdown prunes the scan to the one column the predicate touches and the count fuses into a single {py:func}`count_if <batcher.count_if>` pass. Nothing else is read, and no matching row is materialized.
 
-The 46-case mix added string functions, set operations, scalar expressions and six join shapes. It found large wins that nothing had measured, a semi-join at 0.28x and an anti-join at 0.27x, and a set of string and temporal kernels where DuckDB does less work per row. `benchmarks/results/LOSS_BACKLOG.md` tracks every case where Batcher is behind.
+The 46-case mix added string functions, set operations, scalar expressions and six join shapes. It found large wins that nothing had measured, a semi-join at 0.28x and an anti-join at 0.27x, and a set of string and temporal kernels where DuckDB does less work per row. [`benchmarks/results/LOSS_BACKLOG.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/LOSS_BACKLOG.md) tracks every case where Batcher is behind.
 
 :::{tip}
 The same margins are reachable from your own query. {py:meth}`ds.explain() <batcher.Dataset.explain>` shows whether the predicate reached the scan and which columns survived pruning, and {py:meth}`ds.stats() <batcher.Dataset.stats>` reports what each operator cost. {doc}`/getting-started/tutorials/foundations/optimizing-a-slow-query` walks the loop.
@@ -75,7 +75,7 @@ The same margins are reachable from your own query. {py:meth}`ds.explain() <batc
 
 ## Lakehouse reads
 
-A selective predicate on a Delta table should open one data file, not all of them. The transaction log records each file's column bounds, and Batcher reads it at plan time. The benchmark counts rows matching one day across 10M rows in 200 Delta data files, one `day` per file, on a single node, measured 2026-07-13 with `benchmarks/scenarios/lakehouse_bench.py`:
+A selective predicate on a Delta table should open one data file, not all of them. The transaction log records each file's column bounds, and Batcher reads it at plan time. The benchmark counts rows matching one day across 10M rows in 200 Delta data files, one `day` per file, on a single node, measured 2026-07-13 with [`benchmarks/scenarios/lakehouse_bench.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/scenarios/lakehouse_bench.py):
 
 | `count(*) WHERE day = 42` | Time | Files opened |
 |---|---:|---:|

@@ -8,7 +8,7 @@ Two operators, each estimating its own memory, each deciding independently that 
 room, will together exceed the machine. That's the whole problem, and one shared counter
 is the answer to it.
 
-Batcher's is `MemoryPool`, in `crates/bc-resource/src/lib.rs`. It is deliberately the
+Batcher's is `MemoryPool`, in [`crates/bc-resource/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-resource/src/lib.rs). It is deliberately the
 smallest crate at the bottom of the DAG (`std` plus `thiserror`, no Arrow, no IR), so
 that `bc-runtime` and `bc-transport` can both draw on the same envelope without either
 depending on the other. The design is DataFusion's `MemoryPool` / `MemoryReservation`
@@ -171,7 +171,7 @@ With no registered consumers this is exactly `try_reserve`, so nothing pays for 
 it doesn't use.
 
 One consumer registers today, and which one it is decides where the mechanism applies.
-`ShuffleSpiller` in `crates/bc-py/src/flight.rs` puts the published shuffle store in the
+`ShuffleSpiller` in [`crates/bc-py/src/flight.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/flight.rs) puts the published shuffle store in the
 registry when a Flight server binds, and keeps a pool reservation equal to the store's
 resident bytes so spilling it hands real credit back. Published output is finished work
 waiting to be collected, so writing it out stalls nobody and costs one re-read.

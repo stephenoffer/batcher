@@ -17,10 +17,10 @@ customer's missing income looks more like their segment's income than like every
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg
+from batcher.ml.preprocessors.base import Preprocessor, columns_arg, nan_as_null
 from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
@@ -40,6 +40,35 @@ def _keys(by: str | Sequence[str]) -> list[str]:
     if not keys:
         raise PlanError("a group feature needs at least one grouping column")
     return keys
+
+
+def _learn_lookup(grouped: Dataset, keys: list[str]) -> dict[str, list[Any]]:
+    """Read a per-group aggregate to the driver as plain ``{column: values}`` state.
+
+    The learned table has to be *state*, not a lazy `Dataset`: a lazy plan (even a cached one)
+    cannot be written by `save` or `to_dict`, so both classes used to persist an empty state
+    and fail on the first `transform` after a reload. As plain lists it round-trips through
+    JSON and pickle like every other fitted attribute. The table has one row per group, the
+    same size the cached plan held. It is sorted by the keys, because a group-by emits its
+    groups in hash-table order, which differs between one node and several, and the saved
+    state should not.
+    """
+    return grouped.sort(*keys).collect().to_pydict()
+
+
+def _lookup_frame(lookup: dict[str, list[Any]], keys: list[str], ds: Dataset) -> Dataset:
+    """The learned table as a `Dataset` whose key types match `ds`, ready to join onto it.
+
+    A reloaded table is rebuilt from Python values, so an ``int32`` or ``date`` key would come
+    back as whatever `from_pydict` infers. Casting each key to the frame's own type keeps the
+    join from failing, or silently missing, on a type mismatch.
+    """
+    import batcher as bt
+
+    frame = bt.from_pydict(lookup)
+    schema = ds.schema
+    casts = {k: col(k).cast(schema.field(k).type) for k in keys if k in schema.names}
+    return frame.with_columns(**casts) if casts else frame
 
 
 class GroupStatEncoder(Preprocessor):
@@ -73,7 +102,7 @@ class GroupStatEncoder(Preprocessor):
         statistics: Which statistics to attach; see `GROUP_STATISTICS`.
     """
 
-    __slots__ = ("by", "statistics", "value")
+    __slots__ = ("by", "lookup_", "statistics", "value")
 
     def __init__(
         self,
@@ -100,9 +129,7 @@ class GroupStatEncoder(Preprocessor):
         if not stats:
             raise PlanError("GroupStatEncoder needs at least one statistic")
         self.statistics = stats
-        # The learned lookup is a Dataset, not a scalar, so it lives on the instance rather
-        # than a trailing-underscore field — persistence would have to serialize a table.
-        self._lookup: Dataset | None = None
+        self.lookup_: dict[str, list[Any]] = {}
 
     def _feature_name(self, statistic: str) -> str:
         """The column name for one statistic, e.g. ``amount_mean_by_cust``."""
@@ -140,7 +167,8 @@ class GroupStatEncoder(Preprocessor):
             }.get(statistic)
             name = self._feature_name(statistic)
             aggregates[name] = builder(col(self.value)) if builder else col(self.value).count()
-        self._lookup = ds.group_by(*self.by).agg(**aggregates).cache()
+        clean = nan_as_null(ds, [self.value])
+        self.lookup_ = _learn_lookup(clean.group_by(*self.by).agg(**aggregates), self.by)
         self._fitted = True
         return self
 
@@ -166,8 +194,7 @@ class GroupStatEncoder(Preprocessor):
             A new lazy `Dataset` with one feature column per statistic joined on.
         """
         self._require_fitted()
-        assert self._lookup is not None
-        return ds.join(self._lookup, on=self.by, how="left")
+        return ds.join(_lookup_frame(self.lookup_, self.by, ds), on=self.by, how="left")
 
 
 class GroupImputer(Preprocessor):
@@ -180,7 +207,9 @@ class GroupImputer(Preprocessor):
 
     `fit` learns each group's mean on the training data. A row whose group was unseen, or
     whose group is entirely null, falls back to the global mean rather than staying null —
-    an unfillable value is worse than an approximate one here.
+    an unfillable value is worse than an approximate one here. In a float column a NaN is
+    missing too: it is skipped by the means and filled like a null. The learned per-group
+    table is plain state (``group_means_``), so it survives `save` / `load` and pickling.
 
     Examples:
         .. doctest::
@@ -199,13 +228,13 @@ class GroupImputer(Preprocessor):
         by: The grouping column(s) whose per-group mean supplies the fill value.
     """
 
-    __slots__ = ("by", "columns")
+    __slots__ = ("by", "columns", "global_means_", "group_means_")
 
     def __init__(self, columns: str | Sequence[str], *, by: str | Sequence[str]) -> None:
         self.columns = columns_arg(columns, what="GroupImputer")
         self.by = _keys(by)
-        self._group_means: Dataset | None = None
-        self._global_means: dict[str, float] = {}
+        self.group_means_: dict[str, list[Any]] = {}
+        self.global_means_: dict[str, float] = {}
 
     def _fill_name(self, column: str) -> str:
         """The internal column carrying a column's per-group mean."""
@@ -233,12 +262,14 @@ class GroupImputer(Preprocessor):
         """
         import batcher as bt
 
+        ds = nan_as_null(ds, self.columns)
         group_aggs = {self._fill_name(c): bt.mean(col(c)) for c in self.columns}
-        self._group_means = ds.group_by(*self.by).agg(**group_aggs).cache()
+        self.group_means_ = _learn_lookup(ds.group_by(*self.by).agg(**group_aggs), self.by)
         global_row = ds.agg(**{c: bt.mean(col(c)) for c in self.columns}).collect()
+        self.global_means_ = {}
         for column in self.columns:
             value = global_row.column(column)[0].as_py()
-            self._global_means[column] = 0.0 if value is None else float(value)
+            self.global_means_[column] = 0.0 if value is None else float(value)
         self._fitted = True
         return self
 
@@ -264,8 +295,8 @@ class GroupImputer(Preprocessor):
         from batcher.plan.expr_ir.constructors import lit
 
         self._require_fitted()
-        assert self._group_means is not None
-        joined = ds.join(self._group_means, on=self.by, how="left")
+        ds = nan_as_null(ds, self.columns)
+        joined = ds.join(_lookup_frame(self.group_means_, self.by, ds), on=self.by, how="left")
         projections = {}
         for column in self.columns:
             group_mean = col(self._fill_name(column))
@@ -273,7 +304,7 @@ class GroupImputer(Preprocessor):
             # second fallback. The column is cast to float64 first: a mean is a float, and a
             # serving batch whose column is entirely null types as `null`, which would clash
             # with the float fill value otherwise.
-            fallback = group_mean.fill_null(lit(self._global_means[column]))
+            fallback = group_mean.fill_null(lit(self.global_means_[column]))
             projections[column] = col(column).cast("float64").fill_null(fallback)
         filled = joined.with_columns(**projections)
         return filled.drop(*(self._fill_name(c) for c in self.columns))

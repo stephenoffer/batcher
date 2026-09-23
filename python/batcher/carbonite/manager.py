@@ -44,7 +44,7 @@ from batcher.carbonite.policies import (
     measured_bdp_window,
     shuffle_window_is_stable,
 )
-from batcher.carbonite.policies.cpu_budget import reduced_core_budget
+from batcher.carbonite.policies.cpu_budget import oversubscription_note, reduced_core_budget
 from batcher.carbonite.policies.morsel import (
     MIN_MORSEL_BYTES,
     MIN_MORSEL_ROWS,
@@ -347,6 +347,7 @@ class ResourceManager:
             changes["morsel_rows"], changes["morsel_bytes"] = target
         if parallelism is not None:
             changes["parallelism"] = parallelism
+            _report_reduced_parallelism()
         execution = dataclasses.replace(self._config.execution, **changes)
         return dataclasses.replace(self._config, execution=execution)
 
@@ -647,3 +648,38 @@ class ResourceManager:
                 cache.evict_to_free(deficit)
         with pool.reserve(m_bytes) as granted:
             yield granted
+
+
+def _report_reduced_parallelism() -> None:
+    """Say on the bus that contention, not the plan, narrowed the fan-out.
+
+    Without this the reduction is invisible, and a narrowed fan-out is indistinguishable from
+    an engine that failed to parallelize — two symptoms with opposite fixes (move the
+    workload, or fix the plan). `oversubscription_note` was written for exactly this and had
+    no caller, so the engine has been quietly asking for fewer cores and explaining it nowhere.
+
+    Called only once a reduction has been decided, which keeps the note's second CPU probe off
+    the quiet-machine path: `policies.cpu_budget._measure` exists because those probes were
+    108 us of a 1.3 ms query, and a machine with no contention never reaches this.
+
+    Never raises: this describes a decision that has already been taken.
+    """
+    try:
+        from batcher._internal import events
+        from batcher.plan.profile import Decision
+
+        note = oversubscription_note()
+        if not note:
+            return
+        events.publish(
+            events.DECISION,
+            **Decision(
+                subsystem="carbonite",
+                category="parallelism",
+                summary=note,
+            ).to_dict(),
+        )
+    except Exception as exc:  # pragma: no cover - observation must never fail a query
+        from batcher._internal.logging import note_suppressed
+
+        note_suppressed("carbonite", "report the reduced cpu fan-out", exc)

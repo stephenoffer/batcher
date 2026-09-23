@@ -58,46 +58,47 @@ The table below lists the operations and performance scripts in path order.
 <!-- library-table: operations,perf -->
 | Script | Shows |
 | --- | --- |
-| `examples/operations/comparing_two_runs.py` | Diffing the output of two pipeline versions |
-| `examples/operations/configuration.py` | Configuring the engine: options, scoped overrides, and profiles |
-| `examples/operations/configuration_scopes.py` | Setting engine options, and keeping the change scoped |
-| `examples/operations/dataset_identity.py` | Comparing two Datasets, and what "equal" means for a lazy plan |
-| `examples/operations/debugging_a_wrong_result.py` | Shrinking a wrong result down to the operator that caused it |
-| `examples/operations/environment.py` | What is installed, what the engine sees, and what to paste into a bug report |
-| `examples/operations/environment_and_hardware.py` | What the engine can see about the machine it is on |
-| `examples/operations/error_handling.py` | The exception hierarchy: catching the failure you meant to catch |
-| `examples/operations/error_types.py` | The typed exceptions, and catching the right one |
-| `examples/operations/explain_modes.py` | Reading a plan at different levels of detail |
-| `examples/operations/gpu_cloud.py` | Checking a GPU-cloud node before you trust its throughput |
-| `examples/operations/inspecting_a_query.py` | Reading a plan, timing a query, and checking what the engine actually ran |
-| `examples/operations/lineage.py` | Tracing where a column came from |
-| `examples/operations/memory_and_caching.py` | Bounded memory: caching a reused branch, storage levels, and spilling under a tight budget |
-| `examples/operations/memory_pricing.py` | Memory: what a result costs to hold, and when to hold it |
-| `examples/operations/observability.py` | Watching a query run: verbosity, logging, and execution statistics |
-| `examples/operations/observability_events.py` | Watching a query run: the progress reporter and the activity store |
-| `examples/operations/plan_stability.py` | Checking that a refactor did not change the plan |
-| `examples/operations/profiling_a_query.py` | Measuring where a query spends its time |
-| `examples/operations/query_metadata_feedback.py` | The feedback loop: what the executor measured, and what the optimizer does with it |
-| `examples/operations/reading_a_plan.py` | Reading `explain` output, and what the optimizer did to your query |
-| `examples/operations/release_check.py` | The suite in miniature: one script touching every subsystem |
-| `examples/operations/reproducible_runs.py` | Making a run reproducible, and finding out which parts are not |
-| `examples/operations/session_and_versions.py` | What is running: engine version, build profile, and an isolated session |
-| `examples/operations/streaming_basics.py` | Batch as the bounded case of streaming: the same operators, incrementally |
-| `examples/operations/typed_error_recovery.py` | Recovering from a failure without swallowing it |
-| `examples/perf/adaptive_reoptimization.py` | Adaptive re-optimization: re-planning on measured cardinalities |
-| `examples/perf/aggregation_strategies.py` | Three ways to compute the same summary, and what each costs |
-| `examples/perf/batch_size_and_morsels.py` | Morsel size: the scheduling knob that must never change an answer |
-| `examples/perf/cache_versus_recompute.py` | When caching pays, and when it is just memory you gave away |
-| `examples/perf/caching_a_reused_result.py` | Caching an intermediate that several branches read |
-| `examples/perf/join_side_and_order.py` | Which side of a join is built, and why it matters |
-| `examples/perf/measuring_honestly.py` | How to time a query without fooling yourself |
-| `examples/perf/predicate_selectivity.py` | Selectivity: how much a predicate actually removes, and why it matters |
-| `examples/perf/pushdown_and_projection.py` | Two optimizations you can see: reading fewer columns and fewer rows |
-| `examples/perf/repartitioning.py` | Repartitioning: changing the parallelism without changing the data |
-| `examples/perf/scan_vs_compute_bound.py` | Telling a scan-bound query from a compute-bound one |
-| `examples/perf/spilling_under_a_budget.py` | Running a query that does not fit in memory |
-| `examples/perf/streaming_versus_collect.py` | When to stream and when to collect |
-| `examples/perf/wide_versus_narrow_tables.py` | What column count costs, and why a projection is the first optimization |
+| [`examples/operations/comparing_two_runs.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/comparing_two_runs.py) | Diffing the output of two pipeline versions |
+| [`examples/operations/configuration.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/configuration.py) | Configuring the engine: options, scoped overrides, and profiles |
+| [`examples/operations/configuration_scopes.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/configuration_scopes.py) | Setting engine options, and keeping the change scoped |
+| [`examples/operations/dataset_identity.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/dataset_identity.py) | Comparing two Datasets, and what "equal" means for a lazy plan |
+| [`examples/operations/debugging_a_wrong_result.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/debugging_a_wrong_result.py) | Shrinking a wrong result down to the operator that caused it |
+| [`examples/operations/environment.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/environment.py) | What is installed, what the engine sees, and what to paste into a bug report |
+| [`examples/operations/environment_and_hardware.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/environment_and_hardware.py) | What the engine can see about the machine it is on |
+| [`examples/operations/error_handling.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/error_handling.py) | The exception hierarchy: catching the failure you meant to catch |
+| [`examples/operations/error_types.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/error_types.py) | The typed exceptions, and catching the right one |
+| [`examples/operations/explain_modes.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/explain_modes.py) | Reading a plan at different levels of detail |
+| [`examples/operations/gpu_cloud.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/gpu_cloud.py) | Checking a GPU-cloud node before you trust its throughput |
+| [`examples/operations/inspecting_a_query.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/inspecting_a_query.py) | Reading a plan, timing a query, and checking what the engine actually ran |
+| [`examples/operations/lineage.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/lineage.py) | Tracing where a column came from |
+| [`examples/operations/memory_and_caching.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/memory_and_caching.py) | Bounded memory: caching a reused branch, storage levels, and spilling under a tight budget |
+| [`examples/operations/memory_pricing.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/memory_pricing.py) | Memory: what a result costs to hold, and when to hold it |
+| [`examples/operations/observability.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/observability.py) | Watching a query run: verbosity, logging, and execution statistics |
+| [`examples/operations/observability_events.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/observability_events.py) | Watching a query run: the progress reporter and the activity store |
+| [`examples/operations/plan_stability.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/plan_stability.py) | Checking that a refactor did not change the plan |
+| [`examples/operations/profiling_a_query.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/profiling_a_query.py) | Measuring where a query spends its time |
+| [`examples/operations/query_history_and_lineage.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/query_history_and_lineage.py) | Reading back what ran: query history, column lineage, and OpenLineage events |
+| [`examples/operations/query_metadata_feedback.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/query_metadata_feedback.py) | The feedback loop: what the executor measured, and what the optimizer does with it |
+| [`examples/operations/reading_a_plan.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/reading_a_plan.py) | Reading `explain` output, and what the optimizer did to your query |
+| [`examples/operations/release_check.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/release_check.py) | The suite in miniature: one script touching every subsystem |
+| [`examples/operations/reproducible_runs.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/reproducible_runs.py) | Making a run reproducible, and finding out which parts are not |
+| [`examples/operations/session_and_versions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/session_and_versions.py) | What is running: engine version, build profile, and an isolated session |
+| [`examples/operations/streaming_basics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/streaming_basics.py) | Batch as the bounded case of streaming: the same operators, incrementally |
+| [`examples/operations/typed_error_recovery.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/typed_error_recovery.py) | Recovering from a failure without swallowing it |
+| [`examples/perf/adaptive_reoptimization.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/adaptive_reoptimization.py) | Adaptive re-optimization: re-planning on measured cardinalities |
+| [`examples/perf/aggregation_strategies.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/aggregation_strategies.py) | Three ways to compute the same summary, and what each costs |
+| [`examples/perf/batch_size_and_morsels.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/batch_size_and_morsels.py) | Morsel size: the scheduling knob that must never change an answer |
+| [`examples/perf/cache_versus_recompute.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/cache_versus_recompute.py) | When caching pays, and when it is just memory you gave away |
+| [`examples/perf/caching_a_reused_result.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/caching_a_reused_result.py) | Caching an intermediate that several branches read |
+| [`examples/perf/join_side_and_order.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/join_side_and_order.py) | Which side of a join is built, and why it matters |
+| [`examples/perf/measuring_honestly.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/measuring_honestly.py) | How to time a query without fooling yourself |
+| [`examples/perf/predicate_selectivity.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/predicate_selectivity.py) | Selectivity: how much a predicate actually removes, and why it matters |
+| [`examples/perf/pushdown_and_projection.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/pushdown_and_projection.py) | Two optimizations you can see: reading fewer columns and fewer rows |
+| [`examples/perf/repartitioning.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/repartitioning.py) | Repartitioning: changing the parallelism without changing the data |
+| [`examples/perf/scan_vs_compute_bound.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/scan_vs_compute_bound.py) | Telling a scan-bound query from a compute-bound one |
+| [`examples/perf/spilling_under_a_budget.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/spilling_under_a_budget.py) | Running a query that does not fit in memory |
+| [`examples/perf/streaming_versus_collect.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/streaming_versus_collect.py) | When to stream and when to collect |
+| [`examples/perf/wide_versus_narrow_tables.py`](https://github.com/stephenoffer/batcher/blob/main/examples/perf/wide_versus_narrow_tables.py) | What column count costs, and why a projection is the first optimization |
 <!-- /library-table -->
 
 ## See also

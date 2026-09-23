@@ -10,7 +10,7 @@ those three functions do, and the one decision the executor refuses to take on f
 
 ## Step 1: assign each row a dense group id
 
-`assign_groups` (`crates/bc-runtime/src/agg/group/assign.rs`) is the hot path of every hash
+`assign_groups` ([`crates/bc-runtime/src/agg/group/assign.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/group/assign.rs)) is the hot path of every hash
 aggregate, `DISTINCT`, and partitioned window. It maps each row to a `u32` group id and
 returns the group count and the distinct key columns in first-seen order.
 
@@ -100,7 +100,7 @@ print(hashed.sort("region", "channel", "sku").to_pydict())
 ### When the key arrives sorted
 
 Sorted input makes equal keys adjacent, so a row's group is decided by comparing it with the
-row before it. `crates/bc-runtime/src/agg/group/runs.rs` does that, and `assign_groups` tries
+row before it. [`crates/bc-runtime/src/agg/group/runs.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/group/runs.rs) does that, and `assign_groups` tries
 it before any hash path, because it replaces hashing rather than speeding it up.
 
 The interesting part is where the engine gets the ordering from. It does not take anyone's word
@@ -165,7 +165,7 @@ With dense group ids in hand, each aggregate scatter-adds into its own per-group
 The naive shape is one pass per aggregate, which streams the `group_ids` array N times for N
 aggregates.
 
-`crates/bc-runtime/src/agg/fused.rs` fuses the *simple scalar* aggregates (`sum`, `count`,
+[`crates/bc-runtime/src/agg/fused.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/fused.rs) fuses the *simple scalar* aggregates (`sum`, `count`,
 `count(*)`, `min`, `max`, `mean`) into a single linear scan that visits each row once and
 updates every fused accumulator. It is a pure loop interchange of independent scatter-adds:
 each accumulator owns only its own state, and the fused loop visits rows in the same
@@ -177,7 +177,7 @@ pass, as do two-input aggregates, which decline fusion outright.
 `partial` emits **state**, not answers. `mean` emits `(sum, count)`. `median` emits the
 group's values as a `List`. {py:meth}`approx_count_distinct <batcher.plan.expr_ir.core.Expr.approx_count_distinct>` emits an HLL register array. When a partial
 crosses the distributed boundary its state columns are given synthetic names of the form
-`__s{aggregate_index}_{state_column_index}` (`crates/bc-interp/src/dist.rs`), so the partial
+`__s{aggregate_index}_{state_column_index}` ([`crates/bc-interp/src/dist.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/dist.rs)), so the partial
 travels as an ordinary Arrow batch across a thread, a spill file, or a network hop.
 
 ## Step 3: combine
@@ -232,7 +232,7 @@ value" and "one per row" is the whole difference between the two ends of that ta
 {py:meth}`mode <batcher.plan.expr_ir.core.Expr.mode>` and
 {py:meth}`top_k <batcher.plan.expr_ir.core.Expr.top_k>` only ever ask how *often* a value
 occurs, never what the values in order are, so they carry each group's distinct values
-alongside their counts (`crates/bc-runtime/src/agg/counted.rs`) rather than the values
+alongside their counts ([`crates/bc-runtime/src/agg/counted.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/counted.rs)) rather than the values
 themselves. Both were value-list aggregates before, which meant `top_k(3)` over ten million
 rows retained all ten million to return three.
 
@@ -289,7 +289,7 @@ hash build (~60M inserts) is thrown away, and `combine` costs ~35 ns per *partia
 2.25 s for a group-by DuckDB answers in 429 ms.
 
 So there is a second shape, `partition → partial → finalize`
-(`crates/bc-interp/src/agg_par.rs`): hash-partition the input morsels by group key first, then
+([`crates/bc-interp/src/agg_par.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/agg_par.rs)): hash-partition the input morsels by group key first, then
 aggregate each partition exactly once. Equal keys co-locate, so the partitions are key-disjoint
 and each one's partial is already final. `combine([p]) ≡ p`, and the union of the partitions
 is the answer. One hash build over the relation instead of two, one gather instead of three.
@@ -446,15 +446,15 @@ state instead, and merge in constant space.
 
 ## Where the code lives
 
-- `crates/bc-runtime/src/agg/mod.rs`: `AggFunc`, `partial`, `combine`
-- `crates/bc-runtime/src/agg/dispatch.rs`: `accumulate` and `finalize`, the per-function tables
-- `crates/bc-runtime/src/agg/group/assign.rs`: dense ids and the key dispatch
-- `crates/bc-runtime/src/agg/group/runs.rs`: the sorted-run short-circuit
-- `crates/bc-runtime/src/agg/group/combine.rs`: the parallel radix regroup
-- `crates/bc-runtime/src/agg/fused.rs`: the fused scalar accumulators
-- `crates/bc-runtime/src/agg/spill/mod.rs`: grace aggregation
+- [`crates/bc-runtime/src/agg/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/mod.rs): `AggFunc`, `partial`, `combine`
+- [`crates/bc-runtime/src/agg/dispatch.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/dispatch.rs): `accumulate` and `finalize`, the per-function tables
+- [`crates/bc-runtime/src/agg/group/assign.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/group/assign.rs): dense ids and the key dispatch
+- [`crates/bc-runtime/src/agg/group/runs.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/group/runs.rs): the sorted-run short-circuit
+- [`crates/bc-runtime/src/agg/group/combine.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/group/combine.rs): the parallel radix regroup
+- [`crates/bc-runtime/src/agg/fused.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/fused.rs): the fused scalar accumulators
+- [`crates/bc-runtime/src/agg/spill/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/spill/mod.rs): grace aggregation
 - `crates/bc-runtime/src/agg/{var,median,sketch,stats,argextreme,distinct,counted}.rs`: the state shapes
-- `crates/bc-interp/src/agg_par.rs`: the measured partition-vs-preaggregate decision
+- [`crates/bc-interp/src/agg_par.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/agg_par.rs): the measured partition-vs-preaggregate decision
 
 ## See also
 

@@ -10,20 +10,21 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher._sql.parser.core_utils import (
-    _factor_common_conjuncts,
     _has_aggregate,
     _join_and,
     _split_and,
 )
+from batcher._sql.parser.subquery import shape
 from batcher._sql.parser.subquery.correlation import (
     _correlation_pair,
     _is_plain_column,
     _local_columns,
     _local_tables,
-    _outer_key_reducer,
     _reject_correlated,
 )
 from batcher._sql.parser.subquery.in_set import in_marker as _in_marker
+from batcher._sql.parser.subquery.in_set import not_in_antijoin as _not_in_antijoin
+from batcher._sql.parser.subquery.scalar_sub import decorrelate_scalar_subqueries
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import col, lit
 
@@ -32,12 +33,12 @@ from batcher.plan.expr_ir import col, lit
 #: `clauses.py` drops these once the residual predicate that reads them has been applied —
 #: keying the cleanup on the prefix rather than threading a list keeps it correct for a
 #: nested SELECT, whose own markers are cleared by its own pass.
-EXISTS_MARKER_PREFIX = "__exists_"
+EXISTS_MARKER_PREFIX = "__bc_exists_"
 
 #: The same, for the columns `_in_marker` adds: the probe value, the joined key and the
 #: match bit. Three names rather than one because an `IN` marker has to materialize the
 #: outer expression it probes with, which `EXISTS` does not.
-IN_MARKER_PREFIX = "__in_"
+IN_MARKER_PREFIX = "__bc_in_"
 
 #: Every synthesized column an under-OR subquery marker leaves on the relation. `clauses.py`
 #: drops these once the residual predicate reading them has been applied — one tuple so a
@@ -281,60 +282,70 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     # equalities, with local predicates applied to the inner relation.
     if len(left_keys) != 1:
         raise NotImplementedError("multi-column IN (subquery) with a correlation is unsupported")
-    left_key = left_keys[0]
     if len(inner_select.expressions) != 1:
         raise NotImplementedError("correlated IN subquery must project one column")
-    in_col = inner_select.expressions[0]
-    inner_select.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
-    inner_select.set("expressions", [in_col, *(exp.column(ic) for (_oc, ic) in corr)])
-    # A correlated IN whose projection aggregates (`sal IN (SELECT max(sal) …
-    # WHERE e2.dept = e.dept)`) is a per-correlation-key aggregate: it must GROUP
-    # BY the inner correlation columns, exactly as the scalar decorrelation does.
-    # Without the GROUP BY the query mixes an aggregate with a bare key column and
-    # errors ("references unknown column(s) ['dept']").
-    if _has_aggregate(in_col):
-        inner_select.set("group", exp.Group(expressions=[exp.column(ic) for (_oc, ic) in corr]))
-    else:
-        inner_select.set("group", None)
-    _reject_correlated(inner_select)
-    inner_ds = tr.statement(inner_select).distinct()
+    inner_ds = _correlated_in_set(tr, inner_select, corr, local_preds)
+    if inner_ds is None:  # `LIMIT 0` per key: the set is empty for every outer row
+        return ds if negate else ds.filter(lit(False))
+    if negate:
+        return _not_in_antijoin(ds, left_keys[0], inner_ds, inner_ds.columns[0], corr)
     return ds.join(
         inner_ds,
-        left_on=[left_key, *(oc for (oc, _ic) in corr)],
+        left_on=[left_keys[0], *(oc for (oc, _ic) in corr)],
         right_on=[inner_ds.columns[0], *(ic for (_oc, ic) in corr)],
         how=how,
     )
 
 
-def _not_in_antijoin(ds: Dataset, left_key: str, inner_ds: Dataset, right_key: str) -> Dataset:
-    """`x NOT IN (uncorrelated subquery)` with correct SQL three-valued semantics.
+def _correlated_in_set(tr, inner_select, corr, local_preds) -> Dataset | None:
+    """The distinct `(value, correlation keys…)` rows a correlated `IN` probes, or None if empty.
 
-    A plain anti-join is wrong three ways: an **empty** set makes NOT IN TRUE for
-    every row (even NULL ``x``); a **NULL** anywhere in the set makes it UNKNOWN for
-    all rows (none survive); otherwise a NULL ``x`` against a non-empty set is UNKNOWN
-    and must drop (anti-join keeps it). NULL/emptiness are probed eagerly (uncorrelated,
-    like the EXISTS path); the row-volume anti-join stays lazy.
+    A correlated IN whose projection aggregates (`sal IN (SELECT max(sal) … WHERE e2.dept =
+    e.dept)`) is a per-correlation-key aggregate: it must GROUP BY the inner correlation
+    columns (plus any grouping of its own), exactly as the scalar decorrelation does. An
+    ``ORDER BY … LIMIT`` inside it is a per-key top-N, never a cut of the whole inner table.
     """
-    key_only = inner_ds.select(right_key)
-    if key_only.filter(col(right_key).is_null()).limit(1).collect().num_rows > 0:
-        return ds.filter(lit(False))  # a NULL in the set → NOT IN is never TRUE
-    if key_only.filter(col(right_key).is_not_null()).limit(1).collect().num_rows == 0:
-        return ds  # empty set → NOT IN is TRUE for all rows (NULL x included)
-    # Non-empty, NULL-free set: drop NULL outer keys, then anti-join the rest.
-    ds = ds.filter(col(left_key).is_not_null())
-    return ds.join(key_only.distinct(), left_on=[left_key], right_on=[right_key], how="anti")
+    in_col = inner_select.expressions[0]
+    ics = [ic for (_oc, ic) in corr]
+    limit, offset = shape.paging(inner_select)
+    one_row = shape.is_one_row_aggregate(inner_select)
+    if limit == 0 or (one_row and offset):
+        return None
+    inner_select.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
+    projected = [in_col, *(exp.column(ic) for ic in ics)]
+    group = inner_select.args.get("group")
+    if group is not None or one_row:
+        extra = list(group.expressions) if group is not None else []
+        inner_select.set("group", exp.Group(expressions=[*(exp.column(ic) for ic in ics), *extra]))
+    ranked = not one_row and (limit is not None or offset > 0)
+    if ranked:
+        if inner_select.args.get("order") is None:
+            value = in_col.this if isinstance(in_col, exp.Alias) else in_col
+            inner_select.set("order", exp.Order(expressions=[exp.Ordered(this=value.copy())]))
+        projected.append(shape.top_n_window(inner_select, ics, [in_col]))
+    shape.strip_paging(inner_select)
+    inner_select.set("expressions", projected)
+    _reject_correlated(inner_select)
+    inner_ds = tr.statement(inner_select)
+    if ranked:
+        inner_ds = inner_ds.filter(shape.rank_predicate(limit, offset)).drop(shape.RANK_COLUMN)
+    return inner_ds.distinct()
 
 
 def _exists_shape(tr, node):
     """Split an `EXISTS (SELECT …)` into its inner SELECT, correlation equalities and locals.
 
     Shared by the join rewrite (`_apply_exists`) and the marker-column rewrite
-    (`_exists_marker`) so the two cannot disagree about what correlates.
+    (`_exists_marker`) so the two cannot disagree about what correlates. The inner SELECT's
+    row-count clauses are read here too (`shape.normalize_exists`): a correlated `EXISTS`
+    over an ungrouped aggregate, a ``HAVING``, a ``LIMIT`` or an ``OFFSET`` does not mean
+    "some inner row matches", and both rewrites must see the same answer to what it means.
 
     Returns:
-        `(inner, local, local_cols, corr, local_preds)` — the detached inner SELECT, the
-        table names it introduces, the columns those tables offer, the `(outer, inner)`
-        equality pairs that correlate it, and the predicates local to the inner relation.
+        `(inner, local, local_cols, corr, local_preds, plan)` — the detached inner SELECT,
+        the table names it introduces, the columns those tables offer, the `(outer, inner)`
+        equality pairs that correlate it, the predicates local to the inner relation, and
+        the `shape.ExistsPlan` saying how to answer it.
     """
     inner = node.this
     if isinstance(inner, exp.Subquery):
@@ -349,7 +360,48 @@ def _exists_shape(tr, node):
         for leaf in _split_and(where.this):
             pair = _correlation_pair(leaf, local, local_cols)
             (corr if pair is not None else local_preds).append(pair or leaf)
-    return inner, local, local_cols, corr, local_preds
+    plan = shape.normalize_exists(inner, bool(corr) or _reaches_outside(inner))
+    return inner, local, local_cols, corr, local_preds, plan
+
+
+def _reaches_outside(inner) -> bool:
+    try:
+        _reject_correlated(inner)
+    except NotImplementedError:
+        return True
+    return False
+
+
+def _exists_keys(tr, inner, corr, local_preds, plan, aliases=None) -> Dataset:
+    """The distinct inner correlation keys an equality-correlated `EXISTS` matches against."""
+    inner.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
+    keys = [exp.column(ic) for (_oc, ic) in corr]
+    group = inner.args.get("group")
+    if plan.keep_group and group is not None:
+        # Per key, a group must survive HAVING: group by the keys *and* the inner grouping.
+        inner.set("group", exp.Group(expressions=[*keys, *group.expressions]))
+    else:
+        inner.set("group", None)
+        inner.set("having", None)
+    names = aliases or [None] * len(keys)
+    inner.set(
+        "expressions",
+        [k if a is None else exp.alias_(k.copy(), a) for k, a in zip(keys, names, strict=True)],
+    )
+    _reject_correlated(inner)
+    return tr.statement(inner).distinct()
+
+
+def _predicate_plan(tr, ds: Dataset, plan, corr, negate: bool):
+    """`(ds, ast)` answering an `EXISTS` through a per-key scalar subquery (`plan.predicate`)."""
+    if not corr:
+        raise NotImplementedError(
+            "a correlated EXISTS with HAVING or OFFSET needs an equality correlation "
+            "(inner.c = outer.c); rewrite the other correlations as a join"
+        )
+    predicate = plan.predicate.copy()
+    ds = decorrelate_scalar_subqueries(tr, ds, [predicate])
+    return ds, (exp.Not(this=exp.Paren(this=predicate)) if negate else predicate)
 
 
 def _exists_marker(tr, ds: Dataset, node, *, negate: bool):
@@ -359,15 +411,14 @@ def _exists_marker(tr, ds: Dataset, node, *, negate: bool):
     `EXISTS (…) OR <anything>` cannot: the join would drop rows the `OR` should keep. Spark
     solves this with an **ExistenceJoin** — a left join that emits, per outer row, a boolean
     saying whether the subquery matched — and then evaluates the original boolean over that
-    column. This is that rewrite, spelled with the primitives already here.
+    column. This is that rewrite, spelled with the primitives already here. It also serves
+    an `EXISTS` in the SELECT list, which is the same column read as a value.
 
     It is exact rather than approximate, and for one specific reason: the inner relation is
     reduced to its *distinct* correlation keys before the join, so a left join against it
     matches each outer row at most once and cannot multiply rows. `EXISTS` is also the one
     subquery form with no three-valued subtlety — it is TRUE or FALSE, never NULL — so the
-    marker needs no null reasoning. `IN` under `OR` is deliberately *not* handled here for
-    exactly that reason: `x IN (…)` is NULL when `x` is NULL or the list holds a NULL, and a
-    boolean marker cannot carry that.
+    marker needs no null reasoning.
 
     Args:
         tr: The translator, used to plan the inner SELECT.
@@ -380,17 +431,24 @@ def _exists_marker(tr, ds: Dataset, node, *, negate: bool):
         for the `EXISTS` node — or `None` when the shape is not markerizable, in which case
         the caller reports the original refusal.
     """
-    inner, _local, _local_cols, corr, local_preds = _exists_shape(tr, node)
+    inner, _local, _local_cols, corr, local_preds, plan = _exists_shape(tr, node)
+    if plan.constant is not None:
+        return ds, exp.true() if plan.constant != negate else exp.false()
+    if plan.predicate is not None:
+        if not corr:
+            return None
+        return _predicate_plan(tr, ds, plan, corr, negate)
 
     # A counter on the translator, read defensively: `_sql/parser/translator.py` owns the
     # other `_*_n` counters, and this avoids editing that file to add one more.
     n = getattr(tr, "_exists_n", 0)
     tr._exists_n = n + 1
+    marker = f"{EXISTS_MARKER_PREFIX}{n}"
 
     if not corr:
         # Uncorrelated: a whole-relation emptiness test, so the answer is the same constant
-        # for every outer row. Anything still referencing the outer query here is a range or
-        # `<>` correlation, which reshapes the relation rather than yielding a column.
+        # for every outer row, probed now. Anything still referencing the outer query here is
+        # a range or `<>` correlation, which reshapes the relation rather than yielding a column.
         try:
             _reject_correlated(inner)
         except NotImplementedError:
@@ -401,20 +459,12 @@ def _exists_marker(tr, ds: Dataset, node, *, negate: bool):
     # Correlated on equalities: reduce the inner relation to its distinct keys, tag it, and
     # left join. The keys are aliased to generated names first so an inner key that shares an
     # outer column's name cannot collide in the joined schema.
-    keys = [f"__ex{n}_k{i}" for i in range(len(corr))]
-    marker = f"{EXISTS_MARKER_PREFIX}{n}"
-    inner.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
-    inner.set("group", None)
-    inner.set(
-        "expressions",
-        [exp.alias_(exp.column(ic), k) for k, (_oc, ic) in zip(keys, corr, strict=True)],
-    )
+    keys = [f"__bc_ex{n}_k{i}" for i in range(len(corr))]
     try:
-        _reject_correlated(inner)
+        tagged = _exists_keys(tr, inner, corr, local_preds, plan, keys)
     except NotImplementedError:
         return None
-
-    tagged = tr.statement(inner).distinct().with_columns(**{marker: lit(True)})
+    tagged = tagged.with_columns(**{marker: lit(True)})
     ds = ds.join(tagged, left_on=[oc for (oc, _ic) in corr], right_on=keys, how="left")
     # Matched ⇒ the tag survives; unmatched ⇒ the left join null-extends it. That is exactly
     # the existence bit, with no coalesce needed.
@@ -428,6 +478,56 @@ def _exists_marker(tr, ds: Dataset, node, *, negate: bool):
     return ds, (exp.Not(this=ast) if negate else ast)
 
 
+def exists_in_projection(tr, ds: Dataset, node) -> Dataset:
+    """Turn each `EXISTS (…)` in a SELECT list into the marker column `_exists_marker` builds.
+
+    `SELECT id, EXISTS (SELECT 1 FROM u WHERE u.k = t.id) AS f FROM t` reads the existence
+    bit as a value, which is exactly the column the under-`OR` rewrite already produces.
+
+    Args:
+        tr: The translator.
+        ds: The relation the SELECT list is evaluated over.
+        node: The `Select` whose items are rewritten in place.
+
+    Returns:
+        `ds` carrying one marker column per `EXISTS`.
+
+    Raises:
+        NotImplementedError: The query aggregates (a per-row bit has no value per group), or
+            the `EXISTS` correlates through something other than equalities.
+    """
+    found = [
+        e
+        for item in node.expressions
+        for e in item.find_all(exp.Exists)
+        # Spark's `exists(array, x -> …)` parses to the same node over a list, not a query.
+        if e.find_ancestor(exp.Select) is node and isinstance(e.this, (exp.Select, exp.Subquery))
+    ]
+    if not found:
+        return ds
+    # An aggregate inside the EXISTS belongs to the subquery, not to this SELECT.
+    outer_items = [p.copy() for p in node.expressions]
+    for item in outer_items:
+        for e in list(item.find_all(exp.Exists)):
+            if isinstance(e.this, (exp.Select, exp.Subquery)):
+                e.replace(exp.true())
+    if node.args.get("group") is not None or any(_has_aggregate(p) for p in outer_items):
+        raise NotImplementedError(
+            "EXISTS in the SELECT list of an aggregating query is not supported; compute it "
+            "in a subquery (SELECT *, EXISTS (…) AS e FROM t) and aggregate over that"
+        )
+    for e in found:
+        marked = _exists_marker(tr, ds, e, negate=False)
+        if marked is None:
+            raise NotImplementedError(
+                "EXISTS in the SELECT list is supported for an uncorrelated subquery or one "
+                "correlated by equalities (inner.c = outer.c); rewrite this one as a LEFT JOIN"
+            )
+        ds, ast = marked
+        e.replace(ast)
+    return ds
+
+
 def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     """EXISTS / NOT EXISTS, correlated or not.
 
@@ -435,27 +535,32 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     decorrelates to a SEMI join (anti for NOT EXISTS) of the outer rows with
     `b` filtered by `<local>`, keyed on the correlation equalities.
 
-    An uncorrelated EXISTS is a whole-table keep-or-drop: collect the subquery
-    eagerly to test emptiness, then keep or drop every row.
+    An uncorrelated EXISTS is a whole-table keep-or-drop, decided by probing the subquery for
+    one row while translating.
     """
-    inner, local, local_cols, corr, local_preds = _exists_shape(tr, node)
+    inner, local, local_cols, corr, local_preds, plan = _exists_shape(tr, node)
+    if plan.constant is not None:
+        return ds if plan.constant != negate else ds.filter(lit(False))
+    if plan.predicate is not None:
+        ds, ast = _predicate_plan(tr, ds, plan, corr, negate)
+        return ds.filter(tr._scalar(ast))
 
-    # A pure inequality correlation, or an equality carrying one alongside it, each has its
-    # own plan and neither is the semi join below. See `subquery.specialized`.
-    from batcher._sql.parser.subquery.specialized import decorrelate_correlated_exists
+    if not plan.keep_group:
+        # A pure inequality correlation, or an equality carrying one alongside it, each has
+        # its own plan and neither is the semi join below. See `subquery.specialized`.
+        from batcher._sql.parser.subquery.specialized import decorrelate_correlated_exists
 
-    special = decorrelate_correlated_exists(
-        tr, ds, inner, corr, local_preds, local, local_cols, negate
-    )
-    if special is not None:
-        return special
+        special = decorrelate_correlated_exists(
+            tr, ds, inner, corr, local_preds, local, local_cols, negate
+        )
+        if special is not None:
+            return special
 
     if not corr:
-        # Uncorrelated: emptiness test → keep or drop every outer row.
+        # Uncorrelated: an emptiness test, probed now (`LIMIT 1`), keeps or drops every row.
         _reject_correlated(inner)
         non_empty = tr.statement(inner).limit(1).collect().num_rows > 0
-        keep = non_empty if not negate else (not non_empty)
-        return ds if keep else ds.filter(lit(False))
+        return ds if non_empty != negate else ds.filter(lit(False))
 
     # A single correlated `<>` residual (`inner.c <> outer.c`) is not an equi-join and not
     # local — it correlates on a value, not a key. It decorrelates to a per-key min/max
@@ -465,17 +570,13 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     # is exactly this shape. See `subquery_neq`.
     from batcher._sql.parser.subquery.neq import _decorrelate_neq_single, _parse_neq_exists
 
-    spec = _parse_neq_exists(tr, node)
+    spec = _parse_neq_exists(tr, node) if not plan.keep_group else None
     if spec is not None:
         return _decorrelate_neq_single(tr, ds, spec, negate)
 
     # Correlated → semi/anti join on the correlation keys, with the local
     # (non-correlated) predicates applied to the inner relation.
-    inner.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
-    inner.set("group", None)
-    inner.set("expressions", [exp.column(ic) for (_oc, ic) in corr])
-    _reject_correlated(inner)  # any remaining outer ref is unsupported
-    inner_ds = tr.statement(inner).distinct()
+    inner_ds = _exists_keys(tr, inner, corr, local_preds, plan)
     how = "anti" if negate else "semi"
     return ds.join(
         inner_ds,
@@ -485,79 +586,5 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     )
 
 
-def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots, outer_node=None) -> Dataset:
-    """Rewrite correlated scalar subqueries into LEFT JOINs.
-
-    `(SELECT max(b.v) FROM b WHERE b.k = a.k)` becomes a LEFT JOIN with
-    `(SELECT k, max(v) FROM b … GROUP BY k)` keyed on the correlation; the
-    subquery node is replaced in place by a reference to the joined column
-    (NULL where the outer row has no match — exactly scalar-subquery semantics).
-    """
-    for root in roots:
-        if root is None:
-            continue
-        for sub in list(root.find_all(exp.Subquery)):
-            inner = sub.this
-            if not isinstance(inner, exp.Select):
-                continue
-            local = _local_tables(inner)
-            local_cols = _local_columns(tr, inner)
-            where = inner.args.get("where")
-            corr, local_preds = [], []
-            if where is not None:
-                # A correlation repeated inside every arm of an `OR` is still a correlation;
-                # factoring it back out is what lets it be seen at all (TPC-DS q41).
-                for leaf in _split_and(_factor_common_conjuncts(where.this)):
-                    pair = _correlation_pair(leaf, local, local_cols)
-                    (corr if pair is not None else local_preds).append(pair or leaf)
-            if not corr:
-                continue  # uncorrelated scalar subquery → handled eagerly in _scalar
-            if len(inner.expressions) != 1:
-                raise NotImplementedError("scalar subquery must project one value")
-
-            alias = f"__scalar_{tr._scalar_sub_n}"
-            jk = [f"__jk_{tr._scalar_sub_n}_{i}" for i in range(len(corr))]
-            tr._scalar_sub_n += 1
-
-            m = inner.copy()
-            value = m.expressions[0]
-            value = value.this if isinstance(value, exp.Alias) else value
-            m.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
-            m.set(
-                "expressions",
-                [exp.alias_(exp.column(ic), k) for (k, (_oc, ic)) in zip(jk, corr, strict=True)]
-                + [exp.alias_(value, alias)],
-            )
-            has_agg = any(_has_aggregate(e) for e in m.expressions)
-            if has_agg:
-                m.set("group", exp.Group(expressions=[exp.column(ic) for (_oc, ic) in corr]))
-                # Semi-join reduction (see `_outer_key_reducer`).
-                reducer = _outer_key_reducer(tr, outer_node, sub, corr)
-                if reducer is not None:
-                    ics = [exp.column(ic) for (_oc, ic) in corr]
-                    lhs = ics[0] if len(ics) == 1 else exp.Tuple(expressions=ics)
-                    in_pred = exp.In(this=lhs, query=reducer)
-                    cur = m.args.get("where")
-                    combined = exp.and_(cur.this, in_pred) if cur is not None else in_pred
-                    m.set("where", exp.Where(this=combined))
-            _reject_correlated(m)
-
-            # A GROUP BY already yields one row per key, so a following DISTINCT is a
-            # redundant full pass; only a non-aggregate scalar subquery needs it to dedup.
-            stmt = tr.statement(m)
-            derived = stmt if has_agg else stmt.distinct()
-            ds = ds.join(
-                derived,
-                left_on=[oc for (oc, _ic) in corr],
-                right_on=jk,
-                how="left",
-            )
-            # The "COUNT bug": COUNT over an empty correlated group is 0, but
-            # the LEFT JOIN yields NULL for an unmatched outer row — coalesce it.
-            if isinstance(value, exp.Count):
-                sub.replace(
-                    exp.Coalesce(this=exp.column(alias), expressions=[exp.Literal.number(0)])
-                )
-            else:
-                sub.replace(exp.column(alias))
-    return ds
+#: The scalar decorrelation lives in `scalar_sub`; the translator reaches it by this name.
+_decorrelate_scalar_subqueries = decorrelate_scalar_subqueries

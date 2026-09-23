@@ -12,9 +12,11 @@ from the commit log.
 from __future__ import annotations
 
 import json
-import sqlite3
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import sqlite3
 
 __all__ = ["CommitLog", "OffsetLog"]
 
@@ -35,6 +37,8 @@ def _tune(conn: sqlite3.Connection) -> None:
     failure this log must never produce is the opposite one, recording a batch as committed
     before its rows are durable, and that ordering is enforced by the caller, not by fsync.
     """
+    import sqlite3
+
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -48,6 +52,16 @@ class _LogTable:
     __slots__ = ("_conn",)
 
     def __init__(self, path: str, schema: str) -> None:
+        # Imported here and not at module scope, as `seen_store` beside this already does:
+        # `sqlite3` is not loadable on a common Anaconda install with a pip-installed
+        # pyarrow (pyarrow binds the system `libstdc++` first, after which Anaconda's
+        # `_sqlite3` cannot load its ICU dependency). Eagerly, that made the stdlib module
+        # a precondition of *importing* the checkpoint package rather than of writing a
+        # checkpoint, so `tests/unit/test_checkpoint.py` failed at collection on such a box
+        # and a streaming query that never checkpoints paid for one that does. The metadata
+        # backends were moved off the same hazard; this package's logs were missed.
+        import sqlite3
+
         # The streaming-query loop runs on a background thread, so the connection is
         # used from a different thread than it was opened on. Access is serialized
         # (recovery on the main thread before the loop starts, then only the loop

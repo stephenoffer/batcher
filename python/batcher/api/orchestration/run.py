@@ -175,17 +175,36 @@ def _with_grant(scope, grant):
     adjusted the morsel target from learned statistics, and narrowing the pool must not
     discard it.
     """
-    with scope:
-        workers = getattr(grant, "workers", 0)
-        if not workers:
-            yield  # unbounded: the single-query case and the unconfigured default
-            return
-        current = active_config()
-        narrowed = current.replace(
-            execution=dataclasses.replace(current.execution, parallelism=workers)
-        )
-        with config_context(narrowed):
-            yield
+    with scope, narrowed_to_grant(grant):
+        yield
+
+
+@contextlib.contextmanager
+def narrowed_to_grant(grant):
+    """Run the block with the engine's pool width set to what admission granted.
+
+    Split out of `_with_grant` so the `map_batches` executor can apply the same narrowing.
+    That path holds an admission slot too (`api.executors.UdfExecutor`), and it runs
+    relational operators on the engine between its Python stages -- so without this it
+    would take a slot sized against the other running queries and then ask for a
+    full-width rayon pool anyway, which is the oversubscription the grant exists to
+    prevent. The relational path reaches it through `_with_grant`, which also carries the
+    adaptive-sizing scope; there is no such scope on the UDF path, which is the only
+    difference between the two callers.
+
+    A falsy `workers` means unbounded -- the single-query case, and the default when
+    `execution.max_concurrent_queries` is 0 -- and yields with the config untouched.
+    """
+    workers = getattr(grant, "workers", 0)
+    if not workers:
+        yield
+        return
+    current = active_config()
+    narrowed = current.replace(
+        execution=dataclasses.replace(current.execution, parallelism=workers)
+    )
+    with config_context(narrowed):
+        yield
 
 
 def _optimize(plan, sources, ctx, *, hardware=None):

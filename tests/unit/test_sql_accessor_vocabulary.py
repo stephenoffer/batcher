@@ -26,7 +26,12 @@ from batcher._sql.parser.expressions.lowering.accessors import (
     accessor_namespaces,
     accessor_vocabulary,
 )
-from batcher._sql.parser.expressions.lowering.signatures import STRINGS, parameter_kinds
+from batcher._sql.parser.expressions.lowering.signatures import (
+    STRINGS,
+    hints,
+    parameter_kinds,
+    union_members,
+)
 from batcher.plan.expr_ir import Expr, col
 from batcher.plan.functions.collection import element
 
@@ -36,18 +41,45 @@ _SQL_ARGUMENT = {Expr: "c", str: "'a'", bool: "TRUE", int: "1", float: "1.0", ST
 _PY_ARGUMENT = {Expr: col("c"), str: "a", bool: True, int: 1, float: 1.0, STRINGS: ["a"]}
 
 
-def _accessor_methods() -> list[tuple[str, str]]:
-    """Every public callable on every accessor namespace."""
+def _accessor_methods(*, expressions_only: bool = True) -> list[tuple[str, str]]:
+    """Every public callable on every accessor namespace.
+
+    `expressions_only` drops a method that does not *return an expression*. Only one
+    namespace has any: `.meta` answers questions about an expression's shape
+    (``root_names() -> list[str]``, ``is_column() -> bool``) and reads no data, so there is
+    nothing for SQL to spell. `accessor_vocabulary` already declines those by the same
+    return-annotation test, and this is the half that stops the coverage test below from
+    demanding a SQL name for them.
+
+    The flag exists rather than the filter being unconditional because
+    `test_the_only_accessor_methods_without_a_sql_name_are_introspection` needs the
+    unfiltered list to prove what the filter removed.
+    """
     probe = col("__probe")
     found = []
     for namespace in accessor_namespaces():
         cls = type(getattr(probe, namespace))
-        found += [
-            (namespace, name)
-            for name in sorted(n for n in dir(cls) if not n.startswith("_"))
-            if callable(getattr(cls, name, None)) and not inspect.isclass(getattr(cls, name))
-        ]
+        for name in sorted(n for n in dir(cls) if not n.startswith("_")):
+            fn = getattr(cls, name, None)
+            if not callable(fn) or inspect.isclass(fn):
+                continue
+            if expressions_only and not _returns_an_expression(fn):
+                continue
+            found.append((namespace, name))
     return found
+
+
+def _returns_an_expression(fn: object) -> bool:
+    """Does `fn`'s return annotation name `Expr`, or a union of `Expr` subclasses?
+
+    The same test `accessor_vocabulary` applies, reusing its helpers rather than restating
+    them -- a second copy is how the dispatcher and the test that walks it come to disagree
+    about the vocabulary, which is the failure this whole module exists to prevent.
+    """
+    returns = hints(fn).get("return")
+    if returns is None:
+        return False
+    return all(isinstance(m, type) and issubclass(m, Expr) for m in union_members(returns))
 
 
 def test_the_namespaces_are_not_empty() -> None:
@@ -59,6 +91,30 @@ def test_the_namespaces_are_not_empty() -> None:
     """
     assert len(_accessor_methods()) > 400
     assert "seq" in accessor_namespaces()
+
+
+def test_the_only_accessor_methods_without_a_sql_name_are_introspection() -> None:
+    """What the expression filter removes, named -- so it cannot quietly remove more.
+
+    `_accessor_methods` drops a method whose return annotation is not an `Expr`, and the
+    coverage test below is only meaningful while that stays a handful of introspection
+    methods. A *data* method that loses its `-> Expr` annotation would vanish from
+    `accessor_vocabulary` and from the coverage denominator at the same moment, in opposite
+    directions, and the suite would stay green while SQL stopped reaching it. It would show
+    up here instead, under its own namespace.
+
+    `.meta` is not an omission from SQL. ``col("a").meta.root_names()`` walks the expression
+    tree and returns a Python list; there is no query it could be the translation of.
+    """
+    excluded = sorted(set(_accessor_methods(expressions_only=False)) - set(_accessor_methods()))
+    assert {namespace for namespace, _ in excluded} == {"meta"}, excluded
+    assert [method for _, method in excluded] == [
+        "has_multiple_outputs",
+        "is_column",
+        "output_name",
+        "root_names",
+        "tree_format",
+    ], excluded
 
 
 def test_the_namespace_list_is_the_whole_namespace_list() -> None:

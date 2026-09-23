@@ -150,6 +150,8 @@ class BrokerSource(ABC):
         key_decode_mode: str = "fail",
         schema_registry: Any = None,
         schema_registry_auth: str | None = None,
+        value_codec_options: dict[str, Any] | None = None,
+        key_codec_options: dict[str, Any] | None = None,
         **options: Any,
     ) -> None:
         """Create a broker source for ``topic`` polling ``poll_size`` per batch.
@@ -166,6 +168,9 @@ class BrokerSource(ABC):
         ``"{topic}-value"`` / ``"{topic}-key"`` by the standard naming, overridable with
         ``value_subject`` / ``key_subject``. ``*_decode_mode`` is ``"fail"`` (the default) or
         ``"permissive"``, matching Spark's ``FAILFAST`` / ``PERMISSIVE``.
+        ``value_codec_options`` / ``key_codec_options`` pass codec-specific settings through
+        to that side's codec, such as Protobuf's ``message_indexes`` or the string codec's
+        ``encoding``.
 
         ``max_offsets_per_trigger`` and ``max_bytes_per_trigger`` are the Spark spellings of
         the same two bounds, accepted so a ported job's options carry over verbatim. One
@@ -211,6 +216,8 @@ class BrokerSource(ABC):
             "key_decode_mode": key_decode_mode,
             "schema_registry": schema_registry,
             "schema_registry_auth": schema_registry_auth,
+            "value_codec_options": value_codec_options,
+            "key_codec_options": key_codec_options,
         }
         self._value_codec, self._key_codec = build_payload_codecs(topic, self._codec_config)
         self._schema: pa.Schema | None = None

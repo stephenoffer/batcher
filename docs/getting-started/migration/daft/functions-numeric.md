@@ -18,77 +18,77 @@ The following table maps the 71 names on `Expression`, sorted alphabetically.
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `abs` | `Expr.abs` | canonical |  |
-| `any_value` | `Expr.any_value` | param | Missing: ignore\_nulls=False (Batcher any\_value always skips nulls). Wave W2. |
-| `approx_count_distinct` | `Expr.approx_count_distinct` | canonical |  |
-| `approx_percentiles` | `Expr.approx_quantile` | param | Missing: a list of percentiles in one call (returns a list). Wave W2. |
-| `arccos` | `Expr.arccos` | canonical |  |
-| `arccosh` | `Expr.arccosh` | canonical |  |
-| `arcsin` | `Expr.arcsin` | canonical |  |
-| `arcsinh` | `Expr.arcsinh` | canonical |  |
-| `arctan` | `Expr.arctan` | canonical |  |
-| `arctan2` | `bt.arctan2` | canonical |  |
-| `arctanh` | `Expr.arctanh` | canonical |  |
-| `avg` | `Expr.mean` | canonical |  |
-| `bitwise_and` | `Expr.bitwise_and` | canonical |  |
-| `bitwise_or` | `Expr.bitwise_or` | canonical |  |
-| `bitwise_xor` | `Expr.bitwise_xor` | canonical |  |
-| `bool_and` | `Expr.bool_and` | canonical |  |
-| `bool_or` | `Expr.bool_or` | canonical |  |
-| `cbrt` | `Expr.cbrt` | canonical |  |
-| `ceil` | `Expr.ceil` | canonical |  |
-| `clip` | `Expr.clip` | canonical |  |
-| `cos` | `Expr.cos` | canonical |  |
-| `cosh` | `Expr.cosh` | canonical |  |
-| `cot` | `Expr.cot` | canonical |  |
-| `count` | `Expr.count` | param | Missing: mode= ('all' counts nulls too, 'null' counts only nulls; Batcher counts non-null only). Wave W2. |
-| `count_distinct` | `Expr.count_distinct` | canonical |  |
-| `csc` | `Expr.csc` | canonical |  |
-| `degrees` | `Expr.degrees` | canonical |  |
-| `exp` | `Expr.exp` | canonical |  |
-| `expm1` | `Expr.expm1` | canonical |  |
-| `fill_nan` | `Expr.fill_nan` | canonical |  |
-| `first_value` | `bt.first_value` | param | Missing: ignore\_nulls=. Wave W5. |
-| `floor` | `Expr.floor` | canonical |  |
-| `is_inf` | `Expr.is_infinite` | canonical |  |
-| `is_nan` | `Expr.is_nan` | canonical |  |
-| `lag` | `bt.lag` | param | Missing: default= fill value for rows with no predecessor. Wave W5. |
-| `last_value` | `bt.last_value` | param | Missing: ignore\_nulls=. Wave W5. |
-| `lead` | `bt.lead` | param | Missing: default= fill value for rows with no successor. Wave W5. |
-| `list_agg` | `Expr.array_agg` | canonical |  |
-| `list_agg_distinct` | `Expr.array_agg` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
-| `ln` | `Expr.ln` | canonical |  |
-| `log` | `Expr.ln` | canonical | Missing: base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e). Wave W2. |
-| `log10` | `Expr.log10` | canonical |  |
-| `log1p` | `Expr.log1p` | canonical |  |
-| `log2` | `Expr.log2` | canonical |  |
-| `max` | `Expr.max` | canonical |  |
-| `mean` | `Expr.mean` | canonical |  |
-| `median` | `Expr.median` | canonical |  |
-| `min` | `Expr.min` | canonical |  |
+| `abs` | {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | canonical |  |
+| `any_value` | {py:obj}`Expr.any_value <batcher.plan.expr_ir.core.Expr.any_value>` | param | Missing: ignore\_nulls=False (Batcher any\_value always skips nulls). Wave W2. |
+| `approx_count_distinct` | {py:obj}`Expr.approx_count_distinct <batcher.plan.expr_ir.core.Expr.approx_count_distinct>` | canonical |  |
+| `approx_percentiles` | {py:obj}`Expr.approx_quantile <batcher.plan.expr_ir.core.Expr.approx_quantile>` | param | Missing: a list of percentiles in one call (returns a list). Wave W2. |
+| `arccos` | {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | canonical |  |
+| `arccosh` | {py:obj}`Expr.arccosh <batcher.plan.expr_ir.core.Expr.arccosh>` | canonical |  |
+| `arcsin` | {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | canonical |  |
+| `arcsinh` | {py:obj}`Expr.arcsinh <batcher.plan.expr_ir.core.Expr.arcsinh>` | canonical |  |
+| `arctan` | {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | canonical |  |
+| `arctan2` | {py:obj}`bt.arctan2 <batcher.arctan2>` | canonical |  |
+| `arctanh` | {py:obj}`Expr.arctanh <batcher.plan.expr_ir.core.Expr.arctanh>` | canonical |  |
+| `avg` | {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | canonical |  |
+| `bitwise_and` | {py:obj}`Expr.bitwise_and <batcher.plan.expr_ir.core.Expr.bitwise_and>` | canonical |  |
+| `bitwise_or` | {py:obj}`Expr.bitwise_or <batcher.plan.expr_ir.core.Expr.bitwise_or>` | canonical |  |
+| `bitwise_xor` | {py:obj}`Expr.bitwise_xor <batcher.plan.expr_ir.core.Expr.bitwise_xor>` | canonical |  |
+| `bool_and` | {py:obj}`Expr.bool_and <batcher.plan.expr_ir.core.Expr.bool_and>` | canonical |  |
+| `bool_or` | {py:obj}`Expr.bool_or <batcher.plan.expr_ir.core.Expr.bool_or>` | canonical |  |
+| `cbrt` | {py:obj}`Expr.cbrt <batcher.plan.expr_ir.core.Expr.cbrt>` | canonical |  |
+| `ceil` | {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | canonical |  |
+| `clip` | {py:obj}`Expr.clip <batcher.plan.expr_ir.core.Expr.clip>` | canonical |  |
+| `cos` | {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | canonical |  |
+| `cosh` | {py:obj}`Expr.cosh <batcher.plan.expr_ir.core.Expr.cosh>` | canonical |  |
+| `cot` | {py:obj}`Expr.cot <batcher.plan.expr_ir.core.Expr.cot>` | canonical |  |
+| `count` | {py:obj}`Expr.count <batcher.plan.expr_ir.core.Expr.count>` | param | Missing: mode= ('all' counts nulls too, 'null' counts only nulls; Batcher counts non-null only). Wave W2. |
+| `count_distinct` | {py:obj}`Expr.count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>` | canonical |  |
+| `csc` | {py:obj}`Expr.csc <batcher.plan.expr_ir.core.Expr.csc>` | canonical |  |
+| `degrees` | {py:obj}`Expr.degrees <batcher.plan.expr_ir.core.Expr.degrees>` | canonical |  |
+| `exp` | {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | canonical |  |
+| `expm1` | {py:obj}`Expr.expm1 <batcher.plan.expr_ir.core.Expr.expm1>` | canonical |  |
+| `fill_nan` | {py:obj}`Expr.fill_nan <batcher.plan.expr_ir.core.Expr.fill_nan>` | canonical |  |
+| `first_value` | {py:obj}`bt.first_value <batcher.first_value>` | param | Missing: ignore\_nulls=. Wave W5. |
+| `floor` | {py:obj}`Expr.floor <batcher.plan.expr_ir.core.Expr.floor>` | canonical |  |
+| `is_inf` | {py:obj}`Expr.is_infinite <batcher.plan.expr_ir.core.Expr.is_infinite>` | canonical |  |
+| `is_nan` | {py:obj}`Expr.is_nan <batcher.plan.expr_ir.core.Expr.is_nan>` | canonical |  |
+| `lag` | {py:obj}`bt.lag <batcher.lag>` | param | Missing: default= fill value for rows with no predecessor. Wave W5. |
+| `last_value` | {py:obj}`bt.last_value <batcher.last_value>` | param | Missing: ignore\_nulls=. Wave W5. |
+| `lead` | {py:obj}`bt.lead <batcher.lead>` | param | Missing: default= fill value for rows with no successor. Wave W5. |
+| `list_agg` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | canonical |  |
+| `list_agg_distinct` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
+| `ln` | {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | canonical |  |
+| `log` | {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | canonical | Missing: base= argument: Batcher has Expr.ln and bt.log(base, value) but no Expr.log(base); Daft log(base=e). Wave W2. |
+| `log10` | {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | canonical |  |
+| `log1p` | {py:obj}`Expr.log1p <batcher.plan.expr_ir.core.Expr.log1p>` | canonical |  |
+| `log2` | {py:obj}`Expr.log2 <batcher.plan.expr_ir.core.Expr.log2>` | canonical |  |
+| `max` | {py:obj}`Expr.max <batcher.plan.expr_ir.core.Expr.max>` | canonical |  |
+| `mean` | {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | canonical |  |
+| `median` | {py:obj}`Expr.median <batcher.plan.expr_ir.core.Expr.median>` | canonical |  |
+| `min` | {py:obj}`Expr.min <batcher.plan.expr_ir.core.Expr.min>` | canonical |  |
 | `negate` | `-` operator | canonical |  |
-| `not_nan` | `Expr.is_not_nan` | canonical |  |
-| `over` | `Expr.over` | param | Missing: a Window spec object. Wave WF. |
-| `percentile` | `Expr.quantile` | canonical |  |
+| `not_nan` | {py:obj}`Expr.is_not_nan <batcher.plan.expr_ir.core.Expr.is_not_nan>` | canonical |  |
+| `over` | {py:obj}`Expr.over <batcher.plan.expr_ir.core.Expr.over>` | param | Missing: a Window spec object. Wave WF. |
+| `percentile` | {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | canonical |  |
 | `pow` | `**` operator | canonical |  |
 | `power` | `**` operator | canonical |  |
-| `product` | `Expr.product` | canonical |  |
-| `radians` | `Expr.radians` | canonical |  |
-| `round` | `Expr.round` | canonical |  |
-| `sec` | `Expr.sec` | canonical |  |
+| `product` | {py:obj}`Expr.product <batcher.plan.expr_ir.core.Expr.product>` | canonical |  |
+| `radians` | {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | canonical |  |
+| `round` | {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | canonical |  |
+| `sec` | {py:obj}`Expr.sec <batcher.plan.expr_ir.core.Expr.sec>` | canonical |  |
 | `shift_left` | `lshift` operator | canonical |  |
 | `shift_right` | `rshift` operator | canonical |  |
-| `sign` | `Expr.sign` | canonical |  |
-| `sin` | `Expr.sin` | canonical |  |
-| `sinh` | `Expr.sinh` | canonical |  |
-| `skew` | `Expr.skew` | canonical |  |
-| `sqrt` | `Expr.sqrt` | canonical |  |
-| `stddev` | `Expr.std` | param | Missing: ddof= (Batcher std is always the sample, ddof=1). Wave W2. |
+| `sign` | {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | canonical |  |
+| `sin` | {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | canonical |  |
+| `sinh` | {py:obj}`Expr.sinh <batcher.plan.expr_ir.core.Expr.sinh>` | canonical |  |
+| `skew` | {py:obj}`Expr.skew <batcher.plan.expr_ir.core.Expr.skew>` | canonical |  |
+| `sqrt` | {py:obj}`Expr.sqrt <batcher.plan.expr_ir.core.Expr.sqrt>` | canonical |  |
+| `stddev` | {py:obj}`Expr.std <batcher.plan.expr_ir.core.Expr.std>` | param | Missing: ddof= (Batcher std is always the sample, ddof=1). Wave W2. |
 | `string_agg` | `Expr.str.join` | canonical |  |
-| `sum` | `Expr.sum` | canonical |  |
-| `tan` | `Expr.tan` | canonical |  |
-| `tanh` | `Expr.tanh` | canonical |  |
-| `var` | `Expr.var` | param | Missing: ddof= (Batcher var is always the sample, ddof=1). Wave W2. |
+| `sum` | {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | canonical |  |
+| `tan` | {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | canonical |  |
+| `tanh` | {py:obj}`Expr.tanh <batcher.plan.expr_ir.core.Expr.tanh>` | canonical |  |
+| `var` | {py:obj}`Expr.var <batcher.plan.expr_ir.core.Expr.var>` | param | Missing: ddof= (Batcher var is always the sample, ddof=1). Wave W2. |
 
 ## The `daft.functions` module: math, aggregate, and window functions
 
@@ -96,92 +96,100 @@ The following table maps the 89 names on the `daft.functions` module, sorted alp
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `abs` | `Expr.abs` | canonical |  |
-| `any_value` | `Expr.any_value` | param | Missing: ignore\_nulls=False (Batcher any\_value always skips nulls). Wave W2. |
-| `approx_count_distinct` | `bt.approx_count_distinct` | canonical |  |
-| `approx_percentiles` | `Expr.approx_quantile` | param | Missing: a list of percentiles in one call (returns a list). Wave W2. |
-| `arccos` | `Expr.arccos` | canonical |  |
-| `arccosh` | `Expr.arccosh` | canonical |  |
-| `arcsin` | `Expr.arcsin` | canonical |  |
-| `arcsinh` | `Expr.arcsinh` | canonical |  |
-| `arctan` | `Expr.arctan` | canonical |  |
-| `arctan2` | `bt.arctan2` | canonical |  |
-| `arctanh` | `Expr.arctanh` | canonical |  |
-| `avg` | `bt.mean` | canonical |  |
-| `bin` | `Expr.to_base` | canonical |  |
-| `bitwise_and` | `Expr.bitwise_and` | canonical |  |
-| `bitwise_or` | `Expr.bitwise_or` | canonical |  |
-| `bitwise_xor` | `Expr.bitwise_xor` | canonical |  |
-| `bool_and` | `bt.bool_and` | canonical |  |
-| `bool_or` | `bt.bool_or` | canonical |  |
-| `cbrt` | `Expr.cbrt` | canonical |  |
-| `ceil` | `Expr.ceil` | canonical |  |
-| `clip` | `Expr.clip` | canonical |  |
-| `columns_avg` | `bt.mean_horizontal` | canonical |  |
-| `columns_max` | `bt.greatest` | canonical |  |
-| `columns_mean` | `bt.mean_horizontal` | canonical |  |
-| `columns_min` | `bt.least` | canonical |  |
-| `columns_sum` | `bt.sum_horizontal` | canonical |  |
+| `abs` | {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | canonical |  |
+| `any_value` | {py:obj}`Expr.any_value <batcher.plan.expr_ir.core.Expr.any_value>` | param | Missing: ignore\_nulls=False (Batcher any\_value always skips nulls). Wave W2. |
+| `approx_count_distinct` | {py:obj}`bt.approx_count_distinct <batcher.approx_count_distinct>` | canonical |  |
+| `approx_percentiles` | {py:obj}`Expr.approx_quantile <batcher.plan.expr_ir.core.Expr.approx_quantile>` | param | Missing: a list of percentiles in one call (returns a list). Wave W2. |
+| `arccos` | {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | canonical |  |
+| `arccosh` | {py:obj}`Expr.arccosh <batcher.plan.expr_ir.core.Expr.arccosh>` | canonical |  |
+| `arcsin` | {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | canonical |  |
+| `arcsinh` | {py:obj}`Expr.arcsinh <batcher.plan.expr_ir.core.Expr.arcsinh>` | canonical |  |
+| `arctan` | {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | canonical |  |
+| `arctan2` | {py:obj}`bt.arctan2 <batcher.arctan2>` | canonical |  |
+| `arctanh` | {py:obj}`Expr.arctanh <batcher.plan.expr_ir.core.Expr.arctanh>` | canonical |  |
+| `avg` | {py:obj}`bt.mean <batcher.mean>` | canonical |  |
+| `bin` | {py:obj}`Expr.to_base <batcher.plan.expr_ir.core.Expr.to_base>` | canonical |  |
+| `bitwise_and` | {py:obj}`Expr.bitwise_and <batcher.plan.expr_ir.core.Expr.bitwise_and>` | canonical |  |
+| `bitwise_or` | {py:obj}`Expr.bitwise_or <batcher.plan.expr_ir.core.Expr.bitwise_or>` | canonical |  |
+| `bitwise_xor` | {py:obj}`Expr.bitwise_xor <batcher.plan.expr_ir.core.Expr.bitwise_xor>` | canonical |  |
+| `bool_and` | {py:obj}`bt.bool_and <batcher.bool_and>` | canonical |  |
+| `bool_or` | {py:obj}`bt.bool_or <batcher.bool_or>` | canonical |  |
+| `cbrt` | {py:obj}`Expr.cbrt <batcher.plan.expr_ir.core.Expr.cbrt>` | canonical |  |
+| `ceil` | {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | canonical |  |
+| `clip` | {py:obj}`Expr.clip <batcher.plan.expr_ir.core.Expr.clip>` | canonical |  |
+| `columns_avg` | {py:obj}`bt.mean_horizontal <batcher.mean_horizontal>` | canonical |  |
+| `columns_max` | {py:obj}`bt.greatest <batcher.greatest>` | canonical |  |
+| `columns_mean` | {py:obj}`bt.mean_horizontal <batcher.mean_horizontal>` | canonical |  |
+| `columns_min` | {py:obj}`bt.least <batcher.least>` | canonical |  |
+| `columns_sum` | {py:obj}`bt.sum_horizontal <batcher.sum_horizontal>` | canonical |  |
 | `conv` | n/a | gap | Not yet: base conversion between arbitrary radixes 2-36 on string input. Wave W3. |
-| `cos` | `Expr.cos` | canonical |  |
-| `cosh` | `Expr.cosh` | canonical |  |
-| `cot` | `Expr.cot` | canonical |  |
-| `count` | `bt.count` | mismatch | Differs: Daft count(expr) counts non-null values of expr, which is col.count(); bt.count() counts rows. Wave W0. |
-| `count_distinct` | `bt.count_distinct` | canonical |  |
-| `csc` | `Expr.csc` | canonical |  |
-| `degrees` | `Expr.degrees` | canonical |  |
-| `dense_rank` | `bt.dense_rank` | canonical |  |
-| `e` | `bt.e` | canonical |  |
-| `exp` | `Expr.exp` | canonical |  |
-| `expm1` | `Expr.expm1` | canonical |  |
-| `factorial` | `Expr.factorial` | canonical |  |
-| `fill_nan` | `Expr.fill_nan` | canonical |  |
-| `first_value` | `bt.first_value` | param | Missing: ignore\_nulls=. Wave W5. |
-| `floor` | `Expr.floor` | canonical |  |
-| `hypot` | `bt.hypot` | canonical |  |
-| `is_inf` | `Expr.is_infinite` | canonical |  |
-| `is_nan` | `Expr.is_nan` | canonical |  |
-| `lag` | `bt.lag` | param | Missing: default= fill value for rows with no predecessor. Wave W5. |
-| `last_value` | `bt.last_value` | param | Missing: ignore\_nulls=. Wave W5. |
-| `lead` | `bt.lead` | param | Missing: default= fill value for rows with no successor. Wave W5. |
-| `list_agg` | `Expr.array_agg` | canonical |  |
-| `list_agg_distinct` | `Expr.array_agg` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
-| `ln` | `Expr.ln` | canonical |  |
-| `log` | `bt.log` | param | Missing: expr-first argument order with a default base e (bt.log takes (base, value) and has no default). Wave W2. |
-| `log10` | `Expr.log10` | canonical |  |
-| `log1p` | `Expr.log1p` | canonical |  |
-| `log2` | `Expr.log2` | canonical |  |
-| `max` | `bt.max` | canonical |  |
-| `mean` | `bt.mean` | canonical |  |
-| `median` | `bt.median` | canonical |  |
-| `min` | `bt.min` | canonical |  |
-| `monotonically_increasing_id` | `Dataset.with_row_index` | param | Missing: an Expression form usable inside select/with\_columns. Wave W8. |
+| `cos` | {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | canonical |  |
+| `cosh` | {py:obj}`Expr.cosh <batcher.plan.expr_ir.core.Expr.cosh>` | canonical |  |
+| `cot` | {py:obj}`Expr.cot <batcher.plan.expr_ir.core.Expr.cot>` | canonical |  |
+| `count` | {py:obj}`bt.count <batcher.count>` | mismatch | Differs: Daft count(expr) counts non-null values of expr, which is col.count(); bt.count() counts rows. Wave W0. |
+| `count_distinct` | {py:obj}`bt.count_distinct <batcher.count_distinct>` | canonical |  |
+| `csc` | {py:obj}`Expr.csc <batcher.plan.expr_ir.core.Expr.csc>` | canonical |  |
+| `degrees` | {py:obj}`Expr.degrees <batcher.plan.expr_ir.core.Expr.degrees>` | canonical |  |
+| `dense_rank` | {py:obj}`bt.dense_rank <batcher.dense_rank>` | canonical |  |
+| `e` | {py:obj}`bt.e <batcher.e>` | canonical |  |
+| `exp` | {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | canonical |  |
+| `expm1` | {py:obj}`Expr.expm1 <batcher.plan.expr_ir.core.Expr.expm1>` | canonical |  |
+| `factorial` | {py:obj}`Expr.factorial <batcher.plan.expr_ir.core.Expr.factorial>` | canonical |  |
+| `fill_nan` | {py:obj}`Expr.fill_nan <batcher.plan.expr_ir.core.Expr.fill_nan>` | canonical |  |
+| `first_value` | {py:obj}`bt.first_value <batcher.first_value>` | param | Missing: ignore\_nulls=. Wave W5. |
+| `floor` | {py:obj}`Expr.floor <batcher.plan.expr_ir.core.Expr.floor>` | canonical |  |
+| `hypot` | {py:obj}`bt.hypot <batcher.hypot>` | canonical |  |
+| `is_inf` | {py:obj}`Expr.is_infinite <batcher.plan.expr_ir.core.Expr.is_infinite>` | canonical |  |
+| `is_nan` | {py:obj}`Expr.is_nan <batcher.plan.expr_ir.core.Expr.is_nan>` | canonical |  |
+| `lag` | {py:obj}`bt.lag <batcher.lag>` | param | Missing: default= fill value for rows with no predecessor. Wave W5. |
+| `last_value` | {py:obj}`bt.last_value <batcher.last_value>` | param | Missing: ignore\_nulls=. Wave W5. |
+| `lead` | {py:obj}`bt.lead <batcher.lead>` | param | Missing: default= fill value for rows with no successor. Wave W5. |
+| `list_agg` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | canonical |  |
+| `list_agg_distinct` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
+| `ln` | {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | canonical |  |
+| `log` | {py:obj}`bt.log <batcher.log>` | param | Missing: expr-first argument order with a default base e (bt.log takes (base, value) and has no default). Wave W2. |
+| `log10` | {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | canonical |  |
+| `log1p` | {py:obj}`Expr.log1p <batcher.plan.expr_ir.core.Expr.log1p>` | canonical |  |
+| `log2` | {py:obj}`Expr.log2 <batcher.plan.expr_ir.core.Expr.log2>` | canonical |  |
+| `max` | {py:obj}`bt.max <batcher.max>` | canonical |  |
+| `mean` | {py:obj}`bt.mean <batcher.mean>` | canonical |  |
+| `median` | {py:obj}`bt.median <batcher.median>` | canonical |  |
+| `min` | {py:obj}`bt.min <batcher.min>` | canonical |  |
+| `monotonically_increasing_id` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | param | Missing: an Expression form usable inside select/with\_columns. Wave W8. |
 | `negate` | `-` operator | canonical |  |
-| `not_nan` | `Expr.is_not_nan` | canonical |  |
-| `over` | `Expr.over` | param | Missing: a Window spec object. Wave WF. |
-| `percentile` | `Expr.quantile` | canonical |  |
-| `pi` | `bt.pi` | canonical |  |
-| `pmod` | `bt.pmod` | canonical |  |
+| `not_nan` | {py:obj}`Expr.is_not_nan <batcher.plan.expr_ir.core.Expr.is_not_nan>` | canonical |  |
+| `over` | {py:obj}`Expr.over <batcher.plan.expr_ir.core.Expr.over>` | param | Missing: a Window spec object. Wave WF. |
+| `percentile` | {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | canonical |  |
+| `pi` | {py:obj}`bt.pi <batcher.pi>` | canonical |  |
+| `pmod` | {py:obj}`bt.pmod <batcher.pmod>` | canonical |  |
 | `pow` | `**` operator | canonical |  |
 | `power` | `**` operator | canonical |  |
-| `product` | `bt.product` | canonical |  |
-| `radians` | `Expr.radians` | canonical |  |
+| `product` | {py:obj}`bt.product <batcher.product>` | canonical |  |
+| `radians` | {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | canonical |  |
 | `random_int` | n/a | gap | Not yet: seeded per-row random integer expression. Wave W3. |
-| `rank` | `bt.rank` | canonical |  |
-| `round` | `Expr.round` | canonical |  |
-| `row_number` | `bt.row_number` | canonical |  |
-| `sec` | `Expr.sec` | canonical |  |
+| `rank` | {py:obj}`bt.rank <batcher.rank>` | canonical |  |
+| `round` | {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | canonical |  |
+| `row_number` | {py:obj}`bt.row_number <batcher.row_number>` | canonical |  |
+| `sec` | {py:obj}`Expr.sec <batcher.plan.expr_ir.core.Expr.sec>` | canonical |  |
 | `shift_left` | `lshift` operator | canonical |  |
 | `shift_right` | `rshift` operator | canonical |  |
-| `sign` | `Expr.sign` | canonical |  |
-| `sin` | `Expr.sin` | canonical |  |
-| `sinh` | `Expr.sinh` | canonical |  |
-| `skew` | `bt.skew` | canonical |  |
-| `sqrt` | `Expr.sqrt` | canonical |  |
-| `stddev` | `bt.std` | param | Missing: ddof= (Batcher std is always the sample, ddof=1). Wave W2. |
+| `sign` | {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | canonical |  |
+| `sin` | {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | canonical |  |
+| `sinh` | {py:obj}`Expr.sinh <batcher.plan.expr_ir.core.Expr.sinh>` | canonical |  |
+| `skew` | {py:obj}`bt.skew <batcher.skew>` | canonical |  |
+| `sqrt` | {py:obj}`Expr.sqrt <batcher.plan.expr_ir.core.Expr.sqrt>` | canonical |  |
+| `stddev` | {py:obj}`bt.std <batcher.std>` | param | Missing: ddof= (Batcher std is always the sample, ddof=1). Wave W2. |
 | `string_agg` | `Expr.str.join` | canonical |  |
-| `sum` | `bt.sum` | canonical |  |
-| `tan` | `Expr.tan` | canonical |  |
-| `tanh` | `Expr.tanh` | canonical |  |
-| `try_divide` | `Expr.safe_divide` | canonical |  |
-| `var` | `bt.var` | param | Missing: ddof= (Batcher var is always the sample, ddof=1). Wave W2. |
+| `sum` | {py:obj}`bt.sum <batcher.sum>` | canonical |  |
+| `tan` | {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | canonical |  |
+| `tanh` | {py:obj}`Expr.tanh <batcher.plan.expr_ir.core.Expr.tanh>` | canonical |  |
+| `try_divide` | {py:obj}`Expr.safe_divide <batcher.plan.expr_ir.core.Expr.safe_divide>` | canonical |  |
+| `var` | {py:obj}`bt.var <batcher.var>` | param | Missing: ddof= (Batcher var is always the sample, ddof=1). Wave W2. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

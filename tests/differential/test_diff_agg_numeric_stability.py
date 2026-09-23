@@ -284,3 +284,32 @@ def test_an_expanding_moment_survives_a_large_offset(agg, offset):
     if agg == "expanding_std":
         want = [w**0.5 for w in want]
     assert got[1:] == pytest.approx(want, rel=1e-9)
+
+
+# --- an exact quantile that brackets a non-finite value -----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("values", "q"),
+    [
+        ([1.0, 2.0, float("nan"), 4.0], 0.75),  # next rank is NaN: was `inf`
+        ([1.0, float("nan")], 0.5),
+        ([1.0, 2.0, float("nan"), 4.0], 0.5),  # never reaches the NaN: stays exact
+        ([1.0, float("inf")], 1.0),  # exactly on an infinite element: was NaN
+        ([1.0, float("inf")], 0.5),
+        ([-1.7e308, 1.7e308], 0.25),
+    ],
+)
+def test_an_exact_quantile_matches_duckdb_around_non_finite_values(duck, values, q):
+    """`quantile_cont` over a NaN neighbour answered `inf`, and one landing exactly on `inf`
+    answered NaN; DuckDB answers NaN and `inf`. The values are fed to DuckDB as an Arrow
+    table, because a Python list parameter turns NaN into NULL and would test nothing."""
+    import math
+
+    duck.register("t_q", pa.table({"x": pa.array(values, pa.float64())}))
+    want = duck.sql(f"SELECT quantile_cont(x, {q}) FROM t_q").fetchone()[0]
+    got = bt.from_pydict({"x": values}).quantile("x", q)
+    if math.isnan(want):
+        assert math.isnan(got), f"quantile({values}, {q}) = {got}, DuckDB {want}"
+    else:
+        assert got == want, f"quantile({values}, {q}) = {got}, DuckDB {want}"

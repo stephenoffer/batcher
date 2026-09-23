@@ -86,7 +86,7 @@ at once. The core families live in `kyber/rules/`:
 
 ### The `extra/` families
 
-Much of the rule count lives in `kyber/rules/extra/`, a subpackage of grouped-by-family modules. It exists because the parent `rules/` directory hit the 12-files-per-directory structure cap, and it is allowlisted in `tools/lint_structure.py` as the sanctioned large-rule-set pattern rather than flattened into a god file. Each rule is node-local and individually differential-tested against DuckDB.
+Much of the rule count lives in `kyber/rules/extra/`, a subpackage of grouped-by-family modules. It exists because the parent `rules/` directory hit the 12-files-per-directory structure cap, and it is allowlisted in [`tools/lint_structure.py`](https://github.com/stephenoffer/batcher/blob/main/tools/lint_structure.py) as the sanctioned large-rule-set pattern rather than flattened into a god file. Each rule is node-local and individually differential-tested against DuckDB.
 
 The subpackage holds more modules than this page lists. The following rows are the families a new contributor meets first, each named for the shape it rewrites:
 
@@ -160,10 +160,10 @@ the `add-kyber-optimizer-pass` recipe and {doc}`/architecture/internals/extendin
 A large rule set is only safe if two things hold. Each rule must preserve results,
 and no two rules may interfere in combination. Kyber proves both mechanically.
 
-- **Each rule, individually.** Every rewrite carries a `tests/unit/` plan-shape test
-  (the *plan* changes) and a `tests/differential/` test (the *answer* still matches
+- **Each rule, individually.** Every rewrite carries a [`tests/unit/`](https://github.com/stephenoffer/batcher/tree/main/tests/unit) plan-shape test
+  (the *plan* changes) and a [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential) test (the *answer* still matches
   DuckDB), across nulls, empties, and type edges.
-- **The whole set, in combination.** `tests/property/test_prop_optimizer_result_invariance.py`
+- **The whole set, in combination.** [`tests/property/test_prop_optimizer_result_invariance.py`](https://github.com/stephenoffer/batcher/blob/main/tests/property/test_prop_optimizer_result_invariance.py)
   (Hypothesis) generates a random table and a random-but-valid pipeline and asserts
   `result(full rule set) == result(no rules) == ds.collect()` under an
   order-independent multiset compare, so the subtle rule interaction an example misses

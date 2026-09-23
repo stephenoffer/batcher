@@ -53,7 +53,8 @@ def quat_norm(qx: Numeric, qy: Numeric, qz: Numeric, qw: Numeric) -> Expr:
     ``float32``, or multiplied a few thousand times is only nearly unit, and this is how
     you see how far it has drifted. It is also the one function in the family that
     answers for a zero quaternion rather than nulling it, which makes it the way to find
-    the rows every other function nulled.
+    the rows every other function nulled. A NaN component is null here too, like
+    everywhere else in the family, rather than a NaN length.
 
     Args:
         qx: The rotation's X component.
@@ -62,7 +63,7 @@ def quat_norm(qx: Numeric, qy: Numeric, qz: Numeric, qw: Numeric) -> Expr:
         qw: The rotation's scalar component.
 
     Returns:
-        The Euclidean length of the four components.
+        The Euclidean length of the four components, or null when one is NaN.
 
     Examples:
         .. doctest::
@@ -499,9 +500,11 @@ def quat_from_rotmat_x(
     because nine numbers need no convention note to be unambiguous. Arguments are
     row-major: ``m01`` is row 0, column 1.
 
-    A matrix that is not a rotation is not detected. Check one with
-    ``quat_norm(quat_from_rotmat_x(...), ...)``, which is one only for a genuine
-    rotation.
+    A matrix that is not a rotation gives null: a rotation is orthonormal with
+    determinant +1, and a zero matrix (a missing calibration), a scaled one, a
+    reflection or a NaN is refused rather than turned into some arbitrary quaternion.
+    ``1e-4`` of drift in ``R * R^T`` and in the determinant is allowed, which admits a
+    matrix stored as ``float32``, and the result is always unit length.
 
     Args:
         m00: Row 0, column 0.
@@ -515,7 +518,8 @@ def quat_from_rotmat_x(
         m22: Row 2, column 2.
 
     Returns:
-        The X component of the resulting rotation.
+        The X component of the resulting rotation, or null when the
+        matrix is not a rotation.
 
     Examples:
         .. doctest::
@@ -554,7 +558,8 @@ def quat_from_rotmat_y(
         m22: Row 2, column 2.
 
     Returns:
-        The Y component of the resulting rotation.
+        The Y component of the resulting rotation, or null when the
+        matrix is not a rotation.
 
     Examples:
         .. doctest::
@@ -593,7 +598,8 @@ def quat_from_rotmat_z(
         m22: Row 2, column 2.
 
     Returns:
-        The Z component of the resulting rotation.
+        The Z component of the resulting rotation, or null when the
+        matrix is not a rotation.
 
     Examples:
         .. doctest::
@@ -632,7 +638,8 @@ def quat_from_rotmat_w(
         m22: Row 2, column 2.
 
     Returns:
-        The scalar component of the resulting rotation.
+        The scalar component of the resulting rotation, or null when the
+        matrix is not a rotation.
 
     Examples:
         .. doctest::

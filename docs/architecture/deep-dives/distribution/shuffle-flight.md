@@ -56,9 +56,9 @@ The following table lists each tier with the path it takes and what it costs:
 
 `carbonite/transfer/locality.py::select_mode` makes the choice from the peer's Flight address and node id. A matching, non-empty Flight address means the same process, so `DIRECT_MEMORY`. Otherwise, two known and equal node identities mean the same host, so `SHARED_MEMORY`. Everything else is `NETWORK`, including two addresses that are both still unknown: an empty address is "not bound yet", not a match, and `NETWORK` is the mode that is always correct and only ever slower.
 
-The same test is repeated in Rust inside the concurrent gather in `crates/bc-py/src/shuffle/gather.rs`, so a same-host bucket is read from shared memory *inside* the parallel fetch rather than being serialized ahead of it. Cross-node buckets keep fanning out while the local ones are copied.
+The same test is repeated in Rust inside the concurrent gather in [`crates/bc-py/src/shuffle/gather.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/shuffle/gather.rs), so a same-host bucket is read from shared memory *inside* the parallel fetch rather than being serialized ahead of it. Cross-node buckets keep fanning out while the local ones are copied.
 
-The common GPU-cluster layout packs several worker actors onto each node, so most of a reducer's fetches are same-node but cross-process, which is the tier the shared-memory path accelerates. To measure the gap on your own hardware, run `benchmarks/cluster/carbonite/xnode.py`, which moves an identical partition set both ways between a producer and a consumer actor and reports the delivered throughput.
+The common GPU-cluster layout packs several worker actors onto each node, so most of a reducer's fetches are same-node but cross-process, which is the tier the shared-memory path accelerates. To measure the gap on your own hardware, run [`benchmarks/cluster/carbonite/xnode.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/carbonite/xnode.py), which moves an identical partition set both ways between a producer and a consumer actor and reports the delivered throughput.
 
 ## The Flight server
 
@@ -138,7 +138,7 @@ A flat gather holds all its data anyway, so throttling its fetch buys no memory.
 
 ## Scaling
 
-A single reducer's inbound rate is bounded by its NIC, so there's no headroom to win back on one node once the fetch runs at line rate. The scaling is in the aggregate all-to-all, where every node reduces at once. The mergeable `partial -> combine -> finalize` algebra and credit flow control keep per-node memory bounded however wide the cluster gets, so adding nodes adds reducers rather than contention. Measure it for a given cluster shape with `benchmarks/cluster/carbonite/xnode.py`.
+A single reducer's inbound rate is bounded by its NIC, so there's no headroom to win back on one node once the fetch runs at line rate. The scaling is in the aggregate all-to-all, where every node reduces at once. The mergeable `partial -> combine -> finalize` algebra and credit flow control keep per-node memory bounded however wide the cluster gets, so adding nodes adds reducers rather than contention. Measure it for a given cluster shape with [`benchmarks/cluster/carbonite/xnode.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/carbonite/xnode.py).
 
 That holds while there's enough shuffled volume to divide. It doesn't license widening the exchange to match the cluster. An exchange of `m` mappers and `r` reducers opens `m x r` streams, so a reducer count taken from the node count makes the *coordination* quadratic in the cluster while the bytes stay fixed.
 
@@ -185,14 +185,14 @@ Each concern below has a single owning file, so the transport path this page des
 | Concern | File |
 |---|---|
 | Flight server, handler, ticket, store | `crates/bc-transport/src/{exchange,handler,ticket,store}.rs` |
-| Shared-memory mmap path | `crates/bc-transport/src/shared.rs` |
-| Concurrent gather and fold | `crates/bc-py/src/shuffle/` |
-| The Ray actor hosting a worker's server | `python/batcher/dist/flight_worker.py` |
+| Shared-memory mmap path | [`crates/bc-transport/src/shared.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-transport/src/shared.rs) |
+| Concurrent gather and fold | [`crates/bc-py/src/shuffle/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-py/src/shuffle) |
+| The Ray actor hosting a worker's server | [`python/batcher/dist/flight_worker.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/flight_worker.py) |
 | Per-operator shuffle driving | `python/batcher/dist/flight_{aggregate,join,sort,window}.py` |
-| Session, mode selection, reducer placement | `python/batcher/carbonite/transfer/` |
-| Store cap and credit ceilings | `python/batcher/carbonite/policies/flow_control.py` |
-| Replicating published buckets | `python/batcher/dist/shuffle_replication.py` |
-| The disk shuffle | `python/batcher/dist/shuffle_io.py` |
+| Session, mode selection, reducer placement | [`python/batcher/carbonite/transfer/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/carbonite/transfer) |
+| Store cap and credit ceilings | [`python/batcher/carbonite/policies/flow_control.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/carbonite/policies/flow_control.py) |
+| Replicating published buckets | [`python/batcher/dist/shuffle_replication.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/shuffle_replication.py) |
+| The disk shuffle | [`python/batcher/dist/shuffle_io.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/shuffle_io.py) |
 
 ## See also
 

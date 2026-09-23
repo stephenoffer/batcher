@@ -18,85 +18,85 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `agg` | `Dataset.agg` | canonical |  |
-| `agg_concat` | `Dataset.agg` + `Expr.str.join` | canonical |  |
-| `agg_list` | `Dataset.agg` + `Expr.array_agg` | canonical |  |
-| `agg_set` | `Expr.array_agg` | param | Missing: distinct=True for a global set aggregate. Wave W2. |
-| `any_value` | `Dataset.agg` + `Expr.any_value` | canonical |  |
-| `collect` | `Dataset.collect` | mismatch | Differs: Daft collect() materializes and returns the DataFrame for further chaining; Batcher collect() returns a pyarrow.Table. Rewrite: Dataset.cache() to keep chaining. Wave W0. |
-| `column_names` | `Dataset.columns` | canonical |  |
-| `columns` | `Dataset.columns` | mismatch | Differs: Daft columns is a list of column Expressions; Batcher columns is a list of names. Rewrite: \[bt.col(c) for c in ds.columns\]. Wave W0. |
-| `concat` | `Dataset.union` | canonical |  |
-| `count` | `Dataset.count` | mismatch | Differs: Daft count() returns a one-row DataFrame (\{'count': \[n\]\}), and count(\*cols) counts non-null values per column; Batcher count() returns a Python int of rows. Rewrite: ds.agg(n=bt.count()). Wave W0. |
-| `count_distinct` | `Dataset.count_distinct` | canonical |  |
-| `count_rows` | `Dataset.count` | canonical |  |
-| `describe` | `Dataset.describe` | mismatch | Differs: Daft describe() returns the schema as a DataFrame (column\_name, type); Batcher describe() returns summary statistics. Rewrite: Dataset.schema. Wave W0. |
-| `distinct` | `Dataset.distinct` | canonical |  |
-| `drop_duplicates` | `Dataset.distinct` | canonical |  |
-| `drop_nan` | `Dataset.drop_nans` | canonical |  |
-| `drop_null` | `Dataset.drop_nulls` | canonical |  |
-| `except_all` | `Dataset.except_` | canonical |  |
-| `except_distinct` | `Dataset.except_` | canonical |  |
-| `exclude` | `Dataset.drop` | canonical |  |
-| `explain` | `Dataset.explain` | mismatch | Differs: Daft explain() prints the plan (show\_all= adds the physical plan); Batcher explain() returns the plan as a string. Rewrite: print(ds.explain()). Wave W0. |
-| `explode` | `Dataset.explode` | mismatch | Differs: Daft explode keeps a null or empty list as one row with a null value and accepts several columns at once; Batcher explode drops those rows and takes one column. Param: outer=True, multiple columns. Wave W0. |
-| `filter` | `Dataset.filter` | canonical |  |
-| `groupby` | `Dataset.group_by` | canonical |  |
-| `intersect` | `Dataset.intersect` | canonical |  |
-| `intersect_all` | `Dataset.intersect` | canonical |  |
-| `into_batches` | `Dataset.repartition` | mismatch | Differs: Daft into\_batches re-chunks execution into batch\_size-row partitions; Batcher sizes morsels itself and repartition only lays out written files. Wave W8. |
-| `into_partitions` | `Dataset.repartition` | mismatch | Differs: Daft into\_partitions(n) splits or coalesces execution partitions preserving order; Batcher repartition(num\_files) only sets how the next write lays out files. Wave W8. |
+| `agg` | {py:obj}`Dataset.agg <batcher.Dataset.agg>` | canonical |  |
+| `agg_concat` | {py:obj}`Dataset.agg <batcher.Dataset.agg>` + `Expr.str.join` | canonical |  |
+| `agg_list` | {py:obj}`Dataset.agg <batcher.Dataset.agg>` + {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | canonical |  |
+| `agg_set` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | param | Missing: distinct=True for a global set aggregate. Wave W2. |
+| `any_value` | {py:obj}`Dataset.agg <batcher.Dataset.agg>` + {py:obj}`Expr.any_value <batcher.plan.expr_ir.core.Expr.any_value>` | canonical |  |
+| `collect` | {py:obj}`Dataset.collect <batcher.Dataset.collect>` | mismatch | Differs: Daft collect() materializes and returns the DataFrame for further chaining; Batcher collect() returns a pyarrow.Table. Rewrite: Dataset.cache() to keep chaining. Wave W0. |
+| `column_names` | {py:obj}`Dataset.columns <batcher.Dataset.columns>` | canonical |  |
+| `columns` | {py:obj}`Dataset.columns <batcher.Dataset.columns>` | mismatch | Differs: Daft columns is a list of column Expressions; Batcher columns is a list of names. Rewrite: \[bt.col(c) for c in ds.columns\]. Wave W0. |
+| `concat` | {py:obj}`Dataset.union <batcher.Dataset.union>` | canonical |  |
+| `count` | {py:obj}`Dataset.count <batcher.Dataset.count>` | mismatch | Differs: Daft count() returns a one-row DataFrame (\{'count': \[n\]\}), and count(\*cols) counts non-null values per column; Batcher count() returns a Python int of rows. Rewrite: ds.agg(n=bt.count()). Wave W0. |
+| `count_distinct` | {py:obj}`Dataset.count_distinct <batcher.Dataset.count_distinct>` | canonical |  |
+| `count_rows` | {py:obj}`Dataset.count <batcher.Dataset.count>` | canonical |  |
+| `describe` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | mismatch | Differs: Daft describe() returns the schema as a DataFrame (column\_name, type); Batcher describe() returns summary statistics. Rewrite: Dataset.schema. Wave W0. |
+| `distinct` | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | canonical |  |
+| `drop_duplicates` | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | canonical |  |
+| `drop_nan` | {py:obj}`Dataset.drop_nans <batcher.Dataset.drop_nans>` | canonical |  |
+| `drop_null` | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | canonical |  |
+| `except_all` | {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | canonical |  |
+| `except_distinct` | {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | canonical |  |
+| `exclude` | {py:obj}`Dataset.drop <batcher.Dataset.drop>` | canonical |  |
+| `explain` | {py:obj}`Dataset.explain <batcher.Dataset.explain>` | mismatch | Differs: Daft explain() prints the plan (show\_all= adds the physical plan); Batcher explain() returns the plan as a string. Rewrite: print(ds.explain()). Wave W0. |
+| `explode` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | mismatch | Differs: Daft explode keeps a null or empty list as one row with a null value and accepts several columns at once; Batcher explode drops those rows and takes one column. Param: outer=True, multiple columns. Wave W0. |
+| `filter` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | canonical |  |
+| `groupby` | {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | canonical |  |
+| `intersect` | {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | canonical |  |
+| `intersect_all` | {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | canonical |  |
+| `into_batches` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | mismatch | Differs: Daft into\_batches re-chunks execution into batch\_size-row partitions; Batcher sizes morsels itself and repartition only lays out written files. Wave W8. |
+| `into_partitions` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | mismatch | Differs: Daft into\_partitions(n) splits or coalesces execution partitions preserving order; Batcher repartition(num\_files) only sets how the next write lays out files. Wave W8. |
 | `iter_partitions` | n/a | out of scope | Declined: exposes Daft MicroPartitions or Ray ObjectRefs; Batcher has no user-visible partitions (iterate Arrow batches with iter\_batches). |
-| `iter_rows` | `Dataset.iter_rows` | mismatch | Differs: Daft iter\_rows yields dicts by default; Batcher yields tuples unless named=True. Param: named=True. Wave W0. |
-| `join` | `Dataset.join` | mismatch | Differs: Daft names a clashing right column 'right.\<col\>' (prefix= / suffix=) and accepts strategy= hints; Batcher appends suffix='\_right'. Param: prefix='right.', suffix=''. Wave W0. |
-| `join_asof` | `Dataset.join_asof` | canonical |  |
-| `limit` | `Dataset.limit` | canonical |  |
-| `max` | `Dataset.max` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.max takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
-| `mean` | `Dataset.mean` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.mean takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
-| `melt` | `Dataset.unpivot` | canonical |  |
-| `metrics` | `Dataset.stats` | param | Missing: metrics of the last execution without re-running the query. Wave W8. |
-| `min` | `Dataset.min` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.min takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
+| `iter_rows` | {py:obj}`Dataset.iter_rows <batcher.Dataset.iter_rows>` | mismatch | Differs: Daft iter\_rows yields dicts by default; Batcher yields tuples unless named=True. Param: named=True. Wave W0. |
+| `join` | {py:obj}`Dataset.join <batcher.Dataset.join>` | mismatch | Differs: Daft names a clashing right column 'right.\<col\>' (prefix= / suffix=) and accepts strategy= hints; Batcher appends suffix='\_right'. Param: prefix='right.', suffix=''. Wave W0. |
+| `join_asof` | {py:obj}`Dataset.join_asof <batcher.Dataset.join_asof>` | canonical |  |
+| `limit` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
+| `max` | {py:obj}`Dataset.max <batcher.Dataset.max>` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.max takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
+| `mean` | {py:obj}`Dataset.mean <batcher.Dataset.mean>` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.mean takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
+| `melt` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
+| `metrics` | {py:obj}`Dataset.stats <batcher.Dataset.stats>` | param | Missing: metrics of the last execution without re-running the query. Wave W8. |
+| `min` | {py:obj}`Dataset.min <batcher.Dataset.min>` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.min takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
 | `num_partitions` | n/a | out of scope | Declined: Batcher plans carry no partition count; execution parallelism is engine-owned. |
-| `offset` | `Dataset.limit` | param | Missing: offset without a limit. Wave W2. |
-| `pipe` | `Dataset.pipe` | canonical |  |
-| `pivot` | `Dataset.pivot` | canonical |  |
-| `product` | `Dataset.product` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.product takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
-| `repartition` | `Dataset.repartition` | mismatch | Differs: Daft repartition(num, \*partition\_by) hash-partitions execution; Batcher repartition sets the file layout of the next write and leaves the data unchanged. Wave W8. |
-| `sample` | `Dataset.sample` | param | Missing: with\_replacement=True. Wave W2. |
-| `schema` | `Dataset.schema` | mismatch | Differs: Daft schema() is a method returning a daft Schema; Batcher schema is a property holding a pyarrow.Schema. Rewrite: ds.schema without the call. Wave W0. |
-| `select` | `Dataset.select` | canonical |  |
-| `show` | `Dataset.show` | param | Missing: format=/verbose=/max\_width=/align= display options (Daft defaults to 8 rows, Batcher to 10). Wave W2. |
-| `shuffle` | `Dataset.shuffle` | canonical |  |
-| `skew` | `Dataset.skew` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skew takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True. Wave W0. |
+| `offset` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | param | Missing: offset without a limit. Wave W2. |
+| `pipe` | {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | canonical |  |
+| `pivot` | {py:obj}`Dataset.pivot <batcher.Dataset.pivot>` | canonical |  |
+| `product` | {py:obj}`Dataset.product <batcher.Dataset.product>` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.product takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
+| `repartition` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | mismatch | Differs: Daft repartition(num, \*partition\_by) hash-partitions execution; Batcher repartition sets the file layout of the next write and leaves the data unchanged. Wave W8. |
+| `sample` | {py:obj}`Dataset.sample <batcher.Dataset.sample>` | param | Missing: with\_replacement=True. Wave W2. |
+| `schema` | {py:obj}`Dataset.schema <batcher.Dataset.schema>` | mismatch | Differs: Daft schema() is a method returning a daft Schema; Batcher schema is a property holding a pyarrow.Schema. Rewrite: ds.schema without the call. Wave W0. |
+| `select` | {py:obj}`Dataset.select <batcher.Dataset.select>` | canonical |  |
+| `show` | {py:obj}`Dataset.show <batcher.Dataset.show>` | param | Missing: format=/verbose=/max\_width=/align= display options (Daft defaults to 8 rows, Batcher to 10). Wave W2. |
+| `shuffle` | {py:obj}`Dataset.shuffle <batcher.Dataset.shuffle>` | canonical |  |
+| `skew` | {py:obj}`Dataset.skew <batcher.Dataset.skew>` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skew takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True. Wave W0. |
 | `skip_existing` | n/a | gap | Not yet: anti-join against keys already present in an existing output (resumable pipelines). Wave W13. |
 | `skipped_corrupt_files` | n/a | gap | Not yet: report of files skipped under ignore\_corrupt\_files=True. Wave W13. |
-| `sort` | `Dataset.sort` | mismatch | Differs: Daft sort(desc=True) places nulls first by default (nulls\_first follows desc); Batcher places nulls last. Param: nulls\_first=True when descending. Wave W0. |
-| `stddev` | `Dataset.std` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.std takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=. Wave W0. |
-| `sum` | `Dataset.sum` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.sum takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
-| `summarize` | `Dataset.describe` | mismatch | Differs: Daft summarize() returns one row per column (column, type, min, max, count, count\_nulls, approx\_count\_distinct); Batcher describe() returns one row per statistic with a column per input column. Wave W8. |
-| `to_arrow` | `Dataset.to_arrow` | canonical |  |
-| `to_arrow_iter` | `Dataset.iter_batches` | canonical |  |
+| `sort` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | mismatch | Differs: Daft sort(desc=True) places nulls first by default (nulls\_first follows desc); Batcher places nulls last. Param: nulls\_first=True when descending. Wave W0. |
+| `stddev` | {py:obj}`Dataset.std <batcher.Dataset.std>` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.std takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=. Wave W0. |
+| `sum` | {py:obj}`Dataset.sum <batcher.Dataset.sum>` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.sum takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...). Wave W0. |
+| `summarize` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | mismatch | Differs: Daft summarize() returns one row per column (column, type, min, max, count, count\_nulls, approx\_count\_distinct); Batcher describe() returns one row per statistic with a column per input column. Wave W8. |
+| `to_arrow` | {py:obj}`Dataset.to_arrow <batcher.Dataset.to_arrow>` | canonical |  |
+| `to_arrow_iter` | {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | canonical |  |
 | `to_dask_dataframe` | n/a | gap | Not yet: export to a Dask DataFrame. Wave W13. |
-| `to_pandas` | `Dataset.to_pandas` | canonical |  |
-| `to_pydict` | `Dataset.to_pydict` | canonical |  |
-| `to_pylist` | `Dataset.to_pylist` | canonical |  |
-| `to_ray_dataset` | `Dataset.to_ray_dataset` | canonical |  |
+| `to_pandas` | {py:obj}`Dataset.to_pandas <batcher.Dataset.to_pandas>` | canonical |  |
+| `to_pydict` | {py:obj}`Dataset.to_pydict <batcher.Dataset.to_pydict>` | canonical |  |
+| `to_pylist` | {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | canonical |  |
+| `to_ray_dataset` | {py:obj}`Dataset.to_ray_dataset <batcher.Dataset.to_ray_dataset>` | canonical |  |
 | `to_torch_dataloader` | `Dataset.ml.to_torch_dataloader` | canonical |  |
 | `to_torch_iter_dataset` | `Dataset.ml.iter_torch_batches` | param | Missing: a row-wise torch IterableDataset with shard\_strategy='file' and world\_size/rank sharding. Wave W12. |
 | `to_torch_map_dataset` | n/a | gap | Not yet: a map-style (random access) torch Dataset. Wave W12. |
-| `transform` | `Dataset.pipe` | canonical |  |
-| `union` | `Dataset.union` | mismatch | Differs: Daft union is UNION DISTINCT; Batcher union is UNION ALL. Param: distinct=True. Wave W0. |
-| `union_all` | `Dataset.union` | canonical |  |
-| `union_all_by_name` | `Dataset.union` | param | Missing: by\_name=True column matching. Wave W2. |
-| `union_by_name` | `Dataset.union` | param | Missing: by\_name=True column matching (with distinct=True). Wave W2. |
-| `unique` | `Dataset.distinct` | canonical |  |
-| `unpivot` | `Dataset.unpivot` | canonical |  |
-| `var` | `Dataset.var` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.var takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=. Wave W0. |
-| `where` | `Dataset.filter` | canonical |  |
-| `with_column` | `Dataset.with_columns` | canonical |  |
-| `with_column_renamed` | `Dataset.rename` | canonical |  |
-| `with_columns` | `Dataset.with_columns` | canonical |  |
-| `with_columns_renamed` | `Dataset.rename` | canonical |  |
+| `transform` | {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | canonical |  |
+| `union` | {py:obj}`Dataset.union <batcher.Dataset.union>` | mismatch | Differs: Daft union is UNION DISTINCT; Batcher union is UNION ALL. Param: distinct=True. Wave W0. |
+| `union_all` | {py:obj}`Dataset.union <batcher.Dataset.union>` | canonical |  |
+| `union_all_by_name` | {py:obj}`Dataset.union <batcher.Dataset.union>` | param | Missing: by\_name=True column matching. Wave W2. |
+| `union_by_name` | {py:obj}`Dataset.union <batcher.Dataset.union>` | param | Missing: by\_name=True column matching (with distinct=True). Wave W2. |
+| `unique` | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | canonical |  |
+| `unpivot` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
+| `var` | {py:obj}`Dataset.var <batcher.Dataset.var>` | mismatch | Differs: Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.var takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=. Wave W0. |
+| `where` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | canonical |  |
+| `with_column` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
+| `with_column_renamed` | {py:obj}`Dataset.rename <batcher.Dataset.rename>` | canonical |  |
+| `with_columns` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
+| `with_columns_renamed` | {py:obj}`Dataset.rename <batcher.Dataset.rename>` | canonical |  |
 | `write_bigtable` | n/a | gap | Not yet: Google Cloud Bigtable sink. Wave W13. |
 | `write_clickhouse` | `Dataset.write.clickhouse` | canonical |  |
 | `write_csv` | `Dataset.write.csv` | mismatch | Differs: Daft write\_csv defaults to write\_mode='append' and returns a DataFrame of written paths; Batcher ds.write.csv defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks. Wave W13. |
@@ -117,22 +117,22 @@ The following table maps the 16 names on `GroupedDataFrame`, sorted alphabetical
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `agg` | `GroupBy.agg` | canonical |  |
-| `any_value` | `GroupBy.agg` + `Expr.any_value` | canonical |  |
-| `count` | `GroupBy.count` | canonical |  |
-| `count_distinct` | `GroupBy.count_distinct` | param | Missing: GroupBy.count\_distinct, which Batcher keeps as the one spelling. Wave WF. |
-| `list_agg` | `GroupBy.array_agg` | canonical |  |
-| `list_agg_distinct` | `GroupBy.array_agg` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
-| `map_groups` | `GroupBy.map_groups` | param | Missing: a Daft-style UDF Expression argument whose result column is named after its first input. Wave W11. |
-| `max` | `GroupBy.max` | canonical |  |
-| `mean` | `GroupBy.mean` | canonical |  |
-| `min` | `GroupBy.min` | canonical |  |
-| `product` | `GroupBy.product` | canonical |  |
-| `skew` | `GroupBy.skew` | mismatch | Differs: Daft skew is the population value; port as agg(col(c).skew(bias=True)) per column. Wave W0. |
-| `stddev` | `GroupBy.std` | param | Missing: ddof=. Wave W2. |
-| `string_agg` | `GroupBy.agg` + `Expr.str.join` | canonical |  |
-| `sum` | `GroupBy.sum` | canonical |  |
-| `var` | `GroupBy.var` | param | Missing: ddof=. Wave W2. |
+| `agg` | {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` | canonical |  |
+| `any_value` | {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` + {py:obj}`Expr.any_value <batcher.plan.expr_ir.core.Expr.any_value>` | canonical |  |
+| `count` | {py:obj}`GroupBy.count <batcher.GroupBy.count>` | canonical |  |
+| `count_distinct` | {py:obj}`GroupBy.count_distinct <batcher.GroupBy.count_distinct>` | param | Missing: GroupBy.count\_distinct, which Batcher keeps as the one spelling. Wave WF. |
+| `list_agg` | {py:obj}`GroupBy.array_agg <batcher.GroupBy.array_agg>` | canonical |  |
+| `list_agg_distinct` | {py:obj}`GroupBy.array_agg <batcher.GroupBy.array_agg>` | param | Missing: distinct=True (distinct values, nulls dropped). Wave W2. |
+| `map_groups` | {py:obj}`GroupBy.map_groups <batcher.GroupBy.map_groups>` | param | Missing: a Daft-style UDF Expression argument whose result column is named after its first input. Wave W11. |
+| `max` | {py:obj}`GroupBy.max <batcher.GroupBy.max>` | canonical |  |
+| `mean` | {py:obj}`GroupBy.mean <batcher.GroupBy.mean>` | canonical |  |
+| `min` | {py:obj}`GroupBy.min <batcher.GroupBy.min>` | canonical |  |
+| `product` | {py:obj}`GroupBy.product <batcher.GroupBy.product>` | canonical |  |
+| `skew` | {py:obj}`GroupBy.skew <batcher.GroupBy.skew>` | mismatch | Differs: Daft skew is the population value; port as agg(col(c).skew(bias=True)) per column. Wave W0. |
+| `stddev` | {py:obj}`GroupBy.std <batcher.GroupBy.std>` | param | Missing: ddof=. Wave W2. |
+| `string_agg` | {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` + `Expr.str.join` | canonical |  |
+| `sum` | {py:obj}`GroupBy.sum <batcher.GroupBy.sum>` | canonical |  |
+| `var` | {py:obj}`GroupBy.var <batcher.GroupBy.var>` | param | Missing: ddof=. Wave W2. |
 
 ## `Window`
 
@@ -147,3 +147,11 @@ The following table maps the 7 names on `Window`, sorted alphabetically.
 | `rows_between` | `WindowExpr.over` | param | Missing: min\_periods= on a rows frame. Wave W5. |
 | `unbounded_following` | `WindowExpr.over` | canonical |  |
 | `unbounded_preceding` | `WindowExpr.over` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

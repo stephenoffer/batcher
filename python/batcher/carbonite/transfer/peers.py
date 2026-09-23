@@ -27,7 +27,6 @@ __all__ = [
     "flow_totals",
     "peer_transfers",
     "reset_peer_transfers",
-    "starved_ratio",
     "straggler_peer",
 ]
 
@@ -170,19 +169,6 @@ def bdp_bytes() -> int | None:
         note_suppressed("carbonite", "read the shuffle bandwidth-delay product", exc)
         return None
     return None if measured is None or measured <= 0 else int(measured)
-
-
-def starved_ratio() -> float | None:
-    """Share of this process's shuffle-fetch time spent waiting for data, or `None`.
-
-    The *lifetime* reading, for a diagnosis rather than for a control loop — see `flow_totals`
-    for why a controller must difference the totals instead.
-
-    Returns:
-        The ratio in `[0, 1]`, or `None` when nothing has been fetched.
-    """
-    starved, total = flow_totals()
-    return None if total <= 0 else min(1.0, max(0.0, starved / total))
 
 
 def reset_peer_transfers() -> None:

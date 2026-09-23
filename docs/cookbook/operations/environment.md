@@ -1,6 +1,6 @@
 # Environment report
 
-Half of "it works on my machine" is an optional extra present in one environment and absent in the other. `bt.versions()` and `bt.show_versions()` answer that in one line, so paste them into any bug report. Check `engine_profile` before you trust a timing: a debug build and a release build are not comparable.
+Half of "it works on my machine" is an optional extra present in one environment and absent in the other. {py:obj}`bt.versions() <batcher.versions>` and {py:obj}`bt.show_versions() <batcher.show_versions>` answer that in one line, so paste them into any bug report. Check `engine_profile` before you trust a timing: a debug build and a release build are not comparable.
 
 The script also lists every option with `option_names()` and the environment variable that overrides each with `env_var_names()`, which is how you configure a container without editing code.
 

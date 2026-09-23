@@ -4,7 +4,7 @@ This page compares Batcher with Spark: the measured standing on a single node, a
 
 ## The measured standing
 
-On one machine Batcher is far ahead. The following results are recorded in `benchmarks/BENCHMARK_RESULTS.md`, each correctness-gated against DuckDB:
+On one machine Batcher is far ahead. The following results are recorded in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md), each correctness-gated against DuckDB:
 
 | Workload | Result | Measured |
 |---|---|---|

@@ -116,18 +116,22 @@ class PairMeta(MetaBase):
         left_key, right_key = self._keys(on, right_on)
         return self._ask_pair(joins.key_overlap, left_key, right_key)
 
-    def estimated_rows(self, on: str, right_on: str | None = None) -> float:
+    def estimated_rows(self, on: str, right_on: str | None = None) -> float | None:
         """The estimated size of the join result — the number the optimizer orders joins by.
 
         Explicitly approximate, and free: it reads sketched distinct counts, never the data.
         Use it to decide whether a join is worth attempting at all, not to report a count.
+
+        ``None`` when either side cannot be estimated (a ``map_batches`` stage, a source that
+        cannot read its footers). That is "unknown", which ``0.0`` is not: ``0.0`` is kept for
+        a join whose key ranges prove it empty.
 
         Args:
             on: The join key on this side.
             right_on: The join key on the other side; defaults to `on`.
 
         Returns:
-            The estimated number of result rows.
+            The estimated number of result rows, or ``None`` if either side is unknown.
 
         Examples:
             .. doctest::
@@ -135,12 +139,13 @@ class PairMeta(MetaBase):
                 >>> import batcher as bt
                 >>> a = bt.from_pydict({"k": [1, 2]})
                 >>> b = bt.from_pydict({"k": [1, 2]})
-                >>> a.meta.against(b).estimated_rows("k") >= 0
+                >>> a.meta.against(b).estimated_rows("k") > 0
+                True
+                >>> a.meta.against(b.map_batches(lambda t: t)).estimated_rows("k") is None
                 True
         """
         left_key, right_key = self._keys(on, right_on)
-        estimate = self._ask_pair(joins.estimated_join_rows, left_key, right_key)
-        return 0.0 if estimate is None else estimate
+        return self._ask_pair(joins.estimated_join_rows, left_key, right_key)
 
     def _keys(self, on: str, right_on: str | None) -> tuple[str, str]:
         """Validate the join keys on both sides, defaulting the right key to the left one."""

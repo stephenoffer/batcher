@@ -2029,7 +2029,7 @@ fn fusable_input(op: &RelOp) -> Option<&RelOp> {
 /// build side, serially. Shared by the ordinary hash-join arm and the fused join pipeline, so a
 /// pipeline stage whose build is too large to broadcast runs exactly what the unfused path runs.
 #[allow(clippy::too_many_arguments)]
-fn join_partitioned(
+pub(crate) fn join_partitioned(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
     left_keys: &[String],
@@ -2317,9 +2317,49 @@ fn exec_join_pipeline(
             let t0 = Stopwatch::start();
             let rows_in = count_rows(&cur);
             let rows_build = count_rows(&builds[i]);
+            // The same admission the unfused `HashJoin` arm makes. This stage's build is by
+            // construction the *larger* side of the chain — the one that did not stream — so it
+            // is exactly the join most likely to exceed the envelope, and skipping the check
+            // here let a star join run every such stage in memory with no spill path (TPC-H q9
+            // at sf100). A build the pool cannot admit takes the grace join instead.
+            let build_bytes = batch_bytes(&builds[i]) as usize
+                + bc_runtime::join::estimate_build_bytes(rows_build as usize);
+            let _build_guard = match admit(opts, join_ids[n - 1 - i], build_bytes) {
+                Admit::Spill => {
+                    let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
+                    let sp = &global.with_budget(
+                        opts.op_budget(join_ids[n - 1 - i])
+                            .unwrap_or(global.memory_budget_bytes),
+                    );
+                    let in_bytes = batch_bytes(&cur) + build_bytes as u64;
+                    let (out, spill_vol) = spilling_hash_join_streaming(
+                        &cur, &builds[i], left_keys, right_keys, *join_type, output, sp,
+                    )?;
+                    push_breaker_spilled(
+                        m,
+                        join_ids[n - 1 - i],
+                        "hash_join",
+                        rows_in,
+                        rows_build,
+                        in_bytes,
+                        &out,
+                        t0,
+                        true,
+                        spill_vol,
+                        "interp",
+                    );
+                    // Release this stage's build before the next one runs.
+                    builds[i] = Vec::new();
+                    cur = out;
+                    i += 1;
+                    continue;
+                }
+                Admit::InMemory(reservation) => reservation,
+            };
             let (out, skewed) = join_partitioned(
                 &cur, &builds[i], left_keys, right_keys, *join_type, output, *strategy, opts,
             )?;
+            builds[i] = Vec::new();
             let elapsed_ns = t0.elapsed_ns();
             let (cpu_ns, peak_rss_bytes, hw) = t0.measure();
             m.record(OpMetric {
@@ -6232,6 +6272,78 @@ mod tests {
         let join = m.ops.iter().find(|o| o.kind == "hash_join").unwrap();
         assert!(join.spilled, "pool pressure must force the grace hash join");
         assert_eq!(rows(&seq), rows(&out));
+    }
+
+    /// A fused chain of inner joins honours the pool exactly as a lone join does.
+    ///
+    /// `exec_join_pipeline` runs any stage whose build is the larger side through the
+    /// partitioned join, and it used to do so without `admit` — so a star join ran every such
+    /// stage in memory whatever the envelope said, and TPC-H q9 at sf100 was OOM-killed rather
+    /// than spilling. Both builds here outnumber the probe, so neither stage streams and both
+    /// reach that branch; with the pool already full, both must take the grace join and the
+    /// relation must still be the oracle's. The `fuse_linear: false` arm is the control that
+    /// shows the chain is otherwise the ordinary two-join path.
+    #[test]
+    fn pool_pressure_spills_every_stage_of_a_fused_join_chain() {
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+
+        let keep_left = || {
+            vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "k".into(),
+                    alias: "k".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "v".into(),
+                },
+            ]
+        };
+        let join = |left: RelOp, source_id: usize| RelOp::HashJoin {
+            left: Box::new(left),
+            right: Box::new(RelOp::Scan { source_id }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: JoinType::Inner,
+            output: keep_left(),
+            strategy: JoinStrategy::Hash,
+        };
+        let plan = join(join(RelOp::Scan { source_id: 0 }, 1), 2);
+        let probe = vec![batch(&[1, 2, 3, 2, 5], &[10, 20, 30, 40, 50])];
+        let build1 = vec![batch(&[2, 3, 3, 4, 2, 9, 9, 8], &[1, 2, 3, 4, 5, 6, 7, 8])];
+        let build2 = vec![batch(&[2, 3, 7, 7, 7, 6, 6, 6, 6], &[0; 9])];
+        let inputs = [probe, build1, build2];
+        let seq = execute(&plan, &inputs).unwrap();
+        assert!(!rows(&seq).is_empty(), "the fixture must join something");
+
+        for fuse_linear in [true, false] {
+            let pool = MemoryPool::new(64);
+            let _held = pool.try_reserve(63).unwrap();
+            let dir = std::env::temp_dir().join(format!(
+                "bc_pool_join_chain_{}_{fuse_linear}",
+                std::process::id()
+            ));
+            let opts = ExecOptions {
+                agg_spill: Some(SpillOptions {
+                    memory_budget_bytes: 1 << 30,
+                    dir,
+                    codec: SpillCodec::None,
+                }),
+                pool: Some(Arc::clone(&pool)),
+                fuse_linear,
+                ..ExecOptions::default()
+            };
+            let (out, m) = execute_parallel_with_metrics(&plan, &inputs, &opts).unwrap();
+            let joins: Vec<_> = m.ops.iter().filter(|o| o.kind == "hash_join").collect();
+            assert_eq!(joins.len(), 2, "fuse_linear={fuse_linear}");
+            assert!(
+                joins.iter().all(|j| j.spilled),
+                "fuse_linear={fuse_linear}: every stage must spill under pool pressure"
+            );
+            assert_eq!(rows(&seq), rows(&out), "fuse_linear={fuse_linear}");
+        }
     }
 
     /// Metrics are a pure side-channel: the metered executor returns batches

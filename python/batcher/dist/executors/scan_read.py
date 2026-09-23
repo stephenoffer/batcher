@@ -249,10 +249,13 @@ def _scannable_fragments(splits):
     reason — a split whose credentials or tolerance would be silently dropped must be read
     by the reader that honors them.
     """
-    from batcher.io.splits import FileSplit, MultiFileSplit, RowGroupSplit
+    from batcher.io.splits import ConformedSplit, FileSplit, MultiFileSplit, RowGroupSplit
 
     frags: list[tuple[str, list[int] | None]] = []
     for split in splits:
+        # Taken only once each footer matches its strict-mode contract (`fragments_conform`).
+        if isinstance(split, ConformedSplit):
+            split = split.inner
         if isinstance(split, RowGroupSplit):
             frags.append((split.path, list(split.row_groups)))
             continue
@@ -562,6 +565,7 @@ def _dataset_scan_batches(splits, projection, predicate):
         import pyarrow.dataset as pads
 
         from batcher.io.filesystem import ensure_io_threads, resolve_filesystem
+        from batcher.io.splits.conformed import fragments_conform
 
         ensure_io_threads()  # lift the 8-thread S3 read cap (shared with the single-node path)
         fsw = resolve_filesystem(fragments[0][0])
@@ -577,6 +581,8 @@ def _dataset_scan_batches(splits, projection, predicate):
             fmt.make_fragment(fsw._p(path).rstrip("/"), filesystem=pafs, row_groups=row_groups)
             for path, row_groups in fragments
         ]
+        if not fragments_conform(splits, frags, _SCAN_PREFETCH):
+            return None  # a file differs from its strict-mode contract; the split conforms it
         dset = pads.FileSystemDataset(frags, frags[0].physical_schema, fmt, pafs)
         expr = None
         if predicate is not None:

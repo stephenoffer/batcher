@@ -176,10 +176,10 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
         StEndPoint => chain(&g.geometry)
             .and_then(|l| l.last().copied())
             .and_then(|c| rebuilt(Geometry::Point(Some(c)))),
-        StExteriorRing => g
-            .geometry
-            .polygons()
-            .first()
+        // Defined on a POLYGON only, as in PostGIS and DuckDB: a multipolygon has one
+        // exterior ring per member and no single answer, so it is null rather than
+        // whichever member happens to be first.
+        StExteriorRing => single_polygon(&g.geometry)
             .map(|p| p.exterior.clone())
             .filter(|r| !r.is_empty())
             .and_then(|r| rebuilt(Geometry::LineString(r))),
@@ -187,16 +187,25 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
             let Some(n) = i64_at(&cols[1], i, func)? else {
                 return Ok(None);
             };
-            g.geometry
-                .polygons()
-                .first()
-                .and_then(|p| p.interiors.get((n.max(1) - 1) as usize))
+            // 1-based. `n <= 0` names no ring and is null; clamping it to 1, as this
+            // did, answered `st_interior_ring_n(poly, 0)` and `(poly, -3)` with the
+            // first hole.
+            let idx = usize::try_from(n).ok().and_then(|n| n.checked_sub(1));
+            single_polygon(&g.geometry)
+                .zip(idx)
+                .and_then(|(p, k)| p.interiors.get(k))
                 .cloned()
                 .and_then(|r| rebuilt(Geometry::LineString(r)))
         }
         StCentroid => bc_geo::algo::measure::centroid(&g.geometry)
             .and_then(|c| rebuilt(Geometry::Point(Some(c)))),
-        StEnvelope => rebuilt(construct::envelope(&g)),
+        // A bounding box is 2D (PostGIS and DuckDB drop z here too); keeping the flag
+        // wrote every corner at z = 0, a height the input never had.
+        StEnvelope => Some(Geom {
+            srid,
+            has_z: false,
+            geometry: construct::envelope(&g),
+        }),
         StBoundary => rebuilt(construct::boundary(&g.geometry)),
         StConvexHull => rebuilt(construct::convex_hull(&g)),
         StPointOnSurface => linear::point_on_surface(&g.geometry).and_then(rebuilt),
@@ -211,7 +220,15 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
                     bc_geo::GeoError::invalid(format!("quad_segs must be positive, got {segs}")),
                 ));
             }
-            rebuilt(construct::buffer(&g, r, segs as usize).map_err(|e| caller_error(func, e))?)
+            // A buffer is planar and 2D, as it is in GEOS: an input z does not survive
+            // into a polygon grown around it.
+            row_result(bc_geo::algo::buffer::buffer(&g, r, segs as usize), func)?.map(|geometry| {
+                Geom {
+                    srid,
+                    has_z: false,
+                    geometry,
+                }
+            })
         }
         StSimplify => {
             let eps = num_arg!(func, cols, 1, i);
@@ -225,11 +242,17 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
         }),
         StForce3d => {
             let z = num_arg!(func, cols, 1, i);
-            Some(Geom {
-                srid,
-                has_z: true,
-                geometry: affine::force_3d(&g.geometry, z),
-            })
+            // PostGIS `ST_Force3D(geom, z)`: the z is *added* to a 2D geometry. One that
+            // already has z keeps it — overwriting it discarded real elevations.
+            if has_z {
+                Some(g)
+            } else {
+                Some(Geom {
+                    srid,
+                    has_z: true,
+                    geometry: affine::force_3d(&g.geometry, z),
+                })
+            }
         }
         StForcePolygonCcw => rebuilt(construct::force_winding(&g.geometry, true)),
         StForcePolygonCw => rebuilt(construct::force_winding(&g.geometry, false)),
@@ -351,6 +374,14 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
             })
         }
     })
+}
+
+/// The polygon of a `POLYGON`, and nothing for any other type.
+fn single_polygon(g: &Geometry) -> Option<&bc_geo::Polygon> {
+    match g {
+        Geometry::Polygon(p) => Some(p),
+        _ => None,
+    }
 }
 
 /// The single chain of a geometry, for `st_start_point` / `st_end_point`.

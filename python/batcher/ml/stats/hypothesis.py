@@ -10,6 +10,17 @@ Every test here reduces the data to a handful of aggregates in one pass, then ev
 survival function on the result — no per-row work and no third-party runtime dependency. Each
 returns a `TestResult` carrying the statistic, its degrees of freedom, and the p-value, and
 each is checked against SciPy in the tests.
+
+Missing and degenerate input follows SciPy's defaults, one rule for every test in `ml.stats`:
+
+* a **null** is a missing observation and is dropped -- in the value column, and in the group
+  column, where a null label is never a group of its own;
+* a **NaN** is a value, and it propagates: the statistic and p-value are NaN, never a p of 0
+  (SciPy's ``nan_policy="propagate"``);
+* **too little data** -- one row, a group of one, constant data, no pairs -- gives NaN, not an
+  exception, and constant groups that differ give an infinite statistic with ``p = 0``;
+* **too few groups** for the question (fewer than two, or not exactly two for a two-sample
+  test) raises `PlanError`, as SciPy raises for it.
 """
 
 from __future__ import annotations
@@ -18,19 +29,22 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from batcher.ml.stats._shared import indicator, scalar
+from batcher.ml.stats._shared import complete_rows, indicator, scalar
 from batcher.ml.stats._special import (
     chi2_sf,
     f_sf,
     normal_two_sided_p,
+    safe_ratio,
     students_t_ppf,
     students_t_two_sided_p,
 )
-from batcher.ml.stats.association import anova_f, chi_square
+from batcher.ml.stats.association import _anova, chi_square
 from batcher.plan.expr_ir.constructors import col
 from batcher.plan.functions.aggregate import corr, count_distinct, count_if, mean, std
 
 if TYPE_CHECKING:
+    import pyarrow as pa
+
     from batcher.api.dataset import Dataset
 
 __all__ = [
@@ -95,6 +109,33 @@ class TestResult:
     effect_size: float | None = None
 
 
+def _float(table: pa.Table, name: str) -> float:
+    """A one-row aggregate as a float, NaN where the engine returned null (no rows, or n=1)."""
+    value = table.column(name)[0].as_py()
+    return math.nan if value is None else float(value)
+
+
+def _require_groups(k: int, what: str, group: str, *, exactly_two: bool = False) -> None:
+    """Raise a `PlanError` unless `group` split the rows into enough groups for the test.
+
+    SciPy raises for fewer than two samples too (``f_oneway``, ``levene``, ``bartlett`` and
+    ``kruskal`` all do), because a between-groups test with one group has no question to answer.
+    Everything short of that -- a group of one row, constant data -- is a NaN result instead.
+    """
+    from batcher._internal.errors import PlanError
+
+    if exactly_two and k != 2:
+        raise PlanError(
+            f"{what} needs exactly two groups in {group!r} after dropping null labels and null "
+            f"values, found {k}. Filter {group!r} to the two levels you want to compare."
+        )
+    if k < 2:
+        raise PlanError(
+            f"{what} needs at least two groups in {group!r} after dropping null labels and null "
+            f"values, found {k}. Check that {group!r} is the grouping column and is not all null."
+        )
+
+
 def _mean_ci(estimate: float, se: float, df: float, level: float = 0.95) -> tuple[float, float]:
     """A two-sided t interval around `estimate`, at `level` coverage.
 
@@ -103,8 +144,10 @@ def _mean_ci(estimate: float, se: float, df: float, level: float = 0.95) -> tupl
     interval is a column. Here the mean, its standard error and the degrees of freedom are
     already scalars in hand, and at small `df` the normal quantile is too narrow.
     """
-    if not math.isfinite(se) or se <= 0.0 or df <= 0:
+    if se == 0.0:
         return (estimate, estimate)
+    if math.isnan(estimate) or not math.isfinite(se) or math.isnan(df) or df <= 0:
+        return (math.nan, math.nan)
     half = students_t_ppf(0.5 * (1.0 + level), df) * se
     return (estimate - half, estimate + half)
 
@@ -114,7 +157,8 @@ def t_test_1samp(ds: Dataset, popmean: float, column: str = "x") -> TestResult:
 
     The two-sided test of ``H0: mean == popmean``. Reduces the column to its mean, standard
     deviation, and count in one pass, then reads the p-value off a Student's t with ``n - 1``
-    degrees of freedom.
+    degrees of freedom. Nulls are skipped; a NaN in the column makes the result NaN, as does a
+    column of fewer than two values.
 
     Args:
         ds: The dataset to test.
@@ -135,19 +179,17 @@ def t_test_1samp(ds: Dataset, popmean: float, column: str = "x") -> TestResult:
             1.0
     """
     row = ds.agg(m=mean(col(column)), s=std(col(column)), n=col(column).count()).collect()
-    m = float(row.column("m")[0].as_py())
-    s = float(row.column("s")[0].as_py())
-    n = int(row.column("n")[0].as_py())
-    df = n - 1
-    se = s / math.sqrt(n)
-    t = (m - popmean) / se if s > 0 else math.inf
+    m, s, n = _float(row, "m"), _float(row, "s"), int(row.column("n")[0].as_py())
+    df = float(n - 1) if n > 0 else math.nan
+    se = s / math.sqrt(n) if n > 0 else math.nan
+    t = safe_ratio(m - popmean, se)
     return TestResult(
         statistic=t,
         pvalue=students_t_two_sided_p(t, df),
-        df=float(df),
+        df=df,
         ci=_mean_ci(m - popmean, se, df),
         n=n,
-        effect_size=(m - popmean) / s if s > 0 else math.inf,
+        effect_size=safe_ratio(m - popmean, s),
     )
 
 
@@ -168,7 +210,8 @@ def t_test_ind(ds: Dataset, value: str, group: str) -> TestResult:
         two-sided p-value.
 
     Raises:
-        PlanError: If `group` does not have exactly two distinct values.
+        PlanError: If `group` does not have exactly two distinct non-null values among the rows
+            with a value.
 
     Examples:
         .. doctest::
@@ -181,38 +224,31 @@ def t_test_ind(ds: Dataset, value: str, group: str) -> TestResult:
             >>> t_test_ind(ds, "x", "g").pvalue < 0.05
             True
     """
-    from batcher._internal.errors import PlanError
-
-    levels = sorted(
-        v.as_py()
-        for v in ds.select(group).distinct().collect().column(group)
-        if v.as_py() is not None
-    )
-    if len(levels) != 2:
-        raise PlanError(f"t_test_ind needs exactly two groups in {group!r}, found {len(levels)}.")
-    stats = {}
+    present = complete_rows(ds, value, group)
+    levels = sorted(v.as_py() for v in present.select(group).distinct().collect().column(group))
+    _require_groups(len(levels), "t_test_ind", group, exactly_two=True)
+    stats = []
     for level in levels:
-        sub = ds.filter(col(group) == level)
+        sub = present.filter(col(group) == level)
         row = sub.agg(m=mean(col(value)), v=std(col(value)) ** 2, n=col(value).count()).collect()
-        stats[level] = (
-            float(row.column("m")[0].as_py()),
-            float(row.column("v")[0].as_py()),
-            int(row.column("n")[0].as_py()),
-        )
-    (m1, v1, n1), (m2, v2, n2) = stats[levels[0]], stats[levels[1]]
-    se = math.sqrt(v1 / n1 + v2 / n2)
-    t = (m1 - m2) / se if se > 0 else math.inf
-    df = (v1 / n1 + v2 / n2) ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
+        stats.append((_float(row, "m"), _float(row, "v"), int(row.column("n")[0].as_py())))
+    (m1, v1, n1), (m2, v2, n2) = stats
+    a, b = v1 / n1, v2 / n2
+    se = math.sqrt(a + b)
+    t = safe_ratio(m1 - m2, se)
+    # Welch-Satterthwaite. A group of one row has no variance (NaN), which carries through.
+    spread = a * a / (n1 - 1) + b * b / (n2 - 1) if n1 > 1 and n2 > 1 else math.nan
+    df = (a + b) ** 2 / spread if spread > 0 else math.nan
     # Cohen's d takes the *pooled* SD even though the test itself is Welch's: the interval is
     # about the difference in the data's own units, while d is about a common scale.
-    pooled = math.sqrt(((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)) if n1 + n2 > 2 else 0.0
+    pooled = math.sqrt(((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)) if n1 + n2 > 2 else math.nan
     return TestResult(
         statistic=t,
         pvalue=students_t_two_sided_p(t, df),
         df=df,
         ci=_mean_ci(m1 - m2, se, df),
         n=n1 + n2,
-        effect_size=(m1 - m2) / pooled if pooled > 0 else math.inf,
+        effect_size=safe_ratio(m1 - m2, pooled),
     )
 
 
@@ -232,6 +268,9 @@ def anova_test(ds: Dataset, value: str, group: str) -> TestResult:
         A `TestResult` with the F statistic, its ``(df1, df2)`` pair, and the upper-tail
         p-value.
 
+    Raises:
+        PlanError: If fewer than two groups remain after dropping null values and labels.
+
     Examples:
         .. doctest::
 
@@ -243,12 +282,11 @@ def anova_test(ds: Dataset, value: str, group: str) -> TestResult:
             >>> anova_test(ds, "x", "g").pvalue < 0.05
             True
     """
-    f = anova_f(ds, value, group)
-    row = ds.agg(k=count_distinct(col(group)), n=col(value).count()).collect()
-    k = int(row.column("k")[0].as_py())
-    n = int(row.column("n")[0].as_py())
-    df1, df2 = float(k - 1), float(n - k)
-    return TestResult(statistic=f, pvalue=f_sf(f, df1, df2), df=(df1, df2), n=n)
+    parts = _anova(ds, value, group)
+    _require_groups(parts.k, "anova_test", group)
+    f = parts.f
+    df1, df2 = float(parts.k - 1), float(parts.n - parts.k)
+    return TestResult(statistic=f, pvalue=f_sf(f, df1, df2), df=(df1, df2), n=parts.n)
 
 
 def chi_square_test(ds: Dataset, x: str, y: str) -> TestResult:

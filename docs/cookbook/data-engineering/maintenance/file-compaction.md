@@ -117,7 +117,7 @@ print(len(glob.glob(os.path.join(capped, "*.parquet"))))
 |---|---|---|
 | `repartition(target_size_mb=...)` | at write time, from the materialized result | you know roughly how big the output should be |
 | `max_rows_per_file=` | at write time, per file | rows have a predictable width |
-| `bt.compact(path, target_size_mb=...)` | after the fact, rewriting the table | the small files already exist |
+| {py:obj}`bt.compact(path, target_size_mb=...) <batcher.compact>` | after the fact, rewriting the table | the small files already exist |
 
 For a streaming sink, the honest answer is that per-micro-batch files are the price of low latency. Write them small, and run compaction on a schedule. Trying to buffer your way out of it in the writer moves the latency somewhere less visible instead of removing it.
 
@@ -161,7 +161,7 @@ The retention window (7 days for Delta by default) is the safety argument: a fil
 ## The rules
 
 :::{important}
-`bt.compact` is single-writer and it rewrites in place. Do not run it against a table an ingest job is appending to: it materializes the current contents and writes them back, deleting the parts it replaced. Files written in between are not in the picture it took. Schedule it in a quiet window, or point the ingest at a Delta table and take the transaction.
+{py:obj}`bt.compact <batcher.compact>` is single-writer and it rewrites in place. Do not run it against a table an ingest job is appending to: it materializes the current contents and writes them back, deleting the parts it replaced. Files written in between are not in the picture it took. Schedule it in a quiet window, or point the ingest at a Delta table and take the transaction.
 :::
 
 It is also not free. Compacting a 500 GB table reads and writes 500 GB. Run it on the tables whose read pattern justifies it (the ones queried constantly), not on everything on a cron out of tidiness.
@@ -192,4 +192,4 @@ One file here, so nothing to do. Run it against the 40,000-file table and it say
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: the write options in full.
 - {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: file statistics, pruning, time travel.
 - {doc}`Delta Lake </integrations/lakehouse/delta-lake>`: what `vacuum` is protecting you from.
-- {doc}`IO API reference </api/relational/io>`: `bt.compact`, `bt.vacuum`, and the sink arguments.
+- {doc}`IO API reference </api/relational/io>`: {py:obj}`bt.compact <batcher.compact>`, {py:obj}`bt.vacuum <batcher.vacuum>`, and the sink arguments.

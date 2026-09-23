@@ -14,16 +14,29 @@ exist and are not restated here.
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit
+from functools import reduce
+
+from batcher.plan.expr_ir.constructors import when
+from batcher.plan.expr_ir.core import Expr, IntoExpr
 from batcher.plan.functions.aggregate import _as_column, corr
 
 __all__ = ["correlation_ratio", "point_biserial", "signal_ratio"]
 
 
-def _paired(x: IntoExpr, y: IntoExpr) -> tuple[Expr, Expr]:
-    """Both columns masked to null wherever either is null, so the pairing is exact."""
-    left, right = _as_column(x), _as_column(y)
-    return left + right * Lit(0), right + left * Lit(0)
+def _complete_cases(*columns: IntoExpr) -> tuple[Expr, ...]:
+    """Every column masked to null wherever *any* of them is null, so the rows line up exactly.
+
+    A moment built from several columns -- a covariance, a weighted variance -- has to drop a
+    row from every sum at once. Left to themselves, `sum(w * x)` and `sum(w)` each skip their
+    own nulls, so a row with a missing `x` still adds its weight to the denominator: a weighted
+    variance of ``[1, None, 3]`` at unit weights read 1.56 instead of 1.0.
+
+    The mask is a `when` rather than the ``x + y * 0`` arithmetic it replaces, which turned an
+    infinite partner into a NaN instead of passing the value through.
+    """
+    exprs = [_as_column(c) for c in columns]
+    present = reduce(lambda a, b: a & b, (e.is_not_null() for e in exprs))
+    return tuple(when(present).then(e) for e in exprs)
 
 
 def point_biserial(value: IntoExpr, outcome: Expr) -> Expr:
@@ -79,7 +92,7 @@ def correlation_ratio(value: IntoExpr, group_mean_of_value: IntoExpr) -> Expr:
             >>> round(means.agg(e=bt.correlation_ratio("y", "m")).to_pydict()["e"][0], 4)
             0.9878
     """
-    observed, fitted = _paired(value, group_mean_of_value)
+    observed, fitted = _complete_cases(value, group_mean_of_value)
     return fitted.var() / observed.var()
 
 

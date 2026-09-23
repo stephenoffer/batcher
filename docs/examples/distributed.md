@@ -43,7 +43,7 @@ python examples/dist/mergeable_equivalence.py --distributed
 BATCHER_EXAMPLES_DISTRIBUTED=1 python -m pytest tests/docs/test_examples.py -q -k dist
 ```
 
-CI installs no Ray, so a green PR gate says nothing about the distributed path. A recorded cluster run in `benchmarks/BENCHMARK_RESULTS.md` is the only evidence it works.
+CI installs no Ray, so a green PR gate says nothing about the distributed path. A recorded cluster run in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md) is the only evidence it works.
 
 ## Streaming
 
@@ -56,28 +56,30 @@ The table below lists the distributed and streaming scripts in path order.
 <!-- library-table: dist,streams -->
 | Script | Shows |
 | --- | --- |
-| `examples/dist/broadcast_versus_shuffle.py` | Two ways to join across a cluster, and the size that decides between them |
-| `examples/dist/end_to_end_distributed.py` | A full pipeline checked for single-node/distributed equivalence |
-| `examples/dist/fault_tolerance.py` | What survives a worker failure, and what the mergeable algebra guarantees |
-| `examples/dist/mergeable_equivalence.py` | The contract that makes distribution safe: partial, combine, finalize |
-| `examples/dist/multi_node_aggregation.py` | A grouped aggregate across partitions, checked against the single-node answer |
-| `examples/dist/partitioning.py` | Partition count: what it changes, and what it must not |
-| `examples/dist/scaling_characteristics.py` | How a query's cost moves as the partition count changes |
-| `examples/dist/shuffle_and_joins.py` | What a distributed join costs: the shuffle |
-| `examples/dist/spill_and_memory.py` | Bounded memory: what spilling buys and what it costs |
-| `examples/dist/transport_and_backpressure.py` | Moving bulk data between workers, and why it needs flow control |
-| `examples/streams/deduplication_in_stream.py` | Dropping duplicate events without keeping every key forever |
-| `examples/streams/exactly_once_semantics.py` | What makes a restart safe: idempotent writes and a durable position |
-| `examples/streams/incremental_accumulation.py` | Accumulating state across batches with a mergeable aggregate |
-| `examples/streams/late_data_and_watermarks.py` | Late-arriving events, and the watermark that decides when a window closes |
-| `examples/streams/micro_batches.py` | Batch is the bounded case of streaming: the same operators over a batch at a time |
-| `examples/streams/session_windows.py` | Session windows: grouping events by a gap rather than by a clock |
-| `examples/streams/trigger_and_output_modes.py` | Trigger and output mode: how often a streaming query fires, and what it emits |
-| `examples/streams/windowed_aggregation.py` | Time windows over an event stream, computed as a grouped aggregate |
+| [`examples/dist/broadcast_versus_shuffle.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/broadcast_versus_shuffle.py) | Two ways to join across a cluster, and the size that decides between them |
+| [`examples/dist/end_to_end_distributed.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/end_to_end_distributed.py) | A full pipeline checked for single-node/distributed equivalence |
+| [`examples/dist/fault_tolerance.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/fault_tolerance.py) | What survives a worker failure, and what the mergeable algebra guarantees |
+| [`examples/dist/inspecting_and_validating_on_a_cluster.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/inspecting_and_validating_on_a_cluster.py) | Profile, question and validate a table on a cluster, and get the answers one node gives |
+| [`examples/dist/mergeable_equivalence.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/mergeable_equivalence.py) | The contract that makes distribution safe: partial, combine, finalize |
+| [`examples/dist/multi_node_aggregation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/multi_node_aggregation.py) | A grouped aggregate across partitions, checked against the single-node answer |
+| [`examples/dist/partitioning.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/partitioning.py) | Partition count: what it changes, and what it must not |
+| [`examples/dist/scaling_characteristics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/scaling_characteristics.py) | How a query's cost moves as the partition count changes |
+| [`examples/dist/shuffle_and_joins.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/shuffle_and_joins.py) | What a distributed join costs: the shuffle |
+| [`examples/dist/spill_and_memory.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/spill_and_memory.py) | Bounded memory: what spilling buys and what it costs |
+| [`examples/dist/transport_and_backpressure.py`](https://github.com/stephenoffer/batcher/blob/main/examples/dist/transport_and_backpressure.py) | Moving bulk data between workers, and why it needs flow control |
+| [`examples/streams/deduplication_in_stream.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/deduplication_in_stream.py) | Dropping duplicate events without keeping every key forever |
+| [`examples/streams/exactly_once_semantics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/exactly_once_semantics.py) | What makes a restart safe: idempotent writes and a durable position |
+| [`examples/streams/incremental_accumulation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/incremental_accumulation.py) | Accumulating state across batches with a mergeable aggregate |
+| [`examples/streams/late_data_and_watermarks.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/late_data_and_watermarks.py) | Late-arriving events, and the watermark that decides when a window closes |
+| [`examples/streams/micro_batches.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/micro_batches.py) | Batch is the bounded case of streaming: the same operators over a batch at a time |
+| [`examples/streams/payload_codecs.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/payload_codecs.py) | Payload codecs: turning broker message bytes into typed columns, and back |
+| [`examples/streams/session_windows.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/session_windows.py) | Session windows: grouping events by a gap rather than by a clock |
+| [`examples/streams/trigger_and_output_modes.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/trigger_and_output_modes.py) | Trigger and output mode: how often a streaming query fires, and what it emits |
+| [`examples/streams/windowed_aggregation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streams/windowed_aggregation.py) | Time windows over an event stream, computed as a grouped aggregate |
 <!-- /library-table -->
 
 ## See also
 
 - {doc}`/architecture/deep-dives/distribution/index`: scheduling, the Flight shuffle, and credit-based flow control.
 - {doc}`/cookbook/streaming/index`: streaming recipes, from Kafka ETL to exactly-once sinks.
-- {doc}`/user-guide/moving-data/streaming`: sources, sinks, triggers, and output modes.
+- {doc}`/user-guide/moving-data/streaming/index`: sources, sinks, triggers, and output modes.

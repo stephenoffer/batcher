@@ -22,7 +22,7 @@ from batcher._internal.errors import PlanError
 from batcher._internal.sql_errors import parse_sql
 from batcher.api.catalog import SessionCatalog
 from batcher.api.dataset import Dataset
-from batcher.api.sql_session import catalog_sql, statements
+from batcher.api.sql_session import catalog_sql, statements, views
 from batcher.api.sql_session.registry import RegisteredFunction, resolve_type, validate_options
 
 __all__ = ["Session"]
@@ -55,11 +55,15 @@ class Session:
         "_models",
         "_plan_cache",
         "_tables",
+        "_views",
     )
 
     def __init__(self, *, dialect: str = "duckdb") -> None:
         """Create an empty session reading SQL in `dialect` (the sqlglot read dialect)."""
         self._tables: dict[str, Dataset] = {}
+        # `CREATE VIEW` definitions, translated afresh by every query that names one. They
+        # share one case-insensitive namespace with `_tables`; see `sql_session.views`.
+        self._views: dict[str, views.View] = {}
         self._functions: dict[str, RegisteredFunction] = {}
         self._models: dict[str, Any] = {}
         self._engines: dict[str, Any] = {}
@@ -89,13 +93,13 @@ class Session:
 
     def __repr__(self) -> str:
         """Show the registered table names, e.g. ``Session(tables=['emp', 'dept'])``."""
-        return f"Session(tables={list(self._tables)!r})"
+        return f"Session(tables={[*self._tables, *self._views]!r})"
 
     def __len__(self) -> int:
-        """The number of registered tables.
+        """The number of registered tables and views.
 
         Returns:
-            The count of tables in the session catalog.
+            The count of names in the session catalog.
 
         Examples:
             .. doctest::
@@ -106,16 +110,16 @@ class Session:
                 >>> len(s)
                 1
         """
-        return len(self._tables)
+        return len(self._tables) + len(self._views)
 
     def __contains__(self, name: str) -> bool:
-        """Whether a table is registered under `name`.
+        """Whether a table or view is registered under `name`, compared case-insensitively.
 
         Args:
             name: The table name to look up.
 
         Returns:
-            True if a table is registered under `name`.
+            True if a table or view is registered under `name`.
 
         Examples:
             .. doctest::
@@ -126,7 +130,7 @@ class Session:
                 >>> "t" in s
                 True
         """
-        return name in self._tables
+        return self._key(name) is not None
 
     def __getitem__(self, name: str) -> Dataset:
         """Get a registered table by name — sugar for `table`.
@@ -175,12 +179,13 @@ class Session:
 
     # --- tables ------------------------------------------------------------
     def register(self, name: str, dataset: Dataset | pa.Table, *, replace: bool = True) -> Dataset:
-        """Register `dataset` as the session view `name`, replacing any prior by default.
+        """Register `dataset` as the session table `name`, replacing any prior by default.
 
         The DuckDB ``con.register`` / Spark ``createOrReplaceTempView`` analogue, and with
-        ``replace=False`` Spark's ``createTempView``. A view is a name bound to a lazy plan in
+        ``replace=False`` Spark's ``createTempView``. The name is bound to a lazy plan in
         this session only; it shadows a catalog table of the same name and stores nothing.
-        A pyarrow table is lifted to a `Dataset`.
+        A pyarrow table is lifted to a `Dataset`. Names are case-insensitive, as in SQL:
+        registering ``MyTab`` replaces an existing ``mytab``.
 
         Args:
             name: The table name SQL queries will refer to.
@@ -202,22 +207,25 @@ class Session:
                 >>> s.list()
                 ['t']
         """
-        if not replace and name in self._tables:
+        existing = self._key(name)
+        if not replace and existing is not None:
             raise PlanError(
-                f"a view named {name!r} is already registered",
+                f"a table or view named {existing!r} is already registered",
                 hint="Pass replace=True to replace it, or Session.drop it first.",
             )
         ds = self._as_dataset(dataset)
+        self._forget(name)
         self._tables[name] = ds
         self._bump()
         return ds
 
     def table(self, name: str) -> Dataset:
-        """Return the view registered as `name`, or else the catalog table it resolves to.
+        """Return the table or view registered as `name`, or else the catalog table it names.
 
-        A session view (`register`) shadows a catalog table of the same name. A catalog
-        name resolves as ``session.catalog`` describes: ``"t"``, ``"ns.t"`` or
-        ``"catalog.ns.t"``.
+        A session name (`register`, ``CREATE TABLE AS``, ``CREATE VIEW``) shadows a catalog
+        table of the same name, and is matched case-insensitively. A view is translated
+        now, against the session's current tables. A catalog name resolves as
+        ``session.catalog`` describes: ``"t"``, ``"ns.t"`` or ``"catalog.ns.t"``.
 
         Examples:
             .. doctest::
@@ -237,8 +245,11 @@ class Session:
         Raises:
             PlanError: If neither a view nor a catalog table has that name.
         """
-        if name in self._tables:
-            return self._tables[name]
+        key = self._key(name)
+        if key in self._views:
+            return views.expand(self, key)
+        if key is not None:
+            return self._tables[key]
         if self._catalog.has_table(name):
             return self._catalog.get_table(name).read()
         raise PlanError(
@@ -247,7 +258,7 @@ class Session:
         )
 
     def list(self) -> list[str]:
-        """The sorted names of all registered tables.
+        """The sorted names of all registered tables and views.
 
         Examples:
             .. doctest::
@@ -260,12 +271,12 @@ class Session:
                 ['a', 'b']
 
         Returns:
-            The sorted list of registered table names.
+            The sorted list of registered table and view names.
         """
-        return sorted(self._tables)
+        return sorted([*self._tables, *self._views])
 
     def drop(self, name: str) -> None:
-        """Remove table `name` from the catalog (no error if absent).
+        """Remove the table or view `name` from the session (no error if absent).
 
         Examples:
             .. doctest::
@@ -279,13 +290,13 @@ class Session:
                 ['b']
 
         Args:
-            name: The table name to remove from the catalog.
+            name: The table or view name to remove, matched case-insensitively.
         """
-        self._tables.pop(name, None)
+        self._forget(name)
         self._bump()
 
     def clear(self) -> None:
-        """Remove every registered table (registered functions and dialect are kept).
+        """Remove every registered table and view (functions and dialect are kept).
 
         Examples:
             .. doctest::
@@ -298,6 +309,7 @@ class Session:
                 []
         """
         self._tables.clear()
+        self._views.clear()
         self._bump()
 
     # --- functions ---------------------------------------------------------
@@ -572,8 +584,18 @@ class Session:
         into this session and ``DROP TABLE`` unregisters one; ``INSERT`` /
         ``DELETE`` / ``UPDATE`` rebind the target table to its new state (a pure
         plan rewrite — union / filter / projected CASE — that runs only on a later
-        terminal op). Everything else is a ``SELECT``-family query. Every form
-        returns a lazy `Dataset` — the query result, or the table's new state.
+        terminal op). ``CREATE VIEW`` stores the query text, and every later query
+        naming the view translates it again, so a view sees the base tables as they
+        are when it is queried. Everything else is a ``SELECT``-family query.
+
+        A ``SELECT`` returns a lazy `Dataset` and does no work until a terminal op, with
+        these exceptions, each evaluated while the statement is translated: a
+        ``WITH RECURSIVE`` CTE (run to its fixpoint), an uncorrelated scalar subquery
+        (inlined as a literal), an uncorrelated ``EXISTS`` (a ``LIMIT 1`` probe) or ``NOT IN``
+        (two ``LIMIT 1`` probes, for an empty set and a NULL), and the membership set of an
+        uncorrelated ``IN (SELECT ...)`` under ``OR`` or read as a value. Statements that
+        write a *catalog* table (``CREATE TABLE ns.t AS``, ``INSERT``/``DELETE``/``UPDATE`` on
+        one) write it immediately.
 
         Args:
             query: A SQL statement.
@@ -629,6 +651,8 @@ class Session:
             return statements.dml(self, ast, tables)
         ast, resolved, dynamic = catalog_sql.bind(self, ast, tables)
         ds = self._translate_bound(ast, {**tables, **resolved})
+        # A view is re-translated on every reference, so a plan over one is never reused.
+        dynamic = dynamic or bool(views.referenced_views(self, ast, tables))
         # A plan over a catalog table, or one that inlined session state such as
         # `current_catalog()`, is rebuilt every call: the table's storage and the session's
         # position both change without the query text changing.
@@ -657,30 +681,69 @@ class Session:
     # attributes. Publishing them to widen a within-package seam would enlarge the
     # documented public API, which is a commitment we don't make for plumbing.
 
-    def _translate(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
+    def _translate(
+        self, ast: Any, tables: dict[str, Dataset | pa.Table], active: tuple[str, ...] = ()
+    ) -> Dataset:
         """Lower a parsed ``SELECT``-family AST to a `Dataset` against this catalog.
 
         Args:
             ast: The parsed statement.
             tables: Per-call bindings, which shadow the catalog for this call.
+            active: Views being expanded around this translation (cycle guard).
 
         Returns:
             The lazy result relation.
         """
         ast, resolved, _ = catalog_sql.bind(self, ast, tables)
-        return self._translate_bound(ast, {**tables, **resolved})
+        return self._translate_bound(ast, {**tables, **resolved}, active)
 
-    def _translate_bound(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
-        """Lower an AST whose catalog references `catalog_sql.bind` already resolved."""
+    def _translate_bound(
+        self, ast: Any, tables: dict[str, Dataset | pa.Table], active: tuple[str, ...] = ()
+    ) -> Dataset:
+        """Lower an AST whose catalog references `catalog_sql.bind` already resolved.
+
+        Every view the AST names is translated here, now, against the current session.
+        """
         from batcher._sql import translate_ast
 
+        registry: dict[str, Dataset | pa.Table] = {**self._tables}
+        listing = views.lists_catalog(ast)
+        for key in views.referenced_views(self, ast, tables):
+            try:
+                registry[key] = views.expand(self, key, active)
+            except PlanError:
+                if not listing:
+                    raise  # a query naming a broken view fails, as in DuckDB
         return translate_ast(
             ast,
             functions=self._functions,
             models=self._models,
             engines=self._engines,
-            **{**self._tables, **tables},
+            **{**registry, **tables},
         )
+
+    def _key(self, name: str) -> str | None:
+        """The stored spelling of the session table or view `name` names, if any."""
+        return views.find(self._tables, name) or views.find(self._views, name)
+
+    def _forget(self, name: str) -> None:
+        """Remove every entry `name` names, whatever its case, from tables and views."""
+        for store in (self._tables, self._views):
+            key = views.find(store, name)
+            if key is not None:
+                del store[key]
+
+    def _define_view(self, name: str, view: views.View) -> None:
+        """Bind `name` to a view definition, replacing any table or view of that name.
+
+        Args:
+            name: The view name as written.
+            view: The definition.
+        """
+        key = self._key(name) or name
+        self._forget(name)
+        self._views[key] = view
+        self._bump()
 
     def _rebind(self, name: str, dataset: Dataset) -> None:
         """Point `name` at `dataset` and invalidate the prepared-statement cache.
@@ -689,7 +752,9 @@ class Session:
             name: The catalog name to bind.
             dataset: The relation to bind it to.
         """
-        self._tables[name] = dataset
+        key = self._key(name) or name
+        self._forget(name)
+        self._tables[key] = dataset
         self._bump()
 
     def _unbind(self, name: str) -> None:
@@ -698,7 +763,7 @@ class Session:
         Args:
             name: The catalog name to remove.
         """
-        self._tables.pop(name, None)
+        self._forget(name)
         self._bump()
 
     def _with_dialect(self, dialect: str) -> Session:
@@ -712,6 +777,7 @@ class Session:
         """
         view = Session.__new__(Session)
         view._tables = self._tables
+        view._views = self._views
         view._functions = self._functions
         view._models = self._models
         view._engines = self._engines

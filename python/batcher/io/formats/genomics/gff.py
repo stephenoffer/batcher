@@ -23,11 +23,13 @@ from collections.abc import Iterator
 from typing import IO, Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from batcher._internal.errors import FormatError
 from batcher.io.base import FileSink, FileSource
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.genomics import _tsv
+from batcher.io.formats.genomics._blocks import iter_blocks
 from batcher.io.formats.genomics._tsv import NULL_VALUES
 
 __all__ = ["GFF_SCHEMA", "GffSink", "GffSource"]
@@ -55,12 +57,15 @@ _NAMES = list(GFF_SCHEMA.names)
 _TYPES = {f.name: f.type for f in GFF_SCHEMA}
 
 
-def _is_comment(line: str) -> bool:
-    # `#` covers both the `##` directives (`##gff-version 3`, `##sequence-region`) and plain
-    # comments. The `##FASTA` directive ends the annotation section and is followed by
-    # sequence data; those lines start with `>` or are bare sequence, and both are skipped
-    # by the column-count check in `_parse`, so no separate state machine is needed.
-    return line.startswith("#")
+def _end_of_annotations(lines: pa.Array) -> pa.Array:
+    """True from where the annotation table ends: `##FASTA`, or a bare FASTA `>` header.
+
+    A GFF3 file may append the sequences it annotates after a `##FASTA` directive, and those
+    lines are not nine-column records — reading on past it failed the whole file with
+    "Expected 9 columns". A line starting with `>` ends it too, because GFF3 forbids a seqid
+    that begins with an unescaped `>`, so such a line can only be a sequence header.
+    """
+    return pc.or_(pc.starts_with(lines, "##FASTA"), pc.starts_with(lines, ">"))
 
 
 @SOURCES.register("gff")
@@ -88,9 +93,13 @@ class GffSource(FileSource):
             yield from self._iter_records(fh, projection)
 
     def _iter_records(self, fh: IO[Any], projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        # `#` covers both the `##` directives (`##gff-version 3`, `##sequence-region`) and
+        # plain comments; the embedded FASTA section ends the read.
         yield from _tsv.iter_record_batches(
-            fh,
-            is_comment=_is_comment,
+            iter_blocks(fh),
+            markers=(b"#", b">"),
+            is_comment=_tsv.hash_comment,
+            end_of_data=_end_of_annotations,
             names=_NAMES,
             types=_TYPES,
             null_values=NULL_VALUES,

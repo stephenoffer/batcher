@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import IO, Any
 
 import pyarrow as pa
@@ -16,6 +17,7 @@ from batcher.io.detect import compression_for_path
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.structured._csv_diagnostics import (
+    duplicate_header_error,
     invalid_utf8_error,
     mismatch_reported,
 )
@@ -25,6 +27,7 @@ from batcher.io.formats.structured._csv_options import (
     resolve_read_options,
     resolve_write_options,
 )
+from batcher.io.formats.structured._csv_ranges import record_aligned_starts
 from batcher.io.splits import FileSplit, Split, read_aligned_range
 
 __all__ = ["CSVRangeSplit", "CSVSink", "CSVSource"]
@@ -153,6 +156,9 @@ class CSVSource(FileSource):
 
     suffix = ".csv"
     format_name = "csv"
+    # `_reader_kwargs` sends the resolved schema, so a worker's one-file reader is already
+    # held to the strict-mode contract and its splits need no conforming wrapper.
+    splits_pin_schema = True
 
     __slots__ = ("_options",)
 
@@ -221,7 +227,13 @@ class CSVSource(FileSource):
         holds one file, so re-deriving the schema there would re-infer from that file's rows
         and could disagree with the schema the plan was built against.
         """
-        return {**super()._reader_kwargs(), **self._options.as_kwargs(), "schema": self.schema()}
+        kwargs = {**super()._reader_kwargs(), **self._options.as_kwargs(), "schema": self.schema()}
+        if self._schema_mode != "strict":
+            # The pinned schema is the reconciled one, which names columns a given file may
+            # not hold. Carrying the mode lets the worker's one-file reader do what the
+            # driver's does: read the columns that file has, then fill in the rest.
+            kwargs["schema_mode"] = self._schema_mode
+        return kwargs
 
     def _convert_options(self, projection: list[str] | None) -> Any:
         """Convert options pinning the advertised column types (and the projection).
@@ -277,6 +289,9 @@ class CSVSource(FileSource):
         # failing, which turns a corrupt file into a successful read of a differently-typed
         # table. Nothing downstream can tell that apart from a column of genuine bytes, so
         # the refusal has to happen here, where the choice was made.
+        duplicate = duplicate_header_error(self._path, list(schema.names))
+        if duplicate is not None:
+            raise duplicate
         binary_cols = [f.name for f in schema if pa.types.is_binary(f.type)]
         if binary_cols:
             raise invalid_utf8_error(
@@ -285,14 +300,28 @@ class CSVSource(FileSource):
         return schema
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
+        return self._read_table(fh, projection, self._path)
+
+    def _read_by_path(self, path: str, projection: list[str] | None) -> list[pa.RecordBatch]:
+        """Read `path` through `_read_table`, so a failure names this file, not the source.
+
+        A directory read's error used to name the directory, and the same failure raised on
+        a worker, whose one-file source *is* the file, named the file: one read, two messages.
+        """
+        with self._open(path) as fh:
+            return self._read_table(fh, projection, path)
+
+    def _read_table(
+        self, fh: IO[Any], projection: list[str] | None, path: str
+    ) -> list[pa.RecordBatch]:
         import pyarrow.csv as pacsv
 
         # The projection is pushed into the parse (`include_columns`) so pyarrow only
         # *converts* the wanted columns, and the types are pinned so this path cannot
         # disagree with `schema()` — it used to re-infer over the whole file and return a
         # widened type the engine had not planned for.
-        with mismatch_reported(self._path):
-            table = pacsv.read_csv(fh, **self._parse_kwargs(projection, pin_types=True))
+        with mismatch_reported(path):
+            table = pacsv.read_csv(fh, **self._parse_kwargs(projection, pin_types=True, path=path))
         return table.to_batches()
 
     def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
@@ -306,10 +335,9 @@ class CSVSource(FileSource):
         import pyarrow.csv as pacsv
 
         # `_open` rather than `_fs.open`, so `events.csv.gz` streams here too.
-        with self._open(path) as fh:
+        with self._open(path) as fh, mismatch_reported(path):
             reader = pacsv.open_csv(fh, **self._parse_kwargs(projection, pin_types=True, path=path))
-            with mismatch_reported(self._path):
-                yield from reader
+            yield from reader
 
     def _file_splits(
         self,
@@ -340,13 +368,31 @@ class CSVSource(FileSource):
             return [FileSplit(self.format_name, path, self._reader_kwargs())]
         if size <= chunk:
             return [FileSplit(self.format_name, path, self._reader_kwargs())]
+        # A range must begin where a record begins, and a newline inside a quoted field is
+        # not that: cutting after one parsed the field's tail as rows the file never held.
+        # `record_aligned_starts` proves each cut from the file's quote parity, which costs
+        # a scan, so it is done only where the planner can read the file cheaply.
+        starts = None if self._is_remote() else self._record_starts(path, size, chunk)
+        if starts is None:
+            return [FileSplit(self.format_name, path, self._reader_kwargs())]
         # The advertised schema, not the caller's raw `schema=`, so every range is pinned to
         # the same types the plan was built against even when they came from inference.
         schema, options = self.schema(), self._options.range_kwargs()
-        return [
-            CSVRangeSplit(path, start, min(start + chunk, size), schema, options)
-            for start in range(0, size, chunk)
-        ]
+        bounds = [*starts, size]
+        return [CSVRangeSplit(path, start, end, schema, options) for start, end in pairwise(bounds)]
+
+    def _record_starts(self, path: str, size: int, chunk: int) -> list[int] | None:
+        """Offsets about `chunk` apart where a record of `path` provably begins, else None."""
+        quote = self._options.quote_char
+        escape = self._options.escape_char
+        return record_aligned_starts(
+            self._fs,
+            path,
+            size,
+            chunk,
+            quote='"' if quote is None else (quote or None),
+            escape=escape or None,
+        )
 
 
 def _reject_types_csv_cannot_write(schema: pa.Schema) -> None:
@@ -442,25 +488,23 @@ class CSVSink(FileSink):
         # ranges CONCURRENTLY (pyarrow's CSV encoder releases the GIL) into in-memory
         # buffers — only the first carries the header — and write them back to back.
         _reject_types_csv_cannot_write(table.schema)
-        table = self._options.apply_nulls(table)
         n = table.num_rows
         workers = min(n // _CSV_PARALLEL_MIN_ROWS, available_cpu_count())
         if workers <= 1:
+            if self._options.null_value is not None:
+                fh.write(memoryview(self._options.encode(table, include_header=True)))
+                return
             options = self._options.write_options(include_header=True)
             pacsv.write_csv(table, fh, write_options=options)
             return
         rows = -(-n // workers)  # ceil
         slices = [(i, table.slice(off, rows)) for i, off in enumerate(range(0, n, rows))]
 
-        def _encode(item: tuple[int, pa.Table]) -> pa.Buffer:
+        def _encode(item: tuple[int, pa.Table]) -> pa.Buffer | bytes:
             idx, chunk = item
-            sink = pa.BufferOutputStream()
-            # `include_header=idx == 0` is the chunk's turn; `write_options` ANDs it with the
+            # `include_header=idx == 0` is the chunk's turn; `encode` ANDs it with the
             # caller's `header=`, so `header=False` suppresses it on the first chunk too.
-            pacsv.write_csv(
-                chunk, sink, write_options=self._options.write_options(include_header=idx == 0)
-            )
-            return sink.getvalue()
+            return self._options.encode(chunk, include_header=idx == 0)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             buffers = list(pool.map(_encode, slices))  # order preserved
@@ -501,23 +545,16 @@ class CSVSink(FileSink):
         return self._stream_to_file(batches, path, schema=schema, resume=resume, encode=encode)
 
     def _encode_stream_parallel(self, batches: Iterator[pa.RecordBatch], fh: IO[Any]) -> int:
-        import pyarrow.csv as pacsv
 
         # Checked per batch rather than once, because this path is handed an *iterator* and
         # has no schema before the first batch arrives. It is a field-list walk, so paying it
         # per batch costs nothing measurable next to encoding the rows.
-        def _encode(item: tuple[int, pa.RecordBatch]) -> pa.Buffer:
+        def _encode(item: tuple[int, pa.RecordBatch]) -> pa.Buffer | bytes:
             idx, batch = item
             _reject_types_csv_cannot_write(batch.schema)
-            sink = pa.BufferOutputStream()
             # `idx` counts batches across the WHOLE stream, not within a window, so exactly
-            # one chunk is ever offered the header; `write_options` then honors `header=`.
-            pacsv.write_csv(
-                self._options.apply_nulls(pa.table(batch)),
-                sink,
-                write_options=self._options.write_options(include_header=idx == 0),
-            )
-            return sink.getvalue()
+            # one chunk is ever offered the header; `encode` then honors `header=`.
+            return self._options.encode(pa.table(batch), include_header=idx == 0)
 
         cores = available_cpu_count()
         window = max(1, cores * _CSV_STREAM_WINDOW_PER_CORE)
@@ -546,17 +583,35 @@ class CSVSink(FileSink):
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
         import pyarrow.csv as pacsv
 
-        # The writer is opened against the schema `apply_nulls` will actually hand it — an
-        # all-string one when `null_value=` is set — or every appended batch would be
-        # rejected for not matching the schema the writer was opened with.
+        if self._options.null_value is not None:
+            return _TokenWriter(fh, self._options, schema)
         return pacsv.CSVWriter(
-            fh,
-            self._options.null_schema(schema),
-            write_options=self._options.write_options(include_header=True),
+            fh, schema, write_options=self._options.write_options(include_header=True)
         )
 
     def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
-        writer.write(self._options.apply_nulls(pa.table(batch)))
+        writer.write(pa.table(batch))
 
     def _close_stream_writer(self, writer: Any) -> None:
         writer.close()
+
+
+class _TokenWriter:
+    """The incremental writer for a `null_value=` write, which Arrow's `CSVWriter` cannot do.
+
+    It writes the header on open, as `CSVWriter` does, so an empty stream still yields a file
+    with its column names.
+    """
+
+    __slots__ = ("_fh", "_options")
+
+    def __init__(self, fh: IO[Any], options: Any, schema: pa.Schema) -> None:
+        self._fh = fh
+        self._options = options
+        fh.write(memoryview(options.encode(schema.empty_table(), include_header=True)))
+
+    def write(self, table: pa.Table) -> None:
+        self._fh.write(memoryview(self._options.encode(table, include_header=False)))
+
+    def close(self) -> None:
+        """Nothing to flush: every `write` has already reached the file handle."""

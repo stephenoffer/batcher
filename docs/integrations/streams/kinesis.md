@@ -176,7 +176,7 @@ Only the ambient `boto3` credential chain and the `region` option reach the clie
 
 ## See also
 
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, watermarks, and checkpointing.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, and checkpointing.
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: what to do with the
   records once they land.
 - {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>`: the `query_name` contract

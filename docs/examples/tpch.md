@@ -39,7 +39,7 @@ Two rewrites recur across the suite and are worth recognizing. A correlated subq
 
 Q6 is the query with no joins and no grouping, so it isolates the read path. Comparing a wide read against a projected one, and a filtered one against an unfiltered one, shows what projection and predicate pushdown actually buy.
 
-Q9 is the opposite. Its filter is a substring match no statistic can help with, so the only way to cut work is to apply the expensive predicate to the smallest relation first. `examples/tpch/join_order_matters.py` runs the same five-table query in two orders and asserts they return identical rows.
+Q9 is the opposite. Its filter is a substring match no statistic can help with, so the only way to cut work is to apply the expensive predicate to the smallest relation first. [`examples/tpch/join_order_matters.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/join_order_matters.py) runs the same five-table query in two orders and asserts they return identical rows.
 
 ## Every script on this page
 
@@ -48,36 +48,36 @@ The table below lists the TPC-H scripts in path order.
 <!-- library-table: tpch -->
 | Script | Shows |
 | --- | --- |
-| `examples/tpch/aggregate_pipeline.py` | A full reporting pipeline over TPC-H, from scan to written report |
-| `examples/tpch/full_suite_verification.py` | Verifying every cached TPC-H table against the source it came from |
-| `examples/tpch/join_order_matters.py` | The same five-table query, written in two join orders |
-| `examples/tpch/q01_pricing_summary.py` | TPC-H Q1 - the pricing summary report over real `lineitem` data |
-| `examples/tpch/q01_variants.py` | Q1 written four ways, all returning the same answer |
-| `examples/tpch/q02_minimum_cost_supplier.py` | TPC-H Q2 - the cheapest supplier for a part, via a correlated minimum |
-| `examples/tpch/q03_incremental.py` | Q3 recomputed incrementally as new orders arrive |
-| `examples/tpch/q03_shipping_priority.py` | TPC-H Q3 - unshipped orders with the highest revenue |
-| `examples/tpch/q04_order_priority_checking.py` | TPC-H Q4 - order priority, counted with a semi join |
-| `examples/tpch/q05_local_supplier_volume.py` | TPC-H Q5 - revenue by nation, where customer and supplier share that nation |
-| `examples/tpch/q06_forecasting_revenue_change.py` | TPC-H Q6 - the single-table scan query: three predicates and one sum |
-| `examples/tpch/q06_variants_and_pushdown.py` | Q6 four ways, and what each costs |
-| `examples/tpch/q07_volume_shipping.py` | TPC-H Q7 - trade volume between two nations, in both directions |
-| `examples/tpch/q08_national_market_share.py` | TPC-H Q8 - one nation's share of a market, as a ratio of two conditional sums |
-| `examples/tpch/q09_product_type_profit.py` | TPC-H Q9 - profit by nation and year, from a substring match on part name |
-| `examples/tpch/q10_returned_item_reporting.py` | TPC-H Q10 - the customers costing you the most in returns |
-| `examples/tpch/q11_important_stock.py` | TPC-H Q11 - the parts holding most of the inventory value, against a computed threshold |
-| `examples/tpch/q12_shipping_modes.py` | TPC-H Q12 - late deliveries split by order priority, using conditional sums |
-| `examples/tpch/q13_customer_distribution.py` | TPC-H Q13 - how many customers have how many orders, including the zeros |
-| `examples/tpch/q14_promotion_effect.py` | TPC-H Q14 - what share of a month's revenue came from promotional parts |
-| `examples/tpch/q15_top_supplier.py` | TPC-H Q15 - the supplier with the highest quarterly revenue, via a reused subquery |
-| `examples/tpch/q16_parts_supplier_relationship.py` | TPC-H Q16 - how many suppliers can supply each part variant, after an exclusion |
-| `examples/tpch/q17_small_quantity_revenue.py` | TPC-H Q17 - revenue from unusually small orders, against a per-part average |
-| `examples/tpch/q18_large_volume_customer.py` | TPC-H Q18 - the orders whose total quantity crosses a threshold |
-| `examples/tpch/q19_discounted_revenue.py` | TPC-H Q19 - three unrelated product filters OR'd into one scan |
-| `examples/tpch/q20_potential_part_promotion.py` | TPC-H Q20 - suppliers holding excess stock, through two levels of subquery |
-| `examples/tpch/q21_suppliers_kept_orders_waiting.py` | TPC-H Q21 - the supplier who was the only one late on a multi-supplier order |
-| `examples/tpch/q22_global_sales_opportunity.py` | TPC-H Q22 - customers with a healthy balance who have never ordered |
-| `examples/tpch/query_suite_smoke.py` | Running every TPC-H example's core query in one pass, as a smoke check |
-| `examples/tpch/scan_and_project_costs.py` | What each TPC-H table costs to scan, and how much a projection saves |
+| [`examples/tpch/aggregate_pipeline.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/aggregate_pipeline.py) | A full reporting pipeline over TPC-H, from scan to written report |
+| [`examples/tpch/full_suite_verification.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/full_suite_verification.py) | Verifying every cached TPC-H table against the source it came from |
+| [`examples/tpch/join_order_matters.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/join_order_matters.py) | The same five-table query, written in two join orders |
+| [`examples/tpch/q01_pricing_summary.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q01_pricing_summary.py) | TPC-H Q1 - the pricing summary report over real `lineitem` data |
+| [`examples/tpch/q01_variants.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q01_variants.py) | Q1 written four ways, all returning the same answer |
+| [`examples/tpch/q02_minimum_cost_supplier.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q02_minimum_cost_supplier.py) | TPC-H Q2 - the cheapest supplier for a part, via a correlated minimum |
+| [`examples/tpch/q03_incremental.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q03_incremental.py) | Q3 recomputed incrementally as new orders arrive |
+| [`examples/tpch/q03_shipping_priority.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q03_shipping_priority.py) | TPC-H Q3 - unshipped orders with the highest revenue |
+| [`examples/tpch/q04_order_priority_checking.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q04_order_priority_checking.py) | TPC-H Q4 - order priority, counted with a semi join |
+| [`examples/tpch/q05_local_supplier_volume.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q05_local_supplier_volume.py) | TPC-H Q5 - revenue by nation, where customer and supplier share that nation |
+| [`examples/tpch/q06_forecasting_revenue_change.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q06_forecasting_revenue_change.py) | TPC-H Q6 - the single-table scan query: three predicates and one sum |
+| [`examples/tpch/q06_variants_and_pushdown.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q06_variants_and_pushdown.py) | Q6 four ways, and what each costs |
+| [`examples/tpch/q07_volume_shipping.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q07_volume_shipping.py) | TPC-H Q7 - trade volume between two nations, in both directions |
+| [`examples/tpch/q08_national_market_share.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q08_national_market_share.py) | TPC-H Q8 - one nation's share of a market, as a ratio of two conditional sums |
+| [`examples/tpch/q09_product_type_profit.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q09_product_type_profit.py) | TPC-H Q9 - profit by nation and year, from a substring match on part name |
+| [`examples/tpch/q10_returned_item_reporting.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q10_returned_item_reporting.py) | TPC-H Q10 - the customers costing you the most in returns |
+| [`examples/tpch/q11_important_stock.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q11_important_stock.py) | TPC-H Q11 - the parts holding most of the inventory value, against a computed threshold |
+| [`examples/tpch/q12_shipping_modes.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q12_shipping_modes.py) | TPC-H Q12 - late deliveries split by order priority, using conditional sums |
+| [`examples/tpch/q13_customer_distribution.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q13_customer_distribution.py) | TPC-H Q13 - how many customers have how many orders, including the zeros |
+| [`examples/tpch/q14_promotion_effect.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q14_promotion_effect.py) | TPC-H Q14 - what share of a month's revenue came from promotional parts |
+| [`examples/tpch/q15_top_supplier.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q15_top_supplier.py) | TPC-H Q15 - the supplier with the highest quarterly revenue, via a reused subquery |
+| [`examples/tpch/q16_parts_supplier_relationship.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q16_parts_supplier_relationship.py) | TPC-H Q16 - how many suppliers can supply each part variant, after an exclusion |
+| [`examples/tpch/q17_small_quantity_revenue.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q17_small_quantity_revenue.py) | TPC-H Q17 - revenue from unusually small orders, against a per-part average |
+| [`examples/tpch/q18_large_volume_customer.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q18_large_volume_customer.py) | TPC-H Q18 - the orders whose total quantity crosses a threshold |
+| [`examples/tpch/q19_discounted_revenue.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q19_discounted_revenue.py) | TPC-H Q19 - three unrelated product filters OR'd into one scan |
+| [`examples/tpch/q20_potential_part_promotion.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q20_potential_part_promotion.py) | TPC-H Q20 - suppliers holding excess stock, through two levels of subquery |
+| [`examples/tpch/q21_suppliers_kept_orders_waiting.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q21_suppliers_kept_orders_waiting.py) | TPC-H Q21 - the supplier who was the only one late on a multi-supplier order |
+| [`examples/tpch/q22_global_sales_opportunity.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/q22_global_sales_opportunity.py) | TPC-H Q22 - customers with a healthy balance who have never ordered |
+| [`examples/tpch/query_suite_smoke.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/query_suite_smoke.py) | Running every TPC-H example's core query in one pass, as a smoke check |
+| [`examples/tpch/scan_and_project_costs.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tpch/scan_and_project_costs.py) | What each TPC-H table costs to scan, and how much a projection saves |
 <!-- /library-table -->
 
 ## See also

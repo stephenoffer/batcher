@@ -56,18 +56,43 @@ _AVRO_LOGICAL_TO_ARROW: dict[str, pa.DataType] = {
 }
 
 
+def _holds_a_union(arrow_type: pa.DataType) -> bool:
+    """Does this Arrow type contain a union anywhere inside it?
+
+    Read off the *decoded* batch rather than predicted from the Avro schema, so it cannot
+    drift from what `arrow-avro` actually emits for a shape neither of us anticipated.
+    """
+    if pa.types.is_union(arrow_type):
+        return True
+    return any(_holds_a_union(arrow_type.field(i).type) for i in range(arrow_type.num_fields))
+
+
 def _read_native(data: bytes, batch_rows: int) -> list[pa.RecordBatch] | None:
     """Decode Avro bytes with the native `arrow-avro` reader (via `bc_io`), or ``None``.
 
     Returns ``None`` — signalling the caller to fall back to the row-by-row `fastavro`
     path — if the native engine is unavailable or the decode errors (an Avro feature
     ``arrow-avro`` does not yet cover), so the result is identical either way.
+
+    A **multi-branch union** is declined the same way, and for a reason worth stating
+    because it is not an error: `arrow-avro` decodes ``["null", "long", "string"]`` to an
+    Arrow `dense_union`, which is a faithful decode that this engine cannot use. No
+    operator consumes a union type, so `_arrow_type` advertises the Spark-compatible
+    `struct<member0, member1, ...>` that the fastavro path builds — and the native batches
+    then disagreed with the schema the source had already published, which
+    `conform_batch` correctly refused with "the values do not convert without loss". The
+    decode succeeding is exactly what made this invisible: nothing raised in the reader,
+    and the failure surfaced one layer up as a schema conflict against the file's own
+    advertised type.
     """
     try:
         _native = engine()
-        return _native.read_avro(data, batch_rows)
+        batches = _native.read_avro(data, batch_rows)
     except Exception:
         return None
+    if batches and any(_holds_a_union(f.type) for f in batches[0].schema):
+        return None
+    return batches
 
 
 def _require_fastavro() -> Any:

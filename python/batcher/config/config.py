@@ -1175,7 +1175,8 @@ class MetadataConfig:
 
     Core measures real cardinalities and operator costs each run and records them in
     the `MetadataHub`; Kyber reads them back to plan better next time. This selects
-    the backend (in-process, SQLite, Redis, object storage) and how quickly old
+    the backend (in-process, SQLite, RocksDB, Redis, object storage, or a layered
+    local-over-shared store) and how quickly old
     observations decay, so plans keep improving as a query is re-run.
 
     The default `in_process` backend keeps learned stats for the life of the process
@@ -1196,7 +1197,7 @@ class MetadataConfig:
             'in_process'
     """
 
-    backend: str = "in_process"  # "in_process" | "sqlite" | "redis" | "object_storage"
+    backend: str = "in_process"  # validation.sections.METADATA_BACKENDS names every choice
     # Backend location. None means the backend's default — for `sqlite`, a persistent
     # per-user file (see `metadata.backends.default_sqlite_uri`); pass `":memory:"` for
     # an ephemeral SQLite store.
@@ -1930,6 +1931,14 @@ class DistributedConfig:
     # unknown/large size distributes as before. Result-identical either way; an explicit
     # `distributed=True/False` always overrides. Set to 0 to always distribute on a cluster.
     distribute_min_rows: int = 1_000_000
+    # What `distributed="auto"` means, for every terminal that does not pass `distributed=`
+    # itself. That is most of them: the scalar terminals (`count`, `min`, `sum`), the
+    # `ds.meta` fallbacks, `ds.dq.validate()`/`fail()`, and `to_arrow`/`to_pydict` take no
+    # `distributed=` argument at all, so without this a data-quality gate or a metadata
+    # question could not be pinned to the cluster (or kept off it). "auto" is the size- and
+    # topology-aware routing above; "always" forces the Ray path, starting a local Ray when
+    # none is running; "never" stays single-node. An explicit `distributed=True/False` wins.
+    mode: str = "auto"
     # Cap on the number of shuffle partitions (reducers / hash buckets) an all-to-all
     # exchange creates — aggregate, join, sort, window, distinct. Without a cap the count
     # equals the worker fan-out (one per node), so the exchange is O(nodes²): at 10k nodes a

@@ -328,7 +328,7 @@ checks, never for de-identification.
 
 ## Scoping
 
-`bt.security(...)` is a context manager, not a setter, so a read cannot precede the
+{py:obj}`bt.security(...) <batcher.security>` is a context manager, not a setter, so a read cannot precede the
 policy that governs it. A `Dataset` built inside a block keeps that block's policy for
 its whole life, including terminal operations run after the block exits.
 
@@ -458,7 +458,7 @@ Batcher has no persistent policy store. A `SecurityCatalog` is built in Python, 
 - {doc}`Hardening a deployment </user-guide/trust/hardening>`: making governance mandatory.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and quarantine rows before they reach a
   consumer.
-- {doc}`Complete API reference </api/complete/governance>`: `SecurityCatalog`, `Principal`,
+- {doc}`Governance API reference </api/operations/governance>`: `SecurityCatalog`, `Principal`,
   `GovernanceEvent`, and `security`.
 - {doc}`Agent skills </agents>`: `apply-governance-and-security`, the same
   surface as a procedure, with what to verify before trusting an enforced plan.

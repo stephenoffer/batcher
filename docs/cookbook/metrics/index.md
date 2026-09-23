@@ -4,13 +4,12 @@ In Batcher, a metric is an aggregate expression. Describing a column, scoring a 
 
 These 20 recipes cover model scores, generated-text monitors, embedding health checks, and the statistics you run before trusting a summary.
 
-Every page embeds a complete, self-contained script, from [`examples/metrics/`](https://github.com/stephenoffer/batcher/tree/main/examples/metrics) for the model and text groups and [`examples/statistics/`](https://github.com/stephenoffer/batcher/tree/main/examples/statistics) for the statistics group. `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every page embeds a complete, self-contained script, from [`examples/metrics/`](https://github.com/stephenoffer/batcher/tree/main/examples/metrics) for the model and text groups and [`examples/statistics/`](https://github.com/stephenoffer/batcher/tree/main/examples/statistics) for the statistics group. [`tests/docs/test_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_examples.py) runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Group | Recipes | Covers |
 |---|---|---|
-| {doc}`/cookbook/metrics/model/index` | 5 | Predictions against labels, for classification and regression |
+| {doc}`/cookbook/metrics/model/index` | 6 | Predictions against labels, and the health of an embedding column |
 | {doc}`/cookbook/metrics/text/index` | 8 | Generated text, with and without a reference |
-| {doc}`/cookbook/metrics/embeddings` | 1 | Corpus-level embedding metrics, in aggregate |
 | {doc}`/cookbook/metrics/statistics/index` | 6 | Summary statistics, dispersion, distribution shape, association, and A/B inference |
 
 Read the statistics group first when the question is about a column, and the metric groups when the question is about a prediction. They share one machinery, so nothing here changes when you move between them.
@@ -27,6 +26,5 @@ Read the statistics group first when the question is about a column, and the met
 
 model/index
 text/index
-embeddings
 statistics/index
 ```

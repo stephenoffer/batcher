@@ -67,6 +67,29 @@ Each completed micro-batch reports how many rows it consumed and how long it too
 | `backpressure_min_rate` | `100.0` | Rows per second the derived rate can never fall below. |
 | `backpressure_max_rows_per_trigger` | `0` | A hard ceiling on the derived cap, independent of the source. `0` is unbounded. |
 
+Those defaults are checked rather than transcribed. The table above is what the engine ships:
+
+```python
+import dataclasses
+
+import batcher as bt
+
+shipped = bt.StreamingConfig()
+print({f.name.removeprefix("backpressure_"): getattr(shipped, f.name)
+       for f in dataclasses.fields(shipped) if f.name.startswith("backpressure_")})
+# {'enabled': False, 'pid_proportional': 1.0, 'pid_integral': 0.2, 'pid_derivative': 0.0, 'min_rate': 100.0, 'max_rows_per_trigger': 0}
+```
+
+{py:obj}`bt.config_context <batcher.config_context>` scopes the change to a block, which is what you want when one query in a process needs the controller and the rest do not:
+
+```python
+with bt.config_context(bt.Config(streaming=bt.StreamingConfig(backpressure_enabled=True))):
+    print(bt.active_config().streaming.backpressure_enabled)
+    # True
+print(bt.active_config().streaming.backpressure_enabled)
+# False
+```
+
 The integral term is the one worth understanding before changing. It removes *steady-state* error: a purely proportional controller settles at a rate slightly above what the query sustains and then stays permanently a little behind, which is the compounding case again, arrived at more slowly.
 
 ### What it will not do
@@ -115,7 +138,7 @@ If `behind_by_ms` is climbing while `num_input_rows` is flat at your configured 
 
 ## See also
 
-- {doc}`Streaming </user-guide/moving-data/streaming>`: sources, sinks, triggers, output modes.
-- {doc}`Monitoring </user-guide/moving-data/streaming-monitoring>`: the full progress record.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: sources, sinks, triggers, output modes.
+- {doc}`Monitoring </user-guide/moving-data/streaming/monitoring>`: the full progress record.
 - {doc}`Credit-based flow control </architecture/deep-dives/distribution/credit-flow-control>`: the shuffle's half of the same discipline.
 - {doc}`Kafka ETL </cookbook/streaming/kafka-etl>`: the source options in a working pipeline.

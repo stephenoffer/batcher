@@ -76,56 +76,59 @@ The table below lists the analytical scripts in path order.
 <!-- library-table: statistics,timeseries_real,geospatial,graph,robotics -->
 | Script | Shows |
 | --- | --- |
-| `examples/statistics/ab_test_inference.py` | A/B test statistics computed in the engine: effect size, t-statistic, and intervals |
-| `examples/statistics/association.py` | How strongly does one column relate to another? |
-| `examples/statistics/binomial_proportions.py` | Proportions and their uncertainty |
-| `examples/statistics/comparing_groups.py` | Comparing a metric across groups, with the spread that says whether it means anything |
-| `examples/statistics/correlation_matrix.py` | A correlation matrix over several columns at once |
-| `examples/statistics/describing_a_real_column.py` | What to compute first when you meet a column |
-| `examples/statistics/distribution_shape.py` | Is this column symmetric, skewed, or heavy-tailed? |
-| `examples/statistics/distribution_tails.py` | Where the extreme values are, and how many there are |
-| `examples/statistics/effect_sizes.py` | Effect size: how big a difference is, not just whether it exists |
-| `examples/statistics/hypothesis_intervals.py` | A confidence interval around a difference between two groups |
-| `examples/statistics/quantiles_and_histograms.py` | Quantiles, histograms, and the exact-versus-approximate trade |
-| `examples/statistics/rank_correlation.py` | Rank correlation: agreement that survives a non-linear relationship |
-| `examples/statistics/robust_dispersion.py` | Robust spread: quantile-based measures that one outlier cannot move |
-| `examples/statistics/sampling_error.py` | How wrong a sample is, and how that shrinks with size |
-| `examples/statistics/summary_statistics.py` | Summary aggregates beyond mean and stddev |
-| `examples/statistics/weighted_statistics.py` | Statistics where the rows are not equally important |
-| `examples/timeseries_real/cohort_retention.py` | A cohort table: grouping customers by when they first appeared |
-| `examples/timeseries_real/forecast_baseline.py` | The baselines any forecast has to beat |
-| `examples/timeseries_real/growth_rates.py` | Period-over-period change, and why the first period is null |
-| `examples/timeseries_real/lead_lag_and_gaps.py` | Detecting gaps in an event series |
-| `examples/timeseries_real/moving_windows_by_time.py` | Windows measured in days rather than in rows |
-| `examples/timeseries_real/resampling.py` | Resampling a real order stream to daily, weekly and monthly grain |
-| `examples/timeseries_real/seasonality.py` | Finding a weekly and monthly pattern in a real order series |
-| `examples/geospatial/bounding_boxes.py` | Envelopes: the cheap bound that makes an exact predicate affordable |
-| `examples/geospatial/geometry_basics.py` | Getting geometry in, reading it apart, and writing it back out |
-| `examples/geospatial/grid_keys.py` | Turning positions into cell ids you can group, sort and join on |
-| `examples/geospatial/grid_keys_as_join_keys.py` | Grid keys: turning a point into a joinable string |
-| `examples/geospatial/linestrings_and_areas.py` | Lines and polygons: length, area, centroid, and the relationships between them |
-| `examples/geospatial/measures_and_projections.py` | Measuring geometry, and getting the units right |
-| `examples/geospatial/points_and_distance.py` | Building point geometry from coordinate columns, and measuring between them |
-| `examples/geospatial/predicates_and_joins.py` | Spatial relationships, and the prefilter that makes a spatial join affordable |
-| `examples/geospatial/spatial_joins_with_grids.py` | Making a spatial join hashable by joining on a grid cell first |
-| `examples/geospatial/spatial_predicates.py` | Point-in-polygon and the other spatial predicates |
-| `examples/geospatial/wkt_and_geojson.py` | Geometry codecs: WKT, WKB and GeoJSON |
-| `examples/graph/analytics.py` | Graph analytics end to end: diagnose, rank, cluster, measure |
-| `examples/graph/bipartite_projection.py` | Projecting a bipartite graph onto one of its sides |
-| `examples/graph/degree_and_components.py` | The cheap graph diagnostics that decide what is worth running next |
-| `examples/graph/graph_from_relational.py` | Building a graph out of an ordinary relational table |
-| `examples/graph/graph_ml.py` | Graph ML: sampling a graph a model can read, and building features from it |
-| `examples/graph/pagerank_and_centrality.py` | Ranking nodes by influence on a real bipartite graph |
-| `examples/graph/shortest_paths.py` | Shortest paths on a small weighted graph |
-| `examples/graph/triangles_and_clustering.py` | Local structure: triangles and the clustering coefficient |
-| `examples/robotics/coordinate_frames.py` | Moving a sensor measurement between coordinate frames |
-| `examples/robotics/point_clouds.py` | Putting a lidar sweep in world coordinates, then cutting it down |
-| `examples/robotics/pose_interpolation.py` | Lining up sensors that sample at different rates |
-| `examples/robotics/rotations.py` | Building, cleaning, composing and scoring rotations |
+| [`examples/statistics/ab_test_inference.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/ab_test_inference.py) | A/B test statistics computed in the engine: effect size, t-statistic, and intervals |
+| [`examples/statistics/association.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/association.py) | How strongly does one column relate to another? |
+| [`examples/statistics/binomial_proportions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/binomial_proportions.py) | Proportions and their uncertainty |
+| [`examples/statistics/comparing_groups.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/comparing_groups.py) | Comparing a metric across groups, with the spread that says whether it means anything |
+| [`examples/statistics/correlation_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/correlation_matrix.py) | A correlation matrix over several columns at once |
+| [`examples/statistics/describing_a_real_column.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/describing_a_real_column.py) | What to compute first when you meet a column |
+| [`examples/statistics/distribution_shape.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/distribution_shape.py) | Is this column symmetric, skewed, or heavy-tailed? |
+| [`examples/statistics/distribution_tails.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/distribution_tails.py) | Where the extreme values are, and how many there are |
+| [`examples/statistics/effect_sizes.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/effect_sizes.py) | Effect size: how big a difference is, not just whether it exists |
+| [`examples/statistics/hypothesis_intervals.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/hypothesis_intervals.py) | A confidence interval around a difference between two groups |
+| [`examples/statistics/hypothesis_tests_edge_cases.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/hypothesis_tests_edge_cases.py) | Hypothesis tests on messy data: nulls, NaN, tiny groups, and the one-group mistake |
+| [`examples/statistics/quantiles_and_histograms.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/quantiles_and_histograms.py) | Quantiles, histograms, and the exact-versus-approximate trade |
+| [`examples/statistics/rank_correlation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/rank_correlation.py) | Rank correlation: agreement that survives a non-linear relationship |
+| [`examples/statistics/robust_dispersion.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/robust_dispersion.py) | Robust spread: quantile-based measures that one outlier cannot move |
+| [`examples/statistics/sampling_error.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/sampling_error.py) | How wrong a sample is, and how that shrinks with size |
+| [`examples/statistics/summary_statistics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/summary_statistics.py) | Summary aggregates beyond mean and stddev |
+| [`examples/statistics/weighted_statistics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/statistics/weighted_statistics.py) | Statistics where the rows are not equally important |
+| [`examples/timeseries_real/cohort_retention.py`](https://github.com/stephenoffer/batcher/blob/main/examples/timeseries_real/cohort_retention.py) | A cohort table: grouping customers by when they first appeared |
+| [`examples/timeseries_real/forecast_baseline.py`](https://github.com/stephenoffer/batcher/blob/main/examples/timeseries_real/forecast_baseline.py) | The baselines any forecast has to beat |
+| [`examples/timeseries_real/growth_rates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/timeseries_real/growth_rates.py) | Period-over-period change, and why the first period is null |
+| [`examples/timeseries_real/lead_lag_and_gaps.py`](https://github.com/stephenoffer/batcher/blob/main/examples/timeseries_real/lead_lag_and_gaps.py) | Detecting gaps in an event series |
+| [`examples/timeseries_real/moving_windows_by_time.py`](https://github.com/stephenoffer/batcher/blob/main/examples/timeseries_real/moving_windows_by_time.py) | Windows measured in days rather than in rows |
+| [`examples/timeseries_real/resampling.py`](https://github.com/stephenoffer/batcher/blob/main/examples/timeseries_real/resampling.py) | Resampling a real order stream to daily, weekly and monthly grain |
+| [`examples/timeseries_real/seasonality.py`](https://github.com/stephenoffer/batcher/blob/main/examples/timeseries_real/seasonality.py) | Finding a weekly and monthly pattern in a real order series |
+| [`examples/geospatial/bounding_boxes.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/bounding_boxes.py) | Envelopes: the cheap bound that makes an exact predicate affordable |
+| [`examples/geospatial/geometry_basics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/geometry_basics.py) | Getting geometry in, reading it apart, and writing it back out |
+| [`examples/geospatial/grid_keys.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/grid_keys.py) | Turning positions into cell ids you can group, sort and join on |
+| [`examples/geospatial/grid_keys_as_join_keys.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/grid_keys_as_join_keys.py) | Grid keys: turning a point into a joinable string |
+| [`examples/geospatial/linestrings_and_areas.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/linestrings_and_areas.py) | Lines and polygons: length, area, centroid, and the relationships between them |
+| [`examples/geospatial/measures_and_projections.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/measures_and_projections.py) | Measuring geometry, and getting the units right |
+| [`examples/geospatial/points_and_distance.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/points_and_distance.py) | Building point geometry from coordinate columns, and measuring between them |
+| [`examples/geospatial/predicates_and_joins.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/predicates_and_joins.py) | Spatial relationships, and the prefilter that makes a spatial join affordable |
+| [`examples/geospatial/spatial_joins_with_grids.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/spatial_joins_with_grids.py) | Making a spatial join hashable by joining on a grid cell first |
+| [`examples/geospatial/spatial_predicates.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/spatial_predicates.py) | Point-in-polygon and the other spatial predicates |
+| [`examples/geospatial/wkt_and_geojson.py`](https://github.com/stephenoffer/batcher/blob/main/examples/geospatial/wkt_and_geojson.py) | Geometry codecs: WKT, WKB and GeoJSON |
+| [`examples/graph/analytics.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/analytics.py) | Graph analytics end to end: diagnose, rank, cluster, measure |
+| [`examples/graph/bipartite_projection.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/bipartite_projection.py) | Projecting a bipartite graph onto one of its sides |
+| [`examples/graph/degree_and_components.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/degree_and_components.py) | The cheap graph diagnostics that decide what is worth running next |
+| [`examples/graph/graph_from_relational.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/graph_from_relational.py) | Building a graph out of an ordinary relational table |
+| [`examples/graph/graph_ml.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/graph_ml.py) | Graph ML: sampling a graph a model can read, and building features from it |
+| [`examples/graph/pagerank_and_centrality.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/pagerank_and_centrality.py) | Ranking nodes by influence on a real bipartite graph |
+| [`examples/graph/reshaping_a_graph.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/reshaping_a_graph.py) | Cut a graph down to the part an algorithm should actually run on |
+| [`examples/graph/shortest_paths.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/shortest_paths.py) | Shortest paths on a small weighted graph |
+| [`examples/graph/triangles_and_clustering.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/triangles_and_clustering.py) | Local structure: triangles and the clustering coefficient |
+| [`examples/graph/undirected_graphs.py`](https://github.com/stephenoffer/batcher/blob/main/examples/graph/undirected_graphs.py) | An undirected graph, and the answers you can check by hand on it |
+| [`examples/robotics/coordinate_frames.py`](https://github.com/stephenoffer/batcher/blob/main/examples/robotics/coordinate_frames.py) | Moving a sensor measurement between coordinate frames |
+| [`examples/robotics/point_clouds.py`](https://github.com/stephenoffer/batcher/blob/main/examples/robotics/point_clouds.py) | Putting a lidar sweep in world coordinates, then cutting it down |
+| [`examples/robotics/pose_interpolation.py`](https://github.com/stephenoffer/batcher/blob/main/examples/robotics/pose_interpolation.py) | Lining up sensors that sample at different rates |
+| [`examples/robotics/rotations.py`](https://github.com/stephenoffer/batcher/blob/main/examples/robotics/rotations.py) | Building, cleaning, composing and scoring rotations |
 <!-- /library-table -->
 
 ## See also
 
 - {doc}`/cookbook/metrics/statistics/index`: statistics recipes with the whole script on the page.
 - {doc}`/cookbook/analytics/index`: cohorts, funnels, sessions, and rankings.
-- {doc}`/user-guide/analyze/time-series`, {doc}`/user-guide/analyze/geospatial`, {doc}`/user-guide/analyze/graphs`, and {doc}`/user-guide/analyze/robotics`: the guides behind each section.
+- {doc}`/user-guide/analyze/time-series`, {doc}`/user-guide/analyze/domains/geospatial`, {doc}`/user-guide/analyze/domains/graphs`, and {doc}`/user-guide/analyze/domains/robotics`: the guides behind each section.

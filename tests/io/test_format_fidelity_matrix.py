@@ -92,6 +92,29 @@ NOT_LOCALLY_WRITABLE: dict[str, str] = {
     "fastq": "fixed record schema; round-tripped by tests/io/test_io_fasta_fastq.py",
     "bed": "fixed record schema; round-tripped by tests/io/test_io_bed_gff_vcf.py",
     "gff": "fixed record schema; round-tripped by tests/io/test_io_bed_gff_vcf.py",
+    "clickhouse": "needs a ClickHouse server; covered by tests/io/test_clickhouse_sink.py",
+    # The next four take a *shape*, not an arbitrary relation, so this matrix's two-column
+    # (id, type-class) table is not something they can be handed. Each was tried against it
+    # and refused; the reason here is the refusal each one raises.
+    "numpy": "writes a single column, not a relation; round-tripped by "
+    "tests/io/test_ml_format_writers.py::test_numpy_round_trips_values_and_types",
+    "text": "needs exactly one string column; round-tripped by "
+    "tests/io/test_text_and_xml_writers.py::test_text_round_trips_values_and_writes_a_null_as_an_empty_line",
+    "webdataset": "needs a string __key__ column naming each sample; round-tripped by "
+    "tests/io/test_ml_format_writers.py::test_webdataset_round_trips_bytes_text_numbers_and_missing_members",
+    # tfrecord writes opaque serialized records and reads back as one `record` column, so a
+    # written column has no image in the result to compare a value or a type against.
+    "tfrecord": "records are opaque on read; payloads round-tripped by "
+    "tests/io/test_ml_format_writers.py::test_tfrecord_raw_round_trips_the_record_payloads",
+    # XML reads back flat, by construction: xml2arrow's table has no list type (a `list_int`
+    # column fails outright), a struct arrives as one column per leaf so `struct` becomes
+    # `struct_a`/`struct_b`, and its type vocabulary is Boolean/Int/Float/Utf8 so `date32`
+    # returns as text. `int64` is the one class here it round-trips exactly. The matrix asks
+    # for the same column back with its type intact, which this format cannot answer for
+    # anything but the scalars -- so it is excluded on the shape of the format, not on a
+    # defect. Verified by writing each type class above through the sink and reading it back.
+    "xml": "reads back flat and text-typed (no list, struct flattens, no temporal); "
+    "covered by tests/io/test_text_and_xml_writers.py",
 }
 
 #: Type class -> a 4-row column carrying that class's hard values.

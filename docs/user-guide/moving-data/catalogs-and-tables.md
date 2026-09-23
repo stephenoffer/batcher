@@ -8,7 +8,7 @@ A *catalog* maps dotted names such as `sales.orders` to tables and owns their li
 
 Every {py:class}`Session <batcher.Session>` has a {py:class}`SessionCatalog <batcher.api.catalog.SessionCatalog>`, reached as `session.catalog`. It holds the catalogs the session has attached, and a *current* catalog and namespace that an unqualified name resolves into. A fresh session starts with one in-memory catalog named `memory` and the current namespace `main`, which are DuckDB's names for the same two things.
 
-A session also holds *views*, which are what {py:meth}`Session.register <batcher.Session.register>` creates. A view binds a name to a lazy plan in that session and stores nothing. A catalog table stores rows: writing to it runs the plan, and the table keeps the result. When a view and a catalog table share a name, the view wins.
+A session also holds names of its own, and none of them stores rows. {py:meth}`Session.register <batcher.Session.register>` and an unqualified `CREATE TABLE t AS ...` bind a *session table*, a name for a lazy plan. `CREATE VIEW` binds a *view*, which keeps its query text and translates it again every time a query names it. A catalog table stores rows: writing to it runs the plan, and the table keeps the result. When a session name and a catalog table share a name, the session name wins. All of these names are case-insensitive, so `ORDERS` and `orders` are one name.
 
 Set up a session to follow along:
 
@@ -164,7 +164,29 @@ print(session.sql("SHOW TABLES").to_pydict())
 # {'name': ['events']}
 ```
 
-An unqualified `CREATE TABLE t AS <select>` still registers a view, as it did before catalogs existed. Qualify the name to create a catalog table.
+An unqualified `CREATE TABLE t AS <select>` creates a catalog table once `USE` has moved the session off its starting `memory.main`: after `USE staging` above, it creates `staging.t`, which is what DuckDB does. Before any `USE` it registers a session table, as it did before catalogs existed. `DELETE` and `UPDATE` on a catalog table compute the new rows and overwrite the table immediately, reading the whole table through the driver to do so.
+
+## Keep tables between sessions
+
+A table in a directory or Iceberg catalog is files, so it outlives the process that wrote it. The catalog attachment, the current position, session tables and views are state of one session and are not stored anywhere. A new session attaches the catalog again and finds its tables:
+
+```python
+root = tempfile.mkdtemp()
+first = bt.Session()
+first.catalog.attach(bt.Catalog.from_directory(root, name="wh"))
+first.sql("CREATE SCHEMA wh.raw")
+first.sql("CREATE TABLE wh.raw.events AS SELECT 1 AS id")
+first.sql("CREATE VIEW recent AS SELECT id FROM wh.raw.events")
+
+second = bt.Session()
+second.catalog.attach(bt.Catalog.from_directory(root, name="wh"))
+print(second.sql("SELECT count(*) AS n FROM wh.raw.events").to_pydict(), "recent" in second)
+# {'n': [1]} False
+```
+
+A memory catalog, the one every session starts with, is held by the process and is lost when it exits.
+
+On a Ray cluster, workers read a catalog table's files themselves. A directory catalog on a local path is visible only to the machine that holds the path, so a query over it fails or finds nothing on a worker elsewhere. Give a cluster a catalog on storage every node can reach, such as `bt.Catalog.from_directory("s3://bucket/warehouse")` or a shared filesystem mount.
 
 ## Views and functions on a session
 
@@ -182,7 +204,7 @@ print(session.list_functions())
 
 ## The default session
 
-{py:func}`bt.current_session <batcher.current_session>` returns the process-default session that `bt.sql` and `ds.write.table` use when no session is passed, and {py:func}`bt.set_session <batcher.set_session>` installs another one:
+{py:func}`bt.current_session <batcher.current_session>` returns the process-default session that {py:obj}`bt.sql <batcher.sql>` and `ds.write.table` use when no session is passed, and {py:func}`bt.set_session <batcher.set_session>` installs another one:
 
 ```python
 previous = bt.current_session()
@@ -217,12 +239,13 @@ The table below maps each engine's spelling onto Batcher's, alphabetically by th
 - A Delta table scopes `replace_where` to its partition columns, so an overwrite with a predicate needs a partitioned table there. The in-memory backend takes any predicate.
 - `mode="overwrite_partitions"` commits one scoped overwrite per partition the rows cover. Each commit is atomic and the set isn't, so a concurrent reader can see some partitions reloaded before others.
 - An Iceberg catalog refuses `partition_by` on create, because Iceberg partitioning is a partition spec declared on the table. Create the table with pyiceberg, then write to it. Dropping an Iceberg table removes its catalog entry and leaves the data files.
-- `DELETE`, `UPDATE` and `MERGE` statements act on views only. For a catalog table, use `replace_where` or {py:meth}`ds.write.merge_into <batcher.api.io_namespace.writer.Writer.merge_into>` on the underlying format.
-- `information_schema.tables` and `information_schema.columns` list views only. `SHOW TABLES` lists views and the current namespace's catalog tables, and `DESCRIBE` answers for either.
+- `MERGE` acts on session tables only. For a catalog table, use `replace_where` or {py:meth}`ds.write.merge_into <batcher.api.io_namespace.writer.Writer.merge_into>` on the underlying format. `DELETE` and `UPDATE` on a catalog table rewrite the whole table.
+- `information_schema.tables` and `information_schema.columns` list session tables and views only. `SHOW TABLES` lists those and the current namespace's catalog tables, and `DESCRIBE` answers for either.
+- `DROP VIEW` drops only a view and `DROP TABLE` only a table. DuckDB treats a `register`ed relation as a view, while Batcher treats it as a session table, so drop it with `DROP TABLE` or {py:meth}`Session.drop <batcher.Session.drop>`.
 
 ## See also
 
 - {doc}`writing-data`: path writes and the save modes they share.
 - {doc}`lakehouse`: Delta and Iceberg tables addressed by path or identifier.
 - {doc}`/user-guide/analyze/sql`: the SQL surface a session runs.
-- {doc}`/api/complete/governance`: the `Session`, `Catalog` and `Table` reference.
+- {doc}`/api/relational/sessions-and-catalogs`: the `Session`, `Catalog`, and `Table` reference.

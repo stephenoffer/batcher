@@ -123,13 +123,19 @@ class MetaBase:
         return None if facts is None else shortcut(facts, *args)
 
     def source_stats(self) -> list:
-        """The connectors' declared `SourceStatistics`, or an empty list if unavailable."""
+        """The connectors' declared `SourceStatistics`, one per source, None where unknown.
+
+        A failure yields one None *per source*, never an empty list: the storage totals sum
+        over this list, and an empty one sums to a confident ``0`` rows and ``0`` bytes where
+        the truth is "could not tell".
+        """
         from batcher.api.terminal.metadata_answer._core import _source_stats
 
         try:
             return _source_stats(self._ds._sources, None)
-        except Exception:  # a connector that cannot describe itself describes nothing
-            return []
+        except Exception as exc:  # a connector that cannot describe itself describes nothing
+            note_suppressed("api", "collect source statistics", exc)
+            return [None] * len(self._ds._sources)
 
     def require_column(self, column: str) -> str:
         """Validate that `column` is an output column, else raise `PlanError`."""

@@ -19,13 +19,13 @@ from batcher._internal.errors import PlanError
 from batcher.ml.metrics.evaluate import (
     METRIC_SETS,
     _aggregate_exprs,
-    _negative_of,
+    _hard_prediction,
+    _needs_score,
     _rank_metric_names,
     _resolve_task,
     _validate_metrics,
 )
 from batcher.ml.stats._shared import require_columns
-from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -52,8 +52,12 @@ def compare_models(
 
     Every model's aggregate metrics are evaluated in the *same* `agg`, so the comparison
     costs one scan regardless of how many candidates there are. Rank-based metrics need a
-    sort each and are therefore excluded — ask for them per model with `roc_auc(..., by=)`
-    when you want them.
+    sort each and are therefore not part of the default set; naming one in `metrics=` raises.
+    Score them per model with `roc_auc` when you want them. With ``scores=False`` the default
+    set also leaves out the metrics that need a probability (`log_loss`, `brier_score`).
+
+    A score column's hard prediction is derived as `evaluate` derives it: `positive` at or
+    above `threshold`, the row's negative class below it.
 
     Args:
         ds: The dataset holding the labels and every model's predictions.
@@ -91,8 +95,8 @@ def compare_models(
         raise PlanError("compare_models needs at least one model in predictions=")
     require_columns(ds, *predictions.values(), hint="Pass a prediction column.")
     first = next(iter(predictions.values()))
-    resolved = _resolve_task(task, None if scores else first, first if scores else None)
-    requested = list(metrics) if metrics is not None else list(METRIC_SETS[resolved])
+    resolved = _resolve_task(task, None if scores else first, first if scores else None, ds, y_true)
+    requested = list(metrics) if metrics is not None else _default_metrics(resolved, scores)
     _validate_metrics(requested)
     ranked = [name for name in requested if name in _rank_metric_names()]
     if ranked:
@@ -108,9 +112,9 @@ def compare_models(
             derived = f"__bt_hard_{name}"
             frame = frame.with_columns(
                 **{
-                    derived: when(col(column) >= lit(threshold))
-                    .then(lit(positive))
-                    .otherwise(lit(_negative_of(positive)))
+                    derived: _hard_prediction(
+                        y_true, column, threshold=threshold, positive=positive
+                    )
                 }
             )
             columns[name] = derived
@@ -137,3 +141,18 @@ def compare_models(
         if any(v is not None for v in values):
             table[metric] = values
     return bt.from_pydict(table)
+
+
+def _default_metrics(task: str, scores: bool) -> list[str]:
+    """The task's default metrics that one shared pass over the predictions can compute.
+
+    The default set is a suggestion, not a request. The binary set carries the rank metrics
+    this single pass refuses, so the defaults raised `PlanError` on every binary task; and
+    without score columns the probability metrics have nothing to read.
+    """
+    rank_only = _rank_metric_names()
+    return [
+        name
+        for name in METRIC_SETS[task]
+        if name not in rank_only and (scores or not _needs_score(name))
+    ]

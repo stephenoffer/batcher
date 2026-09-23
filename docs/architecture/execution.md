@@ -102,7 +102,7 @@ many cores (the parallel path builds partials and combines them), and many machi
 where the distributed path composes the same `partial`, `combine`, and `finalize`.
 There is no separate distributed operator with its own semantics, so the rows, the
 column names and the column types come back the same on a laptop and on a cluster.
-`tests/integration/test_distributed.py` asserts that equality operator by operator.
+[`tests/integration/test_distributed.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_distributed.py) asserts that equality operator by operator.
 It skips without Ray installed, which is the state CI runs in, so the arm that proves
 the claim runs only where a cluster is available.
 

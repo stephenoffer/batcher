@@ -37,6 +37,7 @@ The pages below are ordered from the surfaces every job uses to the ones only a 
 - {doc}`/user-guide/operate/tuning/index`: the levers to reach for once the job is stable.
 - {doc}`/configuration/fault-tolerance`: the settings behind the retry and recovery behavior.
 - {doc}`/architecture/fault-tolerance`: how recovery works underneath.
+- {doc}`/examples/distributed`: distributed and streaming scripts, each run on every commit.
 
 ```{toctree}
 :hidden:

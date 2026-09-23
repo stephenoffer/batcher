@@ -16,10 +16,12 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from batcher.ml.stats._shared import complete_rows
 from batcher.ml.stats._special import chi2_sf, normal_two_sided_p
-from batcher.ml.stats.hypothesis import TestResult
+from batcher.ml.stats.hypothesis import TestResult, _require_groups
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.expr_ir.nodes import rank as rank_
+from batcher.plan.functions.aggregate import count_if
 from batcher.plan.functions.aggregate import sum as sum_
 
 if TYPE_CHECKING:
@@ -47,28 +49,25 @@ def _average_ranks(ds: Dataset, value: str) -> Dataset:
 
 def _u_summary(ds: Dataset, value: str, group: str, what: str):
     """The Mann-Whitney ``(u1, n1, n2, n, tie_correction)`` for a two-group split."""
-    from batcher._internal.errors import PlanError
-
-    levels = sorted(
-        v.as_py()
-        for v in ds.select(group).distinct().collect().column(group)
-        if v.as_py() is not None
-    )
-    if len(levels) != 2:
-        raise PlanError(f"{what} needs exactly two groups in {group!r}, found {len(levels)}.")
-    ranked = _average_ranks(ds, value)
+    present = complete_rows(ds, value, group)
+    levels = sorted(v.as_py() for v in present.select(group).distinct().collect().column(group))
+    _require_groups(len(levels), what, group, exactly_two=True)
+    ranked = _average_ranks(present, value)
     first = col(group) == lit(levels[0])
     summary = ranked.agg(
         __bt_r1=sum_(when(first).then(col("__bt_rank")).otherwise(lit(0.0))),
         __bt_n1=sum_(when(first).then(lit(1.0)).otherwise(lit(0.0))),
         __bt_n=col(value).count(),
         __bt_tie=sum_(col("__bt_tie") * col("__bt_tie") - lit(1.0)),
+        __bt_nan=count_if(col(value).is_nan()),
     ).collect()
     r1 = float(summary.column("__bt_r1")[0].as_py())
     n1 = int(summary.column("__bt_n1")[0].as_py())
     n = int(summary.column("__bt_n")[0].as_py())
     tie = float(summary.column("__bt_tie")[0].as_py())
-    return r1 - n1 * (n1 + 1) / 2, n1, n - n1, n, tie
+    # A NaN has no rank; SciPy's default `nan_policy="propagate"` makes the statistic NaN.
+    u1 = math.nan if summary.column("__bt_nan")[0].as_py() else r1 - n1 * (n1 + 1) / 2
+    return u1, n1, n - n1, n, tie
 
 
 def mann_whitney_u(ds: Dataset, value: str, group: str) -> TestResult:
@@ -127,7 +126,10 @@ def kruskal_wallis(ds: Dataset, value: str, group: str) -> TestResult:
 
     Returns:
         A `TestResult` with the H statistic, ``k - 1`` degrees of freedom, and the upper-tail
-        p-value.
+        p-value. NaN when the column holds a NaN or every value ties.
+
+    Raises:
+        PlanError: If fewer than two groups remain after dropping null values and labels.
 
     Examples:
         .. doctest::
@@ -140,29 +142,33 @@ def kruskal_wallis(ds: Dataset, value: str, group: str) -> TestResult:
             >>> kruskal_wallis(ds, "x", "g").df
             2.0
     """
-    ranked = _average_ranks(ds, value)
+    ranked = _average_ranks(complete_rows(ds, value, group), value)
     per_group = (
         ranked.group_by(group)
         .agg(__bt_r=sum_(col("__bt_rank")), __bt_n=col(value).count())
         .collect()
     )
+    k = per_group.num_rows
+    _require_groups(k, "kruskal_wallis", group)
+    df = float(k - 1)
     totals = ranked.agg(
         __bt_n=col(value).count(),
         __bt_tie=sum_(col("__bt_tie") * col("__bt_tie") - lit(1.0)),
+        __bt_nan=count_if(col(value).is_nan()),
     ).collect()
     n = int(totals.column("__bt_n")[0].as_py())
     tie = float(totals.column("__bt_tie")[0].as_py())
-    k = per_group.num_rows
+    correction = 1.0 - tie / (n**3 - n)
+    # A NaN has no rank, and when every value ties there is no ordering to test: SciPy's
+    # `kruskal` answers NaN for both.
+    if totals.column("__bt_nan")[0].as_py() or correction == 0:
+        return TestResult(statistic=math.nan, pvalue=math.nan, df=df)
     rank_sum = 0.0
     for i in range(k):
         group_r = float(per_group.column("__bt_r")[i].as_py())
         group_n = int(per_group.column("__bt_n")[i].as_py())
         rank_sum += group_r * group_r / group_n
-    statistic = 12.0 / (n * (n + 1)) * rank_sum - 3.0 * (n + 1)
-    correction = 1.0 - tie / (n**3 - n) if n > 1 else 1.0
-    if correction != 0:
-        statistic /= correction
-    df = float(k - 1)
+    statistic = (12.0 / (n * (n + 1)) * rank_sum - 3.0 * (n + 1)) / correction
     return TestResult(statistic=statistic, pvalue=chi2_sf(statistic, df), df=df)
 
 
@@ -252,7 +258,9 @@ def wilcoxon_signed_rank(ds: Dataset, x: str, y: str) -> TestResult:
 
     Returns:
         A `TestResult` whose statistic is the smaller signed-rank sum, with the normal limit as
-        degrees of freedom and the two-sided p-value.
+        degrees of freedom and the two-sided p-value. A pair with a null on either side is
+        dropped; a NaN difference makes the result NaN; when every difference is zero the
+        statistic is 0 and the p-value NaN, as in SciPy.
 
     Examples:
         .. doctest::
@@ -265,8 +273,16 @@ def wilcoxon_signed_rank(ds: Dataset, x: str, y: str) -> TestResult:
             >>> wilcoxon_signed_rank(ds, "before", "after").statistic
             0.0
     """
-    diff = ds.with_columns(__bt_d=col(x) - col(y))
-    nonzero = diff.filter((col("__bt_d") != lit(0.0)) & col("__bt_d").is_not_null())
+    from batcher.ml.stats._shared import require_columns
+
+    require_columns(ds, x, y)
+    diff = ds.with_columns(__bt_d=col(x) - col(y)).filter(col("__bt_d").is_not_null())
+    counts = diff.agg(
+        __bt_pairs=col("__bt_d").count(), __bt_nan=count_if(col("__bt_d").is_nan())
+    ).collect()
+    if counts.column("__bt_nan")[0].as_py():
+        return TestResult(statistic=math.nan, pvalue=math.nan, df=math.inf)
+    nonzero = diff.filter(col("__bt_d") != lit(0.0))
     absolute = nonzero.with_columns(__bt_ad=col("__bt_d").abs())
     tie_size = col("__bt_ad").count().over(partition_by=["__bt_ad"])
     rank_expr = rank_().over(order_by=["__bt_ad"]) + (tie_size - lit(1.0)) / lit(2.0)
@@ -278,9 +294,14 @@ def wilcoxon_signed_rank(ds: Dataset, x: str, y: str) -> TestResult:
         __bt_n=col("__bt_d").count(),
         __bt_tie=sum_(col("__bt_tie") * col("__bt_tie") - lit(1.0)),
     ).collect()
+    n = int(summary.column("__bt_n")[0].as_py())
+    if n == 0:
+        # No pairs at all is an empty sample; pairs that all tie at zero leave nothing to rank.
+        # SciPy's `wilcoxon` reports NaN and ``(0, NaN)`` for the two.
+        empty = counts.column("__bt_pairs")[0].as_py() == 0
+        return TestResult(statistic=math.nan if empty else 0.0, pvalue=math.nan, df=math.inf)
     w_plus = float(summary.column("__bt_wp")[0].as_py())
     w_minus = float(summary.column("__bt_wm")[0].as_py())
-    n = int(summary.column("__bt_n")[0].as_py())
     tie = float(summary.column("__bt_tie")[0].as_py())
     statistic = min(w_plus, w_minus)
     mu = n * (n + 1) / 4

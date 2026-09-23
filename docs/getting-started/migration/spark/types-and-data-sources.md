@@ -18,35 +18,35 @@ The following table maps the 32 names on the `pyspark.sql.types` module, sorted 
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `ArrayType` | `Expr.cast` | param | Missing: nested list type names in cast and schema (array\<int\> / list\<int64\>). Wave W11. |
-| `BinaryType` | `Expr.cast` | canonical |  |
-| `BooleanType` | `Expr.cast` | canonical |  |
-| `ByteType` | `Expr.cast` | canonical |  |
+| `ArrayType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: nested list type names in cast and schema (array\<int\> / list\<int64\>). Wave W11. |
+| `BinaryType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `BooleanType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `ByteType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `CalendarIntervalType` | n/a | gap | Not yet: calendar interval type. Wave W6. |
-| `CharType` | `Expr.cast` | param | Missing: char(n) with fixed length and padding semantics. Wave W11. |
-| `DataType` | `Expr.cast` | param | Missing: DataType objects with fromDDL/simpleString/json round-trips. Wave W11. |
-| `DateType` | `Expr.cast` | canonical |  |
+| `CharType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: char(n) with fixed length and padding semantics. Wave W11. |
+| `DataType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: DataType objects with fromDDL/simpleString/json round-trips. Wave W11. |
+| `DateType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `DayTimeIntervalType` | n/a | gap | Not yet: day-time interval type. Wave W6. |
-| `DecimalType` | `Expr.cast` | canonical |  |
-| `DoubleType` | `Expr.cast` | canonical |  |
-| `FloatType` | `Expr.cast` | canonical |  |
+| `DecimalType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `DoubleType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `FloatType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `Geography` | n/a | gap | Not yet: geography value type. Wave W14. |
 | `GeographyType` | n/a | gap | Not yet: geography logical type with SRID. Wave W14. |
-| `Geometry` | `bt.st_geom_from_wkb` | param | Missing: a logical Geometry value type (Batcher geometries are WKB binary). Wave W14. |
-| `GeometryType` | `bt.st_geom_from_wkb` | param | Missing: a logical Geometry column type with SRID (Batcher geometries are WKB binary). Wave W14. |
-| `IntegerType` | `Expr.cast` | canonical |  |
-| `LongType` | `Expr.cast` | canonical |  |
-| `MapType` | `Expr.cast` | param | Missing: map type names in cast and schema (map\<string,int\>). Wave W11. |
-| `NullType` | `Expr.cast` | param | Missing: cast to the null type (Batcher raises 'Casting from Int64 to Null not supported'). Wave W11. |
-| `Row` | `Dataset.to_pylist` | mismatch | Differs: Spark results are Row objects with attribute access; Batcher rows are dicts (to\_pylist) or tuples (iter\_rows). Wave W0. |
-| `ShortType` | `Expr.cast` | canonical |  |
-| `StringType` | `Expr.cast` | canonical |  |
-| `StructField` | `Expr.cast` | param | Missing: Spark StructField objects and their DDL spelling as cast/schema targets. Wave W11. |
-| `StructType` | `Expr.cast` | param | Missing: Spark StructType objects and their DDL spelling as cast/schema targets (struct\<...\> and 'a INT, b STRING' schemas). Wave W11. |
-| `TimestampNTZType` | `Expr.cast` | canonical |  |
-| `TimestampType` | `Expr.cast` | mismatch | Differs: Spark TimestampType is an instant rendered in the session time zone (LTZ); Batcher timestamps are naive and read as UTC. Wave W6. |
+| `Geometry` | {py:obj}`bt.st_geom_from_wkb <batcher.st_geom_from_wkb>` | param | Missing: a logical Geometry value type (Batcher geometries are WKB binary). Wave W14. |
+| `GeometryType` | {py:obj}`bt.st_geom_from_wkb <batcher.st_geom_from_wkb>` | param | Missing: a logical Geometry column type with SRID (Batcher geometries are WKB binary). Wave W14. |
+| `IntegerType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `LongType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `MapType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: map type names in cast and schema (map\<string,int\>). Wave W11. |
+| `NullType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast to the null type (Batcher raises 'Casting from Int64 to Null not supported'). Wave W11. |
+| `Row` | {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | mismatch | Differs: Spark results are Row objects with attribute access; Batcher rows are dicts (to\_pylist) or tuples (iter\_rows). Wave W0. |
+| `ShortType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `StringType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `StructField` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: Spark StructField objects and their DDL spelling as cast/schema targets. Wave W11. |
+| `StructType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: Spark StructType objects and their DDL spelling as cast/schema targets (struct\<...\> and 'a INT, b STRING' schemas). Wave W11. |
+| `TimestampNTZType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `TimestampType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | mismatch | Differs: Spark TimestampType is an instant rendered in the session time zone (LTZ); Batcher timestamps are naive and read as UTC. Wave W6. |
 | `TimeType` | n/a | gap | Not yet: TIME type. Wave W6. |
-| `VarcharType` | `Expr.cast` | param | Missing: varchar(n) length enforcement. Wave W11. |
+| `VarcharType` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: varchar(n) length enforcement. Wave W11. |
 | `VariantType` | n/a | gap | Not yet: VARIANT semi-structured type. Wave W7. |
 | `VariantVal` | n/a | gap | Not yet: VARIANT value object. Wave W7. |
 | `YearMonthIntervalType` | n/a | gap | Not yet: year-month interval type. Wave W6. |
@@ -57,28 +57,36 @@ The following table maps the 25 names on the `pyspark.sql.datasource` module, so
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `DataSource` | `batcher.io.Source` | param | Missing: Spark DataSource class protocol (name/schema/reader/writer) registered by short name. Wave W11. |
-| `DataSourceArrowWriter` | `batcher.io.Sink` | param | Missing: Arrow-batch writer protocol with per-task commit messages and abort(). Wave W11. |
-| `DataSourceReader` | `batcher.io.Source` | param | Missing: partitions()/read(partition) protocol with pushFilters. Wave W11. |
-| `DataSourceRegistration` | `batcher.io.SOURCES` | param | Missing: register(DataSource class) on the session. Wave W11. |
-| `DataSourceStreamArrowWriter` | `batcher.io.Sink` | param | Missing: streaming Arrow writer with per-micro-batch commit/abort. Wave W10. |
-| `DataSourceStreamReader` | `batcher.io.Source` | param | Missing: streaming offsets protocol: initialOffset/latestOffset/partitions/commit. Wave W10. |
-| `DataSourceStreamWriter` | `batcher.io.Sink` | param | Missing: streaming writer with per-micro-batch commit/abort. Wave W10. |
-| `DataSourceWriter` | `batcher.io.Sink` | param | Missing: writer protocol with per-task commit messages and abort(). Wave W11. |
-| `EqualNullSafe` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `EqualTo` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `Filter` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `GreaterThan` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `GreaterThanOrEqual` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `In` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `InputPartition` | `batcher.io.Split` | canonical |  |
-| `IsNotNull` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `IsNull` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `LessThan` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `LessThanOrEqual` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `Not` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `SimpleDataSourceStreamReader` | `batcher.io.Source` | param | Missing: simple streaming reader: read(start) returning rows and the next offset. Wave W10. |
-| `StringContains` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `StringEndsWith` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `StringStartsWith` | `batcher.io.Source` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
-| `WriterCommitMessage` | `batcher.io.WriteManifest` | param | Missing: per-task commit message returned by a writer and passed to commit(). Wave W11. |
+| `DataSource` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSource class protocol (name/schema/reader/writer) registered by short name. Wave W11. |
+| `DataSourceArrowWriter` | {py:obj}`batcher.io.Sink <batcher.io.Sink>` | param | Missing: Arrow-batch writer protocol with per-task commit messages and abort(). Wave W11. |
+| `DataSourceReader` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: partitions()/read(partition) protocol with pushFilters. Wave W11. |
+| `DataSourceRegistration` | {py:obj}`batcher.io.SOURCES <batcher.io.SOURCES>` | param | Missing: register(DataSource class) on the session. Wave W11. |
+| `DataSourceStreamArrowWriter` | {py:obj}`batcher.io.Sink <batcher.io.Sink>` | param | Missing: streaming Arrow writer with per-micro-batch commit/abort. Wave W10. |
+| `DataSourceStreamReader` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: streaming offsets protocol: initialOffset/latestOffset/partitions/commit. Wave W10. |
+| `DataSourceStreamWriter` | {py:obj}`batcher.io.Sink <batcher.io.Sink>` | param | Missing: streaming writer with per-micro-batch commit/abort. Wave W10. |
+| `DataSourceWriter` | {py:obj}`batcher.io.Sink <batcher.io.Sink>` | param | Missing: writer protocol with per-task commit messages and abort(). Wave W11. |
+| `EqualNullSafe` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `EqualTo` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `Filter` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `GreaterThan` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `GreaterThanOrEqual` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `In` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `InputPartition` | {py:obj}`batcher.io.Split <batcher.io.Split>` | canonical |  |
+| `IsNotNull` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `IsNull` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `LessThan` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `LessThanOrEqual` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `Not` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `SimpleDataSourceStreamReader` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: simple streaming reader: read(start) returning rows and the next offset. Wave W10. |
+| `StringContains` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `StringEndsWith` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `StringStartsWith` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects). Wave W11. |
+| `WriterCommitMessage` | {py:obj}`batcher.io.WriteManifest <batcher.io.WriteManifest>` | param | Missing: per-task commit message returned by a writer and passed to commit(). Wave W11. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

@@ -111,7 +111,8 @@ def test_learned_quantile_none_when_unlearned():
     from batcher.metadata.backends import InProcessBackend
 
     assert answer_learned_quantile("x", 0.5, MetadataHub(InProcessBackend())) is None
-    assert metadata_learned_quantile("__never_learned_col__", 0.5) is None
+    unlearned = bt.from_pydict({"__never_learned_col__": [1.0]})
+    assert metadata_learned_quantile(unlearned._plan, "__never_learned_col__", 0.5) is None
 
 
 def test_learned_quantile_reads_grid():
@@ -187,3 +188,40 @@ def test_learned_quantile_resolves_the_source_qualified_key():
     assert answer_learned_quantile("q", 0.25, hub, key) == 25.0  # interpolated
     # A different source must not borrow this one's grid.
     assert answer_learned_quantile("q", 0.5, hub, "id:parquet:/somewhere/else") is None
+
+
+def test_learned_quantile_answers_only_a_column_the_plan_passes_through(tmp_path):
+    """A learned grid is the *source* column's distribution, so nothing above the scan may
+    change that column — the regression was a whole-table median returned for a filter.
+
+    Over ``x = 1..100_000``, once any run had recorded a grid for ``x``,
+    ``filter(x > 90_000).approx_quantile("x", 0.5)`` answered 49,899 where 95,000 is right,
+    and ``with_columns(x=x * 1000)`` and ``limit(10)`` answered the same 49,899.
+    """
+    from batcher import core, kyber
+    from batcher.plan.source_stats import source_stats_key
+
+    path = tmp_path / "x.parquet"
+    pq.write_table(pa.table({"x": pa.array(range(1, 100_001), pa.int64())}), path)
+    src = bt.read.parquet(str(path))
+    grid = {"x": {"probs": [0.0, 0.5, 1.0], "values": [1.0, 50_000.0, 100_000.0]}}
+    kyber.record_column_stats(
+        core.default_hub(), {}, grid, source_key=source_stats_key(src._sources[0])
+    )
+
+    def learned(ds, column="x"):
+        return metadata_learned_quantile(ds._plan, column, 0.5, ds._sources)
+
+    # Positive control: the grid is reachable, through every shape that forwards `x` intact.
+    assert learned(src) == 50_000.0
+    assert learned(src.select("x")) == 50_000.0
+    assert learned(src.rename({"x": "z"}), "z") == 50_000.0
+    assert learned(src.sort("x")) == 50_000.0
+    # Anything that changes the column's distribution must not borrow the source's grid.
+    assert learned(src.filter(bt.col("x") > 90_000)) is None
+    assert learned(src.with_columns(x=bt.col("x") * 1000)) is None
+    assert learned(src.limit(10)) is None
+    assert learned(src.sort("x").limit(10)) is None
+    # And end to end, the terminal answers the filtered relation, not the table.
+    top = src.filter(bt.col("x") > 90_000).approx_quantile("x", 0.5)
+    assert top == pytest.approx(95_000.5, rel=0.01)

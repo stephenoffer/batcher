@@ -103,4 +103,4 @@ One divergence from DuckDB is deliberate. `map(NULL, NULL)` with a bare untyped 
 - {doc}`/user-guide/transform/columns/expression-accessors`: the general-purpose accessors this sits beside.
 - {doc}`/user-guide/transform/columns/type-system`: nested types, and why a map cannot be a key.
 - {doc}`/user-guide/transform/rows/transformations`: `explode` and `unnest` in full.
-- `examples/expr_collections/map_columns.py`: the same material as a runnable script, including the refusals.
+- [`examples/expr_collections/map_columns.py`](https://github.com/stephenoffer/batcher/blob/main/examples/expr_collections/map_columns.py): the same material as a runnable script, including the refusals.

@@ -1,6 +1,6 @@
 # Custom connectors
 
-This page shows how to plug your own format or system into `bt.read` and `ds.write`. Batcher reads and writes through two small contracts. A {py:class}`Source <batcher.io.Source>` says what its
+This page shows how to plug your own format or system into {py:obj}`bt.read <batcher.read>` and `ds.write`. Batcher reads and writes through two small contracts. A {py:class}`Source <batcher.io.Source>` says what its
 schema is and how it divides into {py:class}`Split <batcher.io.Split>`s. A {py:class}`Sink <batcher.io.Sink>` consumes Arrow tables and
 reports the files it produced. Everything the engine ships (Parquet, CSV, JSON,
 Delta, Kafka) is written against those contracts and registered by name, and your
@@ -109,7 +109,7 @@ split ships the format *name*, not the object.
 
 Registration is a decorator, and it happens as a side effect of importing your
 module, so import it once before you read. Extension-based autodetection
-(`bt.read("data/events.parquet")`) uses a fixed table of the built-in extensions, so
+({py:obj}`bt.read("data/events.parquet") <batcher.read>`) uses a fixed table of the built-in extensions, so
 a custom format is addressed by passing `format=` explicitly.
 
 ## A custom format, end to end

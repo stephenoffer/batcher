@@ -102,8 +102,11 @@ print(QuantileTransformer("x", n_quantiles=4).fit_transform(ds).to_pydict())
 
 {py:class}`PowerTransformer <batcher.ml.preprocessors.PowerTransformer>` is the data-driven middle ground. It picks the Yeo-Johnson power
 that makes the column most Gaussian by maximum likelihood. The likelihood at every
-candidate lambda is an aggregate, so one pass evaluates the whole grid rather than one scan
-per optimizer iteration.
+candidate lambda is an aggregate, so one pass evaluates a whole grid of 41 candidates rather
+than one scan per optimizer iteration. A coarse grid over `[-2, 2]` and two zoomed grids
+around its best point take three passes and land within about 1e-4 of scikit-learn's
+lambda. The standardization that follows uses the population standard deviation, as
+scikit-learn's does.
 
 ```python
 from batcher.ml.preprocessors import PowerTransformer

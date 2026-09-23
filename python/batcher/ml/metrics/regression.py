@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.stats._shared import require_columns as _require
-from batcher.plan.expr_ir.constructors import col, lit, when
+from batcher.plan.expr_ir.constructors import col, lit
 from batcher.plan.functions.aggregate import count_if
 
 if TYPE_CHECKING:
@@ -167,6 +167,11 @@ def top_k_accuracy(
     `labels` is omitted). The comparison is done with rank arithmetic over the score columns,
     so no per-row Python is involved.
 
+    Tied scores are broken the way scikit-learn's ``top_k_accuracy_score`` breaks them: among
+    classes with equal scores, the one listed *later* ranks higher. Counting only the classes
+    that strictly beat the truth scored every tie as a hit, so a model giving all classes the
+    same score had a top-1 accuracy of 1.0 where scikit-learn reports 1/3.
+
     Args:
         ds: The scored dataset, one probability column per class.
         y_true: The true-label column.
@@ -207,18 +212,18 @@ def top_k_accuracy(
             f"labels has {len(class_labels)} entries but there are {len(score_columns)} "
             "score columns; give one label per column."
         )
-    # The true class's score, picked out by matching the label: exactly one arm is non-zero,
-    # so their sum is that score. Then count how many class scores strictly beat it — a hit
-    # is when fewer than k classes outrank the truth.
-    true_score = lit(0.0)
-    for label, column in zip(class_labels, score_columns, strict=True):
-        true_score = true_score + when(col(y_true) == lit(label)).then(col(column)).otherwise(
-            lit(0.0)
-        )
-    outranking = lit(0)
-    for column in score_columns:
-        outranking = outranking + (col(column) > true_score).cast("int64")
-    hit = outranking < lit(k)
+    # For each class i, count the classes that outrank it: a strictly higher score, or an
+    # equal score on a class listed after it (scikit-learn's reversed stable argsort). The row
+    # is a hit when its true class has fewer than k classes above it.
+    hit = lit(False)
+    for i, (label, column) in enumerate(zip(class_labels, score_columns, strict=True)):
+        outranking = lit(0)
+        for j, other in enumerate(score_columns):
+            beats = col(other) > col(column)
+            if j > i:
+                beats = beats | (col(other) == col(column))
+            outranking = outranking + beats.cast("int64")
+        hit = hit | ((col(y_true) == lit(label)) & (outranking < lit(k)))
     row = (
         ds.with_columns(__bt_hit=hit)
         .agg(__bt_acc=count_if(col("__bt_hit")) / count_if(col(y_true).is_not_null()))
@@ -226,6 +231,35 @@ def top_k_accuracy(
     )
     value = row.column("__bt_acc")[0].as_py() if row.num_rows else None
     return float("nan") if value is None else float(value)
+
+
+def _paired(ds: Dataset, y_true: str, y_pred: str) -> Dataset:
+    """The rows where both the actual and the prediction are present.
+
+    A D² score compares the model's loss with a baseline's on the *same* rows. Taking the
+    baseline (the mean, median, or quantile of `y_true`) over every actual while scoring the
+    model only where it made a prediction compared two different row sets: one null
+    prediction next to an outlying actual turned a D² of 0.70 into 0.99.
+    """
+    _require(ds, y_true, y_pred)
+    return ds.filter(col(y_true).is_not_null() & col(y_pred).is_not_null())
+
+
+def _d2(model: Any, null: Any, *, force_finite: bool) -> float:
+    """``1 - model / null``, with scikit-learn's answer when the baseline loss is zero.
+
+    A constant target leaves the baseline nothing to get wrong. scikit-learn's
+    ``d2_absolute_error_score`` and ``d2_pinball_score`` then return 1.0 for a perfect
+    prediction and 0.0 otherwise (their ``force_finite``); ``d2_tweedie_score`` divides by
+    zero and raises, for which NaN is the non-raising equivalent.
+    """
+    if model is None or null is None:
+        return float("nan")
+    if null == 0.0:
+        if not force_finite:
+            return float("nan")
+        return 1.0 if model == 0.0 else 0.0
+    return 1.0 - float(model) / float(null)
 
 
 def d2_tweedie_score(ds: Dataset, y_true: str, y_pred: str, *, power: float = 1.5) -> float:
@@ -248,7 +282,8 @@ def d2_tweedie_score(ds: Dataset, y_true: str, y_pred: str, *, power: float = 1.
             `tweedie_deviance`.
 
     Returns:
-        The D² score; at most 1.
+        The D² score; at most 1. It is taken over the rows where both columns are present,
+        and is NaN for a constant target (scikit-learn raises there).
 
     Raises:
         ColumnNotFoundError: If a named column is missing.
@@ -264,17 +299,13 @@ def d2_tweedie_score(ds: Dataset, y_true: str, y_pred: str, *, power: float = 1.
     """
     import batcher as bt
 
-    _require(ds, y_true, y_pred)
-    baselined = ds.with_columns(__bt_base=bt.mean(col(y_true)).over())
+    paired = _paired(ds, y_true, y_pred)
+    baselined = paired.with_columns(__bt_base=bt.mean(col(y_true)).over())
     row = baselined.agg(
         model=bt.tweedie_deviance(y_true, y_pred, power=power),
         null=bt.tweedie_deviance(y_true, "__bt_base", power=power),
     ).collect()
-    model = row.column("model")[0].as_py()
-    null = row.column("null")[0].as_py()
-    if model is None or null is None or null == 0.0:
-        return float("nan")
-    return 1.0 - float(model) / float(null)
+    return _d2(row.column("model")[0].as_py(), row.column("null")[0].as_py(), force_finite=False)
 
 
 def d2_absolute_error_score(ds: Dataset, y_true: str, y_pred: str) -> float:
@@ -292,7 +323,9 @@ def d2_absolute_error_score(ds: Dataset, y_true: str, y_pred: str) -> float:
         y_pred: The predicted values.
 
     Returns:
-        The D² score on the absolute-error scale; at most 1.
+        The D² score on the absolute-error scale; at most 1. It is taken over the rows where
+        both columns are present; a constant target scores 1.0 when predicted exactly and 0.0
+        otherwise, as in scikit-learn.
 
     Raises:
         ColumnNotFoundError: If a named column is missing.
@@ -308,17 +341,15 @@ def d2_absolute_error_score(ds: Dataset, y_true: str, y_pred: str) -> float:
     """
     import batcher as bt
 
-    _require(ds, y_true, y_pred)
-    median = float(ds.agg(m=col(y_true).median()).collect().column("m")[0].as_py())
-    row = ds.agg(
-        model=bt.sum((col(y_true) - col(y_pred)).abs()),
-        null=bt.sum((col(y_true) - bt.lit(median)).abs()),
-    ).collect()
-    model = row.column("model")[0].as_py()
-    null = row.column("null")[0].as_py()
-    if model is None or null is None or null == 0.0:
+    paired = _paired(ds, y_true, y_pred)
+    median = paired.agg(m=col(y_true).median()).collect().column("m")[0].as_py()
+    if median is None:
         return float("nan")
-    return 1.0 - float(model) / float(null)
+    row = paired.agg(
+        model=bt.sum((col(y_true) - col(y_pred)).abs()),
+        null=bt.sum((col(y_true) - bt.lit(float(median))).abs()),
+    ).collect()
+    return _d2(row.column("model")[0].as_py(), row.column("null")[0].as_py(), force_finite=True)
 
 
 def d2_pinball_score(ds: Dataset, y_true: str, y_pred: str, *, alpha: float = 0.5) -> float:
@@ -336,7 +367,9 @@ def d2_pinball_score(ds: Dataset, y_true: str, y_pred: str, *, alpha: float = 0.
         alpha: The quantile the model targets, in ``(0, 1)``.
 
     Returns:
-        The D² score on the pinball scale; at most 1.
+        The D² score on the pinball scale; at most 1. It is taken over the rows where both
+        columns are present; a constant target scores 1.0 when predicted exactly and 0.0
+        otherwise, as in scikit-learn.
 
     Raises:
         ColumnNotFoundError: If a named column is missing.
@@ -352,15 +385,13 @@ def d2_pinball_score(ds: Dataset, y_true: str, y_pred: str, *, alpha: float = 0.
     """
     import batcher as bt
 
-    _require(ds, y_true, y_pred)
-    baseline = float(ds.agg(q=col(y_true).quantile(alpha)).collect().column("q")[0].as_py())
-    baselined = ds.with_columns(__bt_base=bt.lit(baseline))
+    paired = _paired(ds, y_true, y_pred)
+    baseline = paired.agg(q=col(y_true).quantile(alpha)).collect().column("q")[0].as_py()
+    if baseline is None:
+        return float("nan")
+    baselined = paired.with_columns(__bt_base=bt.lit(float(baseline)))
     row = baselined.agg(
         model=bt.pinball_loss(y_true, y_pred, quantile=alpha),
         null=bt.pinball_loss(y_true, "__bt_base", quantile=alpha),
     ).collect()
-    model = row.column("model")[0].as_py()
-    null = row.column("null")[0].as_py()
-    if model is None or null is None or null == 0.0:
-        return float("nan")
-    return 1.0 - float(model) / float(null)
+    return _d2(row.column("model")[0].as_py(), row.column("null")[0].as_py(), force_finite=True)

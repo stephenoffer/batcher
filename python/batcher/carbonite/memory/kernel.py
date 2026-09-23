@@ -52,7 +52,6 @@ __all__ = [
     "oom_kill_count",
     "reset_kernel_sampling",
     "swap_headroom_bytes",
-    "throttle_limit_bytes",
 ]
 
 #: PSI `full` share above which the cgroup is losing meaningful time to reclaim. Below this a
@@ -309,18 +308,6 @@ def cgroup_high_bytes() -> int | None:
         The throttle threshold in bytes, or `None` when unlimited, unset, or not on cgroup v2.
     """
     return _tightest("memory.high")
-
-
-def throttle_limit_bytes() -> int | None:
-    """The ceiling this process is actually allowed to reach: `min(memory.high, memory.max)`.
-
-    The figure every memory budget should be sized against, and the one nothing read. See
-    `KernelMemoryState.effective_limit_bytes`.
-
-    Returns:
-        The binding ceiling in bytes, or `None` when neither limit is set.
-    """
-    return kernel_memory_state().effective_limit_bytes
 
 
 def oom_kill_count() -> int | None:

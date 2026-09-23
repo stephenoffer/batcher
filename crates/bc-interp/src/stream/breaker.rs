@@ -108,7 +108,12 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             // `ctx.workers` is 1 inside a sharded worker (the shard *is* the parallelism, and
             // fanning out again would nest rayon) and the real width on the un-sharded fallback
             // path — where nothing else is spreading this fold across the machine.
-            let stream = build_with(input, ctx)?;
+            // The fold reads a multiset when every aggregate does -- but a grouped fold emits its
+            // groups in first-seen order, so its input order shows unless its own output's order
+            // is unobservable too.
+            let free = super::order::aggregates_ignore_order(aggregates)
+                && (group_keys.is_empty() || ctx.order_free);
+            let stream = build_with(input, ctx.with_order_free(free))?;
             let folded = if ctx.workers > 1 {
                 fold_partial_parallel(stream, group_keys, aggregates, &jit, ctx.workers)?
             } else {
@@ -162,6 +167,8 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
         }
 
         RelOp::Sort { input, keys, limit } => {
+            // A sort totally ordered over unique groups never consults its input order.
+            let ctx = ctx.with_order_free(super::order::sort_is_total_over_groups(keys, input));
             // Top-N (`ORDER BY … LIMIT k`) is **not** a breaker on this path: its state is the k
             // rows it is keeping, so it folds the input away morsel by morsel and never holds it.
             // `parallel_top_n` was already the mergeable top-N — reduce each morsel to its local

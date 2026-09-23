@@ -285,7 +285,7 @@ revenue.meta.tree_format()
 - {doc}`Expression accessors </user-guide/transform/columns/expression-accessors>`: the methods specific to one kind of column, under `.str`, `.dt`, `.list`, `.struct`, and `.json`.
 - {doc}`Expression recipes </user-guide/transform/columns/expression-recipes>`: porting from pandas or Polars, feature engineering, and curating a text corpus.
 - {doc}`The type system </user-guide/transform/columns/type-system>`: what `cast` accepts, and how nulls, NaN, and mixed types behave.
-- {doc}`Expressions API </api/relational/expressions>` and {doc}`Expression accessors API </api/relational/expression-accessors>`: every `Expr` method and every accessor method, enumerated.
+- {doc}`Expressions API </api/relational/expressions>` and {doc}`the accessor namespaces </api/accessors/index>`: every `Expr` method, and a reference page per accessor.
 - {doc}`Aggregations </user-guide/analyze/aggregations>` and {doc}`Window functions </user-guide/analyze/window-functions>`: where aggregate and windowed expressions are used.
 - {doc}`SQL </user-guide/analyze/sql>`: the same column language, spelled as SQL.
 - {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: how a tree of `Expr` nodes becomes vectorized work over an Arrow batch.

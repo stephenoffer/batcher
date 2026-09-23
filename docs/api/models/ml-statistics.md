@@ -20,6 +20,7 @@ reference-versus-current comparisons a deployed model needs. See the
 
    spearman_corr
    entropy
+   normalized_entropy
    gini_impurity
    herfindahl_index
    mode_share
@@ -39,6 +40,7 @@ reference-versus-current comparisons a deployed model needs. See the
    trimmed_mean
    winsorized_mean
    median_abs_deviation
+   mean_abs_deviation
    outlier_mask
    population_stability_index
    kl_divergence

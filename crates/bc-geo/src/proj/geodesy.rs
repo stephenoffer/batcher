@@ -11,10 +11,12 @@
 //! * **Spherical (haversine).** One sphere of mean radius. Accurate to about 0.5%,
 //!   which is a few kilometres on a transcontinental leg and a few centimetres across a
 //!   city. Cheap: a handful of trigonometric calls, no iteration, no failure mode.
-//! * **Ellipsoidal (Vincenty on WGS 84).** Accurate to under a millimetre. Iterative,
-//!   roughly an order of magnitude slower, and famously non-convergent for
-//!   near-antipodal pairs — which this implementation reports rather than returning the
-//!   last iterate as though it were an answer.
+//!   `st_distance_sphere` and `st_dwithin_sphere` use it, and say so in their names.
+//! * **Ellipsoidal (Karney on WGS 84).** Every `*_spheroid` function: distance, length,
+//!   perimeter and area. Accurate to nanometres in distance and to round-off in area,
+//!   defined for every pair of points including antipodal ones, and the same algorithm
+//!   (GeographicLib) that PostGIS `geography`, PROJ and DuckDB spatial use — so the
+//!   answers agree with theirs to about nine significant figures. See `karney`.
 //!
 //! Use the sphere for filtering and ranking, the ellipsoid when the number is the
 //! deliverable.
@@ -34,7 +36,7 @@ pub const WGS84_B: f64 = WGS84_A * (1.0 - WGS84_F);
 
 fn check_lonlat(lon: f64, lat: f64) -> GeoResult<()> {
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
-        return Err(GeoError::invalid(format!(
+        return Err(GeoError::domain(format!(
             "geodesic functions need lon in [-180, 180] and lat in [-90, 90], got ({lon}, {lat})"
         )));
     }
@@ -95,77 +97,15 @@ pub fn destination(lon: f64, lat: f64, bearing_deg: f64, distance_m: f64) -> Geo
     Ok(Coord::new(lon2, p2.to_degrees()))
 }
 
-/// Ellipsoidal distance in metres on WGS 84, by Vincenty's inverse formula.
+/// Ellipsoidal distance in metres on WGS 84, by Karney's geodesic inverse.
 ///
-/// Returns an error rather than a number for the near-antipodal pairs where the
-/// iteration does not converge. That case is real (opposite sides of the Earth, to
-/// within a fraction of a degree) and the alternative — returning the last iterate — is
-/// a plausible-looking answer that can be wrong by hundreds of kilometres.
-pub fn vincenty(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
+/// Converges for every pair of positions, antipodal ones included — which is the case
+/// Vincenty's formula, used here before, reported as an error and the engine then
+/// surfaced as a null distance between two perfectly valid points.
+pub fn ellipsoidal_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
     check_lonlat(lon1, lat1)?;
     check_lonlat(lon2, lat2)?;
-    if lon1 == lon2 && lat1 == lat2 {
-        return Ok(0.0);
-    }
-    let l = (lon2 - lon1).to_radians();
-    let u1 = ((1.0 - WGS84_F) * lat1.to_radians().tan()).atan();
-    let u2 = ((1.0 - WGS84_F) * lat2.to_radians().tan()).atan();
-    let (sin_u1, cos_u1) = u1.sin_cos();
-    let (sin_u2, cos_u2) = u2.sin_cos();
-
-    let mut lambda = l;
-    let mut sin_sigma;
-    let mut cos_sigma;
-    let mut sigma;
-    let mut cos_sq_alpha;
-    let mut cos2_sigma_m;
-    for _ in 0..200 {
-        let (sin_l, cos_l) = lambda.sin_cos();
-        sin_sigma =
-            ((cos_u2 * sin_l).powi(2) + (cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_l).powi(2)).sqrt();
-        if sin_sigma == 0.0 {
-            return Ok(0.0); // coincident points
-        }
-        cos_sigma = sin_u1 * sin_u2 + cos_u1 * cos_u2 * cos_l;
-        sigma = sin_sigma.atan2(cos_sigma);
-        let sin_alpha = cos_u1 * cos_u2 * sin_l / sin_sigma;
-        cos_sq_alpha = 1.0 - sin_alpha * sin_alpha;
-        cos2_sigma_m = if cos_sq_alpha == 0.0 {
-            0.0 // equatorial line
-        } else {
-            cos_sigma - 2.0 * sin_u1 * sin_u2 / cos_sq_alpha
-        };
-        let c = WGS84_F / 16.0 * cos_sq_alpha * (4.0 + WGS84_F * (4.0 - 3.0 * cos_sq_alpha));
-        let lambda_prev = lambda;
-        lambda = l
-            + (1.0 - c)
-                * WGS84_F
-                * sin_alpha
-                * (sigma
-                    + c * sin_sigma
-                        * (cos2_sigma_m
-                            + c * cos_sigma * (-1.0 + 2.0 * cos2_sigma_m * cos2_sigma_m)));
-        if (lambda - lambda_prev).abs() < 1e-12 {
-            let u_sq = cos_sq_alpha * (WGS84_A * WGS84_A - WGS84_B * WGS84_B) / (WGS84_B * WGS84_B);
-            let a =
-                1.0 + u_sq / 16384.0 * (4096.0 + u_sq * (-768.0 + u_sq * (320.0 - 175.0 * u_sq)));
-            let b = u_sq / 1024.0 * (256.0 + u_sq * (-128.0 + u_sq * (74.0 - 47.0 * u_sq)));
-            let delta_sigma = b
-                * sin_sigma
-                * (cos2_sigma_m
-                    + b / 4.0
-                        * (cos_sigma * (-1.0 + 2.0 * cos2_sigma_m * cos2_sigma_m)
-                            - b / 6.0
-                                * cos2_sigma_m
-                                * (-3.0 + 4.0 * sin_sigma * sin_sigma)
-                                * (-3.0 + 4.0 * cos2_sigma_m * cos2_sigma_m)));
-            return Ok(WGS84_B * a * (sigma - delta_sigma));
-        }
-    }
-    Err(GeoError::invalid(format!(
-        "Vincenty did not converge for ({lon1}, {lat1}) to ({lon2}, {lat2}); the points \
-         are nearly antipodal — use the spherical distance for this pair"
-    )))
+    Ok(crate::proj::karney::distance(lon1, lat1, lon2, lat2))
 }
 
 /// Rhumb-line (constant-bearing) distance in metres.
@@ -219,69 +159,69 @@ pub fn rhumb_bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f6
     Ok((dl.atan2(dpsi).to_degrees() + 360.0) % 360.0)
 }
 
-/// The geodesic area of a lon/lat ring, in square metres.
+/// The ellipsoidal (WGS 84) area of a lon/lat ring, in square metres.
 ///
-/// Computed from the spherical excess, so it is correct for a ring of any size —
-/// including one spanning a hemisphere, where projecting to a plane first and taking
-/// the shoelace area is wrong by an unbounded factor. Sign is dropped: the caller asked
-/// for an area.
-#[must_use]
-pub fn ring_area_m2(ring: &[Coord]) -> f64 {
-    if ring.len() < 3 {
-        return 0.0;
+/// Edges are geodesics and the ring is closed implicitly. Correct for a ring of any
+/// size — including one spanning a hemisphere, where projecting to a plane first and
+/// taking the shoelace area is wrong by an unbounded factor — and for one crossing the
+/// antimeridian, which the spherical-excess sum this replaced measured the long way
+/// round the globe (a 20x20-degree box straddling 180 came out at 8.4e13 m² instead of
+/// 4.9e12). Sign is dropped: the caller asked for an area.
+pub fn ring_area_m2(ring: &[Coord]) -> GeoResult<f64> {
+    for c in ring {
+        check_lonlat(c.x, c.y)?;
     }
-    let mut total = 0.0;
-    for w in ring.windows(2) {
-        let l1 = w[0].x.to_radians();
-        let l2 = w[1].x.to_radians();
-        let p1 = w[0].y.to_radians();
-        let p2 = w[1].y.to_radians();
-        total += (l2 - l1) * (2.0 + p1.sin() + p2.sin());
-    }
-    // Close the ring if the caller did not.
-    let (first, last) = (ring[0], ring[ring.len() - 1]);
-    if first.x != last.x || first.y != last.y {
-        let l1 = last.x.to_radians();
-        let l2 = first.x.to_radians();
-        total += (l2 - l1) * (2.0 + last.y.to_radians().sin() + first.y.to_radians().sin());
-    }
-    (total * EARTH_RADIUS_M * EARTH_RADIUS_M / 2.0).abs()
+    let pts: Vec<(f64, f64)> = ring.iter().map(|c| (c.x, c.y)).collect();
+    Ok(crate::proj::karney::ring_area(&pts))
 }
 
-/// The geodesic area of a whole geometry in square metres, holes subtracted.
-#[must_use]
-pub fn geodesic_area_m2(g: &crate::types::Geometry) -> f64 {
-    crate::types::measurement(
-        g.polygons()
-            .iter()
-            .map(|p| {
-                let shell = ring_area_m2(&p.exterior);
-                let holes: f64 = p.interiors.iter().map(|r| ring_area_m2(r)).sum();
-                (shell - holes).max(0.0)
-            })
-            .sum(),
-    )
-}
-
-/// The geodesic length of every chain of a geometry in metres.
-pub fn geodesic_length_m(g: &crate::types::Geometry) -> GeoResult<f64> {
+/// The ellipsoidal area of a whole geometry in square metres, holes subtracted.
+///
+/// `Domain` (a null, at the expression layer) when a coordinate is off the globe.
+pub fn geodesic_area_m2(g: &crate::types::Geometry) -> GeoResult<f64> {
     let mut total = 0.0;
-    for l in crate::algo::relate::linear_parts(g) {
-        for w in l.windows(2) {
-            total += haversine(w[0].x, w[0].y, w[1].x, w[1].y)?;
+    for p in g.polygons() {
+        if p.exterior.is_empty() {
+            continue;
         }
+        let shell = ring_area_m2(&p.exterior)?;
+        let mut holes = 0.0;
+        for r in &p.interiors {
+            holes += ring_area_m2(r)?;
+        }
+        total += (shell - holes).max(0.0);
     }
     Ok(crate::types::measurement(total))
 }
 
-/// The geodesic perimeter of every polygon of a geometry in metres.
+/// The summed ellipsoidal length of consecutive positions of one chain.
+fn chain_length_m(l: &[Coord]) -> GeoResult<f64> {
+    let mut total = 0.0;
+    for w in l.windows(2) {
+        total += ellipsoidal_distance(w[0].x, w[0].y, w[1].x, w[1].y)?;
+    }
+    Ok(total)
+}
+
+/// The ellipsoidal length of every chain of a geometry in metres.
+///
+/// Each segment is the geodesic between its endpoints, measured on WGS 84 — the
+/// definition `ST_Length_Spheroid` has in DuckDB and `ST_Length(geography)` has in
+/// PostGIS. It is not the length of the straight line in lon/lat that a map draws.
+pub fn geodesic_length_m(g: &crate::types::Geometry) -> GeoResult<f64> {
+    let mut total = 0.0;
+    for l in crate::algo::relate::linear_parts(g) {
+        total += chain_length_m(l)?;
+    }
+    Ok(crate::types::measurement(total))
+}
+
+/// The ellipsoidal perimeter of every polygon of a geometry in metres, holes included.
 pub fn geodesic_perimeter_m(g: &crate::types::Geometry) -> GeoResult<f64> {
     let mut total = 0.0;
     for p in g.polygons() {
         for ring in std::iter::once(&p.exterior).chain(p.interiors.iter()) {
-            for w in ring.windows(2) {
-                total += haversine(w[0].x, w[0].y, w[1].x, w[1].y)?;
-            }
+            total += chain_length_m(ring)?;
         }
     }
     Ok(crate::types::measurement(total))
@@ -312,21 +252,73 @@ mod tests {
     }
 
     #[test]
-    fn vincenty_is_close_to_haversine_and_more_precise() {
+    fn the_ellipsoid_is_close_to_the_sphere_and_more_precise() {
         let (a, b, c, d) = (-0.1278, 51.5074, -74.0060, 40.7128);
         let h = haversine(a, b, c, d).unwrap();
-        let v = vincenty(a, b, c, d).unwrap();
+        let v = ellipsoidal_distance(a, b, c, d).unwrap();
         close(v, h, 0.6);
         // The published WGS 84 value for this pair is 5 585 234 m.
         close(v, 5_585_234.0, 0.05);
     }
 
     #[test]
-    fn vincenty_reports_non_convergence_rather_than_guessing() {
-        // Very nearly antipodal: the classic non-convergent case.
-        let r = vincenty(0.0, 0.0, 179.9999, 0.0);
-        assert!(r.is_err(), "expected a non-convergence error, got {r:?}");
-        assert!(format!("{}", r.unwrap_err()).contains("antipodal"));
+    fn antipodal_points_have_an_ellipsoidal_distance() {
+        // Vincenty's non-convergent case, which used to surface as a null.
+        let near = ellipsoidal_distance(0.0, 0.0, 179.9999, 0.0).unwrap();
+        assert!((near - 20_003_931.457_702_395).abs() < 1e-6, "{near}");
+        let exact = ellipsoidal_distance(0.0, 0.0, 180.0, 0.0).unwrap();
+        assert!((exact - 20_003_931.458_625_447).abs() < 1e-6, "{exact}");
+    }
+
+    #[test]
+    fn an_off_globe_coordinate_is_a_row_local_domain_error() {
+        for r in [
+            ellipsoidal_distance(f64::NAN, 0.0, 1.0, 1.0),
+            ellipsoidal_distance(200.0, 0.0, 1.0, 1.0),
+            geodesic_length_m(&crate::types::Geometry::LineString(vec![
+                Coord::new(0.0, 0.0),
+                Coord::new(0.0, 95.0),
+            ])),
+        ] {
+            let e = r.unwrap_err();
+            assert!(e.is_row_local(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn an_antimeridian_box_has_the_area_of_the_same_box_elsewhere() {
+        let bx = |x0: f64, x1: f64| {
+            ring_area_m2(&[
+                Coord::new(x0, -10.0),
+                Coord::new(x1, -10.0),
+                Coord::new(x1, 10.0),
+                Coord::new(x0, 10.0),
+                Coord::new(x0, -10.0),
+            ])
+            .unwrap()
+        };
+        // GeographicLib PolygonArea on these four vertices: 4948480469169.516 m^2.
+        let across = bx(170.0, -170.0);
+        assert!(
+            (across / 4_948_480_469_169.516 - 1.0).abs() < 1e-9,
+            "{across}"
+        );
+        assert!((across / bx(-10.0, 10.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn length_and_perimeter_are_ellipsoidal() {
+        // One degree of longitude on the equator is exactly a * pi / 180 on WGS 84; the
+        // mean-radius sphere this used to sum over says 111 195 m, 0.1% short.
+        let l = geodesic_length_m(&crate::types::Geometry::LineString(vec![
+            Coord::new(0.0, 0.0),
+            Coord::new(1.0, 0.0),
+        ]))
+        .unwrap();
+        assert!(
+            (l - WGS84_A * std::f64::consts::PI / 180.0).abs() < 1e-6,
+            "{l}"
+        );
     }
 
     #[test]
@@ -381,11 +373,16 @@ mod tests {
             Coord::new(0.0, 1.0),
             Coord::new(0.0, 0.0),
         ];
-        close(ring_area_m2(&ring), 1.2308e10, 0.5);
+        // GeographicLib: 12308778361.469452 m^2.
+        close(ring_area_m2(&ring).unwrap(), 12_308_778_361.469_452, 1e-9);
         // Winding does not change the area.
         let mut rev = ring.clone();
         rev.reverse();
-        close(ring_area_m2(&rev), ring_area_m2(&ring), 1e-9);
+        close(
+            ring_area_m2(&rev).unwrap(),
+            ring_area_m2(&ring).unwrap(),
+            1e-9,
+        );
     }
 
     #[test]
@@ -398,6 +395,7 @@ mod tests {
                 Coord::new(0.0, lat + 1.0),
                 Coord::new(0.0, lat),
             ])
+            .unwrap()
         };
         assert!(
             cell(60.0) < cell(0.0) * 0.6,

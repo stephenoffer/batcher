@@ -201,7 +201,10 @@ single-class category encodes as a neutral 0 rather than an infinite log-odds.
 `"median"`, `"most_frequent"`, or `"constant"`, and `"constant"` needs a `fill_value`. The
 `"mean"` and `"median"` strategies cast the column to float, following the scikit-learn
 convention. `"most_frequent"` and `"constant"` keep the original type, so they also work
-on string and categorical columns.
+on string and categorical columns. When two values are equally frequent, `"most_frequent"`
+picks the smallest, as scikit-learn does, so the fill value doesn't depend on how the data
+was partitioned. In a float column, NaN is missing too: it is skipped when the fill value is
+learned and filled by `transform`.
 
 ```python
 import batcher as bt

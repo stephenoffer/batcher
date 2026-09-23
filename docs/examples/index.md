@@ -1,6 +1,6 @@
 # Example library
 
-Batcher ships 512 runnable example scripts under `examples/`, covering every part of the engine from the relational core to GPU inference. Every one executes end to end against the built engine, asserts on its own output, and exits non-zero if anything is wrong, so running the whole directory doubles as a release check. When you need a starting point for a pipeline, one of these is usually close.
+Batcher ships 533 runnable example scripts under `examples/`, covering every part of the engine from the relational core to GPU inference. Every one executes end to end against the built engine, asserts on its own output, and exits non-zero if anything is wrong, so running the whole directory doubles as a release check. When you need a starting point for a pipeline, one of these is usually close.
 
 The tables on these pages are generated from the scripts themselves by `python tools/example_library.py`, so the library cannot drift from the tree. The prose around them is written by hand.
 
@@ -14,7 +14,7 @@ python -m pytest tests/docs/test_examples.py -q
 
 Anything needing more than a handful of literal rows reads the public TPC-H mirror in `s3://ray-benchmark-data`, plus a corpus of small JPEGs for the multimodal scripts. Nothing is synthetic while the network is up.
 
-The shared helper in `examples/_common/` restores the canonical TPC-H column names, which the mirror does not carry, caches a bounded slice of each table locally so five hundred scripts do not each re-read S3, and falls back to a schema-identical stand-in with a notice on stderr when there is no network. Point the cache elsewhere with `BATCHER_EXAMPLES_CACHE`, or take more rows with `BATCHER_EXAMPLES_ROWS`.
+The shared helper in [`examples/_common/`](https://github.com/stephenoffer/batcher/tree/main/examples/_common) restores the canonical TPC-H column names, which the mirror does not carry, caches a bounded slice of each table locally so five hundred scripts do not each re-read S3, and falls back to a schema-identical stand-in with a notice on stderr when there is no network. Point the cache elsewhere with `BATCHER_EXAMPLES_CACHE`, or take more rows with `BATCHER_EXAMPLES_ROWS`.
 
 Scripts reach the helper with a two-line bootstrap that works both under the test runner and when you run the file directly:
 
@@ -36,8 +36,8 @@ Two families would otherwise need hardware that CI does not have. Both take a fl
 
 | Family | Default | Opt in |
 | --- | --- | --- |
-| `examples/gpu/` and the ML device paths | Auto: use an accelerator when the engine sees one, the CPU engine otherwise | `--device gpu`, `--device cpu`, or `BATCHER_EXAMPLES_DEVICE` |
-| `examples/dist/` | Single node, still asserting mergeable equivalence across partitions | `--distributed` or `BATCHER_EXAMPLES_DISTRIBUTED=1` |
+| [`examples/gpu/`](https://github.com/stephenoffer/batcher/tree/main/examples/gpu) and the ML device paths | Auto: use an accelerator when the engine sees one, the CPU engine otherwise | `--device gpu`, `--device cpu`, or `BATCHER_EXAMPLES_DEVICE` |
+| [`examples/dist/`](https://github.com/stephenoffer/batcher/tree/main/examples/dist) | Single node, still asserting mergeable equivalence across partitions | `--distributed` or `BATCHER_EXAMPLES_DISTRIBUTED=1` |
 
 Asking for `--device gpu` on a machine with no accelerator is an error rather than a silent downgrade. The one time you type it deliberately is the time you need to know it did not happen.
 
@@ -49,34 +49,34 @@ The scripts at the root of `examples/` are tours of one topic rather than focuse
 
 Two of these need setup and are marked `# examples: skip`, so the test runner collects them without executing. `distributed.py` needs the optional `[ray]` extra and spins up a local cluster; `streaming_pipeline.py` needs a Kafka broker and a Delta sink. Both still show the real API shape, and running `distributed.py` directly is the fastest way to see single-node and distributed produce identical results.
 
-For a single script that touches every subsystem at once, use `examples/operations/release_check.py` instead. It checks the S3 read path, the scan, the plan surface, each relational operator, SQL, expressions, data quality, backend parity, partition parity, spill parity and the write path, and reports which one failed.
+For a single script that touches every subsystem at once, use [`examples/operations/release_check.py`](https://github.com/stephenoffer/batcher/blob/main/examples/operations/release_check.py) instead. It checks the S3 read path, the scan, the plan surface, each relational operator, SQL, expressions, data quality, backend parity, partition parity, spill parity and the write path, and reports which one failed.
 
 <!-- library-table: . -->
 | Script | Shows |
 | --- | --- |
-| `examples/adaptive_optimization.py` | Adaptive re-optimization: the moat |
-| `examples/data_quality.py` | Data-quality checks: validate, quarantine, drop, and enforce a contract |
-| `examples/distributed.py` | Distributed execution: the same code, single-node or on a cluster (needs external setup) |
-| `examples/feature_engineering.py` | Feature engineering: derive model-ready columns from raw tabular data |
-| `examples/lakehouse_scd.py` | Lakehouse round-trip plus an SCD type-2 history build |
-| `examples/ml_inference.py` | Batch inference: score every row with a model-shaped callable |
-| `examples/performance_caching.py` | Performance: caching a reused result and spilling under a tiny memory budget |
-| `examples/preprocessors.py` | Feature engineering with fit/transform preprocessor objects |
-| `examples/quickstart.py` | Quickstart: build a lazy pipeline and run it |
-| `examples/spill.py` | Out-of-core execution: bounded memory via spill-to-disk |
-| `examples/sql.py` | SQL over Datasets - and blending SQL with Python |
-| `examples/streaming_pipeline.py` | Streaming micro-batch pipeline: Kafka in, windowed aggregate, Delta out (needs external setup) |
-| `examples/tabular_ml.py` | An end-to-end tabular ML workflow: split, fit, score, evaluate, monitor |
-| `examples/timeseries.py` | Time-series patterns: extract date parts, resample, and compute period change |
-| `examples/transformations_aggregations_joins.py` | Transformations, aggregations, and joins - the DataFrame core |
-| `examples/window_functions.py` | Window functions: per-partition aggregates and ranking |
+| [`examples/adaptive_optimization.py`](https://github.com/stephenoffer/batcher/blob/main/examples/adaptive_optimization.py) | Adaptive re-optimization: the moat |
+| [`examples/data_quality.py`](https://github.com/stephenoffer/batcher/blob/main/examples/data_quality.py) | Data-quality checks: validate, quarantine, drop, and enforce a contract |
+| [`examples/distributed.py`](https://github.com/stephenoffer/batcher/blob/main/examples/distributed.py) | Distributed execution: the same code, single-node or on a cluster (needs external setup) |
+| [`examples/feature_engineering.py`](https://github.com/stephenoffer/batcher/blob/main/examples/feature_engineering.py) | Feature engineering: derive model-ready columns from raw tabular data |
+| [`examples/lakehouse_scd.py`](https://github.com/stephenoffer/batcher/blob/main/examples/lakehouse_scd.py) | Lakehouse round-trip plus an SCD type-2 history build |
+| [`examples/ml_inference.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml_inference.py) | Batch inference: score every row with a model-shaped callable |
+| [`examples/performance_caching.py`](https://github.com/stephenoffer/batcher/blob/main/examples/performance_caching.py) | Performance: caching a reused result and spilling under a tiny memory budget |
+| [`examples/preprocessors.py`](https://github.com/stephenoffer/batcher/blob/main/examples/preprocessors.py) | Feature engineering with fit/transform preprocessor objects |
+| [`examples/quickstart.py`](https://github.com/stephenoffer/batcher/blob/main/examples/quickstart.py) | Quickstart: build a lazy pipeline and run it |
+| [`examples/spill.py`](https://github.com/stephenoffer/batcher/blob/main/examples/spill.py) | Out-of-core execution: bounded memory via spill-to-disk |
+| [`examples/sql.py`](https://github.com/stephenoffer/batcher/blob/main/examples/sql.py) | SQL over Datasets - and blending SQL with Python |
+| [`examples/streaming_pipeline.py`](https://github.com/stephenoffer/batcher/blob/main/examples/streaming_pipeline.py) | Streaming micro-batch pipeline: Kafka in, windowed aggregate, Delta out (needs external setup) |
+| [`examples/tabular_ml.py`](https://github.com/stephenoffer/batcher/blob/main/examples/tabular_ml.py) | An end-to-end tabular ML workflow: split, fit, score, evaluate, monitor |
+| [`examples/timeseries.py`](https://github.com/stephenoffer/batcher/blob/main/examples/timeseries.py) | Time-series patterns: extract date parts, resample, and compute period change |
+| [`examples/transformations_aggregations_joins.py`](https://github.com/stephenoffer/batcher/blob/main/examples/transformations_aggregations_joins.py) | Transformations, aggregations, and joins - the DataFrame core |
+| [`examples/window_functions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/window_functions.py) | Window functions: per-partition aggregates and ranking |
 <!-- /library-table -->
 
 ## The sections
 
 Each page below indexes one part of the library and shows code lifted from the scripts it covers. Blocks that need the S3 corpus are marked `# docs: skip` and are shown rather than executed; the rest run as part of the documentation build.
 
-![A bar chart of the 512 example scripts by section, sorted largest first. Relational operations has 115, expressions 101, machine learning 57, reading and writing 47, statistics, time series, geospatial and graph 46, operating the engine 40, TPC-H 30, data quality and governance 23, distributed and streaming 18, the root tour scripts 16, multimodal and text 11, and accelerators 8. The relational core and the expression language together hold 216 of the 512.](/_static/diagrams/example_library_map.svg)
+![A bar chart of the 533 example scripts by section, sorted largest first. Relational operations has 119, expressions 102, machine learning 64, statistics, time series, geospatial and graph 49, reading and writing 48, operating the engine 41, TPC-H 30, data quality and governance 25, distributed and streaming 20, the root tour scripts 16, multimodal and text 11, and accelerators 8. The relational core and the expression language together hold 221 of the 533.](/_static/diagrams/example_library_map.svg)
 
 | Page | Scripts | Covers |
 | --- | --- | --- |

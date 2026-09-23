@@ -223,6 +223,12 @@ pub fn azimuth(a: Coord, b: Coord) -> Option<f64> {
 /// the reason a `GEOMETRYCOLLECTION(POLYGON, POINT)` centroid ignores the point.
 /// A zero-measure areal or linear geometry (a degenerate polygon, a zero-length line)
 /// falls back to the vertex mean rather than dividing by zero.
+///
+/// The z ordinate is carried with the same weights: the mean z of a point set, the
+/// length-weighted z of a chain, and for an areal geometry the area-weighted z of a
+/// triangle fan — which is what DuckDB and GEOS report for a 3D input. Dropping it made
+/// the centroid of `POINT Z (1 2 3)` sit at z = 0. For a 2D geometry z is 0 throughout
+/// and the caller does not write it.
 #[must_use]
 pub fn centroid(g: &Geometry) -> Option<Coord> {
     let polys = g.polygons();
@@ -239,11 +245,7 @@ pub fn centroid(g: &Geometry) -> Option<Coord> {
     }
     let pts = g.points();
     if !pts.is_empty() {
-        let n = pts.len() as f64;
-        return Some(Coord::new(
-            pts.iter().map(|c| c.x).sum::<f64>() / n,
-            pts.iter().map(|c| c.y).sum::<f64>() / n,
-        ));
+        return Some(vertex_mean(&pts));
     }
     // Nothing but degenerate geometry: fall back to the mean of every vertex so a
     // sliver polygon still reports a position rather than nothing.
@@ -255,14 +257,26 @@ pub fn centroid(g: &Geometry) -> Option<Coord> {
     if all.is_empty() {
         return None;
     }
-    let n = all.len() as f64;
-    Some(Coord::new(
-        all.iter().map(|c| c.x).sum::<f64>() / n,
-        all.iter().map(|c| c.y).sum::<f64>() / n,
-    ))
+    Some(vertex_mean(&all))
 }
 
-fn ring_centroid_moment(ring: &[Coord]) -> (f64, f64, f64) {
+/// The arithmetic mean of a non-empty set of positions, z included.
+fn vertex_mean(pts: &[Coord]) -> Coord {
+    let n = pts.len() as f64;
+    Coord::new_z(
+        pts.iter().map(|c| c.x).sum::<f64>() / n,
+        pts.iter().map(|c| c.y).sum::<f64>() / n,
+        pts.iter().map(|c| c.z).sum::<f64>() / n,
+    )
+}
+
+/// Twice the signed area of a closed ring, and its first moments in x, y and z (each
+/// still to be divided by three times that area).
+///
+/// x and y use the shoelace moments; z uses a triangle fan from the first vertex, whose
+/// triangles' signed areas sum to the same total. The fan is what gives a planar
+/// weighting to z without assuming the ring is flat in 3D.
+fn ring_centroid_moment(ring: &[Coord]) -> (f64, f64, f64, f64) {
     let mut a2 = 0.0;
     let mut cx = 0.0;
     let mut cy = 0.0;
@@ -272,18 +286,26 @@ fn ring_centroid_moment(ring: &[Coord]) -> (f64, f64, f64) {
         cx += (w[0].x + w[1].x) * f;
         cy += (w[0].y + w[1].y) * f;
     }
-    (a2, cx, cy)
+    let mut cz = 0.0;
+    if let Some(&p0) = ring.first() {
+        for w in ring.windows(2).skip(1) {
+            let t = crate::algo::primitive::cross(p0, w[0], w[1]);
+            cz += t * (p0.z + w[0].z + w[1].z);
+        }
+    }
+    (a2, cx, cy, cz)
 }
 
 fn area_centroid(polys: &[&Polygon]) -> Option<Coord> {
     let mut a2 = 0.0;
     let mut cx = 0.0;
     let mut cy = 0.0;
+    let mut cz = 0.0;
     for p in polys {
         for ring in std::iter::once(&p.exterior).chain(p.interiors.iter()) {
             let mut closed = ring.clone();
             crate::types::close_ring(&mut closed);
-            let (ra, rx, ry) = ring_centroid_moment(&closed);
+            let (ra, rx, ry, rz) = ring_centroid_moment(&closed);
             // A hole subtracts, which the shoelace sign already encodes when the hole
             // winds opposite the shell. Force the sign so a same-winding hole still
             // subtracts rather than doubling the shell.
@@ -300,27 +322,34 @@ fn area_centroid(polys: &[&Polygon]) -> Option<Coord> {
             a2 += flip * ra;
             cx += flip * rx;
             cy += flip * ry;
+            cz += flip * rz;
         }
     }
     if a2.abs() < f64::MIN_POSITIVE {
         return None;
     }
-    Some(Coord::new(cx / (3.0 * a2), cy / (3.0 * a2)))
+    Some(Coord::new_z(
+        cx / (3.0 * a2),
+        cy / (3.0 * a2),
+        cz / (3.0 * a2),
+    ))
 }
 
 fn line_centroid(lines: &[&LineString]) -> Option<Coord> {
     let mut total = 0.0;
     let mut cx = 0.0;
     let mut cy = 0.0;
+    let mut cz = 0.0;
     for l in lines {
         for w in l.windows(2) {
             let d = dist(w[0], w[1]);
             total += d;
             cx += d * (w[0].x + w[1].x) / 2.0;
             cy += d * (w[0].y + w[1].y) / 2.0;
+            cz += d * (w[0].z + w[1].z) / 2.0;
         }
     }
-    (total > 0.0).then(|| Coord::new(cx / total, cy / total))
+    (total > 0.0).then(|| Coord::new_z(cx / total, cy / total, cz / total))
 }
 
 #[cfg(test)]
@@ -360,7 +389,31 @@ mod tests {
             }
         }
         assert!(
-            !crate::proj::geodesy::geodesic_area_m2(&g("POINT(2 2)").geometry).is_sign_negative()
+            !crate::proj::geodesy::geodesic_area_m2(&g("POINT(2 2)").geometry)
+                .unwrap()
+                .is_sign_negative()
+        );
+    }
+
+    #[test]
+    fn a_centroid_keeps_the_z_of_a_3d_input() {
+        // Every expected value is DuckDB spatial's ST_Centroid on the same WKT.
+        let z = |t: &str| centroid(&g(t).geometry).unwrap();
+        assert_eq!(z("POINT Z (1 2 3)"), Coord::new_z(1.0, 2.0, 3.0));
+        assert_eq!(
+            z("LINESTRING Z (0 0 0, 3 4 10)"),
+            Coord::new_z(1.5, 2.0, 5.0)
+        );
+        assert_eq!(
+            z("MULTIPOINT Z ((0 0 1), (2 2 3))"),
+            Coord::new_z(1.0, 1.0, 2.0)
+        );
+        let c = z("POLYGON Z ((0 0 0, 4 0 0, 4 4 8, 0 0 0))");
+        assert!((c.z - 8.0 / 3.0).abs() < 1e-12, "{c:?}");
+        let c = z("POLYGON Z ((0 0 0, 10 0 10, 10 1 10, 0 1 0, 0 0 0))");
+        assert!(
+            (c.x - 5.0).abs() < 1e-12 && (c.z - 5.0).abs() < 1e-12,
+            "{c:?}"
         );
     }
 

@@ -12,11 +12,13 @@ correlation controlling for several variables, inverting the (tiny) correlation 
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import math
+from functools import reduce
+from typing import TYPE_CHECKING, Any
 
-from batcher.ml.stats._shared import require_columns
+from batcher.ml.stats._shared import require_columns, scalar
 from batcher.plan.expr_ir.constructors import col
-from batcher.plan.functions.aggregate import corr, covar_samp
+from batcher.plan.functions.aggregate import corr, count_if, covar_samp
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -192,7 +194,9 @@ def variance_inflation_factor(ds: Dataset, columns: Sequence[str]) -> dict[str, 
         columns: The numeric columns to check for mutual collinearity.
 
     Returns:
-        A ``{column: vif}`` dict, each at least 1.
+        A ``{column: vif}`` dict, each at least 1 and infinite for an exact linear
+        combination. Every value is NaN when there are no more complete rows than columns (the
+        regression is underdetermined) or a column is constant.
 
     Raises:
         ColumnNotFoundError: If a named column is missing.
@@ -216,7 +220,31 @@ def variance_inflation_factor(ds: Dataset, columns: Sequence[str]) -> dict[str, 
 
     require_columns(ds, *columns)
     names = list(columns)
+    complete = ds.agg(
+        n=count_if(reduce(lambda a, b: a & b, (col(name).is_not_null() for name in names)))
+    )
     matrix = correlation_matrix(ds, names).to_pydict()
     correlation = np.array([matrix[name] for name in names], dtype=float).T
-    diagonal = np.diag(np.linalg.pinv(correlation))
-    return {name: float(diagonal[i]) for i, name in enumerate(names)}
+    # Regressing one column on the other p - 1 plus an intercept fits p parameters, so it needs
+    # more than p complete rows. At p rows or fewer the fit is exact whatever the data, and the
+    # inverse of the correlation matrix returned values below 1 -- impossible for a VIF. A
+    # constant column has no correlation at all (NaN), and neither has anything regressed on it.
+    if scalar(complete, "n") <= len(names) or not np.all(np.isfinite(correlation)):
+        return {name: float("nan") for name in names}
+    return {name: _vif(correlation, j) for j, name in enumerate(names)}
+
+
+def _vif(correlation: Any, j: int) -> float:
+    """``1 / (1 - R^2_j)``, with ``R^2_j`` read off the correlation matrix by least squares.
+
+    The pseudo-inverse of the *other* columns' block, not of the whole matrix: when two of the
+    others are themselves collinear the block is singular, and the pseudo-inverse still gives
+    the right projection, where the diagonal of the whole matrix's pseudo-inverse does not.
+    """
+    import numpy as np
+
+    others = [i for i in range(correlation.shape[0]) if i != j]
+    r = correlation[others, j]
+    explained = float(r @ np.linalg.pinv(correlation[np.ix_(others, others)]) @ r)
+    unexplained = 1.0 - min(max(explained, 0.0), 1.0)
+    return math.inf if unexplained <= 1e-12 else 1.0 / unexplained

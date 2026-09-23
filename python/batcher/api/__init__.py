@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset as Dataset
     from batcher.api.dataset import GroupBy as GroupBy
     from batcher.api.functions import *  # noqa: F403
+    from batcher.api.history import query_history as query_history
     from batcher.api.security import authenticate as authenticate
     from batcher.api.security import current_verifier as current_verifier
     from batcher.api.security import security as security

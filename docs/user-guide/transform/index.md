@@ -53,6 +53,7 @@ The pages below are listed in reading order, rows first and then columns.
 | {doc}`Expressions <columns/expressions>` | The composable column language: operators, conditionals, nulls, math |
 | {doc}`Expression accessors <columns/expression-accessors>` | The `.dt`, `.list`, `.struct`, `.map`, and `.json` namespaces |
 | {doc}`The string accessor <columns/string-accessor>` | {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`: search, regex, paths, recasing, and compression |
+| {doc}`Media columns <columns/media-accessor>` | {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`, {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>`, and {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>`: header facts, decoding, and quality signals |
 | {doc}`The sequence accessor <columns/sequence-accessor>` | {py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>`: DNA, RNA, protein, and FASTQ-quality columns |
 | {doc}`Map columns <columns/map-accessor>` | Building a map and reading it with {py:class}`.map <batcher.plan.expr_ir.namespaces.collections._MapNamespace>` |
 | {doc}`Expression recipes <columns/expression-recipes>` | Porting, feature engineering, and text-corpus curation |
@@ -65,6 +66,7 @@ The pages below are listed in reading order, rows first and then columns.
 - {doc}`/user-guide/analyze/index`: grouping, joining, and windowing the rows you kept.
 - {doc}`/cookbook/expressions/index`: the column language as runnable recipes.
 - {doc}`/api/relational/expressions`: every `Expr` method, enumerated.
+- {doc}`/examples/relational`: the same verbs as standalone scripts, each run on every commit.
 
 ```{toctree}
 :hidden:

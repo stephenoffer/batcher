@@ -10,21 +10,16 @@ from __future__ import annotations
 import os
 
 from batcher._internal.errors import ConfigError, unknown_value
+from batcher.config.validation.sections import METADATA_BACKENDS
 from batcher.metadata.backends.in_process import InProcessBackend
 from batcher.metadata.store import MetadataBackend
 
 __all__ = ["BACKEND_NAMES", "default_sqlite_uri", "make_backend"]
 
-#: Every name `make_backend` accepts. The one source of truth for the set, so the
-#: "unknown backend" error can never offer a name the factory does not build.
-BACKEND_NAMES: tuple[str, ...] = (
-    "in_process",
-    "sqlite",
-    "rocksdb",
-    "object_storage",
-    "redis",
-    "layered",
-)
+#: Every name `make_backend` accepts, so the "unknown backend" error can never offer a name
+#: the factory does not build. Stated once, in config (layer 0), so that the names config
+#: validation accepts and the names this factory builds cannot drift apart again.
+BACKEND_NAMES: tuple[str, ...] = METADATA_BACKENDS
 
 
 def default_sqlite_uri() -> str:

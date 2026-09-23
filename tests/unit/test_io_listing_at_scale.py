@@ -320,7 +320,9 @@ def test_planning_a_wide_corpus_does_not_read_a_footer_per_file(tmp_path, monkey
         splits = source_module.FileSource.splits(ParquetSource(str(tmp_path)))
 
         assert len(splits) == 12
-        assert all(isinstance(s, FileSplit) for s in splits)
+        # Strict mode holds each file it has not read to the declared schema by wrapping its
+        # split (`ConformedSplit`) rather than by reading its footer, which is the point here.
+        assert all(isinstance(getattr(s, "inner", s), FileSplit) for s in splits)
         assert seen == [], "planning a wide corpus must not read a footer per file"
 
 

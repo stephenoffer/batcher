@@ -10,12 +10,17 @@ its second-moment cousin — so each is a single mergeable aggregate that runs d
 composes inside `group_by` exactly as the unweighted versions do. The weights are used as
 *reliability* weights (frequency weights), which is the convention every downstream tool
 expects and matches ``numpy.average`` and a frequency-weighted ``numpy.cov``.
+
+Nulls are dropped **pairwise**: a row missing any column an aggregate reads (the value, the
+weight, or either side of a covariance) leaves every one of its sums together, which is what
+``numpy.average`` over the complete rows computes. Dropping them per sum, as SQL's `sum` does
+on its own, let a row with a null value still add its weight to the denominator.
 """
 
 from __future__ import annotations
 
 from batcher.plan.expr_ir.core import Expr, IntoExpr
-from batcher.plan.functions.aggregate import _as_column
+from batcher.plan.functions.analysis.association import _complete_cases
 
 __all__ = [
     "weighted_correlation",
@@ -58,7 +63,7 @@ def weighted_var(value: IntoExpr, weight: IntoExpr) -> Expr:
             >>> ds.agg(v=bt.weighted_var("x", "w")).to_pydict()
             {'v': [1.0]}
     """
-    x, w = _as_column(value), _as_column(weight)
+    x, w = _complete_cases(value, weight)
     total = w.sum()
     mean = (w * x).sum() / total
     mean_square = (w * x * x).sum() / total
@@ -114,7 +119,7 @@ def weighted_covariance(x: IntoExpr, y: IntoExpr, weight: IntoExpr) -> Expr:
             >>> round(ds.agg(c=bt.weighted_covariance("x", "y", "w")).to_pydict()["c"][0], 4)
             1.3333
     """
-    xc, yc, w = _as_column(x), _as_column(y), _as_column(weight)
+    xc, yc, w = _complete_cases(x, y, weight)
     total = w.sum()
     mean_x = (w * xc).sum() / total
     mean_y = (w * yc).sum() / total
@@ -148,5 +153,8 @@ def weighted_correlation(x: IntoExpr, y: IntoExpr, weight: IntoExpr) -> Expr:
             >>> round(ds.agg(r=bt.weighted_correlation("x", "y", "w")).to_pydict()["r"][0], 6)
             1.0
     """
-    covariance = weighted_covariance(x, y, weight)
-    return covariance / (weighted_std(x, weight) * weighted_std(y, weight))
+    # The spreads are taken over the rows the covariance uses: a row missing `y` must not
+    # widen `x`'s spread, or the ratio leaves [-1, 1]'s meaning behind.
+    xc, yc, w = _complete_cases(x, y, weight)
+    covariance = weighted_covariance(xc, yc, w)
+    return covariance / (weighted_std(xc, w) * weighted_std(yc, w))

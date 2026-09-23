@@ -18,73 +18,73 @@ The following table maps the 67 names on the `pyspark.sql.functions` module, sor
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `abs` | `Expr.abs` | canonical |  |
-| `acos` | `Expr.arccos` | canonical |  |
-| `acosh` | `Expr.arccosh` | canonical |  |
-| `asin` | `Expr.arcsin` | canonical |  |
-| `asinh` | `Expr.arcsinh` | canonical |  |
-| `atan` | `Expr.arctan` | canonical |  |
-| `atan2` | `bt.arctan2` | canonical |  |
-| `atanh` | `Expr.arctanh` | canonical |  |
-| `bin` | `Expr.to_base` | canonical |  |
-| `bit_count` | `Expr.bit_count` | canonical |  |
-| `bit_get` | `bt.bit_get` | canonical |  |
+| `abs` | {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | canonical |  |
+| `acos` | {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | canonical |  |
+| `acosh` | {py:obj}`Expr.arccosh <batcher.plan.expr_ir.core.Expr.arccosh>` | canonical |  |
+| `asin` | {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | canonical |  |
+| `asinh` | {py:obj}`Expr.arcsinh <batcher.plan.expr_ir.core.Expr.arcsinh>` | canonical |  |
+| `atan` | {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | canonical |  |
+| `atan2` | {py:obj}`bt.arctan2 <batcher.arctan2>` | canonical |  |
+| `atanh` | {py:obj}`Expr.arctanh <batcher.plan.expr_ir.core.Expr.arctanh>` | canonical |  |
+| `bin` | {py:obj}`Expr.to_base <batcher.plan.expr_ir.core.Expr.to_base>` | canonical |  |
+| `bit_count` | {py:obj}`Expr.bit_count <batcher.plan.expr_ir.core.Expr.bit_count>` | canonical |  |
+| `bit_get` | {py:obj}`bt.bit_get <batcher.bit_get>` | canonical |  |
 | `bitwise_not` | n/a | gap | Not yet: integer bitwise NOT (\~ on Expr is boolean-only and raises on integers). Wave W3. |
-| `bround` | `Expr.round` | param | Missing: a column-valued scale. Wave W2. |
-| `cbrt` | `Expr.cbrt` | canonical |  |
-| `ceil` | `Expr.ceil` | param | Missing: scale= digits, and a BIGINT result for scale-less input. Wave W2. |
-| `ceiling` | `Expr.ceil` | param | Missing: scale= digits, and a BIGINT result for scale-less input. Wave W2. |
+| `bround` | {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | param | Missing: a column-valued scale. Wave W2. |
+| `cbrt` | {py:obj}`Expr.cbrt <batcher.plan.expr_ir.core.Expr.cbrt>` | canonical |  |
+| `ceil` | {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | param | Missing: scale= digits, and a BIGINT result for scale-less input. Wave W2. |
+| `ceiling` | {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | param | Missing: scale= digits, and a BIGINT result for scale-less input. Wave W2. |
 | `conv` | n/a | gap | Not yet: convert a number string between bases. Wave W3. |
-| `cos` | `Expr.cos` | canonical |  |
-| `cosh` | `Expr.cosh` | canonical |  |
-| `cot` | `Expr.cot` | canonical |  |
-| `csc` | `Expr.csc` | canonical |  |
-| `degrees` | `Expr.degrees` | canonical |  |
-| `e` | `bt.e` | canonical |  |
-| `exp` | `Expr.exp` | canonical |  |
-| `expm1` | `Expr.expm1` | canonical |  |
-| `factorial` | `Expr.factorial` | mismatch | Differs: Batcher returns Int64 and raises outside 0..20; Spark returns null there. Port as bt.when(n.between(0, 20)).then(n.factorial()). Wave W0. |
-| `floor` | `Expr.floor` | param | Missing: scale= digits, and a BIGINT result for scale-less input. Wave W2. |
-| `getbit` | `bt.bit_get` | canonical |  |
-| `greatest` | `bt.greatest` | canonical |  |
-| `hypot` | `bt.hypot` | canonical |  |
-| `least` | `bt.least` | canonical |  |
-| `ln` | `Expr.ln` | canonical |  |
-| `log` | `bt.log` + `Expr.ln` | param | Missing: one-argument natural-log form log(col). Wave W2. |
-| `log10` | `Expr.log10` | canonical |  |
-| `log1p` | `Expr.log1p` | canonical |  |
-| `log2` | `Expr.log2` | canonical |  |
-| `nanvl` | `bt.nanvl` | canonical |  |
+| `cos` | {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | canonical |  |
+| `cosh` | {py:obj}`Expr.cosh <batcher.plan.expr_ir.core.Expr.cosh>` | canonical |  |
+| `cot` | {py:obj}`Expr.cot <batcher.plan.expr_ir.core.Expr.cot>` | canonical |  |
+| `csc` | {py:obj}`Expr.csc <batcher.plan.expr_ir.core.Expr.csc>` | canonical |  |
+| `degrees` | {py:obj}`Expr.degrees <batcher.plan.expr_ir.core.Expr.degrees>` | canonical |  |
+| `e` | {py:obj}`bt.e <batcher.e>` | canonical |  |
+| `exp` | {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | canonical |  |
+| `expm1` | {py:obj}`Expr.expm1 <batcher.plan.expr_ir.core.Expr.expm1>` | canonical |  |
+| `factorial` | {py:obj}`Expr.factorial <batcher.plan.expr_ir.core.Expr.factorial>` | mismatch | Differs: Batcher returns Int64 and raises outside 0..20; Spark returns null there. Port as bt.when(n.between(0, 20)).then(n.factorial()). Wave W0. |
+| `floor` | {py:obj}`Expr.floor <batcher.plan.expr_ir.core.Expr.floor>` | param | Missing: scale= digits, and a BIGINT result for scale-less input. Wave W2. |
+| `getbit` | {py:obj}`bt.bit_get <batcher.bit_get>` | canonical |  |
+| `greatest` | {py:obj}`bt.greatest <batcher.greatest>` | canonical |  |
+| `hypot` | {py:obj}`bt.hypot <batcher.hypot>` | canonical |  |
+| `least` | {py:obj}`bt.least <batcher.least>` | canonical |  |
+| `ln` | {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | canonical |  |
+| `log` | {py:obj}`bt.log <batcher.log>` + {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | param | Missing: one-argument natural-log form log(col). Wave W2. |
+| `log10` | {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | canonical |  |
+| `log1p` | {py:obj}`Expr.log1p <batcher.plan.expr_ir.core.Expr.log1p>` | canonical |  |
+| `log2` | {py:obj}`Expr.log2 <batcher.plan.expr_ir.core.Expr.log2>` | canonical |  |
+| `nanvl` | {py:obj}`bt.nanvl <batcher.nanvl>` | canonical |  |
 | `negate` | `-` operator | canonical |  |
 | `negative` | `-` operator | canonical |  |
-| `pi` | `bt.pi` | canonical |  |
-| `pmod` | `bt.pmod` | canonical |  |
+| `pi` | {py:obj}`bt.pi <batcher.pi>` | canonical |  |
+| `pmod` | {py:obj}`bt.pmod <batcher.pmod>` | canonical |  |
 | `positive` | `Expr` | canonical |  |
 | `pow` | `**` operator | canonical |  |
 | `power` | `**` operator | canonical |  |
-| `radians` | `Expr.radians` | canonical |  |
-| `rand` | `Dataset.with_random` | param | Missing: expression form rand(seed) usable inside select/with\_columns. Wave W2. |
-| `randn` | `Dataset.with_random` | param | Missing: expression form randn(seed) (normal=True) usable inside select/with\_columns. Wave W2. |
-| `rint` | `Expr.round` | canonical |  |
-| `round` | `Expr.round` | canonical |  |
-| `sec` | `Expr.sec` | canonical |  |
+| `radians` | {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | canonical |  |
+| `rand` | {py:obj}`Dataset.with_random <batcher.Dataset.with_random>` | param | Missing: expression form rand(seed) usable inside select/with\_columns. Wave W2. |
+| `randn` | {py:obj}`Dataset.with_random <batcher.Dataset.with_random>` | param | Missing: expression form randn(seed) (normal=True) usable inside select/with\_columns. Wave W2. |
+| `rint` | {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | canonical |  |
+| `round` | {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | canonical |  |
+| `sec` | {py:obj}`Expr.sec <batcher.plan.expr_ir.core.Expr.sec>` | canonical |  |
 | `shiftleft` | `lshift` operator | canonical |  |
 | `shiftright` | `rshift` operator | canonical |  |
 | `shiftrightunsigned` | n/a | gap | Not yet: unsigned (logical) right shift. Wave W3. |
-| `sign` | `Expr.sign` | canonical |  |
-| `signum` | `Expr.sign` | canonical |  |
-| `sin` | `Expr.sin` | canonical |  |
-| `sinh` | `Expr.sinh` | canonical |  |
-| `sqrt` | `Expr.sqrt` | canonical |  |
-| `tan` | `Expr.tan` | canonical |  |
-| `tanh` | `Expr.tanh` | canonical |  |
+| `sign` | {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | canonical |  |
+| `signum` | {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | canonical |  |
+| `sin` | {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | canonical |  |
+| `sinh` | {py:obj}`Expr.sinh <batcher.plan.expr_ir.core.Expr.sinh>` | canonical |  |
+| `sqrt` | {py:obj}`Expr.sqrt <batcher.plan.expr_ir.core.Expr.sqrt>` | canonical |  |
+| `tan` | {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | canonical |  |
+| `tanh` | {py:obj}`Expr.tanh <batcher.plan.expr_ir.core.Expr.tanh>` | canonical |  |
 | `try_add` | n/a | gap | Not yet: addition returning null on overflow (Batcher integer arithmetic wraps). Wave W3. |
-| `try_divide` | `Expr.safe_divide` | canonical |  |
+| `try_divide` | {py:obj}`Expr.safe_divide <batcher.plan.expr_ir.core.Expr.safe_divide>` | canonical |  |
 | `try_mod` | `%` operator | canonical |  |
 | `try_multiply` | n/a | gap | Not yet: multiplication returning null on overflow (Batcher integer arithmetic wraps). Wave W3. |
 | `try_subtract` | n/a | gap | Not yet: subtraction returning null on overflow (Batcher integer arithmetic wraps). Wave W3. |
 | `uniform` | n/a | gap | Not yet: uniform random value in \[min, max) with seed. Wave W3. |
-| `width_bucket` | `bt.width_bucket` | canonical |  |
+| `width_bucket` | {py:obj}`bt.width_bucket <batcher.width_bucket>` | canonical |  |
 
 ## The `pyspark.sql.functions` module: conditionals, sorting, UDFs, session, and geospatial
 
@@ -94,46 +94,46 @@ The following table maps the 66 names on the `pyspark.sql.functions` module, sor
 |---|---|---|---|
 | `AnalyzeArgument` | n/a | gap | Not yet: Python UDTF protocol: analyze() argument descriptor. Wave W11. |
 | `AnalyzeResult` | n/a | gap | Not yet: Python UDTF protocol: analyze() result with schema, partitioning and ordering. Wave W11. |
-| `arrow_udf` | `Dataset.map_batches` | param | Missing: Arrow UDF usable as a column expression (column in, column out) with returnType=. Wave W11. |
+| `arrow_udf` | {py:obj}`Dataset.map_batches <batcher.Dataset.map_batches>` | param | Missing: Arrow UDF usable as a column expression (column in, column out) with returnType=. Wave W11. |
 | `arrow_udtf` | n/a | gap | Not yet: Python UDTF protocol: Arrow-batched UDTF. Wave W11. |
 | `ArrowUDFType` | n/a | gap | Not yet: Arrow UDF eval types (scalar, scalar-iterator, grouped-agg) as expressions. Wave W11. |
-| `asc` | `Dataset.sort` | mismatch | Differs: Spark asc(col) sorts nulls first; Batcher ascending sorts nulls last. Pass nulls\_first=True. Wave W0. |
-| `asc_nulls_first` | `Dataset.sort` | canonical |  |
-| `asc_nulls_last` | `Dataset.sort` | canonical |  |
+| `asc` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | mismatch | Differs: Spark asc(col) sorts nulls first; Batcher ascending sorts nulls last. Pass nulls\_first=True. Wave W0. |
+| `asc_nulls_first` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
+| `asc_nulls_last` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
 | `assert_true` | n/a | gap | Not yet: raise when a condition is false. Wave W3. |
 | `broadcast` | n/a | out of scope | Declined: no join-hint IR; Kyber picks the build side from measured cardinalities (revisit). |
-| `bucket` | `Expr.hash_bucket` | canonical |  |
-| `call_function` | `bt.call_function` | param | Missing: functions registered from Python with bt.register\_function. Wave W2. |
+| `bucket` | {py:obj}`Expr.hash_bucket <batcher.plan.expr_ir.core.Expr.hash_bucket>` | canonical |  |
+| `call_function` | {py:obj}`bt.call_function <batcher.call_function>` | param | Missing: functions registered from Python with bt.register\_function. Wave W2. |
 | `call_udf` | n/a | gap | Not yet: call a registered UDF by name from the DataFrame API. Wave W11. |
-| `coalesce` | `bt.coalesce` | canonical |  |
-| `col` | `bt.col` | canonical |  |
-| `column` | `bt.col` | canonical |  |
+| `coalesce` | {py:obj}`bt.coalesce <batcher.coalesce>` | canonical |  |
+| `col` | {py:obj}`bt.col <batcher.col>` | canonical |  |
+| `column` | {py:obj}`bt.col <batcher.col>` | canonical |  |
 | `current_catalog` | `Session.catalog.current_catalog` | mismatch | Differs: Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current\_catalog()). SQL current\_catalog() works. Wave W9. |
 | `current_database` | `Session.catalog.current_namespace` | mismatch | Differs: Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current\_namespace()). SQL current\_database() works. Wave W9. |
 | `current_path` | n/a | gap | Not yet: current SQL path. Wave W9. |
 | `current_schema` | `Session.catalog.current_namespace` | mismatch | Differs: Spark's is a column expression; Batcher's returns a str, so port as bt.lit(session.catalog.current\_namespace()). SQL current\_schema() works. Wave W9. |
 | `current_user` | n/a | gap | Not yet: current user name. Wave W9. |
-| `desc` | `Dataset.sort` | canonical |  |
-| `desc_nulls_first` | `Dataset.sort` | canonical |  |
-| `desc_nulls_last` | `Dataset.sort` | canonical |  |
-| `equal_null` | `Expr.eq_missing` | canonical |  |
-| `expr` | `bt.sql_expr` | canonical |  |
-| `ifnull` | `Expr.fill_null` | canonical |  |
+| `desc` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
+| `desc_nulls_first` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
+| `desc_nulls_last` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | canonical |  |
+| `equal_null` | {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | canonical |  |
+| `expr` | {py:obj}`bt.sql_expr <batcher.sql_expr>` | canonical |  |
+| `ifnull` | {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | canonical |  |
 | `input_file_block_length` | n/a | out of scope | Declined: HDFS block metadata with no Batcher equivalent. |
 | `input_file_block_start` | n/a | out of scope | Declined: HDFS block metadata with no Batcher equivalent. |
 | `input_file_name` | n/a | gap | Not yet: input-file metadata column. Wave W8. |
-| `isnan` | `Expr.is_nan` | mismatch | Differs: Spark isnan(null) is false; Batcher (DuckDB) returns null. Wave W0. |
-| `isnotnull` | `Expr.is_not_null` | canonical |  |
-| `isnull` | `Expr.is_null` | canonical |  |
+| `isnan` | {py:obj}`Expr.is_nan <batcher.plan.expr_ir.core.Expr.is_nan>` | mismatch | Differs: Spark isnan(null) is false; Batcher (DuckDB) returns null. Wave W0. |
+| `isnotnull` | {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
+| `isnull` | {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | canonical |  |
 | `java_method` | n/a | out of scope | Declined: JVM reflection; no JVM. |
-| `lit` | `bt.lit` | canonical |  |
-| `monotonically_increasing_id` | `Dataset.with_row_index` | canonical |  |
-| `nullif` | `bt.nullif` | canonical |  |
-| `nullifzero` | `bt.nullif` | canonical |  |
-| `nvl` | `Expr.fill_null` | canonical |  |
-| `nvl2` | `bt.when` + `CaseBuilder.then` + `CaseBuilder.otherwise` + `Expr.is_not_null` | canonical |  |
+| `lit` | {py:obj}`bt.lit <batcher.lit>` | canonical |  |
+| `monotonically_increasing_id` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | canonical |  |
+| `nullif` | {py:obj}`bt.nullif <batcher.nullif>` | canonical |  |
+| `nullifzero` | {py:obj}`bt.nullif <batcher.nullif>` | canonical |  |
+| `nvl` | {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | canonical |  |
+| `nvl2` | {py:obj}`bt.when <batcher.when>` + `CaseBuilder.then` + `CaseBuilder.otherwise` + {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
 | `OrderingColumn` | n/a | gap | Not yet: Python UDTF protocol: analyze() ordering column. Wave W11. |
-| `pandas_udf` | `Dataset.map_batches` | param | Missing: pandas UDF usable as a column expression (Series in, Series out) with returnType=. Wave W11. |
+| `pandas_udf` | {py:obj}`Dataset.map_batches <batcher.Dataset.map_batches>` | param | Missing: pandas UDF usable as a column expression (Series in, Series out) with returnType=. Wave W11. |
 | `PandasUDFType` | n/a | gap | Not yet: pandas UDF eval types (scalar, scalar-iterator, grouped-map, grouped-agg) as expressions. Wave W11. |
 | `PartitioningColumn` | n/a | gap | Not yet: Python UDTF protocol: analyze() partitioning column. Wave W11. |
 | `raise_error` | n/a | gap | Not yet: raise an error with a message from an expression. Wave W3. |
@@ -142,19 +142,27 @@ The following table maps the 66 names on the `pyspark.sql.functions` module, sor
 | `session_user` | n/a | gap | Not yet: current session user name. Wave W9. |
 | `SkipRestOfInputTableException` | n/a | gap | Not yet: Python UDTF protocol: skip the rest of the input table. Wave W11. |
 | `spark_partition_id` | n/a | out of scope | Declined: Spark task partition id; Batcher partitions are an engine-internal detail. |
-| `st_asbinary` | `bt.st_as_binary` | param | Missing: endianness= and GEOMETRY/GEOGRAPHY logical input types. Wave W14. |
+| `st_asbinary` | {py:obj}`bt.st_as_binary <batcher.st_as_binary>` | param | Missing: endianness= and GEOMETRY/GEOGRAPHY logical input types. Wave W14. |
 | `st_geogfromwkb` | n/a | gap | Not yet: GEOGRAPHY constructor from WKB. Wave W14. |
-| `st_geomfromwkb` | `bt.st_geom_from_wkb` | param | Missing: srid= argument. Wave W14. |
-| `st_setsrid` | `bt.st_set_srid` | canonical |  |
-| `st_srid` | `bt.st_srid` | canonical |  |
+| `st_geomfromwkb` | {py:obj}`bt.st_geom_from_wkb <batcher.st_geom_from_wkb>` | param | Missing: srid= argument. Wave W14. |
+| `st_setsrid` | {py:obj}`bt.st_set_srid <batcher.st_set_srid>` | canonical |  |
+| `st_srid` | {py:obj}`bt.st_srid <batcher.st_srid>` | canonical |  |
 | `try_reflect` | n/a | out of scope | Declined: JVM reflection; no JVM. |
 | `typeof` | n/a | gap | Not yet: DDL type name of an expression's type. Wave W11. |
-| `udf` | `bt.udf` | mismatch | Differs: bt.udf(fn)(col) raises instead of evaluating at plan time; port a row UDF as ds.map\_batches over Arrow batches, or as an expression. Wave W0. |
+| `udf` | {py:obj}`bt.udf <batcher.udf>` | mismatch | Differs: bt.udf(fn)(col) raises instead of evaluating at plan time; port a row UDF as ds.map\_batches over Arrow batches, or as an expression. Wave W0. |
 | `udtf` | n/a | gap | Not yet: Python UDTF protocol: @udtf class decorator with eval/terminate. Wave W11. |
 | `unwrap_udt` | n/a | out of scope | Declined: JVM user-defined types; no JVM. |
 | `user` | n/a | gap | Not yet: current user name. Wave W9. |
-| `UserDefinedFunction` | `bt.udf` | param | Missing: a UDF object applied to columns as an Expr, with returnType= and asNondeterministic(). Wave W11. |
+| `UserDefinedFunction` | {py:obj}`bt.udf <batcher.udf>` | param | Missing: a UDF object applied to columns as an Expr, with returnType= and asNondeterministic(). Wave W11. |
 | `UserDefinedTableFunction` | n/a | gap | Not yet: Python UDTF protocol: UDTF object callable from the DataFrame API. Wave W11. |
-| `version` | `bt.engine_version` | mismatch | Differs: Spark version() is a column expression; bt.engine\_version() returns a Python str. Wave W1. |
-| `when` | `bt.when` + `CaseBuilder.then` | param | Missing: when(condition, value) in one call. Wave WF. |
-| `zeroifnull` | `Expr.fill_null` | canonical |  |
+| `version` | {py:obj}`bt.engine_version <batcher.engine_version>` | mismatch | Differs: Spark version() is a column expression; bt.engine\_version() returns a Python str. Wave W1. |
+| `when` | {py:obj}`bt.when <batcher.when>` + `CaseBuilder.then` | param | Missing: when(condition, value) in one call. Wave WF. |
+| `zeroifnull` | {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

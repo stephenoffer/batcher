@@ -18,45 +18,45 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
-| `ActorPoolStrategy` | `Dataset.map_batches` | param | Missing: an unbounded max\_size and max\_tasks\_in\_flight\_per\_actor raise; initial\_size above min\_size raises. Wave W11. |
-| `BlockBasedFileDatasink` | `batcher.io.FileSink` | mismatch | Differs: Ray subclasses implement write\_block\_to\_file(block, file) and get a file per block; Batcher FileSink implements write(table, path)/write\_partitioned and commits from a WriteManifest. Wave W11. |
-| `Catalog` | `bt.Catalog` | mismatch | Differs: ray.data.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend. Wave W9. |
+| `ActorPoolStrategy` | {py:obj}`Dataset.map_batches <batcher.Dataset.map_batches>` | param | Missing: an unbounded max\_size and max\_tasks\_in\_flight\_per\_actor raise; initial\_size above min\_size raises. Wave W11. |
+| `BlockBasedFileDatasink` | {py:obj}`batcher.io.FileSink <batcher.io.FileSink>` | mismatch | Differs: Ray subclasses implement write\_block\_to\_file(block, file) and get a file per block; Batcher FileSink implements write(table, path)/write\_partitioned and commits from a WriteManifest. Wave W11. |
+| `Catalog` | {py:obj}`bt.Catalog <batcher.Catalog>` | mismatch | Differs: ray.data.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend. Wave W9. |
 | `CatalogAccessMode` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |
 | `ClickHouseTableSettings` | n/a | gap | Not yet: ClickHouse writer table settings (engine, order\_by, partition\_by) for write\_clickhouse. Wave W13. |
 | `DatabricksUnityCatalog` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |
-| `DataContext` | `bt.Config` | mismatch | Differs: Ray DataContext is a mutable process singleton (DataContext.get\_current().x = ...); Batcher Config is frozen and applied through set\_config/config\_context with Config.replace. Wave W9. |
+| `DataContext` | {py:obj}`bt.Config <batcher.Config>` | mismatch | Differs: Ray DataContext is a mutable process singleton (DataContext.get\_current().x = ...); Batcher Config is frozen and applied through set\_config/config\_context with Config.replace. Wave W9. |
 | `DataIterator` | n/a | gap | Not yet: DataIterator object (shared, stateful iterator with iter\_\* methods and state\_dict). Wave W8. |
-| `Dataset` | `bt.Dataset` | canonical |  |
+| `Dataset` | {py:obj}`bt.Dataset <batcher.Dataset>` | canonical |  |
 | `DatasetContext` | n/a | out of scope | Declined: deprecated alias of DataContext kept for backward compatibility. |
 | `DatasetIterator` | n/a | out of scope | Declined: deprecated alias of DataIterator kept for backward compatibility. |
-| `DatasetSummary` | `Dataset.describe` | mismatch | Differs: Ray DatasetSummary groups statistics by data type and exposes to\_pandas(); Batcher describe() returns a Dataset with a statistic column. Wave W0. |
-| `Datasink` | `batcher.io.Sink` | mismatch | Differs: Ray Datasink protocol: write(blocks, ctx) per task plus on\_write\_start/on\_write\_complete/on\_write\_failed; Batcher Sink: write(table, path)/write\_partitioned and commit(manifest, path). No Ray-protocol adapter. Wave W11. |
-| `Datasource` | `batcher.io.Source` | mismatch | Differs: Ray Datasource protocol: get\_read\_tasks(parallelism) plus estimate\_inmemory\_data\_size and pushdown negotiation; Batcher Source: splits(), read/iter\_batches(projection), schema(), row\_count(). No Ray-protocol adapter. Wave W11. |
-| `ExecutionOptions` | `bt.ExecutionConfig` | mismatch | Differs: Ray ExecutionOptions carries resource\_limits/preserve\_order/verbose\_progress for one Dataset execution; Batcher ExecutionConfig is part of the process/context Config and has no per-execution CPU/GPU/object-store caps. Wave W9. |
-| `ExecutionResources` | `bt.ExecutionConfig` | param | Missing: per-execution cpu/gpu/memory/object\_store\_memory resource caps. Wave W9. |
+| `DatasetSummary` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | mismatch | Differs: Ray DatasetSummary groups statistics by data type and exposes to\_pandas(); Batcher describe() returns a Dataset with a statistic column. Wave W0. |
+| `Datasink` | {py:obj}`batcher.io.Sink <batcher.io.Sink>` | mismatch | Differs: Ray Datasink protocol: write(blocks, ctx) per task plus on\_write\_start/on\_write\_complete/on\_write\_failed; Batcher Sink: write(table, path)/write\_partitioned and commit(manifest, path). No Ray-protocol adapter. Wave W11. |
+| `Datasource` | {py:obj}`batcher.io.Source <batcher.io.Source>` | mismatch | Differs: Ray Datasource protocol: get\_read\_tasks(parallelism) plus estimate\_inmemory\_data\_size and pushdown negotiation; Batcher Source: splits(), read/iter\_batches(projection), schema(), row\_count(). No Ray-protocol adapter. Wave W11. |
+| `ExecutionOptions` | {py:obj}`bt.ExecutionConfig <batcher.ExecutionConfig>` | mismatch | Differs: Ray ExecutionOptions carries resource\_limits/preserve\_order/verbose\_progress for one Dataset execution; Batcher ExecutionConfig is part of the process/context Config and has no per-execution CPU/GPU/object-store caps. Wave W9. |
+| `ExecutionResources` | {py:obj}`bt.ExecutionConfig <batcher.ExecutionConfig>` | param | Missing: per-execution cpu/gpu/memory/object\_store\_memory resource caps. Wave W9. |
 | `FileShuffleConfig` | `bt.read.parquet` | param | Missing: shuffle= FileShuffleConfig(seed) to randomize file read order per epoch. Wave W2. |
-| `from_arrow` | `bt.from_arrow` | param | Missing: a list of pyarrow Tables (Batcher accepts a Table, a RecordBatch or a list of RecordBatches and raises TypeError on a list of Tables). Wave W2. |
+| `from_arrow` | {py:obj}`bt.from_arrow <batcher.from_arrow>` | param | Missing: a list of pyarrow Tables (Batcher accepts a Table, a RecordBatch or a list of RecordBatches and raises TypeError on a list of Tables). Wave W2. |
 | `from_arrow_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
 | `from_blocks` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
-| `from_daft` | `bt.from_daft` | canonical |  |
-| `from_dask` | `bt.from_dask` | canonical |  |
-| `from_huggingface` | `bt.from_huggingface` | param | Missing: datasets.IterableDataset (streaming) input; Batcher takes an Arrow-backed datasets.Dataset only. Wave W13. |
-| `from_items` | `bt.from_items` | canonical |  |
+| `from_daft` | {py:obj}`bt.from_daft <batcher.from_daft>` | canonical |  |
+| `from_dask` | {py:obj}`bt.from_dask <batcher.from_dask>` | canonical |  |
+| `from_huggingface` | {py:obj}`bt.from_huggingface <batcher.from_huggingface>` | param | Missing: datasets.IterableDataset (streaming) input; Batcher takes an Arrow-backed datasets.Dataset only. Wave W13. |
+| `from_items` | {py:obj}`bt.from_items <batcher.from_items>` | canonical |  |
 | `from_mars` | n/a | out of scope | Declined: Mars (pymars) interop; Batcher has no Mars bridge and converts through pandas (bt.from\_pandas). |
 | `from_modin` | n/a | out of scope | Declined: Modin wraps pandas; convert with modin's \_to\_pandas() and bt.from\_pandas. |
-| `from_numpy` | `bt.from_numpy` | canonical |  |
+| `from_numpy` | {py:obj}`bt.from_numpy <batcher.from_numpy>` | canonical |  |
 | `from_numpy_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
-| `from_pandas` | `bt.from_pandas` | param | Missing: a list of pandas DataFrames (Ray concatenates them). Wave W2. |
+| `from_pandas` | {py:obj}`bt.from_pandas <batcher.from_pandas>` | param | Missing: a list of pandas DataFrames (Ray concatenates them). Wave W2. |
 | `from_pandas_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
-| `from_spark` | `bt.from_spark` | canonical |  |
-| `from_tf` | `bt.from_tf` | mismatch | Differs: A tf.data.Dataset of dict elements converts identically; for non-dict elements Ray names the column 'item' and Batcher names it 'data'. Port as: .rename(data='item'). Wave W0. |
-| `from_torch` | `bt.from_torch` | mismatch | Differs: Ray from\_torch wraps each item of a map-style torch Dataset in an 'item' column; Batcher from\_torch adapts tensors (one column per tensor) and raises AttributeError on a Dataset whose items are not tensors. Wave W0. |
+| `from_spark` | {py:obj}`bt.from_spark <batcher.from_spark>` | canonical |  |
+| `from_tf` | {py:obj}`bt.from_tf <batcher.from_tf>` | mismatch | Differs: A tf.data.Dataset of dict elements converts identically; for non-dict elements Ray names the column 'item' and Batcher names it 'data'. Port as: .rename(data='item'). Wave W0. |
+| `from_torch` | {py:obj}`bt.from_torch <batcher.from_torch>` | mismatch | Differs: Ray from\_torch wraps each item of a map-style torch Dataset in an 'item' column; Batcher from\_torch adapts tensors (one column per tensor) and raises AttributeError on a Dataset whose items are not tensors. Wave W0. |
 | `KafkaAuthConfig` | `bt.read.kafka` | param | Missing: typed SASL/SSL auth config object (security\_protocol, sasl\_mechanism, credentials); Batcher takes consumer options as keyword opts. Wave W13. |
 | `MixStoppingCondition` | n/a | gap | Not yet: stopping condition for Dataset.mix weighted interleave. Wave W8. |
 | `NodeIdStr` | n/a | out of scope | Declined: type alias for a Ray node id string used by locality\_hints; Batcher placement is not addressed by node id. |
 | `Preprocessor` | `batcher.ml.Preprocessor` | canonical |  |
-| `RandomSeedConfig` | `Dataset.shuffle` | param | Missing: RandomSeedConfig(seed, reseed\_after\_execution=True): a new permutation per epoch from one base seed. Wave W2. |
-| `range` | `bt.range` | canonical |  |
+| `RandomSeedConfig` | {py:obj}`Dataset.shuffle <batcher.Dataset.shuffle>` | param | Missing: RandomSeedConfig(seed, reseed\_after\_execution=True): a new permutation per epoch from one base seed. Wave W2. |
+| `range` | {py:obj}`bt.range <batcher.range>` | canonical |  |
 | `range_tensor` | n/a | gap | Not yet: range of fixed-shape tensor rows (range\_tensor(n, shape=)). Wave W11. |
 | `read_audio` | `bt.read.audio` | mismatch | Differs: Ray decodes by default into 'amplitude' and 'sample\_rate' columns; Batcher read.audio defaults decode=False. Pass decode=True; verify output column names. Wave W12. |
 | `read_avro` | `bt.read.avro` | canonical |  |
@@ -86,14 +86,14 @@ The following table maps the 76 names on the `ray.data` module, sorted alphabeti
 | `read_webdataset` | `bt.read.webdataset` | mismatch | Differs: Ray applies a default decoder (txt to str, cls to int, jpg/png to ndarray, json to objects); Batcher yields \_\_key\_\_ plus one raw binary column per extension. Wave W13. |
 | `read_zarr` | `bt.read.zarr` | mismatch | Differs: Ray reads a whole store long-form, one row per chunk (array, chunk\_index, chunk\_slices, chunk), or wide-form with align\_axis\_0=True; Batcher reads one array with one row per leading-axis element (a 'value' column for 1-D, one column per trailing index for 2-D). Wave W13. |
 | `ReaderFormat` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |
-| `ReadTask` | `batcher.io.Split` | mismatch | Differs: Ray ReadTask is a serializable callable returning blocks plus BlockMetadata; Batcher Split is an independently readable slice a Source reads. Wave W11. |
+| `ReadTask` | {py:obj}`batcher.io.Split <batcher.io.Split>` | mismatch | Differs: Ray ReadTask is a serializable callable returning blocks plus BlockMetadata; Batcher Split is an independently readable slice a Source reads. Wave W11. |
 | `ResolvedSource` | n/a | gap | Not yet: Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource). Wave W9. |
 | `RowBasedFileDatasink` | n/a | gap | Not yet: file datasink writing one file per row (write\_row\_to\_file). Wave W11. |
 | `SaveMode` | `Dataset.write.iceberg` | param | Missing: SaveMode enum across sinks, including UPSERT for iceberg/lance and APPEND for file sinks (Batcher mode strings cover overwrite/overwrite\_partitions/error/ignore/append on table sinks only). Wave W13. |
-| `Schema` | `Dataset.schema` | mismatch | Differs: Ray Schema wraps a pyarrow or pandas schema with .names/.types; Batcher returns pyarrow.Schema directly. Wave W0. |
+| `Schema` | {py:obj}`Dataset.schema <batcher.Dataset.schema>` | mismatch | Differs: Ray Schema wraps a pyarrow or pandas schema with .names/.types; Batcher returns pyarrow.Schema directly. Wave W0. |
 | `SinkMode` | n/a | gap | Not yet: ClickHouse sink mode enum (CREATE, APPEND, OVERWRITE) for write\_clickhouse. Wave W13. |
 | `StreamingAggFn` | n/a | gap | Not yet: user streaming aggregation function protocol for Dataset.streaming\_aggregate. Wave W10. |
-| `TaskPoolStrategy` | `Dataset.map_batches` | param | Missing: TaskPoolStrategy(size=n) raises: the stateless pool is sized by num\_workers. Wave W11. |
+| `TaskPoolStrategy` | {py:obj}`Dataset.map_batches <batcher.Dataset.map_batches>` | param | Missing: TaskPoolStrategy(size=n) raises: the stateless pool is sized by num\_workers. Wave W11. |
 
 ## `Datasource`
 
@@ -102,18 +102,18 @@ The following table maps the 13 names on `Datasource`, sorted alphabetically.
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
 | `apply_predicate` | n/a | gap | Not yet: predicate pushdown negotiation on a user source (apply\_predicate/get\_current\_predicate/supports\_predicate\_pushdown); Batcher's Source protocol takes projection only. Wave W11. |
-| `apply_projection` | `batcher.io.Source` | mismatch | Differs: Ray negotiates projection by returning a new Datasource from apply\_projection(map); Batcher passes projection= to Source.read/iter\_batches. Wave W11. |
+| `apply_projection` | {py:obj}`batcher.io.Source <batcher.io.Source>` | mismatch | Differs: Ray negotiates projection by returning a new Datasource from apply\_projection(map); Batcher passes projection= to Source.read/iter\_batches. Wave W11. |
 | `create_reader` | n/a | out of scope | Declined: deprecated Datasource v1 reader API (Ray says implement get\_read\_tasks instead). |
-| `estimate_inmemory_data_size` | `batcher.io.Source` | param | Missing: in-memory byte-size estimate hook (Source exposes row\_count only). Wave W11. |
+| `estimate_inmemory_data_size` | {py:obj}`batcher.io.Source <batcher.io.Source>` | param | Missing: in-memory byte-size estimate hook (Source exposes row\_count only). Wave W11. |
 | `get_current_predicate` | n/a | gap | Not yet: predicate pushdown negotiation on a user source (apply\_predicate/get\_current\_predicate/supports\_predicate\_pushdown); Batcher's Source protocol takes projection only. Wave W11. |
-| `get_name` | `batcher.io.Source` | mismatch | Differs: Ray get\_name is a display name for read tasks; Batcher Source.identity() is a stable key for learned metadata, and file sources expose format\_name. Wave W11. |
-| `get_projection_map` | `batcher.io.Source` | mismatch | Differs: Ray keeps a projection/rename map on the datasource; Batcher passes a column list to read/iter\_batches. Wave W11. |
-| `get_read_tasks` | `batcher.io.Source` | mismatch | Differs: Ray get\_read\_tasks(parallelism) returns ReadTasks carrying metadata; Batcher Source.splits(target\_size) returns Splits that the engine reads. Wave W11. |
+| `get_name` | {py:obj}`batcher.io.Source <batcher.io.Source>` | mismatch | Differs: Ray get\_name is a display name for read tasks; Batcher Source.identity() is a stable key for learned metadata, and file sources expose format\_name. Wave W11. |
+| `get_projection_map` | {py:obj}`batcher.io.Source <batcher.io.Source>` | mismatch | Differs: Ray keeps a projection/rename map on the datasource; Batcher passes a column list to read/iter\_batches. Wave W11. |
+| `get_read_tasks` | {py:obj}`batcher.io.Source <batcher.io.Source>` | mismatch | Differs: Ray get\_read\_tasks(parallelism) returns ReadTasks carrying metadata; Batcher Source.splits(target\_size) returns Splits that the engine reads. Wave W11. |
 | `prepare_read` | n/a | out of scope | Declined: deprecated Datasource v1 reader API (Ray says implement get\_read\_tasks instead). |
 | `should_create_reader` | n/a | out of scope | Declined: compatibility switch for the deprecated Datasource v1 reader API. |
-| `supports_distributed_reads` | `batcher.io.FileSource` | mismatch | Differs: Ray's flag launches read tasks only on the driver node when False; Batcher expresses a node-bound source through FileSource.node\_local. Wave W11. |
+| `supports_distributed_reads` | {py:obj}`batcher.io.FileSource <batcher.io.FileSource>` | mismatch | Differs: Ray's flag launches read tasks only on the driver node when False; Batcher expresses a node-bound source through FileSource.node\_local. Wave W11. |
 | `supports_predicate_pushdown` | n/a | gap | Not yet: predicate pushdown negotiation on a user source (apply\_predicate/get\_current\_predicate/supports\_predicate\_pushdown); Batcher's Source protocol takes projection only. Wave W11. |
-| `supports_projection_pushdown` | `batcher.io.Source` | mismatch | Differs: Ray sources opt in to projection pushdown; every Batcher Source receives projection= and may ignore it. Wave W11. |
+| `supports_projection_pushdown` | {py:obj}`batcher.io.Source <batcher.io.Source>` | mismatch | Differs: Ray sources opt in to projection pushdown; every Batcher Source receives projection= and may ignore it. Wave W11. |
 
 ## `Datasink`
 
@@ -121,10 +121,18 @@ The following table maps the 7 names on `Datasink`, sorted alphabetically.
 
 | Ray Data | Batcher | Status | Notes |
 |---|---|---|---|
-| `get_name` | `batcher.io.FileSink` | mismatch | Differs: Ray get\_name is a display name for write tasks; Batcher sinks expose format\_name. Wave W11. |
+| `get_name` | {py:obj}`batcher.io.FileSink <batcher.io.FileSink>` | mismatch | Differs: Ray get\_name is a display name for write tasks; Batcher sinks expose format\_name. Wave W11. |
 | `min_rows_per_write` | n/a | gap | Not yet: sink-declared minimum rows per write call (rebatch before write). Wave W11. |
-| `on_write_complete` | `batcher.io.Sink` | mismatch | Differs: Ray on\_write\_complete(write\_result) runs once after all tasks; Batcher Sink.commit(manifest, path) finalizes from the WriteManifest every shard contributed. Wave W11. |
+| `on_write_complete` | {py:obj}`batcher.io.Sink <batcher.io.Sink>` | mismatch | Differs: Ray on\_write\_complete(write\_result) runs once after all tasks; Batcher Sink.commit(manifest, path) finalizes from the WriteManifest every shard contributed. Wave W11. |
 | `on_write_failed` | n/a | gap | Not yet: sink callback on write failure for cleanup of staged output. Wave W11. |
 | `on_write_start` | n/a | gap | Not yet: sink callback before any write task starts (staging setup). Wave W11. |
 | `supports_distributed_writes` | n/a | gap | Not yet: sink flag restricting write tasks to the driver node. Wave W11. |
-| `write` | `batcher.io.Sink` | mismatch | Differs: Ray Datasink.write(blocks, ctx) consumes a generator of blocks in one task; Batcher Sink.write(table, path) writes one Arrow table to one file (write\_partitioned for directory shards). Wave W11. |
+| `write` | {py:obj}`batcher.io.Sink <batcher.io.Sink>` | mismatch | Differs: Ray Datasink.write(blocks, ctx) consumes a generator of blocks in one task; Batcher Sink.write(table, path) writes one Arrow table to one file (write\_partitioned for directory shards). Wave W11. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Ray Data pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

@@ -73,7 +73,43 @@ def geohash_is_a_prefix_code_over_space() -> None:
     areas = bt.from_pydict(
         {"g": ["POLYGON((-122.42 37.77, -122.41 37.77, -122.41 37.78, -122.42 37.77))"]}
     )
-    print(areas.select(cell=bt.st_geohash(col("g"), 6)).to_pydict())
+    by_shape = areas.select(
+        cell=bt.st_geohash(col("g"), 6),
+        # The same cell, computed from the centroid by hand.
+        via_centroid=bt.geohash_encode(
+            bt.st_x(bt.st_centroid(col("g"))), bt.st_y(bt.st_centroid(col("g"))), 6
+        ),
+    ).to_pydict()
+    print(by_shape)
+    assert by_shape["cell"] == by_shape["via_centroid"]
+    assert by_shape["cell"][0].startswith("9q8yy"), "the triangle is in San Francisco"
+
+
+def a_bad_position_nulls_its_own_row() -> None:
+    """One corrupt fix must not abort a scan; one wrong precision must."""
+    fixes = bt.from_pydict(
+        {"lon": [-122.4194, float("nan"), 200.0, 13.4], "lat": [37.7749, 10.0, 0.0, 95.0]}
+    )
+    print("--- NaN, lon 200 and lat 95 have no cell, and nothing else is affected ---")
+    keyed = fixes.select(
+        gh=bt.geohash_encode(col("lon"), col("lat"), 6),
+        s2=bt.st_s2_cell(col("lon"), col("lat"), 12),
+    ).to_pydict()
+    print(keyed)
+    assert keyed["gh"] == ["9q8yyk", None, None, None]
+    assert keyed["s2"][0] is not None and keyed["s2"][1:] == [None, None, None]
+    # `WHERE key IS NULL` is how the bad rows are found afterwards.
+    assert fixes.filter(bt.geohash_encode(col("lon"), col("lat"), 6).is_null()).count() == 3
+
+    # A precision out of range is a mistake in the query, not in the data: it fails
+    # every row, so it is refused when the expression is built.
+    try:
+        bt.geohash_encode(col("lon"), col("lat"), 13)
+    except bt.PlanError as err:
+        print(f"--- refused up front: {err} ---")
+        assert "got 13" in str(err)
+    else:
+        raise AssertionError("a precision of 13 should be refused")
 
 
 def tiles_are_the_grid_maps_are_served_on() -> None:
@@ -191,6 +227,7 @@ def main() -> None:
     tiles_are_the_grid_maps_are_served_on()
     s2_cells_sort_spatially_and_are_near_equal_area()
     hexagons_remove_the_grid_bias_of_squares()
+    a_bad_position_nulls_its_own_row()
 
 
 if __name__ == "__main__":

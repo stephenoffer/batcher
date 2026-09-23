@@ -50,7 +50,7 @@ differently produce different relations from the same query.
 
 ## The permutation and its tie-break
 
-`sort_indices` (`crates/bc-interp/src/ops/mod.rs`) evaluates the key expressions and builds a
+`sort_indices` ([`crates/bc-interp/src/ops/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/mod.rs)) evaluates the key expressions and builds a
 `UInt32Array` permutation. `sort_batch` then `take`s the whole batch through it.
 
 Arrow's comparison sorts are not stable. `lexsort_to_indices` and `sort_to_indices` leave rows
@@ -364,7 +364,7 @@ in 14.1 ms against Polars' 601 ms, which sorts the whole relation and then slice
 ## The gather is the cost
 
 For most sorts the comparison work is not the bottleneck; the `take` of every column through the
-permutation is. That is why the sample-sort works so hard to gather once, and why `crates/bc-runtime/src/gather/` exists. Arrow's `take` on a variable-length byte
+permutation is. That is why the sample-sort works so hard to gather once, and why [`crates/bc-runtime/src/gather/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/gather) exists. Arrow's `take` on a variable-length byte
 column is far slower than the memory it moves: it drives `MutableArrayData::extend` once per row,
 paying a call and bounds checks to copy a handful of bytes. On a 5M-row sort, adding one string
 column cost ~52 ms, an order of magnitude more than the ~50 MB of characters involved. The fast
@@ -455,22 +455,22 @@ Never assert a sort with an order-independent comparison. The differential harne
 `assert_same` is a multiset comparison: correct for a group-by, and completely blind to a sort
 bug. Sort assertions compare sequences, across the cross-product of `{collect, spill,
 iter_batches, distributed}` and `{nulls, empty, one row, duplicates, -0.0/NaN, descending}`.
-That cross-product is `tests/differential/test_diff_operator_matrix.py`, and it exists because
+That cross-product is [`tests/differential/test_diff_operator_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_operator_matrix.py), and it exists because
 the shape that broke, `descending=True` under spill, was never the shape anyone was thinking
 about.
 :::
 
 ## Where the code lives
 
-- `crates/bc-interp/src/ops/mod.rs`: `sort_batch`, `sort_indices`, `sort_indices_of`
-- `crates/bc-interp/src/ops/radix_sort/`: the LSD radix path (`mod.rs`) and the composite packed key (`packed.rs`)
-- `crates/bc-interp/src/ops/byte_sort.rs`: the stable byte-key permutation (text and binary)
-- `crates/bc-runtime/src/byte_key.rs`: the one reading of a byte-key column, shared by the sort and the range partitioner
-- `crates/bc-interp/src/ops/sample_sort/`: the parallel sample-sort
-- `crates/bc-interp/src/ops/run_sort.rs`: natural-run detection, shared by the radix and packed-key paths
-- `crates/bc-arrow/src/row_sort.rs`: the row-encoded stable comparison sort
-- `crates/bc-interp/src/ops/external_sort.rs`: the spilling k-way merge
-- `crates/bc-runtime/src/gather/`: the bulk `take`/`concat` fills. `mod.rs` holds the byte layouts and `fixed.rs` the fixed-width ones
+- [`crates/bc-interp/src/ops/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/mod.rs): `sort_batch`, `sort_indices`, `sort_indices_of`
+- [`crates/bc-interp/src/ops/radix_sort/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-interp/src/ops/radix_sort): the LSD radix path (`mod.rs`) and the composite packed key (`packed.rs`)
+- [`crates/bc-interp/src/ops/byte_sort.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/byte_sort.rs): the stable byte-key permutation (text and binary)
+- [`crates/bc-runtime/src/byte_key.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/byte_key.rs): the one reading of a byte-key column, shared by the sort and the range partitioner
+- [`crates/bc-interp/src/ops/sample_sort/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-interp/src/ops/sample_sort): the parallel sample-sort
+- [`crates/bc-interp/src/ops/run_sort.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/run_sort.rs): natural-run detection, shared by the radix and packed-key paths
+- [`crates/bc-arrow/src/row_sort.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-arrow/src/row_sort.rs): the row-encoded stable comparison sort
+- [`crates/bc-interp/src/ops/external_sort.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/external_sort.rs): the spilling k-way merge
+- [`crates/bc-runtime/src/gather/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/gather): the bulk `take`/`concat` fills. `mod.rs` holds the byte layouts and `fixed.rs` the fixed-width ones
 
 ## See also
 

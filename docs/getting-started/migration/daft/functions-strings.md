@@ -21,7 +21,7 @@ The following table maps the 58 names on `Expression`, sorted alphabetically.
 | `ascii` | `Expr.str.ascii` | canonical |  |
 | `capitalize` | `Expr.str.capitalize` | canonical |  |
 | `compress` | `Expr.str.compress` | canonical |  |
-| `concat` | `bt.concat_str` | canonical |  |
+| `concat` | {py:obj}`bt.concat_str <batcher.concat_str>` | canonical |  |
 | `contains` | `Expr.str.contains` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `count_matches` | `Expr.str.count_matches` | mismatch | Differs: Daft count\_matches counts literal patterns (with whole\_words= and case\_sensitive=); Batcher count\_matches counts regex matches ('.' on 'a.b.c' is 2 vs 5). Param: literal=True, whole\_words=, case\_sensitive=. Wave W0. |
 | `damerau_levenshtein_distance` | `Expr.str.damerau_levenshtein` | mismatch | Differs: with restricted=True the algorithm matches Daft; Batcher counts bytes where Daft counts characters, so non-ASCII text differs. Wave W0. |
@@ -85,10 +85,10 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 |---|---|---|---|
 | `ascii_func` | `Expr.str.ascii` | canonical |  |
 | `capitalize` | `Expr.str.capitalize` | canonical |  |
-| `chr_func` | `Expr.chr` | canonical |  |
+| `chr_func` | {py:obj}`Expr.chr <batcher.plan.expr_ir.core.Expr.chr>` | canonical |  |
 | `compress` | `Expr.str.compress` | canonical |  |
-| `concat` | `bt.concat_str` | mismatch | Differs: bt.concat stacks Datasets; Daft functions.concat joins two strings and yields null when either is null, which is bt.concat\_str(left, right, ignore\_nulls=False). Wave W0. |
-| `concat_ws` | `bt.concat_ws` | canonical |  |
+| `concat` | {py:obj}`bt.concat_str <batcher.concat_str>` | mismatch | Differs: bt.concat stacks Datasets; Daft functions.concat joins two strings and yields null when either is null, which is bt.concat\_str(left, right, ignore\_nulls=False). Wave W0. |
+| `concat_ws` | {py:obj}`bt.concat_ws <batcher.concat_ws>` | canonical |  |
 | `contains` | `Expr.str.contains` | mismatch | Differs: bt.contains is a column-name selector, not a string predicate; Daft contains(expr, substr) tests values. Rewrite: col.str.contains(substr). Wave W0. |
 | `count_matches` | `Expr.str.count_matches` | mismatch | Differs: Daft count\_matches counts literal patterns (with whole\_words= and case\_sensitive=); Batcher count\_matches counts regex matches ('.' on 'a.b.c' is 2 vs 5). Param: literal=True, whole\_words=, case\_sensitive=. Wave W0. |
 | `damerau_levenshtein_distance` | `Expr.str.damerau_levenshtein` | mismatch | Differs: with restricted=True the algorithm matches Daft; Batcher counts bytes where Daft counts characters, so non-ASCII text differs. Wave W0. |
@@ -97,7 +97,7 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `encode` | `Expr.str.base64` | mismatch | Differs: Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from\_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods. Wave W3. |
 | `endswith` | `Expr.str.ends_with` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
 | `find` | `Expr.str.position` | mismatch | Differs: Daft find is 0-based and returns -1 when absent; Batcher position is 1-based and returns 0. Param: base=0 with -1 for missing. Wave W0. |
-| `format` | `bt.format_string` | mismatch | Differs: Daft format propagates a null argument to a null result; Batcher format\_string renders null as empty. Param: ignore\_nulls=False. Wave W0. |
+| `format` | {py:obj}`bt.format_string <batcher.format_string>` | mismatch | Differs: Daft format propagates a null argument to a null result; Batcher format\_string renders null as empty. Param: ignore\_nulls=False. Wave W0. |
 | `guess_mime_type` | `Expr.str.mime_type` | canonical |  |
 | `hamming_distance_str` | `Expr.str.hamming` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (constant target only). Wave W2. |
 | `ilike` | `Expr.str.ilike` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression). Wave W2. |
@@ -146,3 +146,11 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `try_decompress` | `Expr.str.decompress` | canonical |  |
 | `try_encode` | `Expr.str.base64` | mismatch | Differs: Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from\_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods; the try\_ form nulls on failure. Wave W3. |
 | `upper` | `Expr.str.upper` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

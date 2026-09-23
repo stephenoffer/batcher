@@ -272,7 +272,7 @@ input has both a durable identity and a content version. The path says which tab
 is; the version token says which state of it. Rewrite the file and the key changes, so the
 next run recomputes rather than serving the previous run's rows.
 
-Three consequences follow, all silent by design. In-memory data never shares, because `bt.from_pydict` has no cross-run identity, so a query reading it uses the process cache only. A source that can't version itself declines, because unversioned is indistinguishable from unchanged. And a tenant or a governed viewer never shares with another, because both are in the key.
+Three consequences follow, all silent by design. In-memory data never shares, because {py:obj}`bt.from_pydict <batcher.from_pydict>` has no cross-run identity, so a query reading it uses the process cache only. A source that can't version itself declines, because unversioned is indistinguishable from unchanged. And a tenant or a governed viewer never shares with another, because both are in the key.
 
 Declining costs a recompute, which is why nothing here guesses.
 
@@ -308,7 +308,7 @@ stats = bt.cache_stats()
 print(stats["shared_hits"], stats["shared_misses"], stats["shared_errors"])
 ```
 
-`bt.clear_cache()` empties this process's tiers and leaves the shared store alone, because
+{py:obj}`bt.clear_cache() <batcher.clear_cache>` empties this process's tiers and leaves the shared store alone, because
 it belongs to every process reading it.
 
 ## Caching remote file bytes

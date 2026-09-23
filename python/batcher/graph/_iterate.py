@@ -17,17 +17,121 @@ not per edge, so this is bounded by the smaller side.
 **It checks convergence on the state, not on the round count.** Most graphs converge long
 before the iteration cap, and the cap is a safety net rather than a schedule. The check
 costs one aggregate per round, which is far less than the round it saves.
+
+What a caller does when the cap is hit depends on what kind of answer it promises, and the
+two helpers below are the only two policies. An *approximate* algorithm (PageRank, Katz,
+eigenvector, HITS, label propagation) returns its last iterate and warns with
+`ConvergenceWarning` through `settled`. An *exact* one (components, k-core, shortest paths,
+topological order) has no "nearly right" answer: a component split in two is simply wrong.
+So those run to their fixpoint by default, bounded by the node count through
+`fixpoint_rounds`, and `require_fixpoint` raises `PlanError` if a cap the caller chose cuts
+them short.
 """
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
 
-__all__ = ["IterationResult", "checkpoint", "iterate"]
+__all__ = ["ConvergenceWarning", "IterationResult", "checkpoint", "iterate"]
+
+
+class ConvergenceWarning(UserWarning):
+    """An approximate graph algorithm stopped at its iteration cap before it settled.
+
+    The result is still returned, because the last iterate of PageRank or Katz is usually a
+    usable ranking. It is not the fixed point the algorithm defines, though, and returning
+    it silently is how a truncated run gets reported as a converged one. Raise
+    `max_iterations` or loosen `tolerance`, or promote the warning to an error with
+    `warnings.simplefilter("error", ConvergenceWarning)` when a truncated answer is not
+    acceptable.
+
+    Exact algorithms never warn: they run to their fixpoint, and raise `PlanError` when a
+    `max_iterations` you set is too small to reach it.
+
+    Examples:
+        .. doctest::
+
+            >>> import warnings
+            >>> import batcher as bt
+            >>> from batcher.graph import ConvergenceWarning, Graph, pagerank
+            >>> chain = Graph.from_edges(bt.from_pydict({"src": [1, 2], "dst": [2, 3]}))
+            >>> with warnings.catch_warnings(record=True) as caught:
+            ...     warnings.simplefilter("always")
+            ...     _ = pagerank(chain, max_iterations=1)
+            >>> caught[0].category is ConvergenceWarning
+            True
+    """
+
+
+def settled(result: IterationResult, algorithm: str, max_iterations: int) -> Dataset:
+    """The state an approximate algorithm reached, warning if the cap cut it short.
+
+    Args:
+        result: What `iterate` returned.
+        algorithm: The public function name, for the message.
+        max_iterations: The cap the caller passed, for the message.
+
+    Returns:
+        The final state, whether or not it converged.
+    """
+    if not result.converged:
+        warnings.warn(
+            f"{algorithm}() stopped at max_iterations={max_iterations} before converging, "
+            "so the result is the last iterate rather than the fixed point. Raise "
+            "max_iterations or loosen tolerance.",
+            ConvergenceWarning,
+            stacklevel=3,
+        )
+    return result.state
+
+
+def fixpoint_rounds(max_iterations: int | None, nodes: int) -> int:
+    """The round budget for an exact algorithm: the caller's cap, or one the graph cannot exceed.
+
+    Every exact algorithm here changes at least one node's state per round until it stops,
+    or settles at least one node per round, so `nodes + 1` rounds always reach the fixpoint.
+    That is what `None` means: run to completion.
+
+    Args:
+        max_iterations: The caller's cap, or `None` for no cap.
+        nodes: The node count, which bounds the rounds any fixpoint here needs.
+
+    Returns:
+        The number of rounds to allow.
+
+    Raises:
+        PlanError: If `max_iterations` is given and not positive.
+    """
+    if max_iterations is None:
+        return nodes + 1
+    if max_iterations < 1:
+        raise PlanError(f"max_iterations must be at least 1, got {max_iterations}")
+    return max_iterations
+
+
+def require_fixpoint(converged: bool, algorithm: str, rounds: int) -> None:
+    """Refuse to return an exact algorithm's answer when the round cap stopped it early.
+
+    Args:
+        converged: Whether the loop reached its fixpoint.
+        algorithm: The public function name, for the message.
+        rounds: The cap that was hit.
+
+    Raises:
+        PlanError: If `converged` is false.
+    """
+    if not converged:
+        raise PlanError(
+            f"{algorithm}() did not reach its fixpoint within max_iterations={rounds} rounds. "
+            "It computes an exact answer, and a truncated run would be a wrong one rather "
+            "than an approximate one, so it is refused. Raise max_iterations, or pass "
+            "max_iterations=None (the default) to run to completion."
+        )
 
 
 def check_iterations(max_iterations: int, tolerance: float) -> None:

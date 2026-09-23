@@ -8,7 +8,9 @@ Batcher computes, for every output column, the source columns its values derive 
 
 Each query produces a `START` event before execution and a `COMPLETE` event after it, or a
 `FAIL` event if the query raised. Both halves share a run id derived from the query id, so
-a backend sees one run rather than two.
+a backend sees one run rather than two. Every event of a run also names the same job, `batcher.query.<signature>`, where the signature is the plan's structural fingerprint, so repeated runs of one pipeline over different data collect under one job. `explain(analyze=True)` and `stats()` execute the query, so they emit the same `START` and `COMPLETE` pair.
+
+An input read from a path or a table is named by that path. An in-memory input, such as one built with {py:obj}`bt.from_pydict <batcher.from_pydict>`, has no path, so its dataset name adds an identifier to its position, as in `<source 0 obj:1c4e14dd5444:1>`. The identifier is stable for that object within the process: the same object read by two queries is one dataset, and an equal-looking relation built again is another. {py:obj}`Dataset.lineage() <batcher.Dataset.lineage>` labels the same input by position alone, as `<source 0>`.
 
 The event names its input datasets and carries the standard `columnLineage` facet, which maps each output column to the input fields it derives from. A Batcher run facet records what the run cost and whether it was distributed, with the worker-operator count and usage summed across workers. Without that facet a lineage backend can't tell a plan that ran on one node from the same plan run on a hundred, and those are different runs to audit.
 
@@ -49,7 +51,7 @@ Batcher doesn't depend on `openlineage-python`. That client's classes have moved
 
 ## Reading lineage without emitting it
 
-`Dataset.lineage()` returns the same analysis locally, which is the fastest way to check
+{py:obj}`Dataset.lineage() <batcher.Dataset.lineage>` returns the same analysis locally, which is the fastest way to check
 what an event will say before you turn emission on:
 
 ```python

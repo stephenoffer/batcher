@@ -30,7 +30,7 @@ Breakers are where the pipeline already stops, which is what makes them free pla
 
 ## The loop
 
-The loop lives in `python/batcher/api/adaptive/`, in the `api` layer, and it's entirely Python. There's no Rust component. Rust returns per-operator metrics and the control plane does the segmenting. The package splits three ways: `staging.py` runs the loop, `gating.py` decides whether to be adaptive and whether an estimate held, and `plan_surgery.py` walks and rewrites the plan tree.
+The loop lives in [`python/batcher/api/adaptive/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/api/adaptive), in the `api` layer, and it's entirely Python. There's no Rust component. Rust returns per-operator metrics and the control plane does the segmenting. The package splits three ways: `staging.py` runs the loop, `gating.py` decides whether to be adaptive and whether an estimate held, and `plan_surgery.py` walks and rewrites the plan tree.
 
 Kyber optimizes the logical plan once, up front. Then each round does the following:
 
@@ -196,12 +196,12 @@ this page describes in the source:
 
 | Concern | File |
 |---|---|
-| The stage loop, splicing, intermediate cleanup | `python/batcher/api/adaptive/staging.py` |
-| The on/off gate and the q-error test | `python/batcher/api/adaptive/gating.py` |
-| Breaker set, plan walk, subtree replacement | `python/batcher/api/adaptive/plan_surgery.py` |
+| The stage loop, splicing, intermediate cleanup | [`python/batcher/api/adaptive/staging.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/api/adaptive/staging.py) |
+| The on/off gate and the q-error test | [`python/batcher/api/adaptive/gating.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/api/adaptive/gating.py) |
+| Breaker set, plan walk, subtree replacement | [`python/batcher/api/adaptive/plan_surgery.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/api/adaptive/plan_surgery.py) |
 | Breaker-free test | `python/batcher/plan/logical/transforms.py::is_streamable` |
 | Learned adaptive router | `python/batcher/kyber/learned_tuning/bandit.py::learned_adaptive_route` |
-| Per-operator metrics (Rust) | `crates/bc-interp/src/metrics.rs` |
+| Per-operator metrics (Rust) | [`crates/bc-interp/src/metrics.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/metrics.rs) |
 | Metric to feedback transcription | `python/batcher/core/executor.py::_record_op_feedback` |
 | The `reoptimize_error` knob | `python/batcher/config/config.py::OptimizerConfig` |
 

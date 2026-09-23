@@ -8,10 +8,13 @@ resource reservation, asserted at the plan level so it needs no GPU.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pyarrow as pa
 import pytest
 
 import batcher as bt
+from batcher.config import active_config, config_context
 from batcher.dist.executors.map import _map_resources
 from batcher.plan.logical import MapBatches
 
@@ -118,9 +121,16 @@ def test_resident_inference_pool_keeps_the_model_across_runs():
 
 
 def test_resident_pool_off_rebuilds_per_run():
-    # Without the scope (the default), each run builds its own short-lived pool, so the
-    # two runs see *different* model instances — the contrast that proves residency is
-    # what kept them alive above.
+    # Without the scope, each run builds its own short-lived pool, so the two runs see
+    # *different* model instances — the contrast that proves residency is what kept them
+    # alive above.
+    #
+    # `warm_inference_pools` has to come off explicitly for that contrast to exist. It
+    # defaults to True and is a second, independent mechanism for keeping an actor alive
+    # between queries (`warm_inference_idle_s`, 120s), so on the plain default the two runs
+    # reuse actors whether or not `resident_inference_pools()` is in scope, and this
+    # asserted the opposite. Measured both ways on the same query: warm pools on gives
+    # overlapping tags, off gives disjoint ones.
     n = 600
     ds = bt.from_pydict({"x": list(range(n))})
 
@@ -129,8 +139,13 @@ def test_resident_pool_off_rebuilds_per_run():
             distributed=True, num_workers=4
         )
 
-    tags1 = {r["tag"] for r in infer().to_pylist()}
-    tags2 = {r["tag"] for r in infer().to_pylist()}
+    base = active_config()
+    cold = base.replace(
+        distributed=dataclasses.replace(base.distributed, warm_inference_pools=False)
+    )
+    with config_context(cold):
+        tags1 = {r["tag"] for r in infer().to_pylist()}
+        tags2 = {r["tag"] for r in infer().to_pylist()}
     assert tags1.isdisjoint(tags2)  # fresh models each run (no residency)
 
 

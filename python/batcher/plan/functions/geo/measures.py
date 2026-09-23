@@ -13,7 +13,12 @@ bounding box can bound.
 
 **The geodesic functions** — the `_sphere` and `_spheroid` suffixes — answer in metres
 on the Earth, and take longitude/latitude in degrees. They are the ones to use when the
-number is the deliverable.
+number is the deliverable. `_sphere` is haversine on one mean-radius sphere (about 0.5%
+off the ellipsoid, and cheap); every `_spheroid` function — distance, length, perimeter
+and area — is on the WGS 84 ellipsoid by Karney's algorithm, the one GeographicLib,
+PROJ, PostGIS ``geography`` and DuckDB spatial all use, and agrees with DuckDB to about
+nine significant figures. A position off the globe (a NaN, a longitude of 200) makes that
+row null rather than failing the query.
 
 The third option, and usually the best one for a whole pipeline, is to `st_transform`
 into a projected CRS once and use the planar functions everywhere after. Then the
@@ -262,7 +267,7 @@ def st_distance_sphere(a: Expr | str, b: Expr | str) -> Expr:
 
     Returns:
         The distance in metres, 0 when the geometries intersect, or null when either
-        is empty.
+        is empty or has a position off the globe.
 
     Examples:
         .. doctest::
@@ -281,12 +286,13 @@ def st_distance_sphere(a: Expr | str, b: Expr | str) -> Expr:
 def st_distance_spheroid(a: Expr | str, b: Expr | str) -> Expr:
     """The distance between two lon/lat geometries, in metres on the WGS 84 ellipsoid.
 
-    Vincenty's inverse formula: accurate to under a millimetre, iterative, and roughly
-    an order of magnitude slower than `st_distance_sphere`. Use it when the number is
-    the deliverable and the sphere's 0.5% is too much.
-
-    Near-antipodal pairs, where the iteration does not converge, are skipped rather
-    than reported wrong; if every pair is antipodal the result is null.
+    Karney's geodesic inverse: accurate to nanometres, and defined for every pair of
+    positions, antipodal ones included — Vincenty's formula, which this used before,
+    does not converge there and the pair came back null. Slower than
+    `st_distance_sphere`; use it when the number is the deliverable and the sphere's
+    0.5% is too much. Between polygons or chains it is the smallest vertex-to-vertex
+    distance, an upper bound on the true one; densify with `st_segmentize` first when
+    the segments are long.
 
     Args:
         a: The first geometry.
@@ -294,7 +300,7 @@ def st_distance_spheroid(a: Expr | str, b: Expr | str) -> Expr:
 
     Returns:
         The distance in metres, 0 when the geometries intersect, or null when either
-        is empty.
+        is empty or has a position off the globe.
 
     Examples:
         .. doctest::
@@ -311,17 +317,20 @@ def st_distance_spheroid(a: Expr | str, b: Expr | str) -> Expr:
 
 
 def st_area_spheroid(geom: Expr | str) -> Expr:
-    """The geodesic area of a lon/lat geometry, in square metres.
+    """The geodesic area of a lon/lat geometry, in square metres on the WGS 84 ellipsoid.
 
-    Computed from the spherical excess, so it is correct for a ring of any size —
-    including one spanning a hemisphere, where projecting to a plane and taking the
-    shoelace area is wrong by an unbounded factor. Holes are subtracted.
+    Edges are geodesics, as in PostGIS ``geography`` and DuckDB ``ST_Area_Spheroid``,
+    and the area is Karney's ellipsoidal polygon area, so it is correct for a ring of
+    any size — including one spanning a hemisphere, where projecting to a plane and
+    taking the shoelace area is wrong by an unbounded factor — and for a ring crossing
+    the antimeridian, which is measured the short way across it. Holes are subtracted.
 
     Args:
         geom: A lon/lat geometry.
 
     Returns:
-        The area in square metres; 0 for a non-areal geometry.
+        The area in square metres; 0 for a non-areal geometry; null when a position is
+        off the globe.
 
     Examples:
         .. doctest::
@@ -330,7 +339,7 @@ def st_area_spheroid(geom: Expr | str) -> Expr:
             >>> ds = bt.from_pydict({'g': ['POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))']})
             >>> got = (bt.st_area_spheroid(bt.col("g")) / 1e6).round(0)
             >>> ds.select(v=got).to_pydict()
-            {'v': [12364.0]}
+            {'v': [12309.0]}
     """
     return geo_call("st_area_spheroid", geometry(geom))
 
@@ -338,15 +347,16 @@ def st_area_spheroid(geom: Expr | str) -> Expr:
 def st_length_spheroid(geom: Expr | str) -> Expr:
     """The geodesic length of a lon/lat geometry's chains, in metres.
 
-    Sums the great-circle distance of each segment, so a long segment is measured
-    along the sphere rather than through it. Polygon boundaries are excluded, matching
-    `st_length`.
+    Sums the WGS 84 geodesic length of each segment, so a long segment is measured
+    along the ellipsoid rather than through it. Polygon boundaries are excluded,
+    matching `st_length`.
 
     Args:
         geom: A lon/lat geometry.
 
     Returns:
-        The chain length in metres; 0 for a polygon or point.
+        The chain length in metres; 0 for a polygon or point; null when a position is
+        off the globe.
 
     Examples:
         .. doctest::
@@ -355,7 +365,7 @@ def st_length_spheroid(geom: Expr | str) -> Expr:
             >>> ds = bt.from_pydict({'g': ['LINESTRING(0 0, 1 0)']})
             >>> got = (bt.st_length_spheroid(bt.col("g")) / 1000).round(1)
             >>> ds.select(v=got).to_pydict()
-            {'v': [111.2]}
+            {'v': [111.3]}
     """
     return geo_call("st_length_spheroid", geometry(geom))
 
@@ -363,7 +373,8 @@ def st_length_spheroid(geom: Expr | str) -> Expr:
 def st_perimeter_spheroid(geom: Expr | str) -> Expr:
     """The geodesic perimeter of a lon/lat geometry's polygons, in metres.
 
-    Holes count, matching `st_perimeter`.
+    Each edge is a WGS 84 geodesic, as in `st_length_spheroid`. Holes count, matching
+    `st_perimeter`.
 
     Args:
         geom: A lon/lat geometry.
@@ -378,6 +389,6 @@ def st_perimeter_spheroid(geom: Expr | str) -> Expr:
             >>> ds = bt.from_pydict({'g': ['POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))']})
             >>> got = (bt.st_perimeter_spheroid(bt.col("g")) / 1000).round(0)
             >>> ds.select(v=got).to_pydict()
-            {'v': [445.0]}
+            {'v': [444.0]}
     """
     return geo_call("st_perimeter_spheroid", geometry(geom))

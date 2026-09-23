@@ -543,3 +543,52 @@ def test_every_verdict_carries_advice():
     # A verdict a reader cannot act on is a number with a longer name.
     for name in bottleneck.VERDICT_ADVICE:
         assert bottleneck.Bottleneck(index=0, verdict=name).advice
+
+
+# --- contention reaching the classifier ------------------------------------------------------
+#
+# `classify_device` has taken a `shared` argument since it was written, documented as coming
+# from `telemetry.processes.device_shared_with_others`. Nothing passed it, so it took its
+# `None` default — "treated as not shared" — and `contended` was a verdict that could not fire
+# on any host. These pin the wire in both directions.
+
+
+def _busy_window(index: int = 0):
+    """A device whose SMs are quiet while work is outstanding: starved, or contended."""
+    from batcher._internal.hardware.telemetry.sampler import TelemetrySampler
+
+    window = TelemetrySampler()
+    for _ in range(20):
+        window.observe(index, "sm", 0.10)
+        window.observe(index, "memory", 0.05)
+        window.observe(index, "pcie_utilization", 0.05)
+        window.observe(index, "throttled", 0.0)
+        window.observe(index, "codec", 0.0)
+    return window
+
+
+def test_a_neighbour_on_the_board_is_reported_as_contention(monkeypatch):
+    from batcher.observe.accelerators import diagnosis
+
+    monkeypatch.setattr(diagnosis, "device_shared_with_others", lambda index: True)
+    verdicts = diagnosis.device_verdicts(_busy_window())
+    assert [v.verdict for v in verdicts] == ["contended"]
+
+
+def test_the_same_window_without_a_neighbour_is_not_called_contended(monkeypatch):
+    """The control. Without it the assertion above would pass on a classifier that ignored
+    `shared` entirely and called every quiet device contended."""
+    from batcher.observe.accelerators import diagnosis
+
+    monkeypatch.setattr(diagnosis, "device_shared_with_others", lambda index: False)
+    verdicts = diagnosis.device_verdicts(_busy_window())
+    assert [v.verdict for v in verdicts] != ["contended"]
+
+
+def test_an_unattributable_device_is_not_accused_of_contention(monkeypatch):
+    """`None` is "we cannot see", which is every containerized worker — not "contended"."""
+    from batcher.observe.accelerators import diagnosis
+
+    monkeypatch.setattr(diagnosis, "device_shared_with_others", lambda index: None)
+    verdicts = diagnosis.device_verdicts(_busy_window())
+    assert [v.verdict for v in verdicts] != ["contended"]

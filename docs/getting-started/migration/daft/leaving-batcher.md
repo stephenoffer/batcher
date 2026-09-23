@@ -20,66 +20,66 @@ The following table maps 264 Batcher spellings to the Daft names that compute th
 |---|---|
 | `**` operator | `Expression.pow`, `Expression.power`, `functions.pow`, `functions.power` |
 | `-` operator | `Expression.negate`, `functions.negate` |
-| `^` operator + `Expr.bit_count` | `Expression.hamming_distance`, `functions.hamming_distance` |
-| `bt.approx_count_distinct` | `functions.approx_count_distinct` |
-| `bt.arctan2` | `Expression.arctan2`, `functions.arctan2` |
-| `bt.array` | `functions.to_list` |
-| `bt.bool_and` | `functions.bool_and` |
-| `bt.bool_or` | `functions.bool_or` |
-| `bt.Catalog` | `daft.Catalog` |
-| `bt.coalesce` | `Expression.coalesce`, `functions.coalesce` |
-| `bt.col` | `daft.col` |
-| `bt.concat_str` | `Expression.concat` |
-| `bt.concat_ws` | `functions.concat_ws` |
-| `bt.concat` | `daft.concat` |
-| `bt.count_distinct` | `functions.count_distinct` |
-| `bt.current_session` | `daft.current_session` |
-| `bt.Dataset` | `daft.DataFrame` |
-| `bt.dense_rank` | `functions.dense_rank` |
-| `bt.e` | `functions.e` |
-| `bt.element` | `daft.element` |
+| `^` operator + {py:obj}`Expr.bit_count <batcher.plan.expr_ir.core.Expr.bit_count>` | `Expression.hamming_distance`, `functions.hamming_distance` |
+| {py:obj}`bt.approx_count_distinct <batcher.approx_count_distinct>` | `functions.approx_count_distinct` |
+| {py:obj}`bt.arctan2 <batcher.arctan2>` | `Expression.arctan2`, `functions.arctan2` |
+| {py:obj}`bt.array <batcher.array>` | `functions.to_list` |
+| {py:obj}`bt.bool_and <batcher.bool_and>` | `functions.bool_and` |
+| {py:obj}`bt.bool_or <batcher.bool_or>` | `functions.bool_or` |
+| {py:obj}`bt.Catalog <batcher.Catalog>` | `daft.Catalog` |
+| {py:obj}`bt.coalesce <batcher.coalesce>` | `Expression.coalesce`, `functions.coalesce` |
+| {py:obj}`bt.col <batcher.col>` | `daft.col` |
+| {py:obj}`bt.concat_str <batcher.concat_str>` | `Expression.concat` |
+| {py:obj}`bt.concat_ws <batcher.concat_ws>` | `functions.concat_ws` |
+| {py:obj}`bt.concat <batcher.concat>` | `daft.concat` |
+| {py:obj}`bt.count_distinct <batcher.count_distinct>` | `functions.count_distinct` |
+| {py:obj}`bt.current_session <batcher.current_session>` | `daft.current_session` |
+| {py:obj}`bt.Dataset <batcher.Dataset>` | `daft.DataFrame` |
+| {py:obj}`bt.dense_rank <batcher.dense_rank>` | `functions.dense_rank` |
+| {py:obj}`bt.e <batcher.e>` | `functions.e` |
+| {py:obj}`bt.element <batcher.element>` | `daft.element` |
 | `bt.Expr` | `daft.Expression` |
-| `bt.from_dask` | `daft.from_dask_dataframe` |
-| `bt.from_epoch` | `functions.timestamp_micros`, `functions.timestamp_millis`, `functions.timestamp_seconds` |
-| `bt.from_epoch` + `Expr.dt.strftime` | `functions.from_unixtime` |
-| `bt.from_pandas` | `daft.from_pandas` |
-| `bt.from_pydict` | `daft.from_pydict` |
-| `bt.from_pylist` | `daft.from_pylist` |
-| `bt.from_ray_dataset` | `daft.from_ray_dataset` |
-| `bt.from_unix_date` | `functions.date_from_unix_date` |
-| `bt.greatest` | `functions.columns_max` |
-| `bt.hypot` | `functions.hypot` |
-| `bt.least` | `functions.columns_min` |
-| `bt.lit` | `daft.lit` |
-| `bt.make_date` | `functions.make_date` |
-| `bt.max` | `functions.max` |
-| `bt.mean_horizontal` | `functions.columns_avg`, `functions.columns_mean` |
-| `bt.mean` | `functions.avg`, `functions.mean` |
-| `bt.median` | `functions.median` |
-| `bt.min` | `functions.min` |
-| `bt.partition_days` | `Expression.partition_days`, `Expression.unix_date`, `functions.partition_days`, `functions.unix_date` |
-| `bt.partition_hours` | `Expression.partition_hours`, `functions.partition_hours` |
-| `bt.partition_months` | `Expression.partition_months`, `functions.partition_months` |
-| `bt.partition_years` | `Expression.partition_years`, `functions.partition_years` |
-| `bt.pi` | `functions.pi` |
-| `bt.pmod` | `functions.pmod` |
-| `bt.product` | `functions.product` |
-| `bt.rank` | `functions.rank` |
+| {py:obj}`bt.from_dask <batcher.from_dask>` | `daft.from_dask_dataframe` |
+| {py:obj}`bt.from_epoch <batcher.from_epoch>` | `functions.timestamp_micros`, `functions.timestamp_millis`, `functions.timestamp_seconds` |
+| {py:obj}`bt.from_epoch <batcher.from_epoch>` + `Expr.dt.strftime` | `functions.from_unixtime` |
+| {py:obj}`bt.from_pandas <batcher.from_pandas>` | `daft.from_pandas` |
+| {py:obj}`bt.from_pydict <batcher.from_pydict>` | `daft.from_pydict` |
+| {py:obj}`bt.from_pylist <batcher.from_pylist>` | `daft.from_pylist` |
+| {py:obj}`bt.from_ray_dataset <batcher.from_ray_dataset>` | `daft.from_ray_dataset` |
+| {py:obj}`bt.from_unix_date <batcher.from_unix_date>` | `functions.date_from_unix_date` |
+| {py:obj}`bt.greatest <batcher.greatest>` | `functions.columns_max` |
+| {py:obj}`bt.hypot <batcher.hypot>` | `functions.hypot` |
+| {py:obj}`bt.least <batcher.least>` | `functions.columns_min` |
+| {py:obj}`bt.lit <batcher.lit>` | `daft.lit` |
+| {py:obj}`bt.make_date <batcher.make_date>` | `functions.make_date` |
+| {py:obj}`bt.max <batcher.max>` | `functions.max` |
+| {py:obj}`bt.mean_horizontal <batcher.mean_horizontal>` | `functions.columns_avg`, `functions.columns_mean` |
+| {py:obj}`bt.mean <batcher.mean>` | `functions.avg`, `functions.mean` |
+| {py:obj}`bt.median <batcher.median>` | `functions.median` |
+| {py:obj}`bt.min <batcher.min>` | `functions.min` |
+| {py:obj}`bt.partition_days <batcher.partition_days>` | `Expression.partition_days`, `Expression.unix_date`, `functions.partition_days`, `functions.unix_date` |
+| {py:obj}`bt.partition_hours <batcher.partition_hours>` | `Expression.partition_hours`, `functions.partition_hours` |
+| {py:obj}`bt.partition_months <batcher.partition_months>` | `Expression.partition_months`, `functions.partition_months` |
+| {py:obj}`bt.partition_years <batcher.partition_years>` | `Expression.partition_years`, `functions.partition_years` |
+| {py:obj}`bt.pi <batcher.pi>` | `functions.pi` |
+| {py:obj}`bt.pmod <batcher.pmod>` | `functions.pmod` |
+| {py:obj}`bt.product <batcher.product>` | `functions.product` |
+| {py:obj}`bt.rank <batcher.rank>` | `functions.rank` |
 | `bt.read.csv` | `daft.read_csv` |
 | `bt.read.delta` | `daft.read_deltalake` |
 | `bt.read.hudi` | `daft.read_hudi` |
 | `bt.read.json` | `daft.read_json` |
 | `bt.read.lance` | `daft.read_lance` |
 | `bt.read.parquet` | `daft.read_parquet` |
-| `bt.register_function` | `daft.attach_function` |
-| `bt.row_number` | `functions.row_number` |
-| `bt.Session` | `daft.Session` |
-| `bt.set_session` | `daft.set_session` |
-| `bt.skew` | `functions.skew` |
-| `bt.sql_expr` | `daft.sql_expr` |
-| `bt.sum_horizontal` | `functions.columns_sum` |
-| `bt.sum` | `functions.sum` |
-| `bt.Table` | `daft.Table` |
+| {py:obj}`bt.register_function <batcher.register_function>` | `daft.attach_function` |
+| {py:obj}`bt.row_number <batcher.row_number>` | `functions.row_number` |
+| {py:obj}`bt.Session <batcher.Session>` | `daft.Session` |
+| {py:obj}`bt.set_session <batcher.set_session>` | `daft.set_session` |
+| {py:obj}`bt.skew <batcher.skew>` | `functions.skew` |
+| {py:obj}`bt.sql_expr <batcher.sql_expr>` | `daft.sql_expr` |
+| {py:obj}`bt.sum_horizontal <batcher.sum_horizontal>` | `functions.columns_sum` |
+| {py:obj}`bt.sum <batcher.sum>` | `functions.sum` |
+| {py:obj}`bt.Table <batcher.Table>` | `daft.Table` |
 | `bt` | `daft.functions` |
 | `Catalog.create_namespace` | `Catalog.create_namespace_if_not_exists`, `Catalog.create_namespace` |
 | `Catalog.create_table` | `Catalog.create_table` |
@@ -93,68 +93,68 @@ The following table maps 264 Batcher spellings to the Daft names that compute th
 | `Catalog.list_namespaces` | `Catalog.list_namespaces` |
 | `Catalog.list_tables` | `Catalog.list_tables` |
 | `Catalog.name` | `Catalog.name` |
-| `Dataset.agg` | `DataFrame.agg` |
-| `Dataset.agg` + `Expr.any_value` | `DataFrame.any_value` |
-| `Dataset.agg` + `Expr.array_agg` | `DataFrame.agg_list` |
-| `Dataset.agg` + `Expr.str.join` | `DataFrame.agg_concat` |
-| `Dataset.columns` | `DataFrame.column_names` |
-| `Dataset.count_distinct` | `DataFrame.count_distinct` |
-| `Dataset.count` | `DataFrame.count_rows` |
-| `Dataset.distinct` | `DataFrame.distinct`, `DataFrame.drop_duplicates`, `DataFrame.unique` |
-| `Dataset.drop_nans` | `DataFrame.drop_nan` |
-| `Dataset.drop_nulls` | `DataFrame.drop_null` |
-| `Dataset.drop` | `DataFrame.exclude` |
-| `Dataset.except_` | `DataFrame.except_all`, `DataFrame.except_distinct` |
-| `Dataset.filter` | `DataFrame.filter`, `DataFrame.where` |
-| `Dataset.group_by` | `DataFrame.groupby` |
-| `Dataset.intersect` | `DataFrame.intersect_all`, `DataFrame.intersect` |
-| `Dataset.iter_batches` | `DataFrame.to_arrow_iter` |
-| `Dataset.join_asof` | `DataFrame.join_asof` |
-| `Dataset.limit` | `DataFrame.limit` |
+| {py:obj}`Dataset.agg <batcher.Dataset.agg>` | `DataFrame.agg` |
+| {py:obj}`Dataset.agg <batcher.Dataset.agg>` + {py:obj}`Expr.any_value <batcher.plan.expr_ir.core.Expr.any_value>` | `DataFrame.any_value` |
+| {py:obj}`Dataset.agg <batcher.Dataset.agg>` + {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | `DataFrame.agg_list` |
+| {py:obj}`Dataset.agg <batcher.Dataset.agg>` + `Expr.str.join` | `DataFrame.agg_concat` |
+| {py:obj}`Dataset.columns <batcher.Dataset.columns>` | `DataFrame.column_names` |
+| {py:obj}`Dataset.count_distinct <batcher.Dataset.count_distinct>` | `DataFrame.count_distinct` |
+| {py:obj}`Dataset.count <batcher.Dataset.count>` | `DataFrame.count_rows` |
+| {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | `DataFrame.distinct`, `DataFrame.drop_duplicates`, `DataFrame.unique` |
+| {py:obj}`Dataset.drop_nans <batcher.Dataset.drop_nans>` | `DataFrame.drop_nan` |
+| {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | `DataFrame.drop_null` |
+| {py:obj}`Dataset.drop <batcher.Dataset.drop>` | `DataFrame.exclude` |
+| {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | `DataFrame.except_all`, `DataFrame.except_distinct` |
+| {py:obj}`Dataset.filter <batcher.Dataset.filter>` | `DataFrame.filter`, `DataFrame.where` |
+| {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | `DataFrame.groupby` |
+| {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | `DataFrame.intersect_all`, `DataFrame.intersect` |
+| {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | `DataFrame.to_arrow_iter` |
+| {py:obj}`Dataset.join_asof <batcher.Dataset.join_asof>` | `DataFrame.join_asof` |
+| {py:obj}`Dataset.limit <batcher.Dataset.limit>` | `DataFrame.limit` |
 | `Dataset.ml.to_torch_dataloader` | `DataFrame.to_torch_dataloader` |
-| `Dataset.pipe` | `DataFrame.pipe`, `DataFrame.transform` |
-| `Dataset.pivot` | `DataFrame.pivot` |
-| `Dataset.rename` | `DataFrame.with_column_renamed`, `DataFrame.with_columns_renamed` |
-| `Dataset.select` | `DataFrame.select` |
-| `Dataset.shuffle` | `DataFrame.shuffle` |
-| `Dataset.to_arrow` | `DataFrame.to_arrow` |
-| `Dataset.to_pandas` | `DataFrame.to_pandas` |
-| `Dataset.to_pydict` | `DataFrame.to_pydict` |
-| `Dataset.to_pylist` | `DataFrame.to_pylist` |
-| `Dataset.to_ray_dataset` | `DataFrame.to_ray_dataset` |
-| `Dataset.union` | `DataFrame.concat`, `DataFrame.union_all` |
-| `Dataset.unpivot` | `DataFrame.melt`, `DataFrame.unpivot` |
-| `Dataset.with_columns` | `DataFrame.with_column`, `DataFrame.with_columns` |
+| {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | `DataFrame.pipe`, `DataFrame.transform` |
+| {py:obj}`Dataset.pivot <batcher.Dataset.pivot>` | `DataFrame.pivot` |
+| {py:obj}`Dataset.rename <batcher.Dataset.rename>` | `DataFrame.with_column_renamed`, `DataFrame.with_columns_renamed` |
+| {py:obj}`Dataset.select <batcher.Dataset.select>` | `DataFrame.select` |
+| {py:obj}`Dataset.shuffle <batcher.Dataset.shuffle>` | `DataFrame.shuffle` |
+| {py:obj}`Dataset.to_arrow <batcher.Dataset.to_arrow>` | `DataFrame.to_arrow` |
+| {py:obj}`Dataset.to_pandas <batcher.Dataset.to_pandas>` | `DataFrame.to_pandas` |
+| {py:obj}`Dataset.to_pydict <batcher.Dataset.to_pydict>` | `DataFrame.to_pydict` |
+| {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | `DataFrame.to_pylist` |
+| {py:obj}`Dataset.to_ray_dataset <batcher.Dataset.to_ray_dataset>` | `DataFrame.to_ray_dataset` |
+| {py:obj}`Dataset.union <batcher.Dataset.union>` | `DataFrame.concat`, `DataFrame.union_all` |
+| {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | `DataFrame.melt`, `DataFrame.unpivot` |
+| {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | `DataFrame.with_column`, `DataFrame.with_columns` |
 | `Dataset.write.clickhouse` | `DataFrame.write_clickhouse` |
 | `Dataset.write.delta` | `DataFrame.write_deltalake` |
 | `Dataset.write.table` | `Catalog.write_table`, `Session.write_table`, `daft.write_table` |
-| `Expr.abs` | `Expression.abs`, `functions.abs` |
-| `Expr.alias` | `Expression.alias` |
-| `Expr.approx_count_distinct` | `Expression.approx_count_distinct` |
-| `Expr.arccos` | `Expression.arccos`, `functions.arccos` |
-| `Expr.arccosh` | `Expression.arccosh`, `functions.arccosh` |
-| `Expr.arcsin` | `Expression.arcsin`, `functions.arcsin` |
-| `Expr.arcsinh` | `Expression.arcsinh`, `functions.arcsinh` |
-| `Expr.arctan` | `Expression.arctan`, `functions.arctan` |
-| `Expr.arctanh` | `Expression.arctanh`, `functions.arctanh` |
-| `Expr.array_agg` | `Expression.list_agg`, `functions.list_agg` |
-| `Expr.between` | `Expression.between`, `functions.between` |
-| `Expr.bitwise_and` | `Expression.bitwise_and`, `functions.bitwise_and` |
-| `Expr.bitwise_or` | `Expression.bitwise_or`, `functions.bitwise_or` |
-| `Expr.bitwise_xor` | `Expression.bitwise_xor`, `functions.bitwise_xor` |
-| `Expr.bool_and` | `Expression.bool_and` |
-| `Expr.bool_or` | `Expression.bool_or` |
-| `Expr.cast` | `DataType.binary`, `DataType.bool`, `DataType.date`, `DataType.decimal128`, `DataType.float16`, `DataType.float32`, `DataType.float64`, `DataType.int16`, `DataType.int32`, `DataType.int64`, `DataType.int8`, `DataType.string`, `DataType.uint16`, `DataType.uint32`, `DataType.uint64`, `DataType.uint8`, `Expression.as_binary`, `Expression.as_bool`, `Expression.as_date`, `Expression.as_decimal128`, `Expression.as_float16`, `Expression.as_float32`, `Expression.as_float64`, `Expression.as_int16`, `Expression.as_int32`, `Expression.as_int64`, `Expression.as_int8`, `Expression.as_string`, `Expression.as_uint16`, `Expression.as_uint32`, `Expression.as_uint64`, `Expression.as_uint8` |
-| `Expr.cbrt` | `Expression.cbrt`, `functions.cbrt` |
-| `Expr.ceil` | `Expression.ceil`, `functions.ceil` |
-| `Expr.chr` | `functions.chr_func` |
-| `Expr.clip` | `Expression.clip`, `functions.clip` |
-| `Expr.cos` | `Expression.cos`, `functions.cos` |
-| `Expr.cosh` | `Expression.cosh`, `functions.cosh` |
-| `Expr.cot` | `Expression.cot`, `functions.cot` |
-| `Expr.count_distinct` | `Expression.count_distinct` |
-| `Expr.csc` | `Expression.csc`, `functions.csc` |
-| `Expr.degrees` | `Expression.degrees`, `functions.degrees` |
+| {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | `Expression.abs`, `functions.abs` |
+| {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | `Expression.alias` |
+| {py:obj}`Expr.approx_count_distinct <batcher.plan.expr_ir.core.Expr.approx_count_distinct>` | `Expression.approx_count_distinct` |
+| {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | `Expression.arccos`, `functions.arccos` |
+| {py:obj}`Expr.arccosh <batcher.plan.expr_ir.core.Expr.arccosh>` | `Expression.arccosh`, `functions.arccosh` |
+| {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | `Expression.arcsin`, `functions.arcsin` |
+| {py:obj}`Expr.arcsinh <batcher.plan.expr_ir.core.Expr.arcsinh>` | `Expression.arcsinh`, `functions.arcsinh` |
+| {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | `Expression.arctan`, `functions.arctan` |
+| {py:obj}`Expr.arctanh <batcher.plan.expr_ir.core.Expr.arctanh>` | `Expression.arctanh`, `functions.arctanh` |
+| {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | `Expression.list_agg`, `functions.list_agg` |
+| {py:obj}`Expr.between <batcher.plan.expr_ir.core.Expr.between>` | `Expression.between`, `functions.between` |
+| {py:obj}`Expr.bitwise_and <batcher.plan.expr_ir.core.Expr.bitwise_and>` | `Expression.bitwise_and`, `functions.bitwise_and` |
+| {py:obj}`Expr.bitwise_or <batcher.plan.expr_ir.core.Expr.bitwise_or>` | `Expression.bitwise_or`, `functions.bitwise_or` |
+| {py:obj}`Expr.bitwise_xor <batcher.plan.expr_ir.core.Expr.bitwise_xor>` | `Expression.bitwise_xor`, `functions.bitwise_xor` |
+| {py:obj}`Expr.bool_and <batcher.plan.expr_ir.core.Expr.bool_and>` | `Expression.bool_and` |
+| {py:obj}`Expr.bool_or <batcher.plan.expr_ir.core.Expr.bool_or>` | `Expression.bool_or` |
+| {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | `DataType.binary`, `DataType.bool`, `DataType.date`, `DataType.decimal128`, `DataType.float16`, `DataType.float32`, `DataType.float64`, `DataType.int16`, `DataType.int32`, `DataType.int64`, `DataType.int8`, `DataType.string`, `DataType.uint16`, `DataType.uint32`, `DataType.uint64`, `DataType.uint8`, `Expression.as_binary`, `Expression.as_bool`, `Expression.as_date`, `Expression.as_decimal128`, `Expression.as_float16`, `Expression.as_float32`, `Expression.as_float64`, `Expression.as_int16`, `Expression.as_int32`, `Expression.as_int64`, `Expression.as_int8`, `Expression.as_string`, `Expression.as_uint16`, `Expression.as_uint32`, `Expression.as_uint64`, `Expression.as_uint8` |
+| {py:obj}`Expr.cbrt <batcher.plan.expr_ir.core.Expr.cbrt>` | `Expression.cbrt`, `functions.cbrt` |
+| {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | `Expression.ceil`, `functions.ceil` |
+| {py:obj}`Expr.chr <batcher.plan.expr_ir.core.Expr.chr>` | `functions.chr_func` |
+| {py:obj}`Expr.clip <batcher.plan.expr_ir.core.Expr.clip>` | `Expression.clip`, `functions.clip` |
+| {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | `Expression.cos`, `functions.cos` |
+| {py:obj}`Expr.cosh <batcher.plan.expr_ir.core.Expr.cosh>` | `Expression.cosh`, `functions.cosh` |
+| {py:obj}`Expr.cot <batcher.plan.expr_ir.core.Expr.cot>` | `Expression.cot`, `functions.cot` |
+| {py:obj}`Expr.count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>` | `Expression.count_distinct` |
+| {py:obj}`Expr.csc <batcher.plan.expr_ir.core.Expr.csc>` | `Expression.csc`, `functions.csc` |
+| {py:obj}`Expr.degrees <batcher.plan.expr_ir.core.Expr.degrees>` | `Expression.degrees`, `functions.degrees` |
 | `Expr.dt.date` | `Expression.date`, `functions.date` |
 | `Expr.dt.day` | `Expression.day_of_month`, `Expression.day`, `functions.day_of_month`, `functions.day`, `functions.dayofmonth` |
 | `Expr.dt.dayofweek` | `Expression.day_of_week`, `functions.day_of_week` |
@@ -172,21 +172,21 @@ The following table maps 264 Batcher spellings to the Daft names that compute th
 | `Expr.dt.timestamp` | `Expression.to_unix_epoch`, `functions.to_unix_epoch` |
 | `Expr.dt.week` | `Expression.week_of_year`, `functions.week_of_year`, `functions.weekofyear` |
 | `Expr.dt.year` | `Expression.year`, `functions.year` |
-| `Expr.eq_missing` | `Expression.eq_null_safe`, `functions.eq_null_safe` |
-| `Expr.exp` | `Expression.exp`, `functions.exp` |
-| `Expr.expm1` | `Expression.expm1`, `functions.expm1` |
-| `Expr.factorial` | `functions.factorial` |
-| `Expr.fill_nan` | `Expression.fill_nan`, `functions.fill_nan` |
-| `Expr.fill_null` | `Expression.fill_null`, `functions.fill_null` |
-| `Expr.floor` | `Expression.floor`, `functions.floor` |
-| `Expr.is_in` | `Expression.is_in`, `functions.is_in` |
-| `Expr.is_infinite` | `Expression.is_inf`, `functions.is_inf` |
-| `Expr.is_nan` | `Expression.is_nan`, `functions.is_nan` |
-| `Expr.is_not_nan` | `Expression.not_nan`, `functions.not_nan` |
-| `Expr.is_not_null` | `Expression.not_null`, `functions.not_null` |
-| `Expr.is_null` | `Expression.is_null`, `functions.is_null` |
+| {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | `Expression.eq_null_safe`, `functions.eq_null_safe` |
+| {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | `Expression.exp`, `functions.exp` |
+| {py:obj}`Expr.expm1 <batcher.plan.expr_ir.core.Expr.expm1>` | `Expression.expm1`, `functions.expm1` |
+| {py:obj}`Expr.factorial <batcher.plan.expr_ir.core.Expr.factorial>` | `functions.factorial` |
+| {py:obj}`Expr.fill_nan <batcher.plan.expr_ir.core.Expr.fill_nan>` | `Expression.fill_nan`, `functions.fill_nan` |
+| {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | `Expression.fill_null`, `functions.fill_null` |
+| {py:obj}`Expr.floor <batcher.plan.expr_ir.core.Expr.floor>` | `Expression.floor`, `functions.floor` |
+| {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | `Expression.is_in`, `functions.is_in` |
+| {py:obj}`Expr.is_infinite <batcher.plan.expr_ir.core.Expr.is_infinite>` | `Expression.is_inf`, `functions.is_inf` |
+| {py:obj}`Expr.is_nan <batcher.plan.expr_ir.core.Expr.is_nan>` | `Expression.is_nan`, `functions.is_nan` |
+| {py:obj}`Expr.is_not_nan <batcher.plan.expr_ir.core.Expr.is_not_nan>` | `Expression.not_nan`, `functions.not_nan` |
+| {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | `Expression.not_null`, `functions.not_null` |
+| {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | `Expression.is_null`, `functions.is_null` |
 | `Expr.json.array_length` | `functions.json_array_length` |
-| `Expr.list.concat` + `bt.array` | `Expression.list_append`, `functions.list_append` |
+| `Expr.list.concat` + {py:obj}`bt.array <batcher.array>` | `Expression.list_append`, `functions.list_append` |
 | `Expr.list.cosine_distance` | `Expression.cosine_distance`, `functions.cosine_distance` |
 | `Expr.list.cosine_similarity` | `Expression.cosine_similarity`, `functions.cosine_similarity` |
 | `Expr.list.dot` | `Expression.dot_product`, `functions.dot_product` |
@@ -201,26 +201,26 @@ The following table maps 264 Batcher spellings to the Daft names that compute th
 | `Expr.list.sum` | `Expression.list_sum`, `functions.list_sum` |
 | `Expr.list.transform` | `Expression.list_map`, `functions.list_map` |
 | `Expr.list.unique` | `Expression.list_distinct`, `functions.list_distinct` |
-| `Expr.ln` | `Expression.ln`, `Expression.log`, `functions.ln` |
-| `Expr.log10` | `Expression.log10`, `functions.log10` |
-| `Expr.log1p` | `Expression.log1p`, `functions.log1p` |
-| `Expr.log2` | `Expression.log2`, `functions.log2` |
+| {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | `Expression.ln`, `Expression.log`, `functions.ln` |
+| {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | `Expression.log10`, `functions.log10` |
+| {py:obj}`Expr.log1p <batcher.plan.expr_ir.core.Expr.log1p>` | `Expression.log1p`, `functions.log1p` |
+| {py:obj}`Expr.log2 <batcher.plan.expr_ir.core.Expr.log2>` | `Expression.log2`, `functions.log2` |
 | `Expr.map.keys` | `Expression.map_keys`, `functions.map_keys` |
-| `Expr.max` | `Expression.max` |
-| `Expr.mean` | `Expression.avg`, `Expression.mean` |
-| `Expr.median` | `Expression.median` |
-| `Expr.min` | `Expression.min` |
-| `Expr.product` | `Expression.product` |
-| `Expr.quantile` | `Expression.percentile`, `functions.percentile` |
-| `Expr.radians` | `Expression.radians`, `functions.radians` |
-| `Expr.round` | `Expression.round`, `functions.round` |
-| `Expr.safe_divide` | `functions.try_divide` |
-| `Expr.sec` | `Expression.sec`, `functions.sec` |
-| `Expr.sign` | `Expression.sign`, `functions.sign` |
-| `Expr.sin` | `Expression.sin`, `functions.sin` |
-| `Expr.sinh` | `Expression.sinh`, `functions.sinh` |
-| `Expr.skew` | `Expression.skew` |
-| `Expr.sqrt` | `Expression.sqrt`, `functions.sqrt` |
+| {py:obj}`Expr.max <batcher.plan.expr_ir.core.Expr.max>` | `Expression.max` |
+| {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | `Expression.avg`, `Expression.mean` |
+| {py:obj}`Expr.median <batcher.plan.expr_ir.core.Expr.median>` | `Expression.median` |
+| {py:obj}`Expr.min <batcher.plan.expr_ir.core.Expr.min>` | `Expression.min` |
+| {py:obj}`Expr.product <batcher.plan.expr_ir.core.Expr.product>` | `Expression.product` |
+| {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | `Expression.percentile`, `functions.percentile` |
+| {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | `Expression.radians`, `functions.radians` |
+| {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | `Expression.round`, `functions.round` |
+| {py:obj}`Expr.safe_divide <batcher.plan.expr_ir.core.Expr.safe_divide>` | `functions.try_divide` |
+| {py:obj}`Expr.sec <batcher.plan.expr_ir.core.Expr.sec>` | `Expression.sec`, `functions.sec` |
+| {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | `Expression.sign`, `functions.sign` |
+| {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | `Expression.sin`, `functions.sin` |
+| {py:obj}`Expr.sinh <batcher.plan.expr_ir.core.Expr.sinh>` | `Expression.sinh`, `functions.sinh` |
+| {py:obj}`Expr.skew <batcher.plan.expr_ir.core.Expr.skew>` | `Expression.skew` |
+| {py:obj}`Expr.sqrt <batcher.plan.expr_ir.core.Expr.sqrt>` | `Expression.sqrt`, `functions.sqrt` |
 | `Expr.str.ascii` | `Expression.ascii`, `functions.ascii_func` |
 | `Expr.str.capitalize` | `Expression.capitalize`, `functions.capitalize` |
 | `Expr.str.compress` | `Expression.compress`, `Expression.try_compress`, `functions.compress`, `functions.try_compress` |
@@ -240,20 +240,20 @@ The following table maps 264 Batcher spellings to the Daft names that compute th
 | `Expr.str.to_date` | `Expression.to_date`, `functions.to_date` |
 | `Expr.str.trim` | `Expression.strip`, `functions.strip` |
 | `Expr.str.upper` | `Expression.upper`, `functions.upper` |
-| `Expr.sum` | `Expression.sum` |
-| `Expr.tan` | `Expression.tan`, `functions.tan` |
-| `Expr.tanh` | `Expression.tanh`, `functions.tanh` |
-| `Expr.to_base` | `functions.bin` |
-| `GroupBy.agg` | `GroupedDataFrame.agg` |
-| `GroupBy.agg` + `Expr.any_value` | `GroupedDataFrame.any_value` |
-| `GroupBy.agg` + `Expr.str.join` | `GroupedDataFrame.string_agg` |
-| `GroupBy.array_agg` | `GroupedDataFrame.list_agg` |
-| `GroupBy.count` | `GroupedDataFrame.count` |
-| `GroupBy.max` | `GroupedDataFrame.max` |
-| `GroupBy.mean` | `GroupedDataFrame.mean` |
-| `GroupBy.min` | `GroupedDataFrame.min` |
-| `GroupBy.product` | `GroupedDataFrame.product` |
-| `GroupBy.sum` | `GroupedDataFrame.sum` |
+| {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | `Expression.sum` |
+| {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | `Expression.tan`, `functions.tan` |
+| {py:obj}`Expr.tanh <batcher.plan.expr_ir.core.Expr.tanh>` | `Expression.tanh`, `functions.tanh` |
+| {py:obj}`Expr.to_base <batcher.plan.expr_ir.core.Expr.to_base>` | `functions.bin` |
+| {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` | `GroupedDataFrame.agg` |
+| {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` + {py:obj}`Expr.any_value <batcher.plan.expr_ir.core.Expr.any_value>` | `GroupedDataFrame.any_value` |
+| {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` + `Expr.str.join` | `GroupedDataFrame.string_agg` |
+| {py:obj}`GroupBy.array_agg <batcher.GroupBy.array_agg>` | `GroupedDataFrame.list_agg` |
+| {py:obj}`GroupBy.count <batcher.GroupBy.count>` | `GroupedDataFrame.count` |
+| {py:obj}`GroupBy.max <batcher.GroupBy.max>` | `GroupedDataFrame.max` |
+| {py:obj}`GroupBy.mean <batcher.GroupBy.mean>` | `GroupedDataFrame.mean` |
+| {py:obj}`GroupBy.min <batcher.GroupBy.min>` | `GroupedDataFrame.min` |
+| {py:obj}`GroupBy.product <batcher.GroupBy.product>` | `GroupedDataFrame.product` |
+| {py:obj}`GroupBy.sum <batcher.GroupBy.sum>` | `GroupedDataFrame.sum` |
 | `lshift` operator | `Expression.shift_left`, `functions.shift_left` |
 | `rshift` operator | `Expression.shift_right`, `functions.shift_right` |
 | `Session.catalog.attach` | `Session.attach_catalog`, `daft.attach_catalog` |
@@ -282,3 +282,10 @@ The following table maps 264 Batcher spellings to the Daft names that compute th
 | `Table.read` | `Catalog.read_table`, `Table.read` |
 | `Table.schema` | `Table.schema` |
 | `WindowExpr.over` | `Window.current_row`, `Window.partition_by`, `Window.unbounded_following`, `Window.unbounded_preceding` |
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`/getting-started/migration/index`: porting the other way, from Daft onto Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

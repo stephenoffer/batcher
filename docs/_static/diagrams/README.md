@@ -158,11 +158,11 @@ on its page is not finished, so this table is the checklist as well as the index
 
 | Diagram | Page it belongs on |
 | --- | --- |
-| `streaming_microbatch.svg` | `docs/user-guide/moving-data/streaming.md` |
-| `watermark_late_data.svg` | `docs/user-guide/moving-data/streaming-stateful.md` |
-| `window_types.svg` | `docs/user-guide/moving-data/streaming-stateful.md` |
-| `state_store.svg` | `docs/user-guide/moving-data/streaming-stateful.md` |
-| `exactly_once.svg` | `docs/user-guide/moving-data/streaming-stateful.md` |
+| `streaming_microbatch.svg` | `docs/user-guide/moving-data/streaming/index.md` |
+| `watermark_late_data.svg` | `docs/user-guide/moving-data/streaming/stateful.md` |
+| `window_types.svg` | `docs/user-guide/moving-data/streaming/stateful.md` |
+| `state_store.svg` | `docs/user-guide/moving-data/streaming/stateful.md` |
+| `exactly_once.svg` | `docs/user-guide/moving-data/streaming/stateful.md` |
 | `output_modes.svg` | `docs/api/operations/streaming.md` |
 | `delta_commit_log.svg` | `docs/user-guide/moving-data/lakehouse.md` |
 | `merge_into_branches.svg` | `docs/user-guide/moving-data/lakehouse.md` |
@@ -191,7 +191,7 @@ These sit on the user-facing pages rather than the architecture deep dives: one 
 | --- | --- |
 | `expression_vs_row_loop.svg` | `docs/getting-started/concepts/expressions.md` |
 | `first_pipeline_plan.svg` | `docs/getting-started/tutorials/foundations/first-pipeline.md` |
-| `install_extras_stack.svg` | `docs/getting-started/installation.md` |
+| `install_extras_stack.svg` | `docs/getting-started/install/packages-and-extras.md` |
 | `learning_paths_matrix.svg` | `docs/getting-started/tutorials/paths/index.md` |
 | `medallion_layers.svg` | `docs/getting-started/tutorials/pipelines/building-a-lakehouse.md` |
 | `migration_chooser.svg` | `docs/getting-started/migration/index.md` |
@@ -213,8 +213,8 @@ These sit on the user-facing pages rather than the architecture deep dives: one 
 | `dedup_choice.svg` | `docs/user-guide/transform/rows/distinct-and-dedup.md` |
 | `dq_contract_matrix.svg` | `docs/user-guide/trust/data-contracts.md` |
 | `explain_line_anatomy.svg` | `docs/user-guide/operate/tuning/explain-plans.md` |
-| `frame_chain.svg` | `docs/user-guide/analyze/robotics.md` |
-| `graph_isolated_nodes.svg` | `docs/user-guide/analyze/graphs.md` |
+| `frame_chain.svg` | `docs/user-guide/analyze/domains/robotics.md` |
+| `graph_isolated_nodes.svg` | `docs/user-guide/analyze/domains/graphs.md` |
 | `group_by_flow.svg` | `docs/user-guide/analyze/aggregations.md` |
 | `hardening_boundary.svg` | `docs/user-guide/trust/hardening.md` |
 | `join_types_kept.svg` | `docs/user-guide/analyze/joins.md` |
@@ -228,9 +228,9 @@ These sit on the user-facing pages rather than the architecture deep dives: one 
 | `sampling_choice.svg` | `docs/user-guide/transform/rows/sampling.md` |
 | `secret_reference_flow.svg` | `docs/user-guide/trust/secrets.md` |
 | `skew_hot_key_salting.svg` | `docs/user-guide/operate/tuning/skew.md` |
-| `spatial_join_prefilter.svg` | `docs/user-guide/analyze/geospatial.md` |
-| `streaming_emission.svg` | `docs/user-guide/moving-data/streaming-emission.md` |
-| `streaming_health.svg` | `docs/user-guide/moving-data/streaming-monitoring.md` |
+| `spatial_join_prefilter.svg` | `docs/user-guide/analyze/domains/geospatial.md` |
+| `streaming_emission.svg` | `docs/user-guide/moving-data/streaming/emission.md` |
+| `streaming_health.svg` | `docs/user-guide/moving-data/streaming/monitoring.md` |
 | `time_series_align.svg` | `docs/user-guide/analyze/time-series.md` |
 | `transform_rows_vs_columns.svg` | `docs/user-guide/transform/index.md` |
 | `troubleshooting_tree.svg` | `docs/user-guide/operate/running/troubleshooting.md` |

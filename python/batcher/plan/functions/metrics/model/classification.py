@@ -16,11 +16,33 @@ KS statistic — are not here: they are `batcher.ml.metrics` Dataset functions b
 window rank, because a rank is not an aggregate.
 
 The positive class defaults to ``1``/``True`` and is configurable with `positive`, so a
-string label column (``"churned"``) works without being re-encoded first.
+string label column (``"churned"``) works without being re-encoded first. Every metric here
+except `accuracy` and `cohen_kappa` (with ``labels=``) is *binary*: the positive class
+against everything else, one-vs-rest.
+
+**The undefined-value convention**, shared with the `diagnostic` module and checked against
+scikit-learn:
+
+- A *proportion* whose denominator counts nothing (precision with no positive predictions,
+  recall with no positive rows, specificity with no negative rows, and every rate derived
+  from them) is ``0.0``. That is scikit-learn's ``zero_division=0``, the value its
+  ``precision_score``/``recall_score``/``f1_score``/``jaccard_score`` return by default, and
+  ``matthews_corrcoef`` returns ``0.0`` on its degenerate case too.
+- A score that *averages over the classes* (`balanced_accuracy`, `geometric_mean_score`)
+  averages over the classes present in `y_true` only, as scikit-learn's
+  ``balanced_accuracy_score`` does, so a group holding only positives scores its recall rather
+  than being dragged down by a specificity that has nothing to measure.
+- A *chance-corrected score or a ratio of rates* (`cohen_kappa`, `informedness`,
+  `markedness`, the likelihood ratios, `prevalence_threshold`) is ``NaN`` when undefined,
+  which is what ``cohen_kappa_score`` and ``class_likelihood_ratios`` return.
+
+Null labels or predictions drop the row from every count, so each metric is over the rows
+where both are present. Sample weights are not supported.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from batcher.plan.expr_ir.constructors import lit, when
@@ -153,6 +175,27 @@ def true_negatives(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> 
     return count_if(~positive_mask(y_true, positive) & ~positive_mask(y_pred, positive))
 
 
+def _as_float(count: Expr) -> Expr:
+    """A confusion count as float64, so products of counts cannot overflow int64.
+
+    ``count_if`` is an int64, and the Matthews denominator multiplies four of them: with
+    120,000 balanced rows the product is about 1.3e19, past int64's 9.2e18, and it wrapped
+    negative, so the square root went NaN. At 200,000 rows it wrapped back positive and
+    the metric read 4.38, outside its own ``[-1, 1]`` range.
+    """
+    return count.cast("float64")
+
+
+def _confusion(y_true: IntoExpr, y_pred: IntoExpr, positive: Any) -> tuple[Expr, Expr, Expr, Expr]:
+    """The four confusion cells ``(tp, fp, fn, tn)``, each as float64."""
+    return (
+        _as_float(true_positives(y_true, y_pred, positive=positive)),
+        _as_float(false_positives(y_true, y_pred, positive=positive)),
+        _as_float(false_negatives(y_true, y_pred, positive=positive)),
+        _as_float(true_negatives(y_true, y_pred, positive=positive)),
+    )
+
+
 def accuracy(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     """Fraction of rows where the prediction equals the label.
 
@@ -280,7 +323,10 @@ def false_positive_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1
         positive: The value that counts as the positive class.
 
     Returns:
-        The false-positive rate in ``[0, 1]``.
+        The false-positive rate ``fp / (fp + tn)`` in ``[0, 1]``, and 0.0 when there are no
+        negative rows. It is computed directly rather than as ``1 - specificity``, because a
+        group with no negatives has a specificity of 0.0 by the zero-division convention and
+        its complement would report every negative as a false alarm.
 
     Examples:
         .. doctest::
@@ -290,7 +336,8 @@ def false_positive_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1
             >>> ds.agg(m=bt.false_positive_rate("y", "p")).to_pydict()
             {'m': [0.5]}
     """
-    return lit(1.0) - specificity(y_true, y_pred, positive=positive)
+    fp = false_positives(y_true, y_pred, positive=positive)
+    return _rate(fp, fp + true_negatives(y_true, y_pred, positive=positive))
 
 
 def negative_predictive_value(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -387,7 +434,10 @@ def balanced_accuracy(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) 
         positive: The value that counts as the positive class.
 
     Returns:
-        The balanced accuracy in ``[0, 1]``.
+        The balanced accuracy in ``[0, 1]``: the mean of the recalls of the classes present
+        in `y_true`, as scikit-learn's ``balanced_accuracy_score`` computes it. A group whose
+        labels are all positive scores its recall, one whose labels are all negative scores
+        its specificity, and a group with no labelled rows is NaN.
 
     Examples:
         .. doctest::
@@ -397,8 +447,35 @@ def balanced_accuracy(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) 
             >>> ds.agg(m=bt.balanced_accuracy("y", "p")).to_pydict()
             {'m': [0.5]}
     """
-    sensitivity = recall(y_true, y_pred, positive=positive)
-    return (sensitivity + specificity(y_true, y_pred, positive=positive)) / lit(2.0)
+    return _present_class_mean(y_true, y_pred, positive, geometric=False)
+
+
+def _present_class_mean(
+    y_true: IntoExpr, y_pred: IntoExpr, positive: Any, *, geometric: bool
+) -> Expr:
+    """The arithmetic or geometric mean of recall and specificity over the classes `y_true` has.
+
+    A class with no rows in `y_true` has no recall to measure, and scoring it 0.0 (the
+    zero-division value) halved a perfect classifier's balanced accuracy on a group that
+    happened to hold one class. scikit-learn drops such a class from the mean instead.
+    """
+    tp, fp, fn, tn = _confusion(y_true, y_pred, positive)
+    has_positive = (tp + fn) > lit(0.0)
+    has_negative = (tn + fp) > lit(0.0)
+    sensitivity = _rate(tp, tp + fn)
+    selectivity = _rate(tn, tn + fp)
+    both = (
+        (sensitivity * selectivity).sqrt() if geometric else (sensitivity + selectivity) / lit(2.0)
+    )
+    return (
+        when(has_positive & has_negative)
+        .then(both)
+        .when(has_positive)
+        .then(sensitivity)
+        .when(has_negative)
+        .then(selectivity)
+        .otherwise(lit(float("nan")))
+    )
 
 
 def matthews_corrcoef(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -414,7 +491,8 @@ def matthews_corrcoef(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) 
         positive: The value that counts as the positive class.
 
     Returns:
-        The Matthews correlation coefficient in ``[-1, 1]``.
+        The Matthews correlation coefficient in ``[-1, 1]``, and 0.0 when any row or column
+        of the confusion matrix is empty (scikit-learn's ``matthews_corrcoef`` convention).
 
     Examples:
         .. doctest::
@@ -424,29 +502,42 @@ def matthews_corrcoef(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) 
             >>> ds.agg(m=bt.matthews_corrcoef("y", "p")).to_pydict()
             {'m': [1.0]}
     """
-    tp = true_positives(y_true, y_pred, positive=positive)
-    fp = false_positives(y_true, y_pred, positive=positive)
-    fn = false_negatives(y_true, y_pred, positive=positive)
-    tn = true_negatives(y_true, y_pred, positive=positive)
+    tp, fp, fn, tn = _confusion(y_true, y_pred, positive)
     numerator = tp * tn - fp * fn
     denominator = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)).sqrt()
     return when(denominator == lit(0.0)).then(lit(0.0)).otherwise(numerator / denominator)
 
 
-def cohen_kappa(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
+def cohen_kappa(
+    y_true: IntoExpr,
+    y_pred: IntoExpr,
+    *,
+    positive: Any = 1,
+    labels: Sequence[Any] | None = None,
+) -> Expr:
     """Cohen's kappa — agreement corrected for the agreement chance alone would give.
 
     ``(observed - expected) / (1 - expected)``. 1 is perfect, 0 is chance-level, negative
     is worse than chance. The metric to reach for when comparing a model against a human
     annotator, where both are guessing some of the time.
 
+    Kappa is defined over every class, not one-vs-rest, so a multi-class column needs its
+    class set: pass ``labels=[...]`` and the chance agreement sums over each listed class,
+    exactly as scikit-learn's ``cohen_kappa_score(..., labels=...)`` does (rows whose label
+    or prediction is not listed are left out). Without `labels` the metric is binary on
+    `positive`, and it answers NaN rather than a binarized kappa if either column holds more
+    than one non-positive value: scoring ``["a", "b", "c"]`` as ``"a"``-versus-rest gave 0.5
+    where the three-class kappa is 0.556, a different number under the same name.
+
     Args:
         y_true: The observed labels.
         y_pred: The predicted labels.
-        positive: The value that counts as the positive class.
+        positive: The value that counts as the positive class when `labels` is omitted.
+        labels: Every class, for a multi-class kappa. Omit it for a binary one.
 
     Returns:
-        Cohen's kappa in ``[-1, 1]``.
+        Cohen's kappa in ``[-1, 1]``, and NaN when the chance agreement is already perfect
+        (a single class on both sides, where scikit-learn also answers NaN).
 
     Examples:
         .. doctest::
@@ -455,14 +546,48 @@ def cohen_kappa(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Exp
             >>> ds = bt.from_pydict({"y": [1, 1, 0, 0], "p": [1, 1, 0, 0]})
             >>> ds.agg(m=bt.cohen_kappa("y", "p")).to_pydict()
             {'m': [1.0]}
+            >>> ds = bt.from_pydict({"y": ["a", "b", "a", "c"], "p": ["a", "a", "a", "c"]})
+            >>> k = ds.agg(m=bt.cohen_kappa("y", "p", labels=["a", "b", "c"])).to_pydict()["m"][0]
+            >>> round(k, 4)
+            0.5556
     """
-    tp = true_positives(y_true, y_pred, positive=positive)
-    fp = false_positives(y_true, y_pred, positive=positive)
-    fn = false_negatives(y_true, y_pred, positive=positive)
-    tn = true_negatives(y_true, y_pred, positive=positive)
+    left, right = _as_column(y_true), _as_column(y_pred)
+    if labels is not None:
+        return _multiclass_kappa(left, right, list(labels))
+    tp, fp, fn, tn = _confusion(left, right, positive)
     total = tp + fp + fn + tn
     observed = (tp + tn) / total
     expected = ((tp + fp) * (tp + fn) + (fn + tn) * (fp + tn)) / (total * total)
+    kappa = (observed - expected) / (lit(1.0) - expected)
+    return (
+        when(_single_negative(left, positive) & _single_negative(right, positive))
+        .then(kappa)
+        .otherwise(lit(float("nan")))
+    )
+
+
+def _single_negative(column: Expr, positive: Any) -> Expr:
+    """Whether the column's non-positive values are at most one class — i.e. it is binary.
+
+    ``min == max`` over the non-positive values is a mergeable test for that, where a
+    distinct count would not be. An all-positive column leaves both null, which is binary.
+    """
+    negative = when(~positive_mask(column, positive)).then(column)
+    return (count_if(negative.is_not_null()) == lit(0)) | (negative.min() == negative.max())
+
+
+def _multiclass_kappa(left: Expr, right: Expr, labels: list[Any]) -> Expr:
+    """Cohen's kappa over an explicit class set, as one mergeable aggregate."""
+    listed = left.is_in(labels) & right.is_in(labels)
+    total = _as_float(count_if(listed))
+    agreed = _as_float(count_if(listed & (left == right)))
+    chance = lit(0.0)
+    for label in labels:
+        truth = _as_float(count_if(listed & (left == lit(label))))
+        guess = _as_float(count_if(listed & (right == lit(label))))
+        chance = chance + truth * guess
+    observed = agreed / total
+    expected = chance / (total * total)
     return (observed - expected) / (lit(1.0) - expected)
 
 

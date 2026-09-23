@@ -25,8 +25,7 @@ from __future__ import annotations
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
-from batcher.graph._graph import DST, NODE, SRC, Graph
-from batcher.graph.degree import out_degree
+from batcher.graph._graph import NODE, Graph, ends, undirected_pairs
 
 __all__ = [
     "adamic_adar",
@@ -39,8 +38,18 @@ __all__ = [
 
 
 def _adjacency(g: Graph) -> Dataset:
-    """The symmetrized, deduplicated `(node, neighbour)` table every score joins on."""
-    return g.to_undirected().simple().edges.select(**{NODE: bt.col(SRC), "nbr": bt.col(DST)})
+    """The symmetrized, deduplicated `(node, nbr)` table every score joins on."""
+    return ends(undirected_pairs(g))
+
+
+def _neighbour_counts(g: Graph) -> Dataset:
+    """Each node's distinct-neighbour count, as `node` and `out_degree`.
+
+    Counted from `_adjacency` rather than as `out_degree(g.to_undirected().simple())`: the
+    two agree, but that form is an aggregate over a union, and the scores join onto this
+    table, which a cluster cannot run on such an aggregate.
+    """
+    return _adjacency(g).group_by(NODE).agg(out_degree=bt.count())
 
 
 def candidate_pairs(g: Graph, *, max_degree: int | None = None) -> Dataset:
@@ -79,11 +88,7 @@ def candidate_pairs(g: Graph, *, max_degree: int | None = None) -> Dataset:
         raise PlanError(f"max_degree must be positive, got {max_degree}")
     adj = _adjacency(g)
     if max_degree is not None:
-        hubs = (
-            out_degree(g.to_undirected().simple())
-            .filter(bt.col("out_degree") > bt.lit(max_degree))
-            .select(NODE)
-        )
+        hubs = _neighbour_counts(g).filter(bt.col("out_degree") > bt.lit(max_degree)).select(NODE)
         adj = adj.join(hubs.select(nbr=bt.col(NODE)), on="nbr", how="anti")
     adj = adj.cache()
     left = adj.select(a=bt.col(NODE), nbr=bt.col("nbr"))
@@ -98,9 +103,7 @@ def candidate_pairs(g: Graph, *, max_degree: int | None = None) -> Dataset:
 
 def _with_degrees(g: Graph, pairs: Dataset, a: str, b: str) -> Dataset:
     """Attach each endpoint's neighbour count to a pair table."""
-    deg = out_degree(g.to_undirected().simple()).select(
-        **{NODE: bt.col(NODE), "_k": bt.col("out_degree")}
-    )
+    deg = _neighbour_counts(g).select(**{NODE: bt.col(NODE), "_k": bt.col("out_degree")})
     return (
         pairs.join(deg.select(**{a: bt.col(NODE), "_ka": bt.col("_k")}), on=a, how="left")
         .join(deg.select(**{b: bt.col(NODE), "_kb": bt.col("_k")}), on=b, how="left")
@@ -190,7 +193,7 @@ def _rare_neighbour_score(
 ) -> Dataset:
     """Sum a per-shared-neighbour weight that falls with that neighbour's degree."""
     adj = _adjacency(g).cache()
-    deg = out_degree(g.to_undirected().simple()).select(nbr=bt.col(NODE), _kn=bt.col("out_degree"))
+    deg = _neighbour_counts(g).select(nbr=bt.col(NODE), _kn=bt.col("out_degree"))
     shared = (
         pairs.join(adj.select(**{a: bt.col(NODE), "nbr": bt.col("nbr")}), on=a, how="inner")
         .join(adj.select(**{b: bt.col(NODE), "nbr": bt.col("nbr")}), on=[b, "nbr"], how="semi")

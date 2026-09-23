@@ -20,6 +20,7 @@ The batching is the point in every case, and it is what a naive implementation g
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import pyarrow as pa
@@ -195,23 +196,31 @@ class RocksDBLookup:
     __slots__ = ("_db", "_schema")
 
     def __init__(self, path: str, schema: pa.Schema) -> None:
-        """Open the database at `path` for reading.
+        """Open the existing database at `path`, read-only.
+
+        Read-only is the whole contract of a lookup, and it is also what makes a typo fail:
+        opened read-write, RocksDB *creates* a database at a path that does not exist, so a
+        mistyped path answered every key with "no match" instead of an error.
 
         Args:
-            path: The RocksDB directory. It is locked by the process that opens it, so a
-                lookup join distributed across workers on one node needs Redis or a
-                read-only copy per worker instead.
+            path: The RocksDB directory, which must already exist. A lookup join spread
+                across many workers is better served by Redis, which every worker can reach.
             schema: The columns this lookup contributes.
 
         Raises:
-            ConfigError: If the database cannot be opened.
+            ConfigError: If there is no database at `path`, or it cannot be opened.
             MissingDependencyError: If the ``rocksdict`` package is not installed.
         """
         rocksdict = require(
             "rocksdict", feature="a RocksDB lookup join", provides="RocksDB", extra="rocksdb"
         )
+        if not os.path.isdir(path):
+            raise ConfigError(
+                f"No RocksDB lookup database at {path!r}: the directory does not exist.",
+                hint="Check the path; a lookup opens an existing database and never creates one.",
+            )
         try:
-            self._db: Any = rocksdict.Rdict(path)
+            self._db: Any = rocksdict.Rdict(path, access_type=rocksdict.AccessType.read_only())
         except Exception as exc:
             raise ConfigError(
                 f"Cannot open the RocksDB lookup database at {path!r}: {exc}.",

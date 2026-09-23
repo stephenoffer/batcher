@@ -166,7 +166,7 @@ print(inside.select("t", "crew").sort("t").to_pydict())
 # {'t': [3, 12, 25], 'crew': ['x', 'y', 'z']}
 ```
 
-A predicate names right columns by name. A right column whose name the left side already has takes the `suffix`, `_right` by default, so `bt.col("v_right")` is the right side's `v`. One or two inequalities between the sides run as a range join rather than as a filtered cartesian product, and an equality runs as a hash join.
+A predicate names right columns by name. A right column whose name the left side already has takes the `suffix`, `_right` by default, so {py:obj}`bt.col("v_right") <batcher.col>` is the right side's `v`. One or two inequalities between the sides run as a range join rather than as a filtered cartesian product, and an equality runs as a hash join.
 
 ## Update values from another dataset
 
@@ -238,7 +238,7 @@ Setting `batch_size` small is the one way to make a lookup join slow. The per-ba
 
 You give up a consistent snapshot. The store is read as it stands when each batch arrives, and `cache_ttl` bounds how stale a cached row may be. Where a point-in-time answer is what you meant, read the dimension as a dataset and use `join`.
 
-Against an in-process store, where the hash join has no network to pay, a lookup join is slower than the hash join it replaces. That gap is the mechanism's overhead, not its benefit. The case it is for is a store the hash join cannot read without pulling every row over the network. Reach for it when the dimension lives somewhere else, not to beat a join over data you already have. `benchmarks/internals/cache_bench.py` measures that overhead.
+Against an in-process store, where the hash join has no network to pay, a lookup join is slower than the hash join it replaces. That gap is the mechanism's overhead, not its benefit. The case it is for is a store the hash join cannot read without pulling every row over the network. Reach for it when the dimension lives somewhere else, not to beat a join over data you already have. [`benchmarks/internals/cache_bench.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/internals/cache_bench.py) measures that overhead.
 
 `schema` is required and cannot be inferred. A join's output columns cannot depend on which keys the first batch happened to contain, or a batch that matched nothing would have a different shape from the batch before it, and two workers would disagree about the shape of the same result.
 

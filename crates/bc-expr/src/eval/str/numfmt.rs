@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::array::{new_null_array, Array, ArrayRef, Int64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 
@@ -48,7 +48,30 @@ pub(super) fn eval_numeric_input(
     if !arr.data_type().is_integer() {
         // `hex` is defined on strings and blobs too, and those paths own it; only an
         // integer argument belongs here.
-        return Ok(None);
+        if matches!(func, StrFunc::Hex) {
+            return Ok(None);
+        }
+        // An all-null column is a real type rather than a mistake -- `eval_str` says so
+        // itself, naming the left join that matched nothing and the batch of failed
+        // generations that produce one -- and the convention it settled is that `f(null)`
+        // is `null`. Declining here sent such a column down the string path, which cast it
+        // to `Utf8` and then rejected it as "takes an integer", so `chr`, `to_base`, `bin`
+        // and both `format_bytes` spellings failed the whole query on input that `upper`,
+        // `lower` and `hex` all answer with nulls.
+        if matches!(arr.data_type(), DataType::Null) {
+            return Ok(Some(new_null_array(&DataType::Utf8, arr.len())));
+        }
+        // Anything else is a genuine type error, and it is reported as one. Falling
+        // through to the string path produced "expected a Utf8 argument, got Float64" --
+        // naming a type this function does not take -- and, for a `Utf8` argument, the
+        // self-contradicting "expected a Utf8 argument, got Utf8". `ExpectedType` exists
+        // precisely for this: its own doc comment records the same defect being fixed for
+        // the list/map/struct checks.
+        return Err(ExprError::ExpectedType {
+            func: format!("{func:?}"),
+            want: "an integer",
+            got: crate::error::type_name(arr.data_type()),
+        });
     }
     let ints = cast(arr, &DataType::Int64)?;
     let a =
@@ -258,5 +281,59 @@ mod tests {
         let arr: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         assert!(eval_numeric_input(StrFunc::ToBase, &arr, Some(37)).is_err());
         assert!(eval_numeric_input(StrFunc::ToBase, &arr, Some(1)).is_err());
+    }
+
+    /// An all-null column must answer nulls, not fail the query.
+    ///
+    /// `eval_str` settled that convention for the string family and names what produces
+    /// such a column: a left join that matched nothing, a batch of failed generations,
+    /// `from_pydict({"s": [None, None]})`. The Int -> Utf8 functions sat outside it --
+    /// they declined the column here, the string path cast it to `Utf8`, and they then
+    /// rejected it as "takes an integer", so `chr` raised where `upper` and `hex`
+    /// returned nulls on the very same input.
+    #[test]
+    fn an_all_null_column_answers_nulls_rather_than_erroring() {
+        for func in [
+            StrFunc::Chr,
+            StrFunc::ToBase,
+            StrFunc::Bin,
+            StrFunc::FormatBytes,
+            StrFunc::FormatBytesSi,
+        ] {
+            let arr: ArrayRef = new_null_array(&DataType::Null, 3);
+            let out = eval_numeric_input(func, &arr, Some(16))
+                .unwrap_or_else(|e| panic!("{func:?} errored on an all-null column: {e}"))
+                .unwrap_or_else(|| panic!("{func:?} declined an all-null column"));
+            assert_eq!(out.len(), 3, "{func:?} changed the row count");
+            assert_eq!(out.null_count(), 3, "{func:?} produced a non-null value");
+        }
+    }
+
+    /// A genuinely wrong argument type is reported as the type it wants, not as `Utf8`.
+    ///
+    /// These take an integer, so the old message ("expected a Utf8 argument, got Float64")
+    /// named a type they do not accept, and on a `Utf8` argument it read "expected a Utf8
+    /// argument, got Utf8" -- claiming it expected exactly what it had rejected, which is
+    /// the defect `ExprError::ExpectedType` was introduced to fix elsewhere.
+    #[test]
+    fn a_wrong_argument_type_names_the_type_it_wants() {
+        use arrow::array::{Float64Array, StringArray};
+
+        for arr in [
+            Arc::new(Float64Array::from(vec![65.0])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["65"])) as ArrayRef,
+        ] {
+            let err = eval_numeric_input(StrFunc::Chr, &arr, None)
+                .expect_err("a non-integer argument to chr must be an error");
+            let text = err.to_string();
+            assert!(
+                text.contains("an integer"),
+                "message did not ask for an integer: {text}"
+            );
+            assert!(
+                !text.contains("expected a Utf8 argument"),
+                "message still claims it wants Utf8: {text}"
+            );
+        }
     }
 }

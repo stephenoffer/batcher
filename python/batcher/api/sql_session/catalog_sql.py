@@ -93,11 +93,23 @@ def catalog_statement(session: Session, ast: Any, tables: dict[str, Any]) -> Dat
                 name, if_exists=bool(ast.args.get("exists")), cascade=bool(ast.args.get("cascade"))
             )
         return _relation({"dropped": pa.array(names, pa.string())})
-    if isinstance(ast, exp.Create) and kind == "TABLE" and "." in qualified_name(ast.this):
+    if isinstance(ast, exp.Create) and kind == "TABLE" and _creates_catalog_table(session, ast):
         return _create_table(session, ast, tables)
     if isinstance(ast, exp.Insert) and _is_catalog_target(session, ast.this, tables):
         return _insert(session, ast, tables)
     return None
+
+
+def _creates_catalog_table(session: Session, ast: Any) -> bool:
+    """Whether ``CREATE TABLE name AS …`` writes a catalog table rather than a session one.
+
+    A qualified name always does. An unqualified one does once ``USE`` has moved the session
+    off its starting ``memory.main``: after ``USE wh.raw`` the user means ``wh.raw.name``,
+    exactly as DuckDB resolves it, and quietly binding a session-only name instead made the
+    table vanish with the process. Without a ``USE``, an unqualified ``CREATE TABLE AS``
+    keeps its long-standing meaning, a lazy session table.
+    """
+    return "." in qualified_name(ast.this) or session.catalog._is_repositioned()
 
 
 def _position(session: Session) -> Dataset:
@@ -128,7 +140,7 @@ def _show(session: Session, tables: dict[str, Any], what: str, source: str | Non
     catalog = session.catalog
     if what == "TABLES":
         if source is None:
-            names = list(dict.fromkeys([*session._tables, *tables]))
+            names = list(dict.fromkeys([*session._tables, *session._views, *tables]))
             namespace = catalog.current_namespace()
             owner = catalog.get_catalog(catalog.current_catalog())
         else:
@@ -163,7 +175,7 @@ def _show(session: Session, tables: dict[str, Any], what: str, source: str | Non
 
 def _is_catalog_target(session: Session, target: Any, tables: dict[str, Any]) -> bool:
     name = qualified_name(target)
-    if name in session._tables or name in tables:
+    if name in tables or ("." not in name and session._key(name) is not None):
         return False
     return session.catalog.has_table(name)
 
@@ -239,7 +251,7 @@ def bind(session: Session, ast: Any, tables: dict[str, Any]) -> tuple[Any, dict[
 
 def _references(session: Session, ast: Any, tables: dict[str, Any]) -> list[tuple[Any, str]]:
     """The ``(table node, dotted name)`` pairs in `ast` that name catalog tables."""
-    shadowing = {name.lower() for name in [*session._tables, *tables]}
+    shadowing = {name.lower() for name in [*session._tables, *session._views, *tables]}
     shadowing |= {cte.alias_or_name.lower() for cte in ast.find_all(exp.CTE)}
     found = []
     for node in ast.find_all(exp.Table):

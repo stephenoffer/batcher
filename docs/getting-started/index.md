@@ -19,7 +19,7 @@ print(totals.to_pydict())
 # {'region': ['east', 'west'], 'revenue': [80.0, 165.0]}
 ```
 
-That's the whole shape of a Batcher program: build a dataset, chain lazy steps, ask for the result. Swap `from_pydict` for `bt.read` on a directory of Parquet files and nothing else changes. The engine works through Arrow batches in parallel on every core and spills to disk under memory pressure, so the input can be far larger than RAM. On a Ray cluster, `collect(distributed=True)` runs the same plan across machines.
+That's the whole shape of a Batcher program: build a dataset, chain lazy steps, ask for the result. Swap `from_pydict` for {py:obj}`bt.read <batcher.read>` on a directory of Parquet files and nothing else changes. The engine works through Arrow batches in parallel on every core and spills to disk under memory pressure, so the input can be far larger than RAM. On a Ray cluster, `collect(distributed=True)` runs the same plan across machines.
 
 ## Start here
 
@@ -28,8 +28,8 @@ Most readers take these in order. Skip ahead if you already know the part a card
 ::::{grid} 1 2 2 2
 :gutter: 3
 
-:::{grid-item-card} {octicon}`download;1.1em` Installation
-:link: installation
+:::{grid-item-card} {octicon}`download;1.1em` Install
+:link: install/index
 :link-type: doc
 One wheel with the compiled engine inside. Add extras for Ray, object stores, lakehouse tables, ML backends, and file formats.
 :::
@@ -38,6 +38,12 @@ One wheel with the compiled engine inside. Add extras for Ray, object stores, la
 :link: quickstart
 :link-type: doc
 Filter, join, aggregate, switch to SQL, and write Parquet. Every example runs as written.
+:::
+
+:::{grid-item-card} {octicon}`telescope;1.1em` A tour of the engine
+:link: tour
+:link-type: doc
+One runnable example per capability, on one page: SQL, streaming, media, models, vectors, lakehouse, geospatial, and graphs.
 :::
 
 :::{grid-item-card} {octicon}`light-bulb;1.1em` Core concepts
@@ -68,9 +74,9 @@ Curious how fast it is? The {doc}`benchmarks </benchmarks/index>` page has the c
 ```{toctree}
 :hidden:
 
-installation
 install/index
 quickstart
+tour
 concepts/index
 tutorials/index
 migration/index

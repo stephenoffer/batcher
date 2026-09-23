@@ -138,7 +138,7 @@ print(readings.group_by("device").agg(peak=col("temp_c").max()).sort("device").t
 
 Against the live hub the only line that changes is the source, and the streaming controls
 (triggers, watermarks, checkpoints) attach to that source rather than to the transformation.
-See {doc}`/user-guide/moving-data/streaming`.
+See {doc}`/user-guide/moving-data/streaming/index`.
 
 ## How it parallelizes
 
@@ -207,7 +207,7 @@ The native reader authenticates with a connection string only, and `connection_s
 ## See also
 
 - {doc}`Kafka </integrations/streams/kafka>`: the protocol-compatible path, and the payload-decoding example.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, watermarks, dedup, checkpointing.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, dedup, checkpointing.
 - {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>`: the idempotent sink a replayed micro-batch depends on.
 - {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the `Source`/`Split` protocol.
 - {doc}`Reading and writing </api/relational/io>`: the full reader/writer surface.

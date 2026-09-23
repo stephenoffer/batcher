@@ -10,7 +10,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
+from batcher.ml.preprocessors.base import (
+    Preprocessor,
+    columns_arg,
+    fit_aggregate,
+    nan_as_null,
+)
 from batcher.plan.expr_ir import col, when
 
 if TYPE_CHECKING:
@@ -109,6 +114,7 @@ class KBinsDiscretizer(Preprocessor):
             ``self``, fitted.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         inner = self.n_bins - 1
         if self.strategy == "uniform":
             aggs = {}

@@ -20,52 +20,52 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 |---|---|---|---|
 | `add_months` | `Expr.dt.offset_by` | param | Missing: integer or column-valued month amount (offset\_by takes a '1mo' literal). Wave W2. |
 | `convert_timezone` | `Expr.dt.convert_timezone` | param | Missing: optional sourceTz defaulting to the session time zone. Wave W6. |
-| `curdate` | `bt.current_date` | canonical |  |
-| `current_date` | `bt.current_date` | canonical |  |
+| `curdate` | {py:obj}`bt.current_date <batcher.current_date>` | canonical |  |
+| `current_date` | {py:obj}`bt.current_date <batcher.current_date>` | canonical |  |
 | `current_time` | n/a | gap | Not yet: TIME type and current\_time(precision). Wave W6. |
-| `current_timestamp` | `bt.current_timestamp` | canonical |  |
+| `current_timestamp` | {py:obj}`bt.current_timestamp <batcher.current_timestamp>` | canonical |  |
 | `current_timezone` | n/a | gap | Not yet: session time zone configuration. Wave W6. |
-| `date_add` | `bt.date_add` | param | Missing: column-valued day amount. Wave W2. |
+| `date_add` | {py:obj}`bt.date_add <batcher.date_add>` | param | Missing: column-valued day amount. Wave W2. |
 | `date_diff` | `Expr.dt.days_between` | canonical |  |
 | `date_format` | `Expr.dt.strftime` | mismatch | Differs: Spark takes Java DateTimeFormatter patterns (yyyy-MM-dd) and renders in the session time zone; strftime takes %Y-%m-%d. Codemod translates the pattern. Wave W0. |
-| `date_from_unix_date` | `bt.from_unix_date` | canonical |  |
-| `date_part` | `bt.date_part` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
-| `date_sub` | `bt.date_sub` | param | Missing: column-valued day amount. Wave W2. |
+| `date_from_unix_date` | {py:obj}`bt.from_unix_date <batcher.from_unix_date>` | canonical |  |
+| `date_part` | {py:obj}`bt.date_part <batcher.date_part>` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
+| `date_sub` | {py:obj}`bt.date_sub <batcher.date_sub>` | param | Missing: column-valued day amount. Wave W2. |
 | `date_trunc` | `Expr.dt.truncate` | canonical |  |
-| `dateadd` | `bt.date_add` | param | Missing: column-valued day amount. Wave W2. |
+| `dateadd` | {py:obj}`bt.date_add <batcher.date_add>` | param | Missing: column-valued day amount. Wave W2. |
 | `datediff` | `Expr.dt.days_between` | canonical |  |
-| `datepart` | `bt.date_part` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
+| `datepart` | {py:obj}`bt.date_part <batcher.date_part>` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
 | `day` | `Expr.dt.day` | canonical |  |
 | `dayname` | `Expr.dt.dayname` | canonical |  |
 | `dayofmonth` | `Expr.dt.day` | canonical |  |
 | `dayofweek` | `Expr.dt.dayofweek` | canonical |  |
 | `dayofyear` | `Expr.dt.dayofyear` | canonical |  |
-| `days` | `bt.partition_days` | canonical |  |
-| `extract` | `bt.date_part` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
-| `from_unixtime` | `bt.from_epoch` + `Expr.dt.strftime` | mismatch | Differs: Spark renders a string with a Java pattern in the session time zone; Batcher builds a UTC timestamp and formats it with strftime. Wave W0. |
+| `days` | {py:obj}`bt.partition_days <batcher.partition_days>` | canonical |  |
+| `extract` | {py:obj}`bt.date_part <batcher.date_part>` | mismatch | Differs: Spark DAYOFWEEK/DOW counts Sunday=1 (port as col.dt.dayofweek(base=1)), DAYOFWEEK\_ISO/DOW\_ISO is col.dt.weekday(), and SECOND returns DECIMAL with the fraction (port as col.dt.second() + col.dt.microsecond() / 1\_000\_000, which is Float64); every other field agrees with bt.date\_part. Wave W0. |
+| `from_unixtime` | {py:obj}`bt.from_epoch <batcher.from_epoch>` + `Expr.dt.strftime` | mismatch | Differs: Spark renders a string with a Java pattern in the session time zone; Batcher builds a UTC timestamp and formats it with strftime. Wave W0. |
 | `from_utc_timestamp` | `Expr.dt.convert_timezone` | canonical |  |
 | `hour` | `Expr.dt.hour` | canonical |  |
-| `hours` | `bt.partition_hours` | canonical |  |
+| `hours` | {py:obj}`bt.partition_hours <batcher.partition_hours>` | canonical |  |
 | `last_day` | `Expr.dt.last_day` | canonical |  |
-| `localtimestamp` | `bt.current_timestamp` | param | Missing: session time zone for a local (NTZ) timestamp. Wave W6. |
-| `make_date` | `bt.make_date` | canonical |  |
+| `localtimestamp` | {py:obj}`bt.current_timestamp <batcher.current_timestamp>` | param | Missing: session time zone for a local (NTZ) timestamp. Wave W6. |
+| `make_date` | {py:obj}`bt.make_date <batcher.make_date>` | canonical |  |
 | `make_dt_interval` | n/a | gap | Not yet: day-time interval constructor. Wave W6. |
 | `make_interval` | n/a | gap | Not yet: interval constructor. Wave W6. |
 | `make_time` | n/a | gap | Not yet: TIME constructor. Wave W6. |
-| `make_timestamp` | `bt.make_timestamp` | param | Missing: fractional seconds (DECIMAL secs) and a timezone= argument. Wave W6. |
+| `make_timestamp` | {py:obj}`bt.make_timestamp <batcher.make_timestamp>` | param | Missing: fractional seconds (DECIMAL secs) and a timezone= argument. Wave W6. |
 | `make_timestamp_ltz` | n/a | gap | Not yet: timestamp-with-local-time-zone constructor. Wave W6. |
-| `make_timestamp_ntz` | `bt.make_timestamp` | param | Missing: fractional seconds (DECIMAL secs). Wave W6. |
+| `make_timestamp_ntz` | {py:obj}`bt.make_timestamp <batcher.make_timestamp>` | param | Missing: fractional seconds (DECIMAL secs). Wave W6. |
 | `make_ym_interval` | n/a | gap | Not yet: year-month interval constructor. Wave W6. |
 | `minute` | `Expr.dt.minute` | canonical |  |
 | `month` | `Expr.dt.month` | canonical |  |
 | `monthname` | `Expr.dt.monthname` | canonical |  |
-| `months` | `bt.partition_months` | canonical |  |
+| `months` | {py:obj}`bt.partition_months <batcher.partition_months>` | canonical |  |
 | `months_between` | `Expr.dt.months_between` | canonical |  |
 | `next_day` | `Expr.dt.next_day` | canonical |  |
-| `now` | `bt.current_timestamp` | canonical |  |
+| `now` | {py:obj}`bt.current_timestamp <batcher.current_timestamp>` | canonical |  |
 | `quarter` | `Expr.dt.quarter` | canonical |  |
 | `second` | `Expr.dt.second` | canonical |  |
-| `session_window` | `Dataset.session_window` | param | Missing: session\_window as a grouping expression with a column-valued gap duration. Wave W2. |
+| `session_window` | {py:obj}`Dataset.session_window <batcher.Dataset.session_window>` | param | Missing: session\_window as a grouping expression with a column-valued gap duration. Wave W2. |
 | `time_bucket` | n/a | gap | Not yet: align timestamps to fixed-size buckets with an origin. Wave W6. |
 | `time_diff` | n/a | gap | Not yet: TIME difference in units. Wave W6. |
 | `time_from_micros` | n/a | gap | Not yet: TIME from microseconds. Wave W6. |
@@ -77,9 +77,9 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `time_trunc` | n/a | gap | Not yet: truncate a TIME to a unit. Wave W6. |
 | `timestamp_add` | `Expr.dt.offset_by` | param | Missing: unit name plus a column-valued quantity. Wave W2. |
 | `timestamp_diff` | `Expr.dt.seconds_between` + `Expr.dt.minutes_between` + `Expr.dt.hours_between` + `Expr.dt.days_between` + `Expr.dt.weeks_between` | param | Missing: MONTH, QUARTER and YEAR units with Spark's truncating semantics. Wave W2. |
-| `timestamp_micros` | `bt.from_epoch` | canonical |  |
-| `timestamp_millis` | `bt.from_epoch` | canonical |  |
-| `timestamp_seconds` | `bt.from_epoch` | canonical |  |
+| `timestamp_micros` | {py:obj}`bt.from_epoch <batcher.from_epoch>` | canonical |  |
+| `timestamp_millis` | {py:obj}`bt.from_epoch <batcher.from_epoch>` | canonical |  |
+| `timestamp_seconds` | {py:obj}`bt.from_epoch <batcher.from_epoch>` | canonical |  |
 | `to_date` | `Expr.str.to_date` | mismatch | Differs: Spark takes Java DateTimeFormatter patterns and casts when no format is given; Batcher takes strftime patterns. Codemod translates the pattern. Wave W0. |
 | `to_time` | n/a | gap | Not yet: parse strings to TIME. Wave W6. |
 | `to_timestamp` | `Expr.str.to_datetime` | mismatch | Differs: Spark takes Java DateTimeFormatter patterns (format optional) and yields a session-time-zone timestamp; Batcher takes strftime patterns and yields a naive timestamp. Wave W0. |
@@ -95,7 +95,7 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `try_to_date` | n/a | gap | Not yet: to\_date with Java patterns returning null on invalid input. Wave W6. |
 | `try_to_time` | n/a | gap | Not yet: to\_time returning null on invalid input. Wave W6. |
 | `try_to_timestamp` | n/a | gap | Not yet: to\_timestamp with Java patterns returning null on invalid input. Wave W6. |
-| `unix_date` | `bt.partition_days` | canonical |  |
+| `unix_date` | {py:obj}`bt.partition_days <batcher.partition_days>` | canonical |  |
 | `unix_micros` | `Expr.dt.epoch_us` | canonical |  |
 | `unix_millis` | `Expr.dt.epoch_ms` | canonical |  |
 | `unix_seconds` | `Expr.dt.epoch` | canonical |  |
@@ -105,4 +105,12 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `window` | `bt.window` | mismatch | Differs: Spark window() yields a struct\<start, end\> and accepts startTime=; bt.window yields the window start timestamp. Wave W0. |
 | `window_time` | n/a | gap | Not yet: event time of a window struct (end - 1 microsecond). Wave W10. |
 | `year` | `Expr.dt.year` | canonical |  |
-| `years` | `bt.partition_years` | canonical |  |
+| `years` | {py:obj}`bt.partition_years <batcher.partition_years>` | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

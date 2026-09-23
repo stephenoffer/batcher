@@ -258,7 +258,7 @@ bitwise OR. Each of those is associative and commutative on the nose, so any mer
 a bit-identical state, and two runs' distinct counts are directly comparable. The quantile
 sketches don't work that way. KLL compacts and TDigest re-clusters its centroids, both of which
 depend on what has already been folded in, so a reduce that sees the partials in a different
-order returns a different estimate. `crates/bc-sketches/tests/merge_order.rs` pins both halves:
+order returns a different estimate. [`crates/bc-sketches/tests/merge_order.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-sketches/tests/merge_order.rs) pins both halves:
 bit-identity for the first three, and for the quantile sketches the property a caller actually
 needs, which is that two orders agree to within the sketch's own rank error. Don't write code,
 or a test, that expects a KLL to merge to an identical state.
@@ -292,7 +292,7 @@ the NDV `EXACT` too, which would let an approximate count answer a {py:meth}`cou
 
 :::{important}
 `ColumnStat.ndv_provenance` carries the distinct count's *own* tag, separately from the bundle's
-(`python/batcher/plan/stats.py`). A sketched NDV rides alongside exact bounds, and
+([`python/batcher/plan/stats.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/stats.py)). A sketched NDV rides alongside exact bounds, and
 `ndv_is_exact` is the gate every exact-answer path reads, so the sketch informs cost while it
 still refuses to answer a terminal. `kyber/stats/columns.py::scan_columns` merges a measured NDV
 onto a column that has none and tags it `SKETCH` whatever the bounds are worth.
@@ -375,12 +375,12 @@ a number is actually derived:
 
 | Concern | File |
 |---|---|
-| The estimator | `python/batcher/kyber/stats/estimator.py` |
-| Predicate selectivity | `python/batcher/kyber/stats/selectivity/` |
-| Merging learned column stats into a scan | `python/batcher/kyber/stats/columns.py` |
-| Aggregate output column stats | `python/batcher/kyber/stats/aggregate_columns.py` |
-| `Provenance`, `RelStats`, `ColumnStat` | `python/batcher/plan/stats.py` |
-| The sketches | `crates/bc-sketches/src/` |
+| The estimator | [`python/batcher/kyber/stats/estimator.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/kyber/stats/estimator.py) |
+| Predicate selectivity | [`python/batcher/kyber/stats/selectivity/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/kyber/stats/selectivity) |
+| Merging learned column stats into a scan | [`python/batcher/kyber/stats/columns.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/kyber/stats/columns.py) |
+| Aggregate output column stats | [`python/batcher/kyber/stats/aggregate_columns.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/kyber/stats/aggregate_columns.py) |
+| `Provenance`, `RelStats`, `ColumnStat` | [`python/batcher/plan/stats.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/stats.py) |
+| The sketches | [`crates/bc-sketches/src/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches/src) |
 | Cold-start constants | `python/batcher/config/config.py::CardinalityConfig` |
 
 ## See also

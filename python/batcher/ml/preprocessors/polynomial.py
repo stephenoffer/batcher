@@ -17,7 +17,12 @@ from operator import mul
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg
+from batcher.ml.preprocessors.base import (
+    Preprocessor,
+    columns_arg,
+    fit_aggregate,
+    nan_as_null,
+)
 from batcher.plan.expr_ir import Expr, col, lit
 
 if TYPE_CHECKING:
@@ -154,9 +159,15 @@ class SplineTransformer(Preprocessor):
     knots only, so a wiggle in one region stays in that region. This is the standard way to
     give a generalized additive model its smooth terms.
 
-    Knots are placed at the column's quantiles by default, so they follow the data's density
-    rather than its range — which is what makes the basis behave on a skewed column. That
-    placement is what `fit` learns, in one mergeable quantile aggregate.
+    The basis is scikit-learn's ``SplineTransformer`` default: `n_knots` knots spaced
+    evenly across the training range (``knots="uniform"``), extended by `degree` more knots
+    at each end at the same spacing, and ``extrapolation="constant"``, so a value outside
+    the training range gets the basis value at the nearest boundary rather than an all-zero
+    row. That makes ``n_knots + degree - 1`` output columns per input, the same count
+    scikit-learn emits with ``include_bias=True``. ``knots="quantile"`` places the knots at
+    the column's exact percentiles instead, so they follow the data's density; that
+    placement is what `fit` learns, in one aggregate. Nulls stay null in every basis
+    column, and there is no ``inverse_transform``.
 
     Each output column ``<name>_sp0 … <name>_sp{n}`` is an ordinary `Expr` over the source,
     so the expansion stays lazy, streams, and distributes.
@@ -176,10 +187,12 @@ class SplineTransformer(Preprocessor):
         n_knots: How many knots to place. More knots means a more flexible curve and more
             output columns.
         degree: The spline degree; 1 is piecewise linear, 3 the usual cubic.
-        knots: ``"quantile"`` to follow the data's density, or ``"uniform"`` to space knots
-            evenly across the observed range.
+        knots: ``"uniform"`` (the default, as in scikit-learn) to space knots evenly across
+            the observed range, or ``"quantile"`` to place them at the column's percentiles.
         drop_original: Remove the source columns after expanding them.
     """
+
+    numeric_only = True
 
     __slots__ = ("columns", "degree", "drop_original", "knots", "knots_", "n_knots")
 
@@ -189,7 +202,7 @@ class SplineTransformer(Preprocessor):
         *,
         n_knots: int = 5,
         degree: int = 3,
-        knots: str = "quantile",
+        knots: str = "uniform",
         drop_original: bool = False,
     ) -> None:
         self.columns = columns_arg(columns, what="SplineTransformer")
@@ -228,6 +241,8 @@ class SplineTransformer(Preprocessor):
         Raises:
             PlanError: If a column is entirely null, so no knots can be placed.
         """
+        self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         aggs: dict[str, Expr] = {}
         for name in self.columns:
             if self.knots == "uniform":
@@ -236,9 +251,8 @@ class SplineTransformer(Preprocessor):
             else:
                 for i in range(self.n_knots):
                     fraction = i / (self.n_knots - 1)
-                    aggs[f"{name}__k{i}"] = col(name).approx_quantile(fraction)
-        row = ds.agg(**aggs).collect()
-        read = {name: row.column(name)[0].as_py() for name in row.column_names}
+                    aggs[f"{name}__k{i}"] = col(name).quantile(fraction)
+        read = fit_aggregate(ds, aggs)
         for name in self.columns:
             if self.knots == "uniform":
                 low, high = read[f"{name}__lo"], read[f"{name}__hi"]
@@ -266,11 +280,8 @@ class SplineTransformer(Preprocessor):
     def transform(self, ds: Dataset) -> Dataset:
         """Append the spline basis columns for each fitted column.
 
-        A basis peaks at ``0.99`` rather than ``1.0`` in the example below because the
-        default ``knots="quantile"`` takes its cut points from the **approximate**
-        quantile sketch: on the three-row input it puts the middle knot at ``0.99``
-        rather than exactly ``1.0``. ``knots="uniform"`` spaces them by range instead
-        and peaks at an exact ``1.0``.
+        A value outside the training range is clamped to it first, which is scikit-learn's
+        ``extrapolation="constant"``: the row repeats the boundary's basis values.
 
         Examples:
             .. doctest::
@@ -279,8 +290,8 @@ class SplineTransformer(Preprocessor):
                 >>> from batcher.ml.preprocessors import SplineTransformer
                 >>> ds = bt.from_pydict({"x": [0.0, 1.0, 2.0]})
                 >>> pre = SplineTransformer("x", n_knots=3, degree=1).fit(ds)
-                >>> [round(v, 3) for v in pre.transform(ds).to_pydict()["x_sp1"]]
-                [0.0, 0.99, 0.0]
+                >>> pre.transform(bt.from_pydict({"x": [1.0, 9.0]})).to_pydict()["x_sp1"]
+                [1.0, 0.0]
 
         Args:
             ds: The dataset to expand.
@@ -322,39 +333,36 @@ def _basis_expressions(name: str, knots: list[float], degree: int) -> list[Expr]
     than per row means the result is a plain arithmetic tree over the column, so the engine
     evaluates it column-wise and the JIT can compile it.
 
-    The knot vector is padded by `degree` copies at each end, which is what makes the basis
-    a partition of unity across the whole interior range rather than tailing off at the
-    edges.
+    The knot vector is scikit-learn's: the fitted knots extended by `degree` more at each end,
+    spaced like the first and last fitted interval. A clamped vector (the boundary knot
+    repeated) gives a different basis near the edges. The column is clamped into the fitted
+    range before the recursion, which is scikit-learn's ``extrapolation="constant"``; without
+    it a value past the last knot fell outside every interval and its whole row came back
+    zero.
     """
-    padded = [knots[0]] * degree + list(knots) + [knots[-1]] * degree
-    column = col(name)
+    low_step = knots[1] - knots[0]
+    high_step = knots[-1] - knots[-2]
+    padded = (
+        [knots[0] - low_step * (degree - i) for i in range(degree)]
+        + list(knots)
+        + [knots[-1] + high_step * (i + 1) for i in range(degree)]
+    )
+    column = col(name).cast("float64").clip(lit(knots[0]), lit(knots[-1]))
     # Degree 0: an indicator per interval, each half-open on the right so a value on a knot
-    # belongs to exactly one. The *last non-degenerate* interval is closed instead, or the
-    # maximum value falls outside every basis function and its whole row comes back zero.
-    # It has to be the last non-degenerate one: padding makes the final `degree` intervals
-    # empty, so closing "the last interval" closes one that can never match.
-    last = max(i for i in range(len(padded) - 1) if padded[i] != padded[i + 1])
-    current: list[Expr] = []
-    for i in range(len(padded) - 1):
-        low, high = padded[i], padded[i + 1]
-        if low == high:
-            current.append(lit(0.0))
-            continue
-        upper = column <= lit(high) if i == last else column < lit(high)
-        current.append((column >= lit(low)) & upper)
-    current = [_as_float(expression) for expression in current]
-
+    # belongs to exactly one. The clamped maximum sits on the last fitted knot and so falls in
+    # the first extension interval, which exists because `degree >= 1`.
+    current: list[Expr] = [
+        _as_float((column >= lit(padded[i])) & (column < lit(padded[i + 1])))
+        for i in range(len(padded) - 1)
+    ]
     for d in range(1, degree + 1):
         nxt: list[Expr] = []
         for i in range(len(current) - 1):
             left_span = padded[i + d] - padded[i]
             right_span = padded[i + d + 1] - padded[i + 1]
-            term = lit(0.0)
-            if left_span:
-                term = term + (column - lit(padded[i])) / lit(left_span) * current[i]
-            if right_span:
-                term = term + (lit(padded[i + d + 1]) - column) / lit(right_span) * current[i + 1]
-            nxt.append(term)
+            left = (column - lit(padded[i])) / lit(left_span) * current[i]
+            right = (lit(padded[i + d + 1]) - column) / lit(right_span) * current[i + 1]
+            nxt.append(left + right)
         current = nxt
     return current
 

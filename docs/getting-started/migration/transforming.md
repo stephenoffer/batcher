@@ -100,7 +100,7 @@ print(sales.select(["region", "v"]).sort(["region", "v"]).to_pydict())
 
 The exception is {py:meth}`ds.grouping_sets() <batcher.Dataset.grouping_sets>`, where each argument *is* a list: one grouping level per argument. There the lists carry meaning and are left alone.
 
-An aggregate names its own output with {py:meth}`.alias() <batcher.AggExpr.alias>`, the Polars and PySpark spelling, as an alternative to the keyword form. Only `.alias()` can name a `bt.count()`, which has no input column to be named after:
+An aggregate names its own output with {py:meth}`.alias() <batcher.AggExpr.alias>`, the Polars and PySpark spelling, as an alternative to the keyword form. Only `.alias()` can name a {py:obj}`bt.count() <batcher.count>`, which has no input column to be named after:
 
 ```python
 print(

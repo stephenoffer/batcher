@@ -220,8 +220,13 @@ def validate(ds: Dataset, constraints: tuple[Constraint, ...]) -> ValidationRepo
     runtime = tuple(c for c in constraints if not isinstance(c, SchemaConstraint))
     measured: dict[int, Any] = {}
     rows = 0
-    if runtime and not provably_clean(ds, constraints):
-        rows, measured = _measure(ds, constraints)
+    if runtime:
+        if provably_clean(ds, constraints):
+            # Nothing is measured, but the report still states the relation's size. The
+            # count is answered from metadata for resident and Parquet data.
+            rows = ds.count()
+        else:
+            rows, measured = _measure(ds, constraints)
     report = ValidationReport(
         tuple(_result(c, i, measured, rows) for i, c in enumerate(constraints))
     )
@@ -318,6 +323,7 @@ def _result(c: Constraint, index: int, measured: dict[int, Any], rows: int) -> C
         return ConstraintResult(
             c.name,
             0 if held else 1,
+            rows=rows,
             severity=c.severity,
             kind="aggregate",
             value=None if value is None else float(value),

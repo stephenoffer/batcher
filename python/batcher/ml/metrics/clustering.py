@@ -350,7 +350,7 @@ def adjusted_mutual_info_score(ds: Dataset, labels_true: str, labels_pred: str) 
     if entropy_true == 0.0 and entropy_pred == 0.0:
         return 1.0
     mutual = _mutual_info(matrix, a, b, n)
-    expected = _expected_mutual_info(matrix, a, b, n)
+    expected = _expected_mutual_info(a, b, n)
     normalizer = (entropy_true + entropy_pred) / 2
     denominator = normalizer - expected
     if abs(denominator) < 1e-15:

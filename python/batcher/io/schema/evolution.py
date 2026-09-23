@@ -21,6 +21,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import SchemaError
 from batcher._internal.logging import get_logger, log_kv
+from batcher.io.schema._casts import checked_cast, require_non_null
 from batcher.plan.types import promote
 
 __all__ = [
@@ -216,7 +217,14 @@ def unify_schemas(schemas: list[pa.Schema], mode: str = "union") -> pa.Schema:
                 )
         return first
     if mode == "latest":
-        return schemas[-1]
+        # The newest file's names, order and types, but a field stays non-nullable only if
+        # *every* file declares it so. An older file that lacks the column, or holds it as
+        # nullable, reads nulls into it, and a non-nullable declaration over those nulls is
+        # rejected by the engine long after the read, naming neither file nor column.
+        required = {f.name for f in schemas[0] if not f.nullable}
+        for s in schemas[1:]:
+            required &= {f.name for f in s if not f.nullable}
+        return pa.schema([f if f.name in required else f.with_nullable(True) for f in schemas[-1]])
     if mode != "union":
         raise SchemaError(f"unknown schema_mode {mode!r}; use 'strict'/'union'/'latest'")
 
@@ -298,10 +306,18 @@ def note_dropped_columns(batches: list[pa.RecordBatch], *, context: str) -> None
         )
 
 
-def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
+def normalize_batch(
+    batch: pa.RecordBatch, target: pa.Schema, *, path: str | None = None
+) -> pa.RecordBatch:
     """Reshape `batch` to `target`: add missing columns as typed nulls, cast
     promotable columns, and reorder to the target field order. Vectorized (no row
     iteration).
+
+    A cast that *widens* toward the reconciled type is applied directly. One that does not
+    (``schema_mode='latest'`` casting an older file toward the newest file's type) is
+    verified, and a value it would change raises `SchemaError` naming `path`, the column and
+    both types, rather than coming back altered. `path` is optional because the drifting
+    output of a `map_batches` UDF is reconciled here too, and it has no file.
 
     The source column index is built **once** per batch rather than being re-derived per
     target field. `Schema.names` is a property that materializes a fresh Python list on
@@ -316,6 +332,7 @@ def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
     """
     import pyarrow.compute as pc
 
+    where = f"file {path!r}" if path is not None else "a batch"
     names = batch.schema.names
     source = {name: i for i, name in enumerate(names)}
     # A duplicate column name makes the index ambiguous, and `RecordBatch.column(name)`
@@ -342,13 +359,46 @@ def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
                 # lattice already decided to coerce. DuckDB coerces such a union to
                 # double (large ints rounded to the nearest float); match it. Every other
                 # promotion the lattice makes is lossless and stays a safe cast.
-                lossy_int_to_float = pa.types.is_integer(arr.type) and pa.types.is_floating(
-                    field.type
-                )
-                cols.append(pc.cast(arr, field.type, safe=not lossy_int_to_float))
+                if pa.types.is_integer(arr.type) and field.type.equals(pa.float64()):
+                    cols.append(pc.cast(arr, field.type, safe=False))
+                else:
+                    cols.append(
+                        checked_cast(
+                            arr,
+                            field.type,
+                            verify=not _widens(arr.type, field.type),
+                            keep_tz_awareness=False,
+                            describe=f"{where} has column {field.name!r} as {arr.type}, which "
+                            f"the reconciled schema reads as {field.type}",
+                            hint="Cast the column explicitly after reading, or use "
+                            "schema_mode='union', which only ever widens.",
+                        )
+                    )
+            require_non_null(
+                cols[-1],
+                field,
+                describe=f"column {field.name!r} of {where}",
+                hint="Use schema_mode='union', which declares every column nullable.",
+            )
         else:
+            if not field.nullable and batch.num_rows:
+                raise SchemaError(
+                    f"{where} has no column {field.name!r}, which the reconciled schema "
+                    "declares non-nullable. Use schema_mode='union' to fill it with nulls."
+                )
             cols.append(pa.nulls(batch.num_rows, type=field.type))
     return pa.RecordBatch.from_arrays(cols, schema=target)
+
+
+def _widens(src: pa.DataType, to: pa.DataType) -> bool:
+    """Whether `to` is the reconciled supertype of `src`, so casting cannot change a value.
+
+    The one exception the lattice makes deliberately, an integer read as ``float64``, is
+    handled by the caller before this is asked. An integer that overflows a widening (a
+    ``uint64`` above ``2**63`` read as ``int64``) is still caught, by the safe cast itself.
+    """
+    common = _common_supertype(src, to)
+    return common is not None and common.equals(to)
 
 
 def conform_batch(batch: pa.RecordBatch, target: pa.Schema, *, path: str) -> pa.RecordBatch:
@@ -369,11 +419,16 @@ def conform_batch(batch: pa.RecordBatch, target: pa.Schema, *, path: str) -> pa.
     - a column in `target` but not in the file **raises** — the contract promised it;
     - a differing type is **cast** to the contract's type.
 
-    The cast is *safe*, which is the one deliberate departure from DuckDB: DuckDB reads a
-    ``float64`` file against an ``int64`` contract by truncating, so ``2.5`` silently
-    becomes ``2``. Silently corrupting a value is exactly the failure mode this function
-    exists to remove, so a lossy conformance raises and names ``schema_mode='union'``,
-    which promotes the column to ``float64`` and returns ``2.5`` intact.
+    The cast must not change a value, which is the one deliberate departure from DuckDB:
+    DuckDB reads a ``float64`` file against an ``int64`` contract by truncating, so ``2.5``
+    silently becomes ``2``. Silently corrupting a value is exactly the failure mode this
+    function exists to remove, so a lossy conformance raises and names
+    ``schema_mode='union'``, which promotes the column to ``float64`` and returns ``2.5``
+    intact. Arrow's own safe cast is not enough for that, because it lets ``5`` become
+    ``true``, a timestamp lose its time of day as a ``date32``, and ``0.1`` round to
+    ``float32``; any cast that is not a widening is verified value by value
+    (`_casts.checked_cast`). A timezone-aware column read against a naive contract (or the
+    reverse) raises too, and so does a null in a column the contract marks non-nullable.
 
     Args:
         batch: One batch as the file produced it.
@@ -387,11 +442,13 @@ def conform_batch(batch: pa.RecordBatch, target: pa.Schema, *, path: str) -> pa.
         SchemaError: If `path` lacks a declared column, or holds one whose type cannot be
             cast to the declared type without losing data.
     """
-    import pyarrow.compute as pc
-
     if batch.schema.equals(target):
         return batch
     present = set(batch.schema.names)
+    hint = (
+        "Use schema_mode='union' to promote the column to a type that holds every file, "
+        "or cast it explicitly after reading."
+    )
     cols: list[pa.Array] = []
     for field in target:
         if field.name not in present:
@@ -402,18 +459,17 @@ def conform_batch(batch: pa.RecordBatch, target: pa.Schema, *, path: str) -> pa.
                 "differ, filling the absent ones with nulls."
             )
         arr = batch.column(field.name)
-        if arr.type.equals(field.type):
-            cols.append(arr)
-            continue
-        try:
-            cols.append(pc.cast(arr, field.type))
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
-            raise SchemaError(
-                f"file {path!r} has column {field.name!r} as {arr.type}, but the source's "
-                f"schema declares {field.type} (from the first file), and the values do not "
-                "convert without loss. Use schema_mode='union' to promote the column to a "
-                "type that holds both files."
-            ) from exc
+        arr = checked_cast(
+            arr,
+            field.type,
+            verify=not _widens(arr.type, field.type),
+            keep_tz_awareness=True,
+            describe=f"file {path!r} has column {field.name!r} as {arr.type}, but the "
+            f"source's schema declares {field.type} (from the first file)",
+            hint=hint,
+        )
+        require_non_null(arr, field, describe=f"column {field.name!r} of file {path!r}", hint=hint)
+        cols.append(arr)
     return pa.RecordBatch.from_arrays(cols, schema=target)
 
 

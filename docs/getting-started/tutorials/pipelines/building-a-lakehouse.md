@@ -245,7 +245,7 @@ import batcher as bt
 The query is the same one. `distributed=True` and a bucket are the entire difference.
 
 A distributed write is **one** transaction. Workers produce files; the driver commits once.
-The commit is `O(files)`, not `O(rows)`. In `benchmarks/BENCHMARK_RESULTS.md`, the driver
+The commit is `O(files)`, not `O(rows)`. In [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md), the driver
 commits 16 shards totalling 240 MB in 4.1 ms, against 661.8 ms to re-encode them through the
 driver, and 0 MB of data passes through the driver.
 

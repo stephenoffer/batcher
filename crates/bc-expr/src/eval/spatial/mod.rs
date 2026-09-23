@@ -305,6 +305,30 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_input_and_non_rotation_matrices_null_the_row() {
+        let b = one_row();
+        // quat_norm of a NaN component: null, not NaN, like the rest of the family.
+        let out = run(
+            SpatialFunc::QuatNorm,
+            vec![lit(f64::NAN), lit(0.0), lit(0.0), lit(1.0)],
+            &b,
+        );
+        assert!(out.is_null(0));
+        // slerp at t = NaN: null, not a quaternion of NaNs.
+        let mut args = quat_lits(Quat::IDENTITY);
+        args.extend(quat_lits(Quat::new(0.0, 0.0, 1.0, 1.0)));
+        args.push(lit(f64::NAN));
+        assert!(run(SpatialFunc::QuatSlerpW, args, &b).is_null(0));
+        // A zero matrix is not a rotation; it used to come back as a half turn about z.
+        let zeros: Vec<Expr> = (0..9).map(|_| lit(0.0)).collect();
+        assert!(run(SpatialFunc::QuatFromRotmatZ, zeros, &b).is_null(0));
+        let scaled: Vec<Expr> = (0..9)
+            .map(|k| lit(if k % 4 == 0 { 2.0 } else { 0.0 }))
+            .collect();
+        assert!(run(SpatialFunc::QuatFromRotmatW, scaled, &b).is_null(0));
+    }
+
+    #[test]
     fn wrong_argument_count_is_a_query_error() {
         let b = one_row();
         let err = eval_spatial(SpatialFunc::QuatRotateX, &[lit(1.0)], &b).unwrap_err();
@@ -384,9 +408,22 @@ mod tests {
         assert_eq!(all.len(), 42, "a variant was added without a case here");
         let b = one_row();
         for func in all {
-            // 0.5 everywhere: a valid non-zero quaternion, a valid point, a valid `t`,
-            // and a matrix that `from_rotation_matrix` accepts.
-            let args: Vec<Expr> = (0..func.arity()).map(|_| lit(0.5)).collect();
+            // 0.5 everywhere: a valid non-zero quaternion, a valid point and a valid `t`.
+            // A matrix of 0.5s is not a rotation, so the matrix functions get the
+            // identity instead.
+            let rotmat = matches!(
+                func,
+                QuatFromRotmatX | QuatFromRotmatY | QuatFromRotmatZ | QuatFromRotmatW
+            );
+            let args: Vec<Expr> = (0..func.arity())
+                .map(|k| {
+                    if rotmat {
+                        lit(if k % 4 == 0 { 1.0 } else { 0.0 })
+                    } else {
+                        lit(0.5)
+                    }
+                })
+                .collect();
             let out =
                 eval_spatial(func, &args, &b).unwrap_or_else(|e| panic!("{}: {e}", fn_name(func)));
             assert_eq!(out.len(), 1, "{}", fn_name(func));

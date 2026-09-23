@@ -12,6 +12,9 @@ whether it holds a NULL — so what this trades is a join against a hash-set pro
 Nothing about the semantics is re-derived: `Expr.is_in` already implements SQL's three-valued
 `IN` (a NULL member turns a would-be FALSE into NULL; a NULL probe is NULL), so the collected
 values are handed to it verbatim, nulls included, and `NOT` over the result is `NOT IN`.
+
+`not_in_antijoin` is the `WHERE x NOT IN (SELECT …)` conjunct, carrying the same
+three-valued answer, uncorrelated or correlated on equalities.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher.api.dataset import Dataset
-from batcher.plan.expr_ir import col, lit
+from batcher.plan.expr_ir import col, count, lit
 
 #: Distinct values below which an uncorrelated `IN (subquery)` is inlined as a literal set
 #: rather than joined against.
@@ -192,3 +195,52 @@ def in_marker(tr, ds: Dataset, node, *, negate: bool):
         probe_is_null = exp.Is(this=exp.column(probe), expression=exp.Null())
         ast = case.when(probe_is_null, null_bool).else_(exp.false())
     return ds, exp.Paren(this=exp.Not(this=ast) if negate else ast)
+
+
+def not_in_antijoin(
+    ds: Dataset, left_key: str, inner_ds: Dataset, right_key: str, corr=()
+) -> Dataset:
+    """`x NOT IN (subquery)` with correct SQL three-valued semantics.
+
+    A plain anti-join is wrong three ways: an **empty** set makes NOT IN TRUE for
+    every row (even NULL ``x``); a **NULL** anywhere in the set makes it UNKNOWN for
+    all rows (none survive); otherwise a NULL ``x`` against a non-empty set is UNKNOWN
+    and must drop (anti-join keeps it).
+
+    For an uncorrelated set those two whole-set facts are one answer for the query, so they
+    are probed while translating (two `LIMIT 1` reads) and only the anti join stays lazy:
+    joining a one-row fact relation onto every outer row instead measured about twice as
+    slow. A correlated set (`corr`, the `(outer, inner)` key pairs) has the facts per key,
+    so they are an aggregate LEFT JOINed on the key, and a key with no rows sees an empty
+    set; the membership bit is a LEFT JOIN against the set's distinct values.
+    """
+    if not corr:
+        key_only = inner_ds.select(right_key)
+        if key_only.filter(col(right_key).is_null()).limit(1).collect().num_rows > 0:
+            return ds.filter(lit(False))  # a NULL in the set → NOT IN is never TRUE
+        if key_only.filter(col(right_key).is_not_null()).limit(1).collect().num_rows == 0:
+            return ds  # empty set → NOT IN is TRUE for all rows (NULL x included)
+        ds = ds.filter(col(left_key).is_not_null())
+        return ds.join(key_only.distinct(), left_on=[left_key], right_on=[right_key], how="anti")
+    n = _next_marker(ds, "__bc_nin")
+    key, rows, values, hit = (f"{n}_{part}" for part in ("key", "rows", "vals", "hit"))
+    outer = [oc for (oc, _ic) in corr]
+    inner_keys = {f"{n}_c{i}": col(ic) for i, (_oc, ic) in enumerate(corr)}
+    key_only = inner_ds.select(**{key: col(right_key)}, **inner_keys)
+    members = key_only.filter(col(key).is_not_null()).distinct().with_columns(**{hit: lit(True)})
+    marked = ds.join(members, left_on=[left_key, *outer], right_on=[key, *inner_keys], how="left")
+    facts = key_only.group_by(*inner_keys).agg(**{rows: count(), values: col(key).count()})
+    marked = marked.join(facts, left_on=outer, right_on=list(inner_keys), how="left")
+    empty_set = col(rows).is_null() | (col(rows) == lit(0))
+    definite_miss = (col(rows) == col(values)) & col(left_key).is_not_null() & col(hit).is_null()
+    kept = marked.filter(empty_set | definite_miss)
+    spent = [key, rows, values, hit, *inner_keys]
+    return kept.drop(*[c for c in spent if c in kept.columns and c not in ds.columns])
+
+
+def _next_marker(ds: Dataset, prefix: str) -> str:
+    """A column-name stem no column of `ds` starts with."""
+    i = 0
+    while any(c.startswith(f"{prefix}{i}_") for c in ds.columns):
+        i += 1
+    return f"{prefix}{i}"

@@ -18,83 +18,83 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
-| `abs` | `Expr.abs` | canonical |  |
+| `abs` | {py:obj}`Expr.abs <batcher.plan.expr_ir.core.Expr.abs>` | canonical |  |
 | `add` | `+` operator | canonical |  |
 | `agg_groups` | n/a | gap | Not yet: agg\_groups (group row indices as a list). Wave W8. |
-| `alias` | `Expr.alias` | canonical |  |
-| `all` | `Expr.bool_and` | canonical |  |
+| `alias` | {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | canonical |  |
+| `all` | {py:obj}`Expr.bool_and <batcher.plan.expr_ir.core.Expr.bool_and>` | canonical |  |
 | `and_` | `&` operator | canonical |  |
-| `any` | `Expr.bool_or` | canonical |  |
+| `any` | {py:obj}`Expr.bool_or <batcher.plan.expr_ir.core.Expr.bool_or>` | canonical |  |
 | `append` | n/a | gap | Not yet: Expr.append (length-changing concatenation of two expressions). Wave W8. |
-| `approx_n_unique` | `Expr.approx_count_distinct` | canonical |  |
-| `arccos` | `Expr.arccos` | canonical |  |
-| `arccosh` | `Expr.arccosh` | canonical |  |
-| `arcsin` | `Expr.arcsin` | canonical |  |
-| `arcsinh` | `Expr.arcsinh` | canonical |  |
-| `arctan` | `Expr.arctan` | canonical |  |
-| `arctanh` | `Expr.arctanh` | canonical |  |
-| `arg_max` | `Expr.arg_max` | mismatch | Differs: Polars reads the position in frame order; Batcher needs the order stated: col.arg\_max(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
-| `arg_min` | `Expr.arg_min` | mismatch | Differs: Polars reads the position in frame order; Batcher needs the order stated: col.arg\_min(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
+| `approx_n_unique` | {py:obj}`Expr.approx_count_distinct <batcher.plan.expr_ir.core.Expr.approx_count_distinct>` | canonical |  |
+| `arccos` | {py:obj}`Expr.arccos <batcher.plan.expr_ir.core.Expr.arccos>` | canonical |  |
+| `arccosh` | {py:obj}`Expr.arccosh <batcher.plan.expr_ir.core.Expr.arccosh>` | canonical |  |
+| `arcsin` | {py:obj}`Expr.arcsin <batcher.plan.expr_ir.core.Expr.arcsin>` | canonical |  |
+| `arcsinh` | {py:obj}`Expr.arcsinh <batcher.plan.expr_ir.core.Expr.arcsinh>` | canonical |  |
+| `arctan` | {py:obj}`Expr.arctan <batcher.plan.expr_ir.core.Expr.arctan>` | canonical |  |
+| `arctanh` | {py:obj}`Expr.arctanh <batcher.plan.expr_ir.core.Expr.arctanh>` | canonical |  |
+| `arg_max` | {py:obj}`Expr.arg_max <batcher.plan.expr_ir.core.Expr.arg_max>` | mismatch | Differs: Polars reads the position in frame order; Batcher needs the order stated: col.arg\_max(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
+| `arg_min` | {py:obj}`Expr.arg_min <batcher.plan.expr_ir.core.Expr.arg_min>` | mismatch | Differs: Polars reads the position in frame order; Batcher needs the order stated: col.arg\_min(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
 | `arg_sort` | n/a | gap | Not yet: Expr.arg\_sort (sort permutation indices). Wave W8. |
 | `arg_true` | n/a | gap | Not yet: Expr.arg\_true (indices of true values). Wave W8. |
 | `arg_unique` | n/a | gap | Not yet: Expr.arg\_unique (index of first occurrence of each value). Wave W8. |
-| `arr` | `Expr.list` | canonical |  |
-| `backward_fill` | `Expr.backward_fill` | param | Missing: limit=; Batcher requires an explicit order\_by (explicit-order policy), Polars uses implicit row order. Wave WF. |
-| `bin` | `Expr.str` | param | Missing: binary accessor whose slicing and encoding functions return Binary rather than Utf8. Wave W3. |
-| `bitwise_and` | `Expr.bit_and` | mismatch | Differs: Batcher's bitwise\_and is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit\_and. Wave W0. |
-| `bitwise_count_ones` | `Expr.bit_count` | canonical |  |
+| `arr` | {py:obj}`Expr.list <batcher.plan.expr_ir.core.Expr.list>` | canonical |  |
+| `backward_fill` | {py:obj}`Expr.backward_fill <batcher.plan.expr_ir.core.Expr.backward_fill>` | param | Missing: limit=; Batcher requires an explicit order\_by (explicit-order policy), Polars uses implicit row order. Wave WF. |
+| `bin` | {py:obj}`Expr.str <batcher.plan.expr_ir.core.Expr.str>` | param | Missing: binary accessor whose slicing and encoding functions return Binary rather than Utf8. Wave W3. |
+| `bitwise_and` | {py:obj}`Expr.bit_and <batcher.plan.expr_ir.core.Expr.bit_and>` | mismatch | Differs: Batcher's bitwise\_and is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit\_and. Wave W0. |
+| `bitwise_count_ones` | {py:obj}`Expr.bit_count <batcher.plan.expr_ir.core.Expr.bit_count>` | canonical |  |
 | `bitwise_count_zeros` | n/a | gap | Not yet: bitwise\_count\_zeros. Wave W3. |
 | `bitwise_leading_ones` | n/a | gap | Not yet: bitwise\_leading\_ones. Wave W3. |
 | `bitwise_leading_zeros` | n/a | gap | Not yet: bitwise\_leading\_zeros. Wave W3. |
-| `bitwise_or` | `Expr.bit_or` | mismatch | Differs: Batcher's bitwise\_or is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit\_or. Wave W0. |
+| `bitwise_or` | {py:obj}`Expr.bit_or <batcher.plan.expr_ir.core.Expr.bit_or>` | mismatch | Differs: Batcher's bitwise\_or is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit\_or. Wave W0. |
 | `bitwise_trailing_ones` | n/a | gap | Not yet: bitwise\_trailing\_ones. Wave W3. |
 | `bitwise_trailing_zeros` | n/a | gap | Not yet: bitwise\_trailing\_zeros. Wave W3. |
-| `bitwise_xor` | `Expr.bit_xor` | mismatch | Differs: Batcher's bitwise\_xor is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit\_xor. Wave W0. |
+| `bitwise_xor` | {py:obj}`Expr.bit_xor <batcher.plan.expr_ir.core.Expr.bit_xor>` | mismatch | Differs: Batcher's bitwise\_xor is the element-wise operator on two expressions; the zero-argument Polars aggregate is Expr.bit\_xor. Wave W0. |
 | `bottom_k` | n/a | gap | Not yet: Expr.bottom\_k (k smallest values, length-changing). Wave W8. |
 | `bottom_k_by` | n/a | gap | Not yet: Expr.bottom\_k\_by. Wave W8. |
-| `cast` | `Expr.cast` | param | Missing: strict=, wrap\_numerical=, Polars dtype objects as targets. Wave W2. |
-| `cat` | `Expr.str` | param | Missing: Categorical dtype; the string functions apply to a decoded column. Wave W11. |
-| `cbrt` | `Expr.cbrt` | canonical |  |
-| `ceil` | `Expr.ceil` | canonical |  |
-| `clip` | `Expr.clip` | canonical |  |
-| `cos` | `Expr.cos` | canonical |  |
-| `cosh` | `Expr.cosh` | canonical |  |
-| `cot` | `Expr.cot` | canonical |  |
-| `count` | `Expr.count` | canonical |  |
-| `cum_count` | `Expr.cum_count` | param | Missing: reverse=. Wave W2. |
-| `cum_max` | `Expr.cum_max` | canonical |  |
-| `cum_min` | `Expr.cum_min` | canonical |  |
-| `cum_prod` | `Expr.cum_prod` | mismatch | Differs: Batcher's running product is Float64 (DuckDB product) where Polars keeps an integer type; cast to int64 for values below 2\*\*53. Wave W0. |
-| `cum_sum` | `Expr.cum_sum` | canonical |  |
+| `cast` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: strict=, wrap\_numerical=, Polars dtype objects as targets. Wave W2. |
+| `cat` | {py:obj}`Expr.str <batcher.plan.expr_ir.core.Expr.str>` | param | Missing: Categorical dtype; the string functions apply to a decoded column. Wave W11. |
+| `cbrt` | {py:obj}`Expr.cbrt <batcher.plan.expr_ir.core.Expr.cbrt>` | canonical |  |
+| `ceil` | {py:obj}`Expr.ceil <batcher.plan.expr_ir.core.Expr.ceil>` | canonical |  |
+| `clip` | {py:obj}`Expr.clip <batcher.plan.expr_ir.core.Expr.clip>` | canonical |  |
+| `cos` | {py:obj}`Expr.cos <batcher.plan.expr_ir.core.Expr.cos>` | canonical |  |
+| `cosh` | {py:obj}`Expr.cosh <batcher.plan.expr_ir.core.Expr.cosh>` | canonical |  |
+| `cot` | {py:obj}`Expr.cot <batcher.plan.expr_ir.core.Expr.cot>` | canonical |  |
+| `count` | {py:obj}`Expr.count <batcher.plan.expr_ir.core.Expr.count>` | canonical |  |
+| `cum_count` | {py:obj}`Expr.cum_count <batcher.plan.expr_ir.core.Expr.cum_count>` | param | Missing: reverse=. Wave W2. |
+| `cum_max` | {py:obj}`Expr.cum_max <batcher.plan.expr_ir.core.Expr.cum_max>` | canonical |  |
+| `cum_min` | {py:obj}`Expr.cum_min <batcher.plan.expr_ir.core.Expr.cum_min>` | canonical |  |
+| `cum_prod` | {py:obj}`Expr.cum_prod <batcher.plan.expr_ir.core.Expr.cum_prod>` | mismatch | Differs: Batcher's running product is Float64 (DuckDB product) where Polars keeps an integer type; cast to int64 for values below 2\*\*53. Wave W0. |
+| `cum_sum` | {py:obj}`Expr.cum_sum <batcher.plan.expr_ir.core.Expr.cum_sum>` | canonical |  |
 | `cumulative_eval` | n/a | gap | Not yet: Expr.cumulative\_eval (expanding-window expression evaluation). Wave W8. |
-| `cut` | `Expr.cut` | param | Missing: include\_breaks=, left\_closed=. Wave W2. |
-| `degrees` | `Expr.degrees` | canonical |  |
+| `cut` | {py:obj}`Expr.cut <batcher.plan.expr_ir.core.Expr.cut>` | param | Missing: include\_breaks=, left\_closed=. Wave W2. |
+| `degrees` | {py:obj}`Expr.degrees <batcher.plan.expr_ir.core.Expr.degrees>` | canonical |  |
 | `deserialize` | n/a | gap | Not yet: Expr.deserialize (expression from serialized IR). Wave W8. |
-| `diff` | `Expr.diff` | param | Missing: null\_behavior= ('ignore'/'drop'). Wave W2. |
-| `dot` | `*` operator + `Expr.sum` | canonical |  |
+| `diff` | {py:obj}`Expr.diff <batcher.plan.expr_ir.core.Expr.diff>` | param | Missing: null\_behavior= ('ignore'/'drop'). Wave W2. |
+| `dot` | `*` operator + {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | canonical |  |
 | `drop_nans` | n/a | gap | Not yet: Expr.drop\_nans (length-changing). Wave W8. |
 | `drop_nulls` | n/a | gap | Not yet: Expr.drop\_nulls (length-changing). Wave W8. |
-| `dt` | `Expr.dt` | canonical |  |
-| `entropy` | `Expr.entropy` | mismatch | Differs: Polars entropy reads the values as a distribution in natural log; the template passes of=values and base e. Polars counts a null as a value. Wave W0. |
+| `dt` | {py:obj}`Expr.dt <batcher.plan.expr_ir.core.Expr.dt>` | canonical |  |
+| `entropy` | {py:obj}`Expr.entropy <batcher.plan.expr_ir.core.Expr.entropy>` | mismatch | Differs: Polars entropy reads the values as a distribution in natural log; the template passes of=values and base e. Polars counts a null as a value. Wave W0. |
 | `eq` | `==` operator | canonical |  |
-| `eq_missing` | `Expr.eq_missing` | canonical |  |
-| `ewm_mean` | `Expr.ewm_mean` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
-| `ewm_mean_by` | `Expr.ewm_mean_by` | param | Missing: half\_life as a duration string over a temporal by column. Wave W2. |
-| `ewm_std` | `Expr.ewm_std` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
-| `ewm_var` | `Expr.ewm_var` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
+| `eq_missing` | {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | canonical |  |
+| `ewm_mean` | {py:obj}`Expr.ewm_mean <batcher.plan.expr_ir.core.Expr.ewm_mean>` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
+| `ewm_mean_by` | {py:obj}`Expr.ewm_mean_by <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` | param | Missing: half\_life as a duration string over a temporal by column. Wave W2. |
+| `ewm_std` | {py:obj}`Expr.ewm_std <batcher.plan.expr_ir.core.Expr.ewm_std>` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
+| `ewm_var` | {py:obj}`Expr.ewm_var <batcher.plan.expr_ir.core.Expr.ewm_var>` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
 | `exclude` | `Selector.exclude` | canonical |  |
-| `exp` | `Expr.exp` | canonical |  |
+| `exp` | {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | canonical |  |
 | `explode` | n/a | gap | Not yet: Expr.explode (length-changing). Wave W8. |
 | `ext` | n/a | gap | Not yet: extension-type namespace on Expr. Wave W11. |
 | `extend_constant` | n/a | gap | Not yet: Expr.extend\_constant (length-changing). Wave W8. |
-| `fill_nan` | `Expr.fill_nan` | canonical |  |
-| `fill_null` | `Expr.fill_null` | param | Missing: strategy= ('forward','backward','min','max','mean','zero','one') and limit=. Wave W2. |
+| `fill_nan` | {py:obj}`Expr.fill_nan <batcher.plan.expr_ir.core.Expr.fill_nan>` | canonical |  |
+| `fill_null` | {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | param | Missing: strategy= ('forward','backward','min','max','mean','zero','one') and limit=. Wave W2. |
 | `filter` | n/a | gap | Not yet: Expr.filter inside aggregation context (length-changing). Wave W8. |
-| `first` | `Expr.first` | mismatch | Differs: Polars first takes the first row in frame order, nulls included; Batcher needs an explicit order: col.first(order\_by, ignore\_nulls=False) after with\_row\_index. Wave W0. |
+| `first` | {py:obj}`Expr.first <batcher.plan.expr_ir.core.Expr.first>` | mismatch | Differs: Polars first takes the first row in frame order, nulls included; Batcher needs an explicit order: col.first(order\_by, ignore\_nulls=False) after with\_row\_index. Wave W0. |
 | `flatten` | n/a | gap | Not yet: Expr.flatten (length-changing). Wave W8. |
-| `floor` | `Expr.floor` | canonical |  |
+| `floor` | {py:obj}`Expr.floor <batcher.plan.expr_ir.core.Expr.floor>` | canonical |  |
 | `floordiv` | `//` operator | canonical |  |
-| `forward_fill` | `Expr.forward_fill` | param | Missing: limit=; Batcher requires an explicit order\_by (explicit-order policy), Polars uses implicit row order. Wave WF. |
+| `forward_fill` | {py:obj}`Expr.forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` | param | Missing: limit=; Batcher requires an explicit order\_by (explicit-order policy), Polars uses implicit row order. Wave WF. |
 | `from_json` | n/a | gap | Not yet: Expr.from\_json (deserialize an expression from JSON). Wave W8. |
 | `gather` | n/a | gap | Not yet: Expr.gather (take by index, length-changing). Wave W8. |
 | `gather_every` | n/a | gap | Not yet: Expr.gather\_every (length-changing). Wave W8. |
@@ -102,52 +102,52 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `get` | n/a | gap | Not yet: Expr.get (single element by index). Wave W8. |
 | `gt` | `>` operator | canonical |  |
 | `has_nulls` | n/a | gap | Not yet: Expr.has\_nulls aggregate. Wave W8. |
-| `hash` | `Expr.hash` | mismatch | Differs: Polars documents its hash as unstable across versions, so no Batcher algorithm reproduces it; recompute hashes on both sides. Wave W0. |
+| `hash` | {py:obj}`Expr.hash <batcher.plan.expr_ir.core.Expr.hash>` | mismatch | Differs: Polars documents its hash as unstable across versions, so no Batcher algorithm reproduces it; recompute hashes on both sides. Wave W0. |
 | `head` | n/a | gap | Not yet: Expr.head (length-changing). Wave W8. |
 | `hist` | n/a | gap | Not yet: Expr.hist (binned counts). Wave W8. |
-| `implode` | `Expr.array_agg` | mismatch | Differs: Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array\_agg(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
+| `implode` | {py:obj}`Expr.array_agg <batcher.plan.expr_ir.core.Expr.array_agg>` | mismatch | Differs: Polars implode keeps frame order; Batcher's element order is unspecified unless stated: array\_agg(order\_by=\_row) after with\_row\_index(\_row). Wave W0. |
 | `index_of` | n/a | gap | Not yet: Expr.index\_of. Wave W8. |
 | `inspect` | n/a | gap | Not yet: Expr.inspect (print intermediate value). Wave W8. |
-| `interpolate` | `Expr.interpolate` | param | Missing: method= ('linear','nearest'); Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
+| `interpolate` | {py:obj}`Expr.interpolate <batcher.plan.expr_ir.core.Expr.interpolate>` | param | Missing: method= ('linear','nearest'); Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
 | `interpolate_by` | n/a | gap | Not yet: Expr.interpolate\_by. Wave W5. |
-| `is_between` | `Expr.between` | canonical |  |
+| `is_between` | {py:obj}`Expr.between <batcher.plan.expr_ir.core.Expr.between>` | canonical |  |
 | `is_close` | n/a | gap | Not yet: Expr.is\_close (abs\_tol/rel\_tol/nans\_equal). Wave W3. |
-| `is_duplicated` | `Expr.is_duplicated` | canonical |  |
-| `is_finite` | `Expr.is_finite` | canonical |  |
-| `is_first_distinct` | `Expr.is_first_distinct` | param | Missing: implicit row order: Batcher needs order\_by, here or through over(order\_by=...). Wave W2. |
-| `is_in` | `Expr.is_in` | canonical |  |
-| `is_infinite` | `Expr.is_infinite` | canonical |  |
-| `is_last_distinct` | `Expr.is_last_distinct` | param | Missing: implicit row order: Batcher needs order\_by, here or through over(order\_by=...). Wave W2. |
-| `is_nan` | `Expr.is_nan` | canonical |  |
-| `is_not_nan` | `Expr.is_not_nan` | canonical |  |
-| `is_not_null` | `Expr.is_not_null` | canonical |  |
-| `is_null` | `Expr.is_null` | canonical |  |
-| `is_unique` | `Expr.is_unique` | canonical |  |
+| `is_duplicated` | {py:obj}`Expr.is_duplicated <batcher.plan.expr_ir.core.Expr.is_duplicated>` | canonical |  |
+| `is_finite` | {py:obj}`Expr.is_finite <batcher.plan.expr_ir.core.Expr.is_finite>` | canonical |  |
+| `is_first_distinct` | {py:obj}`Expr.is_first_distinct <batcher.plan.expr_ir.core.Expr.is_first_distinct>` | param | Missing: implicit row order: Batcher needs order\_by, here or through over(order\_by=...). Wave W2. |
+| `is_in` | {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | canonical |  |
+| `is_infinite` | {py:obj}`Expr.is_infinite <batcher.plan.expr_ir.core.Expr.is_infinite>` | canonical |  |
+| `is_last_distinct` | {py:obj}`Expr.is_last_distinct <batcher.plan.expr_ir.core.Expr.is_last_distinct>` | param | Missing: implicit row order: Batcher needs order\_by, here or through over(order\_by=...). Wave W2. |
+| `is_nan` | {py:obj}`Expr.is_nan <batcher.plan.expr_ir.core.Expr.is_nan>` | canonical |  |
+| `is_not_nan` | {py:obj}`Expr.is_not_nan <batcher.plan.expr_ir.core.Expr.is_not_nan>` | canonical |  |
+| `is_not_null` | {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
+| `is_null` | {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | canonical |  |
+| `is_unique` | {py:obj}`Expr.is_unique <batcher.plan.expr_ir.core.Expr.is_unique>` | canonical |  |
 | `item` | n/a | gap | Not yet: Expr.item (assert a single value). Wave W8. |
-| `kurtosis` | `Expr.kurtosis` | canonical |  |
-| `last` | `Expr.last` | mismatch | Differs: Polars last takes the last row in frame order, nulls included; Batcher needs an explicit order: col.last(order\_by, ignore\_nulls=False) after with\_row\_index. Wave W0. |
+| `kurtosis` | {py:obj}`Expr.kurtosis <batcher.plan.expr_ir.core.Expr.kurtosis>` | canonical |  |
+| `last` | {py:obj}`Expr.last <batcher.plan.expr_ir.core.Expr.last>` | mismatch | Differs: Polars last takes the last row in frame order, nulls included; Batcher needs an explicit order: col.last(order\_by, ignore\_nulls=False) after with\_row\_index. Wave W0. |
 | `le` | `<=` operator | canonical |  |
-| `len` | `bt.count` | canonical |  |
+| `len` | {py:obj}`bt.count <batcher.count>` | canonical |  |
 | `limit` | n/a | gap | Not yet: Expr.limit (length-changing). Wave W8. |
-| `list` | `Expr.list` | canonical |  |
-| `log` | `Expr.ln` | canonical | Missing: base= argument (Polars log(base=e)); Batcher's log is a second spelling of ln and is removed, then returns as log(base). Wave W2. |
-| `log10` | `Expr.log10` | canonical |  |
-| `log1p` | `Expr.log1p` | canonical |  |
+| `list` | {py:obj}`Expr.list <batcher.plan.expr_ir.core.Expr.list>` | canonical |  |
+| `log` | {py:obj}`Expr.ln <batcher.plan.expr_ir.core.Expr.ln>` | canonical | Missing: base= argument (Polars log(base=e)); Batcher's log is a second spelling of ln and is removed, then returns as log(base). Wave W2. |
+| `log10` | {py:obj}`Expr.log10 <batcher.plan.expr_ir.core.Expr.log10>` | canonical |  |
+| `log1p` | {py:obj}`Expr.log1p <batcher.plan.expr_ir.core.Expr.log1p>` | canonical |  |
 | `lower_bound` | n/a | gap | Not yet: Expr.lower\_bound (dtype minimum). Wave W3. |
 | `lt` | `<` operator | canonical |  |
 | `map_batches` | n/a | gap | Not yet: Expr.map\_batches (vectorized Python UDF as an expression). Wave W11. |
 | `map_elements` | n/a | gap | Not yet: Expr.map\_elements, only as a batch-vectorized wrapper (per-row Python stays refused). Wave W11. |
-| `max` | `Expr.max` | canonical |  |
-| `max_by` | `Expr.max_by` | canonical |  |
-| `mean` | `Expr.mean` | canonical |  |
-| `median` | `Expr.median` | canonical |  |
-| `meta` | `Expr.meta` | canonical |  |
-| `min` | `Expr.min` | canonical |  |
-| `min_by` | `Expr.min_by` | canonical |  |
+| `max` | {py:obj}`Expr.max <batcher.plan.expr_ir.core.Expr.max>` | canonical |  |
+| `max_by` | {py:obj}`Expr.max_by <batcher.plan.expr_ir.core.Expr.max_by>` | canonical |  |
+| `mean` | {py:obj}`Expr.mean <batcher.plan.expr_ir.core.Expr.mean>` | canonical |  |
+| `median` | {py:obj}`Expr.median <batcher.plan.expr_ir.core.Expr.median>` | canonical |  |
+| `meta` | {py:obj}`Expr.meta <batcher.plan.expr_ir.core.Expr.meta>` | canonical |  |
+| `min` | {py:obj}`Expr.min <batcher.plan.expr_ir.core.Expr.min>` | canonical |  |
+| `min_by` | {py:obj}`Expr.min_by <batcher.plan.expr_ir.core.Expr.min_by>` | canonical |  |
 | `mod` | `%` operator | mismatch | Differs: Polars % takes the sign of the divisor (floored); Batcher % truncates like SQL and DuckDB. Wave W0. |
-| `mode` | `Expr.mode` | mismatch | Differs: with all\_modes=True every tied value is returned as Polars does; Polars also counts null as a mode candidate, Batcher does not. Wave W0. |
+| `mode` | {py:obj}`Expr.mode <batcher.plan.expr_ir.core.Expr.mode>` | mismatch | Differs: with all\_modes=True every tied value is returned as Polars does; Polars also counts null as a mode candidate, Batcher does not. Wave W0. |
 | `mul` | `*` operator | canonical |  |
-| `n_unique` | `Expr.count_distinct` | canonical |  |
+| `n_unique` | {py:obj}`Expr.count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>` | canonical |  |
 | `name` | `Selector.name` | param | Missing: .name accessor (keep/prefix/suffix/map/case) on every Expr, not only on selectors. Wave W2. |
 | `nan_max` | n/a | gap | Not yet: Expr.nan\_max (NaN-propagating max). Wave W3. |
 | `nan_min` | n/a | gap | Not yet: Expr.nan\_min (NaN-propagating min). Wave W3. |
@@ -157,82 +157,90 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `not_` | `~` operator | canonical |  |
 | `null_count` | n/a | gap | Not yet: Expr.null\_count aggregate. Wave W8. |
 | `or_` | `\|` operator | canonical |  |
-| `over` | `Expr.over` | param | Missing: mapping\_strategy= join and explode. Wave WF. |
-| `pct_change` | `Expr.pct_change` | canonical |  |
-| `peak_max` | `Expr.peak_max` | canonical |  |
-| `peak_min` | `Expr.peak_min` | canonical |  |
-| `pipe` | `Expr.pipe` | canonical |  |
+| `over` | {py:obj}`Expr.over <batcher.plan.expr_ir.core.Expr.over>` | param | Missing: mapping\_strategy= join and explode. Wave WF. |
+| `pct_change` | {py:obj}`Expr.pct_change <batcher.plan.expr_ir.core.Expr.pct_change>` | canonical |  |
+| `peak_max` | {py:obj}`Expr.peak_max <batcher.plan.expr_ir.core.Expr.peak_max>` | canonical |  |
+| `peak_min` | {py:obj}`Expr.peak_min <batcher.plan.expr_ir.core.Expr.peak_min>` | canonical |  |
+| `pipe` | {py:obj}`Expr.pipe <batcher.plan.expr_ir.core.Expr.pipe>` | canonical |  |
 | `pow` | `**` operator | canonical |  |
-| `product` | `Expr.product` | canonical |  |
+| `product` | {py:obj}`Expr.product <batcher.plan.expr_ir.core.Expr.product>` | canonical |  |
 | `qcut` | n/a | gap | Not yet: Expr.qcut (quantile binning). Wave W3. |
-| `quantile` | `Expr.quantile` | canonical |  |
-| `radians` | `Expr.radians` | canonical |  |
-| `rank` | `Expr.rank` | canonical |  |
+| `quantile` | {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | canonical |  |
+| `radians` | {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | canonical |  |
+| `rank` | {py:obj}`Expr.rank <batcher.plan.expr_ir.core.Expr.rank>` | canonical |  |
 | `rechunk` | n/a | out of scope | Declined: memory layout is engine-owned (morsels), not user-visible. |
 | `register_plugin` | n/a | gap | Not yet: Rust expression plugin ABI. Wave W11. |
 | `reinterpret` | n/a | gap | Not yet: Expr.reinterpret (signed/unsigned bit reinterpretation). Wave W3. |
 | `repeat_by` | n/a | gap | Not yet: Expr.repeat\_by (length-changing). Wave W8. |
-| `replace` | `Expr.replace` | param | Missing: old/new as parallel lists or scalars (Batcher takes a mapping), return\_dtype=. Wave W2. |
-| `replace_strict` | `Expr.replace` | param | Missing: strict variant: default=, return\_dtype=, raise on an unmapped value. Wave W2. |
+| `replace` | {py:obj}`Expr.replace <batcher.plan.expr_ir.core.Expr.replace>` | param | Missing: old/new as parallel lists or scalars (Batcher takes a mapping), return\_dtype=. Wave W2. |
+| `replace_strict` | {py:obj}`Expr.replace <batcher.plan.expr_ir.core.Expr.replace>` | param | Missing: strict variant: default=, return\_dtype=, raise on an unmapped value. Wave W2. |
 | `reshape` | n/a | gap | Not yet: Expr.reshape (to Array dims). Wave W8. |
 | `reverse` | n/a | gap | Not yet: Expr.reverse (length-preserving reorder). Wave W8. |
 | `rle` | n/a | gap | Not yet: Expr.rle (run-length encoding to struct). Wave W8. |
-| `rle_id` | `Expr.rle_id` | param | Missing: Batcher requires an explicit order\_by (explicit-order policy), Polars uses implicit row order. Wave WF. |
+| `rle_id` | {py:obj}`Expr.rle_id <batcher.plan.expr_ir.core.Expr.rle_id>` | param | Missing: Batcher requires an explicit order\_by (explicit-order policy), Polars uses implicit row order. Wave WF. |
 | `rolling` | n/a | gap | Not yet: Expr.rolling(index\_column, period) dynamic window. Wave W5. |
 | `rolling_kurtosis` | n/a | gap | Not yet: rolling\_kurtosis. Wave W5. |
 | `rolling_map` | n/a | gap | Not yet: rolling\_map (Python function over a window). Wave W5. |
-| `rolling_max` | `Expr.rolling_max` | mismatch | Differs: Polars min\_samples defaults to the window size, so a partial window is null; port as rolling\_max(n, min\_periods=n). Wave W0. |
-| `rolling_max_by` | `Expr.rolling_max_by` | param | Missing: closed=, min\_samples=. Wave W2. |
-| `rolling_mean` | `Expr.rolling_mean` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min\_samples=. Wave W0. |
-| `rolling_mean_by` | `Expr.rolling_mean_by` | param | Missing: closed=, min\_samples=. Wave W2. |
+| `rolling_max` | {py:obj}`Expr.rolling_max <batcher.plan.expr_ir.core.Expr.rolling_max>` | mismatch | Differs: Polars min\_samples defaults to the window size, so a partial window is null; port as rolling\_max(n, min\_periods=n). Wave W0. |
+| `rolling_max_by` | {py:obj}`Expr.rolling_max_by <batcher.plan.expr_ir.core.Expr.rolling_max_by>` | param | Missing: closed=, min\_samples=. Wave W2. |
+| `rolling_mean` | {py:obj}`Expr.rolling_mean <batcher.plan.expr_ir.core.Expr.rolling_mean>` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min\_samples=. Wave W0. |
+| `rolling_mean_by` | {py:obj}`Expr.rolling_mean_by <batcher.plan.expr_ir.core.Expr.rolling_mean_by>` | param | Missing: closed=, min\_samples=. Wave W2. |
 | `rolling_median` | n/a | gap | Not yet: rolling\_median. Wave W5. |
 | `rolling_median_by` | n/a | gap | Not yet: rolling\_median\_by. Wave W5. |
-| `rolling_min` | `Expr.rolling_min` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min\_samples=. Wave W0. |
-| `rolling_min_by` | `Expr.rolling_min_by` | param | Missing: closed=, min\_samples=. Wave W2. |
+| `rolling_min` | {py:obj}`Expr.rolling_min <batcher.plan.expr_ir.core.Expr.rolling_min>` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min\_samples=. Wave W0. |
+| `rolling_min_by` | {py:obj}`Expr.rolling_min_by <batcher.plan.expr_ir.core.Expr.rolling_min_by>` | param | Missing: closed=, min\_samples=. Wave W2. |
 | `rolling_quantile` | n/a | gap | Not yet: rolling\_quantile. Wave W5. |
 | `rolling_quantile_by` | n/a | gap | Not yet: rolling\_quantile\_by. Wave W5. |
 | `rolling_rank` | n/a | gap | Not yet: rolling\_rank. Wave W5. |
 | `rolling_rank_by` | n/a | gap | Not yet: rolling\_rank\_by. Wave W5. |
 | `rolling_skew` | n/a | gap | Not yet: rolling\_skew. Wave W5. |
-| `rolling_std` | `Expr.rolling_std` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows, and returned NaN for every row of a column holding one NaN. Param: min\_samples=. Wave W0. |
+| `rolling_std` | {py:obj}`Expr.rolling_std <batcher.plan.expr_ir.core.Expr.rolling_std>` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows, and returned NaN for every row of a column holding one NaN. Param: min\_samples=. Wave W0. |
 | `rolling_std_by` | n/a | gap | Not yet: rolling\_std\_by. Wave W5. |
-| `rolling_sum` | `Expr.rolling_sum` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min\_samples=. Wave W0. |
-| `rolling_sum_by` | `Expr.rolling_sum_by` | param | Missing: closed=, min\_samples=. Wave W2. |
-| `rolling_var` | `Expr.rolling_var` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min\_samples=. Wave W0. |
+| `rolling_sum` | {py:obj}`Expr.rolling_sum <batcher.plan.expr_ir.core.Expr.rolling_sum>` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min\_samples=. Wave W0. |
+| `rolling_sum_by` | {py:obj}`Expr.rolling_sum_by <batcher.plan.expr_ir.core.Expr.rolling_sum_by>` | param | Missing: closed=, min\_samples=. Wave W2. |
+| `rolling_var` | {py:obj}`Expr.rolling_var <batcher.plan.expr_ir.core.Expr.rolling_var>` | mismatch | Differs: Polars defaults min\_samples to the window size and returns null until the window fills; Batcher emits partial windows. Param: min\_samples=. Wave W0. |
 | `rolling_var_by` | n/a | gap | Not yet: rolling\_var\_by. Wave W5. |
-| `round` | `Expr.round` | canonical |  |
+| `round` | {py:obj}`Expr.round <batcher.plan.expr_ir.core.Expr.round>` | canonical |  |
 | `round_sig_figs` | n/a | gap | Not yet: Expr.round\_sig\_figs. Wave W3. |
 | `sample` | n/a | gap | Not yet: Expr.sample (length-changing). Wave W8. |
 | `search_sorted` | n/a | gap | Not yet: Expr.search\_sorted. Wave W8. |
 | `set_sorted` | n/a | out of scope | Declined: sortedness flags are engine-owned metadata (Dataset.meta.sorted\_by), not a user assertion. |
-| `shift` | `Expr.shift` | param | Missing: fill\_value=. Wave W2. |
+| `shift` | {py:obj}`Expr.shift <batcher.plan.expr_ir.core.Expr.shift>` | param | Missing: fill\_value=. Wave W2. |
 | `shrink_dtype` | n/a | out of scope | Declined: contradicts the FFI boundary's narrow-int normalization to Int64/Float64. |
 | `shuffle` | n/a | gap | Not yet: Expr.shuffle (permute values). Wave W8. |
-| `sign` | `Expr.sign` | mismatch | Differs: Polars sign(NaN) is NaN; Batcher (DuckDB) returns 0. Wave W0. |
-| `sin` | `Expr.sin` | canonical |  |
-| `sinh` | `Expr.sinh` | canonical |  |
-| `skew` | `Expr.skew` | canonical |  |
+| `sign` | {py:obj}`Expr.sign <batcher.plan.expr_ir.core.Expr.sign>` | mismatch | Differs: Polars sign(NaN) is NaN; Batcher (DuckDB) returns 0. Wave W0. |
+| `sin` | {py:obj}`Expr.sin <batcher.plan.expr_ir.core.Expr.sin>` | canonical |  |
+| `sinh` | {py:obj}`Expr.sinh <batcher.plan.expr_ir.core.Expr.sinh>` | canonical |  |
+| `skew` | {py:obj}`Expr.skew <batcher.plan.expr_ir.core.Expr.skew>` | canonical |  |
 | `slice` | n/a | gap | Not yet: Expr.slice (length-changing). Wave W8. |
 | `sort` | n/a | gap | Not yet: Expr.sort (reorder within an expression). Wave W8. |
 | `sort_by` | n/a | gap | Not yet: Expr.sort\_by. Wave W8. |
-| `sqrt` | `Expr.sqrt` | canonical |  |
-| `std` | `Expr.std` | param | Missing: ddof=. Wave W2. |
-| `str` | `Expr.str` | canonical |  |
-| `struct` | `Expr.struct` | canonical |  |
+| `sqrt` | {py:obj}`Expr.sqrt <batcher.plan.expr_ir.core.Expr.sqrt>` | canonical |  |
+| `std` | {py:obj}`Expr.std <batcher.plan.expr_ir.core.Expr.std>` | param | Missing: ddof=. Wave W2. |
+| `str` | {py:obj}`Expr.str <batcher.plan.expr_ir.core.Expr.str>` | canonical |  |
+| `struct` | {py:obj}`Expr.struct <batcher.plan.expr_ir.core.Expr.struct>` | canonical |  |
 | `sub` | `-` operator | canonical |  |
-| `sum` | `Expr.sum` | canonical |  |
+| `sum` | {py:obj}`Expr.sum <batcher.plan.expr_ir.core.Expr.sum>` | canonical |  |
 | `tail` | n/a | gap | Not yet: Expr.tail (length-changing). Wave W8. |
-| `tan` | `Expr.tan` | canonical |  |
-| `tanh` | `Expr.tanh` | canonical |  |
+| `tan` | {py:obj}`Expr.tan <batcher.plan.expr_ir.core.Expr.tan>` | canonical |  |
+| `tanh` | {py:obj}`Expr.tanh <batcher.plan.expr_ir.core.Expr.tanh>` | canonical |  |
 | `to_physical` | n/a | gap | Not yet: Expr.to\_physical. Wave W3. |
-| `top_k` | `Expr.top_k` | mismatch | Differs: Polars pads a group with fewer than k non-null values with its nulls; Batcher returns the values it has (DuckDB max(x, k)). Wave W0. |
+| `top_k` | {py:obj}`Expr.top_k <batcher.plan.expr_ir.core.Expr.top_k>` | mismatch | Differs: Polars pads a group with fewer than k non-null values with its nulls; Batcher returns the values it has (DuckDB max(x, k)). Wave W0. |
 | `top_k_by` | n/a | gap | Not yet: Expr.top\_k\_by. Wave W8. |
 | `truediv` | `/` operator | canonical |  |
-| `truncate` | `Expr.trunc` | param | Missing: decimals= argument. Wave W2. |
+| `truncate` | {py:obj}`Expr.trunc <batcher.plan.expr_ir.core.Expr.trunc>` | param | Missing: decimals= argument. Wave W2. |
 | `unique` | n/a | gap | Not yet: Expr.unique (length-changing). Wave W8. |
 | `unique_counts` | n/a | gap | Not yet: Expr.unique\_counts. Wave W8. |
 | `upper_bound` | n/a | gap | Not yet: Expr.upper\_bound (dtype maximum). Wave W3. |
 | `value_counts` | n/a | gap | Not yet: Expr.value\_counts (struct of value and count). Wave W8. |
-| `var` | `Expr.var` | param | Missing: ddof=. Wave W2. |
+| `var` | {py:obj}`Expr.var <batcher.plan.expr_ir.core.Expr.var>` | param | Missing: ddof=. Wave W2. |
 | `where` | n/a | gap | Not yet: Expr.where (alias of filter, length-changing). Wave W8. |
 | `xor` | `^` operator | canonical |  |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Polars pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

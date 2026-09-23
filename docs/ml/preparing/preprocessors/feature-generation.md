@@ -128,9 +128,13 @@ print([c for c in spline.transform(curved).columns if c.startswith("x_sp")])
 The basis has `n_knots + degree - 1` columns. Every row's values sum to one, so the
 expansion adds shape without adding scale.
 
-Knots go at the column's quantiles by default, following the data's density rather than its
-range, which keeps the basis well-behaved on a skewed column. Pass `knots="uniform"` to space
-them evenly across the observed range:
+The basis is scikit-learn's default one. Knots are spaced evenly across the observed range,
+extended past each end at the same spacing, and a value outside the training range gets the
+basis of the nearest boundary rather than an all-zero row, which is scikit-learn's
+`extrapolation="constant"`. The output matches `sklearn.preprocessing.SplineTransformer` to
+floating-point precision. Pass `knots="quantile"` to put the knots at the column's
+percentiles instead, following the data's density rather than its range, which keeps the
+basis well-behaved on a skewed column. The uniform placement looks like this:
 
 ```python
 print(SplineTransformer("x", n_knots=3, knots="uniform").fit(curved).knots_["x"])
@@ -210,9 +214,10 @@ print(FunctionTransformer("amount", lambda c: c.sqrt()).fit_transform(amounts).t
 ```
 
 Pass `suffix=` to write a new column instead of replacing the old one. A function written
-against a value, such as `lambda v: log(v)`, raises a `PlanError` that says so. A chain
-holding a lambda can't be saved, so name `func` at module scope if the fitted chain has to
-ship.
+against a value, such as `lambda v: log(v)`, raises a `PlanError` that says so. A function
+has no JSON form, so `save` refuses a `FunctionTransformer`, or a chain holding one, with a
+`PlanError`. `pickle` works when `func` is named at module scope, so pickle the fitted chain
+if it has to ship.
 
 ## Reducing dimensionality
 
@@ -343,7 +348,7 @@ print(spec.align(scoring).columns)
 # ['age', 'income']
 ```
 
-Dtype names are the engine's own, as `Dataset.dtypes` renders them, so a float column pins
+Dtype names are the engine's own, as {py:obj}`Dataset.dtypes <batcher.Dataset.dtypes>` renders them, so a float column pins
 as `double`, not `float64`.
 
 ## See also

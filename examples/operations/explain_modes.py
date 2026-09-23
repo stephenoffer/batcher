@@ -47,9 +47,14 @@ def main() -> None:
     print("priorities:", result["o_orderpriority"])
     assert len(result["o_orderpriority"]) == orders.count_distinct("o_orderpriority")
 
-    # `profile` is the executed counterpart, and it needs the query to run.
-    report = query.profile()
-    assert report is not None
+    # `explain(analyze=True)` is the executed counterpart: it runs the query and prints each
+    # operator's measured rows beside the estimate. `stats()` holds the same numbers as
+    # objects, so the aggregate's measured output is the number of result rows.
+    measured = query.explain(analyze=True)
+    print(measured)
+    assert "actual=" in measured
+    aggregate = next(op for op in query.stats().ops if op.kind == "aggregate")
+    assert aggregate.rows_out == len(result["o_orderpriority"])
 
     # `info` and `glimpse` describe the data rather than the plan.
     query.select("o_orderpriority", "lines").glimpse()

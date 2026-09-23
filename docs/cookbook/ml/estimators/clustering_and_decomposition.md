@@ -17,6 +17,29 @@ Run it yourself:
 python examples/ml/clustering_and_decomposition.py
 ```
 
+
+## Fitting and labelling in one pass
+
+{py:meth}`KMeans.fit_predict <batcher.ml.KMeans>` fits the model and returns the training
+data with its cluster assignment attached. It exists because fitting and then transforming
+the same dataset reads it twice, and clustering is the case where the labels you want are
+for the very rows you fitted on.
+
+```python
+import batcher as bt
+from batcher.ml import KMeans
+
+ds = bt.from_pydict(
+    {"x": [1.0, 1.2, 8.0, 8.4, 1.1, 8.2], "y": [1.0, 0.9, 8.1, 7.9, 1.2, 8.3]}
+)
+labelled = KMeans(["x", "y"], n_clusters=2, seed=0).fit_predict(ds)
+print(sorted(labelled.to_pydict()["cluster"]))
+```
+
+Cluster numbers are arbitrary labels, not an ordering, so compare partitions rather than
+individual ids across runs. `seed` makes a run reproducible; it does not make cluster `0`
+mean the same thing as `n_clusters` changes.
+
 ## See also
 
 - {doc}`/cookbook/ml/estimators/classifiers`: naive Bayes, discriminant analysis, and baselines.

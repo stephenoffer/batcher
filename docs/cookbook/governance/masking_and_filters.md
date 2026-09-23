@@ -1,6 +1,6 @@
 # Masking and row filters
 
-Batcher enforces governance as a plan rewrite. A `SecurityCatalog` declares the policy, a `Principal` is the identity, and `bt.security(...)` installs both for a block. The policy is compiled into the plan before it runs, so there is no unenforced path around it and no per-row Python check.
+Batcher enforces governance as a plan rewrite. A `SecurityCatalog` declares the policy, a `Principal` is the identity, and {py:obj}`bt.security(...) <batcher.security>` installs both for a block. The policy is compiled into the plan before it runs, so there is no unenforced path around it and no per-row Python check.
 
 The script grants an analyst three of four columns, masks every column tagged `pii`, and limits the analyst to EU rows, while an admin sees everything. Its last check sums a column as the analyst and gets the filtered total. The filter sits inside the plan, so the aggregate never sees the hidden rows.
 

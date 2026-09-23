@@ -83,20 +83,25 @@ The lattice deciding what your column ends up as is the same one the engine uses
 | a decimal and an integer | a decimal wide enough for both, so the cents survive |
 | `timestamp[ms]` and `timestamp[us]` | `timestamp[us]`, the finer resolution |
 | a date and a timestamp | the timestamp, since a date is midnight |
-| `string` and `large_string` | `large_string` |
+| `string` and `large_string` | `string`: the reconciled type is `large_string`, and the engine reads it as `string` |
 | a dictionary-encoded column and a plain one | the plain value type |
+| `uint64` and `int64` | `int64`, the type the engine holds every integer in; a value above `2**63 - 1` fails the read, naming its file |
 | two timestamps in different timezones | nothing, because the read fails |
+| a naive timestamp and a timezone-aware one | nothing, because the read fails |
+| `binary` and `string` | nothing, because the read fails |
 | `int64` and `string` | nothing, because the read fails |
 
-The full table, including the nested cases, is on {doc}`the type system page </user-guide/transform/columns/type-system>`.
+Column names match exactly, so `Region` and `region` are two columns. DuckDB's `union_by_name` folds them into one, and widens `uint64` beside `int64` to a 128-bit integer rather than failing. The full table, including the nested cases, is on {doc}`the type system page </user-guide/transform/columns/type-system>`.
 
-`schema_mode="latest"` is the other useful mode: the newest file's schema wins outright and older files are cast toward it. Reach for it when the newest file *is* the contract and older columns are debris you want gone.
+`schema_mode="latest"` is the other useful mode: the last file's schema wins outright and older files are cast toward it. "Last" is path order, the order the reader lists the files in, which for date-named files like these is also the newest; it is not modification time. A cast that would change a value, such as `5` read into a `bool` column, fails the read instead of rewriting it. Reach for it when the newest file *is* the contract and older columns are debris you want gone.
 
 | `schema_mode` | What it reads | Cost | Use it when |
 |---|---|---|---|
 | `strict` (default) | the first file's footer, applied to all | one metadata read | every file really does share a schema |
 | `union` | every footer, unified column-wise and promoted | one concurrent round of metadata reads | the directory has drifted and you want all of it |
-| `latest` | the newest file's schema, older files cast toward it | every footer | the newest file is the contract and old columns are debris |
+| `latest` | the last file's schema in path order, older files cast toward it | every footer | the newest file is the contract and old columns are debris |
+
+A distributed read answers the same way in every mode: the same rows and column types as the single-node read, or the same error about a file that breaks the contract.
 
 ## When it cannot be reconciled
 

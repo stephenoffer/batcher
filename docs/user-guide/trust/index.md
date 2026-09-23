@@ -56,6 +56,14 @@ Mandatory governance, verified identities, UDF isolation, and admission control.
 
 Start with {doc}`data-quality` if you are writing your first checks, and move to {doc}`data-contracts` when the failure you care about belongs to the whole table rather than a row. Start with {doc}`governance` if you need to restrict who reads what, then read {doc}`hardening` before you deploy, because that page is where governance becomes mandatory rather than opt-in.
 
+## See also
+
+- {doc}`/examples/data-quality`: quality and governance as standalone scripts, each run on every commit.
+- {doc}`/cookbook/governance/index`: masking, PII transforms, and lineage as runnable recipes.
+- {doc}`/api/operations/governance`: the policy types, the enforcement model, and data residency.
+- {doc}`/api/symbols/dataset-accessors`: the `ds.dq` and `ds.scd` surfaces these guides use.
+- {doc}`/architecture/deep-dives/query/plan-ir`: the plan tree a policy rewrite acts on.
+
 ```{toctree}
 :hidden:
 

@@ -30,6 +30,7 @@ import pytest
 import batcher as bt
 from _ray_cluster import init_test_ray, shutdown_test_ray
 from batcher._internal.errors import PlanError
+from batcher.config import active_config
 
 pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("batcher._native", reason="native engine not built")
@@ -187,18 +188,33 @@ def test_distributed_range_join_with_operators_above(split_source, bands):
 
 
 @pytest.mark.integration
-def test_oversized_build_side_refuses_rather_than_replicating(split_source, monkeypatch):
+def test_oversized_build_side_refuses_rather_than_replicating(split_source, bands, monkeypatch):
     """There is no shuffle fallback for an inequality, so an unbroadcastable build side
-    must raise with the fix — not silently run on one node, nor replicate into an OOM."""
+    must raise with the fix — not silently run on one node, nor replicate into an OOM.
+
+    `bands` on the right, as every other range-join case here has it, and not a second
+    `split_source`. Both of that fixture's columns exist on *both* sides, so
+    `col("x") < col("g")` bound to one side and predicate pushdown sank it under the scan:
+    no cross-side inequality survived above the join, `derive_range_join` never matched,
+    and the plan stayed an ordinary cross join that distributes fine. The test then asked
+    for a refusal no range join was there to give.
+    """
     import batcher.dist.executors.join as dj
 
     monkeypatch.setattr(dj, "l3_cache_bytes", lambda: 1)
-    cfg = bt.config()
-    monkeypatch.setattr(type(cfg.optimizer), "resolved_broadcast_max_bytes", lambda self, _c: 1)
+    # `active_config()`, not `bt.config()`: `batcher.config` is the config *package*, so the
+    # call raised `TypeError: 'module' object is not callable` and this test had never once
+    # reached the assertion it exists for. It is the only `bt.config(` in the tree.
+    cfg = active_config()
+    # `(self, l3_cache_bytes=0, workers=1)`; the stub took one argument and raised once the
+    # `TypeError` above stopped masking it.
+    monkeypatch.setattr(
+        type(cfg.optimizer), "resolved_broadcast_max_bytes", lambda self, _c=0, _w=1: 1
+    )
 
     left = bt.read.parquet(split_source)
-    right = bt.read.parquet(split_source)
-    ds = left.join(right, how="cross").filter(bt.col("x") < bt.col("g"))
+    right = bt.read.parquet(bands)
+    ds = left.join(right, how="cross").filter(bt.col("x") < bt.col("lo"))
     with pytest.raises(PlanError, match="broadcast"):
         ds.collect(distributed=True, num_workers=WORKERS)
 

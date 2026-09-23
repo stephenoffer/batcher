@@ -47,22 +47,25 @@ def main() -> None:
     assert len(set(components["component"])) == 1
     assert len(components["node"]) == 7
 
-    # Triangle counting, where available.
-    if hasattr(bg, "triangle_count"):
-        triangles = bg.triangle_count(graph).to_pydict()
-        print("triangles:", triangles)
-        counts = dict(
-            zip(
-                triangles["node"],
-                triangles[next(name for name in triangles if name != "node")],
-                strict=True,
-            )
-        )
-        # `a`, `b` and `c` form one; `d`, `e` and `f` form another.
-        assert counts["a"] >= 1
-        assert counts["z"] == 0
-    else:
-        print("triangle_count not available in this build")
+    # Each triangle is counted once per member: a, b, c and d, e, f are in one each.
+    triangles = bg.triangle_count(graph).sort("node").to_pydict()
+    print("triangles:", triangles)
+    assert triangles == {
+        "node": ["a", "b", "c", "d", "e", "f", "z"],
+        "triangles": [1, 1, 1, 1, 1, 1, 0],
+    }
+
+    # Clustering by hand. `a` has neighbours b, c, z: three pairs, one closed, so 1/3. `c`
+    # and `d` each have three neighbours and one closed pair; `b`, `e`, `f` have two and
+    # one. `z` has a single neighbour and so no pair, which scores 0.0.
+    clustering = bg.clustering_coefficient(graph).sort("node").to_pydict()["clustering"]
+    assert [round(v, 4) for v in clustering] == [0.3333, 1.0, 0.3333, 0.3333, 1.0, 1.0, 0.0]
+
+    # Transitivity counts triples instead: 3+1+3+3+1+1+0 = 12 connected triples, of which
+    # 3 x 2 triangles are closed, so 0.5. The average of the coefficients above is 0.5714,
+    # and the gap between the two is the point of reporting both.
+    assert bg.transitivity(graph) == 0.5
+    assert round(bg.average_clustering(graph), 4) == 0.5714
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ assert on_device.schema == on_cpu.schema
 assert on_device.to_pydict() == on_cpu.to_pydict()
 ```
 
-Compare the schema before the values. The defects this tier has shipped were *type* bugs with correct values: a DATE column returning a timestamp on a real device, an integer `abs` widening to double, and an empty string column converting to Arrow `null`. A value-only comparison would have passed all three, which is why `examples/gpu/shadow_verification.py` and `examples/gpu/cpu_gpu_parity_matrix.py` check names and types first.
+Compare the schema before the values. The defects this tier has shipped were *type* bugs with correct values: a DATE column returning a timestamp on a real device, an integer `abs` widening to double, and an empty string column converting to Arrow `null`. A value-only comparison would have passed all three, which is why [`examples/gpu/shadow_verification.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/shadow_verification.py) and [`examples/gpu/cpu_gpu_parity_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/cpu_gpu_parity_matrix.py) check names and types first.
 
 A green run of these scripts on a CPU-only machine says the harness works. It does not say the device agrees, and only a recorded run with `distributed.gpu_shadow_verify=True` on real hardware does.
 
@@ -52,14 +52,14 @@ The table below lists the accelerator scripts in path order.
 <!-- library-table: gpu -->
 | Script | Shows |
 | --- | --- |
-| `examples/gpu/backend_fallback.py` | What happens when the device tier cannot run part of a plan |
-| `examples/gpu/batch_sizing.py` | Sizing a batch for the device you actually have |
-| `examples/gpu/cpu_gpu_parity_matrix.py` | A parity matrix: every operator shape, on both tiers |
-| `examples/gpu/device_selection.py` | Choosing a device, and running the same query either way |
-| `examples/gpu/device_sizing.py` | What the engine can see about the accelerators on this machine |
-| `examples/gpu/mixed_device_pipeline.py` | A pipeline where some stages run on a device and some do not |
-| `examples/gpu/shadow_verification.py` | Verifying a device result against the CPU engine |
-| `examples/gpu/torch_inference.py` | Batch inference with a torch model, on whatever device is available |
+| [`examples/gpu/backend_fallback.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/backend_fallback.py) | What happens when the device tier cannot run part of a plan |
+| [`examples/gpu/batch_sizing.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/batch_sizing.py) | Sizing a batch for the device you actually have |
+| [`examples/gpu/cpu_gpu_parity_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/cpu_gpu_parity_matrix.py) | A parity matrix: every operator shape, on both tiers |
+| [`examples/gpu/device_selection.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/device_selection.py) | Choosing a device, and running the same query either way |
+| [`examples/gpu/device_sizing.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/device_sizing.py) | What the engine can see about the accelerators on this machine |
+| [`examples/gpu/mixed_device_pipeline.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/mixed_device_pipeline.py) | A pipeline where some stages run on a device and some do not |
+| [`examples/gpu/shadow_verification.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/shadow_verification.py) | Verifying a device result against the CPU engine |
+| [`examples/gpu/torch_inference.py`](https://github.com/stephenoffer/batcher/blob/main/examples/gpu/torch_inference.py) | Batch inference with a torch model, on whatever device is available |
 <!-- /library-table -->
 
 ## See also

@@ -20,6 +20,7 @@ from batcher._sql.parser.core_utils import (
     _row_window,
     _unwrap_alias,
     _within_group_to_agg,
+    has_grouping_levels,
 )
 from batcher._sql.parser.joins.lateral import select_unnest
 from batcher._sql.parser.subquery import core as subquery
@@ -181,9 +182,11 @@ def _select(tr, node) -> Dataset:
     # Inline `WINDOW w AS (...)` definitions into the `OVER w` references.
     tr._inline_named_windows(node)
 
-    # ROLLUP / CUBE / GROUPING SETS expand into a UNION ALL of grouping levels.
+    # ROLLUP / CUBE / GROUPING SETS expand into a UNION ALL of grouping levels. Which key
+    # carries them depends on the sqlglot version, so ask `has_grouping_levels` rather than
+    # reading one shape's args -- see `core_utils.grouping_levels`.
     group = node.args.get("group")
-    if group is not None and any(group.args.get(k) for k in ("rollup", "cube", "grouping_sets")):
+    if has_grouping_levels(group):
         return tr._grouping_sets_union(node, group)
 
     ds = tr._from(node)
@@ -205,6 +208,9 @@ def _select(tr, node) -> Dataset:
     ds = tr._decorrelate_scalar_subqueries(
         ds, [*node.expressions, residual, node.args.get("having")], node
     )
+    # `SELECT EXISTS (…)` reads the existence bit as a value: the marker column the
+    # under-OR rewrite builds, joined on before the projection reads it.
+    ds = subquery.exists_in_projection(tr, ds, node)
     if residual is not None:
         # A registered scalar function in WHERE becomes a materialized column
         # before the predicate references it.

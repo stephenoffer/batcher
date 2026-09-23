@@ -11,6 +11,7 @@ never a per-row tuple touch) and returns it as a new `Dataset`.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -25,9 +26,24 @@ if TYPE_CHECKING:
 # Internal aggregate-alias suffixes, kept unlikely to collide with user columns.
 _TOTAL = "__bt_n"
 
+# The label columns of the summary views. A user column of the same name would silently
+# overwrite the labels, so each view rejects that input rather than renaming its own label
+# (a schema that shifts with the input is harder to consume than an error naming the fix).
+_DESCRIBE_LABEL = "statistic"
+_MATRIX_LABEL = "column"
+
 
 def _is_numeric(dtype: pa.DataType) -> bool:
-    return pa.types.is_integer(dtype) or pa.types.is_floating(dtype)
+    """Integer, floating, or decimal: the types `mean`/`std`/`quantile`/`corr` accept."""
+    return pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_decimal(dtype)
+
+
+def _reject_label_collision(cols: list[str], label: str, what: str) -> None:
+    if label in cols:
+        raise PlanError(
+            f"{what}: input column {label!r} collides with the {label!r} label column of "
+            f"the result; rename it first, e.g. ds.rename({{{label!r}: {label + '_'!r}}})"
+        )
 
 
 def null_count(ds: Dataset) -> Dataset:
@@ -35,7 +51,9 @@ def null_count(ds: Dataset) -> Dataset:
 
     Lowers to a single global aggregate (``count(*)`` and a per-column non-null
     ``count``) plus a `select` that subtracts them, so it stays lazy and mergeable
-    — identical single-node and distributed. Mirrors pandas ``df.isnull().sum()``.
+    — identical single-node and distributed. Counts Arrow nulls only: a floating-point
+    NaN is a value, not a null, so unlike pandas ``df.isnull().sum()`` it is not counted
+    (use ``col(c).is_nan()`` for those).
     """
     cols = ds.columns
     aggs = {_TOTAL: count()}
@@ -48,16 +66,18 @@ def null_count(ds: Dataset) -> Dataset:
 def describe(ds: Dataset, percentiles: tuple[float, ...] = (0.25, 0.5, 0.75)) -> Dataset:
     """Summary statistics per column as a `Dataset` (executes the query).
 
-    See `Dataset.describe`. Numeric columns get count / null_count / mean / std /
-    min / the requested `percentiles` / max; non-numeric columns get count and
-    null_count only (numeric cells are null). The result has a ``statistic`` label
-    column and one Float64 column per input column.
+    See `Dataset.describe`. Numeric (integer, float, decimal) columns get count /
+    null_count / mean / std / min / the requested `percentiles` / max; other columns
+    get count and null_count only (numeric cells are null). The result has a
+    ``statistic`` label column and one Float64 column per input column, so an input
+    column named ``statistic`` raises `PlanError` instead of overwriting the labels.
     """
     for p in percentiles:
         if not 0.0 <= p <= 1.0:
             raise PlanError(f"describe(): percentile {p} is not in [0, 1]")
 
     cols = ds.columns
+    _reject_label_collision(cols, _DESCRIBE_LABEL, "describe()")
     types = list(ds.schema.types)
     numeric = {c for c, t in zip(cols, types, strict=True) if _is_numeric(t)}
 
@@ -79,7 +99,7 @@ def describe(ds: Dataset, percentiles: tuple[float, ...] = (0.25, 0.5, 0.75)) ->
     pct_labels = [f"{p * 100:g}%" for p in percentiles]
     stat_labels = ["count", "null_count", "mean", "std", "min", *pct_labels, "max"]
 
-    out: dict[str, pa.Array] = {"statistic": pa.array(stat_labels, type=pa.string())}
+    out: dict[str, pa.Array] = {_DESCRIBE_LABEL: pa.array(stat_labels, type=pa.string())}
     total = cell[_TOTAL]
     for c in cols:
         cnt = cell[f"{c}__cnt"]
@@ -150,12 +170,12 @@ def corr_matrix(ds: Dataset, columns: list[str] | None) -> Dataset:
 
     Every pair's ``corr`` runs as one aggregate in a **single** pass — not ``N**2``
     separate queries — then the tiny one-row result is transposed into a labeled matrix
-    (a control-plane reshape, never a per-row touch). The diagonal is ``1.0`` (or ``None``
-    for a constant column, which has no correlation); the matrix is symmetric.
+    (a control-plane reshape, never a per-row touch). The diagonal is exactly ``1.0`` (or
+    ``None`` for a constant column, which has no correlation); the matrix is symmetric.
     """
     from batcher.plan.functions.aggregate import corr
 
-    return _pairwise_matrix(ds, columns, corr, "corr_matrix")
+    return _pairwise_matrix(ds, columns, corr, "corr_matrix", unit_diagonal=True)
 
 
 def cov_matrix(ds: Dataset, columns: list[str] | None) -> Dataset:
@@ -170,12 +190,20 @@ def cov_matrix(ds: Dataset, columns: list[str] | None) -> Dataset:
     return _pairwise_matrix(ds, columns, covar_samp, "cov_matrix")
 
 
-def _pairwise_matrix(ds: Dataset, columns: list[str] | None, agg_fn, what: str) -> Dataset:
+def _pairwise_matrix(
+    ds: Dataset, columns: list[str] | None, agg_fn, what: str, *, unit_diagonal: bool = False
+) -> Dataset:
     """Build a symmetric matrix of a pairwise aggregate over numeric columns, one scan.
 
     Shared by `corr_matrix` and `cov_matrix`: `agg_fn(col_a, col_b)` is the per-pair
     aggregate. Only the unordered pairs are computed (the aggregate is symmetric), then
     the one-row result is transposed into a ``column``-labeled matrix.
+
+    With `unit_diagonal`, a finite diagonal cell is written as exactly ``1.0``: a column's
+    correlation with itself is 1 by definition, and the one-pass aggregate otherwise lands an
+    ulp away (``0.9999999999999998``). A null (constant or too-short column) or NaN (NaN in
+    the data) cell is left as computed. This touches the ``N`` diagonal cells of the already
+    materialized summary, never a data row.
     """
     all_cols = ds.columns
     types = dict(zip(all_cols, ds.schema.types, strict=True))
@@ -187,9 +215,13 @@ def _pairwise_matrix(ds: Dataset, columns: list[str] | None, agg_fn, what: str) 
                 raise PlanError(f"{what}: unknown column {c!r}")
             if not _is_numeric(types[c]):
                 raise PlanError(f"{what}: column {c!r} is not numeric")
+        repeated = sorted({c for c in columns if columns.count(c) > 1})
+        if repeated:
+            raise PlanError(f"{what}: column(s) {repeated} requested more than once")
         cols = list(columns)
     if not cols:
         raise PlanError(f"{what}: no numeric columns")
+    _reject_label_collision(cols, _MATRIX_LABEL, what)
 
     aggs = {}
     for i, a in enumerate(cols):
@@ -199,11 +231,14 @@ def _pairwise_matrix(ds: Dataset, columns: list[str] | None, agg_fn, what: str) 
 
     def _pair(i: int, j: int) -> float | None:
         lo, hi = (i, j) if i <= j else (j, i)
-        return _as_float(cell[f"c__{lo}__{hi}"][0])
+        value = _as_float(cell[f"c__{lo}__{hi}"][0])
+        if unit_diagonal and i == j and value is not None and math.isfinite(value):
+            return 1.0
+        return value
 
     from batcher.api.session import from_arrow
 
-    out = {"column": pa.array(cols, pa.string())}
+    out = {_MATRIX_LABEL: pa.array(cols, pa.string())}
     for j, b in enumerate(cols):
         out[b] = pa.array([_pair(i, j) for i in range(len(cols))], type=pa.float64())
     return from_arrow(pa.table(out))

@@ -28,7 +28,7 @@ Everything below hardens what happens *inside* that boundary. Each layer is only
 
 ## Make governance mandatory
 
-By default, row filters and column masks apply only inside a `bt.security(...)` block. A
+By default, row filters and column masks apply only inside a {py:obj}`bt.security(...) <batcher.security>` block. A
 {py:class}`Dataset <batcher.Dataset>` built outside one is ungoverned, which is the correct default for a library and
 the wrong one for a deployment: forgetting the `with` block becomes the difference between
 a masked column and a plain one, and nothing says so.
@@ -66,7 +66,7 @@ pipeline that joins in a dict, and you will find out from a pager rather than a 
 
 ## Keep a durable audit trail
 
-Every governed read and write emits a `GovernanceEvent`, and by default it goes to the `batcher.governance` logger and to any `audit=` callback you pass to `bt.security(...)`. Neither is an audit trail a reviewer can rely on, because a caller can simply not pass the callback.
+Every governed read and write emits a `GovernanceEvent`, and by default it goes to the `batcher.governance` logger and to any `audit=` callback you pass to {py:obj}`bt.security(...) <batcher.security>`. Neither is an audit trail a reviewer can rely on, because a caller can simply not pass the callback.
 
 Set `governance.audit_path` to make the record unconditional:
 
@@ -116,7 +116,7 @@ print(strict.governance.require_verified_principal)
 bt.set_verifier(None)
 ```
 
-With that on, entering `bt.security(catalog, principal)` with an asserted principal raises
+With that on, entering {py:obj}`bt.security(catalog, principal) <batcher.security>` with an asserted principal raises
 `AccessDeniedError`. Expired claims are refused whether or not the setting is on, so a
 long-running process cannot keep acting on a token that lapsed hours ago.
 

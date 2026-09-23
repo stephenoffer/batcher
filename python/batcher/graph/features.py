@@ -17,7 +17,7 @@ from __future__ import annotations
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
-from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph
+from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph, walked
 from batcher.graph._iterate import checkpoint
 
 __all__ = ["aggregate_neighbors", "propagate_features", "structural_features"]
@@ -46,8 +46,9 @@ def aggregate_neighbors(
     """One round of message passing: summarize each node's neighbours' features.
 
     Args:
-        g: The graph. Features flow along edge direction, from `src` to `dst`; symmetrize
-            with `Graph.to_undirected` when a node should see everyone it touches.
+        g: The graph. On a directed graph features flow along edge direction, from `src`
+            to `dst`; on one built with `directed=False` every node sees everyone it
+            touches.
         node_features: A dataset of `node` plus numeric feature columns.
         features: The feature columns to aggregate.
         how: `"mean"`, `"sum"`, `"max"` or `"min"`.
@@ -95,7 +96,7 @@ def aggregate_neighbors(
     src_side = node_features.select(
         **{SRC: bt.col(node)}, **{f: bt.col(f).cast("float64") for f in features}
     )
-    messages = g.edges.join(src_side, on=SRC, how="inner")
+    messages = walked(g).edges.join(src_side, on=SRC, how="inner")
     if weighted:
         messages = messages.with_columns(**{f: bt.col(f) * bt.col(WEIGHT) for f in features})
     agg = _AGGREGATIONS[how]
@@ -225,8 +226,12 @@ def structural_features(g: Graph) -> Dataset:
     from batcher.graph.community import clustering_coefficient, triangle_count
     from batcher.graph.degree import degree, in_degree, out_degree, weighted_degree
 
+    # Each table is materialized before the joins. Several are an aggregate over a `union`
+    # (the zero rows for nodes in no triangle come from a union arm), and on a cluster such
+    # an aggregate cannot feed a join; each is one row per node, so this is bounded by the
+    # node count, like the per-round state of `pagerank`.
     cached = g.cache()
-    out = in_degree(cached)
+    out = checkpoint(in_degree(cached))
     for table in (
         out_degree(cached),
         degree(cached),
@@ -235,5 +240,5 @@ def structural_features(g: Graph) -> Dataset:
         clustering_coefficient(cached),
         pagerank(cached),
     ):
-        out = out.join(table, on=NODE, how="left")
+        out = out.join(checkpoint(table), on=NODE, how="left")
     return out

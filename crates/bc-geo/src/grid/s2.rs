@@ -153,7 +153,7 @@ fn lsb_for_level(level: u32) -> u64 {
 pub fn cell_id(lon: f64, lat: f64, level: u32) -> GeoResult<u64> {
     check_level(level)?;
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
-        return Err(GeoError::invalid(format!(
+        return Err(GeoError::domain(format!(
             "S2 needs lon in [-180, 180] and lat in [-90, 90], got ({lon}, {lat})"
         )));
     }

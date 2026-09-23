@@ -213,7 +213,7 @@ in the IR.
 An expression the Cranelift tier can compile does not cost what the interpreter would charge
 for it. `expr_cost` divides by `jit_speedup` (4.0) when `jit_compilable(expr)`.
 
-`kyber/expr_cost/jit.py` is a conservative mirror of `crates/bc-codegen/src/analyze.rs`. It
+`kyber/expr_cost/jit.py` is a conservative mirror of [`crates/bc-codegen/src/analyze.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/analyze.rs). It
 answers `False` whenever it cannot *prove* membership in the supported subset. Costing errs
 toward "interpreted", never toward a fast path that does not exist. Integer `div`/`mod`
 compile only against a constant divisor that is neither 0 nor −1, because Cranelift's `sdiv`

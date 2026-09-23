@@ -18,13 +18,13 @@ from __future__ import annotations
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
-from batcher.graph._graph import DST, NODE, SRC, Graph
+from batcher.graph._graph import DST, NODE, SRC, Graph, walked
 from batcher.graph._iterate import checkpoint
 
 __all__ = ["betweenness_centrality"]
 
 
-def _shortest_path_counts(g: Graph, source: object, max_depth: int) -> list[Dataset]:
+def _shortest_path_counts(edges: Dataset, source: object, max_depth: int | None) -> list[Dataset]:
     """One dataset per BFS level: the nodes at that depth and how many shortest paths
     from `source` reach each.
 
@@ -39,10 +39,9 @@ def _shortest_path_counts(g: Graph, source: object, max_depth: int) -> list[Data
     )
     seen = checkpoint(frontier.select(NODE))
     levels.append(frontier)
-    edges = g.edges.cache()
-    for _ in range(max_depth):
-        if frontier.count() == 0:
-            break
+    depth = 0
+    while max_depth is None or depth < max_depth:
+        depth += 1
         nxt = (
             edges.join(
                 frontier.select(**{SRC: bt.col(NODE), "_s": bt.col("sigma")}),
@@ -66,7 +65,7 @@ def _shortest_path_counts(g: Graph, source: object, max_depth: int) -> list[Data
 
 
 def betweenness_centrality(
-    g: Graph, sources: Dataset, *, node: str = "node", max_depth: int = 10
+    g: Graph, sources: Dataset, *, node: str = "node", max_depth: int | None = None
 ) -> Dataset:
     """Estimate betweenness from shortest paths out of a set of source nodes.
 
@@ -76,13 +75,15 @@ def betweenness_centrality(
     a sample is the standard estimator.
 
     Args:
-        g: The graph. Direction is respected; symmetrize with `Graph.to_undirected` for
-            the undirected measure, which is what most questions mean.
+        g: The graph. Direction is respected on a directed graph; one built with
+            `directed=False` is walked both ways. Summed over every node as a source, an
+            undirected graph counts each pair from both ends, so halve the result to get
+            the textbook (networkx ``normalized=False``) value.
         sources: The nodes to compute shortest paths from. A few dozen high-degree nodes
             (`degree(g).sort(...).limit(n)`) converge the ranking fastest.
         node: The column in `sources` holding the node id.
-        max_depth: The hop cap per source. Paths longer than this contribute nothing,
-            which bounds the cost and is why a bounded search is affordable at all.
+        max_depth: The hop cap per source, or `None` for none. Paths longer than a cap
+            contribute nothing, which bounds the cost but changes the answer.
 
     Returns:
         A dataset of `node` and `betweenness`, summed over the sources and **not**
@@ -106,7 +107,7 @@ def betweenness_centrality(
             >>> out.sort("betweenness", descending=True).to_pydict()["node"][0]
             'c'
     """
-    if max_depth < 1:
+    if max_depth is not None and max_depth < 1:
         raise PlanError(f"max_depth must be positive, got {max_depth}")
     seeds = (
         sources.select(**{NODE: bt.col(node)})
@@ -119,11 +120,14 @@ def betweenness_centrality(
             "betweenness_centrality(): none of the source nodes appear in the graph, so "
             "there are no shortest paths to trace"
         )
-    edges = g.edges.cache()
+    edges = walked(g).edges.cache()
     totals: Dataset | None = None
 
+    # One forward and one backward sweep per source, each round a separate query. That is
+    # the scaling limit: the cost is sources x depth queries, so this is for tens of
+    # sampled sources, not for exact betweenness over every node of a large graph.
     for source in seeds:
-        levels = _shortest_path_counts(g, source, max_depth)
+        levels = _shortest_path_counts(edges, source, max_depth)
         if len(levels) < 2:
             continue
         totals = _accumulate_backward(edges, levels, totals)

@@ -20,7 +20,7 @@ print(class_counts(oversample(ds, "y"), "y"))  # exactly balanced by duplicating
 
 Look at `class_counts` first. `undersample` discards majority rows, `oversample` duplicates minority rows deterministically, and `balanced_sample` moves every class to the median count, so big classes lose a little and small ones gain a little.
 
-When the model supports weights, prefer them. `batcher.ml.sampling.class_weights` returns a `{class: weight}` dict for the model's `class_weight`, and `sample_weights` appends a per-row weight column. Both rebalance the *loss* without discarding or duplicating a single row. {py:meth}`Dataset.class_weights <batcher.Dataset.class_weights>` computes the same inverse-frequency weights as a `Dataset` to join back on the label.
+When the model supports weights, prefer them. {py:obj}`batcher.ml.sampling.class_weights <batcher.ml.sampling.class_weights>` returns a `{class: weight}` dict for the model's `class_weight`, and `sample_weights` appends a per-row weight column. Both rebalance the *loss* without discarding or duplicating a single row. {py:meth}`Dataset.class_weights <batcher.Dataset.class_weights>` computes the same inverse-frequency weights as a `Dataset` to join back on the label.
 
 {py:func}`smote <batcher.ml.smote>` is the alternative to duplicating. `oversample` repeats
 minority rows, so a model can still memorize the exact points and tighten its boundary around
@@ -121,7 +121,7 @@ print([(train.count(), validate.count()) for train, validate in ds.ml.time_serie
 
 ## Requirements and limitations
 
-Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed split. Grouped folds (`group=`, or `batcher.ml.splitting.group_kfold`) vary further, because groups differ in size.
+Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed split. Grouped folds (`group=`, or {py:obj}`batcher.ml.splitting.group_kfold <batcher.ml.splitting.group_kfold>`) vary further, because groups differ in size.
 
 ## See also
 

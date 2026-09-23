@@ -64,6 +64,7 @@ mod builds;
 mod fanout;
 mod folds;
 mod meter;
+mod order;
 mod parallel;
 mod pipeline;
 mod probe_chunks;
@@ -115,6 +116,10 @@ pub(crate) struct Ctx<'a> {
     /// queries it fits, and gives way on the ones it does not — instead of quietly turning a
     /// spill into a crash.
     budget: usize,
+    /// Nothing above this stage can observe the order of its output rows, so it may produce them
+    /// in any order. Set by an order-insensitive consumer and cleared by every operator that is
+    /// not one; see [`order`].
+    order_free: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -142,7 +147,14 @@ impl<'a> Ctx<'a> {
             meter,
             budget,
             workers,
+            order_free: false,
         }
+    }
+
+    /// This context, with its consumer's order-freedom set to `free`.
+    pub(crate) fn with_order_free(mut self, free: bool) -> Self {
+        self.order_free = free;
+        self
     }
 
     /// This context, reading the caller's already-materialized spine breakers.
@@ -254,6 +266,18 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
         return Ok(Box::new((0..n).map(move |i| Ok(batches[i].clone()))));
     }
 
+    // Only these hand their consumer's order-freedom on: a filter, a projection and a join's two
+    // sides keep their input's order one-for-one, and the aggregate and the sort decide their
+    // child's for themselves (`breaker`). Everything else observes its input's order -- a
+    // `LIMIT`, a row id, a window -- so its inputs are not free, whatever its consumer is.
+    let ctx = match plan {
+        RelOp::Filter { .. }
+        | RelOp::Project { .. }
+        | RelOp::HashJoin { .. }
+        | RelOp::Aggregate { .. }
+        | RelOp::Sort { .. } => ctx,
+        _ => ctx.with_order_free(false),
+    };
     let id = ctx.id(plan);
     match plan {
         RelOp::Scan { source_id } => {
@@ -477,6 +501,7 @@ fn build_join<'a>(
             output,
             strategy,
             &[],
+            ctx,
         );
     };
     let build_rows = prepared.side.num_rows() as u64;
@@ -513,6 +538,7 @@ fn build_join<'a>(
                 output,
                 strategy,
                 std::slice::from_ref(&prepared.side),
+                ctx,
             );
         }
         let probe = build_with(left, ctx)?;
@@ -524,6 +550,7 @@ fn build_join<'a>(
             output,
             strategy,
             std::slice::from_ref(&prepared.side),
+            ctx,
         );
     };
 
@@ -543,6 +570,7 @@ fn build_join<'a>(
             output,
             strategy,
             std::slice::from_ref(&prepared.side),
+            ctx,
         );
     };
 
@@ -557,6 +585,7 @@ fn build_join<'a>(
             output,
             strategy,
             std::slice::from_ref(&prepared.side),
+            ctx,
         );
     }
 
@@ -655,6 +684,7 @@ fn materialized_join_from<'a>(
     output: &'a [bc_ir::JoinOutputCol],
     strategy: bc_ir::JoinStrategy,
     build_batches: &[RecordBatch],
+    ctx: Ctx<'a>,
 ) -> Result<Morsels<'a>, InterpError> {
     let probe_batches = drain(probe)?;
     let (Ok(probe_side), Ok(build_side)) = (
@@ -689,15 +719,37 @@ fn materialized_join_from<'a>(
     //
     // Making this parallel means making it order-preserving **in the swapped-build regime**, not
     // just parallel.
-    let out = ops::join_batches(
-        &probe_side,
-        &build_side,
-        left_keys,
-        right_keys,
-        join_type,
-        output,
-        strategy,
-    )?;
+    //
+    // The exception is a join whose output order nothing above it can see (`order`): a
+    // `COUNT(*)` over it, or a grouped aggregate sorted on every group key. The order this arm
+    // protects is then unobservable, and the partitioned join runs the same rows on every core.
+    let out = if ctx.order_free && ctx.workers > 1 {
+        let (parts, _) = crate::par::join_partitioned(
+            std::slice::from_ref(&probe_side),
+            std::slice::from_ref(&build_side),
+            left_keys,
+            right_keys,
+            join_type,
+            output,
+            strategy,
+            &crate::ExecOptions::default(),
+        )?;
+        // One batch, as the serial arm emits, for the reason given below.
+        match ops::materialize_opt(&parts)? {
+            Some(one) => one,
+            None => return Ok(Box::new(std::iter::empty())),
+        }
+    } else {
+        ops::join_batches(
+            &probe_side,
+            &build_side,
+            left_keys,
+            right_keys,
+            join_type,
+            output,
+            strategy,
+        )?
+    };
     // Emitted whole, deliberately, even though it can be relation-sized.
     //
     // Splitting it into morsels here looks like the tidy thing to do — everything downstream is

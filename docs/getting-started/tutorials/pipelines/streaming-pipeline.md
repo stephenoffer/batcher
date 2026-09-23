@@ -238,7 +238,7 @@ leak.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Streaming guide
-:link: /user-guide/moving-data/streaming
+:link: /user-guide/moving-data/streaming/index
 :link-type: doc
 Every source, sink, trigger, and output mode.
 :::

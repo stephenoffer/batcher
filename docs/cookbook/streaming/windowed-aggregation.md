@@ -183,7 +183,7 @@ There is no side output for the rows the watermark drops, so a window that close
 - {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>`: what `lateness` actually costs.
 - {doc}`Exactly-once sinks </cookbook/streaming/exactly-once-sink>`: making the gold write survive a restart.
 - {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`: the bronze layer this gold one aggregates.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, output modes, and the query handle.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, output modes, and the query handle.
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the aggregate surface itself.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: the other kind of window, over a bounded frame.
 - {doc}`Delta Lake integration </integrations/lakehouse/delta-lake>`: the sink in the query above.

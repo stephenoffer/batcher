@@ -32,7 +32,6 @@ __all__ = [
     "device_shard_counts",
     "fleet_spread",
     "local_device_group",
-    "placement_summary",
     "shard_device_assignment",
 ]
 
@@ -192,27 +191,3 @@ def adaptive_shard_factor(configured: int, throughputs: Sequence[float]) -> int:
     if spread < _SPREAD_TRIGGER:
         return base
     return base * min(_MAX_SPREAD_FACTOR, max(1, int(spread)))
-
-
-def placement_summary(world_size: int) -> dict:
-    """What this node would give a stage of `world_size` devices, as one record.
-
-    Args:
-        world_size: Devices the stage wants.
-
-    Returns:
-        `group` (the chosen ordinals), `island` (the widest coherent group), `bounded`
-        (whether the request was capped by the fabric), and `class` (the group's worst pair).
-        Zeroed and empty on a node whose topology cannot be read.
-    """
-    from batcher._internal.hardware.fabric.p2p import peer_group_class
-    from batcher.kyber.gpu.exchange import widest_fabric_island
-
-    island = widest_fabric_island()
-    group = local_device_group(world_size)
-    return {
-        "group": list(group),
-        "island": island,
-        "bounded": bool(island and world_size > island),
-        "class": peer_group_class(group) if len(group) > 1 else "",
-    }

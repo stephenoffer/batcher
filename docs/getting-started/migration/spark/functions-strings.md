@@ -18,34 +18,34 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
-| `aes_decrypt` | `bt.aes_decrypt` | mismatch | Differs: Spark defaults to AES-GCM over a 16/24/32-byte key with mode=/padding=/aad= and returns BINARY; bt.aes\_decrypt reads base64 AES-256-GCM-SIV. Ciphertexts do not interoperate. Wave W2. |
-| `aes_encrypt` | `bt.aes_encrypt` | mismatch | Differs: Spark defaults to AES-GCM over a 16/24/32-byte key with mode=/padding=/iv=/aad= and returns BINARY; bt.aes\_encrypt writes base64 AES-256-GCM-SIV. Ciphertexts do not interoperate. Wave W2. |
+| `aes_decrypt` | {py:obj}`bt.aes_decrypt <batcher.aes_decrypt>` | mismatch | Differs: Spark defaults to AES-GCM over a 16/24/32-byte key with mode=/padding=/aad= and returns BINARY; bt.aes\_decrypt reads base64 AES-256-GCM-SIV. Ciphertexts do not interoperate. Wave W2. |
+| `aes_encrypt` | {py:obj}`bt.aes_encrypt <batcher.aes_encrypt>` | mismatch | Differs: Spark defaults to AES-GCM over a 16/24/32-byte key with mode=/padding=/iv=/aad= and returns BINARY; bt.aes\_encrypt writes base64 AES-256-GCM-SIV. Ciphertexts do not interoperate. Wave W2. |
 | `ascii` | `Expr.str.ascii` | canonical |  |
 | `base64` | `Expr.str.base64` | canonical |  |
 | `bit_length` | `Expr.str.bit_length` | canonical |  |
 | `btrim` | `Expr.str.trim` | canonical |  |
-| `char` | `Expr.chr` | mismatch | Differs: Spark char(n) is chr(n % 256) and empty for a negative n: bt.when(n \< 0).then(bt.lit()).otherwise((n % 256).chr()). Wave W0. |
+| `char` | {py:obj}`Expr.chr <batcher.plan.expr_ir.core.Expr.chr>` | mismatch | Differs: Spark char(n) is chr(n % 256) and empty for a negative n: bt.when(n \< 0).then(bt.lit()).otherwise((n % 256).chr()). Wave W0. |
 | `char_length` | `Expr.str.len_chars` | canonical |  |
 | `character_length` | `Expr.str.len_chars` | canonical |  |
 | `collate` | n/a | gap | Not yet: collation-aware string comparison (collate(col, name)). Wave W14. |
 | `collation` | n/a | gap | Not yet: report a column's collation. Wave W14. |
-| `concat` | `bt.concat` + `bt.concat_str` | mismatch | Differs: Spark concat returns null when any argument is null: bt.concat\_str(\*cols, ignore\_nulls=False). Array arguments are list concatenation. Wave W0. |
-| `concat_ws` | `bt.concat_ws` | canonical |  |
+| `concat` | {py:obj}`bt.concat <batcher.concat>` + {py:obj}`bt.concat_str <batcher.concat_str>` | mismatch | Differs: Spark concat returns null when any argument is null: bt.concat\_str(\*cols, ignore\_nulls=False). Array arguments are list concatenation. Wave W0. |
+| `concat_ws` | {py:obj}`bt.concat_ws <batcher.concat_ws>` | canonical |  |
 | `contains` | `Expr.str.contains` | mismatch | Differs: bt.contains is a column-name selector, not a string predicate; F.contains(left, right) is Expr.str.contains. Wave W0. |
 | `crc32` | `Expr.str.crc32` | canonical |  |
 | `decode` | n/a | gap | Not yet: decode BINARY to STRING with a named charset. Wave W3. |
-| `elt` | `bt.elt` | canonical |  |
+| `elt` | {py:obj}`bt.elt <batcher.elt>` | canonical |  |
 | `encode` | n/a | gap | Not yet: encode STRING to BINARY with a named charset. Wave W3. |
 | `endswith` | `Expr.str.ends_with` | canonical |  |
 | `find_in_set` | `Expr.str.find_in_set` | param | Missing: a column-valued needle. Wave W2. |
 | `format_number` | n/a | gap | Not yet: format a number with grouping separators to d decimal places. Wave W3. |
-| `format_string` | `bt.format_string` | mismatch | Differs: Spark uses printf-style placeholders (%s, %d, %.2f); bt.format\_string uses \{\} placeholders. Wave W0. |
-| `hash` | `Expr.hash` | mismatch | Differs: port as bt.hash\_rows(\*cols, seed=42, algorithm=murmur3), cast to int32 where Spark's result is IntegerType. Wave W0. |
+| `format_string` | {py:obj}`bt.format_string <batcher.format_string>` | mismatch | Differs: Spark uses printf-style placeholders (%s, %d, %.2f); bt.format\_string uses \{\} placeholders. Wave W0. |
+| `hash` | {py:obj}`Expr.hash <batcher.plan.expr_ir.core.Expr.hash>` | mismatch | Differs: port as bt.hash\_rows(\*cols, seed=42, algorithm=murmur3), cast to int32 where Spark's result is IntegerType. Wave W0. |
 | `hex` | `Expr.str.hex` | canonical |  |
 | `ilike` | `Expr.str.ilike` | param | Missing: escapeChar= and a column-valued pattern. Wave W2. |
 | `initcap` | `Expr.str.to_titlecase` | canonical |  |
 | `instr` | `Expr.str.position` | canonical |  |
-| `is_valid_utf8` | `Expr.is_not_null` | canonical |  |
+| `is_valid_utf8` | {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
 | `lcase` | `Expr.str.lower` | canonical |  |
 | `left` | `Expr.str.left` | mismatch | Differs: Spark left(n) returns '' when n \<= 0; Batcher left(-k) drops k characters from the end. Wave W0. |
 | `length` | `Expr.str.len_chars` | canonical |  |
@@ -55,14 +55,14 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `lower` | `Expr.str.lower` | canonical |  |
 | `lpad` | `Expr.str.lpad` | canonical |  |
 | `ltrim` | `Expr.str.strip_chars_start` | canonical |  |
-| `make_valid_utf8` | `Expr.cast` | canonical |  |
-| `mask` | `bt.mask` | canonical |  |
+| `make_valid_utf8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `mask` | {py:obj}`bt.mask <batcher.mask>` | canonical |  |
 | `md5` | `Expr.str.md5` | canonical |  |
 | `octet_length` | `Expr.str.octet_length` | canonical |  |
 | `overlay` | `Expr.str.overlay` | canonical |  |
 | `parse_url` | `Expr.str.parse_url` | canonical |  |
 | `position` | `Expr.str.position` | param | Missing: start= position. Wave W2. |
-| `printf` | `bt.format_string` | mismatch | Differs: Spark uses printf-style placeholders (%s, %d, %.2f); bt.format\_string uses \{\} placeholders. Wave W0. |
+| `printf` | {py:obj}`bt.format_string <batcher.format_string>` | mismatch | Differs: Spark uses printf-style placeholders (%s, %d, %.2f); bt.format\_string uses \{\} placeholders. Wave W0. |
 | `quote` | n/a | gap | Not yet: quote a string as a SQL literal. Wave W3. |
 | `randstr` | n/a | gap | Not yet: random string of a given length. Wave W3. |
 | `regexp` | `Expr.str.regexp_matches` | canonical |  |
@@ -102,12 +102,20 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `try_to_binary` | n/a | gap | Not yet: to\_binary returning null on invalid input. Wave W3. |
 | `try_to_number` | n/a | gap | Not yet: to\_number returning null on invalid input. Wave W3. |
 | `try_url_decode` | `Expr.str.url_decode` | canonical |  |
-| `try_validate_utf8` | `Expr.cast` | canonical |  |
+| `try_validate_utf8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `ucase` | `Expr.str.upper` | canonical |  |
 | `unbase64` | `Expr.str.from_base64` | canonical |  |
 | `unhex` | `Expr.str.unhex` | canonical |  |
 | `upper` | `Expr.str.upper` | canonical |  |
 | `url_decode` | `Expr.str.url_decode` | mismatch | Differs: with form=True the decode matches Spark; a malformed escape stays as written where Spark raises. Wave W0. |
 | `url_encode` | `Expr.str.url_encode` | canonical |  |
-| `validate_utf8` | `Expr.cast` | canonical |  |
+| `validate_utf8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `xxhash64` | `Expr.str.xxhash64` | mismatch | Differs: for one string or binary column, xxhash64(col) is col.str.xxhash64(seed=42). Several columns or other types chain the seed in Spark and need a manual port. Wave W0. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

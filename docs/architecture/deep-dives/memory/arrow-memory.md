@@ -61,7 +61,7 @@ re-exports rather than on `arrow` directly, so an Arrow bump is a one-line chang
 
 ## The boundary normalizes types once
 
-`crates/bc-py/src/normalize.rs`.
+[`crates/bc-py/src/normalize.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/normalize.rs).
 
 ::::{tab-set}
 :::{tab-item} On the way in
@@ -157,7 +157,7 @@ it only makes the guard conservative, and it never skips a per-row byte walk tha
 
 ## The memory pool
 
-`crates/bc-resource/src/lib.rs` is Carbonite's enforcement primitive inside the data plane: one process-wide `MemoryPool` with RAII `MemoryReservation`s. The contract is **reserve before you allocate**. A stateful breaker reserves its footprint before it builds or merges state, and a reservation the pool cannot grant forces that operator to spill instead of pushing the process toward OOM.
+[`crates/bc-resource/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-resource/src/lib.rs) is Carbonite's enforcement primitive inside the data plane: one process-wide `MemoryPool` with RAII `MemoryReservation`s. The contract is **reserve before you allocate**. A stateful breaker reserves its footprint before it builds or merges state, and a reservation the pool cannot grant forces that operator to spill instead of pushing the process toward OOM.
 
 The pool accounts and admits. It does not decide. It exposes a coarse `Pressure` level, `Nominal`, `Elevated` at 80% of the limit, or `Critical` at the limit, and Carbonite's finer Python ladder reads the configured `memory.soft_limit` and `memory.hard_limit` (0.85 and 0.90) on top of it. The design follows DataFusion's `MemoryPool` and `MemoryReservation`, adopted rather than re-derived, and kept to `std` plus `thiserror` so it can sit at the bottom of the crate DAG. {doc}`The buffer pool </architecture/deep-dives/memory/buffer-pool>` covers both ladders, cooperative spilling, and where the limit comes from.
 
@@ -207,13 +207,13 @@ per-chunk `concat` (~3 GB/s) does not. The result is byte-identical to `concat_b
 
 ## Where the code lives
 
-- `crates/bc-arrow/src/lib.rs`: `Morsel`, `MorselTarget`, the Arrow pin, `RuntimeTuning`
-- `crates/bc-py/src/lib.rs`: the C Data Interface boundary and the global allocator
-- `crates/bc-py/src/normalize.rs`: narrow/dictionary normalization in and out
-- `crates/bc-resource/src/lib.rs`: `MemoryPool`, `MemoryReservation`, `Pressure`
-- `crates/bc-interp/src/ops/materialize.rs`: parallel concat and offset widening
-- `crates/bc-arrow/src/lib.rs` (`slice_bytes`) and `crates/bc-interp/src/lib.rs` (`batch_bytes`): slice- and dictionary-aware byte accounting
-- `python/batcher/carbonite/memory/reclaim.py`: the arena release valve
+- [`crates/bc-arrow/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-arrow/src/lib.rs): `Morsel`, `MorselTarget`, the Arrow pin, `RuntimeTuning`
+- [`crates/bc-py/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/lib.rs): the C Data Interface boundary and the global allocator
+- [`crates/bc-py/src/normalize.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/normalize.rs): narrow/dictionary normalization in and out
+- [`crates/bc-resource/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-resource/src/lib.rs): `MemoryPool`, `MemoryReservation`, `Pressure`
+- [`crates/bc-interp/src/ops/materialize.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/materialize.rs): parallel concat and offset widening
+- [`crates/bc-arrow/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-arrow/src/lib.rs) (`slice_bytes`) and [`crates/bc-interp/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/lib.rs) (`batch_bytes`): slice- and dictionary-aware byte accounting
+- [`python/batcher/carbonite/memory/reclaim.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/carbonite/memory/reclaim.py): the arena release valve
 
 ## See also
 

@@ -12,6 +12,19 @@ The exceptions are the metrics that need a global ordering rather than a per-row
 
 The split between the two kinds runs along whether a metric's value for one row depends on any other row:
 
+## Where the metrics live
+
+The metrics come from two places, and only one of them is on `bt`. Every aggregate expression is a top-level name: {py:func}`bt.precision <batcher.precision>`, {py:func}`bt.rmse <batcher.rmse>`, {py:func}`bt.matthews_corrcoef <batcher.matthews_corrcoef>`, and the rest of the table below. The Dataset functions are not. ROC AUC, the ranking metrics, the clustering scores, the diagnostic tables, and `evaluate` itself live in `batcher.ml.metrics`, and you import them from there:
+
+```python
+import batcher as bt
+from batcher.ml.metrics import evaluate, ndcg_at_k, roc_auc
+
+print(hasattr(bt, "precision"), hasattr(bt, "roc_auc"))
+```
+
+`evaluate` is also reachable as the {py:meth}`ds.ml.evaluate <batcher.api.dataset.ml.DatasetML.evaluate>` accessor, which is the spelling the rest of this page uses.
+
 ![Why a metric is an aggregate here, and when it is not. ds.agg(m=bt.accuracy('y', 'p')) composes: each worker's partition of scored rows computes partial count_if counts of matched and compared rows, those partials combine by addition in any order because no row depends on another, and accuracy is matched divided by compared. The same code runs on one core or a hundred. roc_auc(ds, 'y', 's') does not compose: it is built on rank and cume_dist, a window over every score, so the rows are sorted by score first and only then does one aggregate pass produce the AUC from the rank identity. A rank depends on every other row, so this one adds a distributed sort, and that is the whole difference between the two rows of the picture. Both forms take by= or group_by, so per-segment scoring is the same query with a grouping added.](/_static/diagrams/metrics_as_aggregates.svg)
 
 ## One call for a whole task
@@ -83,6 +96,50 @@ The full vocabulary:
 
 The test suite checks each one against `sklearn.metrics` at a tolerance of 1e-12, so the definitions are scikit-learn's.
 
+## Binary metrics and the positive class
+
+Every classification metric in the table except `accuracy` and `hamming_loss` is *binary*. It scores the class you name with `positive=` against everything else, one-vs-rest. The default is `1`, so a string or boolean label names its class explicitly:
+
+```python
+ds = bt.from_pydict({"y": ["churn", "stay", "churn", "stay"], "p": ["churn", "churn", "churn", "stay"]})
+print(ds.agg(p=bt.precision("y", "p", positive="churn"), r=bt.recall("y", "p", positive="churn")).to_pydict())
+```
+
+Multi-class averaging lives in `classification_report` and `evaluate(task="multiclass")`, which report per-class and macro or weighted averages, covered below. `cohen_kappa` is the one expression that takes a class set: pass `labels=[...]` for the multi-class kappa. Without `labels`, a column holding more than two classes answers NaN rather than a kappa of one class against the rest, because that is a different number under the same name.
+
+```python
+ds = bt.from_pydict({"y": ["a", "b", "a", "c"], "p": ["a", "a", "a", "c"]})
+print(round(ds.agg(k=bt.cohen_kappa("y", "p", labels=["a", "b", "c"])).to_pydict()["k"][0], 4))
+```
+
+None of the metrics take sample weights. Every row counts once.
+
+## Nulls, NaNs, and undefined values
+
+A row with a null label or a null prediction is dropped from every metric, so each one is computed over the rows where both are present. The rank metrics go one step further and also drop a row whose *score* is null or NaN before ranking it, because the engine sorts NaN above every number and a NaN score would otherwise be ranked as the model's most confident prediction. `evaluate` applies the same rule when it derives a hard prediction from `y_score`: an unscored row predicts nothing.
+
+In the regression metrics a NaN is a value, not a missing one, so it propagates. `mae` and `medae` are both NaN when any paired residual is NaN.
+
+Some metrics have no value on some inputs, such as recall on a group with no positives. Batcher answers rather than raising, following scikit-learn function by function:
+
+| Kind of metric | Undefined when | Answer |
+|---|---|---|
+| A proportion: `precision`, `recall`, `specificity`, `f1_score`, `jaccard_score`, `false_positive_rate` | its denominator counts nothing | `0.0`, scikit-learn's `zero_division=0` |
+| `matthews_corrcoef` | a row or column of the confusion matrix is empty | `0.0`, as `matthews_corrcoef` returns |
+| Class-averaged: `balanced_accuracy`, `geometric_mean_score` | `y_true` holds one class | the mean over the classes present, as `balanced_accuracy_score` does |
+| Ratios and chance-corrected scores: likelihood ratios, `cohen_kappa`, `informedness`, `markedness`, `prevalence_threshold` | a rate they divide by is zero, or a class is absent | `NaN`, as `class_likelihood_ratios` and `cohen_kappa_score` return |
+| Rank metrics: `roc_auc`, `gini_coefficient`, `ks_statistic` | the group holds one class | `NaN`, where scikit-learn raises |
+| `average_precision` | the group has no positives | `0.0`, as `average_precision_score` returns |
+| `r2`, `explained_variance`, `nash_sutcliffe_efficiency` | the target is constant | `1.0` for a perfect prediction, else `0.0` |
+| `wape`, `normalized_rmse` | the total or mean of the target is zero | `NaN` |
+
+NaN is the answer that survives into a grouped report. A per-segment AUC table keeps the segments it can score and marks the one it can't, where an exception would have lost the whole table.
+
+```python
+ds = bt.from_pydict({"y": [1, 1, 1], "p": [1, 1, 0]})
+print(ds.agg(fpr=bt.false_positive_rate("y", "p"), bal=bt.balanced_accuracy("y", "p")).to_pydict())
+```
+
 ## Choosing the right metric
 
 Several of these exist because the obvious choice misleads.
@@ -111,7 +168,20 @@ print(roc_auc(ds, "y", "s"), round(average_precision(ds, "y", "s"), 4))
 print(ks_statistic(ds, "y", "s"), gini_coefficient(ds, "y", "s"))
 ```
 
-ROC AUC uses the rank identity rather than integrating a threshold sweep, so it is exact under ties and needs one sort rather than one scan per threshold. Average precision counts a group of tied scores as a single threshold, which is what scikit-learn's `average_precision_score` does. Each of these takes `by=` for a per-segment value.
+ROC AUC uses the rank identity rather than integrating a threshold sweep, so it is exact under ties and needs one sort rather than one scan per threshold. Average precision counts a group of tied scores as a single threshold, which is what scikit-learn's `average_precision_score` does. Each of these takes `by=` for a per-segment value, and the rank is computed within each segment.
+
+## Ranking metrics per query
+
+A recommender is scored per query and then averaged over queries. `precision_at_k`, `recall_at_k`, `hit_rate_at_k`, `mean_reciprocal_rank`, `ndcg_at_k`, and `map_at_k` take one row per `(query, candidate)` pair:
+
+```python
+recs = bt.from_pydict(
+    {"user": ["a", "a", "a", "b", "b"], "s": [0.9, 0.5, 0.5, 0.8, 0.1], "rating": [3, 0, 1, 0, 2]}
+)
+print(round(ndcg_at_k(recs, "user", "s", "rating", k=2, graded=True), 4))
+```
+
+`ndcg_at_k` matches scikit-learn's `ndcg_score`, including graded gains with `graded=True`. Tied scores never favour the relevant item: `precision_at_k`, `recall_at_k`, and `ndcg_at_k` score a tie group by its average relevance, while `hit_rate_at_k`, `mean_reciprocal_rank`, and `map_at_k` place the whole group at its last position, as `average_precision_score` does. A query with no relevant item scores 0 and stays in the mean for every one of them, so the metrics in one report average over the same queries.
 
 ## Diagnostic tables
 
@@ -205,8 +275,9 @@ print(table.sort("f1", descending=True).to_pydict()["model"])
 
 The result is a `Dataset`, so it sorts, joins to a latency or serving-cost column, and
 appends to an experiment log. That is what turns a comparison into a record of why a model
-was chosen. Rank-based metrics need a sort each and are refused rather than silently made
-slow, so ask for those per model with `roc_auc(..., by=)`.
+was chosen. The default metric set is the task's threshold and probability metrics. Rank-based
+metrics need a sort each, so they are left out of the default and refused when named rather
+than silently made slow. Score those per model with `roc_auc`.
 
 ## Fairness
 
@@ -339,9 +410,27 @@ ds = bt.from_pydict({"y": [0, 0, 0, 0, 1]})
 print(DummyClassifier("y").fit(ds).constant_)  # the majority class a model must beat
 ```
 
+## On a cluster
+
+The expression metrics are mergeable aggregates. Each worker computes partial counts and sums over its partition, the partials combine in any order, and the metric is arithmetic on the combined state. They distribute with whatever query they sit in, so `ds.group_by("region").agg(f1=bt.f1_score("y", "p")).collect(distributed=True)` runs across the cluster with no metric-specific setup.
+
+The Dataset functions collect internally, so they have no `distributed=` argument of their own. They follow `distributed="auto"`, which uses the cluster when the input is large enough to pay for it. To force the Ray path for every internal collect, set `distributed.mode`:
+
+```python
+# docs: skip
+from batcher.config import option_context
+
+with option_context("distributed.mode", "always"):
+    auc = roc_auc(big_scored_table, "y", "score")
+```
+
+The `by=` forms return a lazy `Dataset`, so they also accept an explicit `collect(distributed=True, num_workers=...)`. Single-node and distributed runs agree on every metric here up to floating-point reassociation, including NaN on a one-class group.
+
 ## Requirements and limitations
 
-A ranking metric on a split containing only one class is undefined and returns NaN. Check the class balance of a segment before trusting a per-segment AUC.
+A rank metric on a group containing only one class is undefined and returns NaN. Check the class balance of a segment before trusting a per-segment AUC.
+
+The classification metrics are binary, and none of the metrics take sample weights.
 
 The multi-class averages are computed from a per-class report rather than a single aggregate, so `by=` cannot partition them. Group the dataset and call `evaluate` per group when you need both.
 

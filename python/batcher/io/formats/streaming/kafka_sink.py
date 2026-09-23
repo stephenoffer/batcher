@@ -138,6 +138,8 @@ class KafkaStreamSink:
         key_subject: str | None = None,
         schema_registry: Any = None,
         schema_registry_auth: str | None = None,
+        value_codec_options: dict[str, Any] | None = None,
+        key_codec_options: dict[str, Any] | None = None,
         **options: Any,
     ) -> None:
         if flush_timeout <= 0:
@@ -158,6 +160,8 @@ class KafkaStreamSink:
                 "key_subject": key_subject,
                 "schema_registry": schema_registry,
                 "schema_registry_auth": schema_registry_auth,
+                "value_codec_options": value_codec_options,
+                "key_codec_options": key_codec_options,
             },
         )
         self._config = {

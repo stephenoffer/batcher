@@ -8,11 +8,13 @@ eigenvalue, and the convergence test would measure a scale rather than a shape.
 
 from __future__ import annotations
 
+import math
+
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
-from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph
-from batcher.graph._iterate import check_iterations, iterate, max_abs_change
+from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph, walked
+from batcher.graph._iterate import check_iterations, iterate, max_abs_change, settled
 
 __all__ = ["eigenvector_centrality", "hits", "katz_centrality"]
 
@@ -37,7 +39,13 @@ def _power_iteration(
     and rescaling that changes the fixed point, because it shrinks the propagated term
     against the constant `beta` that is the whole point of Katz. So Katz iterates raw and
     normalizes once at the end, which leaves the returned vector unit-L2 either way.
+
+    It is also what makes Katz *able* to diverge, where eigenvector centrality cannot: with
+    `attenuation` at or above the reciprocal of the leading eigenvalue the raw iterates grow
+    without bound. The per-round change is recorded so that case raises rather than returning
+    whatever direction the blow-up happened to point in when the cap arrived.
     """
+    g = walked(g)
     nodes = g.nodes().cache()
     n = nodes.count()
     if n == 0:
@@ -60,14 +68,40 @@ def _power_iteration(
             return raw.select(**{NODE: bt.col(NODE), value: bt.col("_raw")})
         return _unit_l2(raw.select(**{NODE: bt.col(NODE), value: bt.col("_raw")}), value)
 
-    settled = iterate(
-        initial,
-        step,
-        max_iterations=max_iterations,
-        delta=max_abs_change(NODE, value),
-        tolerance=tolerance,
-    ).state
-    return settled if rescale_each_round else _unit_l2(settled, value)
+    measure = max_abs_change(NODE, value)
+    changes: list[float] = []
+
+    def delta(before: Dataset, after: Dataset) -> float:
+        changes.append(measure(before, after))
+        return changes[-1]
+
+    result = iterate(initial, step, max_iterations=max_iterations, delta=delta, tolerance=tolerance)
+    if not result.converged and not rescale_each_round and _diverging(changes):
+        raise PlanError(
+            f"{value}(): the series diverges. The per-round change grew from "
+            f"{changes[(len(changes) - 1) // 2]:.3g} to {changes[-1]:.3g} instead of shrinking, "
+            "which happens when attenuation is at or above 1 / (the adjacency matrix's "
+            "largest eigenvalue). Lower attenuation: 1 / (1 + the largest weighted_degree) "
+            "always converges."
+        )
+    state = settled(result, value, max_iterations)
+    return state if rescale_each_round else _unit_l2(state, value)
+
+
+def _diverging(changes: list[float]) -> bool:
+    """Whether a run that hit its cap was growing rather than slowly settling.
+
+    A convergent affine iteration shrinks its change geometrically, so by the end of the run
+    it is far below where it was half-way through. A divergent one grows or, exactly at the
+    boundary, holds steady. Comparing against the half-way point rather than the previous
+    round keeps one noisy round from deciding it.
+    """
+    if changes and not math.isfinite(changes[-1]):
+        return True
+    # Too few rounds to tell growth from a slow start; the caller warns instead.
+    if len(changes) < 3:
+        return False
+    return changes[-1] >= changes[(len(changes) - 1) // 2]
 
 
 def _unit_l2(state: Dataset, value: str) -> Dataset:
@@ -90,7 +124,8 @@ def eigenvector_centrality(
 
     Args:
         g: The graph.
-        max_iterations: The cap on rounds.
+        max_iterations: The cap on rounds. Hitting it returns the last iterate and warns
+            with `ConvergenceWarning`.
         tolerance: Stop once no node's score moves by more than this.
 
     Returns:
@@ -101,10 +136,11 @@ def eigenvector_centrality(
 
             >>> import batcher as bt
             >>> from batcher.graph import Graph, eigenvector_centrality
-            >>> e = bt.from_pydict({"src": [1, 2, 0], "dst": [0, 0, 1]})
-            >>> out = eigenvector_centrality(Graph.from_edges(e))
-            >>> len(out.to_pydict()["node"])
-            3
+            >>> # A cycle with a chord: strongly connected, and not periodic, so it settles.
+            >>> e = bt.from_pydict({"src": [0, 1, 2, 0], "dst": [1, 2, 0, 2]})
+            >>> out = eigenvector_centrality(Graph.from_edges(e)).sort("node")
+            >>> [round(v, 4) for v in out.to_pydict()["eigenvector_centrality"]]
+            [0.5484, 0.414, 0.7265]
     """
     check_iterations(max_iterations, tolerance)
     return _power_iteration(
@@ -133,22 +169,26 @@ def katz_centrality(
 
     `attenuation` must be smaller than the reciprocal of the graph's largest eigenvalue
     for the series to converge. There is no cheap way to know that value in advance, so
-    the practical rule is to start small: 0.1 converges on most real graphs, and a result
-    whose scores grow without bound between rounds means it was too large.
+    the practical rule is to start small: 0.1 converges on most real graphs, and
+    `1 / (1 + the largest weighted_degree)` converges on every graph. A run whose change
+    per round is still growing when it reaches `max_iterations` raises `PlanError` rather
+    than returning the direction of a blow-up; one that is shrinking but not yet within
+    `tolerance` warns with `ConvergenceWarning`.
 
     Args:
         g: The graph.
         attenuation: How much of a neighbour's score propagates. Smaller is more local
             and more likely to converge.
         baseline: The score every node starts with and keeps.
-        max_iterations: The cap on rounds.
+        max_iterations: The cap on rounds. Hitting it returns the last iterate and warns
+            with `ConvergenceWarning`.
         tolerance: Stop once no node's score moves by more than this.
 
     Returns:
         A dataset of `node` and `katz_centrality`, normalized to unit L2 norm.
 
     Raises:
-        PlanError: If `attenuation` is not positive.
+        PlanError: If `attenuation` is not positive, or the series diverges.
 
     Examples:
         .. doctest::
@@ -185,7 +225,8 @@ def hits(g: Graph, *, max_iterations: int = 100, tolerance: float = 1e-6) -> Dat
 
     Args:
         g: The graph.
-        max_iterations: The cap on rounds.
+        max_iterations: The cap on rounds. Hitting it returns the last iterate and warns
+            with `ConvergenceWarning`.
         tolerance: Stop once no node's authority moves by more than this.
 
     Returns:
@@ -202,6 +243,7 @@ def hits(g: Graph, *, max_iterations: int = 100, tolerance: float = 1e-6) -> Dat
             0
     """
     check_iterations(max_iterations, tolerance)
+    g = walked(g)
     nodes = g.nodes().cache()
     if nodes.count() == 0:
         return nodes.select(**{NODE: bt.col(NODE), "hub": bt.lit(0.0), "authority": bt.lit(0.0)})
@@ -247,10 +289,11 @@ def hits(g: Graph, *, max_iterations: int = 100, tolerance: float = 1e-6) -> Dat
         )
         return normalize(combined, "hub")
 
-    return iterate(
+    result = iterate(
         initial,
         step,
         max_iterations=max_iterations,
         delta=max_abs_change(NODE, "authority"),
         tolerance=tolerance,
-    ).state
+    )
+    return settled(result, "hits", max_iterations)

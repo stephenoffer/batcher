@@ -1,6 +1,6 @@
 # Quick reference
 
-This page is a one-page map of the public API, for looking a name up fast. Everything below is reachable from `import batcher as bt`. The {doc}`area pages <index>` explain the same surface with runnable examples, and the {doc}`complete reference <complete/index>` renders every signature and docstring.
+This page is a one-page map of the public API, for looking a name up fast. Everything below is reachable from `import batcher as bt`. The {doc}`area pages <index>` explain the same surface with runnable examples, and {doc}`every symbol <symbols/index>` renders every signature and docstring.
 
 ```python
 import batcher as bt
@@ -37,7 +37,7 @@ All readers take a local or cloud path and return a Dataset. {py:obj}`bt.read <b
 
 | Call | Format |
 | --- | --- |
-| `bt.read(path, format=None, **opts)` | inferred |
+| {py:obj}`bt.read(path, format=None, **opts) <batcher.read>` | inferred |
 | {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>`, {py:meth}`bt.read.csv <batcher.api.io_namespace.reader.Reader.csv>`, {py:meth}`bt.read.json <batcher.api.io_namespace.reader.Reader.json>` | tabular files |
 | {py:meth}`bt.read.table <batcher.api.io_namespace.reader.Reader.table>`, {py:meth}`bt.read.orc <batcher.api.io_namespace.reader.Reader.orc>`, {py:meth}`bt.read.arrow <batcher.api.io_namespace.reader.Reader.arrow>`, {py:meth}`bt.read.avro <batcher.api.io_namespace.reader.Reader.avro>` | tabular files |
 | {py:meth}`bt.read.lance <batcher.api.io_namespace.reader.Reader.lance>`, {py:meth}`bt.read.delta <batcher.api.io_namespace.reader.Reader.delta>`, {py:meth}`bt.read.iceberg <batcher.api.io_namespace.reader.Reader.iceberg>`, {py:meth}`bt.read.hudi <batcher.api.io_namespace.reader.Reader.hudi>` | lakehouse tables |
@@ -180,7 +180,7 @@ schema wherever a column is expected. They produce a {py:class}`Selector <batche
 | {py:func}`bt.string() <batcher.string>` / {py:func}`bt.boolean() <batcher.boolean>` / {py:func}`bt.temporal() <batcher.temporal>` | string / boolean / date-time columns |
 | {py:func}`bt.exclude(*names) <batcher.exclude>` | every column except the named ones |
 
-{py:func}`bt.by_dtype <batcher.by_dtype>`, {py:func}`bt.matches <batcher.matches>`, {py:func}`bt.starts_with <batcher.starts_with>`, {py:func}`bt.ends_with <batcher.ends_with>`, and {py:func}`bt.contains <batcher.contains>` select by dtype or by name pattern. See the {doc}`complete reference <complete/index>` for their signatures.
+{py:func}`bt.by_dtype <batcher.by_dtype>`, {py:func}`bt.matches <batcher.matches>`, {py:func}`bt.starts_with <batcher.starts_with>`, {py:func}`bt.ends_with <batcher.ends_with>`, and {py:func}`bt.contains <batcher.contains>` select by dtype or by name pattern. See {doc}`symbols/expression-builders` for their signatures.
 
 ## Scalar, aggregate, and window functions
 
@@ -192,7 +192,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | {py:func}`bt.iff(condition, if_true, if_false) <batcher.iff>` | `if_true` where `condition` is true, else `if_false` (DuckDB `IFF`) |
 | {py:func}`bt.nanvl(value, fallback) <batcher.nanvl>` | `value` unless it is NaN, then `fallback` (Spark `nanvl`) |
 | {py:func}`bt.next_after(value, toward) <batcher.next_after>` | the adjacent representable float, one ULP toward `toward` (DuckDB `nextafter`) |
-| `bt.concat(*exprs)` | concatenate values into one string |
+| {py:obj}`bt.concat(*exprs) <batcher.concat>` | concatenate values into one string |
 | {py:func}`bt.concat_ws(separator, *exprs) <batcher.concat_ws>` | concatenate values with `separator` between them |
 | {py:func}`bt.format_string(format, *exprs) <batcher.format_string>` | interpolate values into a `{}` template (Polars `format`) |
 | {py:func}`bt.mask(e, show_first=0, show_last=0, char="X") <batcher.mask>` | redact a string, optionally revealing its ends |
@@ -247,7 +247,7 @@ These sit outside the `Dataset` and `Expr` surfaces:
 
 | Call | Returns |
 | --- | --- |
-| `bt.date_range(start, end, *, interval_days=1, name="date")` | the date-dimension generator: a one-column Dataset of dates, inclusive, as ISO `YYYY-MM-DD` |
+| {py:obj}`bt.date_range(start, end, *, interval_days=1, name="date") <batcher.date_range>` | the date-dimension generator: a one-column Dataset of dates, inclusive, as ISO `YYYY-MM-DD` |
 | {py:func}`bt.compact(path, *, target_size_mb=128.0, num_files=None, by=None, format=None, **opts) <batcher.compact>` | rewrite many small files at `path` into fewer larger ones in place; returns a {py:class}`WriteManifest <batcher.io.WriteManifest>` |
 | {py:func}`bt.engine_version() <batcher.engine_version>` | the version reported by the compiled Rust engine (`str`) |
 | {py:func}`bt.release_cluster() <batcher.release_cluster>` | hand the warm shuffle fleet and inference pools back to the cluster now, instead of waiting out `distributed.session_fleet_idle_s` (the fleet and CPU pools) or `distributed.warm_inference_idle_s` (a GPU pool's devices); a no-op when nothing is warm |
@@ -298,7 +298,7 @@ print(out.to_pydict())
 
 ## Expression accessor namespaces
 
-Typed methods hang off an expression by namespace rather than crowding `Expr` itself:
+Typed methods hang off an expression by namespace rather than crowding `Expr` itself. {doc}`/api/accessors/index` is the full reference for each one; this table is the map.
 
 | Namespace | Covers |
 | --- | --- |
@@ -311,6 +311,7 @@ Typed methods hang off an expression by namespace rather than crowding `Expr` it
 | `.image` | `decode()`, `to_tensor(width, height)`, `to_tensor_f32(width, height, mean=, std=, channels_first=)`, `center_crop(width, height)`, `to_grayscale(width, height)`, `resize(width, height)` |
 | `.audio` | native WAV/FLAC decode: `decode()` (metadata struct), `to_waveform()` (mono `List<Float32>`), `resample(rate)`, `trim_silence(threshold_db=-40)` (drop the leading and trailing quiet; a clip silent throughout trims to an empty list, which is how a silent recording is filtered out), `peak_normalize()` (scale so the loudest sample sits at full scale, the level-matching step before batching clips from different sources), `zero_crossing_rate()` (the voiced/unvoiced descriptor, in `[0, 1]`), `mel_spectrogram(rate, n_fft=, hop_length=, n_mels=)` (speech-model mel power spectrogram, torchaudio-matching), `mfcc(rate, n_fft=, hop_length=, n_mels=, n_mfcc=)` (MFCC feature, torchaudio-matching) |
 | `.video` | native FFmpeg decode: `decode()` returns a metadata struct, and needs the `video` engine build feature |
+| `.seq` | DNA, RNA, protein, and FASTQ-quality columns: `reverse_complement()`, `translate()`, `gc_content()`, `kmers(k)`, `mean_quality()` |
 
 ## SQL
 
@@ -372,10 +373,12 @@ and {py:meth}`Config.from_file <batcher.Config.from_file>` overlay `BATCHER_*` e
 ## See also
 
 - {doc}`/api/relational/dataset`: every `Dataset` method, with its arguments and its return type.
-- {doc}`/api/relational/expressions` and {doc}`/api/relational/expression-accessors`: the column language and the
-  `.str` / `.dt` / `.list` / `.struct` / `.json` namespaces.
+- {doc}`/api/relational/expressions`: the column language, with an example per group.
+- {doc}`/api/accessors/index`: a reference page per accessor namespace, with signatures.
 - {doc}`/api/relational/functions`: the free functions, grouped by family.
+- {doc}`/api/relational/domains/index`: the geospatial, rigid-body, and graph function libraries.
 - {doc}`/api/relational/io`: readers, writers, save modes, and the format-specific options.
+- {doc}`/api/symbols/index`: the exhaustive listing, one page per object family.
 - {doc}`/user-guide/index`: the task-oriented guides behind these signatures.
 - {doc}`/getting-started/quickstart`: the same surface as a five-minute walkthrough.
-- {doc}`/cookbook/index`: 145 runnable recipes, when the signature is not enough.
+- {doc}`/cookbook/index`: 146 runnable recipes, when the signature is not enough.

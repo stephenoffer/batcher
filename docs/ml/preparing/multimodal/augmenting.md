@@ -133,4 +133,4 @@ print(
 - {doc}`/ml/preparing/multimodal/curating`: the measures that decide which rows are worth keeping, and `dhash` deduplication.
 - {doc}`/ml/preparing/preprocessors/deduplication`: deduplicating tabular and text rows.
 - {doc}`/ml/preparing/multimodal/decoding`: getting the bytes and turning them into tensors.
-- {doc}`/api/relational/expression-accessors`: the full `.image` method list.
+- {doc}`/api/accessors/media`: the full `.image` method list, with signatures.

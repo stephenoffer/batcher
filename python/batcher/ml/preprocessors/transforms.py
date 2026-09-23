@@ -23,7 +23,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
+from batcher.ml.preprocessors.base import (
+    Preprocessor,
+    columns_arg,
+    fit_aggregate,
+    is_missing,
+    nan_as_null,
+)
 from batcher.plan.expr_ir.constructors import col, lit, nullif, when
 from batcher.plan.functions.analysis._normal import normal_ppf
 
@@ -57,7 +63,12 @@ class QuantileTransformer(Preprocessor):
     The mapping is a **step** function with `n_quantiles` steps rather than an interpolated
     one, so two values inside the same step get the same output — the step's midpoint. That
     is a deliberate trade for staying inside the expression language; raise `n_quantiles`
-    for a finer grid.
+    for a finer grid. It is also where the output differs from scikit-learn's
+    ``QuantileTransformer``, which interpolates linearly between its quantiles and maps the
+    training minimum and maximum to exactly 0 and 1: here the lowest step reports
+    ``0.5 / n_quantiles`` and the highest ``1 - 0.5 / n_quantiles``, so no output is ever 0
+    or 1. NaN and null are skipped when the cut points are learned. There is no
+    ``inverse_transform``.
 
     Examples:
         .. doctest::
@@ -118,6 +129,7 @@ class QuantileTransformer(Preprocessor):
             ``self``, fitted.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         fractions = [i / self.n_quantiles for i in range(self.n_quantiles)]
         aggregates = {
             f"{name}__{i}": col(name).quantile(f)
@@ -317,6 +329,7 @@ class Clipper(Preprocessor):
             ``self``, fitted.
         """
         self._check_numeric(ds)
+        ds = nan_as_null(ds, self.columns)
         aggregates = {}
         for name in self.columns:
             if self.lower is not None:
@@ -372,14 +385,17 @@ class MissingIndicator(Preprocessor):
     has to be created *before* the imputer runs. Stateless, so the same expression applies
     to training and serving data.
 
+    A value is missing when it is null or, in a floating-point column, NaN, which is the rule
+    scikit-learn's ``MissingIndicator(missing_values=np.nan)`` applies.
+
     Examples:
         .. doctest::
 
             >>> import batcher as bt
             >>> from batcher.ml.preprocessors import MissingIndicator
-            >>> ds = bt.from_pydict({"x": [1.0, None]})
-            >>> MissingIndicator("x").fit_transform(ds).to_pydict()
-            {'x': [1.0, None], 'x_missing': [False, True]}
+            >>> ds = bt.from_pydict({"x": [1.0, None, float("nan")]})
+            >>> MissingIndicator("x").fit_transform(ds).to_pydict()["x_missing"]
+            [False, True, True]
 
     Args:
         columns: The columns to flag.
@@ -411,7 +427,7 @@ class MissingIndicator(Preprocessor):
             A new lazy `Dataset` with one flag column appended per input column.
         """
         return ds.with_columns(
-            **{f"{name}{self.suffix}": col(name).is_null() for name in self.columns}
+            **{f"{name}{self.suffix}": is_missing(ds, name) for name in self.columns}
         )
 
 

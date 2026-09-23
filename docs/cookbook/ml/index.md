@@ -4,7 +4,7 @@ Batcher runs the data half of machine learning where the data already is. Prepro
 
 The 27 recipes follow the order a model gets built: prepare the features, fit something, check it, then run it. The last group is complete pipelines rather than single calls.
 
-The first four groups each embed one self-contained script that builds its own in-memory data and asserts on its own output, run end to end by `tests/docs/test_examples.py`. A pipeline page is a sequence of shorter blocks instead, executed in document order by `tests/docs/test_doc_examples.py`, with the stages that need a GPU or a cloud bucket shown but not run. Either way a page that stops matching the engine fails the suite rather than drifting.
+The first four groups each embed one self-contained script that builds its own in-memory data and asserts on its own output, run end to end by [`tests/docs/test_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_examples.py). A pipeline page is a sequence of shorter blocks instead, executed in document order by [`tests/docs/test_doc_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_doc_examples.py), with the stages that need a GPU or a cloud bucket shown but not run. Either way a page that stops matching the engine fails the suite rather than drifting.
 
 | Group | Pages | Covers |
 |---|---|---|

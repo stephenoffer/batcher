@@ -76,7 +76,10 @@ _SQL_INJECTION = (
     r"\bunion\s+(?:all\s+)?select\b",
     r";\s*drop\s+table\b",
     r";\s*delete\s+from\b",
-    r"--\s*$",
+    # A comment that cuts off the rest of a query right after breaking out of a string literal
+    # or a statement (`admin'--`, `1; --`). A bare trailing `--` also matched PEM armor
+    # (`-----BEGIN ... KEY-----`) and every Markdown horizontal rule (`---`).
+    r"['\";]\s*--",
     r"\bor\s+1\s*=\s*1\b",
 )
 
@@ -226,7 +229,8 @@ def sql_injection_rate(text: IntoExpr) -> Expr:
 
     Worth a rate wherever a model writes SQL from natural language, or wherever user text is
     about to reach a query. The patterns are the textbook ones — a tautology, a `UNION SELECT`,
-    a trailing comment, a stacked `DROP`.
+    a comment right after a closing quote or semicolon, a stacked `DROP`. A run of dashes on its
+    own (Markdown's `---`, PEM's `-----BEGIN`) is not a comment and does not match.
 
     A generation that legitimately explains SQL injection will match, so this counts occurrences
     to look at, not attacks. It is a filter on volume, not a sanitizer: parameterize the query.

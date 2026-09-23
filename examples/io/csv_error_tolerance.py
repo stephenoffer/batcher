@@ -7,6 +7,10 @@ A *cast* is strict: handed that same value it raises rather than producing a nul
 So the failure surfaces at the cast, not at the read — which means the way to tolerate bad
 rows is to test them before converting, not to convert and hope.
 
+A line with the wrong number of fields is the other kind of bad row, and there the read
+itself refuses. ``on_bad_lines="skip"`` (or ``"warn"``) drops such a line and keeps the rest
+of the file, which ``on_error="skip"`` would not: that drops the whole file.
+
     python examples/io/csv_error_tolerance.py
 """
 
@@ -66,6 +70,25 @@ def main() -> None:
 
         # The rejected rows are a quarantine set, not a silent loss.
         assert bad.to_pydict()["name"] == ["carol"]
+
+        # A *structurally* bad line is a different failure: one field too many. The default
+        # refuses the read and names the line, and `on_bad_lines` decides instead.
+        ragged = str(Path(directory) / "ragged.csv")
+        Path(ragged).write_text("id,name\n1,alice\n2,bob,EXTRA\n3,carol\n")
+        try:
+            bt.read.csv(ragged).count()
+        except bt.FormatError as error:
+            print("ragged line refused:", str(error)[:70])
+            assert "on_bad_lines" in str(error)
+        else:
+            raise AssertionError("a line with an extra field must not parse silently")
+
+        # "skip" drops the line and keeps every good row of the file.
+        kept = bt.read.csv(ragged, on_bad_lines="skip").to_pydict()
+        assert kept == {"id": [1, 3], "name": ["alice", "carol"]}
+
+        # "warn" returns the same rows and logs each dropped line with its file.
+        assert bt.read.csv(ragged, on_bad_lines="warn").to_pydict() == kept
 
 
 if __name__ == "__main__":

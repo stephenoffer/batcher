@@ -15,6 +15,7 @@ from __future__ import annotations
 import batcher as bt
 from batcher.api.dataset import Dataset
 from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph
+from batcher.graph._iterate import checkpoint
 
 __all__ = [
     "average_degree",
@@ -42,8 +43,10 @@ def _totalled(g: Graph, contributions: Dataset, name: str, zero: object) -> Data
     Emitting them as another `union` arm rather than as an outer join from `nodes()` is
     deliberate. The two compute the same table, but the join form is
     `union -> distinct  LEFT JOIN  union -> group_by`, which has no distributed path and
-    raises under `distributed=True`. This form is one `union` into one `group_by`: a single
-    shuffle, no join build, no distinct, and it runs on a cluster.
+    raises under `distributed=True`. This form is one `group_by`: a single shuffle, no join
+    build, no distinct, and it runs on a cluster. The union arm exists only for a graph with
+    a declared node table, and on a cluster an aggregate over it cannot feed a further
+    aggregate, which is why `degree_distribution` materializes such a graph's degree table.
     """
     extra = g.extra_nodes()
     if extra is not None:
@@ -51,13 +54,26 @@ def _totalled(g: Graph, contributions: Dataset, name: str, zero: object) -> Data
     return contributions.group_by(NODE).agg(**{name: bt.sum(_C)})
 
 
+def _endpoints(g: Graph, value: bt.Expr) -> Dataset:
+    """One row per edge endpoint: `node`, `_end` (0 for the source, 1 for the destination)
+    and `value`.
+
+    An `explode` over a two-element array rather than a `union` of the two sides, because a
+    `group_by` over a union cannot feed another aggregate or a join on a cluster, and
+    `degree_distribution` is exactly an aggregate over this one.
+    """
+    return g.edges.select(**{NODE: bt.array(bt.col(SRC), bt.col(DST)), _C: value}).explode(
+        NODE, index="_end"
+    )
+
+
 def _side_count(g: Graph, side: str, name: str) -> Dataset:
     """Count edges by one endpoint, giving the nodes it never names a zero."""
-    other = DST if side == SRC else SRC
     # Every endpoint on the *other* side contributes zero, which is what puts a node with
     # no edge on this side into the output without needing the distinct node set.
-    counted = g.edges.select(**{NODE: bt.col(side), _C: bt.lit(1)}).union(
-        g.edges.select(**{NODE: bt.col(other), _C: bt.lit(0)})
+    at = 0 if side == SRC else 1
+    counted = _endpoints(g, bt.lit(1)).select(
+        NODE, **{_C: bt.when(bt.col("_end") == bt.lit(at)).then(bt.col(_C)).otherwise(bt.lit(0))}
     )
     return _totalled(g, counted, name, 0)
 
@@ -126,10 +142,7 @@ def degree(g: Graph) -> Dataset:
             >>> degree(g).sort("node").to_pydict()
             {'node': [1, 2, 3], 'degree': [2, 2, 2]}
     """
-    both = g.edges.select(**{NODE: bt.col(SRC), _C: bt.lit(1)}).union(
-        g.edges.select(**{NODE: bt.col(DST), _C: bt.lit(1)})
-    )
-    return _totalled(g, both, "degree", 0)
+    return _totalled(g, _endpoints(g, bt.lit(1)).select(NODE, _C), "degree", 0)
 
 
 def weighted_degree(g: Graph) -> Dataset:
@@ -155,10 +168,8 @@ def weighted_degree(g: Graph) -> Dataset:
             >>> weighted_degree(g).sort("node").to_pydict()
             {'node': [1, 2, 3], 'weighted_degree': [5.5, 5.0, 0.5]}
     """
-    both = g.edges.select(**{NODE: bt.col(SRC), _C: bt.col(WEIGHT)}).union(
-        g.edges.select(**{NODE: bt.col(DST), _C: bt.col(WEIGHT)})
-    )
-    return _totalled(g, both, "weighted_degree", 0.0)
+    endpoints = _endpoints(g, bt.col(WEIGHT)).select(NODE, _C)
+    return _totalled(g, endpoints, "weighted_degree", 0.0)
 
 
 def degree_distribution(g: Graph) -> Dataset:
@@ -183,7 +194,12 @@ def degree_distribution(g: Graph) -> Dataset:
             >>> degree_distribution(g).to_pydict()
             {'degree': [2], 'nodes': [3]}
     """
-    return degree(g).group_by("degree").agg(nodes=bt.count()).sort("degree")
+    degrees = degree(g)
+    if g.extra_nodes() is not None:
+        # The declared nodes arrive through a `union` arm, and on a cluster an aggregate over
+        # a union cannot feed this second one. One row per node, so bounded by the node count.
+        degrees = checkpoint(degrees)
+    return degrees.group_by("degree").agg(nodes=bt.count()).sort("degree")
 
 
 def average_degree(g: Graph) -> float:

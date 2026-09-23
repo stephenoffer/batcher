@@ -1178,6 +1178,11 @@ class _StrNamespace:
         Gopher-style filters drop rows outside roughly 3-10, which catches both
         character-spam and concatenated-identifier dumps.
 
+        A letter is any Unicode letter (or combining mark), not only ``A-Z``: ``"héllo"``
+        is five letters and ``"Привет"`` six. Digits, punctuation and ``_`` are not letters.
+        An ASCII-only class read ``"héllo"`` as four letters and any Cyrillic or Greek word
+        as none at all.
+
         Returns:
             A Float64 expression of the mean word length.
 
@@ -1185,12 +1190,16 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["alpha beta"]})
+                >>> ds = bt.from_pydict({"s": ["alpha beta", "héllo wörld"]})
                 >>> ds.select(r=bt.col("s").str.avg_word_length().round(2)).to_pydict()
-                {'r': [4.5]}
+                {'r': [4.5, 5.0]}
         """
 
-        return self.count_matches("[A-Za-z]") / nullif(self.word_count(), lit(0))
+        # `[^\W\d_]` is the Unicode letter class spelled with shorthand classes: a word
+        # character that is neither a digit nor `_`. It says the same as `\p{L}` (plus
+        # combining marks) in the engine, and unlike `\p{L}` the device tier can run it on
+        # ASCII text rather than declining the whole chain.
+        return self.count_matches(r"[^\W\d_]") / nullif(self.word_count(), lit(0))
 
     def url_count(self) -> StrFunc:
         """Count HTTP(S) URLs in the string (→ Int64) — a boilerplate/link-dump signal.
@@ -1474,7 +1483,16 @@ class _StrNamespace:
         return self.estimate_tokens(chars_per_token) <= Lit(budget)
 
     def sentence_count(self) -> StrFunc:
-        """Count sentence-ending punctuation marks (→ Int64) — a document-shape signal.
+        """Count sentence endings (→ Int64) — a document-shape signal.
+
+        A sentence ending is a *run* of terminators (``.``, ``!``, ``?``, ``…``, and the Arabic
+        and Devanagari ``؟`` and ``।``), optionally closed by a quote or bracket, followed by
+        whitespace or the end of the text. So ``"Wait... what?"`` is 2, ``"ok!!!"`` is 1, and
+        the decimal point in ``"3.14"`` ends nothing. The full-width CJK full stop, exclamation
+        and question marks (U+3002, U+FF01, U+FF1F) end a sentence wherever they appear, since
+        CJK text puts no space after them. Text with no terminator has no sentence ending, so
+        ``"Hello World"`` is 0. Abbreviations such as ``"Dr. Smith"`` still count, as they do in
+        any rule that does not know the language.
 
         Returns:
             An Int64 expression of the sentence count.
@@ -1483,11 +1501,20 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["One. Two! Three?"]})
+                >>> ds = bt.from_pydict(
+                ...     {"s": ["One. Two! Three?", "Wait... what?", "猫が座った。猫が寝た。"]}
+                ... )
                 >>> ds.select(r=bt.col("s").str.sentence_count()).to_pydict()
-                {'r': [3]}
+                {'r': [3, 2, 2]}
         """
-        return self.count_matches(r"[.!?]")
+        # Three alternatives so the one `$` is the pattern's last character, which is the only
+        # place the device tier accepts it; the class of whitespace is spelled out for the
+        # same reason (`\s` would gate the whole column on being ASCII).
+        closer = "[\"'\u201d\u2019)\\]]*"
+        terminators = "[.!?\u2026\u061f\u0964]+"
+        return self.count_matches(
+            f"[\u3002\uff01\uff1f]+|{terminators}{closer}[ \\t\\n\\r]|{terminators}{closer}$"
+        )
 
     def has_html(self) -> StrFunc:
         """True where the text still contains HTML tags — the un-stripped-markup check.

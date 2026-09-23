@@ -63,7 +63,7 @@ to remove.
 Two exceptions are worth knowing, because they change the constant factor without changing
 the semantics:
 
-**Scalar literal broadcast.** `try_scalar_binary` (`crates/bc-expr/src/eval/binary.rs`)
+**Scalar literal broadcast.** `try_scalar_binary` ([`crates/bc-expr/src/eval/binary.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-expr/src/eval/binary.rs))
 recognizes `<numeric column> <arith|cmp> <numeric literal>` in either operand order and
 broadcasts the literal as a length-1 Arrow `Scalar`, a `Datum`, instead of materializing N copies of it. Same kernels, same promotion rules, bit-identical result. What it avoids is allocating a 16,384-element array of the number `1`.
 
@@ -75,7 +75,7 @@ directly instead.
 ## Type promotion and null semantics
 
 Promotion follows Arrow: if either operand of an arithmetic or comparison node is a float,
-the node computes in `Float64`, otherwise in `Int64`. Narrow numerics never reach here. The FFI boundary widens `Int8/16/32 → Int64` and `Float16/32 → Float64` once in `crates/bc-py/src/normalize.rs`, so the kernels below see a small set of types.
+the node computes in `Float64`, otherwise in `Int64`. Narrow numerics never reach here. The FFI boundary widens `Int8/16/32 → Int64` and `Float16/32 → Float64` once in [`crates/bc-py/src/normalize.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/normalize.rs), so the kernels below see a small set of types.
 
 Nulls propagate the way SQL says they do, which is not the way a naive `map` would:
 
@@ -86,7 +86,7 @@ Nulls propagate the way SQL says they do, which is not the way a naive `map` wou
 | `Case`, `Coalesce` | selects a branch, so validity is not a function of the inputs' validity at all |
 
 The Kleene row is why the JIT has a separate ABI for compound predicates
-(`crates/bc-codegen/src/kleene.rs`) and cannot use a combined validity mask for them.
+([`crates/bc-codegen/src/kleene.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/kleene.rs)) and cannot use a combined validity mask for them.
 
 Four rows are enough to watch the validity bitmap travel through those rules and come out meaning two different things:
 
@@ -103,7 +103,7 @@ written as one. The JIT compiles both over a float column and declines them over
 ## The function surface
 
 The variants beyond the arithmetic core are grouped by family, one module each under
-`crates/bc-expr/src/eval/`:
+[`crates/bc-expr/src/eval/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-expr/src/eval):
 
 | Module | What it holds |
 |---|---|
@@ -118,7 +118,7 @@ The variants beyond the arithmetic core are grouped by family, one module each u
 | `media/` | image/audio/video decode: library-backed, per-row, heavy |
 | `security/` | masking and encryption |
 
-The cast dtype vocabulary is not per-module. `bc_arrow::dtype_from_name` is the single name-to-type table, and the Python `CAST_DTYPES` set in `plan/types/` is pinned to the live engine vocabulary by `tests/unit/test_dtype_registry_parity.py`, so the two cannot drift.
+The cast dtype vocabulary is not per-module. `bc_arrow::dtype_from_name` is the single name-to-type table, and the Python `CAST_DTYPES` set in `plan/types/` is pinned to the live engine vocabulary by [`tests/unit/test_dtype_registry_parity.py`](https://github.com/stephenoffer/batcher/blob/main/tests/unit/test_dtype_registry_parity.py), so the two cannot drift.
 
 ## Media decode is different
 
@@ -127,7 +127,7 @@ cheap" assumption. Decoding a JPEG is thousands of times more expensive than add
 integers, and the *input* is tiny (a 5 KB encoded blob), so a whole corpus of images can look
 like a single morsel to the scheduler and get one core.
 
-`Expr::contains_media_decode` (`crates/bc-expr/src/analyze.rs`) exists for exactly this: a
+`Expr::contains_media_decode` ([`crates/bc-expr/src/analyze.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-expr/src/analyze.rs)) exists for exactly this: a
 cheap static walk of the tree, consulted before execution, that tells the parallel executor
 to lift its morsel-count-based worker cap and use every core. The match is exhaustive by
 construction (a new `Expr` variant is a compile error there until it is classified), so a
@@ -164,7 +164,7 @@ a branch on the *result* of {py:meth}`is_null <batcher.plan.expr_ir.core.Expr.is
 
 The intermediate-array cost is real, and it's why the JIT exists. It also buys something. Every sub-expression is a materialized Arrow array, so any Arrow kernel and any operator can take it at any point. And because relational state lives in `bc-runtime` as Arrow rather than in generated code, the JIT can decline an expression, or a single batch, and the interpreter picks up with nothing lost.
 
-Kernel dispatch is per batch, not per row, so the overhead amortizes over 16,384 rows. On the operator benchmarks recorded in `benchmarks/BENCHMARK_RESULTS.md`, a filter-then-project over TPC-H `lineitem` at scale factor 1, a shape that is almost pure expression evaluation, runs in 13.9 ms against DuckDB's 12.9 ms and Polars' 9.2 ms. That is close to DuckDB and still behind Polars.
+Kernel dispatch is per batch, not per row, so the overhead amortizes over 16,384 rows. On the operator benchmarks recorded in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md), a filter-then-project over TPC-H `lineitem` at scale factor 1, a shape that is almost pure expression evaluation, runs in 13.9 ms against DuckDB's 12.9 ms and Polars' 9.2 ms. That is close to DuckDB and still behind Polars.
 
 ## The two tiers, side by side
 
@@ -193,11 +193,11 @@ compiled once per (expr, column types, simd) and reused across every morsel
 
 ## Where the code lives
 
-- `crates/bc-expr/src/lib.rs`: the `Expr` enum, the wire contract, serde tag `e`
-- `crates/bc-expr/src/eval/dispatch.rs`: `Expr::eval`, the oracle
-- `crates/bc-expr/src/eval/`: one module per function family
-- `crates/bc-expr/src/analyze.rs`: static predicates over a tree, touching no data
-- `crates/bc-py/src/normalize.rs`: the boundary type normalization the kernels rely on
+- [`crates/bc-expr/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-expr/src/lib.rs): the `Expr` enum, the wire contract, serde tag `e`
+- [`crates/bc-expr/src/eval/dispatch.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-expr/src/eval/dispatch.rs): `Expr::eval`, the oracle
+- [`crates/bc-expr/src/eval/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-expr/src/eval): one module per function family
+- [`crates/bc-expr/src/analyze.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-expr/src/analyze.rs): static predicates over a tree, touching no data
+- [`crates/bc-py/src/normalize.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/normalize.rs): the boundary type normalization the kernels rely on
 
 ## See also
 

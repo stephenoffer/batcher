@@ -55,7 +55,7 @@ writable, so at 0644 a local user could *plant* a well-formed bucket under a tic
 is about to fetch. A planted file that decodes cleanly is read as authoritative shuffle data
 and silently changes the answer.
 
-`tests/integration/test_artifact_permissions.py` drives each real writer and stats what landed.
+[`tests/integration/test_artifact_permissions.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_artifact_permissions.py) drives each real writer and stats what landed.
 It is written that way deliberately: the helpers are ten lines and obviously correct in
 isolation, and what actually rots is a new write site that does not reach for them.
 
@@ -165,6 +165,6 @@ orphaned by a killed process is swept by name on the next run, which is what the
 - {doc}`Spilling </architecture/deep-dives/memory/spilling>`: when a query starts writing these files at all.
 - {doc}`The buffer pool </architecture/deep-dives/memory/buffer-pool>`: the reservation whose failure starts a spill.
 - {doc}`The shuffle </architecture/deep-dives/distribution/shuffle-flight>`: what the shuffle buckets are for.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: the checkpoint artifact, from a user's point of view.
+- {doc}`Streaming </user-guide/moving-data/streaming/index>`: the checkpoint artifact, from a user's point of view.
 - {doc}`Carbonite </architecture/internals/carbonite>`: the subsystem that owns the spill decision.
 - {doc}`Arrow and memory </architecture/deep-dives/memory/arrow-memory>`: the IPC format every artifact here shares.

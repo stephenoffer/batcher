@@ -1,6 +1,6 @@
 # Arrow interop
 
-Arrow is Batcher's columnar format, so `bt.from_arrow` and `to_arrow()` are the cheapest boundary there is: the buffers cross without a copy. The pandas and Polars bridges go through Arrow as well.
+Arrow is Batcher's columnar format, so {py:obj}`bt.from_arrow <batcher.from_arrow>` and `to_arrow()` are the cheapest boundary there is: the buffers cross without a copy. The pandas and Polars bridges go through Arrow as well.
 
 The script moves one table through every exit. `to_pydict`, `to_pylist`, and `item` build Python objects and suit small results. `to_numpy`, `to_pandas`, and `to_polars` hand a block to another library. `iter_batches` hands out `RecordBatch`es one at a time, which is the streaming boundary.
 

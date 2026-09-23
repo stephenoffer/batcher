@@ -40,7 +40,9 @@ def st_line_interpolate_point(geom: Expr | str, fraction: Expr | float) -> Expr:
         fraction: A position along it, from 0 to 1.
 
     Returns:
-        The position as a point, or null for a non-chain.
+        The position as a point, or null for a non-chain or for a chain with fewer than
+        two positions (``LINESTRING EMPTY`` has no length to take a fraction of; one
+        empty route in a table nulls its own row rather than failing the query).
 
     Examples:
         .. doctest::

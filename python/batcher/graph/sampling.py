@@ -17,7 +17,7 @@ from __future__ import annotations
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
-from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph
+from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph, walked
 from batcher.graph._iterate import checkpoint
 
 __all__ = [
@@ -47,7 +47,8 @@ def neighbor_sample(g: Graph, k: int, *, seed: int = 0) -> Dataset:
     still valid.
 
     Args:
-        g: The graph.
+        g: The graph. On one built with `directed=False` every node samples from all
+            its neighbours, and each kept edge is written from the node that kept it.
         k: The maximum number of edges to keep per source node.
         seed: Varies the selection. The same seed always gives the same sample.
 
@@ -70,9 +71,11 @@ def neighbor_sample(g: Graph, k: int, *, seed: int = 0) -> Dataset:
     if k < 1:
         raise PlanError(f"k must be positive, got {k}")
     _check_seed(seed)
-    ranked = g.edges.with_columns(
-        _h=bt.hash_rows(bt.col(SRC), bt.col(DST), bt.lit(seed))
-    ).with_columns(_rank=bt.col("_h").rank().over(partition_by=SRC, order_by="_h"))
+    ranked = (
+        walked(g)
+        .edges.with_columns(_h=bt.hash_rows(bt.col(SRC), bt.col(DST), bt.lit(seed)))
+        .with_columns(_rank=bt.col("_h").rank().over(partition_by=SRC, order_by="_h"))
+    )
     return ranked.filter(bt.col("_rank") <= bt.lit(k)).select(SRC, DST, WEIGHT)
 
 
@@ -97,7 +100,8 @@ def random_walks(
 
     Args:
         g: The graph. Edge weights bias the step: a neighbour reached by a heavier edge is
-            proportionally more likely.
+            proportionally more likely. A graph built with `directed=False` is walked
+            both ways.
         starts: The nodes to walk from, one walk per row.
         length: How many steps to take. A walk holds up to `length + 1` nodes.
         node: The column in `starts` holding the node id.
@@ -132,7 +136,7 @@ def random_walks(
         .select(walk=bt.coalesce(bt.col("walk"), bt.lit(0)), **{NODE: bt.col(NODE)})
     )
     trail = checkpoint(current.select("walk", step=bt.lit(0), **{NODE: bt.col(NODE)}))
-    edges = g.edges.cache()
+    edges = walked(g).edges.cache()
     for step in range(1, length + 1):
         if current.count() == 0:
             break

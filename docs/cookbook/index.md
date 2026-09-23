@@ -1,12 +1,12 @@
 # Cookbook
 
-The cookbook is 145 runnable recipes, each one a working answer you can copy into a pipeline. They're grouped by domain, and the larger domains carry two kinds. A focused recipe demonstrates one API surface, such as the `.str` accessor or the join types. A complete pipeline solves a whole problem, such as sessionizing a click stream or applying a change feed to a table. Came looking for a method name? Browse the focused recipes. Came with a problem? Start from the pipeline at the top of the domain and work down.
+The cookbook is 146 runnable recipes, each one a working answer you can copy into a pipeline. They're grouped by domain, and the larger domains carry two kinds. A focused recipe demonstrates one API surface, such as the `.str` accessor or the join types. A complete pipeline solves a whole problem, such as sessionizing a click stream or applying a change feed to a table. Came looking for a method name? Browse the focused recipes. Came with a problem? Start from the pipeline at the top of the domain and work down.
 
 The figure maps the ten domains onto the four groups this page is organized by, with each domain's recipe count.
 
-![The 145 recipes in four groups. The relational core, 59 recipes: Dataset with 14 (joins, grouping, reshaping), Expressions with 39 (strings, dates, nested types), and I/O with 6 (Parquet, text formats, Arrow). Building and running pipelines, 29 recipes: Data engineering with 11 (ingest, reconcile, repair), Analytics with 11 (cohorts, funnels, sessions), and Streaming with 7 (time and restarts). Models and measurement, 47 recipes: ML with 27 (preprocessing to inference) and Metrics with 20 (metrics and statistics). Running it safely, 10 recipes: Governance with 3 (masks, row filters, lineage) and Operations with 7 (configuration, plans, memory).](/_static/diagrams/cookbook_map.svg)
+![The 146 recipes in four groups. The relational core, 60 recipes: Dataset with 15 (joins, grouping, reshaping), Expressions with 39 (strings, dates, nested types), and I/O with 6 (Parquet, text formats, Arrow). Building and running pipelines, 29 recipes: Data engineering with 11 (ingest, reconcile, repair), Analytics with 11 (cohorts, funnels, sessions), and Streaming with 7 (time and restarts). Models and measurement, 47 recipes: ML with 27 (preprocessing to inference) and Metrics with 20 (metrics and statistics). Running it safely, 10 recipes: Governance with 3 (masks, row filters, lineage) and Operations with 7 (configuration, plans, memory).](/_static/diagrams/cookbook_map.svg)
 
-Every recipe is a complete script you can run unchanged. Each builds its own in-memory data and asserts on its own output, so there are no fixtures to download. The test suite runs all of it on every pass, `tests/docs/test_doc_examples.py` for the code written into a page and `tests/docs/test_examples.py` for the scripts a page embeds from `examples/`. A recipe that stops matching the engine fails the build rather than going stale.
+Every recipe is a complete script you can run unchanged. Each builds its own in-memory data and asserts on its own output, so there are no fixtures to download. The test suite runs all of it on every pass, [`tests/docs/test_doc_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_doc_examples.py) for the code written into a page and [`tests/docs/test_examples.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_examples.py) for the scripts a page embeds from `examples/`. A recipe that stops matching the engine fails the build rather than going stale.
 
 If you're not sure where to begin, start with any of the following:
 
@@ -20,7 +20,7 @@ The verbs, the column language, and the boundary data crosses.
 
 | Domain | Recipes | Covers |
 |---|---|---|
-| {doc}`/cookbook/dataset/index` | 14 | Joins, grouping, reshaping, deduplication, sampling, and the `meta` accessor |
+| {doc}`/cookbook/dataset/index` | 15 | Joins, grouping, reshaping, deduplication, sampling, and the `meta` accessor |
 | {doc}`/cookbook/expressions/index` | 39 | The expression API: the scalar algebra, strings, dates and times, and nested types |
 | {doc}`/cookbook/io/index` | 6 | Parquet, text formats, Arrow interop, save modes, and the source and sink registries |
 
@@ -66,6 +66,8 @@ Two sections teach by code, and they differ in what they hold constant:
 - {doc}`/user-guide/index`: the task-oriented guide behind every recipe here.
 - {doc}`/api/index`: the reference, when you want the signature rather than a worked call.
 - {doc}`/getting-started/tutorials/paths/index`: these pages sequenced by the job you do.
+- {doc}`/getting-started/concepts/glossary`: a one-line definition for any term a recipe assumes.
+- {doc}`/getting-started/tour`: one small example of each capability, if you are not sure which recipe you want.
 
 ```{toctree}
 :hidden:

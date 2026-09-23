@@ -172,6 +172,20 @@ def _batch_row_limit(batch: pa.RecordBatch, morsel_rows: int, batch_bytes: int) 
     return max(morsel_rows, int(batch.num_rows * batch_bytes // nbytes))
 
 
+def _footer_schema(split: Split, fs: Any) -> pa.Schema | None:
+    """The file schema a Parquet row-group split's planning already read, else None.
+
+    `parquet_row_group_splits` read the footer to cut the splits, and it is cached, so this
+    costs no I/O. Any other split kind has no schema in hand without opening its file.
+    """
+    from batcher.io.splits import RowGroupSplit
+    from batcher.io.splits.parquet import _parquet_footer
+
+    if not isinstance(split, RowGroupSplit):
+        return None
+    return _parquet_footer(split.path, fs).schema.to_arrow_schema()
+
+
 class FileSource(ABC):
     """Base for a lazy, multi-file, projection-aware source over one format.
 
@@ -190,6 +204,10 @@ class FileSource(ABC):
 
     suffix: ClassVar[str] = ""
     format_name: ClassVar[str] = ""
+    #: Whether this format's splits already hold each file to the declared schema, because
+    #: `_reader_kwargs` pins it (CSV sends its resolved `schema=`, and the worker's one-file
+    #: reader conforms to that). Such splits need no `ConformedSplit` around them.
+    splits_pin_schema: ClassVar[bool] = False
 
     __slots__ = (
         "_columns",
@@ -1042,7 +1060,11 @@ class FileSource(ABC):
                 target = self.schema()
                 if projection is not None:
                     target = pa.schema([target.field(c) for c in projection])
-            out = conform_batch(b, target, path=path) if strict else normalize_batch(b, target)
+            out = (
+                conform_batch(b, target, path=path)
+                if strict
+                else normalize_batch(b, target, path=path)
+            )
             limit = _batch_row_limit(out, morsel_rows, batch_bytes)
             if out.num_rows <= limit:
                 yield out
@@ -1356,8 +1378,11 @@ class FileSource(ABC):
 
         Parquet subdivides into row-group runs; line-delimited text into byte ranges.
         A schema-evolving read emits one `NormalizedFileSplit` per file, each carrying the
-        unified schema so a worker reshapes its own file to it. A capped (`n_rows`) read
-        stays a single `WholeSourceSplit`, since the cap is a whole-source property.
+        unified schema so a worker reshapes its own file to it. A strict read of several
+        files wraps each split it cannot prove matches file 0 in `ConformedSplit`, so a
+        worker holds its file to the same contract the single-node read does. A capped
+        (`n_rows`) read stays a single `WholeSourceSplit`, since the cap is a whole-source
+        property.
 
         Examples:
             .. doctest::
@@ -1398,6 +1423,12 @@ class FileSource(ABC):
             target = self.schema()
             kwargs = self._reader_kwargs()
             return [NormalizedFileSplit(self.format_name, f, target, kwargs) for f in files]
+        return self._held_to_contract(self._strict_splits(files, target_size, predicate))
+
+    def _strict_splits(
+        self, files: list[str], target_size: int | None, predicate: dict | None
+    ) -> list[Split]:
+        """The splits a strict-mode read plans, before they are held to its contract."""
         # A format with no sub-file granularity (CSV, JSON, Avro, text, images — everything
         # that does not override `_file_splits`) is planned straight from the file list. The
         # base `_file_splits` reads nothing and returns one `FileSplit`, so calling it a
@@ -1433,6 +1464,42 @@ class FileSource(ABC):
         )
         planned = [s for file_splits in per_file for s in file_splits]
         return self._coalesce(planned, target_size)
+
+    def _held_to_contract(self, planned: list[Split]) -> list[Split]:
+        """`planned`, each split wrapped with the declared schema unless it provably matches.
+
+        In strict mode file 0's schema is the contract, and the single-node read holds every
+        file to it (`_normalize`). A split rebuilds a *one-file* reader on the worker, whose
+        contract is that file's own schema, so without this the check never ran distributed
+        and the driver's gather reconciled whatever came back: rows lost to a renamed column,
+        a type the plan never declared, nulls where the single-node read raised.
+
+        A split is left unwrapped only when its file's schema is already in hand and equals
+        the contract's: file 0 itself, or a Parquet row-group split whose footer the planner
+        just read. Everything else is wrapped in `ConformedSplit`, which applies the same
+        check on the worker. A worker's coalesced Parquet scan still takes a wrapped split,
+        after confirming each fragment's footer matches (`dist.executors.scan_read`), so a
+        homogeneous directory keeps its fast path either way.
+        """
+        files = self._files()
+        if len(files) < 2 or not planned or self.splits_pin_schema:
+            return planned
+        from batcher.io.splits import ConformedSplit
+
+        full = self._read_full_schema()
+        target = self.schema()
+        matches: dict[str, bool] = {files[0]: True}
+        out: list[Split] = []
+        for split in planned:
+            path = getattr(split, "path", None)
+            if path is not None and path not in matches:
+                known = _footer_schema(split, self._fs)
+                if known is not None:
+                    matches[path] = known.equals(full)
+            out.append(
+                split if path is not None and matches.get(path) else ConformedSplit(split, target)
+            )
+        return out
 
     def _coalesce(self, planned: list[Split], target_size: int | None) -> list[Split]:
         """Group `planned` into multi-file splits when every one of them is a whole file.
@@ -1550,8 +1617,8 @@ class FileSource(ABC):
         the credentials are dropped. Values must be picklable (they ship to the worker); a
         live `filesystem` rides the split only if it pickles.
 
-        `on_error` is carried for the same reason `splits()` degrades to a
-        `WholeSourceSplit` in non-strict `schema_mode`: a worker rebuilds the reader as
+        `on_error` is carried for the same reason a split carries the declared schema
+        (`NormalizedFileSplit`, `ConformedSplit`): a worker rebuilds the reader as
         ``SOURCES.get(fmt)(path, **kwargs)``, so anything omitted here silently reverts to
         its constructor default. Omitting it made ``read(..., on_error="skip")`` a no-op on
         every split-based path — the distributed executor, the streaming reader, and the GPU

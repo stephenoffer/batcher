@@ -111,7 +111,7 @@ On 8,000,000 rows grouped by the partition column on an eight-worker local clust
 | Delta, four data files per partition | 64 | 310 ms | 780 ms | 2.3x |
 | Hive Parquet, `COUNT(DISTINCT v)` | 16 | 490 ms | 1,020 ms | 2.1x |
 
-Produced by `benchmarks/internals/partition_aligned.py`, which checks the two paths return the same rows before reporting either time. The engine under it was a *debug* build, which slows the local aggregation both paths do while leaving the shuffle's orchestration alone, so a release engine should widen these rather than close them.
+Produced by [`benchmarks/internals/partition_aligned.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/internals/partition_aligned.py), which checks the two paths return the same rows before reporting either time. The engine under it was a *debug* build, which slows the local aggregation both paths do while leaving the shuffle's orchestration alone, so a release engine should widen these rather than close them.
 
 Delta's smaller ratio is the read, not the elimination: four files per partition against one, through pyarrow's per-file open rather than one directory scan. The `COUNT(DISTINCT)` row understates its own case, because `v` here holds only a thousand distinct values. The shuffle it removes carries the *deduped* rows, so the gap grows with the column's cardinality.
 

@@ -23,9 +23,9 @@ C Data Interface. The IR carries the plan; the Arrow pointers carry the rows.
 
 The document nests two independent trees, each defined by one Rust type.
 
-`RelOp`, in `crates/bc-ir/src/lib.rs`, is the relational plan. Its serde attributes are `tag = "op"`, `rename_all = "snake_case"`, and `deny_unknown_fields`, so every node in the document announces itself with an `op` key holding a snake_case variant name. The sixteen variants are `scan`, `filter`, `project`, `aggregate`, `sort`, `limit`, `hash_join`, `asof_join`, `range_join`, `distinct`, `window`, `union`, `unnest`, `row_id`, `unpivot`, and `sample`.
+`RelOp`, in [`crates/bc-ir/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-ir/src/lib.rs), is the relational plan. Its serde attributes are `tag = "op"`, `rename_all = "snake_case"`, and `deny_unknown_fields`, so every node in the document announces itself with an `op` key holding a snake_case variant name. The sixteen variants are `scan`, `filter`, `project`, `aggregate`, `sort`, `limit`, `hash_join`, `asof_join`, `range_join`, `distinct`, `window`, `union`, `unnest`, `row_id`, `unpivot`, and `sample`.
 
-`Expr`, in `crates/bc-expr/src/lib.rs`, is the scalar expression tree carried inside `RelOp` nodes. It is the Rust type the Python {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` lowers to, it uses the same serde attributes with `tag = "e"`, and it runs to fifty-five variants rather than sixteen: `col`, `lit`, `binary`, `not`, `cast`, `is_null`, `is_not_null`, `is_nan`, `is_inf`, `case`, `str`, `date`, and the rest of the function surface.
+`Expr`, in [`crates/bc-expr/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-expr/src/lib.rs), is the scalar expression tree carried inside `RelOp` nodes. It is the Rust type the Python {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` lowers to, it uses the same serde attributes with `tag = "e"`, and it runs to fifty-five variants rather than sixteen: `col`, `lit`, `binary`, `not`, `cast`, `is_null`, `is_not_null`, `is_nan`, `is_inf`, `case`, `str`, `date`, and the rest of the function surface.
 
 :::{important}
 There is exactly one of each. The interpreter, the JIT, the runtime primitives, and the
@@ -34,7 +34,7 @@ existing IR; it never forks a second representation. That shared source is what 
 parity between tiers a structural property rather than a promise.
 :::
 
-Python's side of the contract lives in `python/batcher/plan/ir_tags.py`, which holds the tag
+Python's side of the contract lives in [`python/batcher/plan/ir_tags.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/ir_tags.py), which holds the tag
 *strings* as constants rather than scattering literals across thirty `to_ir()` methods. A
 typo is then an `AttributeError` (`Op.SCNA`) instead of a silently wrong tag that only a
 differential test would find.
@@ -207,7 +207,7 @@ single-node relational path. A distributed plan that references a subplan twice 
 computes it twice, which is the first thing to check if a cluster job scans a source twice.
 
 The IR also has no notion of a *stage*. The distributed path composes stages in Python
-(`python/batcher/dist/`) out of the same mergeable primitives, shipping a sub-plan per task.
+([`python/batcher/dist/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/dist)) out of the same mergeable primitives, shipping a sub-plan per task.
 The engine sees an ordinary plan every time, which is exactly why single-node and distributed
 cannot drift apart.
 
@@ -218,13 +218,13 @@ config field is not behaving as this page describes:
 
 | Piece | File |
 |---|---|
-| `RelOp` + physical hints | `crates/bc-ir/src/lib.rs` |
-| `Expr` + literals | `crates/bc-expr/src/lib.rs` |
-| `EngineConfig` (morsel size, parallelism, tuning) | `crates/bc-ir/src/engine_config.rs` |
-| Python tag vocabulary | `python/batcher/plan/ir_tags.py` |
-| Per-node `to_ir()` | `python/batcher/plan/logical/` |
-| Document assembly | `python/batcher/plan/physical.py` |
-| Deserialization at the boundary | `crates/bc-py/src/lib.rs` |
+| `RelOp` + physical hints | [`crates/bc-ir/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-ir/src/lib.rs) |
+| `Expr` + literals | [`crates/bc-expr/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-expr/src/lib.rs) |
+| `EngineConfig` (morsel size, parallelism, tuning) | [`crates/bc-ir/src/engine_config.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-ir/src/engine_config.rs) |
+| Python tag vocabulary | [`python/batcher/plan/ir_tags.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/ir_tags.py) |
+| Per-node `to_ir()` | [`python/batcher/plan/logical/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/plan/logical) |
+| Document assembly | [`python/batcher/plan/physical.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/physical.py) |
+| Deserialization at the boundary | [`crates/bc-py/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/lib.rs) |
 
 ## See also
 

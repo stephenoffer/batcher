@@ -24,7 +24,7 @@ Carbonite
 : The resource manager in the Python control plane. It checks whether a plan fits, hands out memory reservations and shuffle credits, and decides when to spill, without rewriting a plan or computing a result. See {doc}`/architecture/overview`.
 
 Checkpoint
-: A directory, passed as `checkpoint=` to a streaming write, that records source offsets and sink commits for each micro-batch. A restarted query resumes from the last committed offset. See {doc}`/user-guide/moving-data/streaming`.
+: A directory, passed as `checkpoint=` to a streaming write, that records source offsets and sink commits for each micro-batch. A restarted query resumes from the last committed offset. See {doc}`/user-guide/moving-data/streaming/index`.
 
 Control plane
 : The Python half of Batcher. It builds a query plan, optimizes it, and decides how much memory the work may use, without touching a row. See {doc}`/getting-started/concepts/index`.
@@ -45,7 +45,7 @@ Device tier
 : The GPU relational backend you request with `collect(backend="gpu")`, which replays a plan on cuDF. A plan reaches the device only when every node translates. Anything else is declined and runs on the CPU engine, so the request is always safe. See {doc}`/architecture/deep-dives/distribution/gpu-execution`.
 
 Exactly-once
-: The streaming guarantee that a restart neither loses nor duplicates a row. It comes from a checkpoint, a replayable source that seeks forward, and an idempotent sink that recognizes a replayed batch. See {doc}`/user-guide/moving-data/streaming`.
+: The streaming guarantee that a restart neither loses nor duplicates a row. It comes from a checkpoint, a replayable source that seeks forward, and an idempotent sink that recognizes a replayed batch. See {doc}`/user-guide/moving-data/streaming/index`.
 
 Expression
 : A description of column work, built from {py:obj}`bt.col(...) <batcher.col>`, {py:obj}`bt.lit(...) <batcher.lit>`, operators, and methods. Python ships the expression tree in the plan, and Rust evaluates it over whole Arrow batches. See {doc}`/getting-started/concepts/expressions`.
@@ -78,13 +78,13 @@ MetadataHub
 : Where Batcher keeps what it measured on each run: row counts, operator times, column sketches, fitted cost coefficients, and bandit rewards. Core writes to it after a run, and Kyber reads it before planning the next one. See {doc}`/architecture/deep-dives/adaptive/learned-metadata`.
 
 Micro-batch
-: One increment of a streaming query. A trigger fires it, the engine reads and computes the new input, the sink receives the rows, and the checkpoint records the commit. See {doc}`/user-guide/moving-data/streaming`.
+: One increment of a streaming query. A trigger fires it, the engine reads and computes the new input, the sink receives the rows, and the checkpoint records the commit. See {doc}`/user-guide/moving-data/streaming/index`.
 
 Morsel
 : The unit of work Batcher schedules across cores, an Arrow `RecordBatch` of 16,384 rows or 1 MiB, whichever it reaches first. `execution.morsel_rows` and `execution.morsel_bytes` set the two bounds. See {doc}`/architecture/deep-dives/operators/morsel-parallelism`.
 
 Output mode
-: What each micro-batch of a streaming write emits, set with `output_mode=`. `"append"` emits only rows that won't change again, `"complete"` emits the full result table, and `"update"` emits only the rows whose value changed. See {doc}`/user-guide/moving-data/streaming`.
+: What each micro-batch of a streaming write emits, set with `output_mode=`. `"append"` emits only rows that won't change again, `"complete"` emits the full result table, and `"update"` emits only the rows whose value changed. See {doc}`/user-guide/moving-data/streaming/index`.
 
 Partition pruning
 : Skipping whole directories of a Hive-partitioned table at plan time. A directory that a predicate on the partition column rules out is never listed, opened, or turned into a task. See {doc}`/user-guide/operate/tuning/large-tables`.
@@ -123,7 +123,7 @@ Time travel
 : Reading a lakehouse table as it was at an earlier version. It works because a Delta commit retires a file from the log without deleting it from storage, until a vacuum reclaims it. See {doc}`/user-guide/moving-data/lakehouse`.
 
 Trigger
-: The cadence of a streaming write, set with {py:class}`Trigger <batcher.Trigger>`. `processing_time` fires a micro-batch on a wall-clock interval, and `available_now` drains every record available at start, then stops. See {doc}`/user-guide/moving-data/streaming`.
+: The cadence of a streaming write, set with {py:class}`Trigger <batcher.Trigger>`. `processing_time` fires a micro-batch on a wall-clock interval, and `available_now` drains every record available at start, then stops. See {doc}`/user-guide/moving-data/streaming/index`.
 
 Watermark
-: A bound on event-time lateness, declared with {py:meth}`with_watermark <batcher.Dataset.with_watermark>`. Once the watermark, the latest event time minus the allowed lateness, passes a window's end, the engine emits and evicts that window and drops rows that arrive later. See {doc}`/user-guide/moving-data/streaming`.
+: A bound on event-time lateness, declared with {py:meth}`with_watermark <batcher.Dataset.with_watermark>`. Once the watermark, the latest event time minus the allowed lateness, passes a window's end, the engine emits and evicts that window and drops rows that arrive later. See {doc}`/user-guide/moving-data/streaming/index`.

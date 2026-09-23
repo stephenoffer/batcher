@@ -244,6 +244,79 @@ large = inventory.filter(bt.col("size") > 10_000_000)
 or hold only whitespace, the way Daft's `read_text` does, and the kept rows keep their original
 `line_number`.
 
+## Files whose schemas differ
+
+A directory written over months drifts: a column is added, a type widens, a column is dropped. Every file reader takes `schema_mode=`, which decides what one read of those files returns. The following table lists the three modes.
+
+| `schema_mode` | Columns | Types | A file that disagrees |
+|---|---|---|---|
+| `"strict"` (the default) | the first file's | the first file's | An extra column is dropped, with a warning naming those the last file adds. A missing column, or a value that would change when cast to the first file's type, raises `bt.SchemaError` naming the file. |
+| `"union"` | every file's, in first-seen order | the narrowest type that holds every file's values | A missing column reads as null. |
+| `"latest"` | the last file's, in its order | the last file's | Older files are cast to it. A value that would change raises. |
+
+"First" and "last" are path order, the order the reader lists the files in, not modification time. A strict cast has to leave every value unchanged: an `int32` file under an `int64` first file reads, while `2.5` under `int64`, `5` under `bool`, a timestamp with a time of day under `date32`, and a UTC timestamp under a naive one all raise. So does a null in a column the first file declares non-nullable.
+
+```python
+import os
+import tempfile
+
+import batcher as bt
+
+drift = tempfile.mkdtemp()
+bt.from_pydict({"id": [1, 2], "amount": [10, 20]}).write.parquet(os.path.join(drift, "p0.parquet"))
+bt.from_pydict({"id": [3], "amount": [2.5], "channel": ["web"]}).write.parquet(
+    os.path.join(drift, "p1.parquet")
+)
+
+try:
+    bt.read.parquet(drift).collect(distributed=False)
+except bt.SchemaError as error:
+    print("p1.parquet" in str(error), "'amount' as double" in str(error))
+# True True
+
+print(bt.read.parquet(drift, schema_mode="union").sort("id").to_pydict())
+# {'id': [1, 2, 3], 'amount': [10.0, 20.0, 2.5], 'channel': [None, None, 'web']}
+```
+
+`union` widens a column only where no value can change: integers to `int64`, a date into a timestamp, a timestamp to the finer unit, a struct to the union of its fields. The one exception is an integer column beside a floating one, which becomes `float64` as DuckDB's `union_by_name` does. A pair with no such type raises instead of guessing: an integer and a string, a naive timestamp and a timezone-aware one, binary and string. Names are case-sensitive, so `A` and `a` are two columns where DuckDB folds them into one. A `uint64` column beside an `int64` one reads as `int64`, the type the engine holds every integer in, and a value above `2**63 - 1` raises naming its file. DuckDB widens that pair to a 128-bit integer. {doc}`/cookbook/data-engineering/modeling/schema-evolution` has the full type table.
+
+A distributed read answers exactly as a single-node one does in every mode: the same rows and column types, or the same `bt.SchemaError` about a file that breaks the contract. When several files do, which one is named depends on which is read first.
+
+## CSV options
+
+`read.csv` takes the pandas and Polars spellings of its options. The following table lists them by their canonical name, with the other spellings each one accepts.
+
+| Option | Also spelled | Meaning |
+|---|---|---|
+| `delimiter` | `sep`, `separator` | The field separator. One character. |
+| `quote_char` | `quotechar` | The quote character, `'"'` by default. One character, or `False` for no quoting. |
+| `escape_char` | `escapechar` | A character that escapes the next one inside a quoted field. |
+| `has_header` | `header` | `None` or `False`: the file has no header row. An integer `n`: line `n` is the header and the lines before it are skipped. |
+| `column_names` | `names`, `new_columns` | Column names to use. With a header row, add `skip_rows=1` so the header is not read as data. |
+| `skip_rows` | `skiprows` | Lines to skip before the header. |
+| `skip_rows_after_header` | `skip_rows_after_names` | Lines to skip after the header. |
+| `null_values` | `na_values` | A token, or a list of them, read as null in addition to Arrow's defaults (`""`, `NA`, `NULL`, `null`, `NaN` and others). A quoted value is never a null. |
+| `true_values`, `false_values` | | Extra tokens read as `true` and `false`. |
+| `decimal_point` | | The decimal separator, for `1,5`-style numbers. |
+| `try_parse_dates` | `parse_dates` | `True` widens date inference. A list of columns types those columns as timestamps. |
+| `schema` | `dtype`, `dtypes`, `schema_overrides` | A `pa.Schema` declares every column. A `{column: type}` dict overrides the inferred type of some. |
+| `encoding` | | The text encoding, `"utf8"` by default. |
+| `on_bad_lines` | `on_bad_rows` | What to do with a line whose field count is wrong. See {ref}`messy input <reading-messy-input>`. |
+
+The writer takes `delimiter`, `header` and `null_value` (also `na_rep`). With `null_value`, a null is written as the bare token and a string equal to the token is quoted, so reading the file back with `null_values=` returns the same nulls and the same column types:
+
+```python
+table = bt.from_pydict({"k": [1, None], "note": ["ok", "NULL"]})
+out = os.path.join(tempfile.mkdtemp(), "nulls.csv")
+table.write.csv(out, null_value="NULL")
+print(bt.read.csv(out, null_values="NULL").to_pydict())
+# {'k': [1, None], 'note': ['ok', 'NULL']}
+```
+
+A large local CSV is read in parallel as byte ranges, each starting where a record starts. A newline inside a quoted field does not start one, so a range never cuts a quoted field in two. A file in which the `escape_char` occurs, a remote file, and a compressed file are each read whole, because Batcher cannot prove where their records start without reading all of them first.
+
+(reading-messy-input)=
+
 ## Messy input
 
 Real corpora contain members that will not read. Batcher separates three failures that look
@@ -345,9 +418,12 @@ the inferred type is wrong.
 
 ## Databases, warehouses, and specialized formats
 
-The same `bt.read` namespace reaches databases, warehouses and the scientific container
-formats. They are covered on their own page, because there are enough of them to be a
-reference rather than a walkthrough: {doc}`/user-guide/moving-data/reading-databases`.
+The same {py:obj}`bt.read <batcher.read>` namespace reaches everything else, on two further pages.
+{doc}`/user-guide/moving-data/specialized-formats` covers the scientific and container formats:
+Zarr, HDF5, WARC, PDF, LiDAR, and robot logs. {doc}`/integrations/databases/databases` covers a SQL
+database or warehouse, where the interesting part is not the call but the connection: which backend
+serves your scheme, where the credentials come from, and how to split one extract into parallel
+queries.
 
 ## What you get back
 
@@ -375,8 +451,8 @@ print(isinstance(bt.engine_version(), str))
 - {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: read Delta and Iceberg tables, and travel back
   through their versions.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate inputs as they arrive.
-- {doc}`/user-guide/moving-data/streaming`: the same readers over unbounded sources.
-- {doc}`IO API </api/relational/io>`: the full `bt.read` reader reference.
+- {doc}`/user-guide/moving-data/streaming/index`: the same readers over unbounded sources.
+- {doc}`IO API </api/relational/io>`: the full {py:obj}`bt.read <batcher.read>` reader reference.
 - {doc}`Agent skills </agents>`: `read-and-write-data` covers picking a reader or
   sink, cloud paths, globs, schema evolution, and error tolerance.
 - {doc}`/cookbook/io/index`: 6 runnable recipes for readers, writers, and the registries.

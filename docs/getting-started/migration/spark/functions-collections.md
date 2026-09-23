@@ -19,7 +19,7 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | PySpark | Batcher | Status | Notes |
 |---|---|---|---|
 | `aggregate` | n/a | gap | Not yet: higher-order function with a Python lambda over array elements (fold with initial value and finish). Wave W4. |
-| `array` | `bt.array` | canonical |  |
+| `array` | {py:obj}`bt.array <batcher.array>` | canonical |  |
 | `array_append` | `Expr.list.append` | canonical |  |
 | `array_compact` | `Expr.list.drop_nulls` | canonical |  |
 | `array_contains` | `Expr.list.contains` | canonical |  |
@@ -43,8 +43,8 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `create_map` | n/a | gap | Not yet: map from alternating key/value expressions. Wave W4. |
 | `element_at` | `Expr.list.get` + `Expr.map.get` | mismatch | Differs: Spark element\_at is 1-based with negative indexes counting from the end (and a key lookup on maps); Expr.list.get is 0-based. Subtract 1 for positive literals. Wave W0. |
 | `exists` | n/a | gap | Not yet: higher-order function with a Python lambda over array elements (any element matches). Wave W4. |
-| `explode` | `Dataset.explode` | param | Missing: generator usable inside select, and map input producing key/value columns. Wave W8. |
-| `explode_outer` | `Dataset.explode` | param | Missing: generator usable inside select, and map input producing key/value columns. Wave W8. |
+| `explode` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | param | Missing: generator usable inside select, and map input producing key/value columns. Wave W8. |
+| `explode_outer` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | param | Missing: generator usable inside select, and map input producing key/value columns. Wave W8. |
 | `filter` | `Expr.list.filter` | param | Missing: Python lambda form, including the (x, i) index form (bt.element() today). Wave W4. |
 | `flatten` | `Expr.list.flatten` | canonical |  |
 | `forall` | n/a | gap | Not yet: higher-order function with a Python lambda over array elements (every element matches). Wave W4. |
@@ -53,8 +53,8 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `from_xml` | n/a | gap | Not yet: parse an XML string column into a struct with a schema. Wave W7. |
 | `get` | `Expr.list.get` | mismatch | Differs: Spark get(arr, -1) returns null; Expr.list.get(-1) returns the last element. Wave W0. |
 | `get_json_object` | `Expr.json.extract_string` | canonical |  |
-| `inline` | `Dataset.explode` + `Dataset.unnest` | param | Missing: generator usable inside select that explodes an array of structs into columns. Wave W8. |
-| `inline_outer` | `Dataset.explode` + `Dataset.unnest` | param | Missing: generator usable inside select that explodes an array of structs into columns, keeping empty rows. Wave W8. |
+| `inline` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` + {py:obj}`Dataset.unnest <batcher.Dataset.unnest>` | param | Missing: generator usable inside select that explodes an array of structs into columns. Wave W8. |
+| `inline_outer` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` + {py:obj}`Dataset.unnest <batcher.Dataset.unnest>` | param | Missing: generator usable inside select that explodes an array of structs into columns, keeping empty rows. Wave W8. |
 | `is_valid_variant` | n/a | gap | Not yet: VARIANT validity check. Wave W7. |
 | `is_variant_null` | n/a | gap | Not yet: VARIANT null check. Wave W7. |
 | `json_array_length` | `Expr.json.array_length` | canonical |  |
@@ -64,29 +64,29 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `map_contains_key` | `Expr.map.contains` | canonical |  |
 | `map_entries` | `Expr.map.entries` | canonical |  |
 | `map_filter` | n/a | gap | Not yet: higher-order function with a Python lambda over map entries (filter). Wave W4. |
-| `map_from_arrays` | `bt.map_from_arrays` | canonical |  |
+| `map_from_arrays` | {py:obj}`bt.map_from_arrays <batcher.map_from_arrays>` | canonical |  |
 | `map_from_entries` | n/a | gap | Not yet: map from an array of key/value structs. Wave W4. |
 | `map_keys` | `Expr.map.keys` | canonical |  |
 | `map_values` | `Expr.map.values` | canonical |  |
 | `map_zip_with` | n/a | gap | Not yet: higher-order function with a Python lambda over two maps merged by key. Wave W4. |
-| `named_struct` | `bt.named_struct` | canonical |  |
+| `named_struct` | {py:obj}`bt.named_struct <batcher.named_struct>` | canonical |  |
 | `parse_json` | n/a | gap | Not yet: parse a JSON string into VARIANT. Wave W7. |
-| `posexplode` | `Dataset.explode` | param | Missing: generator usable inside select, and map input producing pos/key/value columns. Wave W8. |
-| `posexplode_outer` | `Dataset.explode` | param | Missing: generator usable inside select, and map input producing pos/key/value columns. Wave W8. |
+| `posexplode` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | param | Missing: generator usable inside select, and map input producing pos/key/value columns. Wave W8. |
+| `posexplode_outer` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | param | Missing: generator usable inside select, and map input producing pos/key/value columns. Wave W8. |
 | `reduce` | n/a | gap | Not yet: higher-order function with a Python lambda over array elements (fold with initial value and finish). Wave W4. |
 | `schema_of_csv` | n/a | gap | Not yet: infer a DDL schema from a CSV string. Wave W7. |
 | `schema_of_json` | n/a | gap | Not yet: infer a DDL schema from a JSON string. Wave W7. |
 | `schema_of_variant` | n/a | gap | Not yet: VARIANT schema inference. Wave W7. |
 | `schema_of_variant_agg` | n/a | gap | Not yet: VARIANT merged schema aggregate. Wave W7. |
 | `schema_of_xml` | n/a | gap | Not yet: infer a DDL schema from an XML string. Wave W7. |
-| `sequence` | `bt.sequence` | param | Missing: date and timestamp sequences with an interval step. Wave W6. |
+| `sequence` | {py:obj}`bt.sequence <batcher.sequence>` | param | Missing: date and timestamp sequences with an interval step. Wave W6. |
 | `shuffle` | n/a | gap | Not yet: random permutation of an array with seed. Wave W3. |
 | `size` | `Expr.list.len` + `Expr.map.len` | canonical |  |
 | `slice` | `Expr.list.slice` | mismatch | Differs: Spark slice is 1-based with negative starts counting from the end; Expr.list.slice is 0-based. Subtract 1 for positive literal starts. Wave W0. |
 | `sort_array` | `Expr.list.sort` | mismatch | Differs: Spark sort\_array ascending puts nulls first (descending puts them last); Expr.list.sort puts nulls last. Needs nulls\_first= and descending=. Wave W0. |
 | `stack` | n/a | gap | Not yet: stack(n, ...) generator separating columns into rows. Wave W8. |
 | `str_to_map` | n/a | gap | Not yet: split a delimited string into a map. Wave W4. |
-| `struct` | `bt.struct` | param | Missing: positional columns named after their source columns (Batcher takes name=expr keywords). Wave W2. |
+| `struct` | {py:obj}`bt.struct <batcher.struct>` | param | Missing: positional columns named after their source columns (Batcher takes name=expr keywords). Wave W2. |
 | `to_csv` | n/a | gap | Not yet: render a struct as a CSV string. Wave W7. |
 | `to_json` | n/a | gap | Not yet: render a struct/array/map as a JSON string. Wave W7. |
 | `to_variant_object` | n/a | gap | Not yet: convert nested values to VARIANT objects. Wave W7. |
@@ -108,3 +108,11 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `xpath_short` | n/a | gap | Not yet: XPath over an XML string. Wave W7. |
 | `xpath_string` | n/a | gap | Not yet: XPath over an XML string. Wave W7. |
 | `zip_with` | n/a | gap | Not yet: higher-order function with a Python lambda over two arrays element-wise. Wave W4. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other PySpark pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

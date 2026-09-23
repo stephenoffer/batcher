@@ -18,7 +18,7 @@ that spills is slower. It isn't different.
 
 ## The admission decision
 
-Everything routes through one function, `admit` in `crates/bc-interp/src/par.rs`:
+Everything routes through one function, `admit` in [`crates/bc-interp/src/par.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/par.rs):
 
 ```rust
 enum Admit { InMemory(Option<MemoryReservation>), Spill }
@@ -53,7 +53,7 @@ in memory with no spill machinery engaged at all. That's what `memory.unbounded_
 ## Grace partitioning
 
 The core algorithm for aggregate and distinct is grace hashing, in
-`crates/bc-runtime/src/agg/spill/mod.rs`:
+[`crates/bc-runtime/src/agg/spill/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/spill/mod.rs):
 
 ```rust
 pub fn combine_finalize_spilling(

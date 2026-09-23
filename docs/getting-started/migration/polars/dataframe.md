@@ -18,95 +18,95 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
-| `approx_n_unique` | `Dataset.approx_count_distinct` | mismatch | Differs: Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count\_nulls=True. Wave W0. |
-| `bottom_k` | `Dataset.bottom_k` | canonical |  |
-| `cache` | `Dataset.cache` | canonical |  |
-| `cast` | `Dataset.cast` | canonical |  |
-| `clear` | `Dataset.limit` | param | Missing: clear(n) with n \> 0 null rows; clear() is limit(0). Wave W8. |
+| `approx_n_unique` | {py:obj}`Dataset.approx_count_distinct <batcher.Dataset.approx_count_distinct>` | mismatch | Differs: Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count\_nulls=True. Wave W0. |
+| `bottom_k` | {py:obj}`Dataset.bottom_k <batcher.Dataset.bottom_k>` | canonical |  |
+| `cache` | {py:obj}`Dataset.cache <batcher.Dataset.cache>` | canonical |  |
+| `cast` | {py:obj}`Dataset.cast <batcher.Dataset.cast>` | canonical |  |
+| `clear` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | param | Missing: clear(n) with n \> 0 null rows; clear() is limit(0). Wave W8. |
 | `clone` | n/a | out of scope | Declined: a Dataset is an immutable plan handle, so a copy is the same object. |
-| `collect` | `Dataset.collect` | mismatch | Differs: Polars returns a DataFrame; Batcher returns a pyarrow.Table (wrap with pl.from\_arrow). Wave W0. |
+| `collect` | {py:obj}`Dataset.collect <batcher.Dataset.collect>` | mismatch | Differs: Polars returns a DataFrame; Batcher returns a pyarrow.Table (wrap with pl.from\_arrow). Wave W0. |
 | `collect_async` | n/a | gap | Not yet: Dataset.collect\_async. Wave W8. |
-| `collect_batches` | `Dataset.iter_batches` | mismatch | Differs: yields pyarrow RecordBatch rather than DataFrame chunks. Wave W0. |
-| `collect_schema` | `Dataset.collect_schema` | canonical |  |
-| `columns` | `Dataset.columns` | canonical |  |
-| `count` | `Dataset.count` | mismatch | Differs: Polars count() returns a one-row frame of per-column non-null counts; Batcher's count() returns the row count as an int. Param: per-column form. Wave W0. |
-| `describe` | `Dataset.describe` | param | Missing: interpolation= for the percentile rows. Wave W2. |
+| `collect_batches` | {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | mismatch | Differs: yields pyarrow RecordBatch rather than DataFrame chunks. Wave W0. |
+| `collect_schema` | {py:obj}`Dataset.collect_schema <batcher.Dataset.collect_schema>` | canonical |  |
+| `columns` | {py:obj}`Dataset.columns <batcher.Dataset.columns>` | canonical |  |
+| `count` | {py:obj}`Dataset.count <batcher.Dataset.count>` | mismatch | Differs: Polars count() returns a one-row frame of per-column non-null counts; Batcher's count() returns the row count as an int. Param: per-column form. Wave W0. |
+| `describe` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | param | Missing: interpolation= for the percentile rows. Wave W2. |
 | `deserialize` | n/a | gap | Not yet: Dataset.deserialize (plan from serialized bytes/JSON). Wave W8. |
-| `drop` | `Dataset.drop` | param | Missing: strict= (raise on a missing column). Wave W2. |
-| `drop_nans` | `Dataset.drop_nans` | canonical |  |
-| `drop_nulls` | `Dataset.drop_nulls` | canonical |  |
-| `dtypes` | `Dataset.dtypes` | canonical |  |
-| `explain` | `Dataset.explain` | param | Missing: optimized=, tree\_format= (format= exists). Wave W2. |
-| `explode` | `Dataset.explode` | mismatch | Differs: Polars keeps a row with null for an empty or null list; Batcher drops those rows. Params: keep\_nulls=True, empty\_as\_null=True, and several columns at once. Wave W0. |
-| `fetch` | `Dataset.limit` | mismatch | Differs: fetch(n) limits every scan to n rows before the query runs; limit(n) truncates the query result. Wave W0. |
+| `drop` | {py:obj}`Dataset.drop <batcher.Dataset.drop>` | param | Missing: strict= (raise on a missing column). Wave W2. |
+| `drop_nans` | {py:obj}`Dataset.drop_nans <batcher.Dataset.drop_nans>` | canonical |  |
+| `drop_nulls` | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | canonical |  |
+| `dtypes` | {py:obj}`Dataset.dtypes <batcher.Dataset.dtypes>` | canonical |  |
+| `explain` | {py:obj}`Dataset.explain <batcher.Dataset.explain>` | param | Missing: optimized=, tree\_format= (format= exists). Wave W2. |
+| `explode` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | mismatch | Differs: Polars keeps a row with null for an empty or null list; Batcher drops those rows. Params: keep\_nulls=True, empty\_as\_null=True, and several columns at once. Wave W0. |
+| `fetch` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | mismatch | Differs: fetch(n) limits every scan to n rows before the query runs; limit(n) truncates the query result. Wave W0. |
 | `fill_nan` | n/a | gap | Not yet: Dataset.fill\_nan (every float column). Wave W5. |
-| `fill_null` | `Dataset.fill_null` | param | Missing: limit= and matches\_supertype=. Wave W2. |
-| `filter` | `Dataset.filter` | canonical |  |
-| `first` | `Dataset.first` | mismatch | Differs: Polars LazyFrame.first() is a one-row LazyFrame; Batcher's first() executes and returns a tuple. Wave W0. |
-| `gather_every` | `Dataset.gather_every` | canonical |  |
-| `group_by` | `Dataset.group_by` | param | Missing: expression keys. Wave WF. |
+| `fill_null` | {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | param | Missing: limit= and matches\_supertype=. Wave W2. |
+| `filter` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | canonical |  |
+| `first` | {py:obj}`Dataset.first <batcher.Dataset.first>` | mismatch | Differs: Polars LazyFrame.first() is a one-row LazyFrame; Batcher's first() executes and returns a tuple. Wave W0. |
+| `gather_every` | {py:obj}`Dataset.gather_every <batcher.Dataset.gather_every>` | canonical |  |
+| `group_by` | {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | param | Missing: expression keys. Wave WF. |
 | `group_by_dynamic` | `bt.window` | param | Missing: frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start\_by=, include\_boundaries=. Wave W5. |
-| `head` | `Dataset.limit` | canonical |  |
+| `head` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
 | `inspect` | n/a | gap | Not yet: Dataset.inspect (print the frame mid-plan). Wave W8. |
 | `interpolate` | n/a | gap | Not yet: Dataset.interpolate (every numeric column). Wave W5. |
-| `join` | `Dataset.join` | mismatch | Differs: on how='full' Polars keeps both key columns (key, key\_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=. Wave W0. |
-| `join_asof` | `Dataset.join_asof` | param | Missing: strategy= ('backward'/'forward'/'nearest'), coalesce=, check\_sortedness=. Wave W2. |
-| `join_where` | `Dataset.join_where` | canonical |  |
-| `last` | `Dataset.last` | mismatch | Differs: Polars LazyFrame.last() is a one-row LazyFrame; Batcher's last() executes and returns a tuple. Wave W0. |
-| `lazy` | `Dataset` | canonical |  |
-| `limit` | `Dataset.limit` | canonical |  |
-| `map_batches` | `Dataset.map_batches` | mismatch | Differs: Polars passes the whole DataFrame to fn once; Batcher calls fn per Arrow batch. Wave W0. |
-| `match_to_schema` | `Dataset.match_to_schema` | param | Missing: struct field options and integer\_cast/float\_cast. Wave W8. |
-| `max` | `Dataset.max` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `mean` | `Dataset.mean` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `median` | `Dataset.median` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `melt` | `Dataset.unpivot` | canonical |  |
-| `merge_sorted` | `Dataset.union` | canonical |  |
-| `min` | `Dataset.min` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `null_count` | `Dataset.null_count` | canonical |  |
-| `pipe` | `Dataset.pipe` | canonical |  |
-| `pipe_with_schema` | `Dataset.pipe` | param | Missing: the schema argument: Batcher's pipe passes only the Dataset; read ds.schema inside the function. Wave W8. |
-| `pivot` | `Dataset.pivot` | param | Missing: positional on=, several on columns, on\_columns=, separator=, an expression aggregate\_function=. Wave W2. |
-| `profile` | `Dataset.profile` | mismatch | Differs: Polars profile() returns (result, per-node timings); Batcher's profile() is a per-column data-quality profile. Timings are Dataset.explain(analyze=True). Wave W0. |
-| `quantile` | `Dataset.quantile` | mismatch | Differs: Polars returns a one-row frame over every column and defaults to interpolation='nearest'; Batcher takes one column and interpolates linearly. Params: all-columns form, interpolation=. Wave W0. |
+| `join` | {py:obj}`Dataset.join <batcher.Dataset.join>` | mismatch | Differs: on how='full' Polars keeps both key columns (key, key\_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=. Wave W0. |
+| `join_asof` | {py:obj}`Dataset.join_asof <batcher.Dataset.join_asof>` | param | Missing: strategy= ('backward'/'forward'/'nearest'), coalesce=, check\_sortedness=. Wave W2. |
+| `join_where` | {py:obj}`Dataset.join_where <batcher.Dataset.join_where>` | canonical |  |
+| `last` | {py:obj}`Dataset.last <batcher.Dataset.last>` | mismatch | Differs: Polars LazyFrame.last() is a one-row LazyFrame; Batcher's last() executes and returns a tuple. Wave W0. |
+| `lazy` | {py:obj}`Dataset <batcher.Dataset>` | canonical |  |
+| `limit` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
+| `map_batches` | {py:obj}`Dataset.map_batches <batcher.Dataset.map_batches>` | mismatch | Differs: Polars passes the whole DataFrame to fn once; Batcher calls fn per Arrow batch. Wave W0. |
+| `match_to_schema` | {py:obj}`Dataset.match_to_schema <batcher.Dataset.match_to_schema>` | param | Missing: struct field options and integer\_cast/float\_cast. Wave W8. |
+| `max` | {py:obj}`Dataset.max <batcher.Dataset.max>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
+| `mean` | {py:obj}`Dataset.mean <batcher.Dataset.mean>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
+| `median` | {py:obj}`Dataset.median <batcher.Dataset.median>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
+| `melt` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
+| `merge_sorted` | {py:obj}`Dataset.union <batcher.Dataset.union>` | canonical |  |
+| `min` | {py:obj}`Dataset.min <batcher.Dataset.min>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
+| `null_count` | {py:obj}`Dataset.null_count <batcher.Dataset.null_count>` | canonical |  |
+| `pipe` | {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | canonical |  |
+| `pipe_with_schema` | {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | param | Missing: the schema argument: Batcher's pipe passes only the Dataset; read ds.schema inside the function. Wave W8. |
+| `pivot` | {py:obj}`Dataset.pivot <batcher.Dataset.pivot>` | param | Missing: positional on=, several on columns, on\_columns=, separator=, an expression aggregate\_function=. Wave W2. |
+| `profile` | {py:obj}`Dataset.profile <batcher.Dataset.profile>` | mismatch | Differs: Polars profile() returns (result, per-node timings); Batcher's profile() is a per-column data-quality profile. Timings are Dataset.explain(analyze=True). Wave W0. |
+| `quantile` | {py:obj}`Dataset.quantile <batcher.Dataset.quantile>` | mismatch | Differs: Polars returns a one-row frame over every column and defaults to interpolation='nearest'; Batcher takes one column and interpolates linearly. Params: all-columns form, interpolation=. Wave W0. |
 | `remote` | n/a | out of scope | Declined: Polars Cloud remote execution. |
-| `remove` | `Dataset.filter` | param | Missing: several predicates and \*\*constraints in one call; port as filter(\~bt.coalesce(pred, bt.lit(False))). Wave W8. |
-| `rename` | `Dataset.rename` | param | Missing: strict= (raise on a missing column). Wave W2. |
-| `reverse` | `Dataset.reverse` | canonical |  |
+| `remove` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | param | Missing: several predicates and \*\*constraints in one call; port as filter(\~bt.coalesce(pred, bt.lit(False))). Wave W8. |
+| `rename` | {py:obj}`Dataset.rename <batcher.Dataset.rename>` | param | Missing: strict= (raise on a missing column). Wave W2. |
+| `reverse` | {py:obj}`Dataset.reverse <batcher.Dataset.reverse>` | canonical |  |
 | `rolling` | n/a | gap | Not yet: Dataset.rolling (frame-level rolling group-by). Wave W5. |
-| `schema` | `Dataset.schema` | canonical |  |
-| `select` | `Dataset.select` | canonical |  |
-| `select_seq` | `Dataset.select` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
+| `schema` | {py:obj}`Dataset.schema <batcher.Dataset.schema>` | canonical |  |
+| `select` | {py:obj}`Dataset.select <batcher.Dataset.select>` | canonical |  |
+| `select_seq` | {py:obj}`Dataset.select <batcher.Dataset.select>` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
 | `serialize` | n/a | gap | Not yet: Dataset.serialize (plan to bytes/JSON). Wave W8. |
 | `set_sorted` | n/a | out of scope | Declined: sortedness flags are engine-owned metadata (Dataset.meta.sorted\_by), not a user assertion. |
 | `shift` | n/a | gap | Not yet: Dataset.shift (every column). Wave W5. |
-| `show` | `Dataset.show` | param | Missing: Polars' default limit of 5 and its formatting options. Wave W2. |
+| `show` | {py:obj}`Dataset.show <batcher.Dataset.show>` | param | Missing: Polars' default limit of 5 and its formatting options. Wave W2. |
 | `show_graph` | n/a | gap | Not yet: Dataset.show\_graph (plan diagram). Wave W8. |
-| `sink_batches` | `Dataset.iter_batches` | canonical |  |
+| `sink_batches` | {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | canonical |  |
 | `sink_csv` | `Dataset.write.csv` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
 | `sink_delta` | `Dataset.write.delta` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
 | `sink_iceberg` | `Dataset.write.iceberg` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
 | `sink_ipc` | `Dataset.write.arrow` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
 | `sink_ndjson` | `Dataset.write.json` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
 | `sink_parquet` | `Dataset.write.parquet` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
-| `slice` | `Dataset.limit` | canonical |  |
-| `sort` | `Dataset.sort` | mismatch | Differs: Polars places nulls first by default (nulls\_last=False); Batcher places them last. Param: nulls\_first=True (exists). Wave W0. |
-| `sql` | `Dataset.sql` | canonical |  |
-| `std` | `Dataset.std` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
-| `sum` | `Dataset.sum` | mismatch | Differs: Polars returns a one-row frame over every column and sums an all-null or empty column to 0; Batcher takes one column and returns null there. Params: all-columns form, empty\_value=0. Wave W0. |
-| `tail` | `Dataset.tail` | canonical |  |
-| `top_k` | `Dataset.top_k` | canonical |  |
-| `unique` | `Dataset.distinct` | canonical |  |
-| `unnest` | `Dataset.unnest` | param | Missing: separator= (prefix the field names). Wave W2. |
-| `unpivot` | `Dataset.unpivot` | canonical |  |
-| `update` | `Dataset.update` | param | Missing: the key-less positional form: Batcher's update needs on=. Wave W8. |
-| `var` | `Dataset.var` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
-| `width` | `Dataset.width` | canonical |  |
-| `with_columns` | `Dataset.with_columns` | canonical |  |
-| `with_columns_seq` | `Dataset.with_columns` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
+| `slice` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
+| `sort` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | mismatch | Differs: Polars places nulls first by default (nulls\_last=False); Batcher places them last. Param: nulls\_first=True (exists). Wave W0. |
+| `sql` | {py:obj}`Dataset.sql <batcher.Dataset.sql>` | canonical |  |
+| `std` | {py:obj}`Dataset.std <batcher.Dataset.std>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
+| `sum` | {py:obj}`Dataset.sum <batcher.Dataset.sum>` | mismatch | Differs: Polars returns a one-row frame over every column and sums an all-null or empty column to 0; Batcher takes one column and returns null there. Params: all-columns form, empty\_value=0. Wave W0. |
+| `tail` | {py:obj}`Dataset.tail <batcher.Dataset.tail>` | canonical |  |
+| `top_k` | {py:obj}`Dataset.top_k <batcher.Dataset.top_k>` | canonical |  |
+| `unique` | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | canonical |  |
+| `unnest` | {py:obj}`Dataset.unnest <batcher.Dataset.unnest>` | param | Missing: separator= (prefix the field names). Wave W2. |
+| `unpivot` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
+| `update` | {py:obj}`Dataset.update <batcher.Dataset.update>` | param | Missing: the key-less positional form: Batcher's update needs on=. Wave W8. |
+| `var` | {py:obj}`Dataset.var <batcher.Dataset.var>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
+| `width` | {py:obj}`Dataset.width <batcher.Dataset.width>` | canonical |  |
+| `with_columns` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
+| `with_columns_seq` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
 | `with_context` | n/a | out of scope | Declined: deprecated in Polars in favour of horizontal concat. |
-| `with_row_count` | `Dataset.with_row_index` | canonical |  |
-| `with_row_index` | `Dataset.with_row_index` | canonical |  |
+| `with_row_count` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | canonical |  |
+| `with_row_index` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | canonical |  |
 
 ## `DataFrame`
 
@@ -114,130 +114,130 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
-| `approx_n_unique` | `Dataset.approx_count_distinct` | mismatch | Differs: Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count\_nulls=True. Wave W0. |
-| `bottom_k` | `Dataset.bottom_k` | canonical |  |
-| `cast` | `Dataset.cast` | canonical |  |
-| `clear` | `Dataset.limit` | param | Missing: clear(n) with n \> 0 null rows; clear() is limit(0). Wave W8. |
+| `approx_n_unique` | {py:obj}`Dataset.approx_count_distinct <batcher.Dataset.approx_count_distinct>` | mismatch | Differs: Polars returns a one-row frame over every column and counts null as a value; Batcher takes one column, returns a scalar, and skips nulls. Params: all-columns form, count\_nulls=True. Wave W0. |
+| `bottom_k` | {py:obj}`Dataset.bottom_k <batcher.Dataset.bottom_k>` | canonical |  |
+| `cast` | {py:obj}`Dataset.cast <batcher.Dataset.cast>` | canonical |  |
+| `clear` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | param | Missing: clear(n) with n \> 0 null rows; clear() is limit(0). Wave W8. |
 | `clone` | n/a | out of scope | Declined: a Dataset is an immutable plan handle, so a copy is the same object. |
-| `collect_schema` | `Dataset.collect_schema` | canonical |  |
-| `columns` | `Dataset.columns` | canonical |  |
-| `corr` | `Dataset.corr_matrix` | mismatch | Differs: Polars corr() returns the correlation matrix as a frame; Batcher's Dataset.corr(x, y) returns one coefficient. Wave W0. |
-| `count` | `Dataset.count` | mismatch | Differs: Polars count() returns a one-row frame of per-column non-null counts; Batcher's count() returns the row count as an int. Param: per-column form. Wave W0. |
-| `describe` | `Dataset.describe` | param | Missing: interpolation= for the percentile rows. Wave W2. |
+| `collect_schema` | {py:obj}`Dataset.collect_schema <batcher.Dataset.collect_schema>` | canonical |  |
+| `columns` | {py:obj}`Dataset.columns <batcher.Dataset.columns>` | canonical |  |
+| `corr` | {py:obj}`Dataset.corr_matrix <batcher.Dataset.corr_matrix>` | mismatch | Differs: Polars corr() returns the correlation matrix as a frame; Batcher's Dataset.corr(x, y) returns one coefficient. Wave W0. |
+| `count` | {py:obj}`Dataset.count <batcher.Dataset.count>` | mismatch | Differs: Polars count() returns a one-row frame of per-column non-null counts; Batcher's count() returns the row count as an int. Param: per-column form. Wave W0. |
+| `describe` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | param | Missing: interpolation= for the percentile rows. Wave W2. |
 | `deserialize` | n/a | gap | Not yet: Dataset.deserialize (plan from serialized bytes/JSON). Wave W8. |
-| `drop` | `Dataset.drop` | param | Missing: strict= (raise on a missing column). Wave W2. |
-| `drop_in_place` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port; the frame is not mutated. Wave W8. |
-| `drop_nans` | `Dataset.drop_nans` | canonical |  |
-| `drop_nulls` | `Dataset.drop_nulls` | canonical |  |
-| `dtypes` | `Dataset.dtypes` | canonical |  |
-| `equals` | `Dataset.equals` | param | Missing: null\_equal=. Wave W2. |
-| `estimated_size` | `Dataset.memory_usage` | param | Missing: unit= and a single total rather than per-column sizes. Wave W2. |
-| `explode` | `Dataset.explode` | mismatch | Differs: Polars keeps a row with null for an empty or null list; Batcher drops those rows. Params: keep\_nulls=True, empty\_as\_null=True, and several columns at once. Wave W0. |
-| `extend` | `Dataset.union` | canonical |  |
+| `drop` | {py:obj}`Dataset.drop <batcher.Dataset.drop>` | param | Missing: strict= (raise on a missing column). Wave W2. |
+| `drop_in_place` | {py:obj}`Dataset.select <batcher.Dataset.select>` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port; the frame is not mutated. Wave W8. |
+| `drop_nans` | {py:obj}`Dataset.drop_nans <batcher.Dataset.drop_nans>` | canonical |  |
+| `drop_nulls` | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | canonical |  |
+| `dtypes` | {py:obj}`Dataset.dtypes <batcher.Dataset.dtypes>` | canonical |  |
+| `equals` | {py:obj}`Dataset.equals <batcher.Dataset.equals>` | param | Missing: null\_equal=. Wave W2. |
+| `estimated_size` | {py:obj}`Dataset.memory_usage <batcher.Dataset.memory_usage>` | param | Missing: unit= and a single total rather than per-column sizes. Wave W2. |
+| `explode` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | mismatch | Differs: Polars keeps a row with null for an empty or null list; Batcher drops those rows. Params: keep\_nulls=True, empty\_as\_null=True, and several columns at once. Wave W0. |
+| `extend` | {py:obj}`Dataset.union <batcher.Dataset.union>` | canonical |  |
 | `fill_nan` | n/a | gap | Not yet: Dataset.fill\_nan (every float column). Wave W5. |
-| `fill_null` | `Dataset.fill_null` | param | Missing: limit= and matches\_supertype=. Wave W2. |
-| `filter` | `Dataset.filter` | canonical |  |
+| `fill_null` | {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | param | Missing: limit= and matches\_supertype=. Wave W2. |
+| `filter` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | canonical |  |
 | `flags` | n/a | out of scope | Declined: sortedness flags are engine-owned metadata, not user-visible. |
 | `fold` | n/a | gap | Not yet: DataFrame.fold (row-wise Python reduction over columns). Wave W11. |
-| `gather_every` | `Dataset.gather_every` | canonical |  |
-| `get_column` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
-| `get_column_index` | `Dataset.columns` | param | Missing: port as ds.columns.index(name). Wave W8. |
-| `get_columns` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
-| `glimpse` | `Dataset.glimpse` | canonical |  |
-| `group_by` | `Dataset.group_by` | param | Missing: expression keys. Wave WF. |
+| `gather_every` | {py:obj}`Dataset.gather_every <batcher.Dataset.gather_every>` | canonical |  |
+| `get_column` | {py:obj}`Dataset.select <batcher.Dataset.select>` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
+| `get_column_index` | {py:obj}`Dataset.columns <batcher.Dataset.columns>` | param | Missing: port as ds.columns.index(name). Wave W8. |
+| `get_columns` | {py:obj}`Dataset.select <batcher.Dataset.select>` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
+| `glimpse` | {py:obj}`Dataset.glimpse <batcher.Dataset.glimpse>` | canonical |  |
+| `group_by` | {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | param | Missing: expression keys. Wave WF. |
 | `group_by_dynamic` | `bt.window` | param | Missing: frame-level dynamic group-by: every=, period=, offset=, closed=, label=, start\_by=, include\_boundaries=. Wave W5. |
-| `hash_rows` | `bt.hash_rows` | mismatch | Differs: different hash function: values never agree with Polars. Param: seed= and algorithm choice. Wave W0. |
-| `head` | `Dataset.limit` | canonical |  |
-| `height` | `Dataset.count` | canonical |  |
-| `hstack` | `Dataset.zip` | param | Missing: implicit row order: port as zip(other, order\_by=...). Wave W8. |
-| `insert_column` | `Dataset.with_columns` + `Dataset.select` | canonical |  |
+| `hash_rows` | {py:obj}`bt.hash_rows <batcher.hash_rows>` | mismatch | Differs: different hash function: values never agree with Polars. Param: seed= and algorithm choice. Wave W0. |
+| `head` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
+| `height` | {py:obj}`Dataset.count <batcher.Dataset.count>` | canonical |  |
+| `hstack` | {py:obj}`Dataset.zip <batcher.Dataset.zip>` | param | Missing: implicit row order: port as zip(other, order\_by=...). Wave W8. |
+| `insert_column` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` + {py:obj}`Dataset.select <batcher.Dataset.select>` | canonical |  |
 | `interpolate` | n/a | gap | Not yet: Dataset.interpolate (every numeric column). Wave W5. |
-| `is_duplicated` | `Expr.is_duplicated` | param | Missing: whole-row form over several columns. Wave W2. |
-| `is_empty` | `Dataset.is_empty` | canonical |  |
-| `is_unique` | `Expr.is_unique` | param | Missing: whole-row form over several columns. Wave W2. |
-| `item` | `Dataset.item` | param | Missing: row= and column index arguments. Wave W2. |
-| `iter_columns` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
-| `iter_rows` | `Dataset.iter_rows` | canonical |  |
-| `iter_slices` | `Dataset.iter_slices` | mismatch | Differs: yields pyarrow RecordBatch rather than a DataFrame. Wave W0. |
-| `join` | `Dataset.join` | mismatch | Differs: on how='full' Polars keeps both key columns (key, key\_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=. Wave W0. |
-| `join_asof` | `Dataset.join_asof` | param | Missing: strategy= ('backward'/'forward'/'nearest'), coalesce=, check\_sortedness=. Wave W2. |
-| `join_where` | `Dataset.join_where` | canonical |  |
-| `lazy` | `Dataset` | canonical |  |
-| `limit` | `Dataset.limit` | canonical |  |
+| `is_duplicated` | {py:obj}`Expr.is_duplicated <batcher.plan.expr_ir.core.Expr.is_duplicated>` | param | Missing: whole-row form over several columns. Wave W2. |
+| `is_empty` | {py:obj}`Dataset.is_empty <batcher.Dataset.is_empty>` | canonical |  |
+| `is_unique` | {py:obj}`Expr.is_unique <batcher.plan.expr_ir.core.Expr.is_unique>` | param | Missing: whole-row form over several columns. Wave W2. |
+| `item` | {py:obj}`Dataset.item <batcher.Dataset.item>` | param | Missing: row= and column index arguments. Wave W2. |
+| `iter_columns` | {py:obj}`Dataset.select <batcher.Dataset.select>` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
+| `iter_rows` | {py:obj}`Dataset.iter_rows <batcher.Dataset.iter_rows>` | canonical |  |
+| `iter_slices` | {py:obj}`Dataset.iter_slices <batcher.Dataset.iter_slices>` | mismatch | Differs: yields pyarrow RecordBatch rather than a DataFrame. Wave W0. |
+| `join` | {py:obj}`Dataset.join <batcher.Dataset.join>` | mismatch | Differs: on how='full' Polars keeps both key columns (key, key\_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=. Wave W0. |
+| `join_asof` | {py:obj}`Dataset.join_asof <batcher.Dataset.join_asof>` | param | Missing: strategy= ('backward'/'forward'/'nearest'), coalesce=, check\_sortedness=. Wave W2. |
+| `join_where` | {py:obj}`Dataset.join_where <batcher.Dataset.join_where>` | canonical |  |
+| `lazy` | {py:obj}`Dataset <batcher.Dataset>` | canonical |  |
+| `limit` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
 | `map_columns` | n/a | gap | Not yet: DataFrame.map\_columns. Wave W8. |
 | `map_rows` | n/a | gap | Not yet: DataFrame.map\_rows (per-row Python function), only as a batch-vectorized wrapper. Wave W11. |
-| `match_to_schema` | `Dataset.match_to_schema` | param | Missing: struct field options and integer\_cast/float\_cast. Wave W8. |
-| `max` | `Dataset.max` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `max_horizontal` | `bt.greatest` | param | Missing: frame-level form over every column. Wave W8. |
-| `mean` | `Dataset.mean` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `mean_horizontal` | `bt.mean_horizontal` | param | Missing: frame-level form over every column. Wave W8. |
-| `median` | `Dataset.median` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `melt` | `Dataset.unpivot` | canonical |  |
-| `merge_sorted` | `Dataset.union` | canonical |  |
-| `min` | `Dataset.min` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
-| `min_horizontal` | `bt.least` | param | Missing: frame-level form over every column. Wave W8. |
+| `match_to_schema` | {py:obj}`Dataset.match_to_schema <batcher.Dataset.match_to_schema>` | param | Missing: struct field options and integer\_cast/float\_cast. Wave W8. |
+| `max` | {py:obj}`Dataset.max <batcher.Dataset.max>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
+| `max_horizontal` | {py:obj}`bt.greatest <batcher.greatest>` | param | Missing: frame-level form over every column. Wave W8. |
+| `mean` | {py:obj}`Dataset.mean <batcher.Dataset.mean>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
+| `mean_horizontal` | {py:obj}`bt.mean_horizontal <batcher.mean_horizontal>` | param | Missing: frame-level form over every column. Wave W8. |
+| `median` | {py:obj}`Dataset.median <batcher.Dataset.median>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
+| `melt` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
+| `merge_sorted` | {py:obj}`Dataset.union <batcher.Dataset.union>` | canonical |  |
+| `min` | {py:obj}`Dataset.min <batcher.Dataset.min>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar). Wave W2. |
+| `min_horizontal` | {py:obj}`bt.least <batcher.least>` | param | Missing: frame-level form over every column. Wave W8. |
 | `n_chunks` | n/a | out of scope | Declined: memory layout is engine-owned (morsels), not user-visible. |
-| `n_unique` | `Dataset.count_distinct` | mismatch | Differs: Polars df.n\_unique(subset) counts unique rows; Batcher's n\_unique(column) counts distinct non-null values of one column. Wave W0. |
-| `null_count` | `Dataset.null_count` | canonical |  |
-| `partition_by` | `Dataset.partition_by` | mismatch | Differs: Batcher returns a dict keyed by the group tuple in key order; Polars returns a list in arrival order unless as\_dict=True. Wave W8. |
-| `pipe` | `Dataset.pipe` | canonical |  |
-| `pivot` | `Dataset.pivot` | param | Missing: positional on=, several on columns, on\_columns=, separator=, an expression aggregate\_function=. Wave W2. |
+| `n_unique` | {py:obj}`Dataset.count_distinct <batcher.Dataset.count_distinct>` | mismatch | Differs: Polars df.n\_unique(subset) counts unique rows; Batcher's n\_unique(column) counts distinct non-null values of one column. Wave W0. |
+| `null_count` | {py:obj}`Dataset.null_count <batcher.Dataset.null_count>` | canonical |  |
+| `partition_by` | {py:obj}`Dataset.partition_by <batcher.Dataset.partition_by>` | mismatch | Differs: Batcher returns a dict keyed by the group tuple in key order; Polars returns a list in arrival order unless as\_dict=True. Wave W8. |
+| `pipe` | {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | canonical |  |
+| `pivot` | {py:obj}`Dataset.pivot <batcher.Dataset.pivot>` | param | Missing: positional on=, several on columns, on\_columns=, separator=, an expression aggregate\_function=. Wave W2. |
 | `plot` | n/a | out of scope | Declined: plotting is outside a data engine; export with to\_pandas/to\_polars. |
-| `product` | `Dataset.product` | mismatch | Differs: Polars returns a one-row frame over every column and returns 1 for an all-null or empty column; Batcher takes one column and returns null there. Params: all-columns form, empty\_value=1. Wave W0. |
-| `quantile` | `Dataset.quantile` | mismatch | Differs: Polars returns a one-row frame over every column and defaults to interpolation='nearest'; Batcher takes one column and interpolates linearly. Params: all-columns form, interpolation=. Wave W0. |
+| `product` | {py:obj}`Dataset.product <batcher.Dataset.product>` | mismatch | Differs: Polars returns a one-row frame over every column and returns 1 for an all-null or empty column; Batcher takes one column and returns null there. Params: all-columns form, empty\_value=1. Wave W0. |
+| `quantile` | {py:obj}`Dataset.quantile <batcher.Dataset.quantile>` | mismatch | Differs: Polars returns a one-row frame over every column and defaults to interpolation='nearest'; Batcher takes one column and interpolates linearly. Params: all-columns form, interpolation=. Wave W0. |
 | `rechunk` | n/a | out of scope | Declined: memory layout is engine-owned (morsels), not user-visible. |
-| `remove` | `Dataset.filter` | param | Missing: several predicates and \*\*constraints in one call; port as filter(\~bt.coalesce(pred, bt.lit(False))). Wave W8. |
-| `rename` | `Dataset.rename` | param | Missing: strict= (raise on a missing column). Wave W2. |
-| `replace_column` | `Dataset.with_columns` | param | Missing: a positional index: port as with\_columns(\*\*\{ds.columns\[i\]: expr\}). Wave W8. |
-| `reverse` | `Dataset.reverse` | canonical |  |
+| `remove` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | param | Missing: several predicates and \*\*constraints in one call; port as filter(\~bt.coalesce(pred, bt.lit(False))). Wave W8. |
+| `rename` | {py:obj}`Dataset.rename <batcher.Dataset.rename>` | param | Missing: strict= (raise on a missing column). Wave W2. |
+| `replace_column` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | param | Missing: a positional index: port as with\_columns(\*\*\{ds.columns\[i\]: expr\}). Wave W8. |
+| `reverse` | {py:obj}`Dataset.reverse <batcher.Dataset.reverse>` | canonical |  |
 | `rolling` | n/a | gap | Not yet: Dataset.rolling (frame-level rolling group-by). Wave W5. |
 | `row` | n/a | gap | Not yet: Dataset.row(index \| by\_predicate). Wave W8. |
-| `rows` | `Dataset.iter_rows` | canonical |  |
+| `rows` | {py:obj}`Dataset.iter_rows <batcher.Dataset.iter_rows>` | canonical |  |
 | `rows_by_key` | n/a | gap | Not yet: Dataset.rows\_by\_key. Wave W8. |
-| `sample` | `Dataset.sample` | param | Missing: with\_replacement=, shuffle=. Wave W2. |
-| `schema` | `Dataset.schema` | canonical |  |
-| `select` | `Dataset.select` | canonical |  |
-| `select_seq` | `Dataset.select` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
+| `sample` | {py:obj}`Dataset.sample <batcher.Dataset.sample>` | param | Missing: with\_replacement=, shuffle=. Wave W2. |
+| `schema` | {py:obj}`Dataset.schema <batcher.Dataset.schema>` | canonical |  |
+| `select` | {py:obj}`Dataset.select <batcher.Dataset.select>` | canonical |  |
+| `select_seq` | {py:obj}`Dataset.select <batcher.Dataset.select>` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
 | `serialize` | n/a | gap | Not yet: Dataset.serialize (plan to bytes/JSON). Wave W8. |
 | `set_sorted` | n/a | out of scope | Declined: sortedness flags are engine-owned metadata (Dataset.meta.sorted\_by), not a user assertion. |
-| `shape` | `Dataset.shape` | canonical |  |
+| `shape` | {py:obj}`Dataset.shape <batcher.Dataset.shape>` | canonical |  |
 | `shift` | n/a | gap | Not yet: Dataset.shift (every column). Wave W5. |
-| `show` | `Dataset.show` | param | Missing: Polars' default limit of 5 and its formatting options. Wave W2. |
+| `show` | {py:obj}`Dataset.show <batcher.Dataset.show>` | param | Missing: Polars' default limit of 5 and its formatting options. Wave W2. |
 | `shrink_to_fit` | n/a | out of scope | Declined: memory layout is engine-owned (morsels), not user-visible. |
-| `slice` | `Dataset.limit` | canonical |  |
-| `sort` | `Dataset.sort` | mismatch | Differs: Polars places nulls first by default (nulls\_last=False); Batcher places them last. Param: nulls\_first=True (exists). Wave W0. |
-| `sql` | `Dataset.sql` | canonical |  |
-| `std` | `Dataset.std` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
+| `slice` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
+| `sort` | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | mismatch | Differs: Polars places nulls first by default (nulls\_last=False); Batcher places them last. Param: nulls\_first=True (exists). Wave W0. |
+| `sql` | {py:obj}`Dataset.sql <batcher.Dataset.sql>` | canonical |  |
+| `std` | {py:obj}`Dataset.std <batcher.Dataset.std>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
 | `style` | n/a | out of scope | Declined: great\_tables styling is presentation, outside a data engine. |
-| `sum` | `Dataset.sum` | mismatch | Differs: Polars returns a one-row frame over every column and sums an all-null or empty column to 0; Batcher takes one column and returns null there. Params: all-columns form, empty\_value=0. Wave W0. |
-| `sum_horizontal` | `bt.sum_horizontal` | param | Missing: frame-level form over every column. Wave W8. |
-| `tail` | `Dataset.tail` | canonical |  |
-| `to_arrow` | `Dataset.to_arrow` | canonical |  |
-| `to_dict` | `Dataset.to_pydict` | mismatch | Differs: Polars to\_dict() defaults to as\_series=True (dict of Series); Batcher returns lists, as as\_series=False does. Wave W0. |
-| `to_dicts` | `Dataset.to_pylist` | canonical |  |
-| `to_dummies` | `Dataset.get_dummies` | param | Missing: several columns, separator=, drop\_first=, drop\_nulls=, UInt8 output. Wave W2. |
+| `sum` | {py:obj}`Dataset.sum <batcher.Dataset.sum>` | mismatch | Differs: Polars returns a one-row frame over every column and sums an all-null or empty column to 0; Batcher takes one column and returns null there. Params: all-columns form, empty\_value=0. Wave W0. |
+| `sum_horizontal` | {py:obj}`bt.sum_horizontal <batcher.sum_horizontal>` | param | Missing: frame-level form over every column. Wave W8. |
+| `tail` | {py:obj}`Dataset.tail <batcher.Dataset.tail>` | canonical |  |
+| `to_arrow` | {py:obj}`Dataset.to_arrow <batcher.Dataset.to_arrow>` | canonical |  |
+| `to_dict` | {py:obj}`Dataset.to_pydict <batcher.Dataset.to_pydict>` | mismatch | Differs: Polars to\_dict() defaults to as\_series=True (dict of Series); Batcher returns lists, as as\_series=False does. Wave W0. |
+| `to_dicts` | {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | canonical |  |
+| `to_dummies` | {py:obj}`Dataset.get_dummies <batcher.Dataset.get_dummies>` | param | Missing: several columns, separator=, drop\_first=, drop\_nulls=, UInt8 output. Wave W2. |
 | `to_init_repr` | n/a | out of scope | Declined: Python source repr of a frame is a notebook convenience, not engine surface. |
-| `to_jax` | `Dataset.to_jax` | mismatch | Differs: Polars defaults to return\_type='array' (one 2-D array); Batcher returns a dict of arrays. Wave W0. |
-| `to_numpy` | `Dataset.to_numpy` | mismatch | Differs: Polars returns one 2-D ndarray; Batcher returns a dict of per-column arrays. Wave W0. |
-| `to_pandas` | `Dataset.to_pandas` | canonical |  |
-| `to_series` | `Dataset.select` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
-| `to_struct` | `Dataset.select` | param | Missing: port as select(bt.struct(\*ds.columns).alias(name)). Wave W8. |
+| `to_jax` | {py:obj}`Dataset.to_jax <batcher.Dataset.to_jax>` | mismatch | Differs: Polars defaults to return\_type='array' (one 2-D array); Batcher returns a dict of arrays. Wave W0. |
+| `to_numpy` | {py:obj}`Dataset.to_numpy <batcher.Dataset.to_numpy>` | mismatch | Differs: Polars returns one 2-D ndarray; Batcher returns a dict of per-column arrays. Wave W0. |
+| `to_pandas` | {py:obj}`Dataset.to_pandas <batcher.Dataset.to_pandas>` | canonical |  |
+| `to_series` | {py:obj}`Dataset.select <batcher.Dataset.select>` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
+| `to_struct` | {py:obj}`Dataset.select <batcher.Dataset.select>` | param | Missing: port as select(bt.struct(\*ds.columns).alias(name)). Wave W8. |
 | `to_torch` | `Dataset.ml.iter_torch_batches` | mismatch | Differs: Polars returns a tensor, dict of tensors, or TensorDataset; Batcher yields per-batch tensor dicts. Wave W0. |
-| `top_k` | `Dataset.top_k` | canonical |  |
-| `transpose` | `Dataset.transpose` | param | Missing: implicit row order: positional column names need order\_by. Wave W8. |
-| `unique` | `Dataset.distinct` | canonical |  |
-| `unnest` | `Dataset.unnest` | param | Missing: separator= (prefix the field names). Wave W2. |
-| `unpivot` | `Dataset.unpivot` | canonical |  |
+| `top_k` | {py:obj}`Dataset.top_k <batcher.Dataset.top_k>` | canonical |  |
+| `transpose` | {py:obj}`Dataset.transpose <batcher.Dataset.transpose>` | param | Missing: implicit row order: positional column names need order\_by. Wave W8. |
+| `unique` | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | canonical |  |
+| `unnest` | {py:obj}`Dataset.unnest <batcher.Dataset.unnest>` | param | Missing: separator= (prefix the field names). Wave W2. |
+| `unpivot` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
 | `unstack` | n/a | gap | Not yet: Dataset.unstack. Wave W8. |
-| `update` | `Dataset.update` | param | Missing: the key-less positional form: Batcher's update needs on=. Wave W8. |
+| `update` | {py:obj}`Dataset.update <batcher.Dataset.update>` | param | Missing: the key-less positional form: Batcher's update needs on=. Wave W8. |
 | `upsample` | n/a | gap | Not yet: Dataset.upsample (fill a regular time grid). Wave W5. |
-| `var` | `Dataset.var` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
-| `vstack` | `Dataset.union` | canonical |  |
-| `width` | `Dataset.width` | canonical |  |
-| `with_columns` | `Dataset.with_columns` | canonical |  |
-| `with_columns_seq` | `Dataset.with_columns` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
-| `with_row_count` | `Dataset.with_row_index` | canonical |  |
-| `with_row_index` | `Dataset.with_row_index` | canonical |  |
+| `var` | {py:obj}`Dataset.var <batcher.Dataset.var>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
+| `vstack` | {py:obj}`Dataset.union <batcher.Dataset.union>` | canonical |  |
+| `width` | {py:obj}`Dataset.width <batcher.Dataset.width>` | canonical |  |
+| `with_columns` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
+| `with_columns_seq` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | param | Missing: sequential evaluation: Batcher always plans the expressions together, with identical results. Wave W2. |
+| `with_row_count` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | canonical |  |
+| `with_row_index` | {py:obj}`Dataset.with_row_index <batcher.Dataset.with_row_index>` | canonical |  |
 | `write_avro` | `Dataset.write.avro` | canonical |  |
 | `write_clipboard` | n/a | out of scope | Declined: clipboard IO is a desktop convenience, not a data engine sink. |
 | `write_csv` | `Dataset.write.csv` | param | Missing: quote\_style=, date\_format=, datetime\_format=, float\_precision=, null\_value=, include\_bom=. Wave W2. |
@@ -257,23 +257,23 @@ The following table maps the 17 names on `GroupBy`, sorted alphabetically.
 
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
-| `agg` | `GroupBy.agg` | canonical |  |
-| `all` | `GroupBy.array_agg` | canonical |  |
-| `count` | `GroupBy.count` | mismatch | Differs: Polars GroupBy.count counts rows into a column named count; port as group\_by(k).len(name=count). Wave W0. |
-| `first` | `GroupBy.first` | param | Missing: implicit row order: GroupBy.first needs order\_by. Wave W2. |
-| `having` | `GroupBy.having` | canonical |  |
-| `head` | `GroupBy.head` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
-| `last` | `GroupBy.last` | param | Missing: implicit row order: GroupBy.last needs order\_by. Wave W2. |
-| `len` | `GroupBy.len` | canonical |  |
-| `map_groups` | `GroupBy.map_groups` | mismatch | Differs: Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches. Wave W0. |
-| `max` | `GroupBy.max` | mismatch | Differs: Polars max ignores NaN; port as agg(col(c).max(nan\_policy=ignore)) per column. Wave W0. |
-| `mean` | `GroupBy.mean` | canonical |  |
-| `median` | `GroupBy.median` | canonical |  |
-| `min` | `GroupBy.min` | canonical |  |
-| `n_unique` | `GroupBy.count_distinct` | mismatch | Differs: Polars counts null as a distinct value; port as agg(col(c).count\_distinct(count\_nulls=True)) per column. Wave W0. |
-| `quantile` | `GroupBy.quantile` | mismatch | Differs: Polars defaults to nearest; port as agg(col(c).quantile(q, nearest)) per column. Wave W0. |
-| `sum` | `GroupBy.sum` | mismatch | Differs: Polars sums an all-null group to 0; port as agg(col(c).sum(empty\_value=0)) per column. Wave W0. |
-| `tail` | `GroupBy.tail` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
+| `agg` | {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` | canonical |  |
+| `all` | {py:obj}`GroupBy.array_agg <batcher.GroupBy.array_agg>` | canonical |  |
+| `count` | {py:obj}`GroupBy.count <batcher.GroupBy.count>` | mismatch | Differs: Polars GroupBy.count counts rows into a column named count; port as group\_by(k).len(name=count). Wave W0. |
+| `first` | {py:obj}`GroupBy.first <batcher.GroupBy.first>` | param | Missing: implicit row order: GroupBy.first needs order\_by. Wave W2. |
+| `having` | {py:obj}`GroupBy.having <batcher.GroupBy.having>` | canonical |  |
+| `head` | {py:obj}`GroupBy.head <batcher.GroupBy.head>` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
+| `last` | {py:obj}`GroupBy.last <batcher.GroupBy.last>` | param | Missing: implicit row order: GroupBy.last needs order\_by. Wave W2. |
+| `len` | {py:obj}`GroupBy.len <batcher.GroupBy.len>` | canonical |  |
+| `map_groups` | {py:obj}`GroupBy.map_groups <batcher.GroupBy.map_groups>` | mismatch | Differs: Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches. Wave W0. |
+| `max` | {py:obj}`GroupBy.max <batcher.GroupBy.max>` | mismatch | Differs: Polars max ignores NaN; port as agg(col(c).max(nan\_policy=ignore)) per column. Wave W0. |
+| `mean` | {py:obj}`GroupBy.mean <batcher.GroupBy.mean>` | canonical |  |
+| `median` | {py:obj}`GroupBy.median <batcher.GroupBy.median>` | canonical |  |
+| `min` | {py:obj}`GroupBy.min <batcher.GroupBy.min>` | canonical |  |
+| `n_unique` | {py:obj}`GroupBy.count_distinct <batcher.GroupBy.count_distinct>` | mismatch | Differs: Polars counts null as a distinct value; port as agg(col(c).count\_distinct(count\_nulls=True)) per column. Wave W0. |
+| `quantile` | {py:obj}`GroupBy.quantile <batcher.GroupBy.quantile>` | mismatch | Differs: Polars defaults to nearest; port as agg(col(c).quantile(q, nearest)) per column. Wave W0. |
+| `sum` | {py:obj}`GroupBy.sum <batcher.GroupBy.sum>` | mismatch | Differs: Polars sums an all-null group to 0; port as agg(col(c).sum(empty\_value=0)) per column. Wave W0. |
+| `tail` | {py:obj}`GroupBy.tail <batcher.GroupBy.tail>` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 
 ## `LazyGroupBy`
 
@@ -281,23 +281,23 @@ The following table maps the 17 names on `LazyGroupBy`, sorted alphabetically.
 
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
-| `agg` | `GroupBy.agg` | canonical |  |
-| `all` | `GroupBy.array_agg` | canonical |  |
-| `count` | `GroupBy.count` | mismatch | Differs: Polars LazyGroupBy.count counts rows into a column named count; port as group\_by(k).len(name=count). Wave W0. |
-| `first` | `GroupBy.first` | param | Missing: implicit row order: GroupBy.first needs order\_by. Wave W2. |
-| `having` | `GroupBy.having` | canonical |  |
-| `head` | `GroupBy.head` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
-| `last` | `GroupBy.last` | param | Missing: implicit row order: GroupBy.last needs order\_by. Wave W2. |
-| `len` | `GroupBy.len` | canonical |  |
-| `map_groups` | `GroupBy.map_groups` | mismatch | Differs: Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches. Wave W0. |
-| `max` | `GroupBy.max` | mismatch | Differs: Polars max ignores NaN; port as agg(col(c).max(nan\_policy=ignore)) per column. Wave W0. |
-| `mean` | `GroupBy.mean` | canonical |  |
-| `median` | `GroupBy.median` | canonical |  |
-| `min` | `GroupBy.min` | canonical |  |
-| `n_unique` | `GroupBy.count_distinct` | mismatch | Differs: Polars counts null as a distinct value; port as agg(col(c).count\_distinct(count\_nulls=True)) per column. Wave W0. |
-| `quantile` | `GroupBy.quantile` | mismatch | Differs: Polars defaults to nearest; port as agg(col(c).quantile(q, nearest)) per column. Wave W0. |
-| `sum` | `GroupBy.sum` | mismatch | Differs: Polars sums an all-null group to 0; port as agg(col(c).sum(empty\_value=0)) per column. Wave W0. |
-| `tail` | `GroupBy.tail` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
+| `agg` | {py:obj}`GroupBy.agg <batcher.GroupBy.agg>` | canonical |  |
+| `all` | {py:obj}`GroupBy.array_agg <batcher.GroupBy.array_agg>` | canonical |  |
+| `count` | {py:obj}`GroupBy.count <batcher.GroupBy.count>` | mismatch | Differs: Polars LazyGroupBy.count counts rows into a column named count; port as group\_by(k).len(name=count). Wave W0. |
+| `first` | {py:obj}`GroupBy.first <batcher.GroupBy.first>` | param | Missing: implicit row order: GroupBy.first needs order\_by. Wave W2. |
+| `having` | {py:obj}`GroupBy.having <batcher.GroupBy.having>` | canonical |  |
+| `head` | {py:obj}`GroupBy.head <batcher.GroupBy.head>` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
+| `last` | {py:obj}`GroupBy.last <batcher.GroupBy.last>` | param | Missing: implicit row order: GroupBy.last needs order\_by. Wave W2. |
+| `len` | {py:obj}`GroupBy.len <batcher.GroupBy.len>` | canonical |  |
+| `map_groups` | {py:obj}`GroupBy.map_groups <batcher.GroupBy.map_groups>` | mismatch | Differs: Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches. Wave W0. |
+| `max` | {py:obj}`GroupBy.max <batcher.GroupBy.max>` | mismatch | Differs: Polars max ignores NaN; port as agg(col(c).max(nan\_policy=ignore)) per column. Wave W0. |
+| `mean` | {py:obj}`GroupBy.mean <batcher.GroupBy.mean>` | canonical |  |
+| `median` | {py:obj}`GroupBy.median <batcher.GroupBy.median>` | canonical |  |
+| `min` | {py:obj}`GroupBy.min <batcher.GroupBy.min>` | canonical |  |
+| `n_unique` | {py:obj}`GroupBy.count_distinct <batcher.GroupBy.count_distinct>` | mismatch | Differs: Polars counts null as a distinct value; port as agg(col(c).count\_distinct(count\_nulls=True)) per column. Wave W0. |
+| `quantile` | {py:obj}`GroupBy.quantile <batcher.GroupBy.quantile>` | mismatch | Differs: Polars defaults to nearest; port as agg(col(c).quantile(q, nearest)) per column. Wave W0. |
+| `sum` | {py:obj}`GroupBy.sum <batcher.GroupBy.sum>` | mismatch | Differs: Polars sums an all-null group to 0; port as agg(col(c).sum(empty\_value=0)) per column. Wave W0. |
+| `tail` | {py:obj}`GroupBy.tail <batcher.GroupBy.tail>` | param | Missing: order\_by optional (Polars takes the implicit row order). Wave W2. |
 
 ## `DynamicGroupBy`
 
@@ -318,3 +318,11 @@ The following table maps the 3 names on `RollingGroupBy`, sorted alphabetically.
 | `agg` | n/a | gap | Not yet: RollingGroupBy.agg (frame rolling windows). Wave W5. |
 | `having` | n/a | gap | Not yet: RollingGroupBy.having. Wave W5. |
 | `map_groups` | n/a | gap | Not yet: RollingGroupBy.map\_groups. Wave W5. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Polars pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import batcher as bt
 from batcher.api.dataset import Dataset
-from batcher.graph._graph import DST, NODE, SRC, Graph
+from batcher.graph._graph import DST, NODE, SRC, Graph, ends, undirected_pairs
 from batcher.graph.degree import degree
 
 __all__ = ["assortativity", "density", "reciprocity", "summarize"]
@@ -41,7 +41,11 @@ def density(g: Graph) -> float:
             >>> density(Graph.from_edges(e))
             1.0
     """
-    n = g.num_nodes()
+    return _density(g, g.num_nodes())
+
+
+def _density(g: Graph, n: int) -> float:
+    """`density` for a graph whose node count is already known."""
     if n < 2:
         return 0.0
     possible = n * (n - 1)
@@ -112,11 +116,11 @@ def assortativity(g: Graph) -> float:
             >>> assortativity(Graph.from_edges(e))
             -1.0
     """
-    undirected = g.to_undirected().simple().without_self_loops()
-    deg = degree(undirected).select(**{NODE: bt.col(NODE), "_k": bt.col("degree")})
+    adjacency = ends(undirected_pairs(g).filter(bt.col("_lo") != bt.col("_hi")))
+    deg = adjacency.group_by(NODE).agg(_k=bt.count())
     pairs = (
-        undirected.edges.join(deg.select(**{SRC: bt.col(NODE), "_ks": bt.col("_k")}), on=SRC)
-        .join(deg.select(**{DST: bt.col(NODE), "_kd": bt.col("_k")}), on=DST)
+        adjacency.join(deg.select(**{NODE: bt.col(NODE), "_ks": bt.col("_k")}), on=NODE)
+        .join(deg.select(nbr=bt.col(NODE), _kd=bt.col("_k")), on="nbr")
         .select(x=bt.col("_ks").cast("float64"), y=bt.col("_kd").cast("float64"))
     )
     if pairs.count() == 0:
@@ -149,20 +153,29 @@ def summarize(g: Graph) -> Dataset:
             >>> row["nodes"], row["edges"], row["max_degree"]
             ([3], [3], [2])
     """
-    cached = g.cache()
-    degrees = degree(cached).cache()
-    stats = degrees.agg(
-        _avg=bt.mean("degree"), _max=bt.max("degree"), _iso=bt.count_if(bt.col("degree") == 0)
-    ).to_pydict()
+    # The degree table has one row per node, so it answers the node count too. That keeps
+    # every number here to an aggregate over an aggregate, which runs on a cluster, rather
+    # than `num_nodes`'s distinct over a union.
+    stats = (
+        degree(g)
+        .agg(
+            _n=bt.count(),
+            _avg=bt.mean("degree"),
+            _max=bt.max("degree"),
+            _iso=bt.count_if(bt.col("degree") == 0),
+        )
+        .to_pydict()
+    )
+    n = int(stats["_n"][0] or 0)
     return bt.from_pydict(
         {
-            "nodes": [cached.num_nodes()],
-            "edges": [cached.num_edges()],
-            "density": [density(cached)],
-            "reciprocity": [reciprocity(cached)],
+            "nodes": [n],
+            "edges": [g.num_edges()],
+            "density": [_density(g, n)],
+            "reciprocity": [reciprocity(g)],
             "average_degree": [float(stats["_avg"][0] or 0.0)],
             "max_degree": [int(stats["_max"][0] or 0)],
             "isolated": [int(stats["_iso"][0] or 0)],
-            "directed": [cached.directed],
+            "directed": [g.directed],
         }
     )

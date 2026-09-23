@@ -34,7 +34,7 @@ There is one set of operator semantics. `dist/` decides *where* work runs and *h
 
 ## What Ray does and does not carry
 
-Ray schedules tasks and actors, and it carries control-plane metadata. The bulk shuffle bytes don't go through the Ray object store. Mapper output is written to Arrow IPC files or served from a Flight endpoint, and what crosses Ray is paths, addresses, tickets, row counts, and a metrics JSON string. You can see it in the return types. The shuffle map task in `python/batcher/dist/executors/aggregate.py` returns a `list[str]` of file paths, and the Flight worker in `python/batcher/dist/flight_worker.py` returns an address, not batches.
+Ray schedules tasks and actors, and it carries control-plane metadata. The bulk shuffle bytes don't go through the Ray object store. Mapper output is written to Arrow IPC files or served from a Flight endpoint, and what crosses Ray is paths, addresses, tickets, row counts, and a metrics JSON string. You can see it in the return types. The shuffle map task in [`python/batcher/dist/executors/aggregate.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/executors/aggregate.py) returns a `list[str]` of file paths, and the Flight worker in [`python/batcher/dist/flight_worker.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/flight_worker.py) returns an address, not batches.
 
 The short slogan overstates it slightly. The following table lists each kind of traffic against whether it transits the object store:
 
@@ -114,7 +114,7 @@ Salting is result-preserving only when each reducer's output is concatenated. `s
 
 ## What the driver still does
 
-The driver composes the stages. For a distributed aggregate (`dist/executors/aggregate.py::_distributed_aggregate`) that means partitioning the source, running map tasks that call `nat.partial_aggregate` and `nat.partition_batches` and write one IPC file per bucket, then running reduce tasks that fold their inputs with `nat.combine` incrementally and call `nat.combine_finalize` once. The Rust functions are the same ones the single-node parallel executor uses, and they live in `crates/bc-interp/src/dist.rs`.
+The driver composes the stages. For a distributed aggregate (`dist/executors/aggregate.py::_distributed_aggregate`) that means partitioning the source, running map tasks that call `nat.partial_aggregate` and `nat.partition_batches` and write one IPC file per bucket, then running reduce tasks that fold their inputs with `nat.combine` incrementally and call `nat.combine_finalize` once. The Rust functions are the same ones the single-node parallel executor uses, and they live in [`crates/bc-interp/src/dist.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/dist.rs).
 
 Some shapes avoid the shuffle entirely. A shuffle join co-partitions both sides by the join key, so when a group-by's keys include the join key every group lies entirely within one bucket and each reducer's bucket is already complete. `_distributed_join_aggregate` gives the reducer an IR of `aggregate(hash_join(...))` and there's no second exchange. That exchange elimination took a distributed join-then-aggregate from 71.6 s to 1.75 s, because the old path collected the whole join to the driver.
 
@@ -187,14 +187,14 @@ Each scheduling concern below lives in one file, so you can follow a task from s
 
 | Concern | File |
 |---|---|
-| Entry point, fan-out, plan-shape dispatch | `python/batcher/dist/executor.py` |
-| Partition-count sizing | `python/batcher/api/tuning/decisions.py` |
+| Entry point, fan-out, plan-shape dispatch | [`python/batcher/dist/executor.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/executor.py) |
+| Partition-count sizing | [`python/batcher/api/tuning/decisions.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/api/tuning/decisions.py) |
 | Per-operator executors | `python/batcher/dist/executors/{aggregate,join,sort,map,window,union,distinct}.py` |
-| Ray tasks/actors, placement, autoscale, fault policy | `python/batcher/dist/executors/ray_runtime/` |
-| Split balancing | `python/batcher/dist/executors/partition_io/assignment.py` |
-| Learned sizing (partitions, actor pool, straggler factor) | `python/batcher/dist/adaptive_sizing/sizing.py` |
-| Join-skew learning | `python/batcher/dist/skew.py` |
-| Rust mergeable primitives | `crates/bc-interp/src/dist.rs` |
+| Ray tasks/actors, placement, autoscale, fault policy | [`python/batcher/dist/executors/ray_runtime/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/dist/executors/ray_runtime) |
+| Split balancing | [`python/batcher/dist/executors/partition_io/assignment.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/executors/partition_io/assignment.py) |
+| Learned sizing (partitions, actor pool, straggler factor) | [`python/batcher/dist/adaptive_sizing/sizing.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/adaptive_sizing/sizing.py) |
+| Join-skew learning | [`python/batcher/dist/skew.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/skew.py) |
+| Rust mergeable primitives | [`crates/bc-interp/src/dist.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/dist.rs) |
 
 ## See also
 

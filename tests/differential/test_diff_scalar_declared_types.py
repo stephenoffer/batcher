@@ -281,3 +281,134 @@ def test_an_empty_result_is_typed_the_way_a_populated_one_is(lists):
     populated = dataset.collect().schema.field("v").type
     empty = dataset.filter(bt.col("v") > 10_000).collect().schema.field("v").type
     assert populated == empty == pa.float64()
+
+
+#: Node kinds with no type rule, each with the reason it has none. Empty, and meant to
+#: stay that way: every one of the five that was missing turned out to declare a wrong type.
+NO_TYPE_RULE: dict[str, str] = {}
+
+
+def test_every_expression_node_has_a_type_rule():
+    """No `IRNode` subclass is missing an arm in `plan/types/infer/dispatch.py`.
+
+    That module is an `isinstance` cascade -- the shape `expr_ir/walk.py` deliberately
+    avoids, because "a per-type cascade silently returns the empty set for any node nobody
+    added an arm for". Five of the node types had no arm and *every one* declared `null`
+    for a column that collects as a real type.
+
+    Two things make this check honest, and both were wrong in its first draft:
+
+    * **The denominator is forced complete.** `IRNode.__subclasses__()` returns 48 types on
+      a bare import and 52 once the lazily-imported `image`/`audio`/`video` namespaces have
+      registered theirs, so the modules are imported here rather than left to whatever a
+      previous test happened to touch. A count that depends on import order is not a count.
+    * **A grouped arm counts, a bare mention does not.** Twelve types are handled by tuple
+      arms such as ``isinstance(expr, (Not, IsNull, IsNotNull, IsNan, IsInf))``, so looking
+      only for ``isinstance(expr, Name)`` reports them missing. Falling back to "the name
+      appears in the module" is the opposite error -- every one of them appears in the
+      import block, so that fallback passes a node for being imported.
+    """
+    import importlib
+    import inspect
+    import re
+
+    import batcher.plan.types.infer.dispatch as dispatch
+    from batcher.plan.expr_ir.core import IRNode
+
+    # Imported for their side effect -- each registers its own `IRNode` subclasses, and
+    # without them `__subclasses__()` is short by five (four multimodal, one `.seq`).
+    # Spelled through `import_module`
+    # rather than a plain `import`, because a plain one reads as unused and `ruff --fix`
+    # deletes it: that happened here, the denominator silently fell back to 48, and only
+    # the length assertion below caught it.
+    for _side_effect in ("audio", "image", "video", "namespaces.sequence"):
+        importlib.import_module(f"batcher.plan.expr_ir.{_side_effect}")
+
+    source = inspect.getsource(dispatch)
+    arms = re.findall(r"isinstance\(\s*expr\s*,\s*(\(?[^)]*\)?)", source)
+    covered = {n for arm in arms for n in re.findall(r"\b([A-Z]\w+)\b", arm)}
+
+    subclasses = sorted(c.__name__ for c in IRNode.__subclasses__())
+    assert len(subclasses) >= 53, f"denominator collapsed to {len(subclasses)} node types"
+
+    missing = sorted(n for n in subclasses if n not in covered)
+    unexplained = [n for n in missing if n not in NO_TYPE_RULE]
+    assert not unexplained, (
+        f"{len(unexplained)} expression node type(s) have no arm in infer/dispatch.py: "
+        f"{unexplained}. Each makes `Dataset.schema` advertise `null` for its column."
+    )
+    stale = sorted(n for n in NO_TYPE_RULE if n not in missing)
+    assert not stale, f"NO_TYPE_RULE lists nodes that now have a rule (remove them): {stale}"
+
+
+def test_map_from_arrays_declares_the_map_type_it_returns():
+    """`map_from_arrays` declares `map<k, v>`, not `null`.
+
+    `MakeMap` was one of five `IRNode` subclasses with no arm in
+    `plan/types/infer/dispatch.py`, and that module is a 43-branch `isinstance` cascade --
+    the shape `expr_ir/walk.py` avoids precisely because "a per-type cascade silently
+    returns the empty set for any node nobody added an arm for". Here the fall-through was
+    `None`, so `Dataset.schema` advertised `null` for a column that collects as
+    `map<string, int64>`.
+
+    That is the failure this file's own docstring describes as "not a cosmetic one": the
+    declared schema is what an empty result is typed from and what the device tier holds
+    its results against, and one uncertain column costs every column beside it its type.
+    """
+    ds = bt.from_pydict({"k": [["a", "b"]], "n": [[1, 2]]})
+    out = ds.select(v=bt.map_from_arrays(bt.col("k"), bt.col("n")))
+    declared, actual = _declared_and_actual(out)
+    assert declared == pa.map_(pa.string(), pa.int64())
+    assert declared == actual
+
+    # The neighbour check this file exists for: an uncertain column would strip the
+    # declared type off the plain passthrough sitting next to it.
+    both = ds.select(v=bt.map_from_arrays(bt.col("k"), bt.col("n")), keep=bt.col("k"))
+    assert both._plan.available_schema() is not None
+    assert both.schema.field("keep").type == pa.list_(pa.string())
+
+
+def test_the_untyped_node_kinds_declare_what_they_return():
+    """All five nodes that had no type rule declare their real type.
+
+    Spelled through the public surface that reaches each, because that is where the wrong
+    type was visible: `Dataset.schema` said `null` for every one of them.
+
+    `WindowStart` is the one worth reading twice. Its type is a **timestamp whatever the
+    input was**, not the input's own type -- the plausible rule. `_sql`'s bucket lowering
+    proves it: for a DATE argument it builds `Cast(WindowStart(...), "date")`, and that cast
+    exists only because the window yields a timestamp. Declaring `date32` made the cast look
+    redundant, it was eliminated, and `time_bucket(INTERVAL 1 DAY, DATE ...)` returned a
+    timestamp -- a wrong declared type becoming a wrong result.
+    """
+    import datetime as _dt
+
+    from batcher.plan.functions.temporal import window
+
+    ds = bt.from_pydict(
+        {
+            "t": [_dt.datetime(2024, 1, 1, 0, 0)],
+            "s": ["abc"],
+            "lst": [[1, 2, 3]],
+            "i": [1],
+            "k": [["a"]],
+            "n": [[1]],
+        }
+    )
+    cases = {
+        "WindowStart": (ds.select(v=window(bt.col("t"), "5 minutes")), pa.timestamp("us")),
+        "WindowBuckets": (
+            ds.select(v=window(bt.col("t"), "10 minutes", "5 minutes")),
+            pa.list_(pa.timestamp("us")),
+        ),
+        "ListGetDyn": (ds.sql("SELECT lst[i] AS v FROM self"), pa.int64()),
+        "StrFuncDyn": (ds.sql("SELECT repeat(s, i) AS v FROM self"), pa.string()),
+        "MakeMap": (
+            ds.select(v=bt.map_from_arrays(bt.col("k"), bt.col("n"))),
+            pa.map_(pa.string(), pa.int64()),
+        ),
+    }
+    for kind, (out, expected) in cases.items():
+        declared, actual = _declared_and_actual(out)
+        assert declared == expected, f"{kind} declared {declared}, expected {expected}"
+        assert declared == actual, f"{kind} declared {declared} but returns {actual}"

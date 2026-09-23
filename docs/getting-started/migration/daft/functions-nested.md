@@ -18,67 +18,67 @@ The following table maps the 94 names on `Expression`, sorted alphabetically.
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `alias` | `Expr.alias` | canonical |  |
+| `alias` | {py:obj}`Expr.alias <batcher.plan.expr_ir.core.Expr.alias>` | canonical |  |
 | `apply` | n/a | gap | Not yet: Expression-level per-value Python function (apply) with return\_dtype. Wave W11. |
-| `as_binary` | `Expr.cast` | canonical |  |
-| `as_bool` | `Expr.cast` | canonical |  |
-| `as_date` | `Expr.cast` | canonical |  |
-| `as_decimal128` | `Expr.cast` | canonical |  |
-| `as_duration` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_binary` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_bool` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_date` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_decimal128` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_duration` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
 | `as_embedding` | n/a | gap | Not yet: Embedding logical type (fixed-size numeric vector). Wave W12. |
 | `as_extension` | n/a | gap | Not yet: extension types. Wave W11. |
 | `as_file` | n/a | gap | Not yet: File logical type. Wave W12. |
-| `as_fixed_size_binary` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
-| `as_fixed_size_list` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
-| `as_float16` | `Expr.cast` | canonical |  |
-| `as_float32` | `Expr.cast` | canonical |  |
-| `as_float64` | `Expr.cast` | canonical |  |
+| `as_fixed_size_binary` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_fixed_size_list` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_float16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_float32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_float64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `as_image` | n/a | gap | Not yet: Image logical type. Wave W12. |
-| `as_int16` | `Expr.cast` | canonical |  |
-| `as_int32` | `Expr.cast` | canonical |  |
-| `as_int64` | `Expr.cast` | canonical |  |
-| `as_int8` | `Expr.cast` | canonical |  |
+| `as_int16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_int32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_int64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_int8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `as_interval` | n/a | gap | Not yet: interval (month-day-nano) type; Batcher's 'interval' cast yields duration\[us\]. Wave W6. |
-| `as_list` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
-| `as_map` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
-| `as_null` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_list` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_map` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_null` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
 | `as_py` | n/a | out of scope | Declined: Expression-object introspection (literal to Python value), not a data operation. |
 | `as_python` | n/a | out of scope | Declined: Python object dtype: per-row Python objects cannot cross the Arrow data plane. |
 | `as_sparse_tensor` | n/a | gap | Not yet: SparseTensor logical type. Wave W12. |
-| `as_string` | `Expr.cast` | canonical |  |
-| `as_struct` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_string` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_struct` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
 | `as_tensor` | n/a | gap | Not yet: Tensor logical type. Wave W12. |
-| `as_time` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
-| `as_timestamp` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
-| `as_uint16` | `Expr.cast` | canonical |  |
-| `as_uint32` | `Expr.cast` | canonical |  |
-| `as_uint64` | `Expr.cast` | canonical |  |
-| `as_uint8` | `Expr.cast` | canonical |  |
+| `as_time` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_timestamp` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `as_uint16` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_uint32` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_uint64` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
+| `as_uint8` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | canonical |  |
 | `as_union` | n/a | gap | Not yet: union type. Wave W11. |
 | `as_uuid` | n/a | gap | Not yet: UUID logical type. Wave W11. |
-| `between` | `Expr.between` | canonical |  |
-| `cast` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `between` | {py:obj}`Expr.between <batcher.plan.expr_ir.core.Expr.between>` | canonical |  |
+| `cast` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
 | `chunk` | n/a | gap | Not yet: list chunking into fixed-size sublists. Wave W4. |
-| `coalesce` | `bt.coalesce` | canonical |  |
+| `coalesce` | {py:obj}`bt.coalesce <batcher.coalesce>` | canonical |  |
 | `column_name` | n/a | out of scope | Declined: Expression-object introspection, not a data operation. |
 | `cosine_distance` | `Expr.list.cosine_distance` | canonical |  |
 | `cosine_similarity` | `Expr.list.cosine_similarity` | canonical |  |
 | `deserialize` | n/a | gap | Not yet: typed JSON decode (json\_decode with a dtype). Wave W7. |
 | `dot_product` | `Expr.list.dot` | canonical |  |
-| `eq_null_safe` | `Expr.eq_missing` | canonical |  |
+| `eq_null_safe` | {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | canonical |  |
 | `euclidean_distance` | `Expr.list.l2_distance` | canonical |  |
-| `explode` | `Dataset.explode` | mismatch | Differs: Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form). Wave W8. |
-| `fill_null` | `Expr.fill_null` | canonical |  |
+| `explode` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | mismatch | Differs: Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form). Wave W8. |
+| `fill_null` | {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | canonical |  |
 | `get` | `Expr.list.get` + `Expr.struct.field` | param | Missing: default= for a missing index/field, and one get over list, struct and map. Wave W4. |
-| `hamming_distance` | `^` operator + `Expr.bit_count` | canonical |  |
-| `hash` | `Expr.hash` | mismatch | Differs: Daft's default xxhash is col.hash(seed, algorithm=xxhash3), with the UInt64 bits read as Int64; murmurhash3 and sha1 have no Batcher algorithm. Wave W0. |
+| `hamming_distance` | `^` operator + {py:obj}`Expr.bit_count <batcher.plan.expr_ir.core.Expr.bit_count>` | canonical |  |
+| `hash` | {py:obj}`Expr.hash <batcher.plan.expr_ir.core.Expr.hash>` | mismatch | Differs: Daft's default xxhash is col.hash(seed, algorithm=xxhash3), with the UInt64 bits read as Int64; murmurhash3 and sha1 have no Batcher algorithm. Wave W0. |
 | `is_column` | n/a | out of scope | Declined: Expression-object introspection, not a data operation. |
-| `is_in` | `Expr.is_in` | canonical |  |
+| `is_in` | {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | canonical |  |
 | `is_literal` | n/a | out of scope | Declined: Expression-object introspection, not a data operation. |
-| `is_null` | `Expr.is_null` | canonical |  |
+| `is_null` | {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | canonical |  |
 | `jaccard_similarity` | `Expr.list.jaccard` | canonical |  |
 | `jq` | n/a | gap | Not yet: jq filter language over JSON strings (Batcher has JSONPath extract\_\* only). Wave W7. |
-| `list_append` | `Expr.list.concat` + `bt.array` | canonical |  |
+| `list_append` | `Expr.list.concat` + {py:obj}`bt.array <batcher.array>` | canonical |  |
 | `list_bool_and` | `Expr.list.min` | canonical |  |
 | `list_bool_or` | `Expr.list.max` | canonical |  |
 | `list_contains` | `Expr.list.contains` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (item). Wave W4. |
@@ -97,9 +97,9 @@ The following table maps the 94 names on `Expression`, sorted alphabetically.
 | `map_keys` | `Expr.map.keys` | canonical |  |
 | `minhash` | `Expr.str.minhash` | mismatch | Differs: Daft minhash(num\_hashes, ngram\_size, seed, hash\_function='murmurhash3') and Batcher str.minhash(num\_perm, ngram) use different shingling and hashing, so signatures differ for the same text. Param: hash\_function=, seed=. Wave W0. |
 | `name` | n/a | out of scope | Declined: Expression-object introspection, not a data operation. |
-| `not_null` | `Expr.is_not_null` | canonical |  |
+| `not_null` | {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
 | `partition_iceberg_bucket` | n/a | gap | Not yet: Iceberg murmur3\_32 bucket transform (Batcher hash\_bucket uses a different hash). Wave W3. |
-| `partition_iceberg_truncate` | `bt.partition_truncate` | param | Missing: string and binary inputs (Batcher raises on Utf8). Wave W2. |
+| `partition_iceberg_truncate` | {py:obj}`bt.partition_truncate <batcher.partition_truncate>` | param | Missing: string and binary inputs (Batcher raises on Utf8). Wave W2. |
 | `pearson_correlation` | n/a | gap | Not yet: Pearson correlation between two vectors per row. Wave W3. |
 | `serialize` | n/a | gap | Not yet: to\_json/serialize of any value to a JSON string. Wave W7. |
 | `simhash` | n/a | gap | Not yet: text SimHash fingerprint (Batcher's list.simhash is a random-hyperplane embedding signature). Wave W3. |
@@ -107,10 +107,10 @@ The following table maps the 94 names on `Expression`, sorted alphabetically.
 | `to_arrow_expr` | n/a | out of scope | Declined: Expression-object introspection (pyarrow.compute bridge), not a data operation. |
 | `tokenize_decode` | n/a | gap | Not yet: BPE tokenizer decode from a tokens file. Wave W3. |
 | `tokenize_encode` | n/a | gap | Not yet: BPE tokenizer encode from a tokens file. Wave W3. |
-| `try_cast` | `Expr.try_cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `try_cast` | {py:obj}`Expr.try_cast <batcher.plan.expr_ir.core.Expr.try_cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
 | `try_deserialize` | n/a | gap | Not yet: typed JSON decode that nulls on failure. Wave W7. |
 | `udf` | n/a | out of scope | Declined: internal Expression constructor used by the Daft UDF machinery, not a user entry point. |
-| `unnest` | `Dataset.unnest` | param | Missing: an Expression-level unnest usable inside select. Wave W8. |
+| `unnest` | {py:obj}`Dataset.unnest <batcher.Dataset.unnest>` | param | Missing: an Expression-level unnest usable inside select. Wave W8. |
 | `value_counts` | n/a | gap | Not yet: per-list value counts as a list of (value, count) structs. Wave W4. |
 
 ## The `daft.functions` module: list, map, struct, JSON, embedding, null, cast, and hash functions
@@ -119,33 +119,33 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `between` | `Expr.between` | canonical |  |
-| `cast` | `Expr.cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `between` | {py:obj}`Expr.between <batcher.plan.expr_ir.core.Expr.between>` | canonical |  |
+| `cast` | {py:obj}`Expr.cast <batcher.plan.expr_ir.core.Expr.cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
 | `chunk` | n/a | gap | Not yet: list chunking into fixed-size sublists. Wave W4. |
-| `coalesce` | `bt.coalesce` | canonical |  |
+| `coalesce` | {py:obj}`bt.coalesce <batcher.coalesce>` | canonical |  |
 | `cosine_distance` | `Expr.list.cosine_distance` | canonical |  |
 | `cosine_similarity` | `Expr.list.cosine_similarity` | canonical |  |
 | `deserialize` | n/a | gap | Not yet: typed JSON decode (json\_decode with a dtype). Wave W7. |
 | `dot_product` | `Expr.list.dot` | canonical |  |
-| `eq_null_safe` | `Expr.eq_missing` | canonical |  |
+| `eq_null_safe` | {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | canonical |  |
 | `euclidean_distance` | `Expr.list.l2_distance` | canonical |  |
-| `explode` | `Dataset.explode` | mismatch | Differs: Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form). Wave W8. |
+| `explode` | {py:obj}`Dataset.explode <batcher.Dataset.explode>` | mismatch | Differs: Daft explode is an Expression and keeps a null or empty list as one null row; Batcher explode is a Dataset method that drops them. Param: outer=True (and an Expression form). Wave W8. |
 | `extract_day_uuid7` | n/a | gap | Not yet: UUIDv7 days-since-epoch extraction. Wave W3. |
 | `extract_hour_uuid7` | n/a | gap | Not yet: UUIDv7 hours-since-epoch extraction. Wave W3. |
 | `extract_minute_uuid7` | n/a | gap | Not yet: UUIDv7 minutes-since-epoch extraction. Wave W3. |
 | `extract_month_uuid7` | n/a | gap | Not yet: UUIDv7 months-since-epoch extraction. Wave W3. |
-| `fill_null` | `Expr.fill_null` | canonical |  |
+| `fill_null` | {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | canonical |  |
 | `get` | `Expr.list.get` + `Expr.struct.field` | param | Missing: default= for a missing index/field, and one get over list, struct and map. Wave W4. |
-| `hamming_distance` | `^` operator + `Expr.bit_count` | canonical |  |
-| `hash` | `bt.hash_rows` | mismatch | Differs: Daft hashes with xxhash (or murmurhash3/sha1 via hash\_function=); Batcher hash\_rows uses a different function, so values differ. Param: hash\_function='xxhash'. Wave W0. |
-| `is_in` | `Expr.is_in` | canonical |  |
-| `is_null` | `Expr.is_null` | canonical |  |
+| `hamming_distance` | `^` operator + {py:obj}`Expr.bit_count <batcher.plan.expr_ir.core.Expr.bit_count>` | canonical |  |
+| `hash` | {py:obj}`bt.hash_rows <batcher.hash_rows>` | mismatch | Differs: Daft hashes with xxhash (or murmurhash3/sha1 via hash\_function=); Batcher hash\_rows uses a different function, so values differ. Param: hash\_function='xxhash'. Wave W0. |
+| `is_in` | {py:obj}`Expr.is_in <batcher.plan.expr_ir.core.Expr.is_in>` | canonical |  |
+| `is_null` | {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | canonical |  |
 | `jaccard_similarity` | `Expr.list.jaccard` | canonical |  |
 | `jq` | n/a | gap | Not yet: jq filter language over JSON strings (Batcher has JSONPath extract\_\* only). Wave W7. |
 | `json_array_length` | `Expr.json.array_length` | canonical |  |
 | `json_object_keys` | `Expr.json.keys` | mismatch | Differs: Daft does not return keys in source order (keys b, a come back as a, b) and returns null for a non-object; Batcher returns source order and an empty list. Param: null for non-objects, key order. Wave W7. |
 | `json_tuple` | n/a | gap | Not yet: json\_tuple(expr, \*fields) returning a struct of top-level values. Wave W7. |
-| `list_append` | `Expr.list.concat` + `bt.array` | canonical |  |
+| `list_append` | `Expr.list.concat` + {py:obj}`bt.array <batcher.array>` | canonical |  |
 | `list_bool_and` | `Expr.list.min` | canonical |  |
 | `list_bool_or` | `Expr.list.max` | canonical |  |
 | `list_contains` | `Expr.list.contains` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (item). Wave W4. |
@@ -163,22 +163,30 @@ The following table maps the 63 names on the `daft.functions` module, sorted alp
 | `map_get` | `Expr.map.get` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (map key). Wave W4. |
 | `map_keys` | `Expr.map.keys` | canonical |  |
 | `minhash` | `Expr.str.minhash` | mismatch | Differs: Daft minhash(num\_hashes, ngram\_size, seed, hash\_function='murmurhash3') and Batcher str.minhash(num\_perm, ngram) use different shingling and hashing, so signatures differ for the same text. Param: hash\_function=, seed=. Wave W0. |
-| `not_null` | `Expr.is_not_null` | canonical |  |
+| `not_null` | {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
 | `partition_iceberg_bucket` | n/a | gap | Not yet: Iceberg murmur3\_32 bucket transform (Batcher hash\_bucket uses a different hash). Wave W3. |
-| `partition_iceberg_truncate` | `bt.partition_truncate` | param | Missing: string and binary inputs (Batcher raises on Utf8). Wave W2. |
+| `partition_iceberg_truncate` | {py:obj}`bt.partition_truncate <batcher.partition_truncate>` | param | Missing: string and binary inputs (Batcher raises on Utf8). Wave W2. |
 | `pearson_correlation` | n/a | gap | Not yet: Pearson correlation between two vectors per row. Wave W3. |
 | `run_process` | n/a | out of scope | Declined: spawns an external process per row: a per-row side effect outside the data plane. |
-| `seq` | `bt.sequence` | mismatch | Differs: Daft seq(n) is \[0, n); Batcher sequence(start, stop) includes stop. Rewrite: sequence(0, n - 1). Wave W1. |
+| `seq` | {py:obj}`bt.sequence <batcher.sequence>` | mismatch | Differs: Daft seq(n) is \[0, n); Batcher sequence(start, stop) includes stop. Rewrite: sequence(0, n - 1). Wave W1. |
 | `serialize` | n/a | gap | Not yet: to\_json/serialize of any value to a JSON string. Wave W7. |
 | `simhash` | n/a | gap | Not yet: text SimHash fingerprint (Batcher's list.simhash is a random-hyperplane embedding signature). Wave W3. |
 | `slice` | `Expr.list.slice` | mismatch | Differs: Daft slice(start, end) takes an exclusive end index; Batcher list.slice(offset, length) takes a length (\[1,2,3,4\] slice(1,3) is \[2,3\] vs \[2,3,4\]). Param: end=. Wave W0. |
-| `to_list` | `bt.array` | canonical |  |
-| `to_struct` | `bt.struct` | param | Missing: positional fields named after their columns (bt.struct takes keywords only). Wave W2. |
+| `to_list` | {py:obj}`bt.array <batcher.array>` | canonical |  |
+| `to_struct` | {py:obj}`bt.struct <batcher.struct>` | param | Missing: positional fields named after their columns (bt.struct takes keywords only). Wave W2. |
 | `tokenize_decode` | n/a | gap | Not yet: BPE tokenizer decode from a tokens file. Wave W3. |
 | `tokenize_encode` | n/a | gap | Not yet: BPE tokenizer encode from a tokens file. Wave W3. |
-| `try_cast` | `Expr.try_cast` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
+| `try_cast` | {py:obj}`Expr.try_cast <batcher.plan.expr_ir.core.Expr.try_cast>` | param | Missing: cast grammar for timestamp units/timezones, duration, list, struct, map, fixed\_size\_list, fixed\_size\_binary, time and null (Batcher's cast accepts primitive and decimal names only). Wave W2. |
 | `try_deserialize` | n/a | gap | Not yet: typed JSON decode that nulls on failure. Wave W7. |
-| `unnest` | `Dataset.unnest` | param | Missing: an Expression-level unnest usable inside select. Wave W8. |
+| `unnest` | {py:obj}`Dataset.unnest <batcher.Dataset.unnest>` | param | Missing: an Expression-level unnest usable inside select. Wave W8. |
 | `uuid` | n/a | gap | Not yet: UUID v4/v7 generator expression (needs a determinism story across seq/par/dist). Wave W3. |
 | `value_counts` | n/a | gap | Not yet: per-list value counts as a list of (value, count) structs. Wave W4. |
-| `when` | `bt.when` | param | Missing: the two-argument when(cond, then) form. Wave WF. |
+| `when` | {py:obj}`bt.when <batcher.when>` | param | Missing: the two-argument when(cond, then) form. Wave WF. |
+
+
+## See also
+
+- {doc}`index`: the statuses, the waves, and the other Daft pages.
+- {doc}`leaving-batcher`: the rows that agree, read the other way, for code moving off Batcher.
+- {doc}`/getting-started/migration/differences`: what Batcher leaves out on purpose, and how to prove a port returns the same rows.
+- {doc}`/api/reference`: every Batcher spelling in one lookup table.

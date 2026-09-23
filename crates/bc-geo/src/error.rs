@@ -1,10 +1,12 @@
 //! The one error type every `bc-geo` entry point returns.
 //!
-//! Geometry work fails for exactly three reasons and callers act differently on
-//! each, so they are separate variants rather than one string: the bytes are not a
-//! geometry (`Parse`), the geometry is a geometry but not the *kind* this operation
-//! is defined on (`Unsupported`), or the operation's numeric preconditions are not
-//! met (`Invalid`). `bc-expr` maps the first two to a null result and the third to a
+//! Geometry work fails for four reasons and callers act differently on each, so they
+//! are separate variants rather than one string: the bytes are not a geometry
+//! (`Parse`), the geometry is a geometry but not the *kind* this operation is defined
+//! on (`Unsupported`), one row's *value* lies outside the operation's domain
+//! (`Domain` — a NaN longitude, a latitude of 95, an empty chain to interpolate along),
+//! or a *parameter* of the operation is unusable (`Invalid` — a precision of 13, a
+//! negative zoom). `bc-expr` maps the first three to a null result and the fourth to a
 //! query error, which is only expressible if the distinction survives the boundary.
 
 use thiserror::Error;
@@ -30,6 +32,12 @@ pub enum GeoError {
         geom_type: &'static str,
     },
 
+    /// One row's input lies outside the operation's domain: a coordinate that is NaN
+    /// or off the globe, a chain too short to measure along. A property of that row
+    /// alone, so the expression layer nulls it rather than failing the whole column.
+    #[error("{0}")]
+    Domain(String),
+
     /// A numeric or structural precondition of the operation was violated.
     #[error("{0}")]
     Invalid(String),
@@ -49,15 +57,26 @@ impl GeoError {
         GeoError::Invalid(detail.into())
     }
 
-    /// True when the failure means "this input is not a geometry / not this shape",
-    /// which the expression layer surfaces as a null rather than a query error.
+    /// A `Domain` failure: this row's value is outside what the operation accepts.
+    pub fn domain(detail: impl Into<String>) -> Self {
+        GeoError::Domain(detail.into())
+    }
+
+    /// True when the failure is a property of one row — the input is not a geometry,
+    /// not this shape, or not inside the function's domain — which the expression layer
+    /// surfaces as a null rather than a query error.
     ///
     /// `Invalid` is deliberately excluded: it reports a caller mistake (a negative
     /// buffer quadrant count, a grid precision out of range) that is a property of the
-    /// *plan*, not of one row, so nulling it would hide the bug on every row.
+    /// *plan*, not of one row, so nulling it would hide the bug on every row. The line
+    /// between the two is "would every row fail?": one GPS fix with a NaN longitude in a
+    /// hundred million must not abort the scan, and a precision of 13 fails every row.
     #[must_use]
     pub fn is_row_local(&self) -> bool {
-        matches!(self, GeoError::Parse { .. } | GeoError::Unsupported { .. })
+        matches!(
+            self,
+            GeoError::Parse { .. } | GeoError::Unsupported { .. } | GeoError::Domain(_)
+        )
     }
 }
 

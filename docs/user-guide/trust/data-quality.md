@@ -108,6 +108,30 @@ print(worst.violations, round(worst.pass_rate, 2))
 # 1 0.8
 ```
 
+`rows` is the relation's row count on every path. That includes a chain Batcher proves clean from metadata without evaluating a single constraint, where the count comes from the same metadata. A schema constraint is decided before any row is read, so its own `rows` is 0.
+
+A relation-level constraint, such as `mean_between` or `row_count_between`, has no violating row. It's true or false of the whole table, so its `pass_rate` is 1.0 when it held and 0.0 when it failed, and its `rows` is the relation's row count.
+
+A relation-level measurement that is NULL or NaN fails its bound. The mean of an empty column is NULL, and the mean of a column holding a NaN is NaN. Neither shows that the value lies inside the bound, so the constraint fails whichever sides you bounded. On a two-sided bound this matches DuckDB's `avg(x) BETWEEN lo AND hi`. A share of rows, such as the null rate or the distinct ratio, divides by the row count. Over an empty relation it takes the value its row-level counterpart agrees with: `null_rate_below` measures 0.0 and `unique_ratio_above` measures 1.0, so both pass as `not_null` and `unique` do. Add `row_count_between(1)` when an empty table should fail.
+
+```python
+readings = bt.from_pydict({"pressure": [1012.0, float("nan"), 1009.5]})
+nan_report = readings.dq.mean_between("pressure", 900, 1100).validate()
+result = nan_report.results[0]
+print(result.ok, result.pass_rate, result.rows)
+# False 0.0 3
+```
+
+`to_dict()` returns strict JSON. A NaN or infinite measurement is emitted as `None`, so `json.dumps(..., allow_nan=False)` accepts the payload and a sink that rejects `NaN` tokens can store it. The `value` attribute on the result keeps the real measurement.
+
+```python
+import json
+
+payload = json.dumps(nan_report.to_dict(), allow_nan=False)
+print(json.loads(payload)["constraints"][0]["value"])
+# None
+```
+
 A chain ends in a terminal, and the terminals differ only in what becomes of the rows that failed:
 
 ![One constraint chain, ds.dq.not_null('id').in_range('age', 0, 120), in which each constraint is a boolean Expr that is TRUE for a valid row. It lowers to FILTER, a keyless AGGREGATE, count() OVER (PARTITION BY keys) and a LEFT JOIN, and validity is forced to a non-null boolean, so the valid and invalid rows together are exactly the input. Three terminals split that partition three ways. fail() takes any violation and returns no dataset: it raises DataQualityError carrying a count per constraint, writes nothing to a dead-letter sink, and stops the run. drop() returns the passing rows as one lazy Dataset with no dead-letter side, so the violating rows are gone and nothing records them. quarantine() returns both, the valid rows and the violating ones as a second lazy Dataset to write to a dead-letter sink. annotate() is a fourth terminal, keeping every row and naming what each one failed, so a quarantined row can carry its reason. A NULL is not a violation, mostly=0.99 passes while one percent violate, and severity='warn' reports without enforcing anywhere.](../../_static/diagrams/dq_actions.svg)
@@ -271,6 +295,17 @@ delete what is a coincidence of today's sample, and keep what is a contract. It 
 never proposes a range read off an observed minimum and maximum, because tomorrow's
 legitimate value is outside today's and a check that cries wolf gets deleted.
 
+A float column gets `is_finite` only when it holds no NaN and no infinity. `suggest` counts them in the same aggregate that measures each numeric column's minimum, so the rule costs no extra pass. The proposals therefore hold on the data they came from, even when that data already carries a NaN.
+
+```python
+sensors = bt.from_pydict({"temp": [21.5, 22.0], "pressure": [1012.0, float("nan")]})
+names = list(sensors.dq.suggest().validate().violations)
+print("is_finite(temp)" in names, "is_finite(pressure)" in names)
+# True False
+```
+
+Restrict `suggest` to some columns with a list, such as `suggest(["id"])`. A bare string raises `PlanError` rather than being read as one column per character.
+
 ## Reuse a contract across datasets
 
 A contract is written once and run against many tables: today's partition and yesterday's,
@@ -329,6 +364,20 @@ evolved = bt.read.parquet(root, schema_mode="union").sort("id")
 print(evolved.to_pydict())
 # {'id': [1, 2, 3], 'amount': [10, 20, 30], 'region': [None, None, 'us']}
 ```
+
+## On a cluster
+
+The `ds.dq` terminals take no `distributed=` argument. `validate()` and `fail()` execute through the same routing as every other terminal, `distributed="auto"`, which chooses single-node or the cluster from the input size and the cluster topology. To pin them, set the session option `distributed.mode` to `"always"` or `"never"`. The default is `"auto"`.
+
+```python
+from batcher.config import option_context
+
+with option_context("distributed.mode", "never"):
+    print(people.dq.not_null("id").validate().ok)
+# True
+```
+
+`drop()`, `quarantine()`, and `annotate()` return lazy datasets, so you choose where they run when you collect them, such as `clean.collect(distributed=True, num_workers=4)`. The checks lower to the same relational operators as any other query, so a cluster run has no separate validation semantics.
 
 ## See also
 

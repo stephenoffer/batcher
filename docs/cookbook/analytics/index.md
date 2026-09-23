@@ -66,7 +66,7 @@ Why a windowed rank beats a sort, and which of the three rank functions you want
 :::
 
 :::{grid-item-card} {octicon}`table;1.1em` Geospatial binning
-:link: geospatial-binning
+:link: /cookbook/analytics/aggregates/geospatial-binning
 :link-type: doc
 Snapping coordinates to a grid, where `round` and `cast` both lie to you.
 :::
@@ -111,5 +111,4 @@ The three-sigma rule never fires, because the outlier is inside its own baseline
 behavior/index
 aggregates/index
 inference/index
-geospatial-binning
 ```

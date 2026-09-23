@@ -46,7 +46,7 @@ Training ingest is deterministic and resumable. {py:meth}`ds.ml.stream_loader <b
 
 ## Measured
 
-Every figure below passed a correctness gate before it was timed: the same predictions, or the same frame count at the same shape, as the comparison. The source is `benchmarks/BENCHMARK_RESULTS.md`, and {doc}`/benchmarks/results/ai-and-gpu` and {doc}`/benchmarks/results/multimodal-ingest` walk through them.
+Every figure below passed a correctness gate before it was timed: the same predictions, or the same frame count at the same shape, as the comparison. The source is [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md), and {doc}`/benchmarks/results/ai-and-gpu` and {doc}`/benchmarks/results/multimodal-ingest` walk through them.
 
 The following table lists single-node media results on 96 cores with a release build, 2,000 JPEG frames or audio clips per run:
 
@@ -138,6 +138,8 @@ Call served models, and feed training ranks a balanced, resumable stream.
 - {doc}`/api/models/ml`: the reference for the `.ml` accessor and the `batcher.ml` package.
 - {doc}`/architecture/deep-dives/distribution/gpu-execution`: how device work is scheduled.
 - {doc}`/benchmarks/results/ai-and-gpu`: the full GPU measurements and how they were taken.
+- {doc}`/examples/machine-learning`: 43 model and metric scripts, each run on every commit.
+- {doc}`/getting-started/concepts/glossary`: morsel, breaker, mergeable, spill, and the rest, defined in one line each.
 
 ```{toctree}
 :hidden:

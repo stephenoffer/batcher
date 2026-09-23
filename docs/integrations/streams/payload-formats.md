@@ -23,7 +23,7 @@ The same options work on every broker source, because the decode belongs to the 
 
 You can decode a payload with `map_batches` and a hand-written function. It costs three things.
 
-The engine can't report the stream's schema, because the shape of the payload is inside a Python callback the optimizer can't see. `Dataset.schema` answers `binary`, so nothing
+The engine can't report the stream's schema, because the shape of the payload is inside a Python callback the optimizer can't see. {py:obj}`Dataset.schema <batcher.Dataset.schema>` answers `binary`, so nothing
 downstream can be type-checked until rows arrive. A projection cannot be pushed into the
 decode either, so a query reading one field of a fifty-field record still pays for all
 fifty. And a malformed record raises from inside user code, where the engine cannot tell it
@@ -92,6 +92,10 @@ Parsing is pyarrow's own JSON reader over the batch, so it is the same C++ path 
 takes and it does not run per row. A field the schema does not mention is ignored rather
 than rejected, which is what lets a producer add fields without stopping the consumer.
 
+One message is always one row. An empty or whitespace-only message decodes to a null, and a message holding two documents is a malformed record rather than two rows. Batcher checks the batch parse against the number of messages it was given, and when they disagree, or the batch will not parse, it re-parses that batch one message at a time so a bad message affects only its own row.
+
+With `schema_registry=`, JSON payloads are read as a Confluent JSON Schema serializer writes them: the five-byte framing is checked and stripped on decode and written on encode, as for Avro. A JSON topic whose producer does not frame its messages takes `value_schema=` without a registry.
+
 ### Protobuf
 
 Pass the generated message class:
@@ -152,6 +156,12 @@ can concatenate.
 Pin the reader schema explicitly, with `value_schema=` alongside `schema_registry=`, when
 you want a consumer to stay on a fixed column set while producers move ahead of it.
 
+### When the registry fails
+
+A registry that is unreachable, or answers with an error, fails the query in every decode mode, including `"permissive"`. That failure says nothing about the message being decoded, and nulling on it would turn an outage into a stream of empty records. A schema id the registry answers "not found" for is different: the id came out of the payload, so that record is malformed, and `"permissive"` nulls it. Batcher looks each unknown id up once per micro-batch, not once per message.
+
+Without `schema_registry=`, an Avro record must use every byte of its payload. A Confluent-framed payload read as bare Avro leaves bytes over, so it is reported as malformed, with a hint to pass the registry, instead of decoding into plausible garbage.
+
 ## Malformed records
 
 `value_decode_mode` decides what a record that will not decode costs, matching Spark's
@@ -173,6 +183,22 @@ events = bt.read.kafka(
 )
 ```
 
+The mode applies per record for every format. Under `"permissive"`, one bad message in a JSON batch nulls that message and nothing else. You can see this on the codec itself, which is what the source runs on each micro-batch:
+
+```python
+import pyarrow as pa
+from batcher.io.formats.streaming.codecs import resolve_codec
+
+codec = resolve_codec("json", schema={"user": "string", "amount": "int64"}, mode="permissive")
+payloads = pa.array(
+    [b'{"user":"u1","amount":10}', b"{not json", b"   ", b'{"user":"u4","amount":4}', None]
+)
+decoded = codec.decode(payloads)
+print(decoded.to_pylist())
+# [{'user': 'u1', 'amount': 10}, None, None, {'user': 'u4', 'amount': 4}, None]
+assert len(decoded) == len(payloads)
+```
+
 Failing is the default deliberately. A stream that silently nulls every record after a
 producer changes format is a stream that reports success while delivering nothing, and
 nothing in the progress record distinguishes it from an idle topic. Reach for permissive
@@ -180,6 +206,63 @@ when you know the tail of the topic holds legacy records, and filter the nulls e
 
 A null payload is not a decode failure. Kafka's tombstone record has a null `value` and
 means the key was deleted, so it survives the decode as a null in every mode.
+
+Both of those behaviours are visible without a broker. Standing a batch of the broker column
+contract in for the source, a malformed payload and a tombstone each null their own row and
+leave the rest of the batch intact:
+
+```python
+import batcher as bt
+import pyarrow as pa
+from batcher import col
+
+schema = pa.schema(
+    [
+        ("key", pa.binary()),
+        ("value", pa.binary()),
+        ("partition", pa.int64()),
+        ("offset", pa.int64()),
+        ("timestamp", pa.int64()),
+        ("topic", pa.string()),
+    ]
+)
+batch = pa.record_batch(
+    {
+        "key": [b"u1", b"u2", b"u3", None],
+        "value": [
+            b'{"user":"u1","amount":10}',
+            b"not json at all",  # malformed
+            b'{"user":"u3","amount":7}',
+            None,  # tombstone
+        ],
+        "partition": [0, 0, 1, 1],
+        "offset": [11, 12, 4, 5],
+        "timestamp": [1700000000000] * 4,
+        "topic": ["orders"] * 4,
+    },
+    schema=schema,
+)
+orders = bt.from_batches(lambda: iter([batch]), schema)
+
+decoded = orders.select(
+    user=col("value").cast("string").json.extract_string("$.user"),
+    amount=col("value").cast("string").json.extract_int("$.amount"),
+)
+print(decoded.to_pydict())
+# {'user': ['u1', None, 'u3', None], 'amount': [10, None, 7, None]}
+```
+
+Two rows decoded, two nulled, and no exception. Filtering the nulls is then the explicit step
+the paragraph above asks for:
+
+```python
+print(decoded.filter(col("user").is_not_null()).count())
+# 2
+```
+
+That is the ad-hoc shape. Against a real topic, name `value_format` instead and the source
+decodes in the reader, so the schema is known before a message is polled rather than
+recovered per expression.
 
 ## Writing
 
@@ -220,9 +303,12 @@ an inline `value_schema`, or drop `schema_registry` to write bare payloads.
 - Protobuf needs the generated message class even with a registry, for the reason above.
 - A JSON payload needs `value_schema=` or a registry subject. It's never inferred, for the reason above.
 - JSON Schema documents from a registry are translated only for the
-  object-with-`properties` shape a message payload uses. `oneOf` and cross-document `$ref`
-  are refused rather than approximated, since a silently wrong column type is worse than an
-  explicit `value_schema=`.
+  object-with-`properties` shape a message payload uses. A property using `$ref`, `oneOf`,
+  `anyOf`, `allOf`, or `not`, or a `type` list naming two non-null types, is refused with the
+  property named, since a silently wrong column type is worse than an explicit
+  `value_schema=`.
+- A Protobuf codec decodes one message of its `.proto`. A framed payload whose message index
+  names a different message is a malformed record, not a decode of the wrong fields.
 
 ## See also
 

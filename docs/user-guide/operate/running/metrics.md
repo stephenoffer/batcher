@@ -261,6 +261,6 @@ counters, for tests and for a service that would rather report per-interval numb
 ## See also
 
 - {doc}`Observability <observability>`: the event bus, the dashboard, and the per-query event log.
-- {doc}`Monitoring a stream </user-guide/moving-data/streaming-monitoring>`: the per-query listener behind the `streaming` counters.
+- {doc}`Monitoring a stream </user-guide/moving-data/streaming/monitoring>`: the per-query listener behind the `streaming` counters.
 - {doc}`Explain plans </user-guide/operate/tuning/explain-plans>`: the same measurements for one query rather than the process.
 - {doc}`Troubleshooting <troubleshooting>`: symptom-first debugging.

@@ -147,7 +147,7 @@ fn float_of(
         StArea => Some(measure::area(&g.geometry)),
         StLength => Some(measure::length(&g.geometry)),
         StPerimeter => Some(measure::perimeter(&g.geometry)),
-        StAreaSpheroid => Some(geodesy::geodesic_area_m2(&g.geometry)),
+        StAreaSpheroid => row_result(geodesy::geodesic_area_m2(&g.geometry), func)?,
         StLengthSpheroid => row_result(geodesy::geodesic_length_m(&g.geometry), func)?,
         StPerimeterSpheroid => row_result(geodesy::geodesic_perimeter_m(&g.geometry), func)?,
         StLineLocatePoint => {
@@ -191,13 +191,16 @@ fn float_of(
 
 /// The smallest geodesic distance between any pair of positions of two geometries.
 ///
-/// Vertex-to-vertex, not the true geodesic distance between the shapes: on the sphere
+/// Vertex-to-vertex, not the true geodesic distance between the shapes: on the globe
 /// the nearest point of a segment is not the nearest point of its chord, and computing
 /// it exactly needs an iterative geodesic solver per segment pair. For point-to-point
 /// work — which is the overwhelming majority of "how far apart are these" queries —
 /// the two coincide exactly. For polygon-to-polygon it over-reports by at most the
 /// segment length, so it is an upper bound and safe to filter with. Densify with
 /// `st_segmentize` first when the segments are long and the answer must be tight.
+///
+/// A position off the globe (NaN, a longitude of 200) nulls the row, like every other
+/// row-local failure in this family.
 fn nearest_geodesic(a: &Geom, b: &Geom, spheroid: bool) -> Result<Option<f64>, ExprError> {
     let (ca, cb) = (a.coords(), b.coords());
     if ca.is_empty() || cb.is_empty() {
@@ -211,19 +214,14 @@ fn nearest_geodesic(a: &Geom, b: &Geom, spheroid: bool) -> Result<Option<f64>, E
     for p in &ca {
         for q in &cb {
             let d = if spheroid {
-                match geodesy::vincenty(p.x, p.y, q.x, q.y) {
-                    Ok(v) => v,
-                    // Non-convergence is near-antipodal, which is never the minimum of a
-                    // set that also holds convergent pairs; skip rather than fail.
-                    Err(_) => continue,
-                }
+                geodesy::ellipsoidal_distance(p.x, p.y, q.x, q.y)
             } else {
-                match geodesy::haversine(p.x, p.y, q.x, q.y) {
-                    Ok(v) => v,
-                    Err(_) => return Ok(None),
-                }
+                geodesy::haversine(p.x, p.y, q.x, q.y)
             };
-            best = best.min(d);
+            match d {
+                Ok(v) => best = best.min(v),
+                Err(_) => return Ok(None),
+            }
         }
     }
     Ok(best.is_finite().then_some(best))
