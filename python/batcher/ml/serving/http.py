@@ -123,7 +123,7 @@ def _retry_after(exc: Any, ceiling: float) -> float | None:
     try:
         return min(ceiling, max(0.0, float(text)))
     except ValueError:
-        pass
+        pass  # not delta-seconds; Retry-After may also be an HTTP date, parsed below
     from email.utils import parsedate_to_datetime
 
     try:

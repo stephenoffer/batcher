@@ -252,7 +252,7 @@ def _series_reader(grouped, fused):
             try:
                 return fused[(column, method)]
             except (KeyError, TypeError):
-                pass
+                pass  # this reduction was not in the fused frame; compute it from the group
         return _call(grouped[column], method)
 
     return read

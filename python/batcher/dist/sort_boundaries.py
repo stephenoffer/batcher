@@ -324,6 +324,6 @@ def _decode_grid(grid: list[Any]) -> list[Any]:
                 out.append(bytes.fromhex(v[len(_BINARY_MARK) :]))
                 continue
             except ValueError:
-                pass
+                pass  # marked but not hex: keep it as found, and the kind guard rejects the grid
         out.append(v)
     return out
