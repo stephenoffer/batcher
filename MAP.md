@@ -887,7 +887,7 @@ The scalar lowerings big enough to own a module, kept out of the `scalar` dispat
 
 | module | lines | what it is |
 |---|---|---|
-| `accessors.py` | 224 | SQL → the typed accessor namespaces, by name. |
+| `accessors.py` | 225 | SQL → the typed accessor namespaces, by name. |
 | `buckets.py` | 121 | `time_bucket` — snapping a timestamp to the start of the period that contains it. |
 | `derived.py` | 44 | The dispatches *derived* from the public expression surface, in the order they run. |
 | `dynamic.py` | 140 | String functions whose parameters are columns rather than constants. |
@@ -1795,7 +1795,7 @@ Credential verification: turning a presented credential into a verified `Princip
 |---|---|---|
 | `_backend.py` | 606 | The `pyarrow.fs`-backed filesystem façade every IO source and sink talks to. |
 | `_concurrent.py` | 121 | Concurrent per-file reads — the shared fan-out for footer/header stats and file bytes. |
-| `_file_cache.py` | 354 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
+| `_file_cache.py` | 352 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 131 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
@@ -2173,7 +2173,7 @@ Splits — independently-readable, picklable slices of a source.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 244 | The `Split` protocol and the whole-source fallback. |
-| `clustering.py` | 131 | What a split set guarantees about *where equal values live* — the clustering protocol. |
+| `clustering.py` | 132 | What a split set guarantees about *where equal values live* — the clustering protocol. |
 | `codecs.py` | 109 | Whether a file's compression is one the device can undo, or one that lands back on the CPU. |
 | `conformed.py` | 240 | The strict-mode contract, carried to the worker on the split itself. |
 | `device.py` | 214 | Which splits a GPU can read for itself, and the locators it needs to do it. |
@@ -2750,7 +2750,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 | module | lines | what it is |
 |---|---|---|
 | `hierarchy.py` | 725 | The Batcher exception hierarchy. |
-| `suggest.py` | 402 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
+| `suggest.py` | 401 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 125 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
 ### `batcher/_internal/hardware/` — 0 · utility
