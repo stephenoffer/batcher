@@ -29,6 +29,8 @@ import base64
 import hashlib
 from typing import Any
 
+from typing_extensions import override
+
 from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource, as_header_pairs
@@ -318,7 +320,8 @@ class PulsarSource(BrokerSource):
             )
         super().seek(position)
 
-    def _apply_seek(self, partition: int, token: Any) -> None:  # noqa: ARG002
+    @override
+    def _apply_seek(self, partition: int, token: Any) -> None:
         """Reposition the consumer to a checkpointed `MessageId`.
 
         Without this the base `_apply_seek` was a no-op, so `seek` recorded a position that

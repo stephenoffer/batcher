@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from typing_extensions import override
+
 from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.streaming.broker import (
@@ -283,7 +285,8 @@ class EventHubsSource(BrokerSource):
         self._buffers[partition_id] = buffer
         return consumer, buffer
 
-    def _apply_seek(self, partition: int, token: Any) -> None:  # noqa: ARG002
+    @override
+    def _apply_seek(self, partition: int, token: Any) -> None:
         """Drop this partition's cached consumer so the next poll reopens it at `token`.
 
         The base records the position in `_resume_from`; a consumer already open is still

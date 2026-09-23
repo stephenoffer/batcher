@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import IO, Any
 
 import pyarrow as pa
+from typing_extensions import override
 
 from batcher._internal.optional import require
 from batcher.io.base import FileSink, FileSource
@@ -398,10 +399,12 @@ class ORCSink(FileSink):
         _reject_unrepresentable_timestamps(table)
         orc.write_table(table, fh, compression=self.compression, stripe_size=self.stripe_size)
 
-    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:  # noqa: ARG002 (ORCWriter infers the schema from the first write)
+    @override
+    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
         # Incremental ORCWriter: `write_stream` appends one batch at a time so a
         # breaker-free read→transform→write never materializes the whole result
         # (bounded memory), instead of the base default that buffers one table.
+        # `schema` goes unused: ORCWriter infers the schema from the first write.
         orc = _require_orc()
         return orc.ORCWriter(fh, compression=self.compression, stripe_size=self.stripe_size)
 

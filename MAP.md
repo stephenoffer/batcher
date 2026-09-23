@@ -561,7 +561,7 @@ Decode media columns into tensors — natively wherever the engine has the codec
 |---|---|---|
 | `accelerated.py` | 255 | Decoding on the device, so the bus carries compressed bytes instead of pixels. |
 | `media.py` | 161 | Image and audio decode — the two media kinds the data plane handles natively. |
-| `stage.py` | 141 | Shared scaffolding every decode stage is built on. |
+| `stage.py` | 140 | Shared scaffolding every decode stage is built on. |
 | `transfer.py` | 189 | Moving bytes in and out of a dataset — the ends of a multimodal pipeline. |
 | `video.py` | 283 | Video decode — sampling a fixed number of resized frames per clip. |
 
@@ -879,7 +879,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | `scalar.py` | 548 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 258 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 222 | SQL string functions whose translation is more than a name lookup. |
-| `temporal.py` | 478 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
+| `temporal.py` | 484 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
 
 ### `batcher/_sql/parser/expressions/lowering/` — 6 · front-end
 
@@ -1728,7 +1728,7 @@ Streaming (incremental) aggregation and the bounded-memory operator drivers.
 
 | module | lines | what it is |
 |---|---|---|
-| `running.py` | 142 | `_AggFold` — the running (unwatermarked) streaming aggregate. |
+| `running.py` | 141 | `_AggFold` — the running (unwatermarked) streaming aggregate. |
 | `shared.py` | 175 | Pieces both streaming folds need: the empty-aggregate identity and the state guard. |
 | `windowed.py` | 700 | `_WindowedAggFold` — the watermark-bounded windowed aggregate, its spill tier and its |
 
@@ -1841,9 +1841,9 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `_blocks.py` | 222 | Line blocks as Arrow arrays — the one line splitter every genomics reader shares. |
 | `_tsv.py` | 234 | The comment-skipping TSV engine BED, GFF, and VCF share. |
 | `bed.py` | 221 | BED format — genomic intervals, the coordinate currency of every annotation track. |
-| `fasta.py` | 227 | FASTA format — the reference-sequence interchange format, as `{id, description, sequence}`. |
-| `fastq.py` | 215 | FASTQ format — sequencing reads as `{id, description, sequence, quality}`. |
-| `gff.py` | 127 | GFF3 and GTF format — genome annotations, nine tab-separated columns. |
+| `fasta.py` | 229 | FASTA format — the reference-sequence interchange format, as `{id, description, sequence}`. |
+| `fastq.py` | 217 | FASTQ format — sequencing reads as `{id, description, sequence, quality}`. |
+| `gff.py` | 129 | GFF3 and GTF format — genome annotations, nine tab-separated columns. |
 | `vcf.py` | 202 | VCF format — variant calls, the output every variant caller agrees to write. |
 
 ### `batcher/io/formats/lakehouse/` — 2 · neutral IO
@@ -2019,12 +2019,12 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 |---|---|---|
 | `autoloader.py` | 440 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 372 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
-| `eventhubs.py` | 364 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
+| `eventhubs.py` | 367 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
 | `kafka.py` | 716 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kafka_sink.py` | 318 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
 | `kinesis.py` | 496 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 244 | Google Cloud Pub/Sub broker source — subscription pull batches. |
-| `pulsar.py` | 419 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
+| `pulsar.py` | 422 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
 | `seen_store.py` | 205 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
 | `sinks.py` | 644 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
 
@@ -2058,7 +2058,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | module | lines | what it is |
 |---|---|---|
 | `avro.py` | 372 | Avro payload codec — bare Avro records, or Confluent Schema Registry framing. |
-| `base.py` | 305 | The payload-codec contract: a binary message column in, a typed Arrow column out. |
+| `base.py` | 296 | The payload-codec contract: a binary message column in, a typed Arrow column out. |
 | `json.py` | 390 | JSON payload codec — the most common Kafka wire format, decoded to a real struct column. |
 | `protobuf.py` | 198 | Protobuf payload codec — a generated message class, or a registry-framed descriptor. |
 | `text.py` | 157 | The two payload codecs with no schema: raw bytes, and UTF-8 text. |
@@ -2078,7 +2078,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `csv.py` | 617 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
 | `excel.py` | 103 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
 | `lance.py` | 331 | Lance format — columnar, random-access read + write via `pylance` (lance). |
-| `orc.py` | 413 | ORC format — lazy, projection-pushdown read + write via `pyarrow.orc`. |
+| `orc.py` | 416 | ORC format — lazy, projection-pushdown read + write via `pyarrow.orc`. |
 
 ### `batcher/io/formats/structured/_csv_options/` — 2 · neutral IO
 
@@ -2110,7 +2110,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 
 | module | lines | what it is |
 |---|---|---|
-| `_extract.py` | 300 | Reading prose out of the document formats a corpus actually contains. |
+| `_extract.py` | 303 | Reading prose out of the document formats a corpus actually contains. |
 | `binary.py` | 216 | Binary-blob source — whole files as ``{uri, bytes, size, mime}`` rows. |
 | `documents.py` | 241 | Document format — text extraction from PDF, HTML, Word, decks, EPUB and Markdown. |
 | `text.py` | 590 | Plain-text source and sink — one row per line or per whole file, one line per value. |

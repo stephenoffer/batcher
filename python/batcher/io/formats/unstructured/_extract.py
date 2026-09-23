@@ -28,6 +28,8 @@ import zipfile
 from collections.abc import Callable
 from html.parser import HTMLParser
 
+from typing_extensions import override
+
 from batcher._internal.errors import IOError as BatcherIOError
 
 __all__ = ["PAGE_EXTRACTORS", "extractor_for", "html_to_text"]
@@ -59,7 +61,8 @@ class _TextExtractor(HTMLParser):
         self._parts: list[str] = []
         self._suppress = 0
 
-    def handle_starttag(self, tag: str, attrs: object) -> None:  # noqa: ARG002
+    @override
+    def handle_starttag(self, tag: str, attrs: object) -> None:
         """Enter a tag: start suppressing non-prose content, or break the line."""
         if tag in _NON_PROSE:
             self._suppress += 1
