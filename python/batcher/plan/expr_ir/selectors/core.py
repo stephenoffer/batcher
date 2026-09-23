@@ -304,28 +304,28 @@ class Selector(Expr):
             needs_dtype=self._needs_dtype or other._needs_dtype,
         )
 
-    def __or__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+    def __or__(self, other: IntoExpr) -> Expr:
         """Union: columns matched by either selector; logical OR over a scalar operand."""
         sel = self._as_selector(other)
         if sel is None:
             return super().__or__(other)
         return self._set_op(sel, lambda a, b: a or b, "|")
 
-    def __and__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+    def __and__(self, other: IntoExpr) -> Expr:
         """Intersection: columns matched by both selectors; logical AND over a scalar."""
         sel = self._as_selector(other)
         if sel is None:
             return super().__and__(other)
         return self._set_op(sel, lambda a, b: a and b, "&")
 
-    def __sub__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+    def __sub__(self, other: IntoExpr) -> Expr:
         """Difference: columns matched by this selector but not the other; else subtraction."""
         sel = self._as_selector(other)
         if sel is None:
             return super().__sub__(other)
         return self._set_op(sel, lambda a, b: a and not b, "-")
 
-    def __xor__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+    def __xor__(self, other: IntoExpr) -> Expr:
         """Symmetric difference: columns matched by exactly one selector; else XOR."""
         sel = self._as_selector(other)
         if sel is None:

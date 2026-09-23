@@ -185,7 +185,7 @@ def _record_udf_admission(ctx: ExecutionContext, input_bytes: int, *, over_budge
                 },
             )
         )
-    except Exception:  # pragma: no cover - a profile that cannot be written is not a failure
+    except Exception:  # a profile that cannot be written is not a failure
         note_suppressed("udf-admission-profile")
 
 
