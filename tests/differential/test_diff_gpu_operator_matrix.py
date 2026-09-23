@@ -66,6 +66,11 @@ STRUCTURAL = frozenset(
         "join_left_str",
         "join_semi_str",
         "join_anti_str",
+        # Added with the operator matrix's right and cross joins. Both reach the device through
+        # `gpu_join_spec` like the joins above -- as `right`, and as an `inner` join under the
+        # projection a cross join lowers to (verified directly) -- so they are structural too.
+        "join_right",
+        "cross_join",
     }
 )
 
