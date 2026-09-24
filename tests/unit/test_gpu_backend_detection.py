@@ -42,3 +42,29 @@ def test_cudf_is_the_device_backend():
 
 def test_the_installed_pandas_is_the_host_backend():
     assert not DfBackend(pd).is_gpu
+
+
+def test_pandas_3_declines_a_nan_bearing_input_instead_of_reading_it_as_missing():
+    """Under pandas 3 a float NaN in an Arrow-backed column is *missing*: `sum` skips it and a
+    NaN group key can fold into the null group, where the engine keeps NaN a value. The host
+    backend therefore declines such input, and the CPU engine answers."""
+    import pyarrow as pa
+    import pytest
+
+    from batcher.core.gpu_plan.backend import Unsupported
+
+    lib = _lib("pandas", from_arrow=True)
+    lib.__version__ = "3.0.3"
+    be = DfBackend(lib)
+    assert be.nan_is_missing
+    with pytest.raises(Unsupported):
+        be.from_arrow(pa.table({"v": pa.array([1.0, float("nan")])}))
+
+
+def test_pandas_2_and_cudf_keep_nan_a_value():
+    old = _lib("pandas", from_arrow=False)
+    old.__version__ = "2.3.3"
+    device = _lib("cudf", from_arrow=True)
+    device.__version__ = "26.08.01"
+    assert not DfBackend(old).nan_is_missing
+    assert not DfBackend(device).nan_is_missing

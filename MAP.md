@@ -1689,7 +1689,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | module | lines | what it is |
 |---|---|---|
 | `aggs.py` | 497 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
-| `backend.py` | 537 | The dataframe-library adapter the GPU translator runs against. |
+| `backend.py` | 567 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 142 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 435 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
 | `exprs.py` | 439 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
