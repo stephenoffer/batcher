@@ -171,7 +171,7 @@ as a bundle for a churning preemptible cluster. It raises actor restarts, task r
 and recompute attempts to ride out repeated loss, spaces the recovery backoff so a
 preemption *wave* isn't retried in a tight loop, turns on the HTTP/2 keepalive so a
 dropped peer is noticed fast, lets a stage wait briefly for the autoscaler to replace
-churned capacity, and sets `shuffle_replication` to 2. A profile applies *below* any value
+churned capacity. It leaves `shuffle_replication` at 1, for the reason under Requirements and limitations. A profile applies *below* any value
 you set explicitly, so an explicit override beats the profile, and the profile beats
 the default. A preemptible environment is auto-detected and switched to `"spot"` when
 `resilience` is left at `"default"`.
@@ -309,8 +309,10 @@ overhead.
   holds it in memory and spills to that worker's local disk under pressure. There is no
   external shuffle service, so a lost worker's buckets are gone and are recomputed unless
   replication placed a copy elsewhere.
-- `shuffle_replication` defaults to 1, meaning no replica. Only the `"spot"` profile
-  raises it, which a preemptible environment selects automatically.
+- `shuffle_replication` defaults to 1, meaning no replica, and no profile raises it. Setting
+  it above 1 is not safe yet: on worker loss it can drop that worker's share of the rows
+  instead of failing, while replication off recovers exactly. The measurements are in
+  `tests/integration/test_shuffle_replication.py`.
 - Draining runs only under the `"spot"` profile, so a stable cluster starts no monitor
   and pays nothing. A preemptible or time-limited environment selects that profile
   automatically, but a cluster whose signals Batcher can't see needs `BATCHER_SPOT=1`,

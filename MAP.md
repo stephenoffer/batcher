@@ -2693,7 +2693,7 @@ Configuration: one frozen, typed `Config` object.
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
-| `profiles.py` | 297 | Named fault-tolerance profiles for the distributed engine. |
+| `profiles.py` | 299 | Named fault-tolerance profiles for the distributed engine. |
 | `serde.py` | 175 | Converting a `Config` to and from dicts, files, and environment-variable names. |
 
 ### `batcher/config/validation/` — 0 · utility
