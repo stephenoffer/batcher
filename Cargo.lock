@@ -755,6 +755,7 @@ dependencies = [
  "bc-arrow",
  "dashmap",
  "futures",
+ "h2",
  "memmap2",
  "rustls",
  "thiserror",

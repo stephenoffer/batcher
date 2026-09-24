@@ -24,6 +24,10 @@ arrow-flight = "60"
 # the data plane across an untrusted network. `ring`/`rustls`/`tokio-rustls` are
 # already in the graph (the cloud IO stack pulls them).
 tonic = { version = "0.14", features = ["tls-ring"] }
+# Named directly only to read the I/O error inside an `h2::Error` (`get_io`): h2 implements
+# `Error` with no `source()`, so a connection reset under an HTTP/2 stream is invisible to a
+# source-chain walk. Same version tonic already links; no new code in the graph.
+h2 = "0.4"
 # Named directly only to install `ring` as the process-level rustls provider (`tls.rs`):
 # `object_store` 0.14 also enables rustls' `aws-lc-rs` backend, and with two backends
 # compiled in rustls refuses to pick a default. Same version tonic already links.
