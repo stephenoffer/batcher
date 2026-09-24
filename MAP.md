@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1510 Python modules across 217 packages and 302 Rust files across 15 crates.
+Covering 1511 Python modules across 217 packages and 302 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -176,7 +176,7 @@ The public, fluent, lazy, expression-first API surface.
 | `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 1159 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 254 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
-| `multi_group.py` | 188 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
+| `multi_group.py` | 408 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 567 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 | `subplan_reuse.py` | 539 | Compute a repeated subplan once and read it back (control plane, `api`). |
@@ -1522,7 +1522,8 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 270 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 488 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 2144 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 2158 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `group_bound.py` | 87 | An upper bound on a group-by's output from where its keys come from, not what they hold. |
 | `join_columns.py` | 202 | Join column-statistics propagation. |
 | `skew.py` | 189 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
 
@@ -1547,7 +1548,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 | `base.py` | 117 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 681 | The result cache — a memory-bounded, cost-aware store of materialized query results. |
 | `cache_disk.py` | 365 | The result cache's disk tier — where an evicted result goes instead of nowhere. |
-| `manager.py` | 685 | The Carbonite resource manager entry point. |
+| `manager.py` | 690 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/accel/` — 3 · subsystem
 
@@ -1599,7 +1600,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | `pool.py` | 411 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 448 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
 | `probe.py` | 373 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
-| `reclaim.py` | 179 | Handing the allocator's arena back when a query is about to go out of core. |
+| `reclaim.py` | 249 | Handing the allocator's arena back when a query is about to go out of core. |
 
 ### `batcher/carbonite/policies/` — 3 · subsystem
 
@@ -2798,7 +2799,7 @@ Hardware facts read back from the compiled data plane, rather than probed from P
 
 | module | lines | what it is |
 |---|---|---|
-| `allocator.py` | 72 | What the engine's allocator is holding, and how to make it give some back. |
+| `allocator.py` | 90 | What the engine's allocator is holding, and how to make it give some back. |
 | `detected.py` | 115 | What the *engine process* detected about its CPU, as opposed to what this interpreter sees. |
 
 ### `batcher/_internal/hardware/fabric/` — 0 · utility
@@ -2980,7 +2981,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `hardware.rs` | 287 | What the engine's own process knows about its hardware and its allocator. |
+| `hardware.rs` | 321 | What the engine's own process knows about its hardware and its allocator. |
 | `lib.rs` | 791 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 738 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 154 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
@@ -3013,7 +3014,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 578 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1759 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1795 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
