@@ -89,12 +89,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight::{FlightData, Ticket};
 use futures::stream::{StreamExt, TryStreamExt};
 use tonic::transport::{Channel, Server};
 
 use crate::handler::FlightHandler;
+
+/// The largest single gRPC message a shuffle peer will encode or decode.
+///
+/// tonic decodes at most 4 MiB per message by default. The Flight encoder splits a batch into
+/// roughly 2 MiB messages, but only *between rows*, so one row wider than 4 MiB -- a large
+/// string or blob in a bucket -- arrives as a single oversized message, and the fetch failed
+/// with "decoded message length too large: found 6086969 bytes, the limit is: 4194304".
+/// Measured on a 3-node Anyscale cluster, where two shuffles died that way; a single-node run
+/// never meets it, because same-host buckets travel over shared memory instead. The shuffle
+/// channel is token-authenticated between the job's own workers, so the peer is trusted and
+/// the bound is the address space, not a policy.
+pub const MAX_FLIGHT_MESSAGE_BYTES: usize = usize::MAX;
 use crate::store::PartitionStore;
 
 mod client_pool;
@@ -458,7 +471,9 @@ impl FlightServer {
         let svc = FlightServiceServer::new(FlightHandler {
             store: self.store,
             token: self.token,
-        });
+        })
+        .max_decoding_message_size(MAX_FLIGHT_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_FLIGHT_MESSAGE_BYTES);
         builder
             .add_service(svc)
             .serve(addr)
@@ -515,7 +530,9 @@ impl FlightServer {
         let svc = FlightServiceServer::new(FlightHandler {
             store: self.store,
             token: self.token,
-        });
+        })
+        .max_decoding_message_size(MAX_FLIGHT_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_FLIGHT_MESSAGE_BYTES);
         let handle =
             tokio::spawn(
                 async move { builder.add_service(svc).serve_with_incoming(incoming).await },
@@ -657,8 +674,11 @@ impl FlightClient {
     /// multiplex over HTTP/2, so one channel backs many `FlightClient`s).
     #[must_use]
     pub fn from_channel(channel: Channel) -> Self {
+        let inner = FlightServiceClient::new(channel)
+            .max_decoding_message_size(MAX_FLIGHT_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_FLIGHT_MESSAGE_BYTES);
         Self {
-            inner: arrow_flight::FlightClient::new(channel),
+            inner: arrow_flight::FlightClient::new_from_inner(inner),
         }
     }
 
@@ -830,6 +850,29 @@ mod tests {
             "serial fetch took {per_fetch_ms:.1} ms; a ~40 ms figure is the delayed-ACK \
              stall returning (TCP_NODELAY lost on the server's accepted sockets)"
         );
+    }
+
+    /// A row wider than tonic's 4 MiB default message must still cross the wire.
+    ///
+    /// The Flight encoder only splits between rows, so a single 6 MB string is one message.
+    /// Before the limit was raised this failed with "decoded message length too large";
+    /// a single-node run never reaches it because same-host buckets use shared memory.
+    #[tokio::test]
+    async fn a_row_wider_than_the_grpc_default_message_still_fetches() {
+        let wide = "x".repeat(6_000_000);
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![wide.as_str()]))],
+        )
+        .unwrap();
+        let server = FlightServer::new();
+        server.register("wide", vec![batch.clone()]).await;
+        let (addr, _handle) = server.serve_ephemeral().await.unwrap();
+        let mut client = FlightClient::connect(addr.to_string()).await.unwrap();
+        let got = client.fetch("wide").await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], batch, "the 6 MB value must arrive intact");
     }
 
     #[tokio::test]
