@@ -450,7 +450,7 @@ The opt-in GPU execution backend for supported relational shapes.
 | `fanout.py` | 198 | Grow the cluster to the devices a plan wants, check one is free, and fan the work out. |
 | `route.py` | 302 | Decide whether a plan runs on the GPU, run it, and record what that cost. |
 | `translate.py` | 456 | Match a plan to a translated GPU execution, from the most specific shape to the general one. |
-| `verify.py` | 264 | Check the device result against the CPU engine — the device tier's two oracles. |
+| `verify.py` | 302 | Check the device result against the CPU engine — the device tier's two oracles. |
 
 ### `batcher/api/terminal/metadata_answer/` — 5 · conductor
 

@@ -136,6 +136,40 @@ def schema_contract_violation(result: pa.Table, plan: LogicalPlan) -> str | None
     return None if declared is None else _schema_mismatch(result.schema, declared, "the engine")
 
 
+#: Arrow types that hold the same values and differ only in the width of their offsets. cuDF
+#: 26.08 returns every string column as `large_string` (measured on TPC-H q16's `p_brand` and
+#: q22's `cntrycode`), so without this the contract refused two correct results and the queries
+#: fell back to the CPU. A cast between these is value-preserving, and one that cannot fit
+#: (offsets past 2 GiB) raises and leaves the column to be refused as before.
+_OFFSET_WIDTH_TWINS = (
+    frozenset({"string", "large_string"}),
+    frozenset({"binary", "large_binary"}),
+)
+
+
+def _offset_width_twins(a: pa.DataType, b: pa.DataType) -> bool:
+    return frozenset({str(a), str(b)}) in _OFFSET_WIDTH_TWINS
+
+
+def _conform_offset_widths(result: pa.Table, declared: pa.Schema) -> pa.Table:
+    """`result` with each column that differs from `declared` only in offset width cast to it."""
+    import pyarrow as pa
+
+    names = set(declared.names)
+    for index, field in enumerate(result.schema):
+        if field.name not in names:
+            continue
+        want = declared.field(field.name).type
+        if field.type == want or not _offset_width_twins(field.type, want):
+            continue
+        try:
+            column = result.column(index).cast(want)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            continue  # does not fit the declared width; the contract refuses it below
+        result = result.set_column(index, field.with_type(want), column)
+    return result
+
+
 def enforce_schema_contract(result: pa.Table, plan: LogicalPlan) -> pa.Table | None:
     """`result` when its columns are what the engine declares, else `None` — use the CPU engine.
 
@@ -155,7 +189,11 @@ def enforce_schema_contract(result: pa.Table, plan: LogicalPlan) -> pa.Table | N
     Returns:
         `result` when the columns agree, else `None`.
     """
-    difference = schema_contract_violation(result, plan)
+    declared = declared_schema(plan)
+    if declared is None:
+        return result
+    result = _conform_offset_widths(result, declared)
+    difference = _schema_mismatch(result.schema, declared, "the engine")
     if difference is None:
         return result
     from batcher.api.terminal.gpu_backend.failure import note_gpu_failure
