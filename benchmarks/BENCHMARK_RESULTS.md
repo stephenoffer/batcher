@@ -1,5 +1,55 @@
 # Batcher CPU benchmark results
 
+## `tests/integration` on a real 3-node cluster: three distributed defects found, and one lossy default withdrawn (2026-09-24)
+
+**The recorded cluster run** (`CLAUDE.md`, `dist/` row) for `release/prod-readiness-v2`.
+Anyscale jobs on 3x `m5.4xlarge` (head + 2 workers, 48 CPUs, Ray 2.58.0), image
+`anyscale/ray:2.58.0-py311`, the engine built from the branch in release profile, every file of
+`tests/integration` run as its own `pytest` process against the attached cluster. Three runs:
+
+| run | commit | passed | failed | errors |
+|---|---|---:|---:|---:|
+| 1 | `8e8a387e` | 3,079 | 224 | 8 |
+| 2 | `0b12c892` | 3,267 | 22 | 15 |
+| 3 | `f03ec9bb` | 3,272 | 17 | 3 |
+
+Found, and fixed with a test that fails on the previous code:
+
+- **Batcher's own `ray.init` failed inside any Ray job that declared `pip` dependencies**
+  ("Failed to merge the Job's runtime env"): the self-shipped env always sets `pip`. 96 of run
+  1's failures. It now leaves the fields the job owns (`2839020e`).
+- **A shuffle row wider than 4 MiB failed the fetch** -- tonic's default decode limit; the
+  Flight encoder splits only between rows. Never seen single-node, where same-host buckets use
+  shared memory (`8a3f6247`).
+- **A peer reset mid-stream was classified fatal**, so worker-loss recovery never ran: the
+  status was `Unknown` "h2 protocol error: error reading a body from connection" over an
+  `io::ErrorKind::ConnectionReset`, and `h2::Error` exposes no `source()` (`f03ec9bb`).
+  `test_carbonite_recovery_e2e` went from 1 failure to 14 of 14.
+
+Reproduced, not fixed: **`shuffle_replication > 1` drops a lost worker's rows** (109,832 against
+146,582 in a replicated sum), the defect `tests/integration/test_shuffle_replication.py` already
+recorded. The `spot` profile, auto-selected on preemptible clusters, set it to 2; it no longer
+does (`0b12c892`), so replication is off unless a user sets it.
+
+What run 3's remaining 17 failures and 3 errors are, so none is read as a pass:
+
+- `test_shuffle_replication` (6): the replication defect above; those tests set it directly.
+- Placement-dependent positive controls (5, in `test_schema_and_csv_distributed`,
+  `test_stats_text_metrics_distributed`, `test_inspection_distributed`, `test_udf_edges_distributed`,
+  `test_map_granularity`): they infer "the work was split" from the unordered-`LIMIT`
+  divergence, which is allowed but not guaranteed, or from a concurrency shape this cluster did
+  not produce. A harness limitation, not a result.
+- Resource shapes this cluster lacks (4): `test_governance_enforcement` (2, unschedulable) and
+  `test_udf_edges_distributed`'s two device-request cases.
+- `test_ml_writers_ray_interop` (3 errors): a hand-rolled `ray.init(num_cpus=2)` the cluster
+  refuses; fixed after run 3 (`50496b4b`).
+- `test_graph_distributed`: OOM-killed on this instance size. `test_spill_bounded_memory`: its
+  spill directory sat on the NFS mount the runs used for `--basetemp`, and it timed out.
+- `test_inspection_distributed::test_scd_maintenance_is_identical_under_both_modes`: distributed
+  SCD type 2 kept only the initial load (3 rows) where single-node applied the update (5). The
+  table lived on that NFS mount, which fits a cross-node listing lag but is **not established**;
+  recorded as open.
+
 ## The device tier on cuDF 26.08 / pandas 3: three defects found, and `gpu_shadow_verify` clean (2026-09-23)
 
 **The device tier's recorded hardware run** (`.claude/rules/device-tier.md`) for the three GPU
