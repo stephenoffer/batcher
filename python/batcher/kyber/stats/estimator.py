@@ -42,6 +42,7 @@ from batcher.kyber.stats.distribution import (
     overlap_fraction,
     union_ndv,
 )
+from batcher.kyber.stats.group_bound import key_origin_rows
 from batcher.kyber.stats.selectivity import predicate_selectivity
 from batcher.kyber.stats.selectivity.scalars import _fraction_below_on_axis, _ordinal
 from batcher.metadata.udf_stats import udf_cost_key
@@ -915,9 +916,8 @@ class StatsEstimator:
             # Multiplying the per-key counts assumed independence; correlated keys then
             # saturated the cap and the optimizer concluded that grouping reduced nothing.
             names = [k.expr.name for k in node.group_keys if isinstance(k.expr, Col)]
-            return RelStats(
-                combine_ndv(key_ndvs, child.rows), _derived_from_ndvs(child, names), key_cols
-            )
+            groups = self._bounded_by_key_origin(node, combine_ndv(key_ndvs, child.rows))
+            return RelStats(groups, _derived_from_ndvs(child, names), key_cols)
         # Not every key is measured. An unknown-placeholder input (an uncountable source —
         # `from_batches`, a stream, an un-pushed SQL scan) must NOT be shrunk below the
         # "unknown" threshold: the shrunk guess (0.1·unknown) is small enough to look like a
@@ -932,7 +932,21 @@ class StatsEstimator:
         estimate = max(1.0, child.rows * 0.1)
         if key_ndvs:
             estimate = max(estimate, combine_ndv(key_ndvs, child.rows))
-        return RelStats(estimate, Provenance.DEFAULT, key_cols)
+        return RelStats(self._bounded_by_key_origin(node, estimate), Provenance.DEFAULT, key_cols)
+
+    def _bounded_by_key_origin(self, node: Aggregate, estimate: float) -> float:
+        """`estimate` capped by the rows of the relation the group keys are drawn from.
+
+        See `kyber.stats.group_bound`: distinct key combinations cannot outnumber the rows of
+        any relation all the keys come from, which is a far tighter cap than the aggregate's
+        input when the keys are dimension columns reached through a join. Only bare-column
+        keys can be followed, so any other key leaves the estimate as it was.
+        """
+        if not all(isinstance(k.expr, Col) for k in node.group_keys):
+            return estimate
+        names = [k.expr.name for k in node.group_keys if isinstance(k.expr, Col)]
+        bound = key_origin_rows(node.input, names, lambda sub: self.estimate(sub).rows)
+        return estimate if bound is None else max(1.0, min(estimate, bound))
 
     def _estimate_distinct(self, node: Distinct) -> RelStats:
         """Dedup count ≈ the distinct combinations of the columns the dedup keys on.

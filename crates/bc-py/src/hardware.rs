@@ -227,6 +227,39 @@ pub(crate) fn tune_allocator() {
     unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, PURGE_DELAY_MS) };
 }
 
+/// Set how long freed regions are retained before purging, in milliseconds; the retention
+/// ceiling's lever.
+///
+/// [`PURGE_DELAY_MS`]'s retention is right while the process has room and wrong once it does
+/// not: on back-to-back 9M-row joins the retained regions were *not* reused, and the resident
+/// set grew by about one result per query until the process was OOM-killed. A forced
+/// [`allocator_collect`] does not bound that — from the control plane's thread it reached 0.5 GB
+/// of ~15 GB retained — but a purge delay does, because it governs every free from here on,
+/// on every thread. So Carbonite shortens the delay while the process is over its retention
+/// ceiling and restores [`PURGE_DELAY_MS`] (`ms < 0`) once it is back under.
+///
+/// A user who set `MIMALLOC_PURGE_DELAY` keeps it: this then changes nothing.
+///
+/// Args:
+///     ms: The delay to use, or a negative number for the engine's default.
+///
+/// Returns:
+///     Whether the setting was applied (false when the user pinned the delay).
+#[pyfunction]
+pub(crate) fn allocator_purge_delay(ms: i64) -> bool {
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_some() {
+        return false;
+    }
+    let ms = if ms < 0 {
+        PURGE_DELAY_MS
+    } else {
+        ms as std::ffi::c_long
+    };
+    // SAFETY: as in `tune_allocator` — two integers, allocator already initialized.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, ms) };
+    true
+}
+
 /// mimalloc's current RSS estimate in bytes, for the before/after in [`allocator_collect`].
 fn allocator_rss() -> u64 {
     // The kernel's own figure, not mimalloc's. On Linux `mi_process_info` *estimates*
@@ -283,5 +316,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(engine_numa_map, m)?)?;
     m.add_function(wrap_pyfunction!(allocator_stats, m)?)?;
     m.add_function(wrap_pyfunction!(allocator_collect, m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_purge_delay, m)?)?;
     Ok(())
 }

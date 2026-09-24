@@ -607,6 +607,11 @@ class ResourceManager:
             yield grant
         finally:
             limiter.release()
+            # The query is done, so whatever the allocator still holds beyond the retention
+            # ceiling is pages no running query is using. See `memory.reclaim`.
+            from batcher.carbonite.memory.reclaim import reclaim_if_retaining
+
+            reclaim_if_retaining(self._envelope)
 
     @contextmanager
     def reserve(self, m_bytes: int) -> Iterator[bool]:

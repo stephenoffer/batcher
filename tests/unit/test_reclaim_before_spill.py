@@ -217,3 +217,64 @@ def test_the_manager_reports_the_trim_and_what_overshooting_means_here():
     stats = ResourceManager().stats()
     assert set(stats["reclaim"]) == {"attempts", "released_bytes", "cooldown_s"}
     assert isinstance(stats["swap"], bool)
+
+
+# --- the retention ceiling, checked as every query finishes ---------------------------------
+
+_ENVELOPE = 100 * _MIB
+_CEILING = _ENVELOPE * reclaim.RETAINED_CEILING_FRACTION
+
+
+@pytest.fixture
+def ceiling(monkeypatch, releases):
+    """A scripted resident set and a recording purge-delay setter."""
+    rss = {"bytes": 0}
+    delays: list[int] = []
+
+    def set_delay(ms: int) -> bool:
+        delays.append(ms)
+        return True
+
+    monkeypatch.setattr("batcher.carbonite.memory.probe.process_rss_bytes", lambda: rss["bytes"])
+    monkeypatch.setattr("batcher._internal.hardware.engine.allocator.set_purge_delay", set_delay)
+    return rss, delays, releases[0]
+
+
+def test_under_the_ceiling_nothing_happens(ceiling):
+    rss, delays, calls = ceiling
+    rss["bytes"] = int(_CEILING * 0.9)
+    assert reclaim.reclaim_if_retaining(_ENVELOPE) == 0
+    assert delays == [] and calls == []
+
+
+def test_over_the_ceiling_purges_until_back_under_half_of_it(ceiling):
+    """Over the ceiling: purge at once and release. Back under half of it: retain again.
+
+    A forced collect alone could not bound this -- from the control plane's thread it reached
+    0.5 GB of ~15 GB retained by back-to-back joins -- so the purge delay is the lever, and the
+    hysteresis between the two thresholds keeps a query at the boundary from toggling it.
+    """
+    rss, delays, calls = ceiling
+    rss["bytes"] = int(_CEILING * 1.2)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [0] and calls == [True]
+    # Still over: already purging, so the mode is not set again (the release is backed off).
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [0]
+    # Under the ceiling but above the restore threshold: keep purging.
+    rss["bytes"] = int(_CEILING * 0.8)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [0]
+    # Under the restore threshold: the engine's retention comes back.
+    rss["bytes"] = int(_CEILING * reclaim.RETAINED_RESTORE_FRACTION * 0.9)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [0, -1]
+
+
+def test_an_unreadable_footprint_or_no_envelope_does_nothing(ceiling, monkeypatch):
+    rss, delays, calls = ceiling
+    rss["bytes"] = 10**12
+    assert reclaim.reclaim_if_retaining(0) == 0
+    monkeypatch.setattr("batcher.carbonite.memory.probe.process_rss_bytes", lambda: None)
+    assert reclaim.reclaim_if_retaining(_ENVELOPE) == 0
+    assert delays == [] and calls == []

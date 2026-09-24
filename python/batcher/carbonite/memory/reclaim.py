@@ -50,7 +50,9 @@ __all__ = [
     "RECLAIM_COOLDOWN_MAX_S",
     "RECLAIM_COOLDOWN_S",
     "RECLAIM_WORTHWHILE_BYTES",
+    "RETAINED_CEILING_FRACTION",
     "reclaim_before_spill",
+    "reclaim_if_retaining",
     "reclaim_stats",
     "reset_reclaim_state",
 ]
@@ -71,6 +73,28 @@ RECLAIM_COOLDOWN_MAX_S = 60.0
 #: it as a success would keep re-trying a trim the process has nothing left to give.
 RECLAIM_WORTHWHILE_BYTES = 16 * 1024 * 1024
 
+#: Share of the memory envelope the process may hold resident between queries before the
+#: allocator is asked for its retained pages back (`reclaim_if_retaining`).
+#:
+#: The engine keeps freed pages on purpose (`bc-py/src/hardware.rs`, `PURGE_DELAY_MS`): a
+#: 13-column, 9M-row join re-runs ~35% faster when its output buffers land on pages it already
+#: has. The premise was that consecutive queries *reuse* those regions, and on repeats of one
+#: large join they do not -- measured on H2O join q1 run back to back, the resident set climbed
+#: by roughly one result per run, 6.5 -> 8.8 -> 10.4 -> 11.6 GiB with the Python side holding
+#: nothing, and the benchmark harness drove it past 40 GiB before the run was stopped, on a
+#: 60 GiB envelope. The ceiling is on the whole process's resident set -- mimalloc's own `commit`
+#: figure reports its arena reservation (a flat 32 GiB through that run), so it cannot see the
+#: retention -- which means other libraries' memory counts against it too. At a quarter, a
+#: benchmark process holding every engine's copy of the data sat over the ceiling permanently
+#: and so purged on every query; at two fifths (24 GiB of 60) the ceiling still leaves room for
+#: one more large query's working set below the envelope, which is what it protects.
+RETAINED_CEILING_FRACTION = 0.4
+
+#: Once over the ceiling, the allocator purges immediately until the resident set falls below
+#: this share of the ceiling, then goes back to retaining. The gap is the hysteresis that keeps
+#: one query at the boundary from toggling the mode on every run.
+RETAINED_RESTORE_FRACTION = 0.5
+
 
 @dataclass
 class _ReclaimState:
@@ -79,12 +103,14 @@ class _ReclaimState:
     Attributes:
         next_attempt_s: Monotonic time before which no attempt is made.
         cooldown_s: The current wait, doubled on an empty release and reset on a paying one.
+        purging: Whether the allocator is in immediate-purge mode, over the ceiling.
         attempts: Attempts made in this process.
         released_bytes: Bytes the allocator reported handing back, in total.
     """
 
     next_attempt_s: float = 0.0
     cooldown_s: float = RECLAIM_COOLDOWN_S
+    purging: bool = False
     attempts: int = 0
     released_bytes: int = 0
 
@@ -120,6 +146,50 @@ def reclaim_before_spill() -> int:
         the figure exists so the backoff and the diagnostic can. Never raises: a failed trim
         must leave the caller free to take the spill it was already going to take.
     """
+    return _attempt_reclaim("released retained allocator memory before spilling")
+
+
+def reclaim_if_retaining(envelope_bytes: int) -> int:
+    """Hold the process's resident set near its share of `envelope_bytes`, as a query finishes.
+
+    The spill path never covers this: a process whose queries all fit in memory never spills,
+    so before this nothing bounded the pages the allocator kept between them. Over the ceiling
+    (`RETAINED_CEILING_FRACTION`) the allocator is switched to purging freed regions at once
+    and a forced release is attempted; once the resident set is back under
+    `RETAINED_RESTORE_FRACTION` of the ceiling, the fast retention is restored. The purge
+    delay is the lever that works: a forced collect from this thread reached 0.5 GB of the
+    ~15 GB a run of large joins had retained.
+
+    The check is one RSS read. The release goes through the same backoff as
+    `reclaim_before_spill`, so a process whose memory is genuinely live stops paying for it.
+    Result-invariant, and never raises.
+
+    Args:
+        envelope_bytes: The memory envelope the ceiling is a fraction of. Zero or negative
+            disables the check.
+
+    Returns:
+        Bytes released, `0` when under the ceiling, inside the cooldown, or unreadable.
+    """
+    from batcher._internal.hardware.engine.allocator import set_purge_delay
+    from batcher.carbonite.memory.probe import process_rss_bytes
+
+    rss = process_rss_bytes()
+    if envelope_bytes <= 0 or rss is None:
+        return 0
+    ceiling = envelope_bytes * RETAINED_CEILING_FRACTION
+    if rss > ceiling:
+        if not _STATE.purging:
+            _STATE.purging = set_purge_delay(0)
+        return _attempt_reclaim("released retained allocator memory over the retention ceiling")
+    if _STATE.purging and rss < ceiling * RETAINED_RESTORE_FRACTION:
+        set_purge_delay(-1)
+        _STATE.purging = False
+    return 0
+
+
+def _attempt_reclaim(message: str) -> int:
+    """One forced release, gated and backed off by `_STATE`; the shared body of both triggers."""
     now = time.monotonic()
     if now < _STATE.next_attempt_s:
         return 0
@@ -145,7 +215,7 @@ def reclaim_before_spill() -> int:
             # Debug rather than info: this is a routine trade the engine makes on its own, and
             # the reader who wants it is diagnosing a spill that did or did not happen.
             10,
-            "released retained allocator memory before spilling",
+            message,
             released_bytes=released,
         )
     else:

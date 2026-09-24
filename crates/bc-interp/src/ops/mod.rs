@@ -769,11 +769,47 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
 pub(crate) fn normalize_sort_key(arr: ArrayRef) -> ArrayRef {
     if matches!(arr.data_type(), DataType::Null) {
         Arc::new(Int64Array::from(vec![0i64; arr.len()]))
+    } else if let Some(narrow) = decimal_as_unscaled_i64(&arr) {
+        narrow
     } else {
         // A float key is canonicalized so the ordering kernels rank it the way the engine's
         // float identity says — see the doc comment above.
         bc_arrow::canon_float_array(&arr)
     }
+}
+
+/// A `Decimal128` sort key as its **unscaled** integers, when every value fits an `i64`.
+///
+/// Every fast sort path here -- the single-key radix, the multi-key packer, the parallel
+/// sample-sort's routing, the top-N heap -- dispatches on the key's type, and none of them knew
+/// `Decimal128`, so a decimal key fell through to the comparator sort on one core. Measured on
+/// TPC-H `lineitem` as `dbgen` writes it (`l_extendedprice DECIMAL(15,2)`, 6M rows): **3.6 s**
+/// for `ORDER BY l_extendedprice`, where DuckDB takes 0.19 s and the same column as `Float64`
+/// sorts in ~40 ms. Money is decimal in almost every warehouse schema, so this is not an edge.
+///
+/// One column has one scale, so its unscaled integers order exactly as its values do -- the
+/// reinterpretation changes the representation, never the order. It is *not* arrow's
+/// `Decimal128 -> Int64` cast, which divides by the scale and would merge values that differ
+/// only in their fractional digits. A precision of 18 or less always fits an `i64`; a wider one
+/// is admitted only when every live value does, and otherwise keeps the comparator path. As
+/// with the float canonicalization above, only the key is rewritten: the sort gathers the
+/// original rows, so the output is still the user's decimal column.
+fn decimal_as_unscaled_i64(arr: &ArrayRef) -> Option<ArrayRef> {
+    let DataType::Decimal128(precision, _) = arr.data_type() else {
+        return None;
+    };
+    let dec = arr
+        .as_any()
+        .downcast_ref::<arrow::array::Decimal128Array>()?;
+    let fits = |v: i128| i64::try_from(v).is_ok();
+    if *precision > 18 && !dec.iter().flatten().all(fits) {
+        return None;
+    }
+    let values: Vec<i64> = dec.values().iter().map(|v| *v as i64).collect();
+    Some(Arc::new(Int64Array::new(
+        values.into(),
+        dec.nulls().cloned(),
+    )))
 }
 
 /// Sort a single (already-materialized) batch by the given keys.
@@ -3064,5 +3100,124 @@ mod top_k_selection_tests {
             .len(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod decimal_sort_key_tests {
+    use super::*;
+    use arrow::array::{Array, Decimal128Array};
+    use arrow::compute::{lexsort_to_indices, SortColumn};
+    use arrow::datatypes::{Field, Schema};
+    use bc_expr::Expr;
+
+    /// A decimal column with nulls, negatives, ties, and values that differ only in their
+    /// fractional digits -- the ones arrow's scale-dividing `Decimal128 -> Int64` cast would
+    /// merge, and the reinterpretation must keep apart.
+    fn decimals(precision: u8, n: usize) -> ArrayRef {
+        let vals: Vec<Option<i128>> = (0..n)
+            .map(|i| match i % 11 {
+                0 => None,
+                1 => Some(-((i as i128) * 7 % 1000)),
+                2 => Some(12_345),
+                3 => Some(12_346),
+                _ => Some(((i as i128) * 7_919) % 100_003 - 50_000),
+            })
+            .collect();
+        Arc::new(
+            Decimal128Array::from(vals)
+                .with_precision_and_scale(precision, 2)
+                .unwrap(),
+        )
+    }
+
+    fn batch(col: ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            col.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    fn key(descending: bool, nulls_first: bool) -> SortKey {
+        SortKey {
+            expr: Expr::Col { name: "d".into() },
+            descending,
+            nulls_first,
+        }
+    }
+
+    /// The comparator order on the untouched decimal column, with the row index as the
+    /// tie-break every stable path resolves ties to.
+    fn oracle(col: &ArrayRef, k: &SortKey) -> Vec<u32> {
+        let row = Arc::new(arrow::array::UInt32Array::from_iter_values(
+            0..col.len() as u32,
+        ));
+        let cols = [
+            SortColumn {
+                values: Arc::clone(col),
+                options: Some(SortOptions {
+                    descending: k.descending,
+                    nulls_first: k.nulls_first,
+                }),
+            },
+            SortColumn {
+                values: row,
+                options: None,
+            },
+        ];
+        lexsort_to_indices(&cols, None).unwrap().values().to_vec()
+    }
+
+    #[test]
+    fn a_decimal_key_narrows_to_its_unscaled_integers() {
+        let narrow = normalize_sort_key(decimals(15, 50));
+        assert_eq!(narrow.data_type(), &DataType::Int64);
+        assert_eq!(narrow.null_count(), 5);
+        // Wider than 18 digits, a value past `i64` keeps the comparator path.
+        let huge: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(i128::from(i64::MAX) * 4), Some(1)])
+                .with_precision_and_scale(38, 2)
+                .unwrap(),
+        );
+        assert!(matches!(
+            normalize_sort_key(huge).data_type(),
+            DataType::Decimal128(38, 2)
+        ));
+        assert_eq!(
+            normalize_sort_key(decimals(38, 50)).data_type(),
+            &DataType::Int64,
+            "a wide type whose values all fit still narrows"
+        );
+    }
+
+    /// Serial, parallel sample-sort and top-N all order a decimal key exactly as the comparator
+    /// does on the decimal itself. 300,000 rows clears `PARALLEL_SORT_MIN_ROWS`.
+    #[test]
+    fn every_sort_path_orders_a_decimal_key_as_the_comparator_does() {
+        for n in [1_000, 300_000] {
+            let col = decimals(15, n);
+            let b = batch(Arc::clone(&col));
+            for (descending, nulls_first) in [(false, false), (true, true), (true, false)] {
+                let k = key(descending, nulls_first);
+                let want = oracle(&col, &k);
+                let serial = sort_indices(&b, std::slice::from_ref(&k), None).unwrap();
+                assert_eq!(serial.values().to_vec(), want, "serial n={n} {descending}");
+                let top = sort_indices(&b, std::slice::from_ref(&k), Some(17)).unwrap();
+                assert_eq!(top.values().to_vec(), want[..17], "top-N n={n}");
+                let parallel = parallel_sort_batch(&b, std::slice::from_ref(&k), None).unwrap();
+                assert_eq!(
+                    parallel.is_some(),
+                    n >= 300_000,
+                    "sample-sort must take a large key"
+                );
+                if let Some(parts) = parallel {
+                    let got = materialize(&parts).unwrap();
+                    let expect = take_batch(&b, &arrow::array::UInt32Array::from(want)).unwrap();
+                    assert_eq!(got.column(0).as_ref(), expect.column(0).as_ref());
+                }
+            }
+        }
     }
 }

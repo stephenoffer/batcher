@@ -1,5 +1,69 @@
 # Batcher CPU benchmark results
 
+## Two memory blow-ups, a 37x decimal sort, and ROLLUP levels that share one aggregate (2026-09-23)
+
+**Read the conditions first.** 48 cores, 92 GiB, a ~60 GiB cgroup envelope, shared all day with
+two or three other agent sessions running builds and suites. The harness refused to time without
+`--allow-busy-box`, and whole-suite numbers moved by 20-40% between identical runs. So every
+speed claim below is an **interleaved A/B**: the same engine binary, fresh processes, arms
+alternated, repeated until the outliers were visibly outliers. Suite tables from this day are
+correctness evidence only. TPC-H here is DuckDB `dbgen` sf1 written to Parquet, which types money
+as `DECIMAL(15,2)`; the harness's own copy uses `Float64`.
+
+### Two queries that took the process down
+
+**TPC-H q17 planned a cartesian product.** A decorrelated scalar subquery projects its value
+through a `CASE` (the empty-group rule), and `push_filter_through_project` refused the *whole*
+`WHERE` because one conjunct read that computed column. The comma join's
+`p_partkey = l_partkey` stayed above it, out of `derive_join_keys`' reach, and `lineitem x part`
+ran as 1.2e12 rows: past 34 GiB at sf1, and the kernel OOM-killed it. The rule now decides per
+conjunct. q17: killed -> **11.7 ms** (DuckDB native 13.6, DuckDB on Arrow 92).
+
+**Back-to-back large joins grew RSS by one result per query.** The allocator keeps freed regions
+for 10 s so a repeat lands on warm pages (`bc-py/src/hardware.rs`), and on repeats of H2O join q1
+those regions were not reused: 6.5 -> 8.8 -> 10.4 -> 11.6 GiB with Python holding nothing, and the
+H2O join suite passed 40 GiB before it was stopped. `carbonite.memory.reclaim` now switches the
+allocator to immediate purging when the process is over two fifths of its envelope and back once
+it is under half of that. On the repeated-join loop, measured at a quarter: peak 19.4 GiB (and
+rising) -> 14.0-14.5 GiB, q1 unchanged, q5's best 233 -> 247-265 ms. The harness then completed at
+34 GiB for the whole five-engine process.
+
+### Decimal sort keys took the comparator path on one core
+
+No fast sort path knew `Decimal128`: `ORDER BY l_extendedprice` over 6M `DECIMAL(15,2)` values
+took **3,565 ms**, against DuckDB's 216 ms native and 266 ms on Arrow. A decimal key is now
+reinterpreted as its unscaled `i64`s when they fit (always, at precision <= 18), which every path
+already handles. **96 ms**; `bc-interp` tests pin serial, parallel and top-N against the
+comparator order on the decimal itself.
+
+### ROLLUP / CUBE / GROUPING SETS
+
+Each level re-ran the whole input, and common-subplan reuse declined to share it because the
+join's *estimate* (16.5M rows, 2.3M actual) was over its cap. `api.multi_group` now aggregates once
+at the finest grouping into partial states and derives every level from that, and the estimator
+caps a group count by the rows of the relation its keys come from (`kyber.stats.group_bound`), so
+the shared aggregate is estimated at the 18,000 `item` rows it can hold rather than 2M. Interleaved,
+two rounds each:
+
+| query | before | after |
+|---|---:|---:|
+| TPC-DS q22 | 542 / 560 ms | **188 / 195 ms** |
+| TPC-DS q67 | 910 / 919 ms | **200 / 204 ms** |
+
+All 22 TPC-H queries were alternated the same way against the estimator change, the one change
+here that could move unrelated plans; none moved outside the noise both arms showed (q21 read
+86.8/124.1, 85.8/86.0 and 214.5/95.0 across three rounds). All 99 TPC-DS queries match DuckDB
+on both arms (q67's recorded tie divergence aside).
+
+### Also on this day
+
+- A FULL join under an order-insensitive consumer (a `COUNT(*)`, or a grouped aggregate sorted on
+  every group key) runs the partitioned join instead of the order-preserving serial one:
+  `op-join-full-outer` **66 -> 45 ms** over three rounds (DuckDB ~27).
+- Distributed scans return rows in source order, which also fixed a recorded distributed sort
+  defect (`test_sql_catalog_distributed`'s strict xfail now passes); distributed global
+  `nth_value` has a decomposition; a resident inference pool is found again on the next run.
+
 ## Two distributed shapes that had no path: a broadcast join's write, and an aggregate over a range join (2026-09-22)
 
 **A correctness record, not a timing one.** Both changes are in `dist/`, which
