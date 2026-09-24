@@ -270,3 +270,10 @@ def test_comma_join_beside_a_scalar_subquery_is_an_equi_join(duck, query):
     """
     _check(duck, query)
     assert "__cross_key" not in _session().sql(query).explain()
+
+
+def test_a_true_cross_join_does_render_the_cross_key():
+    """Positive control for the absence assertion above: `__cross_key` is what `explain()` shows
+    for a cartesian product, so its absence there means the equality became a join key rather
+    than meaning the renderer stopped printing the token."""
+    assert "__cross_key" in _session().sql("SELECT t.id, u.w FROM t, u").explain()
