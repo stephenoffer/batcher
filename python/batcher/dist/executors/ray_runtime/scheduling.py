@@ -192,6 +192,31 @@ def ray_session_key() -> str | None:
         return None
 
 
+def job_owned_runtime_env_fields() -> frozenset[str]:
+    """The `runtime_env` fields the enclosing Ray job already sets, when the driver runs in one.
+
+    A driver started by a Ray job submission (`ray job submit`, an Anyscale job) receives the
+    job's config in `RAY_JOB_CONFIG_JSON_ENV_VAR`, and Ray merges its `runtime_env` with the one
+    `ray.init` passes -- refusing outright when both set the same field. The self-shipped env
+    always sets `pip` (to neutralize an injected install), so every job that declared its own
+    `pip` dependencies failed Batcher's `ray.init` with "Failed to merge the Job's runtime env":
+    measured on an Anyscale job with a `requirements:` list, where every distributed write and
+    every map-aggregate actor path died before a task started. The job's own value is the one to
+    keep -- it is what the user asked for -- so the self-shipped env yields those fields.
+    """
+    import json
+    import os
+
+    raw = os.environ.get("RAY_JOB_CONFIG_JSON_ENV_VAR")
+    if not raw:
+        return frozenset()
+    try:
+        job_env = (json.loads(raw) or {}).get("runtime_env") or {}
+    except (ValueError, AttributeError):
+        return frozenset()
+    return frozenset(job_env) if isinstance(job_env, dict) else frozenset()
+
+
 def worker_runtime_env() -> dict | None:
     """A per-remote Ray `runtime_env` shipping the driver's batcher, or `None`.
 
