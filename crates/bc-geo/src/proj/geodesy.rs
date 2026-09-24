@@ -31,8 +31,6 @@ pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
 pub const WGS84_A: f64 = 6_378_137.0;
 /// WGS 84 flattening.
 pub const WGS84_F: f64 = 1.0 / 298.257_223_563;
-/// WGS 84 semi-minor axis in metres.
-pub const WGS84_B: f64 = WGS84_A * (1.0 - WGS84_F);
 
 fn check_lonlat(lon: f64, lat: f64) -> GeoResult<()> {
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {

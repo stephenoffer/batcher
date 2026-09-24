@@ -107,7 +107,7 @@ use crate::handler::FlightHandler;
 /// never meets it, because same-host buckets travel over shared memory instead. The shuffle
 /// channel is token-authenticated between the job's own workers, so the peer is trusted and
 /// the bound is the address space, not a policy.
-pub const MAX_FLIGHT_MESSAGE_BYTES: usize = usize::MAX;
+const MAX_FLIGHT_MESSAGE_BYTES: usize = usize::MAX;
 use crate::store::PartitionStore;
 
 mod client_pool;

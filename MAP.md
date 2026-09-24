@@ -3372,7 +3372,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `grid/tile.rs` | 119 | Slippy-map tiles and Bing quadkeys — the grid every map tile server is indexed by. |
 | `lib.rs` | 83 | `bc-geo` — the geometry data plane: codecs, planar algorithms, grids, projections. |
 | `proj/crs.rs` | 314 | Coordinate reference system transforms, for a deliberately small set of systems. |
-| `proj/geodesy.rs` | 177 | Distances and areas on the Earth, in metres. |
+| `proj/geodesy.rs` | 175 | Distances and areas on the Earth, in metres. |
 | `proj/karney/area.rs` | 91 | Polygon area on the ellipsoid: GeographicLib's `PolygonArea`, reduced to a ring. |
 | `proj/karney/math.rs` | 231 | The scalar helpers and series coefficients Karney's solver is written in terms of. |
 | `proj/karney/mod.rs` | 653 | Karney's geodesic inverse on the WGS 84 ellipsoid: distance and polygon area. |
