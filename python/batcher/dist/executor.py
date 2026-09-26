@@ -1517,7 +1517,7 @@ def _range_partitionable_sort_key(sort: Sort) -> bool:
     The distributed sort routes rows against sampled quantile boundaries, in one of two
     orders. A numeric key is compared as `f64` (`bc_runtime::shuffle::range_partition_by_key`),
     and a temporal one through its order-preserving integer backing. A **string** key is
-    compared byte-lexically (`range_partition_by_str_key`) — never as `f64`, because arrow
+    compared byte-lexically (`range_partition_by_byte_key`) — never as `f64`, because arrow
     would read `"12"` as `12.0` and order the buckets numerically, disagreeing with the
     single-node lexical sort.
 

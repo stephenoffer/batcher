@@ -3094,7 +3094,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `keys.rs` | 391 | The one canonical form for grouping/partitioning keys. |
 | `lib.rs` | 33 | `bc-runtime` — the engine's runtime library. |
 | `measure.rs` | 111 | Reading an ordered key as a number, so two of them can be *subtracted*. |
-| `shuffle.rs` | 1212 | Hash repartitioning — the shuffle primitive. |
+| `shuffle.rs` | 1150 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 251 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window/agg/median_state.rs` | 82 | The running median's two-heap, kept apart from the aggregates that use it. |
 | `window/agg/mod.rs` | 757 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
