@@ -24,6 +24,7 @@ import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
+from batcher._internal.errors import ConfigError
 from batcher.config.accelerator import AcceleratorConfig
 from batcher.config.env import falsy, truthy
 from batcher.config.fault_tolerance import FaultToleranceConfig
@@ -2939,25 +2940,56 @@ class Config:
         return f"Config({shown}{more})"
 
 
-def _coerce(raw: str, to: object) -> object:
+def _coerce(key: str, raw: str, to: object) -> object:
+    """Parse env var `key`'s string `raw` into the declared field type `to`.
+
+    A sequence field takes a comma-separated list whose elements are coerced to the element
+    type, a mapping field takes a JSON object, and a malformed value raises `ConfigError`
+    naming the variable rather than a bare `ValueError` from deep inside `import batcher`.
+    """
+    try:
+        return _coerce_value(raw, to)
+    except (ValueError, TypeError) as exc:
+        name = getattr(to, "__name__", None) or str(to)
+        raise ConfigError(f"{key}={raw!r}: expected {name} ({exc})") from exc
+
+
+def _coerce_value(raw: str, to: object) -> object:
     if to is bool:
         return truthy(raw)
-    if to is int:
-        return int(raw)
-    if to is float:
-        return float(raw)
+    if to is int or to is float:
+        return to(raw.strip())  # type: ignore[operator]
+    if to is str:
+        return raw
+    origin = typing.get_origin(to)
+    if origin is tuple:
+        return _coerce_tuple(raw, typing.get_args(to))
+    if origin is dict:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise TypeError("a JSON object")
+        return value
     # A `bool | str` field (e.g. `runtime_bloom_join = "auto"`): a recognized boolean
-    # token coerces to a real bool, everything else stays the string. Without this the
-    # whole union was returned uncoerced, so `BATCHER_..._RUNTIME_BLOOM_JOIN=true` shipped
-    # the *string* "true" — which then failed validation ("must be True, False, or 'auto'")
-    # while the string literal "auto" happened to pass. Enabling/disabling the feature via
-    # env raised `ConfigError`; a string-valued sentinel like "auto" still passes through.
+    # token coerces to a real bool, everything else stays the string, so both
+    # `..._RUNTIME_BLOOM_JOIN=true` and the sentinel `"auto"` pass validation.
     members = [a for a in typing.get_args(to) if a is not type(None)]
     if bool in members and (truthy(raw) or falsy(raw)):
         return truthy(raw)
     if str in members:
         return raw
-    return raw
+    raise TypeError("a type an environment variable cannot express")
+
+
+def _coerce_tuple(raw: str, args: tuple[object, ...]) -> tuple[object, ...]:
+    """Split a comma-separated `raw` and coerce each element to the tuple's element type."""
+    parts = [p.strip() for p in raw.split(",")] if raw.strip() else []
+    if len(args) == 2 and args[1] is Ellipsis:
+        element_types: list[object] = [args[0]] * len(parts)
+    else:
+        if len(parts) != len(args):
+            raise ValueError(f"{len(args)} comma-separated values, got {len(parts)}")
+        element_types = list(args)
+    return tuple(_coerce_value(p, t) for p, t in zip(parts, element_types, strict=True))
 
 
 def _scalar_type(annotation: object) -> object:
@@ -2995,7 +3027,7 @@ def _overlay_env(obj: Config, prefix: str, env: dict[str, str]) -> Config:
         elif key in env:
             # Coerce against the *declared* field type, not `type(current)`: an optional
             # field defaulting to None would otherwise resolve to NoneType and skip coercion.
-            updates[field.name] = _coerce(env[key], field_types.get(field.name, type(current)))
+            updates[field.name] = _coerce(key, env[key], field_types.get(field.name, type(current)))
     return replace(obj, **updates) if updates else obj
 
 
