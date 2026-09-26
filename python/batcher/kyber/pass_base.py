@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.memo import IdentityMemo
 from batcher.config import Config
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.metadata import MetadataHub
@@ -51,13 +50,13 @@ class OptimizerContext:
     #: real device instead of a constant. Defaults to detecting the local machine, so a caller
     #: that does not supply one (a test, a single-node run) still plans against real hardware.
     hardware: HardwareProfile = field(default_factory=HardwareProfile.local)
-    #: Per-run memo of `join_elim`'s structural relation identity, `plan -> key` by identity.
+    #: Per-run memo of `join_elim`'s structural relation identity, `{id(plan): (plan, key)}`.
     #: Computing one lowers a whole subtree to IR and deep-copies it to blank the source ids,
     #: and the self-join rules ask for the same two subtrees on every fixpoint iteration. The
     #: plan is held alongside its key so a recycled `id` cannot answer for a freed node --
     #: the same guard `StatsEstimator.estimate` uses for the same reason.
-    relation_keys: IdentityMemo[Any, tuple | None] = field(
-        default_factory=IdentityMemo, repr=False, compare=False
+    relation_keys: dict[int, tuple[Any, tuple | None]] = field(
+        default_factory=dict, repr=False, compare=False
     )
 
     def costs(self) -> CostModel:

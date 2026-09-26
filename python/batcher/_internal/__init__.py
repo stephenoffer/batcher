@@ -10,8 +10,8 @@ happened before.
 What lives here is cross-cutting machinery with no domain of its own: the exception
 hierarchy (`errors`), the observability event bus (`events`), logging (`logging`),
 hardware detection (`hardware`), install paths (`paths`), producer/consumer overlap
-(`prefetch`), the generic `Registry[T]` behind every extension point
-(`registry`), and the identity-keyed memo the optimizer's caches share (`memo`).
+(`prefetch`), and the generic `Registry[T]` behind every extension point
+(`registry`).
 
 `native` is the load-bearing one: it is **the** single accessor for the compiled
 engine. Always `from batcher._internal.native import engine` — never

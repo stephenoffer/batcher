@@ -19,7 +19,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import reduce
 
-from batcher._internal.memo import MISSING
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.plan.expr_ir import Col, Expr
 from batcher.plan.logical import Join, LogicalPlan, Scan, is_cartesian_key_pair
@@ -113,18 +112,18 @@ def _relation_key(plan: LogicalPlan, ctx: OptimizerContext) -> tuple | None:
     # subtrees on every fixpoint iteration -- and each miss lowers the whole subtree to IR
     # and deep-copies it. See `OptimizerContext.relation_keys` for the id-reuse guard.
     memo = ctx.relation_keys
-    hit = memo.get(plan)
-    if hit is not MISSING:
-        return hit
+    hit = memo.get(id(plan))
+    if hit is not None and hit[0] is plan:
+        return hit[1]
     identities: list[int] = []
     for node in walk(plan):
         if isinstance(node, Scan):
             if node.source_id >= len(ctx.sources):
-                memo.put(plan, None)
+                memo[id(plan)] = (plan, None)
                 return None
             identities.append(id(ctx.sources[node.source_id]))
     key = None if not identities else (_blank_source_ids(plan.to_ir()), tuple(identities))
-    memo.put(plan, key)
+    memo[id(plan)] = (plan, key)
     return key
 
 
