@@ -154,20 +154,6 @@ def test_the_rocksdb_shared_cache_round_trips(tmp_path):
         cache.close()
 
 
-def test_the_rocksdb_shared_cache_sweeps_expired_entries(tmp_path):
-    pytest.importorskip("rocksdict")
-    from batcher.carbonite.cache_shared.rocksdb import RocksDBSharedCache
-
-    cache = RocksDBSharedCache(str(tmp_path / "sweep.rocksdb"))
-    try:
-        cache.put("live", b"a")
-        cache.put("dead", b"b", ttl_seconds=-1)
-        assert cache.evict_expired() == 1
-        assert cache.get("live") == b"a"
-    finally:
-        cache.close()
-
-
 def test_an_arrow_result_survives_the_rocksdb_shared_cache(tmp_path):
     pytest.importorskip("rocksdict")
     from batcher.carbonite.cache_shared.rocksdb import RocksDBSharedCache

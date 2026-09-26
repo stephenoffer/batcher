@@ -939,16 +939,16 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 3202 | The distributed executor — the dispatcher. |
+| `executor.py` | 3194 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 893 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_broadcast.py` | 560 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
+| `flight_broadcast.py` | 544 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 574 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1873 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1882 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 433 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 304 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
-| `skew.py` | 336 | Learned join-skew: persist the hot join-key values measured by the detection |
+| `skew.py` | 324 | Learned join-skew: persist the hot join-key values measured by the detection |
 | `sort_boundaries.py` | 329 | Learned range-sort boundaries: persist the quantile grid the SAMPLE barrier measured, |
 
 ### `batcher/dist/adaptive_sizing/` — 4 · backend
@@ -966,12 +966,12 @@ Per-operator distributed executor implementations.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 442 | Distributed aggregation over a disk Arrow-IPC shuffle. |
-| `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
-| `join.py` | 874 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
+| `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
+| `join.py` | 876 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3313 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
-| `plan_analysis.py` | 550 | Plan-shape analysis for the distributed dispatcher. |
-| `scan_read.py` | 715 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
+| `map.py` | 3310 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `plan_analysis.py` | 549 | Plan-shape analysis for the distributed dispatcher. |
+| `scan_read.py` | 720 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
 | `union.py` | 120 | Distributed UNION — one shuffle when the branches allow it, else branch by branch. |
 | `window.py` | 61 | Distributed window functions over a disk Arrow-IPC shuffle. |
@@ -986,7 +986,7 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 | `_sources.py` | 703 | Shared partitioning + post-breaker helpers for the distributed operators. |
 | `assignment.py` | 392 | How a source's splits are divided among the workers — the three assignment strategies. |
 | `folds.py` | 209 | Streaming, byte-bounded folds of a shuffle map-side partition. |
-| `ranges.py` | 619 | Range partitioning: split rows by *value* into globally ordered buckets. |
+| `ranges.py` | 618 | Range partitioning: split rows by *value* into globally ordered buckets. |
 
 ### `batcher/dist/executors/ray_runtime/` — 4 · backend
 
@@ -994,7 +994,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 
 | module | lines | what it is |
 |---|---|---|
-| `accelerators.py` | 177 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
+| `accelerators.py` | 161 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 200 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 595 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `fleet_health.py` | 330 | Live device health across the fleet — every accelerator node, never cached. |
@@ -1020,8 +1020,8 @@ Fabric-aware placement: what the accelerator fleet looks like, and where work sh
 | `market.py` | 215 | Which capacity a stage runs on: spot where the work is recomputable, on-demand where it isn't. |
 | `placement.py` | 419 | Placing accelerator work on the fleet: gang bundles, power zones, and efficiency order. |
 | `residency.py` | 97 | Residency as a placement filter — the point where a sovereignty rule reaches the scheduler. |
-| `shape.py` | 222 | The live cluster, rendered into the neutral shape Kyber plans against. |
-| `topology.py` | 443 | Where the accelerators actually are — NVLink domains, nodes, racks, and power zones. |
+| `shape.py` | 184 | The live cluster, rendered into the neutral shape Kyber plans against. |
+| `topology.py` | 402 | Where the accelerators actually are — NVLink domains, nodes, racks, and power zones. |
 
 ### `batcher/dist/executors/ray_runtime/policies/` — 4 · backend
 
@@ -1029,9 +1029,9 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 
 | module | lines | what it is |
 |---|---|---|
-| `_barrier.py` | 623 | The map-stage barrier: gather partition results under worker-loss recovery. |
+| `_barrier.py` | 626 | The map-stage barrier: gather partition results under worker-loss recovery. |
 | `_drain.py` | 166 | Which workers are on a node that is going away. |
-| `_faults.py` | 434 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
+| `_faults.py` | 433 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `_topn.py` | 112 | Worker-loss recovery for the distributed top-N fold. |
 
 ### `batcher/dist/fleet/` — 4 · backend
@@ -1042,7 +1042,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 |---|---|---|
 | `_fleet.py` | 788 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
-| `held.py` | 78 | What the session fleet already holds, per node, so sizing does not fight its own fleet. |
+| `held.py` | 77 | What the session fleet already holds, per node, so sizing does not fight its own fleet. |
 | `plan_id.py` | 204 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `query.py` | 83 | The query-lifetime fleet: one placement group held for the whole adaptive query. |
 | `source.py` | 222 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
@@ -1053,11 +1053,11 @@ The *global* (no-``PARTITION BY``) ordered window, in bounded memory and across 
 
 | module | lines | what it is |
 |---|---|---|
-| `admission.py` | 300 | Which global windows the ordered-bucket algebra covers, and why the rest are refused. |
+| `admission.py` | 299 | Which global windows the ordered-bucket algebra covers, and why the rest are refused. |
 | `boundary.py` | 123 | The one ordered-bucket correction that reads a *neighbouring* bucket's rows. |
 | `disk.py` | 191 | Distributed *global* ordered window over a disk Arrow-IPC shuffle. |
 | `flight.py` | 303 | Distributed *global* (no-``PARTITION BY``) ordered window over an Arrow Flight shuffle. |
-| `offsets.py` | 596 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
+| `offsets.py` | 595 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
 | `stream.py` | 103 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window, on one node. |
 
 ### `batcher/dist/gpu/` — 4 · backend
@@ -1067,9 +1067,9 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 513 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
-| `cudf_probe.py` | 341 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
+| `cudf_probe.py` | 340 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
 | `device_read.py` | 401 | Read a shard onto the device, instead of onto the host and then across the bus. |
-| `dispatch.py` | 356 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
+| `dispatch.py` | 355 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 242 | The single-key group-by fan-out that predates the plan translator. |
 | `join.py` | 370 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
 | `resources.py` | 514 | What a GPU task asks Ray for — the fractional half of the relational fan-out. |
@@ -1085,7 +1085,7 @@ Scheduling a GPU stage against the wires, not just the device count.
 | module | lines | what it is |
 |---|---|---|
 | `collective_env.py` | 281 | Telling the collective library which wires this node has, instead of letting it guess. |
-| `placement.py` | 193 | Which devices a multi-device stage gets, and how its shards are dealt across them. |
+| `placement.py` | 122 | How a GPU fan-out's shards are sized and dealt against what the devices measured. |
 
 ### `batcher/dist/reduction/` — 4 · backend
 
@@ -1102,7 +1102,7 @@ Out-of-core execution on one node: scratch plumbing, and the spilling aggregate.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 569 | Single-node out-of-core aggregation via partition-and-spill, plus the spill dispatcher. |
-| `buckets.py` | 351 | Bucket mechanics every out-of-core breaker shares: write them, size them, re-split them. |
+| `buckets.py` | 349 | Bucket mechanics every out-of-core breaker shares: write them, size them, re-split them. |
 | `scratch.py` | 168 | Spill scratch: where an out-of-core query's bytes go, and how its input is fed in. |
 | `staging.py` | 128 | Which inputs of a spilling breaker are themselves breakers, and how to stage them. |
 
@@ -1113,7 +1113,7 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 | module | lines | what it is |
 |---|---|---|
 | `join.py` | 443 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
-| `sort.py` | 375 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
+| `sort.py` | 374 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
 | `window.py` | 153 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 
 ### `batcher/dist/streaming/` — 4 · backend
@@ -1559,13 +1559,13 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 | `affinity.py` | 202 | Putting a device's host-side work on the cores next to it, and knowing when it is shared. |
 | `allocator.py` | 488 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
 | `amd_health.py` | 79 | The same admission decision, for a vendor NVML cannot see. |
-| `fractional.py` | 374 | Putting several claimants on one device — Carbonite's half of fractional scheduling. |
+| `fractional.py` | 303 | Putting several claimants on one device — Carbonite's half of fractional scheduling. |
 | `health.py` | 619 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 249 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 109 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
-| `parallelism.py` | 439 | Sharding one model across devices: what each device then holds, and what it costs. |
+| `parallelism.py` | 422 | Sharding one model across devices: what each device then holds, and what it costs. |
 | `power.py` | 156 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
-| `vram.py` | 307 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
+| `vram.py` | 270 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/accel/device/` — 3 · subsystem
 
@@ -1585,7 +1585,7 @@ The shared (cross-process, cross-node) result cache.
 | `base.py` | 123 | What a shared result cache is, and the one rule that makes sharing one sound. |
 | `factory.py` | 107 | Building the shared result cache from its config URI, once per process. |
 | `redis.py` | 134 | Redis-backed shared result cache — low-latency reuse across processes and nodes. |
-| `rocksdb.py` | 189 | RocksDB-backed shared result cache — durable reuse across runs on one node. |
+| `rocksdb.py` | 163 | RocksDB-backed shared result cache — durable reuse across runs on one node. |
 | `store.py` | 217 | The shared result cache as the engine uses it: serialize, store, count, never fail. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
@@ -1594,7 +1594,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 332 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `estimator.py` | 318 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
 | `kernel.py` | 453 | The kernel's own view of how close this process is to being OOM-killed. |
 | `learned.py` | 520 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 411 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
@@ -1609,10 +1609,10 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | module | lines | what it is |
 |---|---|---|
 | `admission.py` | 161 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
-| `bdp.py` | 188 | Sizing a credit window from the path it runs over, instead of probing for it. |
+| `bdp.py` | 110 | Sizing a credit window from the path it runs over, instead of probing for it. |
 | `concurrency.py` | 361 | Bounding how many queries run at once, and how wide each one gets. |
 | `congestion.py` | 255 | What one round of a data channel actually observed, as a three-state congestion verdict. |
-| `cpu_budget.py` | 126 | How many cores the engine should ask for, given how many it is really getting. |
+| `cpu_budget.py` | 101 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 669 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 345 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
@@ -1644,9 +1644,9 @@ Carbonite out-of-core spilling: the two-tier scratch store for oversized state.
 | module | lines | what it is |
 |---|---|---|
 | `disk.py` | 404 | The scratch volume, measured — free space, budget clamping, and the IPC codec. |
-| `handle.py` | 57 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
+| `handle.py` | 39 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
 | `scratch.py` | 75 | Where Carbonite's out-of-core bytes go: resolving a scratch directory and its store. |
-| `store.py` | 495 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
+| `store.py` | 485 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
 | `writer.py` | 452 | One spill bucket, streamed to whichever tier its first batch can afford. |
 
 ### `batcher/carbonite/transfer/` — 3 · subsystem
@@ -1656,14 +1656,14 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | module | lines | what it is |
 |---|---|---|
 | `codec.py` | 110 | Which wire codec a shuffle should use, decided against the link it will actually cross. |
-| `device_exchange.py` | 390 | Redistributing between the devices of one node without serializing them behind each other. |
+| `device_exchange.py` | 385 | Redistributing between the devices of one node without serializing them behind each other. |
 | `fabric_usage.py` | 129 | What the node's RDMA fabric carried while a shuffle was running. |
 | `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
-| `locality.py` | 183 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
-| `peers.py` | 221 | What each peer carried, so a slow shuffle can name the node it was slow on. |
+| `locality.py` | 180 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
+| `peers.py` | 188 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 153 | Locality-aware reducer placement — put a reducer where its data already is. |
-| `server.py` | 459 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
-| `session.py` | 524 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
+| `server.py` | 415 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
+| `session.py` | 523 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
 | `staging.py` | 271 | How a transfer crosses the host link: chunk size, how many are in flight, and pinned or not. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |
 
@@ -1676,7 +1676,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `base.py` | 87 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
 | `energy.py` | 328 | Measuring what a stage drew — Core's half of the energy loop. |
 | `executor.py` | 331 | The Core local executor. |
-| `gpu_transform.py` | 313 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
+| `gpu_transform.py` | 312 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 191 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 257 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 162 | A bare scan needs no engine — the reader has already produced the plan's output. |
@@ -1696,7 +1696,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `exprs.py` | 439 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 384 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `pruning.py` | 417 | Narrow a plan tree to the columns it actually reads, at every level rather than at the leaves. |
-| `scalar_fns.py` | 415 | The named scalar-function families: math, two-argument math, and dates. |
+| `scalar_fns.py` | 414 | The named scalar-function families: math, two-argument math, and dates. |
 | `temporal.py` | 411 | The calendar half of the date vocabulary: `date_trunc`, `offset_by`, the year-derived |
 | `tree.py` | 200 | The whole-plan form of the translator: any tree of scans, joins and unions on the device. |
 | `windows.py` | 483 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
@@ -1708,7 +1708,7 @@ The translator's *named* vocabularies, one module per family — package façade
 | module | lines | what it is |
 |---|---|---|
 | `dates.py` | 149 | What the engine types as a calendar day, and how a temporal value is built from numbers. |
-| `lists.py` | 423 | List and vector expressions, built from the two primitives both dataframe libraries have. |
+| `lists.py` | 415 | List and vector expressions, built from the two primitives both dataframe libraries have. |
 | `operators.py` | 312 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
 | `regex.py` | 241 | The regular-expression functions, for the patterns three regex engines agree on. |
 | `strings.py` | 237 | The string function family — one entry per named function the engine ships. |
@@ -1720,7 +1720,7 @@ Streaming (incremental) aggregation and the bounded-memory operator drivers.
 | module | lines | what it is |
 |---|---|---|
 | `drivers.py` | 634 | Bounded-memory drivers for a top-level operator over a streaming source. |
-| `keyed_state.py` | 374 | Arbitrary keyed state over a stream — the fold behind `transform_with_state`. |
+| `keyed_state.py` | 372 | Arbitrary keyed state over a stream — the fold behind `transform_with_state`. |
 | `spill.py` | 227 | Cold windows of a streaming aggregate's state, held on disk instead of in memory. |
 
 ### `batcher/core/streaming/folds/` — 3 · subsystem
@@ -1740,7 +1740,7 @@ The streaming-query engine — the micro-batch loop behind a unified `ds.write`.
 | module | lines | what it is |
 |---|---|---|
 | `engine.py` | 626 | The micro-batch loop — trigger cadence, checkpointing, recovery, and progress. |
-| `processors.py` | 565 | What a micro-batch *becomes* — the per-batch processors and the routing that picks one. |
+| `processors.py` | 564 | What a micro-batch *becomes* — the per-batch processors and the routing that picks one. |
 | `state_policy.py` | 99 | How much of a streaming query's state to persist on any one micro-batch. |
 
 ### `batcher/core/udf/` — 3 · subsystem
@@ -1749,17 +1749,17 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 
 | module | lines | what it is |
 |---|---|---|
-| `apply.py` | 404 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
+| `apply.py` | 403 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
 | `async_udf.py` | 193 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
-| `call.py` | 474 | The per-batch `map_batches` call boundary (Core, layer 3). |
-| `execute.py` | 340 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
+| `call.py` | 473 | The per-batch `map_batches` call boundary (Core, layer 3). |
+| `execute.py` | 305 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
 | `isolation.py` | 236 | What a UDF child process is allowed to see and consume. |
 | `lifecycle.py` | 90 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
 | `processes.py` | 450 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 158 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
-| `sizing.py` | 300 | What the streaming UDF path learned last run, folded back into this run's sizing. |
-| `strategy.py` | 511 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
-| `stream.py` | 385 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
+| `sizing.py` | 285 | What the streaming UDF path learned last run, folded back into this run's sizing. |
+| `strategy.py` | 496 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
+| `stream.py` | 364 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
 
 ### `batcher/governance/` — 3 · subsystem
 
@@ -1777,7 +1777,7 @@ Governance — who may read which rows and columns, and through what mask.
 | `masks.py` | 193 | Declarative, picklable column-mask factories. |
 | `policy.py` | 240 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
-| `residency.py` | 413 | Data residency — where a dataset is allowed to be computed on, not just stored. |
+| `residency.py` | 404 | Data residency — where a dataset is allowed to be computed on, not just stored. |
 
 ### `batcher/governance/authn/` — 3 · subsystem
 

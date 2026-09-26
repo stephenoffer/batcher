@@ -350,13 +350,12 @@ class WindowedAggregateProcessor:
     def snapshot_state(self) -> pa.RecordBatch | None:
         """The open windows and the watermark, for a checkpoint snapshot.
 
-        This processor previously defined neither `snapshot_state` nor `restore_state`, and
-        `StreamingRunner.has_state` duck-types on exactly this method — so it reported
-        *stateless* and its state was never written. Offsets were committed regardless. A crash
-        therefore resumed **past** consumed data with every open window and the watermark gone:
-        those windows were silently never emitted. That is data loss in the one query shape the
-        whole watermark machinery exists to serve, so these two methods are load-bearing, not a
-        nicety.
+        `StreamingRunner.has_state` duck-types on exactly this method, so without it the processor
+        reports *stateless* and its state is never written while offsets are committed regardless. A
+        crash would then resume **past** consumed data with every open window and the watermark
+        gone: those windows would silently never be emitted. That is data loss in the one query
+        shape the whole watermark machinery exists to serve, so these two methods are load-bearing,
+        not a nicety.
         """
         return self._fold.state()
 

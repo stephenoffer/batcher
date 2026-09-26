@@ -124,7 +124,7 @@ def test_a_fabric_plan_beats_the_host_path_and_is_taken() -> None:
         range(4), 8_000_000_000, FABRIC, nvlink_gbps=450.0, pcie_gbps=50.0, host_gbps=25.0
     )
     assert plan.rounds == 3
-    assert plan.fully_direct
+    assert not plan.staged
     assert plan.speedup > 1.25
     assert worth_device_exchange(plan)
 

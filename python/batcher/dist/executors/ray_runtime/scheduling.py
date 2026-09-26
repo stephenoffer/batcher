@@ -159,8 +159,8 @@ def job_ships_batcher() -> bool:
 # Cache the uploaded-package runtime_env (one GCS upload, reused by every task/actor),
 # keyed by the **Ray session** it was uploaded into.
 #
-# It used to be keyed by nothing, on the reasoning that "the driver's batcher package is
-# fixed per run". The package is; the *cluster it was uploaded to* is not. The cached value
+# Not keyed by nothing: the driver's batcher package is fixed per run, but the *cluster it
+# was uploaded to* is not. The cached value
 # is a content-addressed `gcs://_ray_pkg_<hash>.zip` URI, which is meaningful only inside
 # the GCS that stored it. A driver that outlives one Ray session — a cluster restart, a
 # `ray.shutdown()` and reconnect, a notebook switching between a local and a remote address —

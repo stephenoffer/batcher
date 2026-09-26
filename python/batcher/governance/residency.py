@@ -23,33 +23,24 @@ one this module infers: guessing a region from a bucket name or an endpoint URL 
 fabricated legal fact, and the failure mode of guessing wrong is a compliance incident in
 whichever direction it errs.
 
-**Nothing currently consults this catalog, and the sentence above about "a check that runs
-before placement" describes a hook rather than a live path.** Traced 2026-09-01:
-`active_residency()` has exactly one consumer,
-`dist/executors/ray_runtime/fabric/placement.py::_eligible`, which is reached only through
-`plan_collective(..., datasets=...)`; `plan_collective`'s only caller,
+**Nothing consults this catalog, so "a check that runs before placement" above describes a
+hook, not a live path.** `active_residency()` has one consumer,
+`dist/executors/ray_runtime/fabric/placement.py::_eligible`, reached only through
+`plan_collective(..., datasets=...)`. That function's only caller,
 `dist/executors/ray_runtime/scheduling.py::_collective_bundles`, calls it as
-``plan_collective(workers, cpus_per_device=...)`` and passes no datasets. So ``if datasets:``
-is never true, the catalog is never read, and a rule an operator registers changes no
-placement. Confirmed by running it rather than by reading it: instrumenting
-`active_residency` and `plan_collective` and then calling `_collective_bundles` with a
-four-worker GPU-collective envelope shows ``datasets = ()`` at the call and
-`active_residency` never reached. `plan_collective`'s own docstring names the distinction
-it is failing on: passing the datasets is "the difference between a compliance control and
-a compliance report".
+``plan_collective(workers, cpus_per_device=...)`` with no datasets, so ``if datasets:`` is
+never true and a registered rule changes no placement. `plan_collective`'s own docstring names
+what is missing: passing the datasets is "the difference between a compliance control and a
+compliance report".
 
 Even wired, the reach would be narrower than the opening paragraph implies:
 `_collective_bundles` returns early unless the stage is a **GPU collective** of more than one
-worker at one device per worker, so an ordinary distributed scan or shuffle would still not
-be gated.
+worker at one device per worker, so an ordinary distributed scan or shuffle would still not be
+gated. Wiring it means threading each stage's input names through the scheduling envelope.
 
-This is recorded here rather than quietly fixed because wiring it means threading each
-stage's input names through the scheduling envelope, and because a policy surface that is
-exported, documented and enforced by nothing is exactly the failure this file's own
-"guessing wrong is a compliance incident" paragraph is about. **Do not cite residency as an
-enforced control until this note is removed and a test pins a placement it changed.** The
-value objects, the mode ladder and the matching are real and unit-tested
-(`tests/unit/test_residency_placement.py`); it is the call site that is missing.
+**Do not cite residency as an enforced control until this note is removed and a test pins a
+placement it changed.** The value objects, the mode ladder and the matching are real and
+unit-tested (`tests/unit/test_residency_placement.py`); it is the call site that is missing.
 """
 
 from __future__ import annotations

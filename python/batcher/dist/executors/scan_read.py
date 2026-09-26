@@ -20,7 +20,6 @@ they live here as the single source of truth.
 from __future__ import annotations
 
 import collections
-import contextlib
 import functools
 import os
 import threading
@@ -173,8 +172,9 @@ _SCAN_CACHE_LOCK = threading.Lock()
 
 # --- Broken-record tolerance (distributed.on_read_error="skip") --------------------
 # Count of splits (file / row-group group) a worker skipped because they failed to read.
-# Process-wide on the worker so a persistent-fleet worker's total is observable across a
-# query; `skipped_splits()` reads it. A skip is a silent data loss, so each one logs.
+# Process-wide on the worker, read by `skipped_splits()` and drained by
+# `drain_skipped_splits()`; it is not shipped to the driver. A skip is a data loss, so each
+# one also logs a warning, which is the record the driver sees.
 _SKIPPED_SPLITS = 0
 _SKIPPED_LOCK = threading.Lock()
 
@@ -195,8 +195,11 @@ def drain_skipped_splits() -> int:
 
     A fleet worker outlives the query that ran on it, so a cumulative counter cannot answer
     "did MY job lose data", the only question that matters when a petabyte-scale scan
-    quietly drops a corrupt shard. Draining per task lets the driver sum one number per
-    partition and report the job's true loss.
+    quietly drops a corrupt shard. Draining gives a per-query figure on the worker.
+
+    The count stays on the worker: no task returns it and the driver sums nothing. The
+    driver-visible record of a skip is the warning `_record_skipped` logs per split, which
+    Ray forwards from the worker's log.
     """
     global _SKIPPED_SPLITS
     with _SKIPPED_LOCK:
@@ -234,12 +237,11 @@ def _scannable_fragments(splits):
     That second case is the point. Sub-file splits read faster here (the scanner coalesces
     column-chunk ranges and reads fragments ahead in C++, and the result is cacheable), but
     knowing where the row-groups are costs the *driver* one footer read per file before any
-    worker starts — 18.3 s over 8,192 files, serial with the whole cluster idle. Whole-file
-    splits used to fall out of this fast path onto the per-split reader, so avoiding that
-    sweep meant giving up the reader too, and a 24 GB corpus measured 5.5 s read + 18.3 s
-    plan against 9.3 s read + 0.07 s plan — a choice between two bad halves. Accepting them
-    here removes the choice: the footer work moves off the driver and onto the workers that
-    were going to open the files anyway.
+    worker starts — 18.3 s over 8,192 files, serial with the whole cluster idle. If
+    whole-file splits fell out of this fast path onto the per-split reader, avoiding that
+    sweep would mean giving up the reader too: a 24 GB corpus measured 5.5 s read + 18.3 s
+    plan against 9.3 s read + 0.07 s plan. Accepting them here removes the choice: the
+    footer work moves off the driver and onto the workers that open the files anyway.
 
     Returns None — caller falls back — for any other split kind, and for a Parquet split
     carrying reader kwargs. Those kwargs are a bring-your-own filesystem, `storage_options`,
@@ -444,8 +446,10 @@ def _native_scan_batches(splits, projection, predicate=None):
     # decoder working set per read, which is what OOM-killed a GPU inference actor holding a
     # node's worth of them; the byte cap is a no-op for an ordinary row. See
     # `_parquet_native.NATIVE_READ_TARGET_BYTES`.
-    with contextlib.suppress(Exception):
+    try:
         batch_rows = _parquet_native.native_read_batch(splits[0].schema(), cols, ceiling=batch_rows)
+    except Exception as exc:
+        note_suppressed("dist", "native parquet read batch sizing", exc)
 
     # Window the row-groups so the worker reads ~one window at a time (bounded memory +
     # read/compute overlap) instead of materializing its whole partition.
@@ -467,9 +471,9 @@ def _native_scan_batches(splits, projection, predicate=None):
         """The windows, read CONCURRENTLY and yielded in file order.
 
         Each native call already fetches its own window's column chunks concurrently, but
-        the calls themselves used to run one after another — so a partition spread over
-        many files paid a full object-store round trip per file, in series, with the task's
-        reserved cores idle throughout. That is the common shape, not a corner: the
+        run one after another the calls would make a partition spread over many files pay a
+        full object-store round trip per file, in series, with the task's reserved cores
+        idle throughout. That is the common shape, not a corner: the
         partitioner balances a source's splits across tasks, so a task's ten splits are
         typically ten *different* files.
 
@@ -497,7 +501,8 @@ def _native_scan_batches(splits, projection, predicate=None):
     gen = _gen()
     try:
         first = next(gen, _SENTINEL)
-    except Exception:
+    except Exception as exc:
+        note_suppressed("dist", "native parquet read", exc)
         return None
     if first is _SENTINEL:
         return iter(())

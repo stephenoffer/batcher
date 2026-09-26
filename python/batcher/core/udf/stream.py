@@ -40,14 +40,12 @@ from batcher.core.udf.sizing import (
     stage_sig,
     timed_source,
 )
-from batcher.io.schema.evolution import normalize_batch, unify_schemas
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.profile import StageRecorder, metered, stage_kind
 from batcher.plan.types import total_logical_bytes
 
 __all__ = [
     "linear_map_chain",
-    "reconcile_stream",
     "stream_eligible",
     "stream_linear_chain",
 ]
@@ -364,22 +362,3 @@ def _pipelined_emit(gen, subs_fn, emit_fn, depth: int) -> Iterator[pa.RecordBatc
                 yield from inflight.popleft().result()
         while inflight:
             yield from inflight.popleft().result()
-
-
-def reconcile_stream(gen: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-    """Yield `gen`'s batches, each normalized to the union of the schemas seen *so far*.
-
-    The incremental counterpart of `reconcile_batches`, keeping a drifting-schema UDF (LLM
-    structured outputs that gain a field) concatenable downstream with one batch resident
-    instead of the whole output. Deliberately a weaker contract than the list form: a batch
-    already yielded cannot be widened retroactively, so an early batch keeps the narrower
-    schema. A consumer needing ONE schema over the entire result must use `execute_with_udfs`
-    and pay the materialization — that guarantee is what the memory bound is traded for.
-    """
-    target: pa.Schema | None = None
-    for batch in gen:
-        if target is None:
-            target = batch.schema
-        elif not batch.schema.equals(target):
-            target = unify_schemas([target, batch.schema], mode="union")
-        yield batch if batch.schema.equals(target) else normalize_batch(batch, target)

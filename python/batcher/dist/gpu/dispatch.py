@@ -1,11 +1,10 @@
 """Get a single-device GPU run's *input* to the device without staging it on the driver.
 
-A translated chain that does not shard still has to read its source from somewhere. It used to
-be the driver: `list(source.read())` pulled the whole relation into the driver's memory and
-then shipped that table to a GPU worker as a task argument. For the queries a GPU is worth
-using for, that is the wrong end of the machine — the driver is routinely a small head node,
-and it was being asked to hold a dataset chosen precisely because it is large, then move it
-twice across the network to compute on it once.
+A translated chain that does not shard still has to read its source from somewhere, and the
+driver is the wrong place: `list(source.read())` there would pull the whole relation into the
+driver's memory and ship that table to a GPU worker as a task argument. For the queries a GPU
+is worth using for, the driver is routinely a small head node asked to hold a dataset chosen
+precisely because it is large, then move it twice across the network to compute on it once.
 
 Sending a **partition descriptor** instead moves the read to the worker. The descriptor is a
 small manifest of splits with the projection and predicate already pushed into it, so the

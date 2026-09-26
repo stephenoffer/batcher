@@ -136,11 +136,10 @@ def _is_transient_udf_error(exc: BaseException) -> bool:
     job on it throws away hours of completed inference.
 
     The classification itself lives in `carbonite.resilience.classify`, which is the one
-    taxonomy the single-node executor and this scheduler share. It used to be a marker list
-    here and a second, different marker list nowhere — and a retry rule that two subsystems
-    disagree about is a retry rule that behaves differently depending on which path a failure
-    took to reach it. The classifier also answers the question this predicate structurally
-    cannot: *where* the retry should land. See `must_move`.
+    taxonomy the single-node executor and this scheduler share, because a retry rule that
+    two subsystems disagree about is a retry rule that behaves differently depending on which
+    path a failure took to reach it. The classifier also answers the question this predicate
+    structurally cannot: *where* the retry should land. See `must_move`.
     """
     from batcher.carbonite.resilience import is_retryable
 

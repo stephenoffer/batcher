@@ -237,10 +237,9 @@ def unoffsettable_functions(window: Window, *, assembled: bool = False) -> list[
     """The functions in `window` this algebra has no offset for, for an error message.
 
     `supports_ordered_bucket_offsets` answers *whether*; this answers *which*, from the same
-    tables, so a refusal names the function at fault rather than every function present. The
-    message that used to be built at the call site listed them all — a `row_number` beside a
-    `lag` was reported as equally unsupported, which sends the reader to rewrite the wrong half
-    of their query.
+    tables, so a refusal names the function at fault rather than every function present.
+    Listing them all would report a `row_number` beside a `lag` as equally unsupported, which
+    sends the reader to rewrite the wrong half of their query.
 
     Args:
         window: The global window that found no distributed route.
@@ -286,7 +285,7 @@ def _key_type_partitionable(window: Window) -> bool:
 
     Imported inside the function on purpose: this module is the one part of
     `dist.global_window` that `dist.executor` imports eagerly (see the package docstring on
-    the 0.44 s `import ray` that eager submodule loading used to cost), and
+    the 0.44 s `import ray` that eager submodule loading would cost), and
     `executors.partition_io` is not on that budget.
     """
     from batcher.dist.executors.partition_io import range_partitionable

@@ -340,14 +340,14 @@ def _start_partitions(ctx: _Context, open_inflight: dict) -> None:
 def _issue_publishes(ctx: _Context, publish_inflight: dict) -> None:
     """Fill each opened producer's window with `publish_next` calls, up to `credits`.
 
-    **Queued, not one at a time.** A producer used to be asked for morsel *k+1* only after
-    the driver had observed *k* return, so the actor sat idle across a full round of this
-    loop -- a `ray.wait` over every stage's inflight set, then the handler, then the next
-    issue -- between one morsel's work and the next. On a decode stage that gap is paid
-    3,125 times over a 400,000-image run, and it is why the staged form measured 2.1x slower
-    than the fused one at *both* intermediate widths: the cost was per morsel, not per byte.
-    Queueing the whole window instead lets the actor start *k+1* the instant *k* finishes,
-    which is what the credit window was always meant to buy.
+    **Queued, not one at a time.** Asking a producer for morsel *k+1* only after the driver
+    observes *k* return leaves the actor idle across a full round of this loop -- a
+    `ray.wait` over every stage's inflight set, then the handler, then the next issue --
+    between one morsel's work and the next. On a decode stage that gap is paid 3,125 times
+    over a 400,000-image run, and one-at-a-time issue measured the staged form 2.1x slower
+    than the fused one at *both* intermediate widths: the cost is per morsel, not per byte.
+    Queueing the whole window lets the actor start *k+1* the instant *k* finishes, which is
+    what the credit window is for.
 
     The window is unchanged in size, only in what fills it: a morsel that has been asked for
     is as resident as one that has been published, so an issued-but-unreturned call counts

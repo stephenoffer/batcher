@@ -421,9 +421,9 @@ def merge_shards(partials: list, ops: list[dict]) -> pa.Table:
     per shard — small by construction *when the group count is*, and not otherwise. For a
     row-local chain `ops` is empty and this is the concatenation itself, in shard order.
 
-    **The engine folds it whenever it can, at every size.** This gate used to be a combined-row
-    count (1,048,576), on the reasoning that a plan build and an FFI crossing are not worth
-    paying for a six-row fold. Measured, that is backwards: the *pandas* path has the larger
+    **The engine folds it whenever it can, at every size.** There is no combined-row gate: the
+    reasoning that a plan build and an FFI crossing are not worth paying for a six-row fold is,
+    measured, backwards: the *pandas* path has the larger
     fixed cost — building a `DfBackend`, converting Arrow to pandas and back — and it is about
     3.3 ms flat, against the engine's 0.25 ms. Best of five per point, six shards, group count a
     quarter of the rows:

@@ -3,7 +3,7 @@
 envelope this query may plan against, and why exceeding it is a counter-offer rather
 than a failure.
 
-Source of truth: `python/batcher/carbonite/memory/estimator.py::peak_operator_bytes`
+Source of truth: `python/batcher/carbonite/memory/estimator.py::_peak`
 (the schedule walk and its worked figures), `policies/admission.py::BudgetingAdmission`
 (the envelope arithmetic, the morsel floor, `_bytes_already_held`, `_rests_on_a_guess`)
 and `policies/concurrency.py::query_memory_share`.

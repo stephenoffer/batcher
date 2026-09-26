@@ -140,10 +140,9 @@ def _distributed_distinct_on(
     so a following stage scans them in place. That matters more for this operator than for
     the aggregate it sits beside: a dedup's output is rows, not a summary, so what a collect
     costs is a fraction of the whole relation through one node. It is honored on **both**
-    transports — the Flight branch used to accept the flag and then drop it on the floor, so
-    a keyed `distinct()` on a real multi-node cluster (where `transport="auto"` resolves to
-    Flight) collected every deduped row onto the driver while the same query on one node
-    did not.
+    transports: a Flight branch that dropped the flag would make a keyed `distinct()` on a
+    real multi-node cluster (where `transport="auto"` resolves to Flight) collect every
+    deduped row onto the driver while the same query on one node did not.
     """
     from batcher.dist.executors.keyed_shuffle import keyed_row_shuffle, scan_rooted_ir
     from batcher.dist.executors.plan_analysis import _relabel_single_source, empty_result_table

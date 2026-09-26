@@ -8,7 +8,7 @@ the operator computes from one*:
 - `buckets` — the mechanics every breaker shares: the scratch lifecycle, the per-bucket
   writers, how big a bucket is, and the salted grace re-split. Shared with the ordering and
   binary breakers in `dist.spill_breakers` and with `dist.global_window`, which is the point
-  — each of them used to state these for itself.
+  — none of them states these for itself.
 - `aggregate` — partition-and-spill aggregation and the `spill_collect` dispatcher. The
   bucket reduce and its recursion live there together, with the caller, because that is what
   keeps them one unit.

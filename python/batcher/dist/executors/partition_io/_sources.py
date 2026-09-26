@@ -697,7 +697,7 @@ def _apply_above(above: list[LogicalPlan], agg_table: pa.Table) -> pa.Table:
     for node in reversed(above):  # innermost (closest to agg) first
         plan = dataclasses.replace(node, input=plan)
     # A zero-row table has NO batches (pyarrow drops empty chunks) and `InMemorySource`
-    # needs one, so `filter(<no match>).distinct()` used to die here. Feed it a schema-only
+    # needs one, so `filter(<no match>).distinct()` would die here. Feed it a schema-only
     # batch: same rows, same schema, no crash.
     batches = agg_table.to_batches() or [pa.RecordBatch.from_pylist([], schema=agg_table.schema)]
     return _single_node(plan, [InMemorySource(batches)])

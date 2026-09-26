@@ -157,12 +157,12 @@ def _distributed_join(
     **either** path keep its result partitioned (a `MaterializedSource`) for the next
     adaptive stage or for a write.
 
-    The broadcast path used to collect unconditionally, which is what made
-    `read.parquet(a).join(read.parquet(b)).write.parquet(...)` route through
-    `_distributed_write` -- the collect-then-reshard fallback -- while the same write after
-    a `distinct`, a `group_by` or a sort stayed partitioned. A small dimension table is the
-    common case, so the shape most likely to be broadcast was the one shape that always
-    round-tripped the driver."""
+    A broadcast path that collected unconditionally would route
+    `read.parquet(a).join(read.parquet(b)).write.parquet(...)` through `_distributed_write`
+    -- the collect-then-reshard fallback -- while the same write after a `distinct`, a
+    `group_by` or a sort stayed partitioned. A small dimension table is the common case, so
+    the shape most likely to be broadcast would be the one shape that always round-trips
+    the driver."""
     if join.strategy == "broadcast" and join.join_type in _BROADCAST_SAFE:
         return _broadcast_join(above, join, sources, workers, hub=hub, materialize=materialize)
     return _shuffle_join(above, join, sources, workers, materialize=materialize, hub=hub)
@@ -685,8 +685,10 @@ def _stream_broadcast_join(
 
 
 def _byte_chunks(batches, target_bytes: int):
-    """Group an iterable of batches into lists of about `target_bytes` each (always at
-    least one batch per chunk), so a streaming consumer bounds its working set.
+    """Group an iterable of batches into lists of about `target_bytes` each.
+
+    Always at least one batch per chunk, so a streaming consumer bounds its working set.
+    Shared by the disk broadcast join and the Flight broadcast join's probe side.
 
     Sized by retained bytes: the bound is on memory held, and a batch that windows a
     larger parent holds the parent whatever `nbytes` reports."""

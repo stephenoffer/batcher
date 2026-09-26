@@ -57,7 +57,7 @@ def test_a_long_shuffle_does_not_wash_out_a_starved_round() -> None:
 
 
 def test_a_counter_reset_re_baselines_instead_of_reporting_a_negative_round() -> None:
-    """`reset_peer_transfers` rewinds the totals underneath a live meter.
+    """A counter reset (`reset_shuffle_peer_stats`) rewinds the totals underneath a live meter.
 
     Subtracting the larger baseline would give a negative interval, which clamps to zero and
     reads as a perfectly saturated round — telling the controller to stop growing on the

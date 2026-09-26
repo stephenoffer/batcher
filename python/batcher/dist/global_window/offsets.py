@@ -451,11 +451,10 @@ class OrderedBucketOffsets:
         # Clamp below at zero while letting a NaN through, because that is what the kernel
         # does: `bc_runtime::window::agg::Moments::variance` clamps with a comparison, so a
         # variance poisoned by a NaN input is NaN (Polars' `rolling_var` answer, and the
-        # `GROUP BY` variance's). It used to clamp with `f64::max(_, 0.0)`, which returns the
-        # non-NaN operand and answered `0.0`; this translation matched that, and follows the
-        # kernel's fix rather than improving on it — `bc-interp` is the oracle here.
-        # `np.where` on the comparison keeps NaN, where `np.maximum` would too but reads as the
-        # thing the old clamp was not.
+        # `GROUP BY` variance's), not with `f64::max(_, 0.0)`, which returns the non-NaN
+        # operand and answers `0.0`. This translation follows the kernel rather than improving
+        # on it — `bc-interp` is the oracle here. `np.where` on the comparison keeps NaN, where
+        # `np.maximum` would too but reads like the `f64::max` clamp it is not.
         out = np.where(out < 0.0, 0.0, out)
         if fn.func == "stddev":
             out = np.sqrt(out)

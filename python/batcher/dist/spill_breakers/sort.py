@@ -121,12 +121,11 @@ def execute_spilling_sort(
 def _buckets_for_staged(stage_handle: object, hint: int) -> int:
     """How many ordered buckets the staged input should be split into.
 
-    The bucket count used to be a constant (16, or whatever the caller passed), and that is
-    the one number in an out-of-core sort that must not be a constant: each bucket is read
-    back **whole** to be sorted, so a fixed count makes peak memory `input / 16` — it grows
-    linearly with the input. A sort large enough to need this path is exactly the sort that
-    then OOMs on its first bucket, and the failure looks like an ordinary OOM rather than a
-    misconfigured spill.
+    The bucket count is the one number in an out-of-core sort that must not be a constant
+    (16, or whatever the caller passed): each bucket is read back **whole** to be sorted, so a
+    fixed count makes peak memory `input / 16` — it grows linearly with the input. A sort
+    large enough to need this path is exactly the sort that then OOMs on its first bucket,
+    and the failure looks like an ordinary OOM rather than a misconfigured spill.
 
     Staging has already measured the mapped input, so the count can come from the bucket
     envelope (`bucket_envelope` — the shared ceiling every breaker budgets against, capped

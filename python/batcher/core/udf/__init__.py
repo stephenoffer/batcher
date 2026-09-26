@@ -25,7 +25,6 @@ from batcher.core.udf.execute import (
     has_map_batches,
     prebuild_factories,
     release_prebuilt,
-    stream_with_udfs,
 )
 
 __all__ = [
@@ -34,5 +33,4 @@ __all__ = [
     "has_map_batches",
     "prebuild_factories",
     "release_prebuilt",
-    "stream_with_udfs",
 ]

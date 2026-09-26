@@ -23,7 +23,6 @@ from batcher.carbonite.memory.estimator import (
     OperatorMemoryEstimator,
     binding_operator,
     learned_plan_peak,
-    peak_operator_bytes,
 )
 from batcher.carbonite.policies.admission import BudgetingAdmission
 from batcher.config import Config
@@ -82,19 +81,19 @@ class _DoublingModel:
 
 
 def test_the_envelope_is_the_dominant_breaker() -> None:
-    assert peak_operator_bytes(_plan(100, 900, 300)) == 900 * _MIB
+    assert learned_plan_peak(_plan(100, 900, 300), None) == 900 * _MIB
 
 
 def test_an_unsized_plan_has_no_envelope() -> None:
     """`0` means "no estimate", which callers must read as "no evidence", not "fits"."""
-    assert peak_operator_bytes(_plan(0, 0)) == 0
+    assert learned_plan_peak(_plan(0, 0), None) == 0
     assert binding_operator(_plan(0, 0)) is None
 
 
 def test_a_cold_store_blends_to_exactly_the_plan_estimate() -> None:
     """With no model there is nothing to blend toward, so nothing may change."""
     plan = _plan(100, 900, 300)
-    assert learned_plan_peak(plan, None) == peak_operator_bytes(plan)
+    assert learned_plan_peak(plan, None) == max(op.bounds.m_max_bytes for op in plan.ops)
 
 
 def test_a_model_moves_the_envelope() -> None:
@@ -156,7 +155,7 @@ def test_a_learned_model_reaches_admission_too() -> None:
     the raw estimate must now be refused. A site still reading the raw `max` would admit.
     """
     plan = _plan(4, 32, 8)
-    raw = peak_operator_bytes(plan)
+    raw = learned_plan_peak(plan, None)
     admission = BudgetingAdmission(available_bytes=raw, soft_limit=1.0)
     assert admission.validate(plan, _ctx()).feasible
     assert not admission.validate(plan, _ctx(_DoublingModel())).feasible

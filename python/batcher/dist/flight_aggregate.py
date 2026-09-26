@@ -269,9 +269,9 @@ def execute_aggregate_flight(
         # `on_actors`: keep the result on the workers — each reducer publishes its bucket
         # and the driver gets only handles, so the next adaptive stage reads the intermediate
         # in place. Otherwise the reducers return their batches. Decided once, for **both**
-        # reduce shapes: it used to be asked only inside the flat branch, so a fleet wider
-        # than `fan_in` — which is every fleet past 8 workers — collected its whole aggregate
-        # through the driver however large the result was.
+        # reduce shapes: asked only inside the flat branch, a fleet wider than `fan_in` —
+        # every fleet past 8 workers — would collect its whole aggregate through the driver
+        # however large the result was.
         on_actors = materialize is False and not above
         if workers > fan_in:
             out = _tree_reduce_with_recovery(

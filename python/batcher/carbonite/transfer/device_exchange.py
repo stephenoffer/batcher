@@ -91,11 +91,6 @@ class ExchangePlan:
         return len(self.steps)
 
     @property
-    def fully_direct(self) -> bool:
-        """Whether every pair copies device-to-device with no host bounce."""
-        return not self.staged
-
-    @property
     def speedup(self) -> float:
         """How many times faster than the host path, `0.0` when either cost is unknown.
 

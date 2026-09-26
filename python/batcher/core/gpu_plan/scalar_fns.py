@@ -68,12 +68,11 @@ def _float64():
 # name to pandas' `Series.truncate`, which slices *rows by index* and has nothing to do with
 # truncating a value — it returned a different table without raising.
 #
-# The ufunc is used on **both** backends. This used to prefer a same-named method on the device
-# (`x.sqrt()`, `x.exp()`, `x.sin()`), and cuDF no longer has any of them: every one of those
-# calls raised `AttributeError` on a real GPU, which is not an `Unsupported` and so was reported
-# as "the GPU backend is not usable" — for `sqrt`. The pandas verification backend could not see
-# it, because the preference was `is_gpu`-gated and pandas took the ufunc branch. Measured on a
-# T4 fleet: thirty-one functions, every one of them broken on the device and green in CI.
+# The ufunc is used on **both** backends. cuDF has no same-named method (`x.sqrt()`, `x.exp()`,
+# `x.sin()`): calling one raises `AttributeError` on a real GPU, which is not an `Unsupported` and
+# so reads as "the GPU backend is not usable" — for `sqrt`. The pandas verification backend cannot
+# see that, since an `is_gpu`-gated preference would send pandas down the ufunc branch. Measured on
+# a T4 fleet: thirty-one functions, every one of them broken on the device and green in CI.
 #
 # cuDF dispatches a NumPy ufunc over a column on the GPU, so the ufunc branch is not a host
 # fallback — it is the device path, and it is the one that was already being exercised.
@@ -360,8 +359,8 @@ def eval_date(ir, df, be, eval_expr):
     if fn == "epoch":
         # Whole seconds since the Unix epoch, from the microseconds Arrow stores. The cast to
         # `timestamp[us]` is what lets a DATE take this path: a date's own representation is a
-        # count of *days*, which has no direct cast to int64 at all, so this used to raise and
-        # send the whole plan to the CPU engine over an `epoch()` on an ordinary date column.
+        # count of *days*, which has no direct cast to int64 at all, so without the cast an
+        # `epoch()` on an ordinary date column would send the whole plan to the CPU engine.
         # Flooring (not truncating) is the engine's rule for an instant before 1970.
         return (epoch_micros(x, be) // 1_000_000).astype(be.dtype(_int64()))
     if fn in DATE_FNS:
@@ -387,7 +386,7 @@ def eval_date_trunc(ir, df, be, eval_expr):
     x = be.column(eval_expr(ir["input"], df, be), df)
     if freq is None:
         # A `GROUP BY date_trunc('month', ...)` is the most ordinary shape a time series has,
-        # and it used to send the entire plan to the CPU engine over this one call.
+        # so this one call must not send the entire plan to the CPU engine.
         return eval_calendar_trunc(x, unit, be)
     floor = getattr(x.dt, "floor", None)
     if floor is None:

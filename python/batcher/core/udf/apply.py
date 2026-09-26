@@ -33,14 +33,13 @@ from batcher.plan.types import one_batch
 
 __all__ = ["apply_udf", "rechunk"]
 
-# Idle dispatch pools, keyed by worker count, waiting to be leased again. A stage's per-batch
-# calls used to run on a `ThreadPoolExecutor` built and shut down *inside* `_run_sync_udf`,
-# which is fine when a stage runs once (a `collect`) and ruinous when it runs repeatedly — and
-# it does: `iter_batches` over a `map_batches` chain calls `execute_with_udfs` per *window*, so
-# a 16 M-row four-stage chain built 260 pools and spawned 1,677 threads, and
-# `ThreadPoolExecutor.__exit__` was 9.8 s of a 9.6 s profile. The same shape, measured in
-# isolation, is **4,352 ms against 147 ms** for a reused pool (30x). Streaming micro-batch
-# queries pay it per micro-batch, which is worse still.
+# Idle dispatch pools, keyed by worker count, waiting to be leased again. A `ThreadPoolExecutor`
+# built and shut down *inside* `_run_sync_udf` would be fine when a stage runs once (a `collect`)
+# and is ruinous when it runs repeatedly — and it does: `iter_batches` over a `map_batches` chain
+# calls `execute_with_udfs` per *window*, so a 16 M-row four-stage chain measured 260 pools and
+# 1,677 threads that way, with `ThreadPoolExecutor.__exit__` 9.8 s of a 9.6 s profile. The same
+# shape, measured in isolation, is **4,352 ms against 147 ms** for a reused pool (30x). Streaming
+# micro-batch queries pay it per micro-batch, which is worse still.
 #
 # Leased rather than shared outright: a lease hands out a pool *exclusively*, so a stage still
 # gets exactly `num_workers` concurrent calls and two stages running at once get two pools —

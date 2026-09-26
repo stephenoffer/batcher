@@ -398,9 +398,9 @@ def _class_index() -> dict:
     """Node-class key -> the ids of the nodes in that class. One pass, cheap keys.
 
     The shared half of `node_classes`, `node_class_census` and `fabric.shape.cluster_shape`:
-    the fleet is walked, and classified, exactly once per query. Those three used to make two
-    separate passes over every node record — 240 ms and 170 ms of a single query against a
-    synthetic 100,000-node fleet, which was most of its placement phase.
+    the fleet is walked, and classified, exactly once per query. Two separate passes over
+    every node record cost 240 ms and 170 ms of a single query against a synthetic
+    100,000-node fleet, most of its placement phase.
 
     The classification itself lives in `fabric.census`, which is pure: it takes the node
     records and the two side tables rather than reading Ray, so this stays the only place the
@@ -545,8 +545,8 @@ def cluster_numa_nodes() -> int:
     across the fleet, so it must be one a less-partitioned node can also host without being
     split finer than its own topology wants.
 
-    Best-effort, and deliberately `1` on any failure — an unprobeable fleet keeps exactly the
-    one-worker-per-node fan-out it had before this existed.
+    Best-effort, and deliberately `1` on any failure — an unprobeable fleet keeps the
+    one-worker-per-node fan-out.
 
     Returns:
         NUMA domains per worker node, at least 1.
@@ -573,8 +573,8 @@ def node_classes() -> list[dict]:
     what made a fleet ask for a shape only a completely idle cluster could host.
 
     **Prefer `node_class_census()` unless you need `node_id`.** This expands the census back to
-    one entry per node, which is O(nodes) in dict construction and is what every aggregate
-    question here used to pay. The one caller that genuinely needs identity is the shuffle's
+    one entry per node, which is O(nodes) in dict construction and is a cost an aggregate
+    question has no reason to pay. The one caller that genuinely needs identity is the shuffle's
     spot-node set, which places a replica outside a failure domain.
 
     Grouped by class rather than in the cluster's own node order, which no caller depends on:

@@ -125,8 +125,8 @@ def stream_windowed_aggregate(
 
     A watermarked aggregate whose group keys contain no event-time window has nothing the
     watermark can close, so over an unbounded source it is refused rather than run: the
-    fallback it used to take was an ordinary running aggregate, which on a stream that never
-    ends emits nothing, evicts nothing, and grows until the memory cap fires. Over a bounded
+    fallback, an ordinary running aggregate, on a stream that never ends emits nothing,
+    evicts nothing, and grows until the memory cap fires. Over a bounded
     source the same fallback terminates and is correct, so it stays.
     """
     from batcher.io.source import (

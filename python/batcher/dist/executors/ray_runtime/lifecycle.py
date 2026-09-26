@@ -421,10 +421,10 @@ def _platform_env_hook_disabled():
 # answer is fixed **for that Ray session** — a later `_ensure_ray` must not flip it just
 # because Ray now reports initialized.
 #
-# It was previously fixed for the *process*, which is wrong across a session change. If the
-# cluster restarts, or a driver calls `ray.shutdown()` and reconnects, the next `_ensure_ray`
-# sees Ray initialized and keeps the previous session's answer — so a foreign re-init is
-# treated as "the job already ships batcher" and the workers never receive the package.
+# Fixing it for the *process* would be wrong across a session change. If the cluster
+# restarts, or a driver calls `ray.shutdown()` and reconnects, the next `_ensure_ray` would
+# see Ray initialized and keep the previous session's answer — a foreign re-init read as
+# "the job already ships batcher", and workers that never receive the package.
 # Storing the session the decision belongs to makes the re-decision automatic; `None` means
 # no decision has been made yet.
 _ship_session: str | None = None

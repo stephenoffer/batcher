@@ -78,9 +78,9 @@ def keyed_row_shuffle(
         key_indices: Column positions of the shuffle key in `map_plan`'s output.
         out_schema: The operator's output schema, carrying its real column *types*. A
             shuffle where every bucket came back empty has no batch to take a schema from,
-            and this is what it returns instead. It used to be a list of *names*, from
-            which the empty result was built as `pa.table({name: []})` — every column
-            typed `null`. That is a `distributed != single-node` divergence in column
+            and this is what it returns instead. A list of *names* would build the empty
+            result as `pa.table({name: []})` — every column typed `null`. That is a
+            `distributed != single-node` divergence in column
             types on exactly the empty case, which is where such a divergence hides
             longest: a downstream concat, typed projection or `write.parquet` then breaks
             only when the filter happened to match nothing.

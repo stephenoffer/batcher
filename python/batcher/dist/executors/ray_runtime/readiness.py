@@ -146,14 +146,14 @@ def _note_ceiling(best_cpus: int) -> None:
 def _note_gpu_ceiling(best_gpus: float) -> None:
     """Record that the autoscaler stalled at `best_gpus` devices.
 
-    **A zero is never recorded.** That is the whole reason GPU waits used to learn nothing at
-    all: a fleet whose GPU node has not registered yet reports 0 devices, and capping future
+    **A zero is never recorded, but a positive stall is.** A fleet whose GPU node has not
+    registered yet reports 0 devices, and capping future
     requests at 0 would disable the accelerator for the life of the driver on exactly the
     cluster that was about to have one. A positive stall is different evidence entirely — the
-    fleet showed its devices and stopped there — and refusing to learn from it is what made the
-    docstring's promise ("a fixed cluster pays the startup grace once, not per query") false
-    for every GPU stage: a six-device fleet asked for eight paid the full 12 s grace on *every*
-    query, forever, having already proved on the first one that the eighth device is not coming.
+    fleet showed its devices and stopped there — and refusing to learn from it would make the
+    promise "a fixed cluster pays the startup grace once, not per query" false for every GPU
+    stage: a six-device fleet asked for eight would pay the full 12 s grace on *every* query,
+    having already proved on the first one that the eighth device is not coming.
     """
     global _reachable_gpu_ceiling
     if best_gpus <= 0:

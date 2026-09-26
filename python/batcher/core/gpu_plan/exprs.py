@@ -287,8 +287,8 @@ def _struct_field(ir, df, be: DfBackend):
     """`struct.field(name)` — one field of a struct column.
 
     The one struct operation both libraries spell the same way, and the one worth having: a
-    struct column is how every semi-structured source arrives, so a plan that reads one field
-    of one used to send its whole chain to the host.
+    struct column is how every semi-structured source arrives, and without it a plan that
+    reads one field of one would send its whole chain to the host.
     """
     from batcher.core.gpu_plan.backend import call_or_decline
 

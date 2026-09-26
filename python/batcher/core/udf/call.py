@@ -191,7 +191,7 @@ def _coerce_udf_result(result: object, reference: pa.Schema) -> list[pa.RecordBa
     returned; `importable_batch` then respells any Arrow **layout** the FFI reader cannot
     take. A UDF is the one place a column type is chosen by user code rather than by a
     source, so it is exactly where a layout the engine has never seen arrives -- a
-    ``list_view`` built by a NumPy or Polars round-trip used to reach the user as
+    ``list_view`` built by a NumPy or Polars round-trip would otherwise reach the user as
     ``Extracting byte ranges not supported for type list_view<item: int64>``.
 
     `restore_null_typed_columns` and `restore_widened_columns` are the third and fourth, and
@@ -232,9 +232,8 @@ def _coerce_parts(result: object) -> list[pa.RecordBatch]:
     of those. The frame and iterator forms matter more than they look — a `fn` written
     against ``batch_format="pandas"`` and then reused under the default ``"pyarrow"``
     returns a frame, and a **generator** `fn` (``yield`` one batch per decoded video / per
-    LLM response) is the natural spelling of a row-expanding ML stage. Both used to reach
-    the user as ``must return a pyarrow RecordBatch, Table, or dict; got DataFrame``, which
-    names the type it got and nothing about the fix.
+    LLM response) is the natural spelling of a row-expanding ML stage, so both are accepted
+    rather than refused with an error that names the type and nothing about the fix.
 
     A generator is materialized here rather than streamed: the caller's contract is a
     ``list[RecordBatch]`` per input batch, so the memory bound is the same as returning one
@@ -388,8 +387,8 @@ def _tensorize_columns(result: dict) -> dict:
 
     A **list of arrays of differing shape** — the mixed-resolution decode, and the one shape
     the canonical type cannot express — becomes a variable-shape tensor column instead
-    (`ragged_from_values`). That case used to be the multimodal path's first hard stop: it
-    could not be typed at all, and the only advice was to resize before the engine saw it.
+    (`ragged_from_values`), so a mixed-resolution decode needs no resize before the engine
+    sees it.
 
     1-D arrays, lists, and Arrow arrays pass through untouched, so scalar/label columns are
     unchanged. This keeps the tensor path identical single-node and distributed, for every

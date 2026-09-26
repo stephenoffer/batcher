@@ -81,7 +81,7 @@ _POOL_PROBE_TIMEOUT_S = 10.0
 # is constructed, and an actor is constructed only once the cluster hands it a device — so on
 # a busy fleet the probe waits for capacity, not for a measurement.
 #
-# It used to wait with a bare `ray.get` and no bound. Measured on a 6-GPU cluster, a
+# So the wait is bounded. Measured unbounded (a bare `ray.get`) on a 6-GPU cluster, a
 # `read.parquet(...).map_batches(cls, num_gpus=1).collect(distributed=True)` over four shards:
 # **251.5s of a 267.6s query** was this single call, with the actor pool itself doing the work
 # in 3.8s. The pool's own liveness probe 40 lines below is bounded for exactly this reason,
@@ -809,8 +809,8 @@ def _actor_inflight_depth() -> int:
 def _emptiest_actor(actors, slots: dict):
     """The actor with the most free in-flight slots, or `None` when the pool is full.
 
-    Both actor-pool drivers used to take "the first actor with a free slot", which fills
-    actor 0 to its submit depth before actor 1 receives anything. Whenever the partition
+    Taking "the first actor with a free slot" instead would fill actor 0 to its submit
+    depth before actor 1 receives anything. Whenever the partition
     count is at or below ``len(actors) x depth`` — the ordinary case for an inference stage,
     whose partitions are few and wide — the tail of the pool never runs at all.
 
@@ -1634,19 +1634,16 @@ def _cluster_cores() -> float:
 
 
 def _learning_hub(hub=None):
-    """The MetadataHub to read learned sizing from — the one threaded in, else the
-    process-wide default (the same store Core records feedback to). Best-effort: any
-    failure to reach a hub yields `None`, so a learned read simply falls back to the
-    plan default."""
+    """The MetadataHub to read learned sizing from: the one threaded in, else the
+    process-wide default (the same store Core records feedback to).
+
+    `default_hub` does not raise: a metadata backend that cannot be opened degrades to an
+    in-process store inside it, so there is nothing to catch here."""
     if hub is not None:
         return hub
-    try:
-        from batcher.core import default_hub
+    from batcher.core import default_hub
 
-        return default_hub()
-    except Exception as exc:  # pragma: no cover - learning is best-effort
-        note_suppressed("dist", "resolve the learning hub", exc)
-        return None
+    return default_hub()
 
 
 def _plan_family(plan: LogicalPlan) -> str:
@@ -1880,8 +1877,8 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None, task_cpus=N
       about `rows_per_cpu` rows. More tasks than cores buys nothing, so the clamp is right.
     * *Memory* — `_byte_partition_count`, the count that holds one task's input to
       `target_bytes_per_task`. This one is a **bound, not a preference**, and the core clamp
-      must not apply to it. It used to: `min(max(rows_term, bytes_term), cluster_cores)`
-      discarded the byte term for any source bigger than `cores x target_bytes_per_task`,
+      must not apply to it: `min(max(rows_term, bytes_term), cluster_cores)` would discard
+      the byte term for any source bigger than `cores x target_bytes_per_task`,
       which is precisely the range it exists for. A 1 TB scan on this 128-core cluster asked
       for 4,096 partitions and got 128 — **8 GiB per task against a 256 MiB budget, growing
       linearly with the data**. That is not a slow query; it is an OOM, and it arrives exactly
@@ -3286,8 +3283,8 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # summation order under the scheduler, so a sum can move in its last bits between two
     # runs over the same data. That is the reassociation the distributed contract already
     # allows (partition count moves it too, and `bc-runtime`'s Neumaier compensation is what
-    # bounds it either way) — but it was previously only *across* configurations, and here
-    # it is also within one. Integer and min/max/count aggregates are unaffected; a caller
+    # bounds it either way) — but elsewhere it varies only *across* configurations, and
+    # here it also varies within one. Integer and min/max/count aggregates are unaffected; a caller
     # needing bit-repeatable float sums has the same recourse it always had, which is to fix
     # the partition count.
     def _gather(launch):

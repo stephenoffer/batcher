@@ -26,7 +26,6 @@ __all__ = [
     "bdp_bytes",
     "flow_totals",
     "peer_transfers",
-    "reset_peer_transfers",
     "straggler_peer",
 ]
 
@@ -53,7 +52,7 @@ class PeerTransfer:
         fetches: Fetches completed.
         retries: Fetches that had to be redialed because the cached connection was stale.
         starved_seconds: The part of `seconds` spent blocked awaiting the next batch — the
-            credit window's own feedback. See `starved_fraction`.
+            credit window's own feedback.
     """
 
     addr: str
@@ -71,23 +70,6 @@ class PeerTransfer:
         fetched from must not rank as the slowest one.
         """
         return self.bytes * 8 / self.seconds / 1e9 if self.seconds > 0 else 0.0
-
-    @property
-    def starved_fraction(self) -> float | None:
-        """Share of this peer's fetch time spent waiting for data, or `None` if unmeasured.
-
-        A credit window exists to cover the channel's bandwidth-delay product: enough batches
-        in flight that the consumer never waits on the wire, and not one more, because every
-        credit past that point is buffered memory bought for no throughput. This is the only
-        figure that says which side of that line a channel is on.
-
-        `None` rather than `0.0` for an unmeasured peer, because the two mean opposite things
-        to a controller: zero says "already wide enough, stop growing", and a channel nobody
-        has fetched from has not earned that verdict.
-        """
-        if self.seconds <= 0:
-            return None
-        return min(1.0, max(0.0, self.starved_seconds / self.seconds))
 
 
 def peer_transfers() -> tuple[PeerTransfer, ...]:
@@ -169,21 +151,6 @@ def bdp_bytes() -> int | None:
         note_suppressed("carbonite", "read the shuffle bandwidth-delay product", exc)
         return None
     return None if measured is None or measured <= 0 else int(measured)
-
-
-def reset_peer_transfers() -> None:
-    """Forget every peer's totals, so the next reading measures one stage.
-
-    Best-effort: a build without the counters has nothing to reset, and a caller that measures
-    a stage against a reset it did not get sees the process's totals, which is a superset
-    rather than a wrong answer.
-    """
-    from batcher._internal.native import engine
-
-    try:
-        engine().reset_shuffle_peer_stats()
-    except Exception as exc:  # an older extension has no such symbol
-        note_suppressed("carbonite", "reset the shuffle peer counters", exc)
 
 
 def straggler_peer(

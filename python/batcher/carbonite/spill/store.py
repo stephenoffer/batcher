@@ -159,19 +159,9 @@ class TieredSpillStore:
         return self._local_used
 
     @property
-    def remote_bytes(self) -> int:
-        """Total bytes this store has written to the remote overflow tier."""
-        return self._remote_used
-
-    @property
     def total_bytes(self) -> int:
         """Bytes this store holds across both tiers — its whole out-of-core footprint."""
         return self._local_used + self._remote_used
-
-    @property
-    def bucket_count(self) -> int:
-        """Finalized buckets this store is holding across both tiers."""
-        return len(self._local_paths) + len(self._remote_paths)
 
     @property
     def overflowed(self) -> int:

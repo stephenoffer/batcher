@@ -298,23 +298,6 @@ class ParallelPlan:
         """Devices the whole plan occupies."""
         return self.devices_per_replica * max(0, self.replicas)
 
-    def tensor_group_fits_node(self, devices_per_node: int) -> bool:
-        """Whether one tensor-parallel group sits inside a single node.
-
-        The distinction that decides whether a plan is viable at all. A tensor-parallel group
-        that spans nodes all-reduces over the network on every layer of every token and is
-        almost always the wrong shape; a *pipeline* that spans nodes moves one activation per
-        micro-batch and is routinely correct. So this asks about the tensor degree only.
-
-        Args:
-            devices_per_node: Devices on one node — the NVLink domain's width.
-
-        Returns:
-            True when the group fits, and when the node width is unknown (`0` or less), where
-            reporting a violation would be inventing one.
-        """
-        return devices_per_node <= 0 or self.tensor_parallel <= devices_per_node
-
     def summary(self) -> dict[str, float]:
         """A flat roll-up of the plan, for the decision log and the dashboard."""
         return {

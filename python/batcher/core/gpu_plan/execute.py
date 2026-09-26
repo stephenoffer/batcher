@@ -345,8 +345,8 @@ def _member_of_tuple(left, right, lkeys: list[str], rkeys: list[str], be: DfBack
     does not promise to preserve the left frame's order, and on the host backend it happens to,
     which is the shape of bug that passes every test here and reorders on the device.
 
-    A star-schema anti-join on `(date, store)` is the reason this is worth having at all: the
-    whole plan used to go to the CPU engine over the key having two columns.
+    A star-schema anti-join on `(date, store)` is the reason this is worth having at all:
+    without it the whole plan would go to the CPU engine over the key having two columns.
     """
     pos = "__bt_pos"
     probe = be.lib.DataFrame({f"__bt_k{i}": fold_zero(left[k], be) for i, k in enumerate(lkeys)})

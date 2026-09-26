@@ -129,8 +129,8 @@ class ShuffleSession:
 
         Under adaptive flow control the controller owns the window, so the re-grant is
         applied there (`rewindow`) rather than to the static `_credits` that `_window()`
-        would never read. It used to be dropped silently in that mode — which is the
-        default — so the fleet-reuse fix above never actually applied to a real run.
+        would never read. Adaptive is the default mode, so applying it anywhere else would
+        leave the fleet-reuse re-grant above with no effect on a real run.
 
         Args:
             credits: The new credit window (1 credit = 1 in-flight batch).
@@ -147,13 +147,12 @@ class ShuffleSession:
     def _observe_backpressure(self) -> None:
         """Feed one round's congestion verdict to the AIMD controller (if adaptive).
 
-        Two independent facts decide a credit window, and this used to gather only one of
-        them. Memory pressure past the spill threshold still cuts the window unconditionally,
-        because a slow shuffle is recoverable and an OOM-killed worker is not. But on a
-        healthy node that signal never fires, so every round read as "grow" and the window
-        climbed to its ceiling whether or not the extra credits moved a byte — a ramp rather
-        than a control loop, and the surest way to manufacture the very pressure it backs off
-        on.
+        Two independent facts decide a credit window, and this gathers both. Memory pressure past
+        the spill threshold still cuts the window unconditionally, because a slow shuffle is
+        recoverable and an OOM-killed worker is not. But on a healthy node that signal never fires,
+        so without the second fact every round would read as "grow" and the window would climb to
+        its ceiling whether or not the extra credits moved a byte — a ramp rather than a control
+        loop, and the surest way to manufacture the very pressure it backs off on.
 
         The second fact is the channel's own: the transport records how long the consumer sat
         waiting for the next batch, and its complement is buffer occupancy. A saturated

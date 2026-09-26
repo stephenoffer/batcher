@@ -75,11 +75,11 @@ def _balance(
     not the machine.
 
     `None` (the default) weighs every worker equally, which is exactly right on a uniform
-    fleet and is what every caller got before this existed.
+    fleet.
 
-    Weights are computed once (`split_weights`) rather than per comparison: this used to ask
-    each split for its row count twice, and for a whole-file split that question is a
-    footer read, so assigning N files cost 2N metadata round trips before a worker started.
+    Weights are computed once (`split_weights`) rather than per comparison: for a whole-file
+    split the row count is a footer read, so asking per comparison would cost assigning N
+    files 2N metadata round trips before a worker started.
     The least-loaded worker comes off a heap for the same reason — a linear scan per split
     is O(splits x workers), which is the driver's whole prologue on a wide fleet. Measured
     with an already-known weight (so the footer reads are not even in it): 50,000 splits
@@ -318,8 +318,8 @@ def _weight(split: object) -> int:
 def split_weights(splits: Sequence[object]) -> list[int]:
     """Every split's load weight, each computed at most once.
 
-    Shared with `descriptor_rows`, which sizes a task's CPU share by its data and used to
-    ask the same expensive question a second time.
+    Shared with `descriptor_rows`, which sizes a task's CPU share by its data, so the
+    expensive question is asked once.
 
     Above `_MAX_WEIGHED_SPLITS` a weight that is not already known is taken as 1 instead of
     being read off storage: at that scale the metadata reads dominate the driver and

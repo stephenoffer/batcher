@@ -1,8 +1,8 @@
 """Making RMM the *only* device allocator in a RAPIDS worker, rather than one of three.
 
-`accel.allocator` builds an RMM memory resource and points cuDF at it. That is where the story
-used to end, and it left two other libraries allocating device memory out of the same board
-through allocators RMM does not govern:
+`accel.allocator` builds an RMM memory resource and points cuDF at it. On its own that leaves
+two other libraries allocating device memory out of the same board through allocators RMM does
+not govern:
 
 * **CuPy.** cuDF hands off to it for `.values` and `to_cupy`, for rolling windows, for several
   statistical reductions, and for every host/device array interop the translator touches. Left
