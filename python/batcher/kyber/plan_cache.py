@@ -53,6 +53,7 @@ from typing import Any
 
 from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import safe_div
+from batcher._internal.registry import MISSING, IdentityMemo
 from batcher.config import Config
 from batcher.kyber import learning
 from batcher.plan.source_stats import source_stats_key
@@ -438,11 +439,8 @@ def _bucketed(fit: object, state_key: tuple = ()) -> str:
 # object alive makes the id unique for as long as the entry exists.
 #
 # `SourceStatistics` is `frozen=True, slots=True` with no `__weakref__`, so it can neither be
-# weak-referenced nor carry a cached attribute; an id map that owns its keys is the remaining
-# option. Bounded and cleared wholesale like `_CONFIG_KEY_CACHE`, so the retention cannot grow
-# without limit — a dropped entry costs one recomputation, never a wrong key.
-_STATS_DIGEST_CACHE: dict[int, tuple[object, str]] = {}
-_STATS_DIGEST_CACHE_MAX = 256
+# weak-referenced nor carry a cached attribute; an identity memo is the remaining option.
+_STATS_DIGEST: IdentityMemo[str] = IdentityMemo(256)
 #: Digest of a source that reported no statistics at all. Fixed-width, like a real digest, so
 #: the concatenation in `_source_stats_key` stays positional and therefore injective.
 _NO_STATS_DIGEST = "0" * 16
@@ -452,14 +450,11 @@ def _stats_digest(stats: object) -> str:
     """A fixed-width hex digest of one source's `SourceStatistics`, memoized by identity."""
     if stats is None:
         return _NO_STATS_DIGEST
-    cached = _STATS_DIGEST_CACHE.get(id(stats))
-    if cached is not None and cached[0] is stats:
-        return cached[1]
-    digest = hashlib.blake2b(repr(stats).encode(), digest_size=8).hexdigest()
-    if len(_STATS_DIGEST_CACHE) >= _STATS_DIGEST_CACHE_MAX:
-        _STATS_DIGEST_CACHE.clear()
-    _STATS_DIGEST_CACHE[id(stats)] = (stats, digest)
-    return digest
+    if (cached := _STATS_DIGEST.get(stats)) is not MISSING:
+        return cached
+    return _STATS_DIGEST.put(
+        stats, hashlib.blake2b(repr(stats).encode(), digest_size=8).hexdigest()
+    )
 
 
 def _source_stats_key(source_stats: list | None) -> str:

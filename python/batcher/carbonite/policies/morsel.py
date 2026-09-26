@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher._internal.registry import MISSING, IdentityMemo
 from batcher.carbonite.memory.pressure import PressureLevel
 
 if TYPE_CHECKING:
@@ -196,21 +197,18 @@ def planned_row_cap(
     return _cap_for_width(config, widest, byte_target) if widest > 0.0 else None
 
 
-#: `(id(plan), carried) -> (plan, widest)`, pinning the plan so a recycled id cannot answer for
-#: another. The widest per-row width is a property of an immutable plan and the carried column
-#: set alone, and a re-issued query hands back the same plan object: recomputing it walked every
-#: node's schema and rebuilt a filtered `pa.Schema` per node, which over ClickBench's 105-column
-#: `hits` was most of the ~580 us `recommended_config` charged a 4 ms query.
-_WIDEST_MEMO: dict[tuple[int, frozenset[str] | None], tuple[object, float]] = {}
-_WIDEST_MEMO_MAX = 256
+#: `(plan, carried) -> widest`. The widest per-row width is a property of an immutable plan and
+#: the carried column set alone, and a re-issued query hands back the same plan object:
+#: recomputing it walked every node's schema and rebuilt a filtered `pa.Schema` per node, which
+#: over ClickBench's 105-column `hits` was most of the ~580 us `recommended_config` charged a
+#: 4 ms query.
+_WIDEST_MEMO: IdentityMemo[float] = IdentityMemo(256)
 
 
 def _widest_row_bytes(plan: object, carried: frozenset[str] | None) -> float:
     """The widest per-row width over `plan`'s node schemas, charging only `carried` columns."""
-    key = (id(plan), carried)
-    hit = _WIDEST_MEMO.get(key)
-    if hit is not None and hit[0] is plan:
-        return hit[1]
+    if (hit := _WIDEST_MEMO.get(plan, carried)) is not MISSING:
+        return hit
     from batcher.plan.visitor import walk
 
     widest = 0.0
@@ -220,10 +218,7 @@ def _widest_row_bytes(plan: object, carried: frozenset[str] | None) -> float:
         arrow = getattr(resolved, "arrow", None)
         if arrow is not None:
             widest = max(widest, _node_row_bytes(arrow, carried))
-    if len(_WIDEST_MEMO) >= _WIDEST_MEMO_MAX:
-        _WIDEST_MEMO.clear()
-    _WIDEST_MEMO[key] = (plan, widest)
-    return widest
+    return _WIDEST_MEMO.put(plan, widest, carried)
 
 
 def _planned(

@@ -17,6 +17,7 @@ import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.logging import note_suppressed
+from batcher._internal.registry import MISSING, IdentityMemo
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -214,12 +215,10 @@ def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table 
     return None if inferred is None else inferred.arrow.empty_table()
 
 
-#: `id(plan) -> (plan, carried)`, pinning the plan so a recycled id cannot answer for another.
 #: A re-issued query hands back the *same* plan object, and this analysis walks every node's
 #: schema and reruns Kyber's projection analysis: ~0.5 ms of a TPC-H q8 `collect()` whose whole
 #: control plane is a few milliseconds, recomputed for an immutable plan.
-_CARRIED_MEMO: dict[int, tuple[object, frozenset[str] | None]] = {}
-_CARRIED_MEMO_MAX = 256
+_CARRIED_MEMO: IdentityMemo[frozenset[str] | None] = IdentityMemo(256)
 
 
 def carried_columns(plan) -> frozenset[str] | None:
@@ -227,14 +226,9 @@ def carried_columns(plan) -> frozenset[str] | None:
 
     See `_carried_columns` for what they are. A plan is immutable, so its answer cannot change.
     """
-    hit = _CARRIED_MEMO.get(id(plan))
-    if hit is not None and hit[0] is plan:
-        return hit[1]
-    carried = _carried_columns(plan)
-    if len(_CARRIED_MEMO) >= _CARRIED_MEMO_MAX:
-        _CARRIED_MEMO.clear()
-    _CARRIED_MEMO[id(plan)] = (plan, carried)
-    return carried
+    if (hit := _CARRIED_MEMO.get(plan)) is not MISSING:
+        return hit
+    return _CARRIED_MEMO.put(plan, _carried_columns(plan))
 
 
 def _carried_columns(plan) -> frozenset[str] | None:

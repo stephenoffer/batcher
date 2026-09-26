@@ -18,6 +18,7 @@ import random
 import pyarrow as pa
 
 from batcher._internal.logging import get_logger, note_suppressed
+from batcher._internal.registry import IdentityMemo
 from batcher.config import active_config
 from batcher.io.base._bad_rows import measuring
 from batcher.io.source import Source, iter_source
@@ -357,8 +358,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
 
     try:
         verdict = _seed_verdict_key(hub, sources, kyber.learning.generation())
-        hit = _NOTHING_TO_SEED.get(id(plan))
-        if hit is not None and hit[0] is plan and hit[1] == verdict:
+        if _NOTHING_TO_SEED.get(plan) == verdict:
             return
         wanted = ndv_columns(plan) if plan is not None else None
         learned = kyber.load_learned_stats(hub)
@@ -420,15 +420,13 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
                 measured.append(kyber.MeasuredColumns(source_key, ndv, {}, {}, mcv))
         kyber.record_column_stats_batch(hub, measured)
         if fully_known and plan is not None:
-            if len(_NOTHING_TO_SEED) >= _NOTHING_TO_SEED_MAX:
-                _NOTHING_TO_SEED.clear()
-            _NOTHING_TO_SEED[id(plan)] = (plan, verdict)
+            _NOTHING_TO_SEED.put(plan, verdict)
     except Exception as exc:  # pragma: no cover - learning must never break execution
         note_suppressed("api", "learn column NDV", exc)
 
 
-#: `id(plan) -> (plan, verdict key)` for a plan whose every wanted column was already measured
-#: on every resident source, pinning the plan against id reuse. Reaching that verdict walks the
+#: `plan -> verdict key` for a plan whose every wanted column was already measured on every
+#: resident source. Reaching that verdict walks the
 #: plan for its ndv columns and diffs each source's whole schema against the learned store,
 #: which on a re-issued query is the same work concluding the same "nothing to seed" every time:
 #: half of `_optimize` on a warm ClickBench query over the 105-column `hits`.
@@ -438,8 +436,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
 #: store that learns more can only shrink what needs seeding, and one that learns something
 #: plan-relevant misses the memo and is re-read. Only the post-run learner and this function
 #: write column sketches, and skipping a seed changes an estimate, never a result.
-_NOTHING_TO_SEED: dict[int, tuple[LogicalPlan, tuple[object, ...]]] = {}
-_NOTHING_TO_SEED_MAX = 256
+_NOTHING_TO_SEED: IdentityMemo[tuple[object, ...]] = IdentityMemo(256)
 
 
 def _seed_verdict_key(hub, sources: list[Source], generation: int) -> tuple[object, ...]:

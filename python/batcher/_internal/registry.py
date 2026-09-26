@@ -1,4 +1,4 @@
-"""A single generic registry pattern, used for every extension point.
+"""Keyed lookup tables: the generic extension-point registry and the identity memo.
 
 Sources, sinks, operators, optimization rules, and backends all register through
 an instance of `Registry[T]`. Third-party packages can also contribute via
@@ -13,14 +13,16 @@ rather than a bare "not found".
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from typing import Generic, TypeVar
+import enum
+from collections.abc import Callable, Hashable, Iterator
+from typing import Generic, Literal, TypeVar
 
 from batcher._internal.errors import BatcherError, unknown_value
 
 T = TypeVar("T")
+V = TypeVar("V")
 
-__all__ = ["Registry"]
+__all__ = ["MISSING", "IdentityMemo", "Registry"]
 
 
 class Registry(Generic[T]):
@@ -190,3 +192,66 @@ class Registry(Generic[T]):
             f"Registry({self._kind!r}, {len(self._items)} registered{pending}: "
             f"{sorted(self._items)})"
         )
+
+
+class _Missing(enum.Enum):
+    MISSING = enum.auto()
+
+
+#: What `IdentityMemo.get` returns on a miss, so a memoized `None` stays a hit.
+MISSING = _Missing.MISSING
+
+
+class IdentityMemo(Generic[V]):
+    """A bounded memo keyed on an object's identity, for immutable objects too costly to hash.
+
+    Plans, schemas and rule lists are immutable, so an answer computed from one never goes
+    stale, but hashing them by value costs more than the answer. Each entry holds a reference
+    to its key object: without it a freed object's address is reused and a stale answer would
+    be served for an unrelated one. Full, the memo clears wholesale; a dropped entry costs one
+    recomputation, never a wrong answer.
+
+    Args:
+        maxsize: Entries held before the memo clears.
+    """
+
+    __slots__ = ("_entries", "_maxsize")
+
+    def __init__(self, maxsize: int) -> None:
+        self._entries: dict[tuple[Hashable, ...], tuple[object, V]] = {}
+        self._maxsize = maxsize
+
+    def get(self, obj: object, *extra: Hashable) -> V | Literal[_Missing.MISSING]:
+        """The answer memoized for `obj` (and `extra`), or `MISSING`.
+
+        Args:
+            obj: The object the answer was computed from.
+            *extra: Further hashable inputs the answer depends on.
+
+        Returns:
+            The memoized answer, or `MISSING` when there is none.
+        """
+        hit = self._entries.get((id(obj), *extra))
+        if hit is not None and hit[0] is obj:
+            return hit[1]
+        return MISSING
+
+    def put(self, obj: object, value: V, *extra: Hashable) -> V:
+        """Memoize `value` for `obj` (and `extra`).
+
+        Args:
+            obj: The object the answer was computed from.
+            value: The answer.
+            *extra: Further hashable inputs the answer depends on.
+
+        Returns:
+            `value`, so a call site can `return memo.put(...)`.
+        """
+        if len(self._entries) >= self._maxsize:
+            self._entries.clear()
+        self._entries[(id(obj), *extra)] = (obj, value)
+        return value
+
+    def clear(self) -> None:
+        """Drop every entry."""
+        self._entries.clear()
