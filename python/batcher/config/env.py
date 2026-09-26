@@ -1,29 +1,24 @@
 """Every `BATCHER_*` environment variable the engine reads, declared in one place.
 
-`config.py` is the documented configuration contract — typed, validated, profile-aware,
-serializable, and rendered into the docs. Beside it a second configuration surface had grown:
-**38 `BATCHER_*` variables read inline** with `os.environ.get(...)`, each with its own literal
-default, spread across `io`, `dist`, `core` and `_internal`. They are deliberately env-only —
-last-resort tuning knobs an operator reaches for on a running cluster, not things a user sets
-in a `Config` — and that is a reasonable thing to want.
+`config.py` is the documented configuration contract: typed, validated, profile-aware,
+serializable, and rendered into the docs. Beside it sit the env-only knobs, read with
+`os.environ.get(...)` at their point of use across `io`, `dist`, `core` and `_internal`. They
+are deliberately env-only — last-resort tuning knobs an operator reaches for on a running
+cluster, not things a user sets in a `Config`.
 
-What is not reasonable is that they were undiscoverable. A knob read at its point of use is
-invisible to `Config`, absent from the docs, unvalidated, and impossible to enumerate: the only
-way to learn one existed was to find the line that read it. Two knobs could disagree about a
-default for the same concept and nothing would say so.
-
-This module does not change how any of them are read. It **declares** them, and
-`tests/unit/test_env_knobs.py` fails when the code reads a `BATCHER_*` variable that is not
-declared here, or declares one nothing reads. That makes the surface enumerable and keeps it
-honest, without moving 38 call sites and their defaults — which would be a behavioral change
-dressed up as tidying.
+A knob read at its point of use is invisible to `Config`, absent from the docs, unvalidated,
+and impossible to enumerate, and two knobs can disagree about a default for the same concept
+with nothing to say so. So this module **declares** them, and `tests/unit/test_env_knobs.py`
+fails when the code reads a `BATCHER_*` variable that is not declared here, or declares one
+nothing reads. The declaration leaves each call site's default where it is.
 
 Adding a knob means adding a line here. If a setting deserves validation, a profile, or a
 place in the docs, it does not belong in this file at all — it belongs in `Config`.
 
-It also holds the one *reading* of a boolean knob (`truthy` / `env_flag`), for the reason the
-declaration list exists: seven independent spellings of "is this string yes" had accumulated,
-and one of them accepted only ``"1"`` — so a diagnostic flag set to ``true`` was silently off.
+It also holds the one *reading* of each kind of knob. `truthy` / `env_flag` is the only
+spelling of "is this string yes", so a diagnostic flag set to ``true`` cannot be silently off
+because one reader accepted only ``"1"``. `env_int` / `env_float` parse numbers with a warning
+and a fallback, so a typo in a knob read at import cannot break `import batcher`.
 """
 
 from __future__ import annotations
@@ -124,13 +119,9 @@ ENV_KNOBS: Final[dict[str, str]] = {
 
 #: Strings that mean "yes" to a boolean env var or connection option, and their negations.
 #:
-#: There were **seven** spellings of this in the tree: two named sets (`config.config`,
-#: `plan.functions.security`), three inline tuples (`io.filesystem`, `io.splits.kvikio`,
-#: `carbonite.resilience.collectives`), a superset for spot-instance detection
-#: (`config.profiles`), and — the reason this matters rather than merely being untidy — one
-#: knob compared against the bare string ``"1"``. On that one, `BATCHER_VERIFY_EXPR_MATCHES=true`
-#: silently did nothing, which is the worst possible failure for a *diagnostic* flag: the
-#: operator believes verification is on and it is not.
+#: The single set every boolean reader uses. A reader with its own spelling drifts: one that
+#: accepts only ``"1"`` turns `BATCHER_VERIFY_EXPR_MATCHES=true` into a silent no-op, the
+#: worst failure for a *diagnostic* flag, since the operator believes verification is on.
 TRUE_TOKENS: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
 FALSE_TOKENS: Final[frozenset[str]] = frozenset({"0", "false", "no", "off"})
 

@@ -910,11 +910,8 @@ class OptimizerConfig:
     # probe: 52 ms partitioned vs 83 ms broadcast), so the table — not the machine's RAM —
     # is what this bounds.
     #
-    # NOTE: this is a *true* byte size. It was previously read against a flat 64 B/row
-    # width estimate that over-sized narrow relations ~4x (a two-`int64` key costed as
-    # 64 B/row, not 16), so the effective threshold was ~4x smaller than its nominal
-    # 10 MiB. `plan.types.widths` now makes the width type-exact; this value is the
-    # recalibrated equivalent.
+    # NOTE: this is a *true* byte size, compared against the type-exact widths of
+    # `plan.types.widths` (a two-`int64` key is 16 B/row), not a flat per-row estimate.
     # `0` (the default) means **detect it from the last-level cache** — see
     # `resolved_broadcast_max_bytes`. A positive value pins the threshold, for a machine whose
     # cache the probe cannot read (a non-Linux host) or to deliberately force a strategy.
@@ -2145,14 +2142,14 @@ class DistributedConfig:
         tasks that carry the replicated side. When they disagree the result is an
         out-of-memory on every device at once, so the number is defined once.
 
-        **What it replaces is the reason it is worth having.** Kyber's GPU router asked
-        `adaptive_build_side` for the broadcast verdict with no threshold, which resolves to
-        `resolved_broadcast_max_bytes(l3_cache_bytes=0, workers=1)` — the historical **4 MiB**
-        fallback, a share of a *CPU's L3 cache on one node*. Applied to a 15 GB device that is
-        wrong by three orders of magnitude, and it declined the fan-out for joins that fit a
-        device many times over: measured on a six-T4 fleet at TPC-H sf10, q4 and q12 have build
-        sides of roughly 240 MB and were refused, then ran the whole join on a single device —
-        8.7 s and 8.5 s against CPU-engine answers of 0.33 s and 1.28 s.
+        **The CPU broadcast threshold is the wrong ruler here.** Asking `adaptive_build_side`
+        for the verdict with no threshold resolves to
+        `resolved_broadcast_max_bytes(l3_cache_bytes=0, workers=1)` — the **4 MiB** fallback, a
+        share of a *CPU's L3 cache on one node*. Applied to a 15 GB device that is wrong by three
+        orders of magnitude and declines the fan-out for joins that fit a device many times
+        over: measured on a six-T4 fleet at TPC-H sf10, q4 and q12 have build sides of roughly
+        240 MB, and refused, they run the whole join on a single device in 8.7 s and 8.5 s
+        against CPU-engine answers of 0.33 s and 1.28 s.
 
         Over-estimating is bounded rather than fatal: a probe shard that does not fit its share
         falls into `dist.gpu.shards.run_subdivided`, which divides it and reruns it on the
@@ -2184,17 +2181,17 @@ class DistributedConfig:
         Kyber routes on this: a working set that fits one device is dispatched to it, one that
         does not is sharded across the cluster, and a GPU inference stage seeds its batch size
         from the VRAM left after the model. All three are wrong by the ratio of the real device
-        to the assumed one, and the assumed one used to be a hardcoded 12.0 — a T4. On an 80 GB
-        A100 that shards a working set six times over that one device would have held, and
-        seeds inference batches ~6x too small, which is exactly the "leaves the GPU idle"
+        to the assumed one, which is why it is detected rather than hardcoded: a fixed 12.0 (a
+        T4) on an 80 GB A100 shards a working set six times over that one device would hold,
+        and seeds inference batches ~6x too small, which is exactly the "leaves the GPU idle"
         failure this is supposed to prevent.
 
         Reports the device's **total** memory in decimal GB. It is a *capacity*, and every
-        caller subtracts `accelerator.vram_headroom` from it once, itself — which is the
-        contract that had drifted. Detection used to fold in a private `0.75`, so a stage
-        packed against it applied its own `0.85` on top and budgeted 64% of the board, while
-        the same stage on a Ray cluster took `cluster_gpu_memory_gb()`, which folded in
-        nothing, and budgeted 85%. One decision, two answers, chosen by whether Ray was up.
+        caller subtracts `accelerator.vram_headroom` from it once, itself. Detection folds in
+        no fraction of its own: a private `0.75` here, under a stage's own `0.85`, would budget
+        64% of the board while the same stage on a Ray cluster (`cluster_gpu_memory_gb()`,
+        which folds in nothing) budgets 85%, so one decision would get two answers depending
+        on whether Ray is up.
 
         The unit is decimal GB rather than GiB for the same single-meaning reason: Kyber sizes
         a working set as `rows x width / 1e9`, and dividing a device by `1 << 30` to compare

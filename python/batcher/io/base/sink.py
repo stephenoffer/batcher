@@ -162,7 +162,7 @@ class FileSink(ABC):
         A **transient** failure is retried with jittered backoff, as the read path already
         does. A fast pipeline feeding a directory write bursts concurrent PUTs at one key
         prefix, which is what makes a store answer `SlowDown`/503 — a property of the moment,
-        not of the data, that used to kill a job at 99%. Safe here because a failed attempt
+        not of the data, that would otherwise kill a job at 99%. Safe here because a failed attempt
         publishes nothing: the atomic writer discards the partial and the table is still in
         memory, so the retry writes the same bytes. `write_stream` has no equivalent — its
         batches are an iterator a retry cannot rewind.
@@ -362,9 +362,9 @@ class FileSink(ABC):
         """Stream `batches` into a directory of files, each capped at `max_rows_per_file`.
 
         The bounded-memory form of a row-capped write. `write_partitioned` needs the whole
-        table resident before it can slice it, so asking for a file size used to *cost* a
-        full materialization on the driver — exactly backwards, since a caller who caps the
-        file size is usually the caller whose result does not fit. Here the cap is a
+        table resident before it can slice it, so there a file size *costs* a full
+        materialization on the driver — exactly backwards, since a caller who caps the file
+        size is usually the caller whose result does not fit. Here the cap is a
         rollover point instead: the writer closes the current file and opens the next one
         when it fills, so memory stays at one batch no matter how large the output is.
 
@@ -583,8 +583,8 @@ class FileSink(ABC):
 
         # Write the partition directories CONCURRENTLY: each is an independent subtree
         # (its own mkdirs + encode + PUT), and the columnar encode/compression releases
-        # the GIL, so a high-cardinality partitioned write no longer emits one partition
-        # after another (the serial loop that loses a directory-vs-file race). Bounded to
+        # the GIL, so a high-cardinality partitioned write does not emit one partition after
+        # another. Bounded to
         # the CPU count; `_write_parts` still parallelizes the chunks within a partition.
         # Partitions are disjoint dirs, so order is irrelevant (the manifest merge is
         # commutative), but results are kept in partition order for deterministic output.

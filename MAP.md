@@ -1822,7 +1822,7 @@ Template-Method base classes for file-backed sources and sinks.
 | `_tolerance.py` | 140 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 199 | Retry for the IO failures that are worth retrying, and only those. |
 | `sink.py` | 774 | `FileSink` — the Template-Method base every file-format writer subclasses. |
-| `source.py` | 1679 | `FileSource` — the Template-Method base every file-format reader subclasses. |
+| `source.py` | 1673 | `FileSource` — the Template-Method base every file-format reader subclasses. |
 
 ### `batcher/io/formats/` — 2 · neutral IO
 
@@ -2021,7 +2021,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `autoloader.py` | 440 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 372 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
 | `eventhubs.py` | 364 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
-| `kafka.py` | 716 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
+| `kafka.py` | 715 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kafka_sink.py` | 318 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
 | `kinesis.py` | 496 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 244 | Google Cloud Pub/Sub broker source — subscription pull batches. |
@@ -2687,9 +2687,9 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 3241 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3238 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
-| `env.py` | 281 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
+| `env.py` | 272 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
