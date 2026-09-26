@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
+from batcher._internal.errors import ConfigError
 from batcher.api.executors import result_cache_key
 from batcher.config import active_config
 from batcher.plan.source_stats import source_stats_key
@@ -60,10 +61,14 @@ class TestTenantScope:
             raise RuntimeError("boom")
         assert active_config().tenant.tenant_id == ""
 
-    def test_other_fields_come_along(self) -> None:
-        with bt.tenant("etl", max_concurrent_queries=4, cache_share=0.25):
-            cfg = active_config().tenant
-            assert (cfg.max_concurrent_queries, cfg.cache_share) == (4, 0.25)
+    def test_unimplemented_limits_are_refused_not_ignored(self) -> None:
+        """Nothing enforces a per-tenant cap, so accepting one would bound nothing."""
+        with (
+            pytest.raises(ConfigError, match="not implemented"),
+            bt.tenant("etl", max_concurrent_queries=4, cache_share=0.25),
+        ):
+            pass
+        assert active_config().tenant.tenant_id == ""
 
     def test_it_is_thread_scoped(self) -> None:
         """A `ContextVar`, not a module global — so one thread's tenant is not another's.

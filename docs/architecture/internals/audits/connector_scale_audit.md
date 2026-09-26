@@ -40,7 +40,8 @@ which extrapolates to **~3.2 GB of `Split` objects at 1M files** — before a by
 
 ### S1. `splits()` emits one `Split` per file and never coalesces. **Fatal.**
 `io/base/source.py:319`. 1M files = 1M objects, ~3.2 GB, all pickled and shipped. The
-coalescing primitive already exists (`io/splits/parquet.py:222::pack_row_groups`); the
+row-group coalescing primitive this cited (`pack_row_groups`) had no caller and is deleted;
+file-level coalescing is `io/splits/file.py::pack_files`. The
 `target_size` argument is accepted and ignored by every lakehouse source
 (`# noqa: ARG002` in all four).
 

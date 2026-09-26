@@ -11,7 +11,6 @@ the reader would have produced is written back as the array it came from.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from typing import IO, Any
 
@@ -19,6 +18,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import SchemaError
 from batcher._internal.optional import require
+from batcher.config.env import env_int
 from batcher.io.base import FileSink, FileSource
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.plan.source_stats import SourceStatistics
@@ -28,7 +28,7 @@ __all__ = ["NumpySink", "NumpySource"]
 # Bytes of array data a streamed chunk may hold. Bounds the read window; the batches
 # handed on are re-cut to the configured morsel by `FileSource._normalize`, so this is
 # about resident memory rather than about batch shape.
-_CHUNK_BYTES = max(1 << 20, int(os.environ.get("BATCHER_NUMPY_CHUNK_BYTES", str(64 << 20))))
+_CHUNK_BYTES = env_int("BATCHER_NUMPY_CHUNK_BYTES", 64 << 20, floor=1 << 20)
 
 
 def _np() -> Any:

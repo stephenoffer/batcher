@@ -41,7 +41,6 @@ __all__ = [
     "cotenants_per_device",
     "device_headroom",
     "devices_for",
-    "fits_one_device",
     "pack_fraction",
     "quantize_fraction",
     "share_bytes",
@@ -315,24 +314,3 @@ def balanced_fraction(claimants: int, quanta: Sequence[float] = PACK_QUANTA) -> 
         return 1.0
     fitting = [q for q in quanta if q * claimants <= 1.0]
     return max(fitting) if fitting else min(quanta)
-
-
-def fits_one_device(need_bytes: float, device_bytes: float, headroom: float | None = None) -> bool:
-    """Whether a claimant fits a single device, headroom included.
-
-    The routing question one step above the fraction: a need that fits is *packed*, one that
-    does not is *sharded*, and the two paths are different code. Answering it from the same
-    usable-bytes arithmetic the fraction uses keeps the boundary in one place.
-
-    Args:
-        need_bytes: Device memory the claimant will hold.
-        device_bytes: One device's total memory.
-        headroom: Fraction of the device held back, or `None` for the configured
-            `accelerator.vram_headroom`.
-
-    Returns:
-        True when it fits. An unknown device reports `False`, which routes to the sharded path
-        — the one that is correct at any size, merely slower when it was not needed.
-    """
-    usable = usable_bytes(device_bytes, device_headroom() if headroom is None else headroom)
-    return usable > 0 and 0 < need_bytes <= usable

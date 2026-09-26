@@ -39,8 +39,6 @@ from batcher._internal.hardware.nvml import _device_count, _nvml, _read
 __all__ = [
     "LinkThroughput",
     "device_throughput",
-    "nvlink_throughput_bytes",
-    "pcie_throughput_bytes",
     "transfer_bound_devices",
 ]
 
@@ -256,30 +254,6 @@ def device_throughput() -> tuple[LinkThroughput, ...]:
             )
         )
     return tuple(out)
-
-
-def pcie_throughput_bytes(index: int) -> float:
-    """Total bytes per second crossing one device's host link, `0.0` when unreadable.
-
-    Args:
-        index: NVML device index.
-
-    Returns:
-        Transmit plus receive bytes per second.
-    """
-    return next((t.pcie_bytes_per_s for t in device_throughput() if t.index == index), 0.0)
-
-
-def nvlink_throughput_bytes(index: int) -> float:
-    """Total data bytes per second crossing one device's peer links, `0.0` when unreadable.
-
-    Args:
-        index: NVML device index.
-
-    Returns:
-        Transmit plus receive bytes per second, excluding protocol overhead.
-    """
-    return next((t.nvlink_bytes_per_s for t in device_throughput() if t.index == index), 0.0)
 
 
 def transfer_bound_devices(

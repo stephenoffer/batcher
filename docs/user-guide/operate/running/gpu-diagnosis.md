@@ -185,7 +185,7 @@ print(isinstance(kvikio_status().direct, bool))
 ```
 
 `direct` is the only state in which a device-direct read is worth preferring. When it is false,
-`reason` names why, which is what an operator can act on.
+`reason` names why, which is what an operator can act on. The device read's GPUDirect Storage eligibility check consults the same status, so on a compat-mode host every local file is reported ineligible with the reason `compat` rather than counted as a direct read.
 
 ## Decode on the device to shrink the transfer
 

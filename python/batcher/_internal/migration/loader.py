@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-from batcher._internal.migration.schema import ENGINES, Mapping, RegistryError, Status, validate
+from batcher._internal.migration.schema import ENGINES, Mapping, RegistryError, validate
 
 __all__ = ["DATA_DIR", "Registry", "load_codemod_tables", "load_registry", "load_returns"]
 
@@ -62,17 +62,6 @@ class Registry:
             An iterator over that engine's rows, in file order.
         """
         return (row for key, row in self.rows.items() if key[0] == engine)
-
-    def with_status(self, status: Status) -> Iterator[Mapping]:
-        """Yield every row, across engines, with one status.
-
-        Args:
-            status: The status to select.
-
-        Returns:
-            An iterator over the matching rows.
-        """
-        return (row for row in self.rows.values() if row.status is status)
 
 
 def _parse(engine: str, path: Path, rows: dict[tuple[str, str, str], Mapping]) -> None:

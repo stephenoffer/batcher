@@ -11,6 +11,7 @@ import pyarrow as pa
 from batcher._internal.errors import FormatError
 from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
+from batcher.config.env import env_int
 from batcher.io.base import FileSink, FileSource
 from batcher.io.base._bad_rows import bad_row_handler
 from batcher.io.base._options import BASE_SOURCE_OPTIONS, OptionSpec
@@ -79,7 +80,7 @@ _JSON_COUNTER = 0
 # reader (no `open_json` counterpart to `open_csv`), so streaming means cutting the file at
 # newline boundaries and decoding one cut at a time. 8 MiB keeps peak memory at a window
 # rather than a file while still amortizing the parse.
-_JSON_STREAM_CHUNK_BYTES = max(1 << 16, int(os.environ.get("BATCHER_JSON_CHUNK_BYTES", 8 << 20)))
+_JSON_STREAM_CHUNK_BYTES = env_int("BATCHER_JSON_CHUNK_BYTES", 8 << 20, floor=1 << 16)
 
 
 def _newline_chunks(fh: IO[Any], size: int) -> Iterator[bytes]:

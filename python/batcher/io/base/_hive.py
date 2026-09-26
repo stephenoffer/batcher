@@ -10,10 +10,11 @@ a wrong answer, not a formatting difference.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pyarrow as pa
+
+from batcher.config.env import env_int
 
 __all__ = [
     "HIVE_NULL",
@@ -34,9 +35,7 @@ HIVE_NULL = "__HIVE_DEFAULT_PARTITION__"
 # the second) is the way people arrive here, and the symptom — a write that takes hours and
 # a table that is slow forever after — never names its cause. 10,000 in a single shard is
 # already far past any layout chosen on purpose.
-_HIGH_CARDINALITY_PARTITIONS = max(
-    1, int(os.environ.get("BATCHER_PARTITION_WARN_THRESHOLD", "10000"))
-)
+_HIGH_CARDINALITY_PARTITIONS = env_int("BATCHER_PARTITION_WARN_THRESHOLD", 10000, floor=1)
 
 
 def hive_partition_run_starts(ordered: pa.Table, cols: list[str], pc: Any) -> list[int]:

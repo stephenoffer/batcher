@@ -24,6 +24,7 @@ import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
+from batcher._internal.errors import ConfigError
 from batcher.config.accelerator import AcceleratorConfig
 from batcher.config.env import falsy, truthy
 from batcher.config.fault_tolerance import FaultToleranceConfig
@@ -845,21 +846,19 @@ class CostCoefficients:
 class OptimizerConfig:
     """Knobs for the Kyber optimizer: join planning, cost, and cardinality.
 
-    Controls how hard the optimizer works (exact dynamic-programming join ordering up
-    to a table count, greedy beyond it), how it estimates cost and row counts from
-    learned statistics and sketches, and when a measured estimate is wrong enough to
-    trigger re-optimization mid-query. Defaults suit most workloads.
+    Controls how the optimizer estimates cost and row counts from learned statistics and
+    sketches, and when a measured estimate is wrong enough to trigger re-optimization
+    mid-query. How hard join ordering searches is priced per query rather than set here.
+    Defaults suit most workloads.
 
     Examples:
         .. doctest::
 
             >>> from batcher.config import OptimizerConfig
-            >>> OptimizerConfig().join_dp_max_tables
-            12
+            >>> OptimizerConfig().reoptimize_error
+            2.0
     """
 
-    join_dp_max_tables: int = 12  # DP-CCP exact threshold
-    greedy_max_tables: int = 25  # greedy heuristic threshold
     # Build a per-column membership bloom index when persisting a written source's
     # stats, so a later read can data-skip an equality/`IN` predicate whose value is
     # absent (a point lookup inside [min, max] that zone-map bounds can't prune).
@@ -911,11 +910,8 @@ class OptimizerConfig:
     # probe: 52 ms partitioned vs 83 ms broadcast), so the table — not the machine's RAM —
     # is what this bounds.
     #
-    # NOTE: this is a *true* byte size. It was previously read against a flat 64 B/row
-    # width estimate that over-sized narrow relations ~4x (a two-`int64` key costed as
-    # 64 B/row, not 16), so the effective threshold was ~4x smaller than its nominal
-    # 10 MiB. `plan.types.widths` now makes the width type-exact; this value is the
-    # recalibrated equivalent.
+    # NOTE: this is a *true* byte size, compared against the type-exact widths of
+    # `plan.types.widths` (a two-`int64` key is 16 B/row), not a flat per-row estimate.
     # `0` (the default) means **detect it from the last-level cache** — see
     # `resolved_broadcast_max_bytes`. A positive value pins the threshold, for a machine whose
     # cache the probe cannot read (a non-Linux host) or to deliberately force a strategy.
@@ -1116,10 +1112,11 @@ class TenantConfig:
     #: structure behaves exactly as it did before this existed, which is what keeps this
     #: from changing anything for a single-workload deployment.
     tenant_id: str = ""
-    #: Share of the process result-cache budget this tenant may hold, 0.0-1.0. 0 means
-    #: unbounded (the historical behavior).
+    #: Reserved for a per-tenant share of the result-cache budget, 0.0-1.0. Not
+    #: implemented: validation refuses any value but 0.0 (unbounded).
     cache_share: float = 0.0
-    #: Maximum queries this tenant may run concurrently. 0 means unbounded.
+    #: Reserved for a per-tenant concurrency cap. Not implemented: validation refuses any
+    #: value but 0 (unbounded).
     max_concurrent_queries: int = 0
 
 
@@ -1201,7 +1198,6 @@ class MetadataConfig:
     # per-user file (see `metadata.backends.default_sqlite_uri`); pass `":memory:"` for
     # an ephemeral SQLite store.
     uri: str | None = None
-    decay_per_day: float = 0.1  # confidence half-life ~ a week
 
 
 # Sentinel `autoscale_wait_s` meaning "auto": the config layer resolves it to a bounded
@@ -2145,14 +2141,14 @@ class DistributedConfig:
         tasks that carry the replicated side. When they disagree the result is an
         out-of-memory on every device at once, so the number is defined once.
 
-        **What it replaces is the reason it is worth having.** Kyber's GPU router asked
-        `adaptive_build_side` for the broadcast verdict with no threshold, which resolves to
-        `resolved_broadcast_max_bytes(l3_cache_bytes=0, workers=1)` — the historical **4 MiB**
-        fallback, a share of a *CPU's L3 cache on one node*. Applied to a 15 GB device that is
-        wrong by three orders of magnitude, and it declined the fan-out for joins that fit a
-        device many times over: measured on a six-T4 fleet at TPC-H sf10, q4 and q12 have build
-        sides of roughly 240 MB and were refused, then ran the whole join on a single device —
-        8.7 s and 8.5 s against CPU-engine answers of 0.33 s and 1.28 s.
+        **The CPU broadcast threshold is the wrong ruler here.** Asking `adaptive_build_side`
+        for the verdict with no threshold resolves to
+        `resolved_broadcast_max_bytes(l3_cache_bytes=0, workers=1)` — the **4 MiB** fallback, a
+        share of a *CPU's L3 cache on one node*. Applied to a 15 GB device that is wrong by three
+        orders of magnitude and declines the fan-out for joins that fit a device many times
+        over: measured on a six-T4 fleet at TPC-H sf10, q4 and q12 have build sides of roughly
+        240 MB, and refused, they run the whole join on a single device in 8.7 s and 8.5 s
+        against CPU-engine answers of 0.33 s and 1.28 s.
 
         Over-estimating is bounded rather than fatal: a probe shard that does not fit its share
         falls into `dist.gpu.shards.run_subdivided`, which divides it and reruns it on the
@@ -2184,17 +2180,17 @@ class DistributedConfig:
         Kyber routes on this: a working set that fits one device is dispatched to it, one that
         does not is sharded across the cluster, and a GPU inference stage seeds its batch size
         from the VRAM left after the model. All three are wrong by the ratio of the real device
-        to the assumed one, and the assumed one used to be a hardcoded 12.0 — a T4. On an 80 GB
-        A100 that shards a working set six times over that one device would have held, and
-        seeds inference batches ~6x too small, which is exactly the "leaves the GPU idle"
+        to the assumed one, which is why it is detected rather than hardcoded: a fixed 12.0 (a
+        T4) on an 80 GB A100 shards a working set six times over that one device would hold,
+        and seeds inference batches ~6x too small, which is exactly the "leaves the GPU idle"
         failure this is supposed to prevent.
 
         Reports the device's **total** memory in decimal GB. It is a *capacity*, and every
-        caller subtracts `accelerator.vram_headroom` from it once, itself — which is the
-        contract that had drifted. Detection used to fold in a private `0.75`, so a stage
-        packed against it applied its own `0.85` on top and budgeted 64% of the board, while
-        the same stage on a Ray cluster took `cluster_gpu_memory_gb()`, which folded in
-        nothing, and budgeted 85%. One decision, two answers, chosen by whether Ray was up.
+        caller subtracts `accelerator.vram_headroom` from it once, itself. Detection folds in
+        no fraction of its own: a private `0.75` here, under a stage's own `0.85`, would budget
+        64% of the board while the same stage on a Ray cluster (`cluster_gpu_memory_gb()`,
+        which folds in nothing) budgets 85%, so one decision would get two answers depending
+        on whether Ray is up.
 
         The unit is decimal GB rather than GiB for the same single-meaning reason: Kyber sizes
         a working set as `rows x width / 1e9`, and dividing a device by `1 << 30` to compare
@@ -2938,25 +2934,56 @@ class Config:
         return f"Config({shown}{more})"
 
 
-def _coerce(raw: str, to: object) -> object:
+def _coerce(key: str, raw: str, to: object) -> object:
+    """Parse env var `key`'s string `raw` into the declared field type `to`.
+
+    A sequence field takes a comma-separated list whose elements are coerced to the element
+    type, a mapping field takes a JSON object, and a malformed value raises `ConfigError`
+    naming the variable rather than a bare `ValueError` from deep inside `import batcher`.
+    """
+    try:
+        return _coerce_value(raw, to)
+    except (ValueError, TypeError) as exc:
+        name = getattr(to, "__name__", None) or str(to)
+        raise ConfigError(f"{key}={raw!r}: expected {name} ({exc})") from exc
+
+
+def _coerce_value(raw: str, to: object) -> object:
     if to is bool:
         return truthy(raw)
-    if to is int:
-        return int(raw)
-    if to is float:
-        return float(raw)
+    if to is int or to is float:
+        return to(raw.strip())  # type: ignore[operator]
+    if to is str:
+        return raw
+    origin = typing.get_origin(to)
+    if origin is tuple:
+        return _coerce_tuple(raw, typing.get_args(to))
+    if origin is dict:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise TypeError("a JSON object")
+        return value
     # A `bool | str` field (e.g. `runtime_bloom_join = "auto"`): a recognized boolean
-    # token coerces to a real bool, everything else stays the string. Without this the
-    # whole union was returned uncoerced, so `BATCHER_..._RUNTIME_BLOOM_JOIN=true` shipped
-    # the *string* "true" — which then failed validation ("must be True, False, or 'auto'")
-    # while the string literal "auto" happened to pass. Enabling/disabling the feature via
-    # env raised `ConfigError`; a string-valued sentinel like "auto" still passes through.
+    # token coerces to a real bool, everything else stays the string, so both
+    # `..._RUNTIME_BLOOM_JOIN=true` and the sentinel `"auto"` pass validation.
     members = [a for a in typing.get_args(to) if a is not type(None)]
     if bool in members and (truthy(raw) or falsy(raw)):
         return truthy(raw)
     if str in members:
         return raw
-    return raw
+    raise TypeError("a type an environment variable cannot express")
+
+
+def _coerce_tuple(raw: str, args: tuple[object, ...]) -> tuple[object, ...]:
+    """Split a comma-separated `raw` and coerce each element to the tuple's element type."""
+    parts = [p.strip() for p in raw.split(",")] if raw.strip() else []
+    if len(args) == 2 and args[1] is Ellipsis:
+        element_types: list[object] = [args[0]] * len(parts)
+    else:
+        if len(parts) != len(args):
+            raise ValueError(f"{len(args)} comma-separated values, got {len(parts)}")
+        element_types = list(args)
+    return tuple(_coerce_value(p, t) for p, t in zip(parts, element_types, strict=True))
 
 
 def _scalar_type(annotation: object) -> object:
@@ -2994,7 +3021,7 @@ def _overlay_env(obj: Config, prefix: str, env: dict[str, str]) -> Config:
         elif key in env:
             # Coerce against the *declared* field type, not `type(current)`: an optional
             # field defaulting to None would otherwise resolve to NoneType and skip coercion.
-            updates[field.name] = _coerce(env[key], field_types.get(field.name, type(current)))
+            updates[field.name] = _coerce(key, env[key], field_types.get(field.name, type(current)))
     return replace(obj, **updates) if updates else obj
 
 
@@ -3159,13 +3186,15 @@ def tenant(tenant_id: str, **overrides: object) -> Iterator[Config]:
 
     Args:
         tenant_id: Names the tenant. Empty restores un-tenanted behavior.
-        **overrides: Other `TenantConfig` fields, e.g. ``max_concurrent_queries=4``.
+        **overrides: Other `TenantConfig` fields. The per-tenant limits are not
+            implemented, so validation refuses a non-default value for them.
 
     Yields:
         The `Config` in effect inside the block.
 
     Raises:
-        ConfigError: If an override is not a `TenantConfig` field.
+        ConfigError: If an override is not a `TenantConfig` field, or sets a per-tenant
+            limit that is not implemented.
     """
     current = active_config()
     _check_overrides("tenant", TenantConfig, overrides)

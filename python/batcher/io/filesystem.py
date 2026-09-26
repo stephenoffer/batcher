@@ -34,7 +34,7 @@ import pyarrow as pa
 import pyarrow.fs as pafs
 
 from batcher._internal.errors import IOError
-from batcher.config.env import truthy
+from batcher.config.env import env_int, truthy
 
 # The `FileSystem` protocol and its `pyarrow.fs` adapter live in a sibling module (the
 # interface, separate from this module's job of choosing a backend for a URI); re-exported
@@ -129,9 +129,9 @@ def ensure_io_threads() -> None:
     Both are the same mistake, made in opposite directions by one number."""
     from batcher._internal.hardware import available_cpu_count
 
-    override = os.environ.get("BATCHER_IO_THREADS")
-    if override:
-        target = max(8, int(override))
+    override = env_int("BATCHER_IO_THREADS", -1)
+    if override >= 0:
+        target = max(8, override)
     else:
         scaled = _IO_THREADS_PER_CORE * available_cpu_count()
         target = max(_IO_THREADS_FLOOR, min(_IO_THREADS_CEILING, scaled))

@@ -5,7 +5,8 @@ decodes them in Rust, returning zero-copy Arrow batches — no Python-handle rou
 no FFI copy. Measured 3-4x faster than PyArrow on S3 (100 small files 243ms vs 943ms; one
 8.4M-row file 143ms vs 484ms). Every function returns ``None`` on any unsupported
 scheme/feature (or a missing extension) so the caller falls back to PyArrow and the result
-is byte-identical either way.
+is byte-identical either way. A missing extension falls back silently; any other native
+failure is recorded with `note_suppressed`, so a broken fast path is visible in the logs.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
-from batcher._internal.native import engine
+from batcher._internal.native import engine_or_none
 
 __all__ = [
     "NATIVE_READ_BATCH",
@@ -91,10 +92,13 @@ def read_one(
     `schema` sizes the decode batch by bytes rather than rows (`native_read_batch`); without
     it the flat row ceiling stands, which is only safe for a narrow row.
     """
+    _native = engine_or_none()
+    if _native is None:
+        return None
     try:
-        _native = engine()
         return _native.read_parquet(uri, [], projection, native_read_batch(schema, projection))
-    except Exception:
+    except Exception as exc:
+        note_suppressed("io", "native parquet read_one", exc)
         return None
 
 
@@ -117,8 +121,10 @@ def read_row_groups_filtered(
     regardless (`core.scan_only` declines its shortcut whenever a predicate was pushed).
     Returns ``None`` on any failure (caller falls back to PyArrow).
     """
+    _native = engine_or_none()
+    if _native is None:
+        return None
     try:
-        _native = engine()
         from batcher.io.predicate import to_native_predicate
 
         native_pred = to_native_predicate(predicate) if predicate is not None else None
@@ -128,7 +134,7 @@ def read_row_groups_filtered(
             uri, row_groups, projection, batch_size, json.dumps(native_pred)
         )
     except Exception as exc:
-        note_suppressed("io", "read parquet natively", exc)
+        note_suppressed("io", "native parquet read_row_groups_filtered", exc)
         return None
 
 
@@ -162,13 +168,15 @@ def footer_stats(uris: list[str]) -> FooterStats | None:
     objects on the driver, before any data page is read) with one native pass over footers
     the reader has usually already parsed and cached.
     """
-    if not uris:
+    _native = engine_or_none()
+    if not uris or _native is None:
         return None
     try:
-        batch, columns, rows, nbytes, rgs, files_read, sorted_decl = engine().parquet_footer_stats(
+        batch, columns, rows, nbytes, rgs, files_read, sorted_decl = _native.parquet_footer_stats(
             uris
         )
-    except Exception:
+    except Exception as exc:
+        note_suppressed("io", "native parquet footer_stats", exc)
         return None
     return FooterStats(
         columns=tuple(columns),
@@ -188,11 +196,13 @@ def file_manifest(uris: list[str], columns: list[str]) -> pa.Table | None:
     URI order, built natively from footers the statistics pass has usually already cached.
     A NULL bound means *unknown* (keep the file), never *no match*.
     """
-    if not uris or not columns:
+    _native = engine_or_none()
+    if not uris or not columns or _native is None:
         return None
     try:
-        return pa.Table.from_batches([engine().parquet_file_manifest(uris, columns)])
-    except Exception:
+        return pa.Table.from_batches([_native.parquet_file_manifest(uris, columns)])
+    except Exception as exc:
+        note_suppressed("io", "native parquet file_manifest", exc)
         return None
 
 
@@ -204,8 +214,11 @@ def read_many(
     The many-small-files throughput path: one GIL release + one runtime pass overlaps every
     file's footer + column-chunk GETs, instead of a per-file call (and FFI round trip) each.
     """
+    _native = engine_or_none()
+    if _native is None:
+        return None
     try:
-        _native = engine()
         return _native.read_parquet_many(uris, projection, native_read_batch(schema, projection))
-    except Exception:
+    except Exception as exc:
+        note_suppressed("io", "native parquet read_many", exc)
         return None

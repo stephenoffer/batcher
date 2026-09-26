@@ -1,37 +1,45 @@
 """Every `BATCHER_*` environment variable the engine reads, declared in one place.
 
-`config.py` is the documented configuration contract — typed, validated, profile-aware,
-serializable, and rendered into the docs. Beside it a second configuration surface had grown:
-**38 `BATCHER_*` variables read inline** with `os.environ.get(...)`, each with its own literal
-default, spread across `io`, `dist`, `core` and `_internal`. They are deliberately env-only —
-last-resort tuning knobs an operator reaches for on a running cluster, not things a user sets
-in a `Config` — and that is a reasonable thing to want.
+`config.py` is the documented configuration contract: typed, validated, profile-aware,
+serializable, and rendered into the docs. Beside it sit the env-only knobs, read with
+`os.environ.get(...)` at their point of use across `io`, `dist`, `core` and `_internal`. They
+are deliberately env-only — last-resort tuning knobs an operator reaches for on a running
+cluster, not things a user sets in a `Config`.
 
-What is not reasonable is that they were undiscoverable. A knob read at its point of use is
-invisible to `Config`, absent from the docs, unvalidated, and impossible to enumerate: the only
-way to learn one existed was to find the line that read it. Two knobs could disagree about a
-default for the same concept and nothing would say so.
-
-This module does not change how any of them are read. It **declares** them, and
-`tests/unit/test_env_knobs.py` fails when the code reads a `BATCHER_*` variable that is not
-declared here, or declares one nothing reads. That makes the surface enumerable and keeps it
-honest, without moving 38 call sites and their defaults — which would be a behavioral change
-dressed up as tidying.
+A knob read at its point of use is invisible to `Config`, absent from the docs, unvalidated,
+and impossible to enumerate, and two knobs can disagree about a default for the same concept
+with nothing to say so. So this module **declares** them, and `tests/unit/test_env_knobs.py`
+fails when the code reads a `BATCHER_*` variable that is not declared here, or declares one
+nothing reads. The declaration leaves each call site's default where it is.
 
 Adding a knob means adding a line here. If a setting deserves validation, a profile, or a
 place in the docs, it does not belong in this file at all — it belongs in `Config`.
 
-It also holds the one *reading* of a boolean knob (`truthy` / `env_flag`), for the reason the
-declaration list exists: seven independent spellings of "is this string yes" had accumulated,
-and one of them accepted only ``"1"`` — so a diagnostic flag set to ``true`` was silently off.
+It also holds the one *reading* of each kind of knob. `truthy` / `env_flag` is the only
+spelling of "is this string yes", so a diagnostic flag set to ``true`` cannot be silently off
+because one reader accepted only ``"1"``. `env_int` / `env_float` parse numbers with a warning
+and a fallback, so a typo in a knob read at import cannot break `import batcher`.
 """
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Final
+from typing import Final, TypeVar
 
-__all__ = ["ENV_KNOBS", "FALSE_TOKENS", "TRUE_TOKENS", "env_flag", "falsy", "truthy"]
+__all__ = [
+    "ENV_KNOBS",
+    "FALSE_TOKENS",
+    "TRUE_TOKENS",
+    "env_flag",
+    "env_float",
+    "env_int",
+    "falsy",
+    "truthy",
+]
+
+_log = logging.getLogger("batcher.config.env")
+_N = TypeVar("_N", int, float)
 
 #: `BATCHER_*` variable -> what it controls. Grouped by the subsystem that reads it.
 ENV_KNOBS: Final[dict[str, str]] = {
@@ -39,6 +47,20 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_CONFIG_FILE": "path to a TOML/JSON config loaded at import",
     "BATCHER_HOME": "root for engine-owned state (event logs, scratch); defaults under XDG",
     "BATCHER_DEADLINE_EPOCH_S": "wall-clock deadline the query budget counts down to",
+    "BATCHER_DEADLINE_SECONDS": "lease length in seconds, counted from process start",
+    # --- site detection -------------------------------------------------------------
+    "BATCHER_SCHEDULER": "force the detected batch scheduler (slurm, pbs, lsf, ...)",
+    "BATCHER_SCRATCH_DIR": "force the node-local scratch directory spill uses",
+    "BATCHER_PROVIDER": "force the detected cloud provider",
+    "BATCHER_NODE_NAME": "name this node reports, ahead of the orchestrator's",
+    "BATCHER_SPOT": "declare this node preemptible, selecting the spot profile",
+    "BATCHER_AUTOSCALE": "declare the cluster autoscaling (truthy) or fixed (falsy)",
+    "BATCHER_RAY_CLUSTER": "mark the process as running on a managed Ray cluster",
+    "BATCHER_METADATA_URI": "durable location the spot profile moves learned metadata to",
+    "BATCHER_MPS_CLIENTS": "CUDA MPS clients sharing one device, for feeder-CPU sizing",
+    # --- security -------------------------------------------------------------------
+    "BATCHER_SECRET_COMMAND": "helper command that resolves a secret reference",
+    "BATCHER_REQUIRE_KEY_REFS": "refuse literal encryption keys; accept only key references",
     # --- IO: reads, footers, retries -----------------------------------------------
     "BATCHER_IO_THREADS": "filesystem thread-pool width",
     "BATCHER_FOOTER_CONCURRENCY": "parallel Parquet footer reads during planning",
@@ -97,13 +119,9 @@ ENV_KNOBS: Final[dict[str, str]] = {
 
 #: Strings that mean "yes" to a boolean env var or connection option, and their negations.
 #:
-#: There were **seven** spellings of this in the tree: two named sets (`config.config`,
-#: `plan.functions.security`), three inline tuples (`io.filesystem`, `io.splits.kvikio`,
-#: `carbonite.resilience.collectives`), a superset for spot-instance detection
-#: (`config.profiles`), and — the reason this matters rather than merely being untidy — one
-#: knob compared against the bare string ``"1"``. On that one, `BATCHER_VERIFY_EXPR_MATCHES=true`
-#: silently did nothing, which is the worst possible failure for a *diagnostic* flag: the
-#: operator believes verification is on and it is not.
+#: The single set every boolean reader uses. A reader with its own spelling drifts: one that
+#: accepts only ``"1"`` turns `BATCHER_VERIFY_EXPR_MATCHES=true` into a silent no-op, the
+#: worst failure for a *diagnostic* flag, since the operator believes verification is on.
 TRUE_TOKENS: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
 FALSE_TOKENS: Final[frozenset[str]] = frozenset({"0", "false", "no", "off"})
 
@@ -180,3 +198,75 @@ def env_flag(name: str, default: bool = False) -> bool:
     """
     raw = os.environ.get(name)
     return default if raw is None else truthy(raw)
+
+
+def env_int(name: str, default: int, *, floor: int | None = None) -> int:
+    """Read an integer environment variable, falling back on `default` when it is malformed.
+
+    Most knobs are read into module constants at import, so a strict `int(...)` there turned
+    one typo (`BATCHER_REMOTE_READ_CONCURRENCY=32x`) into an `import batcher` that fails with
+    a bare `ValueError` naming neither the variable nor the option. A tuning knob is not worth
+    refusing to start over: a malformed value logs a warning naming the variable and the
+    default takes its place.
+
+    Args:
+        name: The variable's name. It must be declared in `ENV_KNOBS`.
+        default: The value for an unset, empty, or malformed variable.
+        floor: A lower bound applied to the result, or None for none.
+
+    Returns:
+        The parsed value, raised to `floor`.
+
+    Examples:
+        .. doctest::
+
+            >>> import os
+            >>> from batcher.config.env import env_int
+            >>> os.environ["BATCHER_IO_THREADS"] = "32x"
+            >>> env_int("BATCHER_IO_THREADS", 64)
+            64
+            >>> os.environ["BATCHER_IO_THREADS"] = "4"
+            >>> env_int("BATCHER_IO_THREADS", 64, floor=8)
+            8
+            >>> del os.environ["BATCHER_IO_THREADS"]
+    """
+    value = _env_number(name, default, int)
+    return value if floor is None else max(floor, value)
+
+
+def env_float(name: str, default: float, *, floor: float | None = None) -> float:
+    """Read a float environment variable, falling back on `default` when it is malformed.
+
+    The float twin of `env_int`, with the same warn-and-fall-back contract.
+
+    Args:
+        name: The variable's name. It must be declared in `ENV_KNOBS`.
+        default: The value for an unset, empty, or malformed variable.
+        floor: A lower bound applied to the result, or None for none.
+
+    Returns:
+        The parsed value, raised to `floor`.
+
+    Examples:
+        .. doctest::
+
+            >>> import os
+            >>> from batcher.config.env import env_float
+            >>> os.environ["BATCHER_READ_RETRY_BACKOFF_S"] = "-1"
+            >>> env_float("BATCHER_READ_RETRY_BACKOFF_S", 0.5, floor=0.0)
+            0.0
+            >>> del os.environ["BATCHER_READ_RETRY_BACKOFF_S"]
+    """
+    value = _env_number(name, default, float)
+    return value if floor is None else max(floor, value)
+
+
+def _env_number(name: str, default: _N, parse: type[_N]) -> _N:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return parse(raw)
+    except ValueError:
+        _log.warning("%s=%r is not a valid %s; using %r", name, raw, parse.__name__, default)
+        return default

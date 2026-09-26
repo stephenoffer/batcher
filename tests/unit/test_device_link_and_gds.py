@@ -15,6 +15,7 @@ import pytest
 
 from batcher._internal.hardware.fabric import device_links, pcie
 from batcher.io.splits import gds
+from batcher.io.splits.kvikio import KvikioStatus
 from batcher.kyber.gpu.energy import device_energy_advice
 
 pytestmark = pytest.mark.unit
@@ -33,6 +34,12 @@ def _fresh():
     _clear()
     yield
     _clear()
+
+
+@pytest.fixture(autouse=True)
+def _direct_kvikio(monkeypatch):
+    """Default every test to a host whose KvikIO reads by DMA; compat mode is tested alone."""
+    monkeypatch.setattr(gds, "kvikio_status", lambda: KvikioStatus(True, False, 4, ""))
 
 
 # --- The measured host link ---------------------------------------------------------------
@@ -129,6 +136,20 @@ def test_a_remote_uri_is_never_storage_to_device(monkeypatch):
 def test_without_cufile_nothing_is_eligible(monkeypatch):
     monkeypatch.setattr(gds, "cufile_available", lambda: False)
     assert gds.gds_eligible("/data/a.parquet").reason == "no_cufile"
+
+
+def test_a_compat_mode_kvikio_is_not_storage_to_device(monkeypatch):
+    """Compat mode bounces every byte through the host behind the GDS API, silently."""
+    compat = KvikioStatus(True, True, 4, "cuFile could not open the DMA path")
+    monkeypatch.setattr(gds, "cufile_available", lambda: True)
+    monkeypatch.setattr(gds, "kvikio_status", lambda: compat)
+    monkeypatch.setattr(gds, "filesystem_type", lambda p: "ext4")
+    assert gds.gds_eligible("/nvme/a.parquet").reason == "compat"
+    summary = gds.gds_summary(("/nvme/a.parquet", "/nvme/b.parquet"))
+    assert summary["eligible"] == 0
+    assert summary["reasons"] == {"compat": 2}
+    assert summary["kvikio_direct"] is False
+    assert summary["kvikio_reason"] == "cuFile could not open the DMA path"
 
 
 def test_a_supported_local_filesystem_is_eligible(monkeypatch):

@@ -19,9 +19,9 @@ Organized by the question each module answers:
 * `bottleneck` — one verdict per device, in the vocabulary the fix is written in.
 
 **This façade carries the record types and the one reader per module.** The derived helpers each
-module offers — `transfer_bound_devices`, `throttle_fraction`, `half_precision_dtype`,
-`tensor_cores_idle`, and the rest — are reached at their own module path, because re-exporting
-forty names here would make the façade longer than several of the modules behind it.
+module offers — `transfer_bound_devices`, `throttle_fraction`, `half_precision_dtype`, and the
+rest — are reached at their own module path, because re-exporting forty names here would make
+the façade longer than several of the modules behind it.
 
 Everything degrades to empty or zero rather than raising: absent driver, unmounted container,
 consumer part, MIG instance, and per-field refusal all read as "not reported". Where "not
@@ -42,7 +42,6 @@ from batcher._internal.hardware.telemetry.bottleneck import (
 from batcher._internal.hardware.telemetry.clocks import DeviceClocks, device_clocks
 from batcher._internal.hardware.telemetry.dcgm import (
     DcgmProfile,
-    dcgm_available,
     device_profiles,
 )
 from batcher._internal.hardware.telemetry.energy import DeviceEnergy, device_energy
@@ -74,7 +73,6 @@ __all__ = [
     "ProcessUtilization",
     "TelemetrySampler",
     "classify_device",
-    "dcgm_available",
     "device_clocks",
     "device_energy",
     "device_engines",

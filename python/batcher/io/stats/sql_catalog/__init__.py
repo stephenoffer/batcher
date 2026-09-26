@@ -34,7 +34,6 @@ from batcher.io.stats.sql_catalog.probes import (
     RunRows,
     RunScalar,
     dialect_for_driver,
-    scalar_count_query,
 )
 
 __all__ = [
@@ -45,6 +44,5 @@ __all__ = [
     "catalog_row_count",
     "constraint_column_stats",
     "dialect_for_driver",
-    "scalar_count_query",
     "sql_statistics",
 ]

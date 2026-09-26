@@ -10,7 +10,6 @@ The `Sink` protocol itself lives in `io.sink`; this base structurally satisfies 
 from __future__ import annotations
 
 import contextlib
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +20,8 @@ import pyarrow as pa
 
 from batcher._internal.errors import ColumnNotFoundError
 from batcher._internal.hardware import available_cpu_count, machine_memory_bytes
-from batcher.io._backend import _scheme
+from batcher.config.env import env_float, env_int
+from batcher.io._concurrent import is_local_path
 from batcher.io.base._hive import (
     hive_partition_run_starts,
     hive_path_segment,
@@ -43,13 +43,13 @@ __all__ = ["FileSink", "stream_part_concurrency"]
 # published four of a 200-partition write at a time and spent the rest of its life blocked
 # on sockets. Local disk keeps the core-count sizing: an NVMe write is bandwidth-bound, so
 # oversubscribing it buys nothing and costs resident encoded buffers.
-_REMOTE_WRITE_CONCURRENCY = max(2, int(os.environ.get("BATCHER_REMOTE_WRITE_CONCURRENCY", "32")))
+_REMOTE_WRITE_CONCURRENCY = env_int("BATCHER_REMOTE_WRITE_CONCURRENCY", 32, floor=2)
 
 
 def _write_concurrency(n_files: int, path: str) -> int:
     """How many of `n_files` outputs to publish at once, sized for where they are going."""
     by_core = available_cpu_count()
-    remote = _scheme(path) not in ("", "file")
+    remote = not is_local_path(path)
     return max(1, min(n_files, max(by_core, _REMOTE_WRITE_CONCURRENCY) if remote else by_core))
 
 
@@ -68,8 +68,8 @@ _STREAM_PART_MEMORY_SHARE = 8
 
 # Write-side retry, mirroring the read path's `_READ_RETRY_*` so a deployment tunes one
 # idea rather than two. See `FileSink.write` for why retrying a write is safe.
-_WRITE_RETRY_ATTEMPTS = max(1, int(os.environ.get("BATCHER_WRITE_RETRY_ATTEMPTS", "3")))
-_WRITE_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_WRITE_RETRY_BACKOFF_S", "0.5")))
+_WRITE_RETRY_ATTEMPTS = env_int("BATCHER_WRITE_RETRY_ATTEMPTS", 3, floor=1)
+_WRITE_RETRY_BACKOFF_S = env_float("BATCHER_WRITE_RETRY_BACKOFF_S", 0.5, floor=0.0)
 
 
 def stream_part_concurrency(part_bytes: int, directory: str) -> int:
@@ -162,7 +162,7 @@ class FileSink(ABC):
         A **transient** failure is retried with jittered backoff, as the read path already
         does. A fast pipeline feeding a directory write bursts concurrent PUTs at one key
         prefix, which is what makes a store answer `SlowDown`/503 — a property of the moment,
-        not of the data, that used to kill a job at 99%. Safe here because a failed attempt
+        not of the data, that would otherwise kill a job at 99%. Safe here because a failed attempt
         publishes nothing: the atomic writer discards the partial and the table is still in
         memory, so the retry writes the same bytes. `write_stream` has no equivalent — its
         batches are an iterator a retry cannot rewind.
@@ -362,9 +362,9 @@ class FileSink(ABC):
         """Stream `batches` into a directory of files, each capped at `max_rows_per_file`.
 
         The bounded-memory form of a row-capped write. `write_partitioned` needs the whole
-        table resident before it can slice it, so asking for a file size used to *cost* a
-        full materialization on the driver — exactly backwards, since a caller who caps the
-        file size is usually the caller whose result does not fit. Here the cap is a
+        table resident before it can slice it, so there a file size *costs* a full
+        materialization on the driver — exactly backwards, since a caller who caps the file
+        size is usually the caller whose result does not fit. Here the cap is a
         rollover point instead: the writer closes the current file and opens the next one
         when it fills, so memory stays at one batch no matter how large the output is.
 
@@ -583,8 +583,8 @@ class FileSink(ABC):
 
         # Write the partition directories CONCURRENTLY: each is an independent subtree
         # (its own mkdirs + encode + PUT), and the columnar encode/compression releases
-        # the GIL, so a high-cardinality partitioned write no longer emits one partition
-        # after another (the serial loop that loses a directory-vs-file race). Bounded to
+        # the GIL, so a high-cardinality partitioned write does not emit one partition after
+        # another. Bounded to
         # the CPU count; `_write_parts` still parallelizes the chunks within a partition.
         # Partitions are disjoint dirs, so order is irrelevant (the manifest merge is
         # commutative), but results are kept in partition order for deterministic output.

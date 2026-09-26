@@ -339,11 +339,9 @@ costs. Using the full recursive `cost()` would re-walk and double-count children
 deep subtrees super-linearly.
 
 :::{note}
-`optimizer.join_dp_max_tables` (12) and `greedy_max_tables` (25) are declared and validated,
-but the rule does not read them, so setting either changes nothing. They predate the search
-budget above, which answers the question they were meant to answer and answers it per query
-rather than per session. Greedy also has no upper leaf bound, so there is no table count above
-which reordering stops.
+No config option caps the join search by table count. The search budget above answers that
+question per query rather than per session. Greedy also has no upper leaf bound, so there is no
+table count above which reordering stops.
 :::
 
 ## Limits
