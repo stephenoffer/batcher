@@ -5,7 +5,7 @@ they merge.
 The whole value of this figure is the split, because the prose around it says the
 sketches are "all `Mergeable` with a fixed seed, so a sketch built on partition 3 of
 worker 7 merges with one built anywhere else, in any order" -- true of the `Mergeable`
-contract, and it hides a distinction a reader needs. Three of them reach a
+contract, and it hides a distinction a reader needs. Some of them reach a
 **bit-identical** state whatever the merge order; the quantile sketches do not, and
 cannot, because their merge compacts or re-clusters and that is order-sensitive by
 construction rather than by defect.
@@ -13,8 +13,7 @@ construction rather than by defect.
 Sources, all of which must be kept in step with this drawing:
 
 * `crates/bc-sketches/tests/merge_order.rs` -- pins both halves. The exact half asserts
-  equality for HyperLogLog (register-wise max), CountMin (cell-wise sum), Bloom (bitwise
-  OR) and `ColumnStats`' min/max/count/ndv scalars. The approximate half asserts only
+  equality for HyperLogLog (register-wise max), Bloom (bitwise OR) and `ColumnStats`' min/max/count/ndv scalars. The approximate half asserts only
   that two merge orders agree within the sketch's own rank error, which is the property
   a caller is actually entitled to.
 * The worst-case rank gaps quoted here are that test's own recorded measurements: 0.0097
@@ -37,9 +36,8 @@ W, H = 980, 520
 body = [
     # ---- merges to one state -----------------------------------------------
     band(20, 20, 556, 300, "SAME STATE IN ANY MERGE ORDER", "blue"),
-    card(44, 72, 508, 66, "HyperLogLog", "distinct count -- folds by register-wise max"),
-    card(44, 152, 508, 66, "Count-Min", "how often is THIS key -- folds by cell-wise sum"),
-    card(44, 232, 508, 66, "Bloom", "membership, data skipping -- folds by bitwise OR"),
+    card(44, 92, 508, 66, "HyperLogLog", "distinct count -- folds by register-wise max"),
+    card(44, 192, 508, 66, "Bloom", "membership, data skipping -- folds by bitwise OR"),
     note(298, 312, "ColumnStats' min, max, count and ndv fold the same way.", anchor="middle"),
     # ---- merges to a close enough state ------------------------------------
     band(604, 20, 356, 300, "WITHIN ITS OWN RANK ERROR", "amber"),

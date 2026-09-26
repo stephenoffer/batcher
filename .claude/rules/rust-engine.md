@@ -127,11 +127,11 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
 
 ## Sketches and transport
 
-- `bc-sketches` (HLL / KLL / Count-Min / ColumnStats) are all `Mergeable` with a fixed
+- `bc-sketches` (HLL / KLL / Bloom / ColumnStats) are all `Mergeable` with a fixed
   seed. Kyber consumes them for cardinality/quantile estimates. Keep them deterministic
   and mergeable — but **"merge identically" is only true of some of them**, and the line
-  runs where the algorithm does. HyperLogLog, Count-Min and Bloom fold by register-wise
-  max, cell-wise sum and bitwise OR, so any merge order reaches a bit-identical state, and
+  runs where the algorithm does. HyperLogLog and Bloom fold by register-wise
+  max and bitwise OR, so any merge order reaches a bit-identical state, and
   `ColumnStats`' min/max/count/ndv fold the same way. KLL and TDigest **do not**: their
   merge compacts and re-clusters, which is order-sensitive by construction, so a reduce
   that takes partials in a different order returns a different answer, as does
@@ -143,7 +143,7 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
 
   **Two things this entry got wrong, corrected 2026-09-13 by reading the test rather than
   the comment above it.** `crates/bc-sketches/tests/merge_order.rs` has three test
-  functions, and they cover HLL/Count-Min/Bloom, `ColumnStats` scalars, and the two
+  functions, and they cover HLL/Bloom, `ColumnStats` scalars, and the two
   quantile sketches. It loops `for seed in 1..12u64`, so **11 seeds** times three orders is
   what is pinned; the "39 seeds" this entry used to cite appears only in a *comment*
   describing an earlier sweep, and citing it as the committed measurement is the error this

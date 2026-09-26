@@ -284,7 +284,7 @@ If your operator genuinely has no mergeable form, that's a design conversation, 
 - [`crates/bc-runtime/src/agg/spill/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/spill/mod.rs): grace aggregation (the same algebra, bounded)
 - [`crates/bc-interp/src/dist.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/dist.rs): the distributed primitives
 - [`crates/bc-runtime/src/agg/sketch.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/sketch.rs): the HLL and DDSketch aggregate states
-- [`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches): the mergeable sketches (HLL, DDSketch, KLL, TDigest, Count-Min), fixed seed
+- [`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches): the mergeable sketches (HLL, DDSketch, KLL, TDigest, Misra-Gries, Bloom), fixed seed
 
 ## See also
 

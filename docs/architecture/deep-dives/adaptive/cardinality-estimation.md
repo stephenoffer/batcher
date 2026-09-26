@@ -20,7 +20,7 @@ type in the estimator.
 class Provenance(IntEnum):
     EXACT = 0  # provably correct without execution (a footer, a manifest)
     HISTOGRAM = 1  # KLL / t-digest / DDSketch quantile sketch measured from data
-    SKETCH = 2  # HLL distinct / Count-Min frequency (approximate by construction)
+    SKETCH = 2  # HLL / theta-sketch distinct count (approximate by construction)
     LEARNED = 3  # a prior from a past run, keyed by plan signature
     DEFAULT = 4  # Selinger heuristic / an unconstrained guess
 ```
@@ -248,33 +248,32 @@ the same value differently and merged their registers into a wrong estimate with
 |---|---|---|---|
 | `HyperLogLog` | distinct count (NDV) | precision 14 → 16 KB | ~1.04/√m ≈ 0.8% |
 | `KllSketch` | quantiles / range selectivity | k = 200 | ~1% rank error |
-| `CountMinSketch` | frequency of a known key | `width = ⌈e/ε⌉`, `depth = ⌈ln(1/δ)⌉` | ≤ εN, never under |
 | `FrequentItems` | *find* the hot keys (Misra-Gries) | capacity | ≥ N/(cap+1) guaranteed found |
 | `BloomFilter` | membership (data skipping) | `fp_rate` | one-sided |
 
-What merging "in any order" buys you is not the same for all five, and the line runs where the
-algorithm does. HyperLogLog folds by register-wise max, Count-Min by cell-wise sum, and Bloom by
+What merging "in any order" buys you is not the same for all four, and the line runs where the
+algorithm does. HyperLogLog folds by register-wise max and Bloom by
 bitwise OR. Each of those is associative and commutative on the nose, so any merge order reaches
 a bit-identical state, and two runs' distinct counts are directly comparable. The quantile
 sketches don't work that way. KLL compacts and TDigest re-clusters its centroids, both of which
 depend on what has already been folded in, so a reduce that sees the partials in a different
 order returns a different estimate. [`crates/bc-sketches/tests/merge_order.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-sketches/tests/merge_order.rs) pins both halves:
-bit-identity for the first three, and for the quantile sketches the property a caller actually
+bit-identity for the first two, and for the quantile sketches the property a caller actually
 needs, which is that two orders agree to within the sketch's own rank error. Don't write code,
 or a test, that expects a KLL to merge to an identical state.
 
 That line, and what each side of it is asked for:
 
-![The sketches behind an estimate, split by how they merge. Three of them reach the same state in any merge order: HyperLogLog, for distinct counts, folds by register-wise max; Count-Min, for how often a given key appears, folds by cell-wise sum; and Bloom, for membership and data skipping, folds by bitwise OR. ColumnStats' min, max, count and ndv fold the same way, and exact counts from that side feed the cardinality estimate of row counts and per-column stats. The quantile sketches only agree within their own rank error: KLL's merge compacts and TDigest re-clusters its centroids, so two merge orders give two answers. The worst gap measured in rank was 0.0097 for KLL at k equals 200 and 0.0050 for TDigest at compression 100, which is the error those sketches already promise rather than a defect. They feed quantiles and range selectivity. Never assert that a quantile sketch merges to an identical state, and never set out to fix the fact that it does not.](/_static/diagrams/cardinality_sketches.svg)
+![The sketches behind an estimate, split by how they merge. Two of them reach the same state in any merge order: HyperLogLog, for distinct counts, folds by register-wise max; and Bloom, for membership and data skipping, folds by bitwise OR. ColumnStats' min, max, count and ndv fold the same way, and exact counts from that side feed the cardinality estimate of row counts and per-column stats. The quantile sketches only agree within their own rank error: KLL's merge compacts and TDigest re-clusters its centroids, so two merge orders give two answers. The worst gap measured in rank was 0.0097 for KLL at k equals 200 and 0.0050 for TDigest at compression 100, which is the error those sketches already promise rather than a defect. They feed quantiles and range selectivity. Never assert that a quantile sketch merges to an identical state, and never set out to fix the fact that it does not.](/_static/diagrams/cardinality_sketches.svg)
 
 `FrequentItems` sits on neither side of that line yet. `frequent.rs` argues in its own comments
 that the algorithm is order-independent, because `merge` sums counts and `reduce_to_capacity`
 thresholds on a sorted count, and no test in `merge_order.rs` covers it either way. Treat it as
 unpinned rather than as settled, and don't cite it as an example of either behaviour.
 
-Count-Min and Misra-Gries are used together on purpose. Count-Min never under-counts;
-Misra-Gries never over-counts and is guaranteed to *contain* every key above `N/(capacity+1)`.
-One sizes a hot key you already know about; the other finds the ones you do not.
+No sketch measures the frequency of a given key. Misra-Gries never over-counts and is
+guaranteed to *contain* every key above `N/(capacity+1)`, which is what the distributed join
+needs: `heavy_hitters` finds the hot keys it salts before the shuffle.
 
 One detail in the HLL is worth knowing. Its estimator is Ertl's improved maximum-likelihood
 form, with the `sigma` and `tau` corrections. That form is continuous and essentially unbiased

@@ -676,7 +676,7 @@ ledger warns about, and this catalog nearly did it in its top-ranked item.
 
 ### F. Sketches not yet spent (14)
 
-`bc-sketches` ships bloom, count-min, ddsketch, frequent-items, HLL, KLL, reservoir, and
+`bc-sketches` ships bloom, ddsketch, frequent-items, HLL, KLL, reservoir, and
 t-digest. Kyber consumes bloom, HLL-derived NDV, KLL-derived quantiles, and an MCV table.
 
 | # | Proposal | Metadata | Home |
@@ -684,7 +684,7 @@ t-digest. Kyber consumes bloom, HLL-derived NDV, KLL-derived quantiles, and an M
 | F1 | Wire `reservoir_sample`, which has an FFI entry point and zero callers, into a per-source column sample | new (H9) | `stats` |
 | F2 | Evaluate a conjunct against the sample for joint selectivity when no measured history exists yet (the cold-start half of E14) | F1 | `stats/selectivity` |
 | F3 | Discover column correlations and functional dependencies from the sample, feeding the FD rules that today need a declared key | F1 | REWRITE |
-| F4 | Count-min over join keys to predict skew before the run rather than detecting it during | count-min (unwired) | JOIN_REORDER, `dist` |
+| F4 | Count-min over join keys to predict skew before the run rather than detecting it during | count-min (would need writing; the unwired one was deleted) | JOIN_REORDER, `dist` |
 | F5 | Predict the *maximum* partition size from a t-digest tail instead of the mean | t-digest | `dist`, `cost/imbalance` |
 | F6 | KLL boundaries for range partitioning in sorts and shuffles (partly landed: commit `3ac2e287` added a sort range grid) | KLL | `dist` |
 | F7 | Join cardinality by HLL inclusion-exclusion over key sketches, instead of the NDV-ratio formula | HLL | `stats/join_columns` |

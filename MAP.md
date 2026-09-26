@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1511 Python modules across 217 packages and 298 Rust files across 14 crates.
+Covering 1511 Python modules across 217 packages and 297 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -113,7 +113,6 @@ Three families are not where a crate doc would lead you. Follow these, not intui
 | `bc-io/src/store.rs` vs `bc-transport/src/store.rs` | Object-store URI resolution vs. shuffle-ticket registry. Unrelated. |
 | `bc-expr/src/analyze.rs` vs `bc-codegen/src/analyze.rs` | Static answers *about* an `Expr` (cost, columns read, can-a-skipped-row-hide-an-error, contains-media-decode) vs. JIT-subset validation. |
 | `bc-expr/src/select.rs` vs `bc-interp/src/ops/mod.rs` | Computing a filter's keep mask (short-circuiting the `AND` conjuncts) vs. the Filter operator that gathers with it. |
-| `bc-sketches` `countmin` vs `frequent` | *How often is this key* vs. *which keys are heavy*. |
 | `minhash` (`eval/str/`) vs `simhash` (`eval/list_ops/`) | Jaccard over shingles vs. cosine over embeddings. |
 | `plan/expr_rewrite/` vs `kyber/rules/` | The traversal **mechanism** vs. the rewrite **policy**. |
 | `api/merge/` | SQL `MERGE INTO` (upsert) — *not* joining two datasets, and *not* the row-level upsert a database performs (`ds.write.sql(mode="upsert")`). This one rewrites data files. |
@@ -3274,12 +3273,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 214 | Bloom filter — approximate set membership for runtime join filters. |
-| `countmin.rs` | 201 | Count-Min — frequency (heavy-hitter) estimation. |
 | `ddsketch.rs` | 434 | DDSketch — relative-error quantile sketch (Masson, Rim, Lee). |
-| `frequent.rs` | 237 | Misra-Gries — frequent-items (heavy-hitter *key*) enumeration. |
+| `frequent.rs` | 233 | Misra-Gries — frequent-items (heavy-hitter *key*) enumeration. |
 | `hll.rs` | 401 | HyperLogLog++ — distinct-count (cardinality) estimation. |
 | `kll.rs` | 551 | KLL — streaming quantile / rank sketch (Karnin–Lang–Liberty). |
-| `lib.rs` | 81 | `bc-sketches` — mergeable probabilistic sketches for the optimizer. |
+| `lib.rs` | 79 | `bc-sketches` — mergeable probabilistic sketches for the optimizer. |
 | `reservoir.rs` | 369 | Reservoir sampling — a fixed-size uniform random sample of a stream. |
 | `stats.rs` | 253 | Per-column statistics derived from a single scan. |
 | `tdigest.rs` | 454 | T-Digest — tail-accurate quantile sketch (Dunning). |
