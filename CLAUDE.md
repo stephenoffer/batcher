@@ -160,7 +160,7 @@ is not a substitute.
 
 **Extending the engine:** `add-relational-operator` · `add-expression-or-function` ·
 `add-distributed-operator` · `add-kyber-optimizer-pass` · `add-an-io-format-or-connector` ·
-`run-quality-gate`
+`run-quality-gate` · `audit-codebase-health` (periodic whole-tree health pass)
 
 **Documenting it:** `improve-a-docs-page` · `audit-docs-structure` ·
 `docs-grammar-style` · `write-in-a-human-voice` (reads generated)
@@ -173,7 +173,8 @@ it routes to the rest) ·
 `apply-governance-and-security`
 
 **Migrating:** `migrate-from-spark` · `migrate-from-polars-or-pandas` ·
-`migrate-from-duckdb-sql` · `migrate-from-daft` · `migrate-from-ray-data`
+`migrate-from-duckdb-sql` · `migrate-from-daft` · `migrate-from-ray-data` ·
+`migrate-from-a-sql-warehouse`
 
 Catalog: `docs/agents.md`, gated by `tests/docs/test_skill_coverage.py`.
 
