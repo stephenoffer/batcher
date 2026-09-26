@@ -9,13 +9,14 @@ not a policy.
 
 from __future__ import annotations
 
-import contextlib
 from collections import deque
 
 from batcher._internal import events
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
 from ..capacity import fleet_worker_cpus
+from ..scaling import cluster_topology
 from ..scheduling import map_slots_per_worker
 from ._drain import draining_workers  # noqa: F401  (re-exported for the façade)
 from ._faults import (
@@ -67,11 +68,14 @@ def _pending_window(task_cpus: float = 1.0) -> int:
     d = active_config().distributed
     if d.max_pending_tasks > 0:
         return max(1, d.max_pending_tasks)
+    # The worker-eligible core count every other fan-out sizing in `dist` reads (the head and
+    # draining nodes excluded, snapshot-aware under `topology_scope()`), rather than Ray's raw
+    # `cluster_resources()`, which counts cores no task of this stage will run on.
     cores = 0.0
-    with contextlib.suppress(Exception):
-        import ray
-
-        cores = float(ray.cluster_resources().get("CPU", 0.0))
+    try:
+        cores = float(cluster_topology()["cpus"])
+    except Exception as exc:
+        note_suppressed("dist", "read cluster CPU capacity", exc)
     if cores <= 0:
         return max(1, _DEFAULT_PENDING_WINDOW)
     share = min(1.0, max(float(task_cpus), 1e-3))
