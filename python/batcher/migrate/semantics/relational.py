@@ -203,19 +203,6 @@ def spark_count(ctx: Context, col: Bound) -> Any | None:
 
 
 @transform
-def polars_contains(
-    _ctx: Context, namespace: Bound, pattern: Bound, is_literal: Bound
-) -> Any | None:
-    """Polars `str.contains` is a regex unless `literal=True`."""
-    flag = literal(is_literal.node)
-    if not isinstance(flag, bool):
-        return None
-    method = "contains" if flag else "regexp_matches"
-    func = cst.Attribute(value=parens(namespace.node), attr=cst.Name(method))
-    return simple_call(func, [cst.Arg(pattern.node)])
-
-
-@transform
 def ray_batch_format(_ctx: Context, fmt: Bound) -> Any | None:
     """Ray's `batch_format="default"` is numpy; Batcher's default is pyarrow."""
     value = literal(fmt.node)

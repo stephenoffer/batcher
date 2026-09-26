@@ -2964,7 +2964,7 @@ The `sem.<name>` transforms registry templates call for what the template DSL ca
 | `base.py` | 199 | The transform registry, the context a transform reads, and the node helpers they share. |
 | `columns.py` | 248 | Transforms over column references, argument checks, positions and date patterns. |
 | `ordering.py` | 224 | Transforms over sort and window keys, whose null placement differs per engine. |
-| `relational.py` | 235 | Transforms over relational spellings: joins, writes, sessions, constructors, aggregates. |
+| `relational.py` | 222 | Transforms over relational spellings: joins, writes, sessions, constructors, aggregates. |
 
 ## Rust data plane — `crates/`
 
