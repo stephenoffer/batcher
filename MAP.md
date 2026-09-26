@@ -940,13 +940,13 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 3203 | The distributed executor — the dispatcher. |
+| `executor.py` | 3198 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 893 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 543 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 574 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1884 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1882 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 433 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 304 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 324 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -1021,7 +1021,7 @@ Fabric-aware placement: what the accelerator fleet looks like, and where work sh
 | `market.py` | 215 | Which capacity a stage runs on: spot where the work is recomputable, on-demand where it isn't. |
 | `placement.py` | 419 | Placing accelerator work on the fleet: gang bundles, power zones, and efficiency order. |
 | `residency.py` | 97 | Residency as a placement filter — the point where a sovereignty rule reaches the scheduler. |
-| `shape.py` | 187 | The live cluster, rendered into the neutral shape Kyber plans against. |
+| `shape.py` | 184 | The live cluster, rendered into the neutral shape Kyber plans against. |
 | `topology.py` | 402 | Where the accelerators actually are — NVLink domains, nodes, racks, and power zones. |
 
 ### `batcher/dist/executors/ray_runtime/policies/` — 4 · backend
@@ -1659,7 +1659,7 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | `device_exchange.py` | 385 | Redistributing between the devices of one node without serializing them behind each other. |
 | `fabric_usage.py` | 129 | What the node's RDMA fabric carried while a shuffle was running. |
 | `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
-| `locality.py` | 183 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
+| `locality.py` | 180 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `peers.py` | 188 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 153 | Locality-aware reducer placement — put a reducer where its data already is. |
 | `server.py` | 416 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
@@ -1777,7 +1777,7 @@ Governance — who may read which rows and columns, and through what mask.
 | `masks.py` | 193 | Declarative, picklable column-mask factories. |
 | `policy.py` | 240 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
-| `residency.py` | 413 | Data residency — where a dataset is allowed to be computed on, not just stored. |
+| `residency.py` | 404 | Data residency — where a dataset is allowed to be computed on, not just stored. |
 
 ### `batcher/governance/authn/` — 3 · subsystem
 

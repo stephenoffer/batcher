@@ -402,20 +402,18 @@ try:
                 self.session = ShuffleSession(
                     credits,
                     # Warm-start AIMD at the driver's grant. `credits` is what Carbonite's
-                    # `grant_credits(signature=)` just computed from Kyber's per-operator
-                    # estimate *and* this shuffle's learned converged window — and under
-                    # adaptive credits `_window()` reads the controller, never the session's
-                    # static `credits`, so a bare controller silently discarded all of it and
-                    # every channel re-climbed from `default_credits` (4) on every query.
-                    # The ceiling comes from the driver, not from this process. A Ray
-                    # actor sees neither the driver's `config_context` nor the metadata hub
-                    # the learned row width is fit from, so every input `credit_ceiling`
-                    # needs is wrong or missing here — and AIMD *grows toward* its ceiling,
-                    # so re-deriving a wrong one is not an approximation, it is the window
-                    # the controller settles at and the memory it buffers there. A
-                    # wide-row shuffle (embeddings, blobs) was the case that mattered: its
-                    # learned per-batch width is what holds the window under
-                    # `credit_byte_budget`, and it is invisible from inside the worker.
+                    # `grant_credits(signature=)` computed from Kyber's per-operator estimate
+                    # *and* this shuffle's learned converged window, and under adaptive
+                    # credits `_window()` reads the controller, never the session's static
+                    # `credits` — so a controller started anywhere else would discard that
+                    # and re-climb from `default_credits` on every query.
+                    # The ceiling comes from the driver, not from this process. A Ray actor
+                    # cannot see the metadata hub the learned row width is fit from, so every
+                    # input `credit_ceiling` needs is missing here — and AIMD *grows toward*
+                    # its ceiling, so a wrong one is the window the controller settles at and
+                    # the memory it buffers there. A wide-row shuffle (embeddings, blobs) is
+                    # the case that matters: its learned per-batch width is what holds the
+                    # window under `credit_byte_budget`, and it is invisible from here.
                     flow_control=AIMDFlowControl(
                         cfg, initial_window=credits, ceiling=credit_ceiling or None
                     ),

@@ -415,14 +415,11 @@ def _worker_node_cpus() -> list[float]:
     supervisor, and scheduling data operators there causes contention), anything Ray has
     marked for drain excluded, and neither exclusion allowed to empty the list.
 
-    This used to re-derive that from `ray.nodes()` itself, and the copy had drifted in two
-    ways that matter. It counted **draining** nodes, so the primary fan-out chooser
-    (`_cluster_fill_workers`) sized the fleet onto capacity being reclaimed while
-    `clamp_workers` — reading the same cluster through `scaling` — excluded it, and the two
-    answers to "how many workers fit" disagreed. And it read the cluster directly, so it
-    missed the `topology_scope()` snapshot and paid its own `ray.nodes()` round trip on
-    every call. Sharing the definition is also what the layering asks for: two copies of a
-    rule is the one way to get them out of step.
+    Delegating rather than reading `ray.nodes()` here keeps two properties: the primary
+    fan-out chooser (`_cluster_fill_workers`) and `clamp_workers` agree about which nodes
+    count (a private copy that counted draining nodes would size the fleet onto capacity
+    being reclaimed), and the read shares the `topology_scope()` snapshot instead of paying
+    its own `ray.nodes()` round trip per call.
 
     Nameplate capacity, deliberately: this is the cluster's *shape*, and a node whose cores
     are momentarily all held is still a node the fleet will run on. Sizing the shape from what
@@ -1848,9 +1845,9 @@ def _dispatch(
             return _distributed_map(plan, sources, workers, hub, preserve_order=True)
 
     # A bare `LIMIT n OFFSET k` over a breaker-free single source (`df.limit(10)`,
-    # `df.head()`, `df.filter(...).limit(10)` — the most common interactive shape, and
-    # until now a hard failure on distributed data). Each worker keeps only the first
-    # `k + n` rows of its OWN partition and the driver re-slices their concatenation.
+    # `df.head()`, `df.filter(...).limit(10)` — the most common interactive shape). Each
+    # worker keeps only the first `k + n` rows of its OWN partition and the driver re-slices
+    # their concatenation.
     #
     # This is exact, not a sample: the global first `k + n` rows are a prefix of the
     # source, so every one of them lies in some partition's own first `k + n` rows; and
@@ -1914,9 +1911,7 @@ def _dispatch(
     # A fixed-count `sample(n=...)` keeps the `n` smallest-hash rows of the WHOLE relation,
     # so — unlike the fraction form, which is a per-row predicate and rides the map path
     # above — running it per partition keeps `n` rows from EVERY partition. It is not
-    # row-wise, so until now it reached `_unsupported` and raised on distributed data.
-    #
-    # It is, however, mergeable top-N: a row among the globally `n` smallest hashes is also
+    # row-wise, but it is mergeable top-N: a row among the globally `n` smallest hashes is also
     # among its own partition's `n` smallest (its partition holds a subset of the rows, so
     # its rank there is no worse than its global rank), so the union of the per-partition
     # results *contains* the global answer, and re-applying the same operator to that union
@@ -2256,7 +2251,7 @@ def _dispatch(
     # it is order-free it is a whole-relation aggregate broadcast, and when it is ordered it
     # splits by the order instead — range-partition into ordered buckets, window each, then
     # shift each by the prior buckets' contribution (`dist/global_window/`). Both keep the
-    # ordered global window off the one-node cliff it used to raise on.
+    # global window off a single node.
     window_split = _split_at(plan, Window)
     if window_split is not None:
         above, window = window_split

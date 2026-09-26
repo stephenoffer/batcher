@@ -111,10 +111,9 @@ def cluster_shape() -> ClusterShape:
 
     # Ordered canonically so two reads of an unchanged cluster produce an identical shape. The
     # shape reaches the plan cache key, and a set-ordered tuple would invalidate every memoized
-    # plan on a cluster that had not changed at all. This used to sort by node id, which a
-    # census entry no longer carries and which was itself an arbitrary tie-break, since Ray
-    # node ids are random. Sorting by the fields instead makes the order a property of the
-    # fleet rather than of which machines happened to register first.
+    # plan on a cluster that had not changed at all. Sorting by the fields rather than by node
+    # id (random, and not carried by a census entry) makes the order a property of the fleet
+    # rather than of which machines happened to register first.
     ordered = sorted(
         census.items(),
         # Densest first, then every remaining field, so the order is total and depends on
@@ -145,12 +144,10 @@ def cluster_shape() -> ClusterShape:
 
 
 #: Labels a node's availability zone can arrive under, most current first. The Kubernetes
-#: `topology.kubernetes.io/zone` was the only one read, which covers a KubeRay cluster and
-#: nothing else: a Ray cluster launched by the cluster launcher on EC2 or GCE carries the
-#: cloud's own label instead, and a pre-1.17 Kubernetes carries the `failure-domain.beta` form.
-#: On those fleets every node reported no zone, so a multi-AZ exchange was indistinguishable
-#: from a single-rack one and the zone field — recorded, summarized, and now priced — was
-#: uniformly empty.
+#: `topology.kubernetes.io/zone` covers a KubeRay cluster only: a Ray cluster launched by the
+#: cluster launcher on EC2 or GCE carries the cloud's own label, and a pre-1.17 Kubernetes
+#: carries the `failure-domain.beta` form. Reading one label would leave the zone empty on
+#: those fleets, and a multi-AZ exchange indistinguishable from a single-rack one.
 _ZONE_LABELS = (
     "topology.kubernetes.io/zone",
     "failure-domain.beta.kubernetes.io/zone",
