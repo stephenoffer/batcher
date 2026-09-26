@@ -459,7 +459,12 @@ def record_selectivity(
         entry = dict(hub.get_keyed_param(_NAMESPACE, sig) or {})
         prior = entry.get("selectivity")
         n_obs = entry.get("sel_n_obs", 0)
-        entry["selectivity"] = sel if prior is None else _smooth(prior, sel, n_obs)
+        updated = sel if prior is None else _smooth(prior, sel, n_obs)
+        # The estimator reads this value, so a first write or a material correction must
+        # invalidate memoized plans; only converged drift is exempt (see `bump_generation`).
+        if is_material_change(prior, updated):
+            bump_generation()
+        entry["selectivity"] = updated
         entry["sel_n_obs"] = n_obs + 1
         hub.put_keyed_param(_NAMESPACE, sig, entry)
     except Exception as exc:  # pragma: no cover - learning must never break execution
