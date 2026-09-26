@@ -160,7 +160,7 @@ is not a substitute.
 
 **Extending the engine:** `add-relational-operator` · `add-expression-or-function` ·
 `add-distributed-operator` · `add-kyber-optimizer-pass` · `add-an-io-format-or-connector` ·
-`run-quality-gate` · `audit-codebase-health` (periodic whole-tree health pass)
+`run-quality-gate` · `audit-codebase-health`
 
 **Documenting it:** `improve-a-docs-page` · `audit-docs-structure` ·
 `docs-grammar-style` · `write-in-a-human-voice` (reads generated)
@@ -180,10 +180,6 @@ Catalog: `docs/agents.md`, gated by `tests/docs/test_skill_coverage.py`.
 
 ## Source of truth
 
-`docs/architecture/internals/` holds the design documents. `kyber.md` and `carbonite.md`
-describe the optimizer and the resource manager as built: when a design question has a real
-answer there, read it — do not re-derive or guess. `mathematical_foundations.md` is the
-original (v1-era) design paper. Read it for the math behind the sketches, cost models and
-control loops, not as a description of today's code: several mechanisms it describes (such as
-intra-stage adaptation and an RL batch sizer) do not exist. Where a document and the code
+Design docs: `docs/architecture/internals/kyber.md`, `carbonite.md`.
+`mathematical_foundations.md` is the v1-era paper, not today's code. Where docs and code
 disagree, the code and `competitive_architecture.md` decide.
