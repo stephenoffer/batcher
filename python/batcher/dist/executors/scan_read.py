@@ -173,8 +173,9 @@ _SCAN_CACHE_LOCK = threading.Lock()
 
 # --- Broken-record tolerance (distributed.on_read_error="skip") --------------------
 # Count of splits (file / row-group group) a worker skipped because they failed to read.
-# Process-wide on the worker so a persistent-fleet worker's total is observable across a
-# query; `skipped_splits()` reads it. A skip is a silent data loss, so each one logs.
+# Process-wide on the worker, read by `skipped_splits()` and drained by
+# `drain_skipped_splits()`; it is not shipped to the driver. A skip is a data loss, so each
+# one also logs a warning, which is the record the driver sees.
 _SKIPPED_SPLITS = 0
 _SKIPPED_LOCK = threading.Lock()
 
@@ -195,8 +196,11 @@ def drain_skipped_splits() -> int:
 
     A fleet worker outlives the query that ran on it, so a cumulative counter cannot answer
     "did MY job lose data", the only question that matters when a petabyte-scale scan
-    quietly drops a corrupt shard. Draining per task lets the driver sum one number per
-    partition and report the job's true loss.
+    quietly drops a corrupt shard. Draining gives a per-query figure on the worker.
+
+    The count stays on the worker: no task returns it and the driver sums nothing. The
+    driver-visible record of a skip is the warning `_record_skipped` logs per split, which
+    Ray forwards from the worker's log.
     """
     global _SKIPPED_SPLITS
     with _SKIPPED_LOCK:

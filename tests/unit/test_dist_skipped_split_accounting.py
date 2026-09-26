@@ -3,7 +3,7 @@
 `skipped_splits()` is a cumulative worker-process counter that is never reset. On a
 persistent fleet worker serving many queries it answers "how much has this process ever
 skipped", which cannot tell you whether *your* petabyte scan quietly dropped a corrupt
-shard. `drain_skipped_splits()` is the per-query reading the driver can sum.
+shard. `drain_skipped_splits()` is the per-query reading, taken on the worker.
 """
 
 from __future__ import annotations
