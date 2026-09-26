@@ -239,12 +239,12 @@ def _execute_keyed_flight(
 
         # MAP barrier under worker-loss recovery: a worker preempted while mapping has its
         # source republished on a survivor under the same `src`, so the reducers' tickets
-        # still resolve. A bare `ray.get` here failed the whole query on one preemption —
-        # in the map phase, which reads the source and dominates the query's runtime.
-        # One ticket stage for THIS window's shuffle. It used to be the literal 0, so a
-        # window sharing a fleet with another shuffle of the same query published
-        # byte-identical tickets and one overwrote the other — the collision that made a
-        # join read another join's buckets. See `fleet.plan_id.next_stage_base`.
+        # still resolve. A bare `ray.get` would fail the whole query on one preemption — in
+        # the map phase, which reads the source and dominates the query's runtime.
+        # One ticket stage for THIS window's shuffle, never a literal: a window sharing a
+        # fleet with another shuffle of the same query would otherwise publish byte-identical
+        # tickets and one would overwrite the other, so a join could read another join's
+        # buckets. See `fleet.plan_id.next_stage_base`.
         stage = next_stage_base(1)
         addrs, dead = map_barrier(
             n_sources,

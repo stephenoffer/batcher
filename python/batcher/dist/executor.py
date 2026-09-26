@@ -721,8 +721,8 @@ def _numa_sliced(grant: float) -> float:
     the gaps. More workers means more of those pipelines overlapping, which is why the
     optimum sits below the NUMA slice rather than at it. That measurement — "flattening past
     two per node" — was taken before `bc-transport`'s gather was reworked to keep its rate
-    flat in the bucket count (`BENCHMARK_RESULTS.md`, 2026-08-29), which is precisely the
-    cost that used to punish a wider fan-out. The policy was never re-derived afterwards.
+    flat in the bucket count (`BENCHMARK_RESULTS.md`, 2026-08-29), which removed precisely
+    the cost that punished a wider fan-out, so the policy is re-derived below.
 
     Re-measured on the same fleet at TPC-H sf100, forcing the fan-out, best of four, each
     case correctness-checked against the driver — wall time and *mean cluster CPU*:
@@ -824,12 +824,11 @@ _FILL_STRAND_TOLERANCE = 0.9
 def _fill_grant(node_cpus: list[float]) -> float:
     """The per-worker core grant that leaves the fewest cores stranded.
 
-    The grant used to be `min(node_cpus)`, chosen so a worker is placeable on every node.
-    That is right on a cluster whose nodes differ by a factor of two, and pathological when
-    one node is much smaller than the rest: a single 2-core utility node in a fleet of
-    64-core machines pinned *every* worker to 2 cores, so each one ran its scan and fold on
-    a thirty-second of the node it landed on. The smallest node was setting the shape of
-    the whole cluster.
+    `min(node_cpus)` would make a worker placeable on every node. That is right on a
+    cluster whose nodes differ by a factor of two, and pathological when one node is much
+    smaller than the rest: a single 2-core utility node in a fleet of 64-core machines would
+    pin *every* worker to 2 cores, so each one would run its scan and fold on a thirty-second
+    of the node it landed on, the smallest node setting the shape of the whole cluster.
 
     Nothing actually requires a uniform grant to fit the smallest node. A grant that a node
     cannot host simply means that node hosts no workers, which costs its cores — and losing
@@ -852,12 +851,11 @@ def _fill_grant(node_cpus: list[float]) -> float:
     entirely — a third of the cluster, far past the tolerance. `[16, 32, 32]` keeps 16 for
     the same reason. A homogeneous cluster has one candidate and is unchanged.
 
-    This is the cluster's **nameplate shape** and nothing else. It used to return
-    `_placeable_grant(chosen, ...)` — the shape already thinned against whatever was free at
-    that instant — and the caller then counted workers from it, so on a busy cluster the count
-    was derived from a grant chosen for a different question. The two are separated now: the
-    caller takes the count from this, and asks `_placeable_grant` for the per-worker CPU
-    figure.
+    This is the cluster's **nameplate shape** and nothing else, not
+    `_placeable_grant(chosen, ...)` (the shape thinned against whatever is free at that
+    instant): counting workers from the thinned figure would derive the count on a busy
+    cluster from a grant chosen for a different question. The caller takes the count from
+    this, and asks `_placeable_grant` for the per-worker CPU figure.
     """
     candidates = sorted({max(1.0, float(int(c))) for c in node_cpus if c > 0}, reverse=True)
     if not candidates:
@@ -1523,23 +1521,22 @@ def _range_partitionable_sort_key(sort: Sort) -> bool:
     identically. Refusing it here is what kept the canonical large-sort shape (a short
     fixed-width key over a wide payload) on a single node.
 
-    The string case used to be refused here too, which was the honest answer while it had no
-    routing: the alternative was a `RuntimeError` from inside a Ray task. But refusing is
-    only harmless when the fallback can *run*. Once an earlier stage leaves its result on
-    the workers, every source is splittable and `_unsupported` raises rather than falling
-    back — so `ORDER BY <string column>` after any shuffle failed outright. That is four of
-    the 22 TPC-H queries (q4, q9, q12, q22), each ending in a string `ORDER BY` over a
-    materialized aggregate.
+    A string key is accepted too. Refusing is only harmless when the fallback can *run*:
+    once an earlier stage leaves its result on the workers, every source is splittable and
+    `_unsupported` raises rather than falling back, so refusing would make
+    `ORDER BY <string column>` after any shuffle fail outright. That is four of the 22 TPC-H
+    queries (q4, q9, q12, q22), each ending in a string `ORDER BY` over a materialized
+    aggregate.
 
     `None` from either the schema or the inference means "not certain", and the sound answer
     there is to leave routing exactly as it was — this may only ever *withhold* distribution
     on a key it is sure about.
 
-    The type test itself is `range_partitionable`'s and nothing more. It used to add
-    ``is_decimal(dtype) or is_temporal(dtype) or`` in front of it, which is how the *other*
-    two callers of that predicate came to refuse a timestamp key this one accepts: the sort
-    fixed its own answer instead of the shared one, and the out-of-core sort and the global
-    window kept declining a key the partitioner routes perfectly well.
+    The type test itself is `range_partitionable`'s and nothing more. Widening it here
+    (say, with ``is_decimal(dtype) or is_temporal(dtype) or``) would fix the sort's answer
+    instead of the shared one, and the *other* two callers of that predicate, the
+    out-of-core sort and the global window, would go on declining a key the partitioner
+    routes perfectly well.
     """
     schema = sort.input.available_schema()
     if schema is None:
@@ -2573,12 +2570,11 @@ def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
         # caller reached here only by forcing `adaptive=False`, so say that rather than
         # implying the operator is missing.
         #
-        # The whole sentence branches, not just the tail. It used to open with "distributed
-        # execution has no path for this plan shape (an unsupported operator combination)"
-        # and *then* explain that the shape distributes stage by stage after all — a headline
-        # that contradicted its own remedy, and the exact implication the comment above says
-        # not to make. A reader who stopped at the first clause, which is where a reader
-        # stops, concluded their query could not be distributed at all.
+        # The whole sentence branches, not just the tail. Opening with the generic "no path
+        # for this plan shape" and *then* explaining that the shape distributes stage by stage
+        # would be a headline that contradicts its own remedy: a reader who stops at the
+        # first clause, which is where a reader stops, concludes the query cannot be
+        # distributed at all.
         if requires_staging(plan):
             # Deliberately does NOT assert *why* staging is not carrying this shape. Two
             # different callers arrive here and `_unsupported` cannot tell them apart: one

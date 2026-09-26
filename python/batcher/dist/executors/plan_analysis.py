@@ -188,8 +188,8 @@ def fused_union_ids(plan: LogicalPlan) -> set[int]:
     be taken on the plan the *dispatcher* sees, and this loop holds the plan before Kyber
     rewrites it. Eager aggregation puts an `Aggregate` back on a join side, which has no
     one-shot path, so excluding the join left the loop with nothing to cut and a residual
-    that raised `PlanError` (a four-table star joined then grouped, previously returning
-    three rows). Re-asking `requires_staging` on a locally re-optimized plan does not fix it:
+    that raised `PlanError` (a four-table star joined then grouped, whose answer is three
+    rows). Re-asking `requires_staging` on a locally re-optimized plan does not fix it:
     that probe lacks the collected source statistics the eager-aggregation gate needs, so it
     optimizes to a different plan than the stage will and answers "no". And the exclusion was
     measured worth nothing once the fan-out and reduce-concurrency fixes landed — TPC-H sf100
@@ -466,9 +466,8 @@ def _child_plans(plan: LogicalPlan):
     """The `LogicalPlan` children of `plan`, in field order (including tuple fields).
 
     Delegates to `plan.visitor.children`, which is the one implementation of this walk and
-    caches each node class's child-bearing fields. The hand-rolled copy that used to live
-    here re-derived them per node *and* was a second place the discovery rules could drift
-    from the canonical one.
+    caches each node class's child-bearing fields, so the discovery rules have one home and
+    are not re-derived per node.
     """
     return children(plan)
 

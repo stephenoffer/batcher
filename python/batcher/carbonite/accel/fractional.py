@@ -202,8 +202,8 @@ def plan_task_packing(
             `accelerator.prefer_mig` when omitted.
 
     Returns:
-        The packing. Every unknown resolves to `whole_device_packing`, which is what the fleet
-        did before this existed.
+        The packing. Every unknown resolves to `whole_device_packing`: one claimant per
+        device.
     """
     from batcher.config import active_config
 

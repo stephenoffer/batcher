@@ -381,10 +381,10 @@ def run_bucket_reduce(
     if proactive:
         # Announced before it is attempted, and deliberately outside the `suppress`. This is
         # the engine's best fault-tolerance behaviour — it moves work off a spot node before
-        # the node dies, so the query never pays a recovery round — and it was previously
-        # invisible in both outcomes: silent on success, and silent on failure too, because
-        # the bare `suppress` swallowed the reason. An operator comparing spot against
-        # on-demand had no way to see it working.
+        # the node dies, so the query never pays a recovery round — and without the event it
+        # would be invisible in both outcomes: silent on success, and silent on failure,
+        # because the `suppress` swallows the reason. An operator comparing spot against
+        # on-demand needs to see it working.
         events.publish(
             events.RECOVERY,
             name=kind,

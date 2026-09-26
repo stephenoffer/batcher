@@ -278,10 +278,10 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead, stages=(0
     replicas: list[list[str]] = [[] for _ in range(len(addrs))]
     if not refs:
         return None
-    # Wait for every ack **together**, then read them. Each `ray.get` used to block in
-    # turn, so the acks were collected serially — `workers x factor` sequential round trips
-    # on the map barrier, the point of the query where the reduce is already waiting. One
-    # `ray.wait` for all of them makes the waiting concurrent, and reading each ref
+    # Wait for every ack **together**, then read them. A `ray.get` per ref would collect the
+    # acks serially — `workers x factor` sequential round trips on the map barrier, the point
+    # of the query where the reduce is already waiting. One `ray.wait` for all of them makes
+    # the waiting concurrent, and reading each ref
     # afterwards keeps the per-source error isolation the degradation story depends on: a
     # source whose replica never acked must keep recompute, not fail the query.
     pending = [ref for stage_refs in refs.values() for ref in stage_refs]

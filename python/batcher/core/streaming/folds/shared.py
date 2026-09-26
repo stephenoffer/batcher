@@ -66,9 +66,9 @@ def _read(
 ) -> Iterator[pa.RecordBatch]:
     """Read `source` through the projection Kyber decided for this plan.
 
-    Every driver in this module used to call ``source.iter_batches(None)`` — decoding *every*
-    column of every message regardless of what the plan touched, while `_iter_streaming` on
-    the neighbouring path already read through the pushdown. On a wide topic that is the
+    Reading through ``source.iter_batches(None)`` would decode *every* column of every message
+    regardless of what the plan touched, as `_iter_streaming` on the neighbouring path also
+    avoids. On a wide topic that is the
     dominant cost of a streaming aggregate: a `group_by("user").sum("cents")` over a
     forty-column event decoded thirty-eight columns it then discarded, per micro-batch,
     forever.

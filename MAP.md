@@ -940,9 +940,9 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 3198 | The distributed executor — the dispatcher. |
+| `executor.py` | 3194 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 893 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_broadcast.py` | 543 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
+| `flight_broadcast.py` | 544 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 574 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
@@ -967,12 +967,12 @@ Per-operator distributed executor implementations.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 442 | Distributed aggregation over a disk Arrow-IPC shuffle. |
-| `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
+| `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 876 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
 | `map.py` | 3310 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
-| `plan_analysis.py` | 550 | Plan-shape analysis for the distributed dispatcher. |
-| `scan_read.py` | 721 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
+| `plan_analysis.py` | 549 | Plan-shape analysis for the distributed dispatcher. |
+| `scan_read.py` | 720 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
 | `union.py` | 120 | Distributed UNION — one shuffle when the branches allow it, else branch by branch. |
 | `window.py` | 61 | Distributed window functions over a disk Arrow-IPC shuffle. |
@@ -987,7 +987,7 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 | `_sources.py` | 703 | Shared partitioning + post-breaker helpers for the distributed operators. |
 | `assignment.py` | 392 | How a source's splits are divided among the workers — the three assignment strategies. |
 | `folds.py` | 209 | Streaming, byte-bounded folds of a shuffle map-side partition. |
-| `ranges.py` | 619 | Range partitioning: split rows by *value* into globally ordered buckets. |
+| `ranges.py` | 618 | Range partitioning: split rows by *value* into globally ordered buckets. |
 
 ### `batcher/dist/executors/ray_runtime/` — 4 · backend
 
@@ -1030,9 +1030,9 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 
 | module | lines | what it is |
 |---|---|---|
-| `_barrier.py` | 627 | The map-stage barrier: gather partition results under worker-loss recovery. |
+| `_barrier.py` | 626 | The map-stage barrier: gather partition results under worker-loss recovery. |
 | `_drain.py` | 166 | Which workers are on a node that is going away. |
-| `_faults.py` | 434 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
+| `_faults.py` | 433 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `_topn.py` | 112 | Worker-loss recovery for the distributed top-N fold. |
 
 ### `batcher/dist/fleet/` — 4 · backend
@@ -1043,7 +1043,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 |---|---|---|
 | `_fleet.py` | 788 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
-| `held.py` | 78 | What the session fleet already holds, per node, so sizing does not fight its own fleet. |
+| `held.py` | 77 | What the session fleet already holds, per node, so sizing does not fight its own fleet. |
 | `plan_id.py` | 204 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `query.py` | 83 | The query-lifetime fleet: one placement group held for the whole adaptive query. |
 | `source.py` | 222 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
@@ -1054,11 +1054,11 @@ The *global* (no-``PARTITION BY``) ordered window, in bounded memory and across 
 
 | module | lines | what it is |
 |---|---|---|
-| `admission.py` | 300 | Which global windows the ordered-bucket algebra covers, and why the rest are refused. |
+| `admission.py` | 299 | Which global windows the ordered-bucket algebra covers, and why the rest are refused. |
 | `boundary.py` | 123 | The one ordered-bucket correction that reads a *neighbouring* bucket's rows. |
 | `disk.py` | 191 | Distributed *global* ordered window over a disk Arrow-IPC shuffle. |
 | `flight.py` | 303 | Distributed *global* (no-``PARTITION BY``) ordered window over an Arrow Flight shuffle. |
-| `offsets.py` | 596 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
+| `offsets.py` | 595 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
 | `stream.py` | 103 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window, on one node. |
 
 ### `batcher/dist/gpu/` — 4 · backend
@@ -1068,9 +1068,9 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 513 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
-| `cudf_probe.py` | 341 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
+| `cudf_probe.py` | 340 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
 | `device_read.py` | 401 | Read a shard onto the device, instead of onto the host and then across the bus. |
-| `dispatch.py` | 356 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
+| `dispatch.py` | 355 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 242 | The single-key group-by fan-out that predates the plan translator. |
 | `join.py` | 370 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
 | `resources.py` | 514 | What a GPU task asks Ray for — the fractional half of the relational fan-out. |
@@ -1103,7 +1103,7 @@ Out-of-core execution on one node: scratch plumbing, and the spilling aggregate.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 569 | Single-node out-of-core aggregation via partition-and-spill, plus the spill dispatcher. |
-| `buckets.py` | 351 | Bucket mechanics every out-of-core breaker shares: write them, size them, re-split them. |
+| `buckets.py` | 349 | Bucket mechanics every out-of-core breaker shares: write them, size them, re-split them. |
 | `scratch.py` | 168 | Spill scratch: where an out-of-core query's bytes go, and how its input is fed in. |
 | `staging.py` | 128 | Which inputs of a spilling breaker are themselves breakers, and how to stage them. |
 
@@ -1114,7 +1114,7 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 | module | lines | what it is |
 |---|---|---|
 | `join.py` | 443 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
-| `sort.py` | 375 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
+| `sort.py` | 374 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
 | `window.py` | 153 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 
 ### `batcher/dist/streaming/` — 4 · backend
@@ -1594,7 +1594,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 319 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `estimator.py` | 318 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
 | `kernel.py` | 453 | The kernel's own view of how close this process is to being OOM-killed. |
 | `learned.py` | 520 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 411 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
@@ -1662,8 +1662,8 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | `locality.py` | 180 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `peers.py` | 188 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 153 | Locality-aware reducer placement — put a reducer where its data already is. |
-| `server.py` | 416 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
-| `session.py` | 524 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
+| `server.py` | 415 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
+| `session.py` | 523 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
 | `staging.py` | 271 | How a transfer crosses the host link: chunk size, how many are in flight, and pinned or not. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |
 
@@ -1676,7 +1676,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `base.py` | 87 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
 | `energy.py` | 328 | Measuring what a stage drew — Core's half of the energy loop. |
 | `executor.py` | 331 | The Core local executor. |
-| `gpu_transform.py` | 313 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
+| `gpu_transform.py` | 312 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 191 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 257 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 162 | A bare scan needs no engine — the reader has already produced the plan's output. |
@@ -1696,7 +1696,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `exprs.py` | 439 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 384 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `pruning.py` | 417 | Narrow a plan tree to the columns it actually reads, at every level rather than at the leaves. |
-| `scalar_fns.py` | 415 | The named scalar-function families: math, two-argument math, and dates. |
+| `scalar_fns.py` | 414 | The named scalar-function families: math, two-argument math, and dates. |
 | `temporal.py` | 411 | The calendar half of the date vocabulary: `date_trunc`, `offset_by`, the year-derived |
 | `tree.py` | 200 | The whole-plan form of the translator: any tree of scans, joins and unions on the device. |
 | `windows.py` | 483 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
@@ -1708,7 +1708,7 @@ The translator's *named* vocabularies, one module per family — package façade
 | module | lines | what it is |
 |---|---|---|
 | `dates.py` | 149 | What the engine types as a calendar day, and how a temporal value is built from numbers. |
-| `lists.py` | 416 | List and vector expressions, built from the two primitives both dataframe libraries have. |
+| `lists.py` | 415 | List and vector expressions, built from the two primitives both dataframe libraries have. |
 | `operators.py` | 312 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
 | `regex.py` | 241 | The regular-expression functions, for the patterns three regex engines agree on. |
 | `strings.py` | 237 | The string function family — one entry per named function the engine ships. |
@@ -1740,7 +1740,7 @@ The streaming-query engine — the micro-batch loop behind a unified `ds.write`.
 | module | lines | what it is |
 |---|---|---|
 | `engine.py` | 626 | The micro-batch loop — trigger cadence, checkpointing, recovery, and progress. |
-| `processors.py` | 565 | What a micro-batch *becomes* — the per-batch processors and the routing that picks one. |
+| `processors.py` | 564 | What a micro-batch *becomes* — the per-batch processors and the routing that picks one. |
 | `state_policy.py` | 99 | How much of a streaming query's state to persist on any one micro-batch. |
 
 ### `batcher/core/udf/` — 3 · subsystem
@@ -1749,9 +1749,9 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 
 | module | lines | what it is |
 |---|---|---|
-| `apply.py` | 404 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
+| `apply.py` | 403 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
 | `async_udf.py` | 193 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
-| `call.py` | 474 | The per-batch `map_batches` call boundary (Core, layer 3). |
+| `call.py` | 473 | The per-batch `map_batches` call boundary (Core, layer 3). |
 | `execute.py` | 305 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
 | `isolation.py` | 236 | What a UDF child process is allowed to see and consume. |
 | `lifecycle.py` | 90 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |

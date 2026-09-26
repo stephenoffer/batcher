@@ -339,11 +339,11 @@ def process_pool(limit_bytes: int) -> BufferPool:
     spurious spilling, or failing a reservation for work Carbonite had correctly admitted.
     Growth always applies at once (capacity the autoscaler just added must not wait).
 
-    A deferred shrink is **remembered**. It used to be discarded outright, so the smaller
-    budget only ever landed if some later call happened to ask for that same figure while
-    the pool was idle — which for a shrink caused by an autoscaler taking RAM away is not
-    something that happens at all. The envelope then stayed at the larger limit for the
-    life of the process and admitted against memory the box no longer had. The pending
+    A deferred shrink is **remembered**. Discarding it would land the smaller budget only if
+    some later call happened to ask for that same figure while the pool was idle — which for
+    a shrink caused by an autoscaler taking RAM away does not happen at all — so the envelope
+    would stay at the larger limit for the life of the process and admit against memory the
+    box no longer has. The pending
     figure is applied on the first subsequent call that finds the pool idle, and is
     superseded by any later reconcile so it can never resurrect a stale budget.
 

@@ -339,8 +339,8 @@ class _WindowedAggFold:
     def _check_state_bounded(self) -> None:
         """Keep resident state under the cap — by spilling cold windows, then by failing.
 
-        Reaching the cap used to end the query. That is the wrong answer for the shape that
-        reaches it most legitimately: an open set `allowed_lateness / hop` windows wide, one
+        Ending the query at the cap is the wrong answer for the shape that reaches it most
+        legitimately: an open set `allowed_lateness / hop` windows wide, one
         row per group key, behaving exactly as designed and simply large. Spilling the oldest
         windows to disk trades latency for survival, which is the trade every mature streaming
         engine makes, and the watermark's one-way motion is what makes it cheap here — a

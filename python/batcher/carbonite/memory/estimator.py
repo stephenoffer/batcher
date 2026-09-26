@@ -297,11 +297,10 @@ class OperatorMemoryEstimator:
         fc = ctx.config.flow_control
         peak = learned_plan_peak(plan, ctx.memory_model)
         # Credits and parallelism take the plan's own widest request when Kyber emitted
-        # one, falling back to the configured defaults for an unsized plan. They used to be
-        # the configured constants unconditionally, which made the returned envelope a
-        # description of the *config* rather than of the plan for two of its three fields —
-        # so any consumer reading them (rather than only `m_max_bytes`) would have been
-        # told a 200-way shuffle wanted the default 4-way parallelism.
+        # one, falling back to the configured defaults for an unsized plan. Using the
+        # configured constants unconditionally would make the envelope a description of the
+        # *config* rather than of the plan for two of its three fields — a consumer reading
+        # them would be told a 200-way shuffle wanted the default 4-way parallelism.
         #
         # `getattr` rather than attribute access for the same reason `plan_peak` uses it:
         # a bare-sized bounds object (a test double carrying only `m_max_bytes`) is a

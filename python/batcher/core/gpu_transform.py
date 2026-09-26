@@ -118,9 +118,8 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
     # which would have raised and dropped the whole stage back to the CPU engine.
     backend = accelerator_backend()
     device = _TORCH_DEVICE.get(backend)
-    # `_TORCH_DEVICE` maps only accelerator backends, so an unknown/absent one is `None`.
-    # (A `device == "cpu"` disjunct used to sit here; no entry has that value, so it read as
-    # covering a case it could never match.)
+    # `_TORCH_DEVICE` maps only accelerator backends, so an unknown/absent one is `None`; no
+    # entry is `"cpu"`, so there is no CPU case to test for here.
     if device is None:
         # No accelerator to run on. Raise rather than quietly computing on the CPU *inside*
         # the GPU kernel: the caller asked for the accelerated backend and owns the decision

@@ -1,10 +1,10 @@
 """Cluster-wide accelerator facts, for callers that would otherwise probe the driver.
 
-Every "how big is a GPU?" question in the control plane used to be answered by probing the
-*local* process — `gpu_inventory()`, `torch.cuda`, `gpu_vram_gb()`. That is right for a
-single-node run and wrong for every distributed one, because the driver is routinely a
-CPU-only head node scheduling GPU workers: the probe finds no device and the caller falls
-back to a hardcoded constant, so an A100 fleet gets planned and packed as a 12 GB T4.
+Answering "how big is a GPU?" by probing the *local* process — `gpu_inventory()`,
+`torch.cuda`, `gpu_vram_gb()` — is right for a single-node run and wrong for every
+distributed one, because the driver is routinely a CPU-only head node scheduling GPU
+workers: the probe finds no device and the caller falls back to a hardcoded constant, so an
+A100 fleet would be planned and packed as a 12 GB T4.
 
 This module is the cluster-scoped answer, derived from the live topology via
 `cluster_hardware_profile()`. It reports `None` rather than a guess whenever the topology
@@ -147,10 +147,10 @@ def cluster_gpu_memory_bytes() -> int | None:
 def cluster_gpu_memory_gb() -> float | None:
     """Total VRAM of the cluster's smallest GPU in **decimal** GB, or `None` when unknown.
 
-    The unit matters and used to be wrong. Kyber sizes a working set as `rows x width / 1e9`
-    — decimal gigabytes — and compared it against this, which divided by `1 << 30`. An 80 GiB
-    A100 therefore presented as "80" against a working set measured in GB, over-stating the
-    device by 7.4% in the direction that dispatches a query the board cannot hold.
+    The unit matters. Kyber sizes a working set as `rows x width / 1e9` — decimal
+    gigabytes — and compares it against this. Dividing by `1 << 30` instead would present an
+    80 GiB A100 as "80" against a working set measured in GB, over-stating the device by 7.4%
+    in the direction that dispatches a query the board cannot hold.
 
     Returns:
         Decimal GB of the binding device's total memory, or `None` when undeterminable. This

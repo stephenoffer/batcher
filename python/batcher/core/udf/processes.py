@@ -268,8 +268,8 @@ def run_map_processes(
         per_shard = pool.map(_call_shard, tasks, **kwargs)
         return [r for shard in per_shard for r in shard]
     except TimeoutError as exc:
-        # A wedged UDF used to hang the query forever with no error and no signal. The
-        # pool is torn down rather than reused: its children are still running the stuck
+        # A wedged UDF must fail the query rather than hang it with no signal. The pool is
+        # torn down rather than reused: its children are still running the stuck
         # call, so handing them the next query's work would propagate the wedge.
         shutdown_pool()
         raise ExecutionError(
@@ -363,9 +363,9 @@ class _ByValueFn:
 
     `pickle` sends a function by *reference* — module plus qualified name — which a lambda, a
     closure, or a class defined inside a function has no usable form of, so those simply
-    refuse to pickle. That refusal is what used to bar the single most common spelling of a
-    UDF from the process pool: ``ds.map_batches(lambda b: ...)`` stayed on threads and a
-    GIL-bound body therefore ran on one core, however many were free. Ray, Dask, and Spark
+    refuse to pickle. That refusal would bar the single most common spelling of a UDF from the
+    process pool: ``ds.map_batches(lambda b: ...)`` would stay on threads and a GIL-bound body
+    would run on one core, however many were free. Ray, Dask, and Spark
     all reach for `cloudpickle` here, and so does this: the blob is built once on the driver
     and shipped with each dispatch, and the worker unpickles the real callable.
 

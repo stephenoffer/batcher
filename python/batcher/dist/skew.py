@@ -288,8 +288,8 @@ def resolve_hot_keys(
     # rather than the measurement. `share` is 0.0 only when genuinely unknown — a learned
     # record written before the share was stored, or a hot set with no frequency behind it —
     # and then `fraction` is the only figure available and stands as the conservative floor it
-    # always was. The column-statistics path used to land there too, on a measurement it was
-    # already holding; it now carries it.
+    # always was. The column-statistics path carries its measured share, so it never lands
+    # there with a measurement in hand.
     return hot, salt if salt > 0 else salt_factor(max(share, fraction), partitions)
 
 

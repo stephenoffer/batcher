@@ -90,8 +90,8 @@ _LIGHT_FN_ROW_SECONDS = 5e-8
 _PROBE_ROWS = 65_536
 _PROBE_REPEATS = 3
 # Wall-clock ceiling for one `fn`'s per-row-cost probe. The probe RUNS the user's `fn`, so its
-# cost is the `fn`'s cost: a warm call plus `_PROBE_REPEATS` timed calls over `_PROBE_ROWS` rows
-# used to be paid before the query started, whatever the `fn` did per row. A `fn` already slower
+# cost is the `fn`'s cost: a warm call plus `_PROBE_REPEATS` timed calls over `_PROBE_ROWS` rows,
+# paid before the query starts, whatever the `fn` does per row. A `fn` already slower
 # than this is decisively "heavy" — the only verdict the probe feeds — so one measurement
 # answers it; repeating multiplies a real cost (a billed call, a model forward). A cheap
 # `fn` still gets every repeat, because every repeat is cheap.

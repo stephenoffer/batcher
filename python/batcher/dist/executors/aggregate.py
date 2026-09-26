@@ -243,8 +243,8 @@ def _combine_task(
     for the step that *finalizes*. So a chunk whose inputs already exceed the envelope hands
     its paths back untouched instead of merging them, and that bucket reaches the reducer as
     wide as it was — which is exactly the input the spilling fold is written for. Without
-    this the tree would turn a high-cardinality aggregate that used to spill and finish into
-    one that dies in a level nobody can see.
+    this the tree would turn a high-cardinality aggregate that spills and finishes into one
+    that dies in a level nobody can see.
 
     Returns the paths the next level should read: one merged file normally, the inputs
     unchanged when declined, and an empty list when every input was empty (so an empty

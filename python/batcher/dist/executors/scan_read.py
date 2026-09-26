@@ -237,12 +237,11 @@ def _scannable_fragments(splits):
     That second case is the point. Sub-file splits read faster here (the scanner coalesces
     column-chunk ranges and reads fragments ahead in C++, and the result is cacheable), but
     knowing where the row-groups are costs the *driver* one footer read per file before any
-    worker starts — 18.3 s over 8,192 files, serial with the whole cluster idle. Whole-file
-    splits used to fall out of this fast path onto the per-split reader, so avoiding that
-    sweep meant giving up the reader too, and a 24 GB corpus measured 5.5 s read + 18.3 s
-    plan against 9.3 s read + 0.07 s plan — a choice between two bad halves. Accepting them
-    here removes the choice: the footer work moves off the driver and onto the workers that
-    were going to open the files anyway.
+    worker starts — 18.3 s over 8,192 files, serial with the whole cluster idle. If
+    whole-file splits fell out of this fast path onto the per-split reader, avoiding that
+    sweep would mean giving up the reader too: a 24 GB corpus measured 5.5 s read + 18.3 s
+    plan against 9.3 s read + 0.07 s plan. Accepting them here removes the choice: the
+    footer work moves off the driver and onto the workers that open the files anyway.
 
     Returns None — caller falls back — for any other split kind, and for a Parquet split
     carrying reader kwargs. Those kwargs are a bring-your-own filesystem, `storage_options`,
@@ -472,9 +471,9 @@ def _native_scan_batches(splits, projection, predicate=None):
         """The windows, read CONCURRENTLY and yielded in file order.
 
         Each native call already fetches its own window's column chunks concurrently, but
-        the calls themselves used to run one after another — so a partition spread over
-        many files paid a full object-store round trip per file, in series, with the task's
-        reserved cores idle throughout. That is the common shape, not a corner: the
+        run one after another the calls would make a partition spread over many files pay a
+        full object-store round trip per file, in series, with the task's reserved cores
+        idle throughout. That is the common shape, not a corner: the
         partitioner balances a source's splits across tasks, so a task's ten splits are
         typically ten *different* files.
 

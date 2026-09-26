@@ -88,10 +88,10 @@ def enforce(
     Raises:
         AccessDeniedError: If the principal may select no column of a governed table.
         PlanError: If `tables` is a bare string, `principal` is not a `Principal`, or a
-            `Scan`'s ``source_id`` has no entry in `tables` while the catalog governs
-            anything. That last one used to be ignored — the scan was left ungoverned —
-            which turns a caller's off-by-one into a policy that silently does not
-            apply. On an authorization boundary the only safe direction is to fail.
+            `Scan`'s ``source_id`` has no entry in `tables` while the catalog governs anything.
+            Leaving such a scan ungoverned would turn a caller's off-by-one into a policy that
+            silently does not apply. On an authorization boundary the only safe direction is to
+            fail.
     """
     reject_bare_string(
         tables, what="enforce(tables=...)", param="tables", reads_as="one table per character"

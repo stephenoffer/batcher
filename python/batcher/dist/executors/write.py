@@ -284,10 +284,10 @@ def _distributed_write_partitioned(
     scan of that intermediate as its plan — each worker reads one bucket and writes it,
     and only `WrittenFile` locators come back.
 
-    That is the whole point: a `GROUP BY`, `ORDER BY`, `JOIN`, `DISTINCT` or window
-    followed by a write used to be collected onto the driver in full and re-sharded from
-    there, so the one terminal whose output is the size of the result was also the one
-    that funnelled it through a single process. For the row-preserving breakers (sort,
+    That is the whole point: collecting a `GROUP BY`, `ORDER BY`, `JOIN`, `DISTINCT` or
+    window onto the driver in full and re-sharding it from there before a write would make
+    the one terminal whose output is the size of the result also the one that funnels it
+    through a single process. For the row-preserving breakers (sort,
     window) that is the entire relation.
 
     Args:

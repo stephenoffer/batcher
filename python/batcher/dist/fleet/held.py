@@ -22,9 +22,8 @@ scalar of "we hold 350 cores" cannot say whether the 96-core machine is free. Th
 group knows exactly, since it is what reserved them -- `placement_group_table` maps each bundle
 to the node Ray placed it on, and the bundle specs say what each bundle took.
 
-Best-effort throughout: an unreadable table returns `{}` and every caller then sees the free
-cores it saw before this existed, which is the pre-existing behaviour rather than a new
-failure mode.
+Best-effort throughout: an unreadable table returns `{}` and every caller then sees the plain
+free-core count, with no held cores added back, rather than a new failure mode.
 """
 
 from __future__ import annotations

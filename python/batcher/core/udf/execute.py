@@ -94,9 +94,9 @@ def execute_with_udfs(
 
     `source_projections` is the per-source column list Kyber decided (Core executes the plan it
     is given; it does not compute projections — see `.claude/rules/architecture.md`). Without it
-    the scan beneath a UDF reads **every** column of the source, which is what a `map_batches`
-    over one column of a wide table used to do. `None` means "read everything", the old
-    behavior, which is what an undeclared (`input_columns=None`) UDF still requires.
+    the scan beneath a UDF reads **every** column of the source, even for a `map_batches` over
+    one column of a wide table. `None` means "read everything", which is what an undeclared
+    (`input_columns=None`) UDF requires.
 
     A linear ``Scan → map_batches → … → map_batches`` chain (the batch-inference /
     multimodal-preprocessing shape) runs through the **streaming, stage-overlapped**

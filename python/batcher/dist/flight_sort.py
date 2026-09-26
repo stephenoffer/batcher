@@ -67,9 +67,9 @@ _log = get_logger("dist.sort")
 def _phase(name: str, seconds: float, **fields: object) -> None:
     """Record one distributed-sort phase timing on the central logger.
 
-    These timings used to be `print`s behind a `BATCHER_SORT_PROFILE` env var: invisible to
-    the log file, unfilterable, on stdout in the middle of a user's results, and unknown to
-    the dashboard. As DEBUG records on `batcher.dist.sort` they answer to the same
+    Log records rather than `print`s, which would be invisible to the log file,
+    unfilterable, on stdout in the middle of a user's results, and unknown to the
+    dashboard. As DEBUG records on `batcher.dist.sort` they answer to the same
     `log_level` as everything else, and the phase name and duration are structured fields
     rather than a sentence — so "which phase dominates this sort" is a query, not a grep.
 
@@ -291,10 +291,10 @@ def execute_sort_flight(
         # buckets keep the ticket the reducers dial.
         dead: set[int] = set()
 
-        # One ticket stage for THIS sort's shuffle. The stage used to be the literal 0, so
-        # two sorts in one query (or a sort beside a window) published byte-identical
-        # tickets on the same worker and the second overwrote the first — the collision
-        # that made a join read another join's buckets. See `fleet.plan_id.next_stage_base`.
+        # One ticket stage for THIS sort's shuffle, never a literal: two sorts in one query
+        # (or a sort beside a window) would otherwise publish byte-identical tickets on the
+        # same worker and the second would overwrite the first, so a join could read another
+        # join's buckets. See `fleet.plan_id.next_stage_base`.
         stage_base = next_stage_base(1)
 
         # SAMPLE: each worker samples its own split's leading-key distribution.

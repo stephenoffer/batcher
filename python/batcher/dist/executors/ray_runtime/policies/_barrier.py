@@ -315,17 +315,16 @@ def gather_map_results(
             # A deterministic UDF error fails the same way everywhere, so resubmitting cannot
             # help — surface it immediately. But a CUDA OOM, a throttled model endpoint, or a
             # network timeout also arrives as a `RayTaskError`, and those DO clear on a retry.
-            # Failing the whole job on one used to discard hours of completed inference.
+            # Failing the whole job on one would discard hours of completed inference.
             #
-            # `is_recoverable_task_failure` is the second of those, and it was missing. The
-            # comment in `_faults` reads "a map task that fails reports worker loss as a *Ray*
-            # error", which was true until a map task could **read a Flight intermediate**: a
-            # stage scanning what a previous stage published fetches from a peer inside the
-            # task, so a lost peer arrives here as a `RetryableShuffleError` wrapped in a
-            # `RayTaskError` — the transport's own word for "retry me" — and was re-raised.
-            # Observed as a windowed rank over a hot key dying with `transport error` while
-            # the identical query on a uniform key passed, because only the skewed one moved
-            # a bucket big enough for the fetch to break.
+            # `is_recoverable_task_failure` covers worker loss that arrives as a task error: a
+            # map task can **read a Flight intermediate**, so a stage scanning what a previous
+            # stage published fetches from a peer inside the task, and a lost peer arrives here
+            # as a `RetryableShuffleError` wrapped in a `RayTaskError` — the transport's own
+            # word for "retry me". Re-raising it was observed as a windowed rank over a hot
+            # key dying with `transport error` while the identical query on a uniform key
+            # passed, because only the skewed one moved a bucket big enough for the fetch to
+            # break.
             if not (_is_transient_udf_error(exc) or is_recoverable_task_failure(exc)):
                 raise
             # Almost every failure loses work, which is what a retry is for. A device that
@@ -368,10 +367,10 @@ def gather_map_results(
 def _idle_pool(workers: int, slots: int) -> deque[int]:
     """The pre-filled idle pool, each worker appearing in proportion to the cores it holds.
 
-    The pool is what the barrier deals sources from, and it used to be filled with every worker
-    exactly `slots` times. On a uniform fleet that is right. On an unequal one it is a *static*
-    even deal wearing a dynamic barrier's clothes, because `map_partitions` sizes the source
-    count at `workers x slots` — exactly the pool's depth — so every source is handed out from
+    The pool is what the barrier deals sources from. Filling it with every worker exactly
+    `slots` times is right on a uniform fleet. On an unequal one it is a *static* even deal
+    wearing a dynamic barrier's clothes, because `map_partitions` sizes the source count at
+    `workers x slots` — exactly the pool's depth — so every source is handed out from
     the initial fill and the go-idle path that would have corrected the imbalance never runs.
 
     Measured on the 28-node / 384-core mixed cluster, 128 sources over 32 workers:

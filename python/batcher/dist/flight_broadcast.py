@@ -435,12 +435,13 @@ def _bounded_build_side(nat, build_plan, source: Source, proj, pred, cfg_json: s
     """The build side's batches, or None as soon as they are known to exceed `budget`.
 
     The measured re-check is what makes an *estimated* broadcast decision safe to act on,
-    and it used to buy that safety by reading the whole build relation on the driver —
-    one node, one stream — before it could say no. Measured on TPC-H sf100
+    but reading the whole build relation on the driver — one node, one stream — before it
+    can say no is too expensive a way to buy that safety. Measured on TPC-H sf100
     `lineitem ⋈ orders` over 8 workers, where a runtime-filtered build side estimates
-    small and materializes at gigabytes: **10.2 s of driver time spent to learn the answer
-    and then discard the data**, turning an 11.7 s query into 23.5 s. The guard has to
-    stay; what it must not do is cost more than the strategy it is guarding.
+    small and materializes at gigabytes, the whole-relation read spent **10.2 s of driver
+    time to learn the answer and then discard the data**, turning an 11.7 s query into
+    23.5 s. The guard has to stay; what it must not do is cost more than the strategy it is
+    guarding.
 
     So stop at the budget instead of at the end of the relation. When the build plan is
     row-wise — a chain of scan/filter/project, which is what a build side under a pushed
@@ -452,7 +453,7 @@ def _bounded_build_side(nat, build_plan, source: Source, proj, pred, cfg_json: s
     a budget's worth of reading rather than a relation's.
 
     Any other shape — an aggregate or a join underneath, a source that will not split —
-    falls back to the whole-relation read, which is the behaviour before this existed.
+    falls back to the whole-relation read.
 
     Bailing early is never a correctness question: the caller runs the co-partition
     shuffle, which produces the same relation.
