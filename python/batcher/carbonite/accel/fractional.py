@@ -28,15 +28,12 @@ make a working cluster worse by declining to answer.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 from batcher._internal.device_share import (
-    MAX_COTENANTS,
     balanced_fraction,
     cotenants_per_device,
     devices_for,
-    pack_fraction,
     quantize_fraction,
     share_bytes,
     usable_bytes,
@@ -46,9 +43,7 @@ __all__ = [
     "TaskPacking",
     "derated_cotenants",
     "external_headroom_bytes",
-    "packing_summary",
     "plan_task_packing",
-    "shard_fraction",
     "whole_device_packing",
 ]
 
@@ -166,46 +161,6 @@ def derated_cotenants(per_device: int, derate: float) -> int:
     if per_device <= 1:
         return 1
     return max(1, int(per_device * min(derate, 1.0)))
-
-
-def shard_fraction(
-    shard_bytes: float,
-    device_bytes: float,
-    *,
-    headroom: float | None = None,
-    max_per_device: int = MAX_COTENANTS,
-) -> float:
-    """The `num_gpus` one relational shard task should request.
-
-    The relational counterpart of the inference-stage packing Kyber does. A GPU fan-out
-    oversubscribes shards past the device count so each one is small and a lost one is cheap;
-    every one of those shards then asks for a whole device, and Ray runs exactly one per device
-    while the rest queue. When a shard's working set is a quarter of a device, that is a
-    four-fold under-use of a fleet whose shard count already says it expected to fit.
-
-    Args:
-        shard_bytes: The largest shard's estimated device working set. The *largest*, not the
-            mean: the fraction is one number for the whole fan-out, and sizing it to the mean
-            guarantees the biggest shard does not fit the share it was granted.
-        device_bytes: One device's total memory, the smallest on a mixed fleet.
-        headroom: Fraction of the device held back, or `None` for the configured
-            `accelerator.vram_headroom`. A literal default here was one of the five private
-            copies of that knob, so a fleet that raised it packed shards against memory
-            Carbonite's admission pool had already reserved.
-        max_per_device: Ceiling on co-tenants, which floors the fraction. A caller that knows
-            the device is derated or already occupied passes a lower number here rather than
-            adjusting the byte figure, so the reason survives into the decision log.
-
-    Returns:
-        A fraction from the packing ladder, `1.0` whenever nothing could be decided or the
-        shard needs a whole device or more. Never `0.0`: a shard task with no GPU request is a
-        GPU task scheduled onto a CPU, so the no-opinion answer here is the whole device.
-    """
-    raw = pack_fraction(shard_bytes, device_bytes, headroom=headroom)
-    if raw <= 0.0 or raw >= 1.0:
-        return 1.0
-    floor = balanced_fraction(max(1, min(max_per_device, MAX_COTENANTS)))
-    return max(raw, floor)
 
 
 def plan_task_packing(
@@ -346,29 +301,3 @@ def _isolated_packing(need_bytes: float, accelerator_type: str, want: int) -> Ta
         isolated=True,
         reason=plan.reason,
     )
-
-
-def packing_summary(packings: Sequence[TaskPacking]) -> dict:
-    """What a set of packing decisions costs the fleet, as one record.
-
-    The figure worth reporting is not any single fraction but the *total* device demand: a job
-    whose stages each packed sensibly can still ask for more devices than the cluster has, and
-    that is visible only in the sum.
-
-    Args:
-        packings: The decisions taken, one per stage.
-
-    Returns:
-        `stages`, `devices` (summed), `packed_stages` (those sharing a device), `isolated`
-        (those on a hardware partition), and `min_fraction` — the tightest share granted, which
-        is the one an out-of-memory report should be read against. Zeroed for an empty input.
-    """
-    if not packings:
-        return {"stages": 0, "devices": 0, "packed_stages": 0, "isolated": 0, "min_fraction": 0.0}
-    return {
-        "stages": len(packings),
-        "devices": sum(p.devices for p in packings),
-        "packed_stages": sum(1 for p in packings if p.packed),
-        "isolated": sum(1 for p in packings if p.isolated),
-        "min_fraction": min(p.fraction for p in packings),
-    }

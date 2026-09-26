@@ -5,7 +5,7 @@ peak memory (`m_max_bytes`) and, since it began populating `PhysicalOp.inputs`, 
 shape. Carbonite consumes both: on a linear plan the engine materializes one pipeline
 breaker at a time, so the footprint is the largest breaker rather than the sum; on a bushy
 plan a join's build side stays resident while the probe side runs, so several are alive at
-once and the largest-single reading under-counts. `peak_operator_bytes` walks the schedule
+once and the largest-single reading under-counts. `learned_plan_peak` walks the schedule
 that distinguishes them, and `OperatorMemoryEstimator` returns its answer as the envelope
 the admission check and the spill decision reason about.
 
@@ -34,48 +34,11 @@ __all__ = [
     "binding_operator",
     "learned_plan_peak",
     "peak_contributors",
-    "peak_operator_bytes",
 ]
 
 
-def peak_operator_bytes(plan: PhysicalPlan) -> int:
-    """The plan's peak in-memory footprint: the most bytes resident at any one moment.
-
-    On a **linear** pipeline that is the dominant breaker, because the engine materializes
-    one at a time and summing them would double-count memory never live together.
-
-    On a **bushy** plan it is not, and the difference is the difference between admitting a
-    query and OOMing it. A hash join's build side stays resident for as long as the probe
-    side runs, so a join of two joins has three hash tables alive at once. With three sized
-    at 18.2 / 9.1 / 9.1 MB, the largest-single reading is 18.2 and the honest concurrent one
-    is 27.4 — a 1.5x under-count, in the one direction a safety bound must not fail.
-
-    So the walk is now the schedule, not a `max`. For a join, the build side is materialized
-    first (its own subtree peaks and then collapses to the table), and that table is
-    resident while the probe subtree runs:
-
-        peak(join)  = max(peak(build), resident(join) + peak(probe))
-        peak(unary) = max(peak(input), resident(node))
-
-    A unary breaker takes the `max` because its input pipeline has finished and released by
-    the time its own state is full — which is exactly why the linear case is unchanged and
-    every existing linear-plan envelope is byte-for-byte what it was.
-
-    Falls back to the `max` over all operators when `inputs` is empty, which is what a
-    hand-built `PhysicalPlan` (and every test double) carries. That fallback is the previous
-    behavior exactly, so an unwired plan is never *worse* off than before.
-
-    Args:
-        plan: The annotated physical plan.
-
-    Returns:
-        Peak concurrent bytes, `0` when nothing in the plan could be sized.
-    """
-    return _peak(plan)[0]
-
-
 def peak_contributors(plan: PhysicalPlan) -> tuple:
-    """The operators whose footprints *add up to* `peak_operator_bytes(plan)`.
+    """The operators whose footprints *add up to* the plan's cold-store peak.
 
     On a linear pipeline this is the single dominant breaker, which is what the envelope
     always was. On a bushy plan the peak is a **sum** over operators alive at the same
@@ -101,7 +64,31 @@ def peak_contributors(plan: PhysicalPlan) -> tuple:
 
 
 def _peak(plan: PhysicalPlan, size_of=None) -> tuple[int, frozenset[int]]:
-    """`(peak bytes, contributing operator ids)` for `plan`.
+    """`(peak bytes, contributing operator ids)` for `plan`: the most bytes resident at once.
+
+    On a **linear** pipeline that is the dominant breaker, because the engine materializes
+    one at a time and summing them would double-count memory never live together.
+
+    On a **bushy** plan it is not, and the difference is the difference between admitting a
+    query and OOMing it. A hash join's build side stays resident for as long as the probe
+    side runs, so a join of two joins has three hash tables alive at once. With three sized
+    at 18.2 / 9.1 / 9.1 MB, the largest-single reading is 18.2 and the honest concurrent one
+    is 27.4 — a 1.5x under-count, in the one direction a safety bound must not fail.
+
+    So the walk is the schedule, not a `max`. For a join, the build side is materialized
+    first (its own subtree peaks and then collapses to the table), and that table is
+    resident while the probe subtree runs:
+
+        peak(join)  = max(peak(build), resident(join) + peak(probe))
+        peak(unary) = max(peak(input), resident(node))
+
+    A unary breaker takes the `max` because its input pipeline has finished and released by
+    the time its own state is full, which is why a linear plan's envelope is its largest
+    breaker.
+
+    Falls back to the `max` over all operators when `inputs` is empty, which is what a
+    hand-built `PhysicalPlan` (and every test double) carries, so an unwired plan gets the
+    largest-single reading.
 
     `size_of` overrides each operator's byte figure — the seam the learned blend uses, so
     "how big is this operator" has one answer and the schedule walk has one implementation.
@@ -177,7 +164,7 @@ def learned_plan_peak(plan: PhysicalPlan, model) -> int:
 
     Each operator's plan estimate is folded toward what its family really used
     (`LearnedMemoryModel.blend_peak`), and cold families pass through unchanged, so on a
-    cold store this is exactly `peak_operator_bytes`.
+    cold store this is exactly the plan's own schedule walk.
 
     **The blend is applied per operator and the schedule is walked over the result**, rather
     than by taking the model's own flat `plan_peak`. That distinction is the whole point: a
@@ -293,7 +280,7 @@ def binding_operator(plan: PhysicalPlan):
 class OperatorMemoryEstimator:
     """Estimates a plan's memory envelope from Kyber's per-operator bounds.
 
-    The envelope's `m_max_bytes` is the dominant breaker (`peak_operator_bytes`);
+    The envelope's `m_max_bytes` is the plan's peak (`learned_plan_peak`);
     the credit and parallelism fields carry the same conservative defaults the
     bootstrap used so the flow-control and scheduling sides are unaffected until
     they grow their own estimates.

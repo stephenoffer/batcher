@@ -27,7 +27,6 @@ from batcher.carbonite.policies.congestion import (
     probe_pressure,
 )
 from batcher.carbonite.policies.cpu_budget import (
-    effective_core_budget,
     oversubscription_note,
 )
 from batcher.carbonite.policies.flow_control import (
@@ -62,7 +61,6 @@ __all__ = [
     "StreamingRateController",
     "bdp_window",
     "credit_ceiling",
-    "effective_core_budget",
     "learned_channel_morsel_bytes",
     "load_shuffle_window",
     "measured_bdp_window",

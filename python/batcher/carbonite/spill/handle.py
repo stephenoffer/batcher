@@ -37,21 +37,3 @@ class SpillHandle:
     nbytes: int
     logical_nbytes: int = 0
     num_rows: int = 0
-
-    @property
-    def compression_ratio(self) -> float:
-        """`logical_nbytes / nbytes` — how much the codec actually bought on this bucket.
-
-        `1.0` when either size is unknown, so a caller can multiply by it unconditionally.
-        The figure a re-spill decision wants: a bucket that compressed 8x needs 8x its
-        on-disk size in RAM to read back, which is exactly the trap `logical_nbytes` exists
-        to close.
-        """
-        if self.nbytes <= 0 or self.logical_nbytes <= 0:
-            return 1.0
-        return self.logical_nbytes / self.nbytes
-
-    @property
-    def is_remote(self) -> bool:
-        """Whether this bucket lives on the (slow, durable) object-storage tier."""
-        return self.tier is SpillTier.REMOTE

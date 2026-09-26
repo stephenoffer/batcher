@@ -35,7 +35,7 @@ def machine(monkeypatch):
 def test_a_quiet_machine_keeps_every_permitted_core(machine):
     # The common case must be untouched: no contention, no reduction, no behavior change.
     machine(permitted=16, oversubscription=1.0)
-    assert cpu_budget.effective_core_budget() == 16
+    assert cpu_budget.reduced_core_budget() is None
     assert cpu_budget.oversubscription_note() == ""
 
 
@@ -43,7 +43,7 @@ def test_mild_contention_is_inside_the_deadband(machine):
     # An idle box still reports a small load average and occasional PSI stalls. Acting on
     # those would make fan-out jitter query to query for no reason.
     machine(permitted=16, oversubscription=1.2)
-    assert cpu_budget.effective_core_budget() == 16
+    assert cpu_budget.reduced_core_budget() is None
     assert cpu_budget.oversubscription_note() == ""
 
 
@@ -51,7 +51,7 @@ def test_real_contention_cuts_the_budget(machine):
     # Two workers sharing a 16-core node: each measures 2x oversubscription and should ask
     # for 8, which is what it will actually get. Asking for 16 makes both run slower.
     machine(permitted=16, oversubscription=2.0)
-    assert cpu_budget.effective_core_budget() == 8
+    assert cpu_budget.reduced_core_budget() == 8
     note = cpu_budget.oversubscription_note()
     assert "16 -> 8" in note and "2.0x" in note, note
 
@@ -60,9 +60,8 @@ def test_a_pathological_reading_cannot_serialize_a_query(machine):
     # A load spike, a PSI file reporting a neighbour's stall, or a load average carrying a
     # finished job's tail must not be able to collapse the engine to one thread.
     machine(permitted=16, oversubscription=1000.0)
-    budget = cpu_budget.effective_core_budget()
+    budget = cpu_budget.reduced_core_budget()
     assert budget == int(16 * cpu_budget.MIN_BUDGET_FRACTION) == 4
-    assert budget >= 1
 
 
 def test_the_budget_never_exceeds_what_is_permitted(machine):
@@ -70,14 +69,23 @@ def test_the_budget_never_exceeds_what_is_permitted(machine):
     # throttled by the kernel — the exact failure this policy exists to avoid.
     for pressure in (0.1, 0.5, 1.0, 1.25, 3.0, 50.0):
         machine(permitted=8, oversubscription=pressure)
-        assert 1 <= cpu_budget.effective_core_budget() <= 8
+        reduced = cpu_budget.reduced_core_budget()
+        assert reduced is None or 1 <= reduced < 8
 
 
 def test_an_explicit_setting_is_an_instruction_not_an_estimate(machine):
     # `execution.parallelism` is a user decision. Silently overriding it under load would make
     # the knob a lie, and a user who set it has context this process does not.
+    import dataclasses
+
+    from batcher.carbonite import manager as mgr
+    from batcher.config import Config
+
     machine(permitted=16, oversubscription=8.0)
-    assert cpu_budget.effective_core_budget(configured=12) == 12
+    assert cpu_budget.reduced_core_budget() == 4  # the machine alone would narrow it
+    cfg = Config()
+    cfg = cfg.replace(execution=dataclasses.replace(cfg.execution, parallelism=12))
+    assert mgr.ResourceManager(cfg).recommend_parallelism() is None
 
 
 def test_the_manager_leaves_a_quiet_machine_alone(monkeypatch):

@@ -28,9 +28,7 @@ __all__ = [
     "FlightShuffleServer",
     "ShuffleClient",
     "ShuffleTicket",
-    "bytes_fetched",
     "fetch",
-    "reset_bytes_fetched",
 ]
 
 
@@ -396,43 +394,13 @@ class ShuffleClient:
         `token` is the shuffle auth secret presented to an auth-gated peer.
         """
         if credits is None:
-            batches = self._client.fetch(addr, str(ticket), token=token)
-        else:
-            batches = self._client.fetch(addr, str(ticket), credits, token)
-        _add_bytes_fetched(total_logical_bytes(batches))
-        return batches
+            return self._client.fetch(addr, str(ticket), token=token)
+        return self._client.fetch(addr, str(ticket), credits, token)
 
     @property
     def connection_count(self) -> int:
         """Number of peers with a live cached channel (telemetry/tests)."""
         return self._client.connection_count
-
-
-_BYTES_FETCHED = 0
-# The reducer-ingress counter is written from every fetching thread (a join reducer runs
-# two gathers at once, and each `gather_*` fans out further). `+=` on a module global is a
-# read-modify-write, so concurrent fetches silently lost bytes from the one figure that is
-# supposed to measure how much data actually crossed the wire.
-_BYTES_LOCK = threading.Lock()
-
-
-def _add_bytes_fetched(n: int) -> None:
-    """Fold `n` fetched bytes into the process-wide ingress counter."""
-    global _BYTES_FETCHED
-    with _BYTES_LOCK:
-        _BYTES_FETCHED += n
-
-
-def reset_bytes_fetched() -> None:
-    """Zero the process-wide shuffle-ingress counter.
-
-    A per-process lifetime total cannot answer "how much did *this query* fetch", which is
-    the question a benchmark and a per-query profile both ask. Zeroing at a known point and
-    reading `bytes_fetched()` after gives the delta.
-    """
-    global _BYTES_FETCHED
-    with _BYTES_LOCK:
-        _BYTES_FETCHED = 0
 
 
 def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[pa.RecordBatch]:
@@ -443,17 +411,6 @@ def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[
     Carbonite grants; `None` uses the engine's conservative default window.
     """
     flight_fetch = engine().flight_fetch
-    batches = (
-        flight_fetch(addr, str(ticket))
-        if credits is None
-        else flight_fetch(addr, str(ticket), credits)
-    )
-    _add_bytes_fetched(total_logical_bytes(batches))
-    return batches
-
-
-def bytes_fetched() -> int:
-    """Total bytes this process has fetched over the shuffle network — its reducer-side
-    ingress volume, the counterpart to `FlightShuffleServer.bytes_published` (egress).
-    Measurement only; Carbonite/Kyber reason about shuffle network cost from the pair."""
-    return _BYTES_FETCHED
+    if credits is None:
+        return flight_fetch(addr, str(ticket))
+    return flight_fetch(addr, str(ticket), credits)

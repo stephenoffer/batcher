@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from batcher._internal.hardware import available_cpu_count, cpu_oversubscription
 
-__all__ = ["effective_core_budget", "oversubscription_note", "reduced_core_budget"]
+__all__ = ["oversubscription_note", "reduced_core_budget"]
 
 # Never cut fan-out below this fraction of the permitted budget, however bad the contention
 # reading. A pathological measurement — a transient load spike, a PSI file reporting a
@@ -50,19 +50,13 @@ CONTENTION_DEADBAND = 1.25
 def _measure() -> tuple[int, int, float]:
     """`(permitted, reduced, pressure)` from **one** CPU probe and one contention read.
 
-    The three public entry points below all want some pair of these, and each used to take its
-    own readings — `effective_core_budget` probed the permitted count even when a configured
-    value made it irrelevant, `recommend_parallelism` called `effective_core_budget` and then
-    probed *again* to see whether the answer differed from permitted, and
-    `oversubscription_note` probed a third time to render the same comparison. Every one of
-    those readings is `available_cpu_count`, which walks the affinity mask, the CFS quota and
-    the batch scheduler's dozen environment variables at ~21 microseconds a call.
+    Both public entry points below want some of these, and each reading is
+    `available_cpu_count`, which walks the affinity mask, the CFS quota and the batch
+    scheduler's dozen environment variables at ~21 microseconds a call. Repeated readings of a
+    number that has not changed were most of `ResourceManager.recommend_parallelism`'s 108 us
+    on a 3-row filter costing ~1.3 ms end to end.
 
-    That is small until you count how often it happens: a 3-row filter costs ~1.3 ms end to
-    end, and `ResourceManager.recommend_parallelism` alone was **108 us** of it, most of it
-    the second and third reading of a number that had not changed since the first.
-
-    Taking the readings once here also makes the three answers *consistent* — two probes a
+    Taking the readings once here also makes the answers *consistent* — two probes a
     microsecond apart can straddle a load-average update and report a reduction that the
     accompanying note then declines to explain.
     """
@@ -72,25 +66,6 @@ def _measure() -> tuple[int, int, float]:
         return permitted, permitted, pressure
     floor = max(1, int(permitted * MIN_BUDGET_FRACTION))
     return permitted, max(floor, int(permitted / pressure)), pressure
-
-
-def effective_core_budget(configured: int = 0) -> int:
-    """Cores to fan out across, reduced by measured contention. Never fewer than 1.
-
-    `configured` wins when set, because an explicit `execution.parallelism` is a user
-    instruction rather than an estimate, and silently overriding it would make the knob a lie.
-    Otherwise the permitted budget is divided by the measured oversubscription, floored at
-    `MIN_BUDGET_FRACTION` of the permitted count.
-
-    Args:
-        configured: An explicit parallelism setting, or `0` to derive one.
-
-    Returns:
-        The core count to size thread pools and task fan-out against, at least 1.
-    """
-    if configured > 0:
-        return configured
-    return _measure()[1]
 
 
 def reduced_core_budget() -> int | None:

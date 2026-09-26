@@ -1022,7 +1022,7 @@ Fabric-aware placement: what the accelerator fleet looks like, and where work sh
 | `placement.py` | 419 | Placing accelerator work on the fleet: gang bundles, power zones, and efficiency order. |
 | `residency.py` | 97 | Residency as a placement filter — the point where a sovereignty rule reaches the scheduler. |
 | `shape.py` | 187 | The live cluster, rendered into the neutral shape Kyber plans against. |
-| `topology.py` | 443 | Where the accelerators actually are — NVLink domains, nodes, racks, and power zones. |
+| `topology.py` | 402 | Where the accelerators actually are — NVLink domains, nodes, racks, and power zones. |
 
 ### `batcher/dist/executors/ray_runtime/policies/` — 4 · backend
 
@@ -1559,11 +1559,11 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 | `affinity.py` | 202 | Putting a device's host-side work on the cores next to it, and knowing when it is shared. |
 | `allocator.py` | 488 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
 | `amd_health.py` | 79 | The same admission decision, for a vendor NVML cannot see. |
-| `fractional.py` | 374 | Putting several claimants on one device — Carbonite's half of fractional scheduling. |
+| `fractional.py` | 303 | Putting several claimants on one device — Carbonite's half of fractional scheduling. |
 | `health.py` | 619 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 249 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 109 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
-| `parallelism.py` | 439 | Sharding one model across devices: what each device then holds, and what it costs. |
+| `parallelism.py` | 422 | Sharding one model across devices: what each device then holds, and what it costs. |
 | `power.py` | 156 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
 | `vram.py` | 270 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
@@ -1585,7 +1585,7 @@ The shared (cross-process, cross-node) result cache.
 | `base.py` | 123 | What a shared result cache is, and the one rule that makes sharing one sound. |
 | `factory.py` | 107 | Building the shared result cache from its config URI, once per process. |
 | `redis.py` | 134 | Redis-backed shared result cache — low-latency reuse across processes and nodes. |
-| `rocksdb.py` | 189 | RocksDB-backed shared result cache — durable reuse across runs on one node. |
+| `rocksdb.py` | 163 | RocksDB-backed shared result cache — durable reuse across runs on one node. |
 | `store.py` | 217 | The shared result cache as the engine uses it: serialize, store, count, never fail. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
@@ -1594,7 +1594,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimator.py` | 332 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
+| `estimator.py` | 319 | Per-operator memory estimation — what envelope a plan needs to run in memory. |
 | `kernel.py` | 453 | The kernel's own view of how close this process is to being OOM-killed. |
 | `learned.py` | 520 | Learned per-family memory model — turn measured `m_peak_bytes` into sizing. |
 | `pool.py` | 411 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
@@ -1612,7 +1612,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `bdp.py` | 110 | Sizing a credit window from the path it runs over, instead of probing for it. |
 | `concurrency.py` | 361 | Bounding how many queries run at once, and how wide each one gets. |
 | `congestion.py` | 255 | What one round of a data channel actually observed, as a three-state congestion verdict. |
-| `cpu_budget.py` | 126 | How many cores the engine should ask for, given how many it is really getting. |
+| `cpu_budget.py` | 101 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 669 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 345 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
@@ -1644,9 +1644,9 @@ Carbonite out-of-core spilling: the two-tier scratch store for oversized state.
 | module | lines | what it is |
 |---|---|---|
 | `disk.py` | 404 | The scratch volume, measured — free space, budget clamping, and the IPC codec. |
-| `handle.py` | 57 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
+| `handle.py` | 39 | What a spilled partition *is*: which tier holds it, and how big it is two ways. |
 | `scratch.py` | 75 | Where Carbonite's out-of-core bytes go: resolving a scratch directory and its store. |
-| `store.py` | 495 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
+| `store.py` | 485 | Tiered spill storage — keep large state alive under bounded memory, at any scale. |
 | `writer.py` | 452 | One spill bucket, streamed to whichever tier its first batch can afford. |
 
 ### `batcher/carbonite/transfer/` — 3 · subsystem
@@ -1656,13 +1656,13 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | module | lines | what it is |
 |---|---|---|
 | `codec.py` | 110 | Which wire codec a shuffle should use, decided against the link it will actually cross. |
-| `device_exchange.py` | 390 | Redistributing between the devices of one node without serializing them behind each other. |
+| `device_exchange.py` | 385 | Redistributing between the devices of one node without serializing them behind each other. |
 | `fabric_usage.py` | 129 | What the node's RDMA fabric carried while a shuffle was running. |
 | `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
 | `locality.py` | 183 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `peers.py` | 188 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 153 | Locality-aware reducer placement — put a reducer where its data already is. |
-| `server.py` | 459 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
+| `server.py` | 416 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
 | `session.py` | 524 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
 | `staging.py` | 271 | How a transfer crosses the host link: chunk size, how many are in flight, and pinned or not. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |
