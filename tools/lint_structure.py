@@ -576,6 +576,22 @@ def check_repo_root(tracked: list[str]) -> None:
         fail(f"{name}: data/scratch file tracked at the repository root — it belongs in a package")
 
 
+def check_test_basenames(tracked: list[str]) -> None:
+    """Test modules must have unique basenames: `tests/` has no `__init__.py`, so pytest
+    imports each by basename and a second module of the same name aborts the whole collection.
+    """
+    seen: dict[str, str] = {}
+    for name in tracked:
+        path = Path(name)
+        if path.parts[:1] != ("tests",) or not path.name.startswith("test_"):
+            continue
+        if path.suffix != ".py" or "corpus" in path.parts:
+            continue
+        if path.name in seen:
+            fail(f"{name}: same basename as {seen[path.name]} — pytest aborts collection")
+        seen.setdefault(path.name, name)
+
+
 # --- Allowlist hygiene ------------------------------------------------------------
 #
 # An allowlist that only ever grows is debt wearing a nice hat. Every exemption here was
@@ -666,7 +682,9 @@ def main() -> int:
     repo = Path(__file__).resolve().parent.parent
     os.chdir(repo)
 
-    check_repo_root(_tracked_files())
+    tracked = _tracked_files()
+    check_repo_root(tracked)
+    check_test_basenames(tracked)
 
     for root in (PY_ROOT, BENCH_ROOT):
         if root.is_dir():

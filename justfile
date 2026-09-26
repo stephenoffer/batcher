@@ -27,7 +27,7 @@ test-py:
 # those Ray/adaptive-learning tests are stable on their own (`just test-py`) but
 # flake under coverage instrumentation's timing, which would make the gate
 # non-deterministic. They still run for correctness in `test-py`.
-COV_PATHS := "tests/unit tests/differential tests/property tests/io tests/docs"
+COV_PATHS := "tests/unit tests/differential tests/property tests/io tests/docs tests/migrate"
 
 # Measure Python control-plane coverage (terminal + HTML report).
 cov-py:

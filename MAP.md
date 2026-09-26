@@ -352,7 +352,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 268 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
 | `run.py` | 668 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
-| `sizing.py` | 283 | What the conductor needs to know about a plan's size before it runs it. |
+| `sizing.py` | 277 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 418 | The three ways the conductor can execute an admitted plan, plus the source read. |
 | `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
 
@@ -427,7 +427,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `_metadata.py` | 742 | Post-execution column-statistics learning (Core measures, Kyber persists). |
+| `_metadata.py` | 739 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 1467 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
@@ -1158,7 +1158,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `metadata_answer.py` | 438 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 74 | The optimizer context — shared analysis threaded through every rule. |
-| `plan_cache.py` | 688 | Memoize the optimizer — the same query, planned once. |
+| `plan_cache.py` | 683 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 281 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 282 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 264 | The Kyber rule abstraction — one small, pure unit of optimization. |
@@ -1231,8 +1231,8 @@ The Kyber optimizer entry point.
 
 | module | lines | what it is |
 |---|---|---|
-| `driver.py` | 522 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
-| `expr_dispatch.py` | 255 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
+| `driver.py` | 508 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
+| `expr_dispatch.py` | 239 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
 | `facade.py` | 593 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -1346,7 +1346,7 @@ Extended Kyber rule families.
 | `setops.py` | 388 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
-| `strings.py` | 489 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
+| `strings.py` | 482 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
 | `temporal_date_cast.py` | 186 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
 | `temporal_extra.py` | 462 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
 | `temporal_folds.py` | 185 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
@@ -1614,7 +1614,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `congestion.py` | 255 | What one round of a data channel actually observed, as a three-state congestion verdict. |
 | `cpu_budget.py` | 126 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 669 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
-| `morsel.py` | 350 | How big a morsel should be, given memory pressure and the rows' measured width. |
+| `morsel.py` | 345 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
 | `scheduling.py` | 288 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 469 | Whether a query goes out of core, and what shape its spilled state takes. |
@@ -2636,7 +2636,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `registry.py` | 405 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name grammar. |
 | `sequence.py` | 81 | Output types for the `.seq` genomics expressions. |
 | `text_quality.py` | 47 | Output types for the per-document text-quality string functions. |
-| `widths.py` | 314 | Static per-column byte widths derived from a column's Arrow type. |
+| `widths.py` | 303 | Static per-column byte widths derived from a column's Arrow type. |
 
 ### `batcher/plan/types/infer/` — 1 · contract
 
@@ -2723,7 +2723,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `optional.py` | 82 | The one optional-dependency import guard. |
 | `paths.py` | 107 | Filesystem locations of the installed package, and how to create things there safely. |
 | `prefetch.py` | 116 | Overlap a producer generator with its consumer on a background thread. |
-| `registry.py` | 192 | A single generic registry pattern, used for every extension point. |
+| `registry.py` | 257 | Keyed lookup tables: the generic extension-point registry and the identity memo. |
 | `sql_errors.py` | 57 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
 
 ### `batcher/_internal/concurrency/` — 0 · utility
