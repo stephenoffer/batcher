@@ -245,16 +245,18 @@ times the rows for less than ten times the time. The four that are not (q5, q9, 
 join-tree shapes whose intermediate results grow faster than the scan, and they are most of the
 sf10 gap.
 
-Batcher leads DuckDB's own store at sf1 and sf10 and DuckDB leads at sf100, and the crossover
-has three structural causes, none of them a tuning knob: DuckDB
+Batcher leads DuckDB's own store at sf1 and sf10 and DuckDB leads at sf100, and two structural
+causes favour DuckDB as rows grow, neither of them a tuning knob: DuckDB
 **decompresses its native store on the fly** (fewer bytes off memory — Batcher's Arrow-only
-contract has no compressed form to read), its **vector-at-a-time engine with selection vectors**
-edges Batcher's batch-at-a-time kernels as rows grow, and it **streams** where Batcher's model
-materializes each operator's output — which is what OOMs the largest single-node sf100 joins.
+contract has no compressed form to read), and its **vector-at-a-time engine with selection
+vectors** edges Batcher's batch-at-a-time kernels as rows grow. A third cause is gone: Batcher's
+executor used to materialize every operator's output, which OOM-killed q3/q4/q5 at sf100, and
+it now streams by default, materializing only at pipeline breakers. The last recorded sf100 run
+still did not finish, so that row stays a loss.
 Batcher's answer at that scale is **distribution**: the same mergeable operators shard across a
 cluster (one partition per node, bounded per-node memory), which is the regime it is built for.
 Closing the single-node scale gap to DuckDB is honest, open work — a compressed or
-dictionary-encoded scan path, dictionary-aware grouping, and streaming between operators. The
+dictionary-encoded scan path, dictionary-aware grouping, and selection vectors. The
 first of those is also what the H2O.ai `groupby` loss is: on the identical Arrow input Batcher
 wins that task 10 of 10 by **9×**, and loses it 4 of 10 once DuckDB reads its own dictionary
 encoding instead.
