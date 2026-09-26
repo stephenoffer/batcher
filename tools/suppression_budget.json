@@ -3,7 +3,7 @@
   "dir-allow": 9,
   "noqa": 226,
   "noqa-ARG002": 83,
-  "pragma-no-cover": 230,
+  "pragma-no-cover": 223,
   "production-assert": 13,
   "structure-allow": 35,
   "type-ignore": 133
