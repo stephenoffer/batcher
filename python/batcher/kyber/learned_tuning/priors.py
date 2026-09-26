@@ -19,8 +19,8 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
-from batcher.config import active_config
 from batcher.kyber import plan_cache
+from batcher.metadata.smoothed import convergent_blend
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -55,18 +55,6 @@ _NS_GROUP = "tuning.group_reduction"  # per-signature measured groups / input ro
 
 
 # Decision family — per-signature priors (partitions, pre-aggregation).
-def _smooth(prior: float, observed: float, n_obs: int) -> float:
-    """A running mean while evidence is thin, decaying into an EWMA.
-
-    Step `max(OptimizerConfig.learned_scalar_alpha_floor, 1/(n_obs+1))`. The floor is *not*
-    the static blend weight used elsewhere: at that 0.5 the newest run always carried half the
-    weight, giving these priors a ~2-observation memory one anomalous run swung by half.
-    """
-    floor = active_config().optimizer.learned_scalar_alpha_floor
-    alpha = max(floor, 1.0 / (n_obs + 1))
-    return alpha * observed + (1.0 - alpha) * prior
-
-
 def _record_scalar(
     hub: MetadataHub | None, namespace: str, key: str, field: str, value: float
 ) -> None:
@@ -79,7 +67,9 @@ def _record_scalar(
         entry = dict(hub.get_keyed_param(namespace, key) or {})
         n = int(entry.get("n_obs", 0))
         prior = entry.get(field)
-        entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
+        entry[field] = (
+            float(value) if prior is None else convergent_blend(float(prior), float(value), n)
+        )
         entry["n_obs"] = n + 1
         plan_cache.record_write(hub, namespace, key, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior

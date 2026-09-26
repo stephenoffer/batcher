@@ -41,7 +41,7 @@ from batcher.kyber.learned_tuning.bandit import (
     ucb1_best_arm,
 )
 
-# `_reward_scale` / `_smooth` / `_fold_ols` are re-exported (redundant alias = an explicit
+# `_reward_scale` / `_fold_ols` are re-exported (redundant alias = an explicit
 # re-export) because they are the family's tested primitives, named as such in the audit ledger.
 from batcher.kyber.learned_tuning.bandit import _reward_scale as _reward_scale
 from batcher.kyber.learned_tuning.crossover import _fold_ols as _fold_ols
@@ -51,7 +51,6 @@ from batcher.kyber.learned_tuning.crossover import (
     record_broadcast_timing,
     record_sort_merge_timing,
 )
-from batcher.kyber.learned_tuning.priors import _smooth as _smooth
 from batcher.kyber.learned_tuning.priors import (
     learned_partial_agg,
     learned_partition_count,

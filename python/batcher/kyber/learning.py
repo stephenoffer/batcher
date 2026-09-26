@@ -38,6 +38,7 @@ from batcher.kyber.measured_width import measured_widths
 from batcher.kyber.signature import plan_signature
 from batcher.metadata import MetadataHub
 from batcher.metadata.hardware_scope import local_or_planned_fingerprint
+from batcher.metadata.smoothed import convergent_blend
 from batcher.metadata.udf_stats import load_udf_row_seconds_table
 from batcher.plan.logical import LogicalPlan
 
@@ -139,22 +140,6 @@ def is_material_change(prior: float | None, observed: float) -> bool:
 
 def _is_material(prior: float | None, observed: float) -> bool:
     return is_material_change(prior, observed)
-
-
-def _smooth(prior: float, observed: float, n_obs: int) -> float:
-    """Exponentially smooth `prior` toward `observed`, with an observation-count floor.
-
-    The step is `max(floor, 1/(n_obs+1))`: a **running mean** while evidence is thin (so a
-    single anomalous early run cannot anchor the estimate), decaying into an EWMA with a
-    ~`1/floor`-observation memory once enough runs have accrued.
-
-    The floor is `learned_scalar_alpha_floor`, not `learning_smoothing_alpha`. The latter is
-    a *static blend weight* used elsewhere; at its value of 0.5 the newest run would always
-    carry half the weight, so `1/(n_obs+1)` would be dominated from the second observation
-    onward and the estimate would never converge.
-    """
-    alpha = max(active_config().optimizer.learned_scalar_alpha_floor, 1.0 / (n_obs + 1))
-    return alpha * observed + (1.0 - alpha) * prior
 
 
 #: The assembled bundle per hub, valid while the hub's two change counters stand still **and
@@ -422,7 +407,7 @@ def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: in
         updated = (
             float(output_rows)
             if prior is None
-            else _smooth(prior, float(output_rows), entry.get("n_obs", 0))
+            else convergent_blend(prior, float(output_rows), entry.get("n_obs", 0))
         )
         if _is_material(prior, updated):
             _bump_generation()
@@ -459,7 +444,7 @@ def record_selectivity(
         entry = dict(hub.get_keyed_param(_NAMESPACE, sig) or {})
         prior = entry.get("selectivity")
         n_obs = entry.get("sel_n_obs", 0)
-        updated = sel if prior is None else _smooth(prior, sel, n_obs)
+        updated = sel if prior is None else convergent_blend(prior, sel, n_obs)
         # The estimator reads this value, so a first write or a material correction must
         # invalidate memoized plans; only converged drift is exempt (see `bump_generation`).
         if is_material_change(prior, updated):

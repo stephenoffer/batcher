@@ -958,7 +958,7 @@ Learned execution-time sizing for the distributed executor (façade).
 
 | module | lines | what it is |
 |---|---|---|
-| `sizing.py` | 597 | Learned execution-time sizing for the distributed executor — measure once, tune next run. |
+| `sizing.py` | 598 | Learned execution-time sizing for the distributed executor — measure once, tune next run. |
 
 ### `batcher/dist/executors/` — 4 · backend
 
@@ -1151,7 +1151,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `common_subplan.py` | 311 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 666 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 651 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
 | `measured_selectivity.py` | 67 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
@@ -1213,7 +1213,7 @@ Learned strategy + parameter tuning — self-tuning physical decisions from meas
 |---|---|---|
 | `bandit.py` | 436 | A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it. |
 | `crossover.py` | 247 | An OLS two-line crossover — where one algorithm overtakes another, learned from timings. |
-| `priors.py` | 164 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
+| `priors.py` | 154 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
 | `topn_bound.py` | 333 | Learned top-N bounds: remember the k-th best value a top-N returned, and use it on the |
 | `topn_footer.py` | 206 | First-run top-N bounds, derived from Parquet row-group statistics rather than remembered. |
 
@@ -2660,7 +2660,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | `hub.py` | 444 | `MetadataHub` — the façade over a `MetadataBackend`. |
 | `io_stats.py` | 249 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `params.py` | 352 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
-| `smoothed.py` | 371 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
+| `smoothed.py` | 432 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
 | `source_stats_store.py` | 299 | Persisted source statistics — remember what Batcher wrote, for the next read. |
 | `store.py` | 122 | The pluggable persistence abstraction behind the MetadataHub. |
 | `udf_stats.py` | 162 | Measured per-UDF execution cost — Core measures it, and two subsystems spend it. |
