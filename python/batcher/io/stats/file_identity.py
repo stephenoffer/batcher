@@ -106,12 +106,6 @@ class FileMetaCache:
             return len(self._entries)
 
 
-# What a cache stores when the file's identity cannot be established. Distinct from any
-# real token, so an unstattable file is never mistaken for a cache hit against another
-# unstattable one — it simply never hits.
-_UNKNOWN = object()
-
-
 def file_identity(path: str, fs: Any | None = None) -> tuple[str, int, int] | None:
     """A token that changes whenever `path`'s content could have changed.
 

@@ -26,7 +26,6 @@ from batcher.io.stats.parquet_manifest import parquet_file_manifest
 from batcher.io.stats.pruning import (
     RowGroupBounds,
     parquet_row_group_bounds,
-    surviving_rows_for_range,
 )
 from batcher.io.stats.sql_catalog import (
     catalog_byte_size,
@@ -51,5 +50,4 @@ __all__ = [
     "parquet_row_group_bounds",
     "parquet_statistics",
     "sql_statistics",
-    "surviving_rows_for_range",
 ]

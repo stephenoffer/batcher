@@ -22,7 +22,7 @@ from batcher.config.env import env_int
 from batcher.io.splits.base import Split
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 
-__all__ = ["RowGroupSplit", "fragment_index", "pack_row_groups", "parquet_row_group_splits"]
+__all__ = ["RowGroupSplit", "fragment_index", "parquet_row_group_splits"]
 
 
 # Per-process LRU of ``key -> (dataset, {fragment_path: fragment})``. A worker
@@ -269,31 +269,6 @@ class RowGroupSplit:
             A key that distinguishes this split from the file's other row-groups.
         """
         return f"parquet:{self.path}:rg{','.join(map(str, self.row_groups))}"
-
-
-def pack_row_groups(
-    num_row_groups: int, sizes: list[int], target_bytes: int | None
-) -> list[tuple[int, ...]]:
-    """Group row-group indices into contiguous runs of roughly `target_bytes`.
-
-    With no target (or unknown sizes) each row-group is its own split — maximum
-    parallelism. Otherwise adjacent row-groups are packed until their compressed
-    size reaches the target, balancing task count against per-task overhead.
-    """
-    if target_bytes is None or not sizes:
-        return [(i,) for i in range(num_row_groups)]
-    runs: list[tuple[int, ...]] = []
-    current: list[int] = []
-    acc = 0
-    for i in range(num_row_groups):
-        current.append(i)
-        acc += sizes[i] if i < len(sizes) else 0
-        if acc >= target_bytes:
-            runs.append(tuple(current))
-            current, acc = [], 0
-    if current:
-        runs.append(tuple(current))
-    return runs
 
 
 def parquet_row_group_splits(

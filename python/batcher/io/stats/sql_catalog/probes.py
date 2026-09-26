@@ -13,23 +13,13 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
-__all__ = ["RunRows", "RunScalar", "dialect_for_driver", "scalar_count_query"]
+__all__ = ["RunRows", "RunScalar", "dialect_for_driver"]
 
 #: A callback the connector supplies to run a single-value catalog query.
 RunScalar = Callable[[str], Any]
 #: A callback the connector supplies to run a catalog query returning rows (each a
 #: sequence positional to the SELECT list this package controls).
 RunRows = Callable[[str], Sequence[Sequence[Any]]]
-
-
-def scalar_count_query(table: str) -> str:
-    """A portable ``SELECT COUNT(*)`` for an exact count via one round-trip.
-
-    Used when no cheaper catalog estimate is available but an exact count is
-    wanted; it scans server-side (cheap for columnar warehouses) and returns the
-    authoritative count.
-    """
-    return f"SELECT COUNT(*) AS n FROM {table}"
 
 
 # ---------------------------------------------------------------------------

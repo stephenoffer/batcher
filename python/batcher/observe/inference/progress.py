@@ -53,13 +53,11 @@ _GPU_WINDOW = 16
 _BLOCKED_WINDOW = 16
 
 # GPU utilization bands (percent), from Ray's field guidance. Below `_UTIL_SEVERE` the
-# accelerator is being wasted; the target band is the expensive hardware actually earning out.
+# accelerator is being wasted; below `_UTIL_LOW` it is under-fed.
 _UTIL_SEVERE = 30.0
 _UTIL_LOW = 70.0
-_UTIL_TARGET = 85.0
-# GPU memory bands (fraction of VRAM). The good band leaves headroom for a batch-size spike;
-# past `_MEM_HIGH` an autobatcher is one large batch away from an out-of-memory kill.
-_MEM_GOOD_LO = 0.70
+# GPU memory ceiling (fraction of VRAM): past `_MEM_HIGH` an autobatcher is one large batch
+# away from an out-of-memory kill.
 _MEM_HIGH = 0.90
 # A device whose recent utilization swings below this floor and above this ceiling within the
 # window is cycling — fed in bursts, idle between them — which is data starvation, not a slow

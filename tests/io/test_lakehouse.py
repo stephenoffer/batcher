@@ -213,7 +213,9 @@ def test_delta_deletion_vectors_read(tmp_path) -> None:
     DeltaTable(path).delete("id < 4")  # logically delete ids 0..3
 
     src = DeltaSource(path)
-    assert not src._has_deletion_vectors(), "the flag is set but no file carries a vector"
+    assert not src._snapshot().has_deletion_vectors(), (
+        "the flag is set but no file carries a vector"
+    )
 
     # the deleted rows are gone, and projection still works
     out = pa.Table.from_batches(src.read())

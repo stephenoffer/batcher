@@ -257,8 +257,8 @@ bt.read.parquet(d, schema_mode="latest")  # ['a', 'b'] — last file's schema wi
 - `"latest"` — the last schema wins; older files are cast toward it.
 
 An unbridgeable collision (int vs string, mismatched list kinds) raises `SchemaError`
-rather than picking a lossy winner. `schema_drift(inferred, expected)` reports
-added/removed/retyped columns when you want to *gate* on drift instead of absorbing it.
+rather than picking a lossy winner. To *gate* on drift instead of absorbing it, use
+`schema_mode="strict"`, which raises on the first file that does not match.
 
 **Narrow types widen at the FFI boundary**, once: Int8/16/32 → Int64, Float16/32 → Float64.
 Don't re-implement coercion upstream. Note the asymmetry — the plan-time schema reports the
