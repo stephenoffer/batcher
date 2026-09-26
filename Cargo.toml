@@ -101,7 +101,6 @@ ahash = "0.8"
 # bc-py-only-PyO3 rule — `tracing-subscriber` (the install side) lives only in bc-py.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-smallvec = "1"
 indexmap = "2"
 hashbrown = "0.15"
 rayon = "1"
