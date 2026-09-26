@@ -321,8 +321,8 @@ unsafe impl Sync for CompiledExpr {}
 /// subset (the caller then uses the interpreter).
 ///
 /// Uses the detected host [`HardwareProfile`](bc_arrow::HardwareProfile) to pick the
-/// SIMD width/unroll; use [`compile_expr_with`] to override it (a benchmark pinning a
-/// width, or a config disabling SIMD).
+/// SIMD width/unroll; use [`compile_expr_with`] to override it (the parity tests
+/// pin each width).
 pub fn compile_expr(
     expr: &bc_expr::Expr,
     batch: &RecordBatch,

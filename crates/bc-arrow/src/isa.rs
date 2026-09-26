@@ -25,7 +25,8 @@
 //! the closest available proxy — `avx512vpopcntdq`, which arrived with Ice Lake and is present
 //! on Zen 4, and is absent on every Skylake-derived part — and is documented as a heuristic
 //! rather than a fact. The engine still does **not** auto-widen on it: the default stays at
-//! AVX2-equivalent width and 512-bit is opt-in through [`SimdOverride`](crate::SimdOverride),
+//! AVX2-equivalent width and 512-bit is reachable only through an explicit
+//! [`SimdOverride`](crate::SimdOverride), which no configuration sets,
 //! because widening a default is a performance claim, and a performance claim needs a
 //! benchmark on the part in question. What this flag buys is that the opt-in can be made
 //! knowingly instead of blindly.
