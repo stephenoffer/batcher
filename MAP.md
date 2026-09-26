@@ -2632,7 +2632,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `footprint.py` | 155 | How much memory live Arrow data actually keeps resident. |
 | `ipc.py` | 94 | Arrow tables to bytes and back, for anything that stores a result outside the process. |
 | `lattice.py` | 330 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
-| `layout.py` | 226 | Respell the Arrow *layouts* the FFI boundary cannot import (neutral layer). |
+| `layout.py` | 216 | Respell the Arrow *layouts* the FFI boundary cannot import (neutral layer). |
 | `media.py` | 270 | Output types for the multimodal expressions, where the shape is in the arguments. |
 | `registry.py` | 405 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name grammar. |
 | `sequence.py` | 81 | Output types for the `.seq` genomics expressions. |
