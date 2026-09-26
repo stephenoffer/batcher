@@ -18,44 +18,9 @@ relational shuffle runs on the CPU fleet and a fleet's CPU-only nodes are most o
 
 from __future__ import annotations
 
-from batcher._internal.logging import note_suppressed
 from batcher.plan.resource import ClusterShape, NodeShape
 
 __all__ = ["cluster_shape"]
-
-
-def _node_records() -> list[dict]:
-    """Every node that can host a worker, or `[]` when the topology is unreadable.
-
-    Worker-eligible, not merely alive: the Ray head and anything Ray is draining are excluded,
-    exactly as they are for every fan-out sizing in `scaling`. The shape describes the machines
-    a plan will run *on*, and a node that will host no worker distorts every figure derived
-    from it —
-
-    * `total_cores` drives `exchange_width`, which sets how wide a shuffle is priced as being
-      spread; head cores inflate it, and a wider exchange keeps less of itself local;
-    * `binding_cpu_cores` and `binding_memory_bytes` take the **smallest** node, and a head is
-      routinely the smallest node in the fleet, so it would bind the whole plan's per-worker
-      sizing to a machine that runs none of the work;
-    * an unlabelled head becomes a rack of its own in `locality_shares`, adding a tier crossing
-      to an exchange that never touches it.
-
-    Snapshot-aware, so inside a `topology_scope()` this is the same read every other sizing
-    path uses and cannot disagree with them across an autoscale.
-    """
-    try:
-        import ray
-
-        if not ray.is_initialized():
-            return []
-        from batcher.dist.executors.ray_runtime.scaling import _TOPOLOGY, _worker_eligible
-
-        snapshot = _TOPOLOGY.get()
-        nodes = snapshot.alive_nodes if snapshot is not None else ray.nodes()
-        return _worker_eligible([n for n in nodes if n.get("Alive", True)])
-    except Exception as exc:  # pragma: no cover - Ray optional / cluster down
-        note_suppressed("dist", "read the cluster's node list", exc)
-        return []
 
 
 def cluster_shape() -> ClusterShape:

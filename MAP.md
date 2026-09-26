@@ -1021,7 +1021,7 @@ Fabric-aware placement: what the accelerator fleet looks like, and where work sh
 | `market.py` | 215 | Which capacity a stage runs on: spot where the work is recomputable, on-demand where it isn't. |
 | `placement.py` | 419 | Placing accelerator work on the fleet: gang bundles, power zones, and efficiency order. |
 | `residency.py` | 97 | Residency as a placement filter — the point where a sovereignty rule reaches the scheduler. |
-| `shape.py` | 222 | The live cluster, rendered into the neutral shape Kyber plans against. |
+| `shape.py` | 187 | The live cluster, rendered into the neutral shape Kyber plans against. |
 | `topology.py` | 443 | Where the accelerators actually are — NVLink domains, nodes, racks, and power zones. |
 
 ### `batcher/dist/executors/ray_runtime/policies/` — 4 · backend
