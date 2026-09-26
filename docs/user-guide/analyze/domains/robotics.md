@@ -269,7 +269,7 @@ Every function on this page is a `Float64` expression over `Float64` columns. No
 - It spills and shuffles like arithmetic, so a transform over a cluster-scale log needs no special handling and produces the same rows single-node or distributed.
 - It streams. A transform in an {py:meth}`iter_batches <batcher.Dataset.iter_batches>` pipeline never materializes the sweep.
 
-The arithmetic itself runs in Rust, in the `bc-spatial` crate. The JIT declines this family and falls back to the interpreter, which is deliberate: the kernels call transcendental functions whose bit-for-bit agreement across two tiers is a claim nothing currently proves, and the interpreter's loop is already tight.
+The arithmetic itself runs in Rust, in the `bc-spatial` crate. The JIT declines this family and falls back to the interpreter, which is deliberate: the kernels call transcendental functions whose bit-for-bit agreement across two tiers is a claim nothing proves, and the interpreter's loop is already tight.
 
 ### On a cluster
 
