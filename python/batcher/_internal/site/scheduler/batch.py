@@ -27,7 +27,7 @@ from batcher._internal.site.scheduler.hostlist import (
 )
 from batcher._internal.site.scheduler.job import (
     SchedulerJob,
-    env_int,
+    env_count,
     env_str,
     first_env,
     launcher_ranks,
@@ -96,20 +96,20 @@ def slurm_job() -> SchedulerJob:
         nodes=nodes,
         # A job step that ran without a node list still knows how wide it is, and a
         # single-node reading of a 64-node allocation is the failure this guards.
-        num_nodes=env_int("SLURM_JOB_NUM_NODES") or env_int("SLURM_NNODES"),
+        num_nodes=env_count("SLURM_JOB_NUM_NODES") or env_count("SLURM_NNODES"),
         # `SLURM_GPUS_ON_NODE` is the allocation's grant; `SLURM_GPUS_PER_NODE` is the request
         # in `gpu:8` form, and `SLURM_JOB_GPUS` is the device id list, which older Slurm sets
         # instead. All three are the allocation rather than the node's hardware.
         gpus_per_node=_gpu_grant(("SLURM_GPUS_ON_NODE", "SLURM_GPUS_PER_NODE", "SLURM_JOB_GPUS")),
         cpus_per_node=cpus_on_node,
-        cpus_per_task=env_int("SLURM_CPUS_PER_TASK"),
-        tasks=env_int("SLURM_NTASKS"),
-        tasks_per_node=env_int("SLURM_NTASKS_PER_NODE"),
-        rank=env_int("SLURM_PROCID"),
-        local_rank=env_int("SLURM_LOCALID"),
+        cpus_per_task=env_count("SLURM_CPUS_PER_TASK"),
+        tasks=env_count("SLURM_NTASKS"),
+        tasks_per_node=env_count("SLURM_NTASKS_PER_NODE"),
+        rank=env_count("SLURM_PROCID"),
+        local_rank=env_count("SLURM_LOCALID"),
         # Slurm publishes no per-node task count directly on the step, so the request is the
         # best available answer and the launcher's is the fallback under `srun --overlap`.
-        local_size=env_int("SLURM_NTASKS_PER_NODE") or launcher_ranks().local_size,
+        local_size=env_count("SLURM_NTASKS_PER_NODE") or launcher_ranks().local_size,
         node_name=env_str("SLURMD_NODENAME") or _this_host(nodes),
         partition=env_str("SLURM_JOB_PARTITION"),
         array_index=env_str("SLURM_ARRAY_TASK_ID"),
@@ -129,14 +129,14 @@ def pbs_job() -> SchedulerJob:
     nodefile = env_str("PBS_NODEFILE")
     lines = _slot_lines(nodefile) if nodefile else ()
     nodes = tuple(dict.fromkeys(lines))
-    slots = env_int("PBS_NUM_PPN") or _slots_here(nodes, lines)
-    cpus = env_int("NCPUS") or env_int("PBS_NCPUS")
+    slots = env_count("PBS_NUM_PPN") or _slots_here(nodes, lines)
+    cpus = env_count("NCPUS") or env_count("PBS_NCPUS")
     return SchedulerJob(
         kind="pbs",
         job_id=env_str("PBS_JOBID"),
         nodes=nodes,
-        num_nodes=env_int("PBS_NUM_NODES"),
-        gpus_per_node=env_int("PBS_NGPUS") or visible_device_count(),
+        num_nodes=env_count("PBS_NUM_NODES"),
+        gpus_per_node=env_count("PBS_NGPUS") or visible_device_count(),
         # `NCPUS` is what PBS sets on the *execution* host; `PBS_NCPUS` is the request. Both
         # are the grant rather than the node, and the exec-host value is the sharper one.
         cpus_per_node=cpus,
@@ -145,9 +145,9 @@ def pbs_job() -> SchedulerJob:
         # eight tasks on a 96-core node get 12 cores each, and sizing all eight to 96 is what
         # oversubscribes the node twelve-fold.
         cpus_per_task=cpus // slots if cpus and slots > 1 else 0,
-        tasks=env_int("PBS_NP"),
+        tasks=env_count("PBS_NP"),
         tasks_per_node=slots,
-        rank=env_int("PBS_VNODENUM") or launcher_ranks().rank,
+        rank=env_count("PBS_VNODENUM") or launcher_ranks().rank,
         local_rank=launcher_ranks().local_rank,
         local_size=slots or launcher_ranks().local_size,
         # `PBS_NODENUM` is this node's *index* in the allocation, not its name, and reading it
@@ -208,7 +208,7 @@ def lsf_job() -> SchedulerJob:
         nodes=nodes,
         gpus_per_node=visible_device_count(),
         cpus_per_node=_lsf_slots_here(node_name, slot_hosts),
-        tasks=env_int("LSB_DJOB_NUMPROC"),
+        tasks=env_count("LSB_DJOB_NUMPROC"),
         tasks_per_node=_lsf_slots_here(node_name, slot_hosts),
         rank=ranks.rank,
         local_rank=ranks.local_rank,
@@ -255,9 +255,9 @@ def sge_job() -> SchedulerJob:
         gpus_per_node=visible_device_count(),
         # `NSLOTS` is this task's slot grant on this node; the host file's summed column is
         # the job-wide total and is carried as `tasks`.
-        cpus_per_node=env_int("NSLOTS"),
-        cpus_per_task=env_int("NSLOTS"),
-        tasks=slots or env_int("NSLOTS"),
+        cpus_per_node=env_count("NSLOTS"),
+        cpus_per_task=env_count("NSLOTS"),
+        tasks=slots or env_count("NSLOTS"),
         rank=ranks.rank,
         local_rank=ranks.local_rank,
         local_size=ranks.local_size,
@@ -278,8 +278,8 @@ def flux_job() -> SchedulerJob:
     rather than left to a launcher.
     """
     nodes = expand_nodelist(env_str("FLUX_JOB_NODELIST"))
-    size = env_int("FLUX_JOB_SIZE")
-    nnodes = env_int("FLUX_JOB_NNODES")
+    size = env_count("FLUX_JOB_SIZE")
+    nnodes = env_count("FLUX_JOB_NNODES")
     return SchedulerJob(
         kind="flux",
         job_id=env_str("FLUX_JOB_ID"),
@@ -288,8 +288,8 @@ def flux_job() -> SchedulerJob:
         gpus_per_node=visible_device_count(),
         tasks=size,
         tasks_per_node=size // nnodes if size and nnodes else 0,
-        rank=env_int("FLUX_TASK_RANK"),
-        local_rank=env_int("FLUX_TASK_LOCAL_ID"),
+        rank=env_count("FLUX_TASK_RANK"),
+        local_rank=env_count("FLUX_TASK_LOCAL_ID"),
         local_size=size // nnodes if size and nnodes else 0,
         node_name=_this_host(nodes),
     )
@@ -326,8 +326,8 @@ def condor_job() -> SchedulerJob:
         # the only core figure HTCondor publishes anywhere, and a pool without cgroup
         # confinement enforces nothing — so without it a four-core slot sizes to the machine.
         cpus_per_task=_int_attr(ad, "RequestCpus"),
-        rank=env_int("_CONDOR_PROCNO") or launcher_ranks().rank,
-        tasks=env_int("_CONDOR_NPROCS") or launcher_ranks().tasks,
+        rank=env_count("_CONDOR_PROCNO") or launcher_ranks().rank,
+        tasks=env_count("_CONDOR_NPROCS") or launcher_ranks().tasks,
         node_name=_this_host(()),
         partition=env_str("_CONDOR_SLOT"),
         array_index=proc,

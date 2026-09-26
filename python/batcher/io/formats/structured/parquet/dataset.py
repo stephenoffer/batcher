@@ -8,7 +8,6 @@ O(whole dataset) on the driver.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -16,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
+from batcher.config.env import env_int
 from batcher.io.base._paths import hive_segment
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.structured.parquet.partitions import (
@@ -36,7 +36,7 @@ __all__ = ["ParquetDatasetSource", "ParquetFragmentSplit", "PartitionDirSplit"]
 # Mirrors `FileSource`'s `_MAX_FOOTER_PLAN_FILES` (same env var): a footer sweep is O(files)
 # object-store round trips on the driver, a good trade at hundreds of files and a
 # catastrophic one at millions. Above it, the cheap exact `row_count()` still answers.
-_MAX_FOOTER_PLAN_FILES = max(1, int(os.environ.get("BATCHER_MAX_FOOTER_PLAN_FILES", "10000")))
+_MAX_FOOTER_PLAN_FILES = env_int("BATCHER_MAX_FOOTER_PLAN_FILES", 10000, floor=1)
 
 
 def _footer_row_counter(fs: Any) -> Any:

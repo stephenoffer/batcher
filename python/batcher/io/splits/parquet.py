@@ -10,7 +10,6 @@ with the lakehouse connectors, whose tables are Parquet datasets underneath.
 
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
+from batcher.config.env import env_int
 from batcher.io.splits.base import Split
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 
@@ -104,7 +104,7 @@ def _parquet_footer(path: str, fs: Any | None = None):
 #: a million single-row-group files cost what a few thousand wide ones do. It was 1,024
 #: *entries*, an order of magnitude below the one pass guaranteed to fill it.
 #: Env-overridable for a process reading unusually wide files.
-_MAX_CACHED_ROW_GROUPS = max(1, int(os.environ.get("BATCHER_FOOTER_CACHE_ROW_GROUPS", "262144")))
+_MAX_CACHED_ROW_GROUPS = env_int("BATCHER_FOOTER_CACHE_ROW_GROUPS", 262144, floor=1)
 
 _FOOTERS = FileMetaCache(_MAX_CACHED_ROW_GROUPS)
 

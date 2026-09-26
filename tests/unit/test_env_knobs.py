@@ -27,6 +27,7 @@ pytestmark = pytest.mark.unit
 
 PACKAGE = pathlib.Path(__file__).resolve().parents[2] / "python" / "batcher"
 _ENV_NAME = re.compile(r"^BATCHER_[A-Z0-9_]+$")
+_READERS = frozenset({"env_flag", "env_int", "env_float"})
 
 
 def _read_env_names() -> dict[str, set[str]]:
@@ -77,8 +78,8 @@ def _constant_names(tree: ast.Module) -> list[str]:
 def _env_name(node: ast.AST) -> str | None:
     """The literal variable name this node reads from the environment, if it does.
 
-    Covers the three spellings in the tree: `os.getenv("X")`, `os.environ.get("X")` and
-    `os.environ["X"]`.
+    Covers `os.getenv("X")`, `os.environ.get("X")`, `os.environ["X"]` and the typed readers
+    in `config/env.py` (`env_flag`, `env_int`, `env_float`).
     """
     if isinstance(node, ast.Subscript):
         value = node.value
@@ -91,6 +92,8 @@ def _env_name(node: ast.AST) -> str | None:
     if not isinstance(first, ast.Constant):
         return None
     func = node.func
+    if getattr(func, "id", None) in _READERS or getattr(func, "attr", None) in _READERS:
+        return first.value
     if getattr(func, "attr", None) == "getenv":
         return first.value
     if getattr(func, "attr", None) in ("get", "pop"):

@@ -9,7 +9,6 @@ distributed read parallelizes within a file, reading only its assigned stripe vi
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import IO, Any
@@ -17,6 +16,7 @@ from typing import IO, Any
 import pyarrow as pa
 
 from batcher._internal.optional import require
+from batcher.config.env import env_int
 from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
@@ -34,7 +34,7 @@ from batcher.plan.source_stats import SourceStatistics
 # knee: eight splits, and past it the read stops improving. Overridable because the right
 # answer depends on the reader — a warehouse tuned for HDFS-block-sized stripes wants the
 # ecosystem's 64 MiB back.
-_STRIPE_BYTES = max(1 << 16, int(os.environ.get("BATCHER_ORC_STRIPE_BYTES", str(8 << 20))))
+_STRIPE_BYTES = env_int("BATCHER_ORC_STRIPE_BYTES", 8 << 20, floor=1 << 16)
 
 __all__ = ["ORCSink", "ORCSource", "ORCStripeSplit"]
 

@@ -10,7 +10,6 @@ The `Sink` protocol itself lives in `io.sink`; this base structurally satisfies 
 from __future__ import annotations
 
 import contextlib
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +20,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import ColumnNotFoundError
 from batcher._internal.hardware import available_cpu_count, machine_memory_bytes
+from batcher.config.env import env_float, env_int
 from batcher.io._backend import _scheme
 from batcher.io.base._hive import (
     hive_partition_run_starts,
@@ -43,7 +43,7 @@ __all__ = ["FileSink", "stream_part_concurrency"]
 # published four of a 200-partition write at a time and spent the rest of its life blocked
 # on sockets. Local disk keeps the core-count sizing: an NVMe write is bandwidth-bound, so
 # oversubscribing it buys nothing and costs resident encoded buffers.
-_REMOTE_WRITE_CONCURRENCY = max(2, int(os.environ.get("BATCHER_REMOTE_WRITE_CONCURRENCY", "32")))
+_REMOTE_WRITE_CONCURRENCY = env_int("BATCHER_REMOTE_WRITE_CONCURRENCY", 32, floor=2)
 
 
 def _write_concurrency(n_files: int, path: str) -> int:
@@ -68,8 +68,8 @@ _STREAM_PART_MEMORY_SHARE = 8
 
 # Write-side retry, mirroring the read path's `_READ_RETRY_*` so a deployment tunes one
 # idea rather than two. See `FileSink.write` for why retrying a write is safe.
-_WRITE_RETRY_ATTEMPTS = max(1, int(os.environ.get("BATCHER_WRITE_RETRY_ATTEMPTS", "3")))
-_WRITE_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_WRITE_RETRY_BACKOFF_S", "0.5")))
+_WRITE_RETRY_ATTEMPTS = env_int("BATCHER_WRITE_RETRY_ATTEMPTS", 3, floor=1)
+_WRITE_RETRY_BACKOFF_S = env_float("BATCHER_WRITE_RETRY_BACKOFF_S", 0.5, floor=0.0)
 
 
 def stream_part_concurrency(part_bytes: int, directory: str) -> int:

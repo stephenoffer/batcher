@@ -28,10 +28,23 @@ and one of them accepted only ``"1"`` — so a diagnostic flag set to ``true`` w
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Final
+from typing import Final, TypeVar
 
-__all__ = ["ENV_KNOBS", "FALSE_TOKENS", "TRUE_TOKENS", "env_flag", "falsy", "truthy"]
+__all__ = [
+    "ENV_KNOBS",
+    "FALSE_TOKENS",
+    "TRUE_TOKENS",
+    "env_flag",
+    "env_float",
+    "env_int",
+    "falsy",
+    "truthy",
+]
+
+_log = logging.getLogger("batcher.config.env")
+_N = TypeVar("_N", int, float)
 
 #: `BATCHER_*` variable -> what it controls. Grouped by the subsystem that reads it.
 ENV_KNOBS: Final[dict[str, str]] = {
@@ -194,3 +207,75 @@ def env_flag(name: str, default: bool = False) -> bool:
     """
     raw = os.environ.get(name)
     return default if raw is None else truthy(raw)
+
+
+def env_int(name: str, default: int, *, floor: int | None = None) -> int:
+    """Read an integer environment variable, falling back on `default` when it is malformed.
+
+    Most knobs are read into module constants at import, so a strict `int(...)` there turned
+    one typo (`BATCHER_REMOTE_READ_CONCURRENCY=32x`) into an `import batcher` that fails with
+    a bare `ValueError` naming neither the variable nor the option. A tuning knob is not worth
+    refusing to start over: a malformed value logs a warning naming the variable and the
+    default takes its place.
+
+    Args:
+        name: The variable's name. It must be declared in `ENV_KNOBS`.
+        default: The value for an unset, empty, or malformed variable.
+        floor: A lower bound applied to the result, or None for none.
+
+    Returns:
+        The parsed value, raised to `floor`.
+
+    Examples:
+        .. doctest::
+
+            >>> import os
+            >>> from batcher.config.env import env_int
+            >>> os.environ["BATCHER_IO_THREADS"] = "32x"
+            >>> env_int("BATCHER_IO_THREADS", 64)
+            64
+            >>> os.environ["BATCHER_IO_THREADS"] = "4"
+            >>> env_int("BATCHER_IO_THREADS", 64, floor=8)
+            8
+            >>> del os.environ["BATCHER_IO_THREADS"]
+    """
+    value = _env_number(name, default, int)
+    return value if floor is None else max(floor, value)
+
+
+def env_float(name: str, default: float, *, floor: float | None = None) -> float:
+    """Read a float environment variable, falling back on `default` when it is malformed.
+
+    The float twin of `env_int`, with the same warn-and-fall-back contract.
+
+    Args:
+        name: The variable's name. It must be declared in `ENV_KNOBS`.
+        default: The value for an unset, empty, or malformed variable.
+        floor: A lower bound applied to the result, or None for none.
+
+    Returns:
+        The parsed value, raised to `floor`.
+
+    Examples:
+        .. doctest::
+
+            >>> import os
+            >>> from batcher.config.env import env_float
+            >>> os.environ["BATCHER_READ_RETRY_BACKOFF_S"] = "-1"
+            >>> env_float("BATCHER_READ_RETRY_BACKOFF_S", 0.5, floor=0.0)
+            0.0
+            >>> del os.environ["BATCHER_READ_RETRY_BACKOFF_S"]
+    """
+    value = _env_number(name, default, float)
+    return value if floor is None else max(floor, value)
+
+
+def _env_number(name: str, default: _N, parse: type[_N]) -> _N:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return parse(raw)
+    except ValueError:
+        _log.warning("%s=%r is not a valid %s; using %r", name, raw, parse.__name__, default)
+        return default

@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from batcher._internal.site.scheduler import batch, managed, orchestrator
-from batcher._internal.site.scheduler.job import SchedulerJob, env_int, env_str, run_length_min
+from batcher._internal.site.scheduler.job import SchedulerJob, env_count, env_str, run_length_min
 
 __all__ = [
     "CPU_GRANT_VARS",
@@ -263,7 +263,7 @@ def _lsf_min_slots() -> int | None:
     # A single-host job publishes no breakdown, and there the job-wide total *is* this host's.
     hosts = {h for h in env_str("LSB_HOSTS").split() if h}
     if len(hosts) == 1:
-        return env_int("LSB_DJOB_NUMPROC") or None
+        return env_count("LSB_DJOB_NUMPROC") or None
     return None
 
 
@@ -330,10 +330,10 @@ def scheduler_memory_bytes() -> int | None:
         The grant in bytes, or `None` when the scheduler published none — which callers read
         as "no bound from here", never as zero memory.
     """
-    per_node = env_int(_SLURM_MEM_PER_NODE)
+    per_node = env_count(_SLURM_MEM_PER_NODE)
     if per_node > 0:
         return per_node * _MIB
-    per_cpu = env_int(_SLURM_MEM_PER_CPU)
+    per_cpu = env_count(_SLURM_MEM_PER_CPU)
     cores = allocated_cpus()
     if per_cpu > 0 and cores:
         return per_cpu * cores * _MIB

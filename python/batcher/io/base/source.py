@@ -12,7 +12,6 @@ The `Source` protocol itself lives in `io.source`; this base structurally satisf
 from __future__ import annotations
 
 import hashlib
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
 from typing import IO, Any, ClassVar, TypeVar
@@ -22,6 +21,7 @@ import pyarrow as pa
 from batcher._internal.errors import FormatError, IOError, SchemaError, unknown_value
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.logging import note_suppressed
+from batcher.config.env import env_float, env_int
 from batcher.io._backend import _has_wildcard, _scheme
 from batcher.io._concurrent import listed_sizes, read_each_file, total_file_bytes
 from batcher.io.base._options import BASE_SOURCE_ALIASES, BASE_SOURCE_OPTIONS
@@ -54,7 +54,7 @@ _ITER_READAHEAD_FILES = 16
 # not the file count, is what bounds `iter_batches`: file count alone says nothing about
 # memory when one row can be a 200 MB video and another 4 KB of text. 512 MiB keeps a
 # streaming read comfortably inside a worker's envelope while still overlapping I/O.
-_ITER_READAHEAD_BYTES = max(1 << 20, int(os.environ.get("BATCHER_READAHEAD_BYTES", str(512 << 20))))
+_ITER_READAHEAD_BYTES = env_int("BATCHER_READAHEAD_BYTES", 512 << 20, floor=1 << 20)
 # How many files a **remote** (object-store) source reads concurrently, in `read` and as the
 # `iter_batches` read-ahead depth. Both used to be derived from `available_cpu_count()`, which
 # is the wrong ruler for a remote read: an S3 GET is ~tens of ms of *latency*, so throughput
@@ -73,17 +73,17 @@ _ITER_READAHEAD_BYTES = max(1 << 20, int(os.environ.get("BATCHER_READAHEAD_BYTES
 # which a deeper window divides more finely rather than exceeding. `read` materializes the
 # whole source by definition, so extra concurrency there only widens the transient decode
 # working set.
-_REMOTE_READ_CONCURRENCY = max(2, int(os.environ.get("BATCHER_REMOTE_READ_CONCURRENCY", "32")))
+_REMOTE_READ_CONCURRENCY = env_int("BATCHER_REMOTE_READ_CONCURRENCY", 32, floor=2)
 # Attempts (including the first) for a read that fails *transiently* — an object-store
 # throttle, 5xx, or dropped connection. 3 absorbs the blips a cloud SDK would absorb on its
 # own without masking a real outage for long; 1 disables retrying. Non-transient failures
 # (404/403/malformed) never consume an attempt, so a genuine error still fails on the first
 # try. See `_transient.py` for why the classification, not the count, is the load-bearing part.
-_READ_RETRY_ATTEMPTS = max(1, int(os.environ.get("BATCHER_READ_RETRY_ATTEMPTS", "3")))
+_READ_RETRY_ATTEMPTS = env_int("BATCHER_READ_RETRY_ATTEMPTS", 3, floor=1)
 # First retry's backoff ceiling in seconds, doubling per round with equal jitter. Jitter
 # matters more than the base here: a wide scan retries hundreds of files at once, and
 # without decorrelation a single throttle turns into a synchronized stampede.
-_READ_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_READ_RETRY_BACKOFF_S", "0.5")))
+_READ_RETRY_BACKOFF_S = env_float("BATCHER_READ_RETRY_BACKOFF_S", 0.5, floor=0.0)
 # File count past which `splits()` stops reading a footer per file to plan sub-file splits.
 # The footer sweep is the driver's serial prologue to a distributed scan: it is worth ~100ms
 # of object-store latency per file (pooled, but still O(files) requests), which is a good
@@ -91,14 +91,14 @@ _READ_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_READ_RETRY_BACKOF
 # while the driver GETs metadata it will only use to subdivide files that are already far
 # more numerous than the workers. Whole-file splits need no footer and give the same rows.
 # Env-overridable for a workload whose files are few but enormous.
-_MAX_FOOTER_PLAN_FILES = max(1, int(os.environ.get("BATCHER_MAX_FOOTER_PLAN_FILES", "10000")))
+_MAX_FOOTER_PLAN_FILES = env_int("BATCHER_MAX_FOOTER_PLAN_FILES", 10000, floor=1)
 # Rough bytes a whole-file split should cover when the caller names no target. One split
 # per file is the right unit until files outnumber workers by orders of magnitude; past
 # that, every split is a scheduled task and a pickled locator, so a million 4 KB objects
 # become a million tasks to move four gigabytes. 128 MiB is the figure Spark settled on for
 # the same job (`spark.sql.files.maxPartitionBytes`) and for the same reason. Files are only
 # ever *grouped*, never divided, so a dataset of large files packs one-per-split as before.
-_COALESCE_TARGET_BYTES = max(1, int(os.environ.get("BATCHER_SPLIT_TARGET_BYTES", str(128 << 20))))
+_COALESCE_TARGET_BYTES = env_int("BATCHER_SPLIT_TARGET_BYTES", 128 << 20, floor=1)
 # The fewest splits packing may leave when there are at least that many files. Grouping is
 # a throughput win and a parallelism risk in the same move: eight 10 MB files under a
 # 128 MiB target would coalesce to one task and idle every core but one. The driver cannot

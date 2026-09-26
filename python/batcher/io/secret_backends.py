@@ -50,6 +50,7 @@ import os
 from typing import Any
 
 from batcher._internal.errors import BackendError
+from batcher.config.env import env_float
 
 __all__ = ["BACKEND_SCHEMES", "resolve_backend_ref"]
 
@@ -296,7 +297,4 @@ def _require(module: str, *, scheme: str, extra: str, what: str) -> Any:
 
 def _timeout() -> float:
     """Per-request timeout for the HTTP-answered stores."""
-    try:
-        return float(os.environ.get("BATCHER_SECRET_TIMEOUT_SECONDS", "10"))
-    except ValueError:
-        return 10.0
+    return env_float("BATCHER_SECRET_TIMEOUT_SECONDS", 10.0)
