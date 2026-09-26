@@ -35,17 +35,13 @@ pytestmark = pytest.mark.integration
 
 pytest.importorskip("ray", reason="ray not installed")
 
-from _ray_cluster import init_test_ray, shutdown_test_ray  # noqa: E402  (after importorskip)
+from _ray_cluster import ray_session_fixture  # noqa: E402  (after importorskip)
 
 _WORKERS = 4
 _MODES = ("strict", "union", "latest")
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(4)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(4)
 
 
 def _fingerprint(table: pa.Table) -> tuple[str, list[str]]:

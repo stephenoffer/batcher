@@ -28,14 +28,9 @@ pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("batcher._native", reason="native engine not built")
 
 
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 
-
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(2)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(2)
 
 
 SOURCE = {"id": [1, 2, 3, 4], "body": ["a", "b", "c", "d"]}

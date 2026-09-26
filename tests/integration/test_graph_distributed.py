@@ -33,7 +33,7 @@ import pytest
 
 import batcher as bt
 import batcher.graph as bg
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher.config import option_context
 
 pytest.importorskip("ray", reason="ray not installed")
@@ -49,11 +49,7 @@ _EDGES = 80_000
 _PAIRS = bt.from_pydict({"a": [1, 2, 3, 150, 7], "b": [4, 5, 6, 151, 19_000]})
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(_WORKERS)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(_WORKERS)
 
 
 @pytest.fixture(scope="module")
