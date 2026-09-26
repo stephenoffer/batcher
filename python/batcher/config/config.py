@@ -2951,8 +2951,10 @@ def _coerce(key: str, raw: str, to: object) -> object:
 def _coerce_value(raw: str, to: object) -> object:
     if to is bool:
         return truthy(raw)
-    if to is int or to is float:
-        return to(raw.strip())  # type: ignore[operator]
+    if to is int:
+        return int(raw.strip())
+    if to is float:
+        return float(raw.strip())
     if to is str:
         return raw
     origin = typing.get_origin(to)
@@ -2961,7 +2963,7 @@ def _coerce_value(raw: str, to: object) -> object:
     if origin is dict:
         value = json.loads(raw)
         if not isinstance(value, dict):
-            raise TypeError("a JSON object")
+            raise ConfigError("a JSON object")
         return value
     # A `bool | str` field (e.g. `runtime_bloom_join = "auto"`): a recognized boolean
     # token coerces to a real bool, everything else stays the string, so both
@@ -2971,7 +2973,7 @@ def _coerce_value(raw: str, to: object) -> object:
         return truthy(raw)
     if str in members:
         return raw
-    raise TypeError("a type an environment variable cannot express")
+    raise ConfigError("a type an environment variable cannot express")
 
 
 def _coerce_tuple(raw: str, args: tuple[object, ...]) -> tuple[object, ...]:
@@ -2981,7 +2983,7 @@ def _coerce_tuple(raw: str, args: tuple[object, ...]) -> tuple[object, ...]:
         element_types: list[object] = [args[0]] * len(parts)
     else:
         if len(parts) != len(args):
-            raise ValueError(f"{len(args)} comma-separated values, got {len(parts)}")
+            raise ConfigError(f"{len(args)} comma-separated values, got {len(parts)}")
         element_types = list(args)
     return tuple(_coerce_value(p, t) for p, t in zip(parts, element_types, strict=True))
 
