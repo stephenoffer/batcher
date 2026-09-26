@@ -53,12 +53,10 @@ from batcher.kyber.learned_tuning.crossover import (
 )
 from batcher.kyber.learned_tuning.priors import _smooth as _smooth
 from batcher.kyber.learned_tuning.priors import (
-    learned_build_sides,
     learned_partial_agg,
     learned_partition_count,
     learned_signature_rows,
     record_group_reduction,
-    record_join_sides,
     record_partition_rows,
 )
 
@@ -67,7 +65,6 @@ __all__ = [
     "learned_adaptive_route",
     "learned_arm",
     "learned_broadcast_max_bytes",
-    "learned_build_sides",
     "learned_join_strategy",
     "learned_partial_agg",
     "learned_partition_count",
@@ -77,7 +74,6 @@ __all__ = [
     "record_arm",
     "record_broadcast_timing",
     "record_group_reduction",
-    "record_join_sides",
     "record_join_strategy",
     "record_partition_rows",
     "record_sort_merge_timing",

@@ -201,7 +201,7 @@ def test_learned_num_workers_cold_and_warm():
 # --- 5 + 6 + 7. join-outcome recording closes the bandit / crossover loops -------------------
 def test_record_join_outcomes_feeds_the_bandit():
     from batcher.api.tuning import record_join_outcomes
-    from batcher.kyber.learned_tuning import learned_build_sides, learned_join_strategy
+    from batcher.kyber.learned_tuning import learned_join_strategy
     from batcher.kyber.rules.selection import BuildSideDecision
 
     left = bt.from_arrow(pa.table({"k": [1, 2, 3], "v": [1, 2, 3]}))
@@ -220,7 +220,6 @@ def test_record_join_outcomes_feeds_the_bandit():
     for _ in range(4):
         record_join_outcomes(hub, joined._plan, [dec], wall_ms=12.0)
     assert learned_join_strategy(hub, sig) is not None  # the bandit now has an arm
-    assert learned_build_sides(hub, sig) == (3.0, 2.0)  # measured sides recorded
 
 
 def test_record_join_outcomes_skips_multi_join_ambiguity():

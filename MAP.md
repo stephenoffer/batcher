@@ -494,7 +494,7 @@ Conductor adaptive-tuning: activate the learned decisions and close the feedback
 
 | module | lines | what it is |
 |---|---|---|
-| `decisions.py` | 387 | Conductor-level adaptive-tuning decisions — activate the learned choices, close the loops. |
+| `decisions.py` | 386 | Conductor-level adaptive-tuning decisions — activate the learned choices, close the loops. |
 
 ### `batcher/ml/` — 6 · front-end
 
@@ -1213,7 +1213,7 @@ Learned strategy + parameter tuning — self-tuning physical decisions from meas
 |---|---|---|
 | `bandit.py` | 436 | A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it. |
 | `crossover.py` | 244 | An OLS two-line crossover — where one algorithm overtakes another, learned from timings. |
-| `priors.py` | 220 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
+| `priors.py` | 161 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
 | `topn_bound.py` | 333 | Learned top-N bounds: remember the k-th best value a top-N returned, and use it on the |
 | `topn_footer.py` | 206 | First-run top-N bounds, derived from Parquet row-group statistics rather than remembered. |
 
