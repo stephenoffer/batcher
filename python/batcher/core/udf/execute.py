@@ -40,7 +40,6 @@ __all__ = [
     "has_map_batches",
     "prebuild_factories",
     "release_prebuilt",
-    "stream_with_udfs",
 ]
 
 
@@ -109,9 +108,7 @@ def execute_with_udfs(
     and the GPU-autobatch / multiprocessing strategies keep the materializing path.
 
     **This returns a list, so peak memory is the whole output** — the stage overlap is real
-    but the bounded-memory half of streaming is not available here. A caller that consumes
-    batches incrementally (a distributed map task that writes from the worker) should use
-    `stream_with_udfs` instead, which is the same execution with the materialization removed.
+    but the bounded-memory half of streaming is not available here.
 
     `recorder` is the optional per-stage measurement sink (`stats()` / `explain(analyze=True)`
     for an ML pipeline). `None` — every caller but the profiling one — costs nothing: no
@@ -137,37 +134,6 @@ def execute_with_udfs(
     return batches
 
 
-def stream_with_udfs(
-    plan: LogicalPlan,
-    sources: list,
-    source_projections: dict[int, list[str]] | None = None,
-    engine_config: str | None = None,
-) -> Iterator[pa.RecordBatch]:
-    """Execute a `map_batches` pipeline, yielding output batches **as they are produced**.
-
-    The incremental form of `execute_with_udfs`, with the same arguments and the same rows in
-    the same order. The difference is memory: for a linear ``Scan -> map -> ... -> map`` chain
-    on the streaming path, nothing accumulates. Resident memory is the bounded prefetch windows
-    between the stages (a few morsels each), not the query's whole output — so a worker can
-    read, infer, and write a partition far larger than its RAM. `execute_with_udfs` cannot do
-    this by construction: it hands back a `list`.
-
-    A plan the streaming path can't take (a join or union between maps, a multiprocessing
-    stage, a CPU-only chain) falls back to `execute_with_udfs` and is yielded from the
-    materialized result. That is a scheduling difference only — same rows either way — but the
-    memory bound does *not* hold for it, so don't read "iterator" as "bounded" unconditionally.
-    """
-    projections = source_projections or {}
-    if has_map_batches(plan):
-        gen = _linear_stream(plan, sources, projections)
-        if gen is not None:
-            from batcher.core.udf.stream import reconcile_stream
-
-            yield from reconcile_stream(gen)
-            return
-    yield from execute_with_udfs(plan, sources, source_projections, engine_config)
-
-
 def _linear_stream(
     plan: LogicalPlan,
     sources: list,
@@ -177,8 +143,7 @@ def _linear_stream(
 ) -> Iterator[pa.RecordBatch] | None:
     """The stage-overlapped batch stream for `plan`, or `None` if it isn't eligible.
 
-    The one place the streaming route is decided, so the listing caller and the streaming
-    caller can never disagree about which plans stream.
+    The one place the streaming route is decided.
     """
     from batcher.core.udf.stream import linear_map_chain, stream_eligible, stream_linear_chain
 

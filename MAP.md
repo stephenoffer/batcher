@@ -1752,14 +1752,14 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 | `apply.py` | 404 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
 | `async_udf.py` | 193 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
 | `call.py` | 474 | The per-batch `map_batches` call boundary (Core, layer 3). |
-| `execute.py` | 340 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
+| `execute.py` | 305 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
 | `isolation.py` | 236 | What a UDF child process is allowed to see and consume. |
 | `lifecycle.py` | 90 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
 | `processes.py` | 450 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 158 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
 | `sizing.py` | 300 | What the streaming UDF path learned last run, folded back into this run's sizing. |
 | `strategy.py` | 511 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
-| `stream.py` | 385 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
+| `stream.py` | 364 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
 
 ### `batcher/governance/` — 3 · subsystem
 
