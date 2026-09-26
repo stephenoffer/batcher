@@ -1092,22 +1092,15 @@ def _write(
             layout=layout,
             resume=resume,
         )
-        # The schema, asked for in the order that costs least, and **after** the write rather
-        # than before it. `_schema`'s last resort executes the plan under a zero-row limit,
-        # which for a `map_batches` stage builds the UDF here on the driver -- and this is the
-        # one write shape where that is a batch-inference model. Measured on a GPU-less head
-        # node: `map_batches(Model, num_gpus=1).write.parquet(...)` died in `cupy` with
-        # `cudaErrorInsufficientDriver` on a 1.9 GiB input, and on a 29 GiB one the driver was
-        # OOM-killed at 16.7 GB, both before a single row was written. Scoring a corpus and
-        # writing the scores is the canonical batch-inference job, so that was the shape it
-        # broke on.
-        #
-        # It is asked for at all only because a transactional sink creating a table cannot
-        # recover it from the data files (see `_commit`), and because an empty result still
-        # has to write one empty file with the right columns. The workers already attach the
-        # schema they wrote, which answers both -- except under `partition_by`, where the
-        # partition columns live in the path rather than in the file, so that case keeps the
-        # analysis it had.
+        # The schema is asked for after the write, cheapest source first. `_schema`'s last
+        # resort executes the plan under a zero-row limit, which for a `map_batches` stage builds
+        # the UDF on the driver: for a batch-inference write that loads the model there, which
+        # fails on a GPU-less head node or OOMs it on a large input before any row is written.
+        # The schema is needed only because a transactional sink creating a table cannot recover
+        # it from the data files (see `_commit`), and an empty result still writes one empty
+        # file with the right columns. The workers attach the schema they wrote, which answers
+        # both, except under `partition_by`, where the partition columns live in the path rather
+        # than in the file, so that case keeps the analysis.
         out_schema = _declared_schema(plan, sources)
         if out_schema is None and not partition_by:
             out_schema = manifest.schema

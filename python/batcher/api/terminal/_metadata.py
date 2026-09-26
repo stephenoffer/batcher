@@ -229,16 +229,11 @@ def collect_source_metadata(hub, sources: list[Source], plan: LogicalPlan | None
             source_key = source_stats_key(src)
             if source_key is None:
                 continue
-            # Gated on the marker `learn_column_stats` gates *itself* on, so the two agree
-            # about what is left to learn. It used to ask about the distinct count, which was
-            # the same question only for as long as a sample was allowed to record one: once
-            # the ndv is (correctly) withheld from a partial scan, a column is never marked
-            # measured, and this pass re-sampled the same source on every query for the life
-            # of the process -- 389 ms of a 3,100 ms sf100 join, forever, to learn nothing.
-            # What this pass will read, and therefore what it can mark measured. The two
-            # must be the same set or the "already learned" marker never completes and the
-            # source is re-sampled on every query forever -- see the note above, which
-            # records that exact failure from the previous version of this gate.
+            # Gated on the marker `learn_column_stats` gates itself on (the average-bytes
+            # entry), over exactly the columns this pass reads.
+            # Gating on anything a sample may withhold, such as the distinct count of a
+            # partial scan, or on a different column set, means the marker never completes
+            # and the source is re-sampled on every query.
             names = list(src.schema().names)
             cols = names if wanted is None else [c for c in names if c in wanted]
             if not cols:
@@ -707,22 +702,13 @@ def learn_column_stats(
             total = sum(b.num_rows for b in sample)
             _sample_ndv, quants, avg_bytes = core.column_statistics(sample, cols)
             mcv: dict[str, dict[str, float]] = {}
-            # Heavy hitters are measured on **every** column being sketched, not only
-            # low-cardinality ones.
-            #
-            # This used to skip any column with `ndv > 1/min_frac` (20), reasoning that a
-            # high-cardinality column cannot hold a value above the frequency floor. That is
-            # only true under *uniformity* — which is the one assumption an MCV exists to
-            # correct. A column of a million distinct keys can still have a single value at
-            # 30% of rows (a sentinel, a default account, one whale customer), and
-            # Misra-Gries finds it in the same pass. Measured: 1,000 distinct `cust_id`s with
-            # key 7 at 47.5% of rows was excluded by the gate, so `cust_id = 7` estimated at
-            # `1/ndv` = 0.001 against a true 0.5 — a ~500x under-estimate on the most skewed
-            # key in the table, which is exactly the key a join is about to be built on. The
-            # gate suppressed skew precisely where skew matters, leaving join-key skew
-            # structurally unmeasurable (`kyber.hot_join_values` reads this).
-            # Over the sample, and against the sample's row count: an MCV is a *fraction*
-            # of rows, and a uniform sample preserves a value's frequency.
+            # Heavy hitters are measured on every column being sketched, whatever its
+            # cardinality. "A high-ndv column holds no frequent value" is true only under
+            # uniformity, the one assumption an MCV exists to correct: a million distinct keys
+            # can still include a sentinel or one whale customer at 30% of rows, which is the
+            # join-key skew `kyber.hot_join_values` reads. Misra-Gries finds it in the same
+            # pass. Frequencies are over the sample and its row count, since an MCV is a
+            # fraction of rows and a uniform sample preserves one.
             for col_name, hits in core.heavy_hitters(sample, cols, min_frac).items():
                 if total > 0 and hits:
                     mcv[col_name] = {str(v): n / total for v, n in hits}
