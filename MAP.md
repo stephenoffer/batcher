@@ -1336,7 +1336,7 @@ Extended Kyber rule families.
 | `join_extra.py` | 211 | Structural join rewrites — collapse a join whose result is provably fixed. |
 | `limit_extra.py` | 317 | LIMIT / top-N rewrites that the existing limit rules leave on the table. |
 | `membership_simplify.py` | 118 | `IN`-list and `coalesce` simplifications. |
-| `metadata_adaptive.py` | 317 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
+| `metadata_adaptive.py` | 313 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
 | `null_shapes.py` | 187 | Null-check rewrites driven by an expression's *shape* rather than by column nullability. |
 | `nullability.py` | 367 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
 | `predicate_impossible.py` | 385 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
@@ -1372,7 +1372,7 @@ Join elimination — removing a join outright, and the proofs that make it legal
 
 | module | lines | what it is |
 |---|---|---|
-| `evidence.py` | 147 | The proofs a join elimination must clear before it may delete or degenerate a join. |
+| `evidence.py` | 143 | The proofs a join elimination must clear before it may delete or degenerate a join. |
 | `rules.py` | 363 | The join-elimination rewrites — outer, self, cartesian, inner-reduction, disjoint-key. |
 
 ### `batcher/kyber/rules/extra/runtime_filters/` — 3 · subsystem
@@ -1519,7 +1519,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate_columns.py` | 308 | Aggregate output column statistics — the values a grouped/global aggregate produces. |
-| `columns.py` | 551 | Per-operator column-statistics propagation. |
+| `columns.py` | 564 | Per-operator column-statistics propagation. |
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 270 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 488 | Distributional primitives shared by the cardinality and selectivity estimators. |
