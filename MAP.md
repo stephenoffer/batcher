@@ -1244,7 +1244,7 @@ Kyber rule modules.
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
 | `agg_pushdown.py` | 583 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 | `fusion.py` | 396 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
-| `leaf_rewrite.py` | 312 | The shared machinery every leaf-level expression rule is built from. |
+| `leaf_rewrite.py` | 318 | The shared machinery every leaf-level expression rule is built from. |
 | `literals.py` | 56 | Literal-value predicates shared by the expression rules: the i64 range and boolean literals. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 898 | Projection rewrites — collapse stacked projections and prune unread columns. |
@@ -1327,7 +1327,7 @@ Extended Kyber rule families.
 | `agg_rules.py` | 504 | Aggregate rewrites driven by *proven* metadata — uniqueness, constancy, exact counts. |
 | `arith_algebra.py` | 354 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
 | `arith_extra.py` | 546 | NORMALIZE-phase arithmetic the other families leave on the table — math-function |
-| `boolean_algebra.py` | 445 | NORMALIZE-phase boolean / CASE / COALESCE / NULL simplifications. |
+| `boolean_algebra.py` | 427 | NORMALIZE-phase boolean / CASE / COALESCE / NULL simplifications. |
 | `casts.py` | 456 | NORMALIZE-phase rules for `CAST` — the shapes a SQL front end and the type-coercion |
 | `cse.py` | 191 | Common-subexpression elimination — compute a repeated expression once, not N times. |
 | `disjunction_infer.py` | 124 | NORMALIZE-phase implied-predicate inference from a multi-column disjunction. |
