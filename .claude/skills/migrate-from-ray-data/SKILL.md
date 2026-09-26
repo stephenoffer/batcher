@@ -145,7 +145,7 @@ row; Batcher's calls it per batch and expects one boolean per row back. Ray's
 Compare results, not plans. `ds.equals(other)` executes both sides and ignores row order by
 default; pass `ordered=True` only after an explicit `sort`, because an order-independent
 comparison cannot see a sort bug. Against the Ray Data original, collect both sides and compare
-as multisets of tuples, the way `tests/differential/conftest.py::assert_same` does:
+as multisets of tuples, the way `tests/_harness.py::assert_same` does:
 
 ```python
 import batcher as bt

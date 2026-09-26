@@ -10,7 +10,7 @@ Batcher has two correctness oracles. Use them; don't invent ad-hoc assertions.
 
 1. **DuckDB (Python differential).** For any relational behavior — operators,
    expressions, SQL, optimizer rewrites — the result MUST match DuckDB on the same
-   input. Harness: `tests/differential/conftest.py::assert_same` (order-independent,
+   input. Harness: `tests/_harness.py::assert_same` (order-independent,
    type-tolerant multiset comparison; tolerates int↔float, Decimal→float, float
    rounding). Add cases next to the existing `test_diff_*.py` files.
 2. **The Tier-0 interpreter (Rust).** `bc-interp::execute` (sequential) is the

@@ -9,7 +9,7 @@ reuses the engine's neutralize-the-broken-hook fix and falls back to attaching t
 the running cluster, so the distributed suite runs both on a laptop (a fresh local
 cluster) and against a managed cluster (attach) instead of erroring at setup.
 
-These live here rather than in `tests/integration/conftest.py` for the same reason
+These live in a uniquely-named module rather than a `conftest` for the same reason
 `tests/_harness.py` exists: a `conftest` is imported under the bare name ``conftest``,
 so ``from conftest import init_test_ray`` binds to whichever `conftest` pytest imported
 first. In a run spanning `tests/differential` and `tests/integration` that is the wrong

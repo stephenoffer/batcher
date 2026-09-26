@@ -9,8 +9,7 @@ failed with `ImportError`. A uniquely-named module is unambiguous from anywhere 
 `sys.path`, which pytest guarantees for both `tests/` and each test's own directory.
 
 The comparison semantics are the load-bearing part; see `assert_same` and `_coerce`.
-`tests/differential/conftest.py` re-exports these names, so it stays the documented
-home of the differential oracle and the `duck` fixture.
+The `duck` fixture lives in `tests/differential/conftest.py`.
 """
 
 from __future__ import annotations

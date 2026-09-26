@@ -115,7 +115,7 @@ Three idioms span several names and so have no single row:
    typed `ds.write.parquet/delta/iceberg(...)`.
 8. **Verify equivalence.** Run both scripts on the same input, dump each to Arrow, and
    compare **order-independently** unless the query ends in an explicit `sort`. The
-   in-repo pattern is `tests/differential/conftest.py::assert_same` (multiset comparison,
+   in-repo pattern is `tests/_harness.py::assert_same` (multiset comparison,
    tolerant of int↔float and float rounding); `assert_same_ordered` is the version to use
    when order is part of the contract. Mirror it:
 
