@@ -902,7 +902,7 @@ where
 /// while DuckDB pays the same either way. So the obvious move is to pack 8-15 bytes into an
 /// `i128` and route it through [`int_group_ids`] exactly as this does for `u64`.
 ///
-/// **It was built and measured, and it is 1.13x *slower*** (`id3` 49.7/53.0 ms -> 57.6/59.2 ms
+/// **Measured, it is 1.13x *slower*** (`id3` 49.7/53.0 ms -> 57.6/59.2 ms
 /// over two interleaved rounds, same tree, two `.so`s differing only in this). Two costs swamp
 /// the saving, and both are properties of the wide key rather than of the implementation: the
 /// packing is a second full pass that materializes a 160 MB `Vec<i128>` the hash path never
@@ -1115,9 +1115,8 @@ fn combine_hash(a: u64, b: u64) -> u64 {
 
 /// Per-row hashes of a null-free composite `Int64` key, one **column at a time**.
 ///
-/// The probe loop this feeds used to hash row-major: construct an `ahash` hasher, walk the
-/// column list writing each value into it, finish it — per row. This does the same work
-/// column-major instead, one tight pass per column over a contiguous `&[i64]`. It is the
+/// The row-major alternative constructs an `ahash` hasher, walks the column list writing each
+/// value into it, and finishes it — per row. This does the same work column-major instead, one tight pass per column over a contiguous `&[i64]`. It is the
 /// shape DuckDB (`TightLoopCombineHash`) and Polars (`vec_hash_combine`) both use, and each
 /// pass streams two slices with no hasher state to spill, no bounds check, and no indirect
 /// call through a column list — the column count is loop-invariant rather than re-walked per
@@ -1130,8 +1129,7 @@ fn combine_hash(a: u64, b: u64) -> u64 {
 ///
 /// The `8 x num_rows` this costs is deliberate and is less than the neighbouring paths already
 /// spend — `assign_groups_packed` materializes a `u128` per row, and the `RowConverter` path a
-/// whole encoded row. Storing the hash in the table entry instead was **built and measured**,
-/// and it loses: it removes the array but quadruples the entry (4 bytes to 16), and past a few
+/// whole encoded row. Storing the hash in the table entry instead **measures worse**: it removes the array but quadruples the entry (4 bytes to 16), and past a few
 /// hundred thousand groups the wider table costs more cache than the free rehash saves. See
 /// `competitor_technique_review.md` item 26.
 fn hash_columns_i64(values: &[&[i64]], num_rows: usize) -> Vec<u64> {
@@ -1163,8 +1161,8 @@ fn assign_groups_int64_multi(
         }
     }
 
-    // **Tried and reverted: delegating a two-column key to `assign_groups_packed`.** The loop
-    // below verifies a probe with `eq_rows(reps[g], i)`, reading the rep row in *every* key
+    // **A two-column key is not delegated to `assign_groups_packed`.** The loop below verifies a
+    // probe with `eq_rows(reps[g], i)`, reading the rep row in *every* key
     // column — one random access per column into an array of `8 × num_rows` bytes, on the
     // critical path of each probe. That is the defect [`int_group_ids`] carried, multiplied by
     // the column count, and it costs **362.7 ns/row** at 1.7 M groups and **469.6 ns/row** at
@@ -1175,12 +1173,9 @@ fn assign_groups_int64_multi(
     // *every* row, which is pure overhead once the table is small enough to stay in L1 — the
     // low-cardinality composite key (`GROUP BY <region>, <status>`) measured **21.4 ns/row
     // against 12.3**, a 1.7x regression on the commoner shape. Two cached loads beat building
-    // a key. Restoring the delegation needs a cardinality signal to gate it on, which is not
-    // available here before the probe loop has run.
-    //
-    // Those figures predate the hash now stored in the entry, which removes most of what the
-    // packing was for: the rep-row read still happens, but only once a full 64-bit hash has
-    // matched, rather than on every tag collision. Re-measure before reviving the idea.
+    // a key. Delegating needs a cardinality signal to gate it on, which is not available here
+    // before the probe loop has run. The probe loop has changed since these figures were
+    // taken, so re-measure before reviving the idea.
 
     // Raw value slices for the equality check. `Int64Array::value(i)` re-reads the array's
     // offset and re-checks its bounds on every access, and a probe makes `cols.len()` of them
@@ -1188,12 +1183,10 @@ fn assign_groups_int64_multi(
     let values: Vec<&[i64]> = cols.iter().map(|c| &c.values()[..num_rows]).collect();
     let eq_rows = |a: usize, b: usize| -> bool { values.iter().all(|v| v[a] == v[b]) };
 
-    // The entry carries the row's hash beside its group id, which pays for itself twice. The
-    // table's rehash closure — which fires on every growth step, and which previously had to
-    // re-read the representative row out of *every* key column, one random access each into
-    // `8 x num_rows` bytes — becomes the identity. And a probe compares the full 64-bit hash
-    // before `eq_rows`, so the scattered per-column reads happen only on a real candidate
-    // rather than on `hashbrown`'s 1-in-128 tag collisions.
+    // The per-row hashes stay live beside the table (see `hash_columns_i64`), so the table's
+    // rehash closure — which fires on every growth step — is one array read rather than a
+    // re-read of the representative row out of *every* key column, one random access each into
+    // `8 x num_rows` bytes.
     let hashes = hash_columns_i64(&values, num_rows);
     let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index

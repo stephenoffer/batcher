@@ -1157,22 +1157,19 @@ fn top_k_indices_of(
     // touches its heap only for a row that beats the worst of the `k` kept so far — for a small
     // `k` over random data that is ~one comparison per row and nothing else.
     //
-    // It replaces a *full per-morsel sort* on this path, and the difference is not marginal.
+    // The alternative is a *full per-morsel sort*, and the difference is not marginal.
     // Measured on 6 M random rows, `ORDER BY <i64> LIMIT 10`: the LSD radix runs five passes of
     // random-access counting and scatter to order 16,384 rows and keep ten of them — 199 ms
     // single-threaded, 53 ms across the pool. A `Utf8` key is worse still, because
     // `stable_sort_indices_bytes` is a comparison sort: `ORDER BY <string> LIMIT 10` cost 401 ms
-    // where the same query with a second sort key — which fell through to the O(n) quickselect
-    // below — cost 77 ms. **Fewer sort keys costing five times more was the tell**, the same
-    // tell that had already moved float keys to the quickselect.
+    // where the same query with a second sort key — which falls through to the O(n) quickselect
+    // below — cost 77 ms.
     //
-    // The earlier attempt at this replaced the sort with the general quickselect and measured a
-    // wash at `LIMIT 10`, which is why the full sort stayed. Two things are different here.
-    // The selection is typed — it ranks by the same order-preserving `u64` the radix builds, so
-    // there is no `make_comparator` dynamic dispatch in the inner loop — and it **returns its
-    // survivors already sorted**, so the downstream merge still receives sorted runs. That was
-    // the reason the full sort was kept (a quickselect's unordered output made `LIMIT 100000`
-    // 893 -> 1139 ms), and it no longer applies. The `k * 2 <= num_rows` gate keeps the full
+    // The general quickselect is not the replacement: it measures a wash at `LIMIT 10`, and its
+    // unordered output makes `LIMIT 100000` slower (893 -> 1139 ms) because the downstream
+    // merge wants sorted runs. The selection differs on both counts. It is typed — it ranks by
+    // the same order-preserving `u64` the radix builds, so there is no `make_comparator`
+    // dynamic dispatch in the inner loop — and it **returns its survivors already sorted**. The `k * 2 <= num_rows` gate keeps the full
     // sort for the large-`k` case anyway, where a heap of nearly every row is the wrong shape.
     if !keys.is_empty() && k > 0 && k.saturating_mul(TOP_K_SELECT_RATIO) <= num_rows {
         if keys.len() == 1 {
@@ -1190,11 +1187,11 @@ fn top_k_indices_of(
     // A single key with a large `k`, or one whose type has no selection: the specialized full
     // sort, sliced. `stable_sort_indices_bytes` for strings, the LSD radix for integer/temporal.
     //
-    // A float, decimal or boolean key has no specialized full sort. It used to full-`lexsort`
-    // every morsel to keep `k` rows — an O(n log n) sort. Measured on 6M rows: `ORDER BY <f64>
-    // DESC LIMIT 100` took **26.3 ms against DuckDB's 8.7 ms (3.0x)**, while the *three*-key
-    // form of the same query ran in 18 ms because it reached the O(n) quickselect below. So
-    // those keys fall through to that same quickselect, which is O(n) for any type and (with
+    // A float, decimal or boolean key has no specialized full sort, and a full `lexsort` of
+    // every morsel to keep `k` rows is an O(n log n) sort. Measured on 6M rows: `ORDER BY <f64>
+    // DESC LIMIT 100` took **26.3 ms against DuckDB's 8.7 ms (3.0x)** that way, while the
+    // *three*-key form of the same query ran in 18 ms because it reached the O(n) quickselect
+    // below. So those keys fall through to that same quickselect, which is O(n) for any type and (with
     // the fixed `parallel_top_n` tie-break) selects exactly the stable sort's top-k — proven
     // for a float key with `-0.0`/`0.0`, NaN and heavy ties by
     // `parallel_top_n_float_key_matches_eager`.
@@ -1296,8 +1293,8 @@ fn row_comparator<'a>(
 ///
 /// This is the multi-key twin of [`top_k_single_key`], and it is what makes a `LIMIT` cheap for
 /// the shape a `LIMIT` almost always has: `ORDER BY <measure> DESC, <tie-breakers…>`. Without it
-/// the tie-breakers cost a full quickselect over an `arrow` comparator, whose per-comparison
-/// dispatch is the reason a *three*-key top-N used to be the fast one.
+/// the tie-breakers cost a full quickselect over an `arrow` comparator, with per-comparison
+/// dynamic dispatch on every row.
 fn top_k_by_leading_key(
     key_arrays: &[ArrayRef],
     keys: &[SortKey],
@@ -1439,10 +1436,9 @@ pub(crate) fn parallel_top_n(
         .filter(|(_, b)| b.num_rows() > 0)
         .map(|(p, b)| -> Result<Option<_>, InterpError> {
             // Evaluate the ORDER BY expressions ONCE per morsel and reuse them for the
-            // selection, the bound check and the candidate gather. They used to be evaluated
-            // twice — once inside the selection and again here — which for a computed key is
-            // the expression run twice, and for a float key is `normalize_sort_key` scanning
-            // the whole column twice looking for `-0.0`/NaN.
+            // selection, the bound check and the candidate gather. Evaluating them a second time
+            // inside the selection would run a computed key's expression twice, and would make
+            // `normalize_sort_key` scan a float key's whole column twice for `-0.0`/NaN.
             let key_arrays: Vec<ArrayRef> = keys
                 .iter()
                 .map(|key| Ok(normalize_sort_key(key.expr.eval(b)?)))
@@ -2565,10 +2561,9 @@ mod window_frame_tests {
         Some(WindowFrame { units, start, end })
     }
 
-    /// A value-based `RANGE` offset maps through as a `RANGE` frame carrying its offsets.
-    /// It used to be rejected here, because the runtime had no way to resolve it; the
-    /// bound is now searched against the order key's values. What must NOT happen — then
-    /// or now — is a silent downgrade to the peer-`RANGE` running aggregate, which is a
+    /// A value-based `RANGE` offset maps through as a `RANGE` frame carrying its offsets,
+    /// and the bound is searched against the order key's values. What must NOT happen is a
+    /// silent downgrade to the peer-`RANGE` running aggregate, which is a
     /// different frame and therefore a wrong answer.
     #[test]
     fn numeric_range_offsets_map_through_intact() {

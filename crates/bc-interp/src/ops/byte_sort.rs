@@ -571,14 +571,14 @@ fn top_k_generic<A: ByteKeys>(arr: &A, descending: bool, k: usize) -> Option<Vec
 /// empty on ~93% of ClickBench's rows; a URL column, where every value starts `https://`; an ISO
 /// timestamp rendered as text. Both decline paths above reach it.
 ///
-/// **It exists because declining used to mean a full sort, and a full sort is the wrong shape
-/// for a `LIMIT`.** `stable_sort_indices_bytes` orders all `n` rows in `O(n log n)` string
+/// **It exists because declining would otherwise mean a full sort, and a full sort is the wrong
+/// shape for a `LIMIT`.** `stable_sort_indices_bytes` orders all `n` rows in `O(n log n)` string
 /// comparisons to keep `k` of them; a quickselect partitions in `O(n)` expected comparisons and
 /// then orders only the `k` survivors. The caller's gate (`k * TOP_K_SELECT_RATIO <= num_rows`)
 /// already confines this to `k <= n / 2`, where the second is strictly less work.
 ///
-/// The survivors are returned **sorted**, which is not incidental: an earlier attempt at a
-/// quickselect here returned them unordered and made `LIMIT 100000` slower (893 -> 1139 ms),
+/// The survivors are returned **sorted**, which is not incidental: a quickselect that returns
+/// them unordered makes `LIMIT 100000` slower (893 -> 1139 ms),
 /// because `parallel_top_n`'s merge relies on each morsel handing back a sorted run. Ordering
 /// `k` rows costs `O(k log k)` and restores that.
 ///
@@ -1577,12 +1577,11 @@ mod byte_key_tests {
     ///
     /// `cargo test --release -p bc-interp --lib -- --ignored --nocapture report_the_packed_prefix_alternatives`
     ///
-    /// Recorded because each is the obvious next idea and each costs a day to re-derive.
-    /// `competitor_technique_review.md` item 9 lists "an adaptive-width key" as its one open
-    /// lead; this is that lead, measured. Both helpers are local to this test, so no product
-    /// code carries a rejected design.
+    /// Each is the obvious next idea. `competitor_technique_review.md` item 9 lists "an
+    /// adaptive-width key" as its one open lead, and this measures that lead. Both helpers are
+    /// local to this test, so no product code carries a rejected design.
     ///
-    /// Measured 2026-09-11, 48-core Xeon 8275CL, quiet box. `skip` is `packed@0 / packed@lcp`
+    /// Measured on a 48-core Xeon 8275CL, quiet box. `skip` is `packed@0 / packed@lcp`
     /// and `n/p` is the narrow key against `packed@lcp`; above 1.00x favours the alternative.
     ///
     /// | rows | shape | lcp | narrow | packed@lcp | packed@0 | n/p | skip |
