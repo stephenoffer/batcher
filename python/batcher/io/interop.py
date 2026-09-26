@@ -251,7 +251,7 @@ def from_torch(dataset_or_tensors: Any) -> Source:
     crosses into the engine — only the bulk NumPy buffers do.
 
     A ``{name: tensor}`` **mapping** keeps its keys as column names, which makes this the
-    exact inverse of `ml.to_torch`: what the loader yields, this reads back. Before, a
+    exact inverse of `ml.to_torch_iterable`: what the loader yields, this reads back. Before, a
     mapping fell through to the map-style-`Dataset` branch and indexed it by integer, so the
     natural round-trip raised ``KeyError: 0`` — an error naming nothing the caller wrote.
 

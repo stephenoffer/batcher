@@ -507,7 +507,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `autobatch.py` | 285 | Adaptive batch-size control for inference — what Ray Data makes you hand-tune. |
 | `batch_format.py` | 13 | Re-export of the `batch_format` conversion, which now lives in `interop`. |
 | `cluster.py` | 349 | Unsupervised clustering — grouping rows by similarity, with no labels. |
-| `converters.py` | 293 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
+| `converters.py` | 243 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
 | `devices.py` | 448 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
 | `discriminant.py` | 363 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
 | `dummy.py` | 228 | Baseline predictors — the "does my model beat doing nothing" reference. |
@@ -796,7 +796,7 @@ Statistical analysis and drift monitoring over a `Dataset`.
 | module | lines | what it is |
 |---|---|---|
 | `_shared.py` | 176 | Helpers shared across `ml` — column checks, indicator casting, and scalar collection. |
-| `_special.py` | 266 | Distribution tail probabilities for hypothesis testing, in dependency-free Python. |
+| `_special.py` | 248 | Distribution tail probabilities for hypothesis testing, in dependency-free Python. |
 | `association.py` | 434 | Association between two columns — contingency tables, chi-squared, and ANOVA. |
 | `descriptive.py` | 255 | Statistics that need two passes or a grouping — ranks, entropy, and category association. |
 | `drift.py` | 476 | Distribution drift between a reference dataset and a current one. |
@@ -2934,7 +2934,7 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 
 | module | lines | what it is |
 |---|---|---|
-| `arrays.py` | 309 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
+| `arrays.py` | 310 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
 | `diagnostics.py` | 149 | Why a Python value cannot become an Arrow column, and what to do about it. |
 | `formats.py` | 394 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
 
