@@ -1250,7 +1250,7 @@ Kyber rule modules.
 | `pushdown.py` | 637 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 574 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
-| `zonemap_pruning.py` | 585 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
+| `zonemap_pruning.py` | 581 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
 
@@ -1321,7 +1321,7 @@ Extended Kyber rule families.
 
 | module | lines | what it is |
 |---|---|---|
-| `adaptive_meta.py` | 164 | Adaptive metadata rules — simplifications a provably-EXACT cardinality unlocks. |
+| `adaptive_meta.py` | 160 | Adaptive metadata rules — simplifications a provably-EXACT cardinality unlocks. |
 | `agg_extra.py` | 505 | Extra aggregate / GROUP BY rewrites — small, local, always-correct simplifications. |
 | `agg_rules.py` | 504 | Aggregate rewrites driven by *proven* metadata — uniqueness, constancy, exact counts. |
 | `arith_algebra.py` | 355 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
@@ -1330,9 +1330,9 @@ Extended Kyber rule families.
 | `casts.py` | 456 | NORMALIZE-phase rules for `CAST` — the shapes a SQL front end and the type-coercion |
 | `cse.py` | 191 | Common-subexpression elimination — compute a repeated expression once, not N times. |
 | `disjunction_infer.py` | 124 | NORMALIZE-phase implied-predicate inference from a multi-column disjunction. |
-| `empty_relation.py` | 133 | Empty-relation folding — turn a provably-empty subtree into the canonical marker. |
+| `empty_relation.py` | 134 | Empty-relation folding — turn a provably-empty subtree into the canonical marker. |
 | `filter_split.py` | 139 | Cost-based filter splitting — pay an expensive predicate only on surviving rows. |
-| `join_extra.py` | 213 | Structural join rewrites — collapse a join whose result is provably fixed. |
+| `join_extra.py` | 211 | Structural join rewrites — collapse a join whose result is provably fixed. |
 | `limit_extra.py` | 317 | LIMIT / top-N rewrites that the existing limit rules leave on the table. |
 | `membership_simplify.py` | 118 | `IN`-list and `coalesce` simplifications. |
 | `metadata_adaptive.py` | 317 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
@@ -1343,7 +1343,7 @@ Extended Kyber rule families.
 | `projection_scan.py` | 364 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 469 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
 | `sargable.py` | 301 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
-| `setops.py` | 388 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
+| `setops.py` | 379 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 482 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
@@ -1372,7 +1372,7 @@ Join elimination — removing a join outright, and the proofs that make it legal
 | module | lines | what it is |
 |---|---|---|
 | `evidence.py` | 147 | The proofs a join elimination must clear before it may delete or degenerate a join. |
-| `rules.py` | 354 | The join-elimination rewrites — outer, self, cartesian, inner-reduction, disjoint-key. |
+| `rules.py` | 363 | The join-elimination rewrites — outer, self, cartesian, inner-reduction, disjoint-key. |
 
 ### `batcher/kyber/rules/extra/runtime_filters/` — 3 · subsystem
 
@@ -1380,7 +1380,7 @@ Runtime filters and scan-level data skipping — the sideways-information-passin
 
 | module | lines | what it is |
 |---|---|---|
-| `evidence.py` | 475 | The proofs the runtime-filter rules stand on — and nothing else may stand on. |
+| `evidence.py` | 476 | The proofs the runtime-filter rules stand on — and nothing else may stand on. |
 | `sip.py` | 415 | Sideways information passing — the filters a join implies about its other side. |
 | `skipping.py` | 243 | Scan-level data skipping — decide a predicate's *parts* from the column's metadata. |
 
@@ -2569,7 +2569,7 @@ String free functions, in two halves: building text and reading structure out of
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 666 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
-| `transforms.py` | 678 | Plan transforms and predicates over `LogicalPlan` trees. |
+| `transforms.py` | 695 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 522 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract

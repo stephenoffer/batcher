@@ -207,9 +207,9 @@ def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table 
     Returns:
         A zero-row table, or `None` to execute normally.
     """
-    from batcher.plan.logical import Limit
+    from batcher.plan.logical import is_empty_relation
 
-    if not (isinstance(logical_opt, Limit) and logical_opt.n == 0):
+    if not is_empty_relation(logical_opt):
         return None
     inferred = plan.available_schema()
     return None if inferred is None else inferred.arrow.empty_table()
