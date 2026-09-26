@@ -236,16 +236,12 @@ def test_validate_covers_every_section():
         "target_bytes_per_task": Config().replace(
             optimizer=OptimizerConfig(target_bytes_per_task=0)
         ),
-        "join thresholds": Config().replace(
-            optimizer=OptimizerConfig(join_dp_max_tables=20, greedy_max_tables=10)
-        ),
         "eq_selectivity": Config().replace(
             optimizer=OptimizerConfig(cardinality=CardinalityConfig(eq_selectivity=5.0))
         ),
         "pid gains": Config().replace(pid=PIDConfig(kp=-1.0)),
         "max_step_fraction": Config().replace(pid=PIDConfig(max_step_fraction=1.5)),
         "metadata.backend": Config().replace(metadata=MetadataConfig(backend="postgres")),
-        "decay_per_day": Config().replace(metadata=MetadataConfig(decay_per_day=2.0)),
         "log_level": Config().replace(observability=ObservabilityConfig(log_level="LOUD")),
         "log_format": Config().replace(observability=ObservabilityConfig(log_format="xml")),
     }

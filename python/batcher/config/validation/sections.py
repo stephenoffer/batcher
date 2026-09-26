@@ -217,11 +217,6 @@ def _check_optimizer(o: OptimizerConfig) -> None:
         f"optimizer.reoptimize_error must be positive, got {o.reoptimize_error}",
     )
     _check(
-        1 <= o.join_dp_max_tables <= o.greedy_max_tables,
-        "optimizer join thresholds must satisfy 1 <= join_dp_max_tables "
-        f"({o.join_dp_max_tables}) <= greedy_max_tables ({o.greedy_max_tables})",
-    )
-    _check(
         o.cost_calibration_min_samples >= 1,
         f"optimizer.cost_calibration_min_samples must be >= 1, "
         f"got {o.cost_calibration_min_samples}",
@@ -277,15 +272,11 @@ METADATA_BACKENDS: tuple[str, ...] = (
 
 
 def _check_metadata(md: MetadataConfig) -> None:
-    """Metadata store: the backend name and the per-day decay fraction."""
+    """Metadata store: the backend name."""
     _check(
         md.backend in METADATA_BACKENDS,
         f"metadata.backend must be one of {', '.join(map(repr, METADATA_BACKENDS))}, got "
         f"{md.backend!r}",
-    )
-    _check(
-        0.0 <= md.decay_per_day <= 1.0,
-        f"metadata.decay_per_day must be in [0, 1], got {md.decay_per_day}",
     )
 
 

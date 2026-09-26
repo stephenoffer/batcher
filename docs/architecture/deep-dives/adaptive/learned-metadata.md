@@ -288,8 +288,7 @@ backend the warm numbers quoted here describe a repeated query inside one proces
 the behavior of a new one.
 
 :::{warning}
-**Nothing expires.** `metadata.decay_per_day` is declared and validated and has no reader. There
-is no TTL and no aging on any backend. What provides recency is smoothing, not expiry: a
+**Nothing expires.** There is no TTL, no decay option and no aging on any backend. What provides recency is smoothing, not expiry: a
 per-signature EWMA with step `max(learned_scalar_alpha_floor, 1/(n_obs+1))`, a running mean while
 evidence is thin and then a roughly 10-observation memory, plus the 8-sample window on
 cardinality corrections.

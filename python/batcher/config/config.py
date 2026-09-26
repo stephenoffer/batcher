@@ -846,21 +846,19 @@ class CostCoefficients:
 class OptimizerConfig:
     """Knobs for the Kyber optimizer: join planning, cost, and cardinality.
 
-    Controls how hard the optimizer works (exact dynamic-programming join ordering up
-    to a table count, greedy beyond it), how it estimates cost and row counts from
-    learned statistics and sketches, and when a measured estimate is wrong enough to
-    trigger re-optimization mid-query. Defaults suit most workloads.
+    Controls how the optimizer estimates cost and row counts from learned statistics and
+    sketches, and when a measured estimate is wrong enough to trigger re-optimization
+    mid-query. How hard join ordering searches is priced per query rather than set here.
+    Defaults suit most workloads.
 
     Examples:
         .. doctest::
 
             >>> from batcher.config import OptimizerConfig
-            >>> OptimizerConfig().join_dp_max_tables
-            12
+            >>> OptimizerConfig().reoptimize_error
+            2.0
     """
 
-    join_dp_max_tables: int = 12  # DP-CCP exact threshold
-    greedy_max_tables: int = 25  # greedy heuristic threshold
     # Build a per-column membership bloom index when persisting a written source's
     # stats, so a later read can data-skip an equality/`IN` predicate whose value is
     # absent (a point lookup inside [min, max] that zone-map bounds can't prune).
@@ -1204,7 +1202,6 @@ class MetadataConfig:
     # per-user file (see `metadata.backends.default_sqlite_uri`); pass `":memory:"` for
     # an ephemeral SQLite store.
     uri: str | None = None
-    decay_per_day: float = 0.1  # confidence half-life ~ a week
 
 
 # Sentinel `autoscale_wait_s` meaning "auto": the config layer resolves it to a bounded
