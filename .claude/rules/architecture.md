@@ -63,26 +63,16 @@ failure, not a warning.
 ### The matrix is a contract, not a diagram
 
 `just lint-layers` checks the whole table above as an import-linter `layers` contract, not just
-the four narrow rules that used to stand in for it. Before that contract existed, **28 upward
-edges had accumulated with every gate green** — all of them function-local imports, and only
-one of the 28 recorded anywhere as debt.
+the four narrow rules that used to stand in for it. Before that contract existed, upward edges
+accumulated with every gate green — all of them function-local imports that nothing recorded.
 
-Those 28 are listed individually in `pyproject.toml`'s `ignore_imports`, and
+The ones that remain (6) are listed individually in `pyproject.toml`'s `ignore_imports`, and
 `just lint-layer-debt` fails if the list grows. An exemption records an edge that predates the
 contract; it is **not** a way to make a new import pass. If you find yourself wanting to add
 one, the layer assignment here is what is wrong, and changing it is a design decision to argue
 for rather than a line to append.
 
 ### Known debt (visible on purpose)
-
-Started at 28 upward edges; **6 remain**.
-
-- **Paid off (22).** Five `ml.batch_format` edges went when the Arrow-to-framework conversion
-  moved down into `interop`. Seventeen `api → ml`/`_sql` edges went when the matrix itself was
-  corrected: `api` and the front-ends are *mutually* dependent (`ml` imports `api` 77 times,
-  `api` imports `ml` 17), so they are one layer, not two stacked ones. Calling them stacked
-  made ordinary façade-to-implementation calls look like violations while describing the
-  coupling as one-way, which it never was.
 
 - **`core`/`dist` → `ml.gpu` / `ml.inference`** (6 edges, open). Execution concerns — autocast,
   the inference actor pool, device sizing — still inside the user-facing package. They belong

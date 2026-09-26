@@ -30,7 +30,7 @@ import pytest
 
 import batcher as bt
 from _harness import assert_same, assert_same_ordered, has_outermost_order_by
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 
 pytestmark = pytest.mark.integration
 
@@ -42,11 +42,7 @@ _N = 8_000
 _CUSTOMERS = 97
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(_WORKERS)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(_WORKERS)
 
 
 @pytest.fixture(scope="module")

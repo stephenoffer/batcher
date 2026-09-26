@@ -28,7 +28,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher._internal.errors import PlanError
 from batcher.config import active_config
 
@@ -38,11 +38,7 @@ pytest.importorskip("batcher._native", reason="native engine not built")
 WORKERS = 4
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(WORKERS)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(WORKERS)
 
 
 @pytest.fixture(scope="module")

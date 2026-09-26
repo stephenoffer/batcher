@@ -92,6 +92,13 @@ jobs:
       - name: Gate-suppression ratchet
         run: just lint-suppressions
 
+      # CLAUDE.md lists both as the gate for any test change; neither ran anywhere until here.
+      - name: Tests that cannot fail
+        run: just lint-tests
+
+      - name: Tests arranged not to fail
+        run: just lint-methodology
+
       - name: Public-API docstrings
         run: just lint-docstrings
 

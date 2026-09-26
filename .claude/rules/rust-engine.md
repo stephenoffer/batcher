@@ -141,18 +141,9 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
   algorithm promises rather than a defect. Do not write a test asserting a quantile sketch
   merges to an identical state, and do not set out to "fix" the fact that it does not.
 
-  **Two things this entry got wrong, corrected 2026-09-13 by reading the test rather than
-  the comment above it.** `crates/bc-sketches/tests/merge_order.rs` has three test
-  functions, and they cover HLL/Bloom, `ColumnStats` scalars, and the two
-  quantile sketches. It loops `for seed in 1..12u64`, so **11 seeds** times three orders is
-  what is pinned; the "39 seeds" this entry used to cite appears only in a *comment*
-  describing an earlier sweep, and citing it as the committed measurement is the error this
-  file warns about elsewhere. And **`FrequentItems` is not tested by that file at all**, so
-  listing it as order-sensitive stated as fact something no test checks — while
-  `crates/bc-sketches/src/frequent.rs` argues at length for the opposite, that `merge` sums
-  counts and `heavy_hitters` sorts, making "the *algorithm* order-independent, which is a
-  stronger guarantee than a seed". One of those two files is wrong and the way to settle it
-  is a test, not an edit to either.
+  `crates/bc-sketches/tests/merge_order.rs` pins this over 11 seeds × 3 orders;
+  `FrequentItems` is not covered by it (`crates/bc-sketches/src/frequent.rs` argues its merge
+  is order-independent — settle that with a test, not an edit).
 - `bc-transport` is the Arrow Flight data-plane shuffle with **credit-based flow
   control** (Carbonite model: 1 credit = 1 batch slot; producer blocks at 0). The
   data plane bypasses the Ray object store entirely — do not route bulk batches

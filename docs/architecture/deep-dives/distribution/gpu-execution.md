@@ -163,7 +163,7 @@ print(pid.kp, pid.ki, pid.kd, pid.integral_clamp, pid.max_step_fraction)
 ```
 
 :::{note}
-`architecture.txt` describes a PID controller targeting a *GPU-utilization* setpoint of 80 to 90%, and an RL/PPO batch sizer. Neither exists. The PID targets per-batch **latency**, the GPU path uses the non-PID throughput hill-climb above, and utilization is measured but feeds `num_gpus` and in-flight-depth recommendations rather than a PID.
+The original design paper, `docs/architecture/internals/mathematical_foundations.md`, describes a PID controller targeting a *GPU-utilization* setpoint of 80 to 90%, and an RL/PPO batch sizer. Neither exists. The PID targets per-batch **latency**, the GPU path uses the non-PID throughput hill-climb above, and utilization is measured but feeds `num_gpus` and in-flight-depth recommendations rather than a PID.
 :::
 
 ## Zero config

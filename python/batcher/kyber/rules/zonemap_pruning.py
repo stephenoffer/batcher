@@ -454,9 +454,8 @@ def _float_order_is_ambiguous(bound: object) -> bool:
 
     (The deeper problem is that the engine's float comparisons follow arrow-rs's total order
     rather than IEEE, so they *also* disagree with DuckDB — `WHERE f = 0.0` misses `-0.0`,
-    `WHERE f > 1` matches NaN. That is a separate, engine-side bug recorded in
-    `docs/architecture/internals/bug_hunt_ledger.md`. Declining here is sound under either
-    semantics: it costs a scan, never a row.)
+    `WHERE f > 1` matches NaN. That is a separate, engine-side bug. Declining here is sound
+    under either semantics: it costs a scan, never a row.)
     """
     return ambiguous_float_bound(bound)
 

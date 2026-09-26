@@ -4,7 +4,7 @@ r"""What the text metrics compute, checked against independent Python implementa
 out; a ratio inside `[0, 1]`; a count that is not negative. Every one of those passes for a
 metric that computes the wrong number, and one of them did -- `mean_line_length` counts the
 line separators and reads up to 80% high on the short-line documents it exists to find
-(`docs/architecture/internals/text_metric_audit.md`).
+(`docs/architecture/internals/audits/text_metric_audit.md`).
 
 So this file checks values, and against a *second* implementation rather than against the
 engine's own. The Python on the right-hand side is deliberately naive and written from each

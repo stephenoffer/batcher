@@ -4,7 +4,7 @@ The value half of `test_temporal_and_list_accessor_invariants.py`, and the reaso
 is that the property half is not enough on its own. Those tests check null-preservation and
 boundary handling, and a metric that computes the wrong number satisfies all of them -- which
 is not hypothetical: `mean_line_length` passed every property test written about it while
-reading up to 80% high (`docs/architecture/internals/text_metric_audit.md`).
+reading up to 80% high (`docs/architecture/internals/audits/text_metric_audit.md`).
 
 The oracles are Python's `datetime` and `calendar` for the temporal accessors, and plain
 Python for the list ones. Both are independent of the engine and of Arrow.

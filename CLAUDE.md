@@ -160,7 +160,7 @@ is not a substitute.
 
 **Extending the engine:** `add-relational-operator` · `add-expression-or-function` ·
 `add-distributed-operator` · `add-kyber-optimizer-pass` · `add-an-io-format-or-connector` ·
-`run-quality-gate`
+`run-quality-gate` · `audit-codebase-health`
 
 **Documenting it:** `improve-a-docs-page` · `audit-docs-structure` ·
 `docs-grammar-style` · `write-in-a-human-voice` (reads generated)
@@ -173,12 +173,13 @@ it routes to the rest) ·
 `apply-governance-and-security`
 
 **Migrating:** `migrate-from-spark` · `migrate-from-polars-or-pandas` ·
-`migrate-from-duckdb-sql` · `migrate-from-daft` · `migrate-from-ray-data`
+`migrate-from-duckdb-sql` · `migrate-from-daft` · `migrate-from-ray-data` ·
+`migrate-from-a-sql-warehouse`
 
 Catalog: `docs/agents.md`, gated by `tests/docs/test_skill_coverage.py`.
 
 ## Source of truth
 
-`architecture.txt` and `docs/architecture/internals/` (`kyber.md`, `carbonite.md`,
-`mathematical_foundations.md`) are the authoritative design + math. When a design question has a real answer there, read it — do not
-re-derive or guess. This contract summarizes; those documents decide.
+Design docs: `docs/architecture/internals/kyber.md`, `carbonite.md`.
+`mathematical_foundations.md` is the v1-era paper, not today's code. Where docs and code
+disagree, the code and `competitive_architecture.md` decide.

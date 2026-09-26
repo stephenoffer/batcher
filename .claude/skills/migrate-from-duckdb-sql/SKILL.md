@@ -12,7 +12,7 @@ unchanged. This skill covers what survives that paste, what does not, and how to
 the port is correct.
 
 DuckDB is also this repo's **differential correctness oracle**
-(`tests/differential/conftest.py::assert_same`), which makes equivalence checking
+(`tests/_harness.py::assert_same`), which makes equivalence checking
 unusually easy: run both, compare multisets.
 
 ## Writing new SQL (not just porting)
@@ -184,7 +184,7 @@ rather than returning a wrong answer.
    assert batcher_rows == duck_rows
    ```
 
-   In-repo, mirror `tests/differential/conftest.py::assert_same` — a multiset comparison
+   In-repo, mirror `tests/_harness.py::assert_same` — a multiset comparison
    tolerant of int↔float, Decimal→float, and float rounding. Use `assert_same_ordered`
    when order is part of the contract.
 8. **Check the plan, then the clock.** `print(ported.explain())` to confirm predicates and

@@ -11,14 +11,13 @@ The guard matters on the **default** path, not only under an opt-in: `skew_join_
 defaults to 0, but a measured hot key engages salting anyway
 (`if hot and salt <= 0: salt = DEFAULT_LEARNED_SALT`).
 
-These are unit tests over the pure predicate rather than an end-to-end distributed run,
-and that is deliberate. Reaching the hazard end-to-end needs the disk transport AND a
-fusable join-aggregate AND a detected hot key to line up; `resolve_transport` picks Flight
-on any multi-node cluster, and `docs/architecture/internals/databricks_parity.md` records that
-Flight
-join behaviour "cannot be validated in a single-node dev environment." An integration test
-written here passes whether or not the guard exists, which is worse than no test — so the
-invariant is pinned where it can actually be checked.
+These are unit tests over the pure predicate rather than an end-to-end distributed run, and
+that is deliberate. Reaching the hazard end-to-end needs the disk transport AND a fusable
+join-aggregate AND a detected hot key to line up; `resolve_transport` picks Flight on any
+multi-node cluster, and `docs/architecture/internals/parity/databricks_parity.md` records
+that Flight join behaviour "cannot be validated in a single-node dev environment." An
+integration test written here passes whether or not the guard exists, which is worse than no
+test — so the invariant is pinned where it can actually be checked.
 """
 
 from __future__ import annotations

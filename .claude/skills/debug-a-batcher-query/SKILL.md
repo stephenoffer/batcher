@@ -77,7 +77,7 @@ Then shrink, then bisect. Never debug a wrong answer at full scale.
 
 ```python
 import duckdb, batcher as bt
-from conftest import assert_same, assert_same_ordered  # tests/differential/conftest.py
+from _harness import assert_same, assert_same_ordered  # tests/_harness.py
 
 con = duckdb.connect()
 con.register("t", table)  # `duck_materialize` instead for FLOAT+NaN

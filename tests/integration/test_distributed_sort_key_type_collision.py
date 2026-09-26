@@ -22,7 +22,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 
 pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("batcher._native", reason="native engine not built")
@@ -34,11 +34,7 @@ _FLOAT = pa.schema([("k", pa.float64()), ("v", pa.int64())])
 _STRING = pa.schema([("k", pa.string()), ("v", pa.int64())])
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(3)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(3)
 
 
 def _floats():

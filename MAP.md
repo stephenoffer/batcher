@@ -1250,7 +1250,7 @@ Kyber rule modules.
 | `pushdown.py` | 637 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 574 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
-| `zonemap_pruning.py` | 581 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
+| `zonemap_pruning.py` | 580 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
 
@@ -1758,7 +1758,7 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 | `processes.py` | 450 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 158 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
 | `sizing.py` | 281 | What the streaming UDF path learned last run, folded back into this run's sizing. |
-| `strategy.py` | 496 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
+| `strategy.py` | 495 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
 | `stream.py` | 364 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
 
 ### `batcher/governance/` — 3 · subsystem

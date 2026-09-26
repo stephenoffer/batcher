@@ -127,14 +127,13 @@ exclude_patterns = [
     ".DS_Store",
     "requirements.txt",
     "Makefile",
-    # The contributor working records, grouped by kind. These are measured ledgers, audits,
-    # program logs and RFCs: each carries an explicit "what this did not do" or "still
+    # The contributor working records, grouped by kind. These are measured ledgers, audits
+    # and RFCs: each carries an explicit "what this did not do" or "still
     # unmeasured" register, which is exactly what a published page must not carry. They are
     # excluded by directory rather than one line per file, so adding a record does not mean
     # remembering to exclude it.
     "architecture/internals/parity/*",
     "architecture/internals/audits/*",
-    "architecture/internals/programs/*",
     "architecture/internals/rfcs/*",
     # Standalone formal paper, rendered to PDF by internals/generate_pdf.py rather
     # than as a site page. It carries its own internal cross-reference scheme.

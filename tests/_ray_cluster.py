@@ -9,7 +9,7 @@ reuses the engine's neutralize-the-broken-hook fix and falls back to attaching t
 the running cluster, so the distributed suite runs both on a laptop (a fresh local
 cluster) and against a managed cluster (attach) instead of erroring at setup.
 
-These live here rather than in `tests/integration/conftest.py` for the same reason
+These live in a uniquely-named module rather than a `conftest` for the same reason
 `tests/_harness.py` exists: a `conftest` is imported under the bare name ``conftest``,
 so ``from conftest import init_test_ray`` binds to whichever `conftest` pytest imported
 first. In a run spanning `tests/differential` and `tests/integration` that is the wrong
@@ -18,9 +18,13 @@ module, and the import fails. A uniquely-named module is unambiguous from anywhe
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+
+import pytest
+
 from batcher.dist.executors.ray_runtime.lifecycle import _platform_env_hook_disabled
 
-__all__ = ["init_test_ray", "shutdown_test_ray"]
+__all__ = ["init_test_ray", "ray_session_fixture", "shutdown_test_ray"]
 
 
 def init_test_ray(num_cpus: int) -> bool:
@@ -101,3 +105,21 @@ def shutdown_test_ray(started: bool) -> None:
         import ray
 
         ray.shutdown()
+
+
+def ray_session_fixture(num_cpus: int) -> Callable[[], Iterator[None]]:
+    """Return a module-scoped, autouse fixture holding Ray up for the whole test module.
+
+    Bind it to the name `_ray_session` at module level so pytest collects it:
+    ``_ray_session = ray_session_fixture(4)``. The fixture starts (or attaches to) Ray
+    with `init_test_ray(num_cpus)` before the module's first test and calls
+    `shutdown_test_ray` after its last one.
+    """
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _ray_session() -> Iterator[None]:
+        started = init_test_ray(num_cpus)
+        yield
+        shutdown_test_ray(started)
+
+    return _ray_session
