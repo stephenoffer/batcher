@@ -685,8 +685,10 @@ def _stream_broadcast_join(
 
 
 def _byte_chunks(batches, target_bytes: int):
-    """Group an iterable of batches into lists of about `target_bytes` each (always at
-    least one batch per chunk), so a streaming consumer bounds its working set.
+    """Group an iterable of batches into lists of about `target_bytes` each.
+
+    Always at least one batch per chunk, so a streaming consumer bounds its working set.
+    Shared by the disk broadcast join and the Flight broadcast join's probe side.
 
     Sized by retained bytes: the bound is on memory held, and a batch that windows a
     larger parent holds the parent whatever `nbytes` reports."""

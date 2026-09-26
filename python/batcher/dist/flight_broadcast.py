@@ -24,6 +24,7 @@ import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
+from batcher.dist.executors.join import _byte_chunks
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import engine_config_json
@@ -232,24 +233,6 @@ def _charge(held: int, budget: int, batches) -> int:
             f"{budget / (1 << 30):.1f} GiB bound; falling back to the co-partition shuffle"
         )
     return held
-
-
-def _byte_chunks(batches, target_bytes: int):
-    """Group batches into lists of about `target_bytes` of *retained* bytes each.
-
-    Retained, not addressed: a batch sliced from a larger parent pins the parent, so
-    `nbytes` would under-report exactly the case the bound exists for.
-    """
-    chunk: list[pa.RecordBatch] = []
-    size = 0
-    for b in batches:
-        chunk.append(b)
-        size += retained_bytes(b)
-        if size >= target_bytes:
-            yield chunk
-            chunk, size = [], 0
-    if chunk:
-        yield chunk
 
 
 def execute_broadcast_join_flight(
