@@ -376,7 +376,7 @@ Session entry points that create `Dataset`s.
 | `_scan.py` | 43 | The one place a `Source` becomes a `Dataset`. |
 | `admin.py` | 454 | Session-level administration: table maintenance, streaming control, cluster release. |
 | `cache.py` | 109 | Session-level control of the process result cache: what it holds, and dropping it. |
-| `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
+| `combine.py` | 163 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 515 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
 | `frameworks.py` | 478 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
@@ -842,7 +842,7 @@ SQL frontend — run standard SQL over Batcher datasets.
 
 | module | lines | what it is |
 |---|---|---|
-| `dml.py` | 388 | INSERT / DELETE / UPDATE as pure plan rewrites over a session catalog. |
+| `dml.py` | 373 | INSERT / DELETE / UPDATE as pure plan rewrites over a session catalog. |
 | `expression.py` | 157 | Translate one SQL *expression* (not a query) into an `Expr`. |
 
 ### `batcher/_sql/parser/` — 6 · front-end
@@ -2371,7 +2371,7 @@ The scalar expression algebra.
 | module | lines | what it is |
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
-| `constructors.py` | 487 | Module-level expression constructors (the user-facing entry points). |
+| `constructors.py` | 512 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 6873 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |

@@ -29,6 +29,7 @@ from batcher.plan.expr_ir.nodes import (
     Least,
     NullIf,
 )
+from batcher.plan.types.registry import dtype_name
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -485,3 +486,27 @@ def null(dtype: str | None = None) -> Expr:
     one = Lit(1)
     untyped: Expr = NullIf(one, one)
     return untyped if dtype in (None, "int64") else untyped._cast(dtype, try_cast=False)
+
+
+def null_of_type(dtype: pa.DataType) -> Expr | None:
+    """A NULL of exactly `dtype`, or ``None`` when the cast vocabulary cannot name it.
+
+    `null` takes a *name* from a short list; this takes the Arrow *type* a caller read off
+    a schema, and names it through `dtype_name`, whose round trip is exact. So a column a
+    rewrite has to fill with nulls (a diagonal concat's missing column, an INSERT's unlisted
+    one) keeps its precision, scale, unit and time zone instead of being retyped to the
+    nearest short name.
+
+    Args:
+        dtype: The Arrow type the null must have.
+
+    Returns:
+        An expression that is NULL on every row, typed as `dtype`, or ``None`` for a
+        nested or extension type the cast grammar does not spell, and for the Arrow
+        ``null`` type, which the engine cannot cast to.
+    """
+    name = dtype_name(dtype)
+    if name is None or name == "null":
+        return None
+    one = Lit(1)
+    return NullIf(one, one)._cast(name, try_cast=False)
