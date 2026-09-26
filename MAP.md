@@ -939,7 +939,7 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 3194 | The distributed executor — the dispatcher. |
+| `executor.py` | 3195 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 893 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 544 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
@@ -971,7 +971,7 @@ Per-operator distributed executor implementations.
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
 | `map.py` | 3310 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 549 | Plan-shape analysis for the distributed dispatcher. |
-| `scan_read.py` | 720 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
+| `scan_read.py` | 721 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
 | `union.py` | 120 | Distributed UNION — one shuffle when the branches allow it, else branch by branch. |
 | `window.py` | 61 | Distributed window functions over a disk Arrow-IPC shuffle. |
@@ -985,7 +985,7 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 |---|---|---|
 | `_sources.py` | 703 | Shared partitioning + post-breaker helpers for the distributed operators. |
 | `assignment.py` | 392 | How a source's splits are divided among the workers — the three assignment strategies. |
-| `folds.py` | 209 | Streaming, byte-bounded folds of a shuffle map-side partition. |
+| `folds.py` | 208 | Streaming, byte-bounded folds of a shuffle map-side partition. |
 | `ranges.py` | 618 | Range partitioning: split rows by *value* into globally ordered buckets. |
 
 ### `batcher/dist/executors/ray_runtime/` — 4 · backend
@@ -1757,7 +1757,7 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 | `lifecycle.py` | 90 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
 | `processes.py` | 450 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 158 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
-| `sizing.py` | 285 | What the streaming UDF path learned last run, folded back into this run's sizing. |
+| `sizing.py` | 281 | What the streaming UDF path learned last run, folded back into this run's sizing. |
 | `strategy.py` | 496 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
 | `stream.py` | 364 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
 

@@ -31,6 +31,7 @@ import pyarrow as pa
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher._internal.native import engine
+from batcher.config.env import env_float, env_int
 from batcher.dist.executors.partition_io import (
     descriptor_rows,
     partition_descriptors,
@@ -55,7 +56,7 @@ from batcher.plan.visitor import scanned_source_ids
 # Smallest CPU share a task may request: a tiny partition gets a fraction of a core so
 # Ray packs many such tasks per core (high parallelism over many small files) instead of
 # each reserving a whole core. 1/8 core by default. Env-overridable.
-_MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125")))
+_MIN_TASK_CPU = env_float("BATCHER_MIN_TASK_CPU", 0.125, floor=0.01)
 # How much heavier a per-batch UDF / inference stage is per row than a plain scan/filter.
 # A `map_batches` partition gets this many times the CPU a same-sized scan would — the
 # plan-level compute-skew factor (data skew is handled per-partition by `descriptor_rows`).
@@ -65,7 +66,7 @@ _MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125"))
 # intra-task `num_workers` is derived from this same share, so the wider task runs the UDF
 # just as many ways, and it does so with a quarter of the per-task overhead. Measured 1.4-2.0x
 # slower the other way; see `_adaptive_partition_count`. Keep it out of the count.
-_MAP_COMPUTE_WEIGHT = max(1.0, float(os.environ.get("BATCHER_MAP_COMPUTE_WEIGHT", "4.0")))
+_MAP_COMPUTE_WEIGHT = env_float("BATCHER_MAP_COMPUTE_WEIGHT", 4.0, floor=1.0)
 # Hard ceiling on the per-actor submit-ahead depth (partitions an inference actor keeps in
 # flight). Single source in the neutral `_internal.hardware`, shared with the ML autobatcher
 # — `dist` cannot import `ml`, so the constant lives below both rather than being pasted twice.
@@ -1842,7 +1843,7 @@ def scan_clustering_for(plan: LogicalPlan, sources, workers: int, hub=None) -> t
 #: won at every UDF weight, i.e. cores/4), and it reproduces on this 1,024-core one: forcing
 #: 256 partitions (= 1,024/4) against the 301 the unclamped term asks for runs the sf100 heavy
 #: UDF pipeline in 1,345/1,382 ms against 1,662/1,758 ms.
-_TARGET_TASK_CPUS = max(1, int(os.environ.get("BATCHER_TARGET_TASK_CPUS", "4")))
+_TARGET_TASK_CPUS = env_int("BATCHER_TARGET_TASK_CPUS", 4, floor=1)
 
 
 def _widest_useful_fan_out(task_cpus: float | None = None) -> int:
@@ -2681,7 +2682,6 @@ class _MapActor:
         `host_of(addr)` by construction — both are this node's advertised IP — so the two
         sides of that comparison cannot drift apart.
         """
-        import os
 
         import ray
 
@@ -2817,7 +2817,7 @@ class _MapActor:
 # fast GPU stage fed (the guides' 2-4:1 CPU:GPU ratio). GPU stages always stay at 1 (one CUDA
 # context). Modest so several fractional-GPU actors per node don't grossly oversubscribe the
 # cores; a decode/normalize `fn` releases the GIL (PIL/cv2/NumPy/torch) so threads scale.
-_INFERENCE_CPU_WORKERS = max(1, int(os.environ.get("BATCHER_INFERENCE_CPU_WORKERS", "4")))
+_INFERENCE_CPU_WORKERS = env_int("BATCHER_INFERENCE_CPU_WORKERS", 4, floor=1)
 
 # Seconds between an actor's VRAM readings (see `_MapActor._sample_gpu_vram`). The reading
 # feeds a running maximum used to pack the NEXT run's actors, and a model's footprint peaks in

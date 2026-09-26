@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import contextlib
 import math
-import os
 import time
 from collections.abc import Iterator
 
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
+from batcher.config.env import env_int
 from batcher.core.runtime import default_hub
 from batcher.metadata.hardware_scope import scoped
 from batcher.plan.logical import MapBatches
@@ -49,11 +49,11 @@ __all__ = [
 # Bounded look-ahead between pipelined map stages: a stage may run this many morsels ahead
 # of its consumer (so a CPU stage overlaps the GPU stage draining it) while keeping resident
 # memory to ~`depth` morsels per stage. Env-overridable.
-_STREAM_PREFETCH_DEPTH = max(0, int(os.environ.get("BATCHER_STREAM_PREFETCH_DEPTH", "2")))
+_STREAM_PREFETCH_DEPTH = env_int("BATCHER_STREAM_PREFETCH_DEPTH", 2, floor=0)
 # The deepest source-read look-ahead the learned readahead may request (a slow source hides
 # more of its latency behind compute); bounds resident memory to ~this many morsels.
-_STREAM_MAX_PREFETCH_DEPTH = max(
-    _STREAM_PREFETCH_DEPTH, int(os.environ.get("BATCHER_STREAM_MAX_PREFETCH_DEPTH", "8"))
+_STREAM_MAX_PREFETCH_DEPTH = env_int(
+    "BATCHER_STREAM_MAX_PREFETCH_DEPTH", 8, floor=_STREAM_PREFETCH_DEPTH
 )
 # Adaptive GPU-inference batch when a GPU stage has no explicit `batch_size` (the truly
 # zero-config `ds.map_batches(Model, num_gpus=1)` call). `_GPU_STREAM_BATCH_ROWS` is the row
@@ -62,18 +62,14 @@ _STREAM_MAX_PREFETCH_DEPTH = max(
 # row count SHRINKS on wide rows (a decoded frame, a float embedding tensor) that would
 # otherwise OOM the GPU at the row cap, and stays at the cap for narrow rows. Floored so the
 # batch always fills the SMs. An explicit `batch_size` always wins; env-overridable.
-_GPU_STREAM_BATCH_ROWS = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_ROWS", "256")))
-_GPU_STREAM_BATCH_BYTES = max(
-    1 << 20, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_BYTES", str(64 << 20)))
-)
-_GPU_STREAM_BATCH_MIN = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_MIN", "8")))
+_GPU_STREAM_BATCH_ROWS = env_int("BATCHER_GPU_STREAM_BATCH_ROWS", 256, floor=1)
+_GPU_STREAM_BATCH_BYTES = env_int("BATCHER_GPU_STREAM_BATCH_BYTES", 64 << 20, floor=1 << 20)
+_GPU_STREAM_BATCH_MIN = env_int("BATCHER_GPU_STREAM_BATCH_MIN", 8, floor=1)
 # Per-batch input-byte budget for a CPU (decode/preprocess) stage with no explicit
 # `batch_size`: like the GPU budget, this SHRINKS the chunk below the morsel when a stage's
 # rows are huge so a transient per-thread output stays bounded, and keeps the full morsel for
 # narrow rows. Result-invariant -- the chunk only shards. Env-overridable.
-_CPU_STREAM_BATCH_BYTES = max(
-    1 << 20, int(os.environ.get("BATCHER_CPU_STREAM_BATCH_BYTES", str(128 << 20)))
-)
+_CPU_STREAM_BATCH_BYTES = env_int("BATCHER_CPU_STREAM_BATCH_BYTES", 128 << 20, floor=1 << 20)
 
 
 def gpu_batch_rows(batch: pa.RecordBatch, row_cap: int = _GPU_STREAM_BATCH_ROWS) -> int:

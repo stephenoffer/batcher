@@ -22,12 +22,12 @@ tolerance, so a skewed intermediate keeps its parallelism.
 from __future__ import annotations
 
 import heapq
-import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
 from batcher._internal.mathx import ceil_div
+from batcher.config.env import env_int
 
 __all__ = [
     "assign_clustered_splits",
@@ -45,7 +45,7 @@ __all__ = [
 # this many splits there is ample parallelism for equal-count packing to balance well, and
 # splits that already carry their count (row-group splits, shuffle buckets) keep using it
 # at any scale. Same default and the same reasoning as the footer-planning cap.
-_MAX_WEIGHED_SPLITS = max(1, int(os.environ.get("BATCHER_MAX_WEIGHED_SPLITS", "10000")))
+_MAX_WEIGHED_SPLITS = env_int("BATCHER_MAX_WEIGHED_SPLITS", 10000, floor=1)
 
 # How much heavier the busiest worker may get, relative to an even share, before locality
 # is judged to have cost more parallelism than it saved network. At 2.0 a worker may carry

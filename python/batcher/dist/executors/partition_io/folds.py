@@ -13,11 +13,10 @@ chunk-by-chunk, and combine-of-per-chunk-states equals one state over the whole 
 
 from __future__ import annotations
 
-import os
-
+from batcher.config.env import env_int
 from batcher.plan.types import retained_bytes
 
-_FOLD_CHUNK_BYTES = max(1 << 20, int(os.environ.get("BATCHER_FOLD_CHUNK_BYTES", str(256 << 20))))
+_FOLD_CHUNK_BYTES = env_int("BATCHER_FOLD_CHUNK_BYTES", 256 << 20, floor=1 << 20)
 
 
 def streaming_partial_aggregate(

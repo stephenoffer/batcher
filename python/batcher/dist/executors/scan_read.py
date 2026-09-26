@@ -28,6 +28,7 @@ from inspect import signature
 from batcher._internal.hardware.memory import machine_memory_bytes
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.config.env import env_float, env_int
 from batcher.io.splits import Split
 from batcher.plan.types import retained_bytes
 
@@ -39,14 +40,14 @@ from batcher.plan.types import retained_bytes
 # ~53s → ~31s (it plateaus past 32). Bounded: peak memory is ≤ `depth` in-flight splits.
 # Module-level (not `config`) so it applies on a worker without shipping the driver's
 # config_context; env-overridable for wider tables / tighter RAM.
-_SCAN_PREFETCH = max(1, int(os.environ.get("BATCHER_SCAN_PREFETCH", "32")))
+_SCAN_PREFETCH = env_int("BATCHER_SCAN_PREFETCH", 32, floor=1)
 
 # Target compressed bytes per scan split — coalesces a source's native chunks. Parquet
 # files with many small row-groups (sf100 lineitem: 49/file → 4,900 one-row-group splits)
 # make per-request latency the bottleneck; packing adjacent row-groups to this size turns
 # hundreds of tiny GETs per worker into a few dozen large reads. `_scan_splits` applies it
 # only while enough splits remain to keep the fan-out busy. Env-overridable.
-_SPLIT_TARGET_BYTES = max(1 << 20, int(os.environ.get("BATCHER_SPLIT_TARGET_BYTES", str(64 << 20))))
+_SPLIT_TARGET_BYTES = env_int("BATCHER_SPLIT_TARGET_BYTES", 64 << 20, floor=1 << 20)
 
 # Object-store read concurrency for the dataset scan. The scan is S3-LATENCY-bound, so
 # throughput tracks the number of in-flight range requests, which pyarrow caps at the
@@ -55,8 +56,8 @@ _SPLIT_TARGET_BYTES = max(1 << 20, int(os.environ.get("BATCHER_SPLIT_TARGET_BYTE
 # ~32 threads. The pool itself is lifted by `io.filesystem.ensure_io_threads` (shared with
 # the single-node read path); `fragment_readahead` is how many files a worker reads at once,
 # `batch_readahead` how far it reads into each. All env-overridable.
-_FRAGMENT_READAHEAD = max(2, int(os.environ.get("BATCHER_FRAGMENT_READAHEAD", "32")))
-_BATCH_READAHEAD = max(2, int(os.environ.get("BATCHER_BATCH_READAHEAD", "64")))
+_FRAGMENT_READAHEAD = env_int("BATCHER_FRAGMENT_READAHEAD", 32, floor=2)
+_BATCH_READAHEAD = env_int("BATCHER_BATCH_READAHEAD", 64, floor=2)
 
 
 # Native Rust parquet reader (bc-io via bc_py): decodes parquet over object_store
@@ -84,7 +85,7 @@ _NATIVE_READER = os.environ.get("BATCHER_NATIVE_READER", "1") not in ("0", "fals
 # the streaming partial-aggregate's bounded memory (and its read/compute overlap). Reading
 # in windows of this many row-groups bounds the in-flight memory to ~one window while
 # still fetching that window's row-groups concurrently. Env-overridable.
-_NATIVE_RG_WINDOW = max(1, int(os.environ.get("BATCHER_NATIVE_RG_WINDOW", "8")))
+_NATIVE_RG_WINDOW = env_int("BATCHER_NATIVE_RG_WINDOW", 8, floor=1)
 
 
 # --- Worker scan cache: decoded batches kept on the persistent worker between queries ---
@@ -123,7 +124,7 @@ def _scan_cache_siblings() -> int:
 
 
 def _default_scan_cache_cap() -> int:
-    frac = max(0.0, float(os.environ.get("BATCHER_SCAN_CACHE_FRACTION", "0.3")))
+    frac = env_float("BATCHER_SCAN_CACHE_FRACTION", 0.3, floor=0.0)
     # `machine_memory_bytes` rather than `psutil.virtual_memory().total`, which reports the
     # **host's** RAM. Under a container -- the ordinary way a Ray worker runs -- the cgroup
     # cap is the real ceiling, and a 4 GiB container on a 512 GiB node sized this cache

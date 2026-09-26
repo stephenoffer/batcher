@@ -15,7 +15,6 @@ lives in `core.udf.call`, and `execute_with_udfs` routes a linear chain here.
 
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pyarrow as pa
 
 from batcher.config import active_config
+from batcher.config.env import env_int
 from batcher.core.udf import strategy as strat
 from batcher.core.udf.async_udf import is_async_udf
 from batcher.core.udf.call import _coerce_udf_result, _formatted, _resilient_call
@@ -54,13 +54,13 @@ __all__ = [
 # tensorize/copy with the previous batch's device forward, lifting a single-stage inference's
 # utilization. Default 1 (serial) — a chain with an upstream CPU stage already feeds the GPU,
 # so `stream_linear_chain` raises it only for a lone GPU stage that would otherwise idle.
-_GPU_PIPELINE_DEPTH = max(1, int(os.environ.get("BATCHER_GPU_PIPELINE_DEPTH", "1")))
+_GPU_PIPELINE_DEPTH = env_int("BATCHER_GPU_PIPELINE_DEPTH", 1, floor=1)
 # In-flight forwards for a LONE GPU stage (no upstream CPU stage feeding it): default 2 so a
 # scan->GPU inference overlaps read/tensorize with the forward instead of idling the device.
 # Public because the MATERIALIZING path needs the same overlap: `apply._apply_udf_autobatch`
 # sizes its dispatch pool from it, so a solo GPU stage gets the same two in-flight forwards
 # whichever path the plan shape routes it to. One definition, not two that can drift.
-_GPU_SOLO_PIPELINE_DEPTH = max(1, int(os.environ.get("BATCHER_GPU_SOLO_PIPELINE_DEPTH", "2")))
+_GPU_SOLO_PIPELINE_DEPTH = env_int("BATCHER_GPU_SOLO_PIPELINE_DEPTH", 2, floor=1)
 # The per-batch sizing constants and the learned refinements that narrow them live in
 # `core.udf.sizing`; this module owns the *scheduling* of the overlap, not the sizing.
 
