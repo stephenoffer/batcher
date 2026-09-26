@@ -1795,7 +1795,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | module | lines | what it is |
 |---|---|---|
 | `_backend.py` | 606 | The `pyarrow.fs`-backed filesystem façade every IO source and sink talks to. |
-| `_concurrent.py` | 121 | Concurrent per-file reads — the shared fan-out for footer/header stats and file bytes. |
+| `_concurrent.py` | 122 | Concurrent per-file reads — the shared fan-out for footer/header stats and file bytes. |
 | `_file_cache.py` | 354 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 131 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
@@ -1803,7 +1803,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `filesystem.py` | 720 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 634 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
-| `secret_backends.py` | 302 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
+| `secret_backends.py` | 300 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
 
 ### `batcher/io/base/` — 2 · neutral IO
@@ -1813,7 +1813,7 @@ Template-Method base classes for file-backed sources and sinks.
 | module | lines | what it is |
 |---|---|---|
 | `_bad_rows.py` | 221 | The per-*row* error policy: what a reader does with one record it cannot parse. |
-| `_hive.py` | 150 | Hive partitioning: what a ``col=value`` path segment is, and where the runs begin. |
+| `_hive.py` | 149 | Hive partitioning: what a ``col=value`` path segment is, and where the runs begin. |
 | `_layout.py` | 111 | `FileLayout` — how a write divides its rows into files, resolved wherever the rows are. |
 | `_lines.py` | 198 | Line-delimited decoding, shared by the text and log sources. |
 | `_options.py` | 226 | Reader/writer keyword aliasing — one spelling table per format, one error shape. |
@@ -1900,7 +1900,7 @@ ML / array formats (NumPy, TFRecord, WebDataset, HDF5, Zarr) + training shards
 | `ragged.py` | 207 | Variable-shape tensor columns — arrays of differing shape in one Arrow column. |
 | `tensor.py` | 139 | Fixed-shape tensor columns — multi-dimensional arrays as one Arrow column. |
 | `tfrecord.py` | 323 | TFRecord format — TensorFlow record stream ↔ Arrow via manual framing, read and write. |
-| `webdataset.py` | 333 | WebDataset format — `.tar` shard reader and writer via stdlib `tarfile` (core, no extra). |
+| `webdataset.py` | 332 | WebDataset format — `.tar` shard reader and writer via stdlib `tarfile` (core, no extra). |
 | `zarr.py` | 128 | Zarr format — chunked array read via `zarr`, chunk-parallel to Arrow. |
 
 ### `batcher/io/formats/ml/shards/` — 2 · neutral IO
@@ -1962,7 +1962,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 
 | module | lines | what it is |
 |---|---|---|
-| `json.py` | 488 | JSON format — newline-delimited (line) JSON read + write. |
+| `json.py` | 489 | JSON format — newline-delimited (line) JSON read + write. |
 | `json_encoding.py` | 231 | Process-pool machinery for the JSON **write** path. |
 | `json_tolerance.py` | 146 | Dropping the unparseable line from a newline-delimited JSON buffer. |
 | `json_vector.py` | 317 | Vectorized NDJSON encoding — the JSON writer's fast path, built from Arrow kernels. |
@@ -2098,7 +2098,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 
 | module | lines | what it is |
 |---|---|---|
-| `_native_stream.py` | 148 | Native-reader streaming for `ParquetSource._iter_file`, and the rule for when to use it. |
+| `_native_stream.py` | 146 | Native-reader streaming for `ParquetSource._iter_file`, and the rule for when to use it. |
 | `dataset.py` | 700 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
 | `partitions.py` | 219 | What a Hive ``col=value`` directory segment means, and what it proves. |
 | `routing.py` | 146 | How a predicated Parquet read spends its work: skip row groups on the footers, decode the rest. |
@@ -2689,7 +2689,7 @@ Configuration: one frozen, typed `Config` object.
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
 | `config.py` | 3241 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
-| `env.py` | 182 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
+| `env.py` | 196 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |

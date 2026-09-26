@@ -39,6 +39,20 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_CONFIG_FILE": "path to a TOML/JSON config loaded at import",
     "BATCHER_HOME": "root for engine-owned state (event logs, scratch); defaults under XDG",
     "BATCHER_DEADLINE_EPOCH_S": "wall-clock deadline the query budget counts down to",
+    "BATCHER_DEADLINE_SECONDS": "lease length in seconds, counted from process start",
+    # --- site detection -------------------------------------------------------------
+    "BATCHER_SCHEDULER": "force the detected batch scheduler (slurm, pbs, lsf, ...)",
+    "BATCHER_SCRATCH_DIR": "force the node-local scratch directory spill uses",
+    "BATCHER_PROVIDER": "force the detected cloud provider",
+    "BATCHER_NODE_NAME": "name this node reports, ahead of the orchestrator's",
+    "BATCHER_SPOT": "declare this node preemptible, selecting the spot profile",
+    "BATCHER_AUTOSCALE": "declare the cluster autoscaling (truthy) or fixed (falsy)",
+    "BATCHER_RAY_CLUSTER": "mark the process as running on a managed Ray cluster",
+    "BATCHER_METADATA_URI": "durable location the spot profile moves learned metadata to",
+    "BATCHER_MPS_CLIENTS": "CUDA MPS clients sharing one device, for feeder-CPU sizing",
+    # --- security -------------------------------------------------------------------
+    "BATCHER_SECRET_COMMAND": "helper command that resolves a secret reference",
+    "BATCHER_REQUIRE_KEY_REFS": "refuse literal encryption keys; accept only key references",
     # --- IO: reads, footers, retries -----------------------------------------------
     "BATCHER_IO_THREADS": "filesystem thread-pool width",
     "BATCHER_FOOTER_CONCURRENCY": "parallel Parquet footer reads during planning",
