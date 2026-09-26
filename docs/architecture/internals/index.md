@@ -68,7 +68,7 @@ The two correctness oracles, the property-based suite, and the gates a change ha
 
 The formal treatment of the cost models, sketch error bounds and control-theory stability proofs lives at `docs/architecture/internals/mathematical_foundations.md` in the repository. `docs/architecture/internals/generate_pdf.py` renders it to PDF rather than publishing it as a page, because it carries its own cross-reference scheme.
 
-The contributor working records sit beside it in `audits/`, `parity/`, `programs/` and `rfcs/`, and `docs/conf.py` excludes each directory wholesale. They are notes for deciding what to build next, and each one carries a register of open gaps and unmeasured claims. The code-checked competitive scorecard, `competitive_architecture.md`, is excluded for the same reason.
+The contributor working records sit beside it in `audits/`, `parity/` and `rfcs/`, and `docs/conf.py` excludes each directory wholesale. They are notes for deciding what to build next, and each one carries a register of open gaps and unmeasured claims. The code-checked competitive scorecard, `competitive_architecture.md`, is excluded for the same reason.
 
 ## See also
 
