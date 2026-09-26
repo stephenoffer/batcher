@@ -179,7 +179,7 @@ The public, fluent, lazy, expression-first API surface.
 | `multi_group.py` | 408 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 567 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
-| `subplan_reuse.py` | 539 | Compute a repeated subplan once and read it back (control plane, `api`). |
+| `subplan_reuse.py` | 512 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
 ### `batcher/api/adaptive/` — 5 · conductor
 
@@ -215,12 +215,12 @@ The `Dataset` builder package.
 |---|---|---|
 | `_dedup.py` | 326 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 244 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
-| `_export.py` | 349 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
+| `_export.py` | 331 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
 | `_nulls.py` | 195 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 6687 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 6684 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2760 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -427,9 +427,9 @@ Terminal/materialization operations for `Dataset` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `_metadata.py` | 739 | Post-execution column-statistics learning (Core measures, Kyber persists). |
+| `_metadata.py` | 725 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1467 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1460 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 712 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
@@ -548,10 +548,10 @@ Preparing a training corpus: mixing sources, filtering junk, removing eval leaka
 
 | module | lines | what it is |
 |---|---|---|
-| `decontamination.py` | 176 | Removing evaluation data from a training corpus. |
-| `filtering.py` | 289 | Heuristic quality filtering for a web-scale text corpus. |
+| `decontamination.py` | 171 | Removing evaluation data from a training corpus. |
+| `filtering.py` | 284 | Heuristic quality filtering for a web-scale text corpus. |
 | `mixing.py` | 238 | Sampling several corpora into one training mixture, at declared weights. |
-| `ordering.py` | 192 | Ordering a corpus so a training batch is not mostly padding. |
+| `ordering.py` | 187 | Ordering a corpus so a training batch is not mostly padding. |
 
 ### `batcher/ml/decode/` — 6 · front-end
 
@@ -622,7 +622,7 @@ Streaming training-data loader — Batcher feeding PyTorch DDP/FSDP/DeepSpeed.
 | module | lines | what it is |
 |---|---|---|
 | `indexed.py` | 496 | The indexed loaders: a deterministic, balanced, resumable global sample order per rank. |
-| `lazy.py` | 622 | The lazy path: stream a dataset to torch with no global length and no materialization. |
+| `lazy.py` | 641 | The lazy path: stream a dataset to torch with no global length and no materialization. |
 | `sharding.py` | 141 | Build one rank's shard of a corpus by streaming it, never materializing the whole corpus. |
 | `tensors.py` | 184 | Arrow → torch conversion, and moving the result to a device. |
 
@@ -853,7 +853,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 |---|---|---|
 | `agg_rewrites.py` | 156 | Aggregate pre-pass rewrites for the SQL translator. |
 | `ai_functions.py` | 263 | Generative AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT``. |
-| `clauses.py` | 634 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
+| `clauses.py` | 632 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
 | `core_utils.py` | 691 | Small stateless AST helpers shared across translator theme modules. |
 | `from_clause.py` | 635 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 538 | Grouping, aggregation, and projection mapping for the SQL translator. |
@@ -861,7 +861,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `statements.py` | 212 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 331 | Built-in table functions in the FROM clause: the series generators and model scoring. |
 | `translator.py` | 646 | The `_Translator` skeleton plus the public `sql()` entry point. |
-| `udf.py` | 197 | Registered-Python-function support for the SQL translator. |
+| `udf.py` | 196 | Registered-Python-function support for the SQL translator. |
 
 ### `batcher/_sql/parser/expressions/` — 6 · front-end
 
@@ -932,7 +932,7 @@ Window-function translation for the SQL front-end.
 | module | lines | what it is |
 |---|---|---|
 | `frame.py` | 247 | Resolving a SQL window spec into the engine's frame, partition and order triple. |
-| `translate.py` | 731 | Window-function handling for the SQL translator. |
+| `translate.py` | 724 | Window-function handling for the SQL translator. |
 
 ### `batcher/dist/` — 4 · backend
 
