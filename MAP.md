@@ -1404,7 +1404,7 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | `order.py` | 297 | Cost-based join reordering — the JOIN_REORDER phase. |
 | `order_budget.py` | 191 | How much join-order search a query is worth — the budget the DP search spends against. |
 | `order_residual.py` | 178 | Non-equi predicates inside a join region: hoist them, then re-attach where they fit. |
-| `order_search.py` | 504 | Join-order search: pick a tree over an extracted join graph, and build it. |
+| `order_search.py` | 499 | Join-order search: pick a tree over an extracted join graph, and build it. |
 | `projection.py` | 191 | Push a derived projection through a join onto the side it reads, so the join |
 | `range_join.py` | 365 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
 | `rewrites.py` | 648 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
