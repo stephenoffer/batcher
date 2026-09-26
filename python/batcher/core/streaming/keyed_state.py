@@ -350,8 +350,6 @@ def _group_by(batches: list[pa.RecordBatch], keys: list[str]):
     changed = None
     for name in keys:
         column = table.column(name).combine_chunks()
-        if isinstance(column, pa.ChunkedArray):
-            column = column.combine_chunks()
         previous = pa.concat_arrays([pa.nulls(1, column.type), column.slice(0, len(column) - 1)])
         same = pc.or_(
             pc.fill_null(pc.equal(column, previous), False),
