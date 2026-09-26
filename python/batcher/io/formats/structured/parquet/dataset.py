@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
-from batcher.config.env import env_int
 from batcher.io.base._paths import hive_segment
+from batcher.io.base.source import _MAX_FOOTER_PLAN_FILES
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.structured.parquet.partitions import (
     date_typed_partitioning,
@@ -31,12 +31,6 @@ if TYPE_CHECKING:
     from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["ParquetDatasetSource", "ParquetFragmentSplit", "PartitionDirSplit"]
-
-# File count past which the driver stops sweeping every footer to build full statistics.
-# Mirrors `FileSource`'s `_MAX_FOOTER_PLAN_FILES` (same env var): a footer sweep is O(files)
-# object-store round trips on the driver, a good trade at hundreds of files and a
-# catastrophic one at millions. Above it, the cheap exact `row_count()` still answers.
-_MAX_FOOTER_PLAN_FILES = env_int("BATCHER_MAX_FOOTER_PLAN_FILES", 10000, floor=1)
 
 
 def _footer_row_counter(fs: Any) -> Any:

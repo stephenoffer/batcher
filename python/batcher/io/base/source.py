@@ -92,13 +92,25 @@ _READ_RETRY_BACKOFF_S = env_float("BATCHER_READ_RETRY_BACKOFF_S", 0.5, floor=0.0
 # more numerous than the workers. Whole-file splits need no footer and give the same rows.
 # Env-overridable for a workload whose files are few but enormous.
 _MAX_FOOTER_PLAN_FILES = env_int("BATCHER_MAX_FOOTER_PLAN_FILES", 10000, floor=1)
-# Rough bytes a whole-file split should cover when the caller names no target. One split
-# per file is the right unit until files outnumber workers by orders of magnitude; past
-# that, every split is a scheduled task and a pickled locator, so a million 4 KB objects
-# become a million tasks to move four gigabytes. 128 MiB is the figure Spark settled on for
-# the same job (`spark.sql.files.maxPartitionBytes`) and for the same reason. Files are only
-# ever *grouped*, never divided, so a dataset of large files packs one-per-split as before.
-_COALESCE_TARGET_BYTES = env_int("BATCHER_SPLIT_TARGET_BYTES", 128 << 20, floor=1)
+
+
+def _coalesce_target_bytes() -> int:
+    """Rough bytes a whole-file split should cover when the caller names no target.
+
+    One split per file is the right unit until files outnumber workers by orders of
+    magnitude; past that, every split is a scheduled task and a pickled locator, so a million
+    4 KB objects become a million tasks to move four gigabytes. The target is
+    `execution.split_bytes` (128 MiB, the figure Spark uses for
+    `spark.sql.files.maxPartitionBytes`), the same option the CSV, JSON and text readers
+    divide by, so one knob sizes every file split. `BATCHER_SPLIT_TARGET_BYTES` stays as an
+    operator override. Files are only ever *grouped*, never divided, so a dataset of large
+    files packs one per split.
+    """
+    from batcher.config import active_config
+
+    return env_int("BATCHER_SPLIT_TARGET_BYTES", active_config().execution.split_bytes, floor=1)
+
+
 # The fewest splits packing may leave when there are at least that many files. Grouping is
 # a throughput win and a parallelism risk in the same move: eight 10 MB files under a
 # 128 MiB target would coalesce to one task and idle every core but one. The driver cannot
@@ -393,7 +405,7 @@ class FileSource(ABC):
         sizes = listed_sizes(self._fs, files)
         if not sizes:
             return False
-        return max(sizes) <= (target_size or _COALESCE_TARGET_BYTES)
+        return max(sizes) <= (target_size or _coalesce_target_bytes())
 
     def _is_remote(self) -> bool:
         """Whether this source's files sit behind a network round trip.
@@ -1522,7 +1534,7 @@ class FileSource(ABC):
         sizes = listed_sizes(self._fs, paths)
         if sizes is None:
             return planned
-        runs = pack_files(sizes, target_size or _COALESCE_TARGET_BYTES, _MIN_SPLITS)
+        runs = pack_files(sizes, target_size or _coalesce_target_bytes(), _MIN_SPLITS)
         if len(runs) == len(planned):
             return planned  # nothing grouped; keep the splits the format built
         kwargs = planned[0].kwargs  # type: ignore[attr-defined]
@@ -1561,7 +1573,7 @@ class FileSource(ABC):
         sizes = listed_sizes(self._fs, files)
         if sizes is None:
             return [FileSplit(self.format_name, f, kwargs) for f in files]
-        runs = pack_files(sizes, target_size or _COALESCE_TARGET_BYTES, _MIN_SPLITS)
+        runs = pack_files(sizes, target_size or _coalesce_target_bytes(), _MIN_SPLITS)
         return [
             FileSplit(self.format_name, files[start], kwargs)
             if stop - start == 1
