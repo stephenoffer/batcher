@@ -33,9 +33,10 @@ from batcher.dist.executors.ray_runtime.fabric import (
     power_zone_load,
 )
 from batcher.governance import DataResidency, ResidencyCatalog
-from batcher.kyber.gpu import power_bounded_devices, select_device_class, stage_joules
+from batcher.kyber.gpu import select_device_class
 from batcher.observe import energy_metrics, format_energy_report
 from batcher.plan.energy import GridProfile, merge_ledgers
+from batcher.plan.energy.power import device_power_watts, energy_joules
 
 pytestmark = [pytest.mark.integration, pytest.mark.unit]
 
@@ -79,7 +80,7 @@ def test_the_device_class_kyber_picks_is_one_carbonite_can_price() -> None:
 
 def test_the_fan_out_admission_allows_is_the_one_the_grant_hands_out() -> None:
     with config_context(_config(10_000.0)):
-        allowed = power_bounded_devices(64, "NVIDIA_H100")
+        allowed = devices_within_budget("NVIDIA_H100", 64)
         envelope = DefaultSchedulingPolicy.gpu_envelope(
             num_gpus=1.0, n_tasks=64, gpu_count=64, accelerator_type="NVIDIA_H100"
         )
@@ -176,15 +177,16 @@ def test_a_distributed_run_reports_the_single_node_energy() -> None:
 
 
 def test_the_planned_and_recorded_energy_agree_in_magnitude() -> None:
-    # Kyber estimates a stage's draw before it runs; Core records what it drew. They use the
-    # same power model, so an estimate for the recorded duration must match the record.
+    # The power model predicts a stage's draw; Core records what it drew. Core meters with the
+    # same model, so a prediction for the recorded duration must match the record.
     with (
         energy_scope() as ledger,
         measure_stage("Agg#1", accelerator_type="NVIDIA_H100", device_count=4, utilization=1.0),
     ):
         pass
     record = ledger.stages[0]
-    planned = stage_joules(record.seconds, "NVIDIA_H100", 4, 1.0)
+    watts = device_power_watts("NVIDIA_H100", 1.0, include_host=True)
+    planned = energy_joules(watts * 4, record.seconds)
     assert record.joules == pytest.approx(planned)
 
 

@@ -88,7 +88,6 @@ def test_envelope_defaults_to_unbounded() -> None:
     env = PowerEnvelope()
     assert env.unbounded
     assert env.fits()
-    assert env.scale_to_fit(700.0) == -1
 
 
 def test_envelope_reserves_headroom() -> None:
@@ -104,28 +103,18 @@ def test_envelope_passes_an_unknown_expected_draw() -> None:
     assert PowerEnvelope(budget_watts=10.0, expected_watts=0.0).fits()
 
 
-def test_one_clamp_serves_both_subsystems() -> None:
-    # Kyber sizes against this and Carbonite admits against it. A second copy of the
-    # arithmetic is how a plan gets sized for one fan-out and granted another.
+def test_the_envelope_counts_the_devices_its_usable_budget_powers() -> None:
     envelope = PowerEnvelope(budget_watts=10_000.0, headroom_fraction=0.1)
     assert envelope.devices_that_fit("NVIDIA_H100") == 10
-    assert envelope.clamp_devices(64, "NVIDIA_H100") == 10
-    assert envelope.clamp_devices(4, "NVIDIA_H100") == 4, "a smaller request is left alone"
 
 
 def test_an_unbounded_envelope_has_no_opinion_on_device_count() -> None:
     assert PowerEnvelope().devices_that_fit("NVIDIA_H100") == -1
-    assert PowerEnvelope().clamp_devices(64, "NVIDIA_H100") == 64
 
 
 def test_an_unknown_device_is_never_clamped() -> None:
     envelope = PowerEnvelope(budget_watts=100.0)
     assert envelope.devices_that_fit("MADE_UP") == -1
-    assert envelope.clamp_devices(64, "MADE_UP") == 64
-
-
-def test_a_budget_too_small_for_one_device_still_plans_one() -> None:
-    assert PowerEnvelope(budget_watts=50.0).clamp_devices(8, "NVIDIA_H100") == 1
 
 
 def test_the_configured_envelope_reads_the_active_config() -> None:

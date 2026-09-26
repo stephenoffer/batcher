@@ -1,10 +1,10 @@
 """Energy as a first-class plan quantity: power draw, grid conversion, and per-stage accounting.
 
 A GPU datacenter provisions watts before it provisions slots, so power belongs beside memory
-and CPU in the neutral contract layer rather than inside any one subsystem. Kyber reads these
-to prefer the placement that fits an envelope, Carbonite to refuse work that would exceed it,
-Core to record what a stage actually drew, and `observe` to report it — none of them importing
-another.
+and CPU in the neutral contract layer rather than inside any one subsystem. Kyber reads the
+power model to judge whether a device is worth its watts, Carbonite to refuse work that would
+exceed an envelope, Core to record what a stage actually drew, and `observe` to report it —
+none of them importing another.
 
 Three modules, one responsibility each:
 

@@ -1198,7 +1198,7 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 | module | lines | what it is |
 |---|---|---|
 | `adaptive.py` | 265 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
-| `energy.py` | 450 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
+| `energy.py` | 398 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
 | `exchange.py` | 300 | What a byte costs when the data is on a device, and how wide a stage may fan out before it. |
 | `policy.py` | 628 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
 | `shape.py` | 186 | What Kyber can tell the GPU backend about a plan's *shape*, as opposed to its cost. |
@@ -2362,7 +2362,7 @@ Energy as a first-class plan quantity: power draw, grid conversion, and per-stag
 |---|---|---|
 | `accounting.py` | 340 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
 | `carbon.py` | 175 | Turning joules into the two figures a datacenter is actually judged on: cost and carbon. |
-| `power.py` | 295 | Device power draw — the neutral model every power-aware decision reads. |
+| `power.py` | 256 | Device power draw — the neutral model every power-aware decision reads. |
 
 ### `batcher/plan/expr_ir/` — 1 · contract
 

@@ -20,12 +20,7 @@ from batcher.config import (
     config_context,
     config_to_dict,
 )
-from batcher.kyber.gpu import (
-    device_energy_advice,
-    power_bounded_devices,
-    select_device_class,
-    stage_joules,
-)
+from batcher.kyber.gpu import device_energy_advice, select_device_class
 
 pytestmark = pytest.mark.unit
 
@@ -99,33 +94,6 @@ def test_no_pin_when_a_pin_would_only_constrain() -> None:
     assert select_device_class(["MADE_UP", "ALSO_MADE_UP"], 30.0) is None, "unknowable"
 
 
-# --- power-bounded fan-out ------------------------------------------------------------
-
-
-def test_no_budget_leaves_the_requested_fan_out_alone() -> None:
-    assert power_bounded_devices(64, "NVIDIA_H100") == 64
-
-
-def test_a_budget_clamps_fan_out_below_the_slot_count() -> None:
-    budget = AcceleratorConfig(energy=EnergyConfig(power_budget_watts=10_000.0))
-    with config_context(Config().replace(accelerator=budget)):
-        assert power_bounded_devices(64, "NVIDIA_H100") == 10
-
-
-def test_an_unknown_device_is_never_clamped_on_fabricated_watts() -> None:
-    budget = AcceleratorConfig(energy=EnergyConfig(power_budget_watts=1_000.0))
-    with config_context(Config().replace(accelerator=budget)):
-        assert power_bounded_devices(64, "MADE_UP") == 64
-
-
-def test_a_budget_too_small_for_one_device_still_plans_one() -> None:
-    # Surfacing that as a zero-device plan here would produce a confusing empty stage; the
-    # right place to refuse it is admission, with the budget named.
-    budget = AcceleratorConfig(energy=EnergyConfig(power_budget_watts=100.0))
-    with config_context(Config().replace(accelerator=budget)):
-        assert power_bounded_devices(8, "NVIDIA_H100") == 1
-
-
 # --- the roofline / energy verdict ----------------------------------------------------
 
 
@@ -191,12 +159,6 @@ def test_an_unknown_device_leaves_the_existing_decision_untouched() -> None:
     assert advice.worth_it, "no energy opinion must not become a veto"
     assert advice.speedup == 0.0
     assert "no energy opinion" in advice.reason
-
-
-def test_stage_energy_includes_the_host_share() -> None:
-    joules = stage_joules(60.0, "NVIDIA_H100", 8)
-    assert joules == pytest.approx(60.0 * 8 * 875.0)
-    assert stage_joules(60.0, "MADE_UP", 8) == 0.0
 
 
 def test_a_non_reducing_shape_pays_the_full_return_trip() -> None:

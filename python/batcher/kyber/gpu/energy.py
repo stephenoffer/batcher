@@ -5,21 +5,21 @@ the binding constraint on a full hall is not slots or seconds but power: a rack'
 what its devices may draw, and a stage that finishes 20% faster while drawing twice the power
 has made the fleet slower, not faster, for everyone queued behind it.
 
-Three decisions live here, all of them Kyber's (they choose; they never execute):
+Two decisions live here, both of them Kyber's (they choose; they never execute):
 
 * **Which device class.** On a mixed fleet, the smallest device that fits wastes the least
   VRAM — the rule `recommend_accelerator_type` already implements — but the *most efficient*
   device that fits wastes the least power, and those are different devices. Which one to
   prefer is a configured policy, not a constant.
-* **How many devices.** A power envelope bounds fan-out independently of how many devices are
-  idle. Exceeding it does not fail; it clamps every device in the zone, which reads as the
-  whole rack mysteriously slowing down.
 * **Whether a device is worth it at all.** A scan-shaped stage is bandwidth-bound, so it gains
   a factor of the memory-bandwidth ratio and pays a factor of the power ratio. Below the
   device's roofline ridge those two can cancel, and the honest answer is to stay on the CPU.
 
-Every function reports "no opinion" (`None`, or `-1` for a count) when the inputs are unknown,
-so an unrecognized device or an unconfigured envelope leaves the existing decision untouched.
+How many devices a power envelope allows is an admission question, answered by Carbonite
+(`carbonite.accel.power`), not a choice made here.
+
+Every function reports "no opinion" (`None`) when the inputs are unknown, so an unrecognized
+device leaves the existing decision untouched.
 """
 
 from __future__ import annotations
@@ -38,10 +38,8 @@ __all__ = [
     "EnergyAdvice",
     "device_energy_advice",
     "learned_work_per_joule",
-    "power_bounded_devices",
     "record_measured_efficiency",
     "select_device_class",
-    "stage_joules",
 ]
 
 #: Hub namespace for measured device efficiency, and the sample floor below which a bucket is
@@ -116,56 +114,6 @@ def select_device_class(
         if ranked:
             return ranked[0]
     return min(fitting, key=lambda n: (fitting[n], n))
-
-
-def power_bounded_devices(
-    requested: int,
-    accelerator_type: str | None,
-    *,
-    utilization: float = 1.0,
-) -> int:
-    """Clamp a requested device count to what the configured power envelope allows.
-
-    Args:
-        requested: Devices the sizing path asked for.
-        accelerator_type: Device model those devices are.
-        utilization: Utilization the stage is expected to drive them at.
-
-    Returns:
-        The device count to use. Equal to `requested` when no budget is configured or the
-        device model is unrecognized, and at least 1 otherwise: a budget too small for a
-        single device is a misconfiguration to surface at admission, not a silent zero-device
-        plan here.
-    """
-    from batcher.plan.energy.power import configured_power_envelope
-
-    # The same clamp Carbonite admits against, computed once in the neutral layer: the two
-    # subsystems cannot import each other, and a second copy of this arithmetic is how a plan
-    # comes to be sized for one fan-out and granted another.
-    return configured_power_envelope().clamp_devices(requested, accelerator_type, utilization)
-
-
-def stage_joules(
-    seconds: float,
-    accelerator_type: str | None,
-    device_count: int,
-    utilization: float = 1.0,
-) -> float:
-    """Energy a stage is expected to draw, in joules.
-
-    Args:
-        seconds: Expected wall-clock duration the devices are held.
-        accelerator_type: Device model.
-        device_count: Devices held.
-        utilization: Expected mean utilization.
-
-    Returns:
-        Joules including each device's host share, `0.0` when the device is unrecognized.
-    """
-    from batcher.plan.energy.power import device_power_watts, energy_joules
-
-    watts = device_power_watts(accelerator_type, utilization, include_host=True)
-    return energy_joules(watts * max(0, device_count), seconds)
 
 
 @dataclass(frozen=True, slots=True)
