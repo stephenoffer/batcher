@@ -30,7 +30,6 @@ The class tells you which layer failed, which tells you where to look.
 | `ConfigError` | `config` | A tunable out of range or inconsistent; raised by `Config.validate()`. Read the message — it names the field. |
 | `OptimizationError` | Kyber | The optimizer could not produce a valid physical plan. Go to section E. |
 | `ResourceError` | Carbonite | The request was infeasible. Go to section C. |
-| `BackpressureAbort` (`ResourceError`) | Carbonite | Backpressure could not be relieved — a stuck consumer or too-tight credits. Section C. |
 | `ExecutionError` | Core / engine | An operator failed at runtime. Section B/C. |
 | `BackendError` (`ExecutionError`) | Core | A backend failed; wraps the real error — read `__cause__`. Also raised by `ds.stats()` on `map_batches`/ML pipelines. |
 | `CompileError` (`ExecutionError`) | `bc-codegen` | JIT compile failed. The interpreter is still a fallback, so this surfacing at all is a bug worth reporting. |
@@ -154,8 +153,8 @@ with config_context(Config().replace(memory=MemoryConfig(max_memory_bytes=2 << 3
   `flow_control.default_credits` is 16 batch slots, ceiling
   `default_credits x credit_ceiling_factor` (64), also clamped by `credit_byte_budget`
   (256 MiB) / `execution.morsel_bytes`. Raising credits masks the symptom; find the stalled
-  consumer.
-- `BackpressureAbort` is the *good* outcome — it means the deadlock was detected.
+  consumer. Nothing raises on backpressure: a starved producer blocks, so this shape
+  presents as a hang, never as an exception.
 
 Turn on logging before guessing. There is **no `RUST_LOG` or `BATCHER_DEBUG`** in this
 repo; the Rust tracing level is driven from the same `log_level`:

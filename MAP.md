@@ -1831,7 +1831,7 @@ Template-Method base classes for file-backed sources and sinks.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 118 | Format contracts and registries — the seam new IO formats plug into. |
-| `mime.py` | 74 | MIME sniffing for file payloads — magic bytes first, extension as the fallback. |
+| `mime.py` | 61 | MIME sniffing for file payloads — magic bytes first, extension as the fallback. |
 
 ### `batcher/io/formats/genomics/` — 2 · neutral IO
 
@@ -1871,7 +1871,7 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `_snapshot.py` | 542 | One cached read of a Delta table's `_delta_log`, shared by every metadata question. |
 | `maintenance.py` | 172 | Delta table maintenance: OPTIMIZE, ZORDER, VACUUM, and log checkpointing. |
 | `sink.py` | 470 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
-| `source.py` | 544 | Reading a Delta Lake table: log-driven file skipping, time travel, and CDF. |
+| `source.py` | 522 | Reading a Delta Lake table: log-driven file skipping, time travel, and CDF. |
 | `stream.py` | 395 | Reading a Delta table's Change Data Feed, unbounded or over a fixed version window. |
 
 ### `batcher/io/formats/lakehouse/iceberg/` — 2 · neutral IO
@@ -1909,7 +1909,7 @@ Sharded training dataset — fixed-size Arrow-IPC shards + a JSON index.
 
 | module | lines | what it is |
 |---|---|---|
-| `index.py` | 250 | The shard manifest: what a corpus contains, and where — without holding a list of it. |
+| `index.py` | 244 | The shard manifest: what a corpus contains, and where — without holding a list of it. |
 | `reader.py` | 202 | Random access into a shard corpus by global row index, in bounded memory. |
 | `source.py` | 163 | The relational view of a shard corpus — the same directory, read as rows. |
 | `writer.py` | 309 | Writing a training corpus: streaming, crash-safe, and resumable. |
@@ -2008,7 +2008,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `_bind.py` | 125 | Arrow columns → the parameter sets a PEP 249 ``executemany`` binds. |
 | `_ddl.py` | 303 | Arrow schema → ``CREATE TABLE`` — the one place a column type is chosen for a database. |
 | `_dsn.py` | 313 | Connection URI → the PEP 249 driver and the ``connect()`` kwargs it wants. |
-| `_statements.py` | 485 | Dialect-aware DML for the DB-API write path — the statement each write mode runs. |
+| `_statements.py` | 483 | Dialect-aware DML for the DB-API write path — the statement each write mode runs. |
 | `sink.py` | 520 | The row-level SQL write path — ``INSERT``, ``UPSERT``, ``UPDATE``, ``DELETE``. |
 | `source.py` | 677 | DB-API 2.0 (PEP 249) source — the universal fallback for any Python driver. |
 
@@ -2151,7 +2151,7 @@ Predicate translation for source-side pushdown.
 | module | lines | what it is |
 |---|---|---|
 | `_casts.py` | 137 | Checked column casts: reshape a file's column to a declared type, or say why it cannot. |
-| `evolution.py` | 502 | Schema reconciliation for multi-file reads — column union, type promotion, drift. |
+| `evolution.py` | 470 | Schema reconciliation for multi-file reads — column union, type promotion, drift. |
 
 ### `batcher/io/source/` — 2 · neutral IO
 
@@ -2181,7 +2181,7 @@ Splits — independently-readable, picklable slices of a source.
 | `file.py` | 571 | File-locator splits — a whole file, an IPC stream file, or a byte range of one. |
 | `gds.py` | 222 | Whether a file's bytes can reach a device without a detour through host memory. |
 | `kvikio.py` | 145 | Whether a device read actually bypasses the host, or only reports that it did. |
-| `parquet.py` | 506 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
+| `parquet.py` | 481 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
 | `text.py` | 168 | Byte-range splits for line-delimited text — what lets one huge log fan across workers. |
 
 ### `batcher/io/stats/` — 2 · neutral IO
@@ -2191,14 +2191,14 @@ Splits — independently-readable, picklable slices of a source.
 | module | lines | what it is |
 |---|---|---|
 | `columnar_footer.py` | 438 | Footer-derived statistics for columnar formats (Parquet, ORC, Arrow IPC). |
-| `file_identity.py` | 221 | A cheap identity token for a file, so a metadata cache cannot serve a stale answer. |
+| `file_identity.py` | 215 | A cheap identity token for a file, so a metadata cache cannot serve a stale answer. |
 | `file_listing.py` | 60 | Statistics for a source where one row *is* one file, read from the listing alone. |
 | `file_skipping.py` | 415 | Manifest-driven file skipping — turn a pushed predicate into a surviving-file set. |
 | `free_counts.py` | 75 | Free row counts from file headers — metadata that costs one header read. |
 | `key_pruning.py` | 265 | Key-driven file pruning — the copy-on-write MERGE's "which files must I rewrite?". |
 | `lakehouse_manifest.py` | 190 | Manifest-derived statistics for lakehouse tables (Delta, Iceberg). |
 | `parquet_manifest.py` | 154 | Per-**file** Parquet bounds, in the add-action layout, for file-level pruning. |
-| `pruning.py` | 128 | Row-group / file pruning metadata mined from Parquet footers. |
+| `pruning.py` | 95 | Row-group / file pruning metadata mined from Parquet footers. |
 | `row_estimate.py` | 168 | Advisory row-count estimates from a sample, for datasets too large to count exactly. |
 | `sortedness.py` | 153 | Prove — never assume — that a Parquet dataset is globally sorted by a key. |
 
@@ -2212,7 +2212,7 @@ Catalog-derived statistics for SQL warehouses and databases.
 | `compose.py` | 66 | Composing every catalog probe into the one `SourceStatistics` a connector returns. |
 | `constraints.py` | 234 | Statistics a table's *declared constraints* prove, rather than a sample estimates. |
 | `counts.py` | 140 | Table-level catalog figures: how many rows, and how many bytes on disk. |
-| `probes.py` | 132 | How a connector asks a catalog a question, and which catalog it is asking. |
+| `probes.py` | 122 | How a connector asks a catalog a question, and which catalog it is asking. |
 
 ### `batcher/observe/` — 2 · neutral sinks
 
@@ -2292,7 +2292,7 @@ Live progress for a long-running distributed or batch-inference job.
 | module | lines | what it is |
 |---|---|---|
 | `measures.py` | 70 | Stateless computations behind the live-progress snapshot and its diagnostics. |
-| `progress.py` | 481 | Live progress for a long-running distributed or batch-inference job. |
+| `progress.py` | 479 | Live progress for a long-running distributed or batch-inference job. |
 
 ### `batcher/observe/insights/` — 2 · neutral sinks
 
@@ -2715,7 +2715,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | module | lines | what it is |
 |---|---|---|
 | `accelerators.py` | 604 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
-| `device_share.py` | 338 | How much of one accelerator a claimant gets — the fractional-scheduling vocabulary. |
+| `device_share.py` | 316 | How much of one accelerator a claimant gets — the fractional-scheduling vocabulary. |
 | `events.py` | 561 | The engine's one observability event bus — every subsystem publishes here. |
 | `logging.py` | 376 | Centralized logging for the whole engine — one configured `batcher.*` hierarchy. |
 | `mathx.py` | 131 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
@@ -2750,7 +2750,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 
 | module | lines | what it is |
 |---|---|---|
-| `hierarchy.py` | 725 | The Batcher exception hierarchy. |
+| `hierarchy.py` | 720 | The Batcher exception hierarchy. |
 | `suggest.py` | 402 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 125 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
@@ -2768,7 +2768,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `mig.py` | 162 | Multi-Instance GPU profiles — which partitionings a device model actually offers. |
 | `nvml.py` | 536 | Live device telemetry through NVML — what a GPU is *doing*, not what it is. |
 | `probes.py` | 110 | The one hook that clears every memoized hardware reading. |
-| `profile.py` | 391 | The machine's identity — one record of what this hardware is, and a key that names it. |
+| `profile.py` | 386 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 284 | The block device behind a directory — what spilling to it will actually cost. |
 | `sysfs.py` | 123 | Reading a kernel pseudo-file, where "absent" means "unknown" rather than "error". |
 | `topology.py` | 188 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
@@ -2838,14 +2838,14 @@ Everything a running accelerator will tell you about itself, beyond the five obv
 |---|---|---|
 | `bottleneck.py` | 290 | One verdict per device: what is actually limiting it, and therefore what to change. |
 | `clocks.py` | 265 | Clock rates against their ceilings, and how long the driver has been holding them down. |
-| `dcgm.py` | 314 | Occupancy, tensor-core activity, and DRAM activity — the figures NVML structurally cannot give. |
-| `energy.py` | 254 | The driver's own integrated joule counter, and the power limits a device is held to. |
-| `engines.py` | 226 | The fixed-function engines beside the SMs — NVDEC, NVENC, NVJPG, OFA — and whether they run. |
-| `identity.py` | 296 | What each device *is*, read from the device rather than matched from its name. |
+| `dcgm.py` | 262 | Occupancy, tensor-core activity, and DRAM activity — the figures NVML structurally cannot give. |
+| `energy.py` | 228 | The driver's own integrated joule counter, and the power limits a device is held to. |
+| `engines.py` | 211 | The fixed-function engines beside the SMs — NVDEC, NVENC, NVJPG, OFA — and whether they run. |
+| `identity.py` | 290 | What each device *is*, read from the device rather than matched from its name. |
 | `memory.py` | 232 | Device memory as the driver actually divides it — reserved, resident, and host-mappable. |
 | `processes.py` | 192 | Who on a shared device is using it — per-process SM, memory, and codec utilization. |
 | `sampler.py` | 200 | Turning instantaneous device readings into a figure that describes a stage. |
-| `throughput.py` | 307 | What the wires into and between devices are actually carrying, right now. |
+| `throughput.py` | 281 | What the wires into and between devices are actually carrying, right now. |
 
 ### `batcher/_internal/humanize/` — 0 · utility
 
@@ -2872,7 +2872,7 @@ The migration registry: every PySpark, Polars, Daft and Ray Data name, and its B
 | module | lines | what it is |
 |---|---|---|
 | `hints.py` | 149 | The migration half of an `AttributeError`: what a removed or foreign spelling is called here. |
-| `loader.py` | 158 | Load the migration registry from its TOML files. |
+| `loader.py` | 147 | Load the migration registry from its TOML files. |
 | `renames.py` | 250 | The rename decisions for Batcher's own second spellings, as typed rules the codemod can apply. |
 | `schema.py` | 278 | The shape of one migration-registry row: a competitor's name and what it becomes here. |
 
