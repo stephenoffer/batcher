@@ -111,16 +111,12 @@ def bump_generation() -> None:
 
     Called by every writer whose value the optimizer reads — the join-strategy bandit, the
     adaptive gate, partition sizing, and the column sketches. Only the *converged drift* of
-    an already-known cardinality is exempt (`_is_material`), because that write happens on
+    an already-known cardinality is exempt (`is_material_change`), because that write happens on
     every single execution and gating on it is what makes memoizing a plan possible at all.
     Bumping too often only costs a re-plan; bumping too rarely leaves a stale plan in place,
     so anything uncertain should bump."""
     global _GENERATION
     _GENERATION += 1
-
-
-def _bump_generation() -> None:
-    bump_generation()
 
 
 def is_material_change(prior: float | None, observed: float) -> bool:
@@ -136,10 +132,6 @@ def is_material_change(prior: float | None, observed: float) -> bool:
     if prior <= 0:
         return observed > 0
     return abs(observed - prior) / prior > _MATERIAL_CHANGE
-
-
-def _is_material(prior: float | None, observed: float) -> bool:
-    return is_material_change(prior, observed)
 
 
 #: The assembled bundle per hub, valid while the hub's two change counters stand still **and
@@ -409,8 +401,8 @@ def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: in
             if prior is None
             else convergent_blend(prior, float(output_rows), entry.get("n_obs", 0))
         )
-        if _is_material(prior, updated):
-            _bump_generation()
+        if is_material_change(prior, updated):
+            bump_generation()
         entry["rows"] = updated
         entry["n_obs"] = entry.get("n_obs", 0) + 1
         hub.put_keyed_param(_NAMESPACE, sig, entry)
@@ -639,7 +631,7 @@ def record_column_stats_batch(hub: MetadataHub | None, measured: Sequence[Measur
             # A column measured for the first time can change every join and group-by
             # estimate that reads it — the one column-stat event worth re-planning for.
             if any(name not in existing for name in ndv):
-                _bump_generation()
+                bump_generation()
             merge_column_table(hub, NDV_KEY, ndv, existing)
         if quantiles:
             merge_column_table(hub, QUANTILES_KEY, quantiles)

@@ -17,10 +17,10 @@ Two reusable primitives back the family:
 * a **UCB1 bandit** (`ucb1_best_arm` / `learned_arm`) — regret-minimizing selection over a fixed
   arm set from measured per-arm latencies; deterministic (no RNG, ties broken by arm name), so a
   plan is reproducible. It generalizes the two-arm GPU crossover to N discrete algorithm arms.
-* an **OLS line-crossover** (`_fit` / `_solve_crossover`) — the exact machinery `gpu/adaptive.py`
-  uses, fitting `t ≈ a + b·x` per algorithm and solving for the x (bytes or rows) where the
-  cheaper-below algorithm is overtaken by the cheaper-above one, clamped to a band around the
-  default so one noisy early fit can't send a threshold to an absurd value.
+* an **OLS line-crossover** (`kyber.ols.fit_ols` / `_solve_crossover`) — the exact machinery
+  `gpu/adaptive.py` uses, fitting `t ≈ a + b·x` per algorithm and solving for the x (bytes or
+  rows) where the cheaper-below algorithm is overtaken by the cheaper-above one, clamped to a
+  band around the default so one noisy early fit can't send a threshold to an absurd value.
 
 Everything is best-effort: a malformed bucket, a degenerate fit, or a cold store yields the
 default (or `None`), never an exception into planning or execution. **Core measures, Kyber

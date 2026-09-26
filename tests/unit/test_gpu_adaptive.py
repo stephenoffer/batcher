@@ -196,17 +196,17 @@ def test_tightly_clustered_samples_cannot_identify_a_line():
     and that intercept is the whole numerator of the learned crossover. The absolute
     `xmax > xmin` gate passed it; a relative one must not.
     """
-    from batcher.kyber.gpu.adaptive import _fit
+    from batcher.kyber.ols import fit_ols
 
-    assert _fit(_stats(1e7, 3, noise=0.5)) is None
-    assert _fit(_stats(1e8, 10, noise=1.0)) is None
-    assert _fit(_stats(1e7, 3)) is None  # even noiseless, 3 rows of spread identifies nothing
+    assert fit_ols(_stats(1e7, 3, noise=0.5)) is None
+    assert fit_ols(_stats(1e8, 10, noise=1.0)) is None
+    assert fit_ols(_stats(1e7, 3)) is None  # even noiseless, 3 rows of spread identifies nothing
 
 
 def test_genuinely_spread_samples_still_fit_exactly():
-    from batcher.kyber.gpu.adaptive import _fit
+    from batcher.kyber.ols import fit_ols
 
-    fit = _fit(_stats(1e6, 7e6))
+    fit = fit_ols(_stats(1e6, 7e6))
     assert fit is not None
     intercept, slope = fit
     assert intercept == pytest.approx(100.0)
@@ -217,16 +217,17 @@ def test_every_ols_crossover_shares_the_spread_guard():
     """The broadcast / sort-merge crossovers must reject a cluster too, not just the GPU one.
 
     `gpu/adaptive.py` and `learned_tuning/crossover.py` fold *identical* OLS sufficient
-    statistics, and their `_fit` bodies were copies. The relative-spread guard was added
+    statistics, and their fit bodies were copies. The relative-spread guard was added
     here after the measured failure above and never reached the other copy, so the same
     garbage fit stayed live on the path feeding `learned_broadcast_max_bytes` and
     `learned_sort_merge_min_rows` — consumed by `kyber/rules/selection.py`, where a bad
     intercept flips join strategy. Both now resolve to the one `kyber.ols.fit_ols`.
     """
-    from batcher.kyber.gpu.adaptive import _fit as gpu_fit
-    from batcher.kyber.learned_tuning.crossover import _fit as crossover_fit
+    from batcher.kyber.gpu import adaptive
+    from batcher.kyber.learned_tuning import crossover
     from batcher.kyber.ols import fit_ols
 
+    gpu_fit, crossover_fit = adaptive.fit_ols, crossover.fit_ols
     assert gpu_fit is fit_ols and crossover_fit is fit_ols
     # The exact case the guard was written for: unidentifiable from either entry point.
     assert crossover_fit(_stats(1e7, 3, noise=0.5)) is None

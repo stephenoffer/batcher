@@ -1151,7 +1151,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `common_subplan.py` | 311 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 651 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 643 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
 | `measured_selectivity.py` | 67 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
@@ -1197,7 +1197,7 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 
 | module | lines | what it is |
 |---|---|---|
-| `adaptive.py` | 265 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
+| `adaptive.py` | 259 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
 | `energy.py` | 398 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
 | `exchange.py` | 300 | What a byte costs when the data is on a device, and how wide a stage may fan out before it. |
 | `policy.py` | 628 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
@@ -1212,7 +1212,7 @@ Learned strategy + parameter tuning — self-tuning physical decisions from meas
 | module | lines | what it is |
 |---|---|---|
 | `bandit.py` | 436 | A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it. |
-| `crossover.py` | 247 | An OLS two-line crossover — where one algorithm overtakes another, learned from timings. |
+| `crossover.py` | 244 | An OLS two-line crossover — where one algorithm overtakes another, learned from timings. |
 | `priors.py` | 154 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
 | `topn_bound.py` | 333 | Learned top-N bounds: remember the k-th best value a top-N returned, and use it on the |
 | `topn_footer.py` | 206 | First-run top-N bounds, derived from Parquet row-group statistics rather than remembered. |
