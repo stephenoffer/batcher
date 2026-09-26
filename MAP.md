@@ -214,9 +214,9 @@ The `Dataset` builder package.
 | module | lines | what it is |
 |---|---|---|
 | `_dedup.py` | 326 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
-| `_describe.py` | 248 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
+| `_describe.py` | 244 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
 | `_export.py` | 349 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
-| `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
+| `_nulls.py` | 195 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
@@ -279,7 +279,7 @@ The `Dataset.dq` namespace — data-quality expectations with quarantine.
 | `apply.py` | 417 | Applying an accumulated `ds.dq` chain: lower it, count it, split it, annotate it. |
 | `constraints.py` | 211 | The constraint values a `ds.dq` chain accumulates, before any of them is applied. |
 | `report.py` | 351 | `ValidationReport` — per-constraint results, and the ways to read them. |
-| `suggest.py` | 195 | Read a contract off the data, so the first version of one is not written from memory. |
+| `suggest.py` | 191 | Read a contract off the data, so the first version of one is not written from memory. |
 
 ### `batcher/api/dataset/dq/checks/` — 5 · conductor
 
@@ -301,7 +301,7 @@ The `ds.meta` accessor tree (façade) — answer from metadata, execute only whe
 | module | lines | what it is |
 |---|---|---|
 | `_facts.py` | 157 | The scaffolding every `ds.meta` accessor stands on: get the facts, or execute instead. |
-| `_types.py` | 170 | The type gates every `ds.meta` accessor shares — refuse a question the column cannot answer. |
+| `_types.py` | 165 | The type gates every `ds.meta` accessor shares — refuse a question the column cannot answer. |
 | `approx.py` | 322 | The `ds.meta.approx` accessor — what the sketches know, and nothing they don't. |
 | `checks.py` | 459 | The `ds.meta.col(...).check` accessor — predicate questions answered from the bounds. |
 | `column.py` | 540 | The `ds.meta.col(...)` accessor — one column's facts, from the footer when it can be. |
@@ -309,7 +309,7 @@ The `ds.meta` accessor tree (façade) — answer from metadata, execute only whe
 | `nulls.py` | 178 | The `ds.meta.nulls` accessor — the whole relation's missing-data shape, in one question. |
 | `pair.py` | 168 | The `ds.meta.against(other)` accessor — what two relations' footers say about their join. |
 | `prove.py` | 104 | Prove a constraint from metadata — a data contract that holds should cost nothing. |
-| `schema.py` | 380 | The `ds.meta.schema` accessor — questions about types, which never touch data at all. |
+| `schema.py` | 379 | The `ds.meta.schema` accessor — questions about types, which never touch data at all. |
 | `storage.py` | 275 | The `ds.meta.storage` accessor — what a scan *would* read, without reading it. |
 
 ### `batcher/api/io_namespace/` — 5 · conductor
@@ -2627,7 +2627,7 @@ The neutral type vocabulary and inference for the plan layer.
 | module | lines | what it is |
 |---|---|---|
 | `compact.py` | 82 | Compacting Arrow batches into one, without the row loss the obvious spelling causes. |
-| `domains.py` | 301 | The input type each aggregate, window function, and temporal expression accepts. |
+| `domains.py` | 306 | The input type each aggregate, window function, and temporal expression accepts. |
 | `footprint.py` | 155 | How much memory live Arrow data actually keeps resident. |
 | `ipc.py` | 94 | Arrow tables to bytes and back, for anything that stores a result outside the process. |
 | `lattice.py` | 330 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
