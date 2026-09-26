@@ -9,16 +9,11 @@ It breaks it only at the ends of the range, though. If every value the column ca
 keeps `col + k` inside i64, the addition is exact rather than modular, and the ordinary
 integer identity `v + k OP lit  <=>  v OP lit - k` holds for every row. So the transform
 is sound exactly when the plan can *prove* the arithmetic cannot wrap, and this module is
-that proof, stated once for the two independent ways to obtain a column's range:
+that proof. The range comes from the column's **measured min/max** — the bounds a Parquet
+footer, ORC index, or lakehouse manifest records, which `RelStats` already carries and
+zone-map pruning already trusts to delete whole row groups (`bounds.py`).
 
-* its **declared width** — an `Int32` column holds values in `[-2^31, 2^31 - 1]` whatever
-  the data is, and the FFI widens every narrow numeric to Int64 on the way in
-  (`bc-py/src/normalize.rs`), so the arithmetic really is i64-wide over int32-wide values;
-* its **measured min/max** — the bounds a Parquet footer, ORC index, or lakehouse manifest
-  records, which `RelStats` already carries and zone-map pruning already trusts to delete
-  whole row groups.
-
-Both feed the same three-part obligation, checked per rewrite and never assumed:
+That range feeds a three-part obligation, checked per rewrite and never assumed:
 
 1. the column side is a bare `Col` of provably integer type (the raw column is the point —
    it is what zone-map pruning and source pushdown recognize);
@@ -32,54 +27,12 @@ comparison over the same operand, so a null column yields a null answer either w
 
 from __future__ import annotations
 
+from batcher.kyber.rules.literals import in_int64
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_ir.core import int_literal
-from batcher.plan.ir_tags import ORDERING_COMPARISONS, ORDERING_FLIP
+from batcher.plan.ir_tags import ORDERING_FLIP
 
-__all__ = [
-    "ORDERING_COMPARISONS",
-    "ORDERING_FLIP",
-    "decompose",
-    "narrow_int_range",
-    "transpose",
-]
-
-_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
-
-#: The comparisons this family handles. `=`/`<>` are deliberately absent: `sargable.py`
-#: already transposes those unconditionally, because equality's bijection survives the wrap
-#: and so needs no range proof at all.
-
-#: The comparison you get by swapping the operands, used twice: to normalize a predicate
-#: written with the literal on the left, and to negate one when the column's coefficient is
-#: negative (`k - col < lit` is `col > k - lit`).
-
-#: The value range each integer width guarantees, keyed by the Arrow type's name. Every one
-#: of these widens to Int64 at the FFI boundary, so a column of this type contributes values
-#: in this range to i64-wide arithmetic. `int64` is absent on purpose — it is the width the
-#: arithmetic itself is done in, so it proves nothing, and `uint64` is absent because the
-#: boundary rejects rather than widens a value above `i64::MAX`.
-_NARROW_RANGES: dict[str, tuple[int, int]] = {
-    "int8": (-(2**7), 2**7 - 1),
-    "int16": (-(2**15), 2**15 - 1),
-    "int32": (-(2**31), 2**31 - 1),
-    "uint8": (0, 2**8 - 1),
-    "uint16": (0, 2**16 - 1),
-    "uint32": (0, 2**32 - 1),
-}
-
-
-def narrow_int_range(dtype: object) -> tuple[int, int] | None:
-    """The value range a narrow integer Arrow type guarantees, or ``None``.
-
-    Args:
-        dtype: The column's Arrow type, or ``None`` when it could not be inferred.
-
-    Returns:
-        The inclusive ``(low, high)`` range, or ``None`` for a type that bounds nothing
-        (``int64``, a float, a string) or an unknown one.
-    """
-    return None if dtype is None else _NARROW_RANGES.get(str(dtype))
+__all__ = ["decompose", "transpose"]
 
 
 def _split_inner(inner: Binary) -> tuple[str, Col, int] | None:
@@ -136,11 +89,6 @@ def decompose(expr: Expr) -> tuple[str, str, Col, int, int] | None:
     return None
 
 
-def _in_int64(*values: int) -> bool:
-    """Whether every value is representable as i64."""
-    return all(_INT64_MIN <= v <= _INT64_MAX for v in values)
-
-
 def transpose(form: str, op: str, col: Col, k: int, lit: int, low: int, high: int) -> Expr | None:
     """The transposed `col OP literal`, or ``None`` when the range does not prove it exact.
 
@@ -164,15 +112,15 @@ def transpose(form: str, op: str, col: Col, k: int, lit: int, low: int, high: in
         The rewritten comparison, or ``None`` when it would not be exact.
     """
     if form == "add":
-        if not _in_int64(low + k, high + k, lit - k):
+        if not in_int64(low + k, high + k, lit - k):
             return None
         return Binary(op, col, Lit(lit - k))
     if form == "sub":
-        if not _in_int64(low - k, high - k, lit + k):
+        if not in_int64(low - k, high - k, lit + k):
             return None
         return Binary(op, col, Lit(lit + k))
     if form == "rsub":
-        if not _in_int64(k - low, k - high, k - lit):
+        if not in_int64(k - low, k - high, k - lit):
             return None
         return Binary(ORDERING_FLIP[op], col, Lit(k - lit))
     return None

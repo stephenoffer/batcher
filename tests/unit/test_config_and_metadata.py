@@ -53,7 +53,7 @@ def test_inprocess_hub_records_and_reads():
     hub = MetadataHub(InProcessBackend())
     hub.record(_fb(0, 5))
     hub.record(_fb(0, 7))
-    hist = hub.operator_history(0)
+    hist = hub.op_stats_by_kind()["pipeline"]
     assert [h["n_actual"] for h in hist] == [5, 7]
 
 

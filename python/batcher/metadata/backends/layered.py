@@ -118,11 +118,11 @@ class LayeredBackend:
         Called between runs so this driver picks up statistics other drivers have written
         since the cache was warmed (cross-driver freshness).
 
-        The cache is *emptied*, not replaced. Rebinding to a fresh `InProcessBackend` — which
-        is what this used to do — silently discarded a caller-supplied cache on the first
-        refresh, so a deployment that layered over a bounded or shared cache got the default
-        dict from then on, with nothing to indicate the substitution. A cache that offers no
-        `clear` is the one case that still needs a replacement.
+        The cache is *emptied*, not replaced. Rebinding to a fresh `InProcessBackend` would
+        silently discard a caller-supplied cache on the first refresh, so a deployment layered
+        over a bounded or shared cache would get the default dict from then on, with nothing
+        to indicate the substitution. A cache that offers no `clear` is the one case that needs
+        a replacement.
         """
         clear = getattr(self._cache, "clear", None)
         if callable(clear):

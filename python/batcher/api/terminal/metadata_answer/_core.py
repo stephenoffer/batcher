@@ -229,10 +229,10 @@ def _has_structural_empty(plan: LogicalPlan) -> bool:
     scale) full re-optimization behind this keeps the scan-free win for `limit(0)` while
     a normal join/aggregate/sort — which planning already dominates — pays nothing.
     """
-    from batcher.plan.logical import Limit
+    from batcher.plan.logical import is_empty_relation
     from batcher.plan.visitor import walk
 
-    return any(isinstance(node, Limit) and node.n == 0 for node in walk(plan))
+    return any(is_empty_relation(node) for node in walk(plan))
 
 
 def metadata_empty_table(

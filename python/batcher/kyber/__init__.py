@@ -42,7 +42,6 @@ from batcher.kyber.metadata_answer import (
     approx_count_distinct,
 )
 from batcher.kyber.metadata_filter_count import (
-    answer_filter_any,
     answer_filter_count,
     answer_filter_is_empty,
 )
@@ -66,7 +65,6 @@ __all__ = [
     "Optimizer",
     "answer_aggregate",
     "answer_count",
-    "answer_filter_any",
     "answer_filter_count",
     "answer_filter_is_empty",
     "answer_is_empty",

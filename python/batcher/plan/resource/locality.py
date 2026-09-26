@@ -44,16 +44,6 @@ class LocalityShares:
     intra_rack: float = 0.0
     cross_rack: float = 1.0
 
-    @property
-    def off_node(self) -> float:
-        """Share that leaves the host: everything above the node tier."""
-        return self.intra_rack + self.cross_rack
-
-    @property
-    def on_node(self) -> float:
-        """Share that never leaves the host, including what never leaves the worker."""
-        return self.local + self.intra_domain + self.intra_node
-
     def weighted(
         self,
         *,

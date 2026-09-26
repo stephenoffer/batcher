@@ -34,11 +34,11 @@ from batcher.plan.logical import (
     Filter,
     Join,
     JoinOutputCol,
-    Limit,
     LogicalPlan,
     Project,
     Projection,
     Union,
+    is_empty_relation,
 )
 from batcher.plan.logical._setops import (
     MEMBERSHIP_IN_LEFT,
@@ -64,15 +64,6 @@ __all__ = [
 def _ir_key(node: LogicalPlan) -> str:
     """A hashable structural identity for a plan node (its IR rendered canonically)."""
     return json.dumps(node.to_ir(), sort_keys=True)
-
-
-def _is_empty(node: LogicalPlan) -> bool:
-    """Whether `node` structurally produces zero rows — a `Limit` capped at 0.
-
-    Deliberately narrow: only a syntactically zero-row cap is treated as empty (never
-    an estimate), so a branch is dropped only when it *provably* contributes nothing.
-    """
-    return isinstance(node, Limit) and node.n == 0
 
 
 def _flatten_branches(branch: LogicalPlan, outer_distinct: bool) -> list[LogicalPlan]:
@@ -137,7 +128,7 @@ def prune_empty_union_branch(node: Union, _ctx: OptimizerContext) -> LogicalPlan
     replaces the union (wrapped in `Distinct` when the union was distinct); if every
     branch is empty, one empty branch is kept so the result stays the empty relation.
     """
-    kept = [b for b in node.inputs if not _is_empty(b)]
+    kept = [b for b in node.inputs if not is_empty_relation(b)]
     if len(kept) == len(node.inputs):
         return None
     if not kept:
@@ -271,7 +262,7 @@ def prune_distinct_of_empty(node: Distinct, _ctx: OptimizerContext) -> LogicalPl
     """`Distinct(Limit(x, 0))` → `Limit(x, 0)`. Deduplicating a provably-empty relation
     yields the same empty relation, so the dedup is pure overhead."""
     inner = node.input
-    if isinstance(inner, Limit) and inner.n == 0:
+    if is_empty_relation(inner):
         return inner
     return None
 

@@ -246,29 +246,22 @@ _BY_CLASS_NAME: dict[str, float] = {
     # video decode ahead of an image one it can actually price.
     "VideoFunc": 5_000_000.0,
     # `crop` is its own node rather than an `ImageFunc` because its window is four
-    # sub-expressions, and that is exactly how it slipped past the family table: it fell
-    # through to `_DEFAULT_COST` and was priced at 5.0 -- cheaper than a regex, for an op
-    # that decodes a JPEG, crops it and re-encodes the result. Measured at 2,957 us/row on
-    # this file's reference frame, and 1,686 us/row on the compressible one the rest of
-    # this table is measured on -- so it lands just below `thumbnail`, in the
-    # decode-and-re-encode band where it belongs. No specific plan change is claimed for
-    # this entry: the probes tried were
-    # decided by selectivity or by `filter_split`'s gain gate rather than by the crop's
-    # own cost. It is corrected because 5.0 is simply the wrong number for a JPEG decode,
-    # and because `filter_split` and `cse` read it.
+    # sub-expressions, so the family table does not reach it and it needs its own entry
+    # (the default would price a JPEG decode below a regex). It decodes, crops and
+    # re-encodes: 1,686 us/row on the compressible reference frame the rest of this table
+    # uses (2,957 on the noise frame), just below `thumbnail`, in the decode-and-re-encode
+    # band. `filter_split` and `cse` read it.
     "ImageCrop": 8_500_000.0,
     # Vector work over an embedding, at a **384-dimension** reference -- the size a
     # sentence/image embedding model of the MiniLM class emits, and what these two ops
     # exist for. Both are exactly linear in the list length (and `simhash` additionally in
     # `num_bits`, its default 64 here), so scale by hand for a different width: `simhash`
     # is ~117 ns per dimension per row and `list.add` ~3.7 ns per element. Measured at 5.1M
-    # rows, which is where they stop falling on this box; the entry `ListSimhash` replaced
-    # was 5.0, some four orders of magnitude out, on the op an image-corpus
-    # near-duplicate pass is built from.
+    # rows, which is where the per-row figure stops falling on the reference box.
     "ListSimhash": 230_000.0,
     "ListZip": 7_100.0,
-    # Hashing two Int64 columns into one digest -- 6.5 ns/row, so genuinely cheap, but not
-    # the 5.0 units it was defaulting to.
+    # Hashing two Int64 columns into one digest -- 6.5 ns/row: cheap, but well above the
+    # default.
     "HashRows": 33.0,
 }
 
@@ -276,17 +269,16 @@ _BY_CLASS_NAME: dict[str, float] = {
 # `SpatialFunc`, `SeqFunc` and `MakeTemporal` have no entry above, so `own_cost` gives each
 # of them `_DEFAULT_COST`. That is a guess for whole families (geometry predicates,
 # rigid-body transforms, genomics) whose per-row work spans at least as wide a range as the
-# media ones did, and pricing them needs the same measurement pass rather than a
+# media ones do, and pricing them needs the same measurement pass rather than a
 # plausible-looking number written here.
 #
-# One thing that pass will need, learned the hard way while measuring the three entries
-# above. A scalar or list kernel parallelizes only *across* morsels, so on a 96-core box it
-# needs well past 96 x 16,384 = 1.5M rows before every core has work and the per-row figure
-# stops falling: `list.simhash` reads 1,380,000 ns/row at 20k rows, 87,000 at 320k, and
-# settles near 3,750 (at 32 dimensions) only past 2.5M. Measure below that and the number is
-# not a small factor out, it is orders. The media families are the exception and are why
-# this was not obvious -- their kernels fan out over rows *within* a morsel (`map_rows` in
-# `bc-expr::eval::media`), so they converge in the low thousands of rows.
+# That pass must measure at scale. A scalar or list kernel parallelizes only *across* morsels, so on
+# a 96-core box it needs well past 96 x 16,384 = 1.5M rows before every core has work and the
+# per-row figure stops falling: `list.simhash` reads 1,380,000 ns/row at 20k rows, 87,000 at 320k,
+# and settles near 3,750 (at 32 dimensions) only past 2.5M. Measure below that and the number is not
+# a small factor out, it is orders. The media families are the exception: their kernels fan out
+# over rows *within* a morsel (`map_rows` in `bc-expr::eval::media`), so they converge in the low
+# thousands of rows.
 
 # --- Media, measured ------------------------------------------------------------------
 #
@@ -301,10 +293,9 @@ _BY_CLASS_NAME: dict[str, float] = {
 # entry already in this file: `regexp_matches` is 48.0 units and measures 9.5 ns/row net
 # of a bare projection. A 512x512 JPEG decode really is tens of millions of times a
 # vectorized numeric comparison, and a table that rounds that to a friendlier number is
-# not being conservative, it is being wrong in a direction that matters -- an earlier
-# revision of this block anchored the family at 500.0 and thereby priced an image header
-# read (~15 us/row) *below* a regex (~10 ns/row), so `filter_split` would have run the
-# header probe first and paid it on every row.
+# wrong in a direction that matters: anchoring the family near a scalar op's cost would
+# price even an image header read (~15 us/row) *below* a regex (~10 ns/row), and
+# `filter_split` would then run the media probe first and pay it on every row.
 #
 # `benchmarks/scenarios/media_op_cost.py` prints exactly these numbers, so the table has a
 # reproducer rather than only a provenance claim. It measures on a structured,
@@ -312,19 +303,17 @@ _BY_CLASS_NAME: dict[str, float] = {
 # that is a decoder's worst case -- and it chooses each op's row count so the op's own work
 # dominates the per-call fixed cost.
 #
-# Both of those corrections mattered, and an earlier revision of this block had neither.
-# Measured at a few hundred rows the cheap end reads several times high (`image.format` is
-# 7.5 us/row at 200 rows against 0.45 at 25,600), and content moves the decode-bound ops
-# much further than it moves the rest: `dhash` runs ~8x faster on a compressible frame,
-# while `blur` barely moves, because its work is in the filter rather than in the decode.
-# Correcting both left every ordering here unchanged and brought the cheap and
-# decode-bound entries down by 4-15x.
+# Both choices matter. Measured at a few hundred rows the cheap end reads several times high
+# (`image.format` is 7.5 us/row at 200 rows against 0.45 at 25,600), and content moves the
+# decode-bound ops much further than it moves the rest: `dhash` runs ~8x faster on a compressible
+# frame, while `blur` barely moves, because its work is in the filter rather than in the decode.
+# Neither changes an ordering here; both move the cheap and decode-bound entries by 4-15x.
 #
 # Entries within a band -- the four header reads, or `ahash` and `dhash` -- are within
 # measurement noise of each other and are not meant to be distinguishable.
 #
-# The family used to carry one flat 500.0 for every op, and the measurements say that was
-# wrong by more than two orders of magnitude *inside* the family:
+# The spread *inside* the family is more than two orders of magnitude, which is why each op
+# is priced separately rather than the family carrying one number:
 #
 #     image.format / has_alpha / aspect_ratio / decode      10-17 us/row   (header only)
 #     image.dhash / phash / ahash                          800-860 us/row
@@ -333,8 +322,8 @@ _BY_CLASS_NAME: dict[str, float] = {
 #
 # `probe.rs` reads the container header and never decodes a pixel, so `has_alpha` is ~200x
 # cheaper than `sharpness` -- and `filter_split` orders conjuncts by exactly this number
-# (Krishnamurthy-Boral-Zaniolo rank), so with both at 500.0 it could not tell the header
-# probe from the full decode and had no reason to run the cheap one first.
+# (Krishnamurthy-Boral-Zaniolo rank), so a single family-wide figure could not tell the
+# header probe from the full decode and would give it no reason to run the cheap one first.
 #
 # Two results are worth keeping because a guessed table gets them backwards:
 # `to_tensor_f32` is ~3.2x `to_tensor` (the float conversion and normalization cost more

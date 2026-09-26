@@ -24,43 +24,31 @@ and `empty_limit_past_offset` decide one from an EXACT row count, and `topn_fusi
 * `prune_sort_keys_after_unique_key` — sort keys *after* a provably-unique one never
   break a tie, so they cannot affect the ordering and are dropped.
 
-Deliberately **not** implemented — a `LIMIT` is a *positional prefix*, so almost nothing
-may cross it, and each of these looks plausible and is wrong:
+A `LIMIT` is a *positional prefix*, so almost nothing may cross it, and the rewrites that
+look plausible are wrong:
 
-* `push_limit_through_filter` — **unsound**. `Limit(Filter(p, x), n)` takes the first `n`
-  rows *that pass* `p`; `Filter(p, Limit(x, n))` takes the passing rows of the first `n`.
-  The filter drops rows the limit would have counted, so the second returns *fewer* rows
-  (zero, if the first `n` all fail `p`). The same argument rules out pushing a limit
-  below `Unnest`/`Unpivot` (a row can expand to zero rows, and the engine's unpivot emits
-  column-major within a morsel, so an output prefix is not an input prefix), below
-  `Sample` (which keeps a hash-selected subset, not a prefix), below `Distinct`, below an
-  `Aggregate`/`Window` (both read the whole partition), and below `MapBatches` (opaque
-  row count).
-* `push_limit_into_scan` — **not a rule, and no longer missing**. It is not a plan
-  rewrite at all: the cap does not change the tree, it rides the physical plan's source
-  hand-off beside the projection and the predicate. `PhysicalPlan.source_limits` is that
-  channel and `kyber.rules.source_limits.required_limits_per_source` is the analysis that
-  fills it, so nothing here needs to move a `Limit`. (This entry used to say the change
-  was blocked on a two-sided IR change across the FFI. It was not: that hand-off is a
-  Python-side field on `PhysicalPlan`, and `RelOp::Scan` never had to learn anything.)
-* `limit_zero_to_empty` / `limit_of_limit` / `drop_limit_larger_than_provable_row_count` /
-  `offset_zero_elimination` — already covered: `Limit(x, 0)` *is* the canonical empty
-  relation (the estimator even tags it EXACT-0), `combine_limits` merges stacked limits,
-  `drop_inert_limit` / `drop_redundant_limit` drop a limit an EXACT row count proves
-  inert, and an `offset` of 0 is the `Limit` default — there is no operator to eliminate.
-* `push_limit_through_distinct_when_input_is_unique` — subsumed. The only proof of
-  uniqueness available is an EXACT ndv reaching the EXACT row count, which is exactly
-  `drop_distinct_when_unique`'s condition — and it runs first (REWRITE), deleting the
-  `Distinct` outright.
-* reordering `Limit` and `Sample` in either direction — **unsound**, and not symmetric
-  either: `sample(limit(x))` samples a prefix; `limit(sample(x))` prefixes a sample. Both
-  are legal queries with different rows.
-* `drop_sort_below_limit_when_the_sort_is_by_a_constant` — **unsound in this engine**.
-  With every key constant the sort is an arbitrary permutation, and arrow's
-  `lexsort_to_indices` is *not* stable, so "the first `k`" after such a sort is not the
-  positional first `k`. `prune_constant_sort_keys` refuses the same case for the same
-  reason, and `sort_elimination_from_ordering` refuses a top-N over already-sorted input:
-  "correctness over an extra rewrite".
+* **A filter.** `Limit(Filter(p, x), n)` takes the first `n` rows *that pass* `p`;
+  `Filter(p, Limit(x, n))` takes the passing rows of the first `n`, which is fewer (zero,
+  if the first `n` all fail `p`). The same argument keeps a limit above `Unnest`/`Unpivot`
+  (a row can expand to zero rows, and the engine's unpivot emits column-major within a
+  morsel, so an output prefix is not an input prefix), `Sample` (a hash-selected subset,
+  not a prefix), `Distinct`, `Aggregate`/`Window` (both read the whole partition), and
+  `MapBatches` (opaque row count).
+* **A sample, in either direction.** `sample(limit(x))` samples a prefix;
+  `limit(sample(x))` prefixes a sample. Both are legal queries with different rows.
+* **A sort by constant keys.** With every key constant the sort is an arbitrary
+  permutation, and arrow's `lexsort_to_indices` is *not* stable, so "the first `k`" after
+  such a sort is not the positional first `k`. `prune_constant_sort_keys` refuses the same
+  case for the same reason, and `sort_elimination_from_ordering` refuses a top-N over
+  already-sorted input: "correctness over an extra rewrite".
+
+Capping a scan is not a plan rewrite at all: the cap rides the physical plan's source
+hand-off (`PhysicalPlan.source_limits`, filled by
+`kyber.rules.source_limits.required_limits_per_source`) beside the projection and the
+predicate, so no `Limit` moves. A limit over a provably-unique `Distinct` needs no rule
+here either: the only uniqueness proof is an EXACT ndv reaching the EXACT row count, which
+is `drop_distinct_when_unique`'s condition, and that rule runs first (REWRITE) and deletes
+the `Distinct`.
 """
 
 from __future__ import annotations

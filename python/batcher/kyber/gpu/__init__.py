@@ -16,10 +16,8 @@ from batcher.kyber.gpu.energy import (
     EnergyAdvice,
     device_energy_advice,
     learned_work_per_joule,
-    power_bounded_devices,
     record_measured_efficiency,
     select_device_class,
-    stage_joules,
 )
 from batcher.kyber.gpu.policy import (
     GpuDecision,
@@ -38,10 +36,8 @@ __all__ = [
     "device_energy_advice",
     "learned_gpu_min_rows",
     "learned_work_per_joule",
-    "power_bounded_devices",
     "record_backend_timing",
     "record_measured_efficiency",
     "select_device_class",
     "size_gpu_map_batches",
-    "stage_joules",
 ]

@@ -46,6 +46,7 @@ __all__ = [
     "hoist_sort_key",
     "hoist_window_keys",
     "is_cartesian_key_pair",
+    "is_empty_relation",
     "is_partition_independent",
     "is_streamable",
     "passthrough_renames",
@@ -57,6 +58,22 @@ __all__ = [
     "split_streaming_tail",
     "streaming_fold_target",
 ]
+
+
+def is_empty_relation(node: LogicalPlan) -> bool:
+    """Whether `node` is the canonical empty relation, a `Limit` capped at zero rows.
+
+    Deliberately structural: only a syntactic `Limit(_, 0)` counts, never an estimate, so a
+    caller that drops or short-circuits on it does so only when the relation *provably*
+    contributes nothing.
+
+    Args:
+        node: Any plan node.
+
+    Returns:
+        True when `node` is a `Limit` with `n == 0`.
+    """
+    return isinstance(node, Limit) and node.n == 0
 
 
 def passthrough_renames(items: tuple) -> dict[str, str]:

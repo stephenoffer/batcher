@@ -21,7 +21,6 @@ from batcher.plan.energy import (
     EnergyLedger,
     StageEnergy,
     configured_power_envelope,
-    merge_ledgers,
 )
 
 pytestmark = pytest.mark.unit
@@ -103,11 +102,18 @@ def _ledger(joules: float, rows: int) -> EnergyLedger:
     return out
 
 
+def _merged(*ledgers: EnergyLedger) -> EnergyLedger:
+    out = EnergyLedger()
+    for ledger in ledgers:
+        out.merge(ledger)
+    return out
+
+
 def test_merging_is_commutative_and_associative() -> None:
     a, b, c = _ledger(100.0, 5), _ledger(200.0, 7), _ledger(50.0, 3)
-    left = merge_ledgers([merge_ledgers([a, b]), c]).total_joules
-    right = merge_ledgers([a, merge_ledgers([b, c])]).total_joules
-    swapped = merge_ledgers([c, b, a]).total_joules
+    left = _merged(_merged(a, b), c).total_joules
+    right = _merged(a, _merged(b, c)).total_joules
+    swapped = _merged(c, b, a).total_joules
     assert left == right == swapped == 350.0
 
 
@@ -115,23 +121,11 @@ def test_a_merged_run_equals_the_single_node_figures() -> None:
     single = EnergyLedger()
     single.record(StageEnergy("Agg#1", "NVIDIA_H100", 8, 10.0, 0.9, joules=100.0, rows=5))
     single.record(StageEnergy("Agg#1", "NVIDIA_H100", 8, 10.0, 0.9, joules=200.0, rows=7))
-    merged = merge_ledgers([_ledger(100.0, 5), _ledger(200.0, 7)])
+    merged = _merged(_ledger(100.0, 5), _ledger(200.0, 7))
     assert merged.total_joules == single.total_joules
     assert merged.total_rows == single.total_rows
     assert merged.rows_per_joule() == single.rows_per_joule()
     assert merged.by_device() == single.by_device()
-
-
-def test_merge_leaves_its_inputs_alone() -> None:
-    a, b = _ledger(100.0, 5), _ledger(200.0, 7)
-    merge_ledgers([a, b])
-    assert len(a.stages) == 1
-    assert len(b.stages) == 1
-
-
-def test_merging_nothing_yields_an_empty_ledger() -> None:
-    assert merge_ledgers([]).stages == []
-    assert merge_ledgers([]).total_joules == 0.0
 
 
 def test_in_place_merge_chains() -> None:

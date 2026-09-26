@@ -57,6 +57,7 @@ from batcher.plan.logical import (
     Sort,
     Union,
     is_cartesian_key_pair,
+    is_empty_relation,
 )
 from batcher.plan.stats import ColumnStat, Provenance, RelStats, ambiguous_float_bound
 
@@ -184,7 +185,7 @@ def _already_empty(plan: LogicalPlan) -> bool:
     hits its cap. Walking the spine sees the marker wherever the other rules have parked it.
     """
     while isinstance(plan, (Filter, Sort, Sample, Distinct, Project, Limit)):
-        if isinstance(plan, Limit) and plan.n == 0:
+        if is_empty_relation(plan):
             return True
         plan = plan.input
     return False

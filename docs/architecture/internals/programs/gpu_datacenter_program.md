@@ -132,7 +132,7 @@ inference stage was not worth a GPU — exactly backwards.
 The renderers (`format_energy_report`, `format_fleet_efficiency`, `energy_metrics`,
 `format_device_table`) have no internal caller by design: their caller is the user, and the bar
 they are held to instead is documented, rendered by Sphinx, and taught with an executed
-example. `plan_collective`, `residency_report`, and `merge_ledgers` meet that bar too, but
+example. `plan_collective`, `residency_report`, and `EnergyLedger.merge` meet that bar too, but
 their *scheduler-side* call sites are not wired — see the register below.
 
 ## A second audit, and the two defects it found
@@ -327,7 +327,7 @@ Named explicitly, because the absence of each is a real limit and not an oversig
   physical plan does not carry the device model and count a plan-level power check needs.
 - **Three scheduler call sites are unwired**, and blocked rather than forgotten:
   `plan_collective` (bundles), `residency_report`/`permitted_nodes` (node filtering), and
-  `merge_ledgers` (folding worker ledgers) all belong in
+  `EnergyLedger.merge` (folding worker ledgers) all belong in
   `dist/executors/ray_runtime/scheduling.py` and the `dist/gpu/` task path, which another
   session held under active edit throughout. Each is reachable, tested, and taught; none is
   yet consulted by the distributed executor itself.

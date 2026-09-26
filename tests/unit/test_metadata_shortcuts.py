@@ -102,7 +102,7 @@ def test_an_estimate_is_always_available_and_never_exact():
     f = facts(rows_count=None)
     assert rows.count(f) is None
     assert rows.estimated_rows(f) == 100.0
-    assert rows.row_count_is_exact(f) is False
+    assert f.rows_known is False
 
 
 def test_sketched_distinct_never_answers_the_exact_one():
@@ -270,7 +270,6 @@ def test_sortedness_is_one_sided_a_match_proves_it_and_a_miss_proves_nothing():
     assert ordering.is_sorted_by(f, ["region"]) is True
     assert ordering.is_sorted_by(f, ["region", "day"]) is True
     assert ordering.is_sorted_by(f, ["day"]) is None  # not a prefix — unknown, not false
-    assert ordering.sort_prefix(f, ["region", "hour"]) == 1  # the work a sort can still skip
 
 
 def test_a_descending_ordering_is_recorded_and_only_matches_a_descending_request():

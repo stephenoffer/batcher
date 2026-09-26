@@ -52,7 +52,7 @@ from collections.abc import Iterator
 
 from batcher._internal.hardware import fingerprint
 
-__all__ = ["local_or_planned_fingerprint", "planning_for", "scoped", "scoped_key"]
+__all__ = ["local_or_planned_fingerprint", "planning_for", "scoped"]
 
 # The machine class the enclosing scope is planning *for*, when that is not this process.
 #
@@ -99,10 +99,10 @@ def planning_for(hw_fingerprint: str) -> Iterator[None]:
 def local_or_planned_fingerprint() -> str:
     """The machine class in force here: the enclosing `planning_for` scope, else this process.
 
-    The bare fingerprint that `scoped` and `scoped_key` embed in a name, for the one consumer
+    The bare fingerprint that `scoped` embeds in a name, for the one consumer
     that is not naming a namespace at all — `MetadataHub.op_stats_by_kind`, which buckets the
     feedback rows by fingerprint and needs to know which bucket to read. Exposed rather than
-    re-derived there so all three resolve the class identically; a second resolution is exactly
+    re-derived there so both resolve the class identically; a second resolution is exactly
     how a read and a write come to disagree, which is the hazard `planning_for` exists to
     remove.
 
@@ -127,8 +127,8 @@ def scoped(namespace: str, hw_fingerprint: str = "") -> str:
     **Whose machine is not always this one.** A value written and read on the process that
     *executed* the work is correctly keyed by the local fingerprint, and that covers the UDF,
     autobatch and device-utilization loops. It does not cover the loops that run on the
-    **driver** about work done on the **workers** — the join-strategy bandit, the broadcast and
-    sort-merge crossovers, the build-side priors. Those are self-consistent under the local key
+    **driver** about work done on the **workers** — the join-strategy bandit and the broadcast
+    and sort-merge crossovers. Those are self-consistent under the local key
     (nothing is dropped, unlike the `op_stats` view this mirrors) but they name the wrong
     machine: a fleet that autoscales from one worker type to another files both under one key,
     and two drivers of different classes against identical workers fragment what should be one
@@ -152,33 +152,3 @@ def scoped(namespace: str, hw_fingerprint: str = "") -> str:
         The namespace qualified with that machine class's fingerprint.
     """
     return f"{namespace}{_SEPARATOR}{hw_fingerprint or local_or_planned_fingerprint()}"
-
-
-def scoped_key(key: str, hw_fingerprint: str = "") -> str:
-    """`key` qualified by a hardware fingerprint — by default the one in force for this scope.
-
-    The per-key counterpart of `scoped`, for a store whose namespace is already carrying
-    another dimension and where splitting the namespace would fragment an index that other
-    code walks whole. Prefer `scoped` where there is a choice: a scoped namespace keeps a
-    machine's entries contiguous, which makes them cheap to load together and easy to drop
-    when a machine class goes away.
-
-    **Resolves the machine class exactly as `scoped` does**, through the enclosing
-    `planning_for` scope before falling back to this process. It did not, and that was the one
-    way the two spellings of the same idea could disagree: a value written with `scoped_key`
-    inside a distributed run was filed under the *driver's* class while everything written with
-    `scoped` in the same scope was filed under the *workers'*, so a read that used either
-    spelling found nothing the other had stored. The whole reason `planning_for` is ambient
-    rather than threaded is to make a read and a write agree by construction, and a second
-    entry point that ignored it defeated that for its callers.
-
-    Args:
-        key: The unscoped key.
-        hw_fingerprint: The machine class to key by, from `HardwareProfile.fingerprint`.
-            `""` — the default — falls back to the enclosing `planning_for` scope, then to this
-            process's class.
-
-    Returns:
-        The key qualified with that machine class's fingerprint.
-    """
-    return f"{key}{_SEPARATOR}{hw_fingerprint or local_or_planned_fingerprint()}"

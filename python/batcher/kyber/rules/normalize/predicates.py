@@ -24,10 +24,8 @@ of its two directions. See the individual docstrings.
 The `IN`-list intersection (DuckDB's `in_clause_simplification`) is deliberately *not*
 here. It lives in `extra/predicate_infer.py`, which handles it over an n-ary conjunction
 rather than a single `AND` pair and folds a disjoint pair to the empty relation. A second
-copy used to sit in this module under the same rule name, and because `RuleRegistry.add`
-treats a repeated name as a no-op, it never registered at all: whichever module imported
-first won, and the loser was dead code whose unit test asserted the opposite of what the
-optimizer actually does. `test_no_two_rules_share_a_name` now fails that outright.
+rule under the same name would never register (`RuleRegistry.add` treats a repeated name
+as a no-op), which `test_no_two_rules_share_a_name` enforces.
 """
 
 from __future__ import annotations

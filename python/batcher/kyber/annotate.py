@@ -98,13 +98,12 @@ def _resident_bytes(
     the probe side fanned out by the match rate — and in a star schema those differ by the
     fan-out ratio, in the direction that over-budgets.
 
-    Measured on a 100,000-row fact joined to a 100-row dimension: the cost model sizes the
-    table at 1,600 bytes and this used to hand Carbonite **2,400,000** — 1,500x. That
-    figure is not advisory. It is what admission checks feasibility against, what the spill
-    decision reads, and what the distributed per-task memory grant is derived from, so the
-    single most common join shape in analytics was systematically pushed toward spilling
-    and toward a rejected admission for a hash table that fits in a cache line's worth of
-    pages. `cost.py` has always had this right (`mem=build_bytes`); the two now agree.
+    On a 100,000-row fact joined to a 100-row dimension the build table is 1,600 bytes while
+    the output is 2,400,000 — 1,500x. The figure is not advisory: it is what admission checks
+    feasibility against, what the spill decision reads, and what the distributed per-task
+    memory grant is derived from, so sizing a join by its output would push the most common
+    join shape in analytics toward spilling and rejected admissions. It matches `cost.py`
+    (`mem=build_bytes`).
 
     A **top-N** is the same shape one level down: a fused `Sort` + `Limit` holds a heap of
     `limit` rows, not the relation, which is the entire reason to fuse them.

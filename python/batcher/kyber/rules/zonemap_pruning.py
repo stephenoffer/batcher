@@ -51,6 +51,7 @@ from batcher.plan.logical import (
     Sample,
     Sort,
     Union,
+    is_empty_relation,
 )
 from batcher.plan.stats import (
     ColumnStat,
@@ -128,7 +129,7 @@ def propagate_empty_relation(node: LogicalPlan, _ctx: OptimizerContext) -> Logic
         return _prune_empty_union_branches(node)
     if isinstance(node, Join):
         return _join_over_empty_side(node)
-    if isinstance(node, _SCHEMA_PRESERVING) and _is_empty(node.input):
+    if isinstance(node, _SCHEMA_PRESERVING) and is_empty_relation(node.input):
         return node.input  # empty in, empty out, identical schema
     return None
 
@@ -167,7 +168,7 @@ def _join_over_empty_side(node: Join) -> LogicalPlan | None:
     have — is what makes them pay off, and is tracked separately. The `anti` and `semi`
     rewrites do not wait on it: they remove a subtree rather than mark it empty.
     """
-    left_empty, right_empty = _is_empty(node.left), _is_empty(node.right)
+    left_empty, right_empty = is_empty_relation(node.left), is_empty_relation(node.right)
     if left_empty and node.join_type in LEFT_DRIVEN_JOINS:
         return Limit(node, 0)
     if not right_empty:
@@ -183,13 +184,8 @@ def _join_over_empty_side(node: Join) -> LogicalPlan | None:
     return None
 
 
-def _is_empty(node: LogicalPlan) -> bool:
-    """Whether `node` provably yields zero rows (the `Limit(_, 0)` empty marker)."""
-    return isinstance(node, Limit) and node.n == 0
-
-
 def _prune_empty_union_branches(node: Union) -> LogicalPlan | None:
-    survivors = [i for i in node.inputs if not _is_empty(i)]
+    survivors = [i for i in node.inputs if not is_empty_relation(i)]
     if len(survivors) == len(node.inputs):
         return None  # nothing empty → no change
     if not survivors:

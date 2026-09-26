@@ -99,7 +99,7 @@ def _crossover_step(
     """
     try:
         fits = {
-            name: _fit(
+            name: fit_ols(
                 (candidate if name == bucket else hub.get_keyed_param(scoped(namespace), name))
                 or {}
             )
@@ -119,9 +119,6 @@ def _crossover_step(
     return math.floor(math.log(xover) / math.log(1.0 + _XOVER_STEP))
 
 
-_fit = fit_ols
-
-
 def _solve_crossover(
     hub: MetadataHub | None,
     namespace: str,
@@ -138,9 +135,12 @@ def _solve_crossover(
     if hub is None:
         return None
     try:
-        below = _fit(hub.get_keyed_param(scoped(namespace), cheap_below) or {})
-        above = _fit(hub.get_keyed_param(scoped(namespace), cheap_above) or {})
-    except Exception:  # pragma: no cover
+        below = fit_ols(hub.get_keyed_param(scoped(namespace), cheap_below) or {})
+        above = fit_ols(hub.get_keyed_param(scoped(namespace), cheap_above) or {})
+    except Exception as exc:  # pragma: no cover - a learned threshold must never break a query
+        # Traced for the reason `_crossover_step` gives: a store refusing reads would otherwise
+        # pin every threshold to its default with nothing saying why.
+        note_suppressed("kyber", "read the learned crossover buckets", exc)
         return None
     return _crossover_of(below, above, default)
 

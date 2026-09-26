@@ -104,17 +104,17 @@ def test_learning_something_plan_relevant_invalidates():
     """The generation advances only for a *material* correction, and the key follows it."""
     src = [_source([1, 2, 3])]
     before = _key(_plan_ir(1), src)
-    learning._bump_generation()
+    learning.bump_generation()
     assert _key(_plan_ir(1), src) != before
 
 
 def test_a_settled_estimate_does_not_invalidate():
     """A smoothed average drifting in its fourth decimal must not throw the plan away —
     that is why fingerprinting the stats' *content* never hits."""
-    assert not learning._is_material(1000.0, 1001.0)  # 0.1%
-    assert learning._is_material(1000.0, 1200.0)  # 20%
-    assert learning._is_material(None, 5.0)  # nothing was known
-    assert learning._is_material(0.0, 5.0)  # a provably-empty prior, now non-empty
+    assert not learning.is_material_change(1000.0, 1001.0)  # 0.1%
+    assert learning.is_material_change(1000.0, 1200.0)  # 20%
+    assert learning.is_material_change(None, 5.0)  # nothing was known
+    assert learning.is_material_change(0.0, 5.0)  # a provably-empty prior, now non-empty
 
 
 # --- the store ----------------------------------------------------------------
