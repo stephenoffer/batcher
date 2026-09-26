@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         ObservabilityConfig,
         OptimizerConfig,
         PIDConfig,
+        TenantConfig,
     )
 
 __all__ = ["run_checks"]
@@ -52,6 +53,7 @@ def run_checks(cfg: Config) -> None:
     _check_metadata(cfg.metadata)
     _check_governance(cfg.governance)
     _check_observability(cfg.observability)
+    _check_tenant(cfg.tenant)
 
 
 def _check_memory(m: MemoryConfig) -> None:
@@ -375,3 +377,25 @@ def _valid_verbosity(value: object) -> bool:
     if text.isdigit():
         return 0 <= int(text) < len(VERBOSITY_LEVELS)
     return text in names
+
+
+def _check_tenant(t: TenantConfig) -> None:
+    """Refuse the per-tenant limits nothing enforces.
+
+    `cache_share` and `max_concurrent_queries` are declared but read by nothing: only
+    `tenant_id` keys the process-global caches. Accepting a cap that is never applied would
+    let a tenant believe it is bounded while it consumes as much as an untenanted query, so
+    the non-default values are refused the way `governance.default_deny` is.
+    """
+    _check(
+        t.cache_share == 0.0,
+        f"tenant.cache_share is not implemented: no code path reads it, so {t.cache_share} "
+        "would bound nothing. Size the shared result cache with memory.result_cache_max_bytes "
+        "instead.",
+    )
+    _check(
+        t.max_concurrent_queries == 0,
+        f"tenant.max_concurrent_queries is not implemented: no code path reads it, so "
+        f"{t.max_concurrent_queries} would cap nothing. Use the process-wide "
+        "execution.max_concurrent_queries instead.",
+    )

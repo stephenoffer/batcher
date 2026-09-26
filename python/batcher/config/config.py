@@ -1118,10 +1118,11 @@ class TenantConfig:
     #: structure behaves exactly as it did before this existed, which is what keeps this
     #: from changing anything for a single-workload deployment.
     tenant_id: str = ""
-    #: Share of the process result-cache budget this tenant may hold, 0.0-1.0. 0 means
-    #: unbounded (the historical behavior).
+    #: Reserved for a per-tenant share of the result-cache budget, 0.0-1.0. Not
+    #: implemented: validation refuses any value but 0.0 (unbounded).
     cache_share: float = 0.0
-    #: Maximum queries this tenant may run concurrently. 0 means unbounded.
+    #: Reserved for a per-tenant concurrency cap. Not implemented: validation refuses any
+    #: value but 0 (unbounded).
     max_concurrent_queries: int = 0
 
 
@@ -3192,13 +3193,15 @@ def tenant(tenant_id: str, **overrides: object) -> Iterator[Config]:
 
     Args:
         tenant_id: Names the tenant. Empty restores un-tenanted behavior.
-        **overrides: Other `TenantConfig` fields, e.g. ``max_concurrent_queries=4``.
+        **overrides: Other `TenantConfig` fields. The per-tenant limits are not
+            implemented, so validation refuses a non-default value for them.
 
     Yields:
         The `Config` in effect inside the block.
 
     Raises:
-        ConfigError: If an override is not a `TenantConfig` field.
+        ConfigError: If an override is not a `TenantConfig` field, or sets a per-tenant
+            limit that is not implemented.
     """
     current = active_config()
     _check_overrides("tenant", TenantConfig, overrides)

@@ -360,8 +360,8 @@ process-global caches and learned statistics by accident.
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `tenant_id` | `""` | Names the tenant. Empty means no tenancy: everything behaves as before. |
-| `cache_share` | `0.0` | Share of the result-cache budget this tenant may hold. 0 is unbounded. |
-| `max_concurrent_queries` | `0` | Concurrency cap for this tenant. 0 is unbounded. |
+| `cache_share` | `0.0` | Not implemented. Any value but `0.0` raises `ConfigError`. |
+| `max_concurrent_queries` | `0` | Not implemented. Any value but `0` raises `ConfigError`. Use `execution.max_concurrent_queries` for a process-wide cap. |
 
 These fields are the {py:class}`TenantConfig <batcher.TenantConfig>` dataclass. Set them
 with the {py:func}`bt.tenant <batcher.tenant>` scope, not by replacing the section:
@@ -369,7 +369,7 @@ with the {py:func}`bt.tenant <batcher.tenant>` scope, not by replacing the secti
 ```python
 import batcher as bt
 
-with bt.tenant("analytics", max_concurrent_queries=4):
+with bt.tenant("analytics"):
     print(bt.active_config().tenant.tenant_id)
 # analytics
 ```
