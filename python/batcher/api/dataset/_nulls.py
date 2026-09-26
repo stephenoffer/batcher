@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Col
+from batcher.plan.types.domains import is_numeric_type
 
 if TYPE_CHECKING:
     from batcher.api.dataset.frame import Dataset
@@ -77,9 +78,7 @@ def _accepts_fill(arrow: Any, column: str, value: Any) -> bool:
     if isinstance(value, bool):
         return pa.types.is_boolean(dtype)
     if isinstance(value, (int, float)):
-        return (
-            pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_decimal(dtype)
-        )
+        return is_numeric_type(dtype)
     if isinstance(value, str):
         return pa.types.is_string(dtype) or pa.types.is_large_string(dtype)
     return True  # an exotic literal: let the engine have the final say

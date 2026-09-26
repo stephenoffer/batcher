@@ -18,7 +18,7 @@ call site.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from batcher.ml.embed import (
@@ -325,7 +325,3 @@ def tei_encoder(
             return post_json(self._url, body, headers=self._headers, timeout=timeout)
 
     return _TeiEncoder
-
-
-EmbeddingEncoder = Callable[[list[str]], Sequence[Sequence[float]]]
-"""A batch of texts → their vectors, in order — the served-endpoint encoder contract."""

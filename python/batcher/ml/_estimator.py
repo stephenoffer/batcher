@@ -13,7 +13,7 @@ plane seeing one of them.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.constructors import col, lit, when
@@ -55,7 +55,6 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 __all__ = [
-    "Estimator",
     "argmax_prediction",
     "linear_score",
     "require_fit_columns",
@@ -63,30 +62,6 @@ __all__ = [
     "require_numeric",
     "require_rows",
 ]
-
-
-@runtime_checkable
-class Estimator(Protocol):
-    """What `batcher.ml`'s estimators have in common: `fit` learns, `predict` appends a column.
-
-    The shape every native estimator already follows — `LinearRegression`, `KMeans`,
-    `GaussianMixture`, the GLMs, the discriminants — stated once so the surfaces built on top
-    of them (cross-validation, tuning, interpretation) can name what they accept instead of
-    taking `Any`. `fit` returns `self` so `Model(...).fit(ds).predict(ds)` chains, and
-    `predict` returns a new `Dataset` with the prediction column appended, executing nothing.
-
-    Runtime-checkable so a caller can reject a mis-shaped object with a clear message rather
-    than an `AttributeError` several frames deep. Note that this checks method *presence*
-    only, which is all `runtime_checkable` can do — it is a guard, not a proof.
-    """
-
-    def fit(self, ds: Dataset) -> Estimator:
-        """Learn this estimator's parameters from `ds` and return the fitted estimator."""
-        ...
-
-    def predict(self, ds: Dataset) -> Dataset:
-        """Append this estimator's prediction column to `ds`, lazily."""
-        ...
 
 
 def require_fitted(estimator: object, state: T | None, method: str = "predict") -> T:

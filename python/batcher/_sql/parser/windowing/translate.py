@@ -12,7 +12,6 @@ from sqlglot import expressions as exp
 
 from batcher._sql.parser.core_utils import _alias_of, _unwrap_alias
 from batcher._sql.parser.windowing.frame import (
-    _WINDOW_AGGS,
     _const_int,
     _resolve_frame,
     _window_order,
@@ -415,7 +414,7 @@ def _reshaped_window_argument(tr, item, fn, arg):
     return None
 
 
-def _any_value_func(fn, order):
+def _any_value_func():
     """Refuse `any_value(x) OVER (…)`, naming what it means and what to write instead.
 
     DuckDB implements the windowed `any_value` as *the first non-null value in the frame*,
@@ -428,14 +427,9 @@ def _any_value_func(fn, order):
     because sqlglot parks `any_value(x)` under an `IgnoreNulls` wrapper, so the message
     used to name an ``IGNORE NULLS`` clause the query never contained.
 
-    Args:
-        fn: The `AnyValue` node.
-        order: The window's ORDER BY, or an empty tuple.
-
     Raises:
         NotImplementedError: Always.
     """
-    del fn, order
     raise NotImplementedError(
         "any_value(x) OVER (…) is not supported: DuckDB answers it with the first "
         "non-null value in the frame, which is not one of the runtime's window "
@@ -452,7 +446,7 @@ class _IgnoreNulls(tuple):
     """
 
 
-def _ignore_nulls_func(win, fn, order):
+def _ignore_nulls_func(fn, order):
     """Map `<value fn>(x IGNORE NULLS) OVER (...)` onto the engine's `ignore_nulls` flag.
 
     `IGNORE NULLS` makes `first_value`/`last_value`/`nth_value` pick among the frame's
@@ -470,7 +464,6 @@ def _ignore_nulls_func(win, fn, order):
     and are rejected rather than answered with the null-*respecting* result.
 
     Args:
-        win: The `Window` node.
         fn: The inner function node that `IgnoreNulls` wraps.
         order: The window's ORDER BY, required by every value function.
 
@@ -483,7 +476,6 @@ def _ignore_nulls_func(win, fn, order):
             f"{name}(x) IGNORE NULLS is not supported. Supported: first_value, last_value and "
             "nth_value with IGNORE NULLS over any frame"
         )
-    del win
     return _IgnoreNulls(_value_func(name, fn, order))
 
 
@@ -551,22 +543,10 @@ def _value_func(name: str, fn, order):
     return (_VALUE_FUNCS[name], arg.name)
 
 
-#: Window functions whose first argument is a *value* the engine reads per row. Each takes
-#: a materialized column, so an argument that is any other expression has to be computed
-#: into one first.
-#:
-#: Derived from `_WINDOW_AGGS` rather than listed beside it, because the two describe the
-#: same set and a hand-written copy had already drifted: it named `sum`/`avg`/`min`/`max`/
-#: `count` and omitted `bool_and`/`bool_or`/the `bit_*` family/`stddev`/`variance`/`median`,
-#: all of which take a value argument just as much. So `sum(a + b) OVER (...)` was hoisted
-#: and answered while `bool_or(a > 0) OVER (...)` was refused with "window aggregate
-#: supports a single plain column argument only" — and a predicate is the *only* thing
-#: anyone passes `bool_or`, so the one shape that matters was the one that failed.
-#:
-#: The positional value functions are not aggregates and so are not in `_WINDOW_AGGS`; they
-#: are added here because they read a value per row for the same reason.
+#: Positional window functions that read a value per row, so a non-column argument has to be
+#: materialized into a column first, as a window aggregate's does. They are not aggregates,
+#: so `window_agg` does not recognise them.
 _POSITIONAL_VALUE_FUNCS = frozenset({"lag", "lead", "firstvalue", "lastvalue", "nthvalue"})
-_VALUE_ARG_FUNCS = frozenset(_WINDOW_AGGS) | _POSITIONAL_VALUE_FUNCS
 
 
 def _set_window_argument(fn, replacement) -> None:
@@ -678,11 +658,11 @@ def _window_func(win, order):
         # written, so the IGNORE-NULLS handler answered a plain `any_value(x) OVER (…)`
         # with an error naming a clause the query never used.
         if type(fn.this).__name__.lower() == "anyvalue":
-            return _any_value_func(fn.this, order)
-        return _ignore_nulls_func(win, fn.this, order)
+            return _any_value_func()
+        return _ignore_nulls_func(fn.this, order)
     name = type(fn).__name__.lower()
     if name == "anyvalue":
-        return _any_value_func(fn, order)
+        return _any_value_func()
 
     # Ranking family (no input; needs ORDER BY). `percent_rank`/`cume_dist` produce
     # a fraction; the runtime supports all of these.

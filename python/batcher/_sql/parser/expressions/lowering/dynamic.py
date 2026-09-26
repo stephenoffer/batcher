@@ -24,9 +24,8 @@ from batcher.plan.expr_ir import Expr, StrFunc, StrFuncDyn, lit, when
 
 __all__ = ["const_bool", "const_float", "const_int", "const_str", "str_call"]
 
-#: Which `StrFunc` slot each parameter fills, and whether it is text or an integer.
+#: The `StrFunc` slots that take text; every other slot (`start`, `length`) takes an integer.
 _TEXT_SLOTS = ("pattern", "replacement")
-_INT_SLOTS = ("start", "length")
 
 
 def const_str(node) -> str | None:

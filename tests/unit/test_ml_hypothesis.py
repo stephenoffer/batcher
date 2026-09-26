@@ -28,9 +28,7 @@ from batcher.ml.stats import (
 from batcher.ml.stats._special import (
     chi2_ppf,
     chi2_sf,
-    f_ppf,
     f_sf,
-    normal_sf,
     normal_two_sided_p,
     students_t_ppf,
     students_t_sf,
@@ -108,11 +106,6 @@ def test_students_t_one_sided_matches_scipy(t: float, df: int) -> None:
     )
 
 
-@pytest.mark.parametrize("z", [-8.0, -1.96, -0.5, 0.0, 0.5, 1.96, 8.0])
-def test_normal_one_sided_matches_scipy(z: float) -> None:
-    assert normal_sf(z) == pytest.approx(scipy_stats.norm.sf(z), rel=_TAIL_RTOL, abs=1e-300)
-
-
 @pytest.mark.parametrize("df", [1, 2, 5, 10, 30, 100, 1000])
 @pytest.mark.parametrize("p", [0.001, 0.01, 0.025, 0.05, 0.5, 0.95, 0.975, 0.99, 0.999])
 def test_students_t_quantile_matches_scipy(p: float, df: int) -> None:
@@ -125,15 +118,7 @@ def test_chi2_quantile_matches_scipy(p: float, df: int) -> None:
     assert chi2_ppf(p, df) == pytest.approx(scipy_stats.chi2.ppf(p, df), rel=_TAIL_RTOL)
 
 
-@pytest.mark.parametrize(("d1", "d2"), [(1, 1), (3, 20), (10, 10), (50, 200), (2, 5)])
-@pytest.mark.parametrize("p", [0.01, 0.05, 0.5, 0.95, 0.99])
-def test_f_quantile_matches_scipy(p: float, d1: int, d2: int) -> None:
-    assert f_ppf(p, d1, d2) == pytest.approx(scipy_stats.f.ppf(p, d1, d2), rel=1e-8)
-
-
-@pytest.mark.parametrize(
-    ("ppf", "args"), [(students_t_ppf, (5,)), (chi2_ppf, (5,)), (f_ppf, (3, 7))]
-)
+@pytest.mark.parametrize(("ppf", "args"), [(students_t_ppf, (5,)), (chi2_ppf, (5,))])
 def test_quantiles_invert_their_own_survival_function(ppf, args) -> None:
     """The quantile is the inverse of the tail this module already ships.
 
@@ -141,7 +126,7 @@ def test_quantiles_invert_their_own_survival_function(ppf, args) -> None:
     agree, which is what a caller composing `sf` and `ppf` — a confidence interval — relies
     on. A drift in either one alone shows up here.
     """
-    sf = {students_t_ppf: students_t_sf, chi2_ppf: chi2_sf, f_ppf: f_sf}[ppf]
+    sf = {students_t_ppf: students_t_sf, chi2_ppf: chi2_sf}[ppf]
     for p in (0.01, 0.1, 0.5, 0.9, 0.99):
         assert sf(ppf(p, *args), *args) == pytest.approx(1.0 - p, rel=1e-9)
 

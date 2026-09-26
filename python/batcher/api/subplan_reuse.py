@@ -43,44 +43,17 @@ __all__ = ["reuse_common_subplans"]
 
 _log = get_logger("api.subplan_reuse")
 
-#: The analysis's **verdict** for a plan already analyzed, so a re-issued query does not
-#: re-derive it. Bounded, and holding only the decision — never a materialized result, which
-#: would be a data cache and is `Dataset.cache()`'s job.
-#:
-#: A verdict is the pre-order **positions** of each chosen subtree's appearances, and the
-#: empty list is the (much commoner) "nothing repeats". Positions rather than nodes or keys
-#: because the key below carries `plan.content_key()` — the plan's whole lowered IR — so an
-#: entry can only be served to a plan with the identical tree, where position `i` of the
-#: pre-order walk is the identical node. That makes a hit cost one `walk`, against the
-#: canonical rebuild plus a `structural_key` per node plus a `CostModel` pass over the plan
-#: that deriving it costs: measured on TPC-DS q80, **404 ms per collect** (337 ms of analysis
-#: and 67 ms of canonicalization) against a whole query that runs in 151 ms.
-#:
-#: Caching the positive verdict is what makes that saving reachable at all. Only rejections
-#: were cached before, on the reasoning that a plan with something to reuse pays the analysis
-#: once and then the materialization dominates — true when the analysis was believed to be a
-#: walk, and false by two orders of magnitude on a snowflake query.
-#:
-#: The analysis is not the cheap walk its docstring claimed. `_one_id_per_source` rebuilds the
-#: plan whenever one source object is bound twice (every self-join, and TPC-H q8's two
-#: `nation` bindings), and the fresh nodes defeat `content_key`'s per-instance memo, so every
-#: `collect()` re-keyed every node. Measured warm at scale 1: **TPC-H q8 16.2 ms, q5 6.5 ms,
-#: q9 7.2 ms — 37%, 18% and 12% of those queries' entire wall time, to conclude "nothing
-#: repeats"** each time.
-#:
-#: The verdict is keyed with Kyber's own key builder but **without its learned fields**
-#: (`learned=False`), so it moves with the plan, the config, the hub and the sources and not
-#: with the generation counter or the calibration fingerprint. Carrying those was the obvious
-#: choice and it is measurably the wrong one: inside a mixed workload every query moves the
-#: generation for every other, so the key never repeated and the analysis ran in full on every
-#: execution forever. TPC-DS q80 in isolation is 97 ms with the verdict served and 848 ms
-#: inside the suite without it.
-#:
-#: What that trades away is small and stated plainly: a verdict taken under one set of
-#: estimates can outlive them, so a subtree that stops being worth materializing keeps being
-#: materialized until the plan, config or sources change. That costs a slower query, never a
-#: wrong one — and the decision is far less sensitive than a plan, since it asks only whether
-#: a subtree repeats and whether materializing it beats an engine round trip.
+#: The analysis's verdict for a plan already analyzed, so a re-issued query does not re-derive
+#: it. Bounded, and holding only the decision, never a materialized result (that is
+#: `Dataset.cache()`'s job). A verdict is the pre-order positions of each chosen subtree's
+#: appearances (empty for "nothing repeats"); the key carries `plan.content_key()`, so an entry
+#: is only served to an identical tree, where position `i` is the identical node. Both positive
+#: and negative verdicts are cached because the analysis is not cheap: a canonical rebuild, a
+#: `structural_key` per node and a `CostModel` pass (404 ms per collect on TPC-DS q80, whose
+#: query runs in 151 ms). The key uses Kyber's key builder with `learned=False`, so it follows
+#: the plan, config, hub and sources but not the generation counter, which every query in a
+#: mixed workload moves. The cost is that a verdict can outlive the estimates it was taken
+#: under: a slower query at worst, never a wrong one.
 _VERDICTS: OrderedDict[tuple, tuple[tuple[weakref.ref, ...], tuple[tuple[int, ...], ...]]] = (
     OrderedDict()
 )

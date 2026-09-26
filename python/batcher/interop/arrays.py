@@ -6,9 +6,10 @@ fixed-size-list column restored to its full `(n, width...)` array rather than le
 opaque per-row object array.
 
 It lives here, below every subsystem, because three unrelated callers need it and one of them
-could not reach the others. `ml.converters` uses it for the training-loop bridge (`to_torch`,
-`to_tf`), `interop.formats` for `map_batches(batch_format=...)`, and `core.udf` for the
-per-batch conversion around a user function — and `core` is a subsystem that must not import
+could not reach the others. `ml.converters` uses it for the training-loop bridge
+(`to_torch_iterable`, `to_tf_dataset`), `interop.formats` for
+`map_batches(batch_format=...)`, and `core.udf` for the per-batch conversion around a user
+function — and `core` is a subsystem that must not import
 the user-facing `ml` package, which is where all of this used to live. That import was one of
 eighteen upward edges the layered-architecture contract found.
 """

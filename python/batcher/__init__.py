@@ -70,18 +70,8 @@ __version__ = "0.1.0"
 __all__ = [*_EXPORTS, "__version__"]
 
 
-#: The public subpackages a user reaches as ``bt.<name>``, resolved lazily on first access.
-#:
-#: They are not imported at package load on purpose: `ml` pulls in the whole model surface,
-#: and every ``import batcher`` would pay for it whether or not the script does inference.
-#: But they were not reachable *at all* — ``bt.ml.vllm_engine(...)`` raised
-#: ``AttributeError``, which is the spelling every docstring and documentation page uses,
-#: because `io`, `config` and `governance` happen to be imported transitively by `api` and
-#: `ml` and `graph` do not. Nothing caught it: the examples that use this spelling all need a
-#: GPU or a model, so every one of them carries `+SKIP` and none has ever run.
-#:
-#: Now that the surface is lazy none of them is imported transitively either, so this tuple
-#: is the only thing making ``bt.io`` and ``bt.config`` resolve at all.
+#: The public subpackages a user reaches as ``bt.<name>``, imported lazily on first access so
+#: ``import batcher`` does not pay for the model surface; nothing else makes them resolve.
 _PUBLIC_SUBPACKAGES = ("config", "governance", "graph", "io", "ml")
 
 

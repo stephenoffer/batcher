@@ -17,6 +17,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.api.dataset.meta._facts import MetaBase
+from batcher.plan.types.domains import is_numeric_type
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -25,9 +26,7 @@ __all__ = ["SchemaMeta"]
 
 # The type families a user names in one breath, and the Arrow predicate for each.
 _FAMILIES: dict[str, Callable[[pa.DataType], bool]] = {
-    "numeric": lambda t: (
-        pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_decimal(t)
-    ),
+    "numeric": is_numeric_type,
     "integer": pa.types.is_integer,
     "float": pa.types.is_floating,
     "string": lambda t: pa.types.is_string(t) or pa.types.is_large_string(t),

@@ -114,8 +114,8 @@ def decontaminate(
     """
     _validate(n)
     eval_column = eval_column or column
-    _require_column(ds, column)
-    _require_column(against, eval_column)
+    require_columns(ds, column, hint="Pass an existing text column.")
+    require_columns(against, eval_column, hint="Pass an existing text column.")
     hits = _contaminated_rows(ds, column, against, eval_column, n)
     return ds.with_row_index(_ROW).join(hits, on=_ROW, how="anti").drop(_ROW)
 
@@ -163,14 +163,9 @@ def contamination_rate(
     """
     _validate(n)
     eval_column = eval_column or column
-    _require_column(ds, column)
-    _require_column(against, eval_column)
+    require_columns(ds, column, hint="Pass an existing text column.")
+    require_columns(against, eval_column, hint="Pass an existing text column.")
     total = ds.count()
     if total == 0:
         return 0.0
     return _contaminated_rows(ds, column, against, eval_column, n).count() / total
-
-
-def _require_column(ds: Dataset, column: str) -> None:
-    """Fail at the API edge, naming the columns that do exist."""
-    require_columns(ds, column, hint="Pass an existing text column.")
