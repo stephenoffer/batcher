@@ -1822,7 +1822,7 @@ Template-Method base classes for file-backed sources and sinks.
 | `_tolerance.py` | 140 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 199 | Retry for the IO failures that are worth retrying, and only those. |
 | `sink.py` | 774 | `FileSink` — the Template-Method base every file-format writer subclasses. |
-| `source.py` | 1662 | `FileSource` — the Template-Method base every file-format reader subclasses. |
+| `source.py` | 1674 | `FileSource` — the Template-Method base every file-format reader subclasses. |
 
 ### `batcher/io/formats/` — 2 · neutral IO
 
@@ -2073,7 +2073,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 |---|---|---|
 | `_csv_diagnostics.py` | 169 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
 | `_csv_ranges.py` | 110 | Where a CSV file may be cut into byte ranges without cutting a record in half. |
-| `_parquet_native.py` | 211 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
+| `_parquet_native.py` | 224 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
 | `arrow_ipc.py` | 280 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
 | `avro.py` | 417 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
 | `csv.py` | 617 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
@@ -2099,7 +2099,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | module | lines | what it is |
 |---|---|---|
 | `_native_stream.py` | 146 | Native-reader streaming for `ParquetSource._iter_file`, and the rule for when to use it. |
-| `dataset.py` | 700 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
+| `dataset.py` | 694 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
 | `partitions.py` | 219 | What a Hive ``col=value`` directory segment means, and what it proves. |
 | `routing.py` | 146 | How a predicated Parquet read spends its work: skip row groups on the footers, decode the rest. |
 | `sink.py` | 167 | `ParquetSink` — the Parquet writer. |
@@ -2179,7 +2179,7 @@ Splits — independently-readable, picklable slices of a source.
 | `conformed.py` | 240 | The strict-mode contract, carried to the worker on the split itself. |
 | `device.py` | 214 | Which splits a GPU can read for itself, and the locators it needs to do it. |
 | `file.py` | 571 | File-locator splits — a whole file, an IPC stream file, or a byte range of one. |
-| `gds.py` | 211 | Whether a file's bytes can reach a device without a detour through host memory. |
+| `gds.py` | 222 | Whether a file's bytes can reach a device without a detour through host memory. |
 | `kvikio.py` | 145 | Whether a device read actually bypasses the host, or only reports that it did. |
 | `parquet.py` | 506 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
 | `text.py` | 168 | Byte-range splits for line-delimited text — what lets one huge log fan across workers. |
