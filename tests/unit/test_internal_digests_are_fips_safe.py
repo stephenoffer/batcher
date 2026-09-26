@@ -69,7 +69,7 @@ def test_a_hub_that_cannot_be_read_is_noted_rather_than_silent(monkeypatch, capl
     """The write half already reported a failing hub; the read half swallowed it, so an
     unreachable hub disabled learned skew forever with nothing saying why."""
     import batcher.core as core
-    from batcher.dist.skew import load_learned_hot_keys
+    from batcher.dist.skew import load_learned_skew
 
     def boom():
         raise RuntimeError("hub unreachable")
@@ -80,7 +80,7 @@ def test_a_hub_that_cannot_be_read_is_noted_rather_than_silent(monkeypatch, capl
     # full-suite run (where something else has already configured logging) `log_kv` would
     # short-circuit and this test would pass or fail depending on import order.
     with caplog.at_level("DEBUG", logger="batcher.dist"):
-        assert load_learned_hot_keys("shape") is None
+        assert load_learned_skew("shape") is None
     # `note_suppressed` carries the step and the cause as structured fields hung off the
     # record, not in the message, so assert on those rather than on the rendered line.
     from batcher._internal.logging import _FIELDS_ATTR

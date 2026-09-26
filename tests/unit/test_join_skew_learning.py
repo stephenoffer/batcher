@@ -13,7 +13,6 @@ import pytest
 import batcher as bt
 from batcher.dist.skew import (
     join_skew_key,
-    load_learned_hot_keys,
     load_learned_skew,
     persist_hot_keys,
     resolve_hot_keys,
@@ -43,18 +42,19 @@ def test_learned_hot_keys_round_trip_and_none_vs_empty():
     key = join_skew_key("LIR", "RIR", plan)
 
     # Never measured → None (so the caller knows to run the pre-pass).
-    assert load_learned_hot_keys(key) is None
+    assert load_learned_skew(key) is None
 
     # A measured non-empty hot set round-trips and is what later runs salt on.
     persist_hot_keys(key, ["7", "42"])
-    assert load_learned_hot_keys(key) == ["7", "42"]
+    assert load_learned_skew(key)[0] == ["7", "42"]
 
     # A measured EMPTY result ("not skewed") is distinct from never-measured, so a
     # non-skewed shape never re-runs the pre-pass.
     empty_key = join_skew_key("LIR2", "RIR2", plan)
     persist_hot_keys(empty_key, [])
-    assert load_learned_hot_keys(empty_key) == []
-    assert load_learned_hot_keys(empty_key) is not None
+    learned = load_learned_skew(empty_key)
+    assert learned is not None
+    assert learned[0] == []
 
 
 def test_the_measured_share_is_persisted_and_sizes_the_fan_out():

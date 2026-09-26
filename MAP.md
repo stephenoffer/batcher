@@ -949,7 +949,7 @@ Window-function translation for the SQL front-end.
 | `flight_worker.py` | 1884 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 433 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 304 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
-| `skew.py` | 336 | Learned join-skew: persist the hot join-key values measured by the detection |
+| `skew.py` | 324 | Learned join-skew: persist the hot join-key values measured by the detection |
 | `sort_boundaries.py` | 329 | Learned range-sort boundaries: persist the quantile grid the SAMPLE barrier measured, |
 
 ### `batcher/dist/adaptive_sizing/` — 4 · backend

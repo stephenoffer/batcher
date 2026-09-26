@@ -21,7 +21,6 @@ __all__ = [
     "DEFAULT_LEARNED_SALT",
     "hot_keys_from_column_stats",
     "join_skew_key",
-    "load_learned_hot_keys",
     "persist_hot_keys",
     "resolve_hot_keys",
     "salt_factor",
@@ -107,17 +106,6 @@ def load_learned_skew(shape_key: str) -> tuple[list[str], float] | None:
     if isinstance(raw, dict):
         return [str(v) for v in raw.get("hot", ())], float(raw.get("share", 0.0))
     return [str(v) for v in raw], 0.0  # legacy record: values only
-
-
-def load_learned_hot_keys(shape_key: str) -> list[str] | None:
-    """The hot join-key values learned for this shape, or `None` if never measured.
-
-    A learned empty list means "measured, not skewed" — distinct from never-measured,
-    so a non-skewed shape never re-runs the detection pre-pass. Best-effort; the hub
-    being unavailable simply means no learned skew (fall back to the config behavior).
-    """
-    learned = load_learned_skew(shape_key)
-    return None if learned is None else learned[0]
 
 
 def _load_raw(shape_key: str):
