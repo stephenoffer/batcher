@@ -1086,7 +1086,7 @@ Scheduling a GPU stage against the wires, not just the device count.
 | module | lines | what it is |
 |---|---|---|
 | `collective_env.py` | 281 | Telling the collective library which wires this node has, instead of letting it guess. |
-| `placement.py` | 193 | Which devices a multi-device stage gets, and how its shards are dealt across them. |
+| `placement.py` | 122 | How a GPU fan-out's shards are sized and dealt against what the devices measured. |
 
 ### `batcher/dist/reduction/` — 4 · backend
 
