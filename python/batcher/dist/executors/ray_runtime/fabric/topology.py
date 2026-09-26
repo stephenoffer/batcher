@@ -36,10 +36,8 @@ __all__ = [
     "GpuNodeTopology",
     "devices_of_class",
     "domain_groups",
-    "fits_one_domain",
     "gpu_node_topology",
     "interconnect_class",
-    "is_preemptible",
     "largest_local_domain",
     "market_type",
     "node_zone",
@@ -102,9 +100,8 @@ _NO_MARKET = ("", "")
 def _market_scan(labels: dict) -> tuple[str, str]:
     """`(label_key, raw_value)` for the first market label the node carries, else `("", "")`.
 
-    The shared half of `is_preemptible` and `market_type`: one statement of which label keys
-    name a node's purchase mode and in what order they are believed. Restating that order at
-    two call sites is how the two would come to disagree about a fleet.
+    One statement of which label keys name a node's purchase mode and in what order they are
+    believed, so every reader of a node's market agrees about a fleet.
     """
     # The membership test first: an unlabelled node is the common case and the whole fleet is
     # walked per query, so deciding it in C beats a Python loop over the label names.
@@ -196,24 +193,6 @@ def _label(labels: dict, names: tuple[str, ...]) -> str:
         if value:
             return str(value)
     return ""
-
-
-def is_preemptible(labels: dict) -> bool:
-    """Whether a node's labels say it can be reclaimed out from under a running job.
-
-    Spot capacity is the failure domain a replica most needs to be independent of: a
-    reclamation wave takes a whole instance group, so a second copy on another spot node of
-    the same group dies with the first and buys nothing. A node with none of these labels
-    reads as **not** preemptible, which is the safe direction — it makes an unlabelled fleet
-    behave exactly as it did before rather than distrusting every node in it.
-
-    Args:
-        labels: A Ray node record's `Labels` mapping.
-
-    Returns:
-        True when a market-type label says spot, preemptible, or (GKE's spelling) true.
-    """
-    return market_type(labels)[1] == SPOT
 
 
 def node_zone(labels: dict) -> tuple[str, str]:
@@ -346,26 +325,6 @@ def largest_local_domain(nodes: tuple[GpuNodeTopology, ...] | None = None) -> in
     """
     records = gpu_node_topology() if nodes is None else nodes
     return max((n.local_domain for n in records), default=0)
-
-
-def fits_one_domain(
-    world_size: int,
-    nodes: tuple[GpuNodeTopology, ...] | None = None,
-) -> bool:
-    """Whether a collective of `world_size` devices can stay inside one coherent fabric.
-
-    Args:
-        world_size: Devices the collective needs.
-        nodes: Topology records, or `None` to read them live.
-
-    Returns:
-        True when some node's domain is wide enough. False on an unreadable topology, which is
-        the conservative direction: the caller then plans for a collective that crosses hosts,
-        which is correct everywhere and merely pessimistic on a fleet it could not see.
-    """
-    if world_size <= 1:
-        return True
-    return largest_local_domain(nodes) >= world_size
 
 
 def interconnect_class(

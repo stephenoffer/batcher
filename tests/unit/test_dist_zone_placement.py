@@ -187,9 +187,9 @@ def test_every_provisioners_spelling_of_spot_is_recognized(labels):
     Reading only Ray's own key would report every Karpenter, EKS, and GKE spot fleet as
     durable — which is the population the replica placement most needs to see.
     """
-    from batcher.dist.executors.ray_runtime.fabric.topology import is_preemptible
+    from batcher.dist.executors.ray_runtime.fabric.topology import SPOT, market_type
 
-    assert is_preemptible(labels)
+    assert market_type(labels)[1] == SPOT
 
 
 @pytest.mark.parametrize(
@@ -207,9 +207,9 @@ def test_an_unlabelled_or_on_demand_node_is_not_preemptible(labels):
     Distrusting every unlabelled node would change the placement on every cluster that does
     not label its capacity, which is most of them.
     """
-    from batcher.dist.executors.ray_runtime.fabric.topology import is_preemptible
+    from batcher.dist.executors.ray_runtime.fabric.topology import SPOT, market_type
 
-    assert not is_preemptible(labels)
+    assert market_type(labels)[1] != SPOT
 
 
 # --- the placement decision ---------------------------------------------------------------
