@@ -498,3 +498,47 @@ def test_narrow_rows_still_get_the_window_they_asked_for():
     # 64 narrow rows are nowhere near 256 MiB, so the row bound binds: one full-width block.
     assert len(emitted) == 1
     assert sorted(int(v) for v in emitted[0]["id"]) == list(range(64))
+
+
+def _reference_shuffle(ids: list[int], batch_rows: int, buffer_rows: int, seed: int) -> list[int]:
+    """The local-shuffle order both paths promise: blocks close once they reach
+    `buffer_rows`, and each block is permuted by the next draw of one `RandomState(seed)`."""
+    import numpy as np
+
+    rng = np.random.RandomState(seed)
+    batches = [ids[i : i + batch_rows] for i in range(0, len(ids), batch_rows)]
+    out: list[int] = []
+    block: list[int] = []
+    for batch in batches:
+        block += batch
+        if len(block) >= buffer_rows:
+            out += [block[i] for i in rng.permutation(len(block))]
+            block = []
+    if block:
+        out += [block[i] for i in rng.permutation(len(block))]
+    return out
+
+
+@pytest.mark.parametrize("seed", [0, 1, 7])
+def test_both_local_shuffles_keep_the_order_a_seed_has_always_produced(seed):
+    """`Dataset.iter_batches(local_shuffle_...)` and the training loader share one block
+    builder; the seed-to-order mapping is a contract a reproducible run relies on, so pin it
+    against an independent statement of it, for both callers."""
+    from batcher.api.dataset._export import _shuffled_blocks
+    from batcher.ml.loader import lazy
+
+    ids = list(range(43))
+    batches = pa.table({"id": ids}).to_batches(max_chunksize=5)
+    # A zero-row batch is skipped and must not move a block boundary or a draw.
+    batches.insert(3, batches[0].slice(0, 0))
+    expected = _reference_shuffle(ids, 5, 8, seed)
+
+    arrow = [v for b in _shuffled_blocks(iter(batches), 8, seed) for v in b.column(0).to_pylist()]
+    numpy = [
+        int(v)
+        for chunk in lazy._shuffle_to_numpy(iter(batches), 8, 4, seed=seed, columns=["id"])
+        for v in chunk["id"]
+    ]
+    assert arrow == expected
+    assert numpy == expected
+    assert expected != ids  # the shuffle moved something, so equality is not vacuous
