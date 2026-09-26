@@ -1609,7 +1609,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | module | lines | what it is |
 |---|---|---|
 | `admission.py` | 161 | Admission: does this plan fit the memory envelope, and if not, what is the counter-offer? |
-| `bdp.py` | 188 | Sizing a credit window from the path it runs over, instead of probing for it. |
+| `bdp.py` | 110 | Sizing a credit window from the path it runs over, instead of probing for it. |
 | `concurrency.py` | 361 | Bounding how many queries run at once, and how wide each one gets. |
 | `congestion.py` | 255 | What one round of a data channel actually observed, as a three-state congestion verdict. |
 | `cpu_budget.py` | 126 | How many cores the engine should ask for, given how many it is really getting. |

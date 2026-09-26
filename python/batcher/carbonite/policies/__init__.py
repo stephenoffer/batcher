@@ -18,7 +18,6 @@ from batcher.carbonite.policies.bdp import (
     REFILL_WINDOW_GAIN,
     bdp_window,
     measured_bdp_window,
-    proportional_windows,
 )
 from batcher.carbonite.policies.congestion import (
     ChannelCongestion,
@@ -71,7 +70,6 @@ __all__ = [
     "occupancy_from_starvation",
     "oversubscription_note",
     "probe_pressure",
-    "proportional_windows",
     "record_shuffle_window",
     "shuffle_store_cap",
     "shuffle_window_is_stable",
