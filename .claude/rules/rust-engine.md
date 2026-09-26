@@ -42,8 +42,8 @@ Two things this picture gets right that the shorter `bc-arrow → bc-expr → bc
 {bc-runtime, bc-codegen} → …` chain got wrong, and that you should not "correct"
 back: **`bc-codegen` does not depend on `bc-ir`** — it compiles scalar `Expr`, so
 it sits beside `bc-ir`, both fed by `bc-expr`. And **`bc-py` is not merely
-downstream of `bc-interp`**: it depends directly on `bc-sketches`, `bc-transport`,
-`bc-io`, and `bc-resource` as well, which makes it a second assembly point, not a
+downstream of `bc-interp`**: it depends directly on `bc-runtime`, `bc-sketches`,
+`bc-transport`, `bc-io`, and `bc-resource` as well, which makes it a second assembly point, not a
 thin cap on the chain. `MAP.md` prints the live dependency list for every crate,
 read from the manifests — check there rather than trusting this diagram if the two
 ever disagree.

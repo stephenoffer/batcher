@@ -29,7 +29,7 @@ sits at the bottom and feeds `bc-expr`, which is the single scalar expression ty
 type) leading to `bc-runtime`, and `bc-codegen` (the Cranelift JIT, which compiles
 scalar expressions and so has no dependency on `bc-ir`). Both branches converge on
 `bc-interp`, the interpreter and its parallel and distributed drivers. `bc-py` caps the
-graph, but it isn't a thin cap on a single chain: it depends directly on `bc-sketches`,
+graph, but it isn't a thin cap on a single chain: it depends directly on `bc-runtime`, `bc-sketches`,
 `bc-transport`, `bc-io`, and `bc-resource` as well, which makes it a second assembly
 point.
 

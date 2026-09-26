@@ -2973,7 +2973,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module.
 
-**depends on:** `bc-arrow`, `bc-interp`, `bc-io`, `bc-ir`, `bc-resource`, `bc-sketches`, `bc-transport`
+**depends on:** `bc-arrow`, `bc-interp`, `bc-io`, `bc-ir`, `bc-resource`, `bc-runtime`, `bc-sketches`, `bc-transport`
 
 | file | lines | what it is |
 |---|---|---|
@@ -2988,7 +2988,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `route.rs` | 169 | Which executor a plan runs on, and the two different affordability tests behind that. |
 | `shuffle/gather.rs` | 419 | The reducer's gather: how a worker pulls its bucket from every mapper. |
 | `shuffle/mod.rs` | 554 | Shuffle FFI: partitioners and the concurrent reducer gather. |
-| `sketches.rs` | 611 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
+| `sketches.rs` | 584 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
 | `tracing_init.rs` | 194 | Rust data-plane `tracing` → Python `logging` bridge. |
 
 ### `bc-interp`

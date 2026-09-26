@@ -356,15 +356,6 @@ fn scatter_into_buckets(
         .collect()
 }
 
-/// Range-partition `batch` into `n_buckets` globally-ordered buckets by the leading
-/// sort key at `key_index` and the ascending `boundaries`. Bucket `b` receives rows
-/// whose key falls in the `b`-th open interval of the boundaries
-/// (`searchsorted(boundaries, key, side="right")`), so equal keys never span a
-/// boundary and a concatenation of the per-bucket sorts is globally ordered. Nulls go
-/// to the front or back bucket to match single-node null ordering: `front` is the
-/// bucket the driver concatenates first (`n_buckets-1` for a descending sort, else
-/// `0`), and nulls land there when `nulls_first`, else at the opposite end.
-///
 /// Whether `dt` is a temporal type with a total order that its integer backing
 /// (days / millis / micros / nanos) preserves — so range-partitioning on the backing
 /// gives the same order as the single-node temporal sort. Excludes `Interval`
@@ -395,6 +386,15 @@ pub fn temporal_to_i64(col: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
     }
 }
 
+/// Range-partition `batch` into `n_buckets` globally-ordered buckets by the leading
+/// sort key at `key_index` and the ascending `boundaries`. Bucket `b` receives rows
+/// whose key falls in the `b`-th open interval of the boundaries
+/// (`searchsorted(boundaries, key, side="right")`), so equal keys never span a
+/// boundary and a concatenation of the per-bucket sorts is globally ordered. Nulls go
+/// to the front or back bucket to match single-node null ordering: `front` is the
+/// bucket the driver concatenates first (`n_buckets-1` for a descending sort, else
+/// `0`), and nulls land there when `nulls_first`, else at the opposite end.
+///
 /// This is the Rust counterpart of the hash [`partition_by_keys`] for the
 /// distributed-sort path. The key is compared as `f64` — bit-identical to the
 /// previous NumPy `searchsorted` over `to_numpy()` keys (the boundaries are
