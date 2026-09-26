@@ -1,8 +1,7 @@
 """Differential tests vs DuckDB for regex-replace backreferences, byte-based
 `levenshtein`, and image-tensor allocation bounds.
 
-Each test pins a defect found by the wave-2 string/media bug hunt (see
-docs/architecture/internals/bug_hunt_ledger.md):
+Each test pins a defect found by the wave-2 string/media bug hunt:
 
 * `regexp_replace`/`regexp_replace_all` passed the rewrite template straight to the
   Rust `regex` crate (`$1` syntax), so DuckDB's RE2 backreferences (`\\1`) came out

@@ -1,8 +1,7 @@
 """Differential tests for aggregate/group-by depth defects found in the wave-2 sweep.
 
 Each test pins a specific bug: the query returned the wrong answer (or raised) before
-the fix and matches DuckDB — and the in-memory path — after it. See
-docs/architecture/internals/bug_hunt_ledger.md.
+the fix and matches DuckDB — and the in-memory path — after it.
 """
 
 from __future__ import annotations
