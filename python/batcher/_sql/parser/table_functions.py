@@ -324,9 +324,8 @@ def _scored(source: Dataset, model: Any, options: dict[str, Any]) -> Dataset:
 def _is_native_estimator(model: Any) -> bool:
     """Whether `model` is a `batcher.ml` estimator, which scores a relation rather than a matrix.
 
-    Decided by where the class comes from, not by which methods it has: the `Estimator`
-    protocol is presence-only, and a scikit-learn estimator has `fit` and `predict` too — so
-    an `isinstance` check against it would send every sklearn model down the native path and
-    hand it a `Dataset` where it wants an array.
+    Decided by where the class comes from, not by which methods it has: a scikit-learn
+    estimator has `fit` and `predict` too, so a shape check would send every sklearn model
+    down the native path and hand it a `Dataset` where it wants an array.
     """
     return type(model).__module__.startswith("batcher.ml.")

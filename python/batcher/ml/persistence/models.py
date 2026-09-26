@@ -82,9 +82,8 @@ def _registry() -> dict[str, type]:
     """Every estimator a user can reach from `batcher.ml`, by name.
 
     Built from ``__all__`` rather than a hand-kept list, so a new estimator is loadable the
-    moment it is exported and cannot be forgotten here. Membership is by shape — a class
-    with both `fit` and `predict` — which is the same `Estimator` protocol the rest of the
-    package already programs against.
+    moment it is exported and cannot be forgotten here. Membership is by shape: a class
+    with both `fit` and `predict`.
     """
     import batcher.ml as ml_package
 

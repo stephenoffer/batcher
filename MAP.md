@@ -503,7 +503,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | module | lines | what it is |
 |---|---|---|
 | `_embed_dedup.py` | 45 | In-batch embedding deduplication — encode each distinct text once, gather back. |
-| `_estimator.py` | 302 | The scaffolding every fitted estimator in `batcher.ml` shares. |
+| `_estimator.py` | 277 | The scaffolding every fitted estimator in `batcher.ml` shares. |
 | `autobatch.py` | 285 | Adaptive batch-size control for inference — what Ray Data makes you hand-tune. |
 | `batch_format.py` | 13 | Re-export of the `batch_format` conversion, which now lives in `interop`. |
 | `cluster.py` | 349 | Unsupervised clustering — grouping rows by similarity, with no labels. |
@@ -520,7 +520,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `interpret.py` | 224 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 828 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 368 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
-| `model_selection.py` | 724 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
+| `model_selection.py` | 723 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
 | `multiclass.py` | 219 | `OneVsRestClassifier` — multiclass classification built from a binary estimator. |
 | `naive_bayes.py` | 502 | Naive Bayes — a probabilistic classifier whose whole fit is a grouped aggregate. |
 | `outliers.py` | 537 | Outlier detection — finding the rows a model should not be trained on, at scale. |
@@ -663,7 +663,7 @@ Persisting fitted state — the document format, and estimator save/load.
 | module | lines | what it is |
 |---|---|---|
 | `document.py` | 214 | The JSON document format fitted objects are written in, and how it is read back. |
-| `models.py` | 350 | Saving and loading a fitted estimator — the half of train/serve parity that was missing. |
+| `models.py` | 349 | Saving and loading a fitted estimator — the half of train/serve parity that was missing. |
 
 ### `batcher/ml/preprocessors/` — 6 · front-end
 
@@ -859,7 +859,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `grouping.py` | 538 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 321 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
 | `statements.py` | 212 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
-| `table_functions.py` | 332 | Built-in table functions in the FROM clause: the series generators and model scoring. |
+| `table_functions.py` | 331 | Built-in table functions in the FROM clause: the series generators and model scoring. |
 | `translator.py` | 646 | The `_Translator` skeleton plus the public `sql()` entry point. |
 | `udf.py` | 197 | Registered-Python-function support for the SQL translator. |
 
