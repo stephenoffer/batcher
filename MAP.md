@@ -512,7 +512,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `discriminant.py` | 363 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
 | `dummy.py` | 228 | Baseline predictors — the "does my model beat doing nothing" reference. |
 | `embed.py` | 523 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
-| `embed_api.py` | 331 | Embedding encoders backed by a *served* endpoint, not a local model. |
+| `embed_api.py` | 327 | Embedding encoders backed by a *served* endpoint, not a local model. |
 | `feature_scores.py` | 334 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 335 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
 | `glm.py` | 643 | Generalized linear models fitted by iteratively reweighted least squares. |
