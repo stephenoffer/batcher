@@ -188,7 +188,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 | module | lines | what it is |
 |---|---|---|
 | `gating.py` | 335 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
-| `plan_surgery.py` | 117 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
+| `plan_surgery.py` | 81 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
 | `staging.py` | 599 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
 ### `batcher/api/catalog/` — 5 · conductor

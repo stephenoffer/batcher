@@ -10,8 +10,6 @@ depending on each other.
 
 from __future__ import annotations
 
-import dataclasses
-
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -24,6 +22,7 @@ from batcher.plan.logical import (
     Window,
     is_streamable,
 )
+from batcher.plan.visitor import children, walk, with_children
 
 __all__ = [
     "BREAKERS",
@@ -45,28 +44,6 @@ BREAKERS = (Aggregate, Sort, Distinct, Window, Limit, Join, Union)
 #: structural path uses this; single-node staging keeps `BREAKERS`, so its gate and cut
 #: count are unchanged.
 STRUCTURAL_BREAKERS = (*BREAKERS, RowId)
-
-
-def children(node: LogicalPlan) -> list[LogicalPlan]:
-    if isinstance(node, Join):
-        return [node.left, node.right]
-    if isinstance(node, Union):
-        return list(node.inputs)
-    if hasattr(node, "input"):
-        return [node.input]
-    return []
-
-
-def walk(node: LogicalPlan):
-    """Pre-order walk over the plan tree (local helper, no visitor import cycle).
-
-    Recursive for the reason `plan.visitor.walk` documents: at real plan depths the stack
-    bookkeeping an iterative walk needs costs more than the `yield from` re-entry it
-    removes. Measured, not assumed.
-    """
-    yield node
-    for child in children(node):
-        yield from walk(child)
 
 
 def joins(node: LogicalPlan) -> list[Join]:
@@ -98,20 +75,7 @@ def lowest_breaker(node: LogicalPlan, accept=None, breakers: tuple[type, ...] = 
 
 
 def replace(node: LogicalPlan, target: LogicalPlan, repl: LogicalPlan) -> LogicalPlan:
+    """`node` with the subtree `target` (by identity) swapped for `repl`."""
     if node is target:
         return repl
-    if isinstance(node, Join):
-        return Join(
-            replace(node.left, target, repl),
-            replace(node.right, target, repl),
-            node.left_keys,
-            node.right_keys,
-            node.join_type,
-            node.output,
-            node.strategy,
-        )
-    if isinstance(node, Union):
-        return Union(tuple(replace(i, target, repl) for i in node.inputs), node.distinct)
-    if hasattr(node, "input"):
-        return dataclasses.replace(node, input=replace(node.input, target, repl))
-    return node
+    return with_children(node, [replace(c, target, repl) for c in children(node)])
