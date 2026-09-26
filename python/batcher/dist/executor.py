@@ -85,6 +85,7 @@ from batcher.plan.logical import (
     Sort,
     Union,
     Window,
+    is_empty_relation,
 )
 from batcher.plan.resource import (
     SchedulingEnvelope,
@@ -1400,7 +1401,7 @@ def _is_empty_relation(plan: LogicalPlan) -> bool:
 
     node = plan
     while True:
-        if isinstance(node, Limit) and node.n == 0:
+        if is_empty_relation(node):
             return True
         if isinstance(node, (Filter, Project, Sort, Distinct, Limit, Window, Unnest)):
             node = node.input
