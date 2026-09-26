@@ -414,7 +414,7 @@ def _reshaped_window_argument(tr, item, fn, arg):
     return None
 
 
-def _any_value_func(fn, order):
+def _any_value_func():
     """Refuse `any_value(x) OVER (…)`, naming what it means and what to write instead.
 
     DuckDB implements the windowed `any_value` as *the first non-null value in the frame*,
@@ -427,14 +427,9 @@ def _any_value_func(fn, order):
     because sqlglot parks `any_value(x)` under an `IgnoreNulls` wrapper, so the message
     used to name an ``IGNORE NULLS`` clause the query never contained.
 
-    Args:
-        fn: The `AnyValue` node.
-        order: The window's ORDER BY, or an empty tuple.
-
     Raises:
         NotImplementedError: Always.
     """
-    del fn, order
     raise NotImplementedError(
         "any_value(x) OVER (…) is not supported: DuckDB answers it with the first "
         "non-null value in the frame, which is not one of the runtime's window "
@@ -451,7 +446,7 @@ class _IgnoreNulls(tuple):
     """
 
 
-def _ignore_nulls_func(win, fn, order):
+def _ignore_nulls_func(fn, order):
     """Map `<value fn>(x IGNORE NULLS) OVER (...)` onto the engine's `ignore_nulls` flag.
 
     `IGNORE NULLS` makes `first_value`/`last_value`/`nth_value` pick among the frame's
@@ -469,7 +464,6 @@ def _ignore_nulls_func(win, fn, order):
     and are rejected rather than answered with the null-*respecting* result.
 
     Args:
-        win: The `Window` node.
         fn: The inner function node that `IgnoreNulls` wraps.
         order: The window's ORDER BY, required by every value function.
 
@@ -482,7 +476,6 @@ def _ignore_nulls_func(win, fn, order):
             f"{name}(x) IGNORE NULLS is not supported. Supported: first_value, last_value and "
             "nth_value with IGNORE NULLS over any frame"
         )
-    del win
     return _IgnoreNulls(_value_func(name, fn, order))
 
 
@@ -665,11 +658,11 @@ def _window_func(win, order):
         # written, so the IGNORE-NULLS handler answered a plain `any_value(x) OVER (…)`
         # with an error naming a clause the query never used.
         if type(fn.this).__name__.lower() == "anyvalue":
-            return _any_value_func(fn.this, order)
-        return _ignore_nulls_func(win, fn.this, order)
+            return _any_value_func()
+        return _ignore_nulls_func(fn.this, order)
     name = type(fn).__name__.lower()
     if name == "anyvalue":
-        return _any_value_func(fn, order)
+        return _any_value_func()
 
     # Ranking family (no input; needs ORDER BY). `percent_rank`/`cume_dist` produce
     # a fraction; the runtime supports all of these.
