@@ -9,13 +9,11 @@ unchanged.
 from __future__ import annotations
 
 from batcher.kyber.metadata_filter_count.answers import (
-    answer_filter_any,
     answer_filter_count,
     answer_filter_is_empty,
 )
 
 __all__ = [
-    "answer_filter_any",
     "answer_filter_count",
     "answer_filter_is_empty",
 ]

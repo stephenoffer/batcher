@@ -53,7 +53,7 @@ Read `.claude/rules/architecture.md` (Kyber's lane), `.claude/rules/maintainabil
      (build-side). Make sure the module is imported from `kyber/rules/__init__.py`.
      Do **not** hand-roll a per-node `isinstance` ladder to recurse the tree — the
      structural recursion and the identity-preserving rebuild (the fixpoint detector
-     relies on it) are the shared `transform_up`/`transform_down` from
+     relies on it) are the shared `transform_up` from
      `plan/visitor.py`. Write only the per-node logic and pass it to `transform_up`;
      `kyber/rules/pushdown.py::rewrite_predicate` is the worked example.
 

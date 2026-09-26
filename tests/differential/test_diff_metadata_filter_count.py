@@ -1,7 +1,7 @@
 """Filtered-count metadata shortcuts equal DuckDB — over a real Parquet footer and memory.
 
-`answer_filter_count` / `answer_filter_is_empty` / `answer_filter_any` answer a
-`count()`/`is_empty()`/`any()` over a `Filter` from EXACT footer statistics when provable
+`answer_filter_count` / `answer_filter_is_empty` answer a `count()`/`is_empty()` over a
+`Filter` from EXACT footer statistics when provable
 (a null predicate, a provably-empty comparison, or a tautology) and return `None`
 otherwise. Either way the count MUST equal DuckDB's executed answer. Each case is checked
 over a Parquet file (real footer drives the shortcut) and in memory (the shortcut mostly
@@ -22,7 +22,6 @@ import batcher as bt
 from batcher import core
 from batcher.api.orchestration import collect_source_stats
 from batcher.kyber.metadata_filter_count import (
-    answer_filter_any,
     answer_filter_count,
     answer_filter_is_empty,
 )
@@ -154,16 +153,14 @@ def test_a_float_max_does_not_prove_a_nan_away(tmp_path, duck):
     assert ds.is_empty() is False
 
 
-def test_is_empty_and_any_match_duckdb(pq_path, duck):
+def test_is_empty_and_has_rows_match_duckdb(pq_path, duck):
     _duck(duck)
     hub = core.default_hub()
     # A provably-empty filter and a non-empty one, both answered from the footer.
     empty = bt.read.parquet(pq_path).filter(bt.col("i") > 100)
     nonempty = bt.read.parquet(pq_path).filter(bt.col("i").is_not_null())
     assert answer_filter_is_empty(empty._plan, empty._sources, _stats(empty), hub) is True
-    assert answer_filter_any(empty._plan, empty._sources, _stats(empty), hub) is False
     assert answer_filter_is_empty(nonempty._plan, nonempty._sources, _stats(nonempty), hub) is False
-    assert answer_filter_any(nonempty._plan, nonempty._sources, _stats(nonempty), hub) is True
     # Cross-check the public terminals against DuckDB.
     assert empty.is_empty() is True
     assert empty.has_rows is False

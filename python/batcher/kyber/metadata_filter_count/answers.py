@@ -31,7 +31,6 @@ from batcher.plan.logical import Filter, LogicalPlan, Project, Scan
 from batcher.plan.stats import ColumnStat, Provenance, RelStats, mismatched_exactness
 
 __all__ = [
-    "answer_filter_any",
     "answer_filter_count",
     "answer_filter_is_empty",
 ]
@@ -90,22 +89,6 @@ def answer_filter_is_empty(
     """
     count = answer_filter_count(plan, sources, source_stats, hub, config)
     return None if count is None else count == 0
-
-
-def answer_filter_any(
-    plan: LogicalPlan,
-    sources: list,
-    source_stats: list | None = None,
-    hub: MetadataHub | None = None,
-    config: Config | None = None,
-) -> bool | None:
-    """Whether a filtered relation keeps any row, from metadata, or None if not provable.
-
-    The negation of `answer_filter_is_empty` — `True` iff the exact surviving count is
-    positive (e.g. `col IS NOT NULL` over a footer with a null count below the row count).
-    """
-    count = answer_filter_count(plan, sources, source_stats, hub, config)
-    return None if count is None else count > 0
 
 
 def _descend_to_filter(node: LogicalPlan) -> Filter | None:

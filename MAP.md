@@ -1223,7 +1223,7 @@ EXACT-gated *filtered-count* metadata shortcuts (façade).
 
 | module | lines | what it is |
 |---|---|---|
-| `answers.py` | 338 | Answer *filtered* counts from metadata — Kyber's EXACT-gated filter-count layer. |
+| `answers.py` | 321 | Answer *filtered* counts from metadata — Kyber's EXACT-gated filter-count layer. |
 
 ### `batcher/kyber/optimizer/` — 3 · subsystem
 
@@ -1391,7 +1391,7 @@ Ordered-comparison sargable transposition, proved rather than assumed.
 | module | lines | what it is |
 |---|---|---|
 | `bounds.py` | 107 | Ordered sargable transposition proved by a column's **measured min/max**. |
-| `shared.py` | 178 | The decomposition and the overflow proof shared by the ordered sargable rules. |
+| `shared.py` | 132 | The decomposition and the overflow proof shared by the ordered sargable rules. |
 
 ### `batcher/kyber/rules/joins/` — 3 · subsystem
 
@@ -2343,7 +2343,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `schema.py` | 174 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 394 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 646 | `plan.stats` — the neutral statistics algebra shared across every layer. |
-| `visitor.py` | 346 | Shared traversal for `LogicalPlan` trees. |
+| `visitor.py` | 338 | Shared traversal for `LogicalPlan` trees. |
 
 ### `batcher/plan/distribution/` — 1 · contract
 
@@ -2618,7 +2618,7 @@ Resource contracts between Kyber (optimizer), Carbonite (resource manager), and 
 | `progress.py` | 451 | What a micro-batch reported — the progress records a streaming query publishes. |
 | `rate.py` | 70 | The contract between a streaming query's rate controller and the loop it paces. |
 | `spec.py` | 302 | Neutral streaming-query specification types — triggers, output modes, progress. |
-| `tracker.py` | 284 | Per-partition event-time watermark tracking — a stream's progress is a min, not a max. |
+| `tracker.py` | 279 | Per-partition event-time watermark tracking — a stream's progress is a min, not a max. |
 
 ### `batcher/plan/types/` — 1 · contract
 
@@ -2656,7 +2656,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 
 | module | lines | what it is |
 |---|---|---|
-| `hardware_scope.py` | 184 | Scoping learned parameters to the machine that measured them. |
+| `hardware_scope.py` | 154 | Scoping learned parameters to the machine that measured them. |
 | `hub.py` | 466 | `MetadataHub` — the façade over a `MetadataBackend`. |
 | `io_stats.py` | 249 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `params.py` | 352 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
