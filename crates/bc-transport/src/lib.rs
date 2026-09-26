@@ -699,25 +699,11 @@ impl FlightClient {
     }
 }
 
-/// Convenience blocking wrapper: connect + fetch on a fresh single-threaded
-/// runtime. Handy from non-async call sites (e.g. the current disk-shuffle
-/// reducer) while the engine is being made async end-to-end.
-pub fn fetch_blocking(addr: &str, ticket: &str) -> TransportResult<Vec<RecordBatch>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| TransportError::Io(format!("runtime: {e}")))?;
-    rt.block_on(async {
-        let mut client = FlightClient::connect(addr).await?;
-        client.fetch(ticket).await
-    })
-}
-
 /// Credit-bounded blocking fetch: connect + credit-gated `DoExchange` on a fresh
 /// single-threaded runtime, keeping at most `credits` `RecordBatch`es in flight.
 ///
-/// This is the flow-controlled counterpart to [`fetch_blocking`] (which uses an
-/// un-credited `DoGet` and lets a fast producer race ahead). The distributed
+/// Flow-controlled, unlike the un-credited `DoGet` of [`FlightClient::fetch`], which lets
+/// a fast producer race ahead. The distributed
 /// reducer calls this so a Carbonite-granted window bounds producer memory —
 /// `credits` is clamped to at least 1 by [`ShuffleExchange::fetch_with_credits`].
 pub fn fetch_blocking_with_credits(
@@ -1621,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn blocking_credit_fetch_honors_window() {
         // The FFI-facing wrapper must use the credit-gated DoExchange (not the
-        // un-credited DoGet `fetch_blocking` uses): a small window must bound the
+        // un-credited DoGet `FlightClient::fetch` uses): a small window must bound the
         // producer's in-flight high-water mark. Run the blocking fetch (which
         // builds its own runtime) on a blocking thread so it doesn't nest runtimes.
         const N: i64 = 40;
