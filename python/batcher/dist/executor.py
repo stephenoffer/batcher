@@ -2456,7 +2456,7 @@ def _land_map_stage(
     from batcher.io.formats.structured.parquet import ParquetSource
     from batcher.plan.schema import SchemaRef
 
-    _distributed_map(
+    manifest = _distributed_map(
         node,
         sources,
         workers,
@@ -2468,12 +2468,13 @@ def _land_map_stage(
             "partition_by": None,
         },
     )
-    staged = ParquetSource(work_dir)
-    try:
-        schema = SchemaRef.from_arrow(staged.schema())
-    except Exception:
+    # "Nothing was written" is read off the manifest, never inferred from a failed footer
+    # read: an unreadable scratch (a permission error, a corrupt file) must raise, because
+    # treating it as "every partition was empty" turns an I/O fault into an empty answer.
+    if not manifest.files:
         return None
-    return Scan(source_id, schema), staged
+    staged = ParquetSource(work_dir)
+    return Scan(source_id, SchemaRef.from_arrow(staged.schema())), staged
 
 
 def _stage_map_operands(
