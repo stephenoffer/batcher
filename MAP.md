@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1511 Python modules across 217 packages and 302 Rust files across 15 crates.
+Covering 1511 Python modules across 217 packages and 298 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -581,7 +581,7 @@ Actor-pool batch inference — the ML data plane's orchestration layer.
 | module | lines | what it is |
 |---|---|---|
 | `pipelines.py` | 367 | HuggingFace ``transformers.pipeline`` placement, precision, and the load-once class UDF. |
-| `pool.py` | 667 | The worker pool itself: dynamic batching, OOM survival, and bounded dispatch. |
+| `pool.py` | 668 | The worker pool itself: dynamic batching, OOM survival, and bounded dispatch. |
 
 ### `batcher/ml/llm/` — 6 · front-end
 
@@ -2687,7 +2687,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 3209 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3208 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `env.py` | 182 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
@@ -3332,19 +3332,6 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `row_filter.rs` | 418 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `split_read.rs` | 275 | Split an oversized object-store read into several concurrent range GETs. |
 | `store.rs` | 416 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
-
-### `bc-udf`
-
-The opaque-operator boundary + dynamic-batching machinery for the UDF / ML inference plane.
-
-**depends on:** `bc-arrow`
-
-| file | lines | what it is |
-|---|---|---|
-| `batch_size.rs` | 89 | [`BatchSizeController`] — a PID governor for the dynamic batch size. |
-| `lib.rs` | 49 | The opaque-operator boundary + dynamic-batching machinery for the UDF / ML inference plane. |
-| `operator.rs` | 112 | The [`OpaqueOperator`] trait and its concrete [`FnOperator`] seam. |
-| `rebatch.rs` | 123 | [`Rebatcher`] — re-chunk a stream of batches to a target row count. |
 
 ### `bc-geo`
 

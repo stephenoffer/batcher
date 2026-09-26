@@ -24,7 +24,7 @@ _DEFAULT_BUDGET = int(MemoryConfig().default_total_bytes * MemoryConfig().hard_l
 
 def test_pid_defaults_are_canonical_gains():
     """Regression for the ki/kd transposition: the only PID controller that exists
-    (bc-udf BatchSizeController / ml.inference._LatencyController) uses
+    (ml.inference._LatencyController) uses
     kp=0.4, ki=0.05, kd=0.1. Config must match — not the old swapped 0.4/0.1/0.05."""
     pid = Config().pid
     assert (pid.kp, pid.ki, pid.kd) == (0.4, 0.05, 0.1)

@@ -764,15 +764,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bc-udf"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "bc-arrow",
- "thiserror",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

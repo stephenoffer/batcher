@@ -1070,9 +1070,8 @@ class PIDConfig:
     """Gains for the adaptive batch-size PID controller over batch-latency error.
 
     The loop grows/shrinks the per-batch row count toward a target latency. It is
-    implemented identically in `bc-udf::BatchSizeController` (data plane) and
-    `ml.inference._LatencyController` (Python); shipped to Rust as `EngineConfig` so
-    the two never drift.
+    implemented by `ml.inference._LatencyController`, which reads these gains from the
+    active config.
 
     Examples:
         .. doctest::

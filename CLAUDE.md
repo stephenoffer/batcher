@@ -125,7 +125,7 @@ crates/             Data plane — pure Rust + Arrow (only bc-py links PyO3)
   bc-geo geometry model + WKB/WKT/GeoJSON + planar algos + grids (feeds bc-expr)
   bc-spatial quaternions + SE(3) poses + frame transforms (robotics/AV; feeds bc-expr)
   bc-sketches · bc-transport (Flight; bypasses the Ray object store) · bc-resource
-  bc-io · bc-udf (NOT wired into bc-py — not on a live path) · bc-py (FFI)
+  bc-io · bc-py (FFI)
 ```
 
 ## Gate before "done"

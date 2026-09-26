@@ -129,15 +129,16 @@ There are two controllers, and they optimize different things. The following tab
 
 ::::{tab-set}
 :::{tab-item} Latency (online serving)
-A PID over the *relative* per-batch latency error drives the batch size toward a latency setpoint. The live controller is `ml/inference/pool.py::_LatencyController`, which reads its gains from the shared `PIDConfig`. It's a port of `crates/bc-udf/src/batch_size.rs::BatchSizeController`, which states the same law in Rust. `bc-udf` isn't linked into `bc-py`, so the Rust controller isn't on a live path.
+A PID over the *relative* per-batch latency error drives the batch size toward a latency setpoint. The controller is `ml/inference/pool.py::_LatencyController`, which reads its gains from the shared `PIDConfig`.
 
-```rust
-let error = (self.target_latency_ms - observed_latency_ms) / self.target_latency_ms;
-self.integral = (self.integral + error).clamp(-INTEGRAL_CLAMP, INTEGRAL_CLAMP);
-let derivative = error - self.prev_error;
-let adjustment = (self.kp * error + self.ki * self.integral + self.kd * derivative)
-    .clamp(-MAX_STEP_FRACTION, MAX_STEP_FRACTION);
-self.current = (self.current * (1.0 + adjustment)).clamp(min, max);
+```python
+# docs: skip
+error = (self._target - observed_ms) / self._target
+self._integral = clamp(self._integral + error, -pid.integral_clamp, pid.integral_clamp)
+derivative = error - self._prev
+raw = pid.kp * error + pid.ki * self._integral + pid.kd * derivative
+adjustment = clamp(raw, -pid.max_step_fraction, pid.max_step_fraction)
+self._cur = min(float(self._max), max(float(self._min), self._cur * (1.0 + adjustment)))
 ```
 
 The control law applies *multiplicatively* to the current size over the *relative* error, which makes it scale-free. It behaves the same at 100 rows and at 100,000, with a natural fixed point at `observed == target`. The integral clamp is anti-windup, and the step cap stops a single anomalous latency from swinging the size wildly.
@@ -276,7 +277,7 @@ Each concern below maps to the file that owns it, so the device placement and ba
 | OOM halving and dirty-row bisection | [`python/batcher/core/udf/call.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/call.py) |
 | Threads vs processes policy | [`python/batcher/core/udf/strategy.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/strategy.py) |
 | Distributed actor pools, warm pools | [`python/batcher/dist/executors/map.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/executors/map.py) |
-| Latency PID | [`python/batcher/ml/inference/pool.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/inference/pool.py), mirrored in [`crates/bc-udf/src/batch_size.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-udf/src/batch_size.rs) |
+| Latency PID | [`python/batcher/ml/inference/pool.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/inference/pool.py) |
 | Throughput hill-climb | [`python/batcher/ml/autobatch.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/autobatch.py) |
 | Device detection, utilization, VRAM | [`python/batcher/ml/gpu.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/gpu.py) |
 | GPU-vs-CPU backend policy | [`python/batcher/kyber/gpu/policy.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/kyber/gpu/policy.py) |

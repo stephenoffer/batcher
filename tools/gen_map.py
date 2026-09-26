@@ -96,7 +96,6 @@ CRATE_ORDER = [
     "bc-transport",
     "bc-resource",
     "bc-io",
-    "bc-udf",
 ]
 
 _TEST_MOD = re.compile(r"^#\[cfg\(test\)\]", re.MULTILINE)
