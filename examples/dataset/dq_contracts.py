@@ -24,7 +24,7 @@ def main() -> None:
         }
     )
 
-    def contract(ds: bt.Dataset) -> bt.DatasetDQ:
+    def contract(ds: bt.Dataset):
         return (
             ds.dq.not_null("id", "email")
             .unique("id")
