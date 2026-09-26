@@ -577,7 +577,7 @@ def _s3_with_options(uri: str) -> FileSystem:
             )
     opts["retry_strategy"] = pafs.AwsStandardS3RetryStrategy(max_attempts=attempts)
     try:
-        fs = pafs.S3FileSystem(**opts)  # type: ignore[arg-type]
+        fs = pafs.S3FileSystem(**opts)
     except (ValueError, OSError, pa.ArrowInvalid) as exc:
         raise IOError(f"cannot open s3:// storage with the given options: {exc}") from exc
     # A directly-constructed S3FileSystem addresses objects as `bucket/key`, so the mapping

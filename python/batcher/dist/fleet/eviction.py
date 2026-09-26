@@ -103,5 +103,5 @@ def evict_plan(actors: list[Any], plan_id: int) -> None:
 
         refs = [a.clear_plan.remote(plan_id) for a in actors]
         ray.wait(refs, num_returns=len(refs), timeout=_EVICT_TIMEOUT_S)
-    except Exception as exc:  # pragma: no cover - teardown must never raise
+    except Exception as exc:  # teardown must never raise
         note_suppressed("dist", f"evict shuffle buckets for plan {plan_id}", exc)

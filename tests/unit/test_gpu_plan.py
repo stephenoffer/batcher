@@ -650,6 +650,11 @@ def test_nan_bearing_aggregate_declines(be):
 def test_nan_comparison_follows_the_engine(be):
     """`NaN > x` is True in the engine (it orders above every number) and False under IEEE."""
     table = pa.table({"v": pa.array([float("nan"), 1.0, 3.0], type=pa.float64())})
+    if be.nan_is_missing:
+        # pandas 3 reads the NaN as missing, so the host backend declines instead of answering.
+        with pytest.raises(Unsupported):
+            _run(lambda ds: ds.filter(col("v") > 2.0), table, be)
+        return
     got, exp = _run(lambda ds: ds.filter(col("v") > 2.0), table, be)
     _assert_matches(got, exp, be)
 

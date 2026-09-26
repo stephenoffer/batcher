@@ -202,7 +202,7 @@ def _attempt_reclaim(message: str) -> int:
         # Measured on three Parquet group-bys: 0 MiB unforced against 408 MiB forced, of a
         # 1,397 MiB resident set. The expense of the forced walk is what the cooldown is for.
         released = release_retained_memory(force=True)
-    except Exception as exc:  # pragma: no cover - a trim must never fail a query
+    except Exception as exc:  # a trim must never fail a query
         note_suppressed("carbonite", "release the allocator's retained memory", exc)
         _STATE.next_attempt_s = now + _STATE.cooldown_s
         return 0

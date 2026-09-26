@@ -37,7 +37,7 @@ def has_chat_template(tokenizer: object | None) -> bool:
         return False
     try:
         return bool(getattr(tokenizer, "chat_template", None))
-    except Exception:  # pragma: no cover - tokenizer implementations vary
+    except Exception:  # tokenizer implementations vary
         return False
 
 

@@ -630,10 +630,12 @@ then "exactly one caller"; both are out of date):
   exactly the small clusters it was testable on. The regeneration is now skipped when a copy
   survives on a live peer (at most once per source, so an unreachable replica still falls
   through to a recompute rather than exhausting the attempt budget).
-- `DistributedConfig.shuffle_replication` still defaults to **1**, rising to 2 under the
-  `spot` resilience profile — an on-demand cluster pays no copy.
+- `DistributedConfig.shuffle_replication` defaults to **1**, and no profile raises it any
+  more: above 1, a worker loss can drop that worker's share of the rows rather than fail
+  (`tests/integration/test_shuffle_replication.py`, reproduced on a 3-node cluster
+  2026-09-23), while replication off recovers exactly. The `spot` profile used to set 2.
 
-So on a spot cluster you now get re-fetch recovery for every shuffle. What is still missing
+So re-fetch recovery exists but is not safe to turn on; a spot cluster recomputes. What is still missing
 is the rest of the durability half: there is no external shuffle service, so a bucket cannot
 outlive its worker except by replication, and inside the combiner tree only the leaf partials
 are copied — an interior combiner's output lives on one node, so a loss there still costs a

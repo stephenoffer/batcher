@@ -144,7 +144,7 @@ def projected_input_bytes(
             return 0
         try:
             width = projected_row_bytes(src.schema(), projections.get(i))
-        except Exception:  # pragma: no cover - a source that cannot describe itself
+        except Exception:  # a source that cannot describe itself
             return 0
         total += rows * width
     return int(total)
@@ -166,7 +166,7 @@ def _estimated_row_count(src: Source) -> int | None:
     """
     try:
         stats = src.statistics()
-    except Exception:  # pragma: no cover - a source with no statistics at all
+    except Exception:  # a source with no statistics at all
         return None
     rows = getattr(stats, "row_count", None) if stats is not None else None
     if rows is None or rows < 0:
@@ -272,6 +272,6 @@ def _carried_columns(plan) -> frozenset[str] | None:
                 continue
             (source_names if type(node).__name__ == "Scan" else node_names).update(arrow.names)
         return frozenset(supplied | (node_names - source_names))
-    except Exception as exc:  # pragma: no cover - a sizing hint must never fail a query
+    except Exception as exc:  # a sizing hint must never fail a query
         note_suppressed("carbonite", "derive carried columns", exc)
         return None

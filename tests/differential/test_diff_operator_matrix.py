@@ -367,6 +367,17 @@ UNORDERED_OPS: dict[str, tuple] = {
         lambda d: d.join(bt.from_arrow(RIGHT_STR), left_on="g", right_on="g", how="anti"),
         None,
     ),
+    # The two join flavors no row above reached: a RIGHT join (the build side's unmatched
+    # rows survive, including its null key) and a keyless cross join. The cross side is
+    # three rows so the multibatch and skewed shapes stay ~100k rows.
+    "join_right": (
+        lambda d: d.join(bt.from_arrow(RIGHT), left_on="k", right_on="k", how="right"),
+        None,
+    ),
+    "cross_join": (
+        lambda d: d.cross_join(bt.from_arrow(RIGHT.slice(3, 3))),
+        None,
+    ),
     # A group key that is (almost) unique, so the group count reaches the row count. That is
     # the shape where `assign_groups` hands its key columns back untouched instead of `take`ing
     # them at an identity permutation, and where the executor abandons pre-aggregation for the
@@ -729,6 +740,44 @@ def test_sort_paths_agree_on_every_ordering(shape, key, descending, nulls_first)
     oracle = plan.collect()
     assert_tables_equal(plan.collect(spill=True), oracle, ordered=True)
     assert_tables_equal(_stream(plan), oracle, ordered=True)
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("shape", sorted(INPUTS))
+def test_top_k_matches_duckdb_on_every_path(duck, shape, descending):
+    """`top_k` is a sort fused with a limit, so it gets the ordered assertion too.
+
+    Ordered on every column for the reason `test_sort_matches_duckdb_on_every_ordering`
+    gives, so the kept rows and their sequence are uniquely determined. `k` carries the
+    nulls and `f` the `-0.0`/NaN pair, and `top_k` places nulls last in both directions,
+    as DuckDB's default `ORDER BY` does.
+    """
+    table = INPUTS[shape]
+    duck.register("t", table)
+    d = "DESC" if descending else "ASC"
+    order_by = ", ".join(f"{c} {d} NULLS LAST" for c in TOTAL_ORDER)
+    expected = duck.sql(f"SELECT * FROM t ORDER BY {order_by} LIMIT 5")
+    plan = bt.from_arrow(table).top_k(5, by=TOTAL_ORDER, descending=descending)
+    for out in (plan.collect(), plan.collect(spill=True), _stream(plan)):
+        assert out.num_rows == min(5, table.num_rows)
+        assert_same_ordered(out, expected)
+
+
+_JOIN_ORACLES = {
+    "join_right": "SELECT r.k AS k, t.g, t.f, t.v, r.w FROM t RIGHT JOIN r ON t.k = r.k",
+    "cross_join": "SELECT t.*, r.k AS k_right, r.w FROM t CROSS JOIN r",
+}
+
+
+@pytest.mark.parametrize("op", sorted(_JOIN_ORACLES))
+@pytest.mark.parametrize("shape", sorted(INPUTS))
+def test_right_and_cross_join_match_duckdb(duck, op, shape):
+    """The two join rows need a second relation registered, so they get their own oracle."""
+    table = INPUTS[shape]
+    duck.register("t", table)
+    duck.register("r", RIGHT if op == "join_right" else RIGHT.slice(3, 3))
+    build, _ = UNORDERED_OPS[op]
+    assert_same(build(bt.from_arrow(table)).collect(), duck.sql(_JOIN_ORACLES[op]))
 
 
 @pytest.mark.parametrize("scheduling", sorted(_SCHEDULINGS))

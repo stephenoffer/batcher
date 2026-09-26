@@ -1031,7 +1031,7 @@ class StatsEstimator:
         bounds = [_ordinal(v) for v in (ls.min, ls.max, rs.min, rs.max)]
         if any(b is None for b in bounds):
             return _UNKNOWN_INEQUALITY_SELECTIVITY
-        a1, b1, a2, b2 = bounds  # type: ignore[misc]
+        a1, b1, a2, b2 = bounds
         if b1 < a1 or b2 < a2:
             return _UNKNOWN_INEQUALITY_SELECTIVITY
         p_less = _uniform_p_less(a1, b1, a2, b2)

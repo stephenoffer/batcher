@@ -276,7 +276,7 @@ def _fanout(node: LogicalPlan, estimator) -> float:
     try:
         in_rows = estimator.estimate(inp).rows
         out_rows = estimator.estimate(node).rows
-    except Exception as exc:  # pragma: no cover - budgeting must never break a plan
+    except Exception as exc:  # budgeting must never break a plan
         # Falling back to 1.0 budgets every operator below this one at a single morsel.
         # That is the right *behaviour*, but it is indistinguishable from a plan that
         # genuinely does not fan out, so an estimator broken here would quietly cap

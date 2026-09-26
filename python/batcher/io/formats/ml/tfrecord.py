@@ -43,7 +43,7 @@ def _crc32c() -> Any | None:
     """Return the `crc32c` module if installed, else None (CRCs unverified)."""
     try:
         import crc32c
-    except ImportError:  # pragma: no cover - optional integrity check
+    except ImportError:  # optional integrity check
         return None
     return crc32c
 

@@ -315,7 +315,7 @@ def narrow_to_stage(above: list[LogicalPlan], node: LogicalPlan) -> LogicalPlan:
         source_id = next(iter(scanned_source_ids(node)))
         needed = required_columns_per_source(stage).get(source_id)
         available = node.input.available_columns()
-    except Exception:  # pragma: no cover - an opaque node the analysis cannot walk
+    except Exception:  # an opaque node the analysis cannot walk
         return node
     if not needed:
         return node

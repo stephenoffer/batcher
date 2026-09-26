@@ -180,7 +180,7 @@ class OnnxSession:
 
     def close(self) -> None:
         """Drop the session so its device memory is released with the worker, not with the GC."""
-        self._session = None  # type: ignore[assignment]
+        self._session = None
 
     def _coerce(self, name: str, array: np.ndarray) -> np.ndarray:
         """One input array in the dtype and rank the graph declared for `name`."""

@@ -142,7 +142,7 @@ class DeltaSnapshot:
         masks: dict[str, Any] = {}
         try:
             reader = table.deletion_vectors()
-        except Exception:  # pragma: no cover - an older delta-rs without the API
+        except Exception:  # an older delta-rs without the API
             return masks
         try:
             for batch in reader:

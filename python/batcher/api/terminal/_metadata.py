@@ -416,7 +416,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
         kyber.record_column_stats_batch(hub, measured)
         if fully_known and plan is not None:
             _NOTHING_TO_SEED.put(plan, verdict)
-    except Exception as exc:  # pragma: no cover - learning must never break execution
+    except Exception as exc:  # learning must never break execution
         note_suppressed("api", "learn column NDV", exc)
 
 

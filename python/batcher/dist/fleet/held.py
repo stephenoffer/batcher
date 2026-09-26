@@ -72,6 +72,6 @@ def session_fleet_held_cores() -> dict[str, float]:
                 held[node] = held.get(node, 0.0) + cpu
         del ray
         return held
-    except Exception as exc:  # pragma: no cover - a sizing hint never fails a query
+    except Exception as exc:  # a sizing hint never fails a query
         note_suppressed("dist", "read the session fleet's held cores", exc)
         return {}

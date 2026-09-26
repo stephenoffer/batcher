@@ -63,7 +63,7 @@ def cluster_shape() -> ClusterShape:
     if snapshot is not None:
         cached = snapshot.derived.get("cluster_shape")
         if cached is not None:
-            return cached  # type: ignore[return-value]
+            return cached
 
     # One pass, shared with the placement path: `scaling.fleet_census()` already walked the
     # fleet and classified it, so this groups that census down to the fields a plan is sized

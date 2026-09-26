@@ -64,6 +64,106 @@ on both arms (q67's recorded tie divergence aside).
   defect (`test_sql_catalog_distributed`'s strict xfail now passes); distributed global
   `nth_value` has a decomposition; a resident inference pool is found again on the next run.
 
+## `tests/integration` on a real 3-node cluster: three distributed defects found, and one lossy default withdrawn (2026-09-24)
+
+**The recorded cluster run** (`CLAUDE.md`, `dist/` row) for `release/prod-readiness-v2`.
+Anyscale jobs on 3x `m5.4xlarge` (head + 2 workers, 48 CPUs, Ray 2.58.0), image
+`anyscale/ray:2.58.0-py311`, the engine built from the branch in release profile, every file of
+`tests/integration` run as its own `pytest` process against the attached cluster. Three runs:
+
+| run | commit | passed | failed | errors |
+|---|---|---:|---:|---:|
+| 1 | `8e8a387e` | 3,079 | 224 | 8 |
+| 2 | `0b12c892` | 3,267 | 22 | 15 |
+| 3 | `f03ec9bb` | 3,272 | 17 | 3 |
+
+Found, and fixed with a test that fails on the previous code:
+
+- **Batcher's own `ray.init` failed inside any Ray job that declared `pip` dependencies**
+  ("Failed to merge the Job's runtime env"): the self-shipped env always sets `pip`. 96 of run
+  1's failures. It now leaves the fields the job owns (`2839020e`).
+- **A shuffle row wider than 4 MiB failed the fetch** -- tonic's default decode limit; the
+  Flight encoder splits only between rows. Never seen single-node, where same-host buckets use
+  shared memory (`8a3f6247`).
+- **A peer reset mid-stream was classified fatal**, so worker-loss recovery never ran: the
+  status was `Unknown` "h2 protocol error: error reading a body from connection" over an
+  `io::ErrorKind::ConnectionReset`, and `h2::Error` exposes no `source()` (`f03ec9bb`).
+  `test_carbonite_recovery_e2e` went from 1 failure to 14 of 14.
+
+Reproduced, not fixed: **`shuffle_replication > 1` drops a lost worker's rows** (109,832 against
+146,582 in a replicated sum), the defect `tests/integration/test_shuffle_replication.py` already
+recorded. The `spot` profile, auto-selected on preemptible clusters, set it to 2; it no longer
+does (`0b12c892`), so replication is off unless a user sets it.
+
+What run 3's remaining 17 failures and 3 errors are, so none is read as a pass:
+
+- `test_shuffle_replication` (6): the replication defect above; those tests set it directly.
+- Placement-dependent positive controls (5, in `test_schema_and_csv_distributed`,
+  `test_stats_text_metrics_distributed`, `test_inspection_distributed`, `test_udf_edges_distributed`,
+  `test_map_granularity`): they infer "the work was split" from the unordered-`LIMIT`
+  divergence, which is allowed but not guaranteed, or from a concurrency shape this cluster did
+  not produce. A harness limitation, not a result.
+- Resource shapes this cluster lacks (4): `test_governance_enforcement` (2, unschedulable) and
+  `test_udf_edges_distributed`'s two device-request cases.
+- `test_ml_writers_ray_interop` (3 errors): a hand-rolled `ray.init(num_cpus=2)` the cluster
+  refuses; fixed after run 3 (`50496b4b`).
+- `test_graph_distributed`: OOM-killed on this instance size. `test_spill_bounded_memory`: its
+  spill directory sat on the NFS mount the runs used for `--basetemp`, and it timed out.
+- `test_inspection_distributed::test_scd_maintenance_is_identical_under_both_modes`: distributed
+  SCD type 2 kept only the initial load (3 rows) where single-node applied the update (5). The
+  table lived on that NFS mount, which fits a cross-node listing lag but is **not established**;
+  recorded as open.
+
+## The device tier on cuDF 26.08 / pandas 3: three defects found, and `gpu_shadow_verify` clean (2026-09-23)
+
+**The device tier's recorded hardware run** (`.claude/rules/device-tier.md`) for the three GPU
+changes on `release/prod-readiness-v2`. Anyscale jobs, image `anyscale/ray:2.58.0-py311-cu128`,
+cuDF 26.08.01 (which requires pandas >= 3; the jobs ran pandas 3.0.3), pyarrow 23.0.1, numpy
+2.2.6, the engine built from the branch in release profile and shipped in the job's working
+directory. Two steps: (A) `pytest` over `tests/unit/test_gpu_{plan,vocabulary_contract,
+schema_contract,result_types}.py` and `tests/differential/test_diff_gpu_{operator_matrix,
+join_mirror}.py`, whose backend parameter includes cuDF when a GPU is visible; then (B)
+`benchmarks/gpu_backend/cluster_suite.py` over TPC-H sf10 (the public `ray-benchmark-data`
+parquet, positional column names) with `BATCHER_DISTRIBUTED_GPU_SHADOW_VERIFY=true`,
+`BENCH_RAPIDS_DIR=` and `BENCH_RUNS=2`.
+
+**Result on the final commit (`8e8a387e`, 1x A10G, `g5.2xlarge`):**
+
+    reached a device 11 of 22; matched the CPU engine 11 of 11; schema-contract refusals 0
+    device-tier tests on cuDF: 364 passed, 0 failed (213 skipped: pandas-3 NaN declines)
+
+Earlier the same day, before the fixes below, a 4x A10G run (`g5.12xlarge`) reached a device
+on 9 of 22, matched the CPU on 9 of 9, and had the schema contract refuse q16 and q22.
+
+What the runs found, each fixed on the branch with a test that fails on the previous code:
+
+- **pandas 3 has `DataFrame.from_arrow`, and `DfBackend` took that to mean cuDF.** The host
+  backend then called cuDF's `to_arrow` on a pandas frame: 501 of the device-tier cases
+  failed with `'DataFrame' object has no attribute 'to_arrow'` before any cuDF code ran. The
+  host backend is not test-only: the router's rehearsal and `dist/gpu/aggregate.py`'s fold
+  build `DfBackend(pandas)`. Now decided by module name.
+- **pandas 3 reads a float `NaN` as missing.** On the operator matrix's pandas cases a NaN
+  group came back NULL and a distinct returned 8 rows for 9, against both the engine and
+  DuckDB; every cuDF case passed. The host backend now declines a NaN-bearing input under
+  pandas >= 3 (the CPU engine answers). The rehearsal runs on zero-row frames, so routing is
+  unaffected.
+- **cuDF 26.08 returns strings as `large_string`.** The unconditional schema contract refused
+  q16 (`p_brand`) and q22 (`cntrycode`) -- correct values, wrong offset width -- and both fell
+  back to the CPU. The contract now casts a column that differs from the declared type only
+  in offset width; any other difference is still refused.
+
+**Speed is reported, not claimed.** On one A10G the forced-GPU total was 1.01x the CPU engine
+(95.99 s against 95.02 s over 21 queries; 8 of 21 faster, best 8.62x), and `backend="auto"`
+was **0.82x** -- it routed 8 queries to the device and on balance they lost, which is a routing
+finding, not recorded as fixed. The 4-GPU run measured 1.14x forced and 1.19x `auto`. The
+runs differ in GPU count and commit, so neither number is a comparison with the other.
+
+Environment notes for whoever runs this next: a job must pass an explicit `requirements:`
+list, or Anyscale adds the workspace's editable `batcher` install, which fails on the node;
+the stock Ray image has the same `pyarrow`-then-`sqlite3` `libstdc++` clash as the dev box
+(10 collection errors in the broad `-k gpu` sweep); and two submissions for 4-GPU nodes
+(`g5.12xlarge`, `g6.12xlarge`) never got a cluster, while `g5.2xlarge` started at once.
+
 ## Two distributed shapes that had no path: a broadcast join's write, and an aggregate over a range join (2026-09-22)
 
 **A correctness record, not a timing one.** Both changes are in `dist/`, which

@@ -205,12 +205,14 @@ _SPOT_DISTRIBUTED: dict[str, object] = {
     "speculation_max_backups": 1,
     "fleet_max_attempts": 6,
     "autoscale_wait_s": AUTOSCALE_WAIT_DEFAULT_S,
-    # Keep a second copy of every mapper's shuffle output on another node, so a
-    # preemption — the expected event here, not an exceptional one — is served from the
-    # replica instead of paying a full map recompute (re-reading the source from object
-    # storage). One extra copy of the (pre-aggregated, small) partial state buys the
-    # single largest reduction in recovery cost on a churning cluster.
-    "shuffle_replication": 2,
+    # Deliberately NOT raising `shuffle_replication`, though a preemption is the expected
+    # event here and a replica would spare a map recompute. Replication above 1 currently
+    # drops one worker's share of the rows when a worker is lost (a silently wrong answer,
+    # not an error), while replication off recovers exactly -- recorded, unfixed, in
+    # `tests/integration/test_shuffle_replication.py` and reproduced on a 3-node cluster.
+    # This profile is auto-selected on preemptible environments, so enabling it here put
+    # the wrong answer in front of users who never asked for replication. Restore
+    # `"shuffle_replication": 2` once that test passes.
 }
 
 # Env vars naming a durable, cross-node location for learned stats, in priority order. The

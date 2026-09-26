@@ -210,7 +210,7 @@ def hot_keys_from_column_stats(
         from batcher.core import default_hub
 
         return kyber.hot_join_value_shares(join, sources, default_hub(), fraction, partitions)
-    except Exception as exc:  # pragma: no cover - statistics must never break a join
+    except Exception as exc:  # statistics must never break a join
         note_suppressed("dist", "read hot keys from column stats", exc)
         return [], 0.0
 
@@ -318,7 +318,7 @@ def _detect_is_worth_it(join: Join, sources) -> bool:
 
         est = CardinalityEstimator(sources, {}, active_config().optimizer.cardinality)
         rows = est.estimate(join.left).rows + est.estimate(join.right).rows
-    except Exception as exc:  # pragma: no cover - estimation must never break a join
+    except Exception as exc:  # estimation must never break a join
         note_suppressed("dist", "size the skew detection pre-pass", exc)
         return False
     return rows >= _DETECT_MIN_INPUT_ROWS

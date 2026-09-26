@@ -194,7 +194,7 @@ def release_cluster() -> None:
         from batcher.dist.fleet import release_session_fleet
 
         release_session_fleet()
-    except Exception as exc:  # pragma: no cover - releasing must never raise at the caller
+    except Exception as exc:  # releasing must never raise at the caller
         note_suppressed("api", "release the warm shuffle fleet", exc)
     try:
         from batcher.dist.executors.map import release_inference_pools

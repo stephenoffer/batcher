@@ -47,6 +47,14 @@ def test_spot_profile_hardens_the_budgets():
     assert d.fleet_max_attempts > DistributedConfig().fleet_max_attempts  # more fleet retries
 
 
+def test_spot_profile_does_not_enable_shuffle_replication():
+    """Replication > 1 loses a worker's rows on worker loss (tests/integration/
+    test_shuffle_replication.py), and this profile is auto-selected on preemptible clusters,
+    so it must keep the default -- recompute, which is slower but exact."""
+    cfg = apply_resilience_profile(_with_resilience(resilience="spot"))
+    assert cfg.distributed.shuffle_replication == DistributedConfig().shuffle_replication == 1
+
+
 def test_spot_profile_enables_autoscale_wait():
     # A spot cluster is an autoscaling one: the profile turns on a bounded wait so a
     # stage that over-asks briefly waits for replacement nodes instead of clamping to

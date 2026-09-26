@@ -457,12 +457,18 @@ def _date_diff(tr, node) -> Expr:
 
     scale = _DIFF_YEAR_SCALE.get(unit)
     if scale is not None:
-        period = lambda v: Binary("floor_div", v.dt.year(), lit(scale))  # noqa: E731
+
+        def period(v: Expr) -> Expr:
+            return Binary("floor_div", v.dt.year(), lit(scale))
+
         return Cast(period(end) - period(start), "int64")
 
     if unit in _DIFF_CALENDAR:
         per, field = _DIFF_CALENDAR[unit]
-        ordinal = lambda v: v.dt.year() * lit(per) + getattr(v.dt, field)()  # noqa: E731
+
+        def ordinal(v: Expr) -> Expr:
+            return v.dt.year() * lit(per) + getattr(v.dt, field)()
+
         return Cast(ordinal(end) - ordinal(start), "int64")
 
     known = {

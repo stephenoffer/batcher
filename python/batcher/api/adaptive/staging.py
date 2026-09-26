@@ -441,7 +441,7 @@ def _release(what: str, release, *args) -> None:
     """
     try:
         release(*args)
-    except Exception as exc:  # pragma: no cover - a teardown must not mask the real error
+    except Exception as exc:  # a teardown must not mask the real error
         note_suppressed("api", what, exc)
 
 
@@ -575,7 +575,7 @@ def _worth_staging(srcs: list[Source], hub):
     # plan on every iteration of the stage loop.
     try:
         estimator = build_estimator(srcs, hub)
-    except Exception as exc:  # pragma: no cover - an estimate must never break staging
+    except Exception as exc:  # an estimate must never break staging
         note_suppressed("api", "build the estimator for staging", exc)
         estimator = None
 

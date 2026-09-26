@@ -169,7 +169,7 @@ def _replicate_the_smaller_side(left, right, join_ir: dict) -> bool:
         return False
     try:
         return _relation_bytes(right) > _relation_bytes(left) > 0.0
-    except Exception as exc:  # pragma: no cover - sizing must never break the join
+    except Exception as exc:  # sizing must never break the join
         note_suppressed("dist", "size both join sides to pick the replicated one", exc)
         return False
 

@@ -78,8 +78,11 @@ def rewrite_python(
     Returns:
         The rewritten source and one report covering code and doctests.
     """
-    code, report = canonicalize(  # type: ignore[arg-type]
-        source, *tables, assume_accessors=assume_accessors, imported=imported
+    code, report = canonicalize(
+        source,
+        *tables,  # type: ignore[arg-type]
+        assume_accessors=assume_accessors,
+        imported=imported,
     )
     try:
         tree = ast.parse(code)

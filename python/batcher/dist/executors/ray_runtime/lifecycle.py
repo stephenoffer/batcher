@@ -28,6 +28,7 @@ from batcher._internal.errors import BackendError
 from batcher._internal.logging import note_suppressed
 from batcher._internal.paths import package_dir
 from batcher.config import active_config
+from batcher.dist.executors.ray_runtime.scheduling import job_owned_runtime_env_fields
 from batcher.io.source import Source, read_source
 from batcher.plan.logical import LogicalPlan
 
@@ -370,13 +371,11 @@ def _self_ship_runtime_env() -> dict | None:
     `distributed.trust_cluster_image` is set — a production image that bakes a matching
     batcher into every node and wants to skip the upload.
     """
-    if active_config().distributed.trust_cluster_image:
-        return {"pip": None, "excludes": list(_BUILD_ARTIFACT_EXCLUDES)}
-    return {
-        "py_modules": [package_dir()],
-        "pip": None,
-        "excludes": list(_BUILD_ARTIFACT_EXCLUDES),
-    }
+    env: dict = {"pip": None, "excludes": list(_BUILD_ARTIFACT_EXCLUDES)}
+    if not active_config().distributed.trust_cluster_image:
+        env = {"py_modules": [package_dir()], **env}
+    owned = job_owned_runtime_env_fields()
+    return {field: value for field, value in env.items() if field not in owned}
 
 
 @contextlib.contextmanager
@@ -560,7 +559,7 @@ def _report_attachment(ray) -> None:
             # and it is also the fact that decides whether workers get the driver's package.
             started_by="batcher" if job_ships_batcher() else "another process",
         )
-    except Exception as exc:  # pragma: no cover - a report must never fail a query
+    except Exception as exc:  # a report must never fail a query
         note_suppressed("dist", "report the Ray attachment", exc)
 
 

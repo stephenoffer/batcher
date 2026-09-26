@@ -92,7 +92,7 @@ def pipeline_signature(plan: object) -> str:
         from batcher.kyber.signature import plan_signature
 
         return plan_signature(plan)
-    except Exception as exc:  # pragma: no cover - an unsignable plan must not fail the query
+    except Exception as exc:  # an unsignable plan must not fail the query
         note_suppressed("api", "sign the plan for the event log", exc)
         return ""
 

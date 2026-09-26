@@ -291,10 +291,8 @@ class MetadataHub:
             `{kind: rows}` for that machine class, empty when it has measured nothing.
 
         Best-effort; a malformed row is skipped, not raised."""
-        if self._by_fp is None:
-            self._load_views()
-        assert self._by_fp is not None
-        return self._by_fp.get(hw_fingerprint or local_or_planned_fingerprint(), {})
+        by_fp = self._by_fp if self._by_fp is not None else self._load_views()[0]
+        return by_fp.get(hw_fingerprint or local_or_planned_fingerprint(), {})
 
     def op_stats_with_signature(self) -> list[dict[str, Any]]:
         """Signature-carrying operator feedback, **oldest first**.
@@ -318,12 +316,11 @@ class MetadataHub:
 
         Best-effort; a malformed row is skipped, not raised.
         """
-        if self._signed is None:
-            self._load_views()
-        assert self._signed is not None
-        return self._signed
+        return self._signed if self._signed is not None else self._load_views()[1]
 
-    def _load_views(self) -> None:
+    def _load_views(
+        self,
+    ) -> tuple[dict[str, dict[str, list[dict[str, Any]]]], list[dict[str, Any]]]:
         """Materialize both derived views from a **single** scan of the backend.
 
         The first read of either view builds both. They are read together on every optimize —
@@ -342,7 +339,8 @@ class MetadataHub:
         """
         with self._lock:
             if self._by_fp is not None and self._signed is not None:
-                return  # another thread finished the load while this one waited
+                # another thread finished the load while this one waited
+                return self._by_fp, self._signed
             scanned = list(self._backend.scan(_OP_STATS, ()))
             by_fp, signed = build_views(scanned)
             if self._by_fp is None:
@@ -359,6 +357,7 @@ class MetadataHub:
             # hand costs no extra scan.
             if len(scanned) > _OP_STATS_MAX:
                 self._prune_op_stats([key for key, _value in scanned])
+            return self._by_fp, self._signed
 
     # --- learned parameters ------------------------------------------------
     # Delegated to `LearnedParams`, which owns the two storage shapes and the parsed-read

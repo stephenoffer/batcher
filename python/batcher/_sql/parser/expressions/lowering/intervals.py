@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import re
 
+from batcher._internal.errors import PlanError
+
 __all__ = ["interval_parts"]
 
 #: Months per calendar unit. These shift by *calendar* months, so they can never be
@@ -115,7 +117,7 @@ def interval_parts(text: str, default_unit: str = "") -> tuple[int, int, int]:
         `DateOffset` takes.
 
     Raises:
-        ValueError: If `text` is not an interval, or names a unit that is not one. The
+        PlanError: If `text` is not an interval, or names a unit that is not one. The
             caller turns this into the front end's typed error with the SQL in hand.
     """
     stripped = text.strip()
@@ -138,11 +140,11 @@ def interval_parts(text: str, default_unit: str = "") -> tuple[int, int, int]:
         days += d
         micros += u
     if not matched:
-        raise ValueError(f"{text!r} is not an interval")
+        raise PlanError(f"{text!r} is not an interval")
     # A term is only rejected above; a leftover word (`INTERVAL 'day'`) matches no term at
     # all and must not read as a zero shift.
     if not _TERM.sub("", stripped).strip(" \t,").replace("and", "") == "":
-        raise ValueError(f"{text!r} is not an interval")
+        raise PlanError(f"{text!r} is not an interval")
     return (months, days, micros)
 
 
@@ -165,4 +167,4 @@ def _term_parts(count: float, unit: str, text: str) -> tuple[int, int, int]:
         return (0, whole, round((total - whole) * _MICROS_PER_DAY))
     if unit in _MICROS:
         return (0, 0, round(count * _MICROS[unit]))
-    raise ValueError(f"INTERVAL unit {unit or '(none)'!r} in {text!r} is not supported")
+    raise PlanError(f"INTERVAL unit {unit or '(none)'!r} in {text!r} is not supported")

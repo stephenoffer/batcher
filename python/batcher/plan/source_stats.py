@@ -60,7 +60,7 @@ def declared(source: object, fact: str) -> Any | None:
         return None
     try:
         return method()
-    except Exception:  # pragma: no cover - a source that cannot answer for itself
+    except Exception:  # a source that cannot answer for itself
         return None
 
 

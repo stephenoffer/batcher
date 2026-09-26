@@ -148,7 +148,7 @@ def load_udf_row_seconds_table(hub: MetadataHub | None) -> dict[str, float]:
         return {}
     try:
         params = hub.load_keyed_params(scoped(_NAMESPACE))
-    except Exception as exc:  # pragma: no cover - learning is best-effort
+    except Exception as exc:  # learning is best-effort
         # Learning must never break a query, and this is the read half of the loop that makes
         # plans improve across runs — so a failure here is exactly the one that can persist
         # for months with every gate green. Best-effort, not silent.

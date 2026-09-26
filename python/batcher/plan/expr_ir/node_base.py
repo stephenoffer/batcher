@@ -298,10 +298,10 @@ class IRNode(Expr):
     vocab: ClassVar[frozenset[str] | None] = None
 
     def __post_init__(self) -> None:
-        if self.vocab is not None and self.fn not in self.vocab:  # type: ignore[attr-defined]
+        if self.vocab is not None and self.fn not in self.vocab:
             raise PlanError(
                 f"unknown {type(self).__name__} function "
-                f"{self.fn!r}; "  # type: ignore[attr-defined]
+                f"{self.fn!r}; "
                 "add it to the family vocabulary in plan/expr_ir/fn_names.py"
             )
 

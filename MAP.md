@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1512 Python modules across 217 packages and 297 Rust files across 14 crates.
+Covering 1513 Python modules across 217 packages and 297 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -433,7 +433,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `event_log.py` | 712 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
 | `map_stream.py` | 190 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
-| `otel.py` | 217 | Emit a query's execution profile as OpenTelemetry spans. |
+| `otel.py` | 215 | Emit a query's execution profile as OpenTelemetry spans. |
 | `preview.py` | 186 | Render a small result as a readable table for `Dataset.show`. |
 | `profile.py` | 649 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
 | `routing.py` | 329 | The `distributed="auto"` routing decision for terminal operations. |
@@ -449,7 +449,7 @@ The opt-in GPU execution backend for supported relational shapes.
 | `fanout.py` | 198 | Grow the cluster to the devices a plan wants, check one is free, and fan the work out. |
 | `route.py` | 302 | Decide whether a plan runs on the GPU, run it, and record what that cost. |
 | `translate.py` | 456 | Match a plan to a translated GPU execution, from the most specific shape to the general one. |
-| `verify.py` | 264 | Check the device result against the CPU engine — the device tier's two oracles. |
+| `verify.py` | 302 | Check the device result against the CPU engine — the device tier's two oracles. |
 
 ### `batcher/api/terminal/metadata_answer/` — 5 · conductor
 
@@ -560,7 +560,7 @@ Decode media columns into tensors — natively wherever the engine has the codec
 |---|---|---|
 | `accelerated.py` | 255 | Decoding on the device, so the bus carries compressed bytes instead of pixels. |
 | `media.py` | 161 | Image and audio decode — the two media kinds the data plane handles natively. |
-| `stage.py` | 141 | Shared scaffolding every decode stage is built on. |
+| `stage.py` | 140 | Shared scaffolding every decode stage is built on. |
 | `transfer.py` | 189 | Moving bytes in and out of a dataset — the ends of a multimodal pipeline. |
 | `video.py` | 283 | Video decode — sampling a fixed number of resized frames per clip. |
 
@@ -878,7 +878,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | `scalar.py` | 548 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 258 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 220 | SQL string functions whose translation is more than a name lookup. |
-| `temporal.py` | 478 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
+| `temporal.py` | 484 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
 
 ### `batcher/_sql/parser/expressions/lowering/` — 6 · front-end
 
@@ -886,12 +886,12 @@ The scalar lowerings big enough to own a module, kept out of the `scalar` dispat
 
 | module | lines | what it is |
 |---|---|---|
-| `accessors.py` | 224 | SQL → the typed accessor namespaces, by name. |
+| `accessors.py` | 225 | SQL → the typed accessor namespaces, by name. |
 | `buckets.py` | 121 | `time_bucket` — snapping a timestamp to the start of the period that contains it. |
 | `derived.py` | 44 | The dispatches *derived* from the public expression surface, in the order they run. |
 | `dynamic.py` | 139 | String functions whose parameters are columns rather than constants. |
 | `families.py` | 319 | SQL → the public function library, by name. |
-| `intervals.py` | 168 | SQL ``INTERVAL`` literals → the ``(months, days, microseconds)`` triple. |
+| `intervals.py` | 170 | SQL ``INTERVAL`` literals → the ``(months, days, microseconds)`` triple. |
 | `matching.py` | 78 | ``LIKE`` / ``ILIKE`` lowering, including the shapes that skip the pattern matcher. |
 | `membership.py` | 127 | ``IN``, ``BETWEEN`` and ``IS DISTINCT FROM`` — SQL's set and null-safe comparisons. |
 | `nulls.py` | 164 | Typing a bare SQL ``NULL`` from the position it is written in. |
@@ -997,16 +997,16 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 161 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 200 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 595 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `fleet_health.py` | 330 | Live device health across the fleet — every accelerator node, never cached. |
+| `fleet_health.py` | 340 | Live device health across the fleet — every accelerator node, never cached. |
 | `hardware_probe.py` | 568 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
-| `lifecycle.py` | 726 | Ray lifecycle + single-node fallback for the distributed executor. |
+| `lifecycle.py` | 725 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
 | `readiness.py` | 330 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 292 | How finely a shuffle divides its work — on both sides of the exchange. |
-| `scaling.py` | 795 | What the live cluster is, and what of it a query may use. |
-| `scheduling.py` | 769 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scaling.py` | 796 | What the live cluster is, and what of it a query may use. |
+| `scheduling.py` | 794 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 133 | Why this query got the fan-out it got. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
@@ -1690,7 +1690,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | module | lines | what it is |
 |---|---|---|
 | `aggs.py` | 497 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
-| `backend.py` | 535 | The dataframe-library adapter the GPU translator runs against. |
+| `backend.py` | 567 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 142 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 435 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
 | `exprs.py` | 439 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
@@ -1729,7 +1729,7 @@ Streaming (incremental) aggregation and the bounded-memory operator drivers.
 
 | module | lines | what it is |
 |---|---|---|
-| `running.py` | 142 | `_AggFold` — the running (unwatermarked) streaming aggregate. |
+| `running.py` | 141 | `_AggFold` — the running (unwatermarked) streaming aggregate. |
 | `shared.py` | 175 | Pieces both streaming folds need: the empty-aggregate identity and the state guard. |
 | `windowed.py` | 700 | `_WindowedAggFold` — the watermark-bounded windowed aggregate, its spill tier and its |
 
@@ -1796,7 +1796,7 @@ Credential verification: turning a presented credential into a verified `Princip
 |---|---|---|
 | `_backend.py` | 606 | The `pyarrow.fs`-backed filesystem façade every IO source and sink talks to. |
 | `_concurrent.py` | 122 | Concurrent per-file reads — the shared fan-out for footer/header stats and file bytes. |
-| `_file_cache.py` | 354 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
+| `_file_cache.py` | 352 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 131 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 467 | Format and layout detection for the generic `read(path, format=None)` entry point. |
@@ -1842,9 +1842,9 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `_blocks.py` | 222 | Line blocks as Arrow arrays — the one line splitter every genomics reader shares. |
 | `_tsv.py` | 234 | The comment-skipping TSV engine BED, GFF, and VCF share. |
 | `bed.py` | 221 | BED format — genomic intervals, the coordinate currency of every annotation track. |
-| `fasta.py` | 227 | FASTA format — the reference-sequence interchange format, as `{id, description, sequence}`. |
-| `fastq.py` | 215 | FASTQ format — sequencing reads as `{id, description, sequence, quality}`. |
-| `gff.py` | 127 | GFF3 and GTF format — genome annotations, nine tab-separated columns. |
+| `fasta.py` | 229 | FASTA format — the reference-sequence interchange format, as `{id, description, sequence}`. |
+| `fastq.py` | 217 | FASTQ format — sequencing reads as `{id, description, sequence, quality}`. |
+| `gff.py` | 129 | GFF3 and GTF format — genome annotations, nine tab-separated columns. |
 | `vcf.py` | 202 | VCF format — variant calls, the output every variant caller agrees to write. |
 
 ### `batcher/io/formats/lakehouse/` — 2 · neutral IO
@@ -1982,7 +1982,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `bigquery.py` | 398 | BigQuery source — multi-stream Arrow reads via the Storage Read API. |
 | `clickhouse.py` | 240 | ClickHouse source and sink — Arrow reads and inserts via clickhouse-connect. |
 | `connectorx.py` | 216 | ConnectorX source — the parallel relational reader for the long tail. |
-| `databricks.py` | 320 | Databricks source — direct lakehouse read, warehouse fallback. |
+| `databricks.py` | 325 | Databricks source — direct lakehouse read, warehouse fallback. |
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
 | `routing.py` | 137 | Which SQL backend serves this call — the one router the read and the write share. |
@@ -2020,12 +2020,12 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 |---|---|---|
 | `autoloader.py` | 440 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 372 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
-| `eventhubs.py` | 364 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
+| `eventhubs.py` | 367 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
 | `kafka.py` | 715 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kafka_sink.py` | 318 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
 | `kinesis.py` | 496 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 244 | Google Cloud Pub/Sub broker source — subscription pull batches. |
-| `pulsar.py` | 419 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
+| `pulsar.py` | 422 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
 | `seen_store.py` | 205 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
 | `sinks.py` | 644 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
 
@@ -2059,7 +2059,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | module | lines | what it is |
 |---|---|---|
 | `avro.py` | 372 | Avro payload codec — bare Avro records, or Confluent Schema Registry framing. |
-| `base.py` | 305 | The payload-codec contract: a binary message column in, a typed Arrow column out. |
+| `base.py` | 296 | The payload-codec contract: a binary message column in, a typed Arrow column out. |
 | `json.py` | 390 | JSON payload codec — the most common Kafka wire format, decoded to a real struct column. |
 | `protobuf.py` | 198 | Protobuf payload codec — a generated message class, or a registry-framed descriptor. |
 | `text.py` | 157 | The two payload codecs with no schema: raw bytes, and UTF-8 text. |
@@ -2079,7 +2079,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `csv.py` | 617 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
 | `excel.py` | 103 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
 | `lance.py` | 331 | Lance format — columnar, random-access read + write via `pylance` (lance). |
-| `orc.py` | 413 | ORC format — lazy, projection-pushdown read + write via `pyarrow.orc`. |
+| `orc.py` | 416 | ORC format — lazy, projection-pushdown read + write via `pyarrow.orc`. |
 
 ### `batcher/io/formats/structured/_csv_options/` — 2 · neutral IO
 
@@ -2111,7 +2111,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 
 | module | lines | what it is |
 |---|---|---|
-| `_extract.py` | 300 | Reading prose out of the document formats a corpus actually contains. |
+| `_extract.py` | 303 | Reading prose out of the document formats a corpus actually contains. |
 | `binary.py` | 216 | Binary-blob source — whole files as ``{uri, bytes, size, mime}`` rows. |
 | `documents.py` | 241 | Document format — text extraction from PDF, HTML, Word, decks, EPUB and Markdown. |
 | `text.py` | 590 | Plain-text source and sink — one row per line or per whole file, one line per value. |
@@ -2174,7 +2174,7 @@ Splits — independently-readable, picklable slices of a source.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 244 | The `Split` protocol and the whole-source fallback. |
-| `clustering.py` | 131 | What a split set guarantees about *where equal values live* — the clustering protocol. |
+| `clustering.py` | 132 | What a split set guarantees about *where equal values live* — the clustering protocol. |
 | `codecs.py` | 109 | Whether a file's compression is one the device can undo, or one that lands back on the CPU. |
 | `conformed.py` | 240 | The strict-mode contract, carried to the worker on the split itself. |
 | `device.py` | 214 | Which splits a GPU can read for itself, and the locators it needs to do it. |
@@ -2372,7 +2372,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 512 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6873 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 6874 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2389,6 +2389,7 @@ Migration-error guidance for `Expr` and its typed accessors.
 | module | lines | what it is |
 |---|---|---|
 | `guidance.py` | 510 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
+| `namespaces.py` | 313 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
 
@@ -2422,7 +2423,7 @@ Shared traversal for scalar `Expr` trees and for the expressions inside a node.
 
 | module | lines | what it is |
 |---|---|---|
-| `algebra.py` | 192 | Boolean-connective algebra, column substitution, and window hoisting. |
+| `algebra.py` | 193 | Boolean-connective algebra, column substitution, and window hoisting. |
 | `naming.py` | 96 | The output name a positional expression gets when nothing names it. |
 | `nodes.py` | 129 | Apply an expression rewrite to every expression a *plan node* carries. |
 | `over.py` | 211 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
@@ -2436,9 +2437,9 @@ The expression function library, grouped by family.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 541 | Aggregate free functions that compose existing mergeable aggregates. |
-| `aggregate_semantics.py` | 146 | The aggregate parameters that restore another engine's semantics by composition. |
+| `aggregate_semantics.py` | 144 | The aggregate parameters that restore another engine's semantics by composition. |
 | `collection.py` | 170 | Collection-construction free functions (`struct`, `named_struct`, `map_from_arrays`, `sequence`). |
-| `horizontal.py` | 261 | Row-wise ("horizontal") reductions across several columns. |
+| `horizontal.py` | 262 | Row-wise ("horizontal") reductions across several columns. |
 | `partitioning.py` | 204 | Lakehouse partition transforms — the derived value a partitioned table stores. |
 | `quantiles.py` | 196 | Quantile, cardinality, and histogram aggregate shorthands. |
 | `regression.py` | 263 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
@@ -2657,7 +2658,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | module | lines | what it is |
 |---|---|---|
 | `hardware_scope.py` | 154 | Scoping learned parameters to the machine that measured them. |
-| `hub.py` | 444 | `MetadataHub` — the façade over a `MetadataBackend`. |
+| `hub.py` | 443 | `MetadataHub` — the façade over a `MetadataBackend`. |
 | `io_stats.py` | 249 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `params.py` | 352 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
 | `smoothed.py` | 432 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
@@ -2687,13 +2688,13 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 3239 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3237 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `env.py` | 272 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
-| `profiles.py` | 297 | Named fault-tolerance profiles for the distributed engine. |
+| `profiles.py` | 299 | Named fault-tolerance profiles for the distributed engine. |
 | `serde.py` | 175 | Converting a `Config` to and from dicts, files, and environment-variable names. |
 
 ### `batcher/config/validation/` — 0 · utility
@@ -2751,7 +2752,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 | module | lines | what it is |
 |---|---|---|
 | `hierarchy.py` | 720 | The Batcher exception hierarchy. |
-| `suggest.py` | 402 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
+| `suggest.py` | 401 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 125 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
 ### `batcher/_internal/hardware/` — 0 · utility
@@ -2945,13 +2946,13 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 | module | lines | what it is |
 |---|---|---|
 | `__main__.py` | 174 | `python -m batcher.migrate`: rewrite scripts onto Batcher's API, or off it. |
-| `canonical.py` | 525 | Rewrite Batcher's own removed second spellings to the one spelling that stays. |
+| `canonical.py` | 531 | Rewrite Batcher's own removed second spellings to the one spelling that stays. |
 | `engines.py` | 251 | What the foreign-engine codemod directions know about each engine besides the registry. |
 | `finish.py` | 369 | What both foreign-engine directions share: the site record, markers, and finishing a module. |
 | `outbound.py` | 271 | Rewrite a Batcher script onto PySpark, Polars, Daft or Ray Data: the conservative inverse. |
 | `project.py` | 119 | What the helper functions a script imports from its own project return. |
 | `receivers.py` | 585 | Which expressions in a script are engine objects, and which receiver each one is. |
-| `snippets.py` | 148 | Apply the canonical-name rewrite to code that lives inside text: doctests and Markdown blocks. |
+| `snippets.py` | 151 | Apply the canonical-name rewrite to code that lives inside text: doctests and Markdown blocks. |
 | `templates.py` | 425 | Apply one registry template, or check one call against a signature, on libcst nodes. |
 | `translate.py` | 429 | Rewrite a PySpark, Polars, Daft or Ray Data script onto Batcher, driven by the registry. |
 
@@ -3292,9 +3293,9 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | file | lines | what it is |
 |---|---|---|
 | `client_pool.rs` | 344 | The consumer-side connection pool: how a reducer dials a peer and how many streams it runs against it. |
-| `exchange.rs` | 563 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
+| `exchange.rs` | 595 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
 | `handler.rs` | 428 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
-| `lib.rs` | 107 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
+| `lib.rs` | 120 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 409 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 412 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
 | `store.rs` | 407 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |

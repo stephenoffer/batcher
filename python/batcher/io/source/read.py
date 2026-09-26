@@ -269,7 +269,7 @@ def read_source(
         extras["limit"] = limit
     if ordering and getattr(source, "supports_ordering", False):
         extras["ordering"] = ordering
-    batches = source.read(projection, **extras)  # type: ignore[call-arg]
+    batches = source.read(projection, **extras)
     if batches:
         return batches
     schema = source.schema()

@@ -105,7 +105,7 @@ def _crossover_step(
             )
             for name in (below, above)
         }
-    except Exception as exc:  # pragma: no cover - a decision test must never break a query
+    except Exception as exc:  # a decision test must never break a query
         # Best-effort, but not invisible. A store that has started refusing reads makes
         # every plan silently fall back to its shipped default, and the two look identical
         # from outside: plans that used to improve across runs quietly stop, with nothing
@@ -193,7 +193,7 @@ def record_broadcast_timing(
             below="broadcast",
             above="shuffle",
         )
-    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+    except Exception as exc:  # a learned write must never break a query
         # Noted, not swallowed. This recorder had *no caller at all* until recently, so
         # `learned_broadcast_max_bytes` returned `None` forever and the threshold never moved
         # off its static default — with nothing in the log to say so. A silent failure here
@@ -230,7 +230,7 @@ def record_sort_merge_timing(
             below="hash",
             above="sort_merge",
         )
-    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+    except Exception as exc:  # a learned write must never break a query
         note_suppressed("kyber", "record a hash-vs-sort-merge timing", exc)
 
 

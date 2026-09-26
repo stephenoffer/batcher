@@ -22,7 +22,7 @@ from batcher.plan.types.lattice import promote, widen
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from batcher.plan.expr_ir import Expr
+    from batcher.plan.expr_ir import Binary, Expr, Math2Expr, MathExpr
     from batcher.plan.schema import SchemaRef
 
     #: Resolve a sub-expression's type: the dispatcher's `infer_type`, threaded in.
@@ -114,23 +114,23 @@ def _adopt_null(left: pa.DataType, right: pa.DataType) -> tuple[pa.DataType, pa.
     return left, right
 
 
-def mathfunc_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
+def mathfunc_type(expr: MathExpr, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
     """The result type of a unary `MathExpr`.
 
     Derived from the engine rather than assumed: most unary math promotes to Float64, but
     three arms of `bc_expr::eval::math::eval_math` do not, and treating them as double made
     `Dataset.schema` advertise a type the engine never produces.
     """
-    fn = expr.fn  # type: ignore[attr-defined]
+    fn = expr.fn
     if fn in _MATH_INT_RESULT:
         return pa.int64()
     if fn in _MATH_TYPE_PRESERVING:
-        operand = infer(expr.input, schema)  # type: ignore[attr-defined]
+        operand = infer(expr.input, schema)
         return None if operand is None else _widened_numeric(_alone_as_double(operand))
     return pa.float64()
 
 
-def math2func_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
+def math2func_type(expr: Math2Expr, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
     """The result type of a binary `Math2Expr`.
 
     `pow`/`atan2`/`hypot`/`next_after` are Float64. `gcd`/`lcm` are Int64. `round` follows
@@ -138,11 +138,11 @@ def math2func_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataTy
     it Int64 -- DuckDB returns BIGINT for `round(bigint, n)`, and the f64 round-trip
     corrupted values above 2^53.
     """
-    fn = expr.fn  # type: ignore[attr-defined]
+    fn = expr.fn
     if fn in _MATH2_INT_RESULT:
         return pa.int64()
     if fn in ("round", "round_even"):
-        left = infer(expr.left, schema)  # type: ignore[attr-defined]
+        left = infer(expr.left, schema)
         return None if left is None else _widened_numeric(_alone_as_double(left))
     return pa.float64()
 
@@ -318,18 +318,18 @@ def _arith_type(op: str, left: pa.DataType, right: pa.DataType) -> pa.DataType |
     return widen(common) if common is not None else None
 
 
-def binary_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
+def binary_type(expr: Binary, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
     """The result type of a `Binary` node, or ``None`` if not certain.
 
     The name-only arms answer first so a comparison never descends into its operands.
     """
-    op = expr.op  # type: ignore[attr-defined]
+    op = expr.op
     if op in _BINARY_BOOL:
         return pa.bool_()
     if op == "bit_xor":
         # Two booleans xor to a boolean (`bc_expr::eval::binary`); anything else is Int64.
-        left = infer(expr.left, schema)  # type: ignore[attr-defined]
-        right = infer(expr.right, schema)  # type: ignore[attr-defined]
+        left = infer(expr.left, schema)
+        right = infer(expr.right, schema)
         if left is None or right is None:
             return None
         both_bool = pa.types.is_boolean(left) and pa.types.is_boolean(right)
@@ -343,8 +343,8 @@ def binary_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataType 
     if op not in _BINARY_ARITH and op not in ("div", "floor_div"):
         return None
 
-    left = infer(expr.left, schema)  # type: ignore[attr-defined]
-    right = infer(expr.right, schema)  # type: ignore[attr-defined]
+    left = infer(expr.left, schema)
+    right = infer(expr.right, schema)
     if left is None or right is None:
         return None
     if op in _BINARY_ARITH:

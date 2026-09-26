@@ -203,7 +203,7 @@ def _family_oversubscribed(hub: MetadataHub | None, family: str) -> bool:
         return False
     try:
         return oversubscribed(hub.op_stats_by_kind().get(family, []))
-    except Exception as exc:  # pragma: no cover - a learned read must never break a query
+    except Exception as exc:  # a learned read must never break a query
         note_suppressed("dist", "read family contention", exc)
         return False
 
@@ -407,7 +407,7 @@ def _sizing_rows(node, sources) -> float | None:
     if rows is None or rows <= 0:
         try:
             rows = _estimated_rows(node, sources)
-        except Exception as exc:  # pragma: no cover - the estimator guards itself too
+        except Exception as exc:  # the estimator guards itself too
             note_suppressed("dist", "estimate reducer count", exc)
             rows = None
     return rows if rows is not None and rows > 0 else None

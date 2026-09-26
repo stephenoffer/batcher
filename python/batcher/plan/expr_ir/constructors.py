@@ -105,7 +105,7 @@ def array(*elements: IntoExpr) -> Array:
     if len(elements) == 1 and isinstance(elements[0], (list, tuple)):
         elements = tuple(elements[0])
     if not elements:
-        raise ValueError("array() requires at least one element")
+        raise PlanError("array() requires at least one element")
     return Array([_wrap(e) for e in elements])
 
 
@@ -134,7 +134,7 @@ def coalesce(*exprs: IntoExpr) -> Coalesce:
             {'c': [1, 20, 3]}
     """
     if not exprs:
-        raise ValueError("coalesce() requires at least one argument")
+        raise PlanError("coalesce() requires at least one argument")
     return Coalesce([_col_or_expr(e) for e in exprs])
 
 
@@ -259,7 +259,7 @@ def greatest(*exprs: IntoExpr) -> Greatest:
             {'hi': [4, 9]}
     """
     if not exprs:
-        raise ValueError("greatest() requires at least one argument")
+        raise PlanError("greatest() requires at least one argument")
     return Greatest([_col_or_expr(e) for e in exprs])
 
 
@@ -287,7 +287,7 @@ def least(*exprs: IntoExpr) -> Least:
             {'lo': [1, 2]}
     """
     if not exprs:
-        raise ValueError("least() requires at least one argument")
+        raise PlanError("least() requires at least one argument")
     return Least([_col_or_expr(e) for e in exprs])
 
 

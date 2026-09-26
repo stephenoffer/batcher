@@ -210,35 +210,40 @@ class DatabricksSource:
     def _is_warehouse(self) -> bool:
         return bool(self.query and self.server_hostname and self.http_path and self.access_token)
 
+    def _lakehouse(self) -> tuple[str, str, str]:
+        """`(table, workspace, token)`, for a code path only a lakehouse read reaches."""
+        if not (self.table and self.workspace and self.token):
+            raise BackendError("a Databricks lakehouse read needs table=, workspace= and token=")
+        return self.table, self.workspace, self.token
+
+    def _warehouse(self) -> tuple[str, str, str, str]:
+        """`(server_hostname, http_path, access_token, query)`, for a warehouse-only path."""
+        if not (self.query and self.server_hostname and self.http_path and self.access_token):
+            raise BackendError(
+                "a Databricks warehouse read needs query=, server_hostname=, http_path= "
+                "and access_token="
+            )
+        return self.server_hostname, self.http_path, self.access_token, self.query
+
     def _delta_source(self) -> DeltaSource:
         """Vend Unity credentials and build a direct Delta reader for the table."""
-        storage_url, storage_options = vend_unity_credentials(
-            self.table,  # type: ignore[arg-type] - guarded by _is_lakehouse
-            self.workspace,  # type: ignore[arg-type]
-            self.token,  # type: ignore[arg-type]
-        )
+        storage_url, storage_options = vend_unity_credentials(*self._lakehouse())
         return DeltaSource(storage_url, storage_options=storage_options)
 
     def _warehouse_split(
         self, predicate: dict | None = None, projection: list[str] | None = None
     ) -> _DatabricksWarehouseSplit:
         """The warehouse split, with the pushdown already folded into its SQL (see `push_down`)."""
+        host, http_path, token, query = self._warehouse()
         return _DatabricksWarehouseSplit(
-            self.server_hostname,  # type: ignore[arg-type] - guarded by _is_warehouse
-            self.http_path,  # type: ignore[arg-type]
-            self.access_token,  # type: ignore[arg-type]
-            push_down(self.query, predicate, projection),  # type: ignore[arg-type]
+            host, http_path, token, push_down(query, predicate, projection)
         )
 
     def schema(self) -> pa.Schema:
         if self._is_lakehouse():
             return self._delta_source().schema()
-        probed = _DatabricksWarehouseSplit(
-            self.server_hostname,  # type: ignore[arg-type] - guarded by _is_warehouse
-            self.http_path,  # type: ignore[arg-type]
-            self.access_token,  # type: ignore[arg-type]
-            schema_probe(self.query),
-        ).schema()
+        host, http_path, token, query = self._warehouse()
+        probed = _DatabricksWarehouseSplit(host, http_path, token, schema_probe(query)).schema()
         return probed if probe_is_typed(probed) else self._warehouse_split().schema()
 
     def read(

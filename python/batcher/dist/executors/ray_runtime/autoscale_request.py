@@ -100,7 +100,7 @@ def _arm_drain_release() -> None:
         monitor.on_drain(_release_all)
         monitor.start()
         _drain_release_armed = True
-    except Exception as exc:  # pragma: no cover - arming is best-effort
+    except Exception as exc:  # arming is best-effort
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("dist", "arm the autoscale-floor drain release", exc)

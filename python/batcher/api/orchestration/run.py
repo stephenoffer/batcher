@@ -643,7 +643,7 @@ def _publish_resource_gauges(rm: object) -> None:
     """Publish Carbonite's reading to the event bus. Best-effort; never breaks a query."""
     try:
         rm.publish_stats()  # type: ignore[attr-defined]
-    except Exception as exc:  # pragma: no cover - telemetry must never fail a run
+    except Exception as exc:  # telemetry must never fail a run
         note_suppressed("api", "publish Carbonite resource gauges", exc)
 
 
@@ -659,7 +659,7 @@ def _record_flap_rate(hub: object, rm: object) -> None:
         rate = rm.flap_rate()  # type: ignore[attr-defined]
         if rate is not None:
             record_flap_rate(hub, rate)  # type: ignore[arg-type]
-    except Exception as exc:  # pragma: no cover - a learned write must never fail a run
+    except Exception as exc:  # a learned write must never fail a run
         # Noted, not swallowed, and this is the write where the distinction matters most.
         # It is the producer half of a loop that has already been permanently inert once
         # (`PressureMonitor.flap_rate` records why), and a silent failure here reproduces

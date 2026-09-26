@@ -373,11 +373,10 @@ class _Guidance:
 
     def __init__(self, label: str, name: str, members: tuple[str, ...]) -> None:
         self._parts: tuple[str, str, tuple[str, ...]] | None = (label, name, members)
-        self._text: str | None = None
+        self._text = ""
 
     def _render(self) -> str:
-        if self._text is None:
-            assert self._parts is not None
+        if self._parts is not None:
             self._text = _absent_message(*self._parts)
             # Drop the member list once rendered: it can be a few hundred strings, and an
             # exception that is caught and stored would otherwise pin them.

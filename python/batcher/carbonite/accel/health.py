@@ -295,7 +295,7 @@ def _sampled_bottlenecks() -> tuple[Bottleneck, ...]:
         from batcher.observe.accelerators.diagnosis import device_verdicts
 
         return device_verdicts()
-    except Exception as exc:  # pragma: no cover - a missing window must never block scheduling
+    except Exception as exc:  # a missing window must never block scheduling
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("carbonite", "read the sampled device window", exc)

@@ -408,7 +408,7 @@ def _native_fold(partials: list, ops: list[dict], nbytes: int) -> pa.Table | Non
         out = engine().execute_plan(
             json.dumps(nest_ops(ops)), [batches], active_config().engine_config_json()
         )
-    except Exception as exc:  # pragma: no cover - the fold must not fail on a fast path
+    except Exception as exc:  # the fold must not fail on a fast path
         note_suppressed("dist", "fold the GPU shards on the engine's executor", exc)
         return None
     return pa.Table.from_batches(out) if out else None

@@ -325,7 +325,7 @@ class _Translate(SiteRecorder):
         return new
 
 
-class _Consume(cst.CSTVisitor):  # type: ignore[misc]
+class _Consume(cst.CSTVisitor):
     """Collect every node under an argument, so the rewrites recorded on them can be dropped."""
 
     def __init__(self, consumed: set[int]) -> None:
@@ -388,7 +388,7 @@ def _single_assignments(module: Any) -> dict[str, Any]:
     """Names assigned exactly once anywhere in the file, to their value (for window specs)."""
     seen: dict[str, list[Any]] = {}
 
-    class _Collect(cst.CSTVisitor):  # type: ignore[misc]
+    class _Collect(cst.CSTVisitor):
         def visit_Assign(self, node: Any) -> None:
             for target in node.targets:
                 if isinstance(target.target, cst.Name):

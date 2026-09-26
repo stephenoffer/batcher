@@ -1305,7 +1305,7 @@ def _note_exchange_eliminated(operator: str, columns: tuple[str, ...]) -> None:
                 detail={"operator": operator, "clustered_on": list(columns)},
             ).to_dict(),
         )
-    except Exception as exc:  # pragma: no cover - observation must never fail a query
+    except Exception as exc:  # observation must never fail a query
         note_suppressed("dist", "report the eliminated exchange", exc)
 
 

@@ -185,12 +185,12 @@ def _build_requests(spec: GenerateSpec | str | None, *rest: object) -> list:
     older test drives — which is turned into a spec here.
     """
     if isinstance(spec, GenerateSpec):
-        (batch,) = rest  # type: ignore[assignment]
+        (batch,) = rest
     else:
-        template, prompt_column, image_column, adapter_column, batch = spec, *rest  # type: ignore[assignment]
+        template, prompt_column, image_column, adapter_column, batch = spec, *rest
         spec = GenerateSpec(
             prompt_column=prompt_column,  # type: ignore[arg-type]
-            template=template,  # type: ignore[arg-type]
+            template=template,
             image_column=image_column,  # type: ignore[arg-type]
             adapter_column=adapter_column,  # type: ignore[arg-type]
         )

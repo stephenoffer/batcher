@@ -193,7 +193,7 @@ def _apply_resource(plan: AllocatorPlan) -> bool:
                 resource = adaptor(resource)
                 _statistics_adaptor = resource
         install_rmm_resource(rmm, resource)
-    except Exception as exc:  # pragma: no cover - a device-side refusal
+    except Exception as exc:  # a device-side refusal
         note_suppressed("carbonite", f"install a {plan.allocator} device allocator", exc)
         _statistics_adaptor = None
         return False

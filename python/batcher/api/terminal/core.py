@@ -813,7 +813,7 @@ def _report_write(manifest: WriteManifest, fmt: str) -> None:
             rows=manifest.total_rows,
             bytes=manifest.total_bytes,
         )
-    except Exception as exc:  # pragma: no cover - telemetry must never fail a commit
+    except Exception as exc:  # telemetry must never fail a commit
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("api", "report the write on the event bus", exc)

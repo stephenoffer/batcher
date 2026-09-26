@@ -87,7 +87,7 @@ def _verdict_key(plan: LogicalPlan, sources: list[Source], ctx, config, cfg) -> 
             kind="subplan_reuse",
             learned=False,
         )
-    except Exception as exc:  # pragma: no cover - an unkeyable plan simply is not cached
+    except Exception as exc:  # an unkeyable plan simply is not cached
         note_suppressed("api", "key the common-subplan verdict", exc)
         return None
     if base is None:
@@ -125,7 +125,7 @@ def _record_verdict(key: tuple | None, sources: list[Source], verdict) -> None:
         return
     try:
         held = tuple(weakref.ref(s) for s in sources)
-    except TypeError:  # pragma: no cover - a source that cannot be weakly referenced
+    except TypeError:  # a source that cannot be weakly referenced
         return
     with _VERDICTS_LOCK:
         _VERDICTS[key] = (held, verdict)
@@ -161,7 +161,7 @@ def reuse_common_subplans(
     """
     try:
         return _reuse(plan, sources, ctx)
-    except Exception as exc:  # pragma: no cover - an optimization must never break a query
+    except Exception as exc:  # an optimization must never break a query
         note_suppressed("api", "reuse common subplans", exc)
         return plan, sources
 
@@ -300,7 +300,7 @@ def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> Lo
         if not keep or len(keep) >= len(carried):
             return target
         return Project(target, tuple(Projection(c, col(c)) for c in keep))
-    except Exception as exc:  # pragma: no cover - narrowing must never break a query
+    except Exception as exc:  # narrowing must never break a query
         note_suppressed("api", "narrow a common-subplan candidate", exc)
         return target
 

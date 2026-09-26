@@ -75,7 +75,7 @@ def require(
             # performs, and without it the guard raises AttributeError instead of
             # returning the module the caller asked for.
             return importlib.import_module(f"{module}.{attr}")
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
+    except ImportError as exc:  # exercised only without the extra
         # `MissingDependencyError` is itself an `ImportError`, so it must be raised from
         # the handler (as here) and never from inside the guarded `try` body — moving
         # this line up would make the guard catch its own failure.

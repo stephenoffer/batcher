@@ -56,7 +56,7 @@ def _logical_estimates(plan: LogicalPlan, sources: list[Source]) -> dict[int, fl
             if rows is not None:
                 out[op_id] = float(rows)
         return out
-    except Exception:  # pragma: no cover - an estimate that cannot be made is not a failure
+    except Exception:  # an estimate that cannot be made is not a failure
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("udf-logical-estimates")

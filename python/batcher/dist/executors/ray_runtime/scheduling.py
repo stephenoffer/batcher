@@ -192,6 +192,31 @@ def ray_session_key() -> str | None:
         return None
 
 
+def job_owned_runtime_env_fields() -> frozenset[str]:
+    """The `runtime_env` fields the enclosing Ray job already sets, when the driver runs in one.
+
+    A driver started by a Ray job submission (`ray job submit`, an Anyscale job) receives the
+    job's config in `RAY_JOB_CONFIG_JSON_ENV_VAR`, and Ray merges its `runtime_env` with the one
+    `ray.init` passes -- refusing outright when both set the same field. The self-shipped env
+    always sets `pip` (to neutralize an injected install), so every job that declared its own
+    `pip` dependencies failed Batcher's `ray.init` with "Failed to merge the Job's runtime env":
+    measured on an Anyscale job with a `requirements:` list, where every distributed write and
+    every map-aggregate actor path died before a task started. The job's own value is the one to
+    keep -- it is what the user asked for -- so the self-shipped env yields those fields.
+    """
+    import json
+    import os
+
+    raw = os.environ.get("RAY_JOB_CONFIG_JSON_ENV_VAR")
+    if not raw:
+        return frozenset()
+    try:
+        job_env = (json.loads(raw) or {}).get("runtime_env") or {}
+    except (ValueError, AttributeError):
+        return frozenset()
+    return frozenset(job_env) if isinstance(job_env, dict) else frozenset()
+
+
 def worker_runtime_env() -> dict | None:
     """A per-remote Ray `runtime_env` shipping the driver's batcher, or `None`.
 
@@ -250,7 +275,7 @@ def probe_options() -> dict:
     """
     try:
         env = worker_runtime_env() or None
-    except Exception as exc:  # pragma: no cover - a shipping failure must not stop the probe
+    except Exception as exc:  # a shipping failure must not stop the probe
         note_suppressed("dist", "resolve the probe runtime_env", exc)
         env = None
     return {"num_cpus": 0, "runtime_env": env} if env else {"num_cpus": 0}
@@ -470,7 +495,7 @@ def _collective_bundles(
         from batcher.dist.executors.ray_runtime.fabric import plan_collective
 
         placement = plan_collective(workers, cpus_per_device=max(env.num_cpus, 1.0))
-    except Exception as exc:  # pragma: no cover - a placement hint never fails a placement
+    except Exception as exc:  # a placement hint never fails a placement
         note_suppressed("dist", "plan the collective's bundle layout", exc)
         return None
     if not placement.bundles or sum(b.get("GPU", 0.0) for b in placement.bundles) != workers:
@@ -563,7 +588,7 @@ def _report_placement(bundles: int, strategy: str, zone: dict[str, str]) -> None
                 detail={"bundles": bundles, "strategy": strategy, "zone": dict(zone)},
             ).to_dict(),
         )
-    except Exception as exc:  # pragma: no cover - observation must never fail a placement
+    except Exception as exc:  # observation must never fail a placement
         note_suppressed("dist", "report the fleet placement", exc)
 
 
@@ -606,7 +631,7 @@ def _report_placement_timeout(workers: int, env: SchedulingEnvelope | None, stra
 
     try:
         reason = describe_pending_demand(Demand.from_envelope(env, count=workers))
-    except Exception as exc:  # pragma: no cover - a diagnostic never fails a placement
+    except Exception as exc:  # a diagnostic never fails a placement
         note_suppressed("dist", "diagnose the placement timeout", exc)
         reason = None
     log_kv(

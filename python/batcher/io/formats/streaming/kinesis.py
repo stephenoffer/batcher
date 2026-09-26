@@ -397,7 +397,7 @@ class KinesisSource(BrokerSource):
         """
         client = self._client()
         try:
-            return client.get_records(  # type: ignore[no-any-return]
+            return client.get_records(
                 ShardIterator=self._iterator(shard_id, shard_number),
                 Limit=min(self.poll_size, _GET_RECORDS_MAX_LIMIT),
             )
