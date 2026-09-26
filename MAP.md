@@ -1144,7 +1144,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 
 | module | lines | what it is |
 |---|---|---|
-| `annotate.py` | 575 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
+| `annotate.py` | 574 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 704 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 232 | The learned per-column statistics tables — their schema, their keys, and their bound. |
@@ -1158,10 +1158,10 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `metadata_answer.py` | 438 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 74 | The optimizer context — shared analysis threaded through every rule. |
-| `plan_cache.py` | 683 | Memoize the optimizer — the same query, planned once. |
+| `plan_cache.py` | 681 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 281 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 282 | The Kyber rule registry — where rules are discovered and assembled. |
-| `rule.py` | 264 | The Kyber rule abstraction — one small, pure unit of optimization. |
+| `rule.py` | 262 | The Kyber rule abstraction — one small, pure unit of optimization. |
 | `signature.py` | 215 | Structural plan signatures. |
 | `spill_rates.py` | 203 | What the spill device *measured*, against what its class claimed. |
 | `storage_cost.py` | 76 | What spilling costs on *this* machine's storage. |
@@ -1189,7 +1189,7 @@ Per-row cost of evaluating a scalar `Expr` — the dimension the cost model lack
 |---|---|---|
 | `jit.py` | 278 | Which expressions the Cranelift tier compiles — a conservative mirror of `analyze`. |
 | `model.py` | 146 | Folding the per-node weights into a per-row cost for a whole expression. |
-| `weights.py` | 520 | Per-node evaluation costs, and the traversal that reaches every sub-expression. |
+| `weights.py` | 509 | Per-node evaluation costs, and the traversal that reaches every sub-expression. |
 
 ### `batcher/kyber/gpu/` — 3 · subsystem
 
@@ -1213,7 +1213,7 @@ Learned strategy + parameter tuning — self-tuning physical decisions from meas
 |---|---|---|
 | `bandit.py` | 436 | A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it. |
 | `crossover.py` | 244 | An OLS two-line crossover — where one algorithm overtakes another, learned from timings. |
-| `priors.py` | 154 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
+| `priors.py` | 152 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
 | `topn_bound.py` | 333 | Learned top-N bounds: remember the k-th best value a top-N returned, and use it on the |
 | `topn_footer.py` | 206 | First-run top-N bounds, derived from Parquet row-group statistics rather than remembered. |
 
@@ -1233,7 +1233,7 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 508 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 239 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 581 | The `Optimizer` façade and the module-level entry points. |
+| `facade.py` | 576 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
 
@@ -1334,7 +1334,7 @@ Extended Kyber rule families.
 | `empty_relation.py` | 134 | Empty-relation folding — turn a provably-empty subtree into the canonical marker. |
 | `filter_split.py` | 139 | Cost-based filter splitting — pay an expensive predicate only on surviving rows. |
 | `join_extra.py` | 211 | Structural join rewrites — collapse a join whose result is provably fixed. |
-| `limit_extra.py` | 317 | LIMIT / top-N rewrites that the existing limit rules leave on the table. |
+| `limit_extra.py` | 305 | LIMIT / top-N rewrites that the existing limit rules leave on the table. |
 | `membership_simplify.py` | 118 | `IN`-list and `coalesce` simplifications. |
 | `metadata_adaptive.py` | 313 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
 | `null_shapes.py` | 187 | Null-check rewrites driven by an expression's *shape* rather than by column nullability. |
@@ -1427,7 +1427,7 @@ NORMALIZE-phase whole-tree rewrites, grouped by family.
 |---|---|---|
 | `disjunctions.py` | 174 | Disjunctions of equalities folded into an `IN` list, and the range they imply. |
 | `fold.py` | 280 | Constant folding — evaluate constant sub-expressions at plan time. |
-| `predicates.py` | 232 | Boolean-predicate normalizations in the NORMALIZE phase. |
+| `predicates.py` | 230 | Boolean-predicate normalizations in the NORMALIZE phase. |
 | `ranges.py` | 373 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
 | `simplify.py` | 188 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
 
@@ -2377,7 +2377,7 @@ The scalar expression algebra.
 | `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
-| `node_base.py` | 411 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
+| `node_base.py` | 410 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 643 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 273 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
@@ -2428,7 +2428,7 @@ Shared traversal for scalar `Expr` trees and for the expressions inside a node.
 | `nodes.py` | 129 | Apply an expression rewrite to every expression a *plan node* carries. |
 | `over.py` | 211 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
 | `subtrees.py` | 133 | Structural identity of an expression, and whole-subtree substitution. |
-| `traverse.py` | 291 | The structural ladder for scalar `Expr` trees — child access and rebuilding. |
+| `traverse.py` | 285 | The structural ladder for scalar `Expr` trees — child access and rebuilding. |
 
 ### `batcher/plan/functions/` — 1 · contract
 
@@ -2633,7 +2633,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `ipc.py` | 94 | Arrow tables to bytes and back, for anything that stores a result outside the process. |
 | `lattice.py` | 330 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `layout.py` | 216 | Respell the Arrow *layouts* the FFI boundary cannot import (neutral layer). |
-| `media.py` | 270 | Output types for the multimodal expressions, where the shape is in the arguments. |
+| `media.py` | 260 | Output types for the multimodal expressions, where the shape is in the arguments. |
 | `registry.py` | 405 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name grammar. |
 | `sequence.py` | 81 | Output types for the `.seq` genomics expressions. |
 | `text_quality.py` | 47 | Output types for the per-document text-quality string functions. |
@@ -2665,7 +2665,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | `source_stats_store.py` | 299 | Persisted source statistics — remember what Batcher wrote, for the next read. |
 | `store.py` | 122 | The pluggable persistence abstraction behind the MetadataHub. |
 | `udf_stats.py` | 162 | Measured per-UDF execution cost — Core measures it, and two subsystems spend it. |
-| `views.py` | 164 | The bounded derived views over the feedback history. |
+| `views.py` | 163 | The bounded derived views over the feedback history. |
 
 ### `batcher/metadata/backends/` — 1 · contract
 

@@ -284,10 +284,9 @@ class Optimizer:
 
         Named for what the caller wants (a rewritten `LogicalPlan`, not a `PhysicalPlan`),
         not for a subset of phases: `_run` iterates *all* of `Phase`, so JOIN_REORDER and
-        SELECTION execute here too. The previous "only the logical rewrite phases" wording
-        was wrong and contradicted `optimize_logical`, which memoizes this exact call —
-        worth knowing, because the metadata-answer layer calls this per `.count()` and so
-        pays for join-order search, not just the pruning it is after.
+        SELECTION execute here too (`optimize_logical` memoizes this exact call). Worth
+        knowing, because the metadata-answer layer calls this per `.count()` and so pays for
+        join-order search, not just the pruning it is after.
 
         The seam the metadata-answer layer uses to simplify a plan (combine limits, drop
         redundant distincts, zone-map pruning) before estimating it with an exact-first
@@ -361,13 +360,9 @@ def _format_plan(node: LogicalPlan, est: CardinalityEstimator, depth: int = 0) -
 #: The crossover sits between 3,000 and 4,000, and this is the first swept point on the far
 #: side of it — the conservative choice, since it leaves every measured near-tie where it was.
 #:
-#: It used to be 50,000, chosen as the midpoint of a 1e4..1e5 bracket whose interior had not
-#: been measured. What moved the crossover down an order of magnitude is
-#: `bc_interp::agg_par::chunked_partials`: the materializing aggregate used to build one hash
-#: table per 16,384-row morsel and hand the merge every one of them, which is ruinous in
-#: exactly the band where the group count fills a morsel's table without filling a worker's
-#: share. Building one table per worker instead took the 10,000-group case from 63.3 ms to
-#: 41.1, and with that the executor that was losing this band now wins it.
+#: The crossover is this low because the materializing aggregate builds one hash table per
+#: worker (`bc_interp::agg_par::chunked_partials`) rather than one per morsel, so it wins the
+#: band where the group count fills a morsel's table without filling a worker's share.
 MATERIALIZE_AGG_MIN_GROUPS = 4_000
 
 

@@ -317,13 +317,11 @@ def _calibration_epoch(hub: Any) -> str:
 
     The epoch is read from the two refit memos themselves — the hub version each fit was
     computed at — because that is the only thing that advances exactly when a fit is replaced.
-    It used to be `version // _RECALIBRATE_AFTER`, which reads as the same quantity and is a
-    different clock: the refit throttle counts feedback rows *since the last refit* while the
-    bucket counts from zero, so on a query recording ~35 operators the bucket rolled over every
-    second execution regardless of whether anything had been re-fit. Measured on TPC-H q8 at
-    sf10 the plan cache alternated hit/miss forever over a completely stable set of
-    coefficients — and a miss there costs 350 ms against a hit's 160 ms, so half of the warm
-    query was a re-plan that should have been a lookup.
+    `version // _RECALIBRATE_AFTER` reads as the same quantity and is a different clock: the
+    refit throttle counts feedback rows *since the last refit* while that bucket counts from
+    zero, so on a query recording ~35 operators it would roll over every second execution
+    whether or not anything had been re-fit, and the plan cache would alternate hit/miss over
+    a stable set of coefficients.
     """
     if getattr(hub, "version", None) is None:
         return "-"

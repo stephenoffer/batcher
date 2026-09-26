@@ -46,12 +46,10 @@ _NS_GROUP = "tuning.group_reduction"  # per-signature measured groups / input ro
 # shuffled row count and an aggregate's `groups / input_rows` ratio. A relation has the same
 # number of rows whichever machine counts them.
 #
-# They were scoped, and the cost was exactly what the rule predicts. Every one is recorded on
-# the *driver* from the whole query's figures (`api.tuning.decisions`), never per shard — so
-# the same query planned single-node and then distributed wrote two separate entries for
-# identical data, and neither run could ever inform the other. An autoscaling fleet split them
-# again on every instance type it moved through. Unscoping costs one run of re-learning per
-# signature, which is what `hardware_scope` says a namespace change costs, and it is paid once.
+# Both are recorded on the *driver* from the whole query's figures (`api.tuning.decisions`),
+# never per shard. Scoped, the same query planned single-node and then distributed would
+# write two entries for identical data, neither run informing the other, and an autoscaling
+# fleet would split them again on every instance type it moved through.
 
 
 # Decision family — per-signature priors (partitions, pre-aggregation).

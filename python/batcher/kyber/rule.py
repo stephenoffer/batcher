@@ -63,14 +63,12 @@ class RuleCategory(enum.Enum):
     """What kind of decision a rule makes — introspection metadata, never control flow.
 
     Read this as a *claim the rule makes about itself*, not as something the optimizer acts
-    on: nothing branches on it, and it is not currently rendered anywhere either. The
-    `category` shown in explain output belongs to `DecisionRecord`, which is a different
-    type recording a decision a rule already made. Two members (`ESTIMATION`, `VALIDATION`)
-    used to sit here describing rule kinds the rule set does not contain; they were removed
-    rather than left as vocabulary nobody could use, since an enum arm with no instance is
-    indistinguishable from one whose rules were accidentally deleted.
+    on: nothing branches on it, and it is not rendered anywhere either. The `category` shown
+    in explain output belongs to `DecisionRecord`, which is a different type recording a
+    decision a rule already made. Every member has rules behind it; an enum arm with no
+    instance would be indistinguishable from one whose rules were accidentally deleted.
 
-    What it still earns its place for is the distinction the three surviving members draw.
+    What it earns its place for is the distinction the three members draw.
     A `SELECTION` rule makes a cost-based choice among equivalent physical algorithms and an
     `ENFORCE` rule inserts an operator the plan requires; neither is a semantics-preserving
     rewrite, and telling them apart at a glance across 700-odd rules is worth one field.
