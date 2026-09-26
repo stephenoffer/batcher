@@ -3343,7 +3343,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `algo/buffer.rs` | 186 | `ST_Buffer`: every position within a distance of a geometry, as a polygon. |
 | `algo/construct.rs` | 477 | Geometries derived from other geometries — hulls, envelopes, simplification. |
 | `algo/linear.rs` | 330 | Linear referencing — positions along a chain, expressed as a fraction of its length. |
-| `algo/measure.rs` | 354 | Planar measurements — area, length, distance, azimuth. |
+| `algo/measure.rs` | 353 | Planar measurements — area, length, distance, azimuth. |
 | `algo/mod.rs` | 19 | Planar geometry algorithms, grouped by what they answer. |
 | `algo/overlay.rs` | 625 | Union and difference of polygons, by noding and edge classification. |
 | `algo/predicate.rs` | 466 | The OGC spatial predicates. |
@@ -3355,14 +3355,14 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `codec/wkb.rs` | 478 | WKB — the binary encoding a geometry column is actually stored in. |
 | `codec/wkt.rs` | 484 | WKT — the human-readable geometry spelling, and the one users type. |
 | `error.rs` | 84 | The one error type every `bc-geo` entry point returns. |
-| `grid/geohash.rs` | 192 | Geohash — a lon/lat position as a short base-32 string. |
-| `grid/hexbin.rs` | 169 | Hexagonal binning on a projected plane. |
+| `grid/geohash.rs` | 135 | Geohash — a lon/lat position as a short base-32 string. |
+| `grid/hexbin.rs` | 21 | Hexagonal binning on a projected plane. |
 | `grid/mod.rs` | 20 | Discrete spatial grids — the bridge from continuous coordinates to a group key. |
-| `grid/s2.rs` | 253 | S2 cell identifiers — Google's spherical cell hierarchy, as BigQuery and many geospatial warehouses index by. |
-| `grid/tile.rs` | 202 | Slippy-map tiles and Bing quadkeys — the grid every map tile server is indexed by. |
+| `grid/s2.rs` | 21 | S2 cell identifiers — Google's spherical cell hierarchy, as BigQuery and many geospatial warehouses index by. |
+| `grid/tile.rs` | 20 | Slippy-map tiles and Bing quadkeys — the grid every map tile server is indexed by. |
 | `lib.rs` | 83 | `bc-geo` — the geometry data plane: codecs, planar algorithms, grids, projections. |
 | `proj/crs.rs` | 314 | Coordinate reference system transforms, for a deliberately small set of systems. |
-| `proj/geodesy.rs` | 229 | Distances and areas on the Earth, in metres. |
+| `proj/geodesy.rs` | 62 | Distances and areas on the Earth, in metres. |
 | `proj/karney/area.rs` | 91 | Polygon area on the ellipsoid: GeographicLib's `PolygonArea`, reduced to a ring. |
 | `proj/karney/math.rs` | 231 | The scalar helpers and series coefficients Karney's solver is written in terms of. |
 | `proj/karney/mod.rs` | 653 | Karney's geodesic inverse on the WGS 84 ellipsoid: distance and polygon area. |

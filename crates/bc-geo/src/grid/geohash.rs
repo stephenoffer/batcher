@@ -10,8 +10,8 @@
 //! The failure mode is equally worth stating: prefix proximity is one-directional.
 //! Sharing a prefix means being close, but being close does *not* mean sharing a
 //! prefix — two positions either side of a cell boundary can differ in the first
-//! character. `neighbors` exists precisely so a proximity query can cover the eight
-//! adjacent cells instead of silently missing everything across the seam.
+//! character, so a proximity query must cover the adjacent cells too or it silently
+//! misses everything across the seam.
 
 use crate::error::{GeoError, GeoResult};
 use crate::types::{Bbox, Coord};
@@ -133,63 +133,6 @@ pub fn decode(hash: &str) -> GeoResult<Coord> {
     ))
 }
 
-/// The eight cells around `hash`, in the order N, NE, E, SE, S, SW, W, NW.
-///
-/// Computed by stepping the cell centre by one cell width rather than by the classic
-/// base-32 border tables: the arithmetic is the same length, is obviously correct, and
-/// does not silently produce a wrong neighbour at the ±180° seam — it wraps, which is
-/// the right answer, because the cell east of the date line really is on the other side.
-///
-/// Poleward of the top and bottom rows there is no neighbour, and those directions are
-/// omitted rather than clamped onto the same row.
-pub fn neighbors(hash: &str) -> GeoResult<Vec<String>> {
-    let b = decode_bbox(hash)?;
-    let precision = hash.len();
-    let (w, h) = (b.xmax - b.xmin, b.ymax - b.ymin);
-    let (cx, cy) = (f64::midpoint(b.xmin, b.xmax), f64::midpoint(b.ymin, b.ymax));
-    let mut out = Vec::with_capacity(8);
-    for (dx, dy) in [
-        (0.0, 1.0),
-        (1.0, 1.0),
-        (1.0, 0.0),
-        (1.0, -1.0),
-        (0.0, -1.0),
-        (-1.0, -1.0),
-        (-1.0, 0.0),
-        (-1.0, 1.0),
-    ] {
-        let lat = cy + dy * h;
-        if !(-90.0..=90.0).contains(&lat) {
-            continue;
-        }
-        let mut lon = cx + dx * w;
-        // Wrap across the antimeridian rather than dropping the neighbour.
-        if lon > 180.0 {
-            lon -= 360.0;
-        } else if lon < -180.0 {
-            lon += 360.0;
-        }
-        out.push(encode(lon, lat, precision)?);
-    }
-    Ok(out)
-}
-
-/// The shortest hash that covers the whole box, or `None` when the box straddles a
-/// top-level cell boundary and no single hash contains it.
-///
-/// This is the operation that turns a bounding-box filter into a prefix filter: the
-/// covering hash is the `LIKE` prefix that provably contains every row in the box.
-pub fn covering_prefix(b: &Bbox) -> GeoResult<Option<String>> {
-    let lo = encode(b.xmin.max(-180.0), b.ymin.max(-90.0), MAX_PRECISION)?;
-    let hi = encode(b.xmax.min(180.0), b.ymax.min(90.0), MAX_PRECISION)?;
-    let n = lo
-        .bytes()
-        .zip(hi.bytes())
-        .take_while(|(a, b)| a == b)
-        .count();
-    Ok((n > 0).then(|| lo[..n].to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,53 +178,6 @@ mod tests {
             let short = encode(-122.4194, 37.7749, p).unwrap();
             assert!(long.starts_with(&short), "{short} must prefix {long}");
         }
-    }
-
-    #[test]
-    fn neighbors_surround_the_cell_and_wrap_at_the_antimeridian() {
-        let n = neighbors("9q8yyk").unwrap();
-        assert_eq!(n.len(), 8);
-        assert!(!n.contains(&"9q8yyk".to_string()));
-        // Every neighbour's cell touches the original's box.
-        let b = decode_bbox("9q8yyk").unwrap();
-        for h in &n {
-            let nb = decode_bbox(h).unwrap();
-            assert!(b.expand(1e-9, 1e-9).intersects(&nb), "{h} is not adjacent");
-        }
-        // At the date line the eastern neighbours exist rather than being dropped.
-        let seam = encode(179.999, 0.0, 5).unwrap();
-        assert_eq!(neighbors(&seam).unwrap().len(), 8);
-    }
-
-    #[test]
-    fn polar_cells_have_fewer_neighbors_rather_than_wrong_ones() {
-        let top = encode(0.0, 90.0, 3).unwrap();
-        let n = neighbors(&top).unwrap();
-        assert!(n.len() < 8, "no cell exists north of the top row");
-        assert!(!n.is_empty());
-    }
-
-    #[test]
-    fn covering_prefix_contains_the_box() {
-        let b = Bbox {
-            xmin: -122.42,
-            ymin: 37.77,
-            xmax: -122.41,
-            ymax: 37.78,
-        };
-        let p = covering_prefix(&b)
-            .unwrap()
-            .expect("a small box has a covering cell");
-        let cell = decode_bbox(&p).unwrap();
-        assert!(cell.contains(&b), "{p} must cover the box");
-        // A box spanning the globe shares no prefix.
-        let whole = Bbox {
-            xmin: -180.0,
-            ymin: -90.0,
-            xmax: 180.0,
-            ymax: 90.0,
-        };
-        assert_eq!(covering_prefix(&whole).unwrap(), None);
     }
 
     #[test]
