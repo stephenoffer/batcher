@@ -1002,40 +1002,6 @@ pub(crate) fn take_batch(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-/// Late-materialized parallel top-N over already-morselized `parts`.
-///
-/// The eager parallel top-N gathers **every column** of each morsel's local top-k before
-/// merging (`sort_batch(morsel, keys, Some(k))` per morsel, then a merge). On a wide row that
-/// copies `morsels × k` full rows only to discard all but the final `k` — measured the
-/// dominant cost of a `SELECT * … ORDER BY … LIMIT` once the scan is parallel.
-///
-/// Instead, each morsel emits only its top-k **sort-key values** plus a `(morsel, row)`
-/// locator; the merge sorts those narrow candidates and the wide columns are gathered **once**,
-/// for just the `k` survivors, via `interleave` across the source morsels.
-///
-/// Result-identical to the eager path: the candidates are concatenated in morsel order — the
-/// same order the eager merge produces — and the final sort uses the same keys and the same
-/// trailing row-position tie-break, so it selects the same rows in the same order; the locator
-/// gather then reproduces those exact rows. Callers pass a non-empty `parts`.
-/// The ≤`k` indices of one morsel's rows in sorted order — the per-morsel step of
-/// [`parallel_top_n`], with the same deterministic input-order tie-break the eager oracle uses.
-///
-/// For a **single** sort key this is a *stable full sort* (the radix / specialized path,
-/// no arrow row-format encoding) sliced to `k`, not the multi-column partial sort: `sort_indices`'
-/// limit path appends a `row_index` tie-break key to make ties deterministic, which forces
-/// `lexsort_to_indices` to encode **every row of every morsel** into the arrow row format — the
-/// dominant cost, and independent of `k`, so a `LIMIT 10` top-N paid the same ~full-encode as
-/// `LIMIT 10000`. A stable single-key sort keeps ties in input order already, so its first `k` is
-/// bit-identical to the `(key, row_index)` partial sort at a fraction of the cost (radix is O(n)
-/// and touches the values directly). Multi-key top-N keeps the partial `lexsort` (the row format
-/// is inherent to comparing several columns; the win is specific to the one-key case).
-/// The `k` best rows of a morsel, over key columns the caller has already evaluated and
-/// normalized.
-///
-/// Taking pre-evaluated keys is what lets `parallel_top_n` run each ORDER BY expression once per
-/// morsel and reuse it for the selection, the top-N bound check and the candidate gather.
-/// Evaluating them here instead would repeat a computed key's work, and would repeat
-/// `normalize_sort_key`'s whole-column scan for a float key.
 /// `k` must be this many times smaller than the morsel before selecting beats sorting it.
 ///
 /// The selection is O(n) with a heap of `k`; the full sort is a fixed number of linear passes
@@ -1164,6 +1130,22 @@ where
     kept.into_iter().map(|(_, i)| i).collect()
 }
 
+/// The `k` best rows of a morsel, over key columns the caller has already evaluated and
+/// normalized.
+///
+/// Taking pre-evaluated keys is what lets `parallel_top_n` run each ORDER BY expression once per
+/// morsel and reuse it for the selection, the top-N bound check and the candidate gather.
+/// Evaluating them here instead would repeat a computed key's work, and would repeat
+/// `normalize_sort_key`'s whole-column scan for a float key.
+///
+/// This is the per-morsel step of [`parallel_top_n`], with the same deterministic input-order
+/// tie-break the eager oracle uses. The strategy depends on the key: a bounded-heap selection
+/// when `k` is small against the morsel ([`TOP_K_SELECT_RATIO`]), else a specialized stable full
+/// sort sliced to `k` for a single non-float key, else an O(n) quickselect over the total-order
+/// [`row_comparator`]. Every strategy returns exactly the set of rows the eager `(keys, row
+/// index)` sort keeps; the quickselect alone leaves them unordered, which is immaterial because
+/// [`parallel_top_n`] re-sorts the survivors. The comments in the body give each branch's cost
+/// rationale.
 fn top_k_indices_of(
     key_arrays: &[ArrayRef],
     keys: &[SortKey],
@@ -1415,6 +1397,21 @@ fn split_for_workers(parts: &[RecordBatch], workers: usize) -> Option<Vec<Record
     Some(out)
 }
 
+/// Late-materialized parallel top-N over already-morselized `parts`.
+///
+/// The eager parallel top-N gathers **every column** of each morsel's local top-k before
+/// merging (`sort_batch(morsel, keys, Some(k))` per morsel, then a merge). On a wide row that
+/// copies `morsels × k` full rows only to discard all but the final `k` — measured the
+/// dominant cost of a `SELECT * … ORDER BY … LIMIT` once the scan is parallel.
+///
+/// Instead, each morsel emits only its top-k **sort-key values** plus a `(morsel, row)`
+/// locator; the merge sorts those narrow candidates and the wide columns are gathered **once**,
+/// for just the `k` survivors, via `interleave` across the source morsels.
+///
+/// Result-identical to the eager path: the candidates are concatenated in morsel order — the
+/// same order the eager merge produces — and the final sort uses the same keys and the same
+/// trailing row-position tie-break, so it selects the same rows in the same order; the locator
+/// gather then reproduces those exact rows. Callers pass a non-empty `parts`.
 pub(crate) fn parallel_top_n(
     parts: &[RecordBatch],
     keys: &[SortKey],
