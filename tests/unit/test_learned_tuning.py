@@ -124,6 +124,24 @@ def test_learned_sort_merge_recovers_the_crossover():
     assert abs(got - true_xover) / true_xover < 0.15
 
 
+def test_a_failing_crossover_read_is_traced_not_silent(monkeypatch):
+    """A store that refuses reads must leave a trace, not silently pin the default."""
+    from batcher.kyber.learned_tuning import crossover
+
+    hub = _hub()
+
+    def refuse(*_a, **_k):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(hub, "get_keyed_param", refuse)
+    noted: list[str] = []
+    monkeypatch.setattr(
+        crossover, "note_suppressed", lambda layer, what, exc: noted.append(f"{layer}:{what}")
+    )
+    assert lt.learned_sort_merge_min_rows(hub, default=50_000_000.0) is None
+    assert noted == ["kyber:read the learned crossover buckets"]
+
+
 # --- learned partition/parallelism prior ------------------------------------------------------
 def test_learned_partition_count_cold_is_none():
     assert lt.learned_partition_count(_hub(), "b1", target_rows=4_000_000) is None
