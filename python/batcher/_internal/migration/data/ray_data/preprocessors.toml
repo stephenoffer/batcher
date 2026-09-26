@@ -8,20 +8,20 @@ CountVectorizer = { status = "mismatch", batcher = "batcher.ml.CountVectorizer",
 CustomKBinsDiscretizer = { status = "gap", need = "discretize by explicit per-column bin edges (bins=, right=, include_lowest=, duplicates=, dtypes=)", wave = "W11" }
 FeatureHasher = { status = "gap", need = "hash a set of numeric count columns into a fixed-size feature vector (num_features, output_column)", wave = "W11" }
 HashingVectorizer = { status = "mismatch", batcher = "batcher.ml.HashingVectorizer", note = "Ray emits raw hashed counts of space-split tokens using its own simple_hash over several columns; Batcher follows scikit-learn (lowercase=True, token_pattern of 2+ word chars, norm='l2') and hashes tokens with a different function, so bucket indices differ even with norm=None.", wave = "W0" }
-LabelEncoder = { status = "param", batcher = "batcher.ml.LabelEncoder", need = "output_column= (write the encoded label to a new column)", wave = "W2" }
-MaxAbsScaler = { status = "param", batcher = "batcher.ml.MaxAbsScaler", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
-MinMaxScaler = { status = "param", batcher = "batcher.ml.MinMaxScaler", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
+LabelEncoder = { status = "canonical", batcher = "batcher.ml.LabelEncoder" }
+MaxAbsScaler = { status = "canonical", batcher = "batcher.ml.MaxAbsScaler" }
+MinMaxScaler = { status = "canonical", batcher = "batcher.ml.MinMaxScaler" }
 MultiHotEncoder = { status = "mismatch", batcher = "batcher.ml.MultiHotEncoder", note = "Ray replaces the list column with one multi-hot vector column (max_categories per column, several columns); Batcher keeps the input and appends one 0/1 column per category named '<col>_<value>'.", wave = "W0" }
-Normalizer = { status = "param", batcher = "batcher.ml.Normalizer", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
+Normalizer = { status = "canonical", batcher = "batcher.ml.Normalizer" }
 OneHotEncoder = { status = "mismatch", batcher = "batcher.ml.OneHotEncoder", note = "Ray replaces each column with one one-hot vector column; Batcher drops the input and appends one 0/1 column per category named '<col>_<value>'.", wave = "W0" }
-OrdinalEncoder = { status = "param", batcher = "batcher.ml.OrdinalEncoder", need = "encode_lists= (encode each element of a list column), output_columns=", wave = "W2" }
+OrdinalEncoder = { status = "canonical", batcher = "batcher.ml.OrdinalEncoder" }
 PowerTransformer = { status = "mismatch", batcher = "batcher.ml.PowerTransformer", note = "Ray applies a fixed, user-given power (power=, method='yeo-johnson'|'box-cox') with no standardization; Batcher fits the Yeo-Johnson lambda per column and standardizes by default.", wave = "W0" }
 RobustScaler = { status = "mismatch", batcher = "batcher.ml.RobustScaler", note = "Ray takes quantile_range as fractions (0.25, 0.75) and estimates quantiles with an approximate sketch (quantile_precision=800); Batcher takes percentages (25.0, 75.0) and scales with exact interpolated quantiles, so the IQR and the output differ on small data.", wave = "W0" }
-SimpleImputer = { status = "param", batcher = "batcher.ml.SimpleImputer", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
-StandardScaler = { status = "param", batcher = "batcher.ml.StandardScaler", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
-Tokenizer = { status = "param", batcher = "batcher.ml.Tokenizer", need = "default tokenization_fn (Ray splits on single spaces when none is given; Batcher requires tokenizer=, e.g. lambda s: s.split(' ')), several columns, output_columns=", wave = "W2" }
+SimpleImputer = { status = "canonical", batcher = "batcher.ml.SimpleImputer" }
+StandardScaler = { status = "canonical", batcher = "batcher.ml.StandardScaler" }
+Tokenizer = { status = "param", batcher = "batcher.ml.Tokenizer", need = "several columns in one Tokenizer (columns=[...], output_columns=[...]); Batcher tokenizes one column into output_column=, so port as one Tokenizer per column", wave = "W2" }
 TorchVisionPreprocessor = { status = "gap", need = "apply a torchvision transform to image columns (batched=, output_columns=)", wave = "W12" }
-UniformKBinsDiscretizer = { status = "mismatch", batcher = "batcher.ml.KBinsDiscretizer", note = "Batcher KBinsDiscretizer defaults strategy='quantile'; pass strategy='uniform', n_bins=bins. Missing: per-column bins dict, right=, include_lowest=, duplicates=, dtypes=, output_columns=.", wave = "W2" }
+UniformKBinsDiscretizer = { status = "mismatch", batcher = "batcher.ml.KBinsDiscretizer", note = "Batcher KBinsDiscretizer defaults strategy='quantile' and right=False; port as strategy='uniform', n_bins=bins (an int or a per-column dict), right=True, output_columns= as written. Ray's duplicates= defaults to 'raise' and Batcher's to 'keep', and on a constant column Ray bins every row without raising, where Batcher learns repeated edges that duplicates='raise' refuses. Missing: include_lowest=, dtypes=.", wave = "W2" }
 
 [Preprocessor]
 FitStatus = { status = "mismatch", batcher = "batcher.ml.Preprocessor", note = "Ray FitStatus enum (NOT_FITTABLE, NOT_FITTED, PARTIALLY_FITTED, FITTED); Batcher Preprocessor exposes a boolean is_fitted.", wave = "W11" }

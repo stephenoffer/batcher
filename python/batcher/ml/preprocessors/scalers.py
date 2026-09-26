@@ -20,6 +20,8 @@ from batcher.ml.preprocessors.base import (
     columns_arg,
     fit_aggregate,
     nan_as_null,
+    output_columns_arg,
+    output_pairs,
 )
 from batcher.plan.expr_ir import col, when
 
@@ -56,20 +58,34 @@ class StandardScaler(Preprocessor):
             >>> StandardScaler(["x"]).fit_transform(ds).to_pydict()
             {'x': [-1.0, 1.0]}
 
+            >>> StandardScaler("x", output_columns="x_std").fit_transform(ds).to_pydict()
+            {'x': [1.0, 3.0], 'x_std': [-1.0, 1.0]}
+
     Args:
         columns: the numeric columns to standardize (replaced in place).
         with_mean: subtract the mean (center) when True.
         with_std: divide by the standard deviation (scale) when True.
+        output_columns: write each result to this column instead of over its input, one
+            name per column in order, keeping the inputs (Ray Data's ``output_columns``).
+            ``None`` (the default) rewrites the columns in place.
     """
 
     numeric_only = True
 
-    __slots__ = ("columns", "mean_", "scale_", "with_mean", "with_std")
+    __slots__ = ("columns", "mean_", "output_columns", "scale_", "with_mean", "with_std")
 
     def __init__(
-        self, columns: str | Sequence[str], *, with_mean: bool = True, with_std: bool = True
+        self,
+        columns: str | Sequence[str],
+        *,
+        with_mean: bool = True,
+        with_std: bool = True,
+        output_columns: str | Sequence[str] | None = None,
     ) -> None:
         self.columns = _check_columns(columns)
+        self.output_columns = output_columns_arg(
+            self.columns, output_columns, what="StandardScaler"
+        )
         self.with_mean = with_mean
         self.with_std = with_std
         self.mean_: dict[str, float] = {}
@@ -150,13 +166,13 @@ class StandardScaler(Preprocessor):
         """
         self._require_fitted()
         new = {}
-        for c in self.columns:
+        for c, out in output_pairs(self.columns, self.output_columns):
             expr = col(c)
             if self.with_mean:
                 expr = expr - self.mean_[c]
             if self.with_std and self.scale_[c] != 1.0:
                 expr = expr / self.scale_[c]
-            new[c] = expr
+            new[out] = expr
         return ds.with_columns(**new)
 
 
@@ -175,19 +191,30 @@ class MinMaxScaler(Preprocessor):
             >>> MinMaxScaler(["x"]).fit_transform(ds).to_pydict()
             {'x': [0.0, 0.5, 1.0]}
 
+            >>> MinMaxScaler("x", output_columns=["x01"]).fit_transform(ds).to_pydict()
+            {'x': [0.0, 5.0, 10.0], 'x01': [0.0, 0.5, 1.0]}
+
     Args:
         columns: the numeric columns to scale (replaced in place).
         feature_range: the ``(lo, hi)`` target range (``hi`` must exceed ``lo``).
+        output_columns: write each result to this column instead of over its input, one
+            name per column in order, keeping the inputs (Ray Data's ``output_columns``).
+            ``None`` (the default) rewrites the columns in place.
     """
 
     numeric_only = True
 
-    __slots__ = ("columns", "data_max_", "data_min_", "feature_range")
+    __slots__ = ("columns", "data_max_", "data_min_", "feature_range", "output_columns")
 
     def __init__(
-        self, columns: str | Sequence[str], *, feature_range: tuple[float, float] = (0.0, 1.0)
+        self,
+        columns: str | Sequence[str],
+        *,
+        feature_range: tuple[float, float] = (0.0, 1.0),
+        output_columns: str | Sequence[str] | None = None,
     ) -> None:
         self.columns = _check_columns(columns)
+        self.output_columns = output_columns_arg(self.columns, output_columns, what="MinMaxScaler")
         lo, hi = feature_range
         if hi <= lo:
             raise PlanError(f"feature_range must be (lo, hi) with hi > lo, got {feature_range}")
@@ -251,13 +278,13 @@ class MinMaxScaler(Preprocessor):
         self._require_fitted()
         lo, hi = self.feature_range
         new = {}
-        for c in self.columns:
+        for c, out in output_pairs(self.columns, self.output_columns):
             span = self.data_max_[c] - self.data_min_[c]
             if span == 0.0:
-                new[c] = col(c) * 0.0 + lo
+                new[out] = col(c) * 0.0 + lo
             else:
                 scaled = (col(c) - self.data_min_[c]) / span
-                new[c] = scaled * (hi - lo) + lo if (hi - lo) != 1.0 or lo != 0.0 else scaled
+                new[out] = scaled * (hi - lo) + lo if (hi - lo) != 1.0 or lo != 0.0 else scaled
         return ds.with_columns(**new)
 
 
@@ -276,16 +303,25 @@ class MaxAbsScaler(Preprocessor):
             >>> MaxAbsScaler(["x"]).fit_transform(ds).to_pydict()
             {'x': [-0.5, 0.25, 1.0]}
 
+            >>> MaxAbsScaler("x", output_columns="x_abs").fit_transform(ds).to_pydict()
+            {'x': [-2.0, 1.0, 4.0], 'x_abs': [-0.5, 0.25, 1.0]}
+
     Args:
         columns: the numeric columns to scale (replaced in place).
+        output_columns: write each result to this column instead of over its input, one
+            name per column in order, keeping the inputs (Ray Data's ``output_columns``).
+            ``None`` (the default) rewrites the columns in place.
     """
 
     numeric_only = True
 
-    __slots__ = ("columns", "max_abs_")
+    __slots__ = ("columns", "max_abs_", "output_columns")
 
-    def __init__(self, columns: str | Sequence[str]) -> None:
+    def __init__(
+        self, columns: str | Sequence[str], *, output_columns: str | Sequence[str] | None = None
+    ) -> None:
         self.columns = _check_columns(columns)
+        self.output_columns = output_columns_arg(self.columns, output_columns, what="MaxAbsScaler")
         self.max_abs_: dict[str, float] = {}
 
     def fit(self, ds: Dataset) -> MaxAbsScaler:
@@ -345,9 +381,9 @@ class MaxAbsScaler(Preprocessor):
         """
         self._require_fitted()
         new = {}
-        for c in self.columns:
+        for c, out in output_pairs(self.columns, self.output_columns):
             scale = self.max_abs_[c]
-            new[c] = col(c) / scale if scale != 0.0 else col(c)
+            new[out] = col(c) / scale if scale != 0.0 else col(c)
         return ds.with_columns(**new)
 
 
@@ -471,17 +507,31 @@ class Normalizer(Preprocessor):
             >>> Normalizer(["a", "b"]).fit_transform(ds).to_pydict()
             {'a': [0.6, 0.0], 'b': [0.8, 0.0]}
 
+            >>> unit = Normalizer(["a", "b"], output_columns=["a_n", "b_n"])
+            >>> unit.fit_transform(ds).to_pydict()
+            {'a': [3.0, 0.0], 'b': [4.0, 0.0], 'a_n': [0.6, 0.0], 'b_n': [0.8, 0.0]}
+
     Args:
         columns: the numeric columns that together form each row's vector.
         norm: the norm to divide by — ``"l1"``, ``"l2"``, or ``"max"``.
+        output_columns: write each result to this column instead of over its input, one
+            name per column in order, keeping the inputs (Ray Data's ``output_columns``).
+            ``None`` (the default) rewrites the columns in place.
     """
 
     numeric_only = True
 
-    __slots__ = ("columns", "norm")
+    __slots__ = ("columns", "norm", "output_columns")
 
-    def __init__(self, columns: str | Sequence[str], *, norm: str = "l2") -> None:
+    def __init__(
+        self,
+        columns: str | Sequence[str],
+        *,
+        norm: str = "l2",
+        output_columns: str | Sequence[str] | None = None,
+    ) -> None:
         self.columns = _check_columns(columns)
+        self.output_columns = output_columns_arg(self.columns, output_columns, what="Normalizer")
         if norm not in ("l1", "l2", "max"):
             raise PlanError(f"norm must be 'l1', 'l2', or 'max', got {norm!r}")
         self.norm = norm
@@ -516,4 +566,5 @@ class Normalizer(Preprocessor):
             norm = greatest(*(c.abs() for c in cols))
         # Guard a zero-norm row: divide by 1 so the (all-zero) values stay unchanged.
         divisor = when(norm == 0.0).then(1.0).otherwise(norm)
-        return ds.with_columns(**{c: col(c) / divisor for c in self.columns})
+        pairs = output_pairs(self.columns, self.output_columns)
+        return ds.with_columns(**{out: col(c) / divisor for c, out in pairs})

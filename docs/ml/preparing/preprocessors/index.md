@@ -68,6 +68,19 @@ preceded. Others don't check, and {py:class}`Normalizer <batcher.ml.preprocessor
 there. Relying on that buys you nothing and breaks the moment the step moves into a
 {py:class}`Chain <batcher.ml.preprocessors.Chain>` beside something stateful.
 
+## Keep the input beside the result
+
+A scaler, the imputer, the ordinal encoder and the discretizer rewrite their columns in place by default. Pass `output_columns`, one name per input column in order, to write each result to a new column and keep the input unchanged. {py:class}`LabelEncoder <batcher.ml.preprocessors.LabelEncoder>` and {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` work on one column, so they take a single `output_column`.
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import StandardScaler
+
+ds = bt.from_pydict({"x": [1.0, 3.0]})
+print(StandardScaler("x", output_columns="x_std").fit_transform(ds).to_pydict())
+# {'x': [1.0, 3.0], 'x_std': [-1.0, 1.0]}
+```
+
 ## Available preprocessors
 
 These are the ones you reach for most, with what each `fit` learns and what its

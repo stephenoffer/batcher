@@ -26,6 +26,14 @@ print(LabelEncoder("city").fit_transform(ds).collect().column("city").to_pylist(
 # [1, 2, 1, 0]
 ```
 
+On a list column, `OrdinalEncoder` learns its categories from the elements and encodes each element, keeping a null list null. That is Ray Data's `encode_lists=True`, and the default. `encode_lists=False` would treat each whole list as one category, which the expression layer can't represent, so it raises on a list column.
+
+```python
+tags = bt.from_pydict({"tags": [["b", "a"], ["c"], []]})
+print(OrdinalEncoder("tags").fit_transform(tags).to_pydict())
+# {'tags': [[1, 0], [2], []]}
+```
+
 {py:class}`OneHotEncoder <batcher.ml.preprocessors.OneHotEncoder>` drops each categorical column and adds one `{column}_{category}` 0/1
 indicator per category, following the scikit-learn naming convention. Pass
 `drop_first=True` for dummy encoding, which omits the first category to avoid
@@ -270,6 +278,8 @@ binned = KBinsDiscretizer(["x"], n_bins=4, strategy="quantile").fit_transform(ds
 print(binned.column("x").to_pylist())
 # [0, 1, 1, 1, 2, 3, 3, 3]
 ```
+
+A value that lies exactly on an edge joins the upper bin, as in scikit-learn. Pass `right=True` to put it in the lower bin instead, as pandas' `cut` and Ray Data's `UniformKBinsDiscretizer` do. `n_bins` also accepts a mapping from each column to its own bin count, and `duplicates` decides what happens when two learned edges coincide: `"keep"` leaves the empty bin, `"drop"` merges it, and `"raise"` refuses the fit.
 
 When you know the edges up front, use {py:func}`bt.cut <batcher.cut>` instead. It's a plain expression with no `fit`: it takes explicit break points and returns the integer bin index, or a label per bucket, so it composes anywhere an expression does.
 

@@ -4,7 +4,8 @@
 `array` expression — no per-row Python), the common "make a feature vector before
 training" step. `Tokenizer` maps a text column through a user tokenizer; tokenization
 is inherently per-string, so it runs as a `map_batches` UDF (the opaque path), but
-stays whole-batch at the engine boundary.
+stays whole-batch at the engine boundary. With no tokenizer it splits on single spaces
+as a native `str.split` expression instead.
 """
 
 from __future__ import annotations
@@ -102,6 +103,11 @@ class Tokenizer(Preprocessor):
     string, so pass a real batched tokenizer for anything large. A stateless transform
     (``fit`` is a no-op).
 
+    With no `tokenizer`, the text is split on every single space, which is Ray Data's
+    default ``lambda s: s.split(" ")``: consecutive spaces yield empty tokens and an empty
+    string yields ``[""]``. That split runs as the native ``str.split`` expression, not as
+    Python per string.
+
     Examples:
         .. doctest::
 
@@ -111,10 +117,13 @@ class Tokenizer(Preprocessor):
             >>> Tokenizer("t", str.split).fit_transform(ds).to_pydict()
             {'t': [['a', 'b'], ['c']]}
 
+            >>> Tokenizer("t", output_column="toks").fit_transform(ds).to_pydict()
+            {'t': ['a b', 'c'], 'toks': [['a', 'b'], ['c']]}
+
     Args:
         column: the text column to tokenize.
         tokenizer: a batched HuggingFace-style tokenizer, a ``str -> list`` callable, or
-            an object with ``.encode``.
+            an object with ``.encode``. ``None`` (the default) splits on single spaces.
         output_column: where to put the token-id lists (defaults to `column`).
         max_length: the maximum token count per row, passed to a batched tokenizer.
         truncation: truncate rows longer than `max_length` (batched tokenizers only).
@@ -131,13 +140,14 @@ class Tokenizer(Preprocessor):
         "max_length",
         "output_column",
         "padding",
+        "tokenizer",
         "truncation",
     )
 
     def __init__(
         self,
         column: str,
-        tokenizer: Callable[[str], list[Any]] | Any,
+        tokenizer: Callable[[str], list[Any]] | Any = None,
         *,
         output_column: str | None = None,
         max_length: int | None = None,
@@ -151,6 +161,18 @@ class Tokenizer(Preprocessor):
         self.truncation = truncation
         self.padding = padding
         self.attention_mask_column = attention_mask_column
+        # Kept as a parameter so `save` sees it: a callable has no JSON form and is refused,
+        # where an unrecorded one would reload silently as the default split.
+        self.tokenizer = tokenizer
+        if tokenizer is None:
+            if max_length is not None or truncation or padding or attention_mask_column:
+                raise PlanError(
+                    "Tokenizer: max_length / truncation / padding / attention_mask_column need "
+                    "a batched tokenizer; the default single-space split supports none of them"
+                )
+            self._batched = False
+            self._encode = None
+            return
         # A HuggingFace tokenizer is callable *and* carries `.encode`; a bare function is
         # only callable. That is the discriminator for the batched fast path.
         self._batched = callable(tokenizer) and hasattr(tokenizer, "encode")
@@ -227,6 +249,8 @@ class Tokenizer(Preprocessor):
             A new lazy `Dataset` with the token-list column (and mask) added or replaced.
         """
         self._require_fitted()
+        if self._encode is None:
+            return ds.with_columns(**{self.output_column: col(self.column).str.split(" ")})
         column, output, mask_column = self.column, self.output_column, self.attention_mask_column
         batched, encode, encode_batch = self._batched, self._encode, self._encode_batch
 

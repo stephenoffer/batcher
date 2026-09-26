@@ -670,15 +670,15 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 
 | module | lines | what it is |
 |---|---|---|
-| `base.py` | 597 | The `Preprocessor` contract — sklearn-style fit/transform on a Dataset. |
-| `binning.py` | 184 | Binning / discretization preprocessors. |
+| `base.py` | 682 | The `Preprocessor` contract — sklearn-style fit/transform on a Dataset. |
+| `binning.py` | 259 | Binning / discretization preprocessors. |
 | `chain.py` | 232 | `Chain` — a sequence of preprocessors fitted and applied as one (sklearn ``Pipeline``). |
-| `imputers.py` | 402 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
+| `imputers.py` | 415 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
 | `persistence.py` | 308 | Saving and restoring a fitted preprocessor — the train/serve parity contract. |
 | `polynomial.py` | 372 | Basis expansion — polynomial/interaction terms, and B-splines. |
 | `power.py` | 439 | The Yeo-Johnson power transform and its few-pass maximum-likelihood fit. |
-| `scalers.py` | 519 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
-| `text.py` | 252 | Feature assembly and text tokenization. |
+| `scalers.py` | 570 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
+| `text.py` | 276 | Feature assembly and text tokenization. |
 | `text_features.py` | 160 | Surface features from a text column — the numbers a model can use before an embedding. |
 | `transforms.py` | 518 | Distribution-reshaping preprocessors — quantile, power, log, and clipping transforms. |
 
@@ -711,7 +711,7 @@ Categorical encoders — ordinal codes, 0/1 indicators, and target encoding.
 | `binary.py` | 118 | Binary encoding — a compact base-2 code for a categorical column. |
 | `frequency.py` | 359 | Cardinality-tolerant categorical encoders — frequency, count, rare-bucketing, hashing. |
 | `onehot.py` | 240 | Indicator encoders — one 0/1 output column per learned category. |
-| `ordinal.py` | 226 | Ordinal encoders — fit the category set, transform with a CASE projection. |
+| `ordinal.py` | 302 | Ordinal encoders — fit the category set, transform with a CASE projection. |
 | `shrinkage.py` | 340 | Target encoders that shrink differently — leave-one-out, and James-Stein. |
 | `target.py` | 262 | Mean (likelihood) target encoding, plain and cross-fitted. |
 | `woe.py` | 190 | Weight-of-evidence encoding — the credit-scorecard categorical transform. |
