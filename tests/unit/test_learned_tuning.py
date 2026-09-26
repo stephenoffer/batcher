@@ -154,6 +154,18 @@ def test_learned_partition_count_from_measured_rows():
 
 
 # --- learned partial-aggregation decision -----------------------------------------------------
+def test_a_non_finite_observation_does_not_poison_a_prior():
+    """One NaN or infinity must be dropped, not folded into the stored prior forever."""
+    hub = _hub()
+    for _ in range(4):
+        lt.record_partition_rows(hub, "b-nan", 8_000_000.0)
+    before = lt.learned_partition_count(hub, "b-nan", target_rows=1_000_000)
+    assert before == 8
+    lt.record_partition_rows(hub, "b-nan", float("nan"))
+    lt.record_partition_rows(hub, "b-nan", float("inf"))
+    assert lt.learned_partition_count(hub, "b-nan", target_rows=1_000_000) == before
+
+
 def test_learned_partial_agg_cold_is_none():
     assert lt.learned_partial_agg(_hub(), "a1") is None
 

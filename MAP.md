@@ -1213,7 +1213,7 @@ Learned strategy + parameter tuning — self-tuning physical decisions from meas
 |---|---|---|
 | `bandit.py` | 436 | A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it. |
 | `crossover.py` | 247 | An OLS two-line crossover — where one algorithm overtakes another, learned from timings. |
-| `priors.py` | 161 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
+| `priors.py` | 164 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
 | `topn_bound.py` | 333 | Learned top-N bounds: remember the k-th best value a top-N returned, and use it on the |
 | `topn_footer.py` | 206 | First-run top-N bounds, derived from Parquet row-group statistics rather than remembered. |
 

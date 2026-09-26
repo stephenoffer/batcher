@@ -70,7 +70,10 @@ def _smooth(prior: float, observed: float, n_obs: int) -> float:
 def _record_scalar(
     hub: MetadataHub | None, namespace: str, key: str, field: str, value: float
 ) -> None:
-    if hub is None or value < 0.0:
+    # Non-finite observations are dropped: smoothing folds a NaN or an infinity into the stored
+    # prior and from there into every later update, poisoning the entry for the life of the
+    # store (`metadata.smoothed.record_smoothed_scalar` spells out the same argument).
+    if hub is None or not math.isfinite(value) or value < 0.0:
         return
     try:
         entry = dict(hub.get_keyed_param(namespace, key) or {})
