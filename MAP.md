@@ -1565,7 +1565,7 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 | `mig.py` | 109 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
 | `parallelism.py` | 439 | Sharding one model across devices: what each device then holds, and what it costs. |
 | `power.py` | 156 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
-| `vram.py` | 307 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
+| `vram.py` | 270 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/accel/device/` — 3 · subsystem
 
@@ -1660,7 +1660,7 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | `fabric_usage.py` | 129 | What the node's RDMA fabric carried while a shuffle was running. |
 | `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
 | `locality.py` | 183 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
-| `peers.py` | 221 | What each peer carried, so a slow shuffle can name the node it was slow on. |
+| `peers.py` | 188 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 153 | Locality-aware reducer placement — put a reducer where its data already is. |
 | `server.py` | 459 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
 | `session.py` | 524 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |

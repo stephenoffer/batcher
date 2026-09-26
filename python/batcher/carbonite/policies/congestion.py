@@ -147,10 +147,10 @@ class StarvationMeter:
             leaves the hysteresis band holding the last real verdict.
         """
         starved, total = totals
-        # A reset (`reset_peer_transfers`) rewinds the totals under us, and subtracting a
-        # larger baseline would yield a negative interval that clamps to a fully saturated
-        # round — telling the controller to stop growing on the strength of a bookkeeping
-        # event. Re-baseline instead and report nothing for this round.
+        # A counter reset (the engine's `reset_shuffle_peer_stats`) rewinds the totals under
+        # us, and subtracting a larger baseline would yield a negative interval that clamps
+        # to a fully saturated round — telling the controller to stop growing on the strength
+        # of a bookkeeping event. Re-baseline instead and report nothing for this round.
         if total < self._seen_total or starved < self._seen_starved:
             self._seen_starved, self._seen_total = starved, total
             return None
