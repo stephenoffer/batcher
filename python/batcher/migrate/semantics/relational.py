@@ -73,7 +73,6 @@ def polars_how(ctx: Context, how: Bound, coalesce: Bound) -> Any | None:
     return found
 
 
-@transform
 def spark_mode(_ctx: Context, mode: Bound) -> Any | None:
     """Spark's save mode, with its `errorifexists` default made explicit."""
     value = "error" if is_none(mode.node) else literal(mode.node)
@@ -153,7 +152,6 @@ def spark_read_csv(
     return call(f"{ctx.bt}.read.csv", [cst.Arg(path.node)])
 
 
-@transform
 def spark_session(ctx: Context, builder: Bound) -> Any | None:
     """`SparkSession.builder...getOrCreate()` as `bt.Session()`; dropped config is noted."""
     node = builder.original
