@@ -970,7 +970,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 876 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3313 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3310 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 550 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 721 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -995,7 +995,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 
 | module | lines | what it is |
 |---|---|---|
-| `accelerators.py` | 177 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
+| `accelerators.py` | 161 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 200 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 595 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `fleet_health.py` | 330 | Live device health across the fleet — every accelerator node, never cached. |
@@ -1757,8 +1757,8 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 | `lifecycle.py` | 90 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
 | `processes.py` | 450 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 158 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
-| `sizing.py` | 300 | What the streaming UDF path learned last run, folded back into this run's sizing. |
-| `strategy.py` | 511 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
+| `sizing.py` | 285 | What the streaming UDF path learned last run, folded back into this run's sizing. |
+| `strategy.py` | 496 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
 | `stream.py` | 364 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
 
 ### `batcher/governance/` — 3 · subsystem

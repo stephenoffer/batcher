@@ -26,6 +26,7 @@ from collections.abc import Iterator
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
+from batcher.core.runtime import default_hub
 from batcher.metadata.hardware_scope import scoped
 from batcher.plan.logical import MapBatches
 from batcher.plan.types import retained_bytes
@@ -107,17 +108,6 @@ _GPU_BATCH_NS = "udf_gpu_batch"  # learned VRAM-safe GPU batch rows per model si
 _SCAN_TPUT_NS = "udf_scan_tput"  # learned source read throughput (rows/sec) per source identity
 
 
-def _stream_hub():
-    """The process-wide MetadataHub, or `None` if unreachable — learned reads are best-effort."""
-    try:
-        from batcher.core.runtime import default_hub
-
-        return default_hub()
-    except Exception as exc:  # pragma: no cover - learning must never break a query
-        note_suppressed("core", "resolve metadata hub", exc)
-        return None
-
-
 def stage_sig(op: MapBatches) -> str | None:
     """A stable per-stage signature for `op` (its UDF's ``module.qualname``), or `None`."""
     fn = op.fn
@@ -143,9 +133,7 @@ def fold_ema(namespace: str, key: str | None, value: float) -> None:
     # spells the argument out; `dist.adaptive_sizing._ema` carries the same guard.
     if key is None or not math.isfinite(value) or value <= 0.0:
         return
-    hub = _stream_hub()
-    if hub is None:
-        return
+    hub = default_hub()
     try:
         from batcher.config import active_config
 
@@ -163,11 +151,8 @@ def _read_ema(namespace: str, key: str | None) -> float | None:
     """The learned EMA for a signature (best-effort), or `None` when cold/unreachable."""
     if key is None:
         return None
-    hub = _stream_hub()
-    if hub is None:
-        return None
     try:
-        s = hub.get_keyed_param(scoped(namespace), key) or {}
+        s = default_hub().get_keyed_param(scoped(namespace), key) or {}
     except Exception as exc:  # pragma: no cover
         note_suppressed("core", "read learned ema", exc)
         return None

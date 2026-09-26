@@ -25,6 +25,7 @@ import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import ceil_div
+from batcher.core.runtime import default_hub
 from batcher.core.udf.call import shared_error_budget
 from batcher.core.udf.processes import is_picklable
 from batcher.core.udf.sizing import warn_if_row_is_unsplittable
@@ -130,25 +131,11 @@ _REJECTED: set[str] = set()
 _LEARN_NS = "udf_strategy"
 
 
-def _learning_hub():
-    """The process-wide MetadataHub, or `None` if unreachable — learned reads are best-effort."""
-    try:
-        from batcher.core.runtime import default_hub
-
-        return default_hub()
-    except Exception as exc:  # pragma: no cover - learning must never break a query
-        note_suppressed("core", "resolve the learning hub", exc)
-        return None
-
-
 def _learned_strategy(key: str) -> dict:
     """The persisted policy entry (``{"proc": bool}``) for a `fn` key, or ``{}`` when the hub
     is cold/unreachable. Best-effort — never raises into the probe."""
-    hub = _learning_hub()
-    if hub is None:
-        return {}
     try:
-        return hub.get_keyed_param(scoped(_LEARN_NS), key) or {}
+        return default_hub().get_keyed_param(scoped(_LEARN_NS), key) or {}
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("core", "read learned UDF strategy", exc)
         return {}
@@ -161,9 +148,7 @@ def _persist_strategy(key: str | None, **fields: object) -> None:
     accumulate under one key without clobbering each other."""
     if key is None:
         return
-    hub = _learning_hub()
-    if hub is None:
-        return
+    hub = default_hub()
     try:
         entry = {**(hub.get_keyed_param(scoped(_LEARN_NS), key) or {}), **fields}
         hub.put_keyed_param(scoped(_LEARN_NS), key, entry)
@@ -335,7 +320,7 @@ def _fn_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float | No
     # fact here that another subsystem also spends, and Kyber's cost model reads exactly this
     # value to stop pricing an expensive UDF as a trivial column map.
     if key is not None:
-        learned = load_udf_row_seconds(_learning_hub(), key)
+        learned = load_udf_row_seconds(default_hub(), key)
         if learned is not None:
             _FN_ROW_SECONDS[key] = float(learned)
             return float(learned)
@@ -347,7 +332,7 @@ def _fn_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float | No
         secs = None
     if key is not None and secs is not None:
         _FN_ROW_SECONDS[key] = secs
-        record_udf_row_seconds(_learning_hub(), key, secs)
+        record_udf_row_seconds(default_hub(), key, secs)
     return secs
 
 

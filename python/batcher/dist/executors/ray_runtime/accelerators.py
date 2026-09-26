@@ -14,8 +14,6 @@ a fabricated figure.
 
 from __future__ import annotations
 
-from batcher._internal.logging import note_suppressed
-
 __all__ = [
     "cluster_accelerator_type",
     "cluster_gpu_memory_bytes",
@@ -65,6 +63,7 @@ def recommend_accelerator_type(model_memory_gb: float) -> str | None:
     candidates = sorted({c.get("accelerator_type") or "" for c in classes if c["gpus"] > 0})
     if not any(candidates):
         return None
+    from batcher.core.runtime import default_hub
     from batcher.kyber.gpu import select_device_class
 
     return select_device_class(
@@ -76,23 +75,8 @@ def recommend_accelerator_type(model_memory_gb: float) -> str | None:
         # which is the exact failure this pinning exists to prevent.
         model_memory_gb * 1e9 / (1 << 30),
         headroom=device_headroom(),
-        hub=_learned_hub(),
+        hub=default_hub(),
     )
-
-
-def _learned_hub():
-    """The metadata hub, so the choice can prefer what this fleet measured, or `None`.
-
-    Best-effort: a fleet with no learned history, or a metadata backend that cannot be opened,
-    simply falls back to the datasheet ordering.
-    """
-    try:
-        from batcher.core.runtime import default_hub
-
-        return default_hub()
-    except Exception as exc:
-        note_suppressed("dist", "resolve the learning hub", exc)
-        return None
 
 
 def cluster_accelerator_type() -> str | None:

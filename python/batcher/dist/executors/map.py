@@ -1634,19 +1634,16 @@ def _cluster_cores() -> float:
 
 
 def _learning_hub(hub=None):
-    """The MetadataHub to read learned sizing from — the one threaded in, else the
-    process-wide default (the same store Core records feedback to). Best-effort: any
-    failure to reach a hub yields `None`, so a learned read simply falls back to the
-    plan default."""
+    """The MetadataHub to read learned sizing from: the one threaded in, else the
+    process-wide default (the same store Core records feedback to).
+
+    `default_hub` does not raise: a metadata backend that cannot be opened degrades to an
+    in-process store inside it, so there is nothing to catch here."""
     if hub is not None:
         return hub
-    try:
-        from batcher.core import default_hub
+    from batcher.core import default_hub
 
-        return default_hub()
-    except Exception as exc:  # pragma: no cover - learning is best-effort
-        note_suppressed("dist", "resolve the learning hub", exc)
-        return None
+    return default_hub()
 
 
 def _plan_family(plan: LogicalPlan) -> str:
