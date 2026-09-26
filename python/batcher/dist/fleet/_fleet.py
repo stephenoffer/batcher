@@ -406,7 +406,7 @@ def _regrant_fleet(fleet: ShuffleFleet, credits: int, cfg_json: str) -> None:
     from batcher.dist.executors.ray_runtime import current_envelope
     from batcher.dist.flight_worker import _slot_engine_configs
 
-    cfgs = _slot_engine_configs(current_envelope(), len(fleet.actors), cfg_json, fleet.pg is not None)
+    cfgs = _slot_engine_configs(current_envelope(), len(fleet.actors), cfg_json, bool(fleet.pg))
     ray.get([a.set_grant.remote(credits, cfgs[i]) for i, a in enumerate(fleet.actors)])
     fleet.credits = credits
     fleet.cfg_json = cfg_json

@@ -190,6 +190,44 @@ def column_bounds(build: ColumnBuilder, dtype: pa.DataType, name: str):
     return _merge_bounds(parts, col.null_count)
 
 
+#: Rows checked before the whole column is: a column that is not ascending almost always
+#: shows it within its first morsels, so the full comparison runs only on the likely yes.
+_ASCENDING_PROBE_ROWS = 65_536
+
+
+def column_ascending(build: ColumnBuilder, dtype: pa.DataType, name: str) -> bool:
+    """Whether column `name` never decreases in storage order, with no nulls to place.
+
+    An estimation hint rather than a sort proof (`SourceStatistics.ascending`), so a float
+    column holding NaN, a null anywhere, or an unordered type answers False rather than
+    reasoning about where those would sort. One vectorized comparison of the column against
+    itself shifted by a row, after a probe of its head that turns away the ordinary no.
+    """
+    dtype = _value_dtype(dtype)
+    if not any(ordered(dtype) for ordered in _ORDERED_TYPES):
+        return False
+    try:
+        col = _decoded(build(name))
+        if len(col) < 2 or col.null_count:
+            return False
+        if pa.types.is_floating(dtype) and bool(pc.any(pc.is_nan(col)).as_py()):
+            return False
+        head = col.slice(0, _ASCENDING_PROBE_ROWS)
+        if not _non_decreasing(head):
+            return False
+        return len(col) <= _ASCENDING_PROBE_ROWS or _non_decreasing(col)
+    except _ARROW_ERRORS:
+        return False
+
+
+def _non_decreasing(col: pa.ChunkedArray | pa.Array) -> bool:
+    """Every value is at least the one before it."""
+    if isinstance(col, pa.ChunkedArray):
+        col = col.combine_chunks()
+    n = len(col)
+    return n < 2 or bool(pc.all(pc.greater_equal(col.slice(1), col.slice(0, n - 1))).as_py())
+
+
 def _float_bounds(col: pa.Array):
     """Truthful float bounds under SQL's total order, where NaN is the **greatest** value.
 
@@ -268,10 +306,19 @@ def statistics(build: ColumnBuilder, schema: pa.Schema, rows: int) -> SourceStat
         stat = column_stat(build, f.type, f.name)
         if stat is not None:
             columns[f.name] = stat
+    ascending = tuple(
+        f.name
+        for f in schema
+        if columns.get(f.name) is not None
+        and columns[f.name].min is not None
+        and column_ascending(build, f.type, f.name)
+    )
     # `column_bounds` records NaN as the max when the column holds one (SQL ranks NaN
     # greatest), so unlike a Parquet footer these bounds *are* sound for `max(f)` and
     # for every float fact derived from them — declare it.
-    return SourceStatistics(row_count=rows, columns=columns, bounds_include_nan=True)
+    return SourceStatistics(
+        row_count=rows, columns=columns, bounds_include_nan=True, ascending=ascending
+    )
 
 
 def column_stat(build: ColumnBuilder, dtype: pa.DataType, name: str) -> ColumnStat | None:

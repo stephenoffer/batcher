@@ -8,6 +8,8 @@ bounds peak memory. `aggregate` and `dist.spill_breakers` are the operators that
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pyarrow as pa
 
 from batcher.carbonite.spill.scratch import make_store, scratch_dir
@@ -166,3 +168,81 @@ _FD_SAFE_PARTITIONS = 1024
 
 def _fd_safe(n_buckets: int) -> int:
     return max(1, min(n_buckets, _FD_SAFE_PARTITIONS))
+
+
+def spill_chunk_bytes() -> int:
+    """Decoded bytes a *folding* partition phase reads per chunk: 1/16 of the envelope.
+
+    A phase that folds each chunk straight into partial state (the out-of-core aggregate) is
+    bounded by the chunk plus the partials, not by the input, so its chunk can be far larger
+    than `_SPILL_INPUT_CHUNK_BYTES` -- and must be, because that 8 MiB morsel is one engine
+    call per quarter-million rows: TPC-H sf100 `lineitem` took 2,448 calls, each too small to
+    fill the cores, with the read serialized in front of every one. A sixteenth of the budget
+    keeps two chunks (the one folding and the one prefetching) well inside it; the clamp keeps
+    a small envelope from shrinking a chunk below useful and a huge one from taking seconds
+    per chunk.
+    """
+    from batcher._internal.hardware.memory import machine_memory_bytes
+    from batcher.config import active_config
+
+    budget = active_config().memory.max_memory_bytes or machine_memory_bytes()
+    return max(_SPILL_INPUT_CHUNK_BYTES, min(2 << 30, budget // 16))
+
+
+def iter_spill_chunks(
+    source: Source,
+    projection: list[str] | None,
+    predicate: dict | None,
+    target_bytes: int,
+) -> Iterator[list[pa.RecordBatch]]:
+    """Yield `source` as lists of batches of about `target_bytes`, the next one prefetched.
+
+    A source that can read itself a group of files at a time (`iter_chunks`, Parquet) does,
+    through its concurrent native reader; any other source's stream is grouped into lists as
+    it arrives. The batches are never concatenated -- the engine takes a list of morsels, so
+    compacting them would be a copy of the whole input for nothing.
+
+    The next chunk is read on a background thread while the caller folds the current one, so
+    reading and computing overlap instead of alternating. Both the native reader and the
+    engine release the GIL for their work. Order is preserved, which no caller relies on
+    (every fold is associative and commutative) but costs nothing to keep.
+    """
+    chunked = getattr(source, "iter_chunks", None)
+    if callable(chunked):
+        chunks = chunked(projection, predicate, target_bytes)
+    else:
+        chunks = _grouped(iter_source(source, projection, predicate), target_bytes)
+    yield from _prefetched(chunks)
+
+
+def _grouped(
+    batches: Iterator[pa.RecordBatch], target_bytes: int
+) -> Iterator[list[pa.RecordBatch]]:
+    pending: list[pa.RecordBatch] = []
+    pending_bytes = 0
+    for batch in batches:
+        if batch.num_rows == 0:
+            continue
+        pending.append(batch)
+        pending_bytes += logical_bytes(batch)
+        if pending_bytes >= target_bytes:
+            yield pending
+            pending, pending_bytes = [], 0
+    if pending:
+        yield pending
+
+
+def _prefetched(chunks: Iterator[list[pa.RecordBatch]]) -> Iterator[list[pa.RecordBatch]]:
+    """`chunks`, with the next one produced on a worker thread while the caller works."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    source = iter(chunks)
+    sentinel: list[pa.RecordBatch] | None = None
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="batcher-spill-read") as pool:
+        pending = pool.submit(next, source, sentinel)
+        while True:
+            chunk = pending.result()
+            if chunk is sentinel:
+                return
+            pending = pool.submit(next, source, sentinel)
+            yield chunk

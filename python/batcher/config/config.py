@@ -87,6 +87,7 @@ def _engine_config_json_budgeted(
     values: tuple[object, ...],
     budgets: tuple[tuple[int, int], ...],
     prefer_materializing_aggregate: bool = False,
+    prefer_sideways: bool = False,
 ) -> str:
     """`_engine_config_json` plus per-operator spill budgets, memoized on both parts.
 
@@ -99,6 +100,8 @@ def _engine_config_json_budgeted(
     payload["op_budgets"] = {str(op_id): budget for op_id, budget in budgets}
     if prefer_materializing_aggregate:
         payload["prefer_materializing_aggregate"] = True
+    if prefer_sideways:
+        payload["prefer_sideways"] = True
     return json.dumps(payload)
 
 
@@ -2567,7 +2570,11 @@ class Config:
         return _engine_config_json(self._engine_config_values())
 
     def engine_config_json_with(
-        self, op_budgets: dict[int, int], *, prefer_materializing_aggregate: bool = False
+        self,
+        op_budgets: dict[int, int],
+        *,
+        prefer_materializing_aggregate: bool = False,
+        prefer_sideways: bool = False,
     ) -> str:
         """`engine_config_json` plus Kyber's per-operator spill budgets.
 
@@ -2595,17 +2602,21 @@ class Config:
                 aggregate is cheaper materialized than streamed, taken from the estimated
                 group count only the control plane has. A hint the engine may decline: it
                 re-checks the plan shape and ANDs in its own memory-affordability test.
+            prefer_sideways: Kyber's verdict that a join's build-side aggregate reads far more
+                rows than its probe side can match, so the executor that restricts it to the
+                probe side's keys is faster. A hint on the same terms as the one above.
 
         Returns:
             A JSON string extending `engine_config_json` with the per-operator
             budgets; an empty map reproduces `engine_config_json` exactly.
         """
-        if not op_budgets and not prefer_materializing_aggregate:
+        if not op_budgets and not prefer_materializing_aggregate and not prefer_sideways:
             return self.engine_config_json()
         return _engine_config_json_budgeted(
             self._engine_config_values(),
             tuple(sorted(op_budgets.items())),
             prefer_materializing_aggregate,
+            prefer_sideways,
         )
 
     def _engine_config_values(self) -> tuple[object, ...]:

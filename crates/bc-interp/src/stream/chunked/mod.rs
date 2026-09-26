@@ -1,0 +1,1275 @@
+//! Stream the driving relation into the executor chunk by chunk, instead of all at once.
+//!
+//! Every other entry point takes `sources: &[Vec<RecordBatch>]` — each input already decoded and
+//! resident. For a scan-heavy query over a table larger than memory that is the whole problem:
+//! TPC-H sf100 `lineitem` projected to q5's four columns is ~19 GB, the query's answer is five
+//! rows, and the control plane had to decode every one of those bytes before the engine could
+//! start — or, when they would not fit, route the query to an out-of-core path that ran the plan
+//! once per 8 MiB morsel from Python. q5 took 3 s on a 240 GB box and 233 s on a 92 GB one.
+//!
+//! Here one source — the **driving** one — arrives as a sequence of chunks from a caller-supplied
+//! producer (`bc-py` reads Parquet a group of files at a time, the next group decoding while this
+//! one computes). Everything else is prepared once:
+//!
+//! 1. The plan must be `post ops → Aggregate → spine`, where the post ops are row-wise, sort or
+//!    limit nodes over the aggregate's *result*, and the spine reaches the driving scan through
+//!    filters, projections and the **probe** side of joins that emit each probe row
+//!    independently (`Inner`, `Left`, `Semi`, `Anti`). The driving source is scanned exactly
+//!    once, so no build side reads it. See [`chunkable`].
+//! 2. Every build side is prepared once, from the non-driving sources, exactly as
+//!    [`super::prebuild_joins`] prepares it for a resident run.
+//! 3. Each chunk is sharded across the workers, run through the spine, and folded into partial
+//!    aggregate state — the same `partial → combine → finalize` algebra (invariant #7) the
+//!    sharded executor and the cluster already use. A probe row lives in exactly one chunk, so
+//!    each chunk's partial covers disjoint input and the partials combine to the whole answer.
+//! 4. The combined partial is finalized once and the post ops run over that small result.
+//!
+//! Peak memory is the build sides, the aggregate state and two chunks (the one folding and the
+//! one the producer is decoding), independent of the driving relation's size.
+
+pub(crate) mod units;
+
+use arrow::array::RecordBatch;
+use bc_ir::{JoinType, RelOp};
+use bc_runtime::agg;
+use rayon::prelude::*;
+
+use super::parallel::{effective_shard_count, shard};
+use super::{build_with, combine_and_finalize, fold_partial, prebuild_joins_for_chunks, Ctx};
+use crate::error::InterpError;
+use crate::ops;
+use crate::par::ExecOptions;
+
+/// A chunk producer: the next chunk of the driving relation, `None` once it is exhausted.
+pub type NextChunk<'a> = dyn FnMut() -> Option<Result<Vec<RecordBatch>, InterpError>> + 'a;
+
+/// Whether `plan` can be executed with `driving` streamed in chunks. See the module note.
+#[must_use]
+pub fn chunkable(plan: &RelOp, driving: usize) -> bool {
+    oriented_core(&orient(plan, driving), driving).is_some()
+}
+
+/// What the chunks feed, below the post ops that run once over its result.
+enum Core<'a> {
+    /// An aggregate over the driving spine, wherever it sits in the plan (`path` is the child
+    /// indices from the root down to it): each chunk folds into partial state, finalized once.
+    Aggregate { path: Vec<usize>, node: &'a RelOp },
+    /// A streamable spine (an adaptive stage whose root is a join, say): each chunk's output
+    /// rows are collected in order.
+    Spine { depth: usize, node: &'a RelOp },
+}
+
+fn oriented_core(plan: &RelOp, driving: usize) -> Option<Core<'_>> {
+    if scans_of(plan, driving) != 1 {
+        return None;
+    }
+    // The aggregate whose input is the probe spine over the driving scan, wherever it sits: the
+    // driving source is scanned once, so there is at most one. Everything above it — post ops,
+    // an aggregate over it, or a join to another input — reads only its (small) result, and runs
+    // on the ordinary executor once it is known.
+    //
+    // That placement matters beyond memory. TPC-H q15 compares a grouped `sum` with a `max` of
+    // the same sums that the control plane evaluates first and folds in as a literal, and in the
+    // main query the `sum` sits under a join to `supplier`. If the two evaluations took
+    // different executors they would sum in different orders, disagree in the last bit, and the
+    // equality would keep nothing; streaming the aggregate wherever it sits sends both through
+    // the same chunks, shards and combine.
+    let mut path = Vec::new();
+    if let Some(node) = find_aggregate(plan, driving, &mut path) {
+        return Some(Core::Aggregate { path, node });
+    }
+    // No aggregate over the spine: the spine starts below any global `Sort`/`Limit`, which must
+    // see every chunk's rows at once and so run as post ops over the collected result.
+    let mut node = plan;
+    let mut depth = 0;
+    while let RelOp::Sort { input, .. } | RelOp::Limit { input, .. } = node {
+        node = input;
+        depth += 1;
+    }
+    probe_spine_reaches(node, driving).then_some(Core::Spine { depth, node })
+}
+
+/// The aggregate whose input is the probe spine reaching `driving`, recording its child-index
+/// path from `plan` into `path`.
+fn find_aggregate<'a>(plan: &'a RelOp, driving: usize, path: &mut Vec<usize>) -> Option<&'a RelOp> {
+    if let RelOp::Aggregate { input, .. } = plan {
+        if probe_spine_reaches(input, driving) {
+            return Some(plan);
+        }
+    }
+    for (i, child) in plan.children().into_iter().enumerate() {
+        if scans_of(child, driving) == 0 {
+            continue;
+        }
+        path.push(i);
+        if let Some(found) = find_aggregate(child, driving, path) {
+            return Some(found);
+        }
+        path.pop();
+    }
+    None
+}
+
+/// Execute `plan` with `sources[driving]` supplied by `next_chunk` rather than resident.
+///
+/// `sources[driving]` carries only the driving relation's schema — a zero-row batch — and is
+/// what the plan runs over when the chunks hold no rows at all. Returns the same rows the
+/// resident executors return for the same plan over the concatenated chunks.
+///
+/// # Errors
+/// [`InterpError::NotChunkable`] when the plan is not [`chunkable`] — the caller should run it
+/// resident instead; [`InterpError::MemoryBudgetExceeded`] when the aggregate state (or the
+/// collected output of a spine) outgrows `budget` — the caller routes the query to an executor
+/// that spills; anything a chunk producer or an operator reports.
+pub fn execute_chunked(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    driving: usize,
+    next_chunk: &mut NextChunk<'_>,
+    workers: usize,
+    budget: usize,
+    opts: &ExecOptions,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    let oriented = orient(plan, driving);
+    let plan = &oriented;
+    let Some(core) = oriented_core(plan, driving) else {
+        return Err(InterpError::NotChunkable);
+    };
+    let run = Run {
+        driving,
+        workers: workers.max(1),
+        budget,
+        opts,
+        carrier: sources[driving].clone(),
+        pool: crate::par::pool_for(workers.max(1))?,
+    };
+    let mut srcs: Vec<Vec<RecordBatch>> = sources.to_vec();
+    srcs[driving] = next_chunk().transpose()?.unwrap_or_default();
+    match core {
+        Core::Aggregate { path, node } => {
+            let result = run.aggregate(node, &mut srcs, next_chunk)?;
+            if path.is_empty() {
+                return Ok(result);
+            }
+            // The rest of the plan reads the aggregate's result as a new source.
+            let mut rest = plan.clone();
+            *node_at(&mut rest, &path) = RelOp::Scan {
+                source_id: srcs.len(),
+            };
+            let mut rest_srcs = srcs;
+            rest_srcs[driving] = Vec::new();
+            rest_srcs.push(result);
+            crate::par::execute_parallel_with(&rest, &rest_srcs, opts)
+        }
+        Core::Spine { depth, node } => {
+            let result = run.collect(node, &mut srcs, next_chunk)?;
+            if depth == 0 {
+                return Ok(result);
+            }
+            // The global sort/limit above the spine reads its collected rows as a new source.
+            let path = vec![0; depth];
+            let mut post = plan.clone();
+            *node_at(&mut post, &path) = RelOp::Scan {
+                source_id: srcs.len(),
+            };
+            let mut post_srcs = srcs;
+            post_srcs[driving] = Vec::new();
+            post_srcs.push(result);
+            crate::execute(&post, &post_srcs)
+        }
+    }
+}
+
+/// Execute `plan` with `sources[driving]` read unit by unit from `src` by the workers themselves.
+///
+/// [`execute_chunked`] alternates: the producer decodes a chunk on every core, then the workers
+/// run it on every core. Here there is no producer. The units are split into contiguous ranges,
+/// and each worker decodes its range one unit at a time and pushes each unit's morsels straight
+/// through its pipeline, so decoding overlaps computing across the pool and a worker holds one
+/// decoded unit rather than a chunk. The same plans qualify ([`chunkable`]) and the same rows
+/// come back: ranges are contiguous and taken in order, so a spine's output concatenates in the
+/// relation's order, and an aggregate folds one partial per range.
+///
+/// # Errors
+/// As [`execute_chunked`].
+pub fn execute_units(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    driving: usize,
+    src: &dyn units::UnitSource,
+    workers: usize,
+    budget: usize,
+    opts: &ExecOptions,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    units_with(plan, sources, driving, src, workers, budget, opts, None)
+}
+
+/// [`execute_units`], with per-operator metrics for the operators it runs itself.
+///
+/// The worker-read pass sees every driving row exactly once, so its counts are the query's real
+/// cardinalities and the learning loop can take them — unlike [`execute_chunked`], whose
+/// operators run once per chunk. The operators it hands to another executor (the post ops over
+/// an aggregate's result) are not measured and are simply absent from the metrics. When the
+/// plan had to be re-oriented the metrics are empty: the operators are then numbered by a tree
+/// the control plane never built, and a count attributed to the wrong operator teaches worse
+/// than none.
+///
+/// # Errors
+/// As [`execute_units`].
+#[allow(clippy::too_many_arguments)]
+pub fn execute_units_metered(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    driving: usize,
+    src: &dyn units::UnitSource,
+    workers: usize,
+    budget: usize,
+    opts: &ExecOptions,
+) -> Result<(Vec<RecordBatch>, crate::ExecMetrics), InterpError> {
+    let (oriented, swaps) = orient_counted(plan, driving);
+    if swaps > 0 {
+        let out = units_with(plan, sources, driving, src, workers, budget, opts, None)?;
+        return Ok((out, crate::ExecMetrics::default()));
+    }
+    let meter = super::Meter::new(&oriented, workers.max(1) as u32);
+    let out = units_with(
+        &oriented,
+        sources,
+        driving,
+        src,
+        workers,
+        budget,
+        opts,
+        Some(&meter),
+    )?;
+    Ok((out, meter.finish()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn units_with(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    driving: usize,
+    src: &dyn units::UnitSource,
+    workers: usize,
+    budget: usize,
+    opts: &ExecOptions,
+    meter: Option<&super::Meter>,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    let oriented = orient(plan, driving);
+    // Measure against the plan the meter numbered: `execute_units_metered` passes an already
+    // oriented plan, which orienting again leaves unchanged, so its node addresses are the
+    // meter's only if the tree walked is that very plan.
+    let plan = if meter.is_some() { plan } else { &oriented };
+    let Some(core) = oriented_core(plan, driving) else {
+        return Err(InterpError::NotChunkable);
+    };
+    let run = Run {
+        driving,
+        workers: workers.max(1),
+        budget,
+        opts,
+        carrier: sources[driving].clone(),
+        pool: crate::par::pool_for(workers.max(1))?,
+    };
+    let mut srcs: Vec<Vec<RecordBatch>> = sources.to_vec();
+    srcs[driving] = run.carrier.clone();
+    let ranges = unit_ranges(src.units(), run.workers);
+    match core {
+        Core::Aggregate { path, node } => {
+            let result = run.aggregate_units(node, &srcs, src, &ranges, meter)?;
+            if path.is_empty() {
+                return Ok(result);
+            }
+            let mut rest = plan.clone();
+            *node_at(&mut rest, &path) = RelOp::Scan {
+                source_id: srcs.len(),
+            };
+            srcs[driving] = Vec::new();
+            srcs.push(result);
+            crate::par::execute_parallel_with(&rest, &srcs, opts)
+        }
+        Core::Spine { depth, node } => {
+            let result = run.collect_units(node, &srcs, src, &ranges, meter)?;
+            if depth == 0 {
+                return Ok(result);
+            }
+            let mut post = plan.clone();
+            *node_at(&mut post, &vec![0; depth]) = RelOp::Scan {
+                source_id: srcs.len(),
+            };
+            srcs[driving] = Vec::new();
+            srcs.push(result);
+            crate::execute(&post, &srcs)
+        }
+    }
+}
+
+/// `units` split into contiguous, in-order ranges for `workers` workers.
+///
+/// Two ranges per worker rather than one: units differ in cost (a row group a predicate
+/// empties decodes one column, a full one every column), and with one range each the slowest
+/// worker sets the time. Rayon hands the spare ranges to whichever worker finishes first.
+fn unit_ranges(units: usize, workers: usize) -> Vec<std::ops::Range<usize>> {
+    let pieces = (workers * 2).clamp(1, units.max(1));
+    (0..pieces)
+        .map(|k| (k * units / pieces)..((k + 1) * units / pieces))
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// The node reached from `plan` by following the child indices in `path`.
+fn node_at<'a>(plan: &'a mut RelOp, path: &[usize]) -> &'a mut RelOp {
+    let mut node = plan;
+    for &i in path {
+        node = node
+            .children_mut()
+            .into_iter()
+            .nth(i)
+            .expect("the path was recorded on this plan's shape");
+    }
+    node
+}
+
+/// One chunked execution's settings.
+struct Run<'o> {
+    driving: usize,
+    workers: usize,
+    budget: usize,
+    opts: &'o ExecOptions,
+    /// The zero-row batch carrying the driving relation's schema.
+    carrier: Vec<RecordBatch>,
+    /// The producer is not `Send` (in `bc-py` it calls back into Python), so it is only ever
+    /// called on the driver thread, between the parallel steps that run inside this pool.
+    pool: std::sync::Arc<rayon::ThreadPool>,
+}
+
+impl Run<'_> {
+    /// One view of `srcs` per shard of the current chunk, or none when the chunk is empty.
+    fn shard_views(&self, srcs: &[Vec<RecordBatch>]) -> Vec<Vec<Vec<RecordBatch>>> {
+        let rows: usize = srcs[self.driving].iter().map(RecordBatch::num_rows).sum();
+        if rows == 0 {
+            return Vec::new();
+        }
+        shard(
+            &srcs[self.driving],
+            effective_shard_count(self.workers, rows),
+        )
+        .into_iter()
+        .map(|s| {
+            let mut view = srcs.to_vec();
+            view[self.driving] = s;
+            view
+        })
+        .collect()
+    }
+
+    fn over_budget(&self, bytes: usize, reason: &'static str) -> Result<(), InterpError> {
+        if self.budget > 0 && bytes > self.budget {
+            return Err(InterpError::MemoryBudgetExceeded {
+                needed: bytes,
+                budget: self.budget,
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    /// Fold every chunk into partial aggregate state; finalize once.
+    fn aggregate(
+        &self,
+        node: &RelOp,
+        srcs: &mut [Vec<RecordBatch>],
+        next_chunk: &mut NextChunk<'_>,
+    ) -> Result<Vec<RecordBatch>, InterpError> {
+        let RelOp::Aggregate {
+            input,
+            group_keys,
+            aggregates,
+        } = node
+        else {
+            unreachable!("Core::Aggregate holds an aggregate")
+        };
+        let funcs = ops::agg_funcs(aggregates);
+        // The build sides read no driving rows (`chunkable`), so preparing them against the first
+        // chunk prepares exactly what a resident run prepares.
+        let cache = self.pool.install(|| {
+            prebuild_joins_for_chunks(
+                input,
+                srcs,
+                None,
+                self.budget,
+                self.workers,
+                Some(self.opts),
+            )
+        })?;
+        let jit = std::sync::OnceLock::new();
+        let mut partials: Vec<agg::Partial> = Vec::new();
+        let mut state_bytes = 0usize;
+        loop {
+            self.opts.check_cancelled()?;
+            let views = self.shard_views(srcs);
+            let folded = self.pool.install(|| {
+                views
+                    .par_iter()
+                    .map(|view| {
+                        let ctx = Ctx::new(view, &cache, None, self.budget);
+                        Ok(fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)?.0)
+                    })
+                    .collect::<Result<Vec<_>, InterpError>>()
+            })?;
+            let folded: Vec<agg::Partial> = folded.into_iter().flatten().collect();
+            if !folded.is_empty() {
+                // One partial per chunk: the shards' states merged while they are small, so what
+                // is held across chunks is bounded by the groups, not by chunks times workers.
+                let merged = self.pool.install(|| agg::combine(&folded, &funcs))?;
+                state_bytes += crate::column_bytes(
+                    merged
+                        .group_columns
+                        .iter()
+                        .chain(merged.states.iter().flatten()),
+                ) as usize;
+                self.over_budget(state_bytes, "the chunked aggregate does not spill")?;
+                partials.push(merged);
+            }
+            match next_chunk().transpose()? {
+                Some(chunk) => srcs[self.driving] = chunk,
+                None => break,
+            }
+        }
+        if partials.is_empty() {
+            // No chunk held a row. The aggregate over nothing is the oracle's to answer — a
+            // global aggregate still owes its one identity row — so run it over the empty
+            // relation.
+            let mut empty = srcs.to_vec();
+            empty[self.driving] = self.carrier.clone();
+            return crate::execute(node, &empty);
+        }
+        self.pool
+            .install(|| combine_and_finalize(&partials, group_keys, aggregates))
+    }
+
+    /// Run every chunk through the spine and keep its rows, in chunk and shard order.
+    fn collect(
+        &self,
+        node: &RelOp,
+        srcs: &mut [Vec<RecordBatch>],
+        next_chunk: &mut NextChunk<'_>,
+    ) -> Result<Vec<RecordBatch>, InterpError> {
+        let cache = self.pool.install(|| {
+            prebuild_joins_for_chunks(node, srcs, None, self.budget, self.workers, Some(self.opts))
+        })?;
+        let mut out: Vec<RecordBatch> = Vec::new();
+        let mut held = 0usize;
+        loop {
+            self.opts.check_cancelled()?;
+            let views = self.shard_views(srcs);
+            let pieces = self.pool.install(|| {
+                views
+                    .par_iter()
+                    .map(|view| {
+                        let ctx = Ctx::new(view, &cache, None, self.budget);
+                        build_with(node, ctx)?.collect::<Result<Vec<_>, InterpError>>()
+                    })
+                    .collect::<Result<Vec<_>, InterpError>>()
+            })?;
+            for batch in pieces.into_iter().flatten() {
+                if batch.num_rows() > 0 {
+                    held += crate::column_bytes(batch.columns()) as usize;
+                    out.push(batch);
+                }
+            }
+            self.over_budget(held, "the chunked spine's output is held in memory")?;
+            match next_chunk().transpose()? {
+                Some(chunk) => srcs[self.driving] = chunk,
+                None => break,
+            }
+        }
+        if out.is_empty() {
+            // Nothing survived: the oracle over the empty relation gives the schema.
+            let mut empty = srcs.to_vec();
+            empty[self.driving] = self.carrier.clone();
+            return crate::execute(node, &empty);
+        }
+        Ok(out)
+    }
+}
+
+impl Run<'_> {
+    /// One lazily-read driving scan per unit range.
+    fn lazies<'s>(
+        &self,
+        src: &'s dyn units::UnitSource,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Vec<units::LazyScan<'s>> {
+        ranges
+            .iter()
+            .map(|units| units::LazyScan {
+                source_id: self.driving,
+                src,
+                units: units.clone(),
+            })
+            .collect()
+    }
+
+    /// Fold each unit range into partial aggregate state, on the worker that reads it.
+    fn aggregate_units(
+        &self,
+        node: &RelOp,
+        srcs: &[Vec<RecordBatch>],
+        src: &dyn units::UnitSource,
+        ranges: &[std::ops::Range<usize>],
+        meter: Option<&super::Meter>,
+    ) -> Result<Vec<RecordBatch>, InterpError> {
+        let t = std::time::Instant::now();
+        let RelOp::Aggregate {
+            input,
+            group_keys,
+            aggregates,
+        } = node
+        else {
+            unreachable!("Core::Aggregate holds an aggregate")
+        };
+        // The build sides read no driving rows (`chunkable`), so the carrier suffices.
+        let cache = self.pool.install(|| {
+            prebuild_joins_for_chunks(
+                input,
+                srcs,
+                meter,
+                self.budget,
+                self.workers,
+                Some(self.opts),
+            )
+        })?;
+        self.opts.check_cancelled()?;
+        let lazies = self.lazies(src, ranges);
+        let jit = std::sync::OnceLock::new();
+        let rows_in = std::sync::atomic::AtomicU64::new(0);
+        let partials: Vec<agg::Partial> = self
+            .pool
+            .install(|| {
+                lazies
+                    .par_iter()
+                    .map(|lazy| {
+                        let ctx = Ctx::new(srcs, &cache, meter, self.budget).with_lazy(lazy);
+                        let (partial, n) =
+                            fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)?;
+                        rows_in.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                        Ok(partial)
+                    })
+                    .collect::<Result<Vec<_>, InterpError>>()
+            })?
+            .into_iter()
+            .flatten()
+            .collect();
+        if partials.is_empty() {
+            return crate::execute(node, srcs);
+        }
+        let state = crate::column_bytes(
+            partials
+                .iter()
+                .flat_map(|p| p.group_columns.iter().chain(p.states.iter().flatten())),
+        ) as usize;
+        self.over_budget(state, "the chunked aggregate does not spill")?;
+        let out = self
+            .pool
+            .install(|| combine_and_finalize(&partials, group_keys, aggregates))?;
+        if let Some(m) = meter {
+            if let Some(compiled) = jit.get() {
+                m.note_backend(m.id(node), compiled.backend_tag());
+            }
+            m.breaker(
+                m.id(node),
+                rows_in.into_inner(),
+                0,
+                state as u64,
+                &out,
+                t.elapsed().as_nanos() as u64,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Run each unit range through the spine on the worker that reads it; keep the rows in order.
+    fn collect_units(
+        &self,
+        node: &RelOp,
+        srcs: &[Vec<RecordBatch>],
+        src: &dyn units::UnitSource,
+        ranges: &[std::ops::Range<usize>],
+        meter: Option<&super::Meter>,
+    ) -> Result<Vec<RecordBatch>, InterpError> {
+        let cache = self.pool.install(|| {
+            prebuild_joins_for_chunks(
+                node,
+                srcs,
+                meter,
+                self.budget,
+                self.workers,
+                Some(self.opts),
+            )
+        })?;
+        self.opts.check_cancelled()?;
+        let held = std::sync::atomic::AtomicUsize::new(0);
+        let lazies = self.lazies(src, ranges);
+        let pieces = self.pool.install(|| {
+            lazies
+                .par_iter()
+                .map(|lazy| {
+                    let ctx = Ctx::new(srcs, &cache, meter, self.budget).with_lazy(lazy);
+                    let keep = |batch: Result<RecordBatch, InterpError>| {
+                        let batch = batch?;
+                        let bytes = crate::column_bytes(batch.columns()) as usize;
+                        let total =
+                            held.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed) + bytes;
+                        self.over_budget(total, "the chunked spine's output is held in memory")?;
+                        Ok(batch)
+                    };
+                    let out: Vec<RecordBatch> = build_with(node, ctx)?
+                        .map(keep)
+                        .filter(|b| b.as_ref().map_or(true, |b| b.num_rows() > 0))
+                        .collect::<Result<_, InterpError>>()?;
+                    Ok(out)
+                })
+                .collect::<Result<Vec<_>, InterpError>>()
+        })?;
+        let out: Vec<RecordBatch> = pieces.into_iter().flatten().collect();
+        if out.is_empty() {
+            return crate::execute(node, srcs);
+        }
+        Ok(out)
+    }
+}
+
+/// `plan` with every inner join whose *right* (build) input holds the driving scan swapped, so
+/// the driving source ends up on the probe spine.
+///
+/// Kyber builds the smaller side, and a filtered fact table is sometimes the smaller one — TPC-H
+/// q3 at sf100 hashes the date-filtered `lineitem` and probes it with the customer-orders join.
+/// Streaming needs the fact table on the probe side, and an inner join is commutative: the swap
+/// re-labels which input each output column is read from and changes no row. Outer, semi and
+/// anti joins are not commutative and are left alone (`chunkable` then declines them if the
+/// driving scan sits on their build side).
+fn orient(plan: &RelOp, driving: usize) -> RelOp {
+    orient_counted(plan, driving).0
+}
+
+/// [`orient`], with how many joins it swapped.
+fn orient_counted(plan: &RelOp, driving: usize) -> (RelOp, usize) {
+    let mut out = plan.clone();
+    let swaps = orient_in_place(&mut out, driving);
+    (out, swaps)
+}
+
+fn orient_in_place(plan: &mut RelOp, driving: usize) -> usize {
+    let mut swaps = 0;
+    if let RelOp::HashJoin {
+        left,
+        right,
+        left_keys,
+        right_keys,
+        join_type: JoinType::Inner,
+        output,
+        ..
+    } = plan
+    {
+        if scans_of(right, driving) > 0 && scans_of(left, driving) == 0 {
+            swaps += 1;
+            std::mem::swap(left, right);
+            std::mem::swap(left_keys, right_keys);
+            for col in output.iter_mut() {
+                col.side = match col.side {
+                    bc_ir::JoinSide::Left => bc_ir::JoinSide::Right,
+                    bc_ir::JoinSide::Right => bc_ir::JoinSide::Left,
+                };
+            }
+        }
+    }
+    swaps
+        + match plan {
+            RelOp::HashJoin { left, .. } => orient_in_place(left, driving),
+            RelOp::Filter { input, .. }
+            | RelOp::Project { input, .. }
+            | RelOp::Aggregate { input, .. }
+            | RelOp::Sort { input, .. }
+            | RelOp::Limit { input, .. } => orient_in_place(input, driving),
+            _ => 0,
+        }
+}
+
+/// Whether `spine` reaches `Scan { driving }` through probe-side-streamable nodes only.
+fn probe_spine_reaches(spine: &RelOp, driving: usize) -> bool {
+    let mut node = spine;
+    loop {
+        match node {
+            RelOp::Scan { source_id } => return *source_id == driving,
+            RelOp::Filter { input, .. } | RelOp::Project { input, .. } => node = input,
+            RelOp::HashJoin {
+                left,
+                join_type: JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti,
+                ..
+            } => node = left,
+            _ => return false,
+        }
+    }
+}
+
+fn scans_of(plan: &RelOp, source: usize) -> usize {
+    let own = usize::from(matches!(plan, RelOp::Scan { source_id } if *source_id == source));
+    own + plan
+        .children()
+        .into_iter()
+        .map(|c| scans_of(c, source))
+        .sum::<usize>()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bc_expr::{BinaryOp, Expr, Literal};
+    use bc_ir::{AggFunc, AggregateItem, JoinOutputCol, JoinSide, JoinType, ProjectionItem, RelOp};
+
+    use super::{chunkable, execute_chunked, execute_units};
+    use crate::error::InterpError;
+    use crate::par::ExecOptions;
+
+    fn fact(lo: i64, hi: i64) -> RecordBatch {
+        let k: Vec<Option<i64>> = (lo..hi).map(|i| (i % 41 != 0).then_some(i % 97)).collect();
+        let v: Vec<f64> = (lo..hi).map(|i| (i % 13) as f64 + 0.25).collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, true),
+                Field::new("v", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(k)),
+                Arc::new(Float64Array::from(v)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn dim() -> RecordBatch {
+        let d: Vec<i64> = (0..60).collect();
+        let g: Vec<i64> = (0..60).map(|i| i % 7).collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("d", DataType::Int64, false),
+                Field::new("g", DataType::Int64, false),
+            ])),
+            vec![Arc::new(Int64Array::from(d)), Arc::new(Int64Array::from(g))],
+        )
+        .unwrap()
+    }
+
+    fn agg_item(func: AggFunc, col: Option<&str>, alias: &str) -> AggregateItem {
+        AggregateItem {
+            func,
+            input: col.map(|c| Expr::Col { name: c.into() }),
+            input2: None,
+            order_by: Vec::new(),
+            alias: alias.into(),
+            param: None,
+            interpolation: None,
+        }
+    }
+
+    /// `post(Aggregate(Join(Filter(Scan 0), Scan 1)))`, grouped by `g` when the join keeps it.
+    fn plan(join_type: JoinType, grouped: bool) -> RelOp {
+        let keeps_right = matches!(join_type, JoinType::Inner | JoinType::Left);
+        let mut output = vec![
+            JoinOutputCol {
+                side: JoinSide::Left,
+                name: "k".into(),
+                alias: "k".into(),
+            },
+            JoinOutputCol {
+                side: JoinSide::Left,
+                name: "v".into(),
+                alias: "v".into(),
+            },
+        ];
+        if keeps_right {
+            output.push(JoinOutputCol {
+                side: JoinSide::Right,
+                name: "g".into(),
+                alias: "g".into(),
+            });
+        }
+        let join = RelOp::HashJoin {
+            left: Box::new(RelOp::Filter {
+                input: Box::new(RelOp::Scan { source_id: 0 }),
+                predicate: Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Col { name: "v".into() }),
+                    right: Box::new(Expr::Lit {
+                        value: Literal::Float(1.0),
+                    }),
+                },
+            }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["d".into()],
+            join_type,
+            output,
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+        let group_col = if grouped && keeps_right { "g" } else { "k" };
+        let aggregate = RelOp::Aggregate {
+            input: Box::new(join),
+            group_keys: if grouped {
+                vec![ProjectionItem {
+                    expr: Expr::Col {
+                        name: group_col.into(),
+                    },
+                    alias: "gk".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            aggregates: vec![
+                agg_item(AggFunc::Sum, Some("v"), "s"),
+                agg_item(AggFunc::CountStar, None, "n"),
+                agg_item(AggFunc::Mean, Some("v"), "m"),
+            ],
+        };
+        if !grouped {
+            return aggregate;
+        }
+        RelOp::Limit {
+            input: Box::new(RelOp::Sort {
+                input: Box::new(aggregate),
+                keys: vec![bc_ir::SortKey {
+                    expr: Expr::Col { name: "gk".into() },
+                    descending: false,
+                    nulls_first: true,
+                }],
+                limit: None,
+            }),
+            n: 50,
+            offset: 0,
+        }
+    }
+
+    fn rows(batches: &[RecordBatch]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in batches {
+            for i in 0..b.num_rows() {
+                let cells: Vec<String> = b
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        if c.is_null(i) {
+                            "null".into()
+                        } else if let Some(a) = c.as_any().downcast_ref::<Float64Array>() {
+                            format!("{:.6}", a.value(i))
+                        } else if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
+                            a.value(i).to_string()
+                        } else {
+                            format!("{c:?}")
+                        }
+                    })
+                    .collect();
+                out.push(cells.join("|"));
+            }
+        }
+        out
+    }
+
+    fn run(plan: &RelOp, chunks: Vec<Vec<RecordBatch>>) -> Vec<RecordBatch> {
+        let sources = vec![vec![fact(0, 0)], vec![dim()]];
+        let mut it = chunks.into_iter();
+        let mut next = || it.next().map(Ok::<_, InterpError>);
+        execute_chunked(plan, &sources, 0, &mut next, 8, 0, &ExecOptions::default()).unwrap()
+    }
+
+    /// Every admitted join type, grouped (with a sort and limit above) and global, returns what
+    /// the sequential oracle returns over the concatenated chunks — for uneven chunks, an empty
+    /// chunk, one chunk, and none at all.
+    #[test]
+    fn chunked_matches_the_oracle() {
+        let whole: Vec<RecordBatch> = (0..6).map(|c| fact(c * 70_000, (c + 1) * 70_000)).collect();
+        let splits: Vec<Vec<Vec<RecordBatch>>> = vec![
+            vec![whole.clone()],
+            vec![
+                whole[..1].to_vec(),
+                Vec::new(),
+                whole[1..4].to_vec(),
+                whole[4..].to_vec(),
+            ],
+            whole.iter().map(|b| vec![b.clone()]).collect(),
+            Vec::new(),
+        ];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            for grouped in [true, false] {
+                let p = plan(jt, grouped);
+                assert!(chunkable(&p, 0), "{jt:?} grouped={grouped}");
+                for (i, split) in splits.iter().enumerate() {
+                    let input: Vec<RecordBatch> = split.iter().flatten().cloned().collect();
+                    let input = if input.is_empty() {
+                        vec![fact(0, 0)]
+                    } else {
+                        input
+                    };
+                    let oracle = crate::execute(&p, &[input, vec![dim()]]).unwrap();
+                    let mut want = rows(&oracle);
+                    let mut got = rows(&run(&p, split.clone()));
+                    if !grouped {
+                        want.sort();
+                        got.sort();
+                    }
+                    // Grouped results are sorted by the plan, so the order is compared too.
+                    assert_eq!(got, want, "{jt:?} grouped={grouped} split={i}");
+                }
+            }
+        }
+    }
+
+    /// Units served from memory, one `Vec` of batches per unit, optionally failing one of them.
+    struct Units(Vec<Vec<RecordBatch>>, Option<usize>);
+
+    impl crate::stream::UnitSource for Units {
+        fn units(&self) -> usize {
+            self.0.len()
+        }
+        fn read(&self, unit: usize) -> Result<Vec<RecordBatch>, InterpError> {
+            if self.1 == Some(unit) {
+                return Err(InterpError::ChunkSource(format!("unit {unit} failed")));
+            }
+            Ok(self.0[unit].clone())
+        }
+    }
+
+    /// The worker-read path returns the oracle's rows — in the oracle's order for a spine, which
+    /// its contiguous ranges preserve — for every admitted join type, at every pool width from
+    /// one worker up, for more units than workers and fewer, and for a relation with no rows.
+    #[test]
+    fn units_match_the_oracle_at_every_width() {
+        let whole: Vec<RecordBatch> = (0..6).map(|c| fact(c * 70_000, (c + 1) * 70_000)).collect();
+        let splits: Vec<Vec<Vec<RecordBatch>>> = vec![
+            vec![whole.clone()],
+            whole.iter().map(|b| vec![b.clone()]).collect(),
+            vec![whole[..2].to_vec(), Vec::new(), whole[2..].to_vec()],
+            Vec::new(),
+        ];
+        let sources = vec![vec![fact(0, 0)], vec![dim()]];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            for grouped in [true, false] {
+                let p = plan(jt, grouped);
+                let RelOp::Aggregate { input: spine, .. } = plan(jt, false) else {
+                    unreachable!()
+                };
+                for split in &splits {
+                    let input: Vec<RecordBatch> = split.iter().flatten().cloned().collect();
+                    let input = if input.is_empty() {
+                        vec![fact(0, 0)]
+                    } else {
+                        input
+                    };
+                    let src = Units(split.clone(), None);
+                    for workers in [1, 3, 8] {
+                        let opts = ExecOptions::default();
+                        let oracle = crate::execute(&p, &[input.clone(), vec![dim()]]).unwrap();
+                        let got = execute_units(&p, &sources, 0, &src, workers, 0, &opts).unwrap();
+                        let (mut want, mut got) = (rows(&oracle), rows(&got));
+                        if !grouped {
+                            want.sort();
+                            got.sort();
+                        }
+                        assert_eq!(got, want, "{jt:?} grouped={grouped} workers={workers}");
+                        let oracle = crate::execute(&spine, &[input.clone(), vec![dim()]]).unwrap();
+                        let got =
+                            execute_units(&spine, &sources, 0, &src, workers, 0, &opts).unwrap();
+                        assert_eq!(rows(&got), rows(&oracle), "spine {jt:?} workers={workers}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A unit that fails to read fails the query with its own error rather than dropping rows.
+    #[test]
+    fn a_failed_unit_fails_the_query() {
+        let whole: Vec<Vec<RecordBatch>> = (0..4)
+            .map(|c| vec![fact(c * 70_000, (c + 1) * 70_000)])
+            .collect();
+        let sources = vec![vec![fact(0, 0)], vec![dim()]];
+        let src = Units(whole, Some(2));
+        let err = execute_units(
+            &plan(JoinType::Inner, true),
+            &sources,
+            0,
+            &src,
+            4,
+            0,
+            &ExecOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unit 2 failed"), "{err}");
+    }
+
+    /// A plan with no aggregate — a join spine, bare or under a projection and a sort — collects
+    /// each chunk's rows and returns the oracle's rows (in the oracle's order, under the sort).
+    #[test]
+    fn a_spine_without_an_aggregate_collects_the_oracle_rows() {
+        let RelOp::Aggregate { input: join, .. } = plan(JoinType::Inner, false) else {
+            unreachable!()
+        };
+        let projected = RelOp::Project {
+            input: join.clone(),
+            exprs: vec![
+                ProjectionItem {
+                    expr: Expr::Col { name: "k".into() },
+                    alias: "k".into(),
+                },
+                ProjectionItem {
+                    expr: Expr::Col { name: "v".into() },
+                    alias: "v".into(),
+                },
+                ProjectionItem {
+                    expr: Expr::Col { name: "g".into() },
+                    alias: "g".into(),
+                },
+            ],
+        };
+        let sorted = RelOp::Sort {
+            input: Box::new(projected.clone()),
+            keys: ["k", "v"]
+                .iter()
+                .map(|c| bc_ir::SortKey {
+                    expr: Expr::Col { name: (*c).into() },
+                    descending: false,
+                    nulls_first: true,
+                })
+                .collect(),
+            limit: Some(5_000),
+        };
+        let whole: Vec<RecordBatch> = (0..4).map(|c| fact(c * 80_000, (c + 1) * 80_000)).collect();
+        for (p, ordered) in [(*join, false), (projected, false), (sorted, true)] {
+            assert!(chunkable(&p, 0));
+            let mut want = rows(&crate::execute(&p, &[whole.clone(), vec![dim()]]).unwrap());
+            let mut got = rows(&run(&p, whole.iter().map(|b| vec![b.clone()]).collect()));
+            if !ordered {
+                want.sort();
+                got.sort();
+            }
+            assert_eq!(got, want, "ordered={ordered}");
+        }
+    }
+
+    /// An aggregate over the chunked aggregate (`max` of grouped sums, TPC-H q15's subquery) runs
+    /// as a post op over the inner aggregate's result and matches the oracle.
+    #[test]
+    fn an_aggregate_over_the_chunked_aggregate_is_a_post_op() {
+        let RelOp::Limit { input: sort, .. } = plan(JoinType::Inner, true) else {
+            unreachable!()
+        };
+        let RelOp::Sort { input: grouped, .. } = *sort else {
+            unreachable!()
+        };
+        let nested = RelOp::Aggregate {
+            input: grouped,
+            group_keys: Vec::new(),
+            aggregates: vec![
+                agg_item(AggFunc::Max, Some("s"), "mx"),
+                agg_item(AggFunc::CountStar, None, "groups"),
+            ],
+        };
+        assert!(chunkable(&nested, 0));
+        let whole: Vec<RecordBatch> = (0..4).map(|c| fact(c * 90_000, (c + 1) * 90_000)).collect();
+        let want = rows(&crate::execute(&nested, &[whole.clone(), vec![dim()]]).unwrap());
+        let got = rows(&run(
+            &nested,
+            whole.iter().map(|b| vec![b.clone()]).collect(),
+        ));
+        assert_eq!(got, want);
+    }
+
+    /// An aggregate under a join to another input (TPC-H q15's main query) is streamed where it
+    /// sits, and the join above it runs over its result.
+    #[test]
+    fn an_aggregate_under_a_join_is_streamed_in_place() {
+        let RelOp::Limit { input: sort, .. } = plan(JoinType::Inner, true) else {
+            unreachable!()
+        };
+        let RelOp::Sort { input: grouped, .. } = *sort else {
+            unreachable!()
+        };
+        let over = RelOp::HashJoin {
+            left: Box::new(RelOp::Scan { source_id: 1 }),
+            right: Box::new(RelOp::Filter {
+                input: grouped,
+                predicate: Expr::Binary {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Col { name: "n".into() }),
+                    right: Box::new(Expr::Lit {
+                        value: Literal::Int(10),
+                    }),
+                },
+            }),
+            left_keys: vec!["g".into()],
+            right_keys: vec!["gk".into()],
+            join_type: JoinType::Inner,
+            output: vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "d".into(),
+                    alias: "d".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "s".into(),
+                    alias: "s".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "n".into(),
+                    alias: "n".into(),
+                },
+            ],
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+        assert!(chunkable(&over, 0));
+        let whole: Vec<RecordBatch> = (0..4).map(|c| fact(c * 90_000, (c + 1) * 90_000)).collect();
+        let mut want = rows(&crate::execute(&over, &[whole.clone(), vec![dim()]]).unwrap());
+        let mut got = rows(&run(&over, whole.iter().map(|b| vec![b.clone()]).collect()));
+        want.sort();
+        got.sort();
+        assert!(!want.is_empty());
+        assert_eq!(got, want);
+    }
+
+    /// The driving scan on the *build* side of an inner join is swapped onto the probe side, and
+    /// the swapped plan still returns the oracle's rows with the columns in the right places.
+    #[test]
+    fn a_driving_scan_on_the_build_side_is_reoriented() {
+        let RelOp::Limit { input: sort, .. } = plan(JoinType::Inner, true) else {
+            unreachable!()
+        };
+        let RelOp::Sort {
+            input: aggregate, ..
+        } = *sort
+        else {
+            unreachable!()
+        };
+        let RelOp::Aggregate {
+            input,
+            group_keys,
+            aggregates,
+        } = *aggregate
+        else {
+            unreachable!()
+        };
+        let RelOp::HashJoin {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            output,
+            ..
+        } = *input
+        else {
+            unreachable!()
+        };
+        let flipped = RelOp::Aggregate {
+            input: Box::new(RelOp::HashJoin {
+                left: right,
+                right: left,
+                left_keys: right_keys,
+                right_keys: left_keys,
+                join_type: JoinType::Inner,
+                output: output
+                    .into_iter()
+                    .map(|c| JoinOutputCol {
+                        side: match c.side {
+                            JoinSide::Left => JoinSide::Right,
+                            JoinSide::Right => JoinSide::Left,
+                        },
+                        ..c
+                    })
+                    .collect(),
+                strategy: bc_ir::JoinStrategy::Broadcast,
+            }),
+            group_keys,
+            aggregates,
+        };
+        assert!(chunkable(&flipped, 0));
+        let whole: Vec<RecordBatch> = (0..4).map(|c| fact(c * 90_000, (c + 1) * 90_000)).collect();
+        let mut want = rows(&crate::execute(&flipped, &[whole.clone(), vec![dim()]]).unwrap());
+        let mut got = rows(&run(
+            &flipped,
+            whole.iter().map(|b| vec![b.clone()]).collect(),
+        ));
+        want.sort();
+        got.sort();
+        assert_eq!(got, want);
+    }
+
+    /// A plan scanning the driving source twice, or through a join that keeps unmatched build
+    /// rows, or with no aggregate, is not chunkable — and `execute_chunked` says so up front.
+    #[test]
+    fn unsupported_shapes_are_declined() {
+        let RelOp::Aggregate {
+            group_keys,
+            aggregates,
+            ..
+        } = plan(JoinType::Inner, false)
+        else {
+            unreachable!()
+        };
+        let self_join = RelOp::Aggregate {
+            input: Box::new(RelOp::HashJoin {
+                left: Box::new(RelOp::Scan { source_id: 0 }),
+                right: Box::new(RelOp::Scan { source_id: 0 }),
+                left_keys: vec!["k".into()],
+                right_keys: vec!["k".into()],
+                join_type: JoinType::Inner,
+                output: vec![JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "v".into(),
+                }],
+                strategy: bc_ir::JoinStrategy::Hash,
+            }),
+            group_keys,
+            aggregates,
+        };
+        assert!(!chunkable(&self_join, 0));
+        for jt in [JoinType::Right, JoinType::Full] {
+            assert!(!chunkable(&plan(jt, false), 0), "{jt:?}");
+        }
+        assert!(!chunkable(
+            &RelOp::Distinct {
+                input: Box::new(RelOp::Scan { source_id: 0 }),
+                keys: Vec::new(),
+                order: Vec::new(),
+                limit: None
+            },
+            0
+        ));
+        let mut none = || None;
+        let r = execute_chunked(
+            &self_join,
+            &[vec![fact(0, 0)]],
+            0,
+            &mut none,
+            2,
+            0,
+            &ExecOptions::default(),
+        );
+        assert!(matches!(r, Err(InterpError::NotChunkable)));
+    }
+}

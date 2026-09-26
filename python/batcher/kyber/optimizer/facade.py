@@ -277,6 +277,7 @@ class Optimizer:
             source_limits=required_limits_per_source(plan),
             source_orderings=required_orderings_per_source(plan),
             prefer_materializing_aggregate=_prefers_materializing_aggregate(plan, ctx),
+            prefer_sideways=_prefers_sideways(plan, ctx),
         )
         return phys, plan, ctx.notes.get("build_side_decisions", [])
 
@@ -443,6 +444,60 @@ def _prefers_materializing_aggregate(plan: LogicalPlan, ctx: OptimizerContext) -
         return ctx.estimator.estimate(node).rows >= MATERIALIZE_AGG_MIN_GROUPS
     except Exception:
         return False  # no estimate is not evidence for changing the route
+
+
+#: How many rows a build-side aggregate must read per row of the join's probe side before
+#: restricting it to the probe side's keys (`EngineConfig.prefer_sideways`) is worth routing
+#: the plan to the executor that can. Each probe row keeps at most the rows sharing its key, so
+#: the ratio bounds what the restriction removes; the engine's own run-time gate is 4x, and the
+#: route gives up the streaming executor for it, so this asks for a margin above that. Measured
+#: on TPC-H sf10 q21, whose learned plan settles at an 8.2x ratio: 16 left it streaming at
+#: ~1,030 ms, 8 routes it at ~660 ms. q18 (ratio ~1) and q2 keep streaming either way.
+SIDEWAYS_MIN_RATIO = 8
+
+#: The smallest aggregate input worth the route: the engine's own floor for restricting.
+SIDEWAYS_MIN_ROWS = 262_144
+
+
+def _prefers_sideways(plan: LogicalPlan, ctx: OptimizerContext) -> bool:
+    """Whether some join's build side reads far more rows than its probe side can match.
+
+    The shape the materializing executor restricts (`bc_interp::join_par::sideways`): an inner,
+    left, semi or anti join on one key whose right input, through row-wise nodes, is an
+    `Aggregate` — or, for a semi or anti join, any right input, since what it builds is the key
+    set of every row it reads. The engine re-checks that the key traces to a scan; this half
+    answers only what it cannot, whether the probe side is small enough for the restriction to
+    cut what the build side reads — TPC-H q21's outer spine reaches ~5% of `lineitem`'s orders,
+    while q18's probe side is `lineitem` itself.
+    """
+    from batcher.plan.logical import Aggregate, Filter, Join, Project
+
+    for node in walk(plan):
+        if not (
+            isinstance(node, Join)
+            and node.join_type in ("inner", "left", "semi", "anti")
+            and len(node.right_keys) == 1
+        ):
+            continue
+        right = node.right
+        while isinstance(right, (Project, Filter)):
+            right = right.input
+        if isinstance(right, Aggregate) and right.group_keys:
+            read = right.input
+        elif node.join_type in ("semi", "anti"):
+            # A semi/anti join builds its right side's key set, so the rows it reads are the
+            # cost with or without an aggregate (`sideways::needs_aggregate`).
+            read = node.right
+        else:
+            continue
+        try:
+            reads = ctx.estimator.estimate(read).rows
+            probe = ctx.estimator.estimate(node.left).rows
+        except Exception:
+            continue  # no estimate is not evidence for changing the route
+        if reads >= SIDEWAYS_MIN_ROWS and reads >= probe * SIDEWAYS_MIN_RATIO:
+            return True
+    return False
 
 
 def _source_predicates(logical: LogicalPlan, optimized: LogicalPlan) -> dict[int, dict]:

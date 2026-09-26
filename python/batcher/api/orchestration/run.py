@@ -14,6 +14,7 @@ from batcher._internal.errors import PlanError
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.api._join_helpers import _empty_result_schema
 from batcher.api.orchestration import phases
+from batcher.api.orchestration.chunked import run_chunked
 from batcher.api.orchestration.sizing import (
     DEFAULT_PARTITIONS,
     carried_columns,
@@ -562,7 +563,16 @@ def _run_relational_scoped(
     input_bytes = projected_input_bytes(sources, opt.source_projections, opt.scanned_source_ids())
     # `resident_total_exceeds_budget` subsumes the input-only check: the input and the
     # plan's peak state are concurrent on this path, so what matters is their sum.
-    if must_spill or rm.should_spill(opt) or rm.resident_total_exceeds_budget(input_bytes, opt):
+    spill = must_spill or rm.should_spill(opt) or rm.resident_total_exceeds_budget(input_bytes, opt)
+    # Before either path reads the whole input, stream the largest source into the engine when
+    # the plan's shape allows it (`orchestration.chunked`).
+    streamed = run_chunked(plan, opt, ctx, sources, input_bytes=input_bytes, spill=spill)
+    if streamed is not None:
+        _close_resident_free_loops(
+            plan, logical_opt, ctx, rm, sources, streamed.num_rows, decisions, started=started
+        )
+        return streamed, decisions
+    if spill:
         phases.begin("core.execute.spilled")
         mark = time.perf_counter()
         spilled = spill_to_disk(logical_opt, sources, ctx, rm, opt, verdict)

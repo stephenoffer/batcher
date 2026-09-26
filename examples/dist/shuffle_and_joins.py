@@ -53,8 +53,7 @@ def main() -> None:
         for column, values in left.items():
             if isinstance(values[0], float):
                 assert all(
-                    abs(a - b) <= abs(a) * 1e-12
-                    for a, b in zip(values, right[column], strict=True)
+                    abs(a - b) <= abs(a) * 1e-12 for a, b in zip(values, right[column], strict=True)
                 ), column
             else:
                 assert values == right[column], column

@@ -213,7 +213,8 @@ def _read_cost_key(hub: Any, sources: list | None) -> str:
         from batcher.metadata.io_stats import relative_read_cost
         from batcher.plan.source_stats import source_identity
 
-        factors = relative_read_cost(hub, [source_identity(s) for s in sources])
+        identities = [source_identity(s) for s in sources]
+        factors = relative_read_cost(hub, identities)
     except Exception as exc:
         # A learned read must never break the memo, but it must not fail *invisibly* either.
         # Degrading to "-" is the all-1.0 vector: every source looks equally cheap, so plans
@@ -222,8 +223,13 @@ def _read_cost_key(hub: Any, sources: list | None) -> str:
         # optimization did not apply' and 'this optimization has been broken since March'".
         note_suppressed("kyber", "read learned relative read cost", exc)
         return "-"
+    # Sticky, for the reason the coefficients are (`_BUCKET_HYSTERESIS`): a factor sitting near
+    # a bucket edge re-keyed the memo each time it crossed back, and every miss is a full
+    # re-optimization (137 ms for TPC-H q2 at sf10, twice the engine's whole query). A factor
+    # still converging moves the key as it should; only the back-and-forth is absorbed.
     return ",".join(
-        str(round(math.log2(f) * _READ_COST_BUCKETS)) if f > 0.0 else "0" for f in factors
+        str(_sticky_bucket(("read_cost", id(hub)), ident, f, _READ_COST_BUCKETS))
+        for ident, f in zip(identities, factors, strict=True)
     )
 
 
@@ -372,11 +378,13 @@ _BUCKET_STATE_MAX = 4096
 _COEFF_BUCKETS = 1
 
 
-def _sticky_bucket(state_key: tuple, name: str, value: float) -> int:
-    """`value`'s octave bucket, kept at its previous one inside the deadband."""
+def _sticky_bucket(
+    state_key: tuple, name: str, value: float, per_octave: int = _COEFF_BUCKETS
+) -> int:
+    """`value`'s bucket, `per_octave` to an octave, kept at its previous one inside the deadband."""
     if value <= 0.0:
         return 0
-    raw = math.log2(value) * _COEFF_BUCKETS
+    raw = math.log2(value) * per_octave
     key = (*state_key, name)
     previous = _BUCKET_STATE.get(key)
     if previous is not None and abs(raw - previous) < 0.5 + _BUCKET_HYSTERESIS:

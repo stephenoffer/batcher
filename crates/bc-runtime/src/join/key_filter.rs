@@ -162,7 +162,25 @@ impl KeyFilter {
     /// column with more than [`MAX_DISTINCT_KEYS`] distinct values, which is not the selective
     /// shape this optimization pays for.
     pub fn build(keys: &ArrayRef) -> Option<Self> {
-        if keys.data_type() != &DataType::Int64 || keys.len() > MAX_BUILD_ROWS {
+        Self::build_within(keys, PROBE_LIMITS)
+    }
+
+    /// [`KeyFilter::build`] for a filter applied **once**, over one relation, rather than on
+    /// every probe morsel of a join.
+    ///
+    /// The per-morsel limits exist to keep the digest L2-resident, because a probe filter is
+    /// consulted once per probe row for the whole of a query. A filter applied in one pass over a
+    /// source (the materializing executor's sideways restriction of a build-side aggregate) pays
+    /// its cache misses once per source row instead, and the rows it removes are an aggregate's
+    /// groups never built — so it can afford a far larger digest. TPC-H q21 at sf100 restricts
+    /// `lineitem` to ~7.2M order keys spanning 600M values: a 75 MB bitmap, refused by the probe
+    /// limits on both the row and the span bound.
+    pub fn build_once(keys: &ArrayRef) -> Option<Self> {
+        Self::build_within(keys, ONCE_LIMITS)
+    }
+
+    fn build_within(keys: &ArrayRef, limits: Limits) -> Option<Self> {
+        if keys.data_type() != &DataType::Int64 || keys.len() > limits.max_rows {
             return None;
         }
         let a = keys.as_primitive::<Int64Type>();
@@ -178,10 +196,10 @@ impl KeyFilter {
         // refused rather than wrapped into a small one.
         let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
         let rows = a.len() - a.null_count();
-        if span <= dense_span_budget(rows) {
+        if span <= dense_span_budget(rows, limits.span_per_row, limits.max_dense_span) {
             return Some(Self::dense(a, lo, hi, span));
         }
-        Self::sparse(a, lo, hi)
+        Self::sparse(a, lo, hi, limits.max_distinct)
     }
 
     /// The bitmap digest: one bit per key in `[lo, hi]`, set from the build side in one pass.
@@ -215,14 +233,14 @@ impl KeyFilter {
     }
 
     /// The hash-set digest, for a span too sparse to bitmap. Bounded by [`MAX_DISTINCT_KEYS`].
-    fn sparse(a: &arrow::array::Int64Array, lo: i64, hi: i64) -> Option<Self> {
+    fn sparse(a: &arrow::array::Int64Array, lo: i64, hi: i64, max_distinct: usize) -> Option<Self> {
         let mut set: HashSet<i64, ahash::RandomState> = HashSet::default();
         for i in 0..a.len() {
             if a.is_null(i) {
                 continue; // a null key matches nothing; it is not part of the set
             }
             set.insert(a.value(i));
-            if set.len() > MAX_DISTINCT_KEYS {
+            if set.len() > max_distinct {
                 // Give up here rather than at the end: this is what keeps the digest's cost
                 // proportional to how useful it can be, instead of to the build side's size.
                 return None;
@@ -297,9 +315,43 @@ impl KeyFilter {
 /// "is it an amount of memory worth naming?", which the relative bound alone cannot: at
 /// [`MAX_BUILD_ROWS`] the ratio would admit 32 GiB. [`MIN_DENSE_SPAN`] keeps a small, slightly
 /// gappy build side on the cheaper structure instead of refusing it over a few hundred bytes.
-fn dense_span_budget(rows: usize) -> u128 {
-    ((rows as u128).saturating_mul(DENSE_SPAN_PER_ROW)).clamp(MIN_DENSE_SPAN, MAX_DENSE_SPAN)
+fn dense_span_budget(rows: usize, span_per_row: u128, max_dense_span: u128) -> u128 {
+    ((rows as u128).saturating_mul(span_per_row)).clamp(MIN_DENSE_SPAN, max_dense_span)
 }
+
+/// The size bounds one kind of caller puts on a digest.
+#[derive(Clone, Copy)]
+struct Limits {
+    max_rows: usize,
+    /// Span a bitmap may cover per build key before the hash set is preferred.
+    span_per_row: u128,
+    max_dense_span: u128,
+    max_distinct: usize,
+}
+
+/// A probe filter's bounds: the digest stays cache-resident (see the constants above).
+const PROBE_LIMITS: Limits = Limits {
+    max_rows: MAX_BUILD_ROWS,
+    span_per_row: DENSE_SPAN_PER_ROW,
+    max_dense_span: MAX_DENSE_SPAN,
+    max_distinct: MAX_DISTINCT_KEYS,
+};
+
+/// A one-pass filter's bounds (see [`KeyFilter::build_once`]): a bitmap of up to 2^31 keys
+/// (256 MiB) and a hash set of up to 2^22 keys (~43 MB). Rows are bounded only by the distinct
+/// and span limits, which is what the digest's memory actually depends on.
+///
+/// The bitmap is allowed 4x the span per key the probe limits allow — up to ~4x the memory of
+/// the equivalent hash set — because this digest is consulted once per source row rather than
+/// kept hot for a whole probe, and a bit test beats a hash lookup at any size it can reach
+/// here. TPC-H q21 at sf100 is 7.2M keys over a 600M span, 83 per key: past the probe ratio,
+/// and a 75 MB bitmap under this one.
+const ONCE_LIMITS: Limits = Limits {
+    max_rows: usize::MAX,
+    span_per_row: DENSE_SPAN_PER_ROW * 4,
+    max_dense_span: 1 << 31,
+    max_distinct: 1 << 22,
+};
 
 #[cfg(test)]
 mod tests {
@@ -455,7 +507,7 @@ mod tests {
     #[test]
     fn the_absolute_span_ceiling_bounds_the_bitmap() {
         let rows = 1_000_000usize;
-        assert!(dense_span_budget(rows) <= MAX_DENSE_SPAN);
+        assert!(dense_span_budget(rows, DENSE_SPAN_PER_ROW, MAX_DENSE_SPAN) <= MAX_DENSE_SPAN);
         // Two keys astride the whole i64 range must not wrap into a small span.
         let f = filter_of(vec![Some(i64::MIN), Some(i64::MAX)]).expect("digestible");
         assert!(matches!(f.keys, KeySet::Sparse(_)));
@@ -476,5 +528,39 @@ mod tests {
             mask_of(&f, vec![Some(3), Some(9), Some(-1)]),
             vec![true, false, false]
         );
+    }
+
+    /// A one-pass filter digests what the probe limits refuse — a TPC-H q21-at-sf100 shape: more
+    /// build rows than `MAX_BUILD_ROWS` over a span past `MAX_DENSE_SPAN` — and stays exact.
+    #[test]
+    fn a_one_pass_filter_takes_what_the_probe_limits_refuse() {
+        let keys: Vec<i64> = (0..5_000_000i64).map(|i| i * 80).collect();
+        let arr: ArrayRef = Arc::new(Int64Array::from(keys));
+        assert!(KeyFilter::build(&arr).is_none());
+        let f = KeyFilter::build_once(&arr).expect("within the one-pass limits");
+        assert!(matches!(f.keys, KeySet::Dense(_)));
+        assert_eq!(f.distinct_keys(), 5_000_000);
+        assert_eq!(
+            mask_of(
+                &f,
+                vec![
+                    Some(0),
+                    Some(80),
+                    Some(81),
+                    Some(399_999_920),
+                    Some(400_000_000),
+                    None
+                ]
+            ),
+            vec![true, true, false, true, false, false]
+        );
+        // Sparse keys past the bitmap ceiling fall to the hash set, bounded by its own limit.
+        let sparse: ArrayRef = Arc::new(Int64Array::from(
+            (0..100_000i64)
+                .map(|i| i * 1_000_000_007)
+                .collect::<Vec<_>>(),
+        ));
+        let f = KeyFilter::build_once(&sparse).expect("100k distinct keys fit the one-pass set");
+        assert!(matches!(f.keys, KeySet::Sparse(_)));
     }
 }

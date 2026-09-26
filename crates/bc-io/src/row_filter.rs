@@ -416,6 +416,111 @@ pub(crate) fn build(pred: &Pred, cols: &[String], descr: &SchemaDescriptor) -> R
     RowFilter::new(vec![Box::new(f)])
 }
 
+/// What deciding whether to install a [`RowFilter`] on a read needs to know.
+pub(crate) struct Probe<'a> {
+    pub(crate) pred: &'a Pred,
+    pub(crate) resolved: &'a crate::store::Resolved,
+    pub(crate) size: u64,
+    pub(crate) meta: &'a parquet::arrow::arrow_reader::ArrowReaderMetadata,
+    pub(crate) targets: &'a [usize],
+    pub(crate) batch_size: usize,
+}
+
+/// The columns a read's row filter should decode first, or `None` for no row filter.
+///
+/// A measured decision: the zone maps may decline it for free, and otherwise the predicate
+/// columns of the first target row group are probed for their selected fraction.
+///
+/// # Errors
+/// [`crate::IoError`] when the probe read fails.
+pub(crate) async fn verdict(p: Probe<'_>) -> Result<Option<Vec<String>>, crate::IoError> {
+    use futures::TryStreamExt;
+    use parquet::arrow::ParquetRecordBatchStreamBuilder;
+    let pred = p.pred;
+    let row_groups = p.meta.metadata().row_groups();
+    let probe_rows: usize = p
+        .targets
+        .iter()
+        .filter_map(|&rg| row_groups.get(rg))
+        .map(|rg| rg.num_rows() as usize)
+        .sum();
+    let mut row_filter_cols: Option<Vec<String>> = None;
+    {
+        // Under this size the whole read is already short and the probe would be a larger
+        // share of it than anything the filter could save. A caller reading one row group at a
+        // time (`read_parquet_row_group`) therefore never installs one: probing each file once
+        // for all its row groups was measured and was a net loss (TPC-H sf10 q19 +20-50 ms).
+        if crate::row_filter_enabled()
+            && probe_rows >= crate::ROW_FILTER_MIN_ROWS
+            && row_groups.get(p.targets[0]).is_some()
+        {
+            // Free pre-check before the probe: if the zone maps already say the predicate keeps
+            // most rows, there is nothing for the filter to save and the probe itself would be
+            // the only cost anyone measured. The estimate is only ever allowed to *decline*
+            // (see `row_filter::estimate`) — installing stays a measured decision, because the
+            // interpolation behind it is wrong on skewed data and a wrong install is a
+            // slowdown while a wrong decline is only a missed speed-up.
+            let permissive = {
+                let (mut weighted, mut rows) = (0.0f64, 0.0f64);
+                let mut usable = true;
+                // Column positions resolved once for the file; the loop below asks for the
+                // same columns in every row group.
+                let col_index = crate::predicate::ColumnIndex::build(p.meta.metadata());
+                for &rg in p.targets {
+                    let Some(meta) = row_groups.get(rg) else {
+                        continue;
+                    };
+                    if let Some(f) = estimate(pred, meta, &col_index) {
+                        weighted += f * meta.num_rows() as f64;
+                        rows += meta.num_rows() as f64;
+                    } else {
+                        usable = false;
+                        break;
+                    }
+                }
+                usable && rows > 0.0 && !worth_it_frac(weighted / rows)
+            };
+            if !permissive {
+                if let Some(cols) = plan(pred, p.meta.schema()) {
+                    let reader = crate::split_read::object_reader(
+                        &p.resolved.store,
+                        &p.resolved.path,
+                        p.size,
+                    );
+                    let mask = crate::projection::exact_columns(
+                        p.meta.parquet_schema(),
+                        cols.iter().map(String::as_str),
+                    );
+                    let mut probe =
+                        ParquetRecordBatchStreamBuilder::new_with_metadata(reader, p.meta.clone())
+                            .with_batch_size(p.batch_size.max(1))
+                            .with_row_groups(vec![p.targets[0]])
+                            .with_projection(mask)
+                            .build()?;
+                    // Stop as soon as the estimate is good enough. Decoding the *whole* first row
+                    // group to measure it cost more than the filter saved on a permissive
+                    // predicate (~18 ms, turning a 179 ms read into 198 ms); a few thousand rows
+                    // answer "is this selective?" just as well and cost ~1 ms. The estimate is a
+                    // sample, so a clustered column can mislead it — which changes only speed.
+                    let (mut selected, mut total) = (0usize, 0usize);
+                    while total < crate::ROW_FILTER_PROBE_ROWS {
+                        let Some(batch) = probe.try_next().await? else {
+                            break;
+                        };
+                        let m = mask_of(pred, &batch);
+                        total += m.len();
+                        selected += m.true_count();
+                    }
+                    if worth_it(selected, total) {
+                        row_filter_cols = Some(cols);
+                    }
+                }
+            }
+        }
+    }
+    Ok(row_filter_cols)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

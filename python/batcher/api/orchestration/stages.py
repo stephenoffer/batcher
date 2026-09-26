@@ -347,6 +347,97 @@ class ResolvedSources:
         self.complete = complete
 
 
+def read_scanned(
+    sources: list[Source], opt: PhysicalPlan, ids: set[int] | frozenset[int]
+) -> dict[int, tuple[list[pa.RecordBatch], float]]:
+    """Read the sources in `ids` with the plan's pushdowns, concurrently: `{id: (batches, ms)}`.
+
+    One source after another used to be the rule, and on a join over several tables it put
+    every read in series although each spends its time in native code with the GIL released:
+    the reads of a TPC-H query's `orders`, `customer` and `nation` then cost their sum instead
+    of the longest. Each read keeps its own concurrency across its files, so this adds one
+    thread per source, not per file. `ms` is the read's own wall time — measured while the
+    others ran, which is the throughput the query actually got.
+
+    Args:
+        sources: The plan's bound sources.
+        opt: The optimized physical plan, carrying the pushed projections and predicates.
+        ids: The sources to read.
+
+    Returns:
+        Each read source's batches and its wall time in milliseconds.
+    """
+
+    groups = _shared_reads(sources, opt, sorted(i for i in ids if i < len(sources)))
+
+    def one(group: list[int]) -> tuple[list[pa.RecordBatch], float]:
+        started = time.perf_counter()
+        first = group[0]
+        if len(group) == 1:
+            projection = opt.source_projections.get(first)
+            predicate = opt.source_predicates.get(first)
+        else:
+            projection = _union_projection([opt.source_projections.get(i) for i in group])
+            predicates = [opt.source_predicates.get(i) for i in group]
+            predicate = predicates[0] if all(p == predicates[0] for p in predicates) else None
+        batches = read_source(
+            sources[first],
+            projection,
+            predicate,
+            opt.source_limits.get(first),
+            opt.source_orderings.get(first),
+        )
+        return batches, (time.perf_counter() - started) * 1000.0
+
+    if len(groups) <= 1:
+        results = [one(g) for g in groups]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            results = list(pool.map(one, groups))
+    out: dict[int, tuple[list[pa.RecordBatch], float]] = {}
+    for group, (batches, ms) in zip(groups, results, strict=True):
+        for i in group:
+            wanted = opt.source_projections.get(i)
+            out[i] = (batches if len(group) == 1 else _narrowed(batches, wanted), ms)
+    return out
+
+
+def _shared_reads(sources: list[Source], opt: PhysicalPlan, ids: list[int]) -> list[list[int]]:
+    """`ids` grouped so each group is read once: the bindings of one source object together.
+
+    A source bound twice — a self-join, or a correlated subquery decorrelated into a second
+    scan of the table it correlates with (TPC-H q17, q18, q20, q21) — was decoded once per
+    binding. One read of the union of their columns serves every binding, because what each
+    binding pushed is superset-safe: the engine keeps its `Filter`, so a binding handed rows its
+    predicate would have pruned still computes the same answer. Only bindings with no pushed row
+    cap and no pushed ordering share, since those change *which* rows a read returns.
+    """
+    groups: dict[int, list[int]] = {}
+    alone: list[list[int]] = []
+    for i in ids:
+        if opt.source_limits.get(i) is not None or opt.source_orderings.get(i):
+            alone.append([i])
+        else:
+            groups.setdefault(id(sources[i]), []).append(i)
+    return list(groups.values()) + alone
+
+
+def _union_projection(projections: list[list[str] | None]) -> list[str] | None:
+    """The columns every projection needs, first-seen order; None when any reads every column."""
+    if any(p is None for p in projections):
+        return None
+    return list(dict.fromkeys(c for p in projections for c in p))  # type: ignore[union-attr]
+
+
+def _narrowed(batches: list[pa.RecordBatch], columns: list[str] | None) -> list[pa.RecordBatch]:
+    """`batches` reduced to `columns` in that order (zero-copy), or unchanged for None."""
+    if columns is None:
+        return batches
+    return [b.select(columns) for b in batches]
+
+
 def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionContext):
     """Read every source to Arrow, timing each read and recording its throughput.
 
@@ -376,6 +467,7 @@ def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionCont
     from batcher.metadata.io_stats import record_source_io, scanned_byte_count
 
     scanned_ids = opt.scanned_source_ids()
+    reads = read_scanned(sources, opt, scanned_ids)
     batches_per_source = []
     complete: list[bool] = []
     for i, src in enumerate(sources):
@@ -386,13 +478,9 @@ def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionCont
             batches_per_source.append([])
             complete.append(False)
             continue
-        read_started = time.perf_counter()
         predicate = opt.source_predicates.get(i)
         limit = opt.source_limits.get(i)
-        batches = read_source(
-            src, opt.source_projections.get(i), predicate, limit, opt.source_orderings.get(i)
-        )
-        elapsed_ms = (time.perf_counter() - read_started) * 1000.0
+        batches, elapsed_ms = reads[i]
 
         batches_per_source.append(batches)
         declared = declared_row_count(src)

@@ -484,6 +484,17 @@ src = ["python", "tests", "benchmarks", "examples"]
 # what `batcher.migrate` writes (marker comments, long chains and all), so reformatting them
 # would change the property under test. `tests/migrate/test_corpus.py` holds them exact instead.
 extend-exclude = ["tests/migrate/corpus"]
+# Ruff's default excludes, minus `dist`. The default list skips any directory *named* `dist`
+# (it means packaging output), and that name is also the source package
+# `python/batcher/dist/`: `ruff check python` linted 1,399 of 1,513 files and none of the
+# distributed executor, which carried seven findings nobody saw. The same unanchored-name trap
+# the `.gitignore` comment on `/dist/` records, in a second tool.
+exclude = [
+    ".bzr", ".direnv", ".eggs", ".git", ".git-rewrite", ".hg", ".ipynb_checkpoints",
+    ".mypy_cache", ".nox", ".pants.d", ".pyenv", ".pytest_cache", ".pytype", ".ruff_cache",
+    ".svn", ".tox", ".venv", ".vscode", "__pypackages__", "_build", "buck-out", "build",
+    "node_modules", "site-packages", "venv",
+]
 
 [tool.ruff.lint]
 select = [

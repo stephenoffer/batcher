@@ -61,6 +61,9 @@ use bc_ir::{JoinType, RelOp};
 
 mod breaker;
 mod builds;
+pub mod chunked;
+use chunked::units::LazyScan;
+pub use chunked::units::UnitSource;
 mod fanout;
 mod folds;
 mod meter;
@@ -78,11 +81,13 @@ pub use parallel::{
 };
 
 use breaker::{drain, exec_breaker};
-pub(crate) use builds::{node_key, prebuild_joins, BuildCache, MatCache};
+pub(crate) use builds::{
+    node_key, prebuild_joins, prebuild_joins_for_chunks, BuildCache, MatCache,
+};
 pub(crate) use folds::{combine_and_finalize, finalize_partial, fold_partial};
 pub(crate) use meter::Meter;
 pub(crate) use pipeline::limit_stream;
-use pipeline::scan_stream;
+use pipeline::{scan_stream, unit_stream};
 use probe_chunks::{PendingProbe, ProbeSlicer};
 
 /// Everything a stream stage needs, in one `Copy` handle so an iterator closure can capture it
@@ -120,6 +125,8 @@ pub(crate) struct Ctx<'a> {
     /// in any order. Set by an order-insensitive consumer and cleared by every operator that is
     /// not one; see [`order`].
     order_free: bool,
+    /// The driving scan read unit by unit instead of from `sources` (see [`UnitSource`]).
+    lazy: Option<&'a LazyScan<'a>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -148,7 +155,14 @@ impl<'a> Ctx<'a> {
             budget,
             workers,
             order_free: false,
+            lazy: None,
         }
+    }
+
+    /// This context, with its driving scan read lazily from `lazy`.
+    pub(crate) fn with_lazy(mut self, lazy: &'a LazyScan<'a>) -> Self {
+        self.lazy = Some(lazy);
+        self
     }
 
     /// This context, with its consumer's order-freedom set to `free`.
@@ -280,6 +294,17 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
     };
     let id = ctx.id(plan);
     match plan {
+        RelOp::Scan { source_id } if ctx.lazy.is_some_and(|l| l.source_id == *source_id) => {
+            let lazy = ctx.lazy.expect("guarded above");
+            Ok(Box::new(unit_stream(lazy.src, lazy.units.clone()).map(
+                move |b| {
+                    let t = std::time::Instant::now();
+                    let b = b?;
+                    ctx.morsel(id, b.num_rows() as u64, &b, t);
+                    Ok(b)
+                },
+            )))
+        }
         RelOp::Scan { source_id } => {
             let batches = ctx
                 .sources

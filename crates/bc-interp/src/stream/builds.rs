@@ -151,7 +151,6 @@ pub(crate) fn prebuild_joins(
     workers: usize,
     opts: Option<&crate::par::ExecOptions>,
 ) -> Result<Arc<BuildCache>, InterpError> {
-    let mut cache = BuildCache::new();
     // A plan with exactly one hash join can decline the per-morsel probe and still be run
     // across every core, by handing off to the materializing executor
     // (`parallel::unshardable_join_reason`) — which keeps the partitioned radix join too.
@@ -160,7 +159,47 @@ pub(crate) fn prebuild_joins(
     let admission = Admission {
         driving: driving_rows(plan, sources),
         can_hand_off: parallel::count_hash_joins(plan) == 1,
+        chunked: false,
     };
+    prebuild_with(plan, sources, meter, budget, workers, opts, admission)
+}
+
+/// [`prebuild_joins`] for [`super::chunked`], which streams the driving relation in chunks.
+///
+/// Every build that *can* take a per-morsel probe gets one, whatever its size or join type.
+/// The admission rule's two refusals both rest on an alternative this caller does not have:
+/// handing the plan to the materializing executor (which needs the probe side resident), and,
+/// for a large `Semi`/`Anti` build, the partitioned radix join (which, run per morsel, rebuilds
+/// its partition tables on every call — measured on TPC-H sf100 q3, `join_partition_into` was
+/// 46% of the query). A flat table built once and probed by every chunk is the only shape here
+/// that hashes each build row once.
+pub(crate) fn prebuild_joins_for_chunks(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    meter: Option<&Meter>,
+    budget: usize,
+    workers: usize,
+    opts: Option<&crate::par::ExecOptions>,
+) -> Result<Arc<BuildCache>, InterpError> {
+    let admission = Admission {
+        driving: 0,
+        can_hand_off: false,
+        chunked: true,
+    };
+    prebuild_with(plan, sources, meter, budget, workers, opts, admission)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prebuild_with(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    meter: Option<&Meter>,
+    budget: usize,
+    workers: usize,
+    opts: Option<&crate::par::ExecOptions>,
+    admission: Admission,
+) -> Result<Arc<BuildCache>, InterpError> {
+    let mut cache = BuildCache::new();
     collect_builds(
         plan, sources, &mut cache, meter, budget, workers, admission, opts,
     )?;
@@ -323,12 +362,14 @@ struct Admission {
     driving: usize,
     /// Whether declining still leaves this plan a parallel path (the materializing hand-off).
     can_hand_off: bool,
+    /// The chunked executor's builds: admit every shape a flat probe supports.
+    chunked: bool,
 }
 
 impl Admission {
     fn admits(self, build_rows: usize, join_type: JoinType) -> bool {
         let ceiling = bc_runtime::join::RADIX_MIN_BUILD_ROWS_BROADCAST;
-        if build_rows <= ceiling {
+        if self.chunked || build_rows <= ceiling {
             return true; // unchanged: this is the shape the ceiling was drawn for
         }
         if matches!(join_type, JoinType::Semi | JoinType::Anti) {

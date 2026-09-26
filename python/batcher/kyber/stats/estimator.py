@@ -34,8 +34,9 @@ from batcher.kyber.column_tables import (
     UDF_ROW_SECONDS_KEY,
     columns_for,
 )
-from batcher.kyber.properties import project_ordering
+from batcher.kyber.properties import project_ascending, project_ordering
 from batcher.kyber.stats import columns as col_prop
+from batcher.kyber.stats.comonotone import narrow_comonotone
 from batcher.kyber.stats.distribution import (
     join_match_fraction,
     mcv_join_rows,
@@ -419,7 +420,13 @@ class StatsEstimator:
             # a sort and its consumer in every real query, so the redundant-sort rule could
             # never see across a `SELECT`.
             ordering = project_ordering(node.items, child.sorted_by)
-            return RelStats(child.rows, child.provenance, columns, ordering)
+            return RelStats(
+                child.rows,
+                child.provenance,
+                columns,
+                ordering,
+                project_ascending(node.items, child.ascending),
+            )
         if isinstance(node, MapBatches):
             # A UDF may filter/explode/pass-through — a property of the code the structural
             # estimator can't see, so it assumes 1:1 and lets the measured fan-out from a
@@ -581,7 +588,7 @@ class StatsEstimator:
         if src_stats is not None:
             base = src_stats.to_relstats(default_rows=self._cfg.unknown_rows)
             columns = col_prop.scan_columns(base.columns, learned, base.rows)
-            return RelStats(base.rows, base.provenance, columns, base.sorted_by)
+            return RelStats(base.rows, base.provenance, columns, base.sorted_by, base.ascending)
         # Sources may be absent (plan-shape optimization with no bound inputs) or
         # duck-typed without `row_count`; treat either as unknown rather than crash.
         source = self._sources[node.source_id] if node.source_id < len(self._sources) else None
@@ -638,6 +645,7 @@ class StatsEstimator:
             weakest(child.provenance, prov),
             self._constrained_ndv(node, child, col_prop.filter_columns(child, out_rows)),
             child.sorted_by,
+            child.ascending,
         )
 
     def _constrained_ndv(
@@ -685,16 +693,29 @@ class StatsEstimator:
             stat, before = columns.get(name), child.columns.get(name)
             if stat is None or before is None or not before.ndv or before.ndv <= 0:
                 continue
-            if child.rows <= 0:
+            share = self._kept_share(child, name, predicate)
+            if share is None:
                 continue
-            non_null = 1.0 - min(1.0, max(0.0, (before.null_count or 0.0) / child.rows))
-            if non_null <= 0.0:
-                continue
-            share = min(1.0, self.expr_selectivity(predicate, child) / non_null)
             tightened = max(1.0, before.ndv * share)
             if stat.ndv is None or tightened < stat.ndv:
                 columns[name] = replace(stat, ndv=tightened)
-        return columns
+        return narrow_comonotone(
+            by_column, child, columns, lambda n, p: self._kept_share(child, n, p)
+        )
+
+    def _kept_share(self, child: RelStats, name: str, predicate: Expr) -> float | None:
+        """The fraction of column `name`'s non-null rows `predicate` keeps, or None.
+
+        The conditional `s / (1 - f_null)`, because the null rows a predicate drops carry no
+        value with them (`_constrained_ndv`).
+        """
+        before = child.columns.get(name)
+        if before is None or child.rows <= 0:
+            return None
+        non_null = 1.0 - min(1.0, max(0.0, (before.null_count or 0.0) / child.rows))
+        if non_null <= 0.0:
+            return None
+        return min(1.0, self.expr_selectivity(predicate, child) / non_null)
 
     def _not_null_stats(self, node: Filter, child: RelStats) -> RelStats | None:
         """EXACT stats for a `Filter(col IS NOT NULL)`, or None when this isn't that shape.

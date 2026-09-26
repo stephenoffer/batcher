@@ -60,6 +60,12 @@ def resolve_adaptive(
     # signature may decide a question about size.
     if not _large_enough(plan, sources, hub):
         return False
+    # A plan that can stream its largest input whole needs no stage boundary to bound its
+    # memory, and a boundary is exactly what makes it expensive: the loop cuts at every join,
+    # so TPC-H sf100 q9 materialized `lineitem JOIN orders` — 600M rows — as its first stage,
+    # where streaming `lineitem` through all five joins holds only their build sides.
+    if _streams_whole(plan, sources, hub):
+        return False
     # Above the floor, measured cost decides once both routes have been tried, because this is
     # a cost question and the structural heuristic below cannot answer it. That heuristic fires
     # on nearly every multi-join query at scale, and staging is not the ~20-40 ms of control
@@ -132,6 +138,41 @@ def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
         rows >= _ADAPTIVE_MIN_ROWS_PER_STAGE * stages
         or in_bytes >= _ADAPTIVE_MIN_BYTES_PER_STAGE * stages
     )
+
+
+def _streams_whole(plan: LogicalPlan, sources: list[Source], hub) -> bool:
+    """Whether `plan` looks like one the chunked path streams whole (`orchestration.chunked`).
+
+    Its largest input — by the estimator's exact row count and the scan's own width — can read
+    itself in chunks, is past the chunked path's size threshold, is scanned exactly once, and no
+    right or full join sits above it. This mirrors the engine's `chunkable` on the plan as
+    written; when the optimized plan turns out not to be chunkable after all, the query runs
+    one-shot, which the size floor's own measurements show beats staging on these shapes.
+    """
+    from collections import Counter
+
+    from batcher.api.orchestration.chunked import chunk_worthy
+    from batcher.config import active_config
+    from batcher.plan.logical import Join
+
+    estimator = build_estimator(sources, hub)
+    row_bytes = active_config().optimizer.row_bytes
+    scans = [n for n in walk(plan) if isinstance(n, Scan)]
+    if not scans:
+        return False
+    counts = Counter(n.source_id for n in scans)
+    sized = {
+        n.source_id: estimator.estimate(n).rows * estimator.row_width(n, row_bytes) for n in scans
+    }
+    driving = max(sized, key=sized.__getitem__)
+    if (
+        counts[driving] != 1
+        or not chunk_worthy(int(sized[driving]))
+        or driving >= len(sources)
+        or not callable(getattr(sources[driving], "iter_chunks", None))
+    ):
+        return False
+    return not any(isinstance(n, Join) and n.join_type in ("right", "full") for n in walk(plan))
 
 
 def _stage_count(plan: LogicalPlan) -> int:

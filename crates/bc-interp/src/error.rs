@@ -125,6 +125,16 @@ pub enum InterpError {
     #[error("query cancelled")]
     Cancelled,
 
+    /// Not a failure: the plan cannot stream its driving source in chunks
+    /// (`stream::chunked::chunkable` is false), so the caller should run it with every source
+    /// resident instead. Returned before any work is done.
+    #[error("this plan cannot stream its driving source in chunks")]
+    NotChunkable,
+
+    /// The producer feeding a chunked source failed (a read error, a malformed chunk).
+    #[error("reading the chunked driving source failed: {0}")]
+    ChunkSource(String),
+
     #[error(transparent)]
     Expr(#[from] ExprError),
 

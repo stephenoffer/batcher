@@ -304,7 +304,21 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
             stat = cheap_stat(name)
             if stat is not None:
                 columns[name] = stat
-    stats = SourceStatistics(row_count=rc, columns=columns)
+    # Only among the columns with bounds: the estimator narrows one ascending column's range
+    # from another's (`kyber.stats.comonotone`), which needs both ranges.
+    ascending_of = getattr(source, "column_ascending", None)
+    ascending = (
+        tuple(
+            sorted(
+                n
+                for n in need_columns & have
+                if n in columns and columns[n].min is not None and ascending_of(n)
+            )
+        )
+        if callable(ascending_of)
+        else ()
+    )
+    stats = SourceStatistics(row_count=rc, columns=columns, ascending=ascending)
     if by_columns is not None:
         by_columns[memo_key] = stats
     return stats

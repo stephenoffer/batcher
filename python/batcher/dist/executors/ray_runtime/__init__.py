@@ -32,12 +32,12 @@ from .policies import (
     gather_map_results,
     is_recoverable_task_failure,
     map_barrier,
-    topn_partition,
     recovery_policy,
     runtime_bloom_join,
     skew_join_salt,
     speculation_policy,
     task_event_options,
+    topn_partition,
 )
 from .readiness import await_autoscale
 from .reduce import gather_in_windows, run_bucket_reduce
@@ -89,7 +89,6 @@ __all__ = [
     "gather_map_results",
     "is_recoverable_task_failure",
     "map_barrier",
-    "topn_partition",
     "map_partitions",
     "node_class_selector",
     "placement_actor_options",
@@ -108,6 +107,7 @@ __all__ = [
     "speculation_policy",
     "task_event_options",
     "task_options",
+    "topn_partition",
     "topology_scope",
     "worker_node_memory_bytes",
 ]

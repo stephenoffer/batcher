@@ -55,6 +55,7 @@ __all__ = [
     "clustered_on",
     "delivered",
     "hash_partitioned_on",
+    "project_ascending",
     "project_ordering",
     "satisfies",
 ]
@@ -125,6 +126,29 @@ def satisfies(
     delivered = [set(k) for k in (have.hash_partitioned_on, have.clustered_on) if k]
     partitioned = not required or any(keys <= required for keys in delivered)
     return ordered and partitioned
+
+
+def project_ascending(items: tuple, child_ascending: frozenset[str]) -> frozenset[str]:
+    """The ascending columns a `Project` delivers, under its output names.
+
+    The same carry as `project_ordering`, and for the same reason: a projection reorders no
+    row, so a column that ascended below it still ascends above it — when it is output as a
+    bare column rather than computed from.
+
+    Args:
+        items: The projection's output items.
+        child_ascending: The input's ascending columns (`RelStats.ascending`).
+
+    Returns:
+        The output names of the ascending columns the projection carries.
+    """
+    if not child_ascending:
+        return frozenset()
+    return frozenset(
+        item.alias
+        for item in items
+        if isinstance(item.expr, Col) and item.expr.name in child_ascending
+    )
 
 
 def project_ordering(items: tuple, child_sorted_by: tuple[SortOrder, ...]) -> tuple[SortOrder, ...]:

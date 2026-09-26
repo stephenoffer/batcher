@@ -16,7 +16,8 @@ own; earlier revisions of this docstring said otherwise.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -32,7 +33,18 @@ from batcher.plan.feedback import FeedbackSink, OperatorFeedback, cpu_utilizatio
 from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalOp, PhysicalPlan
 
-__all__ = ["LocalExecutor", "execute_local", "execute_local_metered", "record_exec_metrics"]
+if TYPE_CHECKING:
+    from batcher.io.formats.structured.parquet.units import ParquetUnitRead
+
+__all__ = [
+    "LocalExecutor",
+    "execute_local",
+    "execute_local_chunked",
+    "execute_local_metered",
+    "execute_local_parquet",
+    "plan_chunkable",
+    "record_exec_metrics",
+]
 
 _log = get_logger("core")
 
@@ -246,6 +258,7 @@ class LocalExecutor:
         engine_cfg = cfg.engine_config_json_with(
             plan.op_budgets(),
             prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+            prefer_sideways=plan.prefer_sideways,
         )
         # Collect per-operator metrics only when there is a sink to consume them;
         # the plain entry point avoids the (tiny) JSON serialization otherwise.
@@ -271,6 +284,100 @@ def execute_local(
 ) -> list[pa.RecordBatch]:
     """Convenience wrapper around `LocalExecutor.execute`."""
     return LocalExecutor(feedback).execute(plan, sources)
+
+
+def plan_chunkable(plan: PhysicalPlan, driving: int) -> bool:
+    """Whether the engine can run `plan` with source `driving` streamed in chunks."""
+    return bool(engine().plan_chunkable(plan.to_json(), driving))
+
+
+def execute_local_chunked(
+    plan: PhysicalPlan,
+    sources: list[list[pa.RecordBatch]],
+    driving: int,
+    chunks: Iterator[list[pa.RecordBatch]],
+    memory_budget: int,
+) -> list[pa.RecordBatch]:
+    """Execute `plan` in-process with `sources[driving]` pulled from `chunks`.
+
+    `sources[driving]` holds only a zero-row batch carrying the driving relation's schema. The
+    engine prepares every build side once, then folds each chunk as it arrives, so the driving
+    relation is never resident in full (`bc_interp::stream::chunked`). Raises the engine's
+    `MemoryBudgetExceededError` when what the path holds (aggregate state, or the collected rows
+    of a plan with no aggregate) outgrows `memory_budget` bytes.
+
+    Per-operator metrics are not collected on this path: its operators run once per chunk, and
+    a count taken from one chunk would teach Kyber a fraction of the real cardinality.
+    """
+    cfg = active_config()
+    engine_cfg = cfg.engine_config_json_with(
+        plan.op_budgets(),
+        prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+        prefer_sideways=plan.prefer_sideways,
+    )
+    native = engine()
+    _ensure_native_tracing(native)
+    return native.execute_plan_chunked(
+        plan.to_json(),
+        sources,
+        driving,
+        chunks,
+        engine_cfg,
+        current_query_id() or None,
+        memory_budget,
+    )
+
+
+def execute_local_parquet(
+    plan: PhysicalPlan,
+    sources: list[list[pa.RecordBatch]],
+    driving: int,
+    read: ParquetUnitRead,
+    memory_budget: int,
+    feedback: FeedbackSink | None = None,
+) -> tuple[list[pa.RecordBatch], list[dict], dict]:
+    """Execute `plan` in-process with `sources[driving]` read from Parquet by the engine's workers.
+
+    Each worker decodes its own row groups and pushes them straight through its pipeline
+    (`bc_interp::stream::chunked::execute_units`), so decoding overlaps computing and the driving
+    relation is never resident. `sources[driving]` is the zero-row schema carrier; the budget is
+    `execute_local_chunked`'s. Unlike that path every driving row passes through the operators
+    once, so their measured counts are real and are recorded into `feedback` as the resident
+    executor records its own. Returns ``(batches, ops, usage)`` as `execute_local_metered` does.
+    """
+    cfg = active_config()
+    engine_cfg = cfg.engine_config_json_with(
+        plan.op_budgets(),
+        prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+        prefer_sideways=plan.prefer_sideways,
+    )
+    native = engine()
+    _ensure_native_tracing(native)
+    out, metrics_json = native.execute_plan_parquet(
+        plan.to_json(),
+        sources,
+        driving,
+        read.uris,
+        read.columns,
+        read.predicate,
+        read.batch_size,
+        engine_cfg,
+        current_query_id() or None,
+        memory_budget,
+    )
+    ops, usage = _parse_metrics(metrics_json)
+    if feedback is not None and ops:
+        _record_op_feedback(feedback, ops, cfg.execution.morsel_rows, plan.ops)
+    return out, ops, usage
+
+
+def _parse_metrics(metrics_json: str) -> tuple[list[dict], dict]:
+    """The ``ops`` list and ``query`` block of a metrics document; empty when it is malformed."""
+    try:
+        doc = json.loads(metrics_json)
+        return doc.get("ops", []), doc.get("query") or {}
+    except (ValueError, TypeError, AttributeError):
+        return [], {}
 
 
 def execute_local_metered(
@@ -317,15 +424,11 @@ def execute_local_metered(
         cfg.engine_config_json_with(
             plan.op_budgets(),
             prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+            prefer_sideways=plan.prefer_sideways,
         ),
         current_query_id() or None,
     )
-    try:
-        doc = json.loads(metrics_json)
-        ops = doc.get("ops", [])
-        usage = doc.get("query") or {}
-    except (ValueError, TypeError):
-        ops, usage = [], {}
+    ops, usage = _parse_metrics(metrics_json)
     if feedback is not None and ops:
         _record_op_feedback(feedback, ops, cfg.execution.morsel_rows, plan.ops)
     return out, ops, usage

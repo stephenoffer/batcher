@@ -159,6 +159,7 @@ class InMemorySource:
 
     __slots__ = (
         "__weakref__",  # lets `plan.source_stats` key statistics per instance, not by `id()`
+        "_ascending_cache",
         "_batches",
         "_bounds_cache",
         "_cache",
@@ -227,6 +228,7 @@ class InMemorySource:
         self._sum_cache: dict[str, float | int | None] = {}
         self._valuecount_cache: dict[tuple[str, str, object], int | None] = {}
         self._bounds_cache: dict[str, object] = {}
+        self._ascending_cache: dict[str, bool] = {}
 
     def schema(self) -> pa.Schema:
         """The batches' schema, with narrow numeric columns widened.
@@ -391,6 +393,27 @@ class InMemorySource:
                 self._build_column, field.type, name
             )
         return self._bounds_cache[name]
+
+    def column_ascending(self, name: str) -> bool:
+        """Whether `name` never decreases in storage order, computed once and cached.
+
+        The single-column form of `SourceStatistics.ascending`, for the narrowed statistics a
+        query's plan actually receives (`api.source_stats._resident_subset_stats`). An
+        estimation hint, never a sort proof: see `inmemory_stats.column_ascending`.
+
+        Args:
+            name: The column to test.
+
+        Returns:
+            True when every value is at least the one before it and none is null.
+        """
+        if name not in self._ascending_cache:
+            from batcher.io.source import inmemory_stats
+
+            self._ascending_cache[name] = inmemory_stats.column_ascending(
+                self._build_column, self._schema.field(name).type, name
+            )
+        return self._ascending_cache[name]
 
     def column_cheap_stat(self, name: str):
         """`name`'s null count and average width — the facts that cost O(1), no bounds pass.

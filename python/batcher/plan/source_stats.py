@@ -336,6 +336,15 @@ class SourceStatistics:
     # rescue it: pyarrow lists `RLE_DICTIONARY` for a plain integer column too. There is no
     # cheap footer route to a materialized width — measure it (`inmemory_stats`) or leave it.
     content_byte_size: bool = False
+    # Columns whose values never decrease in storage order, each on its own -- not a
+    # lexicographic ordering, so never a proof a `Sort` may be dropped on (`sorted_by` is
+    # that). What it licenses is estimation: two such columns move together, so a predicate
+    # keeping a contiguous run of one keeps a contiguous run of the other, and the estimator
+    # narrows the second's bounds and distinct count to match (`kyber.stats.comonotone`). A
+    # date dimension is the everyday case: `d_date_sk`, `d_date`, `d_week_seq` and `d_year`
+    # all ascend together, and `d_year = 1999` keeps 52 weeks, not the 359 that treating the
+    # kept rows as a random sample of 10,436 weeks predicts.
+    ascending: tuple[str, ...] = ()
 
     def is_empty(self) -> bool:
         """True iff the source is known to contain zero rows."""
@@ -362,6 +371,7 @@ class SourceStatistics:
             provenance=prov,
             columns=self._columns_for_reasoning(),
             sorted_by=as_sort_orders(self.sorted_by),
+            ascending=frozenset(self.ascending),
         )
 
     def _columns_for_reasoning(self) -> dict[str, ColumnStat]:

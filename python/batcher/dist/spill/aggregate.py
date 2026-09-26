@@ -46,9 +46,10 @@ from batcher.dist.spill.buckets import (
 )
 from batcher.dist.spill.scratch import (
     _fd_safe,
-    _iter_spill_morsels,
+    iter_spill_chunks,
     map_predicate,
     map_projection,
+    spill_chunk_bytes,
 )
 from batcher.dist.spill.staging import peel_to_breaker, stage_breaker_inputs
 from batcher.io.source import Source
@@ -451,13 +452,18 @@ def execute_spilling_aggregate(
         held: list[pa.RecordBatch] = []
         held_bytes = 0
         bucketing = False
-        for batch in _iter_spill_morsels(
-            source, map_projection(agg, source_id), map_predicate(agg, source_id)
+        # Large chunks, the next read while this one folds, and the map and the partial in
+        # one engine call: see `iter_spill_chunks` for why the 8 MiB morsel the other
+        # breakers stage through is the wrong unit for a phase that folds as it goes.
+        for chunk in iter_spill_chunks(
+            source,
+            map_projection(agg, source_id),
+            map_predicate(agg, source_id),
+            spill_chunk_bytes(),
         ):
-            mapped = nat.execute_plan(map_ir, [[batch]], cfg_json)
-            if not mapped:
-                continue
-            partial = nat.partial_aggregate(group_keys_json, aggregates_json, mapped)
+            partial = nat.execute_plan_aggregated(
+                map_ir, [chunk], group_keys_json, aggregates_json, cfg_json, False
+            )
             if not bucketing:
                 held.append(partial)
                 held_bytes += logical_bytes(partial)

@@ -29,9 +29,12 @@ def main() -> None:
     customer = tpch("customer")
 
     # Tiny right side: a broadcast candidate.
-    tiny = customer.join(nation, left_on="c_nationkey", right_on="n_nationkey").group_by(
-        "n_name"
-    ).agg(customers=bt.count()).sort("n_name")
+    tiny = (
+        customer.join(nation, left_on="c_nationkey", right_on="n_nationkey")
+        .group_by("n_name")
+        .agg(customers=bt.count())
+        .sort("n_name")
+    )
 
     # Large right side: a shuffle.
     large = (

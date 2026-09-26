@@ -81,8 +81,16 @@ pub(crate) fn materialize_is_safe_and_faster(
     prefer_aggregate: bool,
     materialize_fits: bool,
     aggregate_materialize_fits: bool,
+    sideways: bool,
 ) -> bool {
     (!bc_interp::streaming_parallelizes(plan) && materialize_fits)
+        // A third reason under the first reason's conservative guard: a build-side aggregate
+        // the materializing executor restricts to the probe side's keys and the streaming one
+        // computes whole. `sideways` is Kyber's size verdict ANDed with the engine's structural
+        // check (`bc_interp::sideways_candidate`). Join intermediates are materialized here too,
+        // so it keeps the capacity-based headroom test that keeps join-heavy plans off this
+        // executor on a box too small for them.
+        || (sideways && materialize_fits)
         || (prefer_aggregate
             && bc_interp::materializing_aggregate_is_faster(plan)
             && aggregate_materialize_fits)

@@ -122,7 +122,13 @@ def common_subplans(
         is the overwhelmingly common case and costs one walk of the plan.
     """
     nodes = list(walk(plan))
-    if len(nodes) > max_nodes:
+    # The size guard counts distinct plan *objects*, not visits. A CTE referenced more than once
+    # is one subtree reachable from several parents, so the walk revisits it at every reference:
+    # TPC-DS q14's six references to two CTEs walk as 1,263 nodes over 267 objects. Counting the
+    # visits skipped the analysis on exactly the plan it exists for — q14 ran its CTEs six times,
+    # 87 ms -> 759 ms — while the work the guard bounds (one key per object, below) scales with
+    # the objects.
+    if len({id(n) for n in nodes}) > max_nodes:
         return []
     # No pipeline breaker anywhere in the plan ⇒ no candidate can exist, because bar 2 below
     # requires every candidate to *contain* one. Checking it here rather than only at the
@@ -136,9 +142,14 @@ def common_subplans(
     # query, `json.encoder.iterencode` was 0.045 s against 0.062 s for the entire engine call.
     if not any(isinstance(n, _EXPENSIVE) for n in nodes):
         return []
+    # Keyed once per object and counted once per visit: a shared subtree's appearances are what
+    # make it worth computing once, and its key is the same at every one of them.
+    memo: dict[int, str | None] = {}
     keyed: list[tuple[str, LogicalPlan]] = []
     for node in nodes:
-        key = structural_key(node)
+        if id(node) not in memo:
+            memo[id(node)] = structural_key(node)
+        key = memo[id(node)]
         if key is not None:
             keyed.append((key, node))
     appearances = Counter(k for k, _ in keyed)
@@ -146,7 +157,7 @@ def common_subplans(
     if not repeated:
         return []
 
-    root_key = structural_key(plan)
+    root_key = memo[id(plan)]
     # One representative per repeated key, largest subtree first, so an outer candidate is
     # considered before anything nested inside it.
     seen: dict[str, LogicalPlan] = {}

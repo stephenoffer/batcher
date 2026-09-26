@@ -31,13 +31,22 @@ _ROWS = 40_000
 def rows_read(monkeypatch):
     seen = {"rows": 0}
     stream = ParquetSource.iter_batches
+    chunks = ParquetSource.iter_chunks
 
     def _stream(self, projection=None, predicate=None):
         for batch in stream(self, projection, predicate):
             seen["rows"] += batch.num_rows
             yield batch
 
+    # The out-of-core aggregate reads through `iter_chunks` (a group of files at a time), the
+    # sort and join through `iter_batches`; both are the reads the predicate must prune.
+    def _chunks(self, projection=None, predicate=None, target_bytes=1 << 30):
+        for chunk in chunks(self, projection, predicate, target_bytes):
+            seen["rows"] += sum(b.num_rows for b in chunk)
+            yield chunk
+
     monkeypatch.setattr(ParquetSource, "iter_batches", _stream)
+    monkeypatch.setattr(ParquetSource, "iter_chunks", _chunks)
     return seen
 
 

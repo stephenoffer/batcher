@@ -38,15 +38,35 @@ _ENVELOPE = 16 << 20
 
 @pytest.fixture
 def routed_out_of_core(monkeypatch):
-    """Whether the query took the out-of-core executor. Returns a one-key dict."""
+    """Whether the query took a bounded-memory route. Returns a one-key dict.
+
+    Three routes count, because each keeps the input from being resident whole: the
+    out-of-core executor, streaming the largest source into the engine in chunks
+    (`orchestration.chunked`), and the engine reading a Parquet source row group by row group
+    itself (`parquet.units`). A Parquet source can take the last two; a CSV or JSON one cannot.
+    """
+    import batcher.core as core
+
     seen = {"n": 0}
-    real = spill_mod.spill_collect
+    real_spill = spill_mod.spill_collect
+    real_chunked = core.execute_local_chunked
+    real_parquet = core.execute_local_parquet
 
-    def traced(*args, **kwargs):
+    def traced_spill(*args, **kwargs):
         seen["n"] += 1
-        return real(*args, **kwargs)
+        return real_spill(*args, **kwargs)
 
-    monkeypatch.setattr(spill_mod, "spill_collect", traced)
+    def traced_chunked(*args, **kwargs):
+        seen["n"] += 1
+        return real_chunked(*args, **kwargs)
+
+    def traced_parquet(*args, **kwargs):
+        seen["n"] += 1
+        return real_parquet(*args, **kwargs)
+
+    monkeypatch.setattr(spill_mod, "spill_collect", traced_spill)
+    monkeypatch.setattr(core, "execute_local_chunked", traced_chunked)
+    monkeypatch.setattr(core, "execute_local_parquet", traced_parquet)
     return seen
 
 

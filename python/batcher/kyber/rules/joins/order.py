@@ -36,6 +36,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, RuleCategory, plan_rule
 from batcher.kyber.rules.joins.order_budget import search_pair_budget
+from batcher.kyber.rules.joins.order_goo import rebuild_goo
 from batcher.kyber.rules.joins.order_residual import (
     bind_residuals,
     hoistable_filter,
@@ -137,7 +138,23 @@ def _try_reorder(top: Join, ctx: OptimizerContext, visit) -> LogicalPlan | None:
     # cannot repay it; it takes none from a query that can.
     budget = search_pair_budget(top, ctx)
     dp = _rebuild_dphyp(leaves, edges, required, ctx, residuals, budget)
-    return dp if dp is not None else _rebuild_greedy(leaves, edges, required, ctx, residuals)
+    if dp is not None:
+        return dp
+    # Past the budget, two cheap builders and the cheaper tree by the same cost model: the
+    # left-deep greedy is at the mercy of which leaf is smallest, and GOO keeps a forest so a
+    # second fact table's selective side can be built before the two meet (`order_goo`).
+    built = [
+        plan
+        for plan in (
+            _rebuild_greedy(leaves, edges, required, ctx, residuals),
+            rebuild_goo(leaves, edges, required, ctx, residuals),
+        )
+        if plan is not None
+    ]
+    if not built:
+        return None
+    cost = ctx.costs()
+    return min(built, key=lambda plan: cost.cost(plan).total())
 
 
 def _is_transparent(node: LogicalPlan) -> bool:

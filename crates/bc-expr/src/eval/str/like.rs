@@ -127,7 +127,8 @@ impl LikeMatcher {
         // plus `value(i)`'s `str` wrapper cost 6.5 ns a row for a three-byte prefix, against
         // 0.42 ns to touch every row's bytes and do nothing — so the predicate was an order of
         // magnitude cheaper than the machinery around it. `Contains` and `Segments` keep the
-        // generic path: their per-row work is a `memmem` search that dwarfs the dispatch.
+        // generic path: their per-row work is a `memmem` search that dwarfs the dispatch. The two
+        // that require a substring take one search over the whole buffer instead (`scanned`).
         let values = match self {
             LikeMatcher::StartsWith(p) => {
                 let k = p.as_bytes();
@@ -140,6 +141,20 @@ impl LikeMatcher {
             LikeMatcher::Exact(p) => {
                 let k = p.as_bytes();
                 anchored(s, |d, a, b| b - a == k.len() && &d[a..b] == k)
+            }
+            // An empty needle matches everywhere, an empty row included, so it has no position to
+            // find and keeps the per-row path (`contains(s, '')`).
+            LikeMatcher::Contains(f) if !f.needle().is_empty() => scanned(s, f, |_, _, _| true),
+            LikeMatcher::Segments {
+                prefix,
+                suffix,
+                middles,
+            } if middles.first().is_some_and(|m| !m.needle().is_empty()) => {
+                scanned(s, &middles[0], |d, a, b| {
+                    // `d[a..b]` is one row of a `StringArray`, so the conversion cannot fail.
+                    std::str::from_utf8(&d[a..b])
+                        .is_ok_and(|row| segment_match(row, prefix, suffix, middles))
+                })
             }
             _ => BooleanBuffer::collect_bool(s.len(), |i| self.is_match(s.value(i))),
         };
@@ -165,6 +180,60 @@ fn anchored(s: &StringArray, hit: impl Fn(&[u8], usize, usize) -> bool) -> Boole
     BooleanBuffer::collect_bool(s.len(), |i| {
         hit(data, offsets[i] as usize, offsets[i + 1] as usize)
     })
+}
+
+/// The match mask for a pattern that requires substring `first` somewhere in the row, found by
+/// searching the column's value buffer once instead of every row separately.
+///
+/// Every row that can match contains `first`, so rows are visited only where the search lands:
+/// each hit is mapped to its row through the offsets, a hit that runs past its row's end is a
+/// false join of two neighbours and the search resumes one byte on, and a hit inside a row hands
+/// that row to `rest`, which decides it exactly and is the only thing that ever marks a row. So
+/// the mask equals `rest` applied to every row containing `first`, and a row without it is false,
+/// which is what the per-row matcher returns for it.
+///
+/// Why: the per-row search set its SIMD searcher up for every ~50-byte row. TPC-H q13's
+/// `o_comment NOT LIKE '%special%requests%'` over 15M rows measured 101 ms against DuckDB's 29 ms
+/// in memory; one pass over the buffer is bandwidth-bound, and here about 1% of rows reach `rest`.
+fn scanned(
+    s: &StringArray,
+    first: &Finder<'_>,
+    rest: impl Fn(&[u8], usize, usize) -> bool,
+) -> BooleanBuffer {
+    let n = s.len();
+    let data = s.value_data();
+    let offsets = s.value_offsets();
+    let mut bits = arrow::array::BooleanBufferBuilder::new(n);
+    bits.append_n(n, false);
+    if n == 0 {
+        return bits.finish();
+    }
+    let (mut pos, end) = (offsets[0] as usize, offsets[n] as usize);
+    let width = first.needle().len();
+    let mut row = 0usize;
+    while pos < end {
+        let Some(found) = first.find(&data[pos..end]) else {
+            break;
+        };
+        let hit = pos + found;
+        while row < n && offsets[row + 1] as usize <= hit {
+            row += 1;
+        }
+        if row == n {
+            break;
+        }
+        let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
+        if hit + width <= b {
+            if rest(data, a, b) {
+                bits.set_bit(row, true);
+            }
+            pos = b;
+            row += 1;
+        } else {
+            pos = hit + 1;
+        }
+    }
+    bits.finish()
 }
 
 /// A prefix, then ordered middle substrings, then a suffix — all within the region the anchors
@@ -291,5 +360,58 @@ mod tests {
         assert!(out.value(0));
         assert!(out.is_null(1));
         assert!(!out.value(2));
+    }
+
+    /// The single-pass column scan returns exactly what the per-row matcher returns: needles that
+    /// straddle two rows (which a buffer search finds and must reject), a needle repeated within
+    /// and across rows, empty rows, nulls, and a sliced array whose offsets do not start at zero.
+    #[test]
+    fn the_buffer_scan_agrees_with_the_per_row_matcher() {
+        use arrow::array::{Array, StringArray};
+        let rows: Vec<Option<&str>> = vec![
+            Some("xx spe"),
+            Some("cial requests"),
+            Some("special requests"),
+            None,
+            Some(""),
+            Some("specialspecial requestsrequests"),
+            Some("requests special"),
+            Some("special"),
+            Some(" requests"),
+            Some("a special b requests c"),
+            Some("specia"),
+            Some("l"),
+        ];
+        let full = StringArray::from(rows);
+        let matchers = [
+            "%special%",
+            "%special%requests%",
+            "%requests%",
+            "sp%requests%",
+            "%l",
+        ]
+        .iter()
+        .map(|p| ((*p).to_string(), LikeMatcher::classify(p)))
+        .chain(std::iter::once((
+            "contains ''".to_string(),
+            LikeMatcher::contains(""),
+        )));
+        for (pattern, m) in matchers {
+            for (offset, len) in [(0, full.len()), (1, full.len() - 1), (2, 7), (5, 0)] {
+                let arr = full.slice(offset, len);
+                let got = m.eval(&arr);
+                for i in 0..arr.len() {
+                    assert_eq!(got.is_null(i), arr.is_null(i), "{pattern} @{offset}+{i}");
+                    if !arr.is_null(i) {
+                        assert_eq!(
+                            got.value(i),
+                            m.is_match(arr.value(i)),
+                            "{pattern} on {:?}",
+                            arr.value(i)
+                        );
+                    }
+                }
+            }
+        }
     }
 }

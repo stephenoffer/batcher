@@ -28,23 +28,24 @@ mod page_index;
 mod predicate;
 mod projection;
 mod row_filter;
+mod row_groups;
 mod split_read;
 mod store;
 
 /// Below this many candidate rows a read is short enough that the row-filter probe would cost
 /// a larger share of it than the filter could save, so neither runs.
-const ROW_FILTER_MIN_ROWS: usize = 200_000;
+pub(crate) const ROW_FILTER_MIN_ROWS: usize = 200_000;
 
 /// How many rows the row-filter selectivity probe reads before deciding. Enough for a stable
 /// selected-fraction, small enough that a decision *not* to filter costs ~1 ms.
-const ROW_FILTER_PROBE_ROWS: usize = 8_192;
+pub(crate) const ROW_FILTER_PROBE_ROWS: usize = 8_192;
 
 /// Whether row-level filter pushdown is enabled (`BATCHER_PARQUET_ROW_FILTER=0` disables).
 ///
 /// An escape hatch in the shape the rest of this module already uses, and the A/B switch the
 /// feature was measured with: comparing two *builds* on a shared machine could not separate
 /// the effect from the noise, whereas one binary run both ways can.
-fn row_filter_enabled() -> bool {
+pub(crate) fn row_filter_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("BATCHER_PARQUET_ROW_FILTER").as_deref() != Ok("0"))
 }
@@ -53,6 +54,7 @@ pub use avro::read_avro_bytes;
 pub use footer_stats::{
     parquet_file_manifest, parquet_footer_stats, ColumnFooterStats, FooterStats,
 };
+pub use row_groups::{parquet_row_groups, read_parquet_row_group};
 
 /// How many row-groups to fetch+decode concurrently. The single-stream reader processes
 /// row-groups one at a time, so a worker reading a many-row-group file waited on each
@@ -482,6 +484,24 @@ async fn read_parquet_async(
     batch_size: usize,
     predicate: Option<&str>,
 ) -> Result<Vec<RecordBatch>, IoError> {
+    read_parquet_inner(uri, row_groups, columns, batch_size, predicate, false).await
+}
+
+/// [`read_parquet_async`], optionally decoding each row group on the polling thread (`inline`)
+/// rather than spawning it onto the runtime's pool.
+///
+/// Spawning is what spreads a many-row-group read across cores. A caller that is itself one of
+/// many workers each reading its own row group wants the opposite: a spawned decode leaves the
+/// worker blocked and idle while a pool thread does its work, which measured as 44% of every
+/// worker's time on TPC-H sf10 q6 (3.2 s of waiting summed over 46 workers, per query).
+pub(crate) async fn read_parquet_inner(
+    uri: &str,
+    row_groups: &[usize],
+    columns: Option<&[String]>,
+    batch_size: usize,
+    predicate: Option<&str>,
+    inline: bool,
+) -> Result<Vec<RecordBatch>, IoError> {
     let resolved = store::resolve(uri)?;
     let (size, arrow_meta) = load_metadata_cached(uri, &resolved).await?;
 
@@ -535,82 +555,20 @@ async fn read_parquet_async(
     // the un-probed path reports it as a clean `row group N out of bounds` error. So the row
     // counts come from `.get()`, and an out-of-range first target skips the probe entirely and
     // leaves the index for the decoder to report exactly as it does today.
-    let row_groups = arrow_meta.metadata().row_groups();
-    let probe_rows: usize = targets
-        .iter()
-        .filter_map(|&rg| row_groups.get(rg))
-        .map(|rg| rg.num_rows() as usize)
-        .sum();
-    let mut row_filter_cols: Option<Vec<String>> = None;
-    if let Some(pred) = parsed.as_ref() {
-        // Under this size the whole read is already short and the probe would be a larger
-        // share of it than anything the filter could save.
-        if row_filter_enabled()
-            && probe_rows >= ROW_FILTER_MIN_ROWS
-            && row_groups.get(targets[0]).is_some()
-        {
-            // Free pre-check before the probe: if the zone maps already say the predicate keeps
-            // most rows, there is nothing for the filter to save and the probe itself would be
-            // the only cost anyone measured. The estimate is only ever allowed to *decline*
-            // (see `row_filter::estimate`) — installing stays a measured decision, because the
-            // interpolation behind it is wrong on skewed data and a wrong install is a
-            // slowdown while a wrong decline is only a missed speed-up.
-            let permissive = {
-                let (mut weighted, mut rows) = (0.0f64, 0.0f64);
-                let mut usable = true;
-                // Column positions resolved once for the file; the loop below asks for the
-                // same columns in every row group.
-                let col_index = predicate::ColumnIndex::build(arrow_meta.metadata());
-                for &rg in &targets {
-                    let Some(meta) = row_groups.get(rg) else {
-                        continue;
-                    };
-                    if let Some(f) = row_filter::estimate(pred, meta, &col_index) {
-                        weighted += f * meta.num_rows() as f64;
-                        rows += meta.num_rows() as f64;
-                    } else {
-                        usable = false;
-                        break;
-                    }
-                }
-                usable && rows > 0.0 && !row_filter::worth_it_frac(weighted / rows)
-            };
-            if !permissive {
-                if let Some(cols) = row_filter::plan(pred, arrow_meta.schema()) {
-                    let reader = split_read::object_reader(&resolved.store, &resolved.path, size);
-                    let mask = projection::exact_columns(
-                        arrow_meta.parquet_schema(),
-                        cols.iter().map(String::as_str),
-                    );
-                    let mut probe = ParquetRecordBatchStreamBuilder::new_with_metadata(
-                        reader,
-                        arrow_meta.clone(),
-                    )
-                    .with_batch_size(batch_size.max(1))
-                    .with_row_groups(vec![targets[0]])
-                    .with_projection(mask)
-                    .build()?;
-                    // Stop as soon as the estimate is good enough. Decoding the *whole* first row
-                    // group to measure it cost more than the filter saved on a permissive
-                    // predicate (~18 ms, turning a 179 ms read into 198 ms); a few thousand rows
-                    // answer "is this selective?" just as well and cost ~1 ms. The estimate is a
-                    // sample, so a clustered column can mislead it — which changes only speed.
-                    let (mut selected, mut total) = (0usize, 0usize);
-                    while total < ROW_FILTER_PROBE_ROWS {
-                        let Some(batch) = probe.try_next().await? else {
-                            break;
-                        };
-                        let m = row_filter::mask_of(pred, &batch);
-                        total += m.len();
-                        selected += m.true_count();
-                    }
-                    if row_filter::worth_it(selected, total) {
-                        row_filter_cols = Some(cols);
-                    }
-                }
-            }
+    let row_filter_cols = match parsed.as_ref() {
+        Some(pred) => {
+            row_filter::verdict(row_filter::Probe {
+                pred,
+                resolved: &resolved,
+                size,
+                meta: &arrow_meta,
+                targets: &targets,
+                batch_size,
+            })
+            .await?
         }
-    }
+        None => None,
+    };
 
     // Read row-groups CONCURRENTLY: each as its own short stream over a cloned reader
     // (which shares the Arc'd store + connection pool and the already-parsed metadata).
@@ -643,7 +601,7 @@ async fn read_parquet_async(
         let bloom_pred = parsed.clone();
         let bloom_meta = arrow_meta.clone();
         let rf_cols = row_filter_cols.clone();
-        tokio::spawn(async move {
+        let decode = async move {
             let mut b = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, amd)
                 .with_batch_size(batch_size)
                 .with_row_groups(vec![rg]);
@@ -676,7 +634,12 @@ async fn read_parquet_async(
             }
             let stream = b.build()?;
             stream.try_collect::<Vec<RecordBatch>>().await
-        })
+        };
+        if inline {
+            futures::future::Either::Left(async move { Ok(decode.await) })
+        } else {
+            futures::future::Either::Right(tokio::spawn(decode))
+        }
     });
 
     let per_rg_batches: Vec<Vec<RecordBatch>> = futures::stream::iter(per_rg)

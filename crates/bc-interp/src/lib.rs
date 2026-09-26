@@ -48,10 +48,15 @@ pub use bc_expr::sniff_mime;
 pub use bc_runtime::agg::spill::SpillCodec;
 pub use coalesce::coalesce_small_batches;
 pub use error::InterpError;
+pub use join_par::sideways::sideways_candidate;
 pub use metrics::{ExecMetrics, OpMetric, QueryMetrics, QueryStopwatch};
 pub use par::{
     auto_width, execute_parallel, execute_parallel_with, execute_parallel_with_metrics, ExecOptions,
 };
+pub use stream::chunked::{
+    chunkable, execute_chunked, execute_units, execute_units_metered, NextChunk,
+};
+pub use stream::UnitSource;
 pub use stream::{
     execute_streaming, execute_streaming_metered, execute_streaming_parallel,
     execute_streaming_parallel_metered, execute_streaming_parallel_metered_or_hand_off,

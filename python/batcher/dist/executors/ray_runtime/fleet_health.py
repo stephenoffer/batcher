@@ -31,6 +31,7 @@ __all__ = [
     "unhealthy_nodes",
 ]
 
+
 def _device_health_on_this_worker() -> dict:
     """Run on a GPU worker: that node's device verdicts and interconnect state.
 

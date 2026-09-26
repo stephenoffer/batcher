@@ -1609,7 +1609,23 @@ fn exec(
             strategy,
         } => {
             let left_batches = exec(left, sources, opts, m, ids)?;
-            let right_batches = exec(right, sources, opts, m, ids)?;
+            // A build-side aggregate restricted to the probe's keys (`join_par::sideways`). Its
+            // operators run over a filtered source, so their row counts describe this query's
+            // restriction rather than the subplan: they go to a scratch collector and are not
+            // reported, or Kyber would learn a cardinality the subplan does not have.
+            let right_batches = match crate::join_par::sideways::restrict_right_sources(
+                *join_type,
+                left_keys,
+                right_keys,
+                &left_batches,
+                right,
+                sources,
+            )? {
+                Some(restricted) => {
+                    exec(right, &restricted, opts, &mut ExecMetrics::default(), ids)?
+                }
+                None => exec(right, sources, opts, m, ids)?,
+            };
 
             // ── Runtime build-side correction ────────────────────────────────────────
             // The planner chose which side to build from *estimated* cardinalities. Both

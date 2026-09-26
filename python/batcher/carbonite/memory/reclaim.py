@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 
 __all__ = [
+    "PURGING_DELAY_MS",
     "RECLAIM_COOLDOWN_MAX_S",
     "RECLAIM_COOLDOWN_S",
     "RECLAIM_WORTHWHILE_BYTES",
@@ -73,8 +74,9 @@ RECLAIM_COOLDOWN_MAX_S = 60.0
 #: it as a success would keep re-trying a trim the process has nothing left to give.
 RECLAIM_WORTHWHILE_BYTES = 16 * 1024 * 1024
 
-#: Share of the memory envelope the process may hold resident between queries before the
-#: allocator is asked for its retained pages back (`reclaim_if_retaining`).
+#: Share of the memory the process could hold (`PressureMonitor.reach_bytes`) that it may keep
+#: resident between queries before the allocator is asked for its retained pages back
+#: (`reclaim_if_retaining`).
 #:
 #: The engine keeps freed pages on purpose (`bc-py/src/hardware.rs`, `PURGE_DELAY_MS`): a
 #: 13-column, 9M-row join re-runs ~35% faster when its output buffers land on pages it already
@@ -87,8 +89,29 @@ RECLAIM_WORTHWHILE_BYTES = 16 * 1024 * 1024
 #: retention -- which means other libraries' memory counts against it too. At a quarter, a
 #: benchmark process holding every engine's copy of the data sat over the ceiling permanently
 #: and so purged on every query; at two fifths (24 GiB of 60) the ceiling still leaves room for
-#: one more large query's working set below the envelope, which is what it protects.
-RETAINED_CEILING_FRACTION = 0.4
+#: one more large query's working set below the envelope, which is what it protects. Those
+#: fractions were of the *live* envelope, which is available memory and so falls by every page
+#: the process keeps: at two fifths the same benchmark process still purged on half the H2O join
+#: queries (a 21 GB resident set against an envelope down to 53 GB), and the purge delay is worth
+#: ~30% on that suite's q5 (358 ms purging against 248 ms retaining, same process, same box).
+#: The ceiling is now a fraction of the process's reach, which does not move when the process's
+#: own resident set does, and three fifths of it: that same process holds 22 GB of a 54-60 GB
+#: reach between queries, all of it the engines' live copies of the data, so two fifths of the
+#: reach still purged it. Three fifths stops the runaway above at 36 GB of a 60 GB reach rather
+#: than 24, and still leaves two fifths of the reach for the next query's working set.
+RETAINED_CEILING_FRACTION = 0.6
+
+#: The purge delay held while over the ceiling, in milliseconds. Not zero: a zero delay also
+#: returns the buffers a query frees and re-allocates *within itself*, so its next batch lands
+#: on fresh pages the kernel must clear. H2O join q5 run under a zero delay took 351 ms against
+#: 233 ms retaining, measured in one process; 250 ms measured 234 ms.
+#:
+#: What it gives up, measured on the same run: under strictly back-to-back queries the resident
+#: set no longer drains -- it went on climbing from 29.9 to 32.7 GB, where a zero delay took it
+#: from 30.2 to 17.4 GB. It drains across any gap longer than the delay, which a workload with a
+#: pause between queries has and a benchmark loop does not. The lever is a guard against
+#: retention outliving the queries that made it, not a limit on a query's own working set.
+PURGING_DELAY_MS = 250
 
 #: Once over the ceiling, the allocator purges immediately until the resident set falls below
 #: this share of the ceiling, then goes back to retaining. The gap is the hysteresis that keeps
@@ -165,8 +188,9 @@ def reclaim_if_retaining(envelope_bytes: int) -> int:
     Result-invariant, and never raises.
 
     Args:
-        envelope_bytes: The memory envelope the ceiling is a fraction of. Zero or negative
-            disables the check.
+        envelope_bytes: The memory the ceiling is a fraction of: the process's reach, its
+            resident set included (`PressureMonitor.reach_bytes`), never the live envelope,
+            which falls as the resident set rises. Zero or negative disables the check.
 
     Returns:
         Bytes released, `0` when under the ceiling, inside the cooldown, or unreadable.
@@ -180,7 +204,7 @@ def reclaim_if_retaining(envelope_bytes: int) -> int:
     ceiling = envelope_bytes * RETAINED_CEILING_FRACTION
     if rss > ceiling:
         if not _STATE.purging:
-            _STATE.purging = set_purge_delay(0)
+            _STATE.purging = set_purge_delay(PURGING_DELAY_MS)
         return _attempt_reclaim("released retained allocator memory over the retention ceiling")
     if _STATE.purging and rss < ceiling * RETAINED_RESTORE_FRACTION:
         set_purge_delay(-1)

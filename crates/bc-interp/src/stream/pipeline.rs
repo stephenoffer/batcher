@@ -32,6 +32,35 @@ pub(super) fn scan_stream(batches: &[RecordBatch]) -> Morsels<'_> {
     }))
 }
 
+/// Stream one unit of a lazily-read driving relation as morsel-sized slices, reading it only
+/// when the pipeline first pulls from it.
+///
+/// The owned counterpart of [`scan_stream`]: the unit's batches are decoded on the pulling
+/// worker and dropped once its morsels have passed through, so a worker holds one unit rather
+/// than its whole share of the relation. Zero-row batches are dropped — the caller keeps the
+/// schema carrier for a relation that turns out empty.
+pub(super) fn unit_stream<'a>(
+    src: &'a dyn super::chunked::units::UnitSource,
+    units: std::ops::Range<usize>,
+) -> Morsels<'a> {
+    Box::new(units.flat_map(move |unit| {
+        let decoded: Vec<Result<RecordBatch, InterpError>> = match src.read(unit) {
+            Ok(batches) => batches
+                .into_iter()
+                .flat_map(|b| {
+                    let rows = b.num_rows();
+                    (0..rows)
+                        .step_by(SCAN_MORSEL_ROWS)
+                        .map(move |off| Ok(b.slice(off, SCAN_MORSEL_ROWS.min(rows - off))))
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            Err(e) => vec![Err(e)],
+        };
+        decoded
+    }))
+}
+
 /// A two-shape iterator, so `scan_stream`'s `flat_map` can return either the schema-carrying
 /// singleton or the sliced morsels without boxing per batch.
 enum Either<A, B> {

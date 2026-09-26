@@ -33,6 +33,7 @@ use pyo3::prelude::*;
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod bloom;
+mod chunked;
 mod errors;
 mod flight;
 mod hardware;
@@ -285,6 +286,7 @@ fn prepare_exec(
         cfg.prefer_materializing_aggregate,
         materialize_fits,
         aggregate_materialize_fits,
+        cfg.prefer_sideways && bc_interp::sideways_candidate(&plan, &sources),
     );
     let streaming = route::use_streaming(&cfg) && !materialize_is_safe_and_faster;
     route::trace(
@@ -747,6 +749,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parquet_file_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_aggregated, m)?)?;
+    m.add_function(wrap_pyfunction!(chunked::execute_plan_chunked, m)?)?;
+    m.add_function(wrap_pyfunction!(chunked::plan_chunkable, m)?)?;
+    m.add_function(wrap_pyfunction!(chunked::execute_plan_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
     // The shuffle surface registers itself, because it is the one family that grows a pair of

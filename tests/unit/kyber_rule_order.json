@@ -452,6 +452,7 @@
   "join_reorder@4",
   "push_projection_through_join@3",
   "push_semijoin_into_decorrelated_aggregate@7",
+  "float_outer_join_above_inner@3",
   "fold_list_len_of_literal_array@1",
   "fold_list_n_unique_of_literal_array@1",
   "fold_list_min_of_literal_array@1",

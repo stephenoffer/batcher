@@ -1003,14 +1003,14 @@ fn fallback_with(
 /// spreads rows evenly, so ceiling would push the split back below a morsel) keeps every worker
 /// at ≥ one morsel; a relation with ≥ `workers` morsels still fills every core. Scheduling only:
 /// `combine` is associative + commutative over contiguous in-order shards, so the result stands.
-fn effective_shard_count(workers: usize, driving_rows: usize) -> usize {
+pub(super) fn effective_shard_count(workers: usize, driving_rows: usize) -> usize {
     workers
         .min(driving_rows / bc_arrow::DEFAULT_MORSEL_ROWS)
         .max(1)
 }
 
 /// Split a relation into `workers` contiguous, in-order shards of whole morsels.
-fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
+pub(super) fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     let per = total.div_ceil(workers).max(1);
     let mut out: Vec<Vec<RecordBatch>> = Vec::with_capacity(workers);

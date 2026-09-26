@@ -116,6 +116,10 @@ class PhysicalPlan:
     #: `EngineConfig.prefer_materializing_aggregate` for the measurements behind the
     #: threshold, and `MATERIALIZE_AGG_MIN_GROUPS` for the threshold itself.
     prefer_materializing_aggregate: bool = False
+    #: Kyber's verdict that a join's build-side aggregate reads far more rows than the join's
+    #: probe side can match (`EngineConfig.prefer_sideways`); the engine pairs it with its own
+    #: structural and memory checks.
+    prefer_sideways: bool = False
     #: One-slot memo for `to_json`. A list rather than a plain string because the dataclass
     #: is frozen: appending to a mutable default needs no `object.__setattr__` escape, and
     #: `compare=False` keeps the memo out of plan equality. See `to_json` for why it exists.

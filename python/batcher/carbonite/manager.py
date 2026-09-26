@@ -608,10 +608,11 @@ class ResourceManager:
         finally:
             limiter.release()
             # The query is done, so whatever the allocator still holds beyond the retention
-            # ceiling is pages no running query is using. See `memory.reclaim`.
+            # ceiling is pages no running query is using. See `memory.reclaim`. Against the
+            # process's reach, not `_envelope`, which shrinks by everything the process holds.
             from batcher.carbonite.memory.reclaim import reclaim_if_retaining
 
-            reclaim_if_retaining(self._envelope)
+            reclaim_if_retaining(self._pressure.reach_bytes())
 
     @contextmanager
     def reserve(self, m_bytes: int) -> Iterator[bool]:

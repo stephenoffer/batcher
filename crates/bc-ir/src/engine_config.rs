@@ -80,6 +80,16 @@ pub struct EngineConfig {
     /// footprint against the envelope`), which is the half only the engine can see. `false`
     /// (the default, and every older control plane) keeps the existing routing exactly.
     pub prefer_materializing_aggregate: bool,
+    /// Kyber's verdict that a join's build-side aggregate reads far more rows than the join's
+    /// probe side can match, so the materializing executor — which restricts that aggregate's
+    /// input to the probe side's keys before aggregating (`bc_interp::join_par::sideways`) — is
+    /// the faster route. Estimated sizes decide it, which only the control plane has: the
+    /// engine's structural check (`bc_interp::sideways_candidate`) sees *that* a restriction is
+    /// possible but not whether it cuts anything. On TPC-H sf10 q21 it cuts a 60M-row
+    /// `GROUP BY l_orderkey` to the orders the outer query can reach (~1,040 ms streamed against
+    /// ~670 ms), while q18, whose probe side is itself 60M rows, would only pay the executor's
+    /// overhead. `false` (the default, and every older control plane) keeps the routing as is.
+    pub prefer_sideways: bool,
     /// Fuse runs of linear, per-morsel streaming operators (Filter/Project) into a
     /// single pass over the input's morsels in the parallel executor. A relation-level
     /// no-op (same rows, same order — verified against the sequential oracle); it only
@@ -151,6 +161,7 @@ impl Default for EngineConfig {
             spill_compression: Some("auto".to_string()),
             op_budgets: HashMap::new(),
             prefer_materializing_aggregate: false,
+            prefer_sideways: false,
             fuse_linear: true,
             shrink_output_dtypes: false,
             streaming: true,

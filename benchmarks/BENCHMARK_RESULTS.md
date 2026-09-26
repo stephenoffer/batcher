@@ -1,5 +1,89 @@
 # Batcher CPU benchmark results
 
+## TPC-H sf100 streams its largest table into the engine: 481 s -> 60 s, 3.53x -> 1.75x DuckDB (2026-09-25)
+
+**Conditions.** Anyscale job, one `m6id.16xlarge` (64 vCPU, 240 GiB, local NVMe), TPC-H sf100
+from `s3://ray-benchmark-data/tpch/parquet/sf100/` copied to the NVMe first, `benchmarks/run.py
+--benchmark tpch --scale 100 --scan --isolate --engines batcher,duckdb`. The before and after runs
+are the same instance type on the same day, one wheel built from `2594078c` and one from the
+working tree carrying the changes below. DuckDB 1.5.5 in both. Every result was checked against
+DuckDB before it was timed; q11 returns zero rows on both engines at this scale.
+
+| q | before (ms) | after (ms) | DuckDB (ms) | after vs DuckDB |
+|---|---:|---:|---:|---:|
+| q1 | 67,421 | **2,371** | 2,038 | 1.16x |
+| q2 | 750 | 733 | 291 | 2.52x |
+| q3 | 6,634 | **2,295** | 1,228 | 1.87x |
+| q4 | 2,959 | 2,595 | 1,023 | 2.54x |
+| q5 | 2,976 | 2,562 | 1,226 | 2.09x |
+| q6 | 2,281 | 1,309 | 892 | 1.47x |
+| q7 | 5,003 | 1,948 | 1,263 | 1.54x |
+| q8 | 3,443 | 2,562 | 1,402 | 1.83x |
+| q9 | 8,696 | 3,477 | 3,221 | 1.08x |
+| q10 | 3,872 | 2,973 | 1,333 | 2.23x |
+| q12 | 4,029 | 2,253 | 1,236 | 1.82x |
+| q13 | 3,182 | 3,396 | 1,995 | 1.70x |
+| q14 | 2,737 | 1,424 | 1,113 | 1.28x |
+| q15 | 4,397 | 1,464 | 1,024 | 1.43x |
+| q16 | 562 | 544 | 365 | 1.49x |
+| q17 | 2,344 | 2,101 | 1,249 | 1.68x |
+| q18 | 6,088 | 3,912 | 2,291 | 1.71x |
+| q19 | 4,055 | 2,653 | 1,732 | 1.53x |
+| q20 | 3,322 | 2,134 | 1,202 | 1.78x |
+| q21 | 345,968 | **16,349** | 4,062 | 4.03x |
+| q22 | 554 | 539 | 343 | 1.57x |
+
+Geomean against DuckDB **3.53x -> 1.75x**, suite total **481 s -> 60 s** against DuckDB's 31 s.
+Still a loss on every query. q13 moved the wrong way by 7%, one run each, and nothing in the
+change touches its plan; it is recorded rather than explained.
+
+On a 48-core, 92 GiB workspace box the same sf100 suite ran in the same harness, and there the
+change is the difference between finishing and not: before it, q5 took 233 s and q8 193 s on the
+out-of-core path and q9 was OOM-killed at 71 GB; after it, all 21 comparable queries finish, q5 in
+5.9 s and q9 in 10.1 s, 1.3x-3.4x DuckDB on that box.
+
+### What was wrong
+
+The in-memory path reads every source to Arrow before the engine starts (`stages.resolve_sources`).
+At sf100 that is ~19-35 GB of `lineitem` for most queries, so the query either paid the whole read
+before any compute (the 64-core box) or was routed out of core (the 92 GiB box), where
+`execute_spilling_aggregate` ran the plan once per **8 MiB** morsel from Python: 2,448 engine calls
+for q1's 600M rows, each too small to fill the cores, the read serialized in front of every one.
+Profiled on the 92 GiB box, q1 spent 7.1 s in `partial_aggregate`, 5.0 s compacting morsels and
+2.3 s in the engine proper.
+
+### What changed
+
+- **`bc_interp::stream::chunked`** runs a plan with one source streamed in chunks. Join builds are
+  prepared once; each chunk is sharded across the workers and folded into the aggregate's partial
+  state, the same `partial -> combine -> finalize` the sharded executor and the cluster use; the
+  rest of the plan runs over the aggregate's result. It serves an aggregate over a probe spine of
+  inner, left, semi and anti joins wherever it sits in the plan, and a join spine with no aggregate
+  (collecting its rows). An inner join whose build side holds the driving scan is swapped onto the
+  probe side first. Right and full joins, and a source scanned twice, are declined.
+- Chunks come from **`ParquetSource.iter_chunks`**, a group of files at a time through the same
+  concurrent native reader and pruning as `read`, prefetched on a thread so decode overlaps compute
+  (`dist.spill.iter_spill_chunks`). The out-of-core aggregate reads through the same tap in 1/16 of
+  the envelope per chunk rather than 8 MiB: q1 on the 92 GiB box 15.7 s -> 5.9 s before streaming
+  replaced that path.
+- In chunked mode every build takes a flat per-morsel probe. The resident admission refuses one to
+  a large or semi/anti build because it can hand off to the materializing executor; the chunked
+  path cannot, and the radix join it fell back to rebuilt its partitions per morsel. q3's stage:
+  12.0 s -> 2.3 s, with `join_partition_into` at 46% of the profile before.
+- **The adaptive loop does not stage a plan that can stream its largest input whole**
+  (`gating._streams_whole`). It cut q9 at a join and materialized `lineitem JOIN orders`, 600M rows,
+  as its first stage.
+- What the chunked path holds (aggregate state, or collected rows) is bounded by half the envelope;
+  past it the engine raises `MemoryBudgetExceededError` and the query takes the out-of-core path.
+
+### A wrong answer found on the way
+
+q15 compares a grouped `sum` with a `max` of the same sums that the control plane evaluates first
+and folds in as a literal. With only one of the two streamed, they summed in different orders,
+disagreed in the last bit, and q15 returned **0 rows where the answer is 1**. The chunked path now
+finds the aggregate over the spine wherever it sits, so both evaluations take the same chunks,
+shards and combine; `test_diff_chunked_scan.py` carries the shape with inexact float factors.
+
 ## Two memory blow-ups, a 37x decimal sort, and ROLLUP levels that share one aggregate (2026-09-23)
 
 **Read the conditions first.** 48 cores, 92 GiB, a ~60 GiB cgroup envelope, shared all day with
