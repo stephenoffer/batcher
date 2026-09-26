@@ -110,12 +110,6 @@ _PRINTF = re.compile(r"%(\d+\$)?([-+ #0]*)(\d+|\*)?(\.\d+|\.\*)?([a-zA-Z%])")
 #: `d`/`i` truncate toward zero the way C does; `s` takes the value as written.
 _PRINTF_CAST = {"s": None, "d": "int64", "i": "int64", "f": "float64", "b": None}
 
-#: The conversions whose C definition *truncates* toward zero rather than rounding.
-#: `.cast("int64")` rounds, so `%d` of 3.7 came out as 4 where C writes 3. DuckDB
-#: refuses a float for `%d` outright; truncating is the more useful answer and is
-#: identical to DuckDB's for the integer arguments the conversion is actually for.
-_PRINTF_TRUNCATES = frozenset({"d", "i"})
-
 
 def _format_call(tr, template, values) -> Expr:
     """`format`/`printf`/`format_string` — interpolate `values` into a constant template.
@@ -198,7 +192,11 @@ def _quote(value: Expr) -> Expr:
 
 
 def _converted(value: Expr, cast: str) -> Expr:
-    """Apply a printf conversion's implied cast, truncating where C truncates."""
+    """Apply a printf conversion's implied cast, truncating where C truncates.
+
+    `.cast("int64")` alone rounds, so `%d` of 3.7 would give 4 where C writes 3. DuckDB
+    refuses a float for `%d`; truncating matches it on the integer arguments `%d` is for.
+    """
     if cast == "int64":
         return value.trunc().cast("int64")
     return value.cast(cast)

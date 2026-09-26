@@ -12,7 +12,6 @@ from sqlglot import expressions as exp
 
 from batcher._sql.parser.core_utils import _alias_of, _unwrap_alias
 from batcher._sql.parser.windowing.frame import (
-    _WINDOW_AGGS,
     _const_int,
     _resolve_frame,
     _window_order,
@@ -551,22 +550,10 @@ def _value_func(name: str, fn, order):
     return (_VALUE_FUNCS[name], arg.name)
 
 
-#: Window functions whose first argument is a *value* the engine reads per row. Each takes
-#: a materialized column, so an argument that is any other expression has to be computed
-#: into one first.
-#:
-#: Derived from `_WINDOW_AGGS` rather than listed beside it, because the two describe the
-#: same set and a hand-written copy had already drifted: it named `sum`/`avg`/`min`/`max`/
-#: `count` and omitted `bool_and`/`bool_or`/the `bit_*` family/`stddev`/`variance`/`median`,
-#: all of which take a value argument just as much. So `sum(a + b) OVER (...)` was hoisted
-#: and answered while `bool_or(a > 0) OVER (...)` was refused with "window aggregate
-#: supports a single plain column argument only" — and a predicate is the *only* thing
-#: anyone passes `bool_or`, so the one shape that matters was the one that failed.
-#:
-#: The positional value functions are not aggregates and so are not in `_WINDOW_AGGS`; they
-#: are added here because they read a value per row for the same reason.
+#: Positional window functions that read a value per row, so a non-column argument has to be
+#: materialized into a column first, as a window aggregate's does. They are not aggregates,
+#: so `window_agg` does not recognise them.
 _POSITIONAL_VALUE_FUNCS = frozenset({"lag", "lead", "firstvalue", "lastvalue", "nthvalue"})
-_VALUE_ARG_FUNCS = frozenset(_WINDOW_AGGS) | _POSITIONAL_VALUE_FUNCS
 
 
 def _set_window_argument(fn, replacement) -> None:

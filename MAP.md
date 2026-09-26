@@ -878,7 +878,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | `maps.py` | 98 | SQL → `.map` accessor dispatch. |
 | `scalar.py` | 548 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 258 | Spark SQL names whose translation is a composition rather than a rename. |
-| `strings.py` | 222 | SQL string functions whose translation is more than a name lookup. |
+| `strings.py` | 220 | SQL string functions whose translation is more than a name lookup. |
 | `temporal.py` | 478 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
 
 ### `batcher/_sql/parser/expressions/lowering/` — 6 · front-end
@@ -890,7 +890,7 @@ The scalar lowerings big enough to own a module, kept out of the `scalar` dispat
 | `accessors.py` | 224 | SQL → the typed accessor namespaces, by name. |
 | `buckets.py` | 121 | `time_bucket` — snapping a timestamp to the start of the period that contains it. |
 | `derived.py` | 44 | The dispatches *derived* from the public expression surface, in the order they run. |
-| `dynamic.py` | 140 | String functions whose parameters are columns rather than constants. |
+| `dynamic.py` | 139 | String functions whose parameters are columns rather than constants. |
 | `families.py` | 319 | SQL → the public function library, by name. |
 | `intervals.py` | 168 | SQL ``INTERVAL`` literals → the ``(months, days, microseconds)`` triple. |
 | `matching.py` | 78 | ``LIKE`` / ``ILIKE`` lowering, including the shapes that skip the pattern matcher. |
@@ -932,7 +932,7 @@ Window-function translation for the SQL front-end.
 | module | lines | what it is |
 |---|---|---|
 | `frame.py` | 247 | Resolving a SQL window spec into the engine's frame, partition and order triple. |
-| `translate.py` | 744 | Window-function handling for the SQL translator. |
+| `translate.py` | 731 | Window-function handling for the SQL translator. |
 
 ### `batcher/dist/` — 4 · backend
 
