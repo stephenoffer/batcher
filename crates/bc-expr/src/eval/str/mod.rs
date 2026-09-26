@@ -1661,15 +1661,13 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 /// 64-bit xxHash of `bytes` — fast, deterministic, and stable across machines (the
-/// standard bucketing/sharding hash). Uses the portable `Hasher` API.
+/// standard bucketing/sharding hash). The engine's one implementation,
+/// [`bc_arrow::xxhash64`], which the shuffle also routes by.
 ///
 /// `seed` is the `start` slot, `0` when absent; the `i64` is reinterpreted as the `u64`
 /// seed, which is how Spark passes its `long` seed (`42`) to the same algorithm.
 fn xxhash64(bytes: &[u8], seed: Option<i64>) -> u64 {
-    use std::hash::Hasher;
-    let mut h = twox_hash::XxHash64::with_seed(seed.unwrap_or(0) as u64);
-    h.write(bytes);
-    h.finish()
+    bc_arrow::xxhash64(bytes, seed.unwrap_or(0) as u64)
 }
 
 /// Translate a SQL `LIKE`/`ILIKE` pattern into an anchored `regex::Regex`.

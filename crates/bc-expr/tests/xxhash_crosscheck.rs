@@ -12,12 +12,8 @@
 //! dependency, and `bc-arrow` should not gain one for a test — it sits at the root of the
 //! crate DAG, so anything added there lands in every build.
 
-use std::hash::Hasher;
-
 fn reference(bytes: &[u8], seed: u64) -> u64 {
-    let mut hasher = twox_hash::XxHash64::with_seed(seed);
-    hasher.write(bytes);
-    hasher.finish()
+    twox_hash_2::XxHash64::oneshot(seed, bytes)
 }
 
 /// Every length from 0 to 255 crosses all four tail branches (the 32-byte main loop, the

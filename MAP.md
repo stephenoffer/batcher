@@ -3224,7 +3224,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/json.rs` | 795 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 205 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 137 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1877 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1875 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/numfmt.rs` | 178 | String functions whose input is a **number**, not a string. |
 | `eval/str/quality/builders.rs` | 27 | Shared column builders for the text-quality measures. |
 | `eval/str/quality/entropy.rs` | 49 | Character-distribution entropy — deliberately *not* one of Gopher's rules. |

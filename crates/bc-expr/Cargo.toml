@@ -42,23 +42,23 @@ base64 = "0.22"
 # stack, so these edges add no new third-party code — which is why six codecs cost what
 # three would.
 flate2 = "1"
-zstd = "0.13"
-brotli = "8"
-lz4_flex = "0.11"
+zstd = "0.14"
+brotli = "9"
+lz4_flex = "0.14"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # IANA timezone database for `convert_timezone` (DST-aware tz conversion).
 chrono-tz = { version = "0.10", default-features = false }
 serde_json = { workspace = true }
-# Cryptographic / non-cryptographic hashes for the `md5`/`sha1`/`sha256`/`crc32`/
-# `xxhash64` string functions (all pure-Rust). Differential-tested vs DuckDB where it
-# has the same function (md5/sha1/sha256), fixture-tested otherwise (crc32/xxhash64).
+# Cryptographic / non-cryptographic hashes for the `md5`/`sha1`/`sha256`/`crc32` string
+# functions (all pure-Rust; `xxhash64` is `bc_arrow::xxhash64`). Differential-tested vs
+# DuckDB where it has the same function (md5/sha1/sha256), fixture-tested otherwise
+# (crc32/xxhash64).
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
 crc32fast = "1"
-twox-hash = "1"
-# XXH3-64 for `hash(algorithm="xxhash3")`, Daft's default hash. The 1.x line above has an
-# `xxh3` module too, but it disagrees with the reference (it hashes an empty input to 0,
+# XXH3-64 for `hash(algorithm="xxhash3")`, Daft's default hash. The 1.x line of this crate has
+# an `xxh3` module too, but it disagrees with the reference (it hashes an empty input to 0,
 # and `1i64` to a different digest than Daft and the xxHash reference implementation); 2.x
 # matches Daft 0.7.25 bit for bit. Already in the lock file through the Parquet stack.
 twox-hash-2 = { package = "twox-hash", version = "2.1", default-features = false, features = [
@@ -131,3 +131,11 @@ video = ["dep:ffmpeg-next"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The independent xxHash64 that `tests/xxhash_crosscheck.rs` holds `bc_arrow::xxhash64`
+# against. A test-only feature of the XXH3 dependency above, so no second version of the
+# crate and nothing added to a non-test build.
+twox-hash-2 = { package = "twox-hash", version = "2.1", default-features = false, features = [
+    "xxhash64",
+] }
