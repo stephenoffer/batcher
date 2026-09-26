@@ -3165,7 +3165,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/geo/mod.rs` | 48 | Evaluation of the `Expr::Geo` variant — the array-level half of geospatial support. |
 | `eval/geo/scalar.rs` | 365 | The scalar-returning geospatial functions: accessors, measures, predicates, codecs. |
 | `eval/hash/compat.rs` | 393 | Engine-compatible digests for `Expr::Hash` — Spark's `hash`, Iceberg's bucket hash, and Daft's default XXH3. |
-| `eval/hash/mod.rs` | 241 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
+| `eval/hash/mod.rs` | 232 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
 | `eval/in_list.rs` | 271 | `x IN (lit, lit, …)` — hash-set membership. |
 | `eval/list.rs` | 791 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 161 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
@@ -3179,7 +3179,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
 | `eval/list_ops/mod.rs` | 28 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/multiset.rs` | 142 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
-| `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
+| `eval/list_ops/simhash.rs` | 135 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 270 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/map_ops/make_map.rs` | 148 | Map construction for `Expr::MakeMap` — SQL `map(keys, values)`, Spark's `map_from_arrays` — pairing two `List` columns into one Arrow `Map` column. |
 | `eval/map_ops/mod.rs` | 9 | `Map`-column **construction**, as the counterpart to the read-side accessors in `eval/map.rs` (`map_keys`/`map_values`/`map_entries`/`element_at`). |
@@ -3223,7 +3223,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/jaro.rs` | 82 | Jaro and Jaro-Winkler string similarity (the `.str.jaro`/`.str.jaro_winkler` funcs). |
 | `eval/str/json.rs` | 795 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 205 | Fast SQL `LIKE` / substring matching. |
-| `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
+| `eval/str/minhash.rs` | 137 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
 | `eval/str/mod.rs` | 1877 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/numfmt.rs` | 178 | String functions whose input is a **number**, not a string. |
 | `eval/str/quality/builders.rs` | 27 | Shared column builders for the text-quality measures. |
@@ -3254,7 +3254,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `dtype_name.rs` | 226 | The cast dtype-*name* grammar — the one place a wire name becomes an Arrow type. |
 | `float_ident.rs` | 161 | The engine's one definition of **float identity**. |
 | `hardware.rs` | 372 | Host CPU capability detection for adaptive execution. |
-| `hash.rs` | 307 | The one hash whose value crosses a process boundary. |
+| `hash.rs` | 308 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 231 | The host's instruction-set capabilities, in full. |
 | `lib.rs` | 233 | `bc-arrow` — Arrow building blocks shared across the engine. |
 | `offset.rs` | 268 | Typed `key ± offset` arithmetic — the one place a temporal distance is applied. |
@@ -3278,7 +3278,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `hll.rs` | 401 | HyperLogLog++ — distinct-count (cardinality) estimation. |
 | `kll.rs` | 551 | KLL — streaming quantile / rank sketch (Karnin–Lang–Liberty). |
 | `lib.rs` | 79 | `bc-sketches` — mergeable probabilistic sketches for the optimizer. |
-| `reservoir.rs` | 369 | Reservoir sampling — a fixed-size uniform random sample of a stream. |
+| `reservoir.rs` | 359 | Reservoir sampling — a fixed-size uniform random sample of a stream. |
 | `stats.rs` | 253 | Per-column statistics derived from a single scan. |
 | `tdigest.rs` | 454 | T-Digest — tail-accurate quantile sketch (Dunning). |
 
