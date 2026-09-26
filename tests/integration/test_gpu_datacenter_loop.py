@@ -35,7 +35,7 @@ from batcher.dist.executors.ray_runtime.fabric import (
 from batcher.governance import DataResidency, ResidencyCatalog
 from batcher.kyber.gpu import select_device_class
 from batcher.observe import energy_metrics, format_energy_report
-from batcher.plan.energy import GridProfile, merge_ledgers
+from batcher.plan.energy import EnergyLedger, GridProfile
 from batcher.plan.energy.power import device_power_watts, energy_joules
 
 pytestmark = [pytest.mark.integration, pytest.mark.unit]
@@ -168,12 +168,17 @@ def test_a_distributed_run_reports_the_single_node_energy() -> None:
         return ledger
 
     workers = [_worker(1000), _worker(2000), _worker(3000)]
-    merged = merge_ledgers(workers)
+    merged = EnergyLedger()
+    for worker in workers:
+        merged.merge(worker)
     assert merged.total_rows == 6000
     assert merged.total_joules == pytest.approx(sum(w.total_joules for w in workers))
-    assert merge_ledgers(list(reversed(workers))).total_joules == pytest.approx(
-        merged.total_joules
-    ), "energy folds in any order, like every other mergeable quantity here"
+    reversed_fold = EnergyLedger()
+    for worker in reversed(workers):
+        reversed_fold.merge(worker)
+    assert reversed_fold.total_joules == pytest.approx(merged.total_joules), (
+        "energy folds in any order, like every other mergeable quantity here"
+    )
 
 
 def test_the_planned_and_recorded_energy_agree_in_magnitude() -> None:

@@ -19,14 +19,13 @@ Three modules, one responsibility each:
 
 from __future__ import annotations
 
-from batcher.plan.energy.accounting import EnergyLedger, StageEnergy, merge_ledgers
+from batcher.plan.energy.accounting import EnergyLedger, StageEnergy
 from batcher.plan.energy.carbon import (
     GridProfile,
     carbon_grams,
     configured_grid,
     energy_cost,
     joules_to_kwh,
-    kwh_to_joules,
 )
 from batcher.plan.energy.power import (
     PowerEnvelope,
@@ -52,7 +51,5 @@ __all__ = [
     "fleet_power_watts",
     "host_overhead_watts",
     "joules_to_kwh",
-    "kwh_to_joules",
     "max_concurrent_devices",
-    "merge_ledgers",
 ]

@@ -29,7 +29,6 @@ import threading
 import time
 from typing import Any
 
-from batcher._internal.errors import ConfigError
 from batcher._internal.logging import get_logger
 from batcher.metadata.hardware_scope import local_or_planned_fingerprint
 from batcher.metadata.params import LearnedParams
@@ -239,27 +238,6 @@ class MetadataHub:
         re-scanning the whole history. Resets only when a fresh hub is constructed.
         """
         return self._seq
-
-    def operator_history(self, op_id: int) -> list[dict[str, Any]]:
-        """All recorded feedback for an operator id, oldest first.
-
-        Args:
-            op_id: The operator's plan-local id.
-
-        Returns:
-            The recorded rows, oldest first. Empty when nothing was recorded.
-
-        Raises:
-            ConfigError: If `op_id` is not an integer. The store's keys are typed, so a
-                string id matches nothing and would otherwise read as "never recorded".
-        """
-        if not isinstance(op_id, int) or isinstance(op_id, bool):
-            raise ConfigError(
-                f"operator_history needs an integer op_id, but got "
-                f"{type(op_id).__name__} {op_id!r}.",
-                hint="Operator ids are the plan-local integers on a PhysicalPlan's ops.",
-            )
-        return [json.loads(value) for _key, value in self._backend.scan(_OP_STATS, (op_id,))]
 
     def op_stats_by_kind(self, hw_fingerprint: str | None = None) -> dict[str, list[dict]]:
         """Operator feedback measured on **one machine class**, bucketed by operator `kind`.

@@ -27,7 +27,6 @@ __all__ = [
     "configured_grid",
     "energy_cost",
     "joules_to_kwh",
-    "kwh_to_joules",
 ]
 
 #: Joules in one kilowatt-hour.
@@ -44,18 +43,6 @@ def joules_to_kwh(joules: float) -> float:
         Kilowatt-hours; `0.0` for a non-positive input.
     """
     return joules / _JOULES_PER_KWH if joules > 0 else 0.0
-
-
-def kwh_to_joules(kwh: float) -> float:
-    """Convert kilowatt-hours to joules.
-
-    Args:
-        kwh: Energy in kilowatt-hours.
-
-    Returns:
-        Joules; `0.0` for a non-positive input.
-    """
-    return kwh * _JOULES_PER_KWH if kwh > 0 else 0.0
 
 
 def carbon_grams(joules: float, gco2e_per_kwh: float, pue: float = 1.0) -> float:

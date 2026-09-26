@@ -25,7 +25,6 @@ from batcher.plan.energy import (
     fleet_power_watts,
     host_overhead_watts,
     joules_to_kwh,
-    kwh_to_joules,
     max_concurrent_devices,
 )
 
@@ -133,9 +132,8 @@ def test_the_configured_envelope_reads_the_active_config() -> None:
     assert envelope.expected_watts == 500.0
 
 
-def test_kwh_round_trips() -> None:
+def test_joules_convert_to_kwh() -> None:
     assert joules_to_kwh(3.6e6) == pytest.approx(1.0)
-    assert kwh_to_joules(joules_to_kwh(1234.0)) == pytest.approx(1234.0)
     assert joules_to_kwh(-5.0) == 0.0
 
 

@@ -35,7 +35,6 @@ from batcher.plan.logical import LogicalPlan
 from batcher.plan.physical import PhysicalPlan
 from batcher.plan.resource import HardwareProfile
 from batcher.plan.source_stats import source_identity
-from batcher.plan.stats import RelStats
 from batcher.plan.visitor import children, walk
 
 __all__ = ["Optimizer", "optimize", "optimize_full", "optimize_logical", "optimize_traced"]
@@ -295,17 +294,6 @@ class Optimizer:
         estimator of its own.
         """
         return self._run(logical, self._context())[0]
-
-    def logical_stats(self, logical: LogicalPlan) -> tuple[LogicalPlan, RelStats]:
-        """Run the logical rewrite phases and estimate the root's `RelStats`.
-
-        Returns the rewritten logical plan and its root statistics. The rewrites
-        run first so algebraic simplifications and zone-map pruning have sharpened
-        the plan before estimation.
-        """
-        ctx = self._context()
-        plan, _ir = self._run(logical, ctx)
-        return plan, ctx.estimator.estimate(plan)
 
     def explain(self, logical: LogicalPlan) -> str:
         """A human-readable view of the optimized plan and its cardinality decisions."""

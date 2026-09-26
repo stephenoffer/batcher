@@ -297,8 +297,6 @@ def test_learned_param_names_must_be_strings():
         hub.load_params(None)  # type: ignore[arg-type]
     with pytest.raises(ConfigError):
         hub.put_keyed_param("ns", 7, 1)  # type: ignore[arg-type]
-    with pytest.raises(ConfigError):
-        hub.operator_history("scan")  # type: ignore[arg-type]
 
 
 # --- governance ------------------------------------------------------------

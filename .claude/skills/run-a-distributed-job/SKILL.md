@@ -215,7 +215,7 @@ of them off or unbounded by default so a fleet that configures nothing behaves a
   fleet to the nodes every input permits. Start in `advisory` mode: `strict` refuses, and the
   first strict run of a large pipeline fails somewhere nobody predicted.
 - **Energy is measured and mergeable.** `core.energy.measure_stage` records what a stage drew,
-  marking whether the figure came from a device reading or a datasheet, and `merge_ledgers`
+  marking whether the figure came from a device reading or a datasheet, and `EnergyLedger.merge`
   folds per-worker ledgers into one figure equal to the single-node one. Report it with
   `observe.format_energy_report`; the idle share is the number to act on.
 

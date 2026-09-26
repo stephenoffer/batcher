@@ -1233,7 +1233,7 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 508 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 239 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 593 | The `Optimizer` façade and the module-level entry points. |
+| `facade.py` | 581 | The `Optimizer` façade and the module-level entry points. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
 
@@ -1507,8 +1507,8 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `joins.py` | 98 | Join shortcuts — the questions two relations' bounds answer about their join. |
 | `moments.py` | 54 | Additive shortcuts — a column's total and its average, when something already recorded them. |
 | `nulls.py` | 110 | Null-shape shortcuts — how much of a column is missing, and which columns are complete. |
-| `ordering.py` | 63 | Ordering shortcuts — what the data is already sorted by, so a sort need not prove it. |
-| `rows.py` | 59 | Relation-shape shortcuts — how many rows, how many columns, is there anything there. |
+| `ordering.py` | 47 | Ordering shortcuts — what the data is already sorted by, so a sort need not prove it. |
+| `rows.py` | 53 | Relation-shape shortcuts — how many rows, how many columns, is there anything there. |
 | `storage.py` | 145 | Storage shortcuts — what a scan *would* have read, without reading it. |
 
 ### `batcher/kyber/stats/` — 3 · subsystem
@@ -2360,8 +2360,8 @@ Energy as a first-class plan quantity: power draw, grid conversion, and per-stag
 
 | module | lines | what it is |
 |---|---|---|
-| `accounting.py` | 340 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
-| `carbon.py` | 175 | Turning joules into the two figures a datacenter is actually judged on: cost and carbon. |
+| `accounting.py` | 321 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
+| `carbon.py` | 162 | Turning joules into the two figures a datacenter is actually judged on: cost and carbon. |
 | `power.py` | 256 | Device power draw — the neutral model every power-aware decision reads. |
 
 ### `batcher/plan/expr_ir/` — 1 · contract
@@ -2601,10 +2601,10 @@ Resource contracts between Kyber (optimizer), Carbonite (resource manager), and 
 | module | lines | what it is |
 |---|---|---|
 | `bounds.py` | 248 | The resource contracts Kyber annotates, Carbonite validates, and `dist` schedules against. |
-| `cluster.py` | 460 | The *shape* of the fleet a plan is optimized for — nodes, devices, and the wires between. |
+| `cluster.py` | 444 | The *shape* of the fleet a plan is optimized for — nodes, devices, and the wires between. |
 | `fleet_plan.py` | 210 | How a fleet of unequal machines is cut into worker slots — the pure sizing, no Ray. |
 | `hardware.py` | 282 | The machine Kyber is planning *for* — the binding node, and the fleet it sits in. |
-| `locality.py` | 298 | How workers land on the fleet's nodes, and how much of an exchange each tier carries. |
+| `locality.py` | 288 | How workers land on the fleet's nodes, and how much of an exchange each tier carries. |
 | `storage.py` | 139 | Where a cached result is allowed to live — the `StorageLevel` contract. |
 
 ### `batcher/plan/streaming/` — 1 · contract
@@ -2657,7 +2657,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | module | lines | what it is |
 |---|---|---|
 | `hardware_scope.py` | 154 | Scoping learned parameters to the machine that measured them. |
-| `hub.py` | 466 | `MetadataHub` — the façade over a `MetadataBackend`. |
+| `hub.py` | 444 | `MetadataHub` — the façade over a `MetadataBackend`. |
 | `io_stats.py` | 249 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `params.py` | 352 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
 | `smoothed.py` | 371 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
