@@ -20,7 +20,6 @@ they live here as the single source of truth.
 from __future__ import annotations
 
 import collections
-import contextlib
 import functools
 import os
 import threading
@@ -448,8 +447,10 @@ def _native_scan_batches(splits, projection, predicate=None):
     # decoder working set per read, which is what OOM-killed a GPU inference actor holding a
     # node's worth of them; the byte cap is a no-op for an ordinary row. See
     # `_parquet_native.NATIVE_READ_TARGET_BYTES`.
-    with contextlib.suppress(Exception):
+    try:
         batch_rows = _parquet_native.native_read_batch(splits[0].schema(), cols, ceiling=batch_rows)
+    except Exception as exc:
+        note_suppressed("dist", "native parquet read batch sizing", exc)
 
     # Window the row-groups so the worker reads ~one window at a time (bounded memory +
     # read/compute overlap) instead of materializing its whole partition.
@@ -501,7 +502,8 @@ def _native_scan_batches(splits, projection, predicate=None):
     gen = _gen()
     try:
         first = next(gen, _SENTINEL)
-    except Exception:
+    except Exception as exc:
+        note_suppressed("dist", "native parquet read", exc)
         return None
     if first is _SENTINEL:
         return iter(())
