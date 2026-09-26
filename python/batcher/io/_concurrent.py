@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
 from batcher.config.env import env_int
+from batcher.io._backend import _scheme
 
 __all__ = ["is_local_path", "listed_sizes", "read_each_file", "total_file_bytes"]
 
@@ -33,8 +34,7 @@ def is_local_path(path: str) -> bool:
     two were making the same decision from the same reasoning and only one of them had
     measured it.
     """
-    idx = path.find("://")
-    return idx <= 0 or path[:idx].lower() == "file"
+    return _scheme(path) in ("", "file")
 
 
 def read_each_file(fs: Any, files: list[str], read_one: Callable[[Any, str], T]) -> list[T]:

@@ -1799,7 +1799,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `_file_cache.py` | 354 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 131 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
-| `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
+| `detect.py` | 467 | Format and layout detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 720 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 634 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
@@ -1817,12 +1817,12 @@ Template-Method base classes for file-backed sources and sinks.
 | `_layout.py` | 111 | `FileLayout` — how a write divides its rows into files, resolved wherever the rows are. |
 | `_lines.py` | 198 | Line-delimited decoding, shared by the text and log sources. |
 | `_options.py` | 226 | Reader/writer keyword aliasing — one spelling table per format, one error shape. |
-| `_paths.py` | 172 | Path normalization shared by every file source and sink. |
+| `_paths.py` | 168 | Path normalization shared by every file source and sink. |
 | `_readahead.py` | 204 | Order-preserving, **byte-bounded** read-ahead over a sequence of files. |
 | `_tolerance.py` | 140 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 199 | Retry for the IO failures that are worth retrying, and only those. |
 | `sink.py` | 774 | `FileSink` — the Template-Method base every file-format writer subclasses. |
-| `source.py` | 1674 | `FileSource` — the Template-Method base every file-format reader subclasses. |
+| `source.py` | 1679 | `FileSource` — the Template-Method base every file-format reader subclasses. |
 
 ### `batcher/io/formats/` — 2 · neutral IO
 

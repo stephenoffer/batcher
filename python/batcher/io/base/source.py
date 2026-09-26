@@ -22,8 +22,13 @@ from batcher._internal.errors import FormatError, IOError, SchemaError, unknown_
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.logging import note_suppressed
 from batcher.config.env import env_float, env_int
-from batcher.io._backend import _has_wildcard, _scheme
-from batcher.io._concurrent import listed_sizes, read_each_file, total_file_bytes
+from batcher.io._backend import _has_wildcard
+from batcher.io._concurrent import (
+    is_local_path,
+    listed_sizes,
+    read_each_file,
+    total_file_bytes,
+)
 from batcher.io.base._options import BASE_SOURCE_ALIASES, BASE_SOURCE_OPTIONS
 from batcher.io.base._paths import normalize_source_path
 from batcher.io.base._readahead import ordered_readahead
@@ -415,7 +420,7 @@ class FileSource(ABC):
         and is therefore sized by in-flight requests rather than by cores. See
         `_REMOTE_READ_CONCURRENCY`.
         """
-        return _scheme(self._path) not in ("", "file")
+        return not is_local_path(self._path)
 
     @property
     def node_local(self) -> bool:

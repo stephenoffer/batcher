@@ -21,7 +21,7 @@ import pyarrow as pa
 from batcher._internal.errors import ColumnNotFoundError
 from batcher._internal.hardware import available_cpu_count, machine_memory_bytes
 from batcher.config.env import env_float, env_int
-from batcher.io._backend import _scheme
+from batcher.io._concurrent import is_local_path
 from batcher.io.base._hive import (
     hive_partition_run_starts,
     hive_path_segment,
@@ -49,7 +49,7 @@ _REMOTE_WRITE_CONCURRENCY = env_int("BATCHER_REMOTE_WRITE_CONCURRENCY", 32, floo
 def _write_concurrency(n_files: int, path: str) -> int:
     """How many of `n_files` outputs to publish at once, sized for where they are going."""
     by_core = available_cpu_count()
-    remote = _scheme(path) not in ("", "file")
+    remote = not is_local_path(path)
     return max(1, min(n_files, max(by_core, _REMOTE_WRITE_CONCURRENCY) if remote else by_core))
 
 
