@@ -32,6 +32,7 @@ from collections.abc import Callable
 
 from batcher.kyber.rules.exprs.guards import is_integer, register_schema_leaf_rule
 from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
+from batcher.kyber.rules.literals import in_int64
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.core import MathExpr
 from batcher.plan.ir_tags import COMPARISON_FLIP
@@ -48,7 +49,6 @@ __all__ = [
     "TRUNC_RANGE_RULES",
 ]
 
-_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 _COMPARISONS = ("lt", "le", "gt", "ge", "eq", "ne")
 
 
@@ -67,10 +67,6 @@ def _integral(expr: Expr) -> int | None:
     if isinstance(value, float) and value.is_integer() and abs(value) < 2**53:
         return int(value)
     return None
-
-
-def _in_int64(value: int) -> bool:
-    return _INT64_MIN <= value <= _INT64_MAX
 
 
 def _comparison_parts(expr: Expr) -> tuple[str, Expr, int] | None:
@@ -128,7 +124,7 @@ def _floor_form(op: str, arg: Expr, k: int) -> Expr | None:
     `floor(x) >= k <=> x >= k` and `floor(x) < k <=> x < k` need no shift; the other two
     half-bounds move by one, since `floor(x) > k` is `floor(x) >= k+1`.
     """
-    if not _in_int64(k + 1):
+    if not in_int64(k + 1):
         return None
     if op == "lt":
         return Binary("lt", arg, Lit(k))
@@ -144,7 +140,7 @@ def _floor_form(op: str, arg: Expr, k: int) -> Expr | None:
 def _ceil_form(op: str, arg: Expr, k: int) -> Expr | None:
     """`ceil(arg) OP k` over the bare `arg` — the mirror of `_floor_form`, with the
     half-open interval closed at the top instead of the bottom."""
-    if not _in_int64(k - 1):
+    if not in_int64(k - 1):
         return None
     if op == "lt":
         return Binary("le", arg, Lit(k - 1))
@@ -178,7 +174,7 @@ def _trunc_upper(k: int) -> tuple[str, int]:
 
 def _trunc_form(op: str, arg: Expr, k: int) -> Expr | None:
     """`trunc(arg) OP k` over the bare `arg`, split at zero."""
-    if not (_in_int64(k + 1) and _in_int64(k - 1)):
+    if not (in_int64(k + 1) and in_int64(k - 1)):
         return None
     if op == "ge":
         low_op, low = _trunc_lower(k)
@@ -233,7 +229,7 @@ def _half_form(op: str, arg: Expr, k: int, lower, upper) -> Expr | None:
     since both families place their bucket at `k ± 0.5` and differ only in which endpoint
     the tie belongs to.
     """
-    if not (_in_int64(k + 1) and _in_int64(k - 1)):
+    if not (in_int64(k + 1) and in_int64(k - 1)):
         return None
     if op == "ge":
         low_op, low = lower(k)
@@ -282,7 +278,7 @@ def _even_form(op: str, arg: Expr, k: int) -> Expr | None:
     `x` at all — and turning an unsatisfiable predicate into `false` would reclassify a
     null row, so an odd bucket declines instead.
     """
-    if k % 2 != 0 or not (_in_int64(k + 2) and _in_int64(k - 2)):
+    if k % 2 != 0 or not (in_int64(k + 2) and in_int64(k - 2)):
         return None
     if op == "ge":
         low_op, low = _even_lower(k)
@@ -432,7 +428,7 @@ def _floor_div_form(op: str, arg: Expr, k: int, divisor: int) -> Expr | None:
     bucket at the edge of the i64 range declines instead of folding to a wrapped bound.
     """
     low, high = k * divisor, (k + 1) * divisor
-    if not (_in_int64(low) and _in_int64(high)):
+    if not (in_int64(low) and in_int64(high)):
         return None
     if op == "lt":
         return Binary("lt", arg, Lit(low))

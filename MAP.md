@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1511 Python modules across 217 packages and 302 Rust files across 15 crates.
+Covering 1512 Python modules across 217 packages and 302 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -1245,6 +1245,7 @@ Kyber rule modules.
 | `agg_pushdown.py` | 583 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 | `fusion.py` | 396 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
 | `leaf_rewrite.py` | 312 | The shared machinery every leaf-level expression rule is built from. |
+| `literals.py` | 56 | Literal-value predicates shared by the expression rules: the i64 range and boolean literals. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 898 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 637 | Predicate pushdown — evaluate filters as early as possible. |
@@ -1299,7 +1300,7 @@ Expression-level Kyber rule families.
 | `complex_types.py` | 454 | Struct, list, and array algebra -- the extract-over-construct family. |
 | `conditionals.py` | 326 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
 | `guards.py` | 274 | Schema-aware helpers for expression rules that may only fire on a known type. |
-| `numeric.py` | 474 | Numeric algebra the earlier arithmetic families leave on the table. |
+| `numeric.py` | 475 | Numeric algebra the earlier arithmetic families leave on the table. |
 | `numeric_rounding.py` | 42 | Rounding calls whose digit argument makes them a different function. |
 | `temporal.py` | 249 | Temporal identities: reading a date part through a truncation, and offset fusion. |
 | `text.py` | 339 | Regex de-specialization and the remaining string identities. |
@@ -1324,9 +1325,9 @@ Extended Kyber rule families.
 | `adaptive_meta.py` | 160 | Adaptive metadata rules — simplifications a provably-EXACT cardinality unlocks. |
 | `agg_extra.py` | 505 | Extra aggregate / GROUP BY rewrites — small, local, always-correct simplifications. |
 | `agg_rules.py` | 504 | Aggregate rewrites driven by *proven* metadata — uniqueness, constancy, exact counts. |
-| `arith_algebra.py` | 355 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
-| `arith_extra.py` | 549 | NORMALIZE-phase arithmetic the other families leave on the table — math-function |
-| `boolean_algebra.py` | 452 | NORMALIZE-phase boolean / CASE / COALESCE / NULL simplifications. |
+| `arith_algebra.py` | 354 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
+| `arith_extra.py` | 546 | NORMALIZE-phase arithmetic the other families leave on the table — math-function |
+| `boolean_algebra.py` | 445 | NORMALIZE-phase boolean / CASE / COALESCE / NULL simplifications. |
 | `casts.py` | 456 | NORMALIZE-phase rules for `CAST` — the shapes a SQL front end and the type-coercion |
 | `cse.py` | 191 | Common-subexpression elimination — compute a repeated expression once, not N times. |
 | `disjunction_infer.py` | 124 | NORMALIZE-phase implied-predicate inference from a multi-column disjunction. |
@@ -1342,7 +1343,7 @@ Extended Kyber rule families.
 | `predicate_infer.py` | 495 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
 | `projection_scan.py` | 364 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 469 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
-| `sargable.py` | 301 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
+| `sargable.py` | 296 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
 | `setops.py` | 379 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
@@ -1361,9 +1362,9 @@ NORMALIZE-phase rewrites for the conditional family — CASE / NULLIF / COALESCE
 
 | module | lines | what it is |
 |---|---|---|
-| `case.py` | 342 | CASE / NULLIF / COALESCE rewrites. |
+| `case.py` | 341 | CASE / NULLIF / COALESCE rewrites. |
 | `minmax.py` | 135 | GREATEST / LEAST rewrites. |
-| `shared.py` | 222 | Shared guards for the conditional family: purity, type tags, and droppability. |
+| `shared.py` | 214 | Shared guards for the conditional family: purity, type tags, and droppability. |
 
 ### `batcher/kyber/rules/extra/join_elim/` — 3 · subsystem
 
@@ -1391,7 +1392,7 @@ Ordered-comparison sargable transposition, proved rather than assumed.
 | module | lines | what it is |
 |---|---|---|
 | `bounds.py` | 107 | Ordered sargable transposition proved by a column's **measured min/max**. |
-| `shared.py` | 132 | The decomposition and the overflow proof shared by the ordered sargable rules. |
+| `shared.py` | 126 | The decomposition and the overflow proof shared by the ordered sargable rules. |
 
 ### `batcher/kyber/rules/joins/` — 3 · subsystem
 
@@ -1416,7 +1417,7 @@ Numeric rule families that turn a computed comparison back into a sargable one.
 |---|---|---|
 | `absolute.py` | 226 | `abs` and `sign` inside a comparison, restated over the bare column. |
 | `float_predicates.py` | 62 | `isnan` / `isinf` see through the rounding functions. |
-| `rounding.py` | 478 | Comparisons against a rounded, bucketed, or popcounted value, restated as a range. |
+| `rounding.py` | 474 | Comparisons against a rounded, bucketed, or popcounted value, restated as a range. |
 
 ### `batcher/kyber/rules/normalize/` — 3 · subsystem
 
@@ -1428,7 +1429,7 @@ NORMALIZE-phase whole-tree rewrites, grouped by family.
 | `fold.py` | 280 | Constant folding — evaluate constant sub-expressions at plan time. |
 | `predicates.py` | 232 | Boolean-predicate normalizations in the NORMALIZE phase. |
 | `ranges.py` | 373 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
-| `simplify.py` | 195 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
+| `simplify.py` | 188 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
 
 ### `batcher/kyber/rules/nulls/` — 3 · subsystem
 

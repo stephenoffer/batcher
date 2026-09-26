@@ -32,6 +32,7 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.literals import is_false_lit, is_true_lit
 from batcher.plan.expr_ir import (
     Binary,
     Col,
@@ -116,14 +117,6 @@ def _bool_valued(expr: Expr) -> bool:
     return isinstance(expr, (Not, IsNull, IsNotNull, IsNan, IsInf, InList))
 
 
-def _is_true(expr: Expr) -> bool:
-    return isinstance(expr, Lit) and expr.value is True
-
-
-def _is_false(expr: Expr) -> bool:
-    return isinstance(expr, Lit) and expr.value is False
-
-
 def _rewrite_node(node: LogicalPlan, leaf) -> LogicalPlan | None:
     """Apply a leaf `Expr → Expr` rewrite to every expression in `node`, returning the
     rebuilt node, or `None` when nothing changed (so the driver reaches a fixpoint).
@@ -171,9 +164,9 @@ def _droppable(expr: Expr) -> bool:
 
 def _and_false(expr: Expr) -> Expr:
     if isinstance(expr, Binary) and expr.op == "and":
-        if _is_false(expr.right) and _droppable(expr.left):
+        if is_false_lit(expr.right) and _droppable(expr.left):
             return Lit(False)
-        if _is_false(expr.left) and _droppable(expr.right):
+        if is_false_lit(expr.left) and _droppable(expr.right):
             return Lit(False)
     return expr
 
@@ -197,9 +190,9 @@ def and_false_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> Log
 
 def _or_true(expr: Expr) -> Expr:
     if isinstance(expr, Binary) and expr.op == "or":
-        if _is_true(expr.right) and _droppable(expr.left):
+        if is_true_lit(expr.right) and _droppable(expr.left):
             return Lit(True)
-        if _is_true(expr.left) and _droppable(expr.right):
+        if is_true_lit(expr.left) and _droppable(expr.right):
             return Lit(True)
     return expr
 

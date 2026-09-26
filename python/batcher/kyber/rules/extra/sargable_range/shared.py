@@ -27,13 +27,12 @@ comparison over the same operand, so a null column yields a null answer either w
 
 from __future__ import annotations
 
+from batcher.kyber.rules.literals import in_int64
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_ir.core import int_literal
 from batcher.plan.ir_tags import ORDERING_FLIP
 
 __all__ = ["decompose", "transpose"]
-
-_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 
 
 def _split_inner(inner: Binary) -> tuple[str, Col, int] | None:
@@ -90,11 +89,6 @@ def decompose(expr: Expr) -> tuple[str, str, Col, int, int] | None:
     return None
 
 
-def _in_int64(*values: int) -> bool:
-    """Whether every value is representable as i64."""
-    return all(_INT64_MIN <= v <= _INT64_MAX for v in values)
-
-
 def transpose(form: str, op: str, col: Col, k: int, lit: int, low: int, high: int) -> Expr | None:
     """The transposed `col OP literal`, or ``None`` when the range does not prove it exact.
 
@@ -118,15 +112,15 @@ def transpose(form: str, op: str, col: Col, k: int, lit: int, low: int, high: in
         The rewritten comparison, or ``None`` when it would not be exact.
     """
     if form == "add":
-        if not _in_int64(low + k, high + k, lit - k):
+        if not in_int64(low + k, high + k, lit - k):
             return None
         return Binary(op, col, Lit(lit - k))
     if form == "sub":
-        if not _in_int64(low - k, high - k, lit + k):
+        if not in_int64(low - k, high - k, lit + k):
             return None
         return Binary(op, col, Lit(lit + k))
     if form == "rsub":
-        if not _in_int64(k - low, k - high, k - lit):
+        if not in_int64(k - low, k - high, k - lit):
             return None
         return Binary(ORDERING_FLIP[op], col, Lit(k - lit))
     return None

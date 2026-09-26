@@ -41,6 +41,7 @@ import pyarrow as pa
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.literals import INT64_MIN
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.logical import Filter, LogicalPlan, Project
@@ -54,8 +55,6 @@ __all__ = [
     "fold_mul_constants",
     "fold_neg_sub",
 ]
-
-_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 
 
 # --- shared helpers ---------------------------------------------------------
@@ -103,7 +102,7 @@ def _offset(v: Expr, k: int) -> Expr:
     k = _wrap_i64(k)
     if k == 0:
         return v
-    if k > 0 or k == _INT64_MIN:
+    if k > 0 or k == INT64_MIN:
         return Binary("add", v, Lit(k))
     return Binary("sub", v, Lit(-k))
 

@@ -43,6 +43,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.leaf_rewrite import EXPR_NODES
+from batcher.kyber.rules.literals import in_int64
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.ir_tags import COMPARISON_FLIP
@@ -50,7 +51,6 @@ from batcher.plan.logical import LogicalPlan
 
 __all__: list[str] = []
 
-_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 # Comparisons that flip when the column moves from the right side to the left.
 # The additive/multiplicative strength reductions are exact *only* for these ops (a wrap of
 # the arithmetic would break an ordered comparison; equality's bijection is wrap-invariant).
@@ -62,11 +62,6 @@ ExprRule = Callable[[Expr], Expr]
 def _is_int(value: object) -> bool:
     """Whether `value` is a plain Python int (bool — an int subclass — excluded)."""
     return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _in_int64(value: int) -> bool:
-    """Whether a folded literal is representable as i64 (so the engine won't itself wrap it)."""
-    return _INT64_MIN <= value <= _INT64_MAX
 
 
 def _arith_and_lit(expr: Binary) -> tuple[Binary, int] | None:
@@ -145,7 +140,7 @@ def _sub_leaf(expr: Expr) -> Expr:
     if not _is_int(inner.right.value):
         return expr
     folded = lit + inner.right.value
-    if not _in_int64(folded):
+    if not in_int64(folded):
         return expr
     return Binary(expr.op, inner.left, Lit(folded))
 
@@ -167,7 +162,7 @@ def _rsub_leaf(expr: Expr) -> Expr:
     if not _is_int(inner.left.value):
         return expr
     folded = inner.left.value - lit
-    if not _in_int64(folded):
+    if not in_int64(folded):
         return expr
     return Binary(expr.op, inner.right, Lit(folded))
 
@@ -188,7 +183,7 @@ def _reduce_additive(expr: Expr, op: str, fold: Callable[[int, int], int]) -> Bi
         return None
     col, k = col_const
     folded = fold(lit, k)
-    if not _in_int64(folded):
+    if not in_int64(folded):
         return None
     return Binary(expr.op, col, Lit(folded))
 
@@ -254,7 +249,7 @@ def _reduce_bitxor(expr: Expr) -> Binary | None:
         return None
     col, k = col_const
     folded = lit ^ k
-    if not _in_int64(folded):
+    if not in_int64(folded):
         return None
     return Binary(expr.op, col, Lit(folded))
 
