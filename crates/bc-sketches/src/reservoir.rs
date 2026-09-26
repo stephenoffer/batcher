@@ -212,8 +212,9 @@ impl<T: Clone> ReservoirSample<T> {
     }
 
     /// Total number of items ever offered via [`add`](ReservoirSample::add).
+    #[cfg(test)]
     #[must_use]
-    pub fn total_seen(&self) -> u64 {
+    pub(crate) fn total_seen(&self) -> u64 {
         self.seen
     }
 

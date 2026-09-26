@@ -483,8 +483,10 @@ pub struct GroupAggResult {
     pub agg_columns: Vec<ArrayRef>,
 }
 
-/// Single-node convenience: `finalize(partial(...))`.
-pub fn group_aggregate(
+/// Single-node convenience: `finalize(partial(...))` — the serial oracle the mergeable-path
+/// tests compare against.
+#[cfg(test)]
+pub(crate) fn group_aggregate(
     group_keys: &[ArrayRef],
     calls: &[AggCall],
     num_rows: usize,

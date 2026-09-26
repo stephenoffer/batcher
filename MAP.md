@@ -2980,9 +2980,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `hardware.rs` | 321 | What the engine's own process knows about its hardware and its allocator. |
+| `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
 | `lib.rs` | 791 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
-| `normalize.rs` | 738 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
+| `normalize.rs` | 737 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 154 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
 | `route.rs` | 169 | Which executor a plan runs on, and the two different affordability tests behind that. |
@@ -3013,7 +3013,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 578 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1792 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1788 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -3058,14 +3058,14 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/distinct.rs` | 605 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/fused.rs` | 708 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
-| `agg/group/assign.rs` | 1709 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
+| `agg/group/assign.rs` | 1702 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
 | `agg/group/combine.rs` | 647 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
 | `agg/inputs/mod.rs` | 194 | Bringing an aggregate call's inputs to a type the accumulator kernels read. |
 | `agg/median.rs` | 612 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
-| `agg/mod.rs` | 743 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
+| `agg/mod.rs` | 487 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/ordered_list/mod.rs` | 184 | `array_agg(x ORDER BY k)`: a per-group list whose element order is a property of the rows. |
 | `agg/sketch.rs` | 196 | The sketch-backed aggregates: bounded memory in exchange for a bounded error. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
@@ -3122,7 +3122,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `compile.rs` | 485 | Build and JIT-compile a Cranelift function that evaluates an `Expr` element-wise over the row index, returning the finalized function pointer. |
 | `emit.rs` | 624 | Per-element IR emitter: recurses over a validated `Expr` building Cranelift values at the current loop index, producing one output element per row. |
 | `kleene.rs` | 111 | Kleene / null-propagation support analysis for the JIT. |
-| `lib.rs` | 743 | `bc-codegen` — a Cranelift JIT backend for `bc-expr` scalar expressions. |
+| `lib.rs` | 154 | `bc-codegen` — a Cranelift JIT backend for `bc-expr` scalar expressions. |
 | `simd.rs` | 360 | Vector (SIMD) emitter for the JIT's vectorizable `Expr` subset. |
 
 ### `bc-ir`
@@ -3273,12 +3273,12 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 214 | Bloom filter — approximate set membership for runtime join filters. |
-| `ddsketch.rs` | 434 | DDSketch — relative-error quantile sketch (Masson, Rim, Lee). |
+| `ddsketch.rs` | 435 | DDSketch — relative-error quantile sketch (Masson, Rim, Lee). |
 | `frequent.rs` | 233 | Misra-Gries — frequent-items (heavy-hitter *key*) enumeration. |
 | `hll.rs` | 401 | HyperLogLog++ — distinct-count (cardinality) estimation. |
 | `kll.rs` | 551 | KLL — streaming quantile / rank sketch (Karnin–Lang–Liberty). |
 | `lib.rs` | 79 | `bc-sketches` — mergeable probabilistic sketches for the optimizer. |
-| `reservoir.rs` | 359 | Reservoir sampling — a fixed-size uniform random sample of a stream. |
+| `reservoir.rs` | 360 | Reservoir sampling — a fixed-size uniform random sample of a stream. |
 | `stats.rs` | 253 | Per-column statistics derived from a single scan. |
 | `tdigest.rs` | 454 | T-Digest — tail-accurate quantile sketch (Dunning). |
 
@@ -3294,7 +3294,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `exchange.rs` | 563 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
 | `handler.rs` | 428 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 107 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
-| `peers.rs` | 408 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
+| `peers.rs` | 409 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 412 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
 | `store.rs` | 407 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 93 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
@@ -3310,7 +3310,7 @@ Process-wide memory accounting for reserve-before-allocate.
 | file | lines | what it is |
 |---|---|---|
 | `cancel.rs` | 201 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
-| `lib.rs` | 553 | Process-wide memory accounting for reserve-before-allocate. |
+| `lib.rs` | 554 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`
 
@@ -3389,5 +3389,5 @@ Resolving a secret *reference* to secret material, on the machine that needs it.
 |---|---|---|
 | `lib.rs` | 57 | `bc-spatial` — rigid-body motion in three dimensions: rotations, poses, frames. |
 | `quat.rs` | 371 | Rotations as quaternions, and the conversions into and out of the other two spellings a log is likely to use. |
-| `rigid.rs` | 74 | A pose — where a frame is, and which way it is facing — and the transforms between frames that poses define. |
+| `rigid.rs` | 75 | A pose — where a frame is, and which way it is facing — and the transforms between frames that poses define. |
 | `vec3.rs` | 77 | A point or displacement in three dimensions. |

@@ -89,8 +89,9 @@ impl DDSketch {
     }
 
     /// The configured relative accuracy `α`.
+    #[cfg(test)]
     #[must_use]
-    pub fn relative_accuracy(&self) -> f64 {
+    pub(crate) fn relative_accuracy(&self) -> f64 {
         self.alpha
     }
 

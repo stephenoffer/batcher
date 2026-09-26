@@ -151,8 +151,9 @@ impl ScalarTy {
 ///
 /// Returns [`CodegenError::Unsupported`] for any expression outside the
 /// supported subset (see the crate docs) so the caller can fall back to
-/// `bc_expr::Expr::eval`.
-pub fn compile_and_eval(
+/// `bc_expr::Expr::eval`. Test-only: the engine compiles once per operator and reuses it.
+#[cfg(test)]
+pub(crate) fn compile_and_eval(
     expr: &bc_expr::Expr,
     batch: &RecordBatch,
 ) -> Result<ArrayRef, CodegenError> {

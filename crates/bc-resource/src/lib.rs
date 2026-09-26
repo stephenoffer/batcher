@@ -193,8 +193,9 @@ impl PoolStats {
     }
 
     /// `peak_used / limit` in `[0, 1]` — the pressure the workload actually reached.
+    #[cfg(test)]
     #[must_use]
-    pub fn peak_utilization(&self) -> f64 {
+    pub(crate) fn peak_utilization(&self) -> f64 {
         if self.limit == 0 {
             return 1.0;
         }
@@ -459,13 +460,13 @@ impl MemoryPool {
 
     /// Set the soft-pressure line as a fraction of the limit (clamped to `[0, 1]`).
     ///
-    /// **Nothing calls this in production**, so the line sits at [`DEFAULT_SOFT_BPS`]. The
-    /// control plane's own soft line is `memory.soft_limit` of the *cap* while the pool's
-    /// limit is `hard_limit` of it, so the two are different absolute figures — and saying
-    /// they were the same, as this used to, hid that. Carrying the fraction across the
-    /// engine-config boundary is what would make them agree; it is a two-sided change and
-    /// belongs with the work that gives the level a consumer.
-    pub fn set_soft_fraction(&self, fraction: f64) {
+    /// Test-only: production leaves the line at [`DEFAULT_SOFT_BPS`]. The control plane's
+    /// own soft line is `memory.soft_limit` of the *cap* while the pool's limit is
+    /// `hard_limit` of it, so the two are different absolute figures. Carrying the fraction
+    /// across the engine-config boundary is what would make them agree; it is a two-sided
+    /// change and belongs with the work that gives the level a consumer.
+    #[cfg(test)]
+    pub(crate) fn set_soft_fraction(&self, fraction: f64) {
         let bps = (fraction.clamp(0.0, 1.0) * 10_000.0).round() as usize;
         self.soft_bps.store(bps, Ordering::Release);
     }
