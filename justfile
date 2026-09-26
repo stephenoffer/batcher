@@ -69,8 +69,8 @@ fmt:
 
 # Lint + format-check the Python control plane (ruff).
 lint-py:
-    ruff check python tests benchmarks examples
-    ruff format --check python tests benchmarks examples
+    ruff check python tests benchmarks examples tools
+    ruff format --check python tests benchmarks examples tools
 
 # Auto-fix + format the Python control plane (ruff).
 fmt-py:

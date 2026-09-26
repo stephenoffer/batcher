@@ -141,17 +141,23 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # tree (`_tree_reduce*`), which is a genuinely separate concern, but that is a wider
     # refactor of a file other agents are concurrently editing — do it deliberately, not
     # as a side effect of a feature change.
-    "python/batcher/dist/flight_aggregate.py": "reduce driver + recovery loop; extract _tree_reduce* next",
+    "python/batcher/dist/flight_aggregate.py": (
+        "reduce driver + recovery loop; extract _tree_reduce* next"
+    ),
     # The one Expr hierarchy: the base class plus the result nodes its own methods
     # construct (Cast/MathExpr/AggExpr/Coalesce/…). They are mutually referential, so
     # splitting across modules forces a fragile base<->subclass import cycle — the
     # one-Expr invariant (rust-engine.md) wins over the line limit here.
-    "python/batcher/plan/expr_ir/core.py": "one-Expr hierarchy; split forces a base/subclass import cycle",
+    "python/batcher/plan/expr_ir/core.py": (
+        "one-Expr hierarchy; split forces a base/subclass import cycle"
+    ),
     # The one `Expr` enum and its `serde` wire tags. `.claude/rules/rust-engine.md` and
     # crates/CLAUDE.md name this as the seam that is never cut across: the enum and its
     # tags stay in the crate's lib.rs, so the wire contract lives in exactly one place.
     # The evaluation bodies are already extracted to `eval/`.
-    "crates/bc-expr/src/lib.rs": "the one Expr enum + serde wire tags; a seam rust-engine.md forbids cutting",
+    "crates/bc-expr/src/lib.rs": (
+        "the one Expr enum + serde wire tags; a seam rust-engine.md forbids cutting"
+    ),
     "crates/bc-ir/src/lib.rs": "the one RelOp enum + serde tags; the same seam as bc-expr",
     # Dataset is the canonical wide fluent builder (rust-engine/maintainability rules
     # name it as legitimately wide); its heavy method bodies are already extracted to
@@ -167,17 +173,23 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # read, streaming read-ahead, split generation). Its subclasses call up into it, so a
     # split would fan a base/subclass import web across modules for no clarity gain; the
     # per-file read primitives are already the subclasses' job. Sits just over the limit.
-    "python/batcher/io/base/source.py": "file-format template base; one spine subclasses call up into",
+    "python/batcher/io/base/source.py": (
+        "file-format template base; one spine subclasses call up into"
+    ),
     # The parallel executor is one cohesive `match` over every RelOp arm (filter /
     # project / aggregate / sort / join / window / …); splitting arms across files
     # would scatter the dispatch and the shared spill/admit scaffolding. Operator
     # *logic* already lives in `ops/`; this file is the scheduling shell.
-    "crates/bc-interp/src/par.rs": "parallel-executor dispatch hub; per-arm split scatters scheduling",
+    "crates/bc-interp/src/par.rs": (
+        "parallel-executor dispatch hub; per-arm split scatters scheduling"
+    ),
     # The projection-pushdown rule is two exhaustive per-RelOp dispatches (`_rewrite`
     # column pruning + `_visit` source-projection analysis). Like the executor hubs it
     # grows by one small arm per relational operator; splitting the dispatch across
     # files would scatter the column-need logic that must stay consistent between them.
-    "python/batcher/kyber/rules/projections.py": "projection-pushdown dispatch hub; per-operator arms",
+    "python/batcher/kyber/rules/projections.py": (
+        "projection-pushdown dispatch hub; per-operator arms"
+    ),
     # The streaming across-cores executor: shard the driving scan, one pipeline per worker
     # over a shard, combine at the breaker. The prebuild cache, shard split, per-breaker
     # combine arms, shard-count cap, and sequential fallback all share one Ctx / build-cache /
@@ -188,14 +200,20 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # same reducer-IR / partition / Ray-task scaffolding and the `_shuffle_join`
     # fallback the broadcast path depends on. Splitting the broadcast path into a
     # sibling forces a base<->fallback import cycle with `_shuffle_join`.
-    "python/batcher/dist/executors/join.py": "distributed-join strategy hub; broadcast/shuffle split forces an import cycle",
+    "python/batcher/dist/executors/join.py": (
+        "distributed-join strategy hub; broadcast/shuffle split forces an import cycle"
+    ),
     # The expression accessor namespaces: each is one bound family (`.str` / `.list`)
     # whose every public method carries a Google-style docstring with a runnable
     # `.. doctest::` example (python-quality.md). The examples — not the code — push
     # these over the limit; the methods are one cohesive accessor that the factory
     # binds as a unit, so splitting them would scatter one namespace across files.
-    "python/batcher/plan/expr_ir/namespaces/strings.py": "one bound .str accessor; per-method runnable examples push it over",
-    "python/batcher/api/io_namespace/writer.py": "ds.write façade; per-format examples push it over",
+    "python/batcher/plan/expr_ir/namespaces/strings.py": (
+        "one bound .str accessor; per-method runnable examples push it over"
+    ),
+    "python/batcher/api/io_namespace/writer.py": (
+        "ds.write façade; per-format examples push it over"
+    ),
     # The `ds.ml` accessor: one bound ML/multimodal namespace (map_batches, infer,
     # embed, the torch loaders, download/upload) whose every public method now carries
     # a Google-style docstring — runnable for the in-memory transforms, illustrative
@@ -241,12 +259,16 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # so the docstring/coverage linters and editors see each. It is a pure re-export module (no
     # logic), and it necessarily grows one line per public function added — splitting it would
     # only fragment the single discoverable `bt.*` surface for no readability gain.
-    "python/batcher/api/functions.py": "the bt.* expression-function facade; pure re-exports, one line per public name",
+    "python/batcher/api/functions.py": (
+        "the bt.* expression-function facade; pure re-exports, one line per public name"
+    ),
     # The plan-layer function facade that api/functions.py re-exports through. Same story: a
     # re-export-only __init__ that curates the SQL/DataFrame-style free functions one name per
     # line, grown just past 120 by the LLM-output-parsing family. Collapsing the import/`__all__`
     # would hide the surface the coverage linter walks.
-    "python/batcher/plan/functions/__init__.py": "re-export-only function facade; one line per public name for discoverability",
+    "python/batcher/plan/functions/__init__.py": (
+        "re-export-only function facade; one line per public name for discoverability"
+    ),
     "python/batcher/graph/__init__.py": (
         "the graph-analytics facade: ~50 algorithms across ten modules, one import line per "
         "public name. Users import from `batcher.graph` directly, so the names have to be "
@@ -266,64 +288,90 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # past the directory cap, so the recommendation family cannot move to a sibling module without
     # making that worse — the dir-size invariant wins (same case as `kyber/rules/joins/order.py`).
     # It gets a home of its own when `ml/` is finally subpackaged.
-    "python/batcher/ml/gpu.py": "accelerator detect + per-GPU recommendations + feedback + autocast; ml/ already over the dir cap",
+    "python/batcher/ml/gpu.py": (
+        "accelerator detect + per-GPU recommendations + feedback + autocast; ml/ already over the "
+        "dir cap"
+    ),
     # The distributed dispatcher: one cohesive routing hub that inspects a plan's shape
     # and sends it to the matching distributed operator (map / aggregate / join / sort /
     # distinct / window / union / asof), plus the cluster-fill + envelope sizing every
     # route shares. Like `par.rs`, splitting the arms scatters the routing it exists to
     # centralize; `executors/` is at the 12-file dir cap so a sibling can't take them.
-    "python/batcher/dist/executor.py": "distributed dispatch hub; per-shape routing + sizing, executors/ at 12-file cap",
+    "python/batcher/dist/executor.py": (
+        "distributed dispatch hub; per-shape routing + sizing, executors/ at 12-file cap"
+    ),
     # The terminal-op conductor: one cohesive routing hub that sequences every terminal's
     # fast-paths (metadata-answer / provably-empty short-circuit / GPU backend / blob
     # offload / distributed / adaptive re-opt / spill) before falling to plain execution.
     # Splitting the ordered fast-path chain out of `_collect` scatters the very routing it
     # exists to centralize; `terminal/` groups the sibling terminals already.
-    "python/batcher/api/terminal/core.py": "terminal-op conductor; ordered fast-path routing for every terminal",
+    "python/batcher/api/terminal/core.py": (
+        "terminal-op conductor; ordered fast-path routing for every terminal"
+    ),
     # The distributed map/inference path: one cohesive hub over its scheduling variants
     # (stateless tasks, autoscaling actor pool, query-resident pool, streamed CPU→GPU
     # stages, map→aggregate) and the data/compute-skew-adaptive task sizing they share.
     # `executors/` is at the 12-file dir cap, so the variants can't move to a sibling.
-    "python/batcher/dist/executors/map.py": "distributed map/inference hub; scheduling variants + adaptive sizing, executors/ at 12-file cap",
+    "python/batcher/dist/executors/map.py": (
+        "distributed map/inference hub; scheduling variants + adaptive sizing, executors/ at "
+        "12-file cap"
+    ),
     # The one shared Flight-shuffle worker actor: every flight_* operator (aggregate /
     # join / sort / window) drives this SAME `_FlightWorker` so they share its session
     # and lineage-recovery contract. The module docstring's whole rationale is keeping
     # it single so operators share the actor without a circular import — splitting it
     # would reintroduce exactly that cycle.
-    "python/batcher/dist/flight_worker.py": "single shared _FlightWorker actor for all flight ops; split reintroduces an import cycle",
+    "python/batcher/dist/flight_worker.py": (
+        "single shared _FlightWorker actor for all flight ops; split reintroduces an import cycle"
+    ),
     # The cardinality/stats estimator: one cohesive `StatsEstimator` (row-count
     # estimation, column stats, per-column NDV from source + learned stats, quantiles,
     # selectivity dispatch) memoized by node identity. The arms share that per-instance
     # cache state, so splitting scatters one estimator across files for ~a dozen lines.
-    "python/batcher/kyber/stats/estimator.py": "cardinality/stats estimator hub; shared per-instance caches",
+    "python/batcher/kyber/stats/estimator.py": (
+        "cardinality/stats estimator hub; shared per-instance caches"
+    ),
     # The scalar string-function family: one cohesive `StrFunc` dispatch (`.str.*`) whose
     # ~50 arms share the same UTF-8/1-based-index/null-propagation scaffolding. It grows by
     # one small arm per function; splitting the family across files would scatter the shared
     # helpers and the single match the interpreter dispatches through — same "many small
     # things = one family module" rationale the maintainability rule prescribes.
-    "crates/bc-expr/src/eval/str/mod.rs": "the one .str function-family dispatch; per-fn arms share UTF-8/index/null scaffolding",
+    "crates/bc-expr/src/eval/str/mod.rs": (
+        "the one .str function-family dispatch; per-fn arms share UTF-8/index/null scaffolding"
+    ),
     # The window engine's per-function evaluation: frameless / running / value / ranking
     # paths over one shared partition+order scaffold. Like the executor hubs, splitting the
     # arms scatters the frame/partition logic that must agree across paths; the runtime
     # state already lives in sibling `window_frame`/`window_partition_agg` files.
-    "crates/bc-runtime/src/window/mod.rs": "window per-function dispatch; frame/partition scaffold shared across paths",
+    "crates/bc-runtime/src/window/mod.rs": (
+        "window per-function dispatch; frame/partition scaffold shared across paths"
+    ),
     # The canonical shuffle/partition primitive: hash + range partitioning, the parallel
     # counting-sort scatter, and the null/NaN/−0.0 routing that EVERY hash path derives key
     # identity from. It is the one place co-partitioning is defined; splitting it risks two
     # partitioners disagreeing — the exact bug class keys.rs exists to prevent.
-    "crates/bc-runtime/src/shuffle.rs": "the one partition/shuffle primitive; co-partitioning defined in one place",
+    "crates/bc-runtime/src/shuffle.rs": (
+        "the one partition/shuffle primitive; co-partitioning defined in one place"
+    ),
     # The Tier-0 executor's operator bodies: one cohesive module of the sequential-oracle
     # implementations (sort, materialize, gather) sharing the morsel/spill scaffolding. Like
     # `par.rs`, splitting the operators scatters the shared execution helpers.
-    "crates/bc-interp/src/ops/mod.rs": "Tier-0 operator bodies hub; shared morsel/spill scaffolding",
+    "crates/bc-interp/src/ops/mod.rs": (
+        "Tier-0 operator bodies hub; shared morsel/spill scaffolding"
+    ),
     # The join primitive hub: hash / sort-merge / radix / asof strategies over one shared
     # build/probe/gather + key-canonicalization scaffold. Splitting the strategies forces a
     # base<->strategy import cycle and scatters the key-identity logic they must share.
-    "crates/bc-runtime/src/join/mod.rs": "join strategy hub; strategies share build/probe/key scaffold",
+    "crates/bc-runtime/src/join/mod.rs": (
+        "join strategy hub; strategies share build/probe/key scaffold"
+    ),
     # Group-key assignment: the one place a batch's rows are mapped to group ids, over every
     # key dtype (int/float/string/bool/multi-column) with the canonical −0.0/NaN folding. It
     # is a single per-dtype dispatch; splitting scatters the folding that grouping/shuffle
     # must agree on.
-    "crates/bc-runtime/src/agg/group/assign.rs": "group-id assignment per key dtype; canonical folding in one place",
+    "crates/bc-runtime/src/agg/group/assign.rs": (
+        "group-id assignment per key dtype; canonical folding in one place"
+    ),
 }
 
 fails: list[str] = []
@@ -357,26 +405,10 @@ def rust_code_lines(text: str) -> int:
 def python_code_lines(text: str) -> int:
     """Line count excluding docstrings — the Python counterpart of `rust_code_lines`.
 
-    Rust files already exclude their trailing `#[cfg(test)]` module, because "counting it
-    would penalize good test density". Python had no equivalent exclusion, and the omission
-    put two gates in direct opposition: `lint-docstrings` *mandates* a Google-style docstring
-    on every public name, with typed `Args:`/`Returns:` sections and a runnable `.. doctest::`
-    example — and then this gate charged the file for having them.
-
-    The result was not close. Measured across the largest allowlisted modules:
-    `expr_ir/namespaces/strings.py` is 4,406 lines of which **832 are code and 3,574 are
-    docstrings** (81% docstring); `api/dataset/frame.py` is 6,362 lines of which **2,077 are
-    code and 4,285 are docstrings**; `plan/expr_ir/core.py` is 6,052 of which **1,944 are
-    code**. Each carried an allowlist entry apologising for a size that is largely the other
-    gate's requirement. Several of the 42 exemptions existed for that reason and no other.
-
-    Re-measure before citing these figures rather than trusting the numbers above: they are a
-    snapshot, the files grow, and an earlier revision of this docstring carried a code count
-    that did not even agree with the total and docstring count printed beside it.
-
-    What the limit is for is the code you have to hold in your head to change the file safely.
-    A docstring is the thing that makes that *easier*. Comments stay counted: they interleave
-    with the logic and a file that needs a thousand of them is genuinely dense.
+    `lint-docstrings` mandates a Google-style docstring with a runnable doctest on every
+    public name, so counting docstrings would charge a file for what the other gate demands.
+    The limit is about the code you must hold in your head; comments stay counted because
+    they interleave with the logic.
     """
     tree = ast.parse(text)
     docstring_lines = 0
@@ -399,22 +431,18 @@ def class_public_methods(node: ast.ClassDef) -> list[str]:
 def func_length(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
     """Line count excluding the docstring — the Python analogue of `rust_code_lines`.
 
-    The point of this check is "a function that needs a section comment wants that section
-    as a named function", which is a claim about *code*. Public functions here carry a
-    mandatory Google-style docstring with runnable `.. doctest::` examples
-    (`python-quality.md`), so counting it penalizes exactly the documentation the docstring
-    gate demands: `ds.write.__call__` read as 288 lines against 222 of code, and
-    `ds.ml.map_batches` as 217 against 79. Of the 214 functions this check flagged before
-    the fix, 117 were over the line on docstring alone — more than half the report was
-    noise, which is how a warning list stops being read.
-
-    Same reasoning, same shape, as the Rust file check cutting at `#[cfg(test)]`.
+    The check asks whether a function's *code* wants splitting; the mandatory docstring and
+    its doctests are not code.
     """
     total = (node.end_lineno or node.lineno) - node.lineno + 1
     body = node.body
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
-        if isinstance(body[0].value.value, str):
-            total -= body[0].end_lineno - body[0].lineno + 1
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        total -= body[0].end_lineno - body[0].lineno + 1
     return total
 
 

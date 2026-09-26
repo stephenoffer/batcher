@@ -512,3 +512,5 @@ ignore = ["RUF003"]
 # makes it importable — a script has to work when run directly, not only under the
 # test runner, so there is nowhere earlier to put it.
 "examples/**" = ["ARG", "E402"]
+# The diagram generators embed SVG markup (paths, style blocks) as string literals.
+"tools/diagrams/**" = ["E501"]

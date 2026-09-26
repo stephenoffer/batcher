@@ -96,7 +96,7 @@ headers = (
     ("Runs on a", "single node"),
     ("Carries what it", "learned to the next run"),
 )
-for x, (h1, h2) in zip(COL_X, headers):
+for x, (h1, h2) in zip(COL_X, headers, strict=True):
     parts += [
         f'<text x="{x + 16}" y="{ROW_Y[0] - 30}" font-family="{FONT}" font-size="12.5" '
         f'font-weight="700" class="colhead">{h1}</text>',
@@ -133,7 +133,7 @@ rows = (
         ],
     ),
 )
-for y, (name, sub, cells) in zip(ROW_Y, rows):
+for y, (name, sub, cells) in zip(ROW_Y, rows, strict=True):
     emph = name == "Batcher"
     parts += [
         f'<text x="{NAME_X}" y="{y + 26}" font-family="{FONT}" font-size="15" font-weight="700" '
@@ -141,7 +141,7 @@ for y, (name, sub, cells) in zip(ROW_Y, rows):
         f'<text x="{NAME_X}" y="{y + 45}" font-family="{FONT}" font-size="11" '
         f'class="t-sub">{sub}</text>',
     ]
-    for x, (has, text) in zip(COL_X, cells):
+    for x, (has, text) in zip(COL_X, cells, strict=True):
         parts.append(cell(x, y, has, text, emphasis=emph and has))
 
 parts += [
