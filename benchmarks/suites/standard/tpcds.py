@@ -30,6 +30,22 @@ QUERY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds_que
 # TPC-DS is 99 queries by definition; anything else means the vendored file is wrong.
 QUERY_COUNT = 99
 
+# Engines a query kills rather than slows. Each entry is a measurement: re-check it when the
+# engine's version changes, and delete it when the engine survives.
+_REFUSE = {
+    "tpcds-q64": {
+        # Measured 2026-09-28, daft 0.7.25, sf1, alone in its own process: SIGKILLed by the
+        # cgroup OOM killer at 44 GB RSS (Batcher peaks at 4.0 GB, DuckDB at 5.6 GB). Without
+        # this refusal the kill takes every other engine's q64 result with it under
+        # `--isolate`, and the rest of the suite without it.
+        "daft": "OOM: daft is SIGKILLed on q64 at sf1 (44 GB RSS, daft 0.7.25)",
+    },
+}
+
 QUERIES = register_vendored(
-    tpcds, QUERY_FILE, count=QUERY_COUNT, vendor_tool="tools/vendor_tpcds_queries.py"
+    tpcds,
+    QUERY_FILE,
+    count=QUERY_COUNT,
+    vendor_tool="tools/vendor_tpcds_queries.py",
+    refuse=_REFUSE,
 )
