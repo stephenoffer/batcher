@@ -138,11 +138,20 @@ enum FusedAcc<'a> {
 /// `start..end` with the concrete array type in hand. Writing the loop inside every arm by
 /// hand would be the same code twelve times, and the twelfth would eventually differ from the
 /// first.
+///
+/// The bracketed names are the arm's state `Vec`s, rebound as `&mut` slices before the loop.
+/// Indexed through the `&mut Vec` instead, every store may alias the `Vec`'s own header (its
+/// pointer and length are machine words like the state), so LLVM reloads both on every row;
+/// a `&mut` slice is `noalias`, which also lets the value array's buffer pointer stay in a
+/// register. On h2o-groupby q4 those reloads were the hottest instructions in the profile.
 macro_rules! block_loop {
-    ($ids:expr, $start:expr, $end:expr, |$i:ident, $g:ident| $body:block) => {
-        for $i in $start..$end {
-            let $g = $ids[$i] as usize;
-            $body
+    ($ids:expr, $start:expr, $end:expr, [$($state:ident),*], |$i:ident, $g:ident| $body:block) => {
+        {
+            $(let $state = $state.as_mut_slice();)*
+            for $i in $start..$end {
+                let $g = $ids[$i] as usize;
+                $body
+            }
         }
     };
 }
@@ -205,7 +214,7 @@ impl FusedAcc<'_> {
                 }
             }
             FusedAcc::SumF64 { v, sums, valid } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [sums, valid], |i, g| {
                     if v.is_valid(i) {
                         sums[g] += v.value(i);
                         valid[g] = true;
@@ -219,7 +228,7 @@ impl FusedAcc<'_> {
                 wide,
             } => {
                 if let Some(w) = wide {
-                    block_loop!(ids, start, end, |i, g| {
+                    block_loop!(ids, start, end, [w, valid], |i, g| {
                         if v.is_valid(i) {
                             w[g] += i128::from(v.value(i));
                             valid[g] = true;
@@ -227,6 +236,8 @@ impl FusedAcc<'_> {
                     });
                     return Ok(());
                 }
+                // Slices for the aliasing reason `block_loop!` gives.
+                let (sums, valid) = (sums.as_mut_slice(), valid.as_mut_slice());
                 for i in start..end {
                     let g = ids[i] as usize;
                     if !v.is_valid(i) {
@@ -256,7 +267,7 @@ impl FusedAcc<'_> {
                 }
             }
             FusedAcc::SumDecimal { v, sums, valid, .. } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [sums, valid], |i, g| {
                     if v.is_valid(i) {
                         // checked_add: a decimal SUM past i128 range errors, not wraps (as the
                         // i64 SumInt arm above does).
@@ -269,13 +280,15 @@ impl FusedAcc<'_> {
             }
             FusedAcc::MeanSumI64NoNull { v, sums } => {
                 // Unchecked by proof, not by omission: `i128` holds `n · 2^63` for every
-                // addressable `n` (`accum::mean_sum_i128`).
-                block_loop!(ids, start, end, |i, g| {
-                    sums[g] += i128::from(v[i]);
-                })
+                // addressable `n` (`accum::mean_sum_i128`). Zipped slices for the reason the
+                // no-null sums give above.
+                let sums = sums.as_mut_slice();
+                for (&gid, &x) in ids[start..end].iter().zip(&v[start..end]) {
+                    sums[gid as usize] += i128::from(x);
+                }
             }
             FusedAcc::MeanSumI64 { v, sums, valid } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [sums, valid], |i, g| {
                     if v.is_valid(i) {
                         sums[g] += i128::from(v.value(i));
                         valid[g] = true;
@@ -283,13 +296,16 @@ impl FusedAcc<'_> {
                 })
             }
             FusedAcc::CountStar { counts } | FusedAcc::CountNoNull { counts } => {
-                block_loop!(ids, start, end, |i, g| {
-                    let _ = i;
-                    counts[g] += 1;
-                })
+                // A slice, not the `&mut Vec`: through the `Vec` every `i64` store may alias the
+                // `Vec`'s own header (its pointer and length are 64-bit words too), so LLVM
+                // reloads both on every row — measured as the hottest instructions of h2o q4.
+                let counts = counts.as_mut_slice();
+                for &gid in &ids[start..end] {
+                    counts[gid as usize] += 1;
+                }
             }
             FusedAcc::CountNull { v, counts } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [counts], |i, g| {
                     if v.is_valid(i) {
                         counts[g] += 1;
                     }
@@ -301,7 +317,7 @@ impl FusedAcc<'_> {
                 valid,
                 is_min,
             } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [cur, valid], |i, g| {
                     if v.is_valid(i) {
                         let val = v.value(i);
                         if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
@@ -317,7 +333,7 @@ impl FusedAcc<'_> {
                 valid,
                 is_min,
             } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [cur, valid], |i, g| {
                     if v.is_valid(i) {
                         let val = v.value(i);
                         // Same total order the per-call `minmax_acc` uses (`crate::keys`), not
@@ -344,7 +360,7 @@ impl FusedAcc<'_> {
                 is_min,
                 ..
             } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [cur, valid], |i, g| {
                     if v.is_valid(i) {
                         let val = v.value(i);
                         if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
@@ -355,7 +371,7 @@ impl FusedAcc<'_> {
                 })
             }
             FusedAcc::MinMaxStr { v, cur, is_min } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [cur], |i, g| {
                     if v.is_valid(i) {
                         let val = v.value(i);
                         let replace = match &cur[g] {

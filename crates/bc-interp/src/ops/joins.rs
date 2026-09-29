@@ -296,6 +296,40 @@ fn is_identity_permutation(indices: &UInt32Array, rows: usize) -> bool {
             .all(|(i, &v)| v as usize == i)
 }
 
+/// A filter predicate equivalent to gathering by `indices`, when `indices` is **strictly
+/// ascending** and null-free over a `rows`-row source.
+///
+/// That is the probe side of a join whose build keys are unique — every dimension join — in
+/// every morsel where some probe row misses, which is where [`is_identity_permutation`] stops
+/// applying. A strictly ascending gather selects each row at most once, in source order, so it
+/// *is* a filter, and a filter is the cheaper of the two: it copies each selected run as one
+/// slice where a gather copies row by row, and the predicate is built **once per side** and
+/// reused for every column, where a gather re-reads the indices per column. On H2O `join` q1
+/// (nine output columns, three of them strings, ~90% of probe rows matching) the per-column
+/// gather was 40% of the query.
+///
+/// `None` for anything else, including a descending or repeating index (a one-to-many match),
+/// which leaves the gather in charge. Deciding costs one pass over a morsel-sized `u32` buffer.
+fn ascending_selection(
+    indices: &UInt32Array,
+    rows: usize,
+) -> Option<arrow::compute::FilterPredicate> {
+    if indices.null_count() > 0 || indices.is_empty() {
+        return None;
+    }
+    let idx = indices.values();
+    if (idx[idx.len() - 1] as usize) >= rows || !idx.windows(2).all(|w| w[0] < w[1]) {
+        return None;
+    }
+    let mut mask = arrow::array::BooleanBufferBuilder::new(rows);
+    mask.append_n(rows, false);
+    for &i in idx.iter() {
+        mask.set_bit(i as usize, true);
+    }
+    let mask = arrow::array::BooleanArray::new(mask.finish(), None);
+    Some(arrow::compute::FilterBuilder::new(&mask).optimize().build())
+}
+
 /// [`gather_join_output`] against a schema the caller already built (see
 /// [`join_output_schema`]).
 pub(crate) fn gather_join_output_with(
@@ -314,18 +348,36 @@ pub(crate) fn gather_join_output_with(
     // scan. Checked once per side here rather than once per column.
     let left_ident = is_identity_permutation(&idx.left, left.num_rows());
     let right_ident = is_identity_permutation(&idx.right, right.num_rows());
+    // Only for a side this join emits more than one column of: the predicate is a pass over
+    // the source's rows, which a single gathered column does not amortize.
+    let emits = |left_side: bool| {
+        output
+            .iter()
+            .filter(|c| matches!(c.side, JoinSide::Left) == left_side)
+            .count()
+    };
+    let left_sel = (!left_ident && emits(true) > 1)
+        .then(|| ascending_selection(&idx.left, left.num_rows()))
+        .flatten();
+    let right_sel = (!right_ident && emits(false) > 1)
+        .then(|| ascending_selection(&idx.right, right.num_rows()))
+        .flatten();
 
     let mut columns = Vec::with_capacity(output.len());
     for col in output {
-        let (batch, indices, ident) = match col.side {
-            JoinSide::Left => (left, &idx.left, left_ident),
-            JoinSide::Right => (right, &idx.right, right_ident),
+        let (batch, indices, ident, sel) = match col.side {
+            JoinSide::Left => (left, &idx.left, left_ident, &left_sel),
+            JoinSide::Right => (right, &idx.right, right_ident, &right_sel),
         };
         let source = batch
             .column_by_name(&col.name)
             .ok_or_else(|| InterpError::UnknownJoinColumn(col.name.clone()))?;
         if ident {
             columns.push(Arc::clone(source));
+            continue;
+        }
+        if let Some(sel) = sel {
+            columns.push(sel.filter(source.as_ref())?);
             continue;
         }
         // `take_column`, not arrow's `take`: same positional semantics, but it carries the
@@ -582,6 +634,49 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use bc_ir::{JoinStrategy, JoinType};
+
+    /// A strictly ascending gather is served by a filter, and the filter must return exactly
+    /// the gather's column: same values, same nulls, same type, for strings as well as
+    /// fixed-width, and for a sparse selection as well as a dense one.
+    #[test]
+    fn an_ascending_selection_filters_to_what_the_gather_returns() {
+        let strs = arrow::array::StringArray::from(vec![
+            Some("id1"),
+            None,
+            Some(""),
+            Some("a-much-longer-value-than-sixteen-bytes"),
+            Some("x"),
+            Some("id22"),
+        ]);
+        let ints = Int64Array::from(vec![Some(1), Some(2), None, Some(4), Some(5), Some(6)]);
+        let cols: [ArrayRef; 2] = [Arc::new(strs), Arc::new(ints)];
+        for sel in [
+            vec![0u32, 1, 2, 3, 5],
+            vec![1, 4],
+            vec![5],
+            vec![0, 2, 3, 4, 5],
+        ] {
+            let indices = UInt32Array::from(sel.clone());
+            let pred = ascending_selection(&indices, 6).expect("ascending selections filter");
+            for col in &cols {
+                let want = bc_runtime::gather::take_column(col.as_ref(), &indices).unwrap();
+                let got = pred.filter(col.as_ref()).unwrap();
+                assert_eq!(got.to_data(), want.to_data(), "selection {sel:?}");
+            }
+        }
+    }
+
+    /// Anything a filter cannot express keeps the gather: a repeated row (one probe row
+    /// matching twice), a reordering, a null index (an outer join's unmatched side), and an
+    /// index past the source.
+    #[test]
+    fn a_selection_a_filter_cannot_express_is_refused() {
+        assert!(ascending_selection(&UInt32Array::from(vec![0u32, 1, 1, 2]), 4).is_none());
+        assert!(ascending_selection(&UInt32Array::from(vec![2u32, 1]), 4).is_none());
+        assert!(ascending_selection(&UInt32Array::from(vec![Some(0u32), None]), 4).is_none());
+        assert!(ascending_selection(&UInt32Array::from(vec![0u32, 4]), 4).is_none());
+        assert!(ascending_selection(&UInt32Array::from(Vec::<u32>::new()), 4).is_none());
+    }
 
     /// A band range join's two conditions name the *same* right column, and the band
     /// algorithm in `bc-runtime` detects that by `Arc::ptr_eq` on the two key arrays. That

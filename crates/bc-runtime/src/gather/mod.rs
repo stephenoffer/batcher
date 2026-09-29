@@ -46,8 +46,10 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 mod fixed;
+mod spans;
 
 use fixed::{take_chunked, take_fixed_width_parallel};
+use spans::{SpanAppender, SpanCopier};
 
 use crate::error::RuntimeError;
 
@@ -491,13 +493,15 @@ fn gather_bytes_of<T: ByteArrayType>(
         .zip(dsts.into_par_iter().zip(bases.par_iter()))
         .for_each(|(((offs, rows), parts), (dst, &base))| {
             let mut at = 0usize;
+            let mut copy = SpanCopier::new(arrs.first().map_or(&[][..], |a| a.value_data()));
             for ((slot, &(start, len)), &p) in offs.iter_mut().zip(rows).zip(parts) {
                 let (start, len) = (start as usize, len as usize);
-                dst[at..at + len]
-                    .copy_from_slice(&arrs[p as usize].value_data()[start..start + len]);
+                copy.set_source(dst, arrs[p as usize].value_data());
+                copy.push(dst, start, len);
                 at += len;
                 *slot = T::Offset::usize_as(base + at);
             }
+            copy.finish(dst);
         });
 
     // A gathered row is null exactly when its source row is, which is what `interleave` also
@@ -592,6 +596,7 @@ fn take_bytes_serial<T: ByteArrayType>(
     let mut offsets: Vec<T::Offset> = Vec::with_capacity(n + 1);
     let mut values: Vec<u8> = Vec::with_capacity(reserve);
     let mut total: usize = 0;
+    let mut copy = SpanAppender::new(src_values);
     offsets.push(T::Offset::usize_as(0));
     for (k, &i) in idx.iter().enumerate() {
         // Without this the loop is a dependent chain of cache misses: the offset load for row
@@ -618,10 +623,11 @@ fn take_bytes_serial<T: ByteArrayType>(
         let i = i as usize;
         let start = src_offsets[i].as_usize();
         let end = src_offsets[i + 1].as_usize();
-        values.extend_from_slice(&src_values[start..end]);
+        copy.push(&mut values, start, end - start);
         total += end - start;
         offsets.push(T::Offset::from_usize(total)?);
     }
+    copy.finish(&mut values);
 
     // A gathered row is null exactly when its source row is. Arrow's `take` leaves a null
     // row's slice empty, which the length pass above already does (start == end).
@@ -725,6 +731,7 @@ fn take_bytes_parallel<T: ByteArrayType>(
         .zip(dsts.into_par_iter().zip(bases.par_iter()))
         .for_each(|((offs, rows), (dst, &base))| {
             let mut at = 0usize;
+            let mut copy = SpanCopier::new(src_values);
             for (k, (slot, &(start, len))) in offs.iter_mut().zip(rows).enumerate() {
                 // The source span is already known here (phase 1 recorded it, and `rows` is
                 // read sequentially), so the only miss left is the source *bytes* — which can
@@ -735,10 +742,11 @@ fn take_bytes_parallel<T: ByteArrayType>(
                     }
                 }
                 let (start, len) = (start as usize, len as usize);
-                dst[at..at + len].copy_from_slice(&src_values[start..start + len]);
+                copy.push(dst, start, len);
                 at += len;
                 *slot = T::Offset::usize_as(base + at);
             }
+            copy.finish(dst);
         });
 
     // A gathered row is null exactly when its source row is — identical to the serial path.
