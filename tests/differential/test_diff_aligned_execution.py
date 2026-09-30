@@ -331,9 +331,11 @@ def test_a_large_broadcast_is_read_by_the_fleet_file_by_file(tables, monkeypatch
     `customer` joined to `segment` aligns on no key, so `route.scan_plan` reads it one file
     per unit, joining each against the whole of `segment`; the union must be the whole join.
     """
-    from batcher.dist.executors.aligned import route
+    from batcher.dist.executors.aligned import hoist, route
 
-    monkeypatch.setattr(aligned_run, "_NESTED_BROADCAST_BYTES", 1)
+    # The threshold is read where the broadcast is evaluated (`hoist.evaluate_broadcast`);
+    # `run` imports the name for its residual path, so patching it there changes nothing here.
+    monkeypatch.setattr(hoist, "_NESTED_BROADCAST_BYTES", 1)
     taken = []
     real = route.scan_plan
 
