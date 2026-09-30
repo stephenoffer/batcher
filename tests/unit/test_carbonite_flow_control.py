@@ -164,10 +164,15 @@ def test_oversized_request_is_clamped_to_ceiling():
     assert ResourceManager().grant_credits(10_000) == ceiling
 
 
-def test_window_is_config_driven():
+def test_window_is_config_driven(monkeypatch):
     # The window tracks config, not a hardcoded constant — the single source of truth.
     # Explicit factor + a generous byte budget so the count ceiling (not the byte cap)
-    # is what this asserts, independent of the shipped defaults.
+    # is what this asserts, independent of the shipped defaults — and of this machine's
+    # RAM, whose share caps each of the `gather_streams` windows below the count ceiling
+    # on a small box (64 credits on a 30 GiB one).
+    from batcher.carbonite.policies import flow_control
+
+    monkeypatch.setattr(flow_control, "total_memory_bytes", lambda: 1 << 40)
     cfg = Config().replace(
         flow_control=FlowControlConfig(
             default_credits=12, credit_ceiling_factor=8, credit_byte_budget=1 << 40

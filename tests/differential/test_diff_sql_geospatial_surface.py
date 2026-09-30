@@ -227,8 +227,13 @@ def rotations() -> pa.Table:
 def test_every_scalar_spatial_function_is_reachable_from_sql(rotations, name):
     """Same reachability contract as the geospatial family, over `spatial_fns.__all__`."""
     columns = {"qx", "qy", "qz", "qw", "px", "py", "pz", "tx", "ty", "tz"}
-    params = list(inspect.signature(getattr(spatial_fns, name)).parameters)
-    args = [p if p in columns else "1.0" for p in params]
+    params = inspect.signature(getattr(spatial_fns, name)).parameters.values()
+    # A string parameter is a plan-time constant (an Euler axis sequence), read off the
+    # literal node, so it gets a string literal a number would not satisfy.
+    args = [
+        p.name if p.name in columns else "'ZYX'" if p.annotation in (str, "str") else "1.0"
+        for p in params
+    ]
     try:
         bt.sql(f"SELECT {name}({', '.join(args)}) AS v FROM t", t=rotations).collect()
     except NotImplementedError as exc:  # pragma: no cover - the defect this test exists for

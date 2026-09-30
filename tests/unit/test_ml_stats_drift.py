@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 import batcher as bt
@@ -274,10 +275,42 @@ def test_js_divergence_is_bounded_by_one_bit() -> None:
     assert 0.0 <= js_divergence(reference, shifted, "x") <= 1.0
 
 
-def test_drift_on_a_constant_reference_column_is_an_actionable_error() -> None:
+def test_a_constant_reference_is_measured_as_a_point_mass() -> None:
     reference = bt.from_pydict({"x": [1.0] * 10})
-    current = bt.from_pydict({"x": [2.0] * 10})
-    with pytest.raises(PlanError, match="is constant"):
+    unmoved = bt.from_pydict({"x": [1.0] * 10})
+    moved = bt.from_pydict({"x": [2.0] * 10})
+    half = bt.from_pydict({"x": [1.0] * 5 + [0.5] * 5})
+    assert population_stability_index(reference, unmoved, "x") == 0.0
+    assert js_divergence(reference, unmoved, "x") == 0.0
+    # A constant that moved is a total shift, not "no drift".
+    assert population_stability_index(reference, moved, "x") > 0.25
+    assert js_divergence(reference, moved, "x") > 0.9
+    assert (
+        0.25
+        < population_stability_index(reference, half, "x")
+        < (population_stability_index(reference, moved, "x"))
+    )
+
+
+def test_an_integer_constant_reference_separates_the_next_integer() -> None:
+    reference = bt.from_pydict({"x": [3] * 10})
+    current = bt.from_pydict({"x": [3] * 5 + [4] * 5})
+    assert population_stability_index(reference, current, "x") > 0.25
+
+
+def test_a_point_mass_in_a_reference_keeps_a_bin_of_its_own() -> None:
+    # 99% of the reference sits on 1.0, so every quantile is 1.0. With 1.0 as the only edge,
+    # 1.0 and 2.0 fell in the same bin and the move scored exactly 0.0.
+    reference = bt.from_pydict({"x": [1.0] * 99 + [2.0]})
+    current = bt.from_pydict({"x": [2.0] * 100})
+    assert population_stability_index(reference, reference, "x") == 0.0
+    assert population_stability_index(reference, current, "x") > 0.25
+
+
+def test_drift_on_an_all_null_reference_column_is_an_actionable_error() -> None:
+    reference = bt.from_pydict({"x": pa.array([None] * 4, pa.float64())})
+    current = bt.from_pydict({"x": [2.0] * 4})
+    with pytest.raises(PlanError, match="entirely null"):
         population_stability_index(reference, current, "x")
 
 

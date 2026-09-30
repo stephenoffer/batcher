@@ -86,6 +86,22 @@ def widen_narrow(table: pa.Table) -> pa.Table:
     return table.cast(pa.schema(fields))
 
 
+def _major_version(lib: Any) -> int:
+    """The leading integer of `lib.__version__`, or 0 when it has none."""
+    head = str(getattr(lib, "__version__", "0")).split(".", 1)[0]
+    return int(head) if head.isdigit() else 0
+
+
+def _carries_nan(table: pa.Table) -> bool:
+    """Whether any floating-point column of `table` holds a `NaN` (as opposed to a null)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    return any(
+        pa.types.is_floating(col.type) and pc.any(pc.is_nan(col)).as_py() for col in table.columns
+    )
+
+
 class Unsupported(Exception):
     """An op or expression the translator does not handle — triggers the CPU fallback.
 
@@ -134,14 +150,21 @@ class DfBackend:
     `remember_dates`.
     """
 
-    __slots__ = ("_arrow_native", "_date_types", "lib")
+    __slots__ = ("_arrow_native", "_date_types", "_nan_is_missing", "lib")
 
     def __init__(self, lib: Any) -> None:
         """Wrap dataframe module `lib` (``cudf`` on a GPU, ``pandas`` for verification)."""
         self.lib = lib
         # cuDF reads Arrow natively and keeps the null mask; pandas needs the ArrowDtype
-        # mapper below to do the same.
-        self._arrow_native = hasattr(lib.DataFrame, "from_arrow")
+        # mapper below to do the same. Decided by the library's name, not by probing for
+        # `DataFrame.from_arrow`: pandas 3 added that classmethod (without cuDF's `to_arrow`),
+        # so the probe classified pandas as a device and every result conversion failed.
+        self._arrow_native = getattr(lib, "__name__", "").partition(".")[0] == "cudf"
+        # pandas 3 treats a float `NaN` in an Arrow-backed column as *missing*: `sum` skips it,
+        # `count` does not count it, and a `NaN` group key can fold into the null group. The
+        # engine, cuDF and pandas 2 all keep `NaN` a value. So on pandas 3 the host backend
+        # declines any input carrying a `NaN` rather than answer with the other semantics.
+        self._nan_is_missing = not self._arrow_native and _major_version(lib) >= 3
         self._date_types: dict[str, Any] = {}
 
     def remember_dates(self, schema) -> None:
@@ -212,8 +235,17 @@ class DfBackend:
         """Whether this backend computes on a device (cuDF) rather than the host (pandas)."""
         return self._arrow_native
 
+    @property
+    def nan_is_missing(self) -> bool:
+        """Whether this library reads a float `NaN` as missing (pandas 3), so declines it."""
+        return self._nan_is_missing
+
     def from_arrow(self, table: pa.Table):
         """An Arrow table as a dataframe, preserving Arrow's null mask on both libraries."""
+        if self._nan_is_missing and _carries_nan(table):
+            raise Unsupported(
+                f"{self.lib.__name__} {self.lib.__version__} reads a float NaN as missing"
+            )
         table = widen_narrow(table)
         self.remember_dates(table.schema)
         if self._arrow_native:
@@ -421,6 +453,35 @@ class DfBackend:
 
             return pa.types.is_boolean(arrow)
         return getattr(dtype, "kind", "") == "b"
+
+    def is_nested(self, value: Any) -> bool:
+        """Whether `value` is a list, struct or map column.
+
+        Asked because the libraries' elementwise `!=` does not compare nested values the way
+        the engine does: over a pandas list column `nullif(v, v)` -- the control plane's typed
+        NULL for a `CASE` with no `ELSE` -- kept every row where the engine nulls them all.
+        Same column type, wrong values, so the schema contract cannot see it.
+        """
+        if not self.is_series(value):
+            return False
+        dtype = getattr(value, "dtype", None)
+        arrow = getattr(dtype, "pyarrow_dtype", None)
+        if arrow is not None:
+            import pyarrow as pa
+
+            return pa.types.is_nested(arrow)
+        return type(dtype).__name__ in ("ListDtype", "StructDtype")
+
+    def require_flat(self, value: Any, what: str) -> Any:
+        """`value`, or `Unsupported` when it is a list, struct or map column.
+
+        A nested `CASE`, `NULLIF` or comparison runs on the CPU engine: the libraries'
+        `where`, `==` and `<` over nested values are not the engine's selection, equality
+        and order (see `is_nested`).
+        """
+        if self.is_nested(value):
+            raise Unsupported(f"{what} over a nested value")
+        return value
 
     def has_nan(self, value: Any) -> bool:
         """Whether a float column actually carries a `NaN` (as opposed to a null).

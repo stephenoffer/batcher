@@ -12,11 +12,14 @@ Arrow result files) — for arbitrary SQL the lakehouse path can't express.
 
 All optional imports are deferred to `BackendError` with a
 ``pip install 'batcher-engine[databricks]'`` hint. Tokens ride on splits as plain
-values and are never logged.
+values and are never logged. A lakehouse split renews its vended credentials on the
+worker when they near expiry (`UnityDeltaFileSplit`).
 """
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -25,9 +28,10 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
-from batcher.io.credentials import resolve_secret, vend_unity_credentials
+from batcher.io.credentials import UnityLease, resolve_secret, unity_lease
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.lakehouse.delta import DeltaSource
+from batcher.io.formats.lakehouse.delta.source import DeltaFileSplit
 from batcher.io.formats.sql._common import (
     connection_fingerprint,
     probe_is_typed,
@@ -210,35 +214,40 @@ class DatabricksSource:
     def _is_warehouse(self) -> bool:
         return bool(self.query and self.server_hostname and self.http_path and self.access_token)
 
+    def _lakehouse(self) -> tuple[str, str, str]:
+        """`(table, workspace, token)`, for a code path only a lakehouse read reaches."""
+        if not (self.table and self.workspace and self.token):
+            raise BackendError("a Databricks lakehouse read needs table=, workspace= and token=")
+        return self.table, self.workspace, self.token
+
+    def _warehouse(self) -> tuple[str, str, str, str]:
+        """`(server_hostname, http_path, access_token, query)`, for a warehouse-only path."""
+        if not (self.query and self.server_hostname and self.http_path and self.access_token):
+            raise BackendError(
+                "a Databricks warehouse read needs query=, server_hostname=, http_path= "
+                "and access_token="
+            )
+        return self.server_hostname, self.http_path, self.access_token, self.query
+
     def _delta_source(self) -> DeltaSource:
         """Vend Unity credentials and build a direct Delta reader for the table."""
-        storage_url, storage_options = vend_unity_credentials(
-            self.table,  # type: ignore[arg-type] - guarded by _is_lakehouse
-            self.workspace,  # type: ignore[arg-type]
-            self.token,  # type: ignore[arg-type]
-        )
-        return DeltaSource(storage_url, storage_options=storage_options)
+        lease = unity_lease(*self._lakehouse())
+        return _LeasedDeltaSource(lease)
 
     def _warehouse_split(
         self, predicate: dict | None = None, projection: list[str] | None = None
     ) -> _DatabricksWarehouseSplit:
         """The warehouse split, with the pushdown already folded into its SQL (see `push_down`)."""
+        host, http_path, token, query = self._warehouse()
         return _DatabricksWarehouseSplit(
-            self.server_hostname,  # type: ignore[arg-type] - guarded by _is_warehouse
-            self.http_path,  # type: ignore[arg-type]
-            self.access_token,  # type: ignore[arg-type]
-            push_down(self.query, predicate, projection),  # type: ignore[arg-type]
+            host, http_path, token, push_down(query, predicate, projection)
         )
 
     def schema(self) -> pa.Schema:
         if self._is_lakehouse():
             return self._delta_source().schema()
-        probed = _DatabricksWarehouseSplit(
-            self.server_hostname,  # type: ignore[arg-type] - guarded by _is_warehouse
-            self.http_path,  # type: ignore[arg-type]
-            self.access_token,  # type: ignore[arg-type]
-            schema_probe(self.query),
-        ).schema()
+        host, http_path, token, query = self._warehouse()
+        probed = _DatabricksWarehouseSplit(host, http_path, token, schema_probe(query)).schema()
         return probed if probe_is_typed(probed) else self._warehouse_split().schema()
 
     def read(
@@ -316,5 +325,104 @@ class DatabricksSource:
         discards the rows afterwards — correct, and arbitrarily expensive.
         """
         if self._is_lakehouse():
-            return self._delta_source().splits(target_size, predicate)
+            delta = self._delta_source()
+            planned = delta.splits(target_size, predicate)
+            lease = getattr(delta, "lease", None)
+            if lease is None:
+                return planned
+            table, workspace, token = self._lakehouse()
+            _remember(workspace, table, lease)
+            return [_renewing(split, table, workspace, token, lease) for split in planned]
         return [self._warehouse_split(predicate, projection)]
+
+
+#: Renew a lease this long before Unity says it expires, so a file read that starts just
+#: before the deadline does not run past it.
+_RENEW_MARGIN_S = 300.0
+
+#: This process's newest lease per ``(workspace, table)``. A worker holding many splits of
+#: one table renews once for all of them rather than once per file.
+_LEASES: dict[tuple[str, str], UnityLease] = {}
+_LEASE_LOCK = threading.Lock()
+
+
+class _LeasedDeltaSource(DeltaSource):
+    """A Delta reader over vended credentials, remembering the lease they came from."""
+
+    def __init__(self, lease: UnityLease) -> None:
+        super().__init__(lease.storage_url, storage_options=lease.storage_options)
+        self.lease = lease
+
+
+def _remember(workspace: str, table: str, lease: UnityLease) -> None:
+    with _LEASE_LOCK:
+        _LEASES[(workspace, table)] = lease
+
+
+def _fresh(lease: UnityLease, now: float) -> bool:
+    return lease.expires_at_s is None or now < lease.expires_at_s - _RENEW_MARGIN_S
+
+
+@dataclass(frozen=True, slots=True)
+class UnityDeltaFileSplit(DeltaFileSplit):
+    """A Delta file split whose vended credentials are renewed when they near expiry.
+
+    Unity vends credentials that last minutes to an hour, and the driver vends them once, at
+    planning time. A split that waits behind a long queue, or a scan that runs for hours,
+    used to reach the object store with credentials that had already lapsed and fail with a
+    403 partway through. This split carries what vending needs -- the table, the workspace,
+    and the token or a reference to it -- and re-vends on the worker once the lease it was
+    planned with is within `_RENEW_MARGIN_S` of expiring. The renewed lease is shared by
+    every split of the table on that worker.
+
+    The token travels with the split, as a warehouse split's does; pass it as a secret
+    reference (``token="env:DATABRICKS_TOKEN"``) so what travels is the reference.
+    """
+
+    unity_table: str = ""
+    workspace: str = ""
+    token: str = field(default="", repr=False)
+    expires_at_s: float | None = None
+
+    def _live_options(self) -> dict[str, str] | None:
+        """The storage options to read with: the planned ones, or a renewed lease's."""
+        now = time.time()
+        planned = UnityLease(self.table_uri, self.storage_options or {}, self.expires_at_s)
+        if _fresh(planned, now):
+            return self.storage_options
+        key = (self.workspace, self.unity_table)
+        with _LEASE_LOCK:
+            cached = _LEASES.get(key)
+            if cached is None or not _fresh(cached, now):
+                cached = unity_lease(self.unity_table, self.workspace, self.token)
+                _LEASES[key] = cached
+        return cached.storage_options
+
+    def _snapshot(self) -> Any:
+        from batcher.io.formats.lakehouse.delta._snapshot import open_snapshot
+
+        return open_snapshot(
+            self.table_uri, version=self.version, storage_options=self._live_options()
+        )
+
+    def schema(self) -> pa.Schema:
+        return self._snapshot().schema()
+
+
+def _renewing(split: Split, table: str, workspace: str, token: str, lease: UnityLease) -> Split:
+    """`split` as a renewing split, when it is a per-file Delta split; unchanged otherwise."""
+    if type(split) is not DeltaFileSplit:
+        return split
+    return UnityDeltaFileSplit(
+        split.table_uri,
+        split.file_path,
+        split.storage_options,
+        split.version,
+        split.rows,
+        split.partition_columns,
+        split.partition_values,
+        unity_table=table,
+        workspace=workspace,
+        token=token,
+        expires_at_s=lease.expires_at_s,
+    )

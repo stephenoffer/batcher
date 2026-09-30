@@ -38,7 +38,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.kyber.common_subplan import structural_key
-from batcher.kyber.rules.agg_pushdown import _PREAGG_MERGE
+from batcher.kyber.rules.agg_pushdown.rules import _PREAGG_MERGE
 from batcher.plan.expr_ir import AggExpr, Col, Expr, coalesce, col, lit, nullif
 from batcher.plan.expr_ir.nodes import NullIf
 from batcher.plan.logical import (

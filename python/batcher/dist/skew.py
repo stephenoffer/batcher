@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 
 from batcher._internal.logging import note_suppressed
 from batcher.plan.logical import Join
@@ -21,7 +22,6 @@ __all__ = [
     "DEFAULT_LEARNED_SALT",
     "hot_keys_from_column_stats",
     "join_skew_key",
-    "load_learned_hot_keys",
     "persist_hot_keys",
     "resolve_hot_keys",
     "salt_factor",
@@ -88,7 +88,8 @@ def load_learned_skew(shape_key: str) -> tuple[list[str], float] | None:
     """The hot values learned for this shape and the largest one's measured share.
 
     `None` when never measured. A learned empty list means "measured, not skewed", which is
-    distinct from never-measured, so a shape known to be uniform never re-runs the pre-pass.
+    distinct from never-measured, so a shape known to be uniform does not re-run the pre-pass
+    while that verdict is fresh (`resolve_hot_keys` expires it).
 
     The share is what sizes the salt fan-out, and it has to be *measured* rather than assumed
     — see `salt_factor`. A record written before the share was stored reads back as `0.0`,
@@ -109,17 +110,6 @@ def load_learned_skew(shape_key: str) -> tuple[list[str], float] | None:
     return [str(v) for v in raw], 0.0  # legacy record: values only
 
 
-def load_learned_hot_keys(shape_key: str) -> list[str] | None:
-    """The hot join-key values learned for this shape, or `None` if never measured.
-
-    A learned empty list means "measured, not skewed" — distinct from never-measured,
-    so a non-skewed shape never re-runs the detection pre-pass. Best-effort; the hub
-    being unavailable simply means no learned skew (fall back to the config behavior).
-    """
-    learned = load_learned_skew(shape_key)
-    return None if learned is None else learned[0]
-
-
 def _load_raw(shape_key: str):
     """The stored learned-skew record for this shape, or `None`. Best-effort: a hub that
     cannot be reached is *noted*, not swallowed — a silent failure here disables learned
@@ -133,25 +123,31 @@ def _load_raw(shape_key: str):
         return None
 
 
-def persist_hot_keys(shape_key: str, hot: list[str], share: float = 0.0) -> None:
+def persist_hot_keys(
+    shape_key: str, hot: list[str], share: float = 0.0, rows: int | None = None
+) -> None:
     """Record what the detection pre-pass measured, so a later run of the same join shape
     engages salting from learned skew without re-running the pre-pass.
 
     `share` — the hottest value's measured share of its side — is stored with the values
     because it is what sizes the fan-out (`salt_factor`), and a later run has no other way
-    to recover it. Best-effort; never breaks the join.
+    to recover it. The measurement time and the input size it was taken at are stored too,
+    because they are what lets a "not skewed" verdict expire (`_uniform_verdict_is_stale`).
+    Best-effort; never breaks the join.
 
     Args:
         shape_key: This join shape's key (`join_skew_key`).
         hot: The hot values, as strings. Empty means "measured, not skewed".
         share: The hottest value's share of its side; `0.0` when unknown.
+        rows: The join's estimated input rows when measured; `None` when unknown.
     """
+    record: dict[str, object] = {"hot": list(hot), "share": float(share), "at": time.time()}
+    if rows is not None and rows > 0:
+        record["rows"] = int(rows)
     try:
         from batcher.core import default_hub
 
-        default_hub().put_keyed_param(
-            _SKEW_NAMESPACE, shape_key, {"hot": list(hot), "share": float(share)}
-        )
+        default_hub().put_keyed_param(_SKEW_NAMESPACE, shape_key, record)
     except Exception as exc:
         note_suppressed("dist", "persist learned hot keys", exc)
 
@@ -222,7 +218,7 @@ def hot_keys_from_column_stats(
         from batcher.core import default_hub
 
         return kyber.hot_join_value_shares(join, sources, default_hub(), fraction, partitions)
-    except Exception as exc:  # pragma: no cover - statistics must never break a join
+    except Exception as exc:  # statistics must never break a join
         note_suppressed("dist", "read hot keys from column stats", exc)
         return [], 0.0
 
@@ -244,13 +240,17 @@ def resolve_hot_keys(
     1. the set **learned** for this exact join shape on a previous run — free and exact, but
        silent about a shape that has not run before. An empty learned list means "measured,
        not skewed", which is distinct from never-measured, so a shape known to be uniform
-       never re-runs the pre-pass;
+       does not re-run the pre-pass — until that verdict goes stale
+       (`_uniform_verdict_is_stale`: older than `_UNIFORM_VERDICT_TTL_S`, or measured at an
+       input size the join has since drifted from by `_UNIFORM_VERDICT_DRIFT`x), when it is
+       treated as never-measured;
     2. the column's **measured most-common values**, which Kyber already holds;
     3. the **detection pre-pass** (`detect`), a distributed Misra-Gries scan of both sides.
        Correct, and the only option when nothing has been measured. It costs an extra pass,
-       so it runs when the config asks for it (`salt > 0`) **or** the join is large enough
-       that `_detect_is_worth_it` says the insurance is cheaper than the exposure — and its
-       result is persisted either way, so it is paid at most once per shape.
+       so it runs when the config asks for it (`salt > 0`) **or** the join's estimated input
+       (`_estimated_input_rows`) clears `_DETECT_MIN_INPUT_ROWS`, where the insurance is
+       cheaper than the exposure — and its result is persisted either way, so it is paid at
+       most once per shape per verdict lifetime.
 
     Shared by both transports so the disk and Flight joins cannot drift on which keys they
     consider hot; only how they *publish* the salted buckets differs.
@@ -278,13 +278,21 @@ def resolve_hot_keys(
         # is only a different kind of cost.
         return [], 0
     learned = load_learned_skew(shape_key)
+    rows: int | None = None
+    if learned is not None and not learned[0]:
+        rows = _estimated_input_rows(join, sources)
+        if _uniform_verdict_is_stale(_load_raw(shape_key), rows, time.time()):
+            learned = None
     if learned is not None:
         hot, share = learned
     else:
         hot, share = hot_keys_from_column_stats(join, sources, fraction, partitions)
-        if not hot and (salt > 0 or _detect_is_worth_it(join, sources)):
-            hot, share = detect()
-            persist_hot_keys(shape_key, hot, share)
+        if not hot:
+            if rows is None:
+                rows = _estimated_input_rows(join, sources)
+            if salt > 0 or (rows is not None and rows >= _DETECT_MIN_INPUT_ROWS):
+                hot, share = detect()
+                persist_hot_keys(shape_key, hot, share, rows)
     if not hot:
         return [], 0
     # A known-skewed key engages salting even when the config left it off: the skew is
@@ -300,8 +308,8 @@ def resolve_hot_keys(
     # rather than the measurement. `share` is 0.0 only when genuinely unknown — a learned
     # record written before the share was stored, or a hot set with no frequency behind it —
     # and then `fraction` is the only figure available and stands as the conservative floor it
-    # always was. The column-statistics path used to land there too, on a measurement it was
-    # already holding; it now carries it.
+    # always was. The column-statistics path carries its measured share, so it never lands
+    # there with a measurement in hand.
     return hot, salt if salt > 0 else salt_factor(max(share, fraction), partitions)
 
 
@@ -315,22 +323,61 @@ def resolve_hot_keys(
 _DETECT_MIN_INPUT_ROWS = 1 << 23  # ~8.4M rows across both sides
 
 
-def _detect_is_worth_it(join: Join, sources) -> bool:
-    """Whether this join is large enough to pay for one hot-key detection pass.
+#: How long a "measured, not skewed" verdict is trusted. A key distribution is a property of
+#: the data, and the shape key hashes the plan, not the bytes under it: a table appended to
+#: daily keeps its join shape while its hottest value grows. A week bounds how long a drift
+#: into skew can go unprobed, and on a shape that stays uniform it costs one pre-pass (~4% of
+#: that join, measured above) per week.
+_UNIFORM_VERDICT_TTL_S = 7 * 24 * 3600.0
 
-    Asked only when nothing cheaper knew anything, and the answer is persisted, so a shape
-    pays this at most once. Estimated rather than measured on purpose — it is deciding
-    whether to *take* a measurement, so requiring one first would be circular. Best-effort:
-    an estimator that cannot answer reads as "not worth it", which is the previous
-    opt-in-only behavior.
+#: How far the join's estimated input may move from the size it was measured at before a
+#: "not skewed" verdict is re-probed. A 4x change is a different relation for skew purposes
+#: -- a key holding 5% of a 10M-row side can hold 40% after a 40M-row append of one value --
+#: while estimator noise on an unchanged input stays well inside it.
+_UNIFORM_VERDICT_DRIFT = 4.0
+
+
+def _uniform_verdict_is_stale(raw, rows_now: int | None, now: float) -> bool:
+    """Whether a stored "measured, not skewed" record should be measured again.
+
+    A record without a timestamp predates expiry and is treated as stale, so it is
+    re-measured once and then carries one. A record without a measured size, or a join
+    whose size cannot be estimated now, expires on age alone.
+
+    Args:
+        raw: The stored learned-skew record (`_load_raw`).
+        rows_now: The join's estimated input rows on this run, or `None`.
+        now: The current time, in seconds since the epoch.
+
+    Returns:
+        True when the verdict has expired and the shape should be treated as never-measured.
+    """
+    if not isinstance(raw, dict) or raw.get("hot"):
+        return False  # a legacy list or a hot set: salting on it is result-preserving
+    at = raw.get("at")
+    if not isinstance(at, int | float) or now - float(at) > _UNIFORM_VERDICT_TTL_S:
+        return True
+    then = raw.get("rows")
+    if not isinstance(then, int) or then <= 0 or not rows_now or rows_now <= 0:
+        return False
+    ratio = rows_now / then
+    return ratio >= _UNIFORM_VERDICT_DRIFT or ratio <= 1.0 / _UNIFORM_VERDICT_DRIFT
+
+
+def _estimated_input_rows(join: Join, sources) -> int | None:
+    """Both sides' estimated rows, which sizes the detection pass and dates its verdict.
+
+    Estimated rather than measured on purpose — it is deciding whether to *take* a
+    measurement, so requiring one first would be circular. Best-effort: an estimator that
+    cannot answer returns `None`, which reads as "not worth detecting" (the previous
+    opt-in-only behavior) and leaves a stored verdict to expire on age alone.
     """
     try:
         from batcher.config import active_config
         from batcher.kyber.cardinality import CardinalityEstimator
 
         est = CardinalityEstimator(sources, {}, active_config().optimizer.cardinality)
-        rows = est.estimate(join.left).rows + est.estimate(join.right).rows
-    except Exception as exc:  # pragma: no cover - estimation must never break a join
+        return int(est.estimate(join.left).rows + est.estimate(join.right).rows)
+    except Exception as exc:  # estimation must never break a join
         note_suppressed("dist", "size the skew detection pre-pass", exc)
-        return False
-    return rows >= _DETECT_MIN_INPUT_ROWS
+        return None

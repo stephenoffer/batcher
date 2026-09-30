@@ -8,6 +8,9 @@ the same statement over a real table. The ordered-set aggregates
 
 from __future__ import annotations
 
+import datetime
+import decimal
+
 import pyarrow as pa
 import pytest
 
@@ -160,3 +163,44 @@ def test_dml_bad_statements_raise_clean(dml):
     s.register("t", _base_table())
     with pytest.raises((PlanError, NotImplementedError)):
         s.sql(dml)
+
+
+# DML keeps the target's exact column types: an unlisted INSERT column is a null of its own
+# type, and an assigned or inserted value is cast to it. A decimal column used to become
+# float64 after any INSERT or UPDATE, and a time-zone-aware one failed the union outright.
+def _typed_table() -> pa.Table:
+    return pa.table(
+        {
+            "k": pa.array([1], pa.int64()),
+            "dec": pa.array([decimal.Decimal("1.25")], pa.decimal128(12, 2)),
+            "tsz": pa.array([datetime.datetime(2020, 1, 1)], pa.timestamp("us", "UTC")),
+            "tsms": pa.array([datetime.datetime(2020, 1, 1)], pa.timestamp("ms")),
+            "d64": pa.array([datetime.date(2020, 1, 1)], pa.date64()),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "dml",
+    [
+        "INSERT INTO t (k) VALUES (2)",
+        "INSERT INTO t SELECT * FROM t",
+        "INSERT INTO t (k, dec) VALUES (3, 7)",
+        "UPDATE t SET dec = 2.345",
+        "UPDATE t SET dec = dec * 2 WHERE k = 1",
+        "UPDATE t SET tsz = TIMESTAMP '2021-05-05 00:00:00'",
+    ],
+)
+def test_dml_keeps_the_exact_column_types(duck, dml):
+    duck.execute("SET TimeZone = 'UTC'")
+    duck.register("base", _typed_table())
+    duck.execute("CREATE TABLE t AS SELECT * FROM base")
+    duck.execute(dml)
+
+    s = bt.Session()
+    s.register("t", _typed_table())
+    s.sql(dml)
+
+    got = s.table("t").to_arrow()
+    assert got.schema.types == _typed_table().schema.types
+    assert_same(got, duck.sql("SELECT * FROM t"))

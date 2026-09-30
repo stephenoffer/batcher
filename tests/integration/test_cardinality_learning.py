@@ -21,6 +21,7 @@ import pytest
 import batcher as bt
 from batcher import col, core
 from batcher.kyber import Optimizer
+from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.learning import CARDINALITY_CORRECTION_KEY, load_learned_stats
 from batcher.metadata import MetadataHub
 from batcher.metadata.backends.in_process import InProcessBackend
@@ -56,8 +57,8 @@ def _query(table: pa.Table):
 
 def _root_estimate(dataset, hub: MetadataHub) -> float:
     """Kyber's estimated output rows for `dataset`, given what `hub` has learned."""
-    _plan, stats = Optimizer(sources=dataset._sources, hub=hub).logical_stats(dataset._plan)
-    return stats.rows
+    plan = Optimizer(sources=dataset._sources, hub=hub).logical_rewrite(dataset._plan)
+    return CardinalityEstimator(dataset._sources, load_learned_stats(hub)).estimate(plan).rows
 
 
 @pytest.mark.integration

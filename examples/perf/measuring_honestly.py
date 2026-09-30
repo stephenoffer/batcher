@@ -9,6 +9,7 @@ measurement, it is the luckiest sample.
 
 from __future__ import annotations
 
+import math
 import statistics
 import sys
 import time
@@ -51,8 +52,15 @@ def main() -> None:
         started = time.perf_counter()
         run = query()
         timings.append((time.perf_counter() - started) * 1000)
-        # Rule 3 again: every run is checked, not just the first.
-        assert run == result
+        # Rule 3 again: every run is checked, not just the first. Exactly for the groups, and
+        # up to summation order for the float totals: the optimizer may re-choose the plan
+        # from what the first runs measured, and a float sum in another order differs in its
+        # last bits without being a different answer.
+        assert run["l_shipmode"] == result["l_shipmode"]
+        assert all(
+            math.isclose(a, b, rel_tol=1e-9)
+            for a, b in zip(run["revenue"], result["revenue"], strict=True)
+        )
 
     # Rule 4: report the distribution.
     timings.sort()

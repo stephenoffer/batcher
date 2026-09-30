@@ -38,6 +38,7 @@ from batcher.kyber.measured_width import measured_widths
 from batcher.kyber.signature import plan_signature
 from batcher.metadata import MetadataHub
 from batcher.metadata.hardware_scope import local_or_planned_fingerprint
+from batcher.metadata.smoothed import convergent_blend
 from batcher.metadata.udf_stats import load_udf_row_seconds_table
 from batcher.plan.logical import LogicalPlan
 
@@ -46,6 +47,7 @@ __all__ = [
     "generation",
     "is_material_change",
     "load_learned_stats",
+    "measured_corrections",
     "q_error_window",
     "record_column_row_bytes",
     "record_column_row_bytes_batch",
@@ -110,16 +112,12 @@ def bump_generation() -> None:
 
     Called by every writer whose value the optimizer reads — the join-strategy bandit, the
     adaptive gate, partition sizing, and the column sketches. Only the *converged drift* of
-    an already-known cardinality is exempt (`_is_material`), because that write happens on
+    an already-known cardinality is exempt (`is_material_change`), because that write happens on
     every single execution and gating on it is what makes memoizing a plan possible at all.
     Bumping too often only costs a re-plan; bumping too rarely leaves a stale plan in place,
     so anything uncertain should bump."""
     global _GENERATION
     _GENERATION += 1
-
-
-def _bump_generation() -> None:
-    bump_generation()
 
 
 def is_material_change(prior: float | None, observed: float) -> bool:
@@ -135,26 +133,6 @@ def is_material_change(prior: float | None, observed: float) -> bool:
     if prior <= 0:
         return observed > 0
     return abs(observed - prior) / prior > _MATERIAL_CHANGE
-
-
-def _is_material(prior: float | None, observed: float) -> bool:
-    return is_material_change(prior, observed)
-
-
-def _smooth(prior: float, observed: float, n_obs: int) -> float:
-    """Exponentially smooth `prior` toward `observed`, with an observation-count floor.
-
-    The step is `max(floor, 1/(n_obs+1))`: a **running mean** while evidence is thin (so a
-    single anomalous early run cannot anchor the estimate), decaying into an EWMA with a
-    ~`1/floor`-observation memory once enough runs have accrued.
-
-    The floor is `learned_scalar_alpha_floor`, not `learning_smoothing_alpha`. The latter is
-    a *static blend weight* used elsewhere; at its value of 0.5 the newest run would always
-    carry half the weight, so `1/(n_obs+1)` would be dominated from the second observation
-    onward and the estimate would never converge.
-    """
-    alpha = max(active_config().optimizer.learned_scalar_alpha_floor, 1.0 / (n_obs + 1))
-    return alpha * observed + (1.0 - alpha) * prior
 
 
 #: The assembled bundle per hub, valid while the hub's two change counters stand still **and
@@ -230,6 +208,26 @@ def load_learned_stats(hub: MetadataHub | None) -> dict[str, Any]:
         stats[UDF_ROW_SECONDS_KEY] = udf_costs
     _BUNDLE_CACHE[hub] = (*fingerprint, stats)
     return stats
+
+
+def measured_corrections(hub: MetadataHub) -> dict[str, float]:
+    """The per-signature cardinality-correction factors currently in force on `hub`.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.kyber.learning import measured_corrections
+            >>> from batcher.metadata import MetadataHub
+            >>> measured_corrections(MetadataHub())
+            {}
+
+    Args:
+        hub: The metadata hub holding the measured q-error history.
+
+    Returns:
+        `{signature: factor}` for every shape with a confident correction.
+    """
+    return _cardinality_corrections(hub)
 
 
 def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
@@ -422,10 +420,10 @@ def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: in
         updated = (
             float(output_rows)
             if prior is None
-            else _smooth(prior, float(output_rows), entry.get("n_obs", 0))
+            else convergent_blend(prior, float(output_rows), entry.get("n_obs", 0))
         )
-        if _is_material(prior, updated):
-            _bump_generation()
+        if is_material_change(prior, updated):
+            bump_generation()
         entry["rows"] = updated
         entry["n_obs"] = entry.get("n_obs", 0) + 1
         hub.put_keyed_param(_NAMESPACE, sig, entry)
@@ -459,10 +457,15 @@ def record_selectivity(
         entry = dict(hub.get_keyed_param(_NAMESPACE, sig) or {})
         prior = entry.get("selectivity")
         n_obs = entry.get("sel_n_obs", 0)
-        entry["selectivity"] = sel if prior is None else _smooth(prior, sel, n_obs)
+        updated = sel if prior is None else convergent_blend(prior, sel, n_obs)
+        # The estimator reads this value, so a first write or a material correction must
+        # invalidate memoized plans; only converged drift is exempt (see `bump_generation`).
+        if is_material_change(prior, updated):
+            bump_generation()
+        entry["selectivity"] = updated
         entry["sel_n_obs"] = n_obs + 1
         hub.put_keyed_param(_NAMESPACE, sig, entry)
-    except Exception as exc:  # pragma: no cover - learning must never break execution
+    except Exception as exc:  # learning must never break execution
         note_suppressed("kyber", "persist a learned selectivity", exc)
 
 
@@ -544,7 +547,7 @@ def record_column_row_bytes_batch(
         return
     try:
         merge_column_table(hub, ROW_BYTES_KEY, widths_out)
-    except Exception as exc:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # learning must never break a query
         note_suppressed("kyber", "persist measured column row widths", exc)
 
 
@@ -649,7 +652,7 @@ def record_column_stats_batch(hub: MetadataHub | None, measured: Sequence[Measur
             # A column measured for the first time can change every join and group-by
             # estimate that reads it — the one column-stat event worth re-planning for.
             if any(name not in existing for name in ndv):
-                _bump_generation()
+                bump_generation()
             merge_column_table(hub, NDV_KEY, ndv, existing)
         if quantiles:
             merge_column_table(hub, QUANTILES_KEY, quantiles)

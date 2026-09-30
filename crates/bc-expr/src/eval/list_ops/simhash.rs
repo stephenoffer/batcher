@@ -31,21 +31,13 @@ use arrow::array::{Array, ArrayRef, Int64Builder, ListArray, ListBuilder};
 use arrow::datatypes::DataType;
 
 use crate::ExprError;
+use bc_arrow::hash::mix64;
 
 /// The `2^-64` scale that maps a `u64` to a uniform `(0, 1]`.
 const U64_SCALE: f64 = 1.0 / (u64::MAX as f64 + 1.0);
 
 /// Guards against a signature so wide it would blow up memory (and is never useful).
 const MAX_BITS: i64 = 4096;
-
-/// SplitMix64 — the finalizer Batcher already uses for `hash_rows`, so the projection is
-/// as well-distributed as the row digest and just as reproducible.
-fn mix64(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
 
 /// One standard-normal entry of the projection matrix, derived from its coordinates.
 ///

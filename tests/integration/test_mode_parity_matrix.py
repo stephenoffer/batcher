@@ -33,7 +33,7 @@ import pytest
 
 import batcher as bt
 from _harness import assert_tables_equal
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher import col, count
 
 pytest.importorskip("ray", reason="ray not installed")
@@ -43,11 +43,7 @@ WORKERS = 2
 ROWS = 12_000
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(4)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(4)
 
 
 @pytest.fixture(scope="module")

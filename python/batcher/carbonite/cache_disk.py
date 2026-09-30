@@ -29,10 +29,12 @@ sheds first are the cheap ones, which are also the ones least worth writing down
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import hashlib
 import shutil
 import threading
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -89,6 +91,7 @@ class DiskCacheTier:
     """
 
     __slots__ = (
+        "__weakref__",  # the exit hook in `_ensure_store` holds the tier weakly
         "_entries",
         "_evictions",
         "_hits",
@@ -327,13 +330,19 @@ class DiskCacheTier:
         from batcher.carbonite.spill.scratch import make_store, scratch_dir
 
         try:
-            work_dir, _owns = scratch_dir(None, "batcher_cache_")
+            work_dir, owns = scratch_dir(None, "batcher_cache_")
             self._store = make_store(work_dir)
         except Exception as exc:
             note_suppressed("carbonite", "open the result cache's disk tier", exc)
             self._max_bytes = 0  # stop retrying a directory that cannot be made
             return None
         self._work_dir = work_dir
+        if owns:
+            # The directory is named per process, so nothing can read it after this one exits;
+            # without this every process that ever demoted a result left one behind. A day of
+            # test runs on one box left 60 of them, 1 GB. Weak, so the hook never keeps a
+            # cache alive; `clear` is idempotent, so a cache cleared earlier costs nothing.
+            atexit.register(_clear_at_exit, weakref.ref(self))
         return self._store
 
     def _release_locked(self, key: str) -> None:
@@ -363,3 +372,11 @@ class DiskCacheTier:
             entry = self._entries.pop(key)
             self._drop_locked(entry)
             self._evictions += 1
+
+
+def _clear_at_exit(ref: weakref.ref) -> None:
+    """Remove a disk tier's scratch directory at interpreter exit, if the tier still exists."""
+    tier = ref()
+    if tier is not None:
+        with contextlib.suppress(Exception):
+            tier.clear()

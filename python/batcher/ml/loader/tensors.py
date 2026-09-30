@@ -11,6 +11,8 @@ import warnings
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.errors import PlanError
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -140,14 +142,14 @@ class DeviceMover:
 
     def _move_all(self, out: Any, staging: list) -> Any:
         if isinstance(out, dict):
-            return {k: self._move(v, staging) for k, v in out.items()}
-        return self._move(out, staging)
+            return {k: self._move(v, staging, str(k)) for k, v in out.items()}
+        return self._move(out, staging, "the batch")
 
-    def _move(self, t: Any, staging: list) -> Any:
+    def _move(self, t: Any, staging: list, name: str) -> Any:
         if not hasattr(t, "to"):
             return t
         if self._is_mps:
-            t = _mps_safe_dtype(t)
+            t = _mps_safe_dtype(t, name)
         if self._pin and hasattr(t, "pin_memory"):
             t = t.pin_memory()
             staging.append(t)  # the DMA source — must outlive the copy
@@ -173,12 +175,41 @@ def _copy_stream(device: Any) -> Any:
     return torch.cuda.Stream()
 
 
-def _mps_safe_dtype(tensor: Any) -> Any:
-    """Downcast a 64-bit tensor to 32-bit (MPS supports no 64-bit dtypes)."""
+def _mps_safe_dtype(tensor: Any, name: str) -> Any:
+    """Downcast a 64-bit tensor to 32-bit (MPS supports no 64-bit dtypes), refusing any loss.
+
+    The narrowing is only safe for the values that fit. An int64 id or epoch-nanosecond
+    timestamp past the int32 range would wrap to a different, plausible-looking number, and a
+    float64 magnitude past float32's range would become infinity. Both raise instead, naming
+    the column, because the fix (cast or rescale it in the plan) is the user's call. A float64
+    column that fits still loses precision, which is the inherent cost of MPS: that is warned
+    about rather than hidden.
+    """
     import torch
 
-    if tensor.dtype == torch.float64:
-        return tensor.to(torch.float32)
     if tensor.dtype == torch.int64:
+        info = torch.iinfo(torch.int32)
+        if tensor.numel() and (int(tensor.min()) < info.min or int(tensor.max()) > info.max):
+            raise PlanError(
+                f"column {name!r} holds int64 values outside the int32 range, and Apple MPS has "
+                "no 64-bit integers, so moving it to the device would wrap them. Cast or "
+                "re-encode the column in the plan (for example to float32 or a dense id), or "
+                "load on the CPU."
+            )
         return tensor.to(torch.int32)
+    if tensor.dtype == torch.float64:
+        finite = tensor[torch.isfinite(tensor)]
+        if finite.numel() and float(finite.abs().max()) > torch.finfo(torch.float32).max:
+            raise PlanError(
+                f"column {name!r} holds float64 values beyond the float32 range, and Apple MPS "
+                "has no 64-bit floats, so moving it to the device would turn them into "
+                "infinity. Rescale the column in the plan, or load on the CPU."
+            )
+        warnings.warn(
+            f"column {name!r} is float64; Apple MPS has no 64-bit floats, so it is moved as "
+            "float32 and loses precision. Cast it in the plan to make the choice explicit.",
+            UserWarning,
+            stacklevel=4,
+        )
+        return tensor.to(torch.float32)
     return tensor

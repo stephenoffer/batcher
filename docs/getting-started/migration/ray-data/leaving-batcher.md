@@ -14,14 +14,21 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Ray Data
 
-The following table maps 111 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
+The following table maps 118 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
 
 | Batcher | Ray Data |
 |---|---|
 | `**` operator | `Expr.power` |
 | `-` operator | `Expr.negate` |
 | `batcher.ml.Chain` | `preprocessors.Chain` |
+| `batcher.ml.LabelEncoder` | `preprocessors.LabelEncoder` |
+| `batcher.ml.MaxAbsScaler` | `preprocessors.MaxAbsScaler` |
+| `batcher.ml.MinMaxScaler` | `preprocessors.MinMaxScaler` |
+| `batcher.ml.Normalizer` | `preprocessors.Normalizer` |
+| `batcher.ml.OrdinalEncoder` | `preprocessors.OrdinalEncoder` |
 | `batcher.ml.Preprocessor` | `Preprocessor.fit_transform`, `Preprocessor.fit`, `Preprocessor.transform`, `ray.data.Preprocessor` |
+| `batcher.ml.SimpleImputer` | `preprocessors.SimpleImputer` |
+| `batcher.ml.StandardScaler` | `preprocessors.StandardScaler` |
 | {py:obj}`bt.all <batcher.all>` | `expressions.star` |
 | {py:obj}`bt.col <batcher.col>` | `expressions.col` |
 | {py:obj}`bt.Dataset <batcher.Dataset>` | `ray.data.Dataset` |

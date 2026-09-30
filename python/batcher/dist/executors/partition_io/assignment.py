@@ -22,12 +22,12 @@ tolerance, so a skewed intermediate keeps its parallelism.
 from __future__ import annotations
 
 import heapq
-import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
 from batcher._internal.mathx import ceil_div
+from batcher.config.env import env_int
 
 __all__ = [
     "assign_clustered_splits",
@@ -45,7 +45,7 @@ __all__ = [
 # this many splits there is ample parallelism for equal-count packing to balance well, and
 # splits that already carry their count (row-group splits, shuffle buckets) keep using it
 # at any scale. Same default and the same reasoning as the footer-planning cap.
-_MAX_WEIGHED_SPLITS = max(1, int(os.environ.get("BATCHER_MAX_WEIGHED_SPLITS", "10000")))
+_MAX_WEIGHED_SPLITS = env_int("BATCHER_MAX_WEIGHED_SPLITS", 10000, floor=1)
 
 # How much heavier the busiest worker may get, relative to an even share, before locality
 # is judged to have cost more parallelism than it saved network. At 2.0 a worker may carry
@@ -60,9 +60,11 @@ S = TypeVar("S")
 def _balance(
     splits: list[S], workers: int, capacities: Sequence[float] | None = None
 ) -> list[list[S]]:
-    """Greedily bin-pack splits into `workers` groups balanced by row count.
+    """Greedily bin-pack splits into `workers` groups balanced by bytes, else row count.
 
-    Splits with an unknown row count are weighted as 1 so they spread evenly.
+    When every split carries its uncompressed byte size (`_byte_weights`) the groups balance
+    decode work; otherwise they balance rows, and a split with an unknown row count is
+    weighted as 1 so they spread evenly.
     Largest-first assignment keeps the per-worker load roughly equal.
 
     `capacities` makes "equal" mean *equal finishing time* rather than equal rows, for a fleet
@@ -75,11 +77,11 @@ def _balance(
     not the machine.
 
     `None` (the default) weighs every worker equally, which is exactly right on a uniform
-    fleet and is what every caller got before this existed.
+    fleet.
 
-    Weights are computed once (`split_weights`) rather than per comparison: this used to ask
-    each split for its row count twice, and for a whole-file split that question is a
-    footer read, so assigning N files cost 2N metadata round trips before a worker started.
+    Weights are computed once (`split_weights`) rather than per comparison: for a whole-file
+    split the row count is a footer read, so asking per comparison would cost assigning N
+    files 2N metadata round trips before a worker started.
     The least-loaded worker comes off a heap for the same reason — a linear scan per split
     is O(splits x workers), which is the driver's whole prologue on a wide fleet. Measured
     with an already-known weight (so the footer reads are not even in it): 50,000 splits
@@ -89,7 +91,7 @@ def _balance(
     groups: list[list[S]] = [[] for _ in range(workers)]
     if workers <= 0 or not splits:
         return groups
-    weights = split_weights(splits)
+    weights = _byte_weights(splits) or split_weights(splits)
     caps = _capacities(capacities, workers)
     loads = [0.0] * workers
     # (load / capacity, worker): ties break on the lower worker index, as the linear scan did.
@@ -136,7 +138,7 @@ def _contiguous(splits: list[S], workers: int) -> list[list[S]]:
     groups: list[list[S]] = [[] for _ in range(workers)]
     if workers <= 0 or not splits:
         return groups
-    weights = split_weights(splits)
+    weights = _byte_weights(splits) or split_weights(splits)
     target = max(1, ceil_div(sum(weights), workers))  # ceil per group
     w, load = 0, 0
     for s, weight in zip(splits, weights, strict=True):
@@ -315,11 +317,30 @@ def _weight(split: object) -> int:
     return rows or 1
 
 
+def _byte_weights(splits: Sequence[object]) -> list[int] | None:
+    """Every split's uncompressed bytes, when every split already carries them; else None.
+
+    Rows are a proxy for read work that fails exactly where scans are heterogeneous: two
+    row groups of a million rows each cost the same to count and very different amounts to
+    decode when one table is three integer columns and the other carries a 4 KiB string per
+    row. Bytes track decode work far more closely, so they win when they are free. The rule
+    is all-or-nothing because a packer comparing one split's bytes against another's rows is
+    comparing different units.
+    """
+    out = []
+    for split in splits:
+        nbytes = getattr(split, "nbytes", None)
+        if not isinstance(nbytes, int) or nbytes <= 0:
+            return None
+        out.append(nbytes)
+    return out
+
+
 def split_weights(splits: Sequence[object]) -> list[int]:
     """Every split's load weight, each computed at most once.
 
-    Shared with `descriptor_rows`, which sizes a task's CPU share by its data and used to
-    ask the same expensive question a second time.
+    Shared with `descriptor_rows`, which sizes a task's CPU share by its data, so the
+    expensive question is asked once.
 
     Above `_MAX_WEIGHED_SPLITS` a weight that is not already known is taken as 1 instead of
     being read off storage: at that scale the metadata reads dominate the driver and

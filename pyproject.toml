@@ -222,6 +222,10 @@ tabular = ["batcher-engine[xgboost,lightgbm,catboost,onnx,sklearn]"]
 dev = [
     "maturin>=1.7,<2",
     "pytest>=8",
+    # `ci.yml` and `ml-frameworks.yml` pass `--timeout` on every integration and backend run,
+    # which is this plugin's option: without it declared, a clean `.[dev]` install rejects the
+    # flag and the step fails before collecting anything.
+    "pytest-timeout>=2",
     "pytest-benchmark>=4",
     "pytest-cov>=5",
     "hypothesis>=6",
@@ -523,3 +527,5 @@ ignore = ["RUF003"]
 # makes it importable — a script has to work when run directly, not only under the
 # test runner, so there is nowhere earlier to put it.
 "examples/**" = ["ARG", "E402"]
+# The diagram generators embed SVG markup (paths, style blocks) as string literals.
+"tools/diagrams/**" = ["E501"]

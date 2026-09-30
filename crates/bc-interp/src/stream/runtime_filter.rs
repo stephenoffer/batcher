@@ -56,6 +56,7 @@ use arrow::array::RecordBatch;
 use bc_ir::{JoinType, RelOp};
 use bc_runtime::join::KeyFilter;
 
+use super::meter::Meter;
 use super::{node_key, BuildCache};
 use crate::error::InterpError;
 use crate::ops;
@@ -190,36 +191,80 @@ fn switch() -> Switch {
 /// Runs once per query, after [`super::prebuild_joins`] has filled `cache` — every key set it
 /// reads is therefore already computed, and this adds one pass over each build side's key
 /// column, no execution.
+///
+/// `driving` is `(source id, rows)` for a relation the executor streams rather than holds: its
+/// entry in `sources` is then a zero-row schema carrier, and without its real size both the
+/// [`MIN_SOURCE_ROWS`] gate and each join's probe-size estimate would read it as empty. That is
+/// what kept every filter off for TPC-H at sf10 and sf100, whose `lineitem` is streamed.
 pub(crate) fn plan_filters(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
     cache: &BuildCache,
+    driving: Option<(usize, usize)>,
+    meter: Option<&Meter>,
 ) -> RuntimeFilters {
     let mut out = RuntimeFilters::new();
+    let rows = SourceRows {
+        sources,
+        driving,
+        meter,
+    };
     let engage = match switch() {
         Switch::Off => false,
         Switch::Force => true,
-        Switch::Default => worth_filtering(sources),
+        Switch::Default => worth_filtering(&rows),
     };
     if engage {
-        collect(plan, cache, &mut out);
+        collect(plan, cache, &rows, &mut out);
     }
     out
+}
+
+/// Row counts of a query's relations, with a streamed relation's real size in place of its
+/// zero-row carrier (see [`plan_filters`]).
+struct SourceRows<'a> {
+    sources: &'a [Vec<RecordBatch>],
+    driving: Option<(usize, usize)>,
+    /// The query's meter, told which operators each placed filter reduces the input of.
+    meter: Option<&'a Meter>,
+}
+
+impl SourceRows<'_> {
+    fn of(&self, source_id: usize) -> usize {
+        match self.driving {
+            Some((id, rows)) if id == source_id => rows,
+            _ => self.sources.get(source_id).map_or(0, |relation| {
+                relation.iter().map(RecordBatch::num_rows).sum::<usize>()
+            }),
+        }
+    }
+
+    fn largest(&self) -> usize {
+        (0..self.sources.len())
+            .map(|i| self.of(i))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Rows scanned anywhere under `plan`: an upper bound on the rows a probe side can feed its
+    /// join, which is all [`KeyFilter::build_for_probe`] needs to judge the ratio.
+    fn scanned(&self, plan: &RelOp) -> usize {
+        match plan {
+            RelOp::Scan { source_id } => self.of(*source_id),
+            _ => plan.children().iter().map(|c| self.scanned(c)).sum(),
+        }
+    }
 }
 
 /// Whether this query's inputs are large enough for runtime filtering to pay — see
 /// [`MIN_SOURCE_ROWS`]. Reads the *largest* relation, not the total: one big fact table joined
 /// against several small dimensions is exactly the shape that benefits, and summing would let a
 /// pile of small inputs qualify a query that has no large probe side to reduce.
-fn worth_filtering(sources: &[Vec<RecordBatch>]) -> bool {
-    sources
-        .iter()
-        .map(|relation| relation.iter().map(RecordBatch::num_rows).sum::<usize>())
-        .max()
-        .is_some_and(|rows| rows >= MIN_SOURCE_ROWS)
+fn worth_filtering(rows: &SourceRows<'_>) -> bool {
+    rows.largest() >= MIN_SOURCE_ROWS
 }
 
-fn collect(plan: &RelOp, cache: &BuildCache, out: &mut RuntimeFilters) {
+fn collect(plan: &RelOp, cache: &BuildCache, rows: &SourceRows<'_>, out: &mut RuntimeFilters) {
     if let RelOp::HashJoin {
         left,
         left_keys,
@@ -228,14 +273,18 @@ fn collect(plan: &RelOp, cache: &BuildCache, out: &mut RuntimeFilters) {
         ..
     } = plan
     {
-        place_for_join(plan, left, left_keys, right_keys, *join_type, cache, out);
+        let probe_rows = rows.scanned(left);
+        place_for_join(
+            plan, left, left_keys, right_keys, *join_type, cache, probe_rows, rows.meter, out,
+        );
     }
     for child in plan.children() {
-        collect(child, cache, out);
+        collect(child, cache, rows, out);
     }
 }
 
 /// Place one join's filter, if it has one to give.
+#[allow(clippy::too_many_arguments)]
 fn place_for_join(
     join: &RelOp,
     probe: &RelOp,
@@ -243,29 +292,52 @@ fn place_for_join(
     right_keys: &[String],
     join_type: JoinType,
     cache: &BuildCache,
+    probe_rows: usize,
+    meter: Option<&Meter>,
     out: &mut RuntimeFilters,
 ) {
     // `Inner`/`Semi` only — see the module note on which sides may be reduced.
     if !matches!(join_type, JoinType::Inner | JoinType::Semi) {
         return;
     }
-    // A single equi-key: a composite key would need the row encoding the join's own hash table
-    // already owns, and digesting one column of it would be a filter on a *projection* of the
-    // key — still sound, but far weaker, and not worth a second encoding path here.
-    let ([probe_key], [build_key]) = (left_keys, right_keys) else {
-        return;
-    };
+    // One key column's digest. For a composite key it is a filter on a *projection* of the
+    // key: weaker than the key itself, and still sound, because a probe row whose value for one
+    // key column is absent from the build side cannot match on all of them. The most selective
+    // column is kept (the fewest distinct build values). TPC-H q20 semi-joins `lineitem` on
+    // `(l_partkey, l_suppkey)` to 86K `partsupp` rows whose part keys are 21.5K of 2M, so the
+    // `l_partkey` digest alone drops ~99% of the scan ahead of its date filter; the single-key
+    // rule this replaces placed no filter at all.
     let Some(prepared) = cache.get(&node_key(join)) else {
         return;
     };
-    let Ok(build_col) = ops::columns_by_name(&prepared.side, std::slice::from_ref(build_key))
-    else {
-        return;
-    };
-    let Some(filter) = build_col.first().and_then(KeyFilter::build) else {
+    let mut best: Option<(KeyFilter, &String)> = None;
+    for (probe_key, build_key) in left_keys.iter().zip(right_keys) {
+        let Ok(build_col) = ops::columns_by_name(&prepared.side, std::slice::from_ref(build_key))
+        else {
+            continue;
+        };
+        let Some(filter) = build_col
+            .first()
+            .and_then(|keys| KeyFilter::build_for_probe(keys, Some(probe_rows)))
+        else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(b, _)| filter.distinct_keys() < b.distinct_keys())
+        {
+            best = Some((filter, probe_key));
+        }
+    }
+    let Some((filter, probe_key)) = best else {
         return;
     };
     let (target, column) = sink_target(probe, probe_key);
+    if let Some(meter) = meter {
+        for node in path_to(probe, target) {
+            meter.mark_runtime_filtered(node);
+        }
+    }
     out.entry(node_key(target))
         .or_default()
         .push(PendingFilter {
@@ -274,6 +346,23 @@ fn place_for_join(
             gauge: Gauge::default(),
             force: switch() == Switch::Force,
         });
+}
+
+/// The nodes from `from` down to `target`, excluding `target`: the operators that consume the
+/// rows a filter placed on `target`'s output removes, found by address because [`sink_target`]
+/// only ever descends to a child. Empty when `target` is `from` or not beneath it.
+fn path_to<'a>(from: &'a RelOp, target: &RelOp) -> Vec<&'a RelOp> {
+    if std::ptr::eq(from, target) {
+        return Vec::new();
+    }
+    for child in from.children() {
+        let mut path = path_to(child, target);
+        if !path.is_empty() || std::ptr::eq(child, target) {
+            path.insert(0, from);
+            return path;
+        }
+    }
+    Vec::new()
 }
 
 /// The deepest node in `probe` whose output still carries the join key, and the key's name there.
@@ -669,5 +758,176 @@ mod tests {
             g.record(GAUGE_WARMUP_ROWS, GAUGE_WARMUP_ROWS / 10);
         }
         assert!(g.enabled());
+    }
+
+    /// A streamed probe relation is a zero-row carrier in `sources`, so only the driving-row
+    /// hint can tell placement how large it is. With the hint, a build side too sparse for the
+    /// probe limits is digested for a probe side 300x its size; without it, the same plan
+    /// places nothing, because the carrier reads as empty. The second half is the control that
+    /// makes the first mean something: it is the behaviour before the hint existed.
+    #[test]
+    fn a_driving_row_hint_places_a_filter_the_carrier_alone_cannot() {
+        use std::sync::Arc;
+
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let probe = Arc::new(Schema::new(vec![Field::new(
+            "l_orderkey",
+            DataType::Int64,
+            true,
+        )]));
+        let carrier = RecordBatch::new_empty(probe);
+        let keys: Vec<i64> = (0..70_000i64).map(|i| i * 100).collect();
+        let build = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "o_orderkey",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from(keys))],
+        )
+        .unwrap();
+        let sources = vec![vec![carrier], vec![build]];
+        let plan = inner_join(
+            scan(0),
+            scan(1),
+            &[(bc_ir::JoinSide::Left, "l_orderkey", "l_orderkey")],
+        );
+        let RelOp::HashJoin { left, .. } = &plan else {
+            unreachable!()
+        };
+        let placed = |driving| {
+            let cache = crate::stream::builds::prebuild_joins_for_chunks(
+                &plan, &sources, None, 0, 1, None, driving,
+            )
+            .unwrap();
+            cache
+                .filters_for(node_key(left))
+                .map(<[PendingFilter]>::len)
+        };
+        assert_eq!(placed(Some((0, 70_000 * 300))), Some(1));
+        assert_eq!(placed(None), None);
+    }
+
+    /// A composite key places one filter, on the key column with the fewest distinct build
+    /// values — TPC-H q20's `(l_partkey, l_suppkey)` shape. The build side's `a` column holds 10
+    /// values and its `b` column 70,000, so the digest must test the probe's `pa`, not `pb`; the
+    /// order of the key pairs is reversed as well, so the first pair winning by position would
+    /// pick the wrong column.
+    #[test]
+    fn a_composite_key_filters_on_its_most_selective_column() {
+        use std::sync::Arc;
+
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let int = |n: &str| Field::new(n, DataType::Int64, true);
+        let carrier = RecordBatch::new_empty(Arc::new(Schema::new(vec![int("pa"), int("pb")])));
+        let build = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![int("a"), int("b")])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..70_000i64).map(|i| i % 10 * 7),
+                )),
+                Arc::new(Int64Array::from_iter_values((0..70_000i64).map(|i| i * 3))),
+            ],
+        )
+        .unwrap();
+        let sources = vec![vec![carrier], vec![build]];
+        let plan = RelOp::HashJoin {
+            left: Box::new(scan(0)),
+            right: Box::new(scan(1)),
+            left_keys: vec!["pb".into(), "pa".into()],
+            right_keys: vec!["b".into(), "a".into()],
+            join_type: JoinType::Semi,
+            output: vec![bc_ir::JoinOutputCol {
+                side: bc_ir::JoinSide::Left,
+                name: "pa".into(),
+                alias: "pa".into(),
+            }],
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+        let RelOp::HashJoin { left, .. } = &plan else {
+            unreachable!()
+        };
+        let cache = crate::stream::builds::prebuild_joins_for_chunks(
+            &plan,
+            &sources,
+            None,
+            0,
+            1,
+            None,
+            Some((0, 70_000 * 300)),
+        )
+        .unwrap();
+        let placed = cache
+            .filters_for(node_key(left))
+            .expect("a filter is placed");
+        assert_eq!(
+            placed.len(),
+            1,
+            "one filter per join, not one per key column"
+        );
+        assert_eq!(placed[0].column, "pa");
+        assert_eq!(placed[0].filter.distinct_keys(), 10);
+    }
+
+    /// The meter lists exactly the operators between a placed filter and its join: here the
+    /// `Filter` and `Project` above the filtered scan. The scan's own count is taken before the
+    /// filter acts and the join's output is exact, so listing either would withhold a true
+    /// count from the learning loop — the control that the list is not simply "everything".
+    #[test]
+    fn the_meter_lists_the_operators_a_placed_filter_reduces() {
+        use std::sync::Arc;
+
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let carrier = RecordBatch::new_empty(Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, true),
+            Field::new("keep", DataType::Boolean, true),
+        ])));
+        let build = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "o_orderkey",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..70_000i64).map(|i| i * 100),
+            ))],
+        )
+        .unwrap();
+        let sources = vec![vec![carrier], vec![build.clone()]];
+        let probe = project(
+            RelOp::Filter {
+                input: Box::new(scan(0)),
+                predicate: col("keep"),
+            },
+            &[("l_orderkey", col("l_orderkey"))],
+        );
+        let plan = inner_join(
+            probe,
+            scan(1),
+            &[(bc_ir::JoinSide::Left, "l_orderkey", "l_orderkey")],
+        );
+        let meter = crate::stream::meter::Meter::new(&plan, 1);
+        crate::stream::builds::prebuild_joins_for_chunks(
+            &plan,
+            &sources,
+            Some(&meter),
+            0,
+            1,
+            None,
+            Some((0, 70_000 * 300)),
+        )
+        .unwrap();
+        // Pre-order: join 0, project 1, filter 2, scan 3, build scan 4. Every operator must have
+        // run to be reported at all.
+        for id in 0..5 {
+            meter.morsel(id, 1, &build, 1);
+        }
+        assert_eq!(meter.finish().runtime_filtered, vec![1, 2]);
     }
 }

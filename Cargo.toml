@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/stephenoffer/batcher"
 authors = ["Batcher contributors"]
@@ -101,7 +101,6 @@ ahash = "0.8"
 # bc-py-only-PyO3 rule — `tracing-subscriber` (the install side) lives only in bc-py.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-smallvec = "1"
 indexmap = "2"
 hashbrown = "0.15"
 rayon = "1"

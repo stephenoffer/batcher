@@ -87,6 +87,7 @@ def translate_ast(
     # anything reads the tree, so every clause sees one spelling of set membership rather
     # than each having to learn a second.
     subquery.normalize_quantified(ast)
+    ast = windowing.normalize_limit_modifiers(ast)
     return _Translator(registry, functions or {}, models or {}, engines or {}).statement(ast)
 
 

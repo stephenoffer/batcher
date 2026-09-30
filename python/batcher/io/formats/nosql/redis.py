@@ -139,25 +139,44 @@ class RedisSource(ScanSource):
 def _scan_range(client: Any, slot_range: _SlotRange, match: str) -> Iterator[dict[str, Any]]:
     """Yield ``{"key", "value"}`` rows for keys whose slot is in `slot_range`.
 
-    Walks the full keyspace with ``SCAN`` and keeps only keys whose cluster hash
-    slot falls in the half-open range, so concurrently-run ranges form a disjoint
-    cover. ``CLUSTER KEYSLOT`` computes the slot the same way the server does.
+    Walks the full keyspace with ``SCAN`` and keeps only keys whose cluster hash slot falls
+    in the half-open range, so concurrently-run ranges form a disjoint cover.
+
+    Each ``SCAN`` page costs at most two round trips, not two per key. The slot is computed
+    locally (`_crc16_slot` is the algorithm the server's ``CLUSTER KEYSLOT`` runs, hashtags
+    included), where it used to be asked of the server once per key on a cluster; and the
+    page's values are fetched in one non-transactional pipeline, where it used to be one
+    ``GET`` each. A keyspace of a million keys went from two million round trips to about
+    two thousand. A client with no ``pipeline`` falls back to one ``GET`` per key.
     """
     start, end = slot_range
     cursor = 0
     while True:
         cursor, keys = client.scan(cursor=cursor, match=match, count=1000)
-        for key in keys:
-            slot = client.cluster("KEYSLOT", key) if _is_cluster(client) else _crc16_slot(key)
-            if start <= slot < end:
-                yield {"key": key, "value": client.get(key)}
+        mine = [key for key in keys if start <= _crc16_slot(_as_text(key)) < end]
+        yield from (
+            {"key": k, "value": v} for k, v in zip(mine, _get_many(client, mine), strict=True)
+        )
         if cursor == 0:
             return
 
 
-def _is_cluster(client: Any) -> bool:
-    """Whether `client` is a Redis Cluster client (has a ``cluster`` command)."""
-    return hasattr(client, "cluster")
+def _as_text(key: Any) -> str:
+    """A key as text, for slot hashing; a client without ``decode_responses`` returns bytes."""
+    return key.decode("utf-8", "surrogateescape") if isinstance(key, bytes) else str(key)
+
+
+def _get_many(client: Any, keys: list[Any]) -> list[Any]:
+    """Every value in `keys`, in order, in one pipelined round trip where the client allows."""
+    if not keys:
+        return []
+    pipeline = getattr(client, "pipeline", None)
+    if pipeline is None:
+        return [client.get(key) for key in keys]
+    pipe = pipeline(transaction=False)
+    for key in keys:
+        pipe.get(key)
+    return list(pipe.execute())
 
 
 def _crc16_slot(key: str) -> int:

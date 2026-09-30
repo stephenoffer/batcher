@@ -81,16 +81,14 @@ pub(crate) fn materialize_is_safe_and_faster(
     prefer_aggregate: bool,
     materialize_fits: bool,
     aggregate_materialize_fits: bool,
-    sideways: bool,
 ) -> bool {
+    // Kyber's sideways verdict is not a reason to materialize any more: the streaming executor
+    // restricts a build-side aggregate to its probe keys itself (`stream::builds`, on
+    // `ExecOptions::prefer_sideways`), where it keeps every other join on the spine streaming.
+    // Routing on it sent whole join-heavy plans here instead: TPC-H q21 at sf10 ran 650 ms
+    // materialized against 215 ms streaming, and q18, whose verdict comes and goes with its
+    // estimates, lost 272 -> 310 ms whenever it was set.
     (!bc_interp::streaming_parallelizes(plan) && materialize_fits)
-        // A third reason under the first reason's conservative guard: a build-side aggregate
-        // the materializing executor restricts to the probe side's keys and the streaming one
-        // computes whole. `sideways` is Kyber's size verdict ANDed with the engine's structural
-        // check (`bc_interp::sideways_candidate`). Join intermediates are materialized here too,
-        // so it keeps the capacity-based headroom test that keeps join-heavy plans off this
-        // executor on a box too small for them.
-        || (sideways && materialize_fits)
         || (prefer_aggregate
             && bc_interp::materializing_aggregate_is_faster(plan)
             && aggregate_materialize_fits)

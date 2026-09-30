@@ -68,7 +68,7 @@ class Report:
         return out
 
 
-class SiteRecorder(cst.CSTTransformer):  # type: ignore[misc]
+class SiteRecorder(cst.CSTTransformer):
     """A transformer that tracks scopes and statements and records sites against them."""
 
     METADATA_DEPENDENCIES = (metadata.PositionProvider,)
@@ -200,7 +200,7 @@ def referenced_names(module: Any) -> dict[str, int]:
     """
     counts: dict[str, int] = {}
 
-    class _Count(cst.CSTVisitor):  # type: ignore[misc]
+    class _Count(cst.CSTVisitor):
         def __init__(self) -> None:
             super().__init__()
             self.labels: set[int] = set()
@@ -254,7 +254,7 @@ def _package(stmt: Any) -> str | None:
     return None
 
 
-class _Finish(cst.CSTTransformer):  # type: ignore[misc]
+class _Finish(cst.CSTTransformer):
     def __init__(self, package: str, markers: dict[int, list[str]], counts: dict[str, int]):
         super().__init__()
         self.package = package

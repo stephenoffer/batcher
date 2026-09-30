@@ -40,7 +40,6 @@ from batcher.io.splits.file import (
 from batcher.io.splits.parquet import (
     RowGroupSplit,
     fragment_index,
-    pack_row_groups,
     parquet_row_group_splits,
 )
 from batcher.io.splits.text import TextRangeSplit, line_range_splits
@@ -62,7 +61,6 @@ __all__ = [
     "group_by_clustering",
     "line_range_splits",
     "pack_files",
-    "pack_row_groups",
     "parquet_row_group_splits",
     "read_aligned_range",
 ]

@@ -67,7 +67,7 @@ def _collector_with_one_op() -> ProfileCollector:
 
 
 def test_event_log_writes_document_and_prunes(tmp_path):
-    from batcher.api.terminal.event_log import _prune, write_event_log
+    from batcher.api.terminal.event_log import _prune, flush_event_log, write_event_log
     from batcher.config import active_config, set_config
 
     prev = active_config()
@@ -76,6 +76,7 @@ def test_event_log_writes_document_and_prunes(tmp_path):
     )
     try:
         write_event_log(_collector_with_one_op(), total_ms=1.5, rows=3)
+        assert flush_event_log(10.0)  # the document is written off the caller's path
         files = list(tmp_path.glob("*.json"))
         assert len(files) == 1
         doc = json.loads(files[0].read_text())

@@ -44,6 +44,7 @@ import batcher as bt  # noqa: E402
 from _harness import assert_same  # noqa: E402
 from batcher.api.terminal.gpu_backend.verify import compare_results  # noqa: E402
 from batcher.core.gpu_plan import DfBackend, gpu_plan_ops  # noqa: E402
+from batcher.core.gpu_plan.backend import Unsupported, _carries_nan  # noqa: E402
 from batcher.core.gpu_plan.execute import run_chain  # noqa: E402
 
 #: Operators `eligibility` matches as a plan *shape* rather than as a chain step, so they are
@@ -66,6 +67,11 @@ STRUCTURAL = frozenset(
         "join_left_str",
         "join_semi_str",
         "join_anti_str",
+        # Added with the operator matrix's right and cross joins. Both reach the device through
+        # `gpu_join_spec` like the joins above -- as `right`, and as an `inner` join under the
+        # projection a cross join lowers to (verified directly) -- so they are structural too.
+        "join_right",
+        "cross_join",
     }
 )
 
@@ -117,7 +123,16 @@ def _translated(op: str, shape: str, be: DfBackend):
     spec = gpu_plan_ops(dataset._plan)
     if spec is None:
         return None
-    return be.to_arrow(run_chain(table, spec[1], be)), dataset.collect()
+    try:
+        device = run_chain(table, spec[1], be)
+    except Unsupported:
+        # A decline is the contract's safe answer, but only one decline is expected here: the
+        # host backend under pandas 3, which refuses a NaN-bearing input rather than read NaN as
+        # missing. Anything else declining is a regression and must still fail.
+        if not (be.nan_is_missing and _carries_nan(table)):
+            raise
+        pytest.skip(f"{be.lib.__name__} {be.lib.__version__} declines NaN-bearing input")
+    return be.to_arrow(device), dataset.collect()
 
 
 @pytest.mark.parametrize("op", sorted(set(UNORDERED_OPS) - STRUCTURAL - set(DECLINED)))

@@ -27,7 +27,7 @@ test-py:
 # those Ray/adaptive-learning tests are stable on their own (`just test-py`) but
 # flake under coverage instrumentation's timing, which would make the gate
 # non-deterministic. They still run for correctness in `test-py`.
-COV_PATHS := "tests/unit tests/differential tests/property tests/io tests/docs"
+COV_PATHS := "tests/unit tests/differential tests/property tests/io tests/docs tests/migrate"
 
 # Measure Python control-plane coverage (terminal + HTML report).
 cov-py:
@@ -69,8 +69,8 @@ fmt:
 
 # Lint + format-check the Python control plane (ruff).
 lint-py:
-    ruff check python tests benchmarks examples
-    ruff format --check python tests benchmarks examples
+    ruff check python tests benchmarks examples tools
+    ruff format --check python tests benchmarks examples tools
 
 # Auto-fix + format the Python control plane (ruff).
 fmt-py:
@@ -216,12 +216,8 @@ lint-tests:
 # CANNOT fail; this catches the neighbouring, harder case — the test, example or benchmark
 # that can fail but has been arranged so that it does not. Every finding here runs real
 # code, takes real time, and turns green, so reading the output cannot tell it from a
-# working check. First run found 18 (11 high): three SQL differentials comparing an
-# `ORDER BY` result order-blind, two parametrizes over a directory walk that would have
-# turned 510 executed examples into zero tests without failing anything, seven examples
-# asserting nothing, a `pytest.skip` hiding 48 of one test's 98 cases behind a bare
-# `except`, and two absence-assertions with no positive control. It also carries one
-# RATCHET (`benchmark-unguarded-build`, 60) rather than gating on it — a permanently-red
+# working check. `.claude/rules/testing.md` lists what it flags. It also carries one
+# RATCHET (`benchmark-unguarded-build`) rather than gating on it — a permanently-red
 # gate is one everybody learns to walk past, which is what `skip_budget.json` became.
 lint-methodology:
     python tools/lint_methodology.py

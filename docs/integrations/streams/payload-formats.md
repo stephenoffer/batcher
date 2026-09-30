@@ -222,7 +222,7 @@ schema = pa.schema(
         ("value", pa.binary()),
         ("partition", pa.int64()),
         ("offset", pa.int64()),
-        ("timestamp", pa.int64()),
+        ("timestamp", pa.timestamp("ms")),
         ("topic", pa.string()),
     ]
 )

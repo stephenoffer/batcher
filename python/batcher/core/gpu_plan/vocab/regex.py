@@ -3,11 +3,11 @@
 A regex is the one thing in this package that cannot be checked by construction: the engine
 compiles Rust's `regex`, the verification backend compiles Python's `re`, and the device
 compiles cuDF's own, and the three disagree on exactly the constructs a test over ASCII data
-would never reach. That is why the whole family used to be declined — and declining it cost far
-more than it looks like, because a *third* of the string surface lowers to one of these four
-calls. `word_count`, `punctuation_ratio`, `has_html`, `slugify`, `remove_digits` and thirty
-more are all a `regexp_count` or a `regexp_replace_all` underneath, and every one of them sent
-its whole chain to the host.
+would never reach. Declining the whole family would cost far more than it looks like, because
+a *third* of the string surface lowers to one of these four calls. `word_count`,
+`punctuation_ratio`, `has_html`, `slugify`, `remove_digits` and thirty more are all a
+`regexp_count` or a `regexp_replace_all` underneath, and every one of them would send its whole
+chain to the host.
 
 So the pattern is classified rather than the family declined. `portable` accepts only what all
 three implement identically and rejects everything else, which keeps the guarantee exact:
@@ -20,8 +20,8 @@ three implement identically and rejects everything else, which keeps the guarant
   trailing newline and Rust's does not, so `^[0-9]+$` disagrees about `"12\\n"` — and about
   nothing else. That makes it a property of the *column* rather than of the pattern, so the
   scanner takes a trailing `$` and `_check_end_anchor` declines at execution time when a row
-  actually ends in a newline. Refusing it outright, which this used to do, gave up every
-  anchored pattern there is to avoid a string most text does not contain. A `$` anywhere else
+  actually ends in a newline. Refusing it outright would give up every anchored pattern there
+  is to avoid a string most text does not contain. A `$` anywhere else
   is a literal inside a class or an anchor that can never match, and is still rejected;
 * **rejected — lookaround, backreferences, inline flags, POSIX and Unicode classes**, none of
   which all three even implement;

@@ -79,7 +79,10 @@ def _read_table(format: str, *args: Any, **opts: Any) -> Dataset:
     Args:
         format: The registered source name, e.g. ``"delta"`` or ``"kafka"``.
         *args: Positional arguments forwarded to that source's constructor.
-        **opts: Keyword options forwarded to that source's constructor.
+        **opts: Keyword options forwarded to that source's constructor, plus
+            ``governed_as``, which is consumed here: the table name a governance policy
+            is matched against for a source that names no table of its own, such as a
+            query-based warehouse read.
 
     Returns:
         A lazy `Dataset` over the source.
@@ -90,7 +93,8 @@ def _read_table(format: str, *args: Any, **opts: Any) -> Dataset:
             >>> import batcher as bt
             >>> ds = bt.read.table("delta", "s3://bucket/table", version=3)  # doctest: +SKIP
     """
-    return _scan(SOURCES.get(format)(*args, **opts))
+    governed_as = opts.pop("governed_as", None)
+    return _scan(SOURCES.get(format)(*args, **opts), governed_as=governed_as)
 
 
 def read_memory(name: str) -> Dataset:

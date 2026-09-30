@@ -17,7 +17,9 @@
 use std::f64::consts::PI;
 
 use crate::error::{GeoError, GeoResult};
-use crate::types::{Bbox, Coord};
+use crate::types::Bbox;
+#[cfg(test)]
+use crate::types::Coord;
 
 /// The latitude where the Web Mercator square is truncated, in degrees.
 pub const MERCATOR_MAX_LAT: f64 = 85.051_128_779_806_59;
@@ -116,8 +118,9 @@ pub fn quadkey(t: Tile) -> GeoResult<String> {
     Ok(out)
 }
 
-/// The tile a quadkey names.
-pub fn from_quadkey(key: &str) -> GeoResult<Tile> {
+/// The tile a quadkey names — the inverse of [`quadkey`], kept as its round-trip oracle.
+#[cfg(test)]
+fn from_quadkey(key: &str) -> GeoResult<Tile> {
     if key.len() as u32 > MAX_ZOOM {
         return Err(GeoError::invalid(format!(
             "quadkey of length {} exceeds zoom {MAX_ZOOM}",
@@ -153,7 +156,8 @@ pub fn from_quadkey(key: &str) -> GeoResult<Tile> {
 /// must be equal-*area-ish* rather than equal-degree. It is conformal, not equal-area:
 /// a cell at 60°N covers a quarter of the ground a cell at the equator does, which is
 /// why a density comparison across latitudes needs an equal-area projection instead.
-pub fn to_web_mercator(lon: f64, lat: f64) -> GeoResult<Coord> {
+#[cfg(test)]
+pub(crate) fn to_web_mercator(lon: f64, lat: f64) -> GeoResult<Coord> {
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
         return Err(GeoError::invalid(format!(
             "web mercator needs lon in [-180, 180] and lat in [-90, 90], got ({lon}, {lat})"
@@ -163,41 +167,6 @@ pub fn to_web_mercator(lon: f64, lat: f64) -> GeoResult<Coord> {
     let x = lon.to_radians() * crate::proj::geodesy::EARTH_RADIUS_M;
     let y = ((PI / 4.0 + lat.to_radians() / 2.0).tan()).ln() * crate::proj::geodesy::EARTH_RADIUS_M;
     Ok(Coord::new(x, y))
-}
-
-/// Invert `to_web_mercator`.
-#[must_use]
-pub fn from_web_mercator(x: f64, y: f64) -> Coord {
-    let lon = (x / crate::proj::geodesy::EARTH_RADIUS_M).to_degrees();
-    let lat =
-        (2.0 * (y / crate::proj::geodesy::EARTH_RADIUS_M).exp().atan() - PI / 2.0).to_degrees();
-    Coord::new(lon, lat)
-}
-
-/// The tiles at zoom `z` that a bounding box touches, capped at `limit`.
-///
-/// The cap is not defensive clutter: a whole-world box at zoom 20 names a trillion
-/// tiles, and a function that tried would hang rather than fail. Exceeding it is an
-/// error naming the count, so the caller can pick a coarser zoom.
-pub fn tiles_covering(b: &Bbox, z: u32, limit: usize) -> GeoResult<Vec<Tile>> {
-    check_zoom(z)?;
-    let lo = tile_of(b.xmin.max(-180.0), b.ymax.min(90.0), z)?;
-    let hi = tile_of(b.xmax.min(180.0), b.ymin.max(-90.0), z)?;
-    let (x0, x1) = (lo.x.min(hi.x), lo.x.max(hi.x));
-    let (y0, y1) = (lo.y.min(hi.y), lo.y.max(hi.y));
-    let count = ((x1 - x0 + 1) as usize).saturating_mul((y1 - y0 + 1) as usize);
-    if count > limit {
-        return Err(GeoError::invalid(format!(
-            "box covers {count} tiles at zoom {z}, over the limit of {limit}; use a coarser zoom"
-        )));
-    }
-    let mut out = Vec::with_capacity(count);
-    for x in x0..=x1 {
-        for y in y0..=y1 {
-            out.push(Tile { z, x, y });
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -260,58 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn quadkey_digits_are_validated() {
-        assert!(from_quadkey("0123").is_ok());
-        assert!(from_quadkey("0124").is_err());
-        assert!(from_quadkey("abc").is_err());
-    }
-
-    #[test]
-    fn web_mercator_round_trips_within_the_projection_limit() {
-        for (lon, lat) in [
-            (0.0, 0.0),
-            (-122.4194, 37.7749),
-            (151.0, -33.0),
-            (179.0, 84.0),
-        ] {
-            let m = to_web_mercator(lon, lat).unwrap();
-            let back = from_web_mercator(m.x, m.y);
-            assert!((back.x - lon).abs() < 1e-9, "{lon} -> {}", back.x);
-            assert!((back.y - lat).abs() < 1e-9, "{lat} -> {}", back.y);
-        }
-        // The origin is the origin.
-        let o = to_web_mercator(0.0, 0.0).unwrap();
-        assert!(o.x.abs() < 1e-9 && o.y.abs() < 1e-9);
-    }
-
-    #[test]
     fn mercator_clamps_the_poles_rather_than_returning_infinity() {
         let p = to_web_mercator(0.0, 90.0).unwrap();
         assert!(p.y.is_finite());
         assert!(tile_of(0.0, 90.0, 5).unwrap().y == 0);
-    }
-
-    #[test]
-    fn covering_a_box_is_bounded_and_says_so_when_it_is_not() {
-        let b = Bbox {
-            xmin: -122.5,
-            ymin: 37.7,
-            xmax: -122.4,
-            ymax: 37.8,
-        };
-        let tiles = tiles_covering(&b, 12, 1000).unwrap();
-        assert!(!tiles.is_empty());
-        for t in &tiles {
-            assert!(tile_bbox(*t).unwrap().intersects(&b));
-        }
-        let world = Bbox {
-            xmin: -180.0,
-            ymin: -85.0,
-            xmax: 180.0,
-            ymax: 85.0,
-        };
-        let err = tiles_covering(&world, 20, 10_000).unwrap_err();
-        assert!(format!("{err}").contains("coarser zoom"), "{err}");
     }
 
     #[test]

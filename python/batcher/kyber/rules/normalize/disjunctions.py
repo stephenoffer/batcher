@@ -160,6 +160,14 @@ def or_to_in_and_range(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | No
         if info is None:
             continue
         col_name, values = info
+        if any(isinstance(v, (str, bytes)) for v in values):
+            # A string bound is paid on every row as a full-width comparison, ahead of the
+            # hash-set membership test it is implied by, and it prunes little: JOB q21a's
+            # `info IN ('Denmark', ..., 'Swedish')` spent 530 ms of CPU comparing 14.8M
+            # `movie_info` strings against the two bounds to keep 10.7M of them, for a
+            # membership test that keeps 154K. The disjunction itself is still pushed to the
+            # scan, where each equality prunes by row-group bounds and bloom on its own.
+            continue
         try:
             lo, hi = min(values), max(values)
         except TypeError:

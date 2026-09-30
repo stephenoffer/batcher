@@ -427,6 +427,41 @@ def test_nested_case_matches_cpu_engine(be):
     _assert_same_order(got, exp, be)
 
 
+@pytest.mark.parametrize(
+    "build",
+    [
+        # no ELSE: the typed NULL is `nullif(l, l)`, which pandas kept as `l` on every row
+        lambda ds: ds.select(r=bt.when(col("a") > 1).then(col("l"))),
+        lambda ds: ds.select(r=bt.when(col("a") > 1).then(col("l")).otherwise(col("m"))),
+        lambda ds: ds.select(r=bt.when(col("a") > 1).then(col("s")).otherwise(col("s"))),
+        lambda ds: ds.select(r=bt.nullif(col("l"), col("m"))),
+        lambda ds: ds.select(r=col("l") == col("m")),
+        lambda ds: ds.select(r=col("l") != col("m")),
+        lambda ds: ds.select(r=col("s") < col("s")),
+        lambda ds: ds.filter(col("l") == col("m")),
+    ],
+)
+def test_a_nested_case_nullif_or_comparison_declines(build, be):
+    table = pa.table(
+        {
+            "a": pa.array([1, 2, 3]),
+            "l": pa.array([[1, 2], [3], None]),
+            "m": pa.array([[9], [8, 7], [6]]),
+            "s": pa.array([{"x": 1}, {"x": 2}, None]),
+        }
+    )
+    spec = gpu_plan_ops(build(bt.from_arrow(table))._plan)
+    assert spec is not None, "the shape matches, so the decline is the expression's"
+    with pytest.raises(Unsupported, match="nested value"):
+        run_chain(table, spec[1], be)
+
+
+def test_a_flat_case_without_else_still_translates(be):
+    """Positive control for the decline above: the same shape over a flat column runs."""
+    got, exp = _run(lambda ds: ds.select(r=bt.when(col("y") > 0.5).then(col("y"))), _table(), be)
+    _assert_same_order(got, exp, be)
+
+
 # --- window functions ----------------------------------------------------------------
 
 
@@ -650,6 +685,11 @@ def test_nan_bearing_aggregate_declines(be):
 def test_nan_comparison_follows_the_engine(be):
     """`NaN > x` is True in the engine (it orders above every number) and False under IEEE."""
     table = pa.table({"v": pa.array([float("nan"), 1.0, 3.0], type=pa.float64())})
+    if be.nan_is_missing:
+        # pandas 3 reads the NaN as missing, so the host backend declines instead of answering.
+        with pytest.raises(Unsupported):
+            _run(lambda ds: ds.filter(col("v") > 2.0), table, be)
+        return
     got, exp = _run(lambda ds: ds.filter(col("v") > 2.0), table, be)
     _assert_matches(got, exp, be)
 

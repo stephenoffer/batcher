@@ -36,7 +36,7 @@ from batcher.kyber.column_tables import (
 )
 from batcher.kyber.properties import project_ascending, project_ordering
 from batcher.kyber.stats import columns as col_prop
-from batcher.kyber.stats.comonotone import narrow_comonotone
+from batcher.kyber.stats.comonotone import narrow_comonotone, narrow_to_matched_keys
 from batcher.kyber.stats.distribution import (
     join_match_fraction,
     mcv_join_rows,
@@ -44,6 +44,7 @@ from batcher.kyber.stats.distribution import (
     union_ndv,
 )
 from batcher.kyber.stats.group_bound import key_origin_rows
+from batcher.kyber.stats.predicate_bounds import bounded_by_predicate
 from batcher.kyber.stats.selectivity import predicate_selectivity
 from batcher.kyber.stats.selectivity.scalars import _fraction_below_on_axis, _ordinal
 from batcher.metadata.udf_stats import udf_cost_key
@@ -81,6 +82,7 @@ from batcher.plan.logical import (
 )
 from batcher.plan.source_stats import SourceStatistics, source_stats_key
 from batcher.plan.stats import (
+    AXIS_NUMERIC,
     ColumnStat,
     LazyColumns,
     Provenance,
@@ -146,7 +148,12 @@ def _uniform_p_less(a1: float, b1: float, a2: float, b2: float) -> float:
     1, the part below `a1` contributes 0, and the overlap contributes the area under the
     ramp between them. Degenerate (zero-width) ranges are the point-mass limits of the same
     expression and are handled explicitly rather than by dividing by zero.
+
+    Two point masses are decided first. They are the one case where a tie has positive
+    probability under this model, and `b1 <= a2` alone would count `P(1 < 1)` as 1.
     """
+    if b1 == a1 and b2 == a2:
+        return 1.0 if a1 < a2 else 0.0
     if b1 <= a2:
         return 1.0
     if a1 >= b2:
@@ -159,6 +166,53 @@ def _uniform_p_less(a1: float, b1: float, a2: float, b2: float) -> float:
     lo, hi = max(a2, a1), min(b2, b1)
     ramp = ((hi - a1) ** 2 - (lo - a1) ** 2) / (2.0 * (b1 - a1)) if hi > lo else 0.0
     return min(1.0, max(0.0, (above + ramp) / (b2 - a2)))
+
+
+def _uniform_p_equal(
+    a1: float, b1: float, a2: float, b2: float, d1: float | None, d2: float | None
+) -> float:
+    """`P(X = Y)` for independent uniforms over `d1` and `d2` distinct values in their ranges.
+
+    The equality mass that separates `<` from `<=`. Two point masses tie exactly when they
+    are equal. A point `x` inside `Y`'s range ties with `Y` at `1/d2`. Two ranges tie only
+    inside their overlap: a share `f1` of `X` and `f2` of `Y` lies there, holding about
+    `d1*f1` and `d2*f2` distinct values. Containment says the smaller set is inside the
+    larger, so `P = min(d1*f1, d2*f2) / (d1*d2) = min(f1/d2, f2/d1)`, which is `1/d` for
+    two copies of one column. An unknown distinct count leaves the continuous model's 0.
+    """
+    if b1 == a1 and b2 == a2:
+        return 1.0 if a1 == a2 else 0.0
+    if b1 == a1:  # X is a point
+        return 1.0 / d2 if d2 and d2 >= 1.0 and a2 <= a1 <= b2 else 0.0
+    if b2 == a2:  # Y is a point
+        return 1.0 / d1 if d1 and d1 >= 1.0 and a1 <= a2 <= b1 else 0.0
+    overlap = min(b1, b2) - max(a1, a2)
+    if not (d1 and d2) or d1 < 1.0 or d2 < 1.0 or overlap <= 0.0:
+        return 0.0
+    f1, f2 = overlap / (b1 - a1), overlap / (b2 - a2)
+    return min(1.0, f1 / d2, f2 / d1)
+
+
+def _range_comparison_probability(
+    op: str, a1: float, b1: float, a2: float, b2: float, d1: float | None, d2: float | None
+) -> float:
+    """`P(X op Y)` for `op` in `lt`/`le`/`gt`/`ge`, with the tie mass assigned per operator.
+
+    The continuous `P(X < Y)` splits a tie's mass evenly between `<` and `>`, so the strict
+    probability takes half the tie mass back out of it. Two point masses have no continuous
+    part and are exact. With no tie mass the four operators reduce to `p` and `1 - p`.
+    """
+    p_eq = _uniform_p_equal(a1, b1, a2, b2, d1, d2)
+    p_cont = _uniform_p_less(a1, b1, a2, b2)
+    exact = b1 == a1 and b2 == a2
+    p_lt = p_cont if exact else min(1.0, max(0.0, p_cont - p_eq / 2.0))
+    p_eq = min(p_eq, 1.0 - p_lt)
+    return {
+        "lt": p_lt,
+        "le": p_lt + p_eq,
+        "gt": 1.0 - p_lt - p_eq,
+        "ge": 1.0 - p_lt,
+    }[op]
 
 
 # Operators whose estimates carry a learned correction. Joins, aggregates, and distincts
@@ -223,6 +277,13 @@ class StatsEstimator:
         # a freed node's reused `id()` can never produce a stale hit.
         self._row_cache: dict[int, tuple[LogicalPlan, RelStats]] = {}
         self._sig_cache: dict[int, tuple[LogicalPlan, str]] = {}
+        # Signatures whose *measured* values (a filter's selectivity, a correction factor, a
+        # row width) this estimator looked up, found or not. Those measurements are folded
+        # from operator feedback rather than written through `learning`'s generation, so a
+        # memoized plan must be re-validated against exactly these (`kyber.plan_deps`).
+        self.consulted: set[str] = set()
+        # The same estimator with no correction factors, built on first need (`_raw`).
+        self._raw_estimator: StatsEstimator | None = None
         # `row_width` memo, same identity discipline and same lifetime as `_row_cache`.
         self._width_cache: dict[tuple[object, float], tuple[LogicalPlan, float]] = {}
         # Per-source learned column stats (`{source_id: {column: ColumnStat}}`), built
@@ -284,7 +345,9 @@ class StatsEstimator:
             return 1.0
         if self._learned_rows_win(node):
             return 1.0  # a measured absolute size supersedes any correction
-        factor = self._corrections.get(self._sig(node))
+        sig = self._sig(node)
+        self.consulted.add(sig)
+        factor = self._corrections.get(sig)
         if factor is None or factor <= 0.0:
             return 1.0
         return float(factor)
@@ -302,8 +365,9 @@ class StatsEstimator:
         * an `EXACT` estimate — provably right, nothing to correct.
         * the `unknown_rows` placeholder — not an estimate at all.
 
-        Otherwise the correction this run applied is divided back out, yielding the raw
-        structural estimate whose error the loop is measuring.
+        Otherwise the estimate with no correction applied anywhere in the subtree: the one
+        `_corrected` scales, so a factor learned from it lands a node on its measured size
+        however many corrected operators sit beneath it.
 
         Args:
             node: The plan node being estimated.
@@ -316,7 +380,7 @@ class StatsEstimator:
         est = self.estimate(node)
         if est.provenance is Provenance.EXACT or est.rows >= self._cfg.unknown_rows:
             return 0.0
-        return est.rows / self.correction_for(node)
+        return self._raw(node) if self._corrections else est.rows
 
     def _learned_rows_win(self, node: LogicalPlan) -> bool:
         """Whether `_estimate_uncached` short-circuits to a measured absolute row count."""
@@ -370,11 +434,27 @@ class StatsEstimator:
         factor = self.correction_for(node)
         if factor == 1.0:
             return stats
+        # The factor is measured against the *uncorrected* estimate (`reportable_estimate`),
+        # so it scales that estimate, not this one. This one was built from inputs that are
+        # already corrected, and multiplying it again double-counts every correction below:
+        # TPC-DS q68's four chained joins each learned ~14x, compounded to ~38,000x, and a
+        # 25,000-row join was estimated at 1.17 billion rows, admitted as 72 GB and spilled
+        # to disk: 10 ms became 8 s.
+        raw = self._raw(node)
         return replace(
             stats,
-            rows=max(1.0, stats.rows * factor),
+            rows=max(1.0, raw * factor),
             provenance=weakest(stats.provenance, Provenance.LEARNED),
         )
+
+    def _raw(self, node: LogicalPlan) -> float:
+        """`node`'s row estimate with no correction factor applied anywhere beneath it."""
+        if self._raw_estimator is None:
+            learned = {k: v for k, v in self._learned.items() if k != CARDINALITY_CORRECTION_KEY}
+            self._raw_estimator = StatsEstimator(
+                self._sources, learned, self._cfg, self._source_stats, self._exact_first
+            )
+        return self._raw_estimator.estimate(node).rows
 
     def _sig(self, node: LogicalPlan) -> str:
         """The node's structural signature, memoized by identity (see `estimate`)."""
@@ -402,11 +482,28 @@ class StatsEstimator:
         #   - A row-preserving operator (Project/Sort/Limit) inherits its input's count, and
         #     a `Filter`'s learned *selectivity* ratio (applied below to the current input)
         #     generalizes across input sizes better than a stale absolute count.
+        #
+        # The measured count replaces the structural one's *rows* only. Returning a bare
+        # `RelStats(rows)` (as this did) dropped every column statistic of the node, so each
+        # join above it saw no distinct count on its keys and fell back to dividing by the
+        # other side's alone: on JOB q29a, a 1.15M-row subtree whose size q8d had measured
+        # met a single-movie side (ndv 1) and was estimated at 1.04e12 rows, the plan went
+        # out of core in 84 partitions, and 85 ms became 3.8 s.
         if not self._exact_first and isinstance(node, _CORRECTABLE):
             learned = self._learned.get(self._sig(node))
             if learned is not None and "rows" in learned:
-                return RelStats(float(learned["rows"]), Provenance.LEARNED)
+                rows = float(learned["rows"])
+                base = self._estimate_structural(node)
+                return replace(
+                    base,
+                    rows=rows,
+                    provenance=Provenance.LEARNED,
+                    columns=_ndv_capped(base.columns, rows),
+                )
+        return self._estimate_structural(node)
 
+    def _estimate_structural(self, node: LogicalPlan) -> RelStats:
+        """`node`'s estimate from its structure and its inputs', before any measured size."""
         if isinstance(node, Scan):
             return self._estimate_scan(node)
         if isinstance(node, Filter):
@@ -691,6 +788,9 @@ class StatsEstimator:
             by_column[name] = conjunct if prior is None else Binary("and", prior, conjunct)
         for name, predicate in by_column.items():
             stat, before = columns.get(name), child.columns.get(name)
+            if stat is not None:
+                # Sound, unlike the ndv below: every surviving value satisfies the predicate.
+                stat = columns[name] = bounded_by_predicate(stat, predicate)
             if stat is None or before is None or not before.ndv or before.ndv <= 0:
                 continue
             share = self._kept_share(child, name, predicate)
@@ -698,7 +798,18 @@ class StatsEstimator:
                 continue
             tightened = max(1.0, before.ndv * share)
             if stat.ndv is None or tightened < stat.ndv:
-                columns[name] = replace(stat, ndv=tightened)
+                stat = replace(stat, ndv=tightened)
+            # A most-common-value frequency is a share of the rows it was *measured* over,
+            # and a predicate on this column has just changed which rows those are. Carried
+            # through unchanged it prices `d_year = 1999` at its base-table share (~0.5%) on an
+            # input the predicate already cut to 1998-2000, where the answer is a third: TPC-DS
+            # q47's date filter was estimated at 1 row against 427, flipping the build side of
+            # the fact join and running the CTE 4.7x slower. Rescaling would need the predicate
+            # evaluated on each value, so the frequencies are dropped instead, and a later
+            # equality on the column falls back to `1/ndv` over the ndv tightened above.
+            if stat.mcv:
+                stat = replace(stat, mcv=None)
+            columns[name] = stat
         return narrow_comonotone(
             by_column, child, columns, lambda n, p: self._kept_share(child, n, p)
         )
@@ -1052,11 +1163,12 @@ class StatsEstimator:
         bounds = [_ordinal(v) for v in (ls.min, ls.max, rs.min, rs.max)]
         if any(b is None for b in bounds):
             return _UNKNOWN_INEQUALITY_SELECTIVITY
-        a1, b1, a2, b2 = bounds  # type: ignore[misc]
+        a1, b1, a2, b2 = bounds
         if b1 < a1 or b2 < a2:
             return _UNKNOWN_INEQUALITY_SELECTIVITY
-        p_less = _uniform_p_less(a1, b1, a2, b2)
-        p = p_less if cond.op in ("lt", "le") else 1.0 - p_less
+        # The tie mass is what separates `<` from `<=`. It needs the distinct counts, and
+        # without them this is the continuous model, where the two coincide.
+        p = _range_comparison_probability(cond.op, a1, b1, a2, b2, ls.ndv, rs.ndv)
         # Never return exactly 0: a zero estimate is a *proof* of emptiness and this is an
         # assumption, so it must not let a downstream rule delete the join.
         return min(1.0, max(_MIN_INEQUALITY_SELECTIVITY, p))
@@ -1106,8 +1218,26 @@ class StatsEstimator:
         # candidate that loses is work nothing ever looks at. `LazyColumns` builds them on
         # the first read, which for a surviving plan is the moment the level above asks for
         # its key statistics.
-        columns = LazyColumns(lambda: col_prop.join_columns(node, left, right, rows))
+        columns = LazyColumns(
+            lambda: col_prop.join_columns(node, *self._matched_sides(node, left, right), rows)
+        )
         return RelStats(rows, provenance, columns)
+
+    def _matched_sides(
+        self, node: Join, left: RelStats, right: RelStats
+    ) -> tuple[RelStats, RelStats]:
+        """Each input of a single-key inner join, confined to the keys the other side holds.
+
+        See `comonotone.narrow_to_matched_keys`. Only the carried column statistics change;
+        the join's row count is the containment estimate either way.
+        """
+        if node.join_type != "inner" or len(node.left_keys) != 1:
+            return left, right
+        lk, rk = node.left_keys[0], node.right_keys[0]
+        return (
+            narrow_to_matched_keys(left, lk, right.columns.get(rk)),
+            narrow_to_matched_keys(right, rk, left.columns.get(lk)),
+        )
 
     def _join_rows(self, node: Join, left: RelStats, right: RelStats) -> tuple[float, Provenance]:
         """The join's estimated output cardinality and the provenance of that estimate.
@@ -1385,9 +1515,19 @@ class StatsEstimator:
             r_range = _ordinal_range(rstat)
             if l_range is None or r_range is None:
                 continue
-            lo, hi = max(l_range[0], r_range[0]), min(l_range[1], r_range[1])
-            # The *narrower* side's overlap fraction is the binding one: whichever key domain
-            # is smaller determines how much of the join can survive.
+            # Intersect where the keys actually *lie*, not only their sound bounds: a filter
+            # on a column that ascends with the key confines the key to one run of its range
+            # (`comonotone`), and records that on the quantile grid while leaving `min`/`max`
+            # at the table's. TPC-DS q22's one-year date filter kept `d_date_sk` at all 200
+            # years, so the join to five years of `inventory` read as full overlap and was
+            # priced at 11.7M rows against 2.35M.
+            l_support, r_support = _support_range(lstat, l_range), _support_range(rstat, r_range)
+            lo, hi = max(l_support[0], r_support[0]), min(l_support[1], r_support[1])
+            corrected = _matched_key_factor(lstat, rstat, l_support, r_support, lo, hi)
+            if corrected is not None:
+                factor = min(factor, corrected)
+                continue
+            # Without both distinct counts, the larger mass share is the safe reading.
             fractions = [
                 f
                 for f in (
@@ -1396,8 +1536,10 @@ class StatsEstimator:
                 )
                 if f is not None
             ]
-            if fractions:
-                factor = min(factor, max(fractions))
+            if not fractions:
+                continue
+            binding = max(fractions)
+            factor = min(factor, binding)
         return factor
 
     def _skew_matched_rows(self, node: Join, left: RelStats, right: RelStats) -> float:
@@ -1499,7 +1641,9 @@ class StatsEstimator:
         # A measured selectivity for this exact plan shape always wins (the
         # learning loop); otherwise estimate from the predicate's structure over the
         # *child's own* column statistics — the ones the scan seeded from this source.
-        learned = self._learned.get(self._sig(node), {}).get("selectivity")
+        sig = self._sig(node)
+        self.consulted.add(sig)
+        learned = self._learned.get(sig, {}).get("selectivity")
         if learned is not None:
             return learned
         return predicate_selectivity(
@@ -1513,7 +1657,9 @@ class StatsEstimator:
         )
 
     def _has_learned(self, node: LogicalPlan) -> bool:
-        return "selectivity" in self._learned.get(self._sig(node), {})
+        sig = self._sig(node)
+        self.consulted.add(sig)
+        return "selectivity" in self._learned.get(sig, {})
 
     def _source_key(self, source_id: int) -> str | None:
         """The key bound source `source_id`'s learned statistics are filed under."""
@@ -1652,7 +1798,9 @@ class StatsEstimator:
         "no observation", never "zero-width rows" — `measured_width` drops a non-positive
         measurement rather than storing it.
         """
-        learned = self._learned.get(self._sig(node))
+        sig = self._sig(node)
+        self.consulted.add(sig)
+        learned = self._learned.get(sig)
         if not learned:
             return 0.0
         width = learned.get("row_bytes")
@@ -1816,6 +1964,65 @@ def _overlap_share(
     return overlap_fraction(own, (lo, hi))
 
 
+def _matched_key_factor(
+    lstat: ColumnStat,
+    rstat: ColumnStat,
+    l_support: tuple[float, float],
+    r_support: tuple[float, float],
+    lo: float,
+    hi: float,
+) -> float | None:
+    """Containment's matched-key count, corrected for where each side's keys lie, as a factor.
+
+    Containment (`|L||R| / max(d_L, d_R)`) assumes the side with fewer distinct keys lies
+    wholly inside the other: `m = min(d_L, d_R)` keys match. With the key ranges known, only
+    each side's keys inside the intersection can match, so `m = min(d_L s_L, d_R s_R)`, where
+    `s` is the share of a side's distinct keys inside `[lo, hi]`; the returned factor is that
+    `m` over containment's. TPC-DS q22's 261 weekly `inventory` dates against one year of 366
+    days match 52 keys, not 261.
+
+    `s` is read only off a side whose bounds are **EXACT**, an unfiltered relation whose
+    `min`/`max` are where its keys really are, under uniform key density. A filtered side
+    keeps its table's bounds while its keys shrink to wherever the predicate left them, so
+    its share cannot be measured and is taken as 1: exactly containment's assumption. Reading
+    it anyway priced a quarter of dates as 2.5% of a 200-year table and cut TPC-DS q17's date
+    joins 40x.
+
+    Returns None when either distinct count is unknown.
+    """
+    d_l, d_r = lstat.ndv, rstat.ndv
+    if not d_l or not d_r or d_l <= 0 or d_r <= 0:
+        return None
+    if hi < lo:
+        return 0.0
+
+    def share(stat: ColumnStat, support: tuple[float, float]) -> float:
+        if not stat.provenance.is_exact:
+            return 1.0
+        return overlap_fraction(support, (lo, hi)) or 0.0
+
+    matched = min(d_l * share(lstat, l_support), d_r * share(rstat, r_support))
+    return max(0.0, min(1.0, matched / min(d_l, d_r)))
+
+
+def _support_range(stat: ColumnStat, bounds: tuple[float, float]) -> tuple[float, float]:
+    """Where a column's values lie: its bounds, narrowed to its quantile grid's span.
+
+    A grid that runs from probability 0 to 1 spans exactly the values it was built from, and
+    `comonotone` records a filtered column's surviving run that way. It is an estimate, not
+    a bound (the run's position rests on uniformity), so only estimation reads it.
+    """
+    grid = stat.quantiles
+    placed = ordinal_with_axis(stat.min)
+    if not grid or placed is None or grid.get("axis", AXIS_NUMERIC) != placed[0]:
+        return bounds
+    probs, values = grid.get("probs") or [], grid.get("values") or []
+    if len(values) < 2 or len(probs) != len(values) or probs[0] > 0.0 or probs[-1] < 1.0:
+        return bounds
+    lo, hi = max(bounds[0], float(values[0])), min(bounds[1], float(values[-1]))
+    return (lo, hi) if lo <= hi else bounds
+
+
 def _ordinal_range(stat: ColumnStat) -> tuple[float, float] | None:
     """A column's `[min, max]` as a pair of ordinals, or None when it is not comparable."""
     lo, hi = _ordinal(stat.min), _ordinal(stat.max)
@@ -1846,6 +2053,18 @@ def _key_non_null(keys: tuple, stats: RelStats) -> float:
 def _provably_empty(stats: RelStats) -> bool:
     """Whether a relation is *proved* to hold no rows (not merely estimated at none)."""
     return stats.rows == 0 and stats.rows_exact
+
+
+def _ndv_capped(columns, rows: float):
+    """`columns` with every distinct count capped at `rows`: a relation of `rows` rows cannot
+    hold more distinct values than that, and a count carried over from a structural estimate
+    of a larger size would otherwise outlive the measured size it now describes."""
+    out = {}
+    for name, col in columns.items():
+        if col.ndv is not None and col.ndv > rows:
+            col = replace(col, ndv=max(1.0, rows))
+        out[name] = col
+    return out
 
 
 def _ndvs(stats: RelStats) -> dict[str, float]:
@@ -2094,6 +2313,11 @@ def _composite_pk_fk(
     True when either side's (capped) combination ndv saturates its row count — that
     side's composite key is then ~unique, so each row of the other side matches at most
     one, and the result is the FK side's rows (the caller uses `max(left, right)`).
+
+    A heuristic, not a key proof. At `_UNIQUE_KEY_NDV_RATIO` a side may still hold one value
+    repeated on `(1 - ratio)` of its rows, and a join of two sides hot on the same value emits
+    the product of those duplicate counts. The estimator has no declared uniqueness to tell
+    the two apart.
     """
 
     def saturated(ndv: float | None, rows: float) -> bool:

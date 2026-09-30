@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         ObservabilityConfig,
         OptimizerConfig,
         PIDConfig,
+        TenantConfig,
     )
 
 __all__ = ["run_checks"]
@@ -52,6 +53,7 @@ def run_checks(cfg: Config) -> None:
     _check_metadata(cfg.metadata)
     _check_governance(cfg.governance)
     _check_observability(cfg.observability)
+    _check_tenant(cfg.tenant)
 
 
 def _check_memory(m: MemoryConfig) -> None:
@@ -215,11 +217,6 @@ def _check_optimizer(o: OptimizerConfig) -> None:
         f"optimizer.reoptimize_error must be positive, got {o.reoptimize_error}",
     )
     _check(
-        1 <= o.join_dp_max_tables <= o.greedy_max_tables,
-        "optimizer join thresholds must satisfy 1 <= join_dp_max_tables "
-        f"({o.join_dp_max_tables}) <= greedy_max_tables ({o.greedy_max_tables})",
-    )
-    _check(
         o.cost_calibration_min_samples >= 1,
         f"optimizer.cost_calibration_min_samples must be >= 1, "
         f"got {o.cost_calibration_min_samples}",
@@ -275,15 +272,11 @@ METADATA_BACKENDS: tuple[str, ...] = (
 
 
 def _check_metadata(md: MetadataConfig) -> None:
-    """Metadata store: the backend name and the per-day decay fraction."""
+    """Metadata store: the backend name."""
     _check(
         md.backend in METADATA_BACKENDS,
         f"metadata.backend must be one of {', '.join(map(repr, METADATA_BACKENDS))}, got "
         f"{md.backend!r}",
-    )
-    _check(
-        0.0 <= md.decay_per_day <= 1.0,
-        f"metadata.decay_per_day must be in [0, 1], got {md.decay_per_day}",
     )
 
 
@@ -375,3 +368,25 @@ def _valid_verbosity(value: object) -> bool:
     if text.isdigit():
         return 0 <= int(text) < len(VERBOSITY_LEVELS)
     return text in names
+
+
+def _check_tenant(t: TenantConfig) -> None:
+    """Refuse the per-tenant limits nothing enforces.
+
+    `cache_share` and `max_concurrent_queries` are declared but read by nothing: only
+    `tenant_id` keys the process-global caches. Accepting a cap that is never applied would
+    let a tenant believe it is bounded while it consumes as much as an untenanted query, so
+    the non-default values are refused the way `governance.default_deny` is.
+    """
+    _check(
+        t.cache_share == 0.0,
+        f"tenant.cache_share is not implemented: no code path reads it, so {t.cache_share} "
+        "would bound nothing. Size the shared result cache with memory.result_cache_max_bytes "
+        "instead.",
+    )
+    _check(
+        t.max_concurrent_queries == 0,
+        f"tenant.max_concurrent_queries is not implemented: no code path reads it, so "
+        f"{t.max_concurrent_queries} would cap nothing. Use the process-wide "
+        "execution.max_concurrent_queries instead.",
+    )

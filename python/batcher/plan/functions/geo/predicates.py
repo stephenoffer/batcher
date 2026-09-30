@@ -387,8 +387,8 @@ def st_dwithin_sphere(a: Expr | str, b: Expr | str, metres: Expr | float) -> Exp
 
     The proximity filter for un-projected data: 'every store within 5 km of this
     customer' without having to convert kilometres into degrees at a particular
-    latitude. Measured vertex to vertex like `st_distance_sphere`, so it is exact for
-    points and slightly generous for extended shapes.
+    latitude. Measured to the nearest point of each edge like `st_distance_sphere`, so
+    a point beside the middle of a long edge counts as near it.
 
     Args:
         a: The first lon/lat geometry.

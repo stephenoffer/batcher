@@ -22,7 +22,6 @@ near-leaves (nothing below them but bc-arrow, the DAG root), consumed higher up:
                 transforms — the robotics/AV surface). Same split as bc-geo and for the
                 same reason: no Arrow, no dependencies, so the mathematics unit-tests
                 without a `RecordBatch`; `eval/spatial` does the array-level work
-  bc-udf → (nothing depends on it — not on a live path)
 ```
 
 Depend only downward — never an upward or sideways edge. A type needed in two places belongs

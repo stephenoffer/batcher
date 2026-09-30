@@ -47,8 +47,15 @@ def _fresh_hub():
 
 @pytest.fixture
 def any_size(monkeypatch):
-    """Lower the size gate so the *confidence* gate is what the test measures."""
+    """Lower the size gate so the *confidence* gate is what the test measures.
+
+    It also stands in a route bandit that takes staging whenever it is offered. The gates
+    decide whether staging is a candidate at all; the bandit then chooses between the
+    candidates, and cold it starts one-shot (see `test_a_cold_bandit_starts_one_shot`). With
+    it fixed, `resolve_adaptive` answers the question these tests ask: is staging offered?
+    """
     monkeypatch.setattr(adaptive_mod, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 1)
+    monkeypatch.setattr(adaptive_mod, "_learned_adaptive_route", lambda _plan, _hub: "staged")
 
 
 def _join_over_a_breaker():
@@ -165,10 +172,27 @@ def test_inaccurate_history_leaves_the_gate_on(any_size):
 
 
 def test_a_cold_hub_is_unchanged(any_size):
-    # No history is not evidence of accuracy. A fresh hub must behave exactly as the gate
-    # did before any of this existed, which is what keeps a first run's plan unchanged.
+    # No history is not evidence of accuracy. On a fresh hub the gate must offer staging
+    # exactly as it did before any history existed.
     joined = _join_over_a_breaker()
     assert resolve_adaptive("auto", joined._plan, joined._sources, _fresh_hub()) is True
+
+
+def test_a_cold_bandit_starts_one_shot(monkeypatch):
+    """Staging is offered, and a route bandit with no evidence still runs one-shot first.
+
+    The one-shot route converges in fewer runs: at TPC-H sf10 a staged start held q5 at
+    170-290 ms for five runs before it tried one-shot and settled at 101. The control is the
+    same plan once the bandit has a verdict for staging, which it then follows.
+    """
+    monkeypatch.setattr(adaptive_mod, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 1)
+    joined = _join_over_a_breaker()
+    hub = _fresh_hub()
+    assert adaptive_mod._adaptive_would_help(joined._plan, joined._sources, hub) is True
+    assert resolve_adaptive("auto", joined._plan, joined._sources, hub) is False
+
+    monkeypatch.setattr(adaptive_mod, "_learned_adaptive_route", lambda _plan, _hub: "staged")
+    assert resolve_adaptive("auto", joined._plan, joined._sources, hub) is True
 
 
 def test_one_good_run_is_not_enough(any_size):

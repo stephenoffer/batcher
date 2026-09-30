@@ -367,7 +367,7 @@ class TextSource:
         """
         return len(self._files()) if self._mode == "file" else None
 
-    def statistics(self):  # type: ignore[no-untyped-def]
+    def statistics(self):
         """Cheap metadata for a text scan: exact rows in file mode, a line estimate otherwise.
 
         A text source reached the estimator with no size and no count, so a join against one

@@ -75,7 +75,7 @@ What happens when that window runs out depends on how the address was found:
 | How the address was found | Cluster unreachable |
 |---|---|
 | `ray_address`, or `RAY_ADDRESS` | Raises. You named a cluster, and running single-node in its place would be a wrong answer. |
-| Detected from the environment | Starts a local single-node Ray, so a dev run in a workspace whose cluster is down still works. |
+| Detected from the environment | Starts a local single-node Ray and logs a warning saying so, so a dev run in a workspace whose cluster is down still works and a production run doesn't strand itself silently. |
 
 You don't need to pre-install Batcher on the workers. When Batcher initializes Ray against a cluster it ships its own package, compiled extension included, through `runtime_env`. Set `trust_cluster_image=True` to skip that upload when your image already has Batcher.
 
@@ -151,7 +151,7 @@ A fleet is pinned to one availability zone when one zone can host it. A shuffle 
 
 If you control provisioning, pin the cluster itself to one zone, which also covers the head node. The runtime pin is for clusters that must span zones, such as an accelerator fleet whose scarce instance types force cross-zone autoscaling.
 
-A shuffle replica avoids the primary's failure domain, not just its node. With `distributed.shuffle_replication` above 1, each mapper's output is copied to another node, so losing a worker costs a re-fetch rather than a recompute. When the primary sits on spot capacity, the copy prefers a node that isn't spot, because a reclamation takes a whole instance group. Spot is read from `ray.io/market-type` and the Karpenter, EKS, and GKE capacity labels. It's a preference, never an exclusion.
+A shuffle replica avoids the primary's failure domain, not just its node. With `distributed.shuffle_replication` above 1, each mapper's output is copied to another node, so losing a worker costs a re-fetch rather than a recompute. When the primary sits on spot capacity, the copy prefers a node that isn't spot, because a reclamation takes a whole instance group. Spot is read from `ray.io/market-type` and the Karpenter, EKS, and GKE capacity labels. It's a preference, never an exclusion. Replication above 1 isn't safe to enable yet, because a worker loss can drop that worker's rows instead of failing. See {doc}`Fault tolerance </architecture/fault-tolerance>`.
 
 Each stage can also run on the capacity its failure model fits. A stateless map partition re-derives from a durable partition descriptor, so a preempted one is resubmitted. A shuffle worker holds partial state its peers haven't fetched yet. Set `distributed.capacity_aware_placement=True` and Batcher asks Ray for spot capacity for map stages and on-demand capacity for shuffle fleets, with a fallback so a fleet that finds no on-demand capacity runs on spot rather than pending. It emits nothing unless the live fleet is genuinely mixed and labelled under a single key. Placement never changes which rows a task processes, so results are identical either way.
 
@@ -188,7 +188,7 @@ A preempted worker recomputes its partition from its durable input. A `map_batch
 
 On an autoscaling cluster Batcher requests the cores a query wants and waits for the nodes before sizing the fan-out, so a big query runs on the grown cluster. `autoscale_wait_s` bounds the wait. Its default resolves to a bounded wait on an autoscaling cluster and to no wait on a fixed one. The wait ends early once capacity has been flat for `autoscale_stall_s`, 90 seconds by default, or hasn't grown within `autoscale_startup_grace_s`, 12 seconds by default. `placement_timeout_s`, 60 seconds by default, bounds the gang reservation that follows.
 
-On a managed workspace that exports no `RAY_ADDRESS`, calling `ray.init()` in your own code before Batcher does can strand the job on a local Ray while the cluster sits idle. Let Batcher attach, or set `ray_address`.
+On a managed workspace that exports no `RAY_ADDRESS`, calling `ray.init()` in your own code before Batcher does can strand the job on a local Ray while the cluster sits idle. Batcher can't tell that local Ray from a genuine one-node cluster, so it doesn't warn about it. What it does is log, once per Ray session at INFO, the address it attached to, the node, CPU and GPU counts behind it, and whether Batcher started that Ray or found it already running. Read that line before trusting a distributed run's timing. Let Batcher attach, or set `ray_address`, which fails rather than falls back.
 
 Don't route bulk data through Ray objects. Calling `ray.put` on a `RecordBatch` to move it between stages reintroduces the object-store cost this design removes.
 

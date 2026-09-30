@@ -21,6 +21,7 @@ import pyarrow as pa
 
 from batcher._internal.mathx import is_nan
 from batcher.kyber.pass_base import OptimizerContext
+from batcher.kyber.rules.literals import INT64_MAX, INT64_MIN
 from batcher.plan.expr_ir import Binary, Cast, Expr, Lit, Not
 from batcher.plan.expr_ir.func_nodes import DateOffset
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
@@ -31,7 +32,6 @@ from batcher.plan.visitor import transform_up
 
 __all__ = ["ConstantFolding", "fold_constants", "fold_expression"]
 
-_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 
 #: Python's operator for each comparison tag. A mapping rather than a chain of `if`s so the
 #: folded value comes from the *one* operator asked for: the previous form built a dict of all
@@ -223,7 +223,7 @@ def _fold_arith(op: str, a: object, b: object) -> Lit | None:
     else:
         # int div/mod (Arrow truncates ≠ Python), and float mod: leave alone.
         return None
-    if same_int and not (_INT64_MIN <= r <= _INT64_MAX):
+    if same_int and not (INT64_MIN <= r <= INT64_MAX):
         return None  # would overflow int64 differently than Arrow
     return Lit(r)
 

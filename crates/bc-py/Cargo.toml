@@ -15,6 +15,8 @@ crate-type = ["cdylib"]
 bc-arrow.workspace = true
 bc-ir.workspace = true
 bc-interp.workspace = true
+# Direct, for the temporal-key helpers the sort sample shares with the range partition.
+bc-runtime.workspace = true
 bc-sketches.workspace = true
 bc-transport.workspace = true
 bc-io.workspace = true

@@ -281,13 +281,18 @@ def _scalar_function(tr, node):
             tr._scalar(node.args["day"]),
         )
     if name == "SHA2":
-        # `sha256(s)` parses as SHA2 with a digest length; only 256 is implemented, so
-        # any other width is refused rather than silently answered with sha256.
+        # `sha256(s)` parses as SHA2 with a digest length. Spark's `sha2(s, bits)` takes 224,
+        # 256, 384 or 512, and 0 for 256; any other width is refused rather than answered
+        # with a digest of a different length.
+        from batcher.plan.expr_ir import StrFunc
+
         width = node.args.get("length")
         bits = _const_int_arg(width, "sha2(): digest length") if width is not None else 256
-        if bits != 256:
-            raise NotImplementedError(f"sha2 digest length {bits} is not supported (only 256)")
-        return tr._scalar(node.this).str.sha256()
+        if bits not in (0, 224, 256, 384, 512):
+            raise NotImplementedError(
+                f"sha2 digest length {bits} is not supported: use 224, 256 (or 0), 384 or 512"
+            )
+        return StrFunc(f"sha{bits or 256}", tr._scalar(node.this))
     if name == "ArrayIntersect":
         # sqlglot gives both operands in `expressions` with no `this`.
         operands = node.expressions

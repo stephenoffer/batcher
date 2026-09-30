@@ -289,6 +289,8 @@ class _WindowedAggFold:
         self._delta = []
         if batch.num_rows == 0:
             return []
+        if self._time_col not in batch.schema.names:
+            return self._push_derived(batch)
         cfg = self._cfg
         # Read the frontier *before* this batch contributes to it: a row is late relative
         # to what the stream had already claimed when it arrived, not to what it claims
@@ -324,6 +326,51 @@ class _WindowedAggFold:
         self._check_state_bounded()
         return out
 
+    def _push_derived(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
+        """`push` for an event-time column the plan *derives* beneath the watermark.
+
+        ``select(ts=col("value").struct.field("ts")).with_watermark("ts", ...)`` is how a
+        decoded Kafka JSON field is watermarked, and the source batch has no ``ts`` at all:
+        reading it there raised a `KeyError`. So the input pipeline runs first and the
+        late-row filter and the watermark read its output, which is where the column
+        exists. Everything else is `push`'s sequence: the frontier is read before this batch
+        contributes to it, and late rows are counted where they are dropped.
+        """
+        from batcher.plan.expr_ir import col, lit
+
+        cfg = self._cfg
+        self._wm = self._tracker.watermark
+        projected = [
+            b
+            for b in self._nat.execute_plan(self._input_ir, [[self._narrow(batch)]], cfg)
+            if b.num_rows
+        ]
+        arrived = sum(b.num_rows for b in projected)
+        kept = projected
+        if self._wm is not None and projected:
+            on_time = col(self._time_col).cast("timestamp") >= lit(_EPOCH + _td(self._wm))
+            kept = [
+                k
+                for b in projected
+                for k in self._nat.execute_plan(_scan_filter_ir(on_time), [[b]], cfg)
+                if k.num_rows
+            ]
+            self._late_dropped = arrived - sum(b.num_rows for b in kept)
+        partition_cols = tuple(
+            c for c in self._partition_cols if projected and c in projected[0].schema.names
+        )
+        for b in projected:
+            self._tracker.observe(b, self._time_col, partition_cols)
+        self._wm = self._tracker.watermark
+        if kept:
+            folded = self._fold.push(kept)
+            if folded is not None:
+                self._delta.append(folded)
+            self._updated += sum(b.num_rows for b in kept)
+        out = self._evict(cfg)
+        self._check_state_bounded()
+        return out
+
     def _narrow(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         """The batch the plan sees — without the columns read only for the watermark.
 
@@ -339,8 +386,8 @@ class _WindowedAggFold:
     def _check_state_bounded(self) -> None:
         """Keep resident state under the cap — by spilling cold windows, then by failing.
 
-        Reaching the cap used to end the query. That is the wrong answer for the shape that
-        reaches it most legitimately: an open set `allowed_lateness / hop` windows wide, one
+        Ending the query at the cap is the wrong answer for the shape that reaches it most
+        legitimately: an open set `allowed_lateness / hop` windows wide, one
         row per group key, behaving exactly as designed and simply large. Spilling the oldest
         windows to disk trades latency for survival, which is the trade every mature streaming
         engine makes, and the watermark's one-way motion is what makes it cheap here — a

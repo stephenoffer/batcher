@@ -293,9 +293,9 @@ def test_pushdown_does_not_change_the_types_it_returns(tmp_path):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "BUG: an all-NULL column is typed pa.null(). dbapi.py:191 returns null-typed fields "
-        "when nothing can be inferred, and schema() is what the plan types operators against "
-        "(core/scan_only.py::_as_table). The declared INTEGER is available from sqlite's "
+        "BUG: an all-NULL column is typed pa.null(). DBAPISource.schema returns null-typed "
+        "fields when nothing can be inferred, and schema() is what the plan types operators "
+        "against (core/scan_only.py::_as_table). The declared INTEGER is available from sqlite's "
         "PRAGMA/declared type and is thrown away. This is exactly the 'null where an int64 "
         "belongs' failure CLAUDE.md names. schema_override= is the documented workaround, "
         "which the next test pins."
@@ -349,7 +349,7 @@ def test_schema_override_recovers_a_null_only_column(tmp_path):
     reason=(
         "BUG: an empty result set is typed all-null. The WHERE 1 = 0 probe returns no rows, "
         "probe_is_typed() correctly rejects it, and the full-read fallback then also sees no "
-        "rows — so dbapi.py:191 types every column null. sqlite reports the column names in "
+        "rows — so DBAPISource.schema types every column null. sqlite reports the column names in "
         "cursor.description and their declared types via PRAGMA table_info, so the types are "
         "recoverable. An empty relation with the right schema is a normal, correct answer; an "
         "empty relation with null columns poisons every operator typed against it."

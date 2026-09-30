@@ -102,7 +102,7 @@ def main() -> None:
     sn_ms, sn_out = _time(lambda: workload(False), args.runs)
     rows.append(("batcher single-node", sn_ms, sn_out))
     dist_ms, dist_out = _time(lambda: workload(True), args.runs)
-    ok, msg = results_match(sn_out, dist_out)
+    ok, msg = results_match(sn_out, dist_out, strict_types=True)
     rows.append((f"batcher distributed ({args.workers}w)", dist_ms, dist_out))
     print(f"\ndistributed == single-node: {ok}" + ("" if ok else f"  ({msg})"))
 

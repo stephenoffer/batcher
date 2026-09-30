@@ -136,7 +136,7 @@ def test_reading_reserves_the_uncompressed_size_not_the_file_size(tmp_path) -> N
         store = TieredSpillStore(str(tmp_path / "s"), compression="zstd")
         handle = store.spill([rows], "b0")
         assert handle is not None
-        if handle.compression_ratio <= 1.5:
+        if handle.logical_nbytes <= 1.5 * handle.nbytes:
             pytest.skip("this pyarrow build did not compress the bucket")
 
         with store.read_reserved(handle):

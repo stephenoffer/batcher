@@ -28,6 +28,7 @@ import pyarrow as pa
 from batcher.api.dataset.dq.checks import aggregates, strings, values
 from batcher.api.dataset.dq.constraints import Constraint, UniqueConstraint
 from batcher.governance._validate import reject_bare_string
+from batcher.plan.types.domains import is_numeric_type
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -43,11 +44,6 @@ DEFAULT_MAX_CATEGORIES = 25
 #: own `distinct()` pass, so the budget is what keeps "profile this table" from turning into
 #: a hundred scans on a wide one.
 _CATEGORY_BUDGET = 8
-
-
-def _is_numeric(dtype: pa.DataType) -> bool:
-    """Whether the column holds a number this module is willing to reason about."""
-    return pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_decimal(dtype)
 
 
 def _is_text(dtype: pa.DataType) -> bool:
@@ -152,7 +148,7 @@ def suggest(
     names = list(columns) if columns else list(schema.names)
     proposed: list[Constraint] = []
     rows = _profile_rows(ds, names)
-    numeric = [c for c in names if _is_numeric(schema.field(c).type)]
+    numeric = [c for c in names if is_numeric_type(schema.field(c).type)]
     floating = [c for c in names if pa.types.is_floating(schema.field(c).type)]
     minimums, finite = _numeric_profile(ds, numeric, floating)
     budget = _CATEGORY_BUDGET

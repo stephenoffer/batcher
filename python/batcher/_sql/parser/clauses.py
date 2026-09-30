@@ -266,6 +266,8 @@ def _select(tr, node) -> Dataset:
         # projection then reads; whole-item windows keep their user alias directly.
         # `lag/lead(x, n, default)` becomes a CASE over supported window functions,
         # before hoisting, so the constructs it introduces are hoisted with the rest.
+        windowing.rewrite_ignore_nulls_navigation(projections)
+        windowing.rewrite_frame_exclusions(projections)
         windowing.rewrite_offset_defaults(projections)
         projections, nested = windowing.hoist_nested_windows(projections)
         # `*` expands the columns the query selects *from*, so it is captured before the
@@ -276,7 +278,7 @@ def _select(tr, node) -> Dataset:
         # A window in the ORDER BY rides along in the same pass rather than a second one,
         # so `SELECT sum(v) OVER (...) FROM t ORDER BY row_number() OVER (...)` computes
         # both windows over the same relation.
-        ordwins, order = _order_windows(tr, order)
+        ordwins, order = _order_windows(order)
         ds = tr._window(ds, [*projections, *nested, *ordwins])
         # QUALIFY filters on the window-function results (named by their SELECT
         # alias) — applied after the window columns exist, before the projection
@@ -304,6 +306,8 @@ def _select(tr, node) -> Dataset:
         # the window items are handed to the aggregate path rather than computed first.
         windows = None
         if has_window:
+            windowing.rewrite_ignore_nulls_navigation(projections)
+            windowing.rewrite_frame_exclusions(projections)
             windowing.rewrite_offset_defaults(projections)
             projections, nested = windowing.hoist_nested_windows(projections)
             windows = [*(p for p in projections if tr._is_window(p)), *nested]
@@ -327,7 +331,7 @@ def _select(tr, node) -> Dataset:
         # list at all, so it reaches here rather than the window branch above. Without the
         # hoist the sort key is an expression the scalar lowering has no node for, and the
         # query failed with "unsupported SQL expression: Window".
-        ordwins, order = _order_windows(tr, order)
+        ordwins, order = _order_windows(order)
         if ordwins:
             ds = tr._window(ds, ordwins)
         named = tr._projection_map(ds, projections)
@@ -350,7 +354,7 @@ def _select(tr, node) -> Dataset:
     return ds
 
 
-def _order_windows(tr, order):
+def _order_windows(order):
     """Hoist any window function an ORDER BY sorts by into hidden output columns.
 
     ``ORDER BY row_number() OVER (ORDER BY i DESC)`` sorts by a value the SELECT list
@@ -364,14 +368,12 @@ def _order_windows(tr, order):
     afterwards, so the hidden column is dropped without a second pass.
 
     Args:
-        tr: The translator (unused today, taken for symmetry with the other hoists).
         order: The `Order` node, or None.
 
     Returns:
         The synthetic `alias(window)` items to materialize, and the rewritten order node.
         Both are empty/unchanged when the ORDER BY names no window.
     """
-    del tr  # symmetry with `_qualify_windows`; the hoist needs no scope
     if order is None or not any(e.find(exp.Window) for e in order.expressions):
         return [], order
     order = order.copy()
@@ -425,7 +427,12 @@ def _qualify_windows(tr, ds: Dataset, qualify):
     Returns:
         The dataset with any window columns appended, and the rewritten predicate.
     """
-    pred = qualify.this.copy()
+    # A parent for the predicate, so a rewrite can replace a window that *is* the predicate.
+    holder = exp.Paren(this=qualify.this.copy())
+    windowing.rewrite_ignore_nulls_navigation([holder])
+    windowing.rewrite_frame_exclusions([holder])
+    windowing.rewrite_offset_defaults([holder])
+    pred = holder.this
     windows = list(pred.find_all(exp.Window))
     if not windows:
         return ds, pred

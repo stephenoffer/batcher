@@ -189,7 +189,7 @@ def _install_interrupt_handler(query_id: str):
 
 
 _hub: MetadataHub | None = None
-_hub_backend_key: tuple[str, str | None] | None = None
+_hub_backend_key: tuple[str, str | None, bool] | None = None
 # The hub is a process singleton and `execution.max_concurrent_queries` lets several queries
 # run at once, so two threads reaching `default_hub()` before either has built one each build
 # their own and one assignment wins. The loser is not merely wasted work: whichever caller
@@ -222,18 +222,18 @@ def default_hub() -> MetadataHub:
     """
     global _hub, _hub_backend_key
     meta = active_config().metadata
-    key = (meta.backend, meta.uri)
+    key = (meta.backend, meta.uri, meta.require_durable)
     hub = _hub
     if hub is not None and key == _hub_backend_key:
         return hub  # the steady state, and it stays lock-free
     with _hub_lock:
         if _hub is None or key != _hub_backend_key:
-            _hub = MetadataHub(_build_backend(meta.backend, meta.uri))
+            _hub = MetadataHub(_build_backend(meta.backend, meta.uri, meta.require_durable))
             _hub_backend_key = key
         return _hub
 
 
-def _build_backend(backend: str, uri: str | None):
+def _build_backend(backend: str, uri: str | None, require_durable: bool = False):
     """Construct the configured backend, degrading to in-process on failure.
 
     A durable backend (object storage / SQLite / Redis) can fail to construct — a
@@ -241,12 +241,23 @@ def _build_backend(backend: str, uri: str | None):
     an optimization, never a correctness input, so a broken store must not fail every
     query: fall back to the in-process store (this session still learns; only cross-run
     persistence is lost) and log once instead of raising into the hot path.
+
+    `metadata.require_durable` turns that off. A deployment that depends on cross-run
+    learning otherwise keeps running with none, and the one sign is a warning in a log.
     """
     if backend == "in_process":
         return InProcessBackend()
     try:
         return make_backend(backend, uri)
-    except Exception:
+    except Exception as exc:
+        if require_durable:
+            from batcher._internal.errors import ConfigError
+
+            raise ConfigError(
+                f"metadata backend {backend!r} (uri={uri!r}) could not be built, and "
+                f"metadata.require_durable is set, so Batcher will not fall back to an "
+                f"in-process store: {exc}"
+            ) from exc
         _log.warning(
             "metadata backend %r (uri=%r) unavailable; using an in-process store "
             "(cross-run learning disabled this session)",

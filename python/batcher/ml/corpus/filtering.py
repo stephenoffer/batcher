@@ -179,7 +179,7 @@ def quality_filter(
             >>> kept.to_pydict()["text"]
             ['A real sentence about something, written out properly.']
     """
-    _require_column(ds, column)
+    require_columns(ds, column, hint="Pass an existing text column.")
     thresholds = thresholds or QualityThresholds()
     return ds.filter(_all_of(_rules(column, thresholds)))
 
@@ -222,7 +222,7 @@ def quality_report(
     """
     from batcher.plan.expr_ir.constructors import lit
 
-    _require_column(ds, column)
+    require_columns(ds, column, hint="Pass an existing text column.")
     thresholds = thresholds or QualityThresholds()
     rules = _rules(column, thresholds)
     aggregates = {
@@ -231,11 +231,6 @@ def quality_report(
     aggregates["all"] = _all_of(rules).cast("float64").mean()
     row = ds.agg(**aggregates).to_pydict()
     return {name: (row[name][0] if row[name][0] is not None else 0.0) for name in aggregates}
-
-
-def _require_column(ds: Dataset, column: str) -> None:
-    """Fail at the API edge, naming the columns that do exist."""
-    require_columns(ds, column, hint="Pass an existing text column.")
 
 
 def quality_flags(
@@ -281,7 +276,7 @@ def quality_flags(
     """
     from batcher.plan.expr_ir.constructors import lit
 
-    _require_column(ds, column)
+    require_columns(ds, column, hint="Pass an existing text column.")
     thresholds = thresholds or QualityThresholds()
     rules = _rules(column, thresholds)
     columns = {name: rule.fill_null(lit(False)) for name, rule in rules.items()}

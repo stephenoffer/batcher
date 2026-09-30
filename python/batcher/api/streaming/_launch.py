@@ -14,8 +14,8 @@ from batcher.api.streaming._query import (
     StreamingQuery,
     _deregister,
     _next_name,
+    _open_checkpoint,
     _register,
-    _warn_if_checkpoint_not_durable,
 )
 from batcher.plan.streaming import OutputMode, Trigger
 
@@ -134,13 +134,6 @@ def start_streaming_query(
             "map_batches); use a processing-time trigger for aggregations"
         )
 
-    store = None
-    if checkpoint is not None:
-        from batcher.io.formats.streaming.checkpoint import CheckpointStore
-
-        _warn_if_checkpoint_not_durable(checkpoint)
-        store = CheckpointStore(checkpoint)
-
     # A top-level aggregate over a `map_batches` input is the one non-stateless shape that
     # still needs a per-batch runner: the UDF runs in Python and the fold consumes what it
     # returns. `iter_batches` has streamed this since S29 (`map_stream`); the sink path
@@ -162,6 +155,11 @@ def start_streaming_query(
             _build_run_batch(plan, sources) if _is_stateless(plan) else (None, None, None)
         )
     processor = core.make_processor(plan, output_mode, run_batch, sources[0])
+    # Opened last, once nothing above can refuse the plan: the claim is a lease, and a
+    # refusal raised after taking it would hold the checkpoint until garbage collection.
+    store = None
+    if checkpoint is not None:
+        store = _open_checkpoint(checkpoint, plan, stateful=not _is_stateless(plan))
     query_name = name or _next_name()
     engine = core.StreamingQueryEngine(
         name=query_name,
@@ -279,6 +277,13 @@ def _start_driver_stream(
             "boundary to fold at. Use a processing-time trigger."
         )
 
+    from batcher.plan.streaming.driver_stats import DriverStats, collecting
+
+    # The driver reads its own sources and holds its own state, so the engine sees neither.
+    # These stats carry both into the progress record; they are made active around
+    # `engine.start()` below, whose context snapshot the loop and reader threads inherit.
+    stats = DriverStats()
+
     def make_runner(should_stop):
         from batcher.core.streaming_runner import DriverRunner
 
@@ -286,7 +291,7 @@ def _start_driver_stream(
             attach = getattr(source, "set_stop_signal", None)
             if attach is not None:
                 attach(should_stop)
-        return DriverRunner(_iter_batches(plan, sources, plan.available_columns()), sink)
+        return DriverRunner(_iter_batches(plan, sources, plan.available_columns()), sink, stats)
 
     engine = core.StreamingQueryEngine(
         name=query_name,
@@ -302,7 +307,8 @@ def _start_driver_stream(
     query = StreamingQuery(query_name, engine, plan, sources)
     _register(query_name, query)
     try:
-        engine.start()
+        with collecting(stats):
+            engine.start()
     except BaseException:
         _deregister(query_name)
         raise

@@ -7,6 +7,7 @@ whatever default it already had rather than acting on a fabricated figure.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 
 from batcher._internal.device_specs.table import RAY_LABEL_ALIASES, SPECS, DeviceSpec
@@ -28,6 +29,7 @@ __all__ = [
     "host_transfer_seconds",
     "known_device_names",
     "rank_devices_by_efficiency",
+    "register_device_spec",
     "resolve_device_name",
 ]
 
@@ -327,6 +329,51 @@ def resolve_device_name(reported: str | None) -> str | None:
         if best is None or candidate > best:
             best = candidate
     return best[2] if best is not None else None
+
+
+def register_device_spec(spec: DeviceSpec, *, aliases: tuple[str, ...] = ()) -> DeviceSpec:
+    """Add or replace one accelerator's row, for a part the built-in table does not carry.
+
+    The table is nameplate figures for the parts Batcher recognizes, and an unrecognized part
+    reports unknown so that every decision keeps the default it had. That is the right answer
+    to a name nobody vouched for, and the wrong one for a part the operator *can* describe: a
+    new SKU, a private accelerator, or a device whose delivered figures were measured and
+    differ from its nameplate. Registering the row is how those figures reach placement,
+    energy and sizing decisions without editing the table.
+
+    Process-local, like the table itself: register at startup in every process that decides
+    placement or sizing. Replacing a built-in row is allowed and deliberate, because a
+    measured figure outranks a nameplate one.
+
+    Args:
+        spec: The row. Its `name` is canonicalized to the table's key alphabet (uppercase, `_`
+            for punctuation), and must not be empty.
+        aliases: Further spellings that should resolve to this row, such as the bare part name
+            a node is labelled with.
+
+    Returns:
+        The row as stored, with its canonical name.
+
+    Raises:
+        ConfigError: If the name is empty or any figure is negative.
+    """
+    from batcher._internal.errors import ConfigError
+
+    key = _canonical(spec.name)
+    if not key.strip("_"):
+        raise ConfigError("a device spec needs a non-empty name")
+    for field in dataclasses.fields(spec):
+        value = getattr(spec, field.name)
+        if isinstance(value, int | float) and value < 0:
+            raise ConfigError(f"device spec {key}: {field.name} must be >= 0, got {value!r}")
+    stored = dataclasses.replace(spec, name=key)
+    SPECS[key] = stored
+    for alias in aliases:
+        RAY_LABEL_ALIASES[_canonical(alias)] = key
+    global _KEY_TOKENS
+    _KEY_TOKENS = tuple((k, tuple(_tokens(k)), _model_token(k)) for k in SPECS)
+    resolve_device_name.cache_clear()
+    return stored
 
 
 def device_host_link(accelerator_type: str | None) -> str:

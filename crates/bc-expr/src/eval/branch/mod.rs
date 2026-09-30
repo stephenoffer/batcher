@@ -49,9 +49,11 @@ use crate::{Expr, ExprError};
 mod case;
 mod coalesce;
 mod literal_case;
+mod nullif;
 
 pub(crate) use case::eval_case;
 pub(crate) use coalesce::eval_coalesce;
+pub(crate) use nullif::eval_nullif;
 
 /// Evaluate `expr` over the rows `selection` marks, returning a full-length array that is
 /// null everywhere else.

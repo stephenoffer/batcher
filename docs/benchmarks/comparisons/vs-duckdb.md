@@ -89,7 +89,7 @@ Batcher is 2.9x faster than `delta_scan` here, and it opens the one file the pre
 
 The largest difference doesn't show up as a number. DuckDB is single-node and its optimizer is static: it commits to a plan before the first row is read.
 
-Batcher re-optimizes at stage boundaries on measured cardinalities. That is the same granularity Spark AQE works at, available on a single node too, and it adds a sketch-backed learned-statistics loop that carries across queries, so a recurring query plans better each time it runs. The same mergeable operators then run across a cluster and return the same rows, with floating-point reductions agreeing to the last bits because the partition count sets the summation order.
+Batcher re-optimizes at stage boundaries on measured cardinalities. That is the same granularity Spark AQE works at, run inside the Python process, and DuckDB doesn't re-plan within a query at all. Batcher also adds a sketch-backed learned-statistics loop that carries across queries, so a recurring query plans better each time it runs. The same mergeable operators then run across a cluster and return the same rows, with floating-point reductions agreeing to the last bits because the partition count sets the summation order.
 
 The within-query loop isn't always on. It engages on a query with a join once the input clears 5M rows, or about 320 MB, for each pipeline breaker it would cut at, so the simplest joined shape qualifies at about 10M rows and a query with no join doesn't qualify single-node at any size.
 

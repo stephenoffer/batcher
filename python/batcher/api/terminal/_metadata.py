@@ -18,6 +18,7 @@ import random
 import pyarrow as pa
 
 from batcher._internal.logging import get_logger, note_suppressed
+from batcher._internal.registry import IdentityMemo
 from batcher.config import active_config
 from batcher.io.base._bad_rows import measuring
 from batcher.io.source import Source, iter_source
@@ -228,16 +229,11 @@ def collect_source_metadata(hub, sources: list[Source], plan: LogicalPlan | None
             source_key = source_stats_key(src)
             if source_key is None:
                 continue
-            # Gated on the marker `learn_column_stats` gates *itself* on, so the two agree
-            # about what is left to learn. It used to ask about the distinct count, which was
-            # the same question only for as long as a sample was allowed to record one: once
-            # the ndv is (correctly) withheld from a partial scan, a column is never marked
-            # measured, and this pass re-sampled the same source on every query for the life
-            # of the process -- 389 ms of a 3,100 ms sf100 join, forever, to learn nothing.
-            # What this pass will read, and therefore what it can mark measured. The two
-            # must be the same set or the "already learned" marker never completes and the
-            # source is re-sampled on every query forever -- see the note above, which
-            # records that exact failure from the previous version of this gate.
+            # Gated on the marker `learn_column_stats` gates itself on (the average-bytes
+            # entry), over exactly the columns this pass reads.
+            # Gating on anything a sample may withhold, such as the distinct count of a
+            # partial scan, or on a different column set, means the marker never completes
+            # and the source is re-sampled on every query.
             names = list(src.schema().names)
             cols = names if wanted is None else [c for c in names if c in wanted]
             if not cols:
@@ -273,7 +269,17 @@ def ndv_columns(plan: LogicalPlan) -> set[str]:
     stands for (`walk_with_base_names`), because the caller matches them against a source's
     own schema. Taking the names as written instead silently seeded nothing at all for an
     aliased table — see that function for what it cost TPC-DS q17.
+
+    Memoized on the plan's content, like `api.source_stats.column_bounds_needed`: it runs on
+    every execution and a re-issued query is a new tree with the same answer.
     """
+    from batcher.plan.logical.base import memoize_by_content
+
+    return set(memoize_by_content(plan, "ndv_columns", _ndv_columns))
+
+
+def _ndv_columns(plan: LogicalPlan) -> frozenset[str]:
+    """`ndv_columns`, uncached."""
     wanted: set[str] = set()
     for node, base in walk_with_base_names(plan):
         if isinstance(node, Join):
@@ -286,7 +292,7 @@ def ndv_columns(plan: LogicalPlan) -> set[str]:
             )
         elif isinstance(node, Filter):
             wanted.update(base.get(c, c) for c in _equality_columns(node.predicate))
-    return wanted
+    return frozenset(wanted)
 
 
 def _equality_columns(expr: Expr) -> set[str]:
@@ -357,8 +363,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
 
     try:
         verdict = _seed_verdict_key(hub, sources, kyber.learning.generation())
-        hit = _NOTHING_TO_SEED.get(id(plan))
-        if hit is not None and hit[0] is plan and hit[1] == verdict:
+        if _NOTHING_TO_SEED.get(plan) == verdict:
             return
         wanted = ndv_columns(plan) if plan is not None else None
         learned = kyber.load_learned_stats(hub)
@@ -420,15 +425,13 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
                 measured.append(kyber.MeasuredColumns(source_key, ndv, {}, {}, mcv))
         kyber.record_column_stats_batch(hub, measured)
         if fully_known and plan is not None:
-            if len(_NOTHING_TO_SEED) >= _NOTHING_TO_SEED_MAX:
-                _NOTHING_TO_SEED.clear()
-            _NOTHING_TO_SEED[id(plan)] = (plan, verdict)
-    except Exception as exc:  # pragma: no cover - learning must never break execution
+            _NOTHING_TO_SEED.put(plan, verdict)
+    except Exception as exc:  # learning must never break execution
         note_suppressed("api", "learn column NDV", exc)
 
 
-#: `id(plan) -> (plan, verdict key)` for a plan whose every wanted column was already measured
-#: on every resident source, pinning the plan against id reuse. Reaching that verdict walks the
+#: `plan -> verdict key` for a plan whose every wanted column was already measured on every
+#: resident source. Reaching that verdict walks the
 #: plan for its ndv columns and diffs each source's whole schema against the learned store,
 #: which on a re-issued query is the same work concluding the same "nothing to seed" every time:
 #: half of `_optimize` on a warm ClickBench query over the 105-column `hits`.
@@ -438,8 +441,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
 #: store that learns more can only shrink what needs seeding, and one that learns something
 #: plan-relevant misses the memo and is re-read. Only the post-run learner and this function
 #: write column sketches, and skipping a seed changes an estimate, never a result.
-_NOTHING_TO_SEED: dict[int, tuple[LogicalPlan, tuple[object, ...]]] = {}
-_NOTHING_TO_SEED_MAX = 256
+_NOTHING_TO_SEED: IdentityMemo[tuple[object, ...]] = IdentityMemo(256)
 
 
 def _seed_verdict_key(hub, sources: list[Source], generation: int) -> tuple[object, ...]:
@@ -710,22 +712,13 @@ def learn_column_stats(
             total = sum(b.num_rows for b in sample)
             _sample_ndv, quants, avg_bytes = core.column_statistics(sample, cols)
             mcv: dict[str, dict[str, float]] = {}
-            # Heavy hitters are measured on **every** column being sketched, not only
-            # low-cardinality ones.
-            #
-            # This used to skip any column with `ndv > 1/min_frac` (20), reasoning that a
-            # high-cardinality column cannot hold a value above the frequency floor. That is
-            # only true under *uniformity* — which is the one assumption an MCV exists to
-            # correct. A column of a million distinct keys can still have a single value at
-            # 30% of rows (a sentinel, a default account, one whale customer), and
-            # Misra-Gries finds it in the same pass. Measured: 1,000 distinct `cust_id`s with
-            # key 7 at 47.5% of rows was excluded by the gate, so `cust_id = 7` estimated at
-            # `1/ndv` = 0.001 against a true 0.5 — a ~500x under-estimate on the most skewed
-            # key in the table, which is exactly the key a join is about to be built on. The
-            # gate suppressed skew precisely where skew matters, leaving join-key skew
-            # structurally unmeasurable (`kyber.hot_join_values` reads this).
-            # Over the sample, and against the sample's row count: an MCV is a *fraction*
-            # of rows, and a uniform sample preserves a value's frequency.
+            # Heavy hitters are measured on every column being sketched, whatever its
+            # cardinality. "A high-ndv column holds no frequent value" is true only under
+            # uniformity, the one assumption an MCV exists to correct: a million distinct keys
+            # can still include a sentinel or one whale customer at 30% of rows, which is the
+            # join-key skew `kyber.hot_join_values` reads. Misra-Gries finds it in the same
+            # pass. Frequencies are over the sample and its row count, since an MCV is a
+            # fraction of rows and a uniform sample preserves one.
             for col_name, hits in core.heavy_hitters(sample, cols, min_frac).items():
                 if total > 0 and hits:
                     mcv[col_name] = {str(v): n / total for v, n in hits}

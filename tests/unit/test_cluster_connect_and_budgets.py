@@ -153,6 +153,32 @@ class TestExplicitAddressIsNotSilentlyDowngraded:
         assert len(started_local) == 1
         assert "address" not in started_local[0]
 
+    def test_falling_back_to_local_is_a_warning(self, clean_env, caplog):
+        """The stranded run: correct rows, one machine, an idle cluster. It must be loud."""
+        import logging
+
+        from batcher.dist.executors.ray_runtime import readiness
+
+        class _FakeRay:
+            def init(self, **kwargs):
+                if kwargs.get("address"):
+                    raise ConnectionError("head not reachable")
+
+            @staticmethod
+            def is_initialized() -> bool:
+                return False
+
+        clean_env.setenv("RAY_CLUSTER_NAME", "raycluster-sample")
+        with (
+            config_context(_cfg(cluster_connect_timeout_s=0.0)),
+            caplog.at_level(logging.WARNING),
+        ):
+            readiness._connect_or_fall_back(_FakeRay(), workers=4)
+        assert any(
+            r.levelno == logging.WARNING and "LOCAL single-node Ray" in r.getMessage()
+            for r in caplog.records
+        )
+
 
 class TestAttachRetry:
     """A head that is still coming up is 'not yet', not 'not there'."""

@@ -212,12 +212,39 @@ def iter_source(
     `read_source`. Sources whose `iter_batches` lacks a `predicate` parameter are
     called with projection only (no signature break).
     """
+    batches = None
     if predicate is not None and getattr(source, "supports_predicate", False):
         from inspect import signature
 
         if "predicate" in signature(source.iter_batches).parameters:
-            return source.iter_batches(projection, predicate=predicate)  # type: ignore[call-arg]
-    return source.iter_batches(projection)
+            batches = source.iter_batches(projection, predicate=predicate)  # type: ignore[call-arg]
+    if batches is None:
+        batches = source.iter_batches(projection)
+    from batcher.plan.streaming.driver_stats import active_driver_stats
+
+    # A driver-produced stream reports what it *read*, not what it emitted: count every row
+    # pulled from an unbounded source while a streaming query collects them. A bounded side
+    # (a stream-static join's dimension table) is not the stream's input, as in Spark.
+    stats = active_driver_stats()
+    if stats is None or is_bounded(source):
+        return batches
+    return _counted(batches, stats)
+
+
+def _counted(batches: Iterator[pa.RecordBatch], stats) -> Iterator[pa.RecordBatch]:
+    """`batches`, adding each one's row count to `stats` as it is read.
+
+    Closing this closes `batches` too, so a source's reader is released when its consumer
+    stops rather than when the wrapper is collected.
+    """
+    try:
+        for batch in batches:
+            stats.add_source_rows(batch.num_rows)
+            yield batch
+    finally:
+        close = getattr(batches, "close", None)
+        if close is not None:
+            close()
 
 
 def read_source(
@@ -269,7 +296,7 @@ def read_source(
         extras["limit"] = limit
     if ordering and getattr(source, "supports_ordering", False):
         extras["ordering"] = ordering
-    batches = source.read(projection, **extras)  # type: ignore[call-arg]
+    batches = source.read(projection, **extras)
     if batches:
         return batches
     schema = source.schema()

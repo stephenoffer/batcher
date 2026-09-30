@@ -273,10 +273,8 @@ def test_web_mercator_reprojection_matches_proj(spatial):
 def test_utm_reprojection_matches_proj_inside_its_own_zone(spatial):
     """UTM, checked in the zone ``st_utm_epsg`` picks for the point.
 
-    Scoped to the correct zone deliberately. Transverse Mercator is a truncated series
-    that diverges far from its central meridian, so two implementations disagree by
-    metres several zones out -- not a defect in either, and comparing there would be
-    testing the divergence rather than the projection.
+    The out-of-zone case has its own test below, because it is where a truncated series
+    shows its truncation.
     """
     lons = [lon for lon, _ in PLACES.values()]
     lats = [lat for _, lat in PLACES.values()]
@@ -297,6 +295,35 @@ def test_utm_reprojection_matches_proj_inside_its_own_zone(spatial):
         # tighter bound is meaningful.
         assert got["x"][0] == pytest.approx(wx, abs=1e-3), f"UTM x of ({lon}, {lat}) in {code}"
         assert got["y"][0] == pytest.approx(wy, abs=1e-3), f"UTM y of ({lon}, {lat}) in {code}"
+
+
+@pytest.mark.parametrize("offset", [10.0, 20.0, 30.0, 40.0])
+def test_utm_reprojection_matches_proj_well_outside_its_zone(spatial, offset):
+    """UTM zone 10 (central meridian -123) at points 10 to 40 degrees from that meridian.
+
+    The earlier truncated series, Snyder's expansion in the longitude offset, was off from
+    PROJ by metres 10 degrees out and returned latitudes above 90 further out. Krueger's
+    series, which PROJ also evaluates, agrees with it to nanometres here, so a millimetre is
+    a bound with a wide margin rather than a tolerance for a known divergence.
+    """
+    lon = -123.0 + offset
+    for lat in (0.5, 37.0, 60.0, 84.0):
+        one = bt.from_pydict({"lon": [lon], "lat": [lat]})
+        projected = bt.st_transform(bt.st_point(bt.col("lon"), bt.col("lat")), 4326, 32610)
+        back = bt.st_transform(projected, 32610, 4326)
+        got = one.select(
+            x=bt.st_x(projected), y=bt.st_y(projected), lon=bt.st_x(back), lat=bt.st_y(back)
+        ).to_pydict()
+        wx, wy = spatial.execute(
+            "SELECT ST_X(p), ST_Y(p) FROM ("
+            "  SELECT ST_Transform(ST_Point(?, ?), 'EPSG:4326', 'EPSG:32610',"
+            "   always_xy := true) p)",
+            [lon, lat],
+        ).fetchone()
+        assert got["x"][0] == pytest.approx(wx, abs=1e-3), f"UTM x of ({lon}, {lat})"
+        assert got["y"][0] == pytest.approx(wy, abs=1e-3), f"UTM y of ({lon}, {lat})"
+        assert got["lon"][0] == pytest.approx(lon, abs=1e-9), f"round-trip lon of ({lon}, {lat})"
+        assert got["lat"][0] == pytest.approx(lat, abs=1e-9), f"round-trip lat of ({lon}, {lat})"
 
 
 def test_utm_zone_and_epsg_follow_the_published_rule():

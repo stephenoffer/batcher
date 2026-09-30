@@ -20,7 +20,7 @@ Read these as single-node results. Spark's per-stage machinery is priced for a c
 
 Spark's Adaptive Query Execution re-plans between stages. When a shuffle finishes, AQE reads the materialized shuffle statistics and can coalesce partitions, switch a sort-merge join to a broadcast join, or split a skewed partition. It is why Spark survives estimates that would sink a purely static optimizer.
 
-Batcher re-plans the same way, at stage boundaries on measured cardinalities, with the same granularity as AQE. When an estimate is off by more than `optimizer.reoptimize_error` (2x by default), the rest of the query is re-planned on the measured numbers, and the result is identical either way. Two things differ. The loop runs on a single node too, where AQE needs shuffle stages to exist. And what it measures outlives the query: Core records actual cardinalities, operator times and peak memory into the metadata hub, sketches and calibrated costs feed Kyber on the next run, so a recurring query gets a better plan each time it executes.
+Batcher re-plans the same way, at stage boundaries on measured cardinalities, with the same granularity as AQE. When an estimate is off by more than `optimizer.reoptimize_error` (2x by default), the rest of the query is re-planned on the measured numbers, and the result is identical either way. Two things differ. AQE is on by default since Spark 3.2 and re-plans at shuffle-exchange query stages in local mode (`local[*]`) too, so both run on one machine. Batcher's loop runs inside the Python process rather than in a JVM beside it. And what it measures outlives the query: Core records actual cardinalities, operator times and peak memory into the metadata hub, sketches and calibrated costs feed Kyber on the next run, so a recurring query gets a better plan each time it executes.
 
 The within-query loop isn't always on. Single-node, it engages on a query with a join once the input clears 5M rows, or about 320 MB, for each pipeline breaker it would cut at, so the simplest joined shape qualifies at about 10M rows.
 
@@ -30,7 +30,7 @@ The following table sets the architectural choices side by side:
 
 | | Spark | Batcher |
 |---|---|---|
-| Re-optimization | Stage boundaries, cluster only | Stage boundaries, single node or cluster, plus statistics learned across runs |
+| Re-optimization | Stage boundaries, on by default since 3.2, local mode or cluster | Stage boundaries, inside the Python process, single node or cluster, plus statistics learned across runs |
 | Data plane | JVM, row and columnar hybrid | Rust over Arrow, columnar throughout |
 | Expression evaluation | Whole-stage codegen to JVM bytecode | Interpreter oracle plus a Cranelift JIT, bit-for-bit identical on its subset |
 | Small-query overhead | JVM, driver and scheduler | In process |

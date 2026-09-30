@@ -139,6 +139,20 @@ the memory.
 You pay in collisions and interpretability. Two terms can land on one feature, and no
 feature has a name. Make `n_features` generous. A few hundred thousand is ordinary.
 
+To score with a model fitted on scikit-learn's `HashingVectorizer`, pass `hash_function="murmur3"` and `alternate_sign=True`. The index is then scikit-learn's `abs(murmurhash3_32(term)) % n_features`, and a term whose hash is negative contributes -1, as scikit-learn's default does. The default tokenization and `norm` are already scikit-learn's, so the output matches it value for value:
+
+```python
+from sklearn.feature_extraction.text import HashingVectorizer as SkHashingVectorizer
+
+texts = ["red car", "red red bike"]
+ours = HashingVectorizer(
+    "text", n_features=16, hash_function="murmur3", alternate_sign=True, dense=True
+).fit_transform(bt.from_pydict({"text": texts}))
+theirs = SkHashingVectorizer(n_features=16).transform(texts).toarray().tolist()
+print(ours.to_pydict()["features"] == theirs)
+# True
+```
+
 ## Fitting on the training split only
 
 A vectorizer is fitted state, so fit it on the training split. Fit on the whole frame and
@@ -171,8 +185,10 @@ ways out: set `max_features`, raise `min_df`, or switch to `HashingVectorizer`.
 
 ## Requirements and limitations
 
-- A null document is read as an empty one. It keeps its row and produces no features,
-  rather than being dropped from the output.
+- By default a null document is read as an empty one. It keeps its row, produces no
+  features, and counts toward the fitted document count. Pass `null_documents="null"` to
+  keep missing text distinguishable from empty text: the null document is left out of the
+  fit, so it doesn't dilute an IDF, and every output column is null for it.
 - Tokenization is regex-based and language-agnostic. There's no stemming, lemmatization, or
   subword tokenization. For those, use
   {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` with a real tokenizer, or an
@@ -180,8 +196,9 @@ ways out: set `max_features`, raise `min_df`, or switch to `HashingVectorizer`.
 - `max_features` breaks a frequency tie alphabetically so the fitted vocabulary is
   reproducible. scikit-learn leaves that tie to an unstable sort, so the two libraries can
   legitimately keep different terms from a tied group.
-- `HashingVectorizer` uses a different hash function from scikit-learn's, so the two agree
-  on a document's *values* but not on which index carries them.
+- `HashingVectorizer`'s default FNV-1a hash differs from scikit-learn's, so under the default
+  the two agree on a document's *values* but not on which index carries them. Pass
+  `hash_function="murmur3", alternate_sign=True` for scikit-learn's indices and signs.
 
 
 ## Where a vectorizer puts its output

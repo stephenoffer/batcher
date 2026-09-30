@@ -24,11 +24,10 @@ the extension before giving up on `application/octet-stream`.
 from __future__ import annotations
 
 import mimetypes
-from typing import IO, Any
 
 from batcher._internal.native import engine_or_none
 
-__all__ = ["MAGIC_PEEK_BYTES", "OCTET_STREAM", "read_header", "sniff_mime"]
+__all__ = ["MAGIC_PEEK_BYTES", "OCTET_STREAM", "sniff_mime"]
 
 # How many leading bytes are enough to sniff a media type by magic number and to read a
 # format header. Kept small so metadata extraction stays header-only.
@@ -60,15 +59,3 @@ def sniff_mime(path: str, data: bytes) -> str:
             return sniffed
     guessed, _ = mimetypes.guess_type(path)
     return guessed or OCTET_STREAM
-
-
-def read_header(fh: IO[Any]) -> bytes:
-    """Read just the leading header bytes from an open handle.
-
-    Args:
-        fh: An open binary file handle positioned at the start.
-
-    Returns:
-        The leading `MAGIC_PEEK_BYTES` bytes, or fewer for a shorter file.
-    """
-    return fh.read(MAGIC_PEEK_BYTES)

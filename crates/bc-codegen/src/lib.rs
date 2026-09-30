@@ -151,8 +151,9 @@ impl ScalarTy {
 ///
 /// Returns [`CodegenError::Unsupported`] for any expression outside the
 /// supported subset (see the crate docs) so the caller can fall back to
-/// `bc_expr::Expr::eval`.
-pub fn compile_and_eval(
+/// `bc_expr::Expr::eval`. Test-only: the engine compiles once per operator and reuses it.
+#[cfg(test)]
+pub(crate) fn compile_and_eval(
     expr: &bc_expr::Expr,
     batch: &RecordBatch,
 ) -> Result<ArrayRef, CodegenError> {
@@ -321,8 +322,8 @@ unsafe impl Sync for CompiledExpr {}
 /// subset (the caller then uses the interpreter).
 ///
 /// Uses the detected host [`HardwareProfile`](bc_arrow::HardwareProfile) to pick the
-/// SIMD width/unroll; use [`compile_expr_with`] to override it (a benchmark pinning a
-/// width, or a config disabling SIMD).
+/// SIMD width/unroll; use [`compile_expr_with`] to override it (the parity tests
+/// pin each width).
 pub fn compile_expr(
     expr: &bc_expr::Expr,
     batch: &RecordBatch,

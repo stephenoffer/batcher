@@ -13,11 +13,19 @@ assembles, JSON-encodes, and writes one document per query — ~0.3 ms, which on
 for an artifact many callers have no reader for; `explain(analyze=True)` and `stats()`
 produce the same profile on demand, so `event_log=False` gets the overhead back.
 
-Note the cost is *not* the disk: the write is a page-cached `open`/`write`/`close` and
-releases the GIL, and moving it to a background writer thread measured **no improvement at
-all** (1.13 ms async vs 1.09 ms sync) because the expensive part — the profile assembly and
-the `json.dumps` — is GIL-bound Python that a thread cannot run in parallel with the query
-anyway. The only way to not pay it is to not do it.
+Note the cost is *not* the disk: the write is a page-cached `open`/`write`/`close`. The
+expensive part is the profile assembly and the `json.dumps`, which is GIL-bound Python.
+
+Moving only the *write* to a background thread measured no improvement (1.13 ms async vs
+1.09 ms sync), and that is why the whole document used to be produced inline. Deferring the
+assembly and the encode as well — everything after the engine returns — is a different
+trade. It takes **0.9-1.35 ms off the latency to result** of a warm TPC-H sf1 q2/q8/q17
+(paired A/B with the writer idle before each timed run), and ~0.4 ms off each query of a
+tight back-to-back loop, where the deferred Python still competes with the next query for
+the GIL. (An A/B alternating single runs read 2.0-2.7 ms; it was biased, charging each
+deferred run's write to the inline run after it.) So when the file is the only consumer (no
+bus subscriber, no OTel, no OpenLineage) the document goes through one ordered background
+writer (`_WRITER`), and anything that reads the directory calls `flush_event_log` first.
 
 The collector is attached to the execution context only when the feature is on, so a
 disabled event log adds nothing.
@@ -35,6 +43,7 @@ from itertools import count
 from pathlib import Path
 from typing import Any
 
+from batcher._internal.concurrency.serial import SerialWorker
 from batcher._internal.logging import note_suppressed
 from batcher._internal.paths import private_dir
 from batcher.plan.profile import ProfileCollector
@@ -42,6 +51,7 @@ from batcher.plan.types import logical_bytes
 
 __all__ = [
     "event_log_collector",
+    "flush_event_log",
     "pipeline_signature",
     "query_label",
     "report_failure",
@@ -53,6 +63,9 @@ __all__ = [
 
 # Per-process query counter, so two queries in the same millisecond get distinct ids.
 _counter = count()
+
+# The one writer every deferred document goes through, in report order — see `write_event_log`.
+_WRITER = SerialWorker("batcher-event-log", capacity=256)
 
 
 def event_log_collector() -> ProfileCollector | None:
@@ -92,7 +105,7 @@ def pipeline_signature(plan: object) -> str:
         from batcher.kyber.signature import plan_signature
 
         return plan_signature(plan)
-    except Exception as exc:  # pragma: no cover - an unsignable plan must not fail the query
+    except Exception as exc:  # an unsignable plan must not fail the query
         note_suppressed("api", "sign the plan for the event log", exc)
         return ""
 
@@ -185,16 +198,64 @@ def write_event_log(
         _publish_end(query_id, total_ms=total_ms, rows=rows, profile=None)
         return
     from batcher._internal import events
-    from batcher._internal.logging import get_logger
-    from batcher._internal.paths import open_private
-    from batcher.api.terminal.lineage import emit_run_complete, openlineage_enabled
-    from batcher.api.terminal.otel import emit_query_spans, otel_enabled
+    from batcher.api.terminal.lineage import openlineage_enabled
+    from batcher.api.terminal.otel import otel_enabled
     from batcher.config import active_config
 
     cfg = active_config().observability
     if not (cfg.event_log or events.listening() or otel_enabled() or openlineage_enabled()):
         _publish_end(query_id, total_ms=total_ms, rows=rows, profile=None)
         return
+    # The file is the only consumer, and nothing reads it until the query has returned
+    # (`flush_event_log` is what a reader calls first). So the assembly, the encode and the
+    # write — ~1 ms of a warm TPC-H sf1 query's latency — run on `_WRITER` instead of between
+    # the engine returning and the caller getting its rows. A full queue writes inline.
+    file_only = cfg.event_log and not (
+        events.listening() or otel_enabled() or openlineage_enabled()
+    )
+    if file_only and _WRITER.submit(_emit, collector, plan, sources, total_ms, rows, query_id):
+        return
+    _emit(collector, plan, sources, total_ms, rows, query_id)
+
+
+def flush_event_log(timeout_s: float | None = None) -> bool:
+    """Wait for every event-log document already reported to reach the log directory.
+
+    Documents are written off the query's critical path when the file is their only reader
+    (see `write_event_log`), so a caller that reads the directory itself calls this first.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.api.terminal.event_log import flush_event_log
+            >>> flush_event_log(5.0)
+            True
+
+    Args:
+        timeout_s: The most to wait, or None to wait as long as it takes.
+
+    Returns:
+        Whether every pending document had been written when this returned.
+    """
+    return _WRITER.flush(timeout_s)
+
+
+def _emit(
+    collector: ProfileCollector,
+    plan: object,
+    sources: list | None,
+    total_ms: float,
+    rows: int,
+    query_id: str | None,
+) -> None:
+    """Assemble one query's profile and send it to every enabled sink (`write_event_log`)."""
+    from batcher._internal.logging import get_logger
+    from batcher._internal.paths import open_private
+    from batcher.api.terminal.lineage import emit_run_complete
+    from batcher.api.terminal.otel import emit_query_spans
+    from batcher.config import active_config
+
+    cfg = active_config().observability
     seq = next(_counter)
     # Reuse the id `start_query_report` already announced, so the live view and the archived
     # document name the same query; mint one only for a caller that never announced a start.
@@ -216,7 +277,7 @@ def write_event_log(
             log_dir = _resolve_dir(cfg.event_log_dir)
             name = f"{query_id}.json"
             with open_private(log_dir / name) as fh:
-                fh.write(json.dumps(document, default=str).encode("utf-8"))
+                fh.write(_encode(document, collector).encode("utf-8"))
             # Retention runs on every write because it is now O(1) there — see `_prune`.
             _prune(log_dir, cfg.event_log_max_files, wrote=name, seq=seq)
         except Exception:  # pragma: no cover - event logging must never break a query
@@ -224,6 +285,31 @@ def write_event_log(
     # The emitter is itself a no-op unless OTel is enabled and a provider is configured.
     emit_query_spans(profile)
     emit_run_complete(profile, plan, sources)
+
+
+def _encode(document: dict[str, Any], collector: ProfileCollector) -> str:
+    """`document` as JSON, splicing in the IR text the collector already holds.
+
+    The two IR fields are most of the document (39 KB logical + 10 KB optimized of 76 KB on
+    TPC-H q8) and both already exist as JSON on every run — the logical plan serialized its
+    IR to compute its `content_key`, and a cached physical plan memoizes `to_json`. Encoding
+    them again was over half of the event log's per-query cost. A field is spliced only when
+    the document still holds the very dict the text was made from; anything else is encoded,
+    so the output is always the document's content.
+    """
+    texts = {
+        key: text
+        for key, text, source in (
+            ("logical_ir", collector.logical_ir_json, collector.logical_ir),
+            ("optimized_ir", collector.optimized_ir_json, collector.optimized_ir),
+        )
+        if text is not None and source is not None and document.get(key) is source
+    }
+    if not texts:
+        return json.dumps(document, default=str)
+    body = json.dumps({k: v for k, v in document.items() if k not in texts}, default=str)
+    spliced = ", ".join(f"{json.dumps(k)}: {text}" for k, text in texts.items())
+    return "{" + spliced + "}" if body == "{}" else body[:-1] + ", " + spliced + "}"
 
 
 def _is_udf_pipeline(plan: object) -> bool:

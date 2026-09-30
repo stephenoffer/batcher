@@ -103,13 +103,11 @@ pub(crate) fn allocator_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     // SAFETY: every pointer is to a live local `usize` for the duration of the call, which is
     // exactly the out-parameter contract `mi_process_info` documents.
     //
-    // The order is `current_rss, peak_rss, current_commit, peak_commit`, and it was written
-    // `current_commit, peak_commit, current_rss, peak_rss` — so the two pairs were swapped and
-    // every reader of `peak_rss` got the peak *commit* and vice versa. Invisible in the current
-    // pair on Linux, where mimalloc estimates `current_rss` from `current_commit` and the two
-    // are equal by construction; plainly wrong in the peaks, which come from different sources
-    // (`getrusage` against mimalloc's own accounting) and measured 879 MiB against 1025 MiB on
-    // the same process.
+    // The argument order is `current_rss, peak_rss, current_commit, peak_commit`. Swapping the
+    // two pairs would be invisible in the current values on Linux, where mimalloc estimates
+    // `current_rss` from `current_commit` so the two are equal by construction, and plainly
+    // wrong in the peaks, which come from different sources (`getrusage` against mimalloc's
+    // own accounting): one process measured 879 MiB against 1025 MiB.
     unsafe {
         libmimalloc_sys::mi_process_info(
             &mut elapsed,

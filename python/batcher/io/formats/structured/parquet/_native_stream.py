@@ -28,12 +28,12 @@ rule below, and it is why this decision needs the read-ahead depth rather than a
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from typing import Any
 
 import pyarrow as pa
 
+from batcher.config.env import env_int
 from batcher.io.formats.structured import _parquet_native
 
 __all__ = ["iter_windows", "row_group_windows", "use_native_stream"]
@@ -50,16 +50,14 @@ __all__ = ["iter_windows", "row_group_windows", "use_native_stream"]
 # footprint — one window per in-flight file, not a pile, because `ordered_readahead` parks a
 # producer on its byte credit before it can start a second. With the depth rule below,
 # `depth` is at most `_LOCAL_MAX_DEPTH` on local disk, so that is ~64 MiB.
-_NATIVE_WINDOW_BYTES = max(
-    1 << 20, int(os.environ.get("BATCHER_NATIVE_WINDOW_BYTES", str(32 << 20)))
-)
+_NATIVE_WINDOW_BYTES = env_int("BATCHER_NATIVE_WINDOW_BYTES", 32 << 20, floor=1 << 20)
 _NATIVE_WINDOW_MAX_GROUPS = 8
 
 # The measured crossover (see the module docstring): at read-ahead depth 1-2 the native
 # reader wins 1.4-2.0x, at depth 4 it has already lost, and at the default depth of 16 it is
 # 3x slower. Local disk is bandwidth- and CPU-bound, so the parallelism has to come from
 # exactly one place.
-_LOCAL_MAX_DEPTH = max(1, int(os.environ.get("BATCHER_NATIVE_STREAM_MAX_DEPTH", "2")))
+_LOCAL_MAX_DEPTH = env_int("BATCHER_NATIVE_STREAM_MAX_DEPTH", 2, floor=1)
 
 
 def use_native_stream(depth: int, remote: bool) -> bool:

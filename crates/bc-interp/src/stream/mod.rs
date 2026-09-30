@@ -274,7 +274,12 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
     // against this worker's *shard*. Metrics are not re-recorded: the run that filled the cache
     // was metered, and counting it again in every worker would inflate the very cardinalities
     // Kyber learns from.
-    if let Some(batches) = ctx.mats.and_then(|m| m.get(&node_key(plan))) {
+    let key = node_key(plan);
+    if let Some(batches) = ctx
+        .mats
+        .and_then(|m| m.get(&key))
+        .or_else(|| ctx.cache.probe_leaf(key))
+    {
         let batches = Arc::clone(batches);
         let n = batches.len();
         return Ok(Box::new((0..n).map(move |i| Ok(batches[i].clone()))));

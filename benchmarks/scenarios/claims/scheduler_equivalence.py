@@ -110,7 +110,7 @@ def main() -> int:
             failed += 1
             notes.append(f"{case}: distributed raised {type(exc).__name__}")
             continue
-        ok, why = results_match(single, dist)
+        ok, why = results_match(single, dist, strict_types=True)
         # `results_match` sorts both sides, so on its own it cannot see a distributed path
         # that dropped an `ORDER BY` — which is precisely the divergence this benchmark
         # exists to rule out. 18 of the 22 TPC-H queries carry one. Both sides are checked,

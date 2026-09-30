@@ -325,7 +325,11 @@ fn run_with_cache(
     // `Project(Sort(Aggregate(…)))` takes (TPC-H q3): the pass materializes the `Sort`, then
     // `peel_row_wise` re-enters on that same `Sort`, and without this check the whole aggregate
     // underneath it runs a second time. Nothing in the *result* would betray it.
-    if let Some(batches) = prebuilt_mats.and_then(|m| m.get(&node_key(plan))) {
+    let key = node_key(plan);
+    if let Some(batches) = prebuilt_mats
+        .and_then(|m| m.get(&key))
+        .or_else(|| prebuilt.and_then(|c| c.probe_leaf(key)))
+    {
         return Ok(batches.as_ref().clone());
     }
 
@@ -537,6 +541,17 @@ fn run_with_cache(
         (!owned_mats.is_empty()).then_some(&owned_mats)
     } else {
         None
+    };
+    // Probe sides the build preparation evaluated ahead of their joins (`builds::build_sideways`)
+    // are finished relations exactly like the breakers above, and must be *seen* as such by every
+    // shardability check below: a scan under one is never executed, so sharding past it would
+    // hand every worker the whole leaf and multiply its rows by the worker count.
+    let merged_mats: MatCache;
+    let mats: Option<&MatCache> = if cache.has_probe_leaves() {
+        merged_mats = cache.merged_with(mats);
+        Some(&merged_mats)
+    } else {
+        mats
     };
 
     let Some(driving) = shardable_source(plan, cache, mats) else {

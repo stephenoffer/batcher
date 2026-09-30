@@ -1,6 +1,6 @@
 """The plan cache's accumulator lists must describe the state its writers actually store.
 
-`plan_cache._materially_differs` decides whether a learned write invalidates every memoized
+`plan_cache.writes._materially_differs` decides whether a learned write invalidates every memoized
 plan. It classifies a dict's fields by *name*: a field named in `_BOOKKEEPING_FIELDS` is an
 accumulator that grows with every observation and is ignored, a pair in `_DERIVED_RATIOS` is
 compared as a quotient, and anything else is compared directly.
@@ -24,7 +24,7 @@ from __future__ import annotations
 import pytest
 
 from batcher.kyber import ols
-from batcher.kyber.plan_cache import (
+from batcher.kyber.plan_cache.writes import (
     _BOOKKEEPING_FIELDS,
     _DERIVED_RATIOS,
     _materially_differs,

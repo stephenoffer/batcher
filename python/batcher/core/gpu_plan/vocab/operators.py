@@ -61,8 +61,8 @@ BINOPS = {
 
 def eval_binary(ir, df, be, eval_expr):
     op = ir["op"]
-    left = eval_expr(ir["left"], df, be)
-    right = eval_expr(ir["right"], df, be)
+    left = be.require_flat(eval_expr(ir["left"], df, be), f"binary {op}")
+    right = be.require_flat(eval_expr(ir["right"], df, be), f"binary {op}")
     if op == "concat":
         # String concatenation, not addition: `+` on two string Series does concatenate on
         # both backends, but a scalar operand has to become a column first or pandas raises.

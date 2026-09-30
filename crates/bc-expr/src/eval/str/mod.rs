@@ -561,6 +561,9 @@ pub(crate) fn eval_str(
                 hex_lower(Sha256::digest(v.as_bytes()).as_slice())
             }))
         }
+        StrFunc::Sha224 | StrFunc::Sha384 | StrFunc::Sha512 => {
+            Arc::new(map_str(s, |v| sha2_hex(func, v.as_bytes())))
+        }
         StrFunc::Crc32 => Arc::new(
             s.iter()
                 .map(|o| o.map(|v| i64::from(crc32fast::hash(v.as_bytes()))))
@@ -1351,6 +1354,12 @@ fn eval_bytes(
                     .collect::<StringArray>(),
             )
         }
+        StrFunc::Sha224 | StrFunc::Sha384 | StrFunc::Sha512 => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.map(|v| sha2_hex(func, v)))
+                .collect::<StringArray>(),
+        ),
         StrFunc::Base64 => {
             use base64::Engine as _;
             Arc::new(
@@ -1425,6 +1434,17 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
         out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
     }
     out
+}
+
+/// The lowercase-hex SHA-2 digest `func` names, for the widths other than 256 (which keeps
+/// its own arm). Spark's `sha2(s, bits)` reaches these; the digest is the `sha2` crate's.
+fn sha2_hex(func: StrFunc, bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha224, Sha384, Sha512};
+    match func {
+        StrFunc::Sha224 => hex_lower(Sha224::digest(bytes).as_slice()),
+        StrFunc::Sha384 => hex_lower(Sha384::digest(bytes).as_slice()),
+        _ => hex_lower(Sha512::digest(bytes).as_slice()),
+    }
 }
 
 /// Parse a string of hex-digit pairs into bytes (DuckDB `unhex`). Returns `None`
@@ -1661,15 +1681,13 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 /// 64-bit xxHash of `bytes` — fast, deterministic, and stable across machines (the
-/// standard bucketing/sharding hash). Uses the portable `Hasher` API.
+/// standard bucketing/sharding hash). The engine's one implementation,
+/// [`bc_arrow::xxhash64`], which the shuffle also routes by.
 ///
 /// `seed` is the `start` slot, `0` when absent; the `i64` is reinterpreted as the `u64`
 /// seed, which is how Spark passes its `long` seed (`42`) to the same algorithm.
 fn xxhash64(bytes: &[u8], seed: Option<i64>) -> u64 {
-    use std::hash::Hasher;
-    let mut h = twox_hash::XxHash64::with_seed(seed.unwrap_or(0) as u64);
-    h.write(bytes);
-    h.finish()
+    bc_arrow::xxhash64(bytes, seed.unwrap_or(0) as u64)
 }
 
 /// Translate a SQL `LIKE`/`ILIKE` pattern into an anchored `regex::Regex`.
@@ -2354,6 +2372,10 @@ mod tests {
             str_of(StrFunc::Sha256).0,
             hex_lower(Sha256::digest(raw).as_slice())
         );
+        assert_eq!(
+            str_of(StrFunc::Sha512).0,
+            hex_lower(sha2::Sha512::digest(raw).as_slice())
+        );
         // base64 of the four raw bytes.
         assert_eq!(str_of(StrFunc::Base64).0, "3q2+7w==");
     }
@@ -2370,6 +2392,21 @@ mod tests {
         assert_eq!(
             hex_lower(Sha256::digest(b"abc").as_slice()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // FIPS 180-4 test vectors for "abc", reached through the `sha2(s, bits)` arms.
+        assert_eq!(
+            super::sha2_hex(crate::StrFunc::Sha224, b"abc"),
+            "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"
+        );
+        assert_eq!(
+            super::sha2_hex(crate::StrFunc::Sha384, b"abc"),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+             8086072ba1e7cc2358baeca134c825a7"
+        );
+        assert_eq!(
+            super::sha2_hex(crate::StrFunc::Sha512, b"abc"),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
         );
         // crc32(IEEE) "abc" = 0x352441C2; empty = 0.
         assert_eq!(crc32fast::hash(b"abc"), 0x3524_41c2);

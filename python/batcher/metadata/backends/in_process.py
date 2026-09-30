@@ -88,6 +88,18 @@ class InProcessBackend:
         for key, value in items:
             dst[key] = value
 
+    def keys(self, table: str, prefix: Key = ()) -> list[Key]:
+        """Every key under `prefix`, without reading a value.
+
+        Optional, like `delete`, and for the same caller: `MetadataHub._prune_op_stats` needs
+        only the keys (they carry the sequence number that orders them), and reading them
+        through `scan` JSON-encoded every deferred row it walked past — tens of milliseconds
+        per prune at the 65,536-row cap, for bytes it discarded unread.
+        """
+        rows = self._tables.get(table, {})
+        n = len(prefix)
+        return [key for key in list(rows) if key[:n] == prefix]
+
     def delete(self, table: str, keys: list[Key]) -> None:
         """Drop `keys` from `table`; absent keys are ignored.
 

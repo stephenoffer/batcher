@@ -164,7 +164,12 @@ class Trigger:
 
     @classmethod
     def continuous(cls, interval: float | int | str | timedelta) -> Trigger:
-        """Continuous processing, committing a checkpoint epoch every `interval`.
+        """Back-to-back micro-batches with no delay, committing a checkpoint epoch every `interval`.
+
+        This is Spark's name, not Spark's engine. Spark's continuous mode processes records
+        one at a time on long-running tasks; this one is still micro-batch execution, with
+        the inter-batch wait removed, so its latency is one micro-batch rather than one
+        record. Stateless pipelines only (filter / select / map_batches).
 
         Examples:
             .. doctest::

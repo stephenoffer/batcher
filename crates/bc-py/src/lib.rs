@@ -236,7 +236,12 @@ fn prepare_exec(
     // pool (per-query pools would let N concurrent queries each hold `budget` and OOM).
     // Zero budget ⇒ no pool ⇒ the fast path pays nothing.
     if cfg.memory_budget_bytes > 0 {
-        opts.pool = Some(shared_memory_pool(cfg.memory_budget_bytes));
+        let pool = shared_memory_pool(cfg.memory_budget_bytes);
+        // The control plane classifies this pool's `used / limit` against `memory.soft_limit`;
+        // drawing the pool's own soft line at the same fraction keeps the `pressure` it reports
+        // (`engine_pool_stats`) from disagreeing with Carbonite about the same counter.
+        pool.set_soft_fraction(cfg.memory_soft_fraction);
+        opts.pool = Some(pool);
     }
     // Look the token up rather than creating one: the control plane registered the id before
     // it started optimizing, so a cancel that arrived during planning is already recorded on
@@ -286,7 +291,6 @@ fn prepare_exec(
         cfg.prefer_materializing_aggregate,
         materialize_fits,
         aggregate_materialize_fits,
-        cfg.prefer_sideways && bc_interp::sideways_candidate(&plan, &sources),
     );
     let streaming = route::use_streaming(&cfg) && !materialize_is_safe_and_faster;
     route::trace(

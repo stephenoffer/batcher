@@ -48,6 +48,7 @@ use crate::{Expr, ExprError, GeoFunc};
 mod build;
 #[cfg(test)]
 mod edge_tests;
+mod geodesic;
 mod grid;
 mod scalar;
 
@@ -94,6 +95,38 @@ pub(crate) fn caller_error(func: GeoFunc, e: GeoError) -> ExprError {
         func: fn_name(func),
         reason: e.to_string(),
     }
+}
+
+/// Decode row `i` of a function's second geometry operand, refusing one whose SRID
+/// differs from the first's.
+///
+/// Two geometries in different reference systems have coordinates that are not
+/// comparable, and every two-operand function here compares coordinates. Measuring a
+/// Web Mercator point against a longitude and latitude gives a plausible number that
+/// means nothing, so this refuses the pair instead, as PostGIS does. SRID 0 is
+/// "unknown", which a literal WKT and every constructor produce, and it is compatible
+/// with anything: refusing it would make every mixed literal-and-column query an error.
+pub(crate) fn second_geom_at(
+    col: &ArrayRef,
+    i: usize,
+    func: GeoFunc,
+    first: &Geom,
+) -> Result<Option<Geom>, ExprError> {
+    let second = geom_at(col, i, func)?;
+    if let Some(b) = &second {
+        if first.srid != 0 && b.srid != 0 && first.srid != b.srid {
+            return Err(ExprError::InvalidArgument {
+                func: fn_name(func),
+                reason: format!(
+                    "the operands are in different reference systems (SRID {} and {}); \
+                     reproject one with st_transform, or relabel it with st_set_srid if \
+                     the SRID itself is wrong",
+                    first.srid, b.srid
+                ),
+            });
+        }
+    }
+    Ok(second)
 }
 
 /// Decode row `i` of a geometry column.
@@ -361,8 +394,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn operands_in_different_reference_systems_are_refused() {
+        let col: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![
+            "SRID=3857;POINT(1 1)",
+            "POINT(1 1)",
+        ]));
+        let lonlat = bc_geo::codec::wkt::read_wkt("SRID=4326;POINT(1 1)").unwrap();
+        let err = second_geom_at(&col, 0, GeoFunc::StIntersects, &lonlat).unwrap_err();
+        assert!(err.to_string().contains("SRID 4326 and 3857"), "{err}");
+        // SRID 0 is unknown, and compatible with anything.
+        assert!(second_geom_at(&col, 1, GeoFunc::StIntersects, &lonlat).is_ok());
+        let unknown = bc_geo::codec::wkt::read_wkt("POINT(1 1)").unwrap();
+        assert!(second_geom_at(&col, 0, GeoFunc::StIntersects, &unknown).is_ok());
+    }
+
     /// Every `GeoFunc`, for the routing tests above.
-    pub(super) const ALL: [GeoFunc; 113] = [
+    pub(super) const ALL: [GeoFunc; 116] = [
         GeoFunc::StPoint,
         GeoFunc::StPointZ,
         GeoFunc::StMakeLine,
@@ -454,6 +502,9 @@ mod tests {
         GeoFunc::StSegmentize,
         GeoFunc::StExpand,
         GeoFunc::StCollect,
+        GeoFunc::StUnion,
+        GeoFunc::StIntersection,
+        GeoFunc::StDifference,
         GeoFunc::StRemoveRepeatedPoints,
         GeoFunc::StLineInterpolatePoint,
         GeoFunc::StLineLocatePoint,

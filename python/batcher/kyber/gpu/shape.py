@@ -139,7 +139,7 @@ def is_shardable(plan: LogicalPlan) -> bool:
 
     try:
         return ir_divides(plan.to_ir())
-    except Exception as exc:  # pragma: no cover - routing must never break a plan
+    except Exception as exc:  # routing must never break a plan
         note_suppressed("kyber", "test the plan for a mergeable reducer", exc)
         return False
 

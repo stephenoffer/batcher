@@ -1,7 +1,9 @@
-"""Generative AI from SQL — ``AI_GENERATE`` / ``ai_query`` / ``ai_complete`` / ``AI_EXTRACT``.
+"""AI from SQL — ``AI_GENERATE`` / ``ai_query`` / ``ai_complete`` / ``AI_EXTRACT`` / ``AI_CLASSIFY``
+/ ``AI_EMBED``.
 
 `ML_PREDICT` gives SQL the traditional model; these are the generative half, and they lower to
-`Dataset.ml.generate` and `Dataset.ml.extract` rather than to a second inference path.
+`Dataset.ml.generate`, `.extract`, `.classify` and `.embed` rather than to a second inference
+path.
 
 Every engine here is a plain ``list[str] -> list[str]`` closure, so the whole file runs with no
 network, no API key and no GPU — which is the point of the engine contract being that narrow.
@@ -108,6 +110,96 @@ def test_ai_extract_types_each_declared_field(session: bt.Session) -> None:
     assert out["label"] == ["positive", "negative", "negative"]
 
 
+# --- classification -------------------------------------------------------------------
+
+
+def test_ai_classify_appends_one_label_per_row(session: bt.Session) -> None:
+    """The relational form sqlglot's three-argument ``AIClassify`` grammar used to reject."""
+    session.register_engine(
+        "labeller",
+        lambda: lambda prompts: ["positive" if "love" in p else "negative" for p in prompts],
+    )
+    out = session.sql(
+        "SELECT id, label FROM AI_CLASSIFY(reviews, labeller, prompt_column => 'body',"
+        " labels => ['positive', 'negative']) ORDER BY id"
+    ).to_pydict()
+    assert out == {"id": [1, 2, 3], "label": ["positive", "negative", "negative"]}
+
+
+def test_ai_classify_output_column_renames_the_label(session: bt.Session) -> None:
+    session.register_engine("always_neg", lambda: lambda prompts: ["negative"] * len(prompts))
+    out = session.sql(
+        "SELECT verdict FROM AI_CLASSIFY(reviews, always_neg, prompt_column => 'body',"
+        " labels => ['positive', 'negative'], output_column => 'verdict')"
+    ).to_pydict()
+    assert out == {"verdict": ["negative", "negative", "negative"]}
+
+
+def test_ai_classify_needs_its_labels(session: bt.Session) -> None:
+    with pytest.raises(PlanError, match="needs 'labels'"):
+        session.sql("SELECT * FROM AI_CLASSIFY(reviews, grader, prompt_column => 'body')")
+
+
+def test_the_three_argument_snowflake_form_is_refused_clearly(session: bt.Session) -> None:
+    """Snowflake's ``AI_CLASSIFY(input, categories)`` has no relation or engine to resolve."""
+    with pytest.raises(PlanError, match="registered engine name"):
+        session.sql("SELECT * FROM AI_CLASSIFY(reviews, ['a', 'b'])")
+
+
+def test_ai_classify_in_the_select_list_still_parses_other_sql() -> None:
+    """Reading AI_CLASSIFY as a plain call must not change how anything else parses."""
+    from batcher._internal.sql_errors import parse_sql
+
+    node = parse_sql("SELECT a + 1 AS b FROM t WHERE c > 2", dialect="duckdb")
+    assert node.sql() == "SELECT a + 1 AS b FROM t WHERE c > 2"
+
+
+# --- embedding ---------------------------------------------------------------------
+
+
+def test_ai_embed_lowers_to_ds_ml_embed(
+    session: bt.Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model id reaches `ds.ml.embed`; a stand-in encoder keeps the test offline."""
+    import importlib
+
+    import pyarrow as pa
+
+    # `batcher.ml` re-exports a function named `embed`, which shadows the submodule on a
+    # plain `import batcher.ml.embed as ...`; the module object is what `ds.ml.embed` reads.
+    embed_module = importlib.import_module("batcher.ml.embed")
+
+    seen: dict[str, str] = {}
+
+    def fake_encoder(model: str, text_column: str, *, output_column: str, **_: object) -> type:
+        seen.update(model=model, column=text_column)
+
+        class _Encoder:
+            def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+                lengths = [float(len(t)) for t in batch.column(text_column).to_pylist()]
+                return batch.append_column(output_column, pa.array(lengths))
+
+        return _Encoder
+
+    monkeypatch.setattr(embed_module, "sentence_transformer_encoder", fake_encoder)
+    out = session.sql(
+        "SELECT id, vec FROM AI_EMBED(reviews, 'some/model', column => 'body',"
+        " output_column => 'vec') ORDER BY id"
+    ).to_pydict()
+    assert seen == {"model": "some/model", "column": "body"}
+    assert out == {"id": [1, 2, 3], "vec": [7.0, 10.0, 10.0]}
+
+
+def test_ai_embed_takes_a_quoted_model_id(session: bt.Session) -> None:
+    with pytest.raises(PlanError, match="quoted sentence-transformers model id"):
+        session.sql("SELECT * FROM AI_EMBED(reviews, shouty, column => 'body')")
+
+
+def test_ai_embed_needs_its_text_column(session: bt.Session) -> None:
+    with pytest.raises(PlanError, match="needs 'column'"):
+        session.sql("SELECT * FROM AI_EMBED(reviews, 'some/model')")
+
+
 # --- it is an ordinary relation ------------------------------------------------------
 
 
@@ -188,9 +280,10 @@ def test_a_malformed_extract_schema_says_how_to_write_it(
 @pytest.mark.parametrize(
     ("query", "points_at"),
     [
-        ("SELECT * FROM AI_CLASSIFY(reviews, ['a', 'b'])", "AI_EXTRACT"),
-        ("SELECT * FROM AI_EMBED(reviews, shouty)", "ds.ml.embed"),
         ("SELECT * FROM AI_SIMILARITY(reviews, shouty)", "ds.ml.similarity_to"),
+        ("SELECT * FROM AI_AGG(reviews, shouty)", "grouped relation"),
+        # Parsed as a plain call, not sqlglot's `AIForecast` node, so it needs a name key.
+        ("SELECT * FROM AI_FORECAST(reviews, body)", "no forecasting model"),
     ],
 )
 def test_an_untranslated_ai_call_says_where_the_capability_is(
@@ -202,6 +295,6 @@ def test_an_untranslated_ai_call_says_where_the_capability_is(
 
 
 def test_the_untranslated_message_uses_the_sql_spelling(session: bt.Session) -> None:
-    """Quoting sqlglot's ``AIClassify`` back sends the reader looking for another function."""
-    with pytest.raises(PlanError, match=r"^AI_CLASSIFY is not translated"):
-        session.sql("SELECT * FROM AI_CLASSIFY(reviews, ['a', 'b'])")
+    """Quoting sqlglot's ``AISimilarity`` back sends the reader looking for another function."""
+    with pytest.raises(PlanError, match=r"^AI_SIMILARITY is not translated"):
+        session.sql("SELECT * FROM AI_SIMILARITY(reviews, shouty)")

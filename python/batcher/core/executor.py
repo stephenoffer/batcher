@@ -73,10 +73,30 @@ def record_exec_metrics(
         return
     if not isinstance(doc, dict):
         return  # a document of the wrong shape is not an error, it is nothing to record
-    ops = doc.get("ops") or []
-    if not isinstance(ops, list):
+    ops = _ops_of(doc)
+    if not ops:
         return
     _record_op_feedback(sink, ops, batch_size, planned)
+
+
+def _ops_of(doc: dict) -> list[dict]:
+    """The document's ``ops``, each marked ``runtime_filtered`` when the engine listed it so.
+
+    The engine lists by `op_id` the operators whose input a runtime join filter reduced
+    (`ExecMetrics::runtime_filtered`): their `rows_out` is what reached the join the filter
+    serves, which depends on the plan around them, so it is not their cardinality. Marking
+    the op itself keeps that fact next to the count it qualifies, for every reader.
+    """
+    ops = doc.get("ops") or []
+    if not isinstance(ops, list):
+        return []
+    filtered = doc.get("runtime_filtered") or ()
+    if filtered:
+        marked = set(filtered)
+        for op in ops:
+            if isinstance(op, dict) and op.get("op_id") in marked:
+                op["runtime_filtered"] = True
+    return ops
 
 
 _tracing_started = False
@@ -142,7 +162,7 @@ def _record_op_feedback(
             _record_one(
                 sink, op, batch_size, planned, local_fingerprint, local_throttled, local_thermal
             )
-        except Exception:  # pragma: no cover - measurement must never break a query
+        except Exception:  # measurement must never break a query
             _log.warning("skipped an unreadable operator metrics entry", exc_info=True)
 
 
@@ -203,7 +223,11 @@ def _record_one(
             n_build=int(_num(op, "rows_build")),
             result_bytes=int(_num(op, "result_bytes") or _num(op, "peak_bytes")),
             signature=_signature_of(annotated),
-            n_estimated=_raw_estimate_of(annotated),
+            # `0` is the correction loop's "nothing to learn from" (`kyber.learning`): a count a
+            # runtime join filter reduced is not this operator's cardinality, so its q-error
+            # would teach the next plan a correction that plan's own filters contradict. TPC-H
+            # q7 at sf10 re-planned every few runs that way, between a 76 ms plan and a 95 ms one.
+            n_estimated=0.0 if op.get("runtime_filtered") else _raw_estimate_of(annotated),
             expr_factor=annotated.properties.expr_factor if annotated else 1.0,
             # The engine flattens its hardware counters into the same document, so they
             # read as ordinary keys. `or 0` covers both an older engine that omits the key
@@ -375,7 +399,7 @@ def _parse_metrics(metrics_json: str) -> tuple[list[dict], dict]:
     """The ``ops`` list and ``query`` block of a metrics document; empty when it is malformed."""
     try:
         doc = json.loads(metrics_json)
-        return doc.get("ops", []), doc.get("query") or {}
+        return _ops_of(doc), doc.get("query") or {}
     except (ValueError, TypeError, AttributeError):
         return [], {}
 

@@ -26,9 +26,12 @@ gets a plausible wrong answer:
   contributes its own ten rows to a global ten that may all have come from one shard.
 * **Which reducer has a mergeable form?** `aggregate` (for the reductions whose partials fold),
   `distinct` (idempotent, so deduplicating twice is deduplicating once), and a `sort` carrying
-  a limit (a global top-N is the top-N of the shards' top-Ns). `median`, `quantile`, `var`,
-  `stddev` and `count_distinct` are not: each needs the group's whole value set, so they stay
-  on one device. A reducer that cannot shard is a scale ceiling, never a wrong number.
+  a limit (a global top-N is the top-N of the shards' top-Ns). `median`, `quantile` and
+  `count_distinct` are not: each needs the group's whole value set, so they stay on one
+  device. `var` and `stddev` do have a mergeable form — per-shard `(count, mean, M2)` folded
+  with Chan's formula, as `bc-runtime` does — but it is not expressible as the self-combining
+  sums this split emits without the cancellation-prone sum-of-squares identity, so they are
+  not split here either. A reducer that cannot shard is a scale ceiling, never a wrong number.
 """
 
 from __future__ import annotations

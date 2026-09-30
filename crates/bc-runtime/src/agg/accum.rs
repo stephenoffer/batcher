@@ -46,6 +46,10 @@ pub(super) fn accumulate_call(
             group_ids,
             num_groups,
         ),
+        // An `Int64` `SUM` partial is its exact 128-bit total (`agg::int_sum` says why here).
+        AggFunc::Sum if super::int_sum::takes(call) => {
+            super::int_sum::call_state(call, group_ids, num_groups)
+        }
         _ => accumulate(call.func, call.values.as_ref(), group_ids, num_groups),
     }
 }

@@ -19,10 +19,10 @@ on any real key space. The TTL is checked once per micro-batch against the *engi
 clock rather than per key on a timer, so there is no timer thread.
 
 That check costs **O(keys expired)**, not O(keys retained), and the difference is what
-decides whether the operator has a scale ceiling. A trigger that touches ten keys used to
-walk all of them three times over — once to find the stale ones, twice more to size the
-retained bytes for the budget and the metrics — so a ten-million-key space paid thirty
-million dict steps per second to expire nothing. Insertion order *is* touch order here
+decides whether the operator has a scale ceiling. Walking every key three times per trigger —
+once to find the stale ones, twice more to size the retained bytes for the budget and the
+metrics — would make a ten-million-key space pay thirty million dict steps per second to
+expire nothing. Insertion order *is* touch order here
 (a touched key is reinserted, and the clock is held non-decreasing), so expiry walks the
 stale prefix and stops at the first live key, and the byte estimate is a running maximum
 rather than a scan.
@@ -350,8 +350,6 @@ def _group_by(batches: list[pa.RecordBatch], keys: list[str]):
     changed = None
     for name in keys:
         column = table.column(name).combine_chunks()
-        if isinstance(column, pa.ChunkedArray):
-            column = column.combine_chunks()
         previous = pa.concat_arrays([pa.nulls(1, column.type), column.slice(0, len(column) - 1)])
         same = pc.or_(
             pc.fill_null(pc.equal(column, previous), False),

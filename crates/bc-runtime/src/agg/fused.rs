@@ -382,10 +382,12 @@ impl FusedAcc<'_> {
                 let n = sums.len();
                 Arc::new(masked_f64(sums, vec![true; n]))
             }
+            // An `Int64` `SUM` finishes bare when its total fits, and as its exact 128-bit
+            // state when a promoted accumulator's does not (`agg::int_sum`).
             FusedAcc::SumI64NoNull { sums, wide, .. } => {
                 let n = sums.len();
                 match wide {
-                    Some(w) => Arc::new(masked_i64(super::narrow_wide(w)?, vec![true; n])),
+                    Some(w) => super::int_sum::from_i128(w, vec![true; n])?,
                     None => Arc::new(masked_i64(sums, vec![true; n])),
                 }
             }
@@ -393,7 +395,7 @@ impl FusedAcc<'_> {
             FusedAcc::SumI64 {
                 sums, valid, wide, ..
             } => match wide {
-                Some(w) => Arc::new(masked_i64(super::narrow_wide(w)?, valid)),
+                Some(w) => super::int_sum::from_i128(w, valid)?,
                 None => Arc::new(masked_i64(sums, valid)),
             },
             FusedAcc::SumDecimal {
@@ -711,16 +713,25 @@ mod tests {
     use super::*;
     use arrow::array::{Decimal128Array, Float64Array, Int64Array};
 
-    /// Reference oracle: today's per-call kernel (`super::accumulate`, the parent's
-    /// private fn — a child module may call it). Only fusable funcs are tested, all
-    /// of which `accumulate` handles directly.
+    /// Reference oracle: the per-call kernel `partial` runs for a call the fused scan does
+    /// not take (`accum::accumulate_call`). Not bare `accumulate`: an `Int64` `SUM`'s partial
+    /// state is built one level up, in `accumulate_call` (`agg::int_sum`).
     fn per_call(calls: &[AggCall], group_ids: &[u32], num_groups: usize) -> Vec<Vec<ArrayRef>> {
         calls
             .iter()
-            .map(|c| {
-                super::super::accumulate(c.func, c.values.as_ref(), group_ids, num_groups).unwrap()
-            })
+            .map(|c| super::super::accum::accumulate_call(c, group_ids, num_groups).unwrap())
             .collect()
+    }
+
+    /// An `Int64` `SUM`'s finished value: its partial state -- bare, or the 128-bit form --
+    /// finalized.
+    fn int_sum(state: &ArrayRef) -> Result<Int64Array, RuntimeError> {
+        let p = super::super::Partial {
+            group_columns: Vec::new(),
+            states: vec![vec![state.clone()]],
+        };
+        let out = super::super::finalize(&[AggFunc::Sum], &p)?.remove(0);
+        Ok(out.as_primitive::<Int64Type>().clone())
     }
 
     fn fused(calls: &[AggCall], group_ids: &[u32], num_groups: usize) -> Vec<Vec<ArrayRef>> {
@@ -873,7 +884,7 @@ mod tests {
         }
         // And the validity the no-null arm asserts rather than accumulates: every group is
         // non-empty, so every sum is non-null.
-        let sums = got[0][0].as_primitive::<Int64Type>();
+        let sums = int_sum(&got[0][0]).unwrap();
         assert_eq!(sums.null_count(), 0, "a no-null input yields no null sums");
     }
 
@@ -890,21 +901,27 @@ mod tests {
         let want = per_call(&calls, &group_ids, 2);
         let got = fused(&calls, &group_ids, 2);
         assert_cols_eq(&want[0], &got[0]);
-        let sums = got[0][0].as_primitive::<Int64Type>();
+        let sums = int_sum(&got[0][0]).unwrap();
         assert_eq!(sums.value(0), 10);
         assert!(sums.is_null(1), "an all-null group sums to null, not 0");
     }
 
+    /// A fused partial whose own total exceeds `i64` is not an error: it is a partial, and
+    /// another partition may bring the grand total back. It keeps the exact total, and the
+    /// overflow is raised where the true total is known — `finalize`.
     #[test]
-    fn fused_sum_overflow_still_errors() {
+    fn fused_sum_overflow_is_kept_exactly_and_raised_at_finalize() {
         let i: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1]));
         let group_ids = [0u32, 0];
         let calls = vec![
             AggCall::new(AggFunc::Sum, Some(i.clone())),
             AggCall::new(AggFunc::CountStar, None),
         ];
-        let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
-        let r = run_fused(&calls, &group_ids, 1, &mut out);
+        let got = fused(&calls, &group_ids, 1);
+        let exact = got[0][0].as_struct().column(0).clone();
+        let exact = exact.as_primitive::<Decimal128Type>();
+        assert_eq!(exact.value(0), i128::from(i64::MAX) + 1);
+        let r = int_sum(&got[0][0]);
         assert!(matches!(r, Err(RuntimeError::SumOverflow)), "got {r:?}");
     }
 
@@ -929,8 +946,7 @@ mod tests {
             let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
             run_fused(&calls, &[0u32; 4], 1, &mut out)
                 .unwrap_or_else(|e| panic!("{order:?} failed: {e:?}"));
-            let got = out[0].as_ref().expect("sum produced")[0].clone();
-            let got = got.as_primitive::<Int64Type>();
+            let got = int_sum(&out[0].as_ref().expect("sum produced")[0]).unwrap();
             assert_eq!(got.value(0), 0, "order {order:?}");
         }
     }
@@ -957,8 +973,7 @@ mod tests {
         ];
         let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
         run_fused(&calls, &group_ids, 3, &mut out).expect("must promote, not error");
-        let got = out[0].as_ref().expect("sum produced")[0].clone();
-        let got = got.as_primitive::<Int64Type>();
+        let got = int_sum(&out[0].as_ref().expect("sum produced")[0]).unwrap();
         assert_eq!(got.value(0), 0, "group 0 overflowed partway and came back");
         assert_eq!(got.value(1), 12, "group 1 must survive the promotion");
         assert!(got.is_null(2), "an all-null group stays null");

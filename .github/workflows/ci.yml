@@ -13,7 +13,8 @@ name: CI
 #
 # Heavy optional backends (torch/tensorflow/gpu) are not installed in `gate`, so tests needing
 # them skip via `importorskip`. That hole is real and intentional — `just lint-skips` ratchets
-# its size so it cannot grow unnoticed.
+# its size so it cannot grow unnoticed — and torch and TensorFlow are no longer inside it:
+# `ml-frameworks.yml` installs both on CPU and runs every suite that needs them.
 #
 # **Ray is no longer part of that hole.** The `distributed` job below installs it and runs
 # every Ray-gated suite, because `dist/` is 34k lines that the gate never executed: a green
@@ -26,6 +27,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # `release.yml` calls this whole workflow on a version tag and publishes only if it passes.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -59,6 +62,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e '.[dev]'
+          pip freeze > "$RUNNER_TEMP/resolved-requirements.txt"
+
+      # The dependency ranges in pyproject.toml are open, so a fresh install tomorrow can
+      # resolve a different pyarrow, numpy, sqlglot or duckdb than the one that passed here.
+      # Keep the exact set this run tested, so a later break can be diffed against it.
+      - name: Record the resolved dependency set
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-requirements-gate
+          path: ${{ runner.temp }}/resolved-requirements.txt
 
       - name: Rust check + clippy
         run: |
@@ -92,6 +105,13 @@ jobs:
       - name: Gate-suppression ratchet
         run: just lint-suppressions
 
+      # CLAUDE.md lists both as the gate for any test change; neither ran anywhere until here.
+      - name: Tests that cannot fail
+        run: just lint-tests
+
+      - name: Tests arranged not to fail
+        run: just lint-methodology
+
       - name: Public-API docstrings
         run: just lint-docstrings
 
@@ -122,6 +142,36 @@ jobs:
       - name: Integration tests (no coverage instrumentation)
         run: pytest tests/integration -q --timeout=300
         timeout-minutes: 30
+
+  # `rust-version` in Cargo.toml is a promise to anyone building from source, and the other
+  # jobs install `stable`, which says nothing about it. It said 1.88 while a locked dependency
+  # (`crc-fast` 1.10) required 1.89, so the documented source install failed on the version it
+  # named. The toolchain is read from Cargo.toml, so the check cannot drift from the claim.
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # bc-py's PyO3 build script needs an interpreter even for `cargo check`.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read the declared minimum
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install that toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check the workspace on the declared minimum
+        run: cargo check --workspace --locked
 
   distributed:
     name: Distributed (Ray) ${{ matrix.shard }}/4
@@ -174,29 +224,19 @@ jobs:
       #
       # The file list is computed, never hardcoded: a hardcoded list silently stops covering
       # files added after it was written, which is the failure mode where the suite keeps
-      # passing while covering less. The count is asserted non-zero for the same reason —
-      # a glob that matches nothing runs nothing and reports success.
+      # passing while covering less. `tools/backend_suites.py` reads the test AST rather than
+      # grepping one spelling of `importorskip("ray")`, which missed single quotes, a
+      # `ray.serve` gate, a gate in a conftest, a shared helper such as `_ray_cluster`, and
+      # every test reaching the cluster through `distributed=True` — each of those skipped in
+      # `gate` and was never selected here, so it ran nowhere. The first call holds the
+      # selection against the committed inventory (`tools/backend_suites.json`) and names any
+      # file that dropped out, which a "at least N files" floor could not see.
       - name: Collect this shard's Ray-gated suites
         id: suites
         run: |
-          all=$(grep -rl 'importorskip("ray"' tests/ | sort)
-          total=$(printf '%s\n' "$all" | wc -l)
-          echo "found $total Ray-gated test files in total"
-          if [ "$total" -lt 40 ]; then
-            echo "::error::expected at least 40 Ray-gated suites, found $total —" \
-                 "the detection pattern has drifted and this lane would test almost nothing"
-            exit 1
-          fi
-          # Round-robin rather than contiguous blocks: files are sorted by name, so
-          # contiguous blocks would put every test_distributed_* file in one shard and leave
-          # another with almost nothing.
-          files=$(printf '%s\n' "$all" | awk "NR % 4 == ${{ matrix.shard }} % 4" | tr '\n' ' ')
-          count=$(printf '%s' "$files" | wc -w)
-          echo "shard ${{ matrix.shard }} runs $count files"
-          if [ "$count" -eq 0 ]; then
-            echo "::error::this shard selected no files; the sharding arithmetic is wrong"
-            exit 1
-          fi
+          python tools/backend_suites.py --dep ray
+          files=$(python tools/backend_suites.py --dep ray --shard ${{ matrix.shard }}/4)
+          echo "shard ${{ matrix.shard }} runs $(printf '%s' "$files" | wc -w) files"
           echo "files=$files" >> "$GITHUB_OUTPUT"
 
       # RAY_ADDRESS=local makes each run start its own cluster rather than attaching to a

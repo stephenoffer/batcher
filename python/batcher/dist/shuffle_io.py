@@ -8,6 +8,7 @@ bounded by memory.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -23,9 +24,11 @@ __all__ = [
     "IpcWriter",
     "distributed_work_dir",
     "read_ipc",
+    "read_visibility_token",
     "reduce_envelope",
     "shared_scratch_root",
     "shuffle_ipc_options",
+    "verify_shared_scratch",
     "write_ipc",
     "write_ipc_round_robin",
     "write_shuffle_buckets",
@@ -79,13 +82,21 @@ def distributed_work_dir(prefix: str) -> str:
     Falls back to a node-local tempdir on a single-node/shared-filesystem cluster (see
     :func:`shared_scratch_root`). The caller owns the returned dir and removes it.
     """
+    return tempfile.mkdtemp(prefix=prefix, dir=_scratch_base())
+
+
+def _scratch_base() -> str | None:
+    """The directory `distributed_work_dir` creates its scratch dirs under.
+
+    `None` is the process tempdir, which `mkdtemp(dir=None)` resolves.
+    """
     root = shared_scratch_root()
     if root:
         # The root is a *shared cluster mount*, so creating it 0755 publishes every
         # query's scratch listing to the whole node. `mkdtemp` already gives the inner
         # directory 0700; this closes the parent, which nothing else does.
         private_dir(root)
-        return tempfile.mkdtemp(prefix=prefix, dir=root)
+        return root
     # No shared mount: this is a genuine single node, so node-local scratch is correct — and
     # the node's measured local volume is a better one than the container root's overlay,
     # which is where a bare tempdir lands on a GPU node.
@@ -100,8 +111,96 @@ def distributed_work_dir(prefix: str) -> str:
     if local:
         root = os.path.join(local, "batcher_shuffle")
         private_dir(root)
-        return tempfile.mkdtemp(prefix=prefix, dir=root)
-    return tempfile.mkdtemp(prefix=prefix)
+        return root
+    return None
+
+
+#: `(scratch base, node ids)` pairs already probed, so a session pays the probe once per
+#: cluster shape rather than once per query.
+_VISIBLE_SCRATCH: set[tuple[str, frozenset[str]]] = set()
+
+
+def read_visibility_token(path: str) -> str | None:
+    """Read the driver's visibility sentinel, run on a worker node (`verify_shared_scratch`).
+
+    Args:
+        path: The sentinel's path as the driver wrote it.
+
+    Returns:
+        The token the file holds, or `None` when this node cannot read it at that path.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def verify_shared_scratch(node_ids, read_on) -> None:
+    """Prove every node in `node_ids` reads the same bytes at the disk shuffle's paths.
+
+    The disk shuffle hands tasks nothing but paths, so it is correct only where each path
+    names the same file on every node. `distributed.shared_filesystem = True` *declares*
+    that, and an explicit `transport="disk"` assumes it; neither shows it. A mount missing
+    on one node, or two nodes with different volumes at the same mount point, surfaced as a
+    `FileNotFoundError` inside a reducer, or worse, a reducer reading another run's file.
+    So the driver writes a random token under the scratch base and each node reads it back
+    at the same path before any shuffle file is written. A node that answers with anything
+    other than the token fails the query up front with the node named. A node that does not
+    answer at all proves nothing either way and is logged, not
+    failed, because a busy cluster must not turn into a configuration error.
+
+    Args:
+        node_ids: The worker nodes that may run shuffle tasks, the driver's own excluded.
+        read_on: `read_on(node_ids, path)` returns, per node, what that node reads at
+            `path`: the file's contents, `None` when it cannot open it, or `...` (or no
+            entry) when it did not answer.
+
+    Raises:
+        ConfigError: When some node cannot read what the driver wrote.
+    """
+    import secrets
+
+    from batcher._internal.errors import ConfigError
+    from batcher._internal.logging import get_logger
+
+    nodes = frozenset(node_ids)
+    base = _scratch_base() or tempfile.gettempdir()
+    if not nodes or (base, nodes) in _VISIBLE_SCRATCH:
+        return
+    token = secrets.token_hex(16)
+    fd, path = tempfile.mkstemp(prefix=".batcher_visibility_", dir=base)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token)
+        answers = read_on(sorted(nodes), path)
+        silent = []
+        for node in sorted(nodes):
+            seen = answers.get(node, ...)
+            if seen is ...:
+                silent.append(node)
+            elif seen != token:
+                raise ConfigError(
+                    f"the disk shuffle needs every worker to see the same files at "
+                    f"{base!r}, but node {node} "
+                    + ("cannot read" if seen is None else "reads different bytes at")
+                    + f" {path!r}. Mount one shared filesystem at that path on every node "
+                    "(or set memory.spill_dir to one), or use distributed.transport='flight'."
+                )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    if silent:
+        get_logger("dist").warning(
+            "could not confirm the disk shuffle's scratch %r is visible from %d node(s) %s; "
+            "proceeding",
+            base,
+            len(silent),
+            ", ".join(silent[:4]),
+        )
+    # Recorded for a silent node too: re-asking every query would charge each one the
+    # probe's full timeout for a node that has already shown it will not answer.
+    _VISIBLE_SCRATCH.add((base, nodes))
 
 
 class ReduceEnvelope(NamedTuple):

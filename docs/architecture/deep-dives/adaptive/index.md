@@ -2,7 +2,7 @@
 
 These pages describe how Batcher learns from the data it runs on, within one query and across many.
 
-The within-query half re-optimizes at stage boundaries on measured cardinalities. That is the same mechanism and the same granularity as Spark AQE, and Batcher runs it on a single node too. It engages where it can pay for itself. On one node a query needs a join and has to clear a floor charged per stage: 5,000,000 input rows, or roughly 320 MB, for each pipeline breaker the loop would cut at. On a cluster, a plan the one-shot dispatcher can't run correctly, such as a snowflake join or an aggregate over a `limit`, is staged at any size.
+The within-query half re-optimizes at stage boundaries on measured cardinalities. That is the same mechanism and the same granularity as Spark AQE, which also runs on a single machine in local mode. Batcher runs its loop inside the Python process rather than in a JVM beside it. It engages where it can pay for itself. On one node a query needs a join and has to clear a floor charged per stage: 5,000,000 input rows, or roughly 320 MB, for each pipeline breaker the loop would cut at. On a cluster, a plan the one-shot dispatcher can't run correctly, such as a snowflake join or an aggregate over a `limit`, is staged at any size.
 
 The cross-query half is what neither DuckDB nor Spark has. Sketches, calibrated cost coefficients and a bandit over equivalent strategies persist between runs, so a plan improves the more a query runs, at any size. Read these pages for how both halves work and where each one stops.
 

@@ -73,6 +73,74 @@ def columns_arg(columns: str | Sequence[str], *, what: str) -> list[str]:
     return cols
 
 
+def output_columns_arg(
+    columns: list[str], output_columns: str | Sequence[str] | None, *, what: str
+) -> list[str] | None:
+    """Validate an `output_columns` argument against the `columns` it writes.
+
+    Ray Data's preprocessors take ``output_columns`` to write each result beside its input
+    instead of over it. ``None`` keeps the in-place rewrite. Otherwise there must be one
+    output name per input column, in order, with no name repeated, since two results
+    written to one name would silently keep only the last.
+
+    Args:
+        columns: The already-normalized input columns.
+        output_columns: ``None``, a single name (for a single input), or one name per input.
+        what: The caller's class name, used in the error message.
+
+    Returns:
+        ``None`` when writing in place, else the output names as a list.
+
+    Raises:
+        PlanError: If the count differs from `columns`, a name is not a string, or a name
+            repeats.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml.preprocessors.base import output_columns_arg
+            >>> output_columns_arg(["a", "b"], ["a_s", "b_s"], what="StandardScaler")
+            ['a_s', 'b_s']
+            >>> output_columns_arg(["a"], None, what="StandardScaler") is None
+            True
+    """
+    if output_columns is None:
+        return None
+    outs = [output_columns] if isinstance(output_columns, str) else list(output_columns)
+    if len(outs) != len(columns):
+        raise PlanError(
+            f"{what}: output_columns needs one name per column ({len(columns)}), "
+            f"got {len(outs)}: {outs!r}"
+        )
+    bad = [c for c in outs if not isinstance(c, str)]
+    if bad:
+        raise PlanError(f"{what}: output_columns must be strings, got {bad[0]!r}")
+    if len(set(outs)) != len(outs):
+        raise PlanError(f"{what}: output_columns repeats a name: {outs!r}")
+    return outs
+
+
+def output_pairs(columns: list[str], output_columns: list[str] | None) -> list[tuple[str, str]]:
+    """Pair each input column with the column its result is written to.
+
+    Args:
+        columns: The input columns.
+        output_columns: The validated output names, or ``None`` for in place.
+
+    Returns:
+        One ``(input, output)`` pair per input column; the output is the input itself when
+        writing in place.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml.preprocessors.base import output_pairs
+            >>> output_pairs(["a"], None), output_pairs(["a"], ["a2"])
+            ([('a', 'a')], [('a', 'a2')])
+    """
+    return list(zip(columns, columns if output_columns is None else output_columns, strict=True))
+
+
 def append_projections(
     ds: Dataset, projections: dict[str, Any], sources: list[str], *, drop_original: bool
 ) -> Dataset:
@@ -278,6 +346,23 @@ def without_nan(expression: Expr) -> Expr:
     return nullif(expression, lit(math.nan))
 
 
+def nan_free(ds: Dataset, column: str) -> Expr:
+    """`column` with NaN mapped to null when it is floating point, else the column unchanged.
+
+    The per-column, expression form of `nan_as_null`, for a transform that must read a
+    column's missing values as null without rewriting the column itself, because the
+    column is kept beside the result (``output_columns``).
+
+    Args:
+        ds: The dataset whose schema says whether `column` can hold a NaN.
+        column: The column to read.
+
+    Returns:
+        An expression over `column`, null wherever it is null or NaN.
+    """
+    return without_nan(col(column)) if _float_columns(ds, [column]) else col(column)
+
+
 def is_missing(ds: Dataset, column: str) -> Expr:
     """True where `column` is null, or NaN when the column is floating point.
 
@@ -421,7 +506,7 @@ class Preprocessor(abc.ABC):
 
                 >>> from batcher.ml.preprocessors import StandardScaler
                 >>> sorted(StandardScaler("x").get_params())
-                ['columns', 'with_mean', 'with_std']
+                ['columns', 'output_columns', 'with_mean', 'with_std']
 
         Returns:
             A ``{name: value}`` dict of the constructor hyperparameters.

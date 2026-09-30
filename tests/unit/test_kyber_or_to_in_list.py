@@ -84,3 +84,18 @@ def test_the_fold_unlocks_the_in_list_pruning_family():
     assert '"in_list"' in plan
     # 5 cannot satisfy `a < 3`, so a refinement rule that can see the list drops it.
     assert '{"int": 5}' not in plan
+
+
+def _bounds(ds) -> list[str]:
+    """The `ge`/`le` comparison operators left in the optimized IR, in order."""
+    text = json.dumps(_ir(ds))
+    return [op for op in ('"op": "ge"', '"op": "le"') if op in text]
+
+
+def test_range_bounds_are_derived_for_numbers_but_not_for_strings():
+    """A string bound costs a full comparison per row ahead of the membership test it is
+    implied by (JOB q21a: 530 ms of CPU to keep 10.7M of 14.8M rows for a test keeping
+    154K), so only a numeric disjunction gets one. The numeric case is the control that the
+    rule still fires on this fixture."""
+    assert _bounds(DS.filter((col("a") == 1) | (col("a") == 3))) == ['"op": "ge"', '"op": "le"']
+    assert _bounds(DS.filter((col("s") == "x") | (col("s") == "z"))) == []

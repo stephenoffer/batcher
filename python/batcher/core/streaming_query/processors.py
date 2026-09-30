@@ -152,14 +152,27 @@ class AggregateProcessor:
         if result is None:
             return []
         self._emitted = True
+        if not self._update_only:
+            # `complete` replaces the sink with each snapshot, so an emptied one is the
+            # answer too and is emitted as a zero-row batch (see `replaces_output`).
+            return [self._tail.apply_snapshot(result)]
         # The tail runs before the `update` diff, so "which rows changed" is asked of the
         # rows the sink actually receives rather than of the pre-projection aggregate.
         result = self._tail.apply(result)
         if result is None:  # a HAVING filter left nothing this trigger
             return []
-        if not self._update_only:
-            return [result]
         return self._changed_rows(result)
+
+    @property
+    def replaces_output(self) -> bool:
+        """Whether each emission is the whole answer, so an empty one must still be written.
+
+        True in `complete` mode. A group that stops satisfying a HAVING filter leaves the
+        snapshot, and when it was the last one the snapshot is empty. The runner drops empty
+        emissions for every other processor, and doing so here left the sink holding the
+        rows from the trigger before.
+        """
+        return not self._update_only
 
     def _folded(self, mapped: pa.RecordBatch) -> _AggFold:
         """The fold, built against the mapped schema the first time one is available.
@@ -350,13 +363,12 @@ class WindowedAggregateProcessor:
     def snapshot_state(self) -> pa.RecordBatch | None:
         """The open windows and the watermark, for a checkpoint snapshot.
 
-        This processor previously defined neither `snapshot_state` nor `restore_state`, and
-        `StreamingRunner.has_state` duck-types on exactly this method — so it reported
-        *stateless* and its state was never written. Offsets were committed regardless. A crash
-        therefore resumed **past** consumed data with every open window and the watermark gone:
-        those windows were silently never emitted. That is data loss in the one query shape the
-        whole watermark machinery exists to serve, so these two methods are load-bearing, not a
-        nicety.
+        `StreamingRunner.has_state` duck-types on exactly this method, so without it the processor
+        reports *stateless* and its state is never written while offsets are committed regardless. A
+        crash would then resume **past** consumed data with every open window and the watermark
+        gone: those windows would silently never be emitted. That is data loss in the one query
+        shape the whole watermark machinery exists to serve, so these two methods are load-bearing,
+        not a nicety.
         """
         return self._fold.state()
 

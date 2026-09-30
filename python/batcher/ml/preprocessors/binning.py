@@ -15,11 +15,13 @@ from batcher.ml.preprocessors.base import (
     columns_arg,
     fit_aggregate,
     nan_as_null,
+    output_columns_arg,
+    output_pairs,
 )
 from batcher.plan.expr_ir import col, when
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from batcher.api.dataset import Dataset
 
@@ -29,6 +31,27 @@ __all__ = ["KBinsDiscretizer"]
 # transform builds one CASE arm per inner edge, so an unbounded `n_bins` is an unbounded
 # fit cost and an unbounded plan. 256 covers every realistic discretization.
 MAX_BINS = 256
+
+#: What `duplicates=` accepts. ``"keep"`` leaves a repeated edge in place, so the bin between
+#: the two copies is empty and its index is skipped. ``"drop"`` removes the repeat and numbers
+#: the surviving bins consecutively, and ``"raise"`` refuses the fit. The last two are pandas'
+#: ``cut(duplicates=)``, which Ray Data's discretizers pass straight through.
+_DUPLICATES = ("keep", "drop", "raise")
+
+
+def _check_bins(n_bins: int) -> int:
+    """Validate one bin count against the ``[2, MAX_BINS]`` range."""
+    if isinstance(n_bins, bool) or not isinstance(n_bins, int):
+        raise PlanError(f"n_bins must be an integer, got {n_bins!r}")
+    if n_bins < 2:
+        raise PlanError(f"n_bins must be >= 2, got {n_bins}")
+    if n_bins > MAX_BINS:
+        raise PlanError(
+            f"n_bins must be <= {MAX_BINS}, got {n_bins}. Each bin edge is a CASE arm in "
+            f"the transform, and on the 'quantile' strategy also its own sketch in the "
+            f"fit, so both the plan and the fit cost grow with n_bins."
+        )
+    return n_bins
 
 
 class KBinsDiscretizer(Preprocessor):
@@ -63,32 +86,65 @@ class KBinsDiscretizer(Preprocessor):
             >>> KBinsDiscretizer(["v"], n_bins=2, strategy="uniform").fit_transform(ds).to_pydict()
             {'v': [0, 0, 1, 1, 1]}
 
+            >>> # Ray Data's right-closed bins, written beside the input.
+            >>> kb = KBinsDiscretizer(
+            ...     "v", n_bins=2, strategy="uniform", right=True, output_columns="v_bin"
+            ... )
+            >>> kb.fit_transform(bt.from_pydict({"v": [0.0, 5.0, 10.0]})).to_pydict()
+            {'v': [0.0, 5.0, 10.0], 'v_bin': [0, 0, 1]}
+
     Args:
         columns: the numeric columns to discretize (replaced in place).
-        n_bins: the number of bins (>= 2).
+        n_bins: the number of bins (>= 2), or a mapping from each column to its own count.
         strategy: ``"quantile"`` or ``"uniform"``.
+        right: which bin a value lying exactly on an inner edge joins. ``False`` (the
+            default, scikit-learn's reading) puts it in the upper bin, so bins are
+            ``[lo, hi)``; ``True`` puts it in the lower one, so bins are ``(lo, hi]``, as
+            pandas' ``cut`` and Ray Data's ``UniformKBinsDiscretizer`` do.
+        duplicates: what to do when two learned edges coincide: ``"keep"`` (the default)
+            leaves the empty bin and skips its index, ``"drop"`` removes the repeated edge
+            and numbers the remaining bins consecutively, ``"raise"`` refuses the fit.
+        output_columns: write each bin-index column to this name instead of over its
+            input, one name per column in order, keeping the inputs (Ray Data's
+            ``output_columns``). ``None`` (the default) replaces the columns in place.
     """
 
     numeric_only = True
 
-    __slots__ = ("columns", "edges_", "n_bins", "strategy")
+    __slots__ = ("columns", "duplicates", "edges_", "n_bins", "output_columns", "right", "strategy")
 
     def __init__(
-        self, columns: str | Sequence[str], *, n_bins: int = 5, strategy: str = "quantile"
+        self,
+        columns: str | Sequence[str],
+        *,
+        n_bins: int | Mapping[str, int] = 5,
+        strategy: str = "quantile",
+        right: bool = False,
+        duplicates: str = "keep",
+        output_columns: str | Sequence[str] | None = None,
     ) -> None:
         self.columns = columns_arg(columns, what="KBinsDiscretizer")
-        if n_bins < 2:
-            raise PlanError(f"n_bins must be >= 2, got {n_bins}")
-        if n_bins > MAX_BINS:
-            raise PlanError(
-                f"n_bins must be <= {MAX_BINS}, got {n_bins}. Each bin edge is a CASE arm in "
-                f"the transform, and on the 'quantile' strategy also its own sketch in the "
-                f"fit, so both the plan and the fit cost grow with n_bins."
-            )
+        if isinstance(n_bins, int):
+            _check_bins(n_bins)
+        else:
+            n_bins = {str(k): _check_bins(v) for k, v in dict(n_bins).items()}
+            missing = [c for c in self.columns if c not in n_bins]
+            if missing:
+                raise PlanError(
+                    f"KBinsDiscretizer: n_bins is a mapping but has no entry for {missing!r}; "
+                    "give every column its bin count"
+                )
         if strategy not in ("quantile", "uniform"):
             raise PlanError(f"strategy must be 'quantile' or 'uniform', got {strategy!r}")
+        if duplicates not in _DUPLICATES:
+            raise PlanError(f"duplicates must be one of {_DUPLICATES}, got {duplicates!r}")
         self.n_bins = n_bins
         self.strategy = strategy
+        self.right = bool(right)
+        self.duplicates = duplicates
+        self.output_columns = output_columns_arg(
+            self.columns, output_columns, what="KBinsDiscretizer"
+        )
         # Per column: the n_bins-1 inner edges separating the bins.
         self.edges_: dict[str, list[float]] = {}
 
@@ -115,7 +171,6 @@ class KBinsDiscretizer(Preprocessor):
         """
         self._check_numeric(ds)
         ds = nan_as_null(ds, self.columns)
-        inner = self.n_bins - 1
         if self.strategy == "uniform":
             aggs = {}
             for c in self.columns:
@@ -123,26 +178,44 @@ class KBinsDiscretizer(Preprocessor):
                 aggs[f"{c}__max"] = col(c).max()
             cell = fit_aggregate(ds, aggs)
             for c in self.columns:
+                bins = self._bins(c)
                 lo = float(cell[f"{c}__min"] or 0.0)
                 hi = float(cell[f"{c}__max"] or 0.0)
-                width = (hi - lo) / self.n_bins
-                self.edges_[c] = [lo + width * (i + 1) for i in range(inner)]
+                width = (hi - lo) / bins
+                self.edges_[c] = self._dedupe(c, [lo + width * (i + 1) for i in range(bins - 1)])
         else:  # quantile
             aggs = {}
             for c in self.columns:
-                for i in range(inner):
-                    aggs[f"{c}__q{i}"] = col(c).approx_quantile((i + 1) / self.n_bins)
+                bins = self._bins(c)
+                for i in range(bins - 1):
+                    aggs[f"{c}__q{i}"] = col(c).approx_quantile((i + 1) / bins)
             cell = fit_aggregate(ds, aggs)
             for c in self.columns:
-                self.edges_[c] = [float(cell[f"{c}__q{i}"] or 0.0) for i in range(inner)]
+                edges = [float(cell[f"{c}__q{i}"] or 0.0) for i in range(self._bins(c) - 1)]
+                self.edges_[c] = self._dedupe(c, edges)
         self._fitted = True
         return self
+
+    def _bins(self, column: str) -> int:
+        """The bin count for `column`, from the shared count or the per-column mapping."""
+        return self.n_bins if isinstance(self.n_bins, int) else self.n_bins[column]
+
+    def _dedupe(self, column: str, edges: list[float]) -> list[float]:
+        """Apply the `duplicates` policy to one column's sorted inner edges."""
+        if self.duplicates == "keep" or len(set(edges)) == len(edges):
+            return edges
+        if self.duplicates == "raise":
+            raise PlanError(
+                f"KBinsDiscretizer: column {column!r} learned repeated bin edges {edges!r}, "
+                "so some bins are empty. Pass duplicates='drop' to merge them, or fewer n_bins."
+            )
+        return sorted(set(edges))
 
     def transform(self, ds: Dataset) -> Dataset:
         """Replace each fitted column with its integer bin index ``0..n_bins-1``.
 
-        The index is how many learned edges the value meets or exceeds, computed by a
-        `CASE` chain. A null stays null, and does not become a bin.
+        The index is how many learned edges the value meets or exceeds (only exceeds, with
+        ``right=True``), computed by a `CASE` chain. A null stays null, and does not become a bin.
 
         Examples:
             .. doctest::
@@ -166,12 +239,14 @@ class KBinsDiscretizer(Preprocessor):
         """
         self._require_fitted()
         new = {}
-        for c in self.columns:
+        for c, out in output_pairs(self.columns, self.output_columns):
             edges = self.edges_[c]
-            # Bin index = how many edges the value meets or exceeds (first match wins).
-            expr = self.n_bins - 1
+            # Bin index = how many edges the value passes (first match wins). Left-closed
+            # bins count an edge the value meets; right-closed ones only an edge it exceeds.
+            expr = len(edges)
             for i in range(len(edges) - 1, -1, -1):
-                expr = when(col(c) < edges[i]).then(i).otherwise(expr)
+                below = col(c) <= edges[i] if self.right else col(c) < edges[i]
+                expr = when(below).then(i).otherwise(expr)
             # A null compares false against every edge, so the CASE chain fell all the way
             # through to the `otherwise` and binned every missing value into the TOP bin.
             # Nothing errored and nothing warned: a model then trained on fabricated values
@@ -180,5 +255,5 @@ class KBinsDiscretizer(Preprocessor):
             # The `then` arm is reached only where the value IS null, so casting that null
             # to the bin type yields a null of the right type. The IR has no null literal,
             # and this needs none.
-            new[c] = when(col(c).is_null()).then(col(c).cast("int64")).otherwise(expr)
+            new[out] = when(col(c).is_null()).then(col(c).cast("int64")).otherwise(expr)
         return ds.with_columns(**new)

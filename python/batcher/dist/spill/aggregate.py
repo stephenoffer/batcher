@@ -206,9 +206,9 @@ def spill_collect(
             hoisted = hoist_sort_key(plan)
             if hoisted is not None and br.supports_spilling_sort(hoisted[0], sources):
                 plan, keep = hoisted
-        elif isinstance(plan, Window) and not br.supports_spilling_window(plan):
+        elif isinstance(plan, Window) and not br.supports_bounded_window(plan):
             hoisted = hoist_window_keys(plan)
-            if hoisted is not None and br.supports_spilling_window(hoisted[0]):
+            if hoisted is not None and br.supports_bounded_window(hoisted[0]):
                 plan, keep = hoisted
         if isinstance(plan, Sort) and br.supports_spilling_sort(plan, sources):
             return _dropping(br.execute_spilling_sort(plan, sources, num_partitions), keep)
@@ -316,7 +316,7 @@ def narrow_to_stage(above: list[LogicalPlan], node: LogicalPlan) -> LogicalPlan:
         source_id = next(iter(scanned_source_ids(node)))
         needed = required_columns_per_source(stage).get(source_id)
         available = node.input.available_columns()
-    except Exception:  # pragma: no cover - an opaque node the analysis cannot walk
+    except Exception:  # an opaque node the analysis cannot walk
         return node
     if not needed:
         return node

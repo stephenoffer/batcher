@@ -13,7 +13,23 @@ wall clock -- twelve cores -- was reported as "CPU 2% utilized".
 
 from __future__ import annotations
 
+import pytest
+
+from batcher.observe.insights import resources
 from batcher.observe.insights.resources import idle_cpu
+
+
+@pytest.fixture(autouse=True)
+def _an_uncontended_box(monkeypatch):
+    """Pin the machine to "not contended" so these tests read the rule, not the neighbours.
+
+    Before the idle finding is reported, `idle_cpu` asks the live machine whether the cores
+    were *taken* (a throttled quota, an oversubscribed run queue) and, if so, reports that
+    instead. That is the right behaviour and it is covered elsewhere, but left live here it
+    made this file's verdict depend on the box: on a shared node at 5x oversubscription every
+    "is still reported idle" case turned into `cpu-contended` and failed.
+    """
+    monkeypatch.setattr(resources, "cpu_contention", lambda: {})
 
 
 def _streaming_ops(threads: int = 61, elapsed: float = 30.0):

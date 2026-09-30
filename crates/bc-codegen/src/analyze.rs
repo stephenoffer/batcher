@@ -189,7 +189,8 @@ pub(crate) fn analyze(
                 }
             };
             match (inner, target) {
-                // int64 -> float64: exact (`fcvt_from_sint` == Arrow int->float).
+                // int64 -> float64: rounds to nearest past 2^53, exactly as Arrow's int->float
+                // cast does (`fcvt_from_sint`), so the tiers agree bit for bit.
                 (ScalarTy::I64, ScalarTy::F64) => Ok(ScalarTy::F64),
                 // Same-type no-ops.
                 (ScalarTy::I64, ScalarTy::I64) => Ok(ScalarTy::I64),

@@ -123,8 +123,10 @@ RATCHET: dict[str, int] = {
     # declines to the CPU engine; `_BUILD_ARTIFACT_EXCLUDES` needed neither -- a containment
     # check over a list built from the tuple is a tautology -- so each pattern now names the
     # build output it must match and is held against paths the upload must carry.
-    # The remaining 1 is `JOIN_TYPES`, whose file was another session's at the time.
-    "shadowed-production-set": 1,
+    # 1 -> 0: `JOIN_TYPES` in test_diff_runtime_filters.py is now `sorted()` of the plan's own
+    # set, and the per-type expectation is a table keyed by every member, so a new join type
+    # raises there instead of reading as "no filter on either side".
+    "shadowed-production-set": 0,
     # A test comparing two engine runs on a figure describing *how* they ran -- CPU
     # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
     # and the one is a live failure rather than an accepted shape:
@@ -139,7 +141,9 @@ RATCHET: dict[str, int] = {
     # (test_diff_morsel_size_invariance) and `run_with` (test_spilling) both `set_config(...)`
     # before running, so they *force* the difference and then prove it reached the engine.
     # Setting a knob is the discriminator between a control and a hope.
-    "uncontrolled-runtime-comparison": 1,
+    # 1 -> 0: the telemetry test now asserts, within one run, that the operators do not all
+    # report exactly 1/threads -- the bug's shape -- instead of comparing two runs' load.
+    "uncontrolled-runtime-comparison": 0,
     # Standalone timing entry points under `benchmarks/` that never call
     # `require_release_build`, so they can publish a number from a debug build — 8-60x
     # slower by the guard's own docstring — without saying so. Was **60 of 64**; 40 have

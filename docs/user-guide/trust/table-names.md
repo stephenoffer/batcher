@@ -24,6 +24,7 @@ before anyone has read it:
 | Delta, Delta change feed, Hudi | the table URI |
 | Iceberg | the table identifier |
 | Kafka, Kinesis, Pulsar, Event Hubs, Pub/Sub | the topic, stream, or subscription |
+| A SQL query (Snowflake, BigQuery `query=`, `bt.read.sql`) | nothing, unless the read declares `governed_as`; see below |
 | In-memory tables, a rate generator, a raw socket | nothing; see below |
 
 The name is the **table**, never the slice of it a particular query reads. A read narrowed
@@ -34,6 +35,27 @@ the slice would leave `bt.read.parquet(path, n_rows=2)` governed by nothing.
 An in-memory table and a live socket have no durable name, so no policy can be declared
 about them. `governance.mode` decides what to do about that. Under `strict` such a read is
 refused rather than exempted.
+
+## Declare the table a query reads
+
+A read defined by SQL names no table. Batcher doesn't parse the query to guess one, because a policy matched against the wrong table governs the wrong data. Declare the name instead with `governed_as`, spelled exactly as the policy spells it, and that table's policy is applied to the query's result:
+
+```python
+import duckdb
+
+con = duckdb.connect()
+con.execute("CREATE TABLE users (id INTEGER, ssn TEXT)")
+con.execute("INSERT INTO users VALUES (1, '111')")
+catalog = bt.SecurityCatalog().grant("analyst", on="main.users", select=["id"])
+
+with bt.security(catalog, analyst):
+    users = bt.read.sql("SELECT * FROM users", connection=con, governed_as="main.users")
+    print(users.to_pydict())
+```
+
+The declaration is matched against the result's column names, so a query that renames a governed column (`SELECT ssn AS x`) escapes a mask keyed on `ssn`. A grant that lists the visible columns still withholds `x`, because a column no grant names isn't visible.
+
+Inside a {py:obj}`bt.security() <batcher.security>` block, an undeclared query whose text names a governed table, either in full or by its last dotted component, is refused with `AccessDeniedError` rather than read ungoverned. That check is a safety net rather than the guarantee. It reads identifiers written in the query, so a view or a synonym over a governed table passes it. A declaration that differs from a governed name only in case is refused too, since a warehouse identifier is usually case-insensitive and the policy name isn't. A source that names its own table, such as a Parquet path, can't be re-declared under a different name.
 
 ## One object, one policy
 

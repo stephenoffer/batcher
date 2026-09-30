@@ -100,7 +100,7 @@ def _sampled_type(samples: list[str]) -> str:
             int(v)
         return "Int64"
     except ValueError:
-        pass
+        pass  # not every sample is an integer; try the next wider type
     try:
         for v in samples:
             float(v)

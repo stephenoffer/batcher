@@ -43,6 +43,15 @@ pub struct EngineConfig {
     /// window grace-partition out of core). Derived by the control plane from
     /// `MemoryConfig` (`max_memory_bytes`/`default_total_bytes` × `hard_limit`).
     pub memory_budget_bytes: usize,
+    /// The soft-pressure line of the engine's memory pool, as a fraction of
+    /// `memory_budget_bytes`. The control plane ships `min(memory.soft_limit,
+    /// memory.hard_limit)`, the same fraction its pressure monitor classifies this pool's
+    /// `used / limit` against, so the pool's reported `Elevated` starts where Carbonite's
+    /// `SPILL` reading of it does. Diagnostic only: nothing in the data plane acts on the
+    /// level. The default, `0.8`, is `bc_resource`'s own line, so an older control plane
+    /// that omits it changes nothing.
+    #[serde(default = "default_soft_fraction")]
+    pub memory_soft_fraction: f64,
     /// Scratch directory for spill files (one Arrow-IPC file per hash partition).
     /// `None`/absent falls back to the OS temp dir. Mirrors `MemoryConfig.spill_dir`.
     pub spill_dir: Option<String>,
@@ -81,14 +90,14 @@ pub struct EngineConfig {
     /// (the default, and every older control plane) keeps the existing routing exactly.
     pub prefer_materializing_aggregate: bool,
     /// Kyber's verdict that a join's build-side aggregate reads far more rows than the join's
-    /// probe side can match, so the materializing executor — which restricts that aggregate's
-    /// input to the probe side's keys before aggregating (`bc_interp::join_par::sideways`) — is
-    /// the faster route. Estimated sizes decide it, which only the control plane has: the
-    /// engine's structural check (`bc_interp::sideways_candidate`) sees *that* a restriction is
-    /// possible but not whether it cuts anything. On TPC-H sf10 q21 it cuts a 60M-row
-    /// `GROUP BY l_orderkey` to the orders the outer query can reach (~1,040 ms streamed against
-    /// ~670 ms), while q18, whose probe side is itself 60M rows, would only pay the executor's
-    /// overhead. `false` (the default, and every older control plane) keeps the routing as is.
+    /// probe side can match, so restricting that aggregate's input to the probe side's keys
+    /// pays. The streaming executor then evaluates the join's probe side first and restricts
+    /// (`bc_interp::stream::builds`; the materializing executor always does,
+    /// `bc_interp::join_par::sideways`). Estimated sizes decide it, which only the control plane
+    /// has: the engine's structural check sees *that* a restriction is possible, not whether it
+    /// cuts anything. On TPC-H sf10 q21 it cuts a 60M-row `GROUP BY l_orderkey` to the orders
+    /// the outer query can reach (648 -> 215 ms). `false` (the default, and every older control
+    /// plane) evaluates as before.
     pub prefer_sideways: bool,
     /// Fuse runs of linear, per-morsel streaming operators (Filter/Project) into a
     /// single pass over the input's morsels in the parallel executor. A relation-level
@@ -150,6 +159,11 @@ fn default_true() -> bool {
     true
 }
 
+/// `#[serde(default)]` for `memory_soft_fraction`: `bc_resource`'s unconfigured soft line.
+fn default_soft_fraction() -> f64 {
+    0.8
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -157,6 +171,7 @@ impl Default for EngineConfig {
             morsel_bytes: bc_arrow::DEFAULT_MORSEL_BYTES,
             parallelism: 0,
             memory_budget_bytes: 0,
+            memory_soft_fraction: default_soft_fraction(),
             spill_dir: None,
             spill_compression: Some("auto".to_string()),
             op_budgets: HashMap::new(),
@@ -321,6 +336,16 @@ mod tests {
         let d = bc_arrow::RuntimeTuning::default();
         assert_eq!(t.sort_merge_fanin, d.sort_merge_fanin);
         assert_eq!(t.bloom_min_build_rows, d.bloom_min_build_rows);
+    }
+
+    #[test]
+    fn memory_soft_fraction_defaults_to_the_pool_line_and_overlays() {
+        assert_eq!(EngineConfig::default().memory_soft_fraction, 0.8);
+        let c = EngineConfig::from_json(r#"{"memory_soft_fraction": 0.85}"#).unwrap();
+        assert_eq!(c.memory_soft_fraction, 0.85);
+        // An older control plane omits it and keeps the default line.
+        let c = EngineConfig::from_json(r#"{"memory_budget_bytes": 4096}"#).unwrap();
+        assert_eq!(c.memory_soft_fraction, 0.8);
     }
 
     #[test]

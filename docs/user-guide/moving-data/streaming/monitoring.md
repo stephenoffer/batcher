@@ -29,8 +29,15 @@ q.exception()  # the failure that stopped it, or None (does not re-raise)
 q.explain()  # the plan this query is running
 q.process_all_available()  # block until the current backlog is done
 q.stop()  # halt at the next micro-batch boundary
+q.stop(timeout=60)  # the same, but give up waiting after 60 seconds
 bt.streams()  # all active streaming queries
 ```
+
+A stop is observed only between micro-batches, so a long batch or a source blocked in a read
+holds `stop()` for as long as that takes. `stop(timeout=...)` returns `False` when the wait
+runs out. The query still stops at its next boundary, and nothing is cut off mid-batch: the
+in-flight batch either finishes and commits, or, if the process exits first, a restart from
+the checkpoint replays it.
 
 `q.explain()` shows the *planned* tree only. {py:obj}`Dataset.explain(analyze=True) <batcher.Dataset.explain>` runs the
 query to measure it, which a stream cannot do twice: the source has moved on, and running
@@ -57,10 +64,28 @@ if late:
 ```
 
 A batch that occasionally runs long is normal. A `behind_by_ms` that grows batch over batch
-means the query is falling behind its source, and the fix is upstream of the metric: a
-larger trigger interval, more workers, or less work per row. Both fields are `0` for a
-trigger with no interval (`once`, `available_now`, `continuous`), where there is no cadence
-to be late for.
+says the query cannot process what each trigger hands it within the interval.
+
+`behind_by_ms` measures the batch against its *cadence*, not against the *source*, so it is
+not a backlog measurement and the two can disagree in both directions. A source capped per
+trigger, by an option such as `max_offsets_per_trigger` or `max_files_per_trigger` or by the
+adaptive rate controller narrowing admission after an overrun, can finish every batch on time
+while the unread backlog keeps growing. A batch can also overrun its interval while the
+backlog shrinks, because it read more than one interval's worth. To see backlog, compare the
+`end_offset` each {py:class}`SourceProgress <batcher.SourceProgress>` reports against the
+source's own latest position, such as a Kafka partition's high-water mark from the broker's
+tooling. Batcher does not report that position.
+
+The remedy depends on where the time goes, which `durationMs` in the progress payload breaks
+down (see {ref}`streaming-ship-progress`). If `addBatch` dominates, the per-row work is the
+bottleneck: add workers or do less per row. A larger trigger interval does not help there.
+It reports less overrun because the deadline moved, while throughput stays the same. A larger
+interval raises throughput only when the fixed per-batch cost dominates, meaning `latestOffset`
+and `walCommit`, because that cost is then paid once per more rows.
+
+Both fields are `0` for a trigger with no interval (`once`, `available_now`, `continuous`),
+where there is no cadence to be late for. Under those triggers neither field can say whether
+the query is keeping up; compare source offsets as above.
 
 ## Is it dropping rows, and how much state is it holding?
 
@@ -71,10 +96,16 @@ micro-batch is the count of what it discarded:
 
 ```python
 # docs: skip
-dropped = sum(p.num_late_rows for p in q.recent_progress)
+dropped = q.status.total_late_rows
 if dropped:
     print(f"{dropped} rows arrived too late for their window")
 ```
+
+Read the total from `q.status`, not from a sum over `recent_progress`. That window holds only
+the last `streaming.progress_history` batches, so a sum over it undercounts any query that
+has run longer. {py:class}`StreamingQueryStatus <batcher.StreamingQueryStatus>` carries
+`total_input_rows`, `total_output_rows` and `total_late_rows` over every batch since this run
+of the query started. They restart at zero when the query restarts.
 
 A non-zero count means the allowed lateness is tighter than the stream's real skew. Widen
 it with {py:meth}`with_watermark(col, "30 minutes") <batcher.Dataset.with_watermark>` and the rows are counted at the cost of holding
@@ -111,16 +142,21 @@ print(p.sink.description, p.sink.num_output_rows, p.sink.token)
 ### What a multi-source or row-retaining query reports
 
 A query whose plan is a stream-stream join, a stream-static join, a session window, a
-watermark dedup, a limit, or a union of streams runs through a driver that produces
-finished rows and hands them to the sink. The engine sees what the driver hands it, not
-what the driver read, so for these queries:
+watermark dedup, a limit, or a union of streams runs through a driver that reads its own
+sources and hands finished rows to the sink. Each micro-batch is one batch the driver
+emits, and the driver reports what it read and what it holds:
 
-- `num_input_rows` counts the rows the driver emitted, not the rows it consumed from the
-  source.
-- `state_operators` is empty, even though these operators do retain state.
+- `num_input_rows` counts the rows read from the query's unbounded sources since the
+  previous micro-batch. A stream-static join's table isn't counted, because it isn't the
+  stream's input. Rows read after the last emitted batch belong to no micro-batch, so a
+  stream that ends without emitting again doesn't count them.
+- `state_operators` carries one entry each for a stream-stream join (`stream_join`, both
+  buffers), a session window (`session_window`, the rows of open sessions, and the rows
+  dropped as late) and a watermark dedup (`dedup`, the seen keys), with the watermark each
+  one has reached. A limit and a union keep no rows between batches, so they report none.
 
-The state is still bounded, and still raises a {py:exc}`ResourceError <batcher.ResourceError>` naming the stall when a
-watermark stops advancing. What is missing is the per-batch reporting, not the guard.
+The state is also bounded, and raises a {py:exc}`ResourceError <batcher.ResourceError>` naming the stall when a
+watermark stops advancing.
 
 ## React to batches as they happen
 
@@ -167,7 +203,9 @@ otherwise, as a string so it can be shipped to a metrics system without pickling
 :::{warning}
 Callbacks run on the query's own loop thread, between micro-batches. Work done there is
 latency the next batch pays, so push to a queue rather than making a network call inline.
-A listener that raises is logged and skipped, never allowed to fail the query.
+A listener that raises is logged and skipped, never allowed to fail the query. That also
+hides a broken monitoring callback, so `q.status.listener_failures` counts the callbacks that
+raised while handling this query's events. Alert on it being non-zero.
 :::
 
 ## What an idle stream does
@@ -193,6 +231,7 @@ last `progress_history` micro-batches, not every batch since the query started.
 Apply it for one query with {py:func}`bt.config_context(cfg) <batcher.config_context>`, or process-wide with
 {py:func}`bt.set_config(cfg) <batcher.set_config>`.
 
+(streaming-ship-progress)=
 ## Ship progress to a log or metrics system
 
 A progress record's destination is usually a log line or a metrics system, and both want

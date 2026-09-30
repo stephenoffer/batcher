@@ -1,7 +1,7 @@
 """The one builder every geospatial function is written in terms of.
 
 Each `st_*` function in this package is a thin, typed, documented wrapper around a
-single `GeoFunc` node. Keeping the node construction here means the 113 wrappers carry
+single `GeoFunc` node. Keeping the node construction here means the 116 wrappers carry
 no logic at all — they are a signature, a docstring, and one call — so the family reads
 uniformly and a new function cannot accidentally lower differently from its neighbours.
 

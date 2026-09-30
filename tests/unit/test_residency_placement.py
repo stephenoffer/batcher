@@ -47,11 +47,39 @@ def test_a_regulated_input_narrows_the_fleet() -> None:
     assert {n.node_id for n in nodes} == {"eu-a", "unlabelled"}
 
 
-def test_an_unlabelled_node_is_never_filtered_out() -> None:
+def test_an_unlabelled_node_is_kept_by_default() -> None:
     # An unreadable label is not evidence of a violation, and dropping it would take a
     # cluster offline the day a label was missed.
     nodes = permitted_nodes(_catalog(), ["s3://eu/orders"], _FLEET)
     assert any(n.node_id == "unlabelled" for n in nodes)
+
+
+def test_refuse_unlabeled_drops_the_unlabelled_node_for_regulated_data() -> None:
+    # Fail-closed: a node whose region cannot be read is outside every permitted region.
+    catalog = _catalog()
+    catalog.refuse_unlabeled = True
+    nodes = permitted_nodes(catalog, ["s3://eu/orders"], _FLEET)
+    assert {n.node_id for n in nodes} == {"eu-a"}
+    assert residency_report(catalog, ["s3://eu/orders"], _FLEET)["excluded_nodes"] == 2
+
+
+def test_refuse_unlabeled_restricts_nothing_for_unregistered_data() -> None:
+    catalog = _catalog()
+    catalog.refuse_unlabeled = True
+    assert len(permitted_nodes(catalog, ["s3://public/reference"], _FLEET)) == len(_FLEET)
+
+
+def test_refuse_unlabeled_makes_the_check_refuse_an_unknown_region() -> None:
+    default = _catalog()
+    assert default.check("s3://eu/orders", "").allowed
+    strict = _catalog()
+    strict.refuse_unlabeled = True
+    verdict = strict.check("s3://eu/orders", "")
+    assert not verdict.allowed
+    assert verdict.enforced
+    assert "no region label" in verdict.message()
+    assert strict.check("s3://eu/orders", "eu-north-1").allowed
+    assert strict.check("s3://public/x", "").allowed
 
 
 def test_an_unregistered_input_restricts_nothing() -> None:

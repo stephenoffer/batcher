@@ -26,7 +26,7 @@ from batcher.io.formats.structured import _parquet_native
 from batcher.io.formats.structured.parquet import _native_stream
 from batcher.io.predicate import to_pyarrow_expression
 from batcher.io.splits import FileSplit, Split, parquet_row_group_splits
-from batcher.io.splits.parquet import _parquet_footer
+from batcher.io.splits.parquet import FileKeyBounds, _parquet_footer
 from batcher.io.stats import RowGroupBounds
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 from batcher.plan.source_stats import SourceStatistics
@@ -613,6 +613,55 @@ class ParquetSource(FileSource):
         ):
             return [FileSplit(self.format_name, path, self._reader_kwargs())]
         return parquet_row_group_splits(path, target_size, predicate, self._fs)
+
+    def column_byte_sizes(self) -> dict[str, int] | None:
+        """Estimated uncompressed bytes of each column across the source, from its footers.
+
+        What a read of a projection costs in decoded bytes, which the column count does not
+        say: one long string column can outweigh every other column of a table together.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io import ParquetSource  # doctest: +SKIP
+                >>> ParquetSource("customer/").column_byte_sizes()["c_comment"]  # doctest: +SKIP
+                9123456789
+
+        Returns:
+            Bytes per column name, or None when the footers cannot be read.
+        """
+        from batcher.io.splits.parquet import footer_column_bytes
+
+        if self._filesystem is not None:
+            return None
+        return footer_column_bytes(self._files(), self._fs)
+
+    def key_bounds(self, column: str) -> list[FileKeyBounds] | None:
+        """Each file's min/max of `column` from its footer, the layout a key-range split reads.
+
+        A table written in key order stores disjoint key ranges in its files, which is what
+        lets a distributed join give each worker one range of every table and skip the
+        shuffle. This reports those ranges without reading a data page.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io import ParquetSource  # doctest: +SKIP
+                >>> ParquetSource("lineitem/").key_bounds("l_orderkey")[0].lo  # doctest: +SKIP
+                1
+
+        Args:
+            column: The column whose per-file range to return.
+
+        Returns:
+            One entry per file, in file order, or None when a footer does not bound the
+            column or the source has more files than a footer sweep is worth.
+        """
+        from batcher.io.splits.parquet import file_key_bounds
+
+        if self._too_many_files_to_sweep() or self._filesystem is not None:
+            return None
+        return file_key_bounds(self._files(), column, self._fs)
 
     def row_group_bounds(self, columns: list[str]) -> list[RowGroupBounds] | None:
         """Per-row-group min/max/null-count of `columns`, read from the footers alone.

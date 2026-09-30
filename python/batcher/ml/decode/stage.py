@@ -75,13 +75,12 @@ def _bounded_map(
     pending: deque[tuple[float, Any]] = deque()
     # Both branches start the call at submit time, so `workers` of them are in flight at
     # once and a deadline measured from submit time measures the call itself.
-    if timeout is None:
-        pool = _shared_pool(workers)
-        submit: Any = lambda item: pool.submit(fn, item)  # noqa: E731
-    else:
-        submit = lambda item: start_call(  # noqa: E731
-            functools.partial(fn, item), name="bt-media"
-        )
+    pool = _shared_pool(workers) if timeout is None else None
+
+    def submit(item: Any) -> Any:
+        if pool is not None:
+            return pool.submit(fn, item)
+        return start_call(functools.partial(fn, item), name="bt-media")
 
     def _take() -> Any:
         submitted, handle = pending.popleft()

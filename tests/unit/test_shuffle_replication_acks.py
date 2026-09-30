@@ -91,7 +91,7 @@ def _run(monkeypatch, acks):
     ]
     fake = _FakeRay({})
     monkeypatch.setitem(__import__("sys").modules, "ray", fake)
-    result = repl.replicate_shuffle_output(actors, addrs, 2, 2, set())
+    result = repl.replicate_shuffle_output(actors, addrs, 2, 2, set(), stages=(0,))
     return result, fake
 
 
@@ -134,7 +134,7 @@ def test_a_single_worker_cluster_cannot_host_an_independent_copy(monkeypatch, re
     actors = [_Actor(0, "nodeA", addrs[0], _FakeRef("a0:1"))]
     fake = _FakeRay({})
     monkeypatch.setitem(__import__("sys").modules, "ray", fake)
-    assert repl.replicate_shuffle_output(actors, addrs, 2, 1, set()) is None
+    assert repl.replicate_shuffle_output(actors, addrs, 2, 1, set(), stages=(0,)) is None
 
 
 def test_a_probe_failure_is_noted_rather_than_silent(monkeypatch, replicating, caplog):
@@ -154,7 +154,7 @@ def test_a_probe_failure_is_noted_rather_than_silent(monkeypatch, replicating, c
     from batcher._internal.logging import _FIELDS_ATTR
 
     with caplog.at_level("DEBUG", logger="batcher.dist"):
-        assert repl.replicate_shuffle_output(actors, addrs, 2, 2, set()) is None
+        assert repl.replicate_shuffle_output(actors, addrs, 2, 2, set(), stages=(0,)) is None
     steps = [getattr(r, _FIELDS_ATTR, {}).get("step") for r in caplog.records]
     assert "probe workers for replica placement" in steps, caplog.text
 

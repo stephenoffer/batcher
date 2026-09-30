@@ -108,7 +108,7 @@ class _TritonServingClient:
                 import tritonclient.grpc as tc
             else:
                 import tritonclient.http as tc
-        except ImportError as exc:  # pragma: no cover - optional extra
+        except ImportError as exc:  # optional extra
             from batcher._internal.errors import MissingDependencyError
 
             raise MissingDependencyError.of(
@@ -165,7 +165,7 @@ class _TritonServingClient:
             absent, or the config cannot be read.
         """
         get_config = getattr(self._client, "get_model_config", None)
-        if get_config is None:  # pragma: no cover - an older tritonclient
+        if get_config is None:  # an older tritonclient
             return None
         config = get_config(self._model, model_version=self._version)
         # The HTTP client returns the config dict itself; the gRPC client wraps it in a

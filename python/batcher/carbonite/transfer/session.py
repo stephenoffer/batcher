@@ -84,6 +84,12 @@ class ShuffleSession:
         # bucket could ever be read. Defaults True so a caller that never sets it behaves
         # exactly as before; the fleet sets it once, from the addresses it already has.
         self._shm_peers = True
+        # The tmpfs mirror is a second resident copy of a bucket, charged to this worker's
+        # cgroup (tmpfs pages count toward `memory.current`) but to neither the buffer pool
+        # nor the shuffle store's cap. Counted so capacity planning can see it: logical
+        # bytes mirrored, and buckets whose mirror the gate skipped.
+        self._shm_mirrored_bytes = 0
+        self._shm_mirrors_skipped = 0
         # Locality is tracked as two counters, not a per-fetch list: a long-lived
         # reducer does an unbounded number of fetches, so an append-per-fetch list
         # would grow without bound. off_network / total reconstruct the ratio.
@@ -129,8 +135,8 @@ class ShuffleSession:
 
         Under adaptive flow control the controller owns the window, so the re-grant is
         applied there (`rewindow`) rather than to the static `_credits` that `_window()`
-        would never read. It used to be dropped silently in that mode — which is the
-        default — so the fleet-reuse fix above never actually applied to a real run.
+        would never read. Adaptive is the default mode, so applying it anywhere else would
+        leave the fleet-reuse re-grant above with no effect on a real run.
 
         Args:
             credits: The new credit window (1 credit = 1 in-flight batch).
@@ -147,13 +153,12 @@ class ShuffleSession:
     def _observe_backpressure(self) -> None:
         """Feed one round's congestion verdict to the AIMD controller (if adaptive).
 
-        Two independent facts decide a credit window, and this used to gather only one of
-        them. Memory pressure past the spill threshold still cuts the window unconditionally,
-        because a slow shuffle is recoverable and an OOM-killed worker is not. But on a
-        healthy node that signal never fires, so every round read as "grow" and the window
-        climbed to its ceiling whether or not the extra credits moved a byte — a ramp rather
-        than a control loop, and the surest way to manufacture the very pressure it backs off
-        on.
+        Two independent facts decide a credit window, and this gathers both. Memory pressure past
+        the spill threshold still cuts the window unconditionally, because a slow shuffle is
+        recoverable and an OOM-killed worker is not. But on a healthy node that signal never fires,
+        so without the second fact every round would read as "grow" and the window would climb to
+        its ceiling whether or not the extra credits moved a byte — a ramp rather than a control
+        loop, and the surest way to manufacture the very pressure it backs off on.
 
         The second fact is the channel's own: the transport records how long the consumer sat
         waiting for the next batch, and its complement is buffer occupancy. A saturated
@@ -182,8 +187,14 @@ class ShuffleSession:
         reducer falls back to Flight, which stays correct).
         """
         nbytes = self._server.publish(ticket, batches)
-        if self._shm and batches and self._shm_mirror_ok():
-            self._server.publish_shared(ticket, batches)
+        if self._shm and batches:
+            if self._shm_mirror_ok():
+                self._server.publish_shared(ticket, batches)
+                with self._stats_lock:
+                    self._shm_mirrored_bytes += nbytes
+            else:
+                with self._stats_lock:
+                    self._shm_mirrors_skipped += 1
         return nbytes
 
     def set_shm_peers(self, has_peer: bool) -> None:
@@ -460,6 +471,11 @@ class ShuffleSession:
             # The bytes behind that count. A worker holding four partitions says nothing
             # about its footprint; a worker holding four gigabytes does.
             "bytes_retained": self._server.retained_bytes,
+            # The shared-memory mirror's volume, cumulative like `bytes_published`. It is a
+            # second copy on top of `bytes_retained`, so a same-node shuffle's peak resident
+            # footprint is up to their sum — the figure a node's capacity plan has to hold.
+            "bytes_mirrored_shm": self._shm_mirrored_bytes,
+            "shm_mirrors_skipped": self._shm_mirrors_skipped,
         }
         if self._flow_control is not None:
             out.update({f"credit_{k}": v for k, v in self._flow_control.stats().items()})

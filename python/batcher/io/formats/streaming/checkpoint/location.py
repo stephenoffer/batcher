@@ -43,9 +43,9 @@ def is_local_location(location: str) -> bool:
     Returns:
         True for a bare path or a ``file:`` URI.
     """
-    from batcher.io._backend import _scheme
+    from batcher.io._concurrent import is_local_path
 
-    return _scheme(location) in ("", "file")
+    return is_local_path(location)
 
 
 class CheckpointDir:

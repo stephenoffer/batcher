@@ -348,25 +348,88 @@ class IcebergSource:
             return [WholeSourceSplit(self)]
         if not tasks:
             return [WholeSourceSplit(self)]
-        clustering, spec_id = self._partition_clustering()
-        return [
-            IcebergTableSplit(
-                identifier=self._identifier,
-                catalog=self._catalog,
-                snapshot_id=self._snapshot_id,
-                task=task,
-                rows=getattr(task.file, "record_count", None),
-                row_filter=self._row_filter,
-                # A file written under an OLDER partition spec carries a partition record with
-                # different fields in it, so reading it against the current spec's columns
-                # would group by the wrong thing. Such a file declares nothing, which makes
-                # `declared_clustering` refuse the whole set rather than half-trust it.
-                clustering=clustering
-                if clustering and getattr(task.file, "spec_id", None) == spec_id
-                else (),
+        clustering, positions = self._common_clustering(
+            {getattr(task.file, "spec_id", None) for task in tasks}
+        )
+        out = []
+        for task in tasks:
+            # A file written under an OLDER partition spec carries a partition record with
+            # different fields in it, at different positions. Its value is read at the
+            # positions of the fields every live spec shares (`_common_clustering`), so an
+            # old file and a new one holding the same value group together. A file whose spec
+            # cannot be mapped declares nothing, which makes `declared_clustering` refuse the
+            # whole set rather than half-trust it.
+            where = positions.get(getattr(task.file, "spec_id", None))
+            out.append(
+                IcebergTableSplit(
+                    identifier=self._identifier,
+                    catalog=self._catalog,
+                    snapshot_id=self._snapshot_id,
+                    task=task,
+                    rows=getattr(task.file, "record_count", None),
+                    row_filter=self._row_filter,
+                    clustering=clustering if where is not None else (),
+                    positions=where or (),
+                )
             )
-            for task in tasks
-        ]
+        return out
+
+    def _common_clustering(self, spec_ids: set) -> tuple[tuple[str, ...], dict]:
+        """The partition fields every live file's spec shares, and where each spec keeps them.
+
+        Partition evolution is why this is not simply the current spec. A file carries the
+        record of the spec it was written under, so a table that evolved from `day` to
+        `(day, region)` holds files of both. Grouping those by their raw records compares a
+        one-field tuple against a two-field one, which is why an evolved table used to refuse
+        the clustering outright. But a field present in *both* specs with the same source
+        column and the same transform is computed identically under either, so equal column
+        values still produce equal partition values in every file. Clustering on the fields
+        common to every live spec, read from each file at that spec's own position, is
+        therefore exactly as sound as the unevolved case, and it is coarser only by the
+        fields that were added or dropped.
+
+        A field whose transform differs between specs (`days(ts)` then `hours(ts)`) is not
+        common, since a day-file and an hour-file holding the same `ts` carry different
+        values. `void` fields, which v1 tables use for a dropped field, are never claimed.
+
+        Args:
+            spec_ids: The spec id of every file the scan will read.
+
+        Returns:
+            `(source column names, {spec_id: positions})`; `((), {})` when nothing is common,
+            the table is unpartitioned, or a spec or source column cannot be resolved.
+        """
+        try:
+            table = self._table()
+            current = table.spec()
+            specs = table.specs()
+            if not current.fields or any(sid not in specs for sid in spec_ids):
+                return (), {}
+
+            def key(field: Any) -> tuple[int, str]:
+                return field.source_id, str(field.transform)
+
+            common = [
+                f
+                for f in current.fields
+                if str(f.transform) != "void"
+                and all(any(key(g) == key(f) for g in specs[sid].fields) for sid in spec_ids)
+            ]
+            schema = table.schema()
+            names = [schema.find_column_name(f.source_id) for f in common]
+            if not common or any(n is None for n in names):
+                return (), {}
+            positions = {
+                sid: tuple(
+                    next(i for i, g in enumerate(specs[sid].fields) if key(g) == key(f))
+                    for f in common
+                )
+                for sid in spec_ids
+            }
+            return tuple(names), positions
+        except Exception as exc:
+            note_suppressed("io", "read the Iceberg partition specs", exc)
+            return (), {}
 
     def clustering_columns(self) -> tuple[str, ...]:
         """The columns this table's splits will hold constant, from the already-loaded metadata.
@@ -377,29 +440,19 @@ class IcebergSource:
         Returns:
             The partition fields' source columns, or an empty tuple.
         """
-        return self._partition_clustering()[0]
-
-    def _partition_clustering(self) -> tuple[tuple[str, ...], int | None]:
-        """The current spec's partition *source* columns, and the spec id they belong to.
-
-        Returns `((), None)` for an unpartitioned table, or when any partition field's source
-        column cannot be named — a partial set does not identify a partition, and a
-        half-identified one is exactly the over-claim that turns a skipped shuffle into a wrong
-        answer.
-        """
         try:
             table = self._table()
             spec = table.spec()
             if not spec.fields:
-                return (), None
+                return ()
             schema = table.schema()
             names = [schema.find_column_name(field.source_id) for field in spec.fields]
-            if any(n is None for n in names):
-                return (), None
-            return tuple(names), spec.spec_id
+            # A partial set does not identify a partition, and a half-identified one is
+            # exactly the over-claim that turns a skipped shuffle into a wrong answer.
+            return () if any(n is None for n in names) else tuple(names)
         except Exception as exc:
             note_suppressed("io", "read the Iceberg partition spec", exc)
-            return (), None
+            return ()
 
 
 class IcebergTableSplit:
@@ -438,6 +491,7 @@ class IcebergTableSplit:
         "_catalog",
         "_clustering",
         "_identifier",
+        "_positions",
         "_row_filter",
         "_rows",
         "_snapshot_id",
@@ -454,8 +508,12 @@ class IcebergTableSplit:
         rows: int | None = None,
         row_filter: Any = None,
         clustering: tuple[str, ...] = (),
+        positions: tuple[int, ...] = (),
     ) -> None:
         self._clustering = clustering
+        #: Where this file's spec keeps each clustering field in its partition record. Only
+        #: meaningful alongside a non-empty `clustering`; see `_common_clustering`.
+        self._positions = positions
         self._identifier = identifier
         self._catalog = catalog
         self._snapshot_id = snapshot_id
@@ -490,8 +548,14 @@ class IcebergTableSplit:
 
     @property
     def clustering_value(self) -> tuple[Any, ...]:
-        """This file's partition values, in spec-field order — the key its splits group by."""
+        """This file's values for the clustering fields — the key its splits group by.
+
+        Read at this file's own spec positions, so a file written before a partition field
+        was added reports the same key as a newer file holding the same value.
+        """
         record = self._task.file.partition
+        if self._positions:
+            return tuple(record[i] for i in self._positions)
         return tuple(record[i] for i in range(len(record)))
 
     def _source(self) -> IcebergSource:

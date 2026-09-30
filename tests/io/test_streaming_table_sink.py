@@ -134,11 +134,17 @@ def test_the_query_name_is_the_stable_application_id(registered):
     assert ("commit", ("t://x", "nightly", 0)) in _Recording.calls
 
 
-def test_without_a_query_name_the_app_id_is_derived_from_the_table(registered):
-    sink = TransactionalStreamSink("t://x/", "_txn_test")
-    sink.open()
-    sink.write_batch(0, _TABLE)
-    assert ("commit", ("t://x/", "batcher-stream:t://x", 0)) in _Recording.calls
+def test_two_unnamed_streams_into_one_table_do_not_share_an_app_id(registered):
+    """The default used to be derived from the table, so the second unnamed stream's
+    batch 0 found the first's transaction and was skipped as already committed."""
+    first = TransactionalStreamSink("t://x/", "_txn_test")
+    second = TransactionalStreamSink("t://x/", "_txn_test")
+    first.open()
+    second.open()
+    first.write_batch(0, _TABLE)
+    token = second.write_batch(0, _TABLE)
+    assert not token.endswith("already-committed")
+    assert [c[0] for c in _Recording.calls] == ["write", "commit", "write", "commit"]
 
 
 def test_a_format_without_a_transaction_marker_warns_once_and_appends(registered):

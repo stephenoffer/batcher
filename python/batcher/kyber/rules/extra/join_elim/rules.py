@@ -17,9 +17,9 @@ from batcher.kyber.rule import Phase
 
 # Reused rather than re-derived: copy-pasting a *soundness* proof is how two rules drift
 # apart and one of them starts deleting rows. `_right_unique_on_keys` is the engine's one
-# uniqueness proof; `_is_empty`/`_output_side`/`_passthrough` are its one empty-marker and
-# single-side-projection vocabulary; `_exact_rows` its one EXACT-cardinality gate; and the
-# `evidence` module is where this family's own proofs live.
+# uniqueness proof; `plan.logical.is_empty_relation` is its one empty marker and
+# `_output_side`/`_passthrough` its single-side-projection vocabulary; `_exact_rows` its one
+# EXACT-cardinality gate; and the `evidence` module is where this family's own proofs live.
 from batcher.kyber.rules.extra.adaptive_meta import _exact_rows
 from batcher.kyber.rules.extra.join_elim.evidence import (
     _cartesian_keys,
@@ -28,10 +28,19 @@ from batcher.kyber.rules.extra.join_elim.evidence import (
     _keys_non_null,
     _same_relation,
 )
-from batcher.kyber.rules.extra.join_extra import _is_empty, _output_side, _passthrough
+from batcher.kyber.rules.extra.join_extra import _output_side, _passthrough
 from batcher.kyber.rules.joins import _right_unique_on_keys
 from batcher.plan.expr_ir import IsNotNull, IsNull, referenced_columns, remap_columns
-from batcher.plan.logical import Distinct, Filter, Join, Limit, LogicalPlan, Project, Projection
+from batcher.plan.logical import (
+    Distinct,
+    Filter,
+    Join,
+    Limit,
+    LogicalPlan,
+    Project,
+    Projection,
+    is_empty_relation,
+)
 
 __all__ = [
     "anti_join_of_nonempty_cartesian_to_empty",
@@ -271,7 +280,7 @@ def anti_join_of_nonempty_cartesian_to_empty(
 # --- inner-join reduction ----------------------------------------------------
 
 
-@rule(name="inner_join_to_semi_when_right_unique", phase=Phase.PUSHDOWN, matches=(Join,))
+@rule(name="inner_join_to_semi_when_right_unique", phase=Phase.FUSION, matches=(Join,))
 def inner_join_to_semi_when_right_unique(node: Join, ctx: OptimizerContext) -> LogicalPlan | None:
     """`Inner Join(L, R)` reading only L's columns, R unique on the key → a **semi** join.
 
@@ -286,10 +295,14 @@ def inner_join_to_semi_when_right_unique(node: Join, ctx: OptimizerContext) -> L
     It also unlocks the semi-join family — `drop_redundant_distinct_build`,
     `push_semijoin_through_join`. Uniqueness must be *proven* (structural `GROUP BY` /
     `DISTINCT` on the key, or an EXACT ndv reaching an EXACT row count); an estimate would
-    silently collapse a legitimate fan-out. Runs in PUSHDOWN so column pruning has already
-    reduced the output to one side, and is registered **after** the self-join and cartesian
-    rules: they can delete such a join outright, and a rule that only matches `inner` must
-    not get to rewrite it into a semi join first. Idempotent (semi is not inner).
+    silently collapse a legitimate fan-out. Runs in FUSION, after join ordering, and not in
+    PUSHDOWN where it used to: join reordering places inner joins only, so a semi join created
+    before it is pinned where the FROM order put it and `push_semijoin_through_join` then sinks
+    it onto the fact scan. Once a dimension's key was provably unique that took TPC-DS q53 from
+    8.6 to 13.9 ms, probing `store` with all 2.88M fact rows ahead of the selective `item` and
+    `date` joins. It is registered **after** the self-join and cartesian rules: they can
+    delete such a join outright, and a rule that only matches `inner` must not get to rewrite
+    it into a semi join first. Idempotent (semi is not inner).
     """
     if ctx is None or node.join_type != "inner":
         return None
@@ -321,7 +334,7 @@ def join_disjoint_keys_to_empty(node: Join, ctx: OptimizerContext) -> LogicalPla
     input would delete the answer. Guarded on the left not already being empty, so it fires
     once (idempotent).
     """
-    if ctx is None or node.join_type not in ("inner", "semi") or _is_empty(node.left):
+    if ctx is None or node.join_type not in ("inner", "semi") or is_empty_relation(node.left):
         return None
     if not _disjoint_keys(node, ctx):
         return None

@@ -331,14 +331,20 @@ def test_elasticsearch_esql_schema_reads_only_the_ipc_header(monkeypatch) -> Non
     assert source.schema() == _ESQL_BATCH.schema
 
 
-def test_elasticsearch_search_schema_asks_for_one_document(monkeypatch) -> None:
-    """The scroll path's schema probe stays a ``size=1`` search."""
-    client = _FakeESClient(hits=[{"a": 1, "b": "x"}])
+def test_elasticsearch_search_schema_asks_for_a_bounded_sample(monkeypatch) -> None:
+    """The scroll path's schema probe stays one bounded search, never the whole index.
+
+    Bounded at `SCHEMA_SAMPLE_ROWS` rather than one hit: a first hit says nothing about a
+    field only later documents carry (F333), so the sample is unioned instead.
+    """
+    from batcher.io.formats.nosql.base import SCHEMA_SAMPLE_ROWS
+
+    client = _FakeESClient(hits=[{"a": 1, "b": "x"}, {"a": 2, "c": 1.5}])
     source = ElasticsearchSource(hosts="h", index="i")
     monkeypatch.setattr(ElasticsearchSource, "_client", lambda _self: client)
 
-    assert source.schema().names == ["a", "b"]
-    assert [s["size"] for s in client.searches] == [1]
+    assert source.schema().names == ["a", "b", "c"]
+    assert [s["size"] for s in client.searches] == [SCHEMA_SAMPLE_ROWS]
 
 
 # =============================================================================

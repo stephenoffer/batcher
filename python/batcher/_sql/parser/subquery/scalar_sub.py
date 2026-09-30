@@ -39,9 +39,9 @@ from batcher._sql.parser.subquery.correlation import (
     _reject_correlated,
 )
 from batcher.api.dataset import Dataset
-from batcher.plan.expr_ir import col, lit, nullif, when
+from batcher.plan.expr_ir import Col, col, lit, nullif, when
 
-__all__ = ["MULTIPLE_ROWS_MESSAGE", "decorrelate_scalar_subqueries"]
+__all__ = ["MULTIPLE_ROWS_MESSAGE", "decorrelate_scalar_subqueries", "equality_join"]
 
 #: DuckDB's wording, so a ported query fails with the message its author already knows.
 MULTIPLE_ROWS_MESSAGE = (
@@ -236,3 +236,76 @@ def _raise_on_multiple_rows(batch):
     if batch.num_rows and (pc.max(batch.column(_ROWS_COLUMN)).as_py() or 0) > 1:
         raise ExecutionError(MULTIPLE_ROWS_MESSAGE)
     return batch
+
+
+def equality_join(tr, ds: Dataset, pred) -> Dataset | None:
+    """`column = (SELECT agg(...) FROM t)` as an equi-join onto its one row, or None.
+
+    An uncorrelated scalar subquery is otherwise evaluated while the SQL is translated and
+    inlined as a literal (`expressions.scalar._scalar_subquery`), which runs it as a query
+    of its own. When it reads a relation the outer query reads too, that is the relation
+    computed twice: TPC-H q15 aggregates `lineitem` into its `revenue` CTE, then keeps the
+    supplier whose revenue equals `(SELECT max(total_revenue) FROM revenue)`, and the eager
+    evaluation cost a full second scan and aggregate of `lineitem`. As one plan, the CTE is
+    a repeated subtree `kyber.common_subplan` finds and `api.subplan_reuse` computes once.
+
+    Taken only where the join means exactly what the comparison does: the subquery is an
+    ungrouped aggregate, so it yields at most one row and cannot multiply the outer rows;
+    a NULL or missing value matches nothing, as `x = NULL` keeps nothing; and both sides
+    have the same type, so the join compares what `=` would. Without a relation shared with
+    the outer query the literal stays, since then there is nothing to compute once and a
+    literal filter is cheaper than a join.
+    """
+    if not isinstance(pred, exp.EQ):
+        return None
+    for outer, sub in ((pred.this, pred.expression), (pred.expression, pred.this)):
+        if isinstance(outer, exp.Column) and isinstance(sub, exp.Subquery):
+            break
+    else:
+        return None
+    inner = sub.this
+    if not _ungrouped_aggregate(inner):
+        return None
+    # A correlated subquery is `decorrelate_scalar_subqueries`' to plan. Detected the way that
+    # path detects it: `_reject_correlated` assumes an unqualified column is local, and TPC-H
+    # q2's `ps_supplycost = (SELECT min(ps_supplycost) ... WHERE p_partkey = ps_partkey)`
+    # correlates through exactly such a column.
+    corr, _local = _split_correlation(tr, inner)
+    if corr:
+        return None
+    try:
+        tr._reject_correlated(inner)
+    except Exception:
+        return None
+    key = tr._scalar(outer)
+    if not isinstance(key, Col):
+        return None
+    saved = tr._agg_map, tr._agg_n
+    try:
+        value = tr.statement(inner.copy())
+    except Exception:  # anything this path cannot build, the literal path still can
+        return None
+    finally:
+        tr._agg_map, tr._agg_n = saved
+    if len(value.columns) != 1 or not {id(s) for s in value._sources} & {
+        id(s) for s in ds._sources
+    }:
+        return None
+    left, right = ds.schema, value.schema
+    if key.name not in left.names or left.field(key.name).type != right.field(0).type:
+        return None
+    alias, _, _ = _next_names(tr, 0)
+    value = value.rename({value.columns[0]: alias})
+    joined = ds.join(value, left_on=key.name, right_on=alias, how="inner")
+    # The key pair is equal on every joined row, so the join may already keep one of them.
+    return joined.drop(alias) if alias in joined.columns else joined
+
+
+def _ungrouped_aggregate(inner) -> bool:
+    """Whether `inner` is a plain `SELECT agg(...) FROM ...`: one row at most, always."""
+    if not isinstance(inner, exp.Select) or len(inner.expressions) != 1:
+        return False
+    if any(inner.args.get(k) for k in ("group", "limit", "offset", "distinct", "qualify")):
+        return False
+    item = inner.expressions[0]
+    return item.find(exp.AggFunc) is not None and item.find(exp.Window) is None

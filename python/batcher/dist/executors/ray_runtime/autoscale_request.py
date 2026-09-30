@@ -49,10 +49,10 @@ def _apply_autoscale_floor(
         # asks for GPU nodes, which a TPU cluster has none of, so the query would wait out
         # the autoscale window and then run on whatever was already up.
         #
-        # Both lists, not one or the other. Naming a custom resource used to *replace* the
-        # GPU bundles rather than join them, so a job with a GPU stage and a TPU stage — or
-        # any accelerator alongside an operator's own resource — asked the autoscaler for one
-        # of the two and then waited for hardware it had not requested.
+        # Both lists, not one or the other. If a custom resource *replaced* the GPU bundles,
+        # a job with a GPU stage and a TPU stage — or any accelerator alongside an operator's
+        # own resource — would ask the autoscaler for one of the two and then wait for
+        # hardware it had not requested.
         bundles += [{name: amount} for name, amount in resources]
         if bundles:
             request_resources(num_cpus=cpus, bundles=bundles)
@@ -100,7 +100,7 @@ def _arm_drain_release() -> None:
         monitor.on_drain(_release_all)
         monitor.start()
         _drain_release_armed = True
-    except Exception as exc:  # pragma: no cover - arming is best-effort
+    except Exception as exc:  # arming is best-effort
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("dist", "arm the autoscale-floor drain release", exc)

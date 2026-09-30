@@ -30,6 +30,7 @@ from batcher.dist.spill_breakers.sort import (
 )
 from batcher.dist.spill_breakers.window import (
     stream_spilling_window,
+    supports_bounded_window,
     supports_spilling_window,
 )
 
@@ -43,6 +44,7 @@ __all__ = [
     "stream_spilling_join",
     "stream_spilling_sort",
     "stream_spilling_window",
+    "supports_bounded_window",
     "supports_spilling_join",
     "supports_spilling_sort",
     "supports_spilling_window",

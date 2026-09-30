@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher import core
+from batcher.api.orchestration.chunked_sideways import run_staged_sideways
+from batcher.api.orchestration.sizing import projected_input_bytes
 from batcher.api.orchestration.stages import read_scanned
 
 if TYPE_CHECKING:
@@ -70,7 +72,6 @@ def run_chunked(
     """
     from batcher.api._join_helpers import _empty_result_schema
     from batcher.api.orchestration import phases
-    from batcher.api.orchestration.sizing import projected_input_bytes
 
     python_chunks = spill or chunk_worthy(input_bytes)
     if not (python_chunks or units_worthy(input_bytes)):
@@ -127,6 +128,24 @@ def execute_chunked(
     # executors summing in different orders disagree in the last bit. Preferring an unswapped
     # source was measured doing exactly that (q15 returned no row), and on q4/q10/q18 it
     # streamed a small table to hash `lineitem`, 1.4-1.7x slower.
+    if opt.prefer_sideways:
+        # A decorrelated aggregate over a relation the chunks do not drive: run the outer side
+        # first and stream the aggregate restricted to its keys (`chunked_sideways`). Tried
+        # before the plan is judged chunkable, because its stages can be when the plan is not:
+        # a semi join whose build side is the largest relation (`chunked_sideways._sideways_join`).
+        staged = run_staged_sideways(
+            sources,
+            opt,
+            input_bytes_of,
+            lambda srcs, stage: execute_chunked(
+                srcs,
+                stage,
+                lambda i: projected_input_bytes(srcs, stage.source_projections, [i]),
+                python_chunks=python_chunks,
+            ),
+        )
+        if staged is not None:
+            return staged
     driving = _driving_source(sources, opt, input_bytes_of)
     if driving is None or not core.plan_chunkable(opt, driving):
         return None

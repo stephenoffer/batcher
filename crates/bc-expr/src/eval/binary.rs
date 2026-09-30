@@ -347,6 +347,14 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
         Add, AddMonths, And, BitAnd, BitOr, BitXor, Concat, Div, Eq, FloorDiv, Ge, Gt, Le, Lt, Mod,
         Mul, Ne, Or, ShiftLeft, ShiftRight, Sub,
     };
+    // A list, struct or map compares element-wise through the nested path; the flat
+    // kernels below refuse nested types, and every flat operand bypasses this check.
+    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
+        && (crate::eval::cmp::is_nested(l.data_type())
+            || crate::eval::cmp::is_nested(r.data_type()))
+    {
+        return crate::eval::cmp::eval_nested_cmp(op, l, r);
+    }
     // SQL-style implicit numeric promotion: mixed Int64/Float64 operands are
     // promoted to Float64 so `qty * price` (int × float) works as expected.
     //

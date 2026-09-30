@@ -71,6 +71,7 @@ def test_morsel_cap_restricted_to_plan_families(monkeypatch):
     ex = rm._config.execution
     # A learned aggregate width that fills a morsel to 4× the byte budget.
     wide = LearnedMemoryModel(
+        _row_width={"aggregate": (4.0 * ex.morsel_bytes) / ex.morsel_rows},
         _bytes_per_row={"aggregate": (4.0 * ex.morsel_bytes) / ex.morsel_rows},
         _alpha=0.5,
         _clamp=4.0,

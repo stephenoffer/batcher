@@ -31,13 +31,14 @@ use super::radix;
 
 /// The dense map's slot value for "no build row carries this key".
 ///
-/// Zero, not `u32::MAX`, so a slot holds `row + 1` rather than `row`. That one-line change of
-/// encoding is what lets the map be **allocated already empty**: `vec![0u32; span]` lowers to
-/// `alloc_zeroed`, so the pages come from the OS zeroed and are faulted in lazily by the
-/// threads that write them, where `vec![u32::MAX; span]` is a single-threaded memset of the
-/// whole map before any work starts. At the sizes this path actually sees — TPC-H sf10's
+/// Zero, not `u32::MAX`, so a slot holds `row + 1` rather than `row`. That encoding is what
+/// lets a small map be **allocated already empty**: `vec![0u32; span]` lowers to
+/// `alloc_zeroed`, where `vec![u32::MAX; span]` is a single-threaded memset of the whole map
+/// before any work starts. At the sizes the parallel fill sees — TPC-H sf10's
 /// `orders.o_orderkey` spans 60,000,000 slots, a **240 MB** map — that memset alone was tens
-/// of milliseconds of pure Amdahl on the critical path of nearly every large join.
+/// of milliseconds of pure Amdahl on the critical path of nearly every large join. The
+/// parallel fill still writes each chunk before scattering into it ([`written_empty`]), but
+/// on the worker that owns it, so the writing runs on every core.
 const EMPTY: u32 = 0;
 
 /// Build rows below which the serial fill wins: the partition pass and the rayon fan-out cost
@@ -136,6 +137,21 @@ const MIN_SPAN: usize = 1024;
 // 20 MB hash table. One measured win against one measured 1.7x regression is not evidence for
 // a wider rule, so the ratio stands alone until something distinguishes the two cases — the
 // probe side's key ordering is the obvious candidate, and nothing measures it today.
+
+/// `len` empty slots, every page of them **written** before the scatter reads any.
+///
+/// `vec![EMPTY; len]` is `alloc_zeroed` (`EMPTY` is 0), which hands back fresh pages the kernel
+/// has not mapped. The scatter then *reads* each cell before writing it, so a page's first
+/// touch maps the shared zero page read-only and the write right after is a copy-on-write
+/// fault -- whose `ptep_clear_flush` interrupts every core running this process to flush its
+/// TLB. With every worker filling its own chunk at once that was 21% of TPC-H q12's CPU at
+/// sf100 on 64 cores, all of it in this loop. Written first, a page faults once, privately,
+/// with nothing to flush.
+fn written_empty(len: usize) -> Vec<u32> {
+    let mut cells = Vec::with_capacity(len);
+    cells.resize(len, EMPTY);
+    cells
+}
 
 impl DenseHeads {
     /// Build a dense map over the non-null build keys, or `None` when their range is too
@@ -252,7 +268,7 @@ impl DenseHeads {
             .enumerate()
             .map(|(p, rows_here)| {
                 let base = p << shift;
-                let mut cells = vec![EMPTY; chunk_len.min(span - base)];
+                let mut cells = written_empty(chunk_len.min(span - base));
                 let mut chain: Vec<(u32, u32)> = Vec::new();
                 for (slot, abs) in rows_here {
                     let cell = &mut cells[slot as usize - base];

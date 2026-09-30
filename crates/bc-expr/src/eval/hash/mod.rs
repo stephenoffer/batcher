@@ -24,6 +24,7 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 
 use crate::{ExprError, HashAlgorithm};
+use bc_arrow::hash::mix64;
 
 mod compat;
 
@@ -46,16 +47,6 @@ pub(crate) fn eval_hash_with(
 /// A distinct, arbitrary constant mixed in for a null so it is a *value*, not an
 /// absence: without it `hash(1, NULL)` and `hash(NULL, 1)` would coincide.
 const NULL_TAG: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// SplitMix64's finalizer — an avalanching 64-bit integer hash.
-fn mix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
 
 /// Fold `value` into the running hash. Order-sensitive: mixing after the combine means
 /// swapping two columns changes the digest.

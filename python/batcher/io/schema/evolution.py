@@ -15,7 +15,6 @@ operation is a vectorized Arrow kernel (``cast`` / ``nulls`` / column reorder).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 
 import pyarrow as pa
 
@@ -25,12 +24,10 @@ from batcher.io.schema._casts import checked_cast, require_non_null
 from batcher.plan.types import promote
 
 __all__ = [
-    "SchemaDrift",
     "conform_batch",
     "normalize_batch",
     "note_dropped_columns",
     "reconcile_batches",
-    "schema_drift",
     "unify_schemas",
 ]
 
@@ -471,32 +468,3 @@ def conform_batch(batch: pa.RecordBatch, target: pa.Schema, *, path: str) -> pa.
         require_non_null(arr, field, describe=f"column {field.name!r} of file {path!r}", hint=hint)
         cols.append(arr)
     return pa.RecordBatch.from_arrays(cols, schema=target)
-
-
-@dataclass(frozen=True, slots=True)
-class SchemaDrift:
-    """How an `inferred` schema differs from an `expected` one."""
-
-    added: tuple[str, ...]
-    removed: tuple[str, ...]
-    type_changed: tuple[tuple[str, str, str], ...]  # (column, expected_type, actual_type)
-
-    @property
-    def has_drift(self) -> bool:
-        return bool(self.added or self.removed or self.type_changed)
-
-
-def schema_drift(inferred: pa.Schema, expected: pa.Schema) -> SchemaDrift:
-    """Compare an `inferred` schema against an `expected` one and report the drift —
-    columns added/removed and columns whose type changed. The basis for schema-drift
-    detection and alerting on a daily ingest."""
-    inferred_names = set(inferred.names)
-    expected_names = set(expected.names)
-    added = tuple(n for n in inferred.names if n not in expected_names)
-    removed = tuple(n for n in expected.names if n not in inferred_names)
-    changed = tuple(
-        (n, str(expected.field(n).type), str(inferred.field(n).type))
-        for n in inferred.names
-        if n in expected_names and not inferred.field(n).type.equals(expected.field(n).type)
-    )
-    return SchemaDrift(added=added, removed=removed, type_changed=changed)

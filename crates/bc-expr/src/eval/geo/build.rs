@@ -11,12 +11,13 @@
 
 use arrow::array::ArrayRef;
 
+use bc_geo::algo::setops::{set_op, SetOp};
 use bc_geo::algo::{affine, construct, linear};
 use bc_geo::{Geom, Geometry};
 
 use crate::{ExprError, GeoFunc};
 
-use super::{caller_error, f64_at, geom_at, i64_at, row_result, str_at, GeomOut};
+use super::{caller_error, f64_at, geom_at, i64_at, row_result, second_geom_at, str_at, GeomOut};
 
 /// True when this dispatcher owns `func`.
 pub(super) fn handles(func: GeoFunc) -> bool {
@@ -57,12 +58,13 @@ macro_rules! num_arg {
 fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprError> {
     use GeoFunc::{
         StAffine, StBoundary, StBuffer, StCentroid, StClosestPoint, StCollect, StConvexHull,
-        StEndPoint, StEnvelope, StExpand, StExteriorRing, StFlipCoordinates, StForce2d, StForce3d,
-        StForcePolygonCcw, StForcePolygonCw, StGeomFromGeohash, StGeomFromGeojson, StGeomFromText,
-        StGeomFromWkb, StGeometryN, StInteriorRingN, StLineInterpolatePoint, StLineSubstring,
-        StMakeEnvelope, StMakeLine, StMakePolygon, StPoint, StPointN, StPointOnSurface, StPointZ,
-        StProject, StRemoveRepeatedPoints, StReverse, StRotate, StScale, StSegmentize, StSetSrid,
-        StShortestLine, StSimplify, StSnapToGrid, StStartPoint, StTransform, StTranslate,
+        StDifference, StEndPoint, StEnvelope, StExpand, StExteriorRing, StFlipCoordinates,
+        StForce2d, StForce3d, StForcePolygonCcw, StForcePolygonCw, StGeomFromGeohash,
+        StGeomFromGeojson, StGeomFromText, StGeomFromWkb, StGeometryN, StInteriorRingN,
+        StIntersection, StLineInterpolatePoint, StLineSubstring, StMakeEnvelope, StMakeLine,
+        StMakePolygon, StPoint, StPointN, StPointOnSurface, StPointZ, StProject,
+        StRemoveRepeatedPoints, StReverse, StRotate, StScale, StSegmentize, StSetSrid,
+        StShortestLine, StSimplify, StSnapToGrid, StStartPoint, StTransform, StTranslate, StUnion,
     };
     // The constructors that build from plain numbers or text, before any geometry decode.
     match func {
@@ -132,7 +134,7 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
 
     Ok(match func {
         StMakeLine => {
-            let Some(b) = geom_at(&cols[1], i, func)? else {
+            let Some(b) = second_geom_at(&cols[1], i, func, &g)? else {
                 return Ok(None);
             };
             let (Some(p), Some(q)) = (g.coords().first().copied(), b.coords().first().copied())
@@ -303,10 +305,27 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
             rebuilt(affine::expand(&g, dx, dy).map_err(|e| caller_error(func, e))?)
         }
         StCollect => {
-            let Some(b) = geom_at(&cols[1], i, func)? else {
+            let Some(b) = second_geom_at(&cols[1], i, func, &g)? else {
                 return Ok(None);
             };
             rebuilt(construct::collect(&g.geometry, &b.geometry))
+        }
+        StUnion | StIntersection | StDifference => {
+            let Some(b) = second_geom_at(&cols[1], i, func, &g)? else {
+                return Ok(None);
+            };
+            let op = match func {
+                StUnion => SetOp::Union,
+                StIntersection => SetOp::Intersection,
+                _ => SetOp::Difference,
+            };
+            // Planar and 2D, like `st_buffer`: the overlay is computed in x and y, so a
+            // z the operands carried does not survive into the new vertices.
+            row_result(set_op(op, &g, &b), func)?.map(|geometry| Geom {
+                srid,
+                has_z: false,
+                geometry,
+            })
         }
         StRemoveRepeatedPoints => {
             let tol = num_arg!(func, cols, 1, i);
@@ -329,13 +348,13 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
             }
         }
         StClosestPoint => {
-            let Some(b) = geom_at(&cols[1], i, func)? else {
+            let Some(b) = second_geom_at(&cols[1], i, func, &g)? else {
                 return Ok(None);
             };
             linear::closest_point(&g.geometry, &b.geometry).and_then(rebuilt)
         }
         StShortestLine => {
-            let Some(b) = geom_at(&cols[1], i, func)? else {
+            let Some(b) = second_geom_at(&cols[1], i, func, &g)? else {
                 return Ok(None);
             };
             linear::shortest_line(&g.geometry, &b.geometry).and_then(rebuilt)

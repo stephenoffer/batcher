@@ -35,7 +35,6 @@ from batcher.carbonite.transfer.locality import (
 from batcher.carbonite.transfer.peers import (
     PeerTransfer,
     peer_transfers,
-    reset_peer_transfers,
     straggler_peer,
 )
 from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleTicket, fetch
@@ -71,7 +70,6 @@ __all__ = [
     "pipeline_depth",
     "plan_exchange",
     "plan_staging",
-    "reset_peer_transfers",
     "ring_bandwidth_gbps",
     "ring_order",
     "select_device_mode",

@@ -1,9 +1,20 @@
-"""A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it.
+"""A deterministic UCB-style bandit over a fixed arm set — and the join-strategy choice on it.
 
-Regret-minimizing selection from measured per-arm latencies, with no RNG anywhere (ties break
-by arm name), so a plan is reproducible run to run. It generalizes the two-arm GPU crossover
-(`gpu/adaptive.py`) to N discrete algorithm arms, and its one caller here is the join-strategy
-decision: hash vs broadcast vs sort-merge, all of which emit the same relation.
+Selection from measured per-arm latencies, with no RNG anywhere (ties break by arm name), so a
+plan is reproducible run to run. It generalizes the two-arm GPU crossover (`gpu/adaptive.py`) to
+N discrete algorithm arms, and its one caller here is the join-strategy decision: hash vs
+broadcast vs sort-merge, all of which emit the same relation.
+
+It is a heuristic in the UCB family, not textbook UCB1, and UCB1's regret bound does not carry
+over. Three departures break its assumptions: evidence is discounted (`_ARM_DISCOUNT`) so a
+drifting arm is re-examined, the radius is scaled by each arm's *observed* spread (UCB-V style)
+rather than by a known reward range, and rewards are unbounded latencies. Discounted UCB
+(Garivier and Moulines) has a bound for bounded rewards with a limited number of change points,
+and UCB-V (Audibert, Munos and Szepesvari) has one for rewards in a known bounded range.
+Unbounded latency rewards satisfy neither assumption, so no regret guarantee is claimed here.
+What bounds the exploration cost in practice is structural: an untried arm is sampled once
+before ranking starts, and `learned_arm` defers to the cost model until `min_total`
+observations have accrued.
 
 The family contract — result-invariance, cold-store fallback, best-effort — is in the package
 docstring.
@@ -126,7 +137,7 @@ def record_arm(
     `plan_cache.record_write`'s `decides`, which documents the twelve-run feedback loop the
     drift test produced. Omitted, the value-drift test stands.
     """
-    if hub is None or reward_ms <= 0.0 or not arm:
+    if hub is None or not _valid_reward(reward_ms) or not arm:
         return
     try:
         stored = hub.get_keyed_param(scoped(namespace), key) or {}
@@ -144,6 +155,18 @@ def record_arm(
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("kyber", "record a bandit arm observation", exc)
         return
+
+
+def _valid_reward(reward_ms: float) -> bool:
+    """Whether a measured latency may enter an arm's statistics: finite and positive.
+
+    `reward_ms <= 0.0` alone let NaN through, because every comparison with NaN is false.
+    One NaN poisons the arm's Welford mean and `m2` for good: a NaN lower-confidence bound
+    never compares less than anything, so the arm is never chosen again, and the pooled
+    spread every other arm's radius is scaled by becomes NaN with it. An infinite latency
+    does the same damage through `inf - inf`.
+    """
+    return isinstance(reward_ms, (int, float)) and math.isfinite(reward_ms) and reward_ms > 0.0
 
 
 def _decayed(state: dict) -> dict:
@@ -193,9 +216,10 @@ def _reward_scale(tried: dict) -> float:
     comparable to a mean. These rewards are latencies in arbitrary units, so a bare radius is
     dimensionally meaningless: against a 500 ms mean it is a 0.2% nudge and the bandit collapses to
     greedy, while against a per-row mean of 1e-5 ms the same radius is pure exploration. Scaling by
-    the pooled standard deviation (recovered from the `sumsq` each `record_arm` already stores)
-    makes `c` dimensionless, so the arm ranking is invariant to whether the reward is recorded in
-    ms, microseconds, or ms-per-row, and the exploration rate is a real fraction of the spread.
+    the pooled standard deviation (pooled from the Welford `(n, mean, m2)` each `record_arm`
+    stores) makes `c` dimensionless, so the arm ranking is invariant to whether the reward is
+    recorded in ms, microseconds, or ms-per-row, and the exploration rate is a real fraction of
+    the spread.
 
     This does **not** rescue an arm whose recorded mean is genuinely far worse: the pooled spread
     decays as `1/sqrt(N)`, so the radius shrinks faster than such a gap closes, and UCB is right to
@@ -298,7 +322,7 @@ def learned_arm(
     try:
         stats = hub.get_keyed_param(scoped(namespace), key) or {}
         return _chosen_arm(stats, arms, min_total=min_total)
-    except Exception as exc:  # pragma: no cover - a learned read must never break planning
+    except Exception as exc:  # a learned read must never break planning
         # `None` here means "the bandit has no opinion", which is indistinguishable from a
         # cold store — so a read that is *failing* looks exactly like one that is merely
         # young, and the arm the loop measured is never applied. Say which it was.
@@ -388,7 +412,7 @@ def record_adaptive_route(
         route: The arm that ran (`staged` / `one_shot`).
         wall_ms: Measured wall time for the whole query.
     """
-    if hub is None or wall_ms <= 0.0 or not route:
+    if hub is None or not _valid_reward(wall_ms) or not route:
         return
     try:
         spent = dict(hub.get_keyed_param(scoped(_NS_ROUTE_COLD), signature) or {})

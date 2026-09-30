@@ -22,8 +22,8 @@ from batcher.api.streaming._query import (
     StreamingQuery,
     _deregister,
     _next_name,
+    _open_checkpoint,
     _register,
-    _warn_if_checkpoint_not_durable,
 )
 from batcher.plan.streaming import (
     OutputMode,
@@ -74,13 +74,6 @@ def start_distributed_stream(
     # launchers cannot come to differ about what a query costs.
     warn_if_state_is_unbounded(plan, sources)
     output_mode = OutputMode.validate(output_mode)
-    store = None
-    if checkpoint is not None:
-        _warn_if_checkpoint_not_durable(checkpoint)
-        from batcher.io.formats.streaming.checkpoint import CheckpointStore
-
-        store = CheckpointStore(checkpoint)
-
     # What each worker runs. A stateless epoch runs the whole Kyber-optimized plan (with
     # its projection pushed into the read); an aggregate's workers run only its *input*
     # pipeline and hand back a partial, exactly as the single-node fold does — so the two
@@ -99,7 +92,16 @@ def start_distributed_stream(
     else:
         plan_ir, projection = json.dumps(agg.input.to_ir()), None
 
+    from batcher.io.formats.streaming.checkpoint.identity import stream_app_id
+
+    store = None
+    if checkpoint is not None:
+        store = _open_checkpoint(checkpoint, plan, stateful=agg is not None)
     query_name = name or _next_name()
+    # The transaction id each epoch commits under. Not `query_name`: an unnamed query's is
+    # a per-process counter, so two drivers' first queries on one table were both
+    # "query-1" and the second found its epochs already committed.
+    app_id = stream_app_id(name, checkpoint, path)
     workers = num_workers if num_workers is not None else _drain_workers(sources[0])
     drain = trigger.is_drain
 
@@ -113,7 +115,7 @@ def start_distributed_stream(
             path=path,
             fmt=fmt,
             sink_kwargs=sink_kwargs,
-            query_name=query_name,
+            query_name=app_id,
             num_workers=workers,
             drain=drain,
             should_stop=should_stop,
@@ -172,8 +174,9 @@ class _DrainEngine:
     def __init__(self, progress: StreamingQueryProgress) -> None:
         self._progress = [progress]
 
-    def stop(self) -> None:
+    def stop(self, timeout: float | None = None) -> bool:  # noqa: ARG002
         """No-op — the drain already ran to completion before the handle was returned."""
+        return True
 
     def await_termination(self, timeout: float | None = None) -> bool:  # noqa: ARG002
         """Already terminated; always returns ``True``."""
@@ -186,6 +189,9 @@ class _DrainEngine:
             is_trigger_active=False,
             message="Stopped",
             batches_processed=len(self._progress),
+            total_input_rows=sum(p.num_input_rows for p in self._progress),
+            total_output_rows=sum(p.num_output_rows for p in self._progress),
+            total_late_rows=sum(p.num_late_rows for p in self._progress),
         )
 
     def recent_progress(self) -> list[StreamingQueryProgress]:

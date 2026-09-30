@@ -272,44 +272,58 @@ def streaming_listeners() -> list[StreamingQueryListener]:
     return list(_LISTENERS)
 
 
-def _fire(method: str, event: object) -> None:
-    """Deliver `event` to every listener, never letting one break the query."""
+def _fire(method: str, event: object) -> int:
+    """Deliver `event` to every listener, never letting one break the query.
+
+    Returns how many callbacks raised, so the engine can count them onto the query's
+    status: a failure that is only logged is invisible to anything watching the query.
+    """
     listeners = _LISTENERS
     if not listeners:
-        return
+        return 0
+    failed = 0
     for listener in listeners:
         try:
             getattr(listener, method)(event)
         except Exception:
             from batcher._internal.logging import get_logger
 
+            failed += 1
             get_logger("streaming").warning(
                 "streaming listener %s.%s raised; the query is unaffected",
                 type(listener).__name__,
                 method,
                 exc_info=True,
             )
+    return failed
 
 
-def notify_query_started(name: str, timestamp: float) -> None:
+def notify_query_started(name: str, timestamp: float) -> int:
     """Deliver a `QueryStartedEvent` to every listener.
 
     Args:
         name: The query's name.
         timestamp: Unix wall-clock seconds at which it started.
+
+    Returns:
+        How many listener callbacks raised (each was logged and skipped).
     """
-    _fire("on_query_started", QueryStartedEvent(name, name, timestamp))
+    return _fire("on_query_started", QueryStartedEvent(name, name, timestamp))
 
 
-def notify_query_progress(name: str, progress: StreamingQueryProgress) -> None:
+def notify_query_progress(name: str, progress: StreamingQueryProgress) -> int:
     """Deliver a `QueryProgressEvent` to every listener.
 
     Args:
         name: The query's name.
         progress: The completed micro-batch's metrics.
+
+    Returns:
+        How many listener callbacks raised (each was logged and skipped).
     """
-    _fire("on_query_progress", QueryProgressEvent(name, progress))
+    failed = _fire("on_query_progress", QueryProgressEvent(name, progress))
     _publish_progress(name, progress)
+    return failed
 
 
 def _publish_progress(name: str, progress: StreamingQueryProgress) -> None:
@@ -346,12 +360,15 @@ def _publish_progress(name: str, progress: StreamingQueryProgress) -> None:
     )
 
 
-def notify_query_terminated(name: str, exception: BaseException | None) -> None:
+def notify_query_terminated(name: str, exception: BaseException | None) -> int:
     """Deliver a `QueryTerminatedEvent` to every listener.
 
     Args:
         name: The query's name.
         exception: The failure that ended it, or None for a clean stop.
+
+    Returns:
+        How many listener callbacks raised (each was logged and skipped).
     """
     detail = None if exception is None else f"{type(exception).__name__}: {exception}"
-    _fire("on_query_terminated", QueryTerminatedEvent(name, name, detail))
+    return _fire("on_query_terminated", QueryTerminatedEvent(name, name, detail))

@@ -623,7 +623,7 @@ class BrokerSource(ABC):
             "value": lambda: pa.array([m.value for m in messages], type=pa.binary()),
             "partition": lambda: pa.array([m.partition for m in messages], type=pa.int64()),
             "offset": lambda: pa.array([m.offset for m in messages], type=pa.int64()),
-            "timestamp": lambda: pa.array([m.timestamp for m in messages], type=pa.int64()),
+            "timestamp": lambda: pa.array([m.timestamp for m in messages], type=pa.timestamp("ms")),
             "topic": lambda: pa.array([m.topic for m in messages], type=pa.string()),
             "headers": lambda: pa.array(
                 [_header_rows(m.headers) for m in messages], type=HEADERS_TYPE

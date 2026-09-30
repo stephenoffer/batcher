@@ -16,6 +16,8 @@ from batcher.plan.streaming import StreamingQueryProgress, StreamingQueryStatus
 
 if TYPE_CHECKING:
     from batcher.core.streaming_query import StreamingQueryEngine
+    from batcher.io.formats.streaming.checkpoint import CheckpointStore
+    from batcher.plan.logical import LogicalPlan
 
 __all__ = [
     "StreamingQuery",
@@ -108,6 +110,35 @@ def _warn_if_checkpoint_not_durable(location: str) -> None:
             "shared mount that survives node loss).",
             stacklevel=3,
         )
+
+
+def _open_checkpoint(location: str, plan: LogicalPlan, *, stateful: bool) -> CheckpointStore:
+    """Open a query's checkpoint and claim it for this driver, bound to `plan`.
+
+    One helper for every launcher, so the single-node and distributed paths take the same
+    lease and apply the same plan-compatibility check (`checkpoint.identity`). The
+    fingerprint is `LogicalPlan.content_key`, or ``None`` for a plan with an opaque node,
+    whose key is per-process and would refuse every restart.
+
+    Args:
+        location: The checkpoint location.
+        plan: The streaming plan the checkpoint will record.
+        stateful: Whether the query restores running state from the checkpoint.
+
+    Returns:
+        A claimed `CheckpointStore`.
+    """
+    from batcher.io.formats.streaming.checkpoint import CheckpointStore
+
+    _warn_if_checkpoint_not_durable(location)
+    store = CheckpointStore(location)
+    fingerprint = plan.content_key() if plan.ir_json() is not None else None
+    try:
+        store.claim(fingerprint, stateful=stateful)
+    except BaseException:
+        store.close()
+        raise
+    return store
 
 
 def active_streams() -> list[StreamingQuery]:
@@ -261,11 +292,38 @@ class StreamingQuery:
         """Whether the micro-batch loop is still running."""
         return self._engine.is_active
 
-    def stop(self) -> None:
-        """Halt the query at the next micro-batch boundary and wait for it to finish."""
-        self._engine.stop()
-        with _LOCK:
-            _ACTIVE.pop(self._name, None)
+    def stop(self, timeout: float | None = None) -> bool:
+        """Halt the query at the next micro-batch boundary and wait for it to finish.
+
+        A stop is observed only between micro-batches, so a long batch, or a source blocked
+        in a read, holds the wait. With `timeout` the wait gives up and returns ``False``;
+        the query still stops at its next boundary. Nothing is cut off mid-batch, so the
+        checkpoint's exactly-once order holds either way: the in-flight batch commits, or a
+        restart replays it.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> stream = bt.read.rate(rows_per_second=5, num_rows=5, pace=False)
+                >>> q = stream.write.memory(
+                ...     "stop_demo", trigger=bt.Trigger.processing_time("1 second")
+                ... )
+                >>> q.stop(timeout=30.0)
+                True
+
+        Args:
+            timeout: Seconds to wait for the query to finish, or None to wait for as long
+                as it takes.
+
+        Returns:
+            Whether the query has stopped.
+        """
+        stopped = self._engine.stop(timeout)
+        if stopped:
+            with _LOCK:
+                _ACTIVE.pop(self._name, None)
+        return stopped
 
     def await_termination(self, timeout: float | None = None) -> bool:
         """Block until the query stops (or `timeout` seconds elapse).

@@ -219,6 +219,44 @@ environment, because it is that process.
 **Run untrusted UDFs in a container, not behind a config flag.**
 ```
 
+## Secure the shuffle
+
+A distributed query moves its rows directly between worker processes over Arrow Flight, including columns a governance policy has already masked or decrypted. Each worker's Flight server binds on every interface. Two layers protect it, and both are off by default: a shared `distributed.shuffle_token` that a peer must present before any data is served, and `distributed.tls`, which encrypts the channel and, with `require_client_auth`, authenticates peers by certificate. See {doc}`Distributed options </configuration/distributed-options>` for the TLS fields.
+
+Set `distributed.require_secure_shuffle=True` so a missing layer fails at startup rather than falling back to plaintext:
+
+```python
+import dataclasses
+
+from batcher import Config
+
+cfg = Config()
+secured = cfg.replace(distributed=dataclasses.replace(cfg.distributed, require_secure_shuffle=True))
+print(secured.distributed.require_secure_shuffle)
+# True
+```
+
+With it on, spawning a shuffle fleet with no token, or with TLS off, raises `ConfigError` before any worker starts. It's checked there rather than when the config is set because the token can arrive by the `BATCHER_SHUFFLE_TOKEN` environment variable or a secret reference, and because the same config also runs single-node, where there is no shuffle to secure.
+
+The token is one secret shared by the whole cluster. It proves a peer belongs to the fleet, not which principal or query it serves, so it grants no per-query authorization. It's read when the fleet starts, so a rotated token applies to the next fleet and doesn't revoke a running one.
+
+## Turn every switch on at once
+
+A deployment assembled one flag at a time is one that forgets a flag. {py:meth}`Config.hardened <batcher.Config.hardened>` sets the ones on this page together: `governance.mode="strict"`, `require_verified_principal`, the `audit_path` you pass, `udf_isolation="strict"`, and `require_secure_shuffle`.
+
+```python
+import os
+import tempfile
+
+from batcher import Config
+
+hardened = Config().hardened(audit_path=os.path.join(tempfile.mkdtemp(), "audit.jsonl"))
+print(hardened.governance.mode, hardened.execution.udf_isolation)
+# strict strict
+```
+
+It can't supply the material those switches consume: a verifier installed with {py:obj}`bt.set_verifier <batcher.set_verifier>`, a shuffle token, and the TLS certificates. Each one that's missing fails where it's first needed. It sets no UDF memory limit or timeout either, because the right values depend on the workload, so set `udf_memory_limit_bytes` and `udf_timeout_s` as shown above. An asserted principal is refused on entering {py:obj}`bt.security() <batcher.security>`, and an unsecured shuffle is refused before its fleet starts.
+
 ## Bound how many queries run at once
 
 Batcher admits every arriving query immediately by default, and each one asks the executor
@@ -347,6 +385,7 @@ Two things follow when you write a policy:
 Before a deployment that matters, complete the following:
 
 1. Decide the trust boundary and run one process per trust domain.
+1. Start from `Config().hardened(audit_path=...)` and supply what it names: a verifier, a shuffle token and TLS certificates.
 1. Run under `governance.mode="advisory"`, fix every warning, then switch to `"strict"`.
 1. Set `execution.udf_isolation="strict"` with a memory limit and a timeout, or run
    untrusted UDFs in a container.
@@ -367,6 +406,7 @@ Before a deployment that matters, complete the following:
   filesystem-level encryption underneath.
 - UDF isolation covers the process path, not the thread path, and is not a sandbox.
 - Admission is per-process. There is no cross-node queue, so each driver bounds only itself.
+- The shuffle token is one shared secret per cluster. It authenticates fleet membership, not a principal or a query.
 
 ## See also
 

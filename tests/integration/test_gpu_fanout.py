@@ -59,6 +59,12 @@ def cluster(tmp_path_factory):
     # tests never ran once. Registering by value makes the worker deserialize the function
     # body instead of importing it.
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    # An earlier module's `collect(distributed=True)` connects this driver to Ray and leaves
+    # it connected, and a second `ray.init` then raises "called ray.init twice". Releasing
+    # that connection first is what makes the module order-independent: `shutdown` only
+    # detaches this driver (and stops a local instance it started), never a shared cluster.
+    if ray.is_initialized():
+        ray.shutdown()
     ray.init(
         address="local",
         num_cpus=4,

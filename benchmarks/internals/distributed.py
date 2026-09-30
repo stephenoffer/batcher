@@ -215,7 +215,7 @@ def run(scale: float = DEFAULT_SCALE, num_partitions: int = 8, runs: int = 3) ->
         print(f"running {name} ...", flush=True)
         single = plan.collect()
         dist = plan.collect(distributed=True, num_partitions=num_partitions)
-        ok, msg = results_match(single, dist)
+        ok, msg = results_match(single, dist, strict_types=True)
         # Both sides are order-checked, not just the distributed one. A single-node sort
         # that came back unordered is the same defect and would otherwise be invisible
         # here, because `results_match` would happily call two identically-unsorted

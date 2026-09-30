@@ -51,12 +51,14 @@ import pyarrow as pa
 from batcher._internal.logging import note_suppressed
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import (
+    SCHEMA_SAMPLE_ROWS,
     BulkSink,
     PartitionSpec,
     ScanSource,
     _ScanSplit,
     require_driver,
     rows_to_batches,
+    schema_from_rows,
 )
 from batcher.io.predicate import combine_conjunction, conjuncts
 from batcher.io.predicate._literals import _col_and_untyped_literal
@@ -116,8 +118,10 @@ class DynamoDBSource(ScanSource):
         partition_key: str | None = None,
         sort_key: str | None = None,
         partition_spec: PartitionSpec | None = None,
+        schema: pa.Schema | None = None,
     ) -> None:
         super().__init__(
+            schema=schema,
             partition_spec=partition_spec,
             table=table,
             region_name=region_name,
@@ -188,11 +192,8 @@ class DynamoDBSource(ScanSource):
 
     def _infer_schema(self) -> pa.Schema:
         client = self._client()
-        resp = client.scan(TableName=self._conn_kwargs["table"], Limit=1)
-        items = [_deserialize(item) for item in resp.get("Items", [])]
-        if not items:
-            return pa.schema([])
-        return pa.RecordBatch.from_pylist(items).schema
+        resp = client.scan(TableName=self._conn_kwargs["table"], Limit=SCHEMA_SAMPLE_ROWS)
+        return schema_from_rows([_deserialize(item) for item in resp.get("Items", [])])
 
     def key_schema(self) -> tuple[str | None, str | None]:
         """The table's ``(partition_key, sort_key)``, from the constructor or DescribeTable.

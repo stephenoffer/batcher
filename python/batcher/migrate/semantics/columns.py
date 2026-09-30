@@ -225,13 +225,6 @@ def _non_negative(node: Any) -> int | None:
 
 
 @transform
-def plus_one(_ctx: Context, offset: Bound) -> Any | None:
-    """A non-negative 0-based literal offset as the 1-based one."""
-    value = _non_negative(offset.node)
-    return None if value is None else cst.Integer(str(value + 1))
-
-
-@transform
 def spark_position(_ctx: Context, pos: Bound) -> Any | None:
     """Spark's `substring` start: 0 means 1, and a positive literal carries over."""
     value = _non_negative(pos.node)

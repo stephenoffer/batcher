@@ -74,8 +74,8 @@ The reverse means the estimate was too high and the query spilled needlessly.
 ## Pressure
 
 `used / limit` is coarsened into levels, and this is the one signal every backpressure
-mechanism reads: proactive spill, the morsel-admission gate, and the shuffle credit window.
-They can't invent disagreeing thresholds.
+mechanism reads: the plan-time decision to go out of core, the morsel-admission gate, and the
+shuffle credit window. They can't invent disagreeing thresholds.
 
 ```text
    memory.max_memory_bytes: auto-sensed once at the terminal op, cgroup-aware,
@@ -86,7 +86,7 @@ They can't invent disagreeing thresholds.
    │     a new reservation succeeds only after something spills         │
    │                                                                    │
    ├─ memory.soft_limit   0.85  ───────────────────────────────────────►│  SPILL
-   │     spill proactively; AIMD reads its congestion signal here       │
+   │     new plans go out of core; AIMD reads its congestion signal here│
    │                                                                    │
    ├─ soft_limit × 0.9    0.765 ───────────────────────────────────────►│  ELEVATED
    │     trim the result cache; narrow the in-flight window             │
@@ -105,13 +105,17 @@ They can't invent disagreeing thresholds.
 pub enum Pressure { Nominal, Elevated, Critical }
 ```
 
-`Critical` is `used >= limit`. `Elevated` is `used >= limit * soft_bps / 10_000`, where
-`soft_bps` is seeded to `DEFAULT_SOFT_BPS` of 8000, meaning 80%. `Elevated` exists so an
-operator can spill *proactively*, before the hard cap forces a stall.
+`Critical` is `used >= limit`. `Elevated` is `used >= limit * soft_bps / 10_000`. A pool
+nobody configured seeds `soft_bps` to `DEFAULT_SOFT_BPS` of 8000, meaning 80%. On every query,
+`execute_plan` moves the engine pool's line with `set_soft_fraction` to the engine config's
+`memory_soft_fraction`, which the control plane ships as `min(memory.soft_limit,
+memory.hard_limit)`. That is the fraction the Python monitor classifies this pool's
+`used / limit` against, so the pool's `Elevated` begins at the same byte as the monitor's
+`SPILL` reading of the pool.
 
-The pool exposes `set_soft_fraction` to move that line, but nothing outside the crate's own
-tests calls it, so the Rust soft line sits at 80% and is independent of
-`memory.soft_limit`. The finer Python ladder is the one that reads the configured limits.
+The level is reported, not acted on. It reaches the control plane as the `pressure` field of
+`engine_pool_stats()`, and nothing in the data plane spills early because of it. Spilling
+before the cap trades throughput for headroom, and that trade waits on a benchmark.
 :::
 
 :::{tab-item} The Python monitor
@@ -185,7 +189,7 @@ the owning operator is reading it.
 The pool's whole behavior fits in one picture: one soft line, one limit, and the two ways
 a refused reservation can end.
 
-![The Rust buffer pool as a single gauge with one soft line at 80% of the limit. Below that line the pool is nominal and nothing throttles; above it the pool is elevated and operators spill early. Critical is used == limit rather than a band, because growth past the limit is refused outright. The value moves right as operators reserve and back as they release: the pool counts bytes, it never allocates them. A try_reserve(n) that still fits under the limit is granted as an RAII guard, and every byte returns when the guard drops, on a panic as much as on a clean finish. One that does not fit is refused with the denial counted and used untouched, the pool then asks the largest other registered consumer to spill and re-reserves, for at most 32 rounds and stopping the moment a round frees nothing. A caller still short after that spills itself, the refusal being the signal. Carbonite's pool and the engine's pool count different bytes and are read side by side, never summed.](/_static/diagrams/buffer_pool_zones.svg)
+![The Rust buffer pool as a single gauge with one soft line, drawn at memory.soft_limit of the limit on every query and at 80% on a pool nobody configured. Below that line the pool is nominal and nothing throttles; above it the pool reports elevated to the control plane, and nothing in the data plane acts on that report. Critical is used == limit rather than a band, because growth past the limit is refused outright. The value moves right as operators reserve and back as they release: the pool counts bytes, it never allocates them. A try_reserve(n) that still fits under the limit is granted as an RAII guard, and every byte returns when the guard drops, on a panic as much as on a clean finish. One that does not fit is refused with the denial counted and used untouched, the pool then asks the largest other registered consumer to spill and re-reserves, for at most 32 rounds and stopping the moment a round frees nothing. A caller still short after that spills itself, the refusal being the signal. Carbonite's pool and the engine's pool count different bytes and are read side by side, never summed.](/_static/diagrams/buffer_pool_zones.svg)
 
 ## Where the limit comes from
 
@@ -194,16 +198,35 @@ terminal-op boundary from the live envelope (host RAM, honoring a cgroup limit),
 freezes it for the query. The data-plane budget shipped to Rust is
 `cap * memory.hard_limit`, as `EngineConfig.memory_budget_bytes`.
 
-A `memory_budget_bytes` of `0` means unbounded. `ExecOptions.agg_spill` stays `None` and
-the engine runs fully in memory with zero spill machinery. Set
-`memory.unbounded_memory = True` to ask for that explicitly. A query then fails fast rather
-than spilling.
+A `memory_budget_bytes` of `0` means unbounded. `ExecOptions.agg_spill` stays `None`, no
+engine pool is attached, and the engine runs fully in memory with zero spill machinery. Set
+`memory.unbounded_memory = True` to ask for that explicitly. Nothing then bounds the query: it
+neither spills nor fails early, so a plan larger than RAM runs until the allocator or the
+kernel's OOM killer stops it.
+
+Under a positive budget the pool and the spill path are switched on by the same condition,
+`memory_budget_bytes > 0` (`bc-py`'s `prepare_exec` and `ExecOptions::with_engine_config`), so
+a refused reservation always has a spill path to take. The `admit` branch that proceeds in
+memory after a refusal exists only for an embedding that attaches a pool without a spill
+directory, which `bc-py` never does.
+
+The cap is sensed per terminal op, not per process, so the next query picks up a new
+`max_memory_bytes`. What it is sensed *from* is memoized for the process: host RAM, the cgroup
+caps, the scheduler grant and `RLIMIT_AS` are treated as fixed for the container's lifetime,
+so a container whose limit is resized in place keeps the old ceiling until it restarts. The
+live readings are not frozen. The pressure monitor re-samples the cgroup's usage, its PSI
+stall share and its OOM history on short TTLs, and a `SPILL` reading sends the next plan out
+of core however large the frozen cap says the envelope is. One more thing grows but never
+shrinks: the engine's process-wide pool takes the largest budget any query in the process has
+shipped, so a smaller budget cannot strand a concurrent query's granted reservation.
 
 In a container the OS often reports the *host's* RAM rather than the cgroup limit, which
 is why the pressure monitor reads cgroup v2 `memory.max` and falls back to v1
 `memory.limit_in_bytes`. Where it can't, set `max_memory_bytes` yourself.
 
-You can see the budget the engine actually ran under:
+The profile reports peak memory against the machine's soft envelope, host memory or the
+cgroup cap times `memory.soft_limit`. That figure is the one the profile's memory percentage
+is computed against, not the engine's spill budget:
 
 ```python
 import json
@@ -211,10 +234,14 @@ import batcher as bt
 
 ds = bt.from_pydict({"g": [i % 100 for i in range(5000)], "x": [1.0] * 5000})
 report = json.loads(ds.group_by("g").agg(n=bt.count()).explain(analyze=True, format="json"))
-print("budget bytes:", report["memory_budget_bytes"])
+print("soft envelope bytes:", report["memory_budget_bytes"])
 print("peak rss:", report["peak_rss_bytes"])
 print("spilled:", report["spilled"])
 ```
+
+The budget shipped to the engine is `Config.spill_budget_bytes()`, and the engine pool it
+attached is readable after a query from `engine_pool_stats()` in `carbonite/memory/pool.py`,
+whose `limit_bytes` is that budget.
 
 To pin a smaller envelope, derive a config:
 
@@ -269,9 +296,19 @@ Three things bound the division:
   shrinking it would make a concurrent query's already-granted reservation retroactively
   unaffordable.
 - A nested query, such as a `collect()` inside a `map_batches` UDF, takes no admission slot
-  and so does not raise the occupancy. The outer query already paid for the machine.
+  and so does not raise the occupancy. The outer query already paid for the machine. Where
+  the UDF runs on a thread, the nested query's operator reservations land in the same
+  process-wide engine pool as the outer query's, so they count against the one envelope. A
+  UDF that runs in a child process, because it asked for `multiprocessing` or because
+  `core/udf/strategy.py` measured processes as faster, has its own pools there, and nothing
+  charges that child's memory to the parent's envelope. The
+  process footprint floor sees it only through the cgroup reading, and only when parent and
+  child share a cgroup.
 - The default is unbounded concurrency (`max_concurrent_queries = 0`), where the share is
-  exactly 1 and no budget changes.
+  exactly 1 and no budget changes. That is a deliberate bypass, not a large limit, and it
+  leaves queries that plan at the same moment each sizing against the whole envelope. A
+  process that serves queries side by side should set `max_concurrent_queries`; see
+  {doc}`Hardening </user-guide/trust/hardening>`.
 
 The share is reactive as well as proactive. `BudgetingAdmission` subtracts what concurrent
 queries have already reserved, and a reservation that does not fit routes the query out of
@@ -316,14 +353,36 @@ What the trim sheds isn't necessarily lost. Under the default `MEMORY_AND_DISK` 
 
 The pool is a single atomic counter with a CAS loop, so it's cheap but it's a process-wide
 contention point at high reservation rates. That's why reservations are per-*operator*,
-not per-morsel: one reserve for a hash table build, not one per batch.
+not per-morsel: one reserve for a hash table build, not one per batch. No benchmark of
+reservation throughput under many simultaneous operators has been recorded.
 
 It only accounts what's routed through it. Arrow buffers allocated by pyarrow on the
 Python side and a UDF's torch tensors are invisible to `used`. The Flight partition store is visible only where `ShuffleSpiller` registers it, which is a distributed worker with a bound Flight server. The pressure monitor's RSS and cgroup floor is the mitigation, and
 it's a floor, not a ledger.
 
+The figures that floor collapses are reported separately. `ResourceManager.stats()` carries
+a `memory_ledger` block (`carbonite/memory/ledger.py`) with each pool's reservation, their
+maximum as the accounted bytes, the bytes pyarrow's default memory pool holds, this
+process's resident set, the cgroup's unreclaimable usage, and `unaccounted_bytes`, the
+resident bytes above the accounted figure. The pyarrow figure is exact for Arrow buffers built
+on the Python side. Batches the engine returns were allocated by Rust and cross the FFI
+zero-copy, so they aren't in it. That last one
+is a lower bound on foreign allocations rather than a measurement of them, because a
+reservation is taken before its state is allocated and reserved-but-unfilled bytes offset
+foreign ones.
+
+A release is clamped so it can't underflow the counter, and the clamp would hide the
+defect that caused it: a release charged to the wrong owner leaves `used` too low and the
+pool admitting more than the envelope holds. So the pool counts what the clamp discards, a
+`release_bytes` past `used` or a `MemoryReservation::shrink` past the reservation's size, as
+`over_released`. It reaches the control plane as `over_released_bytes` in
+`engine_pool_stats()` and in `BufferPool.stats()`, and it is `0` on a run whose reservations
+balance.
+
 A reservation is also an *estimate* accepted in advance. The pool can't tell you that the
-hash table you reserved 100 MB for will actually take 400. What corrects that is the
+hash table you reserved 100 MB for will actually take 400, and no operator grows its
+reservation as its state grows: the stateful breakers reserve once, at admission. What
+corrects the estimate is the
 learned memory model described in {doc}`Learned metadata </architecture/deep-dives/adaptive/learned-metadata>`, which fits a
 measured bytes-per-input-row figure per operator family from `m_peak_bytes` and blends the
 plan's estimate toward it.
@@ -332,7 +391,7 @@ plan's estimate toward it.
 
 - {doc}`Architecture </architecture/index>`: Carbonite's lane, where it protects but never decides or executes.
 - {doc}`Carbonite </architecture/internals/carbonite>`: the resource manager that drives the pool.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the control theory behind the hysteresis.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the control theory behind the hysteresis.
 - {doc}`Configuration options </configuration/options>`: every `memory.*` knob named here.
 - {doc}`Performance </user-guide/operate/tuning/performance>`: setting an envelope on purpose.
 - {doc}`Scaling benchmarks </benchmarks/results/scaling>`: what bounded memory buys under load.

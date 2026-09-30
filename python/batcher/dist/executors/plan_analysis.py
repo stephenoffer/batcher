@@ -92,6 +92,47 @@ def _split_at(plan: LogicalPlan, breaker_type: type):
             return None
 
 
+def stackable_on_buckets(above: list[LogicalPlan]) -> bool:
+    """Whether every operator in `above` can run inside each reducer, over its bucket alone.
+
+    A `Filter` or a `Project` reads one row at a time and keeps the rows it keeps in the order
+    they arrived, so applied to each bucket of an ordered shuffle it computes exactly what it
+    computes over the concatenation -- and the result stays where the reducer published it.
+    That is narrower than `_PASS_THROUGH` on purpose: a `Limit`, a `Sort`, a `Distinct` or a
+    `RowId` above a breaker reads *across* buckets, and even a `Sample` or an `Unnest`, row-wise
+    as they are, would stop this being a statement about order as well as about rows.
+
+    Args:
+        above: The operators stacked above a breaker, outermost first.
+
+    Returns:
+        True when `above` is non-empty and every entry is a `Filter` or a `Project`.
+    """
+    return bool(above) and all(type(node) in (Filter, Project) for node in above)
+
+
+def stack_above_ir(above: list[LogicalPlan], base_ir: dict) -> dict:
+    """`base_ir` with the `stackable_on_buckets` operators of `above` wrapped around it.
+
+    Each node's own IR is taken whole and only its ``input`` is replaced, so every field it
+    carries crosses to the reducer without being listed here -- the same property
+    `ir_specs.unary_task_ir` gives a breaker's own shape.
+
+    Args:
+        above: Operators accepted by `stackable_on_buckets`, outermost first.
+        base_ir: The per-task IR of the breaker they sit on.
+
+    Returns:
+        The per-task IR of the whole stage.
+    """
+    ir = base_ir
+    for node in reversed(above):  # innermost (closest to the breaker) first
+        # A copy: `to_ir()` is memoized, and writing `input` into it would re-root the plan's
+        # own cached IR at this task's input.
+        ir = {**node.to_ir(), "input": ir}
+    return ir
+
+
 def _single_source(plan: LogicalPlan) -> bool:
     return len(scanned_source_ids(plan)) == 1
 
@@ -188,8 +229,8 @@ def fused_union_ids(plan: LogicalPlan) -> set[int]:
     be taken on the plan the *dispatcher* sees, and this loop holds the plan before Kyber
     rewrites it. Eager aggregation puts an `Aggregate` back on a join side, which has no
     one-shot path, so excluding the join left the loop with nothing to cut and a residual
-    that raised `PlanError` (a four-table star joined then grouped, previously returning
-    three rows). Re-asking `requires_staging` on a locally re-optimized plan does not fix it:
+    that raised `PlanError` (a four-table star joined then grouped, whose answer is three
+    rows). Re-asking `requires_staging` on a locally re-optimized plan does not fix it:
     that probe lacks the collected source statistics the eager-aggregation gate needs, so it
     optimizes to a different plan than the stage will and answers "no". And the exclusion was
     measured worth nothing once the fan-out and reduce-concurrency fixes landed — TPC-H sf100
@@ -466,9 +507,8 @@ def _child_plans(plan: LogicalPlan):
     """The `LogicalPlan` children of `plan`, in field order (including tuple fields).
 
     Delegates to `plan.visitor.children`, which is the one implementation of this walk and
-    caches each node class's child-bearing fields. The hand-rolled copy that used to live
-    here re-derived them per node *and* was a second place the discovery rules could drift
-    from the canonical one.
+    caches each node class's child-bearing fields, so the discovery rules have one home and
+    are not re-derived per node.
     """
     return children(plan)
 

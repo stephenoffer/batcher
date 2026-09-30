@@ -23,13 +23,21 @@ _DISPLAY_NAMES = ("show", "print", "glimpse", "preview", "display", "console", "
 _Func = ast.FunctionDef | ast.AsyncFunctionDef
 
 
-def _is_display(fn: _Func, owner: str) -> bool:
+def _is_display(fn: _Func, owner: str, rel: str = "") -> bool:
     """Whether printing *is* this function's contract (`show`, `glimpse`, a console sink).
 
     `owner` is the enclosing class name, because `ConsoleStreamSink.write_batch` prints by
-    contract while the method name alone says nothing.
+    contract while the method name alone says nothing. Two more contracts are structural
+    rather than named: the `main` of a `__main__.py` is a command-line entry point whose
+    interface *is* stdout (`python -m batcher.migrate`), and a function taking
+    `return_as_string` is the Polars print-or-return convention (`meta.tree_format`), which
+    prints exactly when the caller asked it not to return.
     """
     if any(word in f"{owner}.{fn.name}".lower() for word in _DISPLAY_NAMES):
+        return True
+    if fn.name == "main" and not owner and rel.endswith("__main__.py"):
+        return True
+    if "return_as_string" in _param_names(fn):
         return True
     doc = (ast.get_docstring(fn) or "").lstrip()
     return doc.split(" ")[0].rstrip(".,") in {"Print", "Show", "Display"}
@@ -69,7 +77,7 @@ def _class_owners(tree: ast.Module) -> dict[int, str]:
 
 def _function_findings(fn: _Func, rel: str, owner: str) -> Iterator[Finding]:
     """Printing, argument-validating asserts, and mutable defaults in one function."""
-    display = _is_display(fn, owner)
+    display = _is_display(fn, owner, rel)
     params = _param_names(fn)
     for node in ast.walk(fn):
         if not display and isinstance(node, ast.Call) and getattr(node.func, "id", "") == "print":

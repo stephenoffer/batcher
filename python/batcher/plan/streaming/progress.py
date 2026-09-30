@@ -144,10 +144,12 @@ class StreamingQueryProgress:
     fires on — the one question a low-latency query needs answered and the one nothing here
     could answer. Throughput says how fast the batch ran; it cannot say whether that was
     fast *enough*, because "enough" is the trigger interval and the progress record did not
-    carry it. A query behind by a growing amount is falling behind its source no matter how
-    healthy its rows-per-second looks. ``0.0`` when the batch kept up, and for a trigger
-    with no interval (``once`` / ``available_now`` / ``continuous``), where there is no
-    cadence to be late for.
+    carry it. A query behind by a growing amount cannot process what each trigger hands it
+    within the interval, however healthy its rows-per-second looks. It measures the batch
+    against its cadence, not the source's backlog: a source capped per trigger can keep
+    every batch on time while its unread backlog grows. ``0.0`` when the batch kept up, and
+    for a trigger with no interval (``once`` / ``available_now`` / ``continuous``), where
+    there is no cadence to be late for.
 
     Every field after `behind_by_ms` has a default, so a positional construction written
     against an earlier version still builds.
@@ -444,6 +446,18 @@ class StreamingQueryStatus:
     #: Per-stateful-operator state as of the last completed micro-batch, so an operator
     #: can ask "how much state is this query holding right now" without walking history.
     state_operators: tuple[StateOperatorProgress, ...] = field(default=())
+    #: Lifetime totals since this run of the query started. ``recent_progress`` keeps only
+    #: the last ``streaming.progress_history`` batches, so a sum over it undercounts a query
+    #: that has run longer than that; these do not. They restart at zero on a restart.
+    total_input_rows: int = 0
+    total_output_rows: int = 0
+    #: Rows the stateful operators dropped for arriving behind the watermark, summed over
+    #: every micro-batch of this run (`StreamingQueryProgress.num_late_rows`, accumulated).
+    total_late_rows: int = 0
+    #: Listener callbacks that raised while handling this query's events. A listener that
+    #: raises is logged and skipped so it cannot fail the query, which also means a broken
+    #: monitoring callback is otherwise invisible; a non-zero count here is that signal.
+    listener_failures: int = 0
 
     def __str__(self) -> str:
         """A one-line human summary: liveness, the status message, and batches processed."""

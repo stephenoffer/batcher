@@ -24,6 +24,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
+from typing_extensions import override
 
 from batcher._internal.errors import FormatError
 from batcher.io.base import FileSink, FileSource
@@ -82,7 +83,8 @@ class GffSource(FileSource):
     suffix = (".gff", ".gff3", ".gtf", ".gff.gz", ".gff3.gz", ".gtf.gz")
     format_name = "gff"
 
-    def _read_schema(self, fh: IO[Any]) -> pa.Schema:  # noqa: ARG002 (fixed shape)
+    @override
+    def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         return GFF_SCHEMA
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:

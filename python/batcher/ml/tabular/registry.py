@@ -13,6 +13,7 @@ An explicit ``framework=`` always wins, so an unusual wrapper is never a dead en
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, Protocol
 
 from batcher._internal.errors import PlanError
@@ -439,9 +440,16 @@ def check_feature_names(adapter: TabularAdapter, model: Any, features: Sequence[
         PlanError: On a feature-count mismatch, or a same-set-different-order mismatch.
     """
     trained = adapter.feature_names(model)
-    if not trained:
-        return
     wanted = list(features)
+    if not trained:
+        count = _trained_feature_count(model)
+        if count is not None and count != len(wanted):
+            raise PlanError(
+                f"the model was trained on {count} features but features= names "
+                f"{len(wanted)}. It recorded no feature names, so only the count can be "
+                "checked; pass the training columns in their training order."
+            )
+        return
     if len(trained) != len(wanted):
         raise PlanError(
             f"the model expects {len(trained)} features but features= names {len(wanted)}. "
@@ -455,3 +463,47 @@ def check_feature_names(adapter: TabularAdapter, model: Any, features: Sequence[
             f"scores by position, so this would silently change every prediction. Pass "
             f"features={list(trained)}."
         )
+    position = {name: index for index, name in enumerate(trained)}
+    moved = [name for index, name in enumerate(wanted) if position.get(name, index) != index]
+    if moved:
+        raise PlanError(
+            f"features= puts {moved} at a different position than the model was trained "
+            f"with. A tabular model scores by position, so a named feature in another slot "
+            f"feeds it the wrong column. Model features: {list(trained)}."
+        )
+    if _GENERIC_NAMES.fullmatch(" ".join(trained)) and not set(trained) & set(wanted):
+        import warnings
+
+        warnings.warn(
+            f"the model records only generic feature names ({trained[0]}..{trained[-1]}), so "
+            "the order of features= cannot be checked against training. Fit from a DataFrame, "
+            "or set the model's feature names to the training columns, to have it verified.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def _trained_feature_count(model: Any) -> int | None:
+    """How many features `model` was fitted on, from whichever attribute its framework uses.
+
+    A model fitted from a bare matrix records no names, but every supported framework still
+    records the width: ``n_features_in_`` (scikit-learn and the boosters' wrappers),
+    ``num_features()`` (an XGBoost `Booster`), ``num_feature()`` (a LightGBM `Booster`).
+    """
+    width = getattr(model, "n_features_in_", None)
+    if isinstance(width, int):
+        return width
+    for method in ("num_features", "num_feature"):
+        probe = getattr(model, method, None)
+        if callable(probe):
+            try:
+                value = probe()
+            except Exception:  # a wrapper that is not fitted, or not this framework
+                continue
+            if isinstance(value, int):
+                return value
+    return None
+
+
+#: The ``f0 f1 … fN`` names a booster records when it was fitted from a bare matrix.
+_GENERIC_NAMES = re.compile(r"f\d+(?: f\d+)*")

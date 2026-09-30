@@ -15,7 +15,6 @@ from batcher.dist.executors.ray_runtime.fabric import (
     GpuNodeTopology,
     devices_within_power_budget,
     domain_groups,
-    fits_one_domain,
     interconnect_class,
     largest_local_domain,
     nvlink_domain_size,
@@ -114,10 +113,7 @@ def test_a_pcie_only_node_is_not_reported_as_nvlink() -> None:
     assert interconnect_class(node, node) == "intra-node"
 
 
-def test_fits_one_domain_is_conservative_without_topology() -> None:
-    assert fits_one_domain(1, ())
-    assert not fits_one_domain(4, ()), "unknown fleet plans for the slower path, never the faster"
-    assert fits_one_domain(4, (_node("a"),))
+def test_an_unreadable_topology_has_no_local_domain() -> None:
     assert largest_local_domain(()) == 0
 
 

@@ -32,7 +32,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 
 pytestmark = pytest.mark.integration
 
@@ -42,11 +42,7 @@ _N = 400
 _WORKERS = 2
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(4)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(4)
 
 
 @pytest.fixture(scope="module")
@@ -188,3 +184,110 @@ def test_nth_value_past_the_first_distributes(unique_keys, k):
         assert last is None
     elif k in (2, 5, 400):
         assert last is not None, "the control needs a non-NULL k-th value"
+
+
+#: A leading ORDER BY key that is an *expression* (F092). The range partitioner reads the cut
+#: key from a column, so before `hoist_window_keys` learned the global case these raised
+#: `PlanError` on this splittable source -- which is what makes the comparison below a test
+#: of the distributed route rather than of a fallback: the unfixed system fails it outright.
+_COMPUTED_ORDER = {
+    # The fixture repeats every `rid` once per file, so a `row_number` would break ties the
+    # query leaves open; `dense_rank` gives peers one value and has a single answer.
+    "dense_rank_negated": ({"r": "dense_rank"}, [bt.col("rid") * -1]),
+    "rank_dup": ({"r": "rank"}, [bt.col("x") % 13]),
+    "sum_then_column": ({"r": ("sum", bt.col("v"))}, [bt.col("x") * 2 + 1, bt.col("rid")]),
+    "percent_rank_dup": ({"r": "percent_rank"}, [bt.col("x") - 40]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_COMPUTED_ORDER))
+def test_a_computed_order_key_distributes(splittable, case):
+    functions, order = _COMPUTED_ORDER[case]
+    windowed = bt.read.parquet(splittable).window(order_by=order, functions=functions)
+    single = _by_rid(windowed.collect(distributed=False))
+    distributed = windowed.collect(distributed=True, num_workers=_WORKERS)
+    assert distributed.column_names == windowed.collect(distributed=False).column_names
+    got = _by_rid(distributed)
+    assert got.keys() == single.keys()
+    for column in single:
+        want = single[column]
+        if want and isinstance(next((w for w in want if w is not None), None), float):
+            assert [g is None for g in got[column]] == [w is None for w in want], column
+            pairs = [(g, w) for g, w in zip(got[column], want, strict=True) if w is not None]
+            assert [g for g, _ in pairs] == pytest.approx([w for _, w in pairs], rel=1e-12)
+        else:
+            assert got[column] == want, column
+
+
+#: A top-N bound over a global ranking, which Kyber fuses into the window as `rank_limit`
+#: (F094). Fused, a bucket knows only its local rank, so these raised `PlanError` here. Each is
+#: checked against DuckDB directly as well as against single-node: `row_number` over a key
+#: with no ties (so the tie exception cannot pick different rows), `rank`/`dense_rank` over a
+#: heavily duplicated key, where the bound must keep every row tied at the cut, and the
+#: degenerate bounds -- zero rows, and more rows than the relation holds.
+_RANK_BOUNDS = {
+    "row_number_le_25": ("row_number", "rid", "<=", 25),
+    "row_number_eq_1_desc": ("row_number", ("rid", True), "=", 1),
+    "row_number_le_0": ("row_number", "rid", "<=", 0),
+    "row_number_past_the_end": ("row_number", "rid", "<=", 10 * _N),
+    "rank_le_40_dups": ("rank", "x", "<=", 40),
+    "dense_rank_le_3_dups": ("dense_rank", "x", "<=", 3),
+}
+
+
+def _bounded(path: str, case: str):
+    func, order, op, k = _RANK_BOUNDS[case]
+    ranked = bt.read.parquet(path).window(order_by=[order], functions={"r": func})
+    predicate = bt.col("r") <= k if op == "<=" else bt.col("r") == k
+    return ranked.filter(predicate)
+
+
+@pytest.mark.parametrize("case", sorted(_RANK_BOUNDS))
+def test_a_global_rank_bound_distributes_and_matches_duckdb(splittable, unique_keys, case):
+    import duckdb
+
+    from _harness import assert_same
+
+    func, order, op, k = _RANK_BOUNDS[case]
+    path = unique_keys if func == "row_number" else splittable
+    single = _bounded(path, case).collect(distributed=False)
+    distributed = _bounded(path, case).collect(distributed=True, num_workers=_WORKERS)
+    assert distributed.column_names == single.column_names
+    assert _by_rid(distributed) == _by_rid(single)
+
+    key, desc = order if isinstance(order, tuple) else (order, False)
+    over = f"{func}() OVER (ORDER BY {key}{' DESC' if desc else ''})"
+    con = duckdb.connect()
+    con.register("t", bt.read.parquet(path).collect(distributed=False))
+    columns = ", ".join(single.column_names[:-1])
+    duck = con.sql(f"SELECT * FROM (SELECT {columns}, {over} AS r FROM t) WHERE r {op} {k}")
+    assert_same(distributed, duck)
+    if k in (25, 40, 3):
+        assert distributed.num_rows > 0, "the control needs a non-empty bound"
+
+
+#: The two ROWS frames every cumulative and rolling helper builds (F093). An explicit frame on
+#: a global window was refused, so each raised `PlanError` on this splittable source. Over a
+#: unique key, so a ROWS frame has one answer. `rolling_count(1500)` is wider than a bucket at
+#: this size, so its frame reaches more than one bucket back.
+_ROWS_FRAMES = {
+    "rolling_sum_4": lambda c: c("v").rolling_sum(4, order_by="rid"),
+    "rolling_mean_30": lambda c: c("v").rolling_mean(30, order_by="rid"),
+    "rolling_max_5": lambda c: c("v").rolling_max(5, order_by="rid"),
+    "rolling_count_1500": lambda c: c("v").rolling_count(1500, order_by="rid"),
+    "cum_sum": lambda c: c("v").cum_sum(order_by="rid"),
+    "cum_min": lambda c: c("v").cum_min(order_by="rid"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_ROWS_FRAMES))
+def test_a_rows_framed_global_window_distributes(unique_keys, case):
+    framed = bt.read.parquet(unique_keys).with_columns(r=_ROWS_FRAMES[case](bt.col))
+    single = _by_rid(framed.collect(distributed=False))
+    distributed = framed.collect(distributed=True, num_workers=_WORKERS)
+    got = _by_rid(distributed)
+    assert got.keys() == single.keys()
+    assert [g is None for g in got["r"]] == [w is None for w in single["r"]]
+    pairs = [(g, w) for g, w in zip(got["r"], single["r"], strict=True) if w is not None]
+    assert pairs, "the control needs non-NULL values"
+    assert [g for g, _ in pairs] == pytest.approx([w for _, w in pairs], rel=1e-12)

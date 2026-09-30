@@ -17,7 +17,7 @@ from batcher.config.validation.gpu import check_gpu_packing
 if TYPE_CHECKING:
     from batcher.config.config import DistributedConfig, ShuffleTlsConfig
 
-__all__ = ["check_distributed"]
+__all__ = ["check_distributed", "require_secure_shuffle"]
 
 
 def check_distributed(d: DistributedConfig) -> None:
@@ -26,6 +26,47 @@ def check_distributed(d: DistributedConfig) -> None:
     _check_distributed_placement(d)
     check_gpu_packing(d)
     _check_shuffle_tls(d.tls)
+
+
+def require_secure_shuffle(d: DistributedConfig, token: str) -> None:
+    """Refuse to start a shuffle fleet that `require_secure_shuffle` says must be secured.
+
+    Checked where the fleet is spawned rather than at config time, for two reasons. The
+    token may arrive by environment variable (`BATCHER_SHUFFLE_TOKEN`) or as a secret
+    reference that resolves only then. And a hardened config is also run single-node, where
+    no shuffle exists and refusing it for want of certificates would be refusing nothing.
+
+    Args:
+        d: The driver's distributed config.
+        token: The resolved shuffle token, empty when none is set.
+
+    Raises:
+        ConfigError: If the setting is on and the token or TLS is missing.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import DistributedConfig
+            >>> from batcher.config.validation.distributed import require_secure_shuffle
+            >>> require_secure_shuffle(DistributedConfig(), token="")  # off: no check
+    """
+    if not d.require_secure_shuffle:
+        return
+    from batcher._internal.errors import ConfigError
+
+    missing = [
+        name
+        for name, present in (
+            ("a shuffle token (distributed.shuffle_token or BATCHER_SHUFFLE_TOKEN)", token),
+            ("TLS (distributed.tls.enabled)", d.tls.enabled),
+        )
+        if not present
+    ]
+    if missing:
+        raise ConfigError(
+            "distributed.require_secure_shuffle refuses to start an unsecured shuffle "
+            f"fleet: missing {' and '.join(missing)}."
+        )
 
 
 def _check_distributed_faults(d: DistributedConfig) -> None:

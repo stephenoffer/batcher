@@ -18,6 +18,10 @@ from batcher.io.manifest import WriteManifest, WrittenFile
 
 __all__ = ["IcebergSink"]
 
+#: Snapshot-summary keys recording a streaming micro-batch's transaction.
+_APP_ID = "batcher.stream.app-id"
+_TXN_VERSION = "batcher.stream.txn-version"
+
 
 @SINKS.register("iceberg")
 class IcebergSink:
@@ -43,7 +47,7 @@ class IcebergSink:
         mode: ``"append"`` (default) or ``"overwrite"``.
     """
 
-    __slots__ = ("_catalog", "_identifier", "_mode", "_replace_where", "_token")
+    __slots__ = ("_app_txn", "_catalog", "_identifier", "_mode", "_replace_where", "_token")
 
     def __init__(
         self,
@@ -53,6 +57,8 @@ class IcebergSink:
         mode: str = "append",
         replace_where: dict | None = None,
         write_token: str | None = None,
+        app_id: str | None = None,
+        txn_version: int | None = None,
     ) -> None:
         if mode not in ("append", "overwrite"):
             raise BackendError(f"unsupported Iceberg write mode {mode!r}; use append/overwrite")
@@ -64,6 +70,12 @@ class IcebergSink:
         # shards of one write share it and it differs between writes; falls back to a
         # locally-derived token for a direct single-process construction.
         self._token = write_token or _new_write_token()
+        # A streaming micro-batch's `(app_id, batch_id)`, recorded in the snapshot summary so
+        # a replayed batch finds itself committed: Delta's `txn` action, in the one place an
+        # Iceberg snapshot carries caller metadata.
+        self._app_txn = (
+            (app_id, txn_version) if app_id is not None and txn_version is not None else None
+        )
 
     def _staging(self) -> str:
         """The staging directory for this write, under the catalog warehouse so every
@@ -206,14 +218,50 @@ class IcebergSink:
             schema = _staged_schema(files[0].path)
             table = cat.create_table_if_not_exists(self._identifier, schema=schema)
             scope = self._delete_scope()
+            marker = {}
+            if self._app_txn is not None:
+                marker = {_APP_ID: self._app_txn[0], _TXN_VERSION: str(self._app_txn[1])}
             with table.transaction() as tx:
                 if scope is not None:
-                    tx.delete(scope)
-                tx.add_files([f.path for f in files])
+                    tx.delete(scope, snapshot_properties=marker)
+                tx.add_files([f.path for f in files], snapshot_properties=marker)
         except BackendError:
             raise
         except Exception as exc:
             raise BackendError(f"Iceberg commit to {self._identifier!r} failed: {exc}") from exc
+
+    def is_committed(self, path: str) -> bool:  # noqa: ARG002 - the identifier is the path
+        """Whether this write's ``(app_id, batch_id)`` is already recorded in the table.
+
+        A streaming micro-batch is committed when any snapshot of the table carries this
+        app id with a transaction version at or past this batch's, the rule Delta's `txn`
+        uses. With no transaction configured there is nothing to find, so the write
+        proceeds. A table that does not exist yet has committed nothing.
+
+        Args:
+            path: Unused: an Iceberg destination is its catalog identifier.
+
+        Returns:
+            True when this exact micro-batch was already committed.
+        """
+        if self._app_txn is None:
+            return False
+        app_id, version = self._app_txn
+        cat = resolve_catalog(self._catalog if self._catalog is not None else "default")
+        try:
+            table = cat.load_table(self._identifier)
+        except Exception:
+            return False
+        for snapshot in table.snapshots():
+            props = snapshot.summary.additional_properties if snapshot.summary else {}
+            if props.get(_APP_ID) != app_id:
+                continue
+            try:
+                if int(props.get(_TXN_VERSION, "-1")) >= version:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def _delete_scope(self) -> Any:
         """What this commit removes before adding its files: nothing, a predicate, or all.

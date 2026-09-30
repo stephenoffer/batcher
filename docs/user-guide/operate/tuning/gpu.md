@@ -64,10 +64,12 @@ That subset is a deliberate split of the engine's vocabulary rather than a list 
 
 Every device result is also checked against the column types the engine declares for the plan before any backend runs. A result whose schema disagrees is refused and the CPU engine answers instead. That check is always on and touches no rows. For benchmark and staging runs, `distributed.gpu_shadow_verify=True` goes further and re-runs each result on the CPU engine to compare values, at the cost of doing the work twice.
 
+That fallback is the wrong behavior when the point of the run is the device, such as a benchmark or a capacity test, because a silent CPU answer reports a timing for a GPU that never ran. Set `distributed.gpu_require=True` and an explicit `backend="gpu"` raises `BackendError` with the decline reason instead, such as `no visible device` or `untranslatable shape`. It doesn't change `backend="auto"`, and it doesn't change what a device run computes. Set `distributed.gpu_shard_cpu_fallback=False` as well to fail when any single shard would have been recomputed on the CPU engine.
+
 ## Requirements and limitations
 
 - The backend needs a Ray cluster with visible GPUs. Without one, every `backend` value runs on the CPU engine.
-- `backend` defaults to `"cpu"`, so the GPU is never used unless you ask for it.
+- `backend` defaults to `"cpu"`, so the GPU is never used unless you ask for it. Pair `backend="gpu"` with `distributed.gpu_require=True` to make a run that silently used the CPU engine fail instead.
 - The learned crossover is fitted from group-by runs.
 - This backend covers relational operators. Model inference reaches the GPU through the ML pipelines instead.
 

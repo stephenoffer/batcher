@@ -137,7 +137,7 @@ class FileBytesCache:
             self._misses += 1
             leader = self._inflight.get(key)
             mine = leader is None
-            if mine:
+            if leader is None:
                 leader = threading.Event()
                 self._inflight[key] = leader
             else:
@@ -147,7 +147,6 @@ class FileBytesCache:
             # Someone else is already pulling these bytes. Wait for them rather than
             # duplicating the transfer. Bounded, so a leader that wedges costs this
             # caller a redundant fetch instead of the query.
-            assert leader is not None
             leader.wait(_INFLIGHT_WAIT_S)
             with self._lock:
                 # Validated, not merely present: the leader's file can be evicted by a
@@ -165,7 +164,6 @@ class FileBytesCache:
             if mine:
                 with self._lock:
                     self._inflight.pop(key, None)
-                assert leader is not None
                 leader.set()
 
     def _fetch_and_admit(self, key: str, local: str, fetch: Callable[[str], None]) -> str | None:

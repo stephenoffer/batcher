@@ -11,7 +11,7 @@ Both GPU paths are Python. The `bc-*` crates contain no GPU code at all, which f
 | GPU relational backend ({py:meth}`collect(backend="gpu") <batcher.Dataset.collect>`) | cuDF dataframe ops, with a torch scatter-reduce fallback | `core/gpu_plan/` translates, `dist/gpu/` schedules, in Ray tasks with `num_gpus=1` |
 | GPU inference stage (`map_batches(..., num_gpus=...)`) | the user's torch model | a Python Ray actor |
 
-The relational backend is an opt-in accelerator for relational shapes, described in the next section. An unsupported shape, an OOM, or a GPU-less cluster falls back to the CPU engine, so `backend="gpu"` is always safe to request.
+The relational backend is an opt-in accelerator for relational shapes, described in the next section. An unsupported shape, an OOM, or a GPU-less cluster falls back to the CPU engine, so `backend="gpu"` is always safe to request. Set `distributed.gpu_require=True` to make an explicit `backend="gpu"` raise with the reason instead.
 
 ## The relational backend
 
@@ -40,7 +40,7 @@ A chain with a **mergeable reducer** folds: each device reduces its shard, and t
 
 Three reducers have a mergeable form. An `aggregate`, for the reductions whose partials fold: a mean is not itself mergeable, but the sum and count it is a ratio of are. A `distinct`, because deduplicating twice is deduplicating once. And a sort carrying a limit, because a global top-N is the top-N of the shards' top-Ns. Only the row-local operators (filter and project) may run *below* the reducer; everything else reads rows its shard does not have. Anything *above* it runs once on the folded result, which is what lets the ordinary analytical shape (group by, then sort, then limit) fan out at all.
 
-`median`, `quantile`, `var`, `stddev` and `count-distinct` each need a group's whole value set, so a chain reducing with one of those stays on a single device. An aggregate that cannot shard is a scale ceiling; one that shards wrongly is a wrong number.
+`median`, `quantile` and `count-distinct` each need a group's whole value set, so a chain reducing with one of those stays on a single device. `var` and `stddev` stay on one device too, for a different reason: they do have a mergeable form, the per-shard count, mean and sum of squared deviations that `bc-runtime` combines with Chan's formula on the CPU engine, but the device fan-out's split in `plan/distribution/mergeable.py` doesn't implement it. An aggregate that cannot shard is a scale ceiling; one that shards wrongly is a wrong number.
 
 A **row-local** chain concatenates. Every shard's output is already its slice of the answer, in order, so reassembling the slices in shard order is the answer. That is why a filter over a very large scan isn't bounded by one device's memory, though it's still bounded by the driver's, since every surviving row is returned there.
 
@@ -129,15 +129,16 @@ There are two controllers, and they optimize different things. The following tab
 
 ::::{tab-set}
 :::{tab-item} Latency (online serving)
-A PID over the *relative* per-batch latency error drives the batch size toward a latency setpoint. The live controller is `ml/inference/pool.py::_LatencyController`, which reads its gains from the shared `PIDConfig`. It's a port of `crates/bc-udf/src/batch_size.rs::BatchSizeController`, which states the same law in Rust. `bc-udf` isn't linked into `bc-py`, so the Rust controller isn't on a live path.
+A PID over the *relative* per-batch latency error drives the batch size toward a latency setpoint. The controller is `ml/inference/pool.py::_LatencyController`, which reads its gains from the shared `PIDConfig`.
 
-```rust
-let error = (self.target_latency_ms - observed_latency_ms) / self.target_latency_ms;
-self.integral = (self.integral + error).clamp(-INTEGRAL_CLAMP, INTEGRAL_CLAMP);
-let derivative = error - self.prev_error;
-let adjustment = (self.kp * error + self.ki * self.integral + self.kd * derivative)
-    .clamp(-MAX_STEP_FRACTION, MAX_STEP_FRACTION);
-self.current = (self.current * (1.0 + adjustment)).clamp(min, max);
+```python
+# docs: skip
+error = (self._target - observed_ms) / self._target
+self._integral = clamp(self._integral + error, -pid.integral_clamp, pid.integral_clamp)
+derivative = error - self._prev
+raw = pid.kp * error + pid.ki * self._integral + pid.kd * derivative
+adjustment = clamp(raw, -pid.max_step_fraction, pid.max_step_fraction)
+self._cur = min(float(self._max), max(float(self._min), self._cur * (1.0 + adjustment)))
 ```
 
 The control law applies *multiplicatively* to the current size over the *relative* error, which makes it scale-free. It behaves the same at 100 rows and at 100,000, with a natural fixed point at `observed == target`. The integral clamp is anti-windup, and the step cap stops a single anomalous latency from swinging the size wildly.
@@ -162,7 +163,7 @@ print(pid.kp, pid.ki, pid.kd, pid.integral_clamp, pid.max_step_fraction)
 ```
 
 :::{note}
-`architecture.txt` describes a PID controller targeting a *GPU-utilization* setpoint of 80 to 90%, and an RL/PPO batch sizer. Neither exists. The PID targets per-batch **latency**, the GPU path uses the non-PID throughput hill-climb above, and utilization is measured but feeds `num_gpus` and in-flight-depth recommendations rather than a PID.
+The original design paper, `docs/architecture/internals/mathematical_foundations.md`, describes a PID controller targeting a *GPU-utilization* setpoint of 80 to 90%, and an RL/PPO batch sizer. Neither exists. The PID targets per-batch **latency**, the GPU path uses the non-PID throughput hill-climb above, and utilization is measured but feeds `num_gpus` and in-flight-depth recommendations rather than a PID.
 :::
 
 ## Zero config
@@ -259,7 +260,7 @@ A GPU `fn` never runs in a process pool, because it has to keep a single process
 
 Gang placement for an inference pool is best-effort. The actor pool reserves a placement group sized to its autoscaling ceiling, and a stage flagged `gpu_collective` in `plan/resource/bounds.py` gets `STRICT_PACK` so its actors are co-located, as {doc}`the wires between GPUs </architecture/deep-dives/distribution/gpu-fabric>` describes. When the cluster can't grant the reservation in time, the pool logs a warning and falls back to default scheduling, which runs correctly but may place actors unevenly. The relational fan-out described above uses many devices as independent single-device tasks that share nothing, which is a weaker requirement than a collective.
 
-The relational backend has no device-to-device shuffle, so it distributes only what the algebra above covers. A chain that reduces with `median`, `quantile`, `var`, `stddev` or `count-distinct` runs on one device, because each needs a group's whole value set. A `right` or `full` join runs on one device, because broadcasting the build side would duplicate its unmatched rows, and a join the planner did not mark `broadcast` runs on one device because its build side does not fit. All are scale ceilings rather than wrong answers, and all would lift with a key-partitioning exchange between devices.
+The relational backend has no device-to-device shuffle, so it distributes only what the algebra above covers. A chain that reduces with `median`, `quantile` or `count-distinct` runs on one device, because each needs a group's whole value set. One that reduces with `var` or `stddev` runs on one device because the fan-out doesn't yet carry their mergeable partial. A `right` or `full` join runs on one device, because broadcasting the build side would duplicate its unmatched rows, and a join the planner did not mark `broadcast` runs on one device because its build side does not fit. All are scale ceilings rather than wrong answers, and all would lift with a key-partitioning exchange between devices.
 
 A sharded relational result returns to the driver through the Ray object store, one message per shard, and the driver holds all of it. Two things follow. Splitting a *reducing* chain moves only one row per group per shard, so the driver sees a small result however large the input was. Splitting a **row-local** chain moves every surviving row: the ceiling stops being one device's memory and becomes the driver's, which is a better ceiling but not an absent one. And it is a deviation from the data-plane rule that bulk Arrow travels by Arrow Flight rather than as Ray objects, inherited from the original single-task backend and widened by sharding. Lifting it is the same work as the device-to-device exchange above.
 
@@ -276,7 +277,7 @@ Each concern below maps to the file that owns it, so the device placement and ba
 | OOM halving and dirty-row bisection | [`python/batcher/core/udf/call.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/call.py) |
 | Threads vs processes policy | [`python/batcher/core/udf/strategy.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/core/udf/strategy.py) |
 | Distributed actor pools, warm pools | [`python/batcher/dist/executors/map.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/executors/map.py) |
-| Latency PID | [`python/batcher/ml/inference/pool.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/inference/pool.py), mirrored in [`crates/bc-udf/src/batch_size.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-udf/src/batch_size.rs) |
+| Latency PID | [`python/batcher/ml/inference/pool.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/inference/pool.py) |
 | Throughput hill-climb | [`python/batcher/ml/autobatch.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/autobatch.py) |
 | Device detection, utilization, VRAM | [`python/batcher/ml/gpu.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/ml/gpu.py) |
 | GPU-vs-CPU backend policy | [`python/batcher/kyber/gpu/policy.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/kyber/gpu/policy.py) |

@@ -199,7 +199,9 @@ def test_the_engine_read_still_measures_its_operators(lineitem_dir, engine_read)
     assert ops.get("aggregate", {}).get("rows_out") == 4
 
 
-def test_the_q15_equality_holds_when_the_sideways_verdict_is_set(duck, tmp_path, engine_read):
+def test_the_q15_equality_holds_when_the_sideways_verdict_is_set(
+    duck, tmp_path, engine_read, monkeypatch
+):
     """TPC-H q15's main query and its scalar subquery must sum on one executor.
 
     The subquery's `max` is evaluated first and folded in as a literal, and the main query keeps
@@ -234,10 +236,28 @@ def test_the_q15_equality_holds_when_the_sideways_verdict_is_set(duck, tmp_path,
     s = bt.Session()
     s.register("lineitem", bt.read.parquet(str(tmp_path / "*.parquet")))
     s.register("supp", supp)
+    from batcher.api import subplan_reuse
+
+    materialized: list[str] = []
+    real_materialize = subplan_reuse._materialize
+
+    def spy_materialize(*args, **kwargs):
+        materialized.append(type(args[0]).__name__)
+        return real_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(subplan_reuse, "_materialize", spy_materialize)
     got = s.sql(query).collect()
     # The property itself, since the last-bit disagreement is data-dependent and did not show at
-    # this size: the subquery and the main query both took the row-group read.
-    assert len(engine_read) == 2, f"{len(engine_read)} of 2 evaluations took the row-group read"
+    # this size: every evaluation of the aggregate took the row-group read. There are two when
+    # the subquery is folded in as a literal, and one when the query is planned as a join onto
+    # the subquery's row (`scalar_sub.equality_join`): the CTE is then materialized once and
+    # both the join and the `max` read that one result, so the equality compares a value with
+    # itself. A single read *without* that materialization would be the bug: one evaluation
+    # took another executor.
+    evaluations = 1 if materialized else 2
+    assert len(engine_read) == evaluations, (
+        f"{len(engine_read)} of {evaluations} evaluations took the row-group read"
+    )
     assert got.num_rows >= 1, "the equality kept nothing: the two sums came from two executors"
     duck.register(
         "lineitem", pa.concat_tables(pq.read_table(p) for p in sorted(tmp_path.glob("*.parquet")))

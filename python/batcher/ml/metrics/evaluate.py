@@ -174,7 +174,7 @@ def _infer_task_from_labels(ds: Dataset | None, y_true: str | None, max_classes:
         ):
             return None
         classes = ds.select(__bt_label=col(y_true)).distinct().count()
-    except Exception as exc:  # pragma: no cover - inference must never break the report
+    except Exception as exc:  # inference must never break the report
         note_suppressed("ml", "infer the evaluation task from the labels", exc)
         return None
     if classes <= 1:
@@ -311,20 +311,22 @@ def evaluate(
     ]
 
     averages_requested = [name for name in requested if name in _MULTICLASS_AVERAGES]
-    if averages_requested and groups:
-        raise PlanError(
-            "the multi-class averages are computed from a per-class report, which by= cannot "
-            "partition. Ask for them without by=, or group the dataset and call evaluate() "
-            "per group."
-        )
+    if groups:
+        if averages_requested and prediction is not None:
+            from batcher.ml.metrics.tables import _grouped_multiclass_averages
+
+            rank_frames.append(
+                _grouped_multiclass_averages(
+                    frame, y_true, prediction, groups, averages_requested, max_classes
+                )
+            )
+        return _join_group_results(results.get("__aggregates"), rank_frames, groups, requested)
     averages = (
         multiclass_averages(frame, y_true, prediction, max_classes=max_classes)
         if averages_requested and prediction is not None
         else {}
     )
 
-    if groups:
-        return _join_group_results(results.get("__aggregates"), rank_frames, groups, requested)
     scalars = _scalar_results(results.get("__aggregates"), rank_requested, rank_frames, requested)
     scalars.update({k: v for k, v in averages.items() if k in requested})
     return {name: scalars[name] for name in requested if name in scalars}

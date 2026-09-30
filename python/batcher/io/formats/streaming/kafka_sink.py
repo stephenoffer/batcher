@@ -176,7 +176,12 @@ class KafkaStreamSink:
 
     def open(self) -> None:
         """Construct the producer. Deferred to here so a plan can be built without the extra."""
-        self._producer = _import_producer()(self._config)
+        from batcher.io.credentials import resolve_client_secrets
+        from batcher.io.formats.streaming.broker.schema import _BROKER_SECRET_HINTS
+
+        self._producer = _import_producer()(
+            resolve_client_secrets(self._config, what="kafka", hints=_BROKER_SECRET_HINTS)
+        )
         self._reported = []
 
     def write_batch(self, batch_id: int, table: pa.Table) -> str | None:

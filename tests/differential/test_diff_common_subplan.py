@@ -406,3 +406,37 @@ def test_narrowing_keeps_a_column_a_later_level_still_reads(duck):
     assert got.num_rows > finest.num_rows > 0, (
         f"levels went missing: {got.num_rows} rows against {finest.num_rows} for the finest"
     )
+
+
+def test_a_failed_cluster_materialization_is_retried_on_the_driver(fact, monkeypatch):
+    """The distributed route must not decline reuse when the cluster run fails.
+
+    Declined, each appearance is recomputed across the cluster, and a float reduction can
+    come back with different last bits in each: TPC-H q15 (`sum = max(sum)`) returned no rows
+    at SF1 when a cold fleet timed the first materialization out. The retry on the driver is
+    what keeps the appearances reading one set of values.
+    """
+    from batcher import core
+    from batcher.api import subplan_reuse
+    from batcher.api.orchestration import run as orchestration_run
+    from batcher.api.subplan_reuse import reuse_common_subplans
+
+    real = orchestration_run.run_relational
+    routes = []
+
+    def cluster_down(plan, sources, ctx, *, distributed=False, **kw):
+        routes.append(distributed)
+        if distributed:
+            raise RuntimeError("no distributed worker became available within 60s")
+        return real(plan, sources, ctx, distributed=False, **kw)
+
+    monkeypatch.setattr(orchestration_run, "run_relational", cluster_down)
+    # Big enough that `auto` would send it to the cluster, whatever this machine is.
+    monkeypatch.setattr("batcher.api.terminal.routing.resolve_distributed", lambda *a: True)
+    q = _shared_agg_join(fact)
+    ctx = core.ExecutionContext(columns=q.columns, hub=core.default_hub())
+    subplan_reuse._VERDICTS.clear()
+    plan, sources = reuse_common_subplans(q._plan, q._sources, ctx, distributed=True)
+    assert routes[:2] == [True, False]
+    assert len(sources) > len(q._sources), "reuse was declined after the cluster run failed"
+    assert plan is not q._plan

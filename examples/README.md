@@ -1,6 +1,6 @@
 # Examples
 
-500 runnable scripts covering the engine's public surface. Every one executes end to end
+More than 500 runnable scripts covering the engine's public surface. Every one executes end to end
 against the built engine, asserts on its own output, and exits non-zero if anything is
 wrong — so running the whole directory is a release check, not a documentation exercise.
 
@@ -9,8 +9,10 @@ python examples/quickstart.py
 python examples/operations/release_check.py     # the whole engine in one script
 ```
 
-`tests/docs/test_examples.py` runs all 500 in CI. An example that references a removed or
-renamed API fails the suite instead of rotting quietly.
+`tests/docs/test_examples.py` runs them in CI. An example that references a removed or
+renamed API fails the suite instead of rotting quietly. The two exceptions are
+`distributed.py` and `streaming_pipeline.py`, marked `# examples: skip` because they need a
+Ray cluster or a live broker; the suite collects them but does not execute them.
 
 ## The data is real
 

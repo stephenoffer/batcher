@@ -20,7 +20,7 @@ type in the estimator.
 class Provenance(IntEnum):
     EXACT = 0  # provably correct without execution (a footer, a manifest)
     HISTOGRAM = 1  # KLL / t-digest / DDSketch quantile sketch measured from data
-    SKETCH = 2  # HLL distinct / Count-Min frequency (approximate by construction)
+    SKETCH = 2  # HLL / theta-sketch distinct count (approximate by construction)
     LEARNED = 3  # a prior from a past run, keyed by plan signature
     DEFAULT = 4  # Selinger heuristic / an unconstrained guess
 ```
@@ -94,8 +94,11 @@ default_filter_selectivity: float = 0.5
 ```
 
 The string-pattern ones earn their place. Without a string histogram a `LIKE '%green%'` is
-genuinely unknowable, but it is near-universally *selective*. Nobody writes a substring
-search that matches half the table. Falling back to 0.5 made Kyber believe TPC-H Q9's
+genuinely unknowable, and 0.05 is a prior about workloads rather than a property of the data:
+analytic substring filters are usually selective. It is wrong for the queries that search for
+a common pattern, such as a validation check for `'@'` in an email column or a routing rule on
+a shared URL prefix, which can keep most of the table. The learned selectivity corrects such a
+filter after its first run. Falling back to 0.5 made Kyber believe TPC-H Q9's
 `p_name LIKE '%green%'` kept 100k of 200k parts (it keeps 10.7k), which hid the most
 selective join in the query and steered the order into gigabyte intermediates.
 
@@ -118,10 +121,13 @@ s₁ · s₂^(1/2) · s₃^(1/4) · …
 ```
 
 The most selective conjunct counts fully, and each subsequent one is damped by a further
-square root. The result lands between the pure independence product, which is a lower bound
-exact only when the conjuncts really are independent, and the most selective conjunct alone,
-which is the upper bound of the perfectly-correlated case. That makes it dramatically less
-wrong than independence on correlated columns, which is most real schemas. Two range
+square root. Because every exponent is at most 1, the result is never below the independence
+product and never above the most selective conjunct alone, which is the true selectivity's
+upper bound: `P(A and B) <= min(P(A), P(B))`. The independence product is *not* a lower bound
+on the truth. The true lower bound is Frechet's, `max(0, P(A) + P(B) - 1)`, and two mutually
+exclusive predicates reach it at 0. Backoff is a heuristic that assumes positive correlation,
+which makes it dramatically less wrong than independence on correlated columns, the common
+case in real schemas, and makes it overestimate exclusive predicates. Two range
 conjuncts on the same column are recognized first and combined as a single interval, since
 two bounds on one column carve one range rather than two independent predicates. `OR` uses
 honest inclusion-exclusion. `NOT` subtracts the null mass first, because SQL keeps only TRUE.
@@ -135,8 +141,12 @@ honest inclusion-exclusion. `NOT` subtracts the null mass first, because SQL kee
 ```
 
 where `d` is the key's distinct count. With a composite key whose combined NDV saturates
-its row count (ratio ≥ 0.95, i.e. it is effectively a primary key), it short-circuits to
-`max(|L|, |R|)`, because a PK-FK join produces one row per FK row.
+its row count (ratio ≥ 0.95), it short-circuits to `max(|L|, |R|)`, the PK-FK answer of one
+row per FK row. That is an assumption, not a proof of a key. A ratio of 0.95 still allows 5% of
+the rows to share one value, and if the other side is hot on that value too, the output grows
+with the product of the two duplicate counts. Nothing declares uniqueness to the estimator, so
+it can't tell a near-key from a key with one heavy duplicate; the learned correction and the
+adaptive loop are what catch the miss.
 
 With no NDV at all it also returns `max(|L|, |R|)`, which assumes many-to-one.
 
@@ -248,33 +258,32 @@ the same value differently and merged their registers into a wrong estimate with
 |---|---|---|---|
 | `HyperLogLog` | distinct count (NDV) | precision 14 → 16 KB | ~1.04/√m ≈ 0.8% |
 | `KllSketch` | quantiles / range selectivity | k = 200 | ~1% rank error |
-| `CountMinSketch` | frequency of a known key | `width = ⌈e/ε⌉`, `depth = ⌈ln(1/δ)⌉` | ≤ εN, never under |
 | `FrequentItems` | *find* the hot keys (Misra-Gries) | capacity | ≥ N/(cap+1) guaranteed found |
 | `BloomFilter` | membership (data skipping) | `fp_rate` | one-sided |
 
-What merging "in any order" buys you is not the same for all five, and the line runs where the
-algorithm does. HyperLogLog folds by register-wise max, Count-Min by cell-wise sum, and Bloom by
+What merging "in any order" buys you is not the same for all four, and the line runs where the
+algorithm does. HyperLogLog folds by register-wise max and Bloom by
 bitwise OR. Each of those is associative and commutative on the nose, so any merge order reaches
 a bit-identical state, and two runs' distinct counts are directly comparable. The quantile
 sketches don't work that way. KLL compacts and TDigest re-clusters its centroids, both of which
 depend on what has already been folded in, so a reduce that sees the partials in a different
 order returns a different estimate. [`crates/bc-sketches/tests/merge_order.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-sketches/tests/merge_order.rs) pins both halves:
-bit-identity for the first three, and for the quantile sketches the property a caller actually
+bit-identity for the first two, and for the quantile sketches the property a caller actually
 needs, which is that two orders agree to within the sketch's own rank error. Don't write code,
 or a test, that expects a KLL to merge to an identical state.
 
 That line, and what each side of it is asked for:
 
-![The sketches behind an estimate, split by how they merge. Three of them reach the same state in any merge order: HyperLogLog, for distinct counts, folds by register-wise max; Count-Min, for how often a given key appears, folds by cell-wise sum; and Bloom, for membership and data skipping, folds by bitwise OR. ColumnStats' min, max, count and ndv fold the same way, and exact counts from that side feed the cardinality estimate of row counts and per-column stats. The quantile sketches only agree within their own rank error: KLL's merge compacts and TDigest re-clusters its centroids, so two merge orders give two answers. The worst gap measured in rank was 0.0097 for KLL at k equals 200 and 0.0050 for TDigest at compression 100, which is the error those sketches already promise rather than a defect. They feed quantiles and range selectivity. Never assert that a quantile sketch merges to an identical state, and never set out to fix the fact that it does not.](/_static/diagrams/cardinality_sketches.svg)
+![The sketches behind an estimate, split by how they merge. Two of them reach the same state in any merge order: HyperLogLog, for distinct counts, folds by register-wise max; and Bloom, for membership and data skipping, folds by bitwise OR. ColumnStats' min, max, count and ndv fold the same way, and exact counts from that side feed the cardinality estimate of row counts and per-column stats. The quantile sketches only agree within their own rank error: KLL's merge compacts and TDigest re-clusters its centroids, so two merge orders give two answers. The worst gap measured in rank was 0.0097 for KLL at k equals 200 and 0.0050 for TDigest at compression 100, which is the error those sketches already promise rather than a defect. They feed quantiles and range selectivity. Never assert that a quantile sketch merges to an identical state, and never set out to fix the fact that it does not.](/_static/diagrams/cardinality_sketches.svg)
 
 `FrequentItems` sits on neither side of that line yet. `frequent.rs` argues in its own comments
 that the algorithm is order-independent, because `merge` sums counts and `reduce_to_capacity`
 thresholds on a sorted count, and no test in `merge_order.rs` covers it either way. Treat it as
 unpinned rather than as settled, and don't cite it as an example of either behaviour.
 
-Count-Min and Misra-Gries are used together on purpose. Count-Min never under-counts;
-Misra-Gries never over-counts and is guaranteed to *contain* every key above `N/(capacity+1)`.
-One sizes a hot key you already know about; the other finds the ones you do not.
+No sketch measures the frequency of a given key. Misra-Gries never over-counts and is
+guaranteed to *contain* every key above `N/(capacity+1)`, which is what the distributed join
+needs: `heavy_hitters` finds the hot keys it salts before the shuffle.
 
 One detail in the HLL is worth knowing. Its estimator is Ertl's improved maximum-likelihood
 form, with the `sigma` and `tau` corrections. That form is continuous and essentially unbiased
@@ -387,7 +396,7 @@ a number is actually derived:
 
 - {doc}`Architecture </architecture/index>`: Kyber's lane, where it decides and never executes or measures.
 - {doc}`Kyber optimizer </architecture/internals/kyber>`: the passes these estimates feed.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the sketch error bounds, derived.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the sketch error bounds, derived.
 - {doc}`Reading a plan </user-guide/operate/tuning/explain-plans>`: the `est≈` and provenance tags in the tree.
 - {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`: what to do when an estimate is badly wrong.
 - {doc}`TPC-H benchmarks </benchmarks/results/tpch>`: q5 and q9, the two queries this page keeps naming.

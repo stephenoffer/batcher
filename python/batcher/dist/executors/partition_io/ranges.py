@@ -331,8 +331,7 @@ def bucketize(
     # KEY COLUMN decides, not the boundary list: a split whose key is entirely null samples an
     # empty grid, and an empty list of boundaries cannot say which partitioner it belongs
     # to. Routing a text key through the numeric one would order "12" before "9" and
-    # disagree with the single-node sort — the reason the dispatcher used to refuse the
-    # shape outright.
+    # disagree with the single-node sort.
     kind = grid_kind_of(batches[0].schema.field(key_index).type)
     if kind == "text":
         router = nat.range_partition_batches_str

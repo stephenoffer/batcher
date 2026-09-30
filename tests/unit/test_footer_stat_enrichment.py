@@ -26,7 +26,7 @@ from batcher.io.stats.columnar_footer import (
     parquet_statistics,
 )
 from batcher.io.stats.lakehouse_manifest import manifest_statistics
-from batcher.io.stats.pruning import parquet_row_group_bounds, surviving_rows_for_range
+from batcher.io.stats.pruning import parquet_row_group_bounds
 from batcher.plan.stats import Provenance
 
 
@@ -236,16 +236,6 @@ def test_row_group_bounds_one_entry_per_group(multi_rg):
     assert len(bounds) == 4
     assert sum(b.num_rows for b in bounds) == 100
     assert bounds[0].mins["x"] == 0 and bounds[0].maxs["x"] == 24
-
-
-def test_range_pruning_counts_survivors(multi_rg):
-    bounds = parquet_row_group_bounds(_FakeFS(), [multi_rg], ["x"])
-    # x in [30, 60] keeps only the groups [25,49] and [50,74] → 50 rows upper bound.
-    assert surviving_rows_for_range(bounds, "x", lower=30, upper=60) == 50
-    # Entirely out of range → provably zero (basis for an exact is_empty()).
-    assert surviving_rows_for_range(bounds, "x", lower=1000) == 0
-    # Unbounded → nothing pruned.
-    assert surviving_rows_for_range(bounds, "x") == 100
 
 
 # --- ORC exact row count -----------------------------------------------------

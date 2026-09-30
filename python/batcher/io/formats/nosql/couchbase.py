@@ -22,6 +22,7 @@ import pyarrow as pa
 from batcher._internal.logging import note_suppressed
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.nosql.base import (
+    SCHEMA_SAMPLE_ROWS,
     PartitionSpec,
     ScanSource,
     offset_windows,
@@ -92,8 +93,10 @@ class CouchbaseSource(ScanSource):
         scope: str,
         collection: str,
         partition_spec: PartitionSpec | None = None,
+        schema: pa.Schema | None = None,
     ) -> None:
         super().__init__(
+            schema=schema,
             partition_spec=partition_spec,
             connstr=connstr,
             username=username,
@@ -126,10 +129,10 @@ class CouchbaseSource(ScanSource):
         return f"{kw['database']}.{kw['scope']}.{kw['collection']}"
 
     def _infer_schema(self) -> pa.Schema:
-        stmt = f"SELECT VALUE c FROM {self._from_clause()} c LIMIT 1"
+        stmt = f"SELECT VALUE c FROM {self._from_clause()} c LIMIT {SCHEMA_SAMPLE_ROWS}"
         with _closing_cluster(self._cluster()) as cluster:
             rows = list(cluster.execute_query(stmt).rows())
-        return schema_from_rows([rows[0]] if rows else [])
+        return schema_from_rows(rows)
 
     def _enumerate_partitions(self) -> list[_Window]:
         """Offset windows that cover the whole collection — see `offset_windows`.

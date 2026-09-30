@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from batcher.kyber.rules import agg_pushdown
+from batcher.kyber.rules.agg_pushdown import rules as agg_pushdown
 
 bt = pytest.importorskip("batcher")
 duckdb = pytest.importorskip("duckdb")

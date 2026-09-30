@@ -62,9 +62,10 @@ mod inputs;
 ///
 /// `i128` cannot itself overflow here: 2^64 rows of `i64::MAX` is below 2^127.
 ///
-/// **Residual limit, deliberately not fixed:** a partial's state is still an `i64` column, so
-/// a single partition whose own true sum exceeds `i64` still errors even when the grand total
-/// would fit. Closing that needs a wider intermediate schema, which is a wire-contract change.
+/// This retry fixes the *running* total inside one partial. The other half of the problem --
+/// a partition whose own true total exceeds `i64` while the grand total fits -- is closed by
+/// the partial *state*, which is an exact `i128` narrowed only in `finalize`: see
+/// [`int_sum`].
 pub(crate) fn promote_wide(sums: &[i64]) -> Vec<i128> {
     sums.iter().copied().map(i128::from).collect()
 }
@@ -129,6 +130,10 @@ mod distinct;
 mod distinct_on;
 mod fused;
 mod group;
+mod int_sum;
+/// Widen every bare `Int64` `SUM` state to its 128-bit form: what a partial must carry
+/// wherever it is pooled with others under one schema (see `int_sum`). `None` when none.
+pub use int_sum::widen_bare as widen_int_sum_states;
 pub(crate) mod median;
 mod ordered_list;
 mod sketch;
@@ -483,8 +488,10 @@ pub struct GroupAggResult {
     pub agg_columns: Vec<ArrayRef>,
 }
 
-/// Single-node convenience: `finalize(partial(...))`.
-pub fn group_aggregate(
+/// Single-node convenience: `finalize(partial(...))` — the serial oracle the mergeable-path
+/// tests compare against.
+#[cfg(test)]
+pub(crate) fn group_aggregate(
     group_keys: &[ArrayRef],
     calls: &[AggCall],
     num_rows: usize,
@@ -614,6 +621,9 @@ pub fn combine_sized(
     estimated_groups: usize,
 ) -> Result<Partial, RuntimeError> {
     assert!(!parts.is_empty(), "combine requires at least one partial");
+    // A persisted partial from before `int_sum` carries a bare `Int64` SUM state.
+    let upgraded = int_sum::upgrade_all(parts, funcs)?;
+    let parts = upgraded.as_deref().unwrap_or(parts);
     let radix_parallel_threshold = self::radix_parallel_threshold(radix_parallel_threshold);
 
     // A single partial is already grouped (`combine([p]) ≡ p`), so re-folding it is
@@ -693,6 +703,8 @@ pub fn combine_partitioned(
     radix_parallel_threshold: usize,
 ) -> Result<Vec<Partial>, RuntimeError> {
     assert!(!parts.is_empty(), "combine requires at least one partial");
+    let upgraded = int_sum::upgrade_all(parts, funcs)?;
+    let parts = upgraded.as_deref().unwrap_or(parts);
     let radix_parallel_threshold = self::radix_parallel_threshold(radix_parallel_threshold);
     let n_keys = parts[0].group_columns.len();
     let total_rows = partial_rows(parts);
@@ -1406,18 +1418,15 @@ mod tests {
         );
     }
 
-    /// The mergeable invariant for the wide-retry path, and the exact edge of what it can
-    /// promise: `combine(partial(p_k))` equals the single-node answer for every split whose
-    /// **partials each fit an `i64`**, even when the running total inside a partial does not.
+    /// The mergeable invariant for integer `SUM`: `combine(partial(p_k))` equals the
+    /// single-node answer for **every** split, even when the running total inside a partial
+    /// does not fit an `i64`, and even when a partial's *own* total does not.
     ///
-    /// Before the retry this held for almost no split at all: `[M,-M][M,-M]` returned 0 while
-    /// every other arrangement of the same rows raised, so the operator's answer depended on a
-    /// scheduling decision.
-    ///
-    /// `step == 2` is the documented residual and is asserted, not skipped. It puts both
-    /// positives in one partial, whose own true sum is 2^63, and a partial's state is an
-    /// `i64` column — so there is nothing for it to hold. Widening the *intermediate schema*
-    /// is what would close that, and it is a wire-contract change.
+    /// Before the wide retry this held for almost no split: `[M,-M][M,-M]` returned 0 while
+    /// every other arrangement raised. Before the 128-bit partial state (`agg::int_sum`),
+    /// `step == 2` still raised: it puts both positives in one partial, whose own true sum is
+    /// 2^63, and an `i64` state had nothing to hold it in. Both made the operator's answer
+    /// depend on a scheduling decision.
     #[test]
     fn a_partitioned_int_sum_that_overflows_partway_still_merges_to_the_true_total() {
         const M: i64 = 1 << 62;
@@ -1453,18 +1462,13 @@ mod tests {
                 .value(0))
         };
 
-        // Every partial fits an i64; the running total inside one of them does not.
-        for step in [1usize, 3, 4, 5, 6] {
+        // Some partials' running totals overflow; at `step == 2` the first partial's own true
+        // total (`[M, M]` = 2^63) does. None of that is visible in the answer.
+        for step in [1usize, 2, 3, 4, 5, 6] {
             let got =
                 split(step).unwrap_or_else(|e| panic!("chunks of {step} should merge, got {e:?}"));
             assert_eq!(got, oracle_sum, "split into chunks of {step}");
         }
-
-        // The residual: `[M, M]` is a partial whose own true sum is 2^63.
-        assert!(
-            matches!(split(2), Err(RuntimeError::SumOverflow)),
-            "a partial that cannot fit its own true sum must still say so"
-        );
     }
 
     #[test]
@@ -1510,6 +1514,62 @@ mod tests {
         ));
         let b: ArrayRef = Arc::new(StringArray::from(
             (0..n).map(|i| format!("g{}", i % 400)).collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 9) as i64).collect::<Vec<_>>(),
+        ));
+        assert_radix_combine_sum_matches(&[a, b], &vals, n);
+    }
+
+    #[test]
+    fn radix_combine_matches_serial_on_nullable_multikey() {
+        // NULLs in both a string and an Int64 key column: the tagged mixed fold must bucket
+        // every NULL of a column together, and apart from the empty string and from zero.
+        let n = 250_000usize;
+        let a: ArrayRef = Arc::new(StringArray::from(
+            (0..n)
+                .map(|i| match i % 13 {
+                    0 => None,
+                    1 => Some(String::new()),
+                    _ => Some(format!("g{}", i % 300)),
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let b: ArrayRef = Arc::new(Int64Array::from(
+            (0..n)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        None
+                    } else {
+                        Some((i % 7) as i64)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 9) as i64).collect::<Vec<_>>(),
+        ));
+        assert_radix_combine_sum_matches(&[a, b], &vals, n);
+    }
+
+    #[test]
+    fn radix_combine_matches_serial_when_only_the_last_rows_hold_nulls() {
+        // Early partials are null-free and later ones are not: the relation-wide gate must
+        // still hash one key identically in both, or the same group lands in two buckets.
+        let n = 250_000usize;
+        let a: ArrayRef = Arc::new(StringArray::from(
+            (0..n)
+                .map(|i| {
+                    if i + 500 > n && i % 2 == 0 {
+                        None
+                    } else {
+                        Some(format!("g{}", i % 300))
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let b: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 7) as i64).collect::<Vec<_>>(),
         ));
         let vals: ArrayRef = Arc::new(Int64Array::from(
             (0..n).map(|i| (i % 9) as i64).collect::<Vec<_>>(),

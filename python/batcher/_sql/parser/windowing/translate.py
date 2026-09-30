@@ -11,8 +11,8 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher._sql.parser.core_utils import _alias_of, _unwrap_alias
+from batcher._sql.parser.windowing.derived import SHARED_FRAME, apply_shared_frames
 from batcher._sql.parser.windowing.frame import (
-    _WINDOW_AGGS,
     _const_int,
     _resolve_frame,
     _window_order,
@@ -167,6 +167,10 @@ def rewrite_aggs_in_windows(tr, items) -> None:
         return
     for item in items:
         for agg in list(_unwrap_alias(item).find_all(exp.AggFunc)):
+            if isinstance(agg.parent, exp.Window) and agg.arg_key == "this":
+                # The window's own function, which may share its text with a grouped
+                # aggregate: `count(*) OVER ()` beside `count(*)` counts the groups.
+                continue
             entry = tr._agg_map.get(agg.sql())
             if entry is not None:
                 agg.replace(exp.column(entry[0]))
@@ -341,6 +345,7 @@ def _window(tr, ds: Dataset, projections) -> Dataset:
 
     # Group window items by their (partition, order, frame) spec, preserving order.
     groups: list[tuple[tuple, tuple, tuple | None, dict]] = []
+    piece_frames: dict[str, tuple] = {}
     for p in projections:
         if not _is_window(p):
             continue
@@ -353,8 +358,11 @@ def _window(tr, ds: Dataset, projections) -> Dataset:
         func = _window_func(win, order)
         frame = _resolve_frame(win)
         out = window_output_name(tr, taken, alias)
-
-        key = (part, order, frame)
+        # The pieces of one excluded frame share an operator, each under its own frame.
+        shared = win.meta.get(SHARED_FRAME)
+        if shared is not None:
+            piece_frames[out] = frame
+        key = (part, order, frame if shared is None else ("shared", shared))
         for gpart, gorder, gframe, funcs in groups:
             if (gpart, gorder, gframe) == key:
                 funcs[out] = func
@@ -368,8 +376,10 @@ def _window(tr, ds: Dataset, projections) -> Dataset:
             partition_by=list(part),
             order_by=list(order),
             functions={name: tuple(f) if name in skipping else f for name, f in funcs.items()},
-            frame=frame,
+            frame=None if frame and frame[0] == "shared" else frame,
         )
+        if frame and frame[0] == "shared":
+            ds = apply_shared_frames(ds, piece_frames)
         if skipping:
             ds = _mark_ignore_nulls(ds, skipping, bool(order))
     return ds
@@ -415,7 +425,7 @@ def _reshaped_window_argument(tr, item, fn, arg):
     return None
 
 
-def _any_value_func(fn, order):
+def _any_value_func():
     """Refuse `any_value(x) OVER (…)`, naming what it means and what to write instead.
 
     DuckDB implements the windowed `any_value` as *the first non-null value in the frame*,
@@ -428,14 +438,9 @@ def _any_value_func(fn, order):
     because sqlglot parks `any_value(x)` under an `IgnoreNulls` wrapper, so the message
     used to name an ``IGNORE NULLS`` clause the query never contained.
 
-    Args:
-        fn: The `AnyValue` node.
-        order: The window's ORDER BY, or an empty tuple.
-
     Raises:
         NotImplementedError: Always.
     """
-    del fn, order
     raise NotImplementedError(
         "any_value(x) OVER (…) is not supported: DuckDB answers it with the first "
         "non-null value in the frame, which is not one of the runtime's window "
@@ -452,7 +457,7 @@ class _IgnoreNulls(tuple):
     """
 
 
-def _ignore_nulls_func(win, fn, order):
+def _ignore_nulls_func(fn, order):
     """Map `<value fn>(x IGNORE NULLS) OVER (...)` onto the engine's `ignore_nulls` flag.
 
     `IGNORE NULLS` makes `first_value`/`last_value`/`nth_value` pick among the frame's
@@ -470,7 +475,6 @@ def _ignore_nulls_func(win, fn, order):
     and are rejected rather than answered with the null-*respecting* result.
 
     Args:
-        win: The `Window` node.
         fn: The inner function node that `IgnoreNulls` wraps.
         order: The window's ORDER BY, required by every value function.
 
@@ -483,7 +487,6 @@ def _ignore_nulls_func(win, fn, order):
             f"{name}(x) IGNORE NULLS is not supported. Supported: first_value, last_value and "
             "nth_value with IGNORE NULLS over any frame"
         )
-    del win
     return _IgnoreNulls(_value_func(name, fn, order))
 
 
@@ -551,22 +554,10 @@ def _value_func(name: str, fn, order):
     return (_VALUE_FUNCS[name], arg.name)
 
 
-#: Window functions whose first argument is a *value* the engine reads per row. Each takes
-#: a materialized column, so an argument that is any other expression has to be computed
-#: into one first.
-#:
-#: Derived from `_WINDOW_AGGS` rather than listed beside it, because the two describe the
-#: same set and a hand-written copy had already drifted: it named `sum`/`avg`/`min`/`max`/
-#: `count` and omitted `bool_and`/`bool_or`/the `bit_*` family/`stddev`/`variance`/`median`,
-#: all of which take a value argument just as much. So `sum(a + b) OVER (...)` was hoisted
-#: and answered while `bool_or(a > 0) OVER (...)` was refused with "window aggregate
-#: supports a single plain column argument only" — and a predicate is the *only* thing
-#: anyone passes `bool_or`, so the one shape that matters was the one that failed.
-#:
-#: The positional value functions are not aggregates and so are not in `_WINDOW_AGGS`; they
-#: are added here because they read a value per row for the same reason.
+#: Positional window functions that read a value per row, so a non-column argument has to be
+#: materialized into a column first, as a window aggregate's does. They are not aggregates,
+#: so `window_agg` does not recognise them.
 _POSITIONAL_VALUE_FUNCS = frozenset({"lag", "lead", "firstvalue", "lastvalue", "nthvalue"})
-_VALUE_ARG_FUNCS = frozenset(_WINDOW_AGGS) | _POSITIONAL_VALUE_FUNCS
 
 
 def _set_window_argument(fn, replacement) -> None:
@@ -678,11 +669,11 @@ def _window_func(win, order):
         # written, so the IGNORE-NULLS handler answered a plain `any_value(x) OVER (…)`
         # with an error naming a clause the query never used.
         if type(fn.this).__name__.lower() == "anyvalue":
-            return _any_value_func(fn.this, order)
-        return _ignore_nulls_func(win, fn.this, order)
+            return _any_value_func()
+        return _ignore_nulls_func(fn.this, order)
     name = type(fn).__name__.lower()
     if name == "anyvalue":
-        return _any_value_func(fn, order)
+        return _any_value_func()
 
     # Ranking family (no input; needs ORDER BY). `percent_rank`/`cume_dist` produce
     # a fraction; the runtime supports all of these.

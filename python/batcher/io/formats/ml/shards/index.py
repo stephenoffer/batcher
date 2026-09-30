@@ -112,12 +112,6 @@ class ShardIndex:
         start = shard * self.rows_per_shard
         return max(0, min(self.rows_per_shard, self.total_rows - start))
 
-    def start_of(self, shard: int) -> int:
-        """The global row index shard `shard` begins at — O(1) for a uniform corpus."""
-        if self.uniform:
-            return shard * self.rows_per_shard
-        return sum(self.explicit_rows[:shard])
-
     def locate(self, global_index: int) -> tuple[int, int]:
         """Map a global row index to ``(shard_idx, local_idx)``.
 

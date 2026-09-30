@@ -2,7 +2,7 @@
 //!
 //! `combine` must be associative and commutative, because a shuffle's reduce receives
 //! partials in an order nobody chooses. Which sketches here satisfy that *exactly* is not
-//! uniform, and it was not written down: three reach a bit-identical state whatever the
+//! uniform, and it was not written down: HyperLogLog and Bloom reach a bit-identical state whatever the
 //! order, and the quantile sketches do not, because their merge re-clusters or compacts and
 //! that is order-sensitive by construction rather than by defect.
 //!
@@ -46,8 +46,8 @@ fn true_rank(all: &[f64], v: f64) -> f64 {
 }
 
 #[test]
-fn hll_countmin_and_bloom_reach_the_same_state_in_any_merge_order() {
-    // These three merge by register-wise max, cell-wise sum and bitwise OR. Each of those
+fn hll_and_bloom_reach_the_same_state_in_any_merge_order() {
+    // These two merge by register-wise max and bitwise OR. Each of those
     // is associative and commutative on the nose, so the merged state is identical, not
     // merely close -- and that is worth pinning, because it is what lets a caller compare
     // two runs' distinct counts directly.
@@ -63,17 +63,6 @@ fn hll_countmin_and_bloom_reach_the_same_state_in_any_merge_order() {
         }))
         .unwrap()
         .estimate()
-    };
-    let countmin = |order: &[usize]| {
-        let merged = merge_all(order.iter().map(|&i| {
-            let mut sketch = bc_sketches::CountMinSketch::new(256, 4);
-            for &x in &parts[i] {
-                sketch.add(&(x as u64));
-            }
-            sketch
-        }))
-        .unwrap();
-        (0..200u64).map(|k| merged.estimate(&k)).collect::<Vec<_>>()
     };
     let bloom = |order: &[usize]| {
         let merged = merge_all(order.iter().map(|&i| {
@@ -92,11 +81,6 @@ fn hll_countmin_and_bloom_reach_the_same_state_in_any_merge_order() {
             hll(&ORDERS[0]),
             hll(order),
             "HyperLogLog moved with the merge order"
-        );
-        assert_eq!(
-            countmin(&ORDERS[0]),
-            countmin(order),
-            "CountMin moved with the merge order"
         );
         assert_eq!(
             bloom(&ORDERS[0]),

@@ -17,7 +17,23 @@ from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Scan, is_streamable
 from batcher.plan.stats import Provenance
 
-__all__ = ["record_adaptive_route", "resolve_adaptive"]
+__all__ = ["aligned_claims", "record_adaptive_route", "resolve_adaptive"]
+
+
+def aligned_claims(plan: LogicalPlan, sources: list[Source], hub) -> bool:
+    """Whether the aligned executor claims `plan`, which is why the gate does not stage it.
+
+    Asked of the *optimized* plan, which is what the executor sees: before projection
+    pushdown every scan reads its whole table, so TPC-H q3 priced a 25 GB broadcast of
+    `customer` it never reads (1.5 GB once pruned) and was staged. `optimize_logical` is
+    memoized, so this costs one lookup. `orchestration.stages` asks the same question when
+    the executor then declines, so the two must be one function: asked of different plans,
+    they disagreed on TPC-H q22 and its decline raised instead of falling back to staging.
+    """
+    from batcher import kyber
+    from batcher.dist.executors.aligned import aligned_route
+
+    return aligned_route(kyber.optimize_logical(plan, sources=sources, hub=hub), sources)
 
 
 def resolve_adaptive(
@@ -49,6 +65,10 @@ def resolve_adaptive(
     if distributed:
         from batcher.dist import requires_staging
 
+        # A plan the aligned executor will run whole is not staged: a boundary between two
+        # tables stored in join-key order is exactly the exchange their layout removes.
+        if aligned_claims(plan, sources, hub):
+            return False
         if requires_staging(plan):
             return True
     # The size floor is a precondition, not one vote among several, and it is checked before
@@ -92,10 +112,15 @@ def resolve_adaptive(
     # the cold-start fallback the bandit overrides once it has a verdict.
     if not _adaptive_would_help(plan, sources, hub):
         return False
+    # Cold, the one-shot route runs first. Staging used to, on the argument that it earns the
+    # statistics a cold shape lacks, but the one-shot route earns them too (it seeds distinct
+    # counts and records every operator's feedback the same way), and it converges in fewer
+    # runs: at TPC-H sf10, forced one-shot, 20 of 22 queries are within 10% of their steady
+    # time by the fifth run, where the staged start kept q5 at 170-290 ms for five runs before
+    # trying one-shot and settling at 101. The bandit still explores staging once one-shot has a
+    # settled sample, so a shape where staging wins (q7, 76 against 90 ms) still finds it.
     route = _learned_adaptive_route(plan, hub)
-    if route is not None:
-        return route == "staged"
-    return True
+    return route == "staged"
 
 
 def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
@@ -131,13 +156,60 @@ def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     """
     if not joins(plan):
         return False
-    estimator = build_estimator(sources, hub)
-    rows, in_bytes = _total_input_size(plan, estimator)
-    stages = _stage_count(plan)
+    rows, in_bytes, stages = _input_size(plan, sources, hub)
     return (
         rows >= _ADAPTIVE_MIN_ROWS_PER_STAGE * stages
         or in_bytes >= _ADAPTIVE_MIN_BYTES_PER_STAGE * stages
     )
+
+
+def _input_size(plan: LogicalPlan, sources: list[Source], hub) -> tuple[float, float, int]:
+    """`(input rows, input bytes, stage count)` for `_large_enough`, memoized.
+
+    The *measurement* is cached rather than the verdict, so the floors it is compared with
+    are read fresh on every call and can never be answered from a stale threshold.
+    """
+    key = _size_key(plan, sources, hub)
+    hit = _INPUT_SIZES.get(key) if key is not None else None
+    if hit is not None:
+        return hit
+    estimator = build_estimator(sources, hub)
+    rows, in_bytes = _total_input_size(plan, estimator)
+    size = (rows, in_bytes, _stage_count(plan))
+    if key is not None:
+        _INPUT_SIZES[key] = size
+        while len(_INPUT_SIZES) > _INPUT_SIZES_MAX:
+            _INPUT_SIZES.pop(next(iter(_INPUT_SIZES)))
+    return size
+
+
+# `_input_size` results, keyed on everything the measurement reads. Building an estimator and
+# sizing every scan cost ~1.8 ms profiled on each execution of a small TPC-H join, to reach
+# the same numbers every time. Insertion-ordered and trimmed oldest-first.
+_INPUT_SIZES: dict[tuple, tuple[float, float, int]] = {}
+_INPUT_SIZES_MAX = 1024
+
+
+def _size_key(plan: LogicalPlan, sources: list[Source], hub) -> tuple | None:
+    """What `_input_size` depends on, or `None` when any part of it cannot be keyed.
+
+    The plan's content, each source's data-stable key (the one the learned statistics are
+    filed under, so a changed source is a different key), and the hub and learning generation,
+    since a scan without exact statistics is sized from learned ones, and the configured row
+    width the byte figure falls back to. An unkeyable source means no memo, never a stale answer.
+    """
+    from batcher.config import active_config
+    from batcher.kyber import learning
+    from batcher.plan.source_stats import source_stats_key
+
+    keys = []
+    for source in sources:
+        k = source_stats_key(source)
+        if k is None:
+            return None
+        keys.append(k)
+    row_bytes = active_config().optimizer.row_bytes
+    return (plan.content_key(), tuple(keys), id(hub), learning.generation(), row_bytes)
 
 
 def _streams_whole(plan: LogicalPlan, sources: list[Source], hub) -> bool:
@@ -204,12 +276,31 @@ def _learned_adaptive_route(plan: LogicalPlan, hub) -> str | None:
         return None
 
 
-def record_adaptive_route(hub, plan: LogicalPlan, staged: bool, wall_ms: float) -> None:
-    """Fold one query's measured wall time into the staged-vs-one-shot bandit. Best-effort."""
+def record_adaptive_route(
+    hub, plan: LogicalPlan, staged: bool, wall_ms: float, misses_before: int
+) -> None:
+    """Fold one query's measured wall time into the staged-vs-one-shot bandit. Best-effort.
+
+    `misses_before` is `kyber.plan_cache.misses()` read as the run started. A one-shot run
+    that derived any plan rather than replaying it is not recorded, because it timed learning
+    rather than the route: TPC-H q10 at sf10 runs its one-shot plan at 183, 149, 143 ms while
+    the plan converges on the 105 ms it keeps, against 125 ms staged, and a bandit fed those
+    first runs settled on staging in roughly half of the processes it ran in.
+
+    A staged run is recorded either way. One-shot is the route a query starts on and the one
+    whose steady state matters; staging is explored, and exploring it costs what it costs. Held
+    to the same rule, staging's stage plans took four runs to settle before the bandit would
+    compare the arms at all, so the exploration landed four slow runs on every staged-eligible
+    query: TPC-H sf10 q5 ran 444, 280, 186, 171 ms against a 101 ms one-shot.
+    """
     if hub is None or wall_ms <= 0.0:
         return
     try:
+        from batcher.kyber import plan_cache
         from batcher.kyber.learned_tuning import record_adaptive_route as _record
+
+        if not staged and plan_cache.misses() != misses_before:
+            return
         from batcher.kyber.signature import plan_signature
 
         _record(hub, plan_signature(plan), "staged" if staged else "one_shot", wall_ms)
@@ -320,13 +411,36 @@ def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     plan_joins = joins(plan)
     if not plan_joins:
         return False
+    # The estimator half is memoized on what it reads, as `_input_size` is: it built an
+    # estimator and sized every join operand on each execution of the same plan, ~5 ms of a
+    # 25 ms JOB query to reach the answer the previous run reached. The q-error half is not:
+    # recording an operator's feedback moves no learning generation, so a memoized verdict
+    # would go on staging a plan whose history had since shown staging corrects nothing.
+    # It reads the hub's history for the few operands left, which is cheap.
+    key = _size_key(plan, sources, hub)
+    unsized = _WOULD_HELP.get(key) if key is not None else None
+    if unsized is None:
+        unsized = _unsized_operands(plan_joins, sources, hub)
+        if key is not None:
+            _WOULD_HELP[key] = unsized
+            while len(_WOULD_HELP) > _INPUT_SIZES_MAX:
+                _WOULD_HELP.pop(next(iter(_WOULD_HELP)))
+    return any(not _estimate_has_held_up(operand, hub) for operand in unsized)
+
+
+# `_unsized_operands` results, keyed and trimmed exactly like `_INPUT_SIZES`.
+_WOULD_HELP: dict[tuple, tuple[LogicalPlan, ...]] = {}
+
+
+def _unsized_operands(plan_joins, sources: list[Source], hub) -> tuple[LogicalPlan, ...]:
+    """The join operands a stage boundary could measure whose size is only a default guess."""
     estimator = build_estimator(sources, hub)
-    return any(
-        not is_streamable(operand)
-        and estimator.estimate(operand).provenance >= Provenance.DEFAULT
-        and not _estimate_has_held_up(operand, hub)
+    return tuple(
+        operand
         for join in plan_joins
         for operand in (join.left, join.right)
+        if not is_streamable(operand)
+        and estimator.estimate(operand).provenance >= Provenance.DEFAULT
     )
 
 

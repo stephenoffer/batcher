@@ -77,7 +77,7 @@ def test_the_fleet_tells_every_worker_and_survives_one_that_cannot_be_told():
     The helper is best-effort on purpose: a missing mirror already falls back to Flight, so
     the worst case of not being told is the behaviour that shipped before.
     """
-    from batcher.dist.fleet._fleet import _tell_workers_about_node_peers
+    from batcher.dist.fleet.spawn import _tell_workers_about_node_peers
 
     told: list[bool] = []
 
@@ -120,3 +120,38 @@ def test_the_fleet_tells_every_worker_and_survives_one_that_cannot_be_told():
             sys.modules["ray"] = saved
         else:
             del sys.modules["ray"]
+
+
+def test_the_mirror_is_counted_so_capacity_planning_can_see_it():
+    """The tmpfs mirror is a second resident copy the buffer pool and the store cap never
+    see, so the session reports its volume, and the buckets whose mirror was skipped."""
+    import threading
+
+    import pyarrow as pa
+
+    class _Server:
+        def __init__(self):
+            self.shared = []
+
+        def publish(self, ticket, batches):
+            return sum(b.nbytes for b in batches)
+
+        def publish_shared(self, ticket, batches):
+            self.shared.append(ticket)
+
+    s = _real_session()
+    s._server = _Server()
+    s._stats_lock = threading.Lock()
+    s._shm_mirrored_bytes = 0
+    s._shm_mirrors_skipped = 0
+    batch = pa.record_batch({"x": pa.array(range(1000), pa.int64())})
+
+    s.publish("t0", [batch])
+    assert s._server.shared == ["t0"]
+    assert s._shm_mirrored_bytes == batch.nbytes
+
+    s.set_shm_peers(False)
+    s.publish("t1", [batch])
+    assert s._server.shared == ["t0"], "a skipped mirror must not be written"
+    assert s._shm_mirrored_bytes == batch.nbytes
+    assert s._shm_mirrors_skipped == 1

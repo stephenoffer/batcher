@@ -16,30 +16,23 @@ Two properties are pinned here, and they are not the same property:
    this, `shuffle_replication` could be wired to nothing at all and property 1 would still
    pass via the recompute fallback, which is exactly the state this feature was in before.
 
-**Property 1 is currently FAILING, and the shape of the failure is recorded here because it
-is the opposite of what anyone would guess.** Measured on a 4-worker fleet, the aggregate
-above (120,000 rows, 40 groups), injecting worker kills and comparing the row count against
-the single-node answer:
+**Property 1 failed for every operator, and the cause was the replica's ticket stage.** On
+a 4-worker fleet the aggregate above (120,000 rows, 40 groups) returned all 40 groups with
+exactly one worker's quarter of the input missing (90,000 rows) when workers `{0, 2}` were
+killed with `shuffle_replication=2`, while replication *off* was exact. Every shuffle
+publishes its map buckets under its own `next_stage_base` block (never below 100), but
+`replicate_shuffle_output` defaulted to stage 0, so each replica copied a ticket nobody had
+published. That fetch reads back EMPTY rather than failing, the empty copy acked, and the
+retried reducer — whose primary for source 2 was dead — fell over to it and folded zero
+rows. Instrumented: `replica .../100/2/0/0 rows 0` against the primary's 40.
 
-| `shuffle_replication` | kill `{1}` | kill `{0, 2}` |
-|---|---|---|
-| 1 (off) | exact | exact |
-| 2 | exact | **-25%** (90,000 of 120,000 rows) |
-| 3 | exact | exact |
-| 4 | **-25%** | — |
+The stage is now a required argument, and `test_every_shuffle_declares_the_stages_it_publishes`
+pins it to the block each driver reserved (it used to pin the literal `(0,)`, i.e. the bug).
 
-**Replication *off* is correct in every case; turning it on is what loses the rows.** The
-recompute path this feature exists to avoid is the one that works. And the loss is not
-partial-looking: all 40 groups come back, with one worker's entire quarter of the input
-missing from their sums and counts — a silently wrong answer, not an error, which is the
-failure mode `CLAUDE.md` names as the one that "appears at cluster scale, as wrong results
-rather than an error".
-
-`factor = 4` on 4 workers is the row that rules out "the copies simply ran out": every
-worker holds every bucket there, so losing one worker cannot have removed the last copy of
-anything, and it still loses exactly one worker's share. That points at the *selection* of a
-fallback rather than its availability. Reproduced identically at `430fd373`, so it predates
-the session that measured it; unfixed, and deliberately not guessed at.
+The `*_serves_the_loss_*` spies and the unreplicated controls also depend on the kill being
+real. `ray.kill` is asynchronous and the killed worker's Flight server kept answering for
+~30 ms, long enough for the reduce to read every bucket from it, so the hooks now wait for
+the worker's address to close (`kill_workers`).
 """
 
 from __future__ import annotations
@@ -49,7 +42,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher import col, count
 from batcher.config import Config, DistributedConfig, FlowControlConfig, config_context
 
@@ -57,11 +50,7 @@ pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("batcher._native", reason="native engine not built")
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(4)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(4)
 
 
 def _data():
@@ -78,9 +67,18 @@ def _norm(t: pa.Table) -> set:
     }
 
 
+# Every helper pins `shared_memory_transfer` off, because a kill is only a *loss* over Flight.
+# With the same-node fast path on (the default), a mapper also mirrors each bucket into
+# `/dev/shm`, and that file outlives the killed actor — so on one machine a reducer still reads
+# the "lost" partition, nothing is recomputed, and nothing is served from a replica either.
+# The unreplicated control then failed (no recompute), and the replicated tests passed without
+# ever touching a replica: a true statement about shared memory, not about replication.
+_NO_SHM = {"shared_memory_transfer": False}
+
+
 def _replicated(factor: int = 2):
     return config_context(
-        Config().replace(distributed=DistributedConfig(shuffle_replication=factor))
+        Config().replace(distributed=DistributedConfig(shuffle_replication=factor, **_NO_SHM))
     )
 
 
@@ -90,7 +88,7 @@ def _replicated_tree(factor: int = 2, fan_in: int = 2):
     # id), which is a different code path from the flat reduce and needs its own coverage.
     return config_context(
         Config().replace(
-            distributed=DistributedConfig(shuffle_replication=factor),
+            distributed=DistributedConfig(shuffle_replication=factor, **_NO_SHM),
             flow_control=FlowControlConfig(shuffle_fan_in=fan_in),
         )
     )
@@ -262,7 +260,7 @@ def test_factor_one_places_no_replicas():
     from batcher.dist.shuffle_replication import replicate_shuffle_output
 
     with _replicated(factor=1):
-        assert replicate_shuffle_output(object(), ["a", "b"], 2, 2, set()) is None
+        assert replicate_shuffle_output(object(), ["a", "b"], 2, 2, set(), stages=(100,)) is None
 
 
 def test_single_worker_places_no_replicas():
@@ -271,7 +269,7 @@ def test_single_worker_places_no_replicas():
     from batcher.dist.shuffle_replication import replicate_shuffle_output
 
     with _replicated(factor=2):
-        assert replicate_shuffle_output(object(), ["a"], 2, 1, set()) is None
+        assert replicate_shuffle_output(object(), ["a"], 2, 1, set(), stages=(100,)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -418,25 +416,41 @@ def test_window_replication_serves_the_loss_without_a_recompute(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("shuffle", "stages"),
-    [("aggregate", (0,)), ("sort", (0,)), ("window", (0,)), ("join", (0, 1))],
+    ("shuffle", "width"),
+    [("aggregate", 1), ("sort", 1), ("window", 1), ("join", 2)],
 )
-def test_every_shuffle_declares_the_stages_it_publishes(shuffle, stages, monkeypatch):
+def test_every_shuffle_declares_the_stages_it_publishes(shuffle, width, monkeypatch):
     # The wiring contract, asserted directly rather than inferred from a kill: each driver
-    # must ask for a replica of every stage it published. A join that asked for stage 0
-    # only would place a half-copy that silently under-joins, and no correctness test
-    # above would fail on a cluster where the replica was never needed.
+    # must ask for a replica of every stage it published, **at the stage it published it
+    # under**. A join that asked for its left stage only would place a half-copy that
+    # silently under-joins.
+    #
+    # This test used to pin the literal stages `(0,)` and `(0, 1)`, which was the bug rather
+    # than the contract: every shuffle publishes under its own `next_stage_base` block (never
+    # below 100), so a replica of stage 0 copied a ticket nobody had published. That fetch
+    # reads back EMPTY rather than failing, the empty copy acked, and a reducer that fell
+    # over to it dropped the mapper's rows — 90,000 of 120,000 on the aggregate above. The
+    # expectation is therefore the block each driver actually reserved, read from the driver.
     import batcher.dist.shuffle_replication as repl
 
     seen: dict[str, tuple] = {}
+    bases: list[int] = []
     real = repl.replicate_shuffle_output
 
-    def _spy(actors, addrs, n_reducers, workers, dead, stages=(0,)):
+    def _spy(actors, addrs, n_reducers, workers, dead, *, stages):
         seen["stages"] = tuple(stages)
-        return real(actors, addrs, n_reducers, workers, dead, stages)
+        return real(actors, addrs, n_reducers, workers, dead, stages=stages)
+
+    from batcher.dist.fleet import plan_id
+
+    def _base_spy(count=1):
+        base = plan_id.next_stage_base(count)
+        bases.append(base)
+        return base
 
     for mod in ("flight_aggregate", "flight_join", "flight_sort", "flight_window"):
         monkeypatch.setattr(f"batcher.dist.{mod}.replicate_shuffle_output", _spy, raising=False)
+        monkeypatch.setattr(f"batcher.dist.{mod}.next_stage_base", _base_spy, raising=False)
 
     plans = {
         "aggregate": (_agg, "batcher.dist.flight_aggregate", "execute_aggregate_flight"),
@@ -451,7 +465,11 @@ def test_every_shuffle_declares_the_stages_it_publishes(shuffle, stages, monkeyp
     ds = build()
     with _replicated():
         fn([], ds._plan, ds._sources, workers=4)
-    assert seen.get("stages") == stages, f"{shuffle} replicated stages {seen.get('stages')}"
+    assert len(bases) == 1, f"{shuffle} reserved {len(bases)} stage blocks, expected one"
+    expected = tuple(bases[0] + i for i in range(width))
+    assert seen.get("stages") == expected, (
+        f"{shuffle} published under stages {expected} but replicated {seen.get('stages')}"
+    )
 
 
 @pytest.mark.parametrize(

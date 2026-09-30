@@ -19,6 +19,7 @@ import os
 from typing import Any
 
 from batcher._internal.errors import FormatError, unknown_value
+from batcher.io._backend import _scheme
 
 __all__ = [
     "COMPRESSION_SUFFIXES",
@@ -117,11 +118,6 @@ _SCHEME_TO_FORMAT: dict[str, str] = {
     "iceberg": "iceberg",
     "hudi": "hudi",
 }
-
-
-def _scheme(path: str) -> str:
-    idx = path.find("://")
-    return path[:idx].lower() if idx > 0 else ""
 
 
 def _ext(path: str) -> str:

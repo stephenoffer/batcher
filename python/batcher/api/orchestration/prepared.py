@@ -143,8 +143,13 @@ class Prepared:
         phys = self.physical
         projections, predicates = phys.source_projections, phys.source_predicates
         limits, orderings = phys.source_limits, phys.source_orderings
+        # Only what the plan scans: a source the optimizer pruned away is bound but never read,
+        # and reading it anyway decodes it whole with no projection.
+        scanned = set(phys.scanned_source_ids())
         batches = [
             read_source(src, projections.get(i), predicates.get(i), limits.get(i), orderings.get(i))
+            if i in scanned
+            else []
             for i, src in enumerate(sources)
         ]
         hub = core.default_hub()

@@ -10,6 +10,10 @@ The harness in [`benchmarks/harness/`](https://github.com/stephenoffer/batcher/t
 
 The engine that disagreed is still timed, and its milliseconds still appear in the harness output. How fast a wrong answer was is diagnostic, and hiding it would make a failing engine look the same as an absent one. The harness only refuses to divide the two times, because a ratio is a claim about which engine is faster.
 
+The comparison is exact wherever the types allow it. Integers, strings, booleans and decimals compare exactly, and a decimal is never routed through a float, so two decimals that differ in the nineteenth significant digit fail. Only a column that some engine returns as a float is compared within tolerance, and that tolerance is symmetric: it scales with the larger of the two magnitudes, so swapping the engines can't change a verdict. A non-finite value matches only the same value, so `+inf` matches `+inf` and never `1.0`. Rows are lined up on their exact columns first, and where floats that agree within tolerance sort differently on the two sides, the harness searches for a one-to-one pairing within each group of equal exact keys instead of failing on the swap. Column names are compared case-insensitively, but two columns of one result that would share a name, such as `x` and `X`, are both kept and both compared. A result with no columns still compares on its row count. [`tests/unit/test_benchmark_comparator.py`](https://github.com/stephenoffer/batcher/blob/main/tests/unit/test_benchmark_comparator.py) pins each of these cases.
+
+The cross-engine comparison reconciles column types on purpose, because DuckDB's `DECIMAL` sum and Batcher's `int64` sum are the same answer. It therefore can't support a claim that two paths return identical types. The scripts that compare Batcher against itself, single node against distributed, CPU against GPU and one cluster width against another, pass `strict_types=True`, which fails on any column whose Arrow type differs.
+
 A result that asks for an order gets a second check. The multiset comparison sorts both sides first, so on its own it can't tell a sorted result from an unsorted one, and an engine that skipped its `ORDER BY` would pass. Every case with an outermost `ORDER BY` is therefore also checked for monotonicity in its own order, per engine ([`benchmarks/harness/order.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/harness/order.py)), and an engine that fails that check is disqualified the same way a wrong value is.
 
 This is the discipline the engine itself is built under. Every relational operator is differential-tested against DuckDB, and the Tier-0 interpreter is the oracle that the parallel executor and the JIT must match bit for bit. {doc}`/architecture/internals/testing-strategy` covers that side.
@@ -93,7 +97,22 @@ This is the largest of the three. A user who runs a query once sees a number the
 
 The benefit of one shared process is Batcher's. Run alone, DuckDB barely cares which mode it is in (1.3%, with per-query signs split 11 to 11) while Batcher gains 3.8%, because cross-query carry-over is exactly what Batcher has and DuckDB doesn't. So the shared-process mode credits that carry-over into the headline ratio. A figure is only comparable to one taken the same way, and `run.py` names the mode in its header. The 2026-09-13 board runs one process per case.
 
-`--isolate` isn't a cold-start measurement. The child still executes the query once for the correctness check, once as a warm-up and N more times, so the plan cache and learned statistics are warm when the number is taken. Isolated, Batcher reads about 1.01x its in-process time, not the 2.6x of a first run.
+`--isolate` isn't a cold-start measurement by itself. The child still executes the query once for the correctness check, once as a warm-up and N more times, so the plan cache and learned statistics are warm when the number is taken. Isolated, Batcher reads about 1.01x its in-process time, not the 2.6x of a first run.
+
+### What the harness prints beside best-of-N
+
+A minimum is the optimistic tail of a distribution, so the harness keeps every timed repetition and prints a second table under the headline one ([`benchmarks/harness/timing.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/harness/timing.py)). For each engine and case it gives the following:
+
+- `first_ms`, the first call. That is the correctness run, which meets cold caches, an empty plan cache and no learned statistics. Under `--isolate` it is the one cold call in a fresh process.
+- `best_ms`, the headline figure.
+- `median_ms` and `p95_ms` over the timed repetitions.
+- `cpu_ms`, the CPU time of the best repetition in this process. It sees every thread of the benchmark process and nothing outside it, so an engine that works in another process, such as a Spark JVM or Ray workers, under-reports.
+
+`first_ms` is also what separates a scan from a metadata lookup. An unfiltered `SUM` over an in-memory table is answered from statistics recorded on an earlier run, so its best-of-N is a lookup while its first call executed the scan.
+
+The engines are timed in the lineup order rotated by a stable hash of the case name, so no engine is always timed first or last over a suite, and a rerun of one case keeps its order. The report order doesn't change.
+
+A cell with no timing says why: `n/a` means the engine has no form of the query, `OOM` means it ran out of memory, `ERR` means it raised, and `-` means it wasn't measured. None of these is a wrong answer. A wrong answer keeps its timing and loses its ratio as `n/c`. The geomean line counts every case it left out, including cases where one side has no timing, and prints the ratio of summed times and the worst single case beside it, because a geomean weighs a 2 ms query the same as a 20 s one.
 
 ## Suite coverage
 

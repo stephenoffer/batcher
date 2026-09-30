@@ -25,13 +25,13 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
+from batcher.plan.types.domains import is_numeric_type
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = [
     "declared_dtype",
-    "is_numeric_type",
     "require_comparable",
     "require_numeric",
     "require_numeric_values",
@@ -82,11 +82,6 @@ def declared_dtype(ds: Dataset, column: str) -> pa.DataType | None:
     if pa.types.is_dictionary(dtype):
         dtype = dtype.value_type
     return None if pa.types.is_null(dtype) else dtype
-
-
-def is_numeric_type(dtype: pa.DataType) -> bool:
-    """Whether `dtype` is an integer, float, or decimal type — never a boolean."""
-    return pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_decimal(dtype)
 
 
 def require_numeric(ds: Dataset, column: str, op: str) -> None:

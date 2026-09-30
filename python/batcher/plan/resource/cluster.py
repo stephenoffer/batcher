@@ -116,22 +116,6 @@ class NodeShape:
         """VRAM across every device on this node, `0` when either figure is unknown."""
         return max(0, self.gpus) * max(0, self.gpu_memory_bytes)
 
-    @property
-    def per_device_egress_gbps(self) -> float:
-        """The off-node rate one device here actually has, in gigabits per second.
-
-        The node's aggregate rate divided by the devices contending for it. Sizing a
-        cross-node transfer against the node total over-commits by the device count on
-        exactly the dense nodes where the mistake costs most, and a rail assignment cannot
-        fix arithmetic that never divided.
-
-        `0.0` when the rate is unmeasured, which a caller must read as "no opinion" and not
-        as "no bandwidth".
-        """
-        if self.fabric_gbps <= 0.0:
-            return 0.0
-        return self.fabric_gbps / max(1, self.gpus)
-
 
 @dataclass(frozen=True, slots=True)
 class ClusterShape:

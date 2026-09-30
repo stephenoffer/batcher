@@ -34,6 +34,7 @@ from batcher.dist.executors.partition_io import partition_descriptors, stage_pus
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    kill_workers,
     map_barrier,
     map_partitions,
     shuffle_partitions,
@@ -188,7 +189,6 @@ def _execute_keyed_flight(
     `operator` is the breaker itself, carried only so the read can be narrowed against the
     whole stage (`above` over it) rather than against its map prefix — see `stage_pushdown`.
     """
-    import ray
 
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to worker actors
@@ -234,17 +234,16 @@ def _execute_keyed_flight(
         placement = SourcePlacement(workers)
 
         if _fault_inject_map:  # test hook: kill before the barrier, so nothing publishes
-            for i in _fault_inject_map:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject_map)
 
         # MAP barrier under worker-loss recovery: a worker preempted while mapping has its
         # source republished on a survivor under the same `src`, so the reducers' tickets
-        # still resolve. A bare `ray.get` here failed the whole query on one preemption —
-        # in the map phase, which reads the source and dominates the query's runtime.
-        # One ticket stage for THIS window's shuffle. It used to be the literal 0, so a
-        # window sharing a fleet with another shuffle of the same query published
-        # byte-identical tickets and one overwrote the other — the collision that made a
-        # join read another join's buckets. See `fleet.plan_id.next_stage_base`.
+        # still resolve. A bare `ray.get` would fail the whole query on one preemption — in
+        # the map phase, which reads the source and dominates the query's runtime.
+        # One ticket stage for THIS window's shuffle, never a literal: a window sharing a
+        # fleet with another shuffle of the same query would otherwise publish byte-identical
+        # tickets and one would overwrite the other, so a join could read another join's
+        # buckets. See `fleet.plan_id.next_stage_base`.
         stage = next_stage_base(1)
         addrs, dead = map_barrier(
             n_sources,
@@ -258,11 +257,12 @@ def _execute_keyed_flight(
         # Placed HERE, as soon as the buckets exist and before anything can take a worker
         # away — replicating after a loss would be probing a corpse. `None` (the default
         # factor of 1) leaves the reduce byte-identical to the unreplicated path.
-        replicas = replicate_shuffle_output(actors, addrs, n_buckets, workers, dead)
+        replicas = replicate_shuffle_output(
+            actors, addrs, n_buckets, workers, dead, stages=(stage,)
+        )
 
         if _fault_inject:
-            for i in _fault_inject:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject)
 
         batches = _window_reduce_with_recovery(
             actors,

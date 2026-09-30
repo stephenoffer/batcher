@@ -10,8 +10,11 @@ stage-boundary re-optimization, the same mechanism and the same granularity as A
 The differentiator is therefore not *how often* the plan is revised inside one query.
 It is two other things, and this diagram is built to show exactly those:
 
-1. **Where it is available.** AQE is a cluster mechanism. Batcher runs the same
-   stage-boundary loop on a single node, where DuckDB has no equivalent at all.
+1. **Where the loop runs.** Spark AQE is on by default since Spark 3.2 and re-plans at
+   shuffle-exchange query stages in local mode (`local[*]`) too, so it does run on one
+   machine; an earlier version of this diagram said otherwise, and that was wrong. What
+   differs is the process: Batcher's loop runs inside the Python process, not in a JVM
+   beside it. DuckDB runs in-process but does not re-plan within a query.
 2. **Whether anything survives the query.** Batcher's measurements are recorded to the
    MetadataHub and read by the *next* run: sketch-backed cardinality, cost coefficients
    calibrated from measured operator times, and a UCB1 bandit over join strategies
@@ -87,16 +90,16 @@ parts = [
     f'<text x="40" y="46" font-family="{FONT}" font-size="19" font-weight="700" class="t-head">'
     f"What the adaptive loop actually buys</text>",
     f'<text x="40" y="70" font-family="{FONT}" font-size="13" class="t-sub">'
-    f"Not a finer re-planning grain than Spark AQE. The same grain, in two places AQE and "
-    f"DuckDB do not reach.</text>",
+    f"Not a finer re-planning grain than Spark AQE. The same grain, run in-process, plus a "
+    f"cross-run loop neither AQE nor DuckDB has.</text>",
 ]
 
 headers = (
     ("Re-plans inside", "one query"),
-    ("Runs on a", "single node"),
+    ("Runs inside the", "Python process"),
     ("Carries what it", "learned to the next run"),
 )
-for x, (h1, h2) in zip(COL_X, headers):
+for x, (h1, h2) in zip(COL_X, headers, strict=True):
     parts += [
         f'<text x="{x + 16}" y="{ROW_Y[0] - 30}" font-family="{FONT}" font-size="12.5" '
         f'font-weight="700" class="colhead">{h1}</text>',
@@ -110,30 +113,30 @@ rows = (
         "static optimizer",
         [
             (False, "optimizes once, up front"),
-            (True, "single-node by design"),
+            (True, "embedded, in-process"),
             (False, "no cross-run state"),
         ],
     ),
     (
         "Spark AQE",
-        "cluster only",
+        "on by default since 3.2",
         [
             (True, "at stage boundaries"),
-            (False, "needs shuffle stages"),
+            (False, "in a JVM beside Python"),
             (False, "no cross-run state"),
         ],
     ),
     (
         "Batcher",
-        "same grain, wider reach",
+        "same grain, plus learning",
         [
             (True, "at stage boundaries"),
-            (True, "same loop, one node"),
+            (True, "same loop, in-process"),
             (True, "sketches, costs, bandit"),
         ],
     ),
 )
-for y, (name, sub, cells) in zip(ROW_Y, rows):
+for y, (name, sub, cells) in zip(ROW_Y, rows, strict=True):
     emph = name == "Batcher"
     parts += [
         f'<text x="{NAME_X}" y="{y + 26}" font-family="{FONT}" font-size="15" font-weight="700" '
@@ -141,7 +144,7 @@ for y, (name, sub, cells) in zip(ROW_Y, rows):
         f'<text x="{NAME_X}" y="{y + 45}" font-family="{FONT}" font-size="11" '
         f'class="t-sub">{sub}</text>',
     ]
-    for x, (has, text) in zip(COL_X, cells):
+    for x, (has, text) in zip(COL_X, cells, strict=True):
         parts.append(cell(x, y, has, text, emphasis=emph and has))
 
 parts += [

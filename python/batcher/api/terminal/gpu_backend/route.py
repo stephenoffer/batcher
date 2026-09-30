@@ -58,7 +58,7 @@ def try_gpu_collect(
     if gpu_count < 1:
         if force:
             _note_no_visible_device()
-        note_gpu_declined("no visible device")
+        _decline("no visible device", force)
         return None
     from batcher.dist.executors.ray_runtime.accelerators import (
         cluster_accelerator_type,
@@ -96,7 +96,7 @@ def try_gpu_collect(
         accelerator_type=cluster_accelerator_type(),
     )
     if not decision.use_gpu:
-        note_gpu_declined(decision.reason or "kyber routed to cpu")
+        _decline(decision.reason or "kyber routed to cpu", force)
         return None
 
     import time
@@ -118,10 +118,10 @@ def try_gpu_collect(
         # so a query the GPU could not run *failed* instead of running — the legacy kernel
         # raised a bare `TypeError` on a string group key, which is an ordinary column.
         note_gpu_failure("run this plan on the GPU; using the CPU engine", exc)
-        note_gpu_declined(f"raised: {type(exc).__name__}")
+        _decline(f"raised: {type(exc).__name__}", force, exc)
         return None
     if result is None:
-        note_gpu_declined("untranslatable shape")
+        _decline("untranslatable shape", force)
         return None
     # Stopped before verification of either kind: the recorded figure has to be what the device
     # path costs, not what checking it costs, or the learned GPU/CPU crossover moves the moment
@@ -137,7 +137,7 @@ def try_gpu_collect(
     # disagrees is refused, and the CPU engine answers the query.
     checked = enforce_schema_contract(result, plan)
     if checked is None:
-        note_gpu_declined("schema contract refused the device result")
+        _decline("schema contract refused the device result", force)
         return None
     result = checked
     from batcher.config import active_config
@@ -155,6 +155,30 @@ def try_gpu_collect(
     _record_gpu_timing(hub, raw_plan, sources, decision.est_rows, elapsed_ms)
     note_gpu_ran()
     return result
+
+
+def _decline(reason: str, force: bool, cause: BaseException | None = None) -> None:
+    """Record a decline so the CPU engine answers, or raise under `gpu_require`.
+
+    `distributed.gpu_require` turns an explicit `backend="gpu"` from "run it here if you can"
+    into "run it here or fail", for the benchmark and capacity runs where a silent CPU answer
+    reports a timing for a device that never ran. The decline is recorded in the ledger either
+    way, so `gpu_ledger()` agrees with what was raised. `backend="auto"` (`force=False`) is a
+    request for Kyber's choice, not for the device, so it always falls back.
+    """
+    note_gpu_declined(reason)
+    if not force:
+        return
+    from batcher.config import active_config
+
+    if not active_config().distributed.gpu_require:
+        return
+    from batcher._internal.errors import BackendError
+
+    raise BackendError(
+        f'backend="gpu" was requested with distributed.gpu_require=True and the device tier '
+        f"declined this plan: {reason}. Set gpu_require=False to let the CPU engine answer."
+    ) from cause
 
 
 #: Whether the "no device for an explicit GPU request" warning has already been given. Once per

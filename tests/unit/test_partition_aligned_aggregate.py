@@ -558,22 +558,19 @@ def test_an_iceberg_group_by_the_partition_column_needs_no_exchange(iceberg_tabl
     assert _partition_aligned_aggregate(ds._plan, list(ds._sources), 2, None) == ("day",)
 
 
-def test_a_file_written_under_an_older_partition_spec_refuses_the_whole_set(tmp_path_factory):
-    """Partition evolution is the hazard that makes Iceberg different from Delta and Hive.
+def _evolved_iceberg(tmp_path_factory, evolve_spec, name):
+    """A table written under `day`, evolved by `evolve_spec`, then appended to again.
 
-    An older file's partition record holds the *old* spec's fields, so reading it against the
-    current spec's columns groups by the wrong thing entirely — and would put rows sharing a
-    value on different workers while the plan claims they cannot be. The old file therefore
-    declares nothing, which makes `declared_clustering` refuse the set rather than half-trust
-    it.
+    `day = 2` is written under both specs, so a clustering that groups by raw partition
+    records would put that day's rows in two groups.
     """
     from pyiceberg.partitioning import PartitionField, PartitionSpec
     from pyiceberg.transforms import IdentityTransform
 
-    catalog, spec = _iceberg_catalog(tmp_path_factory.mktemp("ice_evolved"))
+    catalog, spec = _iceberg_catalog(tmp_path_factory.mktemp(name))
     catalog.create_namespace("db")
     table = catalog.create_table(
-        "db.evolved",
+        f"db.{name}",
         schema=_iceberg_schema(),
         partition_spec=PartitionSpec(
             PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="day")
@@ -585,15 +582,54 @@ def test_a_file_written_under_an_older_partition_spec_refuses_the_whole_set(tmp_
         )
     )
     with table.update_spec() as evolve:
-        evolve.add_field("v", IdentityTransform(), "v_id")
-    table = catalog.load_table("db.evolved")
+        evolve_spec(evolve)
+    table = catalog.load_table(f"db.{name}")
     table.append(
-        pa.table({"day": pa.array([3, 3], pa.int64()), "v": pa.array([20, 21], pa.int64())})
+        pa.table({"day": pa.array([2, 3], pa.int64()), "v": pa.array([20, 21], pa.int64())})
     )
+    return f"db.{name}", spec
 
-    splits = bt.read.iceberg("db.evolved", catalog=spec)._sources[0].splits()
+
+def test_an_added_partition_field_keeps_the_clustering_on_the_shared_field(tmp_path_factory):
+    """Partition evolution used to refuse the whole set; a field every spec shares survives.
+
+    An older file's partition record holds the *old* spec's fields, so grouping files by their
+    raw records compares `(day,)` against `(day, v)` and would put rows sharing a `day` on
+    different workers. But `day` is in both specs under the same transform, so it is computed
+    identically in every file. Reading each file's `day` at its own spec's position clusters
+    the table on `day`, and puts the old and new files for `day = 2` in one group.
+    """
+    from pyiceberg.transforms import IdentityTransform
+
+    identifier, spec = _evolved_iceberg(
+        tmp_path_factory,
+        lambda evolve: evolve.add_field("v", IdentityTransform(), "v_id"),
+        "evolved_add",
+    )
+    splits = bt.read.iceberg(identifier, catalog=spec)._sources[0].splits()
     assert len({s._task.file.spec_id for s in splits}) == 2, "the table must span two specs"
-    assert [s.clustering_columns for s in splits].count(()) == 2, "old-spec files declare nothing"
+    assert declared_clustering(splits) == ("day",)
+    groups = group_by_clustering(splits)
+    by_day = {g[0].clustering_value: {s._task.file.spec_id for s in g} for g in groups}
+    assert set(by_day) == {(1,), (2,), (3,)}
+    assert len(by_day[(2,)]) == 2, "day 2's old-spec and new-spec files must group together"
+
+    ds = bt.read.iceberg(identifier, catalog=spec).group_by("day").agg(s=col("v").sum())
+    assert _partition_aligned_aggregate(ds._plan, list(ds._sources), 2, None) == ("day",)
+
+
+def test_a_dropped_partition_field_still_refuses_the_whole_set(tmp_path_factory):
+    """The negative control: with no field common to every live spec there is nothing to
+    cluster on, and the set must decline rather than half-trust either spec."""
+    from pyiceberg.transforms import IdentityTransform
+
+    def _swap(evolve):
+        evolve.remove_field("day")
+        evolve.add_field("v", IdentityTransform(), "v_id")
+
+    identifier, spec = _evolved_iceberg(tmp_path_factory, _swap, "evolved_swap")
+    splits = bt.read.iceberg(identifier, catalog=spec)._sources[0].splits()
+    assert len({s._task.file.spec_id for s in splits}) == 2
     assert declared_clustering(splits) == ()
 
 

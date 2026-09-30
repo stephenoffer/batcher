@@ -300,7 +300,7 @@ def test_an_unplaceable_fleet_says_why_not_just_that_it_failed(topology, monkeyp
     and the topology already knows which one it is. This is the error a user actually sees
     when a distributed query cannot start, so it is the one worth making actionable.
     """
-    from batcher.dist.fleet import _fleet
+    from batcher.dist.fleet import spawn
     from batcher.plan.resource import SchedulingEnvelope
 
     topology([_node(8)])
@@ -308,7 +308,7 @@ def test_an_unplaceable_fleet_says_why_not_just_that_it_failed(topology, monkeyp
         "batcher.dist.executors.ray_runtime.scheduling.current_envelope",
         lambda: SchedulingEnvelope(num_cpus=32.0, n_tasks=4),
     )
-    reason = _fleet._fleet_demand_reason()
+    reason = spawn._fleet_demand_reason()
     assert reason is not None
     assert "no node can host one task" in reason
     assert "CPU (8 available, 32 needed)" in reason
@@ -324,11 +324,11 @@ def test_a_fleet_that_comes_up_narrow_is_reported(topology, monkeypatch, caplog)
     """
     import logging
 
-    from batcher.dist.fleet import _fleet
+    from batcher.dist.fleet import spawn
 
     topology([_node(8, free=0.0)])
     with caplog.at_level(logging.WARNING, logger="batcher.dist"):
-        _fleet._warn_degraded_fleet(placed=2, wanted=8, timeout=60.0)
+        spawn._warn_degraded_fleet(placed=2, wanted=8, timeout=60.0)
     assert any("narrower than requested" in r.message for r in caplog.records)
 
 
@@ -336,11 +336,11 @@ def test_a_full_width_fleet_says_nothing(topology, caplog):
     """The normal case must stay silent, or the warning stops meaning anything."""
     import logging
 
-    from batcher.dist.fleet import _fleet
+    from batcher.dist.fleet import spawn
 
     topology([_node(8)])
     with caplog.at_level(logging.WARNING, logger="batcher.dist"):
-        _fleet._warn_degraded_fleet(placed=8, wanted=8, timeout=60.0)
+        spawn._warn_degraded_fleet(placed=8, wanted=8, timeout=60.0)
     assert not [r for r in caplog.records if "narrower" in r.message]
 
 

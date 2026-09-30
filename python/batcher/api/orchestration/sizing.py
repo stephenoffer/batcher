@@ -17,6 +17,7 @@ import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.logging import note_suppressed
+from batcher._internal.registry import MISSING, IdentityMemo
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -143,7 +144,7 @@ def projected_input_bytes(
             return 0
         try:
             width = projected_row_bytes(src.schema(), projections.get(i))
-        except Exception:  # pragma: no cover - a source that cannot describe itself
+        except Exception:  # a source that cannot describe itself
             return 0
         total += rows * width
     return int(total)
@@ -165,7 +166,7 @@ def _estimated_row_count(src: Source) -> int | None:
     """
     try:
         stats = src.statistics()
-    except Exception:  # pragma: no cover - a source with no statistics at all
+    except Exception:  # a source with no statistics at all
         return None
     rows = getattr(stats, "row_count", None) if stats is not None else None
     if rows is None or rows < 0:
@@ -206,20 +207,18 @@ def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table 
     Returns:
         A zero-row table, or `None` to execute normally.
     """
-    from batcher.plan.logical import Limit
+    from batcher.plan.logical import is_empty_relation
 
-    if not (isinstance(logical_opt, Limit) and logical_opt.n == 0):
+    if not is_empty_relation(logical_opt):
         return None
     inferred = plan.available_schema()
     return None if inferred is None else inferred.arrow.empty_table()
 
 
-#: `id(plan) -> (plan, carried)`, pinning the plan so a recycled id cannot answer for another.
 #: A re-issued query hands back the *same* plan object, and this analysis walks every node's
 #: schema and reruns Kyber's projection analysis: ~0.5 ms of a TPC-H q8 `collect()` whose whole
 #: control plane is a few milliseconds, recomputed for an immutable plan.
-_CARRIED_MEMO: dict[int, tuple[object, frozenset[str] | None]] = {}
-_CARRIED_MEMO_MAX = 256
+_CARRIED_MEMO: IdentityMemo[frozenset[str] | None] = IdentityMemo(256)
 
 
 def carried_columns(plan) -> frozenset[str] | None:
@@ -227,14 +226,9 @@ def carried_columns(plan) -> frozenset[str] | None:
 
     See `_carried_columns` for what they are. A plan is immutable, so its answer cannot change.
     """
-    hit = _CARRIED_MEMO.get(id(plan))
-    if hit is not None and hit[0] is plan:
-        return hit[1]
-    carried = _carried_columns(plan)
-    if len(_CARRIED_MEMO) >= _CARRIED_MEMO_MAX:
-        _CARRIED_MEMO.clear()
-    _CARRIED_MEMO[id(plan)] = (plan, carried)
-    return carried
+    if (hit := _CARRIED_MEMO.get(plan)) is not MISSING:
+        return hit
+    return _CARRIED_MEMO.put(plan, _carried_columns(plan))
 
 
 def _carried_columns(plan) -> frozenset[str] | None:
@@ -258,13 +252,23 @@ def _carried_columns(plan) -> frozenset[str] | None:
     settle where it takes two (`test_the_memo_stops_missing_once_there_is_nothing_left_to_learn`).
     A sizing hint must not move the learning loop.
 
+    Answered after **projection pruning** (`rewrite_projection`), though, which is not the
+    optimizer: it is one pure plan-to-plan pass with no statistics, no plan cache and nothing
+    learned, so the warmup argument above does not reach it. The analysis needs it because it
+    reads each node's *declared* output, and before pruning a SQL comma join declares every
+    column of every table in its `FROM`. TPC-DS q5's shared subplan was charged 187 columns
+    and 1,312 bytes a row for a query that moves eight, so its morsel was cut to 799 rows
+    where 16,384 fit, and the stage ran in 89 ms against 17 ms for the same plan sized right.
+
     `None` on any failure, which restores the previous behaviour of charging every column:
     this decides what a query *costs*, never what it returns, so a miss must be a cost.
     """
     try:
         from batcher import kyber
+        from batcher.kyber.rules.projections import rewrite_projection
         from batcher.plan.visitor import walk
 
+        plan = rewrite_projection(plan)
         supplied: set[str] = set()
         for names in kyber.required_columns_per_source(plan).values():
             supplied.update(names)
@@ -278,6 +282,6 @@ def _carried_columns(plan) -> frozenset[str] | None:
                 continue
             (source_names if type(node).__name__ == "Scan" else node_names).update(arrow.names)
         return frozenset(supplied | (node_names - source_names))
-    except Exception as exc:  # pragma: no cover - a sizing hint must never fail a query
+    except Exception as exc:  # a sizing hint must never fail a query
         note_suppressed("carbonite", "derive carried columns", exc)
         return None

@@ -34,10 +34,15 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-__all__ = ["aggregate_domain_error", "key_domain_error", "window_domain_error"]
+__all__ = [
+    "aggregate_domain_error",
+    "is_numeric_type",
+    "key_domain_error",
+    "window_domain_error",
+]
 
 
-def _is_numeric(dt: pa.DataType) -> bool:
+def is_numeric_type(dt: pa.DataType) -> bool:
     """Integer, floating, or decimal -- a value arithmetic is *meaningful* on.
 
     `pa.types.is_numeric` is not this: it counts booleans, and the whole point of the
@@ -156,7 +161,7 @@ def aggregate_domain_error(func: str, column: str, dt: pa.DataType) -> str | Non
                 f"type of its own; cast it to bool so the empty case is still a boolean"
             )
         return None
-    if func in _NUMERIC and not _is_numeric(dt):
+    if func in _NUMERIC and not is_numeric_type(dt):
         return _reject(func, column, dt, "numeric")
     if func in _REAL and not _is_real(dt) and not pa.types.is_decimal(dt):
         return _reject(func, column, dt, "numeric")

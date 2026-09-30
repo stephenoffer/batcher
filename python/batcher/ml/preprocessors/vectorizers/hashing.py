@@ -21,14 +21,18 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, column_arg
-from batcher.ml.preprocessors.vectorizers.assemble import bag_of_words, set_columns
+from batcher.ml.preprocessors.vectorizers.assemble import (
+    bag_of_words,
+    null_document_policy,
+    set_columns,
+)
 from batcher.ml.preprocessors.vectorizers.tokens import (
     DEFAULT_TOKEN_PATTERN,
     resolve_stop_words,
     term_expr,
     validate_ngram_range,
 )
-from batcher.plan.expr_ir.constructors import lit
+from batcher.plan.expr_ir.constructors import hash_rows, lit, when
 from batcher.plan.functions.collection import element
 
 if TYPE_CHECKING:
@@ -39,6 +43,9 @@ if TYPE_CHECKING:
 __all__ = ["HashingVectorizer"]
 
 _NORMS = ("l1", "l2", None)
+#: The term hashes on offer; ``"murmur3"`` is `hash_rows(algorithm="iceberg")`, which is the
+#: standard seed-0 MurmurHash3_x86_32 of the UTF-8 bytes that scikit-learn computes.
+_HASH_FUNCTIONS = frozenset({"fnv1a", "murmur3"})
 
 
 class HashingVectorizer(Preprocessor):
@@ -53,11 +60,15 @@ class HashingVectorizer(Preprocessor):
     generous — a few hundred thousand is ordinary. Collisions degrade a model gracefully;
     too narrow a space does not.
 
-    The feature index is ``abs(fnv1a_64(term)) % n_features``, from the engine's
+    By default the feature index is ``abs(fnv1a_64(term)) % n_features``, from the engine's
     ``str.hash64``. scikit-learn's ``HashingVectorizer`` uses signed 32-bit MurmurHash3 and, by
-    default, ``alternate_sign=True``, so the two assign different indices and signs to the
-    same term: the outputs are equivalent as feature spaces but not interchangeable, and a
-    model trained on one cannot score features from the other.
+    default, ``alternate_sign=True``, so under the default the two assign different indices
+    and signs to the same term, and a model trained on one cannot score features from the
+    other. ``hash_function="murmur3"`` with ``alternate_sign=True`` reproduces scikit-learn's
+    indices and signs exactly: the index is ``abs(murmur3_32(term)) % n_features`` and a term
+    whose hash is negative contributes -1, so a model fitted on scikit-learn's hashed
+    features scores Batcher's. Tokenization must match too, and this class's defaults
+    (lowercasing, words of two or more characters) are scikit-learn's.
 
     Examples:
         .. doctest::
@@ -80,16 +91,25 @@ class HashingVectorizer(Preprocessor):
         binary: Record presence as ``1.0`` rather than the count.
         norm: ``"l2"`` (the default), ``"l1"``, or ``None`` to leave rows unscaled.
         dense: Emit one fixed-width list column instead of the index/value pair.
+        hash_function: ``"fnv1a"`` (the engine's ``str.hash64``) or ``"murmur3"``
+            (scikit-learn's signed 32-bit MurmurHash3, seed 0).
+        alternate_sign: Give a term the sign of its hash, so colliding terms tend to cancel
+            rather than add, as scikit-learn does by default.
+        null_documents: ``"empty"`` reads a null document as one with no terms; ``"null"``
+            makes every output column null for it, so missing text stays distinguishable.
     """
 
     __slots__ = (
+        "alternate_sign",
         "binary",
         "column",
         "dense",
+        "hash_function",
         "lowercase",
         "n_features",
         "ngram_range",
         "norm",
+        "null_documents",
         "output_column",
         "stop_words",
         "token_pattern",
@@ -108,8 +128,19 @@ class HashingVectorizer(Preprocessor):
         binary: bool = False,
         norm: str | None = "l2",
         dense: bool = False,
+        hash_function: str = "fnv1a",
+        alternate_sign: bool = False,
+        null_documents: str = "empty",
     ) -> None:
         what = type(self).__name__
+        self.null_documents = null_document_policy(null_documents, what=what)
+        if hash_function not in _HASH_FUNCTIONS:
+            raise PlanError(
+                f"{what}: hash_function must be one of {sorted(_HASH_FUNCTIONS)}, "
+                f"got {hash_function!r}"
+            )
+        self.hash_function = hash_function
+        self.alternate_sign = alternate_sign
         self.column = column_arg(column, what=what)
         if n_features < 1:
             raise PlanError(f"{what}: n_features must be at least 1, got {n_features}")
@@ -173,7 +204,19 @@ class HashingVectorizer(Preprocessor):
             stop_words=self.stop_words,
             ngram_range=self.ngram_range,
         )
-        return terms.list.transform(element().str.hash64().abs() % lit(self.n_features))
+        term = element()
+        digest = (
+            hash_rows(term, algorithm="iceberg")
+            if self.hash_function == "murmur3"
+            else term.str.hash64()
+        )
+        index = digest.abs() % lit(self.n_features)
+        if not self.alternate_sign:
+            return terms.list.transform(index)
+        # Signed codes, ±(index + 1): `bag_of_words` reads the sign as the token's
+        # contribution and the magnitude as its feature. The +1 keeps index 0 signable.
+        signed = when(digest >= lit(0)).then(index + lit(1)).otherwise(lit(-1) - index)
+        return terms.list.transform(signed)
 
     def transform(self, ds: Dataset) -> Dataset:
         """Append each document's hashed term counts, lazily.
@@ -196,14 +239,23 @@ class HashingVectorizer(Preprocessor):
         """
         self._require_fitted()
         width, binary, dense, norm = self.n_features, self.binary, self.dense, self.norm
+        signed = self.alternate_sign
         indices_column, values_column = self.indices_column, self.values_column
         code_column = "__bt_codes"
-        keep = list(ds.columns)
-        for extra in [values_column] if dense else [indices_column, values_column]:
-            if extra not in keep:
-                keep.append(extra)
+        outputs = [values_column] if dense else [indices_column, values_column]
+        final = list(ds.columns)
+        for extra in outputs:
+            if extra not in final:
+                final.append(extra)
+        keep_nulls = self.null_documents == "null"
+        text_column = self.column
 
         def _udf(batch: Any) -> Any:
+            null_rows = (
+                batch.column(text_column).is_null().to_numpy(zero_copy_only=False)
+                if keep_nulls
+                else None
+            )
             built = bag_of_words(
                 batch.column(code_column),
                 vocabulary=None,
@@ -211,11 +263,13 @@ class HashingVectorizer(Preprocessor):
                 binary=binary,
                 norm=norm,
                 dense=dense,
+                signed_codes=signed,
+                null_rows=null_rows,
             )
             written = {values_column: built["values"]}
             if not dense:
                 written[indices_column] = built["indices"]
-            return set_columns(batch, written).select(keep)
+            return set_columns(batch, written).select(final)
 
         staged = ds.with_columns(**{code_column: self._codes()})
-        return staged.map_batches(_udf, output_columns=keep)
+        return staged.map_batches(_udf, output_columns=final)

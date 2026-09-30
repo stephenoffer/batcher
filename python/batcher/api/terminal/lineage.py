@@ -174,7 +174,7 @@ def _drain(q: queue.Queue[_Delivery]) -> None:
         delivery = q.get()
         try:
             _post(delivery)
-        except Exception:  # pragma: no cover - telemetry must never escalate
+        except Exception:  # telemetry must never escalate
             from batcher._internal.logging import get_logger
 
             get_logger("api").debug("openlineage post failed", exc_info=True)
@@ -346,7 +346,7 @@ def emit_run_start(query_id: str, plan: LogicalPlan, sources: list[Source] | Non
         job = _job_name(plan)
         _remember_job(query_id, job)
         _emit(_build(query_id, "START", plan=plan, sources=sources, profile=None, job=job))
-    except Exception:  # pragma: no cover - telemetry must never fail a query
+    except Exception:  # telemetry must never fail a query
         from batcher._internal.logging import get_logger
 
         get_logger("api").debug("openlineage start emit failed", exc_info=True)
@@ -379,7 +379,7 @@ def emit_run_complete(
                 job=job,
             )
         )
-    except Exception:  # pragma: no cover - telemetry must never fail a query
+    except Exception:  # telemetry must never fail a query
         from batcher._internal.logging import get_logger
 
         get_logger("api").debug("openlineage complete emit failed", exc_info=True)
@@ -411,7 +411,7 @@ def emit_run_failure(query_id: str, exc: BaseException) -> None:
             "programmingLanguage": "PYTHON",
         }
         _emit(event)
-    except Exception:  # pragma: no cover - telemetry must never fail a query
+    except Exception:  # telemetry must never fail a query
         from batcher._internal.logging import get_logger
 
         get_logger("api").debug("openlineage failure emit failed", exc_info=True)

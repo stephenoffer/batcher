@@ -27,7 +27,8 @@ __all__ = ["geofunc_type", "spatialfunc_type"]
 _GEO_BINARY = frozenset(
     {
         "st_affine", "st_as_binary", "st_as_ewkb", "st_boundary", "st_buffer", "st_centroid",
-        "st_closest_point", "st_collect", "st_convex_hull", "st_end_point", "st_envelope",
+        "st_closest_point", "st_collect", "st_convex_hull", "st_difference", "st_end_point",
+        "st_envelope", "st_intersection", "st_union",
         "st_expand", "st_exterior_ring", "st_flip_coordinates", "st_force2d", "st_force3d",
         "st_force_polygon_ccw", "st_force_polygon_cw", "st_geom_from_geohash",
         "st_geom_from_geojson", "st_geom_from_text", "st_geom_from_wkb", "st_geometry_n",

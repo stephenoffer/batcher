@@ -4,15 +4,8 @@ Dataset-wide min/max (in `columnar_footer`) prune a predicate against the whole
 source; this module exposes the *finer* per-row-group bounds a range predicate
 uses to eliminate whole row groups (and whole files) without reading a row. It is
 the zone-map surface: each `RowGroupBounds` carries one row group's row count and
-per-column min/max/null-count, and `surviving_rows_for_range` reports how many
-rows could still match a ``lower <= col <= upper`` bound after pruning the groups
-that provably cannot.
-
-The count is an *upper bound* on matches (a surviving group may still contain
-non-matching rows), with one exact corner: when it is **zero**, the predicate is
-provably empty over the source — the sound basis for an exact `is_empty()` on a
-range predicate. Bounds for a truncated string column are still valid for
-pruning (they only widen the range), so they are surfaced too.
+per-column min/max/null-count. Bounds for a truncated string column are still valid
+for pruning (they only widen the range), so they are surfaced too.
 """
 
 from __future__ import annotations
@@ -23,7 +16,7 @@ from typing import Any
 
 from batcher._internal.logging import note_suppressed
 
-__all__ = ["RowGroupBounds", "parquet_row_group_bounds", "surviving_rows_for_range"]
+__all__ = ["RowGroupBounds", "parquet_row_group_bounds"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,29 +93,3 @@ def _collect_bounds(
         maxs[name] = stats.max
     if getattr(stats, "has_null_count", False) and stats.null_count is not None:
         nulls[name] = stats.null_count
-
-
-def surviving_rows_for_range(
-    bounds: list[RowGroupBounds],
-    column: str,
-    lower: Any | None = None,
-    upper: Any | None = None,
-) -> int:
-    """Upper-bound row count that survives ``lower <= column <= upper`` pruning.
-
-    A row group is pruned when its recorded ``[min, max]`` is entirely below
-    `lower` or entirely above `upper`; its rows then cannot match. A group with no
-    recorded bound for `column` is conservatively kept (cannot be pruned). The
-    returned sum over surviving groups is an upper bound on matching rows — and is
-    exactly zero iff every group was pruned, which proves the predicate empty.
-    """
-    total = 0
-    for rg in bounds:
-        cmin = rg.mins.get(column)
-        cmax = rg.maxs.get(column)
-        if lower is not None and cmax is not None and cmax < lower:
-            continue  # whole group below the lower bound
-        if upper is not None and cmin is not None and cmin > upper:
-            continue  # whole group above the upper bound
-        total += rg.num_rows
-    return total

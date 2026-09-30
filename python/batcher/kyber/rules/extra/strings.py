@@ -42,6 +42,7 @@ import dataclasses
 
 import pyarrow as pa
 
+from batcher._internal.registry import MISSING, IdentityMemo
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
@@ -133,27 +134,19 @@ def _cols_of(node: LogicalPlan) -> frozenset[str]:
     return cached
 
 
-#: `id(schema) -> (schema, utf8 column names)`. The fused chain hands each leaf the node's
-#: schema, but these leaves want the *Utf8 column set* derived from it, and deriving that is
-#: a scan of every field. Schemas are immutable and shared across a plan's nodes, so one
-#: entry per distinct schema serves every leaf and every expression. The schema is stored
-#: alongside to pin the id against reuse. (`_cols_of` memoizes the same answer on the input
-#: node, for the standalone path that still resolves the schema itself.)
-_STR_COLS_BY_SCHEMA: dict[int, tuple[object, frozenset[str]]] = {}
-_STR_COLS_MAX = 256
+#: `schema -> utf8 column names`. The fused chain hands each leaf the node's schema, but these
+#: leaves want the Utf8 column set derived from it, which is a scan of every field. Schemas are
+#: immutable and shared across a plan's nodes, so one entry per distinct schema serves every
+#: leaf. (`_cols_of` memoizes the same answer on the input node, for the standalone path.)
+_STR_COLS_BY_SCHEMA: IdentityMemo[frozenset[str]] = IdentityMemo(256)
 
 
 def _str_cols_of(schema: SchemaRef | None) -> frozenset[str]:
     if schema is None:
         return frozenset()
-    cached = _STR_COLS_BY_SCHEMA.get(id(schema))
-    if cached is not None and cached[0] is schema:
-        return cached[1]
-    found = _str_cols(schema)
-    if len(_STR_COLS_BY_SCHEMA) >= _STR_COLS_MAX:
-        _STR_COLS_BY_SCHEMA.clear()
-    _STR_COLS_BY_SCHEMA[id(schema)] = (schema, found)
-    return found
+    if (cached := _STR_COLS_BY_SCHEMA.get(schema)) is not MISSING:
+        return cached
+    return _STR_COLS_BY_SCHEMA.put(schema, _str_cols(schema))
 
 
 def _schema_leaf(leaf):

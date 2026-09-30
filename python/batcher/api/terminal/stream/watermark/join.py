@@ -27,6 +27,7 @@ from batcher.api.terminal.stream.watermark._state import (
     _stream_tracker,
 )
 from batcher.io.source import Source
+from batcher.plan.streaming.driver_stats import report_state
 
 __all__ = ["stream_stream_join"]
 
@@ -222,6 +223,10 @@ def stream_stream_join(
             # one-sided stream), so cap both after eviction.
             _check_stream_state(state["bufL"], "stream-join")
             _check_stream_state(state["bufR"], "stream-join")
+            known = [w for w in (state["wmL"], state["wmR"]) if w is not None]
+            report_state(
+                "stream_join", state["bufL"], state["bufR"], watermark=min(known, default=None)
+            )
         return out
 
     def flush() -> list[pa.RecordBatch]:
@@ -250,24 +255,17 @@ def stream_stream_join(
     it_r = iter_source(
         sources[1], right_opt.source_projections.get(0), right_opt.source_predicates.get(0)
     )
-    done_l = done_r = False
-    while not (done_l and done_r):
-        if not done_l:
-            try:
-                raw = next(it_l)
-            except StopIteration:
-                done_l = True
-            else:
-                if raw.num_rows:
-                    yield from push(raw, left_opt, left_side=True)
-        if not done_r:
-            try:
-                raw = next(it_r)
-            except StopIteration:
-                done_r = True
-            else:
-                if raw.num_rows:
-                    yield from push(raw, right_opt, left_side=False)
+    # Each side is read on its own thread and pushed as it arrives. Alternating blocking
+    # reads let an idle side hold the busy one behind its poll, so the join emitted nothing
+    # while one stream was quiet. Arrival order across the sides does not change the
+    # result: a side's rows are evicted by the *other* side's watermark, which only that
+    # side's own batches (still in their own order) advance.
+    from batcher.api.terminal.stream.multiplex import multiplex
+
+    for side, raw in multiplex([it_l, it_r]):
+        if raw.num_rows:
+            left_side = side == 0
+            yield from push(raw, left_opt if left_side else right_opt, left_side=left_side)
     if tracking:
         yield from flush()
 

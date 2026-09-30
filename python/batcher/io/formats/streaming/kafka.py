@@ -194,12 +194,11 @@ def _is_no_offset(exc: BaseException) -> bool:
 def _is_benign_record_error(err: Any) -> bool:
     """Whether a per-message error is routine back-pressure rather than a failure.
 
-    Every errored record used to be dropped on the floor. That is right for a partition-EOF
-    marker and catastrophic for anything else: an unknown topic, a failed SASL handshake, or
-    an out-of-range offset arrives as an errored record on *every* poll, so the source
-    returned an empty list forever. The query stayed "running", read nothing, reported no
-    failure, and the back-off in `BrokerSource._poll_loop` made it look idle rather than
-    broken.
+    Dropping every errored record is right for a partition-EOF marker and catastrophic for
+    anything else: an unknown topic, a failed SASL handshake, or an out-of-range offset
+    arrives as an errored record on *every* poll, so the source would return an empty list
+    forever. The query would stay "running", read nothing, report no failure, and the
+    back-off in `BrokerSource._poll_loop` would make it look idle rather than broken.
 
     Benign means partition EOF, or an error librdkafka itself marks retriable (a transient
     leader election, a broker restart) — those resolve on the next poll. Anything else is a
@@ -360,7 +359,12 @@ class KafkaSource(BrokerSource):
             "auto.offset.reset": opts.pop("auto_offset_reset", self._offset_reset),
             **{k.replace("_", "."): v for k, v in opts.items()},
         }
-        self._consumer = consumer_cls(config)
+        from batcher.io.credentials import resolve_client_secrets
+        from batcher.io.formats.streaming.broker.schema import _BROKER_SECRET_HINTS
+
+        self._consumer = consumer_cls(
+            resolve_client_secrets(config, what="kafka", hints=_BROKER_SECRET_HINTS)
+        )
         if self._partitions is not None:
             from confluent_kafka import TopicPartition
 
@@ -474,13 +478,13 @@ class KafkaSource(BrokerSource):
 
         Bounded by ``metadata_timeout`` on purpose. ``list_topics`` with no timeout blocks
         forever when the bootstrap servers are wrong or unreachable, and this runs on the
-        *driver* while planning a distributed read — so a typo in ``bootstrap_servers``
-        presented as a hung `collect()` with no error and no traceback rather than as the
-        configuration mistake it is.
+        *driver* while planning a distributed read — so without the bound a typo in
+        ``bootstrap_servers`` presents as a hung `collect()` with no error and no traceback
+        rather than as the configuration mistake it is.
 
         A missing topic is likewise reported rather than swallowed: metadata for an unknown
-        topic comes back as an entry carrying an ``error``, and indexing it used to raise a
-        bare ``KeyError`` on the topic name.
+        topic comes back as an entry carrying an ``error``, which is raised with the topic's
+        name rather than surfacing as a bare ``KeyError`` from indexing it.
         """
         if self._partitions is not None:
             return list(self._partitions)
@@ -707,9 +711,9 @@ class KafkaSource(BrokerSource):
         consumer abandons the generator mid-stream.
 
         The handle is dropped in a `finally`: a `close()` that raises (a broker already gone,
-        a group coordinator that timed out on the leave) used to leave `_consumer` set, so the
-        next `close()` — and `iter_batches` guarantees one — re-closed a dead consumer and
-        raised again, this time out of a `finally` where it masks the original error.
+        a group coordinator that timed out on the leave) must not leave `_consumer` set, or the
+        next `close()` — and `iter_batches` guarantees one — re-closes a dead consumer and
+        raises again, this time out of a `finally` where it masks the original error.
         """
         if self._consumer is not None:
             consumer, self._consumer = self._consumer, None

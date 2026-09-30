@@ -18,14 +18,16 @@ was asked for to arrive.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 
 from batcher._internal.errors import BackendError
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.config.deadline import remaining_budget
 
-__all__ = ["await_autoscale"]
+__all__ = ["await_autoscale", "resolve_transport", "verify_disk_reach"]
 
 
 def _cluster_topology() -> dict:
@@ -117,7 +119,19 @@ def _connect_or_fall_back(ray, workers: int) -> None:
         )
     # Only a *detected* address gets here: the environment hinted at a cluster that turned
     # out not to be reachable. Degrade to a local single-node Ray rather than fail a job the
-    # user never pointed at a specific cluster.
+    # user never pointed at a specific cluster — but say so at WARNING. This is the stranded
+    # case the Ray integration guide describes. The job succeeds on one machine while the
+    # cluster it was billed for sits idle, and the only other trace of it is the INFO-level
+    # attachment line.
+    from batcher._internal.logging import get_logger
+
+    get_logger("dist").warning(
+        "a managed Ray cluster was detected from the environment but did not answer within "
+        "%ss; running on a LOCAL single-node Ray instead. Set RAY_ADDRESS or "
+        "distributed.ray_address to fail rather than fall back, or raise "
+        "distributed.cluster_connect_timeout_s if the head is still starting.",
+        active_config().distributed.cluster_connect_timeout_s,
+    )
     ray.init(**_ray_init_kwargs(workers, force_local=True))
 
 
@@ -146,14 +160,14 @@ def _note_ceiling(best_cpus: int) -> None:
 def _note_gpu_ceiling(best_gpus: float) -> None:
     """Record that the autoscaler stalled at `best_gpus` devices.
 
-    **A zero is never recorded.** That is the whole reason GPU waits used to learn nothing at
-    all: a fleet whose GPU node has not registered yet reports 0 devices, and capping future
+    **A zero is never recorded, but a positive stall is.** A fleet whose GPU node has not
+    registered yet reports 0 devices, and capping future
     requests at 0 would disable the accelerator for the life of the driver on exactly the
     cluster that was about to have one. A positive stall is different evidence entirely — the
-    fleet showed its devices and stopped there — and refusing to learn from it is what made the
-    docstring's promise ("a fixed cluster pays the startup grace once, not per query") false
-    for every GPU stage: a six-device fleet asked for eight paid the full 12 s grace on *every*
-    query, forever, having already proved on the first one that the eighth device is not coming.
+    fleet showed its devices and stopped there — and refusing to learn from it would make the
+    promise "a fixed cluster pays the startup grace once, not per query" false for every GPU
+    stage: a six-device fleet asked for eight would pay the full 12 s grace on *every* query,
+    having already proved on the first one that the eighth device is not coming.
     """
     global _reachable_gpu_ceiling
     if best_gpus <= 0:
@@ -328,3 +342,83 @@ def _await_autoscale(
         elif not truncated:
             _note_gpu_ceiling(best[1])
     return avail
+
+
+def resolve_transport(transport: str, workers: int) -> str:
+    """Resolve `transport == "auto"` to a concrete shuffle transport.
+
+    Flight (Carbonite) on a genuine multi-node cluster — the disk shuffle writes to
+    a driver-local `work_dir` that worker nodes can't reach, so disk is correct only
+    on a single node or a configured shared filesystem. Explicit `"flight"`/`"disk"`
+    pass through unchanged.
+    """
+    if transport == "auto":
+        if active_config().distributed.shared_filesystem:
+            transport = "disk"
+        else:
+            from .lifecycle import _ensure_ray
+
+            _ensure_ray(workers)
+            transport = "flight" if _cluster_topology()["nodes"] > 1 else "disk"
+    if transport == "disk":
+        verify_disk_reach()
+    return transport
+
+
+#: Seconds a node has to read the disk shuffle's visibility sentinel. A node that misses it
+#: is logged rather than failed (see `shuffle_io.verify_shared_scratch`).
+_REACH_PROBE_TIMEOUT_S = 30.0
+
+
+def verify_disk_reach() -> None:
+    """Prove the disk shuffle's scratch base is the same directory on every worker node.
+
+    Only nodes other than the driver's are asked: the driver wrote the sentinel, so its own
+    node reads it by construction, and a single-node cluster therefore pays nothing. A
+    `ConfigError` from the probe propagates, since running the shuffle anyway fails later
+    and less clearly; any other failure to *run* the probe is noted and the query proceeds.
+    """
+    from batcher._internal.errors import ConfigError
+    from batcher.dist.shuffle_io import verify_shared_scratch
+
+    try:
+        import ray
+
+        if not ray.is_initialized():
+            return
+        from .scaling import _alive_nodes
+
+        here = ray.get_runtime_context().get_node_id()
+        others = [n["NodeID"] for n in _alive_nodes() if n.get("NodeID") not in (None, here)]
+        verify_shared_scratch(others, _read_on_nodes)
+    except ConfigError:
+        raise
+    except Exception as exc:  # a probe that cannot run must not fail a query
+        note_suppressed("dist", "verify the disk shuffle's shared scratch", exc)
+
+
+def _read_on_nodes(node_ids: list[str], path: str) -> dict:
+    """Run `read_visibility_token(path)` pinned to each node; `...` for a node that is silent."""
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    from batcher.dist.shuffle_io import read_visibility_token
+
+    probe = ray.remote(num_cpus=0)(read_visibility_token)
+    refs = {
+        probe.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
+        ).remote(path): node_id
+        for node_id in node_ids
+    }
+    ready, pending = ray.wait(list(refs), num_returns=len(refs), timeout=_REACH_PROBE_TIMEOUT_S)
+    out: dict = {}
+    for ref in ready:
+        try:
+            out[refs[ref]] = ray.get(ref)
+        except Exception as exc:
+            note_suppressed("dist", "read the disk shuffle sentinel on a node", exc)
+    for ref in pending:
+        with contextlib.suppress(Exception):
+            ray.cancel(ref, force=True)
+    return out

@@ -98,6 +98,7 @@ class DeltaSink:
         "_mode",
         "_partition_by",
         "_replace_where",
+        "_replaced_partitions",
         "_storage_options",
         "_table_parts",
         "_table_properties",
@@ -125,6 +126,7 @@ class DeltaSink:
         self._table_parts: dict[str, list[str]] = {}
         self._merge_predicate = merge_predicate
         self._replace_where = replace_where
+        self._replaced_partitions: list | None = None
         self._merge_schema = merge_schema
         self._storage_options = storage_options
         self._app_id = app_id
@@ -347,12 +349,16 @@ class DeltaSink:
         if already_committed(path, self._app_txn, self._storage_options):
             return
         mode, filters = self._overwrite_scope(path)
+        replaced = None
+        if mode == "replace_partitions":
+            mode, filters, replaced = "overwrite", None, self._replaced_partitions
         commit_add_actions(
             manifest,
             path,
             mode=mode,
             partition_by=self._partition_by,
             partition_filters=filters,
+            replace_partitions=replaced,
             merge_schema=self._merge_schema,
             storage_options=self._storage_options,
             app_txn=self._app_txn,
@@ -381,11 +387,21 @@ class DeltaSink:
 
         from batcher.io.formats.lakehouse.delta._predicate import to_partition_filters
 
-        filters = to_partition_filters(self._replace_where, self._partition_columns(path))
+        columns = self._partition_columns(path)
+        filters = to_partition_filters(self._replace_where, columns)
+        if filters is None:
+            from batcher.io.formats.lakehouse.delta._partition_replace import to_partition_dnf
+
+            # Several partitions (an OR of partition equalities) are replaced in one
+            # commit of explicit removals, which delta-rs's AND-only filters cannot say.
+            self._replaced_partitions = to_partition_dnf(self._replace_where, columns)
+            if self._replaced_partitions is not None:
+                return "replace_partitions", None
         if filters is None:
             raise CommitError(
                 "write(replace_where=...) on a Delta table needs a predicate over the "
-                "table's partition columns (an AND of `partition_col == value`), so the "
+                "table's partition columns (an AND of `partition_col == value`, or an OR of "
+                "those), so the "
                 "overwrite can be scoped to those partitions. Partition the table on the "
                 "columns you backfill by, or overwrite the whole table explicitly."
             )

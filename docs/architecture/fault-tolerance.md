@@ -171,7 +171,7 @@ as a bundle for a churning preemptible cluster. It raises actor restarts, task r
 and recompute attempts to ride out repeated loss, spaces the recovery backoff so a
 preemption *wave* isn't retried in a tight loop, turns on the HTTP/2 keepalive so a
 dropped peer is noticed fast, lets a stage wait briefly for the autoscaler to replace
-churned capacity, and sets `shuffle_replication` to 2. A profile applies *below* any value
+churned capacity. It leaves `shuffle_replication` at 1, for the reason under Requirements and limitations. A profile applies *below* any value
 you set explicitly, so an explicit override beats the profile, and the profile beats
 the default. A preemptible environment is auto-detected and switched to `"spot"` when
 `resilience` is left at `"default"`.
@@ -309,14 +309,32 @@ overhead.
   holds it in memory and spills to that worker's local disk under pressure. There is no
   external shuffle service, so a lost worker's buckets are gone and are recomputed unless
   replication placed a copy elsewhere.
-- `shuffle_replication` defaults to 1, meaning no replica. Only the `"spot"` profile
-  raises it, which a preemptible environment selects automatically.
+- `shuffle_replication` defaults to 1, meaning no replica, and no profile raises it. Setting
+  it above 1 is not safe yet: on worker loss it can drop that worker's share of the rows
+  instead of failing, while replication off recovers exactly. The measurements are in
+  [`tests/integration/test_shuffle_replication.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_shuffle_replication.py).
 - Draining runs only under the `"spot"` profile, so a stable cluster starts no monitor
   and pays nothing. A preemptible or time-limited environment selects that profile
   automatically, but a cluster whose signals Batcher can't see needs `BATCHER_SPOT=1`,
   an exported `BATCHER_DEADLINE_EPOCH_S`, or an explicit `resilience="spot"`.
 - The signal traps need the main thread. A worker that can't install them, which is the
-  usual case inside a Ray actor, falls back to the metadata and deadline polls.
+  usual case inside a Ray actor, falls back to the metadata and deadline polls. Those run
+  every 5 seconds (`PreemptionMonitor`'s `poll_interval_s`), each metadata probe bounded at
+  0.3 seconds, so a notice is seen within about 5 seconds plus one probe per endpoint the node
+  can answer. That fits inside the 30 seconds or more that the cloud providers give before
+  reclamation. A notice the poll never sees, because the node is gone before the next poll,
+  isn't lost work either: it degrades to the reactive recompute described above.
+- Which profile and replication factor a run got is stated where the cluster is first
+  seen. The once-per-session `attached to Ray` INFO line carries `resilience` and
+  `shuffle_replication` alongside the node count, so a preemptible site that Batcher didn't
+  recognize, still on the `"default"` budgets, is visible before anything is lost rather
+  than after.
+- Everything on this page recovers *workers*. The driver holds the plan, the stage handles
+  and the fleet's ownership, and nothing replicates them: if the driver process dies, the
+  batch query fails and its fleet actors, which the driver owns, go with it. The resumable
+  boundary for a job that must survive its driver is a streaming query with `checkpoint=`,
+  which restarts from its last committed offset, as
+  {doc}`Streaming </user-guide/moving-data/streaming/index>` describes.
 
 ## See also
 

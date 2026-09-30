@@ -21,7 +21,7 @@ fallback.
 from __future__ import annotations
 
 from batcher.kyber.pass_base import OptimizerContext
-from batcher.kyber.rules.joins.order_residual import Residual, attach_residuals
+from batcher.kyber.rules.joins.order_residual import Residual, attach_residuals, residual_refs
 from batcher.kyber.rules.joins.order_search import (
     ColRef,
     SrcRef,
@@ -30,7 +30,6 @@ from batcher.kyber.rules.joins.order_search import (
     _final_projection,
     _join_plans,
     _needed_cols,
-    _residual_refs,
 )
 from batcher.plan.logical import LogicalPlan
 
@@ -65,7 +64,7 @@ def rebuild_goo(
         or a residual that cannot be placed.
     """
     residuals = residuals or []
-    needed = _needed_cols(required, edges) | _residual_refs(residuals)
+    needed = _needed_cols(required, edges) | residual_refs(residuals)
     cost = ctx.costs()
     forest: dict[int, _Tree] = {}
     for i, leaf in enumerate(leaves):

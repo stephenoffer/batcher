@@ -6,11 +6,10 @@ GPU context) loaded **once per worker** and reused across batches. `InferencePoo
 does that — a fixed pool of workers, each built once from a factory, fed
 dynamically-sized batches and run concurrently while preserving input order.
 
-This is the control-plane orchestration twin of the native-pipeline primitives in
-the Rust `bc-udf` crate (`OpaqueOperator`/`Rebatcher`/`BatchSizeController`): the
-same dynamic-batching idea, applied here over whole Arrow batches for the
-actor-pool path. Workers receive whole `pyarrow.RecordBatch`es — never per-row
-Python — so the control plane never touches a tuple in the hot path.
+Batching is dynamic: a latency PID retunes the batch size between calls, applied
+over whole Arrow batches for the actor-pool path. Workers receive whole
+`pyarrow.RecordBatch`es — never per-row Python — so the control plane never touches
+a tuple in the hot path.
 
 Two responsibilities, two modules: `pool` is the pool and its batching/OOM/dispatch
 control, `pipelines` is the HuggingFace ``transformers`` placement and class UDF.

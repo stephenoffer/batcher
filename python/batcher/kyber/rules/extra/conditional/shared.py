@@ -200,14 +200,6 @@ def _rewrite_typed(
     return None if result is node else result
 
 
-def _is_true_lit(expr: Expr) -> bool:
-    return isinstance(expr, Lit) and expr.value is True
-
-
-def _is_false_lit(expr: Expr) -> bool:
-    return isinstance(expr, Lit) and expr.value is False
-
-
 def _is_null_lit(expr: Expr) -> bool:
     """Whether `expr` is the engine's typed-NULL idiom `NULLIF(lit(v), lit(v))` — NULL on every row
     (`v = v` holds, so NULLIF nulls it out) while carrying `v`'s type. NaN is refused: it is the one

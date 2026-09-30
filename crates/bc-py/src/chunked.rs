@@ -120,11 +120,17 @@ struct ParquetUnits<'a> {
     predicate: Option<&'a str>,
     batch_size: usize,
     units: Vec<(usize, usize)>,
+    /// Rows across every unit, from the footers `parquet_row_groups` already read.
+    rows: usize,
 }
 
 impl bc_interp::UnitSource for ParquetUnits<'_> {
     fn units(&self) -> usize {
         self.units.len()
+    }
+
+    fn rows(&self) -> Option<usize> {
+        Some(self.rows)
     }
 
     fn read(&self, unit: usize) -> Result<Vec<RecordBatch>, bc_interp::InterpError> {
@@ -198,17 +204,16 @@ pub(crate) fn execute_plan_parquet(
         bc_arrow::usable_cores().max(1)
     };
     let out = py.detach(|| {
-        let units = bc_io::parquet_row_groups(&uris)
-            .map_err(|e| bc_interp::InterpError::ChunkSource(e.to_string()))?
-            .into_iter()
-            .map(|(file, rg, _)| (file, rg))
-            .collect();
+        let groups = bc_io::parquet_row_groups(&uris)
+            .map_err(|e| bc_interp::InterpError::ChunkSource(e.to_string()))?;
+        let rows = groups.iter().map(|&(_, _, n)| n).sum();
         let src = ParquetUnits {
             uris: &uris,
             columns: columns.as_deref(),
             predicate: predicate.as_deref(),
             batch_size: batch_size.max(1),
-            units,
+            units: groups.into_iter().map(|(file, rg, _)| (file, rg)).collect(),
+            rows,
         };
         bc_interp::execute_units_metered(&plan, &sources, driving, &src, workers, budget, &opts)
     });

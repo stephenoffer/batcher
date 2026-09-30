@@ -5,25 +5,29 @@
 //! calls into `bc_spatial`. That makes the argument-order convention — quaternions
 //! scalar-last, poses translation-first — checkable in one place.
 
-use bc_spatial::{Euler, Pose, Quat, Vec3};
+use bc_spatial::{Euler, EulerSeq, Pose, Quat, Vec3};
 
 use crate::SpatialFunc;
 
 /// One row. `a` is exactly `func.arity()` long.
 ///
 /// `None` is a null result — a quaternion with no rotation in it, a matrix that is not a
-/// rotation, or a non-finite interpolation fraction. Split by argument shape rather than by function so each group reads its
+/// rotation, a non-finite interpolation fraction, or an Euler sequence code that names
+/// no sequence. Split by argument shape rather than by function so each group reads its
 /// arguments once, in the order the vocabulary documents them.
 pub(super) fn apply(func: SpatialFunc, a: &[f64]) -> Option<f64> {
     use SpatialFunc::{
-        QuatAngle, QuatAngularDistance, QuatFromEulerW, QuatFromEulerX, QuatFromEulerY,
-        QuatFromEulerZ, QuatFromRotmatW, QuatFromRotmatX, QuatFromRotmatY, QuatFromRotmatZ,
+        QuatAngle, QuatAngularDistance, QuatFromEulerSeqW, QuatFromEulerSeqX, QuatFromEulerSeqY,
+        QuatFromEulerSeqZ, QuatFromEulerW, QuatFromEulerX, QuatFromEulerY, QuatFromEulerZ,
+        QuatFromRotmatNearestW, QuatFromRotmatNearestX, QuatFromRotmatNearestY,
+        QuatFromRotmatNearestZ, QuatFromRotmatW, QuatFromRotmatX, QuatFromRotmatY, QuatFromRotmatZ,
         QuatInverseRotateX, QuatInverseRotateY, QuatInverseRotateZ, QuatInverseW, QuatInverseX,
         QuatInverseY, QuatInverseZ, QuatMultiplyW, QuatMultiplyX, QuatMultiplyY, QuatMultiplyZ,
         QuatNorm, QuatNormalizeW, QuatNormalizeX, QuatNormalizeY, QuatNormalizeZ, QuatRotateX,
-        QuatRotateY, QuatRotateZ, QuatSlerpW, QuatSlerpX, QuatSlerpY, QuatSlerpZ, QuatToPitch,
-        QuatToRoll, QuatToYaw, Se3InverseTransformX, Se3InverseTransformY, Se3InverseTransformZ,
-        Se3TransformX, Se3TransformY, Se3TransformZ,
+        QuatRotateY, QuatRotateZ, QuatSlerpW, QuatSlerpX, QuatSlerpY, QuatSlerpZ,
+        QuatToEulerSeqFirst, QuatToEulerSeqSecond, QuatToEulerSeqThird, QuatToPitch, QuatToRoll,
+        QuatToYaw, Se3InverseTransformX, Se3InverseTransformY, Se3InverseTransformZ, Se3TransformX,
+        Se3TransformY, Se3TransformZ,
     };
     match func {
         // --- roll, pitch, yaw -----------------------------------------------
@@ -110,6 +114,39 @@ pub(super) fn apply(func: SpatialFunc, a: &[f64]) -> Option<f64> {
                 QuatFromRotmatY => q.y,
                 QuatFromRotmatZ => q.z,
                 _ => q.w,
+            })
+        }
+
+        QuatFromRotmatNearestX
+        | QuatFromRotmatNearestY
+        | QuatFromRotmatNearestZ
+        | QuatFromRotmatNearestW => {
+            let m = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]];
+            let q = Quat::nearest_to_matrix(m)?;
+            Some(match func {
+                QuatFromRotmatNearestX => q.x,
+                QuatFromRotmatNearestY => q.y,
+                QuatFromRotmatNearestZ => q.z,
+                _ => q.w,
+            })
+        }
+
+        // --- any Euler sequence: the sequence code is the last argument --------
+        QuatFromEulerSeqX | QuatFromEulerSeqY | QuatFromEulerSeqZ | QuatFromEulerSeqW => {
+            let q = Quat::from_euler_seq(EulerSeq::from_code(a[3])?, [a[0], a[1], a[2]]);
+            Some(match func {
+                QuatFromEulerSeqX => q.x,
+                QuatFromEulerSeqY => q.y,
+                QuatFromEulerSeqZ => q.z,
+                _ => q.w,
+            })
+        }
+        QuatToEulerSeqFirst | QuatToEulerSeqSecond | QuatToEulerSeqThird => {
+            let angles = quat(a, 0).to_euler_seq(EulerSeq::from_code(a[4])?)?;
+            Some(match func {
+                QuatToEulerSeqFirst => angles[0],
+                QuatToEulerSeqSecond => angles[1],
+                _ => angles[2],
             })
         }
 

@@ -15,7 +15,6 @@ import pyarrow as pa
 import pytest
 
 from batcher.carbonite.transfer import ShuffleSession, ShuffleTicket
-from batcher.carbonite.transfer import server as server_mod
 from batcher.carbonite.transfer.lifecycle import host_of, process_client
 from batcher.carbonite.transfer.locality import TransferMode, locality_ratio
 
@@ -142,34 +141,6 @@ def test_the_session_clears_its_buckets_on_context_exit() -> None:
         session.publish(ShuffleTicket(9, 0, 0, 0), [_batch()])
         assert session.partition_count == 1
     assert session.partition_count == 0
-
-
-def test_the_ingress_counter_is_resettable_per_query() -> None:
-    """A process lifetime total cannot answer "how much did *this query* fetch"."""
-    server_mod.reset_bytes_fetched()
-    assert server_mod.bytes_fetched() == 0
-    server_mod._add_bytes_fetched(4096)
-    assert server_mod.bytes_fetched() == 4096
-    server_mod.reset_bytes_fetched()
-    assert server_mod.bytes_fetched() == 0
-
-
-def test_the_ingress_counter_survives_concurrent_writers() -> None:
-    server_mod.reset_bytes_fetched()
-    try:
-
-        def add() -> None:
-            for _ in range(2000):
-                server_mod._add_bytes_fetched(1)
-
-        threads = [threading.Thread(target=add) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=60)
-        assert server_mod.bytes_fetched() == 8000
-    finally:
-        server_mod.reset_bytes_fetched()
 
 
 def test_a_static_session_reports_its_credit_window() -> None:

@@ -62,7 +62,7 @@ Re-planning mid-query on measured cardinalities, plus the cross-query learned-st
 
 - {doc}`Architecture </architecture/index>`: the shape of the system these pages sit inside.
 - {doc}`Kyber </architecture/internals/kyber>`, {doc}`Carbonite </architecture/internals/carbonite>`, {doc}`the execution engine </architecture/internals/execution>`: the three subsystems, at design level.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repository, not a site page): the contracts, the control theory, the sketch error bounds, and the regret proofs.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repository, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the contracts, the control theory, the sketch error bounds, and the regret proofs.
 - {doc}`Performance </user-guide/operate/tuning/performance>` and {doc}`reading a plan </user-guide/operate/tuning/explain-plans>`: where a reader applies all of this.
 - {doc}`Benchmarks </benchmarks/index>`: the numbers these pages keep quoting.
 - {doc}`Extending the engine </architecture/internals/extending>`: what to read before you change one of these mechanisms.

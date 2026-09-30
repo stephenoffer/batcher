@@ -66,9 +66,9 @@ def _read(
 ) -> Iterator[pa.RecordBatch]:
     """Read `source` through the projection Kyber decided for this plan.
 
-    Every driver in this module used to call ``source.iter_batches(None)`` — decoding *every*
-    column of every message regardless of what the plan touched, while `_iter_streaming` on
-    the neighbouring path already read through the pushdown. On a wide topic that is the
+    Reading through ``source.iter_batches(None)`` would decode *every* column of every message
+    regardless of what the plan touched, as `_iter_streaming` on the neighbouring path also
+    avoids. On a wide topic that is the
     dominant cost of a streaming aggregate: a `group_by("user").sum("cents")` over a
     forty-column event decoded thirty-eight columns it then discarded, per micro-batch,
     forever.
@@ -169,7 +169,35 @@ class StreamingTail:
         """
         if not self._nodes:
             return result
+        return one_batch([b for b in self._run(result) if b.num_rows])
+
+    def apply_snapshot(self, result: pa.RecordBatch) -> pa.RecordBatch:
+        """Run the tail over a whole-result snapshot, keeping an emptied one as a typed batch.
+
+        A `complete`-mode sink replaces its contents with each snapshot, so a HAVING filter
+        that leaves no rows is itself the answer and must still be written. `apply` answers
+        None there, and the emission was dropped. The sink then kept the previous snapshot's
+        rows, which `collect()` over the same input does not return.
+
+        Args:
+            result: The fold's current snapshot.
+
+        Returns:
+            The transformed snapshot, possibly with zero rows, typed as the tail's output.
+        """
+        if not self._nodes:
+            return result
+        out = self._run(result)
+        merged = one_batch([b for b in out if b.num_rows])
+        if merged is not None:
+            return merged
+        if out:
+            return out[0].slice(0, 0)
+        schema = rebuild_over_scan(self._nodes, result.schema).available_schema().arrow
+        return pa.RecordBatch.from_pylist([], schema=schema)
+
+    def _run(self, result: pa.RecordBatch) -> list[pa.RecordBatch]:
+        """The engine's output for the tail over `result`, empty batches included."""
         if self._ir is None:
             self._ir = json.dumps(rebuild_over_scan(self._nodes, result.schema).to_ir())
-        out = engine().execute_plan(self._ir, [[result]], self._cfg)
-        return one_batch([b for b in out if b.num_rows])
+        return engine().execute_plan(self._ir, [[result]], self._cfg)

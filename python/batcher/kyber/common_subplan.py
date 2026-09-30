@@ -258,7 +258,7 @@ def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appear
         # 0.094 and was refused -- where the true savings are half the plan and 8/9 of it.
         share = model.cost(node).total() * appearances / total
         return share * (appearances - 1) / appearances >= _MIN_SAVED_SHARE
-    except Exception as exc:  # pragma: no cover - a cost failure must not break planning
+    except Exception as exc:  # a cost failure must not break planning
         note_suppressed("kyber", "cost a common-subplan candidate", exc)
         return False
 

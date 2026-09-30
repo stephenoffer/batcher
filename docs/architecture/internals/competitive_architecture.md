@@ -632,10 +632,12 @@ then "exactly one caller"; both are out of date):
   exactly the small clusters it was testable on. The regeneration is now skipped when a copy
   survives on a live peer (at most once per source, so an unreachable replica still falls
   through to a recompute rather than exhausting the attempt budget).
-- `DistributedConfig.shuffle_replication` still defaults to **1**, rising to 2 under the
-  `spot` resilience profile — an on-demand cluster pays no copy.
+- `DistributedConfig.shuffle_replication` defaults to **1**, and no profile raises it any
+  more: above 1, a worker loss can drop that worker's share of the rows rather than fail
+  (`tests/integration/test_shuffle_replication.py`, reproduced on a 3-node cluster
+  2026-09-23), while replication off recovers exactly. The `spot` profile used to set 2.
 
-So on a spot cluster you now get re-fetch recovery for every shuffle. What is still missing
+So re-fetch recovery exists but is not safe to turn on; a spot cluster recomputes. What is still missing
 is the rest of the durability half: there is no external shuffle service, so a bucket cannot
 outlive its worker except by replication, and inside the combiner tree only the leaf partials
 are copied — an interior combiner's output lives on one node, so a loss there still costs a
@@ -1178,9 +1180,12 @@ These are asserted in the repo and contradicted by its own code.
    Same mechanism, same granularity as AQE. It is also **off below a size floor**
    (`_ADAPTIVE_MIN_ROWS_PER_STAGE`, 5M input rows for each pipeline breaker the loop would
    cut at — about 10M for the simplest joined shape), so most queries never touch it.
-   *Defensible replacement:* "stage-boundary re-optimization like Spark AQE, but available
-   single-node too, **plus** a sketch-backed cross-query learned-stats and bandit loop that
-   neither DuckDB nor Spark has." That is true, and still interesting.
+   *Defensible replacement:* "stage-boundary re-optimization like Spark AQE, **plus** a
+   sketch-backed cross-query learned-stats and bandit loop that neither DuckDB nor Spark has."
+   An earlier version said "but available single-node too", which does not separate the two:
+   AQE is on by default since Spark 3.2 and re-plans at shuffle-exchange stages in `local[*]`
+   mode as well. What single-node adds for Batcher is that the loop runs in-process, not in a
+   JVM beside it.
 2. **`BENCHMARK_RESULTS.md`: "beats DuckDB's execution engine on every TPC-H query" (21/21).**
    True only against `duckdb_arrow` — DuckDB forced through an Arrow scan, which strips its zone
    maps, compression *and* dictionary encoding, and the scan cost lands inside the timed region.

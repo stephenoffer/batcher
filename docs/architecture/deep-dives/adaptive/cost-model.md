@@ -26,18 +26,32 @@ class Cost:
 ```
 
 :::{important}
-`mem` is deliberately absent from the scalar. It is a *peak*, not a throughput cost, so it gates
-feasibility rather than speed. The question it answers is whether Carbonite can admit this plan.
-When costs compose up the tree, `cpu`, `io`, and `net` **sum** over children while `mem`
-accumulates as a **max**. Breakers run at different times, so peak memory is the tallest one
-rather than the total.
+`mem` is deliberately absent from the scalar. It is a *peak*, not a throughput cost, so it can't
+be added to one. When costs compose up the tree, `cpu`, `io`, and `net` **sum** over children
+while `mem` accumulates as a **max**, the tallest single operator.
 :::
+
+That max is a floor on the real peak, not the peak, and it isn't what admission reads. Two
+breakers can be resident at once: a hash join's build table stays in memory for as long as its
+probe subtree runs, so a bushy plan holds several tables together. Carbonite sizes a plan's
+envelope from the per-operator state `annotate_ops` records and walks the tree as a schedule
+(`carbonite/memory/estimator.py::_peak`):
+
+```text
+peak(join)  = max(peak(build), resident(join) + peak(probe))
+peak(unary) = max(peak(input), resident(node))
+```
+
+On a four-way bushy join with hash tables of 18.2, 9.1 and 9.1 MB, the tallest operator is
+18.2 MB and the concurrent peak is 27.4 MB. The
+{doc}`buffer pool </architecture/deep-dives/memory/buffer-pool>` page covers the envelope that
+figure is admitted against.
 
 ```text
               join            cpu = own + Σ children.cpu
              /    \           io  = own + Σ children.io
          scan      aggregate  net = own + Σ children.net
-                       │      mem = max(own, max over children)   ← a PEAK
+                       │      mem = max(own, max over children)   ← tallest operator
                      scan
                               total(w) = w.cpu·cpu + w.io·io + w.net·net
                                          mem is not in the scalar at all
@@ -54,7 +68,7 @@ net: float = 2.0  # a shuffled byte costs twice a local one
 
 What feeds that fold, and what comes out of it:
 
-![What the cost model consumes and what it emits. Four inputs feed one fold over the plan tree in CostModel.cost(node): estimated rows per node from the estimator, a type-exact row width rather than a flat 64 bytes, machine terms such as L3 cache size, memory budget and spill device, and coefficients that ship as constants and are then calibrated from measured runs. It emits four axes, three of which enter the scalar. cpu, io and net combine as 1.0 times cpu plus 1.0 times io plus 2.0 times net, and that one comparable number ranks the alternatives: join order, join strategy, whether to spill. mem is the peak working set, a max along the tree and never summed, so it gates feasibility rather than throughput, because a peak is not a quantity you can add up.](/_static/diagrams/cost_model_inputs.svg)
+![What the cost model consumes and what it emits. Four inputs feed one fold over the plan tree in CostModel.cost(node): estimated rows per node from the estimator, a type-exact row width rather than a flat 64 bytes, machine terms such as L3 cache size, memory budget and spill device, and coefficients that ship as constants and are then calibrated from measured runs. It emits four axes, three of which enter the scalar. cpu, io and net combine as 1.0 times cpu plus 1.0 times io plus 2.0 times net, and that one comparable number ranks the alternatives: join order, join strategy, whether to spill. mem is the tallest single operator's state, a max along the tree and never summed. It is a floor on the peak rather than the peak, it ranks nothing, and Carbonite admits a plan on its own walk of the concurrent peak instead.](/_static/diagrams/cost_model_inputs.svg)
 
 ## Per-operator formulas
 
@@ -339,11 +353,9 @@ costs. Using the full recursive `cost()` would re-walk and double-count children
 deep subtrees super-linearly.
 
 :::{note}
-`optimizer.join_dp_max_tables` (12) and `greedy_max_tables` (25) are declared and validated,
-but the rule does not read them, so setting either changes nothing. They predate the search
-budget above, which answers the question they were meant to answer and answers it per query
-rather than per session. Greedy also has no upper leaf bound, so there is no table count above
-which reordering stops.
+No config option caps the join search by table count. The search budget above answers that
+question per query rather than per session. Greedy also has no upper leaf bound, so there is no
+table count above which reordering stops.
 :::
 
 ## Limits
@@ -403,7 +415,7 @@ for it to save. It keeps firing wherever the outer aggregate groups.
 
 - {doc}`Architecture </architecture/index>`: Kyber decides, and the cost model is how.
 - {doc}`Kyber optimizer </architecture/internals/kyber>`: the phases these costs run in.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the shrinkage estimator and its fixed point.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the shrinkage estimator and its fixed point.
 - {doc}`Configuration options </configuration/options>`: `optimizer.cost_coeffs` and `cost_weights`.
 - {doc}`Reading a plan </user-guide/operate/tuning/explain-plans>`: the decisions block these numbers produce.
 - {doc}`TPC-H benchmarks </benchmarks/results/tpch>`: the join-order shapes the DP is for.

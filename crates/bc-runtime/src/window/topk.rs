@@ -13,22 +13,22 @@
 //!
 //! ## Where it is applied, which is the whole difference
 //!
-//! **Inside [`super::window_serial`], which already runs once per hash bucket.** A first version
-//! hooked it above `window_with` instead — at the top, over the whole batch — and that traded
-//! the operator's parallelism for the better complexity: `O(n log k)` on one core against
+//! **Inside [`super::window_serial`], which already runs once per hash bucket.** Hooking it above
+//! `window_with` instead — at the top, over the whole batch — trades the operator's parallelism
+//! for the better complexity: `O(n log k)` on one core against
 //! `O(n log n)` on ninety-six, measured at **0.24-0.50x**, i.e. two to four times *slower*.
 //! `window_with` hash-partitions rows so equal partition keys co-locate and then runs the serial
 //! kernel per bucket across rayon; applied here the bounded selection inherits that instead of
 //! replacing it, and each worker heaps only the partitions it owns.
 //!
-//! **And the mirror-image idea does not work either, measured 2026-09-11.** If the selection
+//! **And the mirror-image idea does not pay either.** If the selection
 //! ran *above* `window_with` but **in parallel** — one `groups x k` heap per worker over a
 //! contiguous row range, merged by taking the best `k` of the `threads` candidates per partition
 //! — it would keep the cores *and* skip the bucketing entirely, which `perf` says is 66% of the
 //! H2O `groupby` suite's `q8` (`scatter_blocked` 19.5%, two `arrow::take` gathers 23.3%,
 //! `memmove` 11.1%, `bucket_of_each_row` 9.0%, `partition_row_indices` 3.8%, against 9.4% in
-//! this kernel). A heap is mergeable, so the answer is exact; it was built, held to the serial
-//! form entry-for-entry at every worker count, and **it is slower**: q8 105.4 -> 141.0 ms.
+//! this kernel). A heap is mergeable, so the answer is exact, and held to the serial form
+//! entry-for-entry at every worker count **it is slower**: q8 105.4 -> 141.0 ms.
 //!
 //! The reason is the thing the profile makes look like waste. **Bucketing buys a heap that fits
 //! cache.** Per bucket the heap is `groups / threads` regions — 70 KB at q8's shape, L2-resident

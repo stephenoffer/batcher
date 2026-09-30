@@ -26,7 +26,7 @@ From [`crates/bc-codegen/src/analyze.rs`](https://github.com/stephenoffer/batche
 | `Binary` | `Add`/`Sub`/`Mul`/`Div`/`Mod`, the six comparisons, `And`/`Or` over boolean sub-results | integer `Div`/`Mod` only against a constant divisor (below) |
 | `Not` | of a boolean sub-result | |
 | `Case` | over the numeric subset | lowered to a `select` chain in the interpreter's reverse-fold order, so the first matching `WHEN` wins |
-| `Cast` | exact numeric (`i64 → f64`, or a no-op) | |
+| `Cast` | `i64 → f64`, or a no-op | a *rounding* conversion, not an exact one: an integer beyond 2^53 lands on the nearest representable double. It rounds exactly as the interpreter's Arrow cast does, so the two tiers stay bit-identical |
 | `Math`, `Math2` | value-only math over the numeric subset | libm calls, so the SIMD body excludes them |
 | `IsNan`, `IsInf` | over a `Float64` operand | any other operand type declines |
 | everything else | no | strings, date functions, lists, structs, `IsNull`, `Coalesce`, media decode → `CodegenError::Unsupported`, and the caller uses `Expr::eval` |
@@ -60,7 +60,7 @@ garbage at null slots. Three cases, decided per batch in `CompiledExpr::eval`:
    the inputs' validity bitmaps together and apply the combined mask to the result. This is
    correct exactly when the SQL result is null *iff* an input is null, and when no operation
    can trap on the garbage at a masked-out slot: `Col`, `Lit`, `Add`/`Sub`/`Mul`, the
-   comparisons, value-only math, exact casts, `Not`, and the constant-divisor `Div`/`Mod`
+   comparisons, value-only math, the numeric casts, `Not`, and the constant-divisor `Div`/`Mod`
    above. The predicate is `kleene::is_null_propagating`.
 1. **Nulls, and the expression is a compound predicate** (`And`/`Or` somewhere). The
    combined-mask trick is *wrong* here: `false AND null` is `false`, not null. So a second
@@ -106,7 +106,7 @@ Those two refusals leave the compiled path at different heights because they cos
 
 The scalar loop is the baseline. [`crates/bc-codegen/src/simd.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/simd.rs) emits a vector body when
 every node is in the vectorizable subset: numeric leaves, integer `+`/`-`/`*` and float
-`+`/`-`/`*`/`/`, the comparisons (the big filter win), `Not`, and exact numeric casts.
+`+`/`-`/`*`/`/`, the comparisons (the big filter win), `Not`, and the numeric casts.
 
 Width comes from the host at compile time via `bc_arrow::HardwareProfile`: 2 f64 lanes on SSE2 and NEON, 4 on AVX2, and 8 on AVX-512. Detection caps the automatic choice at 4 even on an AVX-512 host, because 512-bit code can down-clock the core, so the 8-lane width is opt-in. Cranelift legalizes a wider IR vector into native instructions where the ISA has them and splits it into 128-bit ops otherwise. A width that doesn't lower natively is at worst a no-op, never a wrong answer. A scalar remainder loop handles the rows past the last full step.
 
@@ -162,8 +162,11 @@ is `Send + Sync`). Compiling per morsel would lose to the interpreter outright.
 
 ## Using it
 
-There is no user-facing switch and no way to observe which tier ran, by design: the result
-is identical either way. What you can observe is the shape that compiles:
+There is no user-facing switch, by design: the result is identical either way. You can observe which tier ran, though. {py:meth}`Dataset.stats() <batcher.Dataset.stats>` reports a `BACKEND` column per operator, and each `op.backend` on the returned run reads `interp`, `jit`, or `interp+jit` when some of an operator's expressions compiled and others fell back. The process-wide `backends` counter in {doc}`/user-guide/operate/running/metrics` tallies the same tags across queries.
+
+Expect `interp` on filters and projections in most queries. The engine's default streaming executor keeps `Filter` and `Project` on the interpreter by a measured choice, recorded at the `Filter` arm in [`crates/bc-interp/src/stream/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/stream/mod.rs): wiring the JIT into that path measured 1.01x over TPC-H, with five queries slower, because Arrow's comparison kernels are already SIMD. On that path the JIT compiles aggregate group keys and inputs, and the materializing parallel executor (`par.rs`) compiles filters and projections too. The `backend` tag records what actually compiled, so it is the thing to read rather than this table.
+
+The shape that compiles:
 
 ```python
 import batcher as bt
@@ -207,7 +210,7 @@ disagrees with the oracle.
 
 - {doc}`Architecture </architecture/index>`: where a second execution tier is allowed to live.
 - {doc}`Execution engine </architecture/internals/execution>`: the tiering contract at the architecture level.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the parity argument, stated formally.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the parity argument, stated formally.
 - {doc}`Performance </user-guide/operate/tuning/performance>`: writing predicates that land on this tier.
 - {doc}`Analytics benchmarks </benchmarks/results/analytics>`: the operator benchmarks on numeric filter and projection shapes.
 - {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: the Tier-0 oracle it must match.

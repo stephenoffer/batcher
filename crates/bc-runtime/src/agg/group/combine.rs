@@ -116,6 +116,35 @@ fn gather(
             DataType::Date32 => arrow::datatypes::Date32Type,
             DataType::Date64 => arrow::datatypes::Date64Type,
         }
+        // A decimal state -- an integer `AVG`'s 128-bit sum, a `DECIMAL` `SUM` -- is a
+        // primitive too; only its precision and scale ride on the type, so they are put back.
+        if let Some(dt @ DataType::Decimal128(..)) = cols.first().map(|c| c.data_type()) {
+            let out = gather_primitive::<arrow::datatypes::Decimal128Type>(cols, part_of, row_of);
+            let out = out
+                .as_primitive::<arrow::datatypes::Decimal128Type>()
+                .clone();
+            return Ok(std::sync::Arc::new(out.with_data_type(dt.clone())));
+        }
+        // An integer `SUM`'s marked state (`agg::int_sum`) is a validity-free one-field
+        // struct over that decimal: gather the child and re-wrap it, rather than send the
+        // most common aggregate's state through `interleave`.
+        if crate::agg::int_sum::is_state(cols[0].data_type())
+            && cols.iter().all(|c| c.nulls().is_none())
+        {
+            let children: Vec<&dyn Array> = cols
+                .iter()
+                .map(|c| c.as_struct().column(0).as_ref())
+                .collect();
+            let child = gather(&children, part_of, row_of, pairs)?;
+            let DataType::Struct(fields) = cols[0].data_type() else {
+                unreachable!("is_state matched a struct")
+            };
+            return Ok(std::sync::Arc::new(arrow::array::StructArray::new(
+                fields.clone(),
+                vec![child],
+                None,
+            )));
+        }
     }
     // A string key is the *other* common high-cardinality group key, and arrow's `interleave`
     // costs it what it costs any variable-width column: `MutableArrayData::extend` per row,
@@ -323,8 +352,16 @@ pub(crate) fn combine_radix_parts(
 /// high-cardinality group-by concatenates a string key column here twice (the partials in,
 /// the partitions out) and arrow's per-row path made those two copies the dominant cost of
 /// the whole combine.
+///
+/// An integer `SUM`'s pieces may differ in form -- one radix partition's merge overflowed an
+/// `i64` and went 128-bit, its neighbour's did not -- so they are unified first
+/// (`agg::int_sum::unify`); a no-op unless the forms are actually mixed.
 fn concat_col<'a>(arrs: impl Iterator<Item = &'a ArrayRef>) -> Result<ArrayRef, RuntimeError> {
     let owned: Vec<&dyn Array> = arrs.map(|a| a.as_ref()).collect();
+    if let Some(wide) = crate::agg::int_sum::unify(&owned)? {
+        let wide: Vec<&dyn Array> = wide.iter().map(|a| a.as_ref()).collect();
+        return crate::gather::concat_columns(&wide);
+    }
     crate::gather::concat_columns(&owned)
 }
 /// Merge already-partial state columns into one group via the function's
@@ -338,6 +375,16 @@ pub(crate) fn merge_state(
     num_groups: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
     Ok(match func {
+        // An integer `SUM`'s exact 128-bit state adds as `i128` and keeps its marker, so no
+        // partial is narrowed before the true total is known (`agg::int_sum`).
+        AggFunc::Sum if crate::agg::int_sum::is_state(state[0].data_type()) => {
+            vec![crate::agg::int_sum::merge(&state[0], group_ids, num_groups)?]
+        }
+        // Bare `Int64` totals add in `i64` and promote to the marked state, never raise, when
+        // two fitting partials overflow together: the next merge may bring them back.
+        AggFunc::Sum if state[0].data_type() == &arrow::datatypes::DataType::Int64 => {
+            vec![crate::agg::int_sum::state(&state[0], group_ids, num_groups)?]
+        }
         AggFunc::CountStar | AggFunc::Count | AggFunc::Sum => {
             accumulate(AggFunc::Sum, Some(&state[0]), group_ids, num_groups)?
         }

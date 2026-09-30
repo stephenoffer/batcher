@@ -22,22 +22,13 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Builder, ListBuilder, StringArray};
 
 use crate::{ExprError, StrFunc};
+use bc_arrow::hash::mix64;
 
 /// The Mersenne prime 2^61 - 1: permutations are affine maps modulo this, which admits
 /// the fold-and-subtract reduction below instead of a 128-bit division per shingle.
 const MERSENNE_61: u64 = (1 << 61) - 1;
 /// Signature values live in `[0, 2^32)` so they are exact as `f64` (see module docs).
 const MAX_HASH: u64 = (1 << 32) - 1;
-
-/// SplitMix64's finalizer — derives the permutation coefficients deterministically.
-fn mix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
 
 /// FNV-1a over the shingle's bytes, folded into 32 bits.
 fn shingle_hash(bytes: &[u8]) -> u64 {

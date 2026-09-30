@@ -50,7 +50,7 @@ print(ds.schema)
 
 The widening is value-preserving, since `Int32` fits in `Int64` and `Float32` in `Float64`. A `UInt64` value above the `Int64` maximum is the one case that does not fit, and it raises at the boundary rather than wrapping. The widening happens on the way in, so {py:obj}`ds.schema <batcher.Dataset.schema>` tells you the truth without executing anything.
 
-Two consequences follow. An `Int32` overflow that would have wrapped in another engine does not wrap here, because the arithmetic runs in 64 bits. A `Float32` sum accumulates in double precision, so it differs slightly from a `Float32` engine's answer, and it is the more accurate of the two.
+Two consequences follow. An `Int32` overflow that would have wrapped in another engine does not wrap here, because the arithmetic runs in 64 bits. A `Float32` sum accumulates in double precision, so it differs slightly from a `Float32` engine's answer. The wider accumulator usually carries less rounding error, but it is a different answer rather than a guaranteed better one: it does not match a reference computed in `Float32`, and the summation order still moves the last bits.
 
 Widening moves the overflow boundary. It does not remove it. Scalar integer arithmetic *wraps* at the edge of `Int64`, silently, the way Rust and Polars do:
 
@@ -64,10 +64,12 @@ That is deliberate rather than an oversight. The Cranelift JIT compiles `+` to a
 Reductions do not inherit the convention, because nothing forces them to match a compiled kernel. `sum` over an `Int64` column raises rather than wrapping, and `cum_prod` returns `Float64` for an integer input for the same reason:
 
 ```python
+past_max = bt.from_pydict({"x": [2**63 - 1, 1]})
 try:
-    big.agg(total=bt.col("x").sum()).to_pydict()
-except Exception as exc:
+    past_max.agg(total=bt.col("x").sum()).to_pydict()
+except bt.ExecutionError as exc:
     print(type(exc).__name__)
+# ExecutionError
 ```
 
 Whether it raises depends on the total, not on the order the rows arrive in. A column whose large values cancel sums cleanly, even though adding them left to right passes outside `Int64` on the way:
@@ -79,7 +81,7 @@ print(cancels.agg(total=bt.col("x").sum()).to_pydict()["total"])
 
 That distinction matters more than it looks. How a table is split into batches, and across how many machines, is a scheduling decision. If a running total decided the outcome, the same query would succeed on one node and fail across several, on identical data.
 
-One limit remains, and it is worth knowing before you rely on the guarantee. Each partition is summed into its own `Int64` before the partitions are merged, so a partition whose *own* total exceeds `Int64` still raises, even when the totals across partitions would cancel. Row order inside a partition never decides anything. How the rows are divided between partitions still can, in that one case.
+The guarantee holds across partitions too. Each partition carries its exact total until the partitions are merged, switching to a 128-bit integer only when that total does not fit `Int64`, and only the final answer is checked against `Int64`. A partition whose *own* total passes outside `Int64` therefore sums cleanly when another partition brings the total back. The query raises exactly when the true total does not fit, whether the rows are summed in one pass, in parallel, spilled to disk, or across machines. The result type is `Int64` in every case.
 
 So the rule to carry is that an integer *expression* can wrap and an integer *aggregate* cannot. If a column's values approach `2**63` and the arithmetic matters, cast before computing. Use `Float64` for magnitude and `decimal(38, s)` when the digits have to be exact.
 

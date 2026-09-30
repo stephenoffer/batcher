@@ -28,6 +28,8 @@ object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 futures = "0.3"
 bytes = "1"
+# Zero-copy local reads: a column chunk is a view of the file's mapping (see `mapped`).
+memmap2 = "0.9"
 url = "2"
 thiserror = { workspace = true }
 # Parse the pushed predicate handed over the FFI boundary (a compact JSON the Python

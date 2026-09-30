@@ -24,6 +24,7 @@ use parquet::file::metadata::ParquetMetaData;
 mod avro;
 mod bloom;
 mod footer_stats;
+mod mapped;
 mod page_index;
 mod predicate;
 mod projection;
@@ -55,6 +56,7 @@ pub use footer_stats::{
     parquet_file_manifest, parquet_footer_stats, ColumnFooterStats, FooterStats,
 };
 pub use row_groups::{parquet_row_groups, read_parquet_row_group};
+pub use split_read::block_cache::{stats as object_cache_stats, CacheStats};
 
 /// How many row-groups to fetch+decode concurrently. The single-stream reader processes
 /// row-groups one at a time, so a worker reading a many-row-group file waited on each
@@ -582,13 +584,20 @@ pub(crate) async fn read_parquet_inner(
     let store = resolved.store;
     let loc = resolved.path;
     let remote = resolved.remote;
+    let local = resolved.local;
     let batch_size = batch_size.max(1);
     let per_rg = targets.into_iter().map(|rg| {
         // Over the network a row group's contiguous column chunks coalesce into one enormous
         // GET, which one connection then serves at a fraction of the link — see `split_read`.
         // Local reads keep the plain reader: the page cache has no such limit.
         let base = split_read::object_reader(&store, &loc, size);
-        let reader = split_read::maybe_split(base, &store, &loc, remote);
+        let reader = split_read::maybe_split(
+            base,
+            &store,
+            &loc,
+            remote.then_some((uri, size)),
+            local.as_deref().map(|p| (p, size)),
+        );
         let amd = arrow_meta.clone();
         let proj = projection.clone();
         // Page-level pruning *within* a surviving row group. Computed here, on the metadata

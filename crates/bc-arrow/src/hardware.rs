@@ -6,9 +6,9 @@
 //! detected **locally on each worker**, never shipped in `EngineConfig`: a profile
 //! baked into the driver's config would be wrong on a heterogeneous worker, and
 //! single-node == distributed depends on the shipped config being host-independent.
-//! `EngineConfig` carries only host-independent *policy overrides* (force a width,
-//! disable SIMD, opt into AVX-512 width), which [`HardwareProfile::resolved`] layers
-//! on top of detection.
+//! A [`SimdOverride`] (force a width, disable SIMD, opt into AVX-512 width) is layered on
+//! top of detection by [`HardwareProfile::resolved`]; it is not an `EngineConfig` field,
+//! so production always compiles with the default and only the tests pin it.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -18,8 +18,8 @@ use std::time::Instant;
 ///
 /// The `simd_lanes_f64` / `simd_unroll` fields are the *resolved* plan: detection
 /// caps the auto-selected f64 lane count at AVX2-equivalent (4) even on AVX-512
-/// hosts, because 512-bit code can down-clock the core — AVX-512 width is opt-in via
-/// the [`SimdOverride`]. The unroll factor defaults to 1 (the historical single
+/// hosts, because 512-bit code can down-clock the core — AVX-512 width is reachable only
+/// through an explicit [`SimdOverride`]. The unroll factor defaults to 1 (the historical single
 /// vector chain); widening it trades code size for instruction-level parallelism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HardwareProfile {
@@ -34,8 +34,12 @@ pub struct HardwareProfile {
     pub logical_cores: usize,
 }
 
-/// A host-independent policy override for the SIMD plan, carried in `EngineConfig`
-/// and applied by [`HardwareProfile::resolved`]. All-default means "use detection".
+/// A host-independent policy override for the SIMD plan, applied by
+/// [`HardwareProfile::resolved`]. All-default means "use detection".
+///
+/// Not user-configurable: no `EngineConfig` field carries it, and the engine's operators
+/// always pass the default. It exists so the codegen parity tests can prove every width
+/// computes the same result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SimdOverride {
     /// Force the f64 lane count (`0` = auto/detected). Set to 2/4/8 to pin a width

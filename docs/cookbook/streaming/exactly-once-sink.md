@@ -78,7 +78,7 @@ File sinks (`ds.write(path, format="parquet")`) write one file per micro-batch, 
 
 Delta (`ds.write.delta(uri)`) commits each micro-batch as one transaction carrying a `txn` action of `(app_id, batch_id)`, and checks the log for that pair before it writes anything. A replayed batch finds its own transaction already recorded, writes no file, and commits nothing. Idempotence **by transaction id**, which is strictly stronger: the log ends up with exactly one commit per micro-batch no matter how often it was retried.
 
-`app_id` is the `query_name` you passed, or a value derived from the destination table. It must be stable across restarts, or the check will never find the previous run's commits. Name your queries.
+With a checkpoint, `app_id` is the `query_name` you passed, or an id Batcher creates on the first run and stores in the checkpoint. Either way a restart on the same checkpoint finds the previous run's commits, and a query on a different checkpoint can't mistake them for its own. Without a checkpoint the id is unique to the run, because the batch counter starts again at 0 and there's nothing earlier to be idempotent against. A named query must be the only query using that name on the table.
 
 `for_each_batch`, `for_each`, `console` and `memory` dedup nothing at all. `for_each_batch` does receive the `batch_id`, which is the hook. It is the same id on a replay, so you can use it as the idempotency key of your own upsert (a `MERGE` keyed on batch id, a Redis `SETNX`, whatever your target supports). The engine hands you the identifier and steps back; the guarantee is then yours to implement.
 

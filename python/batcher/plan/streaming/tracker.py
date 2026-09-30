@@ -231,11 +231,6 @@ class WatermarkTracker:
         self._refresh()
         return self._wm
 
-    @property
-    def partitions_tracked(self) -> int:
-        """How many partitions have delivered at least one row with an event time."""
-        return len(self._maxima)
-
     # --- checkpointing ----------------------------------------------------
     def to_json(self) -> str:
         """The tracker's durable state — per-partition maxima and the frontier reached.

@@ -85,8 +85,9 @@ return a wrong answer. There staging is a correctness requirement rather than an
 optimization.
 
 A query that clears the gate gets stage-boundary re-optimization, the same mechanism and
-granularity as Spark AQE. Two things about it reach further than AQE: it runs single-node
-as well as distributed, and what it measured is recorded to the `MetadataHub` and read by
+granularity as Spark AQE. AQE also runs on a single machine in local mode. Two things about
+Batcher's loop differ: it runs inside the Python process rather than in a JVM beside it, and
+what it measured is recorded to the `MetadataHub` and read by
 the next run. See {doc}`/architecture/internals/kyber` for that
 cross-query half.
 

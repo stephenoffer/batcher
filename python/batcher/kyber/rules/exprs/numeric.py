@@ -28,6 +28,7 @@ from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.exprs.guards import is_float, is_integer, nullable, schema_rule
 from batcher.kyber.rules.leaf_rewrite import node_expr_rule, rewrite_node, safe_expr
+from batcher.kyber.rules.literals import in_int64
 from batcher.plan.expr_ir import Expr, Lit
 from batcher.plan.expr_ir.core import Binary, IsInf, IsNan, Math2Expr, MathExpr, int_literal
 from batcher.plan.expr_rewrite import expr_key
@@ -450,7 +451,7 @@ def _fold_shift_impl(expr: Expr, op: str) -> Expr:
         left, right = int_literal(expr.left), int_literal(expr.right)
         if left is not None and right is not None and 0 <= right < 64:
             value = left << right if op == "shl" else left >> right
-            if -(2**63) <= value < 2**63:
+            if in_int64(value):
                 return Lit(value)
     return expr
 

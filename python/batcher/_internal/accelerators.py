@@ -532,7 +532,7 @@ def _nvml_inventory() -> list[dict[str, object]]:
             return out
         finally:
             pynvml.nvmlShutdown()
-    except Exception:  # pragma: no cover - NVML absent or no NVIDIA driver
+    except Exception:  # NVML absent or no NVIDIA driver
         return []
 
 

@@ -32,6 +32,7 @@ from batcher.dist.executors.partition_io import consumer_pushdown, partition_des
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     gather_in_windows,
+    kill_workers,
     map_barrier,
     map_partitions,
     release_placement,
@@ -196,8 +197,7 @@ def execute_aggregate_flight(
         placement = SourcePlacement(workers)
 
         if _fault_inject_map:  # test hook: kill before the barrier, so nothing publishes
-            for i in _fault_inject_map:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject_map)
 
         # MAP barrier: every mapper publishes ALL its buckets on its own Flight server,
         # under worker-loss recovery. A spot preemption *here* — the map phase reads the
@@ -239,14 +239,15 @@ def execute_aggregate_flight(
         # Placed HERE, as soon as the buckets exist and before anything can take a worker
         # away — replicating after a loss would be probing a corpse. `None` (the default
         # factor of 1) leaves the reduce byte-identical to the unreplicated path.
-        replicas = replicate_shuffle_output(actors, addrs, n_reducers, workers, dead)
+        replicas = replicate_shuffle_output(
+            actors, addrs, n_reducers, workers, dead, stages=(stage_base,)
+        )
 
         # Simulate worker loss after the map barrier (test hook): the killed workers'
         # published buckets vanish, so the reduce must recompute them — or, with
         # replication on, re-fetch them from the survivor holding the copy.
         if _fault_inject:
-            for i in _fault_inject:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject)
 
         # A wide shuffle (more upstreams than the fan-in bound) reduces through a
         # combiner tree so no node fans in more than `fan_in` streams; a small one
@@ -269,9 +270,9 @@ def execute_aggregate_flight(
         # `on_actors`: keep the result on the workers — each reducer publishes its bucket
         # and the driver gets only handles, so the next adaptive stage reads the intermediate
         # in place. Otherwise the reducers return their batches. Decided once, for **both**
-        # reduce shapes: it used to be asked only inside the flat branch, so a fleet wider
-        # than `fan_in` — which is every fleet past 8 workers — collected its whole aggregate
-        # through the driver however large the result was.
+        # reduce shapes: asked only inside the flat branch, a fleet wider than `fan_in` —
+        # every fleet past 8 workers — would collect its whole aggregate through the driver
+        # however large the result was.
         on_actors = materialize is False and not above
         if workers > fan_in:
             out = _tree_reduce_with_recovery(

@@ -41,7 +41,7 @@ Every broker source in Batcher (Kafka, Kinesis, Pulsar, Pub/Sub, Event Hubs) del
 | `value` | binary | The raw payload, undecoded |
 | `partition` | int64 | The topic partition |
 | `offset` | int64 | The Kafka offset |
-| `timestamp` | int64 | Milliseconds since the Unix epoch |
+| `timestamp` | timestamp[ms] | The record timestamp, millisecond precision, as Spark types it |
 | `topic` | string | The topic name |
 
 Without a declared format the payload stays opaque bytes, and decoding is your first transformation. Write it as ordinary expressions and it runs in Rust rather than in a Python loop:
@@ -57,7 +57,7 @@ schema = pa.schema(
         ("value", pa.binary()),
         ("partition", pa.int64()),
         ("offset", pa.int64()),
-        ("timestamp", pa.int64()),
+        ("timestamp", pa.timestamp("ms")),
         ("topic", pa.string()),
     ]
 )
@@ -158,8 +158,10 @@ window.count()
 
 The end is exclusive, as in Spark: an end of 2000 reads up to and including offset 1999.
 `ending_offsets="latest"` reads to the head of each partition as of the first poll, so a
-partition that keeps growing during the read does not extend it and the same command run
-twice covers the same rows.
+partition that keeps growing during the read does not extend it. That bounds one run. The
+head is captured again every time a read starts, so running the same command twice covers
+more rows the second time if the topic grew in between. To make a read reproducible, pin
+explicit per-partition `ending_offsets`.
 
 A range read assigns every partition of the topic rather than joining the consumer group. A group hands a consumer whichever partitions a rebalance decides, so a subscribed read would stop at the end of its own partitions and omit the rest of the range.
 
@@ -343,7 +345,7 @@ Every query left on the default `group="batcher"` joins one consumer group, so g
 
 The Kafka sink delivers at-least-once, so consumers of its output must be idempotent or dedup on the key. `fail_on_data_loss=False` skips rows that aged out of retention, with a warning in the log.
 
-Client options such as `sasl_password` go to librdkafka as given. They aren't resolved as secret references, so read them from your own secret store before building the source.
+A credential option such as `sasl_password` accepts a secret reference, `sasl_password="env:KAFKA_PASSWORD"`, resolved where the consumer or producer is built, which is on the worker. Only options whose name marks them as a credential are resolved, the same names Batcher masks in logs, such as ones containing `password`, `secret` or `token`, so a path option that starts with `file:` still reaches librdkafka as written.
 
 ## See also
 

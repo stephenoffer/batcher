@@ -19,6 +19,7 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher._internal.mathx import safe_div
 from batcher.plan.expr_ir import col, count
+from batcher.plan.types.domains import is_numeric_type
 
 if TYPE_CHECKING:
     from batcher.api.dataset.frame import Dataset
@@ -31,11 +32,6 @@ _TOTAL = "__bt_n"
 # (a schema that shifts with the input is harder to consume than an error naming the fix).
 _DESCRIBE_LABEL = "statistic"
 _MATRIX_LABEL = "column"
-
-
-def _is_numeric(dtype: pa.DataType) -> bool:
-    """Integer, floating, or decimal: the types `mean`/`std`/`quantile`/`corr` accept."""
-    return pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_decimal(dtype)
 
 
 def _reject_label_collision(cols: list[str], label: str, what: str) -> None:
@@ -79,7 +75,7 @@ def describe(ds: Dataset, percentiles: tuple[float, ...] = (0.25, 0.5, 0.75)) ->
     cols = ds.columns
     _reject_label_collision(cols, _DESCRIBE_LABEL, "describe()")
     types = list(ds.schema.types)
-    numeric = {c for c, t in zip(cols, types, strict=True) if _is_numeric(t)}
+    numeric = {c for c, t in zip(cols, types, strict=True) if is_numeric_type(t)}
 
     aggs = {_TOTAL: count()}
     for c in cols:
@@ -208,12 +204,12 @@ def _pairwise_matrix(
     all_cols = ds.columns
     types = dict(zip(all_cols, ds.schema.types, strict=True))
     if columns is None:
-        cols = [c for c in all_cols if _is_numeric(types[c])]
+        cols = [c for c in all_cols if is_numeric_type(types[c])]
     else:
         for c in columns:
             if c not in types:
                 raise PlanError(f"{what}: unknown column {c!r}")
-            if not _is_numeric(types[c]):
+            if not is_numeric_type(types[c]):
                 raise PlanError(f"{what}: column {c!r} is not numeric")
         repeated = sorted({c for c in columns if columns.count(c) > 1})
         if repeated:

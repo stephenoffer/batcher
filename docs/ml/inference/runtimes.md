@@ -173,9 +173,9 @@ Each runtime needs its own package: `onnxruntime` (or `onnxruntime-gpu`) for ONN
 
 Inputs must have a numeric array form. A string or nested column is rejected by name at the batch edge, so tokenize or cast before the model stage.
 
-An ONNX graph doesn't coerce dtypes. Batcher casts each input to the type the graph declares, so a float column fed to a graph exported for `int64` token ids is cast, and loses information, rather than rejected.
+An ONNX graph doesn't coerce dtypes, so Batcher casts each input to the type the graph declares. A cast that only lowers float precision, such as float32 into a `float16` export, is applied. A cast that would change values raises a `PlanError` naming the input instead: fractional, NaN, or infinite floats fed to an integer or bool input, and integers outside the declared type's range. That is almost always the wrong column wired to a token-id input. Cast the column in the plan when the conversion is intended.
 
-`bfloat16` graph inputs are fed as float32 and cast by the runtime on ingest, because NumPy has no `bfloat16`. Half-precision *outputs* are widened to float32 on the way back into Arrow.
+ONNX Runtime rejects a float32 feed for a `bfloat16` input, and NumPy has no `bfloat16`. Batcher rounds the float32 values to nearest-even `bfloat16` and feeds them as a typed `OrtValue`. Half-precision *outputs* are widened to float32 on the way back into Arrow.
 
 ## See also
 

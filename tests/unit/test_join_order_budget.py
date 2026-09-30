@@ -207,3 +207,42 @@ def test_a_sparse_graph_keeps_its_full_search():
     time nobody was spending.
     """
     assert 0 < _plan_pairs(_chain, 15) <= order_budget._MIN_PAIRS
+
+
+def test_a_join_is_priced_by_its_best_cheap_order_not_as_written(monkeypatch):
+    """A badly written join order does not buy a search its good order could never repay.
+
+    Written as `fact ⋈ wide` on a ten-value key first, the region prices at billions of
+    intermediate rows; the selective `narrow` side, joined first, leaves a handful. Pricing the
+    written order granted such queries the ceiling: JOB q29c (17 leaves over IMDB) spent 45 s
+    evaluating 200,000 pairs for a 22 ms execution. The control prices the as-written region
+    and asserts it earns more than the floor, so the floor the search is actually granted is
+    the new pricing at work rather than a query too small to price above it either way.
+    """
+    import batcher as bt
+    from batcher.kyber.rules.joins import order
+
+    n = 200_000
+    fact = bt.from_arrow(pa.table({"k1": list(range(n)), "k2": [i % 10 for i in range(n)]}))
+    wide = bt.from_arrow(pa.table({"k2": [i % 10 for i in range(n)], "w": list(range(n))}))
+    narrow = bt.from_arrow(pa.table({"k1": list(range(n)), "v": list(range(n))})).filter(
+        bt.col("v") < 5
+    )
+    as_written: list[int] = []
+    granted: list[int] = []
+    real_try, real_dphyp = order._try_reorder, order._rebuild_dphyp
+
+    def spy_try(top, ctx, visit):
+        as_written.append(order_budget.search_pair_budget(top, ctx))
+        return real_try(top, ctx, visit)
+
+    def spy_dphyp(leaves, edges, required, ctx, residuals=None, budget=None):
+        granted.append(budget)
+        return real_dphyp(leaves, edges, required, ctx, residuals, budget)
+
+    monkeypatch.setattr(order, "_try_reorder", spy_try)
+    monkeypatch.setattr(order, "_rebuild_dphyp", spy_dphyp)
+    got = fact.join(wide, on="k2").join(narrow, on="k1").agg(n=bt.col("w").count()).collect()
+    assert got.column("n").to_pylist() == [5 * n // 10]
+    assert as_written and max(as_written) > order_budget._MIN_PAIRS, as_written
+    assert granted and max(granted) < max(as_written), (granted, as_written)

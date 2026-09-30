@@ -32,6 +32,11 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+
+# `_rewrite_node` keeps its name here because the sibling families import it from this
+# module, and that import is what pins this module's registration position.
+from batcher.kyber.rules.leaf_rewrite import rewrite_node as _rewrite_node
+from batcher.kyber.rules.literals import is_false_lit, is_true_lit
 from batcher.plan.expr_ir import (
     Binary,
     Col,
@@ -43,7 +48,7 @@ from batcher.plan.expr_ir import (
     Not,
 )
 from batcher.plan.expr_ir.core import IsInf, IsNan
-from batcher.plan.expr_rewrite import expr_key, map_node_expressions, transform_expr_up
+from batcher.plan.expr_rewrite import expr_key
 from batcher.plan.ir_tags import SAFE_BINARY_OPS
 from batcher.plan.logical import Filter, LogicalPlan, Project
 
@@ -116,36 +121,6 @@ def _bool_valued(expr: Expr) -> bool:
     return isinstance(expr, (Not, IsNull, IsNotNull, IsNan, IsInf, InList))
 
 
-def _is_true(expr: Expr) -> bool:
-    return isinstance(expr, Lit) and expr.value is True
-
-
-def _is_false(expr: Expr) -> bool:
-    return isinstance(expr, Lit) and expr.value is False
-
-
-def _rewrite_node(node: LogicalPlan, leaf) -> LogicalPlan | None:
-    """Apply a leaf `Expr → Expr` rewrite to every expression in `node`, returning the
-    rebuilt node, or `None` when nothing changed (so the driver reaches a fixpoint).
-
-    **Identity first.** `map_node_expressions` and `transform_expr_up` share structure: when
-    a rule touches nothing — the overwhelming case, since each of the hundred-odd expression
-    rules matches a handful of shapes and passes over the rest — the *same* node object comes
-    back. That is an O(1) "no change", and it is the answer almost every time this is called.
-
-    Falling straight through to `to_ir() != to_ir()` instead meant serializing the node's
-    whole expression tree to JSON **twice, per rule, per node, per fixpoint iteration** just
-    to conclude nothing had happened. That serialization — not the rewriting — was what made
-    the rule set expensive to plan with: it is quadratic in (rules x expression size), and it
-    is pure waste. The IR comparison is still needed on the path where the object *did*
-    change, because a rule may rebuild an equal-but-new tree (`Lit(False)` over an already
-    `Lit(False)`), and treating that as a change would spin the fixpoint forever."""
-    new = map_node_expressions(node, lambda e: transform_expr_up(e, leaf))
-    if new is node:
-        return None  # structural sharing proved the rewrite was a no-op
-    return new if new.to_ir() != node.to_ir() else None
-
-
 # --- annihilators -----------------------------------------------------------
 
 
@@ -171,9 +146,9 @@ def _droppable(expr: Expr) -> bool:
 
 def _and_false(expr: Expr) -> Expr:
     if isinstance(expr, Binary) and expr.op == "and":
-        if _is_false(expr.right) and _droppable(expr.left):
+        if is_false_lit(expr.right) and _droppable(expr.left):
             return Lit(False)
-        if _is_false(expr.left) and _droppable(expr.right):
+        if is_false_lit(expr.left) and _droppable(expr.right):
             return Lit(False)
     return expr
 
@@ -197,9 +172,9 @@ def and_false_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> Log
 
 def _or_true(expr: Expr) -> Expr:
     if isinstance(expr, Binary) and expr.op == "or":
-        if _is_true(expr.right) and _droppable(expr.left):
+        if is_true_lit(expr.right) and _droppable(expr.left):
             return Lit(True)
-        if _is_true(expr.left) and _droppable(expr.right):
+        if is_true_lit(expr.left) and _droppable(expr.right):
             return Lit(True)
     return expr
 

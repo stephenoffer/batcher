@@ -2,7 +2,7 @@
 
 This section covers installing Batcher: the package and its optional extras, and how to pick the install method that fits where Batcher will run, from a laptop to a container fleet to a cluster with no internet access.
 
-Every method installs the same thing. Batcher is one Python package, `batcher-engine` on PyPI, with the compiled Rust engine inside it. The pip wheel, the container images, and a wheelhouse carried into an offline network all hold the same wheel, so a pipeline behaves the same whichever way it arrived. {doc}`packages-and-extras` covers the package itself, its optional extras, and how to confirm what you installed.
+Every method installs the same thing. Batcher is one Python package, `batcher-engine`, with the compiled Rust engine inside it. No release has been published to PyPI or to the container registry, so every route that downloads a release is unavailable. Until one is published, install from the repository as {doc}`packages-and-extras` describes. The pip wheel, the container images, and a wheelhouse carried into an offline network all hold the same wheel, so a pipeline behaves the same whichever way it arrived. {doc}`packages-and-extras` covers the package itself, its optional extras, and how to confirm what you installed.
 
 ## Find your situation
 
@@ -21,7 +21,7 @@ The following table maps where Batcher runs to the method that suits it and the 
 
 ## Supported platforms
 
-Batcher publishes a prebuilt wheel for every platform that PyArrow, its columnar foundation, publishes one for. Batcher can't install where PyArrow can't, so this list and PyArrow's are the same. The following table lists them by operating system:
+The release workflow builds a prebuilt wheel for every platform that PyArrow, its columnar foundation, publishes one for. Batcher can't install where PyArrow can't, so this list and PyArrow's are the same. The following table lists them by operating system:
 
 | Operating system | Architecture | Covers |
 |---|---|---|

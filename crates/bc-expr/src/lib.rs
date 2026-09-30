@@ -858,6 +858,12 @@ pub enum GeoFunc {
     StExpand,
     /// `st_collect(a, b)` — concatenate without an overlay.
     StCollect,
+    /// `st_union(a, b)` — every point in either areal operand, as polygons.
+    StUnion,
+    /// `st_intersection(a, b)` — every point in both areal operands.
+    StIntersection,
+    /// `st_difference(a, b)` — every point in `a` and not in `b`.
+    StDifference,
     /// `st_remove_repeated_points(g, tolerance)`.
     StRemoveRepeatedPoints,
     /// `st_line_interpolate_point(g, fraction)`.
@@ -959,6 +965,9 @@ impl GeoFunc {
             | StSnapToGrid
             | StSegmentize
             | StCollect
+            | StUnion
+            | StIntersection
+            | StDifference
             | StRemoveRepeatedPoints
             | StLineInterpolatePoint
             | StLineLocatePoint
@@ -1026,6 +1035,9 @@ impl GeoFunc {
                 | StSegmentize
                 | StExpand
                 | StCollect
+                | StUnion
+                | StIntersection
+                | StDifference
                 | StRemoveRepeatedPoints
                 | StLineInterpolatePoint
                 | StLineSubstring
@@ -1122,6 +1134,36 @@ pub enum SpatialFunc {
     QuatFromRotmatZ,
     /// `quat_from_rotmat_w(...)`.
     QuatFromRotmatW,
+    /// `quat_from_rotmat_nearest_x(m00, ..., m22)` — the X component of the rotation
+    /// nearest the matrix in the Frobenius norm. The explicit repair for a matrix that
+    /// has drifted past `quat_from_rotmat_*`'s tolerance; null only for a non-finite
+    /// entry or a determinant that is not positive. See `bc_spatial::repair`.
+    QuatFromRotmatNearestX,
+    /// `quat_from_rotmat_nearest_y(...)`.
+    QuatFromRotmatNearestY,
+    /// `quat_from_rotmat_nearest_z(...)`.
+    QuatFromRotmatNearestZ,
+    /// `quat_from_rotmat_nearest_w(...)`; never negative.
+    QuatFromRotmatNearestW,
+
+    // --- Any Euler sequence: 4 args (a1, a2, a3, seq) or 5 (qx, qy, qz, qw, seq) --
+    /// `quat_from_euler_seq_x(a1, a2, a3, seq)` — the X component of the rotation these
+    /// angles describe about the axes `seq` encodes (`bc_spatial::euler_seq` has the
+    /// encoding). Null for a `seq` that names no sequence.
+    QuatFromEulerSeqX,
+    /// `quat_from_euler_seq_y(...)`.
+    QuatFromEulerSeqY,
+    /// `quat_from_euler_seq_z(...)`.
+    QuatFromEulerSeqZ,
+    /// `quat_from_euler_seq_w(...)`.
+    QuatFromEulerSeqW,
+    /// `quat_to_euler_seq_first(qx, qy, qz, qw, seq)` — the first angle of the rotation
+    /// read in the sequence `seq`, in radians, wrapped to at least -pi and below pi.
+    QuatToEulerSeqFirst,
+    /// `quat_to_euler_seq_second(...)`.
+    QuatToEulerSeqSecond,
+    /// `quat_to_euler_seq_third(...)`; zero at gimbal lock.
+    QuatToEulerSeqThird,
 
     // --- Quaternion composition (8 args: a then b, four each) ---------------
     /// `quat_multiply_x(ax, ay, az, aw, bx, by, bz, bw)` — the X component of `a * b`,
@@ -1197,6 +1239,12 @@ impl SpatialFunc {
             // Euler angles in.
             QuatFromEulerX | QuatFromEulerY | QuatFromEulerZ | QuatFromEulerW => 3,
 
+            // Euler angles in any sequence, and the sequence.
+            QuatFromEulerSeqX | QuatFromEulerSeqY | QuatFromEulerSeqZ | QuatFromEulerSeqW => 4,
+
+            // One quaternion and a sequence.
+            QuatToEulerSeqFirst | QuatToEulerSeqSecond | QuatToEulerSeqThird => 5,
+
             // One quaternion.
             QuatNorm | QuatNormalizeX | QuatNormalizeY | QuatNormalizeZ | QuatNormalizeW
             | QuatInverseX | QuatInverseY | QuatInverseZ | QuatInverseW | QuatAngle
@@ -1212,8 +1260,18 @@ impl SpatialFunc {
             }
 
             // Two quaternions and a parameter, or a 3x3 matrix.
-            QuatSlerpX | QuatSlerpY | QuatSlerpZ | QuatSlerpW | QuatFromRotmatX
-            | QuatFromRotmatY | QuatFromRotmatZ | QuatFromRotmatW => 9,
+            QuatSlerpX
+            | QuatSlerpY
+            | QuatSlerpZ
+            | QuatSlerpW
+            | QuatFromRotmatX
+            | QuatFromRotmatY
+            | QuatFromRotmatZ
+            | QuatFromRotmatW
+            | QuatFromRotmatNearestX
+            | QuatFromRotmatNearestY
+            | QuatFromRotmatNearestZ
+            | QuatFromRotmatNearestW => 9,
 
             // A pose and a point.
             Se3TransformX | Se3TransformY | Se3TransformZ | Se3InverseTransformX
@@ -2241,6 +2299,12 @@ pub enum StrFunc {
     Sha1,
     /// SHA-256 digest of the UTF-8 bytes as lowercase hex (DuckDB `sha256`). → Utf8.
     Sha256,
+    /// SHA-224 digest as lowercase hex (Spark `sha2(s, 224)`). → Utf8.
+    Sha224,
+    /// SHA-384 digest as lowercase hex (Spark `sha2(s, 384)`). → Utf8.
+    Sha384,
+    /// SHA-512 digest as lowercase hex (Spark `sha2(s, 512)`). → Utf8.
+    Sha512,
     /// CRC-32 (IEEE) checksum of the UTF-8 bytes (Spark `crc32`). → Int64.
     Crc32,
     /// `mime_type()` → what the value's leading bytes say it is (`image/png`,

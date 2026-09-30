@@ -14,6 +14,11 @@ from batcher.plan.resource import ClusterShape, HardwareProfile, LocalityShares,
 pytestmark = pytest.mark.unit
 
 
+def _on_node(shares: LocalityShares) -> float:
+    """The share of an exchange that never leaves the host."""
+    return shares.local + shares.intra_domain + shares.intra_node
+
+
 def _dense(nodes: int = 4, gpus: int = 8, domain: int = 8, rack: str = "r1") -> ClusterShape:
     """`nodes` hosts of `gpus` devices each, all in one rack."""
     return ClusterShape(
@@ -93,9 +98,8 @@ def test_dense_and_sparse_fleets_are_distinguished():
     """
     dense = _dense().locality_shares(32, unit="gpu")
     sparse = _sparse().locality_shares(32, unit="gpu")
-    assert dense.on_node == pytest.approx(0.25)
-    assert sparse.on_node == pytest.approx(1.0 / 32)
-    assert dense.off_node < sparse.off_node
+    assert _on_node(dense) == pytest.approx(0.25)
+    assert _on_node(sparse) == pytest.approx(1.0 / 32)
 
 
 def test_nvlink_domain_narrower_than_the_node_splits_the_on_host_share():
@@ -154,9 +158,9 @@ def test_placement_is_even_and_capacity_bounded():
             *(NodeShape(node_id=f"s{i}", cpu_cores=1) for i in range(7)),
         )
     )
-    assert lopsided.locality_shares(8, unit="cpu").on_node == pytest.approx(1.0 / 8)
+    assert _on_node(lopsided.locality_shares(8, unit="cpu")) == pytest.approx(1.0 / 8)
     even = ClusterShape(nodes=tuple(NodeShape(node_id=f"n{i}", cpu_cores=8) for i in range(8)))
-    assert even.locality_shares(8, unit="cpu").on_node == pytest.approx(1.0 / 8)
+    assert _on_node(even.locality_shares(8, unit="cpu")) == pytest.approx(1.0 / 8)
 
 
 def test_a_small_node_stops_taking_workers_once_it_is_full():
@@ -170,13 +174,13 @@ def test_a_small_node_stops_taking_workers_once_it_is_full():
     )
     shares = fleet.locality_shares(9, unit="cpu")
     # Eight on the big node and one on the small: 8^2 + 1^2 over 9^2.
-    assert shares.on_node == pytest.approx(65 / 81)
+    assert _on_node(shares) == pytest.approx(65 / 81)
 
 
 def test_more_workers_than_capacity_oversubscribes_evenly():
     """An over-subscribed grant is dealt round the fleet, not piled onto its largest node."""
     fleet = ClusterShape(nodes=tuple(NodeShape(node_id=f"n{i}", gpus=8) for i in range(4)))
-    assert fleet.locality_shares(64, unit="gpu").on_node == pytest.approx(0.25)
+    assert _on_node(fleet.locality_shares(64, unit="gpu")) == pytest.approx(0.25)
 
 
 def test_fewer_workers_than_nodes_still_partitions():
@@ -247,13 +251,6 @@ def test_node_local_domain_is_capped_by_the_devices_present():
     assert NodeShape(gpus=2, nvlink_domain=8).local_domain == 2
     assert NodeShape(gpus=8, nvlink_domain=0).local_domain == 8  # unknown: no narrower than node
     assert NodeShape(gpus=8, nvlink_domain=4).domains == 2
-
-
-def test_per_device_egress_divides_the_node_rate():
-    """Eight devices sharing a 400 Gb/s node have 50 Gb/s each, not 400."""
-    node = NodeShape(gpus=8, fabric_gbps=400.0)
-    assert node.per_device_egress_gbps == pytest.approx(50.0)
-    assert NodeShape(gpus=8).per_device_egress_gbps == 0.0  # unmeasured is not "no bandwidth"
 
 
 def test_hardware_profile_defaults_preserve_the_flat_answers():

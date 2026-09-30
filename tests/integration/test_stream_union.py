@@ -47,10 +47,27 @@ def test_a_union_of_two_streams_yields_every_row_from_both():
 
 @pytest.mark.integration
 def test_the_branches_are_interleaved_rather_than_concatenated():
-    """The point of the change: a busy branch cannot starve a quiet one of its place,
-    and an unbounded first branch cannot shut the second one out entirely."""
-    got = _drain(_stream([0, 1, 2]).union(_stream([10, 11])))
-    assert got[:2] == [0, 10], f"branch 1 waited for branch 0 to finish: {got}"
+    """The point of the change: an unbounded first branch cannot shut the second one out.
+
+    Branch 0 never ends, so under concatenation branch 1 would never emit. Each branch is
+    read on its own thread and emitted as it is ready (`stream.multiplex`), so the exact
+    interleaving is arrival order rather than strict alternation; what is pinned is that
+    branch 1's rows arrive while branch 0 is still producing.
+    """
+
+    def endless():
+        value = 0
+        while True:
+            yield pa.record_batch({"v": [value]}, schema=_SCHEMA)
+            value += 1
+
+    union = bt.from_batches(endless, _SCHEMA, bounded=False).union(_stream([10_000, 10_001]))
+    seen: list[int] = []
+    for batch in union.iter_batches():
+        seen.extend(batch.to_pydict()["v"])
+        if {10_000, 10_001} <= set(seen) or len(seen) > 100_000:
+            break
+    assert {10_000, 10_001} <= set(seen), "branch 1 waited for an endless branch 0"
 
 
 @pytest.mark.integration

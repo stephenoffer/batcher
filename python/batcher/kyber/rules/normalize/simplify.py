@@ -24,6 +24,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 from batcher.kyber.pass_base import OptimizerContext
+from batcher.kyber.rules.literals import is_false_lit, is_true_lit
 from batcher.plan.expr_ir import Binary, Cast, Expr, Lit, Not
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.logical import LogicalPlan
@@ -81,14 +82,14 @@ def _simplify(expr: Expr, schema: SchemaRef | None = None) -> Expr:
         # does not merely change a type here -- it deletes the engine's own error and
         # returns the operand untouched. `col("i").and_(True)` returned `6`, and
         # `col("s").and_(True)` returned `"a"`, both typed `bool` by the control plane.
-        if _is_true(right) and _is_boolean(left, schema):
+        if is_true_lit(right) and _is_boolean(left, schema):
             return left
-        if _is_true(left) and _is_boolean(right, schema):
+        if is_true_lit(left) and _is_boolean(right, schema):
             return right
     elif op == "or":
-        if _is_false(right) and _is_boolean(left, schema):
+        if is_false_lit(right) and _is_boolean(left, schema):
             return left
-        if _is_false(left) and _is_boolean(right, schema):
+        if is_false_lit(left) and _is_boolean(right, schema):
             return right
     elif op == "add":
         # `x + 0 → x` only when `x` is provably integral — see the module docstring: for a
@@ -112,14 +113,6 @@ def _simplify(expr: Expr, schema: SchemaRef | None = None) -> Expr:
         if _is_int_one(right) and _keeps_its_type(left, schema):
             return left
     return expr
-
-
-def _is_true(expr: Expr) -> bool:
-    return isinstance(expr, Lit) and expr.value is True
-
-
-def _is_false(expr: Expr) -> bool:
-    return isinstance(expr, Lit) and expr.value is False
 
 
 def _is_int_zero(expr: Expr) -> bool:

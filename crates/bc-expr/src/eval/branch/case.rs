@@ -284,4 +284,108 @@ mod tests {
             ]
         );
     }
+
+    /// A `CASE` over nested branch values with no `ELSE`, as the control plane lowers it:
+    /// the missing arm is `nullif(v, v)`, a NULL typed like `v`. It used to fail with
+    /// "Nested comparison: List(Int64) == List(Int64)" because that typed NULL went
+    /// through the flat equality kernel. The masks select values; nothing compares them.
+    fn nested_case(value: ArrayRef, cond: Vec<Option<bool>>) -> ArrayRef {
+        use arrow::array::BooleanArray;
+        let schema = Schema::new(vec![
+            Field::new("c", DataType::Boolean, true),
+            Field::new("v", value.data_type().clone(), true),
+        ]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(BooleanArray::from(cond)), value],
+        )
+        .expect("nested batch");
+        let typed_null = Expr::NullIf {
+            left: Box::new(col("v")),
+            right: Box::new(col("v")),
+        };
+        let branches = vec![CaseBranch {
+            when: col("c"),
+            then: col("v"),
+        }];
+        let out = eval_case(&branches, &typed_null, &batch).expect("nested case");
+        assert_eq!(out.data_type(), batch.column(1).data_type());
+        out
+    }
+
+    fn nulls(arr: &ArrayRef) -> Vec<bool> {
+        (0..arr.len()).map(|i| arr.is_null(i)).collect()
+    }
+
+    fn int_list(rows: Vec<Option<Vec<Option<i64>>>>) -> ArrayRef {
+        use arrow::array::ListArray;
+        use arrow::datatypes::Int64Type;
+        std::sync::Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(rows))
+    }
+
+    #[test]
+    fn a_list_case_without_else_selects_by_mask() {
+        let v = int_list(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![None]),
+            None,
+            Some(vec![]),
+        ]);
+        let out = nested_case(v.clone(), vec![Some(true), Some(true), Some(true), None]);
+        assert_eq!(nulls(&out), vec![false, false, true, true]);
+        assert_eq!(out.slice(0, 2).to_data(), v.slice(0, 2).to_data());
+    }
+
+    #[test]
+    fn a_large_list_case_without_else_selects_by_mask() {
+        use arrow::array::LargeListArray;
+        use arrow::datatypes::Int64Type;
+        let v: ArrayRef =
+            std::sync::Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+                vec![Some(vec![Some(1)]), Some(vec![Some(2)])],
+            ));
+        let out = nested_case(v, vec![Some(false), Some(true)]);
+        assert_eq!(nulls(&out), vec![true, false]);
+    }
+
+    #[test]
+    fn a_struct_case_without_else_selects_by_mask() {
+        use arrow::array::StructArray;
+        let x: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let v: ArrayRef = std::sync::Arc::new(StructArray::from(vec![(
+            std::sync::Arc::new(Field::new("x", DataType::Int64, true)),
+            x,
+        )]));
+        let out = nested_case(v, vec![Some(true), Some(true), Some(false)]);
+        assert_eq!(nulls(&out), vec![false, false, true]);
+    }
+
+    #[test]
+    fn a_map_case_without_else_selects_by_mask() {
+        use arrow::array::{Int64Builder, MapBuilder};
+        let mut b = MapBuilder::new(None, Int64Builder::new(), Int64Builder::new());
+        b.keys().append_value(1);
+        b.values().append_value(10);
+        b.append(true).expect("map row");
+        b.append(true).expect("empty map row");
+        let v: ArrayRef = std::sync::Arc::new(b.finish());
+        let out = nested_case(v, vec![Some(false), Some(true)]);
+        assert_eq!(nulls(&out), vec![true, false]);
+    }
+
+    /// No row selected, and every row selected: the two ends of the mask.
+    #[test]
+    fn a_nested_case_under_an_all_false_or_all_true_mask() {
+        let v = int_list(vec![Some(vec![Some(1)]), None, Some(vec![Some(2)])]);
+        let none = nested_case(v.clone(), vec![None, Some(false), None]);
+        assert_eq!(nulls(&none), vec![true; 3]);
+        let all = nested_case(v.clone(), vec![Some(true); 3]);
+        assert_eq!(all.to_data(), v.to_data());
+    }
+
+    #[test]
+    fn a_nested_case_over_an_empty_batch() {
+        let out = nested_case(int_list(vec![]), vec![]);
+        assert_eq!(out.len(), 0);
+    }
 }

@@ -87,7 +87,7 @@ def _learn_from(ledger: EnergyLedger) -> None:
                 record_measured_efficiency(
                     hub, stage.accelerator_type, stage.joules, stage.rows, kind="rows"
                 )
-    except Exception as exc:  # pragma: no cover - learning must never break a query
+    except Exception as exc:  # learning must never break a query
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("api", "record measured efficiency", exc)

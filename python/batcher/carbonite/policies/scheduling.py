@@ -83,9 +83,9 @@ class DefaultSchedulingPolicy:
         """Budget a GPU map/inference stage against the GPUs that actually exist.
 
         The relational `envelope` below is the CPU shuffle grant and correctly requests no
-        GPU. This closes the gap that GPU demand previously reached Ray *only* as the raw
+        GPU. Without this, GPU demand would reach Ray *only* as the raw
         `map_batches(num_gpus=)` tag, so Carbonite — the layer that decides feasibility —
-        never saw it, and an infeasible request hung instead of erroring. The grant is
+        would never see it, and an infeasible request would hang instead of erroring. The grant is
         clamped to inventory: `gpu_count / num_gpus` tasks can hold a GPU at once, and a
         cluster reporting no GPUs gets no GPU grant (the stage runs on CPU rather than
         pending forever). Fractional `num_gpus` is preserved — packing four 0.25-GPU

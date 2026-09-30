@@ -63,6 +63,8 @@ pub fn combine_finalize_spilling(
     for partial in chunk_partials {
         any = true;
         n_keys = partial.group_columns.len();
+        // A bare `Int64` SUM state must not share a spill file with marked ones (`agg::int_sum`).
+        let partial = super::int_sum::widen_bare(&partial, funcs)?.unwrap_or(partial);
         let packed = pack_partial(&partial)?;
         for (pi, sub) in route(&packed, n_keys, partitions)? {
             store.append(pi, &sub)?;

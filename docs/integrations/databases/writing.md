@@ -8,7 +8,7 @@ This page covers writing rows back into a SQL database: appending a load, and ma
 | **Modes** | `append`, `overwrite`, `upsert`, `update`, `delete`, `delete_insert` |
 | **Backends** | ADBC for a bulk append where a driver exists, any PEP 249 driver otherwise |
 | **Extra** | the per-database driver, such as `pip install psycopg` or `pip install pymysql` |
-| **Transactions** | one per write call, and one per shard of a distributed write |
+| **Transactions** | one per write call, and one per shard of a distributed write unless it's `staged=True` |
 | **Credentials** | A secret reference such as `password="env:VAR"`, resolved on the worker |
 
 ## What each mode does
@@ -92,13 +92,9 @@ usually what you want, because two pipelines can then maintain different columns
 key without reading each other's. It is the opposite of `ds.write.mongo`, whose upsert
 *replaces* the document, so a column absent from the frame is lost there.
 
-A repeated key inside one write behaves differently per mode. `upsert`, `update` and
-`delete` bind one statement per row, so the last row for a key wins. Quietly, and in frame
-order, which a distributed write does not fix. `delete_insert` deletes the key once and then
-inserts every row, so a repeated key becomes a repeated row and the target's own key
-constraint rejects it. Deduplicate first with
-{py:meth}`ds.distinct(subset=...) <batcher.Dataset.distinct>` when the source
-can carry more than one row per key.
+A repeated key inside one write needs `sequence_by` to have a defined winner. `upsert`, `update` and `delete` bind one statement per row, so without it the last row for a key wins, in frame order, which a distributed write does not fix. The sink logs a warning when it sees a repeated key and no `sequence_by`. `delete_insert` deletes the key once and then inserts every row, so a repeated key becomes a repeated row and the target's own key constraint rejects it.
+
+Pass `sequence_by="<column>"` and only the row with the greatest value per key is written, in every keyed mode including `delete_insert`. A batch write applies it across the whole frame before any shard writes, as one {py:meth}`ds.distinct(subset=key_columns, keep="last", order_by=sequence_by) <batcher.Dataset.distinct>`, so two shards can't each commit their own winner. A streaming write applies it to each micro-batch, which is the unit it commits. A null sequence value never beats a non-null one. A tie keeps one of the tied rows, and which one isn't defined.
 
 A column the frame does not have is not written at all. For `append` that means the column
 takes its database default, or `NULL`, and the write does not fail. For `upsert` it means
@@ -157,9 +153,16 @@ One `write` call is one transaction. Every chunk of every statement runs, then a
 
 `overwrite` empties the table with `DELETE FROM` rather than `TRUNCATE`, deliberately. Truncation is DDL on several engines and commits the surrounding transaction implicitly, which would publish the empty table before the new rows were written. A crash between the two would have destroyed the table's contents.
 
-A distributed write is one transaction per shard, not one across the cluster. That is safe for `append`, `upsert`, `update` and `delete`, because a shard only ever touches the keys its own rows name. `overwrite` is refused past the first shard: every shard would empty the one table they all target, so each would discard the shards before it. It is invisible single-node and appears at cluster scale as missing rows rather than an error.
+A distributed write is one transaction per shard, not one across the cluster. That is safe for `upsert`, `update` and `delete`, because a shard only ever touches the keys its own rows name and a re-run converges on the same table. It isn't atomic for `append`: a failure on the last shard leaves the earlier shards' rows published. `overwrite` is refused past the first shard, because every shard would empty the one table they all target.
 
-Where you need cluster-wide atomicity, write to a staging table and swap, or use a {doc}`lakehouse table </user-guide/moving-data/lakehouse>`, whose commit is atomic by construction.
+`staged=True` makes an `append` or `overwrite` atomic across every shard. Each shard writes into its own staging table, named `<table>__bt_stage_<token>`, in the same schema as the target. Once every shard has succeeded, the driver publishes them in one transaction: an `overwrite` runs `DELETE FROM` on the target, then each staging table is copied in with `INSERT ... SELECT`. A failure before or during that transaction leaves the target unchanged. The staging tables are dropped afterwards whether the publish succeeded or not.
+
+```python
+# docs: skip
+ds.write.sql("orders", uri="postgresql://db/shop", mode="overwrite", staged=True)
+```
+
+The price is a second copy. Every row is written into a staging table and then copied again, server-side, into the target. The write also needs permission to create and drop tables in the target's schema. A write whose shards fail never reaches the publish, so their staging tables are left behind. Find them by the `__bt_stage_` marker in the name. The keyed modes can't be staged. They're idempotent per key, so re-running a failed write finishes it. A {doc}`lakehouse table </user-guide/moving-data/lakehouse>` commits atomically by construction and needs no second copy.
 
 ## Streaming into a table
 
@@ -184,10 +187,19 @@ query = bt.read.kafka("orders").write(
 Use `mode="upsert"`, not `mode="append"`, and the reason is exactly-once. The engine
 records a micro-batch's source offset before processing it, so a crash between processing
 and committing leaves a batch the next run replays. An append writes those rows a second
-time. An upsert writes the same keys to the same values, which makes the replay a no-op.
-That is the same end-to-end guarantee a Delta stream gets from its `(app_id, batch_id)`
-transaction, reached by a different route. Batcher does not warn about at-least-once
-delivery for a keyed mode, because for a keyed mode it does not apply.
+time. An upsert writes the same keys to the same values, so the table ends in the state it
+would have reached without the crash. Batcher does not warn about at-least-once delivery for
+a keyed mode for that reason.
+
+That guarantee is about the table's final rows, and it holds only when three conditions do.
+The replay must compute the same values, so a column derived from the current time, a random
+draw, or a model with nondeterministic output can land a different value on replay. The
+database must have no side effect per statement, because a trigger, an audit log, or a
+change-data-capture feed on the target sees the replayed statements a second time. No other
+writer may change those keys between the crash and the replay, because the replay writes the
+batch's values over whatever is there, including a newer one. A Delta stream's
+`(app_id, batch_id)` transaction is stronger: it skips a batch already committed rather than
+rewriting it, so none of the three conditions applies there.
 
 This is the shape Spark spells as `foreachBatch` plus a hand-written `MERGE`.
 {py:meth}`ds.write.for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>`
@@ -251,7 +263,7 @@ A row whose key column is null matches no row on any database, because SQL equal
 
 `update` and `delete` do not report which keys matched nothing. The server's affected-row count is recorded on the manifest as `stats["affected_rows"]` where the driver reports one, which is the closest available signal.
 
-There is no cross-shard transaction. There is no cross-*call* transaction either, so two `write` calls are two transactions unless you pass your own `connection=` and commit it yourself.
+There is no cross-shard transaction for the keyed modes, and none for `append` or `overwrite` without `staged=True`. There is no cross-*call* transaction either, so two `write` calls are two transactions unless you pass your own `connection=` and commit it yourself.
 
 Each write opens and closes its own connection. For a batch job that is one connect. For a streaming query it is one per micro-batch, so a one-second trigger dials the database once a second and a distributed stream does so once per shard. Check the server's connection limit before running a short trigger interval across many workers, or hold the connection yourself with `connection=` on a single-node stream.
 

@@ -20,7 +20,6 @@ from batcher._internal.device_share import (
     balanced_fraction,
     cotenants_per_device,
     devices_for,
-    fits_one_device,
     pack_fraction,
     quantize_fraction,
     share_bytes,
@@ -131,13 +130,6 @@ def test_asking_for_more_cotenants_than_the_ladder_divides_hits_the_floor() -> N
 def test_balanced_and_cotenant_counts_are_mutually_consistent() -> None:
     for n in range(1, MAX_COTENANTS + 1):
         assert cotenants_per_device(balanced_fraction(n)) >= n
-
-
-def test_fits_one_device_routes_an_unknown_device_to_the_sharded_path() -> None:
-    assert fits_one_device(3 * GIB, 80 * GIB)
-    assert not fits_one_device(80 * GIB, 80 * GIB), "headroom is not available to a claimant"
-    assert not fits_one_device(3 * GIB, 0), "unknown routes to sharding, which is always correct"
-    assert not fits_one_device(0, 80 * GIB)
 
 
 def test_device_share_reports_whether_it_decided_anything() -> None:

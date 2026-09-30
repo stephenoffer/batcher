@@ -217,7 +217,7 @@ def cluster_hardware_profiles() -> tuple[dict, ...]:
             return ()
         _PROFILES_BY_TOPOLOGY[signature] = result
         return result
-    except Exception as exc:  # pragma: no cover - Ray optional / probe unschedulable
+    except Exception as exc:  # Ray optional / probe unschedulable
         note_suppressed("dist", "probe ray node hardware", exc)
         return ()
 
@@ -340,9 +340,9 @@ def cluster_worker_fingerprint() -> str:
     workers it is wrong by the whole reason the scoping exists.
 
     `""` on a mixed fleet, following the same rule as `accelerator_type`: there is no single
-    honest answer, and every consumer then falls back to its local key, which is what it did
-    before this existed. A mixed fleet is *reported* by `warn_once_if_fleet_is_mixed`, so the
-    condition is visible rather than silently degrading.
+    honest answer, and every consumer then falls back to its local key. A mixed fleet is
+    *reported* by `warn_once_if_fleet_is_mixed`, so the condition is visible rather than
+    silently degrading.
 
     Returns:
         The shared worker fingerprint, or `""` when the fleet is mixed or unprobeable.

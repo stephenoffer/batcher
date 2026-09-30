@@ -104,17 +104,17 @@ def test_learning_something_plan_relevant_invalidates():
     """The generation advances only for a *material* correction, and the key follows it."""
     src = [_source([1, 2, 3])]
     before = _key(_plan_ir(1), src)
-    learning._bump_generation()
+    learning.bump_generation()
     assert _key(_plan_ir(1), src) != before
 
 
 def test_a_settled_estimate_does_not_invalidate():
     """A smoothed average drifting in its fourth decimal must not throw the plan away —
     that is why fingerprinting the stats' *content* never hits."""
-    assert not learning._is_material(1000.0, 1001.0)  # 0.1%
-    assert learning._is_material(1000.0, 1200.0)  # 20%
-    assert learning._is_material(None, 5.0)  # nothing was known
-    assert learning._is_material(0.0, 5.0)  # a provably-empty prior, now non-empty
+    assert not learning.is_material_change(1000.0, 1001.0)  # 0.1%
+    assert learning.is_material_change(1000.0, 1200.0)  # 20%
+    assert learning.is_material_change(None, 5.0)  # nothing was known
+    assert learning.is_material_change(0.0, 5.0)  # a provably-empty prior, now non-empty
 
 
 # --- the store ----------------------------------------------------------------
@@ -209,7 +209,7 @@ def test_a_bandit_arms_mean_invalidates_but_a_bare_tick_does_not():
     every execution and defeat the memo. The *ratio* — the mean reward `ucb1_best_arm` ranks
     by — is what must decide.
     """
-    from batcher.kyber.plan_cache import _materially_differs
+    from batcher.kyber.plan_cache.writes import _materially_differs
 
     # A run that ticks `n` without moving the mean stays a cache hit.
     assert not _materially_differs({"sum": 100.0, "n": 10}, {"sum": 110.0, "n": 11})
@@ -228,7 +228,7 @@ def test_the_calibration_key_tracks_the_fit_not_the_refit_count():
     re-optimization against 20 ms in the engine, forever. tpcds-q80's epoch climbed by 76 per
     run and never settled.
 
-    So the key carries the *fit itself*, bucketed at half-octaves (`plan_cache._bucketed`) —
+    So the key carries the *fit itself*, bucketed at half-octaves (`plan_cache.keys._bucketed`) —
     stable under the drift a settled exponential average always has, and moving as soon as a
     coefficient crosses a bucket. The two assertions below are the whole contract.
     """
@@ -257,7 +257,7 @@ def test_the_calibration_key_tracks_the_fit_not_the_refit_count():
     live = calibration.live_coefficients(hub)
     assert live is not None
     moved = dataclasses.replace(live, filter_row=live.filter_row * 8.0)
-    assert plan_cache._bucketed(moved) != plan_cache._bucketed(live)
+    assert plan_cache.keys._bucketed(moved) != plan_cache.keys._bucketed(live)
     assert isinstance(moved, CostCoefficients)
 
 
@@ -267,23 +267,25 @@ def test_the_bucketed_fingerprint_absorbs_drift_but_not_a_real_move():
     from batcher.kyber import plan_cache
 
     base = CostCoefficients()
-    assert plan_cache._bucketed(None) == "-"
+    assert plan_cache.keys._bucketed(None) == "-"
     # A few percent of drift — what a settled exponential average does every run — must not move.
     drifted = dataclasses.replace(base, filter_row=base.filter_row * 1.03)
-    assert plan_cache._bucketed(drifted) == plan_cache._bucketed(base)
+    assert plan_cache.keys._bucketed(drifted) == plan_cache.keys._bucketed(base)
     # Nor does a 60% one. A cost coefficient sits in a feedback loop (it is fit from the
     # operators the plan ran, and it picks the plan that runs next), so it walks by tens of
     # percent in one direction for many runs without settling — see `_COEFF_BUCKETS`. Half-
     # octave buckets re-keyed the memo on every one of those steps.
     walked = dataclasses.replace(base, filter_row=base.filter_row * 1.6)
-    assert plan_cache._bucketed(walked) == plan_cache._bucketed(base)
+    assert plan_cache.keys._bucketed(walked) == plan_cache.keys._bucketed(base)
     # A doubling is a different claim about the machine, and the key follows it — the same
     # threshold at which `calibration._tracked` stops damping and takes the fit whole.
     moved = dataclasses.replace(base, filter_row=base.filter_row * 2.5)
-    assert plan_cache._bucketed(moved) != plan_cache._bucketed(base)
+    assert plan_cache.keys._bucketed(moved) != plan_cache.keys._bucketed(base)
     # A dict (the cpu-share medians) takes the same treatment, and a family appearing moves it.
-    assert plan_cache._bucketed({"scan": 1.0}) == plan_cache._bucketed({"scan": 1.02})
-    assert plan_cache._bucketed({"scan": 1.0}) != plan_cache._bucketed({"scan": 1.0, "filter": 1.0})
+    assert plan_cache.keys._bucketed({"scan": 1.0}) == plan_cache.keys._bucketed({"scan": 1.02})
+    assert plan_cache.keys._bucketed({"scan": 1.0}) != plan_cache.keys._bucketed(
+        {"scan": 1.0, "filter": 1.0}
+    )
 
 
 def _feedback_row():
@@ -345,7 +347,7 @@ def test_converged_ols_statistics_do_not_invalidate():
     but still live for the accumulators beside it. What a plan reads is the *fit*, which is a
     function of the per-observation moments.
     """
-    from batcher.kyber.plan_cache import _materially_differs
+    from batcher.kyber.plan_cache.writes import _materially_differs
 
     prior = {"n": 100, "sx": 1000.0, "sy": 2000.0, "sxx": 12000.0, "sxy": 21000.0,
              "xmin": 1.0, "xmax": 50.0}  # fmt: skip
@@ -355,7 +357,7 @@ def test_converged_ols_statistics_do_not_invalidate():
 
 
 def test_a_shifted_ols_relationship_still_invalidates():
-    from batcher.kyber.plan_cache import _materially_differs
+    from batcher.kyber.plan_cache.writes import _materially_differs
 
     prior = {"n": 100, "sx": 1000.0, "sy": 2000.0, "sxx": 12000.0, "sxy": 21000.0,
              "xmin": 1.0, "xmax": 50.0}  # fmt: skip
@@ -369,7 +371,7 @@ def test_a_shifted_ols_relationship_still_invalidates():
 
 def test_bandit_arm_invalidates_on_its_mean_not_its_accumulator():
     """`record_arm` grows `sum`/`sumsq` every run; `ucb1_best_arm` ranks by `sum/n`."""
-    from batcher.kyber.plan_cache import _materially_differs
+    from batcher.kyber.plan_cache.writes import _materially_differs
 
     prior = {"hash": {"n": 50, "sum": 500.0, "sumsq": 6000.0}}
     stable = {"hash": {"n": 51, "sum": 510.0, "sumsq": 6120.0}}  # same ~10ms mean
@@ -392,11 +394,14 @@ def test_bandit_arm_invalidates_on_its_mean_not_its_accumulator():
 # a slower one, so nothing else in the suite is looking.
 
 
-#: Executions a query is allowed before the memo must start hitting. Two, and both are real:
-#: the first run learns the column sketches the plan had no statistics for, and the second is
-#: the first one whose key reflects that learning. From the third on, nothing new is being
-#: learned about an unchanged query over unchanged data, so every run must hit.
-_WARMUP_RUNS = 2
+#: Executions a query is allowed before the memo must start hitting. Three, and all are real:
+#: the first run learns the column sketches the plan had no statistics for, the second is the
+#: first one whose key reflects that learning, and the third re-plans once because the second
+#: run's operator feedback made the plan's *own* measured selectivities and corrections
+#: confident (`kyber.optimizer.plan_deps`) — the one re-plan that lets those measurements be
+#: used at all. From the fourth on, nothing new is being learned about an unchanged query over
+#: unchanged data, so every run must hit.
+_WARMUP_RUNS = 3
 
 
 def _lookup_trace(query, times: int) -> list[str]:
@@ -404,8 +409,8 @@ def _lookup_trace(query, times: int) -> list[str]:
     trace: list[str] = []
     real_lookup = plan_cache.lookup
 
-    def counting_lookup(key):
-        result = real_lookup(key)
+    def counting_lookup(key, holds=None):
+        result = real_lookup(key, holds)
         trace.append("HIT" if result is not None else "miss")
         return result
 

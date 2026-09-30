@@ -14,7 +14,11 @@ that no longer existed (`ops.rs`, `plan/logical.py`, `api/dataset.py` — all no
 So the guidance is linted like code:
 
 * every repo-relative path mentioned in a guardrail file must exist; and
-* every `just <recipe>` named must be a real recipe in the justfile.
+* every `just <recipe>` named must be a real recipe in the justfile; and
+* every `docs/architecture/internals/**.md` page cited from code, tests or tools must exist.
+  Those citations are how a comment says "the reasoning is written up over there", and the
+  internals shelf is the part of `docs/` that gets reorganized; a citation that outlives its
+  page sends the reader nowhere.
 
 The check is deliberately conservative — it only flags strings that clearly *look* like a repo
 path (they contain a `/` and start with a known top-level directory), so prose stays free. It
@@ -40,7 +44,7 @@ GUARDRAILS = [
     *sorted(ROOT.glob("*/CLAUDE.md")),
     # The contributor cookbook routes a change to the file that should hold it — the same
     # job as a skill, for humans. A stale path here misroutes exactly as badly.
-    ROOT / "docs" / "internals" / "extending.md",
+    ROOT / "docs" / "architecture" / "internals" / "extending.md",
 ]
 
 #: Only these roots are treated as repo paths; everything else in backticks is prose.
@@ -130,6 +134,38 @@ def _git_ignored(paths: list[str]) -> set[str]:
     return {p for p in paths if p in ignored or f"python/batcher/{p}" in ignored}
 
 
+#: Trees whose source files may cite an internals page, and the suffixes read in them.
+CODE_ROOTS = ("python", "tests", "crates", "tools", "benchmarks", "examples")
+CODE_SUFFIXES = (".py", ".rs", ".toml")
+INTERNALS_RE = re.compile(r"docs/architecture/internals/[A-Za-z0-9_./\-]+\.md")
+
+
+def _stale_internals_citations() -> list[str]:
+    """Return a failure message for every cited internals page that does not exist.
+
+    Files come from git (tracked plus untracked-but-not-ignored), so build output under
+    `target/` is never read.
+    """
+    proc = subprocess.run(
+        ["git", "ls-files", "-co", "--exclude-standard", "--", *CODE_ROOTS],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    failures = []
+    for rel in proc.stdout.splitlines():
+        path = ROOT / rel
+        if not rel.endswith(CODE_SUFFIXES) or not path.is_file():
+            continue
+        text = path.read_text(errors="replace")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for cited in INTERNALS_RE.findall(line):
+                if not (ROOT / cited).exists():
+                    failures.append(f"{rel}:{lineno}: cited page does not exist: {cited}")
+    return failures
+
+
 def _justfile_recipes() -> set[str]:
     """Recipe names from the justfile, including parameterized ones (`bench args="":`)."""
     text = (ROOT / "justfile").read_text()
@@ -144,9 +180,12 @@ def main() -> int:
     pending: list[tuple[str, str]] = []
 
     for doc in GUARDRAILS:
-        if not doc.exists():
-            continue
         rel_doc = doc.relative_to(ROOT)
+        if not doc.exists():
+            # A listed guardrail that has moved is not "nothing to check": skipping it is
+            # how the contributor cookbook went unlinted after it moved under architecture/.
+            pending.append(("", f"{rel_doc}: guardrail file does not exist"))
+            continue
         text = doc.read_text()
 
         for lineno, line in enumerate(text.splitlines(), 1):
@@ -165,6 +204,7 @@ def main() -> int:
 
     generated = _git_ignored([path for path, _ in pending if path])
     failures = [message for path, message in pending if path not in generated]
+    failures += _stale_internals_citations()
 
     for failure in failures:
         print(f"FAIL: {failure}")

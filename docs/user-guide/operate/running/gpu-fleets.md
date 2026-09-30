@@ -31,6 +31,29 @@ print(spec.memory_gib, spec.tdp_watts, spec.nvlink_domain, spec.mig_slices)
 # 80 700.0 8 7
 ```
 
+For a part the table doesn't carry, or one whose delivered figures you measured, register a
+row with `register_device_spec`. Every accessor, and the resolver that maps a driver-reported
+name onto the table, then reads it. The registration is per process, so make it at startup
+in every process that decides placement or sizing. A row with the same name as a built-in one
+replaces it.
+
+```python
+from batcher._internal.device_specs import DeviceSpec, device_tdp_watts, register_device_spec
+
+print(device_tdp_watts("ACME_X9"))
+# 0.0
+register_device_spec(
+    DeviceSpec(
+        name="ACME_X9", vendor="acme", generation="x", memory_gib=64,
+        memory_bandwidth_gbps=2000.0, tdp_watts=450.0, idle_watts=60.0, half_tflops=300.0,
+        fp8_tflops=0.0, nvlink_domain=1, nvlink_gbps=0.0, mig_slices=0,
+    ),
+    aliases=("X9",),
+)
+print(device_tdp_watts("X9"))
+# 450.0
+```
+
 ## See what the fleet looks like
 
 {py:func}`bt.accelerators() <batcher.accelerators>` reports what this process and its cluster can see: the local devices with
@@ -426,8 +449,10 @@ _ = set_residency(previous)
 
 On a cluster, the catalog reaches the scheduler through
 `batcher.dist.executors.ray_runtime.fabric.permitted_nodes`, which keeps only the accelerator
-nodes whose region every input permits. A node with no region label is never filtered out, so
-labelling your fleet is part of enabling the control. `residency_report` gives the before and
+nodes whose region every input permits. By default a node with no region label is kept, so
+labelling your fleet is part of enabling the control. Build the catalog with
+`ResidencyCatalog(mode="strict", refuse_unlabeled=True)` to fail closed instead: for a registered
+dataset, a node whose region can't be read is then excluded, and `check` refuses an empty region. `residency_report` gives the before and
 after device counts, which is what distinguishes a fleet narrowed by a compliance rule from one
 that is merely busy.
 
@@ -435,7 +460,8 @@ that is merely busy.
 
 - Device power, bandwidth, and interconnect figures cover the datacenter accelerators Batcher
   recognizes by model name. An unrecognized model reports unknown, and every decision falls
-  back to its prior behavior rather than to a substituted figure.
+  back to its prior behavior rather than to a substituted figure, until you register a row for
+  it with `register_device_spec`.
 - Live telemetry requires `pynvml`, from `pip install 'batcher-engine[nvml]'`, and a mounted
   driver. Without it, power reporting falls back to the modelled draw and health checking is
   inert.
@@ -444,7 +470,8 @@ that is merely busy.
 - MIG instances must already exist. Batcher plans against the profiles a device supports and
   never reconfigures one.
 - Residency applies to the regions Batcher can see on node labels. A worker whose region is
-  unlabeled is never refused, so labeling is part of enabling the control.
+  unlabeled is kept by default, so labeling is part of enabling the control. Set
+  `refuse_unlabeled=True` on the catalog to exclude such a worker from regulated data instead.
 
 ## See also
 

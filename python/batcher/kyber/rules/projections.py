@@ -66,6 +66,7 @@ __all__ = [
     "required_columns_per_source",
     "required_predicates_per_source",
     "rewrite_projection",
+    "scan_predicates",
 ]
 
 
@@ -673,16 +674,26 @@ def required_predicates_per_source(plan: LogicalPlan) -> dict[int, dict]:
     Both are supersets of what each individual scan needs, which is the property source-side
     pushdown has to have.
     """
+    return {source_id: pred.to_ir() for source_id, pred in scan_predicates(plan).items()}
+
+
+def scan_predicates(plan: LogicalPlan) -> dict[int, Expr]:
+    """`required_predicates_per_source` as expressions rather than IR.
+
+    The same reconciliation: a source is keyed only when every scan of it is filtered, and
+    then by the disjunction of their predicates. `api.subplan_reuse` reads it to learn which
+    rows of a shared subplan its consumers can read at all.
+    """
     acc: dict[int, list[Expr] | None] = {}
     _collect_scan_predicates(plan, None, acc)
-    out: dict[int, dict] = {}
+    out: dict[int, Expr] = {}
     for source_id, preds in acc.items():
         if not preds:
             continue  # `None`: some scan of this source reads it unfiltered
         combined = preds[0]
         for extra in preds[1:]:
             combined = _or(combined, extra)
-        out[source_id] = combined.to_ir()
+        out[source_id] = combined
     return out
 
 

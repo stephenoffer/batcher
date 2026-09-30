@@ -17,6 +17,7 @@ directory.
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 
 from batcher.carbonite.spill.store import TieredSpillStore
@@ -46,11 +47,67 @@ def scratch_dir(spill_dir: str | None, prefix: str) -> tuple[str, bool]:
 
     if spill_dir is not None:
         return spill_dir, False
-    root = active_config().memory.spill_dir or local_scratch_root()
-    if root:
-        os.makedirs(root, exist_ok=True)
-        return tempfile.mkdtemp(prefix=prefix, dir=root), True
-    return tempfile.mkdtemp(prefix=prefix), True
+    root = active_config().memory.spill_dir or local_scratch_root() or tempfile.gettempdir()
+    os.makedirs(root, exist_ok=True)
+    _sweep_orphans(root, prefix)
+    return tempfile.mkdtemp(prefix=f"{prefix}{os.getpid()}-", dir=root), True
+
+
+#: `(root, prefix)` pairs this process has already swept, so a sweep costs one directory
+#: listing per root rather than one per breaker.
+_SWEPT: set[tuple[str, str]] = set()
+
+
+def _sweep_orphans(root: str, prefix: str) -> None:
+    """Remove scratch directories under `root` left by processes that no longer exist.
+
+    `rmtree` in a `finally` and an `atexit` hook cover every ordinary end, and neither runs
+    on `SIGKILL` -- which is how the OOM killer ends the process most likely to be spilling.
+    Its scratch then outlives it on the spill volume, so the next query has less room and is
+    likelier to be killed in turn. The engine's own grace stores already embed their pid and
+    sweep the dead ones (`bc-runtime` `DiskSpillStore`); this is the same fence for the
+    directories allocated here, which is what the pid in the name is for.
+
+    Only a name this module creates -- `prefix`, a pid, `-` -- is ever considered, and only
+    when that pid is not a live process, so a concurrently spilling sibling is never touched.
+    A reused pid reads as alive and the directory is kept, which is the safe way to be wrong.
+    Best-effort throughout: cleanup must never fail a query.
+
+    Args:
+        root: The scratch root the new directory is about to be created under.
+        prefix: The name prefix of the directories to consider.
+    """
+    key = (os.path.abspath(root), prefix)
+    if key in _SWEPT:
+        return
+    _SWEPT.add(key)
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        pid = _owner_pid(name, prefix)
+        if pid is not None and pid != os.getpid() and not _alive(pid):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
+def _owner_pid(name: str, prefix: str) -> int | None:
+    """The pid in a `{prefix}{pid}-{suffix}` directory name, or `None` for any other name."""
+    if not name.startswith(prefix):
+        return None
+    pid, sep, _ = name[len(prefix) :].partition("-")
+    return int(pid) if sep and pid.isdigit() else None
+
+
+def _alive(pid: int) -> bool:
+    """Whether `pid` is a live process; anything that cannot answer says it is."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def make_store(work_dir: str) -> TieredSpillStore:

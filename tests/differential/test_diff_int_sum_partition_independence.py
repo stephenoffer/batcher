@@ -19,14 +19,14 @@ partition's success is a property of its data.
 
 * Within a partition, row order no longer decides anything. Any order of a multiset whose true
   sum fits an `int64` now sums.
-* Across partitions, a partition whose *own* true sum exceeds `int64` still raises, because a
-  partial's state is an `int64` column and there is nothing for it to hold. `[M, M]` as one
-  batch is exactly that case and is asserted below rather than skipped.
+* Across partitions, a partition whose *own* true sum exceeds `int64` no longer raises: a
+  partial carries its exact 128-bit total and only the final answer is narrowed
+  (`bc-runtime/src/agg/int_sum`, finding F212). `[M, M]` as one batch is exactly that case and
+  is asserted below.
 
-So batching still decides in that narrower case. Closing it needs a wider intermediate schema,
-which is a wire-contract change. `SUM` also still returns `int64` and still raises when the
-true total needs more, which is the one place this deliberately differs from DuckDB (which
-promotes to `HUGEINT`).
+So batching decides nothing. `SUM` still returns `int64` and still raises when the true total
+needs more, which is the one place this deliberately differs from DuckDB (which promotes to
+`HUGEINT`). `test_diff_int_sum_partitioning.py` holds the same contract at shard scale.
 """
 
 from __future__ import annotations
@@ -82,12 +82,10 @@ def test_a_split_whose_partitions_each_fit_merges_to_the_true_total(chunks):
     assert _sum(chunks) == 0, f"chunks={chunks}"
 
 
-def test_a_partition_that_cannot_hold_its_own_sum_still_raises():
-    # `[M, M]` has a true sum of 2**63. A partial's state is an int64 column, so there is
-    # nothing for it to hold -- this is the residual the module docstring describes, and it
-    # is asserted so that closing it later is a deliberate change rather than a surprise.
-    with pytest.raises(Exception, match=r"(?i)overflow"):
-        _sum([[_M, _M], [-_M, -_M]])
+def test_a_partition_that_cannot_hold_its_own_sum_in_int64_still_merges():
+    # `[M, M]` has a true sum of 2**63, past `int64`. Its partial carries that total exactly,
+    # and the other partition brings the answer back to 0. This used to raise (F212).
+    assert _sum([[_M, _M], [-_M, -_M]]) == 0
 
 
 def test_a_sum_that_truly_exceeds_int64_still_raises():

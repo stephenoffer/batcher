@@ -37,7 +37,6 @@ from batcher._internal.errors.suggest import suggestion as _suggestion
 __all__ = [
     "AccessDeniedError",
     "BackendError",
-    "BackpressureAbort",
     "BatcherError",
     "ColumnNotFoundError",
     "CommitError",
@@ -299,10 +298,6 @@ class ResourceError(BatcherError):
             >>> issubclass(ResourceError, BatcherError)
             True
     """
-
-
-class BackpressureAbort(ResourceError):
-    """Execution was aborted because backpressure could not be relieved."""
 
 
 class ExecutionError(BatcherError, RuntimeError):

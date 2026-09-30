@@ -4,20 +4,16 @@ AIMD and CUBIC probe because a TCP sender cannot measure what it needs. Batcher 
 transport keeps a min-filter on round-trip time and a max-filter on delivery rate, so the
 bandwidth-delay product is a measurement rather than something to be discovered by overshooting.
 
-These tests pin the two results that follow. The window's factor of two is *forced* by the
-refill batching rather than chosen, and an even split of a reducer's credit budget is worse
-than a size-proportional one by exactly the shuffle's skew factor.
+These tests pin what follows from that. The window's factor of two is *forced* by the refill
+batching rather than chosen, and a learned window is trusted only as far as its spread allows.
 """
 
 from __future__ import annotations
-
-import pytest
 
 from batcher.carbonite.policies import (
     REFILL_WINDOW_GAIN,
     AIMDFlowControl,
     bdp_window,
-    proportional_windows,
 )
 from batcher.config import Config, FlowControlConfig
 
@@ -126,70 +122,6 @@ def test_the_controller_says_which_constraint_is_binding() -> None:
 def test_an_unmeasured_path_is_not_reported_as_memory_bound() -> None:
     """No evidence of a memory constraint is not the same as evidence of one."""
     assert AIMDFlowControl(Config()).network_limited is True
-
-
-# --- allocating one budget across skewed channels -----------------------------------
-
-
-def test_the_split_is_proportional_to_what_each_channel_carries() -> None:
-    windows = proportional_windows(64, [800, 100, 100])
-    assert sum(windows) == 64
-    assert windows[0] > windows[1] == windows[2]
-
-
-def test_an_even_split_is_worse_by_exactly_the_skew_factor() -> None:
-    """The result that makes this worth doing, checked as a makespan rather than asserted.
-
-    Channel `i` is window-limited to `w_i b / R` bytes per second, so it finishes at
-    `s_i R / (w_i b)` and the reducer is done when its slowest channel is. Proportional
-    allocation equalizes those times; an even split leaves the largest bucket carrying the
-    whole delay. The ratio is `s_max / mean(s)` — the skew.
-    """
-    sizes = [1000, 100, 100, 100, 100]  # 10:1 against the mean of 280
-    budget = 100
-
-    def makespan(windows: list[int]) -> float:
-        return max(s / w for s, w in zip(sizes, windows, strict=True))
-
-    even = [budget // len(sizes)] * len(sizes)
-    optimal = proportional_windows(budget, sizes)
-    skew = max(sizes) / (sum(sizes) / len(sizes))
-    assert makespan(optimal) < makespan(even)
-    assert makespan(even) / makespan(optimal) == pytest.approx(skew, rel=0.1)
-
-
-def test_no_channel_is_ever_left_unable_to_progress() -> None:
-    """A zero window is not a small share; it is a channel that never completes."""
-    windows = proportional_windows(8, [10_000_000, 1, 1, 1])
-    assert min(windows) >= 1
-    assert sum(windows) == 8
-
-
-def test_a_budget_tighter_than_the_channel_count_still_feeds_everyone() -> None:
-    windows = proportional_windows(2, [500, 500, 500, 500])
-    assert windows == [1, 1, 1, 1], "the floor outranks the budget; a stalled reducer is worse"
-
-
-def test_no_size_information_gives_an_even_split() -> None:
-    """The correct answer under no information, rather than a guess."""
-    assert proportional_windows(64, [0, 0, 0, 0]) == [16, 16, 16, 16]
-
-
-def test_the_split_is_exact_and_deterministic() -> None:
-    """Largest-remainder, ties to the earlier channel.
-
-    Credits are integers, so rounding has to go somewhere; leaving it to chance makes a
-    shuffle's timing unreproducible run to run.
-    """
-    sizes = [37, 41, 43, 47, 53]
-    for budget in range(len(sizes), 200):
-        windows = proportional_windows(budget, sizes)
-        assert sum(windows) == budget, f"budget {budget} was not fully allocated"
-        assert windows == proportional_windows(budget, sizes)
-
-
-def test_an_empty_reducer_allocates_nothing() -> None:
-    assert proportional_windows(64, []) == []
 
 
 # --- trusting a learned window only as far as its own spread justifies --------------

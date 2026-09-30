@@ -255,11 +255,12 @@ def st_distance_sphere(a: Expr | str, b: Expr | str) -> Expr:
     Haversine on the mean-radius sphere: accurate to about 0.5%, cheap, and with no
     failure mode. Coordinates must be longitude and latitude in degrees.
 
-    Measured **vertex to vertex**, not between the nearest points of the shapes. For
-    two points — the overwhelming majority of proximity queries — those coincide
-    exactly. For extended geometries it over-reports by at most a segment length, so
-    it is an upper bound and safe to filter with; `st_segmentize` first when the answer
-    must be tight.
+    Measured between the nearest points of the shapes, with every edge taken as the
+    shorter great-circle arc between its two positions, the edge model of PostGIS
+    ``geography`` and BigQuery. A position beside the middle of a long edge measures to
+    the edge, not to its far-off vertices. Shapes that intersect in longitude and
+    latitude, such as a point inside a polygon, are 0 apart, and so are two edges whose
+    arcs cross.
 
     Args:
         a: The first geometry.
@@ -290,9 +291,10 @@ def st_distance_spheroid(a: Expr | str, b: Expr | str) -> Expr:
     positions, antipodal ones included — Vincenty's formula, which this used before,
     does not converge there and the pair came back null. Slower than
     `st_distance_sphere`; use it when the number is the deliverable and the sphere's
-    0.5% is too much. Between polygons or chains it is the smallest vertex-to-vertex
-    distance, an upper bound on the true one; densify with `st_segmentize` first when
-    the segments are long.
+    0.5% is too much. Between chains or polygons it measures to the nearest point of
+    each edge, taken as the great-circle arc between its positions like
+    `st_distance_sphere`, and finds that point on the ellipsoid by a bounded search
+    along the arc. Shapes that intersect in longitude and latitude are 0 apart.
 
     Args:
         a: The first geometry.

@@ -78,10 +78,9 @@ class BucketWriter:
         # includes that whole dictionary in every one — see `_charged_bytes`.
         self._seen_dictionaries: set[int] = set()
         self._num_rows = 0
-        # The finalized handle, so `close()` is idempotent. A double close previously
-        # re-entered `writer.close()` on a closed stream and, worse, charged the bucket's
-        # bytes to the store's confirmed usage twice while appending its path to the
-        # cleanup list twice.
+        # The finalized handle, so `close()` is idempotent: a double close must not re-enter
+        # `writer.close()` on a closed stream, charge the bucket's bytes to the store's
+        # confirmed usage twice, or append its path to the cleanup list twice.
         self._handle: SpillHandle | None = None
 
     @property
@@ -228,7 +227,8 @@ class BucketWriter:
         is the case at scale: a bucket is a whole partition, so a 16-way spill of a terabyte
         writes ~60 GB per bucket, and the check at open is a single sample taken before any
         of it was written. `memory.spill_remote_uri` is documented to keep an out-of-core
-        query alive when local disk fills, and until now it only did so at bucket boundaries.
+        query alive when local disk fills, and this is what makes that hold mid-bucket rather
+        than only at bucket boundaries.
 
         Recovery is possible because the batches already streamed are **on disk**, not
         discarded — they are read back and re-written to the remote tier **one at a time**,

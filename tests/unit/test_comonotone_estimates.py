@@ -78,3 +78,54 @@ def test_the_narrowing_never_moves_the_sound_bounds() -> None:
     filtered = _date_dim().filter(bt.col("year") == 2005)
     stat = build_estimator(filtered._sources, None).estimate(filtered._plan).columns["sk"]
     assert (stat.min, stat.max) == (1_000, 1_000 + _DAYS - 1)
+
+
+def _year_ndv_after_joining(dim: bt.Dataset, fact_keys: list[int]) -> float:
+    facts = bt.from_pydict({"f_sk": fact_keys, "v": list(range(len(fact_keys)))})
+    joined = facts.join(dim, left_on="f_sk", right_on="sk")
+    est = build_estimator(joined._sources, None)
+    return est.estimate(joined._plan).columns["year"].ndv
+
+
+def test_an_inner_join_confines_the_dimension_to_the_facts_key_range() -> None:
+    """Facts dated in 2005-2006 join to two of the dimension's twenty years, not all twenty.
+
+    TPC-DS `store_sales ⋈ date_dim` is the shape: its fact keys span five of `d_year`'s 201
+    values, and a `GROUP BY customer, d_year` above the join read the unnarrowed 201.
+    """
+    lo = 1_000 + 5 * 364
+    keys = [lo + (i * 7) % (2 * 364) for i in range(5_000)]
+    ndv = _year_ndv_after_joining(_date_dim(), keys)
+    assert 1.5 <= ndv <= 3.5, f"the facts span two years, estimated {ndv}"
+    # Control: facts spanning the whole dimension confine nothing.
+    wide = [1_000 + (i * 7) % _DAYS for i in range(5_000)]
+    assert _year_ndv_after_joining(_date_dim(), wide) > 15
+
+
+def test_control_an_unordered_dimension_is_not_narrowed_by_a_join() -> None:
+    lo = 1_000 + 5 * 364
+    keys = [lo + (i * 7) % (2 * 364) for i in range(5_000)]
+    assert _year_ndv_after_joining(_date_dim(shuffled=True), keys) > 15
+
+
+def test_a_join_to_a_filtered_dimension_counts_only_the_facts_inside_its_run() -> None:
+    """Facts spread over five years, joined to the dimension cut to one of them, keep a year.
+
+    The fact key has fewer distinct values than the filtered dimension (weekly against daily),
+    so containment assumed every fact key finds a partner. They only do inside the kept run,
+    which the filter records on the key's quantile grid; TPC-DS q22 was estimated 5x high.
+    """
+    dim = _date_dim()
+    one_year = dim.filter(bt.col("year") == 2005)
+    # Every week of 2003-2007: 260 fact keys against the one year's 364 dimension keys.
+    weekly = [1_000 + 3 * 364 + 7 * w for w in range(5 * 52)]
+    facts = bt.from_pydict({"f_sk": weekly * 5, "v": list(range(len(weekly) * 5))})
+    from batcher import core
+
+    # Measure both keys' distinct counts through a *different* query: running the one under
+    # test would record its own cardinality, and the estimate would replay the measurement.
+    facts.join(dim, left_on="f_sk", right_on="sk").collect()
+    joined = facts.join(one_year, left_on="f_sk", right_on="sk")
+    est = build_estimator(joined._sources, core.default_hub()).estimate(joined._plan).rows
+    actual = 52 * 5  # one year of weeks, each fact week five times
+    assert actual / 3 <= est <= actual * 3, (est, actual)

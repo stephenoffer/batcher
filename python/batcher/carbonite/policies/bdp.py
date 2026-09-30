@@ -24,10 +24,6 @@ What that buys is convergence in *one* round trip rather than `log2(W)` of them.
 doubling from 16 credits to 64 costs two round trips on a link where a round trip is 100 ms,
 and a short bucket finishes before the ramp ever completes — so the transfer that most needs
 the window runs its whole life below it.
-
-`proportional_windows` is the other half, and it is the one Batcher's metadata makes possible
-at all: a reducer knows how big each of its buckets is, so it can split a fixed byte budget the
-way that actually minimizes makespan rather than splitting it evenly.
 """
 
 from __future__ import annotations
@@ -40,7 +36,6 @@ __all__ = [
     "REFILL_WINDOW_GAIN",
     "bdp_window",
     "measured_bdp_window",
-    "proportional_windows",
 ]
 
 #: Multiplier on the bandwidth-delay product that a credit window must carry.
@@ -113,76 +108,3 @@ def measured_bdp_window(config: Config | None = None) -> int | None:
     if measured is None or measured <= 0:
         return None
     return bdp_window(measured, (config or active_config()).execution.morsel_bytes)
-
-
-def proportional_windows(total_credits: int, sizes: list[int]) -> list[int]:
-    """Split `total_credits` across concurrent channels so the *slowest* one finishes soonest.
-
-    A reducer fetches several buckets at once out of one byte budget, and how that budget is
-    divided is not a detail. Splitting it evenly is what the engine does when it knows nothing
-    about the buckets, and on skewed data it is badly wrong.
-
-    **The optimum is proportional to size.** Channel `i` carrying `s_i` bytes with a window of
-    `w_i` batches of `b` bytes over a path of round-trip time `R` is window-limited to
-    `w_i b / R` bytes per second, so it finishes at `t_i = s_i R / (w_i b)`. The reducer is done
-    when its last channel is, so the objective is `T = max_i t_i` subject to `sum(w_i) = W`.
-
-    At an optimum every `t_i` is equal: if some channel finished early, moving a credit from it
-    to the slowest one strictly lowers the maximum, so an unequal allocation is never optimal.
-    Setting `t_i = T` for all `i` and summing gives `T = R sum(s) / (W b)` and
-
-        w_i = W x s_i / sum(s)
-
-    **What even splitting costs.** It yields `T_even = R k s_max / (W b)` against the optimum's
-    `R sum(s) / (W b)`, a ratio of `k s_max / sum(s)` — which is `s_max / mean(s)`, the skew
-    factor exactly. A shuffle with one bucket ten times the average takes ten times longer than
-    it needs to, and every credit of the difference was already paid for.
-
-    Batcher can act on this because it knows `s_i`: the sketches estimate the buckets before the
-    shuffle and the mappers measure them while publishing. A TCP sender never knows the size of
-    the flow it is carrying, which is why no transport-layer controller does this.
-
-    Args:
-        total_credits: Credits to divide, the whole reducer's budget.
-        sizes: Bytes each channel will carry, in channel order.
-
-    Returns:
-        One window per channel, each at least 1, summing to `total_credits` whenever that is at
-        least the channel count. Falls back to an even split when no size is known, which is the
-        correct answer under no information rather than a guess.
-
-    Examples:
-        .. doctest::
-
-            >>> from batcher.carbonite.policies import proportional_windows
-            >>> proportional_windows(64, [800, 100, 100])
-            [50, 7, 7]
-    """
-    n = len(sizes)
-    if n == 0:
-        return []
-    # Every channel needs a credit to make progress at all, so the budget can never be tighter
-    # than one per channel. A zero window is not a small share, it is a channel that never
-    # completes and a reducer that never finishes.
-    if total_credits < n:
-        return [1] * n
-    total_size = sum(max(0, s) for s in sizes)
-    if total_size <= 0:
-        even, extra = divmod(total_credits, n)
-        return [even + (1 if i < extra else 0) for i in range(n)]
-
-    # Hold one credit back per channel as the floor, then share what is left by size. Applying
-    # the floor afterwards instead would let the rounding hand out more than the budget.
-    spare = total_credits - n
-    exact = [max(0, s) / total_size * spare for s in sizes]
-    windows = [1 + int(x) for x in exact]
-    # Largest-remainder: give the leftover credits to the channels the flooring shortchanged
-    # most, so the split sums to the budget exactly and no channel is systematically starved by
-    # rounding. Ties break on the earlier channel, which keeps the result deterministic — a
-    # window that varies run to run makes a shuffle's timing unreproducible.
-    leftover = total_credits - sum(windows)
-    if leftover > 0:
-        order = sorted(range(n), key=lambda i: (-(exact[i] - int(exact[i])), i))
-        for i in order[:leftover]:
-            windows[i] += 1
-    return windows

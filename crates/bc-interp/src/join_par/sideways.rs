@@ -108,39 +108,32 @@ pub(crate) fn restrict_right_sources(
     Ok(Some(out))
 }
 
-/// Whether `plan` holds a join whose build side [`restrict_right_sources`] could restrict: a
-/// qualifying join type, one key traced to a source scanned once on that side (through an
-/// aggregate unless the join is a semi or anti join), and a source of at least
-/// [`MIN_SOURCE_ROWS`].
-///
-/// Read before execution, so it cannot know the probe side's size and the restriction may still
-/// decline at run time; it answers only whether routing the plan to the executor that can
-/// restrict (the materializing one) has anything to gain. TPC-H q21 at sf10 streams in ~1,040 ms
-/// and runs materialized in ~670 ms, the difference being the 60M-row `GROUP BY l_orderkey`
-/// this restriction cuts to the orders the outer query can match.
-#[must_use]
-pub fn sideways_candidate(plan: &RelOp, sources: &[Vec<RecordBatch>]) -> bool {
-    if let RelOp::HashJoin {
-        join_type: join_type @ (JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti),
-        right_keys,
-        right,
-        ..
-    } = plan
-    {
-        if let [key] = right_keys.as_slice() {
-            if let Some((source_id, _)) = trace_to_scan(right, key, needs_aggregate(*join_type)) {
-                let rows: usize = sources
-                    .get(source_id)
-                    .map_or(0, |b| b.iter().map(RecordBatch::num_rows).sum());
-                if count_scans_of(right, source_id) == 1 && rows >= MIN_SOURCE_ROWS {
-                    return true;
-                }
-            }
-        }
+/// Whether this one join's build side is shaped for [`restrict_right_sources`], before its probe
+/// side has been evaluated: the join type, the single key, the trace to a scan read once in
+/// `right`, and a source large enough to be worth filtering. Everything that needs the probe
+/// rows (the probe-per-source ratio, the digest, the keep fraction) is left to the restriction.
+pub(crate) fn restrictable(
+    join_type: JoinType,
+    right_keys: &[String],
+    right: &RelOp,
+    sources: &[Vec<RecordBatch>],
+) -> bool {
+    if !matches!(
+        join_type,
+        JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
+    ) {
+        return false;
     }
-    plan.children()
-        .into_iter()
-        .any(|c| sideways_candidate(c, sources))
+    let [key] = right_keys else {
+        return false;
+    };
+    let Some((source_id, _)) = trace_to_scan(right, key, needs_aggregate(join_type)) else {
+        return false;
+    };
+    let rows: usize = sources
+        .get(source_id)
+        .map_or(0, |b| b.iter().map(RecordBatch::num_rows).sum());
+    count_scans_of(right, source_id) == 1 && rows >= MIN_SOURCE_ROWS
 }
 
 /// The scan the key column of `plan` comes from and its name there, provided the path crosses an
@@ -257,7 +250,21 @@ mod tests {
     use bc_expr::Expr;
     use bc_ir::{AggFunc, AggregateItem, JoinOutputCol, JoinSide, JoinType, ProjectionItem, RelOp};
 
-    use super::{restrict_right_sources, sideways_candidate};
+    use super::{restrict_right_sources, restrictable};
+
+    /// [`restrictable`] asked of a root join, as the streaming prepass asks it.
+    fn sideways_candidate(plan: &RelOp, sources: &[Vec<RecordBatch>]) -> bool {
+        let RelOp::HashJoin {
+            join_type,
+            right_keys,
+            right,
+            ..
+        } = plan
+        else {
+            return false;
+        };
+        restrictable(*join_type, right_keys, right, sources)
+    }
     use crate::par::{execute_parallel_with_metrics, ExecOptions};
 
     fn batch(cols: &[(&str, Vec<Option<i64>>)]) -> RecordBatch {

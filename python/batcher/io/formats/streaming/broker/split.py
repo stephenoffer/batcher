@@ -75,7 +75,7 @@ class BrokerSplit:
         from batcher.io.formats.base import SOURCES
 
         cls = SOURCES.get(self.format_name)
-        return cls(  # type: ignore[no-any-return]
+        return cls(
             self.topic,
             poll_size=self.poll_size,
             poll_bytes=self.poll_bytes,

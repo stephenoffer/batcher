@@ -26,6 +26,7 @@ from batcher.dist.executors.partition_io import (
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    kill_workers,
     map_barrier,
     map_partitions,
     shuffle_partitions,
@@ -86,7 +87,6 @@ def execute_join_flight(
     thereafter via `ShuffleRecovery`. Object store bypassed. `_fault_inject` /
     `_fault_inject_map` are test-only hooks: worker ids to kill after / before the map
     barrier."""
-    import ray
 
     # A broadcast-marked join replicates its small build side and shuffles nothing — see
     # `flight_broadcast`. Tried first and only for the join types where it yields the same
@@ -211,8 +211,7 @@ def execute_join_flight(
 
         # Simulate worker loss BEFORE the map barrier (test hook).
         if _fault_inject_map:
-            for i in _fault_inject_map:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject_map)
 
         # MAP barrier under worker-loss recovery: a worker preempted while mapping has
         # BOTH its sides republished on one survivor under the same `src`, so the single
@@ -275,13 +274,17 @@ def execute_join_flight(
         # worker costs no re-read of either source. `None` (the default factor of 1)
         # leaves the reduce byte-identical to the unreplicated path.
         replicas = replicate_shuffle_output(
-            actors, mapper_addrs, n_buckets, workers, mapper_dead, stages=(0, 1)
+            actors,
+            mapper_addrs,
+            n_buckets,
+            workers,
+            mapper_dead,
+            stages=(stage_base, stage_base + 1),
         )
 
         # Simulate worker loss after the map barrier (test hook).
         if _fault_inject:
-            for i in _fault_inject:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject)
 
         lschema = probe(left_ir, sources[lsid])
         rschema = probe(right_ir, sources[rsid])

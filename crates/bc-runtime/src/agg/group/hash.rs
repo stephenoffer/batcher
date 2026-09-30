@@ -159,6 +159,18 @@ fn hash_keys_gated(
     {
         return Ok(hash_mixed(group_keys, num_rows));
     }
+    // The same fold for a key that holds NULLs, with a presence tag before each column's value
+    // so a NULL hashes as itself rather than as whatever bytes sit in its slot. Sound because
+    // `null_free` is decided once for the whole relation: every partial of a nullable key takes
+    // this path, never the tagless one above, so a key hashes identically wherever it occurs.
+    // Before it, one NULL anywhere sent the whole combine through the serial row encoder, which
+    // was TPC-DS q47's hottest kernel (its `i_brand`/`i_category` keys carry NULLs).
+    if !null_free
+        && group_keys.len() >= 2
+        && group_keys.iter().all(|a| is_hashable_mixed(a.data_type()))
+    {
+        return Ok(hash_mixed_nullable(group_keys, num_rows));
+    }
     let fields: Vec<SortField> = group_keys
         .iter()
         .map(|a| SortField::new(a.data_type().clone()))
@@ -233,6 +245,44 @@ fn hash_mixed(group_keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
             let mut h = SEED.build_hasher();
             for c in &cols {
                 c.write(&mut h, i);
+            }
+            h.finish()
+        })
+        .collect()
+}
+
+/// [`hash_mixed`] for columns that may hold NULLs: each column contributes a presence byte and,
+/// when present, its value, so every NULL of a column hashes alike and apart from every value.
+fn hash_mixed_nullable(group_keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
+    use std::hash::{BuildHasher, Hasher};
+    let cols: Vec<(MixedCol, Option<&arrow::buffer::NullBuffer>)> = group_keys
+        .iter()
+        .map(|k| {
+            let col = match k.data_type() {
+                DataType::Int64 => MixedCol::Int(k.as_primitive::<Int64Type>().values()),
+                DataType::Float64 => {
+                    MixedCol::Float(k.as_primitive::<arrow::datatypes::Float64Type>().values())
+                }
+                DataType::Utf8 => MixedCol::Str32(k.as_string::<i32>()),
+                DataType::LargeUtf8 => MixedCol::Str64(k.as_string::<i64>()),
+                DataType::Binary => MixedCol::Bin32(k.as_binary::<i32>()),
+                DataType::LargeBinary => MixedCol::Bin64(k.as_binary::<i64>()),
+                _ => unreachable!("caller gated on is_hashable_mixed"),
+            };
+            (col, k.nulls())
+        })
+        .collect();
+    (0..num_rows)
+        .into_par_iter()
+        .map(|i| {
+            let mut h = SEED.build_hasher();
+            for (c, nulls) in &cols {
+                if nulls.is_some_and(|n| n.is_null(i)) {
+                    h.write_u8(0);
+                } else {
+                    h.write_u8(1);
+                    c.write(&mut h, i);
+                }
             }
             h.finish()
         })

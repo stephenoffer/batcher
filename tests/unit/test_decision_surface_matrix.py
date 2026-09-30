@@ -19,7 +19,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from batcher.carbonite.memory.estimator import peak_operator_bytes
+from batcher.carbonite.memory.estimator import learned_plan_peak
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.carbonite.policies.morsel import morsel_target
 from batcher.config import active_config
@@ -120,7 +120,7 @@ def test_the_envelope_grows_with_the_modality(modality):
     _, _, this = _annotated(_frame(modality).sort("k"))
     if modality == "narrow":
         return
-    assert peak_operator_bytes(this) > peak_operator_bytes(narrow), modality
+    assert learned_plan_peak(this, None) > learned_plan_peak(narrow, None), modality
 
 
 # --- the scale axis ---------------------------------------------------------------

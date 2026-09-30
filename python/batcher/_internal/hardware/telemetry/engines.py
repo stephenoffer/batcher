@@ -97,21 +97,6 @@ class EngineUtilization:
         """
         return max(self.decoder, self.encoder, self.jpeg, self.optical_flow) > 0.0
 
-    @property
-    def decode_saturated(self) -> bool:
-        """Whether the decode block was busy for effectively the whole sample window.
-
-        A 90% band rather than 100% because the counter is quantized to whole percent and a
-        fully-loaded engine routinely reports 97-99. A saturated decoder caps a media stage at
-        the engine's rate regardless of how much SM capacity is left.
-        """
-        return self.decoder >= 0.9
-
-    @property
-    def encoder_saturated(self) -> bool:
-        """Whether the encode block was busy for effectively the whole sample window."""
-        return self.encoder >= 0.9
-
 
 def _utilization(nv, handle, getter: str) -> float | None:
     """One engine's duty cycle in [0, 1], or `None` when the part has no such counter.

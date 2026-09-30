@@ -36,6 +36,8 @@ __all__ = [
     "column_bounds_needed",
     "invalidate_source_stats",
     "persist_written_source_stats",
+    "planning_source_stats",
+    "with_exact_join_keys",
 ]
 
 #: The aggregate functions whose *input column's* statistics a rule reads, and therefore the only
@@ -79,6 +81,10 @@ _SOURCE_STATS_CACHE: dict[str, object] = {}
 # reads. On ClickBench's 105-column `hits` that is 105 objects per query, then re-digested by
 # the plan cache and re-derived by the estimator, for a query naming one column.
 _RESIDENT_SUBSET_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+# Per-source memo of `with_exact_join_keys`' output, keyed by the join-key set and valid only
+# for the very statistics object it was computed from (see `_exact_keys_memoized`).
+_EXACT_KEYS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def build_estimator(sources: list[Source], hub: MetadataHub | None):
@@ -324,6 +330,146 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
     return stats
 
 
+#: The largest in-memory relation whose integer join keys are counted exactly before planning.
+#: A count is one hash pass (~4 ns a row) memoized on the immutable source, so it is paid once
+#: per relation, never per query; the cap keeps a first query over a fact table from paying
+#: it for a key that is almost never unique there (`l_orderkey`, `ss_customer_sk`).
+_EXACT_KEY_MAX_ROWS = 4_000_000
+
+
+def planning_source_stats(
+    sources: list[Source], hub: MetadataHub | None, plan: LogicalPlan, collected: list | None = None
+) -> list:
+    """The per-source statistics Kyber plans `plan` with: bounds it can use, exact join keys.
+
+    One definition for the two places that plan a query, execution and `explain`, so the
+    plan `explain` shows is the plan that runs.
+
+    Args:
+        sources: The plan's bound sources.
+        hub: The metadata hub, or None.
+        plan: The plan about to be optimized.
+        collected: Statistics a caller already collected for these sources, reused as-is.
+
+    Returns:
+        The statistics, index-aligned with `sources`.
+    """
+    if collected is None:
+        collected = collect_source_stats(sources, hub, need_columns=column_bounds_needed(plan))
+    return with_exact_join_keys(sources, collected, plan)
+
+
+def with_exact_join_keys(sources: list[Source], stats: list, plan: LogicalPlan) -> list:
+    """`stats`, with an EXACT distinct count for each in-memory source's integer join keys.
+
+    A key's *uniqueness* is what licenses the additive aggregate rewrites — pushing a `SUM`
+    below a join (`kyber.rules.agg_pushdown.pre_aggregation_through_join`) is correct only when
+    the other side matches each partial row once — and uniqueness must be proven, never
+    estimated: an HLL count overshoots near the row count and once turned a non-unique key
+    into a "proof" that halved a `SUM`. An immutable in-memory relation can prove it by
+    counting, so this counts: only integer columns a join names, only below
+    `_EXACT_KEY_MAX_ROWS`, and memoized on the source (`InMemorySource.column_ndv`). A file
+    source, an ephemeral stage intermediate, and a column that already carries an exact count
+    are left as they are.
+
+    Measured on TPC-DS q4's `year_total` branch at sf1: the rewrite it enables groups the fact
+    join by `(ss_customer_sk, d_year)` before `customer`'s seven string attributes are gathered
+    and row-encoded, 96 ms -> 69 ms a branch.
+
+    Args:
+        sources: The plan's bound sources.
+        stats: Their `SourceStatistics`, index-aligned with `sources`.
+        plan: The plan whose join keys are counted.
+
+    Returns:
+        A new statistics list; `stats` is not mutated.
+    """
+    from batcher.io.source import InMemorySource
+    from batcher.plan.logical.base import memoize_by_content
+
+    keys = memoize_by_content(plan, "join_key_base_columns", _join_key_base_columns)
+    if not keys:
+        return stats
+    out = list(stats)
+    for i, (src, st) in enumerate(zip(sources, stats, strict=False)):
+        if st is None or not isinstance(src, InMemorySource) or getattr(src, "ephemeral", False):
+            continue
+        if not st.row_count or st.row_count > _EXACT_KEY_MAX_ROWS:
+            continue
+        out[i] = _exact_keys_memoized(src, st, keys)
+    return out
+
+
+def _exact_keys_memoized(src: Source, st, keys: frozenset[str]):
+    """`_exact_keys` for one source, the *same object* for the same inputs on every query.
+
+    Identity matters as much as the work saved: the plan cache digests source statistics and
+    memoizes that digest by object, so a fresh-but-equal statistics object per query re-digested
+    every column on every warm run -- 0.3 -> 1.6 ms of `plan_cache.cache_key` on TPC-DS q92,
+    a query that runs in 5 ms.
+    """
+    try:
+        by_input = _EXACT_KEYS_CACHE.setdefault(src, {})
+    except TypeError:  # not weak-referenceable
+        return _exact_keys(src, st, keys)
+    hit = by_input.get(keys)
+    if hit is not None and hit[0] is st:
+        return hit[1]
+    result = _exact_keys(src, st, keys)
+    by_input[keys] = (st, result)
+    return result
+
+
+def _exact_keys(src: Source, st, keys: frozenset[str]):
+    """`st` with an EXACT `ndv` on each of `keys` that is an integer column of `src`."""
+    from dataclasses import replace
+
+    from batcher.plan.stats import ColumnStat, Provenance
+
+    schema = src.schema()
+    columns = dict(st.columns)
+    for name in keys & set(schema.names):
+        have = columns.get(name)
+        if have is not None and have.ndv is not None and have.ndv_is_exact:
+            continue
+        if not pa.types.is_integer(schema.field(name).type):
+            continue
+        ndv = src.column_ndv(name)
+        if ndv is None:
+            continue
+        base = have if have is not None else ColumnStat(provenance=Provenance.DEFAULT)
+        columns[name] = replace(base, ndv=ndv, ndv_provenance=Provenance.EXACT)
+    return replace(st, columns=columns) if columns != st.columns else st
+
+
+def _join_key_base_columns(plan: LogicalPlan) -> frozenset[str]:
+    """Every join key of `plan`, resolved through renaming projections to its base column.
+
+    Read off the plan *before* Kyber, where a SQL `FROM a, b WHERE a.k = b.k` is still a cross
+    product under a filter, so a `column = column` conjunct counts as a key as well as a
+    `Join`'s own keys.
+    """
+    from batcher.plan.expr_ir import Binary, Col
+    from batcher.plan.expr_rewrite.algebra import split_conjuncts
+    from batcher.plan.logical import Filter, Join
+    from batcher.plan.visitor import walk_with_base_names
+
+    keys: set[str] = set()
+    for node, base in walk_with_base_names(plan):
+        if isinstance(node, Join):
+            keys.update(base.get(k, k) for k in (*node.left_keys, *node.right_keys))
+        elif isinstance(node, Filter):
+            for term in split_conjuncts(node.predicate):
+                if (
+                    isinstance(term, Binary)
+                    and term.op == "eq"
+                    and isinstance(term.left, Col)
+                    and isinstance(term.right, Col)
+                ):
+                    keys.update(base.get(c.name, c.name) for c in (term.left, term.right))
+    return frozenset(keys)
+
+
 def column_bounds_needed(plan: LogicalPlan) -> set[str]:
     """The column names whose per-column statistics the plan could consume.
 
@@ -372,7 +518,17 @@ def column_bounds_needed(plan: LogicalPlan) -> set[str]:
     contract, but which one a query gets should not depend on whether an unrelated rule wanted
     bounds. Requesting every aggregate's input column did exactly that, so this asks only for what
     the consumer above actually reads.
+
+    Memoized on the plan's content (`memoize_by_content`): the conductor asks on every
+    execution, and a re-issued query is a new tree with the same answer.
     """
+    from batcher.plan.logical.base import memoize_by_content
+
+    return set(memoize_by_content(plan, "column_bounds_needed", _column_bounds_needed))
+
+
+def _column_bounds_needed(plan: LogicalPlan) -> frozenset[str]:
+    """`column_bounds_needed`, uncached."""
     from batcher.plan.expr_ir import Col, referenced_columns
     from batcher.plan.logical import Aggregate, AsofJoin, Filter, Join, Sort
     from batcher.plan.visitor import walk_with_base_names
@@ -401,7 +557,7 @@ def column_bounds_needed(plan: LogicalPlan) -> set[str]:
         elif isinstance(node, Sort):
             found = {k.expr.name for k in node.keys if isinstance(k.expr, Col)}
         needed |= {base.get(name, name) for name in found}
-    return needed
+    return frozenset(needed)
 
 
 def invalidate_source_stats(path: str, fmt: str) -> None:

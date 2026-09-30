@@ -228,19 +228,66 @@ def _polars_lazy_source(lf: Any, pl: Any) -> Source:
 
 
 def from_huggingface(hf_dataset: Any) -> Source:
-    """Build a `Source` from a HuggingFace `datasets.Dataset` (Arrow-backed).
+    """Build a `Source` from a HuggingFace `datasets.Dataset` or `datasets.IterableDataset`.
 
-    HuggingFace datasets are Arrow tables under the hood, so the underlying table
-    is taken directly (zero-copy) — falling back to ``with_format('arrow')`` for
-    dataset views that do not expose ``.data`` directly.
+    A map-style dataset is an Arrow table under the hood, so the table is taken directly
+    (zero-copy) when it *is* the dataset. It is not always: ``select``, ``filter``,
+    ``shuffle`` and ``train_test_split`` return a view carrying an indices mapping over the
+    full, untouched table, and taking ``.data.table`` there returned every row of the parent
+    instead of the view's. A view is read through ``with_format('arrow')``, which applies the
+    mapping.
+
+    An `IterableDataset` (``load_dataset(..., streaming=True)``) becomes a streaming
+    `IteratorSource`: each scan re-opens the stream and pulls bounded Arrow batches from it,
+    so `iter_batches` over it holds one batch at a time instead of the whole corpus.
     """
     require("datasets", feature="HuggingFace interop", provides="datasets", extra="huggingface")
-    data = getattr(hf_dataset, "data", None)
-    table = getattr(data, "table", None)
-    if isinstance(table, pa.Table):
+    if not hasattr(hf_dataset, "data"):
+        return _huggingface_stream(hf_dataset)
+    table = getattr(hf_dataset.data, "table", None)
+    if isinstance(table, pa.Table) and getattr(hf_dataset, "_indices", None) is None:
         return _source_from_table(table)
-    arrow_ds = hf_dataset.with_format("arrow")
-    return _source_from_table(pa.Table.from_batches(list(arrow_ds.iter(batch_size=1024))))
+    chunks = [pa.table(c) for c in _huggingface_arrow_batches(hf_dataset)]
+    if chunks:
+        return _source_from_table(pa.concat_tables(chunks))
+    schema = _huggingface_schema(hf_dataset)
+    return _source_from_table(schema.empty_table() if schema is not None else pa.table({}))
+
+
+#: Rows per batch pulled from a HuggingFace dataset: one engine morsel, the unit the
+#: engine schedules anyway, so the stream never holds more than that per pull.
+_HF_BATCH_ROWS = 16_384
+
+
+def _huggingface_arrow_batches(hf_dataset: Any) -> Any:
+    """The dataset's rows as a fresh iterator of Arrow tables of `_HF_BATCH_ROWS` rows."""
+    return hf_dataset.with_format("arrow").iter(batch_size=_HF_BATCH_ROWS)
+
+
+def _huggingface_schema(hf_dataset: Any) -> pa.Schema | None:
+    """The Arrow schema the dataset's declared ``features`` imply, or `None` if undeclared."""
+    schema = getattr(getattr(hf_dataset, "features", None), "arrow_schema", None)
+    return schema if isinstance(schema, pa.Schema) else None
+
+
+def _huggingface_stream(hf_dataset: Any) -> Source:
+    """A streaming `IteratorSource` over a HuggingFace `IterableDataset`."""
+
+    def factory() -> Any:
+        for chunk in _huggingface_arrow_batches(hf_dataset):
+            yield from pa.table(chunk).combine_chunks().to_batches()
+
+    # The schema is read off the first real batch rather than trusted from ``features``:
+    # the declared features and the Arrow the stream emits can disagree on a physical type
+    # (``string`` against ``large_string``), and the batches are what the engine will see.
+    first = next(factory(), None)
+    schema = first.schema if first is not None else _huggingface_schema(hf_dataset)
+    if schema is None:
+        raise PlanError(
+            "from_huggingface(): the IterableDataset declares no features and yielded no "
+            "rows, so there is no schema to read. Pass it through `.cast(features)` first."
+        )
+    return IteratorSource(factory, schema)
 
 
 def from_torch(dataset_or_tensors: Any) -> Source:
@@ -251,7 +298,7 @@ def from_torch(dataset_or_tensors: Any) -> Source:
     crosses into the engine — only the bulk NumPy buffers do.
 
     A ``{name: tensor}`` **mapping** keeps its keys as column names, which makes this the
-    exact inverse of `ml.to_torch`: what the loader yields, this reads back. Before, a
+    exact inverse of `ml.to_torch_iterable`: what the loader yields, this reads back. Before, a
     mapping fell through to the map-style-`Dataset` branch and indexed it by integer, so the
     natural round-trip raised ``KeyError: 0`` — an error naming nothing the caller wrote.
 

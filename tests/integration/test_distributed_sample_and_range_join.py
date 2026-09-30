@@ -28,7 +28,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher._internal.errors import PlanError
 from batcher.config import active_config
 
@@ -38,11 +38,7 @@ pytest.importorskip("batcher._native", reason="native engine not built")
 WORKERS = 4
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(WORKERS)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(WORKERS)
 
 
 @pytest.fixture(scope="module")
@@ -185,6 +181,30 @@ def test_distributed_range_join_with_operators_above(split_source, bands):
     assert _sorted_rows(ds.collect(distributed=True, num_workers=WORKERS)) == _sorted_rows(
         ds.collect(distributed=False)
     )
+
+
+@pytest.mark.integration
+def test_distributed_range_join_beneath_an_anti_join(split_source, cluster_scratch):
+    """TPC-H q22's shape: rows above their table's average, then those with no match.
+
+    The range join against the one-row average sits beneath the anti join, where it has no
+    distributed form; the staged loop cuts there so it runs as a stage of its own. Before, it
+    raised "did not stage" under `distributed=True`.
+    """
+    d = cluster_scratch("orders")
+    pq.write_table(pa.table({"o_x": np.arange(0, 2_000, 7, dtype="int64")}), d / "o.parquet")
+    left = bt.read.parquet(split_source)
+    avg = left.agg(m=bt.col("x").mean())
+    above = left.join(avg, how="cross").filter(bt.col("x") > bt.col("m")).select("x", "g")
+    ds = (
+        above.join(bt.read.parquet(str(d)), left_on="x", right_on="o_x", how="anti")
+        .group_by("g")
+        .agg(n=bt.count(), s=bt.col("x").sum())
+    )
+    single = ds.collect(distributed=False)
+    dist = ds.collect(distributed=True, num_workers=WORKERS)
+    assert single.num_rows > 0
+    assert _sorted_rows(dist) == _sorted_rows(single)
 
 
 @pytest.mark.integration

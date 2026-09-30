@@ -152,8 +152,8 @@ when an estimate was off by more than `optimizer.reoptimize_error`, 2.0 by defau
 Kyber re-plans the rest of the query on the measured numbers before continuing. The
 same mechanism runs single-node and distributed.
 
-This is stage-boundary re-optimization, the same granularity Spark AQE adapts at, and
-Batcher runs it on one machine too. DuckDB optimizes once, before execution, and never
+This is stage-boundary re-optimization, the same granularity Spark AQE adapts at. Like AQE
+in local mode, it runs on one machine, and Batcher runs it inside the Python process. DuckDB optimizes once, before execution, and never
 revises. Check the gate before assuming your query is in it. On a single node,
 `adaptive="auto"`, the default, engages the loop only on a query that contains a join,
 where measuring could still flip a downstream decision such as a build side or a join

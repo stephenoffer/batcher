@@ -96,6 +96,11 @@ from batcher.plan.functions.geo.measures import (
     st_perimeter,
     st_perimeter_spheroid,
 )
+from batcher.plan.functions.geo.overlay import (
+    st_difference,
+    st_intersection,
+    st_union,
+)
 from batcher.plan.functions.geo.parts import (
     st_end_point,
     st_exterior_ring,
@@ -172,6 +177,7 @@ __all__ = [
     "st_covered_by",
     "st_covers",
     "st_crosses",
+    "st_difference",
     "st_dimension",
     "st_disjoint",
     "st_distance",
@@ -202,6 +208,7 @@ __all__ = [
     "st_hex_center_x",
     "st_hex_center_y",
     "st_interior_ring_n",
+    "st_intersection",
     "st_intersects",
     "st_intersects_extent",
     "st_is_closed",
@@ -250,6 +257,7 @@ __all__ = [
     "st_touches",
     "st_transform",
     "st_translate",
+    "st_union",
     "st_utm_epsg",
     "st_utm_zone",
     "st_within",

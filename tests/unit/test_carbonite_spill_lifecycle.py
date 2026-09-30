@@ -23,6 +23,12 @@ def _batch(n: int = 8) -> pa.RecordBatch:
     return pa.record_batch({"v": pa.array(list(range(n)), type=pa.int64())})
 
 
+def _buckets(store: TieredSpillStore) -> int:
+    """Finalized buckets the store holds across both tiers."""
+    stats = store.stats()
+    return int(stats["local_buckets"]) + int(stats["remote_buckets"])
+
+
 def test_close_is_idempotent(tmp_path) -> None:
     """A second close returns the same handle and charges the store once."""
     store = TieredSpillStore(str(tmp_path / "s"), compression=None)
@@ -67,7 +73,7 @@ def test_context_manager_aborts_on_an_exception(tmp_path) -> None:
         raise RuntimeError("operator blew up mid-partition")
 
     assert store.stats()["local_pending_bytes"] == 0
-    assert store.bucket_count == 0
+    assert _buckets(store) == 0
 
 
 def test_spill_aborts_when_the_batch_source_raises(tmp_path) -> None:
@@ -82,17 +88,17 @@ def test_spill_aborts_when_the_batch_source_raises(tmp_path) -> None:
         store.spill(batches(), "b0")
 
     assert store.stats()["local_pending_bytes"] == 0
-    assert store.bucket_count == 0
+    assert _buckets(store) == 0
 
 
-def test_handle_carries_row_count_and_compression_ratio(tmp_path) -> None:
+def test_handle_carries_row_count_and_both_sizes(tmp_path) -> None:
     store = TieredSpillStore(str(tmp_path / "s"), compression=None)
     handle = store.spill([_batch(10), _batch(10)], "b0")
 
     assert handle is not None
     assert handle.num_rows == 20
-    assert handle.compression_ratio > 0
-    assert handle.is_remote is False
+    assert handle.nbytes > 0 and handle.logical_nbytes > 0
+    assert handle.tier is SpillTier.LOCAL
 
 
 def test_release_frees_one_bucket_incrementally(tmp_path) -> None:
@@ -100,15 +106,15 @@ def test_release_frees_one_bucket_incrementally(tmp_path) -> None:
     store = TieredSpillStore(str(tmp_path / "s"), compression=None)
     a = store.spill([_batch(10)], "b0")
     b = store.spill([_batch(10)], "b1")
-    assert store.bucket_count == 2
+    assert _buckets(store) == 2
 
     store.release(a)
 
-    assert store.bucket_count == 1
+    assert _buckets(store) == 1
     assert store.local_bytes == b.nbytes
     assert not os.path.exists(a.path)
     store.release(a)  # already gone — a no-op, not an error
-    assert store.bucket_count == 1
+    assert _buckets(store) == 1
 
 
 def test_store_is_a_context_manager_that_cleans_up(tmp_path) -> None:
@@ -138,14 +144,14 @@ def test_remote_buckets_are_cleaned_up_too(tmp_path) -> None:
     assert handle is not None and handle.tier is SpillTier.REMOTE
     fs, _, paths = fsspec.get_fs_token_paths(handle.path)
     assert fs.exists(paths[0])
-    assert store.remote_bytes > 0
+    assert store.stats()["remote_bytes"] > 0
     assert store.overflowed == 1
 
     store.cleanup()
 
     assert not fs.exists(paths[0])
-    assert store.remote_bytes == 0
-    assert store.bucket_count == 0
+    assert store.stats()["remote_bytes"] == 0
+    assert _buckets(store) == 0
 
 
 def test_free_disk_reading_is_ttl_cached(tmp_path, monkeypatch) -> None:

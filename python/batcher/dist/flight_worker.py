@@ -35,6 +35,7 @@ from batcher.carbonite.transfer.codec import resolve_codec
 from batcher.kyber.cost.fabric import measured_fabric_gbps
 
 if TYPE_CHECKING:
+    from batcher.config import Config
     from batcher.config.config import ShuffleTlsConfig
 
 __all__ = [
@@ -116,11 +117,23 @@ def _reduce_work_dir(prefix: str, spill_dir: str | None) -> str:
     Returns:
         A fresh directory the caller owns and removes.
     """
+    import glob
+    import os
+    import shutil
     import tempfile
 
     from batcher._internal.site import local_scratch_root
 
-    return tempfile.mkdtemp(prefix=prefix, dir=spill_dir or local_scratch_root() or None)
+    root = spill_dir or local_scratch_root() or tempfile.gettempdir()
+    # Named for the owning process, so a directory whose owner is gone can be recognized.
+    # A reducer killed mid-query (a fleet teardown, a lost node) never runs the cleanup
+    # that removes its directory, and on the SF1000 TPC-H suite those orphans, with the
+    # shuffle store's, filled a 145 GB worker disk until no task could start on it.
+    for stale in glob.glob(os.path.join(root, f"{prefix}*_*")):
+        owner = os.path.basename(stale)[len(prefix) :].split("_", 1)[0]
+        if owner.isdigit() and not os.path.exists(f"/proc/{owner}") and os.path.isdir("/proc"):
+            shutil.rmtree(stale, ignore_errors=True)
+    return tempfile.mkdtemp(prefix=f"{prefix}{os.getpid()}_", dir=root)
 
 
 def new_plan_id() -> int:
@@ -288,9 +301,19 @@ try:
             credit_ceiling: int = 0,
             prefer_fabric: bool = False,
             concurrency: int = 1,
+            config: Config | None = None,
         ) -> None:
             nat = engine()
             from batcher.carbonite.transfer import ShuffleSession
+            from batcher.config import active_config
+
+            # The driver's `Config`, shipped whole. This actor's process sees neither the
+            # driver's `config_context` nor its profile, so every tunable read below — the
+            # shuffle store cap, the gather's stream count and byte bound, the AIMD gains and
+            # the memory-pressure limits — comes from this object rather than from
+            # `active_config()`, which here would answer with the worker's own defaults.
+            # `None` only for a direct construction outside `spawn_flight_workers`.
+            cfg = config if config is not None else active_config()
 
             # Fence this worker's tickets to the query it was spawned for, so a
             # reused fleet actor cannot serve a prior (crashed) query's stale buckets.
@@ -318,21 +341,19 @@ try:
             # result-preserving. Set before the server is created: each store captures the
             # cap at construction so its bound cannot shift mid-query.
             from batcher.carbonite.policies import shuffle_store_cap
-            from batcher.config import active_config
 
             # The gather's shape and its memory bound: how many concurrent Flight streams
             # this reducer runs across its peers, and the decoded bytes they may hold
             # between them. Set here rather than left to the engine default so an operator
             # can trade the two off in one place, as with every other transport tunable.
-            _fc = active_config().flow_control
             nat.set_flight_transport_config(
                 idle_timeout_ms,
                 keepalive_ms,
                 connections_per_peer,
                 compression,
-                shuffle_store_cap(active_config()),
-                _fc.gather_streams,
-                _fc.gather_inflight_bytes,
+                shuffle_store_cap(cfg),
+                cfg.flow_control.gather_streams,
+                cfg.flow_control.gather_inflight_bytes,
             )
 
             # Shuffle TLS (off unless the operator mounted certs and enabled it). Read
@@ -393,24 +414,22 @@ try:
                 self.session = ShuffleSession(
                     credits,
                     # Warm-start AIMD at the driver's grant. `credits` is what Carbonite's
-                    # `grant_credits(signature=)` just computed from Kyber's per-operator
-                    # estimate *and* this shuffle's learned converged window — and under
-                    # adaptive credits `_window()` reads the controller, never the session's
-                    # static `credits`, so a bare controller silently discarded all of it and
-                    # every channel re-climbed from `default_credits` (4) on every query.
-                    # The ceiling comes from the driver, not from this process. A Ray
-                    # actor sees neither the driver's `config_context` nor the metadata hub
-                    # the learned row width is fit from, so every input `credit_ceiling`
-                    # needs is wrong or missing here — and AIMD *grows toward* its ceiling,
-                    # so re-deriving a wrong one is not an approximation, it is the window
-                    # the controller settles at and the memory it buffers there. A
-                    # wide-row shuffle (embeddings, blobs) was the case that mattered: its
-                    # learned per-batch width is what holds the window under
-                    # `credit_byte_budget`, and it is invisible from inside the worker.
+                    # `grant_credits(signature=)` computed from Kyber's per-operator estimate
+                    # *and* this shuffle's learned converged window, and under adaptive
+                    # credits `_window()` reads the controller, never the session's static
+                    # `credits` — so a controller started anywhere else would discard that
+                    # and re-climb from `default_credits` on every query.
+                    # The ceiling comes from the driver, not from this process. A Ray actor
+                    # cannot see the metadata hub the learned row width is fit from, so every
+                    # input `credit_ceiling` needs is missing here — and AIMD *grows toward*
+                    # its ceiling, so a wrong one is the window the controller settles at and
+                    # the memory it buffers there. A wide-row shuffle (embeddings, blobs) is
+                    # the case that matters: its learned per-batch width is what holds the
+                    # window under `credit_byte_budget`, and it is invisible from here.
                     flow_control=AIMDFlowControl(
-                        initial_window=credits, ceiling=credit_ceiling or None
+                        cfg, initial_window=credits, ceiling=credit_ceiling or None
                     ),
-                    pressure=PressureMonitor(),
+                    pressure=PressureMonitor(cfg),
                     advertise_host=advertise_host,
                     token=shuffle_token,
                     shm=shm,
@@ -637,6 +656,16 @@ try:
             `ShuffleSession._shm_mirror_ok` for what it turns off and what that is worth.
             """
             self.session.set_shm_peers(has_peer)
+
+        def aligned_units(self, calls: list, held: dict, empties: dict) -> list:
+            """Run key-range units in this worker: the aligned executor's work, leaseless.
+
+            The body is `aligned.run.run_units_here`; see `_run_units` there for why a warm
+            fleet runs it instead of plain tasks.
+            """
+            from batcher.dist.executors.aligned.run import run_units_here
+
+            return run_units_here(calls, held, empties)
 
         @ray.method(concurrency_group="control")
         def node_id(self) -> str:
@@ -1754,7 +1783,8 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     )
     from batcher.dist.executors.ray_runtime.scheduling import FLEET_CONCURRENCY
 
-    dc = active_config().distributed
+    cfg = active_config()
+    dc = cfg.distributed
     adaptive = dc.adaptive_credits
     # The shuffle auth token is decided on the driver (the worker can't see the
     # driver's config_context) and shipped to every actor, so all servers expect and
@@ -1775,6 +1805,9 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
         )
         or ""
     )
+    from batcher.config.validation.distributed import require_secure_shuffle
+
+    require_secure_shuffle(dc, token)
     # Flight transport timeouts decided on the driver and shipped to every worker
     # (which can't see the driver's config_context), in milliseconds for the native
     # setter. 0 keepalive = off.
@@ -1845,6 +1878,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
             ceiling,
             dc.prefer_fabric_interface,
             FLEET_CONCURRENCY,
+            cfg,
         )
         for i in range(workers)
     ]

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 
 import pytest
 
@@ -25,6 +26,8 @@ from batcher.config.env import ENV_KNOBS
 pytestmark = pytest.mark.unit
 
 PACKAGE = pathlib.Path(__file__).resolve().parents[2] / "python" / "batcher"
+_ENV_NAME = re.compile(r"^BATCHER_[A-Z0-9_]+$")
+_READERS = frozenset({"env_flag", "env_int", "env_float"})
 
 
 def _read_env_names() -> dict[str, set[str]]:
@@ -37,18 +40,46 @@ def _read_env_names() -> dict[str, set[str]]:
             tree = ast.parse(path.read_text())
         except SyntaxError:  # pragma: no cover - a module mid-edit by another session
             continue
-        for node in ast.walk(tree):
-            name = _env_name(node)
+        names = [_env_name(node) for node in ast.walk(tree)] + _constant_names(tree)
+        for name in names:
             if isinstance(name, str) and name.startswith("BATCHER_"):
                 found.setdefault(name, set()).add(path.relative_to(PACKAGE).as_posix())
     return found
 
 
+def _constant_names(tree: ast.Module) -> list[str]:
+    """`BATCHER_*` names held in module-level constants, which the reading call then uses.
+
+    Most override variables are named once at module level (`_SCHEDULER_OVERRIDE =
+    "BATCHER_SCHEDULER"`, `_SPOT_FLAG_VARS = ("BATCHER_SPOT", "RAY_SPOT")`) and read through
+    the constant, so a scan for a literal `getenv("X")` alone missed twelve real knobs.
+    `__all__` is skipped: it holds Python names, one of which (`BATCHER_SEEDS`) merely
+    looks like a variable.
+    """
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+            continue
+        elements = value.elts if isinstance(value, (ast.Tuple, ast.List, ast.Set)) else [value]
+        names.extend(
+            e.value
+            for e in elements
+            if isinstance(e, ast.Constant) and isinstance(e.value, str) and _ENV_NAME.match(e.value)
+        )
+    return names
+
+
 def _env_name(node: ast.AST) -> str | None:
     """The literal variable name this node reads from the environment, if it does.
 
-    Covers the three spellings in the tree: `os.getenv("X")`, `os.environ.get("X")` and
-    `os.environ["X"]`.
+    Covers `os.getenv("X")`, `os.environ.get("X")`, `os.environ["X"]` and the typed readers
+    in `config/env.py` (`env_flag`, `env_int`, `env_float`).
     """
     if isinstance(node, ast.Subscript):
         value = node.value
@@ -61,6 +92,8 @@ def _env_name(node: ast.AST) -> str | None:
     if not isinstance(first, ast.Constant):
         return None
     func = node.func
+    if getattr(func, "id", None) in _READERS or getattr(func, "attr", None) in _READERS:
+        return first.value
     if getattr(func, "attr", None) == "getenv":
         return first.value
     if getattr(func, "attr", None) in ("get", "pop"):

@@ -70,7 +70,7 @@ schema = pa.schema(
         ("value", pa.binary()),
         ("partition", pa.int64()),
         ("offset", pa.int64()),
-        ("timestamp", pa.int64()),
+        ("timestamp", pa.timestamp("ms")),
         ("topic", pa.string()),
     ]
 )
@@ -172,7 +172,7 @@ write, or bound the read with {py:meth}`bt.Trigger.available_now() <batcher.Trig
 
 KPL aggregation isn't unpacked. Producers using the Kinesis Producer Library pack several user records into one Kinesis record inside a protobuf envelope, and Batcher hands you that envelope as the `value`. De-aggregate it in `map_batches` if your producers use it.
 
-Only the ambient `boto3` credential chain and the `region` option reach the client. There's no endpoint override or credential keyword.
+The client takes `region`, and optionally `endpoint_url`, for LocalStack, a VPC endpoint or a Kinesis-compatible service, and `aws_access_key_id`, `aws_secret_access_key` and `aws_session_token`. The secret key and session token accept secret references, resolved on the worker. With none of them set, the ambient `boto3` credential chain applies.
 
 ## See also
 

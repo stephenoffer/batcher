@@ -37,7 +37,7 @@ import pyarrow.compute as pc
 from batcher._internal.errors import BackendError
 from batcher.io.formats.sql.dbapi._statements import Statement
 
-__all__ = ["null_key_rows", "parameter_chunks"]
+__all__ = ["duplicate_key_rows", "latest_per_key", "null_key_rows", "parameter_chunks"]
 
 
 def _column(table: pa.Table, name: str) -> pa.ChunkedArray:
@@ -123,3 +123,81 @@ def null_key_rows(table: pa.Table, key_columns: tuple[str, ...]) -> int:
         is_null = pc.is_null(_column(table, name))
         mask = is_null if mask is None else pc.or_(mask, is_null)
     return 0 if mask is None else int(pc.sum(pc.cast(mask, pa.int64())).as_py() or 0)
+
+
+def duplicate_key_rows(table: pa.Table, key_columns: tuple[str, ...]) -> int:
+    """How many rows repeat a key an earlier row of `table` already holds.
+
+    A keyed DML write binds one statement per row, so a repeated key is resolved by
+    statement order: the row that happens to run last wins. Frame order is not a property
+    a distributed write fixes, so this is counted and reported rather than trusted.
+
+    Args:
+        table: The rows about to be written.
+        key_columns: The columns identifying a row.
+
+    Returns:
+        ``num_rows - distinct keys``: zero when every key is unique.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.io.formats.sql.dbapi._bind import duplicate_key_rows
+            >>> duplicate_key_rows(pa.table({"id": [1, 1, 2]}), ("id",))
+            1
+    """
+    if not key_columns or table.num_rows < 2:
+        return 0
+    keys = pa.table({f"k{i}": _column(table, n) for i, n in enumerate(key_columns)})
+    groups = keys.group_by(keys.schema.names).aggregate([]).num_rows
+    return table.num_rows - groups
+
+
+def latest_per_key(
+    table: pa.Table, key_columns: tuple[str, ...], sequence_by: tuple[str, ...]
+) -> pa.Table:
+    """Keep, per key, the row with the greatest `sequence_by` value, in frame order.
+
+    This is what makes a repeated key's winner a property of the data rather than of the
+    order rows reached the statement: the change with the highest sequence is the one
+    applied, however the frame was split. A null sequence value sorts below every non-null
+    one, so it never beats a non-null change -- the rule `Dataset.distinct(keep="last",
+    order_by=...)` applies on a single sequence column, which keeps the per-shard and the
+    whole-frame dedupe in agreement there. A tie falls back to frame order.
+
+    Args:
+        table: The rows about to be written.
+        key_columns: The columns identifying a row.
+        sequence_by: The columns ordering two changes to one key, most significant first.
+
+    Returns:
+        `table` with one row per key, the survivors in their original relative order.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.io.formats.sql.dbapi._bind import latest_per_key
+            >>> t = pa.table({"id": [1, 1, 2], "seq": [2, 1, 1], "v": ["new", "old", "x"]})
+            >>> latest_per_key(t, ("id",), ("seq",)).to_pydict()
+            {'id': [1, 2], 'seq': [2, 1], 'v': ['new', 'x']}
+    """
+    if not key_columns or not sequence_by or table.num_rows < 2:
+        return table
+    index = "__batcher_row"
+    keyed = pa.table(
+        {f"k{i}": _column(table, n) for i, n in enumerate(key_columns)}
+        | {f"s{i}": _column(table, n) for i, n in enumerate(sequence_by)}
+        | {index: pa.array(range(table.num_rows), type=pa.int64())}
+    )
+    ordered = keyed.sort_by(
+        [(f"s{i}", "ascending") for i in range(len(sequence_by))] + [(index, "ascending")],
+        null_placement="at_start",
+    )
+    # `last` in the order just imposed; single-threaded, so `last` means last-in-order.
+    winners = pa.TableGroupBy(
+        ordered, [f"k{i}" for i in range(len(key_columns))], use_threads=False
+    ).aggregate([(index, "last")])
+    survivors = winners.column(f"{index}_last")
+    return table.take(pc.take(survivors, pc.sort_indices(survivors)))

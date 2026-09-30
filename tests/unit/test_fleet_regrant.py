@@ -56,6 +56,13 @@ def _no_ray(monkeypatch):
     import sys
     import types
 
+    # Imported under the *real* Ray first. `_regrant_fleet` imports both lazily, and
+    # `flight_worker` applies `@ray.remote` at import time, so resolving them against the
+    # stub below raised inside the re-grant — which swallows errors by design — and this
+    # file failed whenever it ran before anything else had imported them.
+    import batcher.dist.executors.ray_runtime
+    import batcher.dist.flight_worker  # noqa: F401
+
     fake = types.ModuleType("ray")
     fake.get = list  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "ray", fake)

@@ -3,7 +3,7 @@
 
 The non-obvious half is the output, not the input: `Cost` has four axes and the scalar
 that ranks plans is built from **three** of them. `mem` is a peak rather than a sum, so
-it is a max along the tree and never enters `total()`; it gates feasibility instead. A
+it is a max along the tree and never enters `total()`, and nothing ranks or admits on it. A
 reader who assumes four axes in, one weighted sum out, has the model wrong in the one
 place it matters.
 
@@ -49,15 +49,15 @@ body = [
     label(770, 212, "work units", anchor="start"),
     band(20, 390, 940, 140, "WHAT IT EMITS  ·  FOUR AXES, THREE IN THE SCALAR", "amber"),
     card(100, 420, 340, 88, "One comparable number", "1.0 x cpu  +  1.0 x io  +  2.0 x net"),
-    card(540, 420, 340, 88, "Peak working set", "a max along the tree, never summed"),
+    card(540, 420, 340, 88, "Tallest operator", "a max along the tree: a floor on the peak"),
     arrow(420, 350, 300, 416, "amber"),
     label(300, 382, "cpu, io, net", anchor="end"),
     arrow(560, 350, 700, 416, "amber"),
     label(700, 382, "mem", anchor="start"),
     note(270, 552, "ranks the alternatives:", anchor="middle"),
     note(270, 572, "join order, join strategy, whether to spill", anchor="middle"),
-    note(710, 552, "gates feasibility, not throughput --", anchor="middle"),
-    note(710, 572, "a peak is not a quantity you can add up", anchor="middle"),
+    note(710, 552, "ranks nothing; admission walks the", anchor="middle"),
+    note(710, 572, "concurrent peak in Carbonite instead", anchor="middle"),
 ]
 
 write("cost_model_inputs", svg(W, H, "".join(body)))

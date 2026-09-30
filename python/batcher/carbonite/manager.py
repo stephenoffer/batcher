@@ -419,6 +419,7 @@ class ResourceManager:
         from batcher._internal.hardware import swap_configured
         from batcher.carbonite.cache import current_result_cache
         from batcher.carbonite.memory.kernel import kernel_stats
+        from batcher.carbonite.memory.ledger import memory_ledger
         from batcher.carbonite.memory.pool import current_process_pool, engine_pool_stats
         from batcher.carbonite.memory.reclaim import reclaim_stats
         from batcher.carbonite.policies.concurrency import process_limiter
@@ -458,6 +459,9 @@ class ResourceManager:
             # reads it; it is here so a person tuning `memory.soft_limit` can see which node
             # they are on.
             "swap": swap_configured(),
+            # What the pressure level's `max` collapses: each pool's reservation, the
+            # resident set, and the resident bytes no pool was asked for (pyarrow, UDFs).
+            "memory_ledger": memory_ledger(),
         }
         pool = current_process_pool()
         if pool is not None:

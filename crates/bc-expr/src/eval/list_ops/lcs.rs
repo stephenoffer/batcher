@@ -7,16 +7,21 @@
 //! scored with the latter: a summary that uses the right words in the wrong order is not a
 //! summary.
 //!
-//! **This is the expensive one.** The DP is `O(n·m)` in the two rows' lengths, against `O(n+m)`
-//! for every other list op here. On tokenized sentences (tens of elements) that is nothing; on
-//! two thousand-token documents it is a million cell updates per row, and a corpus of those is
-//! a real cost rather than a rounding error. Truncate long texts, or score at the sentence
-//! level, rather than reaching for it on whole documents.
+//! **This is the expensive one.** An LCS is `O(n·m)` in the two rows' lengths, against `O(n+m)`
+//! for every other list op here. The kernel is the bit-parallel form (Allison and Dix 1986, in
+//! Hyyrö's 2004 formulation): the shorter row becomes one bit vector per distinct element, and
+//! each element of the longer row advances all `m` DP cells at once with a handful of 64-bit
+//! word operations. That divides the work by 64, so two thousand-token documents cost about
+//! 64 thousand word updates per row rather than four million cell updates, with the same
+//! answer. It is still quadratic: truncate very long texts, or score at the sentence level.
+//! When the shorter row has so many distinct elements that its bit vectors would not fit a
+//! bounded budget, the kernel falls back to the classic two-row DP rather than allocate them.
 //!
 //! Elements are compared through Arrow's row encoding, so token strings, token ids, and n-gram
 //! strings all work through one path. A null row on either side yields null; a null element
 //! matches nothing, so it can never extend a subsequence.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Builder, ListArray};
@@ -43,11 +48,7 @@ pub(crate) fn eval_lcs_length(la: &ListArray, ra: &ListArray) -> Result<ArrayRef
 
     let (lo, ro) = (la.value_offsets(), ra.value_offsets());
     let mut out = Float64Builder::with_capacity(la.len());
-    // Two rolling rows rather than the full table: the DP only ever reads the previous row, so
-    // the memory is O(min(n, m)) instead of O(n·m). On a long document that is the difference
-    // between a few kilobytes and a few megabytes per row.
-    let mut previous: Vec<u32> = Vec::new();
-    let mut current: Vec<u32> = Vec::new();
+    let mut scratch = Scratch::default();
     for i in 0..la.len() {
         if la.is_null(i) || ra.is_null(i) {
             out.append_null();
@@ -61,34 +62,113 @@ pub(crate) fn eval_lcs_length(la: &ListArray, ra: &ListArray) -> Result<ArrayRef
             .filter(|&k| !rv.is_null(k))
             .map(|k| rows.row(roffset + k))
             .collect();
-        if left.is_empty() || right.is_empty() {
-            out.append_value(0.0);
-            continue;
-        }
-        // Iterate the longer side outside so the rolling rows are sized by the shorter one.
+        // The longer side is scanned, the shorter one is encoded, so the bit vectors (or the
+        // rolling DP rows) are sized by the shorter one.
         let (outer, inner) = if left.len() >= right.len() {
             (&left, &right)
         } else {
             (&right, &left)
         };
-        previous.clear();
-        previous.resize(inner.len() + 1, 0);
-        for a in outer {
-            current.clear();
-            current.push(0);
-            for (j, b) in inner.iter().enumerate() {
-                let value = if a == b {
-                    previous[j] + 1
-                } else {
-                    current[j].max(previous[j + 1])
-                };
-                current.push(value);
-            }
-            std::mem::swap(&mut previous, &mut current);
-        }
-        out.append_value(f64::from(previous[inner.len()]));
+        out.append_value(f64::from(lcs_length(outer, inner, &mut scratch)));
     }
     Ok(Arc::new(out.finish()))
+}
+
+/// The most 64-bit words the per-element match vectors of one row may occupy (32 MiB). Past
+/// it, the classic DP's `O(m)` memory is the better trade.
+const MATCH_WORD_BUDGET: usize = 1 << 22;
+
+/// The shorter-row length from which the bit-parallel kernel beats the DP.
+const BIT_PARALLEL_MIN: usize = 32;
+
+/// Buffers reused across rows, so a batch allocates once rather than once per row.
+#[derive(Default)]
+struct Scratch {
+    masks: Vec<u64>,
+    vector: Vec<u64>,
+    previous: Vec<u32>,
+    current: Vec<u32>,
+}
+
+/// The LCS length of `outer` and `inner`, with `inner` the shorter side.
+fn lcs_length(outer: &[Row<'_>], inner: &[Row<'_>], scratch: &mut Scratch) -> u32 {
+    if inner.is_empty() {
+        return 0;
+    }
+    // Below one word's worth of cells the hash map costs more than the DP it replaces:
+    // measured in release at 4 to 16 elements the DP is 1.3x to 4x faster, and from 32 up
+    // the bit-parallel kernel wins (3x at 64, 54x at 2,000).
+    if inner.len() < BIT_PARALLEL_MIN {
+        return dp_lcs_length(outer, inner, scratch);
+    }
+    let words = inner.len().div_ceil(64);
+    let mut ids: HashMap<&[u8], usize> = HashMap::with_capacity(inner.len());
+    for row in inner {
+        let next = ids.len();
+        ids.entry(row.as_ref()).or_insert(next);
+    }
+    if ids.len().saturating_mul(words) > MATCH_WORD_BUDGET {
+        return dp_lcs_length(outer, inner, scratch);
+    }
+    // One bit vector per distinct inner element: bit j is set where `inner[j]` is it.
+    scratch.masks.clear();
+    scratch.masks.resize(ids.len() * words, 0);
+    for (j, row) in inner.iter().enumerate() {
+        let id = ids[row.as_ref()];
+        scratch.masks[id * words + j / 64] |= 1u64 << (j % 64);
+    }
+    // V starts all ones; each outer element with match vector M updates
+    // V <- (V + (V & M)) | (V & !M), the addition carrying across words. The LCS is the
+    // number of zero bits V ends with among its low `m`.
+    scratch.vector.clear();
+    scratch.vector.resize(words, u64::MAX);
+    for row in outer {
+        let Some(&id) = ids.get(row.as_ref()) else {
+            continue; // matches nothing: M = 0 leaves V unchanged
+        };
+        let mask = &scratch.masks[id * words..(id + 1) * words];
+        let mut carry = 0u64;
+        for (v, &m) in scratch.vector.iter_mut().zip(mask) {
+            let u = *v & m;
+            let (sum, first) = v.overflowing_add(u);
+            let (sum, second) = sum.overflowing_add(carry);
+            carry = u64::from(first || second);
+            *v = sum | (*v & !m);
+        }
+    }
+    let tail = inner.len() % 64;
+    let mut zeros = 0u32;
+    for (w, v) in scratch.vector.iter().enumerate() {
+        let live = if w + 1 == words && tail != 0 {
+            (1u64 << tail) - 1
+        } else {
+            u64::MAX
+        };
+        zeros += (!v & live).count_ones();
+    }
+    zeros
+}
+
+/// The classic two-row DP: `O(n·m)` cell updates, `O(m)` memory. The reference the
+/// bit-parallel kernel is tested against, and its fallback when the match vectors are too big.
+fn dp_lcs_length(outer: &[Row<'_>], inner: &[Row<'_>], scratch: &mut Scratch) -> u32 {
+    let (previous, current) = (&mut scratch.previous, &mut scratch.current);
+    previous.clear();
+    previous.resize(inner.len() + 1, 0);
+    for a in outer {
+        current.clear();
+        current.push(0);
+        for (j, b) in inner.iter().enumerate() {
+            let value = if a == b {
+                previous[j] + 1
+            } else {
+                current[j].max(previous[j + 1])
+            };
+            current.push(value);
+        }
+        std::mem::swap(previous, current);
+    }
+    previous[inner.len()]
 }
 
 #[cfg(test)]
@@ -213,6 +293,40 @@ mod tests {
         let b = words(&["a", "b"]);
         let got = values(&eval_lcs_length(&a, &b).unwrap())[0].unwrap();
         assert!(got <= 2.0);
+    }
+
+    /// The bit-parallel kernel agrees with the classic DP everywhere, including across the
+    /// 64-bit word boundaries its carries run through and on heavy repetition.
+    #[test]
+    fn the_bit_parallel_kernel_matches_the_dp_on_random_rows() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let converter =
+            RowConverter::new(vec![SortField::new(arrow::datatypes::DataType::Int64)]).unwrap();
+        let mut scratch = Scratch::default();
+        for case in 0..400 {
+            // Both sides at least `BIT_PARALLEL_MIN`, so the bit-parallel kernel is what runs.
+            let (n, m) = (32 + next(300) as usize, 32 + next(200) as usize);
+            let alphabet = [2, 4, 16, 1000][case % 4];
+            let values: Vec<i64> = (0..n + m).map(|_| next(alphabet) as i64).collect();
+            let column: ArrayRef = Arc::new(arrow::array::Int64Array::from(values));
+            let rows = converter.convert_columns(&[column]).unwrap();
+            let outer: Vec<Row> = (0..n).map(|k| rows.row(k)).collect();
+            let inner: Vec<Row> = (n..n + m).map(|k| rows.row(k)).collect();
+            let (long, short) = if outer.len() >= inner.len() {
+                (&outer, &inner)
+            } else {
+                (&inner, &outer)
+            };
+            let fast = lcs_length(long, short, &mut scratch);
+            let slow = dp_lcs_length(long, short, &mut scratch);
+            assert_eq!(fast, slow, "case {case}: n={n} m={m} alphabet={alphabet}");
+        }
     }
 
     /// Rows are independent — the rolling DP buffers are reused and must be reset.

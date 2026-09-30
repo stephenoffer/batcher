@@ -13,8 +13,8 @@ for Redis when more than one process needs the same entries.
 
 TTL is enforced on read rather than by a compaction filter. `rocksdict` does not expose
 one, and a read-side check is honest about what it costs: an expired entry occupies disk
-until something asks for it or `evict_expired` sweeps. Both are cheap because the stamp is
-an 8-byte header on a value that is otherwise megabytes.
+until something asks for it or overwrites it. The check is cheap because the stamp is an
+8-byte header on a value that is otherwise megabytes.
 
 ``rocksdict`` is an optional dependency (the ``rocksdb`` extra).
 """
@@ -155,32 +155,6 @@ class RocksDBSharedCache:
             return
         except Exception as exc:
             raise SharedCacheError(f"rocksdb delete failed: {exc}") from exc
-
-    def evict_expired(self) -> int:
-        """Delete every expired entry, returning how many were removed.
-
-        The sweep the read-side expiry check does not do. Expired entries are invisible to
-        `get` but still occupy disk, so a long-lived store wants this called occasionally
-        — from a maintenance job, not from a query, since it walks the whole database.
-
-        Returns:
-            The number of entries removed.
-
-        Raises:
-            SharedCacheError: If the scan fails.
-        """
-        now = time.time()
-        try:
-            stale = [
-                bytes(key)
-                for key, value in self._db.items()
-                if _unstamped(bytes(value), now) is None
-            ]
-            for key in stale:
-                del self._db[key]
-        except Exception as exc:
-            raise SharedCacheError(f"rocksdb sweep failed: {exc}") from exc
-        return len(stale)
 
     def close(self) -> None:
         """Flush and close the database, releasing the directory lock. Idempotent."""

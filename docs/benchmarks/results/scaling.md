@@ -48,7 +48,7 @@ The honest curve on more cores isn't a straight line. The following ladder is th
 | Speedup | 1.0x | 2.0x | 3.4x | 5.8x | 8.8x | 9.8x | **10.1x** | 8.6x |
 | Efficiency | 100% | 101% | 85% | 72% | 55% | 31% | 21% | 13% |
 
-It is linear to two cores, 85% efficient at four, and reaches a ceiling near 10x by sixteen, an Amdahl serial fraction of roughly 9%. Past the box's 48 physical cores it gets worse, which is why the executor's default width is every physical core plus a third of the SMT siblings rather than every hardware thread. A query that moves a gigabyte of output is bounded by the part of that work that can't be split, so the way to make it faster is to move less, not to add threads.
+It is linear to two cores, 85% efficient at four, and reaches a ceiling near 10x by sixteen. Fitting Amdahl's law to the 48-thread point gives a serial fraction of about 8%, but that number describes the curve rather than diagnosing it. A pure Amdahl curve with that fraction predicts 7.3x at sixteen threads, not the 8.8x measured, and memory bandwidth, scheduling and NUMA effects can each flatten a curve the same way. No profile separating them was taken. Past the box's 48 physical cores it gets worse, which is why the executor's default width is every physical core plus a third of the SMT siblings rather than every hardware thread. This shape is a counterexample to linear core scaling, not a typical one, because its cost is dominated by materializing a gigabyte of output. For a query like it, moving less data helps more than adding threads.
 
 ## Small data shouldn't distribute
 
@@ -129,7 +129,7 @@ Everything above rests on the mergeable algebra. A stateful operator reduces its
 The following limits apply to the distributed results:
 
 - **ClickBench** reads 37 of 43 because the full distributed rerun after the scanner fix hasn't been recorded. The single-node 43 of 43 is a different measurement.
-- **TPC-H q15** still fails distributed, with every worker marked dead at the map barrier. Its CTE is referenced by both a join and a scalar subquery.
+- **TPC-H q15** failed distributed on the project cluster, with every worker marked dead at the map barrier. Its CTE is referenced by both a join and a scalar subquery. The same query returns the single-node answer at sf0.5 on a single-node Ray cluster with four workers, over both the Flight and the disk transport, so the failure has not been reproduced off the multi-node cluster and its root cause is not established.
 - **`filter_count`** against Daft at sf10 and sf100 is a loss, at 0.92x and 0.84x, on the shape bound by object-store reads.
 - **Shuffle durability** relies on replication. There is no external shuffle service, so a bucket outlives its worker only if a replica does.
 

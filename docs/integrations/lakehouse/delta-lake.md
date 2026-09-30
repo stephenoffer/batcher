@@ -137,6 +137,8 @@ print(bt.read.delta(table).sort("id").to_pydict()["id"])
 ```
 
 The two rows on `2024-01-02` are gone; `id=9` replaced them.
+
+The predicate has to be answerable from the log alone: an AND of `partition_col == value`, or an OR of those to replace several partitions at once. Several partitions still land as one commit, so a reader never sees some replaced and others not.
 :::
 
 ::::

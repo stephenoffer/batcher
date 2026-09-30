@@ -157,7 +157,7 @@ def fold_measured(
             else:
                 state.result.pop(sig, None)
         return state.result
-    except Exception as exc:  # pragma: no cover - learning must never break planning
+    except Exception as exc:  # learning must never break planning
         note_suppressed("kyber", f"read measured {what}", exc)
         return {}
 

@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import batcher as bt
+from _ray_cluster import init_test_ray, shutdown_test_ray
 
 pytestmark = pytest.mark.integration
 
@@ -21,12 +22,12 @@ ray_data = pytest.importorskip("ray.data")
 
 @pytest.fixture(scope="module", autouse=True)
 def _local_ray():
-    started = not ray.is_initialized()
-    if started:
-        ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False, ignore_reinit_error=True)
+    # The shared helper, not a hand-rolled `ray.init(num_cpus=2)`: on a real cluster that
+    # call is refused ("When connecting to an existing cluster, num_cpus and num_gpus must
+    # not be provided"), which errored all three tests on a 3-node Anyscale run.
+    started = init_test_ray(2)
     yield
-    if started:
-        ray.shutdown()
+    shutdown_test_ray(started)
 
 
 def test_ray_reads_a_numpy_file_as_the_same_rows(tmp_path):

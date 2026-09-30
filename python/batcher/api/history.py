@@ -201,6 +201,11 @@ def _read(directory: str, limit: int | None) -> dict[str, list[Any]]:
     transposes: the output is Arrow, so building rows first would allocate a dict per
     query only to take it apart again.
     """
+    from batcher.api.terminal.event_log import flush_event_log
+
+    # Documents are written off each query's critical path; the ones already reported must be
+    # on disk before this reads the directory, or a query that just ran is missing from it.
+    flush_event_log(timeout_s=10.0)
     columns: dict[str, list[Any]] = {name: [] for name in _schema().names}
     for name in _document_names(directory, limit):
         full = os.path.join(directory, name)

@@ -63,8 +63,9 @@ impl Pose {
     ///
     /// Composes the way the frame names read: `world_from_ego.compose(ego_from_lidar)`
     /// is `world_from_lidar`.
+    #[cfg(test)]
     #[must_use]
-    pub fn compose(self, other: Self) -> Option<Self> {
+    pub(crate) fn compose(self, other: Self) -> Option<Self> {
         Some(Self::new(
             self.rotation.rotate(other.translation)? + self.translation,
             self.rotation * other.rotation,

@@ -155,7 +155,8 @@ impl PeerTransfer {
     /// not treat an unmeasured channel as saturated and stop growing a window that has never
     /// been tested. Clamped, because the two counters are read separately and a fetch
     /// completing between the loads can otherwise put the ratio marginally above one.
-    pub fn starved_ratio(&self) -> Option<f64> {
+    #[cfg(test)]
+    pub(crate) fn starved_ratio(&self) -> Option<f64> {
         let nanos = self.nanos() as f64;
         if nanos <= 0.0 {
             return None;

@@ -47,9 +47,11 @@
 </div>
 ```
 
-Every figure on this site is correctness-gated: the harness runs the query on each engine,
-compares the results, and refuses to record a timing when they disagree. A missing number
-means a wrong answer, not a slow one.
+Every ratio on this site is correctness-gated: the harness runs the query on each engine and
+compares the results before it divides any timings. When the results disagree the timings are
+still recorded, as a diagnostic, but the ratio is withheld. A missing ratio can mean a wrong
+answer, an engine that can't express the query, a crash or an out-of-memory failure, and the
+{doc}`methodology </benchmarks/methodology>` says which codes mark each.
 
 ## What Batcher is
 
@@ -60,13 +62,20 @@ a Rust data plane on Apache Arrow.
 
 ![One engine: any source, whether Parquet, media, Kafka, or a lakehouse table, flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.svg)
 
-One decision buys most of that. Every stateful operator exists once, as a mergeable
-`partial -> combine -> finalize` triple in Rust over Arrow. One core, ninety-six cores, and a
-cluster differ only in how that triple is scheduled, so scaling out is a scheduling decision
-rather than a port. The same triple is the incremental form, so batch is the bounded case of
-streaming rather than a second execution model. Because the operator is identical everywhere,
-a measurement taken anywhere is valid everywhere, which is what lets the optimizer plan from
-evidence instead of vendor constants. And decode, embedding, vector search, and inference are
+One decision buys most of that. Every stateful operator exists once, in Rust over Arrow, and
+one core, ninety-six cores, and a cluster differ only in how that one implementation is
+scheduled. Two contracts carry it. Aggregation is a mergeable `partial -> combine -> finalize`
+triple, so partial states from any split of the input fold into the single-node answer, and
+the same triple is the incremental form that makes batch the bounded case of streaming. A
+join, a partitioned window, and a sort hold state that doesn't fold, so they partition
+instead: a join co-partitions both sides on its key, a window partitions on its `PARTITION BY`
+keys, and a sort range-partitions its leading key. {doc}`architecture/deep-dives/operators/mergeable-algebra`
+says which operator uses which contract. Because the operator is identical everywhere, a
+cardinality measured anywhere describes the same relation everywhere. Measurements in machine
+units, such as operator times, fitted cost coefficients and bandit rewards, are filed under a
+hardware fingerprint, so they transfer only between machines of the same class, and they still
+depend on data size and memory pressure. That is what lets the optimizer plan from evidence
+instead of vendor constants. And decode, embedding, vector search, and inference are
 expressions in that same algebra, so a predicate pushes beneath a JPEG decode and a tensor
 never leaves the engine.
 
@@ -149,14 +158,25 @@ print(ds.select(revenue=revenue, tier=tier).to_pydict())
 ```python
 # docs: skip
 import batcher as bt
+from batcher import col
 
-# the same group-by, now over an unbounded source
-clicks = bt.read.kafka(topic="clicks")
-counts = clicks.group_by("page").agg(n=bt.count())
+# every Parquet file that lands in the directory, read as an unbounded stream
+clicks = bt.read.files_incremental("landing/clicks", "parquet", state_dir="state/seen")
 
-# batch (default), micro-batch, or continuous: change one argument
-counts.write.parquet("out/", trigger=bt.Trigger.processing_time("10s"))
+# page views per one-minute event-time window; the watermark bounds the open state
+counts = (
+    clicks.with_watermark("ts", "10 minutes")
+    .group_by("page", w=bt.window(col("ts"), "1 minute"))
+    .agg(n=bt.count())
+)
+
+# every 10 seconds, append the windows the watermark closed since the last trigger
+counts.write.parquet(
+    "out/", trigger=bt.Trigger.processing_time("10s"), checkpoint="state/checkpoint"
+)
 ```
+
+Each output row is one `(page, window)` count, written once, after the watermark passes the window's end. A row that arrives more than ten minutes behind the latest event time is dropped as late. The checkpoint records source progress, so a restarted query resumes where it stopped. An aggregate with no watermark over a source that never ends emits nothing to a file sink. {doc}`user-guide/moving-data/streaming/emission` explains why, and {doc}`/integrations/streams/kafka` covers decoding a broker's `value` bytes into columns first.
 :::
 ::::
 
@@ -175,7 +195,7 @@ Each card is one capability family, linked to the guide that covers it. {doc}`ge
 :link: /user-guide/moving-data/reading-data
 :link-type: doc
 Parquet, CSV, JSON, Arrow, ORC, Avro. Text, logs, and documents. Images, audio, and video.
-Databases and warehouses over JDBC. Kafka, Kinesis, Pulsar, and Pub/Sub.
+Databases and warehouses through ADBC, ConnectorX, or any DB-API driver. Kafka, Kinesis, Pulsar, and Pub/Sub.
 :::
 
 :::{grid-item-card} {octicon}`pencil;1.1em` Query and transform
@@ -188,8 +208,8 @@ DataFrame form. Typed accessors for strings, dates, lists, structs, and JSON.
 :::{grid-item-card} {octicon}`stack;1.1em` Lakehouse tables
 :link: /user-guide/moving-data/lakehouse
 :link-type: doc
-Delta, Iceberg, and Hudi with transactional writes, `MERGE INTO` upserts, change feeds,
-time travel, schema evolution, and compaction.
+Transactional writes, `MERGE INTO` upserts, time travel and schema evolution on Delta and
+Iceberg, with change feeds and compaction on Delta. Hudi tables are read-only.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
@@ -203,7 +223,8 @@ stream joins, checkpointing, and exactly-once delivery into a transactional sink
 :link: /ml/index
 :link-type: doc
 Batch inference on GPU, LLM scoring, embeddings and vector search, RAG, tabular models,
-preprocessors, and zero-copy loaders for PyTorch training.
+preprocessors, and PyTorch loaders that copy each batch into tensors, with a DLPack zero-copy
+path for read-only inference.
 :::
 
 :::{grid-item-card} {octicon}`image;1.1em` Multimodal and vectors
@@ -232,7 +253,8 @@ UI, and metrics. The same code from a laptop to a cluster.
 
 You don't size batches, pick join strategies, or guess partition counts. Batcher re-optimizes
 at stage boundaries on measured cardinalities, the same mechanism and the same granularity as
-Spark AQE, but available single-node too. It engages only on a joined query big enough to pay
+Spark AQE, which also runs in Spark's local mode. The difference on one machine is that
+Batcher's loop runs inside the Python process rather than in a JVM beside it. It engages only on a joined query big enough to pay
 for the re-planning, which is 5M rows or roughly 320 MB for each pipeline breaker the loop
 would cut at, so most small queries never reach it.
 
@@ -267,7 +289,7 @@ Batcher is faster than Polars and than DuckDB on the same Arrow in all six suite
 | ResNet-50 batch inference, 8xT4 | **2,504 img/s** at 81% GPU utilization |
 | Text embeddings, MiniLM, 8xT4 | **33,611 text/s** |
 | Image decode to tensor, one 96-core node | **5,693 img/s**, 2.4x Daft |
-| TPC-H sf10 q6, cluster against cluster | **2.4x** Daft on equal hardware, and Daft's answer is wrong |
+| TPC-H sf10 q6, cluster against cluster | Batcher matches DuckDB and Daft does not, so no ratio is quoted |
 
 ![Bar chart of the TPC-H scale-factor-10 suite on the same Arrow input, from the 2026-08-28 sweep on 92 cores. Batcher is 3.03x faster than DuckDB reading the same Arrow and 2.86x faster than Polars.](_static/diagrams/tpch_sf10.svg)
 
@@ -278,32 +300,36 @@ the hardware per family, and the reproduction commands.
 ## How it compares
 
 Each tool stops somewhere. Batcher aims at the whole range on one engine. This is a capability
-view rather than a benchmark; for timings, read {doc}`benchmarks/index`.
+view rather than a benchmark, so latency and throughput live in {doc}`benchmarks/index`, where
+each figure has a workload, a machine, and a method behind it. Polars means the open-source
+library. Polars Cloud is a separate product that runs distributed queries. Spark means Apache Spark,
+including local mode. "Same code, laptop to cluster" counts a change to the transformation code
+against a tool, and doesn't count a change to session, cluster, or resource configuration.
 
 ```{raw} html
 <table class="bt-matrix">
 <thead><tr><th>Capability</th>
 <th>Batcher</th>
 <th>DuckDB</th>
-<th>Polars</th>
+<th>Polars (open source)</th>
 <th>Spark</th>
 </tr></thead><tbody>
-<tr><td>Runs in-process, no cluster</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Sub-second small queries</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Runs without a cluster</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Runs inside the Python process</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
 <tr><td>Scales to a cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Same code, laptop to cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
+<tr><td>Same code, laptop to cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td></tr>
 <tr><td>SQL</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
 <tr><td>DataFrame API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
 <tr><td>Composable expression API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
 <tr><td>Cost-based optimizer</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Stage-boundary re-optimization, single-node</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Stage-boundary re-optimization, single-node</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td></tr>
 <tr><td>Cross-query learned statistics</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
 <tr><td>Streaming</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
 <tr><td>ML / batch inference</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
 <tr><td>Multimodal (images, audio, video)</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
 <tr><td>Out-of-core spill</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
 </tbody></table>
-<p class="bt-matrix-legend"><span class="y">✓</span> built-in &nbsp; <span class="p">~</span> partial or via an add-on &nbsp; <span class="n">—</span> not supported.</p>
+<p class="bt-matrix-legend"><span class="y">✓</span> built-in &nbsp; <span class="p">~</span> partial or via an add-on &nbsp; <span class="n">—</span> not supported. Spark runs its JVM engine beside the Python process rather than inside it.</p>
 ```
 
 ## Find your way around
@@ -319,7 +345,7 @@ of the engine you are touching.
 | {doc}`ML and inference </ml/index>` | Preparing data for models, batch inference, retrieval and generation, evaluation, and training loaders |
 | {doc}`Integrations </integrations/index>` | Kafka, Snowflake, BigQuery, Delta, Iceberg, Hudi, MongoDB, Elasticsearch, Ray, PyTorch, Hugging Face |
 | {doc}`Cookbook </cookbook/index>` | 146 runnable pages, from a one-method recipe to a complete pipeline, each executed on every test run |
-| {doc}`Example library </examples/index>` | 533 standalone scripts, indexed by what each one shows, and run on every commit |
+| {doc}`Example library </examples/index>` | 533 standalone scripts, indexed by what each one shows. CI runs each one on every pull request, except two that need a cluster or a broker, and a few return early when their optional dependency isn't installed |
 | {doc}`API reference </api/index>` | Every public name three ways: a one-page lookup table, the area guides, and the full signature listing |
 | {doc}`Configuration </configuration/index>` | Profiles, options, environment variables, accelerators, and fault tolerance |
 | {doc}`Benchmarks </benchmarks/index>` | The full grid against DuckDB, Polars, Spark, and Daft, with the methodology and the losses |

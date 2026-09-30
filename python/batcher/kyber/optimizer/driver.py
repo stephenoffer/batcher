@@ -25,6 +25,7 @@ re-runs both the chain and the whole phase unfiltered to prove it.
 from __future__ import annotations
 
 from batcher._internal.logging import get_logger
+from batcher._internal.registry import MISSING, IdentityMemo
 from batcher.kyber.optimizer.expr_dispatch import (
     VERIFY_EXPR_MATCHES,
     apply_expr_leaves,
@@ -105,15 +106,11 @@ def _fixpoint_bound(plan: LogicalPlan, configured: int) -> int:
     return max(configured, _depth(plan) + _FIXPOINT_DEPTH_SLACK)
 
 
-#: `(id(rules), present, shapes) -> (rules, applicable)`. Selecting the applicable rules is a
-#: pure function of those three, and the same three recur constantly: a phase's rule list is
-#: fixed, and consecutive fixpoint iterations (and repeated queries of the same shape) ask
-#: about identical plans. Without this the selection is rebuilt from all ~700 rules on every
-#: iteration of every phase, which is O(rules) work that a small query cannot amortize -- it
-#: made a two-column filter measurably *slower*, the trade `performance.md` rules out. The
-#: rule list is stored alongside to pin the id against reuse.
-_APPLICABLE_CACHE: dict[tuple, tuple[list[Rule], list[Rule]]] = {}
-_APPLICABLE_CACHE_MAX = 512
+#: `(rules, present, shapes) -> applicable rules`. A pure function of those three, and they
+#: recur constantly: a phase's rule list is fixed and consecutive fixpoint iterations ask about
+#: identical plans. Without this, selection re-scans all ~700 rules on every iteration of every
+#: phase, which a small query cannot amortize.
+_APPLICABLE: IdentityMemo[list[Rule]] = IdentityMemo(512)
 
 
 def _applicable(
@@ -141,14 +138,11 @@ def _applicable(
     running the chain unfiltered. An undeclared rule (`expr_matches is None`) is never
     dropped, which keeps the default safe.
     """
-    key = (id(rules), present, shapes)
-    cached = _APPLICABLE_CACHE.get(key)
-    if cached is not None and cached[0] is rules:
-        return cached[1]
+    if (cached := _APPLICABLE.get(rules, present, shapes)) is not MISSING:
+        return cached
     by_node = [r for r in rules if r.matches is None or (r.matches & present)]
     if shapes is None:
-        _remember(key, rules, by_node)
-        return by_node
+        return _APPLICABLE.put(rules, by_node, present, shapes)
     index = expr_type_index(rules)
     reachable: set[int] = set()
     for expr_type, op in shapes:
@@ -160,15 +154,7 @@ def _applicable(
                 reachable.add(i)
     keep = {id(rules[i]) for i in reachable}
     selected = [r for r in by_node if r.expr_matches is None or id(r) in keep]
-    _remember(key, rules, selected)
-    return selected
-
-
-def _remember(key: tuple, rules: list[Rule], selected: list[Rule]) -> None:
-    """Record one rule selection, clearing the cache wholesale if it has grown too large."""
-    if len(_APPLICABLE_CACHE) >= _APPLICABLE_CACHE_MAX:
-        _APPLICABLE_CACHE.clear()
-    _APPLICABLE_CACHE[key] = (rules, selected)
+    return _APPLICABLE.put(rules, selected, present, shapes)
 
 
 def _fingerprint(plan: LogicalPlan) -> object:

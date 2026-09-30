@@ -161,6 +161,35 @@ mod tests {
         assert_eq!(i.eval(&batch_i64()).unwrap().len(), 3);
     }
 
+    /// A cached *refusal* is keyed on the schema too, so it cannot leak across a type change:
+    /// `a + 1` over a string column is outside the subset and remembered as such, and the same
+    /// expression over an integer column, seen afterwards, must still compile. The refusal is
+    /// also stable across a nullable batch, because `analyze` never reads nullability (nulls
+    /// are decided per batch at `eval`), which is why nullability is not part of the key.
+    #[test]
+    fn a_cached_refusal_does_not_outlive_a_schema_change() {
+        use arrow::array::StringArray;
+        let e = add_one();
+        let over = bc_arrow::SimdOverride::default();
+        let strings = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![Some("x"), None]))],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(compile_expr_cached(&e, &strings, over).is_none());
+        }
+        assert!(compile_expr_cached(&e, &batch_i64(), over).is_some());
+        let nullable = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let jit = compile_expr_cached(&e, &nullable, over).expect("nullability does not refuse");
+        let got = jit.eval(&nullable).unwrap();
+        assert_eq!(got.as_ref(), e.eval(&nullable).unwrap().as_ref());
+    }
+
     /// A cached artifact must agree with the interpreter oracle — the whole point of Tier-1.
     #[test]
     fn cached_artifact_matches_the_interpreter() {

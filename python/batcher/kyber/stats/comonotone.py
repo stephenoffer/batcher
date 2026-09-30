@@ -30,7 +30,7 @@ from batcher.plan.expr_ir import Binary, Expr
 from batcher.plan.expr_rewrite import split_conjuncts
 from batcher.plan.stats import ColumnStat, RelStats, ordinal_with_axis
 
-__all__ = ["narrow_comonotone"]
+__all__ = ["narrow_comonotone", "narrow_to_matched_keys"]
 
 # `col OP literal` operators that bound a column from below or above, as written with the
 # column on the left. A column on the right flips them (`5 < col` is `col > 5`).
@@ -72,6 +72,48 @@ def narrow_comonotone(
             if narrowed is not None:
                 columns[other] = narrowed
     return columns
+
+
+def narrow_to_matched_keys(side: RelStats, key: str, other_key: ColumnStat | None) -> RelStats:
+    """`side`, as an inner join on `key` leaves it: confined to the keys the other side holds.
+
+    An inner join keeps only the rows whose key the other side holds, so a dimension joined to
+    a fact whose keys are a sliver of the dimension's is filtered to that sliver as surely as
+    by a `WHERE`. When the dimension's rows ascend with its key, the columns ascending with it
+    keep the same share of their distinct values. The case that needs it: TPC-DS
+    `store_sales ⋈ date_dim` keeps 1,823 of 73,049 dates, which is five of `d_year`'s 201
+    values, and without this a `GROUP BY ss_customer_sk, d_year` over the join is estimated at
+    a 2.1x reduction against a true 14x.
+
+    The share is the join's own containment assumption, `ndv(other key) / ndv(key)`, not the
+    other key's *range*: a side a filter has already confined to a run keeps its full
+    `min`/`max` (those stay sound bounds), so a range test would narrow it a second time.
+    TPC-DS q23's dates, already cut to 2000-2003, read as 37 dates instead of 1,461 that way.
+    Only `ndv` moves; the bounds stay what they were.
+
+    Args:
+        side: One join input's statistics.
+        key: That input's join key.
+        other_key: The other input's statistics for its matching key.
+
+    Returns:
+        `side`, with the ascending columns' distinct counts scaled by the kept share.
+    """
+    if len(side.ascending) < 2 or key not in side.ascending or other_key is None:
+        return side
+    mine = side.columns.get(key)
+    if mine is None or not mine.ndv or not other_key.ndv:
+        return side
+    share = other_key.ndv / mine.ndv
+    if not 0.0 < share < 1.0:
+        return side  # the other side holds as many keys as this one: the join confines nothing
+    columns = dict(side.columns)
+    for name in side.ascending:
+        stat = columns.get(name)
+        if name == key or stat is None or not stat.ndv:
+            continue
+        columns[name] = dataclasses.replace(stat, ndv=max(1.0, stat.ndv * share))
+    return dataclasses.replace(side, columns=columns)
 
 
 def _kept_run(

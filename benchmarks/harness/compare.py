@@ -14,9 +14,8 @@ vectorized over Arrow, because a row-wise one costs more than the queries it is 
 
 from __future__ import annotations
 
-import math
-import time
 import traceback
+import zlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -25,8 +24,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from .divergences import explain
+from .matching import unmatched_group
 from .names import canonical_names
 from .order import order_violation
+from .timing import Timing, bench_samples, timed_call
 
 # Absolute / relative tolerance for the pairwise float comparison.
 FLOAT_ATOL = 1e-6
@@ -52,6 +53,22 @@ GRID_ATOL = 1.5 * 10**-ROUND_DECIMALS
 # Comparison classes a column can be reconciled to, in widening order: a column's class
 # across engines is the widest any engine assigns it.
 _INT, _FLOAT, _BOOL, _STR = "int", "float", "bool", "str"
+# A decimal class carries its scale, ``"dec:<scale>"``, and compares *exactly*. Routing a
+# decimal through float64 made ``10000000000000000.01`` equal ``.02``: float64 has ~16
+# significant digits and that value needs 19. Two decimals, or a decimal and an integer
+# (DuckDB's ``Decimal`` sum against Batcher's ``int64``), are compared as decimal256 at the
+# wider scale, which represents both sides without rounding.
+_DEC = "dec:"
+_DEC_PRECISION = 76
+_DEC_MAX_SCALE = 38  # keeps 38 integer digits free: every decimal128 and every int64 fits
+
+
+def _is_dec(cls: str) -> bool:
+    return cls.startswith(_DEC)
+
+
+def _scale(cls: str) -> int:
+    return int(cls[len(_DEC) :])
 
 
 def _class_of(dtype: pa.DataType) -> str:
@@ -60,7 +77,9 @@ def _class_of(dtype: pa.DataType) -> str:
         return _BOOL
     if pa.types.is_integer(dtype):
         return _INT
-    if pa.types.is_floating(dtype) or pa.types.is_decimal(dtype):
+    if pa.types.is_decimal(dtype):
+        return f"{_DEC}{min(dtype.scale, _DEC_MAX_SCALE)}"
+    if pa.types.is_floating(dtype):
         return _FLOAT
     return _STR
 
@@ -68,14 +87,28 @@ def _class_of(dtype: pa.DataType) -> str:
 def _widen(a: str, b: str) -> str:
     """Reconcile two engines' classes for the same column.
 
-    ``int`` widens to ``float`` (DuckDB's ``Decimal`` sum vs Batcher's ``int64``), and
-    anything mixed with a non-numeric class falls back to string equality.
+    Exact classes stay exact where both sides can be represented without rounding: two
+    decimals widen to the larger scale, and an integer joins a decimal at its scale. Only a
+    genuine float on either side makes the column tolerance-compared, and anything mixed
+    with a non-numeric class falls back to string equality.
     """
     if a == b:
         return a
-    if {a, b} == {_INT, _FLOAT}:
+    if _is_dec(a) and _is_dec(b):
+        return f"{_DEC}{max(_scale(a), _scale(b))}"
+    if _is_dec(a) and b == _INT:
+        return a
+    if _is_dec(b) and a == _INT:
+        return b
+    numeric = {_INT, _FLOAT}
+    if (a in numeric or _is_dec(a)) and (b in numeric or _is_dec(b)):
         return _FLOAT
     return _STR
+
+
+def _is_exact(cls: str) -> bool:
+    """Is `cls` compared exactly (as opposed to within a float tolerance)?"""
+    return cls != _FLOAT
 
 
 def column_classes(tables: list[pa.Table]) -> dict[str, str]:
@@ -101,7 +134,13 @@ def column_classes(tables: list[pa.Table]) -> dict[str, str]:
 def _canon_column(col: pa.ChunkedArray, cls: str) -> pa.Array:
     """Cast one column into its reconciled class, rounding floats onto the grid."""
     if cls == _FLOAT:
-        out = pc.round(col.cast(pa.float64()), ndigits=ROUND_DECIMALS)
+        # `safe=False`: an int64 past 2**53 (or a wide decimal) has no exact float64, and a
+        # safe cast raised `ArrowInvalid` out of the gate instead of comparing. The column is
+        # tolerance-compared anyway, and `FLOAT_RTOL * |x|` at 2**53 is ~9e6, far wider than
+        # the one-unit rounding the cast introduces.
+        out = pc.round(pc.cast(col, pa.float64(), safe=False), ndigits=ROUND_DECIMALS)
+    elif _is_dec(cls):
+        out = pc.cast(col, pa.decimal256(_DEC_PRECISION, _scale(cls)))
     elif cls == _INT:
         # int64 spans every signed width; a uint64 past 2^63 would need uint64, but no
         # benchmark column produces one and float64 would lose it silently.
@@ -120,14 +159,21 @@ class RowSet:
     table: pa.Table
     classes: dict[str, str]
 
+    @property
+    def num_rows(self) -> int:
+        return self.table.num_rows
+
 
 def to_rowset(table: pa.Table, classes: dict[str, str]) -> RowSet:
     """Canonicalize and sort ``table`` so two results compare as row multisets.
 
-    Columns are reordered by lowercased name and cast to their reconciled class, then
-    the whole table is sorted on every column. Any total order works for a multiset
-    comparison as long as both sides use the same one, and sorting after rounding keeps
-    equal-within-tolerance rows adjacent.
+    Columns are reordered by canonical name and cast to their reconciled class, then the
+    whole table is sorted on every column, **exact columns first**. Any total order works
+    for a multiset comparison as long as both sides use the same one, but putting the exact
+    keys first is what makes two matching results line up row-for-row on them: a float
+    that rounds to a different grid point on the two sides can then only reorder rows
+    *within* a run of equal exact keys, which `rowsets_match` resolves by matching rather
+    than failing.
 
     Args:
         table: One engine's result.
@@ -136,11 +182,18 @@ def to_rowset(table: pa.Table, classes: dict[str, str]) -> RowSet:
     Returns:
         The canonicalized, sorted rowset.
     """
-    keyed = sorted(zip(canonical_names(table), table.column_names, strict=True))
-    canon = pa.table({key: _canon_column(table.column(n), classes[key]) for key, n in keyed})
-    if canon.num_rows > 1 and canon.num_columns:
-        keys = [(n, "ascending") for n in canon.column_names]
-        canon = canon.sort_by(keys)
+    if table.num_columns == 0:
+        # `pa.table({})` has zero rows whatever it was built from, so rebuilding a
+        # zero-column result through a dict made a two-row and a one-row answer compare
+        # equal. `select([])` keeps the row count, which is the only thing such a result says.
+        return RowSet(table=table.select([]), classes=classes)
+    keyed = sorted(zip(canonical_names(table), range(table.num_columns), strict=True))
+    canon = pa.table({key: _canon_column(table.column(i), classes[key]) for key, i in keyed})
+    if canon.num_rows > 1:
+        names = canon.column_names
+        exact_first = [n for n in names if _is_exact(classes[n])]
+        exact_first += [n for n in names if not _is_exact(classes[n])]
+        canon = canon.sort_by([(n, "ascending") for n in exact_first])
     return RowSet(table=canon, classes=classes)
 
 
@@ -148,8 +201,10 @@ def _agree(cls: str, ref: pa.Array, oth: pa.Array) -> pa.Array:
     """A boolean mask, one entry per row: do the two columns agree on this row?
 
     Null-vs-null counts as agreement and null-vs-value as disagreement, so the mask
-    alone decides the column. Floats compare within tolerance (and ``NaN == NaN``);
-    every other class compares exactly.
+    alone decides the column. Floats compare within a **symmetric** tolerance, scaled by
+    the larger magnitude of the two so swapping reference and candidate cannot change a
+    verdict; only finite values compare within tolerance, a signed infinity agrees only
+    with the same infinity, and ``NaN == NaN``. Every other class compares exactly.
 
     Stays in Arrow kernels rather than dropping to NumPy: a ``large_string`` column
     converts to a NumPy array of Python objects, which at benchmark scale costs more
@@ -157,8 +212,14 @@ def _agree(cls: str, ref: pa.Array, oth: pa.Array) -> pa.Array:
     """
     both_null = pc.and_(ref.is_null(), oth.is_null())
     if cls == _FLOAT:
-        tol = pc.add(max(FLOAT_ATOL, GRID_ATOL), pc.multiply(FLOAT_RTOL, pc.abs(oth)))
-        close = pc.fill_null(pc.less_equal(pc.abs(pc.subtract(ref, oth)), tol), False)
+        # Without the finiteness guard, `1.0` against `+inf` passed: the difference is inf
+        # and so is `FLOAT_RTOL * |inf|`, and `inf <= inf`. And `+inf` against `+inf`
+        # failed, because `inf - inf` is NaN. Exact equality covers equal infinities.
+        magnitude = pc.max_element_wise(pc.abs(ref), pc.abs(oth))
+        tol = pc.add(max(FLOAT_ATOL, GRID_ATOL), pc.multiply(FLOAT_RTOL, magnitude))
+        finite = pc.and_(pc.is_finite(ref), pc.is_finite(oth))
+        within = pc.and_(finite, pc.less_equal(pc.abs(pc.subtract(ref, oth)), tol))
+        close = pc.or_(pc.fill_null(within, False), pc.fill_null(pc.equal(ref, oth), False))
         nan_eq = pc.fill_null(pc.and_(pc.is_nan(ref), pc.is_nan(oth)), False)
         close = pc.or_(close, nan_eq)
     else:
@@ -167,14 +228,17 @@ def _agree(cls: str, ref: pa.Array, oth: pa.Array) -> pa.Array:
     return pc.or_(close, both_null)
 
 
-def _column_diff(name: str, cls: str, ref: pa.Array, oth: pa.Array) -> str | None:
-    """The first disagreement in one sorted column, or ``None`` when they agree."""
+def _disagreeing_rows(cls: str, ref: pa.Array, oth: pa.Array) -> np.ndarray:
+    """Indices of the rows where one sorted column disagrees (empty when it agrees)."""
     if len(ref) == 0:
-        return None
+        return np.zeros(0, dtype=np.int64)
     agree = _agree(cls, ref, oth)
     if pc.all(agree).as_py() is True:
-        return None
-    row = int(np.flatnonzero(~agree.to_numpy(zero_copy_only=False))[0])
+        return np.zeros(0, dtype=np.int64)
+    return np.flatnonzero(~agree.to_numpy(zero_copy_only=False))
+
+
+def _describe(name: str, row: int, ref: pa.Array, oth: pa.Array) -> str:
     return f"column {name!r} row {row}: {ref[row].as_py()!r} vs {oth[row].as_py()!r}"
 
 
@@ -190,22 +254,66 @@ def rowsets_match(ref: RowSet, oth: RowSet) -> tuple[bool, str]:
     """
     if ref.table.column_names != oth.table.column_names:
         return False, f"column mismatch: {ref.table.column_names} vs {oth.table.column_names}"
-    if ref.table.num_rows != oth.table.num_rows:
-        return False, f"row count: {ref.table.num_rows} vs {oth.table.num_rows}"
+    if ref.num_rows != oth.num_rows:
+        return False, f"row count: {ref.num_rows} vs {oth.num_rows}"
 
-    for name in ref.table.column_names:
-        diff = _column_diff(
-            name,
-            ref.classes[name],
-            ref.table.column(name).combine_chunks(),
-            oth.table.column(name).combine_chunks(),
-        )
-        if diff is not None:
-            return False, diff
-    return True, "ok"
+    names = ref.table.column_names
+    exact = [n for n in names if _is_exact(ref.classes[n])]
+    floats = [n for n in names if not _is_exact(ref.classes[n])]
+    # Exact columns first: both sides are sorted on them first, so equal multisets of exact
+    # keys are equal *sequences* and any positional difference here is a real one.
+    for name in exact:
+        r, o = ref.table.column(name).combine_chunks(), oth.table.column(name).combine_chunks()
+        bad = _disagreeing_rows(ref.classes[name], r, o)
+        if len(bad):
+            return False, _describe(name, int(bad[0]), r, o)
+
+    first_diff: str | None = None
+    failing = np.zeros(0, dtype=np.int64)
+    for name in floats:
+        r, o = ref.table.column(name).combine_chunks(), oth.table.column(name).combine_chunks()
+        bad = _disagreeing_rows(_FLOAT, r, o)
+        if len(bad):
+            first_diff = first_diff or _describe(name, int(bad[0]), r, o)
+            failing = np.union1d(failing, bad)
+    if first_diff is None:
+        return True, "ok"
+    # Positional float disagreement inside runs of equal exact keys may be two valid rows
+    # sorted in opposite orders. Decide it by matching, not by position.
+    unmatched = unmatched_group(
+        ref.table, oth.table, exact, [(n, _FLOAT) for n in floats], failing, _agree
+    )
+    if unmatched is None:
+        return True, "ok"
+    return False, f"{first_diff} ({unmatched})"
 
 
-def results_match(reference: pa.Table, other: pa.Table) -> tuple[bool, str]:
+def type_differences(reference: pa.Table, other: pa.Table) -> list[str]:
+    """Every column whose Arrow type differs between two results, by canonical name.
+
+    The value comparison reconciles types on purpose (DuckDB's ``Decimal`` against
+    Batcher's ``int64`` is the same answer), so it cannot by itself support a claim that
+    two paths return identical *types*. This is the separate schema check that can.
+
+    Args:
+        reference: The reference result.
+        other: The result under test.
+
+    Returns:
+        ``"<column>: <ref type> vs <other type>"`` per differing column, in name order.
+    """
+    ref_types = dict(zip(canonical_names(reference), reference.schema.types, strict=True))
+    oth_types = dict(zip(canonical_names(other), other.schema.types, strict=True))
+    return [
+        f"{name}: {ref_types[name]} vs {oth_types[name]}"
+        for name in sorted(ref_types.keys() & oth_types.keys())
+        if ref_types[name] != oth_types[name]
+    ]
+
+
+def results_match(
+    reference: pa.Table, other: pa.Table, *, strict_types: bool = False
+) -> tuple[bool, str]:
     """Compare two engines' results as sorted row multisets. Returns ``(ok, message)``.
 
     The standalone entry point, for callers holding exactly two tables. The benchmark
@@ -215,6 +323,10 @@ def results_match(reference: pa.Table, other: pa.Table) -> tuple[bool, str]:
     Args:
         reference: The oracle engine's result.
         other: The result under test.
+        strict_types: Also require every column's Arrow type to be identical. Set it when
+            both sides are the *same* engine on two paths (single-node against distributed,
+            CPU against GPU), where identical types are part of the contract; leave it off
+            across engines, which legitimately type the same answer differently.
 
     Returns:
         ``(True, "ok")`` when the two are equal as row multisets, else ``(False, why)``.
@@ -225,28 +337,37 @@ def results_match(reference: pa.Table, other: pa.Table) -> tuple[bool, str]:
         return False, (
             f"column mismatch: {sorted(reference.column_names)} vs {sorted(other.column_names)}"
         )
+    if strict_types and (diffs := type_differences(reference, other)):
+        return False, "type mismatch: " + "; ".join(diffs)
     classes = column_classes([reference, other])
     return rowsets_match(to_rowset(reference, classes), to_rowset(other, classes))
 
 
 # --------------------------------------------------------------------------- #
-def bench(fn: Callable[[], object], runs: int = 5) -> float:
-    """Time ``fn`` best-of-``runs`` in milliseconds (one warm-up first)."""
-    fn()  # warm up
-    best = math.inf
-    for _ in range(runs):
-        t0 = time.perf_counter()
-        fn()
-        dt = (time.perf_counter() - t0) * 1000.0
-        best = min(best, dt)
-    return best
-
-
 @dataclass
 class EngineResult:
+    """One engine's outcome on one case.
+
+    ``ms`` is the best-of-N headline. ``samples_ms`` keeps every timed repetition so the
+    median and tail travel with it, ``cpu_ms`` is the in-process CPU time of the best
+    repetition, and ``first_ms`` is the first call — the correctness run, which is the only
+    one that meets cold caches and no learned state. See `timing`.
+    """
+
     ms: float | None = None
     error: str | None = None
     correct: bool | None = None  # None until checked
+    first_ms: float | None = None
+    samples_ms: list[float] = field(default_factory=list)
+    cpu_ms: float | None = None
+
+    @property
+    def median_ms(self) -> float | None:
+        return Timing(self.samples_ms).quantile(0.5)
+
+    @property
+    def p95_ms(self) -> float | None:
+        return Timing(self.samples_ms).quantile(0.95)
 
 
 @dataclass
@@ -275,6 +396,19 @@ class CompareResult:
 # This list is hand-maintained while the adapters self-register, so an engine added to
 # `engines/lineup.py` and not added here silently becomes ineligible. That is what happened.
 _ORACLE_PREFERENCE = ("duckdb", "duckdb_arrow", "polars", "spark", "daft", "pyarrow", "ray")
+
+
+def _guarded_match(ref: RowSet, out: pa.Table, classes: dict[str, str]) -> tuple[bool, str]:
+    """`rowsets_match`, with a comparator failure reported as a mismatch rather than raised.
+
+    A comparator that raises takes the whole case down with it, and the row then reads as
+    an *engine* error. Naming it as the comparator's keeps the two apart: the result was
+    produced, and it could not be compared.
+    """
+    try:
+        return rowsets_match(ref, to_rowset(out, classes))
+    except (pa.ArrowException, ValueError, TypeError) as exc:
+        return False, f"comparator error: {type(exc).__name__}: {exc}"
 
 
 def degenerate_reason(table: pa.Table) -> str | None:
@@ -341,6 +475,21 @@ def _release_engine(engine: str, lineup: list[str]) -> None:
         pass
 
 
+def timing_order(case: str, engines: list[str]) -> list[str]:
+    """The order `engines` are timed in for `case`: the lineup, rotated per case.
+
+    A fixed order times the same engine first on every case, straight after the correctness
+    runs, and last after every other engine has warmed (or dirtied) the shared caches, page
+    cache and thermal state. Rotating by a stable hash of the case name spreads each engine
+    across every position over a suite while keeping any single run reproducible, which a
+    random shuffle would not. The report order is unaffected.
+    """
+    if len(engines) < 2:
+        return engines
+    k = zlib.crc32(case.encode()) % len(engines)
+    return engines[k:] + engines[:k]
+
+
 def compare(
     name: str,
     fns: dict[str, Callable[[], pa.Table] | None],
@@ -373,7 +522,7 @@ def compare(
             result.engines[engine] = er
             continue
         try:
-            out = fn()
+            out, er.first_ms, _ = timed_call(fn)
             if not isinstance(out, pa.Table):
                 out = pa.table(out) if isinstance(out, dict) else pa.Table.from_pandas(out)
             outputs[engine] = out
@@ -404,7 +553,7 @@ def compare(
             if names[engine] != names[ref_engine]:
                 ok, msg = False, f"column mismatch: {names[ref_engine]} vs {names[engine]}"
             else:
-                ok, msg = rowsets_match(ref_rows, to_rowset(out, classes))
+                ok, msg = _guarded_match(ref_rows, out, classes)
             result.engines[engine].correct = ok
             if not ok:
                 # `msg` comes from `rowsets_match(ref, other)` and reads "<ref> vs <other>",
@@ -458,12 +607,16 @@ def compare(
 
     # Timing: only time engines that produced a result. Even on a correctness
     # FAILURE we time them (useful signal), but the row stays marked FAILED.
-    for engine in outputs:
+    for engine in timing_order(name, list(outputs)):
         fn = fns[engine]
         try:
-            result.engines[engine].ms = bench(fn, runs=runs)
+            timing = bench_samples(fn, runs=runs)
         except Exception as exc:
             result.engines[engine].error = f"timing failed: {exc}"
+        else:
+            er = result.engines[engine]
+            er.ms, er.samples_ms = timing.best, timing.wall_ms
+            er.cpu_ms = timing.cpu_ms[timing.wall_ms.index(timing.best)]
         _release_engine(engine, engines)
 
     if result.status == "OK" and any(e.error and e.error != "n/a" for e in result.engines.values()):

@@ -27,10 +27,11 @@
 //! Peak memory is the build sides, the aggregate state and two chunks (the one folding and the
 //! one the producer is decoding), independent of the driving relation's size.
 
+mod orient;
 pub(crate) mod units;
 
 use arrow::array::RecordBatch;
-use bc_ir::{JoinType, RelOp};
+use bc_ir::RelOp;
 use bc_runtime::agg;
 use rayon::prelude::*;
 
@@ -39,6 +40,7 @@ use super::{build_with, combine_and_finalize, fold_partial, prebuild_joins_for_c
 use crate::error::InterpError;
 use crate::ops;
 use crate::par::ExecOptions;
+use orient::{orient, orient_counted, original_ids, probe_spine_reaches, scans_of};
 
 /// A chunk producer: the next chunk of the driving relation, `None` once it is exhausted.
 pub type NextChunk<'a> = dyn FnMut() -> Option<Result<Vec<RecordBatch>, InterpError>> + 'a;
@@ -141,6 +143,7 @@ pub fn execute_chunked(
         budget,
         opts,
         carrier: sources[driving].clone(),
+        driving_rows: None,
         pool: crate::par::pool_for(workers.max(1))?,
     };
     let mut srcs: Vec<Vec<RecordBatch>> = sources.to_vec();
@@ -227,10 +230,6 @@ pub fn execute_units_metered(
     opts: &ExecOptions,
 ) -> Result<(Vec<RecordBatch>, crate::ExecMetrics), InterpError> {
     let (oriented, swaps) = orient_counted(plan, driving);
-    if swaps > 0 {
-        let out = units_with(plan, sources, driving, src, workers, budget, opts, None)?;
-        return Ok((out, crate::ExecMetrics::default()));
-    }
     let meter = super::Meter::new(&oriented, workers.max(1) as u32);
     let out = units_with(
         &oriented,
@@ -242,7 +241,18 @@ pub fn execute_units_metered(
         opts,
         Some(&meter),
     )?;
-    Ok((out, meter.finish()))
+    // The meter numbers the plan it ran, and a swapped join reorders its children in that
+    // numbering. The control plane files each metric under the op id of the plan *it* built,
+    // so a swapped plan's ids are translated back rather than dropped: dropping them is what
+    // left every scan-mode query that joins onto its driving table with no measured
+    // cardinality at all, so TPC-H q18 at sf10 planned its 60M-row hash build from defaults
+    // on every run and never learned otherwise.
+    let metrics = if swaps == 0 {
+        meter.finish()
+    } else {
+        meter.finish_renumbered(&original_ids(plan, &oriented, driving))
+    };
+    Ok((out, metrics))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -270,6 +280,7 @@ fn units_with(
         budget,
         opts,
         carrier: sources[driving].clone(),
+        driving_rows: src.rows(),
         pool: crate::par::pool_for(workers.max(1))?,
     };
     let mut srcs: Vec<Vec<RecordBatch>> = sources.to_vec();
@@ -339,12 +350,21 @@ struct Run<'o> {
     opts: &'o ExecOptions,
     /// The zero-row batch carrying the driving relation's schema.
     carrier: Vec<RecordBatch>,
+    /// The driving relation's total rows, when the source can say (a Parquet footer can; a
+    /// chunk producer cannot). The carrier stands in for the relation everywhere else, so
+    /// this is the only place its size is known to the runtime-filter placement.
+    driving_rows: Option<usize>,
     /// The producer is not `Send` (in `bc-py` it calls back into Python), so it is only ever
     /// called on the driver thread, between the parallel steps that run inside this pool.
     pool: std::sync::Arc<rayon::ThreadPool>,
 }
 
 impl Run<'_> {
+    /// The streamed relation's `(source id, rows)` for [`prebuild_joins_for_chunks`].
+    fn driving_hint(&self) -> Option<(usize, usize)> {
+        self.driving_rows.map(|rows| (self.driving, rows))
+    }
+
     /// One view of `srcs` per shard of the current chunk, or none when the chunk is empty.
     fn shard_views(&self, srcs: &[Vec<RecordBatch>]) -> Vec<Vec<Vec<RecordBatch>>> {
         let rows: usize = srcs[self.driving].iter().map(RecordBatch::num_rows).sum();
@@ -401,6 +421,7 @@ impl Run<'_> {
                 self.budget,
                 self.workers,
                 Some(self.opts),
+                self.driving_hint(),
             )
         })?;
         let jit = std::sync::OnceLock::new();
@@ -457,7 +478,15 @@ impl Run<'_> {
         next_chunk: &mut NextChunk<'_>,
     ) -> Result<Vec<RecordBatch>, InterpError> {
         let cache = self.pool.install(|| {
-            prebuild_joins_for_chunks(node, srcs, None, self.budget, self.workers, Some(self.opts))
+            prebuild_joins_for_chunks(
+                node,
+                srcs,
+                None,
+                self.budget,
+                self.workers,
+                Some(self.opts),
+                self.driving_hint(),
+            )
         })?;
         let mut out: Vec<RecordBatch> = Vec::new();
         let mut held = 0usize;
@@ -539,6 +568,7 @@ impl Run<'_> {
                 self.budget,
                 self.workers,
                 Some(self.opts),
+                self.driving_hint(),
             )
         })?;
         self.opts.check_cancelled()?;
@@ -607,6 +637,7 @@ impl Run<'_> {
                 self.budget,
                 self.workers,
                 Some(self.opts),
+                self.driving_hint(),
             )
         })?;
         self.opts.check_cancelled()?;
@@ -641,88 +672,6 @@ impl Run<'_> {
     }
 }
 
-/// `plan` with every inner join whose *right* (build) input holds the driving scan swapped, so
-/// the driving source ends up on the probe spine.
-///
-/// Kyber builds the smaller side, and a filtered fact table is sometimes the smaller one — TPC-H
-/// q3 at sf100 hashes the date-filtered `lineitem` and probes it with the customer-orders join.
-/// Streaming needs the fact table on the probe side, and an inner join is commutative: the swap
-/// re-labels which input each output column is read from and changes no row. Outer, semi and
-/// anti joins are not commutative and are left alone (`chunkable` then declines them if the
-/// driving scan sits on their build side).
-fn orient(plan: &RelOp, driving: usize) -> RelOp {
-    orient_counted(plan, driving).0
-}
-
-/// [`orient`], with how many joins it swapped.
-fn orient_counted(plan: &RelOp, driving: usize) -> (RelOp, usize) {
-    let mut out = plan.clone();
-    let swaps = orient_in_place(&mut out, driving);
-    (out, swaps)
-}
-
-fn orient_in_place(plan: &mut RelOp, driving: usize) -> usize {
-    let mut swaps = 0;
-    if let RelOp::HashJoin {
-        left,
-        right,
-        left_keys,
-        right_keys,
-        join_type: JoinType::Inner,
-        output,
-        ..
-    } = plan
-    {
-        if scans_of(right, driving) > 0 && scans_of(left, driving) == 0 {
-            swaps += 1;
-            std::mem::swap(left, right);
-            std::mem::swap(left_keys, right_keys);
-            for col in output.iter_mut() {
-                col.side = match col.side {
-                    bc_ir::JoinSide::Left => bc_ir::JoinSide::Right,
-                    bc_ir::JoinSide::Right => bc_ir::JoinSide::Left,
-                };
-            }
-        }
-    }
-    swaps
-        + match plan {
-            RelOp::HashJoin { left, .. } => orient_in_place(left, driving),
-            RelOp::Filter { input, .. }
-            | RelOp::Project { input, .. }
-            | RelOp::Aggregate { input, .. }
-            | RelOp::Sort { input, .. }
-            | RelOp::Limit { input, .. } => orient_in_place(input, driving),
-            _ => 0,
-        }
-}
-
-/// Whether `spine` reaches `Scan { driving }` through probe-side-streamable nodes only.
-fn probe_spine_reaches(spine: &RelOp, driving: usize) -> bool {
-    let mut node = spine;
-    loop {
-        match node {
-            RelOp::Scan { source_id } => return *source_id == driving,
-            RelOp::Filter { input, .. } | RelOp::Project { input, .. } => node = input,
-            RelOp::HashJoin {
-                left,
-                join_type: JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti,
-                ..
-            } => node = left,
-            _ => return false,
-        }
-    }
-}
-
-fn scans_of(plan: &RelOp, source: usize) -> usize {
-    let own = usize::from(matches!(plan, RelOp::Scan { source_id } if *source_id == source));
-    own + plan
-        .children()
-        .into_iter()
-        .map(|c| scans_of(c, source))
-        .sum::<usize>()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -732,6 +681,7 @@ mod tests {
     use bc_expr::{BinaryOp, Expr, Literal};
     use bc_ir::{AggFunc, AggregateItem, JoinOutputCol, JoinSide, JoinType, ProjectionItem, RelOp};
 
+    use super::orient::{orient_counted, original_ids};
     use super::{chunkable, execute_chunked, execute_units};
     use crate::error::InterpError;
     use crate::par::ExecOptions;
@@ -1271,5 +1221,47 @@ mod tests {
             &ExecOptions::default(),
         );
         assert!(matches!(r, Err(InterpError::NotChunkable)));
+    }
+
+    /// A swapped join reorders its children in the numbering the meter uses, and every metric
+    /// must still be filed under the op id the control plane gave that node in *its* plan.
+    #[test]
+    fn a_swapped_plans_metrics_are_numbered_as_the_original_plan() {
+        fn preorder<'a>(node: &'a RelOp, out: &mut Vec<&'a RelOp>) {
+            out.push(node);
+            for c in node.children() {
+                preorder(c, out);
+            }
+        }
+        fn same_node(a: &RelOp, b: &RelOp) -> bool {
+            match (a, b) {
+                (RelOp::Scan { source_id: x }, RelOp::Scan { source_id: y }) => x == y,
+                _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+            }
+        }
+        let original = plan(JoinType::Inner, true);
+        let (oriented, swaps) = orient_counted(&original, 1);
+        assert_eq!(
+            swaps, 1,
+            "driving from the right-hand scan must swap the join"
+        );
+        let ids = original_ids(&original, &oriented, 1);
+        let (mut orig_nodes, mut ran_nodes) = (Vec::new(), Vec::new());
+        preorder(&original, &mut orig_nodes);
+        preorder(&oriented, &mut ran_nodes);
+        assert_eq!(ids.len(), ran_nodes.len());
+        for (ran, &id) in ran_nodes.iter().zip(&ids) {
+            assert!(
+                same_node(ran, orig_nodes[id as usize]),
+                "{ran:?} filed under {id}"
+            );
+        }
+        // The swap really reordered the numbering: identity would have filed the scans wrongly.
+        assert_ne!(ids, (0..ids.len() as u32).collect::<Vec<_>>());
+        // Positive control: an unswapped plan maps every node to itself.
+        let (same, none) = orient_counted(&original, 0);
+        assert_eq!(none, 0);
+        let identity = original_ids(&original, &same, 0);
+        assert_eq!(identity, (0..identity.len() as u32).collect::<Vec<_>>());
     }
 }

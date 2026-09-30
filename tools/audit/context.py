@@ -51,10 +51,6 @@ BROAD_TRY_NODES = 60
 #: Known-dead-by-design, with the reason. Same ledger discipline as the other linters:
 #: an entry is visible debt, not an amnesty.
 DEAD_ALLOW: dict[str, str] = {
-    "crates/bc-udf": (
-        "documented in CLAUDE.md as not wired into bc-py — the UDF/inference plane is not "
-        "on a live path, so its public surface is unreferenced on purpose"
-    ),
     "crates/bc-secrets/src/lib.rs": (
         "`clear_cache` is reached only by this crate's own tests, and its docstring says why "
         "it is still `pub`: the resolution cache is process-global with a TTL, so a host that "

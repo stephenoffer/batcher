@@ -307,6 +307,17 @@ pub(crate) fn distinct_state(
 ) -> Result<ArrayRef, RuntimeError> {
     // At most one entry per input row; reserve up front so a large group-by does not
     // repeatedly reallocate (each growth copies the whole buffer and transiently holds ~1.5×).
+    // No nulls to drop: every row is kept, so the values are the column itself and only the
+    // group ids need widening. Gathering them through an identity index copied every value
+    // for nothing -- a whole-column `memmove` per aggregate on TPC-H q21's per-order counts.
+    if values.null_count() == 0 {
+        let groups: Vec<i64> = group_ids.iter().map(|&g| i64::from(g)).collect();
+        return distinct_pairs_to_list(
+            Arc::new(Int64Array::from(groups)),
+            values.clone(),
+            num_groups,
+        );
+    }
     let mut keep: Vec<u32> = Vec::with_capacity(group_ids.len());
     let mut kept_groups: Vec<i64> = Vec::with_capacity(group_ids.len());
     // `values` is an `Arc<dyn Array>`, so `values.is_valid(i)` is a **virtual call per row** —
@@ -435,9 +446,15 @@ fn par_dedup_pairs(grp: &Int64Array, vals: &Int64Array, n: usize) -> (Vec<i64>, 
     let per: Vec<(Vec<i64>, Vec<i64>)> = (0..parts)
         .into_par_iter()
         .map(|b| {
+            // Sized for every pair the partition holds, the most it can keep: grown from empty,
+            // the set rehashed its way up and that was 13% of TPC-H q21's per-unit profile.
+            let len: usize = per_chunk
+                .iter()
+                .map(|(_, off)| (off[b + 1] - off[b]) as usize)
+                .sum();
             let mut seen: hashbrown::HashSet<(i64, i64), ahash::RandomState> =
-                hashbrown::HashSet::with_hasher(ahash::RandomState::with_seed(1));
-            let (mut dg, mut dv) = (Vec::new(), Vec::new());
+                hashbrown::HashSet::with_capacity_and_hasher(len, ahash::RandomState::with_seed(1));
+            let (mut dg, mut dv) = (Vec::with_capacity(len), Vec::with_capacity(len));
             for (rows, off) in &per_chunk {
                 for &i in &rows[off[b] as usize..off[b + 1] as usize] {
                     let pair = (g[i as usize], v[i as usize]);

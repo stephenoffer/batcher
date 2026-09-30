@@ -21,12 +21,14 @@ The mean and the standard deviation are the wrong summary for most real columns.
 |---|---|
 | `midhinge` | The midpoint of the middle half, ignoring the outer quartiles entirely. |
 | `trimean` | Tukey's robust location estimate, weighting the median twice. |
-| {py:func}`quartile_dispersion <batcher.quartile_dispersion>` | Unitless spread in `[0, 1]`, comparable across columns. |
-| {py:func}`robust_cv <batcher.robust_cv>` | Interquartile range over the median: the outlier-proof coefficient of variation. |
+| {py:func}`quartile_dispersion <batcher.quartile_dispersion>` | `(Q3 - Q1) / (Q3 + Q1)`: unitless spread, in `[0, 1]` only when `Q1 >= 0`. |
+| {py:func}`robust_cv <batcher.robust_cv>` | Interquartile range over the median: a coefficient of variation that one extreme row cannot move. |
 | {py:func}`interdecile_range <batcher.interdecile_range>` | The span containing the middle 80% of values. |
 | {py:func}`decile_ratio <batcher.decile_ratio>` | P90 over P10, the classic inequality ratio. |
 
-A second family expresses spread *relative to level*, so the number is unitless and comparable across columns on different scales. {py:func}`bt.index_of_dispersion <batcher.index_of_dispersion>` is the variance-to-mean ratio (the Fano factor, exactly 1 for a Poisson process), {py:func}`bt.signal_to_noise <batcher.signal_to_noise>` is the mean over the standard deviation (the reciprocal of the coefficient of variation), {py:func}`bt.studentized_range <batcher.studentized_range>` is the range in standard deviations (a quick outlier smell), and {py:func}`bt.relative_range <batcher.relative_range>` is the range over the mean. Each is a single aggregate over the existing moment primitives:
+The two ratios divide by a quantile, so they assume a column on a positive scale, such as a latency or a price. A column that crosses zero breaks both. With `Q1 = -1` and `Q3 = 2`, `quartile_dispersion` is 3, and a negative median flips the sign of `robust_cv`. A zero denominator is not an error either. The division follows IEEE arithmetic, so it returns `inf` when the numerator is nonzero and `NaN` when the column is constant at zero. A median near zero makes `robust_cv` unstable long before it becomes infinite. Check `q1` and the median before you compare these numbers across columns.
+
+A second family expresses spread *relative to level*. {py:func}`bt.index_of_dispersion <batcher.index_of_dispersion>` is the variance-to-mean ratio, the Fano factor. It is the one member that is not unitless: variance carries the square of the column's unit and the mean carries one power of it, so the ratio has the column's unit, and multiplying the column by 10 multiplies it by 10. It is a count-data statistic, where it is 1 for a Poisson process and above 1 for overdispersed counts, so compare it only between count columns. The rest are unitless and compare across columns on different positive scales. {py:func}`bt.signal_to_noise <batcher.signal_to_noise>` is the mean over the standard deviation (the reciprocal of the coefficient of variation), {py:func}`bt.studentized_range <batcher.studentized_range>` is the range in standard deviations (a quick outlier smell), and {py:func}`bt.relative_range <batcher.relative_range>` is the range over the mean. Each is a single aggregate over the existing moment primitives:
 
 ```python
 ds = bt.from_pydict({"counts": [8.0, 12.0, 9.0, 11.0, 10.0]})
@@ -44,13 +46,13 @@ ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 100.0]})
 print(ds.agg(skew=bt.bowley_skew("x"), normality=bt.jarque_bera("x")).to_pydict())
 ```
 
-{py:func}`bowley_skew <batcher.bowley_skew>` and {py:func}`moors_kurtosis <batcher.moors_kurtosis>` are the quantile-based versions, which stay meaningful on a column whose fourth moment does not exist. That covers most real latency, revenue, and file-size columns. {py:func}`jarque_bera <batcher.jarque_bera>` combines skew and kurtosis into the standard normality statistic, useful as a screen over hundreds of features.
+{py:func}`bowley_skew <batcher.bowley_skew>` and {py:func}`moors_kurtosis <batcher.moors_kurtosis>` are the quantile-based versions. They're defined for any distribution, including one whose fourth moment does not exist, and one extreme row moves them only as far as it moves a quartile or an octile. The moment-based skewness and kurtosis assume finite third and fourth moments. A heavy-tailed column such as latency, revenue, or file size may not satisfy that assumption, and a sample alone can't prove it does, so prefer the quantile versions when the tail is in doubt. {py:func}`jarque_bera <batcher.jarque_bera>` combines skew and kurtosis into the standard normality statistic, useful as a screen over hundreds of features.
 
 ### Weighted statistics
 
-Survey weights, recency decay, and per-group sizes all give some rows more influence than others,
+Replication counts, recency decay, and per-group sizes all give some rows more influence than others,
 and the plain mean and variance are wrong once they do. {py:func}`bt.weighted_mean <batcher.weighted_mean>`, {py:func}`bt.weighted_var <batcher.weighted_var>`, {py:func}`bt.weighted_std <batcher.weighted_std>`,
-{py:func}`bt.weighted_covariance <batcher.weighted_covariance>`, and {py:func}`bt.weighted_correlation <batcher.weighted_correlation>` are the frequency-weighted forms, each
+{py:func}`bt.weighted_covariance <batcher.weighted_covariance>`, and {py:func}`bt.weighted_correlation <batcher.weighted_correlation>` are the weighted descriptive statistics, each
 a single aggregate matching `numpy.average`:
 
 ```python
@@ -64,6 +66,8 @@ Nulls are dropped pairwise. A row missing the value, the weight, or either side 
 gaps = bt.from_pydict({"income": [1.0, None, 3.0], "weight": [1.0, 1.0, 1.0]})
 assert gaps.agg(v=bt.weighted_var("income", "weight")).to_pydict() == {"v": [1.0]}
 ```
+
+Each one normalizes by the total weight. `weighted_var` is `sum(w * (x - m)^2) / sum(w)` with no Bessel correction, so it is the variance of the weighted population as given. That point estimate is the same whatever the weights mean. What differs by weight type is the uncertainty, and none of these functions computes it. A frequency weight that counts identical rows gives the unbiased sample variance with a denominator of `sum(w) - 1`. A reliability or analytic weight needs `sum(w) - sum(w^2) / sum(w)`. A survey design weight needs a design-based standard error that also depends on strata and clusters these functions never see. Treat the results as descriptive, and use a survey package when you need a confidence interval under a sampling design.
 
 ### Two-sample comparison
 
@@ -134,7 +138,7 @@ print(entropy(cats, "a"), cramers_v(cats, "a", "b"), mutual_information(cats, "a
 
 `correlation_matrix` and `covariance_matrix` give the whole pairwise structure of a feature set in one scan, returned as a labeled square `Dataset`. Reading down a column shows what a feature moves with, which flags redundant features.
 
-`partial_correlation` removes a confounder. Two features can correlate only because both track a third, and the partial correlation is what survives holding that third fixed. `variance_inflation_factor` puts a number on multicollinearity per feature: how much the rest of the set inflates each column's variance. A VIF above 5 or 10 flags a feature whose linear-model coefficient will be unstable.
+`partial_correlation` adjusts for a third variable. Two features can correlate only because both track a third, and the partial correlation is the Pearson correlation of what is left of each after a linear regression on the controls. It is computed from the correlation matrix, so it removes only the *linear* part of the controls' influence. A nonlinear dependence on a control survives the adjustment, and a variable you did not list is not adjusted for at all. It measures association under that linear model, not a causal effect. `variance_inflation_factor` puts a number on multicollinearity per feature: how much the rest of the set inflates each column's variance. A VIF above 5 or 10 flags a feature whose linear-model coefficient will be unstable.
 
 Where `cramers_v` is symmetric, `theils_u` is directional: it reports the fraction of one categorical column's uncertainty that knowing the other removes, so `theils_u(ds, "x", "y")` and `theils_u(ds, "y", "x")` differ and answer "does `x` predict `y`" rather than "are they related". For a numeric column against a grouping, `eta_squared` and its bias-corrected sibling `epsilon_squared` are the bounded effect sizes `anova_f` lacks: both read as "this grouping explains 30% of the variance" and stay comparable across sample sizes, which a raw F never is. `omega_squared` corrects the bias furthest for generalizing beyond the sample, and `cohens_f` is the effect-size scale a power analysis is specified on.
 
@@ -407,9 +411,9 @@ An autocorrelation needs the whole series in time order, so unlike the mergeable
 
 ## Requirements and limitations
 
-A drift measure needs a reference column with more than one distinct value. A constant reference raises rather than reporting 0.0, because "no drift" for a column that moved from 1.0 to 2.0 is the worst possible answer.
+A value that holds a large share of the reference, so that several quantiles land on it, gets a bin of its own rather than sharing one with the values just above it. A constant reference is the extreme case and is measured exactly, over three bins: below its value, at it, and above it. A current column still at that value scores 0.0, and one that moved from 1.0 to 2.0 scores as a total shift rather than "no drift". A reference column that is entirely null has no distribution and raises.
 
-`js_divergence` does not reach 1 for a wholly shifted column, because the outermost reference bins are open-ended and absorb everything beyond them. Alert on `population_stability_index`, which has no such ceiling; use JS to compare across columns.
+`js_divergence` does not reach 1 for a wholly shifted column, because the outermost reference bins are open-ended and absorb everything beyond them. `population_stability_index` has the same blind spot. Every binned measure here compares shares on the reference's bins, so once the whole current column lies past the last edge, moving it farther changes neither histogram nor score. A 0 to 99 reference with 10 buckets scores a PSI of about 12.43 and a JS of about 0.758 whether today's data is shifted by 200 or by 2,000,000. Alert on PSI, whose fixed bands read the same for any column, and use JS to compare across columns. Neither measures how far past the reference range the data moved. Track that with the current column's `min` and `max` against the reference's.
 
 ## See also
 

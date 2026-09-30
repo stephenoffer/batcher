@@ -23,8 +23,9 @@ staging is the only execution path rather than an optimization, and that second 
 needs no join. So "no join, never adaptive" is a statement about this ladder, not about
 every route into the loop, and the drawing has to say which.
 
-The route bandit that can turn staging back off has its own diagram (`bandit_tuning`)
-and appears here only as the override it is.
+The route bandit that decides between the two routes once staging is offered has its own
+diagram (`bandit_tuning`) and appears here only as the note under the staged route: cold, it
+runs one-shot first.
 """
 
 from __future__ import annotations
@@ -74,9 +75,9 @@ body = [
     card(660, 348, 280, 88, "Stage, measure, re-plan", "one breaker per stage"),
     arrow(870, GATE_Y + GATE_H, 870, 348, "blue"),
     label(882, 294, "yes", anchor="start"),
-    note(660, 462, "...unless the route bandit, having", anchor="start"),
-    note(660, 482, "measured both arms for this plan", anchor="start"),
-    note(660, 502, "signature, says one-shot was faster.", anchor="start"),
+    note(660, 462, "...once the route bandit has measured", anchor="start"),
+    note(660, 482, "staging faster for this signature.", anchor="start"),
+    note(660, 502, "Cold, it runs one-shot first.", anchor="start"),
 ]
 
 # ---- the per-stage floor, spelled out -------------------------------------

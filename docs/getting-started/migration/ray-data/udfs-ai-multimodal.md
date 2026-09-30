@@ -44,20 +44,20 @@ The following table maps the 21 names on the `ray.data.preprocessors` module, so
 | `CustomKBinsDiscretizer` | n/a | gap | Not yet: discretize by explicit per-column bin edges (bins=, right=, include\_lowest=, duplicates=, dtypes=). Wave W11. |
 | `FeatureHasher` | n/a | gap | Not yet: hash a set of numeric count columns into a fixed-size feature vector (num\_features, output\_column). Wave W11. |
 | `HashingVectorizer` | `batcher.ml.HashingVectorizer` | mismatch | Differs: Ray emits raw hashed counts of space-split tokens using its own simple\_hash over several columns; Batcher follows scikit-learn (lowercase=True, token\_pattern of 2+ word chars, norm='l2') and hashes tokens with a different function, so bucket indices differ even with norm=None. Wave W0. |
-| `LabelEncoder` | `batcher.ml.LabelEncoder` | param | Missing: output\_column= (write the encoded label to a new column). Wave W2. |
-| `MaxAbsScaler` | `batcher.ml.MaxAbsScaler` | param | Missing: output\_columns= (write results to new columns and keep the inputs). Wave W2. |
-| `MinMaxScaler` | `batcher.ml.MinMaxScaler` | param | Missing: output\_columns= (write results to new columns and keep the inputs). Wave W2. |
+| `LabelEncoder` | `batcher.ml.LabelEncoder` | canonical |  |
+| `MaxAbsScaler` | `batcher.ml.MaxAbsScaler` | canonical |  |
+| `MinMaxScaler` | `batcher.ml.MinMaxScaler` | canonical |  |
 | `MultiHotEncoder` | `batcher.ml.MultiHotEncoder` | mismatch | Differs: Ray replaces the list column with one multi-hot vector column (max\_categories per column, several columns); Batcher keeps the input and appends one 0/1 column per category named '\<col\>\_\<value\>'. Wave W0. |
-| `Normalizer` | `batcher.ml.Normalizer` | param | Missing: output\_columns= (write results to new columns and keep the inputs). Wave W2. |
+| `Normalizer` | `batcher.ml.Normalizer` | canonical |  |
 | `OneHotEncoder` | `batcher.ml.OneHotEncoder` | mismatch | Differs: Ray replaces each column with one one-hot vector column; Batcher drops the input and appends one 0/1 column per category named '\<col\>\_\<value\>'. Wave W0. |
-| `OrdinalEncoder` | `batcher.ml.OrdinalEncoder` | param | Missing: encode\_lists= (encode each element of a list column), output\_columns=. Wave W2. |
+| `OrdinalEncoder` | `batcher.ml.OrdinalEncoder` | canonical |  |
 | `PowerTransformer` | `batcher.ml.PowerTransformer` | mismatch | Differs: Ray applies a fixed, user-given power (power=, method='yeo-johnson'\|'box-cox') with no standardization; Batcher fits the Yeo-Johnson lambda per column and standardizes by default. Wave W0. |
 | `RobustScaler` | `batcher.ml.RobustScaler` | mismatch | Differs: Ray takes quantile\_range as fractions (0.25, 0.75) and estimates quantiles with an approximate sketch (quantile\_precision=800); Batcher takes percentages (25.0, 75.0) and scales with exact interpolated quantiles, so the IQR and the output differ on small data. Wave W0. |
-| `SimpleImputer` | `batcher.ml.SimpleImputer` | param | Missing: output\_columns= (write results to new columns and keep the inputs). Wave W2. |
-| `StandardScaler` | `batcher.ml.StandardScaler` | param | Missing: output\_columns= (write results to new columns and keep the inputs). Wave W2. |
-| `Tokenizer` | `batcher.ml.Tokenizer` | param | Missing: default tokenization\_fn (Ray splits on single spaces when none is given; Batcher requires tokenizer=, e.g. lambda s: s.split(' ')), several columns, output\_columns=. Wave W2. |
+| `SimpleImputer` | `batcher.ml.SimpleImputer` | canonical |  |
+| `StandardScaler` | `batcher.ml.StandardScaler` | canonical |  |
+| `Tokenizer` | `batcher.ml.Tokenizer` | param | Missing: several columns in one Tokenizer (columns=\[...\], output\_columns=\[...\]); Batcher tokenizes one column into output\_column=, so port as one Tokenizer per column. Wave W2. |
 | `TorchVisionPreprocessor` | n/a | gap | Not yet: apply a torchvision transform to image columns (batched=, output\_columns=). Wave W12. |
-| `UniformKBinsDiscretizer` | `batcher.ml.KBinsDiscretizer` | mismatch | Differs: Batcher KBinsDiscretizer defaults strategy='quantile'; pass strategy='uniform', n\_bins=bins. Missing: per-column bins dict, right=, include\_lowest=, duplicates=, dtypes=, output\_columns=. Wave W2. |
+| `UniformKBinsDiscretizer` | `batcher.ml.KBinsDiscretizer` | mismatch | Differs: Batcher KBinsDiscretizer defaults strategy='quantile' and right=False; port as strategy='uniform', n\_bins=bins (an int or a per-column dict), right=True, output\_columns= as written. Ray's duplicates= defaults to 'raise' and Batcher's to 'keep', and on a constant column Ray bins every row without raising, where Batcher learns repeated edges that duplicates='raise' refuses. Missing: include\_lowest=, dtypes=. Wave W2. |
 
 ## `Preprocessor`
 

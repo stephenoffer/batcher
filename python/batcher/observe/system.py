@@ -118,7 +118,7 @@ def _memory() -> tuple[int | None, int | None]:
         available = int(virtual.available)
         if total is None:
             total = int(virtual.total)
-    except Exception:  # pragma: no cover - psutil absent or unreadable
+    except Exception:  # psutil absent or unreadable
         if total is None:
             try:
                 pages = os.sysconf("SC_PHYS_PAGES")

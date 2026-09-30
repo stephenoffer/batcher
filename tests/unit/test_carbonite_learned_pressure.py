@@ -100,6 +100,9 @@ def _seed_width(hub: MetadataHub, kind: str, bytes_per_row: float, *, n: int = 3
                 n_actual=100,
                 t_op_ms=1.0,
                 m_peak_bytes=int(bytes_per_row * 1000),
+                # The rows it emits are as wide as the ones it read: the morsel cap reads the
+                # output width (`max_row_width`), the footprint reads the peak per input row.
+                result_bytes=int(bytes_per_row * 100),
                 selectivity=0.1,
                 batch_size=16384,
                 n_input=1000,
@@ -215,3 +218,34 @@ def test_the_monitor_measures_the_flap_rate_its_hysteresis_consumes():
     assert steady.flap_rate() == 0.0
     # ...and a quiet history keeps the static default.
     assert hysteresis_alpha_from_flap(steady.flap_rate()) == PressureMonitor._EWMA_ALPHA
+
+
+def test_a_fanning_out_join_does_not_shrink_the_morsel_by_its_fan_out():
+    # A join that held 125 MB for 2,190 input rows emitted 799,350 rows of 157 bytes. Its
+    # footprint per input row (57 KB) is right for sizing the join and wrong for the morsel,
+    # which it once cut to 173 rows (TPC-DS q59); the rows flowing out are what a morsel holds.
+    hub = _hub()
+    for _ in range(30):
+        hub.record(
+            OperatorFeedback(
+                op_id=OpId(1),
+                kind="hash_join",
+                n_actual=799_350,
+                t_op_ms=1.0,
+                m_peak_bytes=125_611_305,
+                result_bytes=125_198_203,
+                selectivity=365.0,
+                batch_size=16384,
+                n_input=2_190,
+                n_build=2_190,
+            )
+        )
+    rm = ResourceManager(hub=hub)
+    target = rm.recommend_morsel_target(["Join"])
+    rows = target[0] if target is not None else active_config().execution.morsel_rows
+    assert rows >= 4_096, rows
+    # Positive control: the per-input-row footprint the join is *sized* with stays learned.
+    assert rm._mem_model.bytes_per_row("hash_join") > 10_000
+    # ...and it is filed under the family the plan names, so the cap above really read it.
+    assert rm._mem_model.max_bytes_per_row(["Join"]) > 10_000
+    assert rm._mem_model.max_row_width(["Join"]) < 200

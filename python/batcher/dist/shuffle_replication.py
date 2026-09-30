@@ -223,7 +223,7 @@ def replicate_interior_outputs(actors, outputs, workers, dead, probe=None):
     return fallbacks if any(fallbacks) else None
 
 
-def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead, stages=(0,)):
+def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead, *, stages):
     """Place a second copy of every mapper's buckets on an off-node survivor.
 
     Best-effort by construction: anything that fails leaves that source unreplicated and
@@ -235,11 +235,19 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead, stages=(0
         n_reducers: Bucket count per mapper, so a replica copies every one of them.
         workers: Live worker count.
         dead: Workers already known gone; never given a copy to hold.
-        stages: The shuffle stages this operator published. Aggregate, sort and window
-            each publish one (stage 0); a **join publishes two** — the left side on stage
-            0 and the right on stage 1, under one address. A replica of a join mapper is
-            only usable if it holds *both*, so every stage's ack is required before the
-            host is advertised (see the all-or-nothing rule below).
+        stages: The ticket stages this operator's mappers **actually published under** —
+            the operator's `next_stage_base` block, never a literal. Aggregate, sort and
+            window publish one (`(stage_base,)`); a **join publishes two** — left on
+            `stage_base`, right on `stage_base + 1`, under one address. A replica of a join
+            mapper is only usable if it holds *both*, so every stage's ack is required
+            before the host is advertised (see the all-or-nothing rule below).
+
+            Required, with no default, because the default was the bug. This used to
+            default to stage 0, which was right until every shuffle moved onto its own
+            stage block: from then on each replica copied a ticket nobody had published,
+            that fetch read back **empty rather than failing**, the empty copy acked, and a
+            reducer that fell over to it silently dropped that mapper's rows — measured as
+            90,000 of 120,000 rows on a four-worker aggregate with two workers killed.
 
     Returns:
         ``replicas[src] = [addr, ...]`` for the reduce gather to fall over to, or ``None``
@@ -278,10 +286,10 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead, stages=(0
     replicas: list[list[str]] = [[] for _ in range(len(addrs))]
     if not refs:
         return None
-    # Wait for every ack **together**, then read them. Each `ray.get` used to block in
-    # turn, so the acks were collected serially — `workers x factor` sequential round trips
-    # on the map barrier, the point of the query where the reduce is already waiting. One
-    # `ray.wait` for all of them makes the waiting concurrent, and reading each ref
+    # Wait for every ack **together**, then read them. A `ray.get` per ref would collect the
+    # acks serially — `workers x factor` sequential round trips on the map barrier, the point
+    # of the query where the reduce is already waiting. One `ray.wait` for all of them makes
+    # the waiting concurrent, and reading each ref
     # afterwards keeps the per-source error isolation the degradation story depends on: a
     # source whose replica never acked must keep recompute, not fail the query.
     pending = [ref for stage_refs in refs.values() for ref in stage_refs]

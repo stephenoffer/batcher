@@ -23,6 +23,7 @@ import pyarrow as pa
 from batcher._internal.errors import BackendError
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import (
+    SCHEMA_SAMPLE_ROWS,
     BulkSink,
     PartitionSpec,
     ScanSource,
@@ -95,8 +96,10 @@ class MongoSource(ScanSource):
         collection: str,
         query: dict[str, Any] | None = None,
         partition_spec: PartitionSpec | None = None,
+        schema: pa.Schema | None = None,
     ) -> None:
         super().__init__(
+            schema=schema,
             partition_spec=partition_spec,
             uri=uri,
             database=database,
@@ -127,6 +130,7 @@ class MongoSource(ScanSource):
             collection=self._conn_kwargs["collection"],
             query=merged,
             partition_spec=self._partition_spec,
+            schema=self._conn_kwargs.get("schema"),
         )
 
     def _client(self) -> Any:
@@ -180,10 +184,27 @@ class MongoSource(ScanSource):
 
         client = self._client()
         try:
-            table = find_arrow_all(self._coll(client), self._conn_kwargs["query"], limit=1)
+            # A sample of documents rather than one: `pymongoarrow` types a field from the
+            # documents it is shown, so one document hides every field only later ones carry.
+            table = find_arrow_all(
+                self._coll(client), self._conn_kwargs["query"], limit=SCHEMA_SAMPLE_ROWS
+            )
             return table.schema
         finally:
             client.close()
+
+    def _read_schema(self) -> dict[str, Any]:
+        """``schema=`` for `find_arrow_all` when the caller declared one, else nothing.
+
+        Without it every partition is typed from its own documents, so two ``_id`` ranges
+        can disagree on a column's type; a declared schema makes every partition read to it.
+        """
+        declared = self._conn_kwargs.get("schema")
+        if declared is None:
+            return {}
+        from pymongoarrow.api import Schema
+
+        return {"schema": Schema.from_arrow(declared)}
 
     def _enumerate_partitions(self) -> list[_IdRange]:
         segments = max(1, self._partition_spec.segments)
@@ -239,7 +260,9 @@ class MongoSource(ScanSource):
         projection_doc = dict.fromkeys(projection, 1) if projection else None
         client = self._client()
         try:
-            table = find_arrow_all(self._coll(client), query, projection=projection_doc)
+            table = find_arrow_all(
+                self._coll(client), query, projection=projection_doc, **self._read_schema()
+            )
         finally:
             client.close()
         yield from table.to_batches()
@@ -330,6 +353,44 @@ class MongoSink(BulkSink):
             if ops:
                 target.bulk_write(ops, ordered=False)
         except Exception as exc:
-            raise BackendError(f"mongo bulk {self.mode} failed: {exc}") from exc
+            raise BackendError(
+                f"mongo bulk {self.mode} failed: {exc}{self._outcome(exc, rows)}"
+            ) from exc
         finally:
             client.close()
+
+    def _outcome(self, exc: Exception, rows: list[dict[str, Any]]) -> str:
+        """What a failed unordered bulk write had already applied, and which keys failed.
+
+        ``ordered=False`` has no commit phase: the documents that succeeded stay applied when
+        others fail. pymongo's `BulkWriteError` carries exactly that in ``details`` -- the
+        applied counts and one entry per failed operation, by index into the batch -- and a
+        bare ``str(exc)`` shows none of it. Naming the failed keys is what makes the
+        recovery (re-run the keyed write, or repair those documents) something a caller can
+        act on rather than guess at.
+        """
+        details = getattr(exc, "details", None)
+        if not isinstance(details, dict):
+            return ""
+        applied = ", ".join(
+            f"{name}={details.get(key, 0)}"
+            for name, key in (
+                ("inserted", "nInserted"),
+                ("upserted", "nUpserted"),
+                ("modified", "nModified"),
+                ("removed", "nRemoved"),
+            )
+        )
+        errors = details.get("writeErrors") or []
+        failed = [
+            rows[e["index"]].get(self.key_field)
+            for e in errors
+            if isinstance(e.get("index"), int) and 0 <= e["index"] < len(rows)
+        ]
+        shown = ", ".join(repr(k) for k in failed[:10])
+        more = f" and {len(failed) - 10} more" if len(failed) > 10 else ""
+        return (
+            f". The write is unordered with no commit phase, so what succeeded stays applied "
+            f"({applied}); {len(errors)} operation(s) failed, {self.key_field}: "
+            f"[{shown}{more}]."
+        )

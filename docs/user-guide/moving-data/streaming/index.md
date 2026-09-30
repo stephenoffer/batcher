@@ -172,7 +172,7 @@ A {py:class}`Trigger <batcher.Trigger>` sets the cadence, with Spark's names. Th
 | {py:meth}`bt.Trigger.processing_time("5 seconds") <batcher.Trigger.processing_time>` | Fires a micro-batch on a wall-clock interval. The default streaming cadence. |
 | {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>` | Drains every record available at start, then stops. The incremental-batch and backfill trigger. |
 | {py:meth}`bt.Trigger.once() <batcher.Trigger.once>` | The same execution as `available_now()`. |
-| {py:meth}`bt.Trigger.continuous("1 second") <batcher.Trigger.continuous>` | Runs micro-batches back to back and commits a checkpoint epoch on the interval. Stateless pipelines only. |
+| {py:meth}`bt.Trigger.continuous("1 second") <batcher.Trigger.continuous>` | Runs micro-batches back to back and commits a checkpoint epoch on the interval. It is still micro-batch execution, not Spark's record-at-a-time continuous mode, so latency is one micro-batch. Stateless pipelines only. |
 
 Spark's `Once` forces everything into a single micro-batch and was deprecated for that reason. Batcher's drains across as many micro-batches as the data needs, so prefer `available_now()` in new code: same behavior, the name Spark now recommends.
 
@@ -318,7 +318,14 @@ The order inside one micro-batch is what makes replay safe, and it's the same un
 
 ![One micro-batch as a cycle. A trigger fires on a processing-time interval or as an available_now drain. The engine stages the epoch, reading and computing while publishing nothing; writes the source position it consumed ahead of publishing anything; hands the rows to the sink; then snapshots state and commits with the sink's token. A dashed edge sleeps the rest of the interval before the next trigger, and a draining trigger skips that wait and stops when the source is spent. Because the position is durable before anything is published, the only epoch a crash can lose is one that was staged and not published, and the next run replays it into a sink that records its own query name and batch id and so commits nothing the second time.](/_static/diagrams/streaming_microbatch.svg)
 
-Give the query a stable `query_name` if you rely on this. The name is the transaction's application id, so it must stay the same across restarts for the check to find the previous run's commits. Without one it's derived from the destination table, which is stable but shared: two unnamed queries writing the same table would collide.
+The transaction's application id identifies the stream. With a checkpoint and no `query_name`, the id is created on the first run and stored in the checkpoint, so a restart on that checkpoint finds its own commits and a second query on a different checkpoint never finds them. A `query_name` replaces the stored id, so a named query must be the only one writing under that name. Without a checkpoint every run gets an id of its own. The batch counter starts again at 0 on each run, so an id shared with an earlier run would make the new run's batches look already committed.
+
+A checkpoint also records who is using it and which plan wrote it:
+
+- **One driver at a time.** A local checkpoint is locked while its query runs, so a second query started on it raises {py:exc}`CommitError <batcher.CommitError>` straight away. The lock is released when the query stops or its process dies. An object store has no lock, so on `s3://` or `gs://` the newest driver takes the checkpoint over. The older driver raises {py:exc}`CommitError <batcher.CommitError>` at its next offset record or commit, before it writes to either log.
+- **State only resumes under the plan that wrote it.** A stateful query, such as an aggregation, a window or a dedup, restarted under a different plan raises {py:exc}`PlanError <batcher.PlanError>` rather than restoring state that a different computation produced. Keep the plan to resume, or start the changed plan on a new checkpoint. A stateless pipeline stores only source positions, so its filters and projections can change between runs. A plan containing `map_batches` can't be fingerprinted across processes, so this check is skipped for it.
+
+[`tests/integration/test_streaming_crash_windows.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_streaming_crash_windows.py) kills a query at each point in a micro-batch where it can die: before the sink write, between a Delta data file and its commit, and between the sink publish and the checkpoint commit. It restarts the query and checks the destination against a run that didn't crash, for the Delta and Parquet sinks and for stateless and windowed plans.
 
 ```python
 # docs: skip
@@ -359,7 +366,7 @@ q.stop()  # the query runs until you stop it; an idle minute is not the end of a
 
 A streaming aggregation distributes too. Each worker aggregates its share of the epoch into a partial result and the driver merges them, the same `partial`, `combine`, `finalize` sequence the single-node aggregate uses, so the answer is identical.
 
-Write to Delta for a distributed exactly-once stream. Iceberg's writer has no transaction-id check, so a replayed micro-batch would duplicate rows, and a distributed streaming write to it is refused rather than quietly giving you a weaker guarantee.
+Write to Delta for a distributed exactly-once stream. A single-node stream into Iceberg is exactly-once too: each micro-batch's query id and batch number go in the snapshot summary, and a replayed batch that finds them commits nothing. The distributed epoch commit hasn't been wired to that check, so a distributed streaming write to Iceberg is refused rather than quietly giving you a weaker guarantee.
 
 ## The medallion pattern
 

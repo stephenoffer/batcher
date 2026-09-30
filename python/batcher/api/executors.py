@@ -80,11 +80,18 @@ class DistributedExecutor:
             collect_source_metadata(ctx.hub, sources, plan)
             record_udf_cardinality(ctx.hub, plan, table.num_rows)
             return table
+
         # Relational distributed result — deterministic and identical to single-node,
-        # so it shares the same result cache (`Dataset.cache()`).
-        return _cached_or_run(
-            plan, sources, ctx, lambda: run_relational(plan, sources, ctx, distributed=True)[0]
-        )
+        # so it shares the same result cache (`Dataset.cache()`). A repeated subplan is run
+        # once, as on the single-node path (`LocalNativeExecutor`), and here that is also what
+        # keeps both appearances of a float reduction bit-identical (`api.subplan_reuse`).
+        def run() -> pa.Table:
+            from batcher.api.subplan_reuse import reuse_common_subplans
+
+            run_plan, run_sources = reuse_common_subplans(plan, sources, ctx, distributed=True)
+            return run_relational(run_plan, run_sources, ctx, distributed=True)[0]
+
+        return _cached_or_run(plan, sources, ctx, run)
 
 
 class UdfExecutor:
@@ -185,7 +192,7 @@ def _record_udf_admission(ctx: ExecutionContext, input_bytes: int, *, over_budge
                 },
             )
         )
-    except Exception:  # pragma: no cover - a profile that cannot be written is not a failure
+    except Exception:  # a profile that cannot be written is not a failure
         note_suppressed("udf-admission-profile")
 
 

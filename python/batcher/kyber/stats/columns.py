@@ -45,6 +45,7 @@ __all__ = [
     "filter_columns",
     "global_aggregate_columns",
     "grouped_aggregate_columns",
+    "has_exact_range",
     "integral_range_ndv",
     "join_columns",
     "limit_columns",
@@ -111,6 +112,18 @@ def scan_columns(
             if bound is not None:
                 cols[name] = dataclasses.replace(stat, ndv=bound, ndv_provenance=Provenance.DEFAULT)
     return cols
+
+
+def has_exact_range(stat: ColumnStat) -> bool:
+    """Whether `stat` carries an EXACT, fully-populated ``[min, max]`` range.
+
+    Args:
+        stat: A column's statistics.
+
+    Returns:
+        True when the provenance is `EXACT` and both bounds are present.
+    """
+    return stat.provenance is Provenance.EXACT and stat.min is not None and stat.max is not None
 
 
 def integral_range_ndv(stat: ColumnStat, rows: float) -> float | None:

@@ -106,9 +106,8 @@ a serialized protocol.
   A `LIMIT` that returned four rows where one node returned three, or a row the unlimited
   answer does not contain, is a defect and not this exception.
 
-  **A collecting aggregate with no `order_by` may order its elements differently.** This is
-  a fourth kind, found 2026-09-22 by sweeping every aggregate across worker counts, and the
-  section said "three" until then. `array_agg` gathers a group's values into a list, and
+  **A collecting aggregate with no `order_by` may order its elements differently.**
+  `array_agg` gathers a group's values into a list, and
   which order they land in is not a property of the query any more than a hash table's walk
   order is. Measured on 100,000 rows over four Parquet files: for the first group the two
   paths returned **the same 1,031 elements, as the same multiset, in a different order** --

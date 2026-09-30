@@ -41,7 +41,7 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 | `JOIN` | Inner, left, right, full, cross, and `NATURAL` joins on equi-keys (`ON` / `USING` / shared columns); an extra non-equi `AND` condition is applied as a filter on the join result. |
 | Set operations | `UNION` / `UNION ALL`, `INTERSECT`, `EXCEPT`. |
 | `WITH` | Common table expressions (CTEs). |
-| Subqueries | Derived tables, `IN` / `NOT IN`, `EXISTS` / `NOT EXISTS`, `= ANY` / `= SOME` / `<> ALL`, correlated scalar subqueries. See [Subqueries](#subqueries) for the forms that don't translate. |
+| Subqueries | Derived tables, `IN` / `NOT IN`, `EXISTS` / `NOT EXISTS`, `= ANY` / `= SOME` / `<> ALL` and the inequality quantifiers (`> ALL`, `<= ANY`, ...), correlated scalar subqueries. See [Subqueries](#subqueries) for the forms that don't translate. |
 | Window functions | `<fn> OVER (PARTITION BY ... ORDER BY ... [ROWS BETWEEN ...])`: ranking, aggregates, and `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`, with explicit `ROWS` frames. |
 | `QUALIFY` | Filter on a window-function result (referenced by its output alias). |
 | `TABLESAMPLE` | `BERNOULLI(p PERCENT)` (fraction) or `RESERVOIR(n ROWS)` (fixed count). |
@@ -288,15 +288,13 @@ print(out.to_pydict())
 Both sides of a correlation must be plain columns. A correlation on an expression, such as
 `limits.cap > events.amount + 5`, raises instead of translating.
 
-Two forms raise rather than translate, both because the honest answer needs SQL's third
-truth value and the natural rewrite cannot express it:
+The inequality quantifiers (`> ANY`, `>= ALL`, ...) translate to their full three-valued
+answer, computed from the subquery's row count, non-null count and `min`/`max`. That is not
+`x > (SELECT max(c) FROM S)`: `x > ALL (S)` is TRUE over an empty `S` and UNKNOWN when `S`
+yields a NULL, where the `max` form answers UNKNOWN and TRUE.
 
-- The inequality quantifiers (`> ANY`, `>= ALL`, ...). `x > ALL (S)` is UNKNOWN, not TRUE,
-  when `S` yields a NULL, and `x > (SELECT max(c) FROM S)` says TRUE because `max` skips
-  NULLs.
-- `IN` under `OR`. Write it as the `EXISTS` above, qualifying the outer column.
-
-Each error names the rewrite that works.
+`IN` under `OR` raises rather than translating. Write it as the `EXISTS` above, qualifying the
+outer column. The error names that rewrite.
 
 ## Sessions, registered tables, and dialects
 

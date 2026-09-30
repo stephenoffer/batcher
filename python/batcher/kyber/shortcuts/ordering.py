@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from batcher.kyber.shortcuts.facts import Facts
 from batcher.plan.stats import SortOrder, as_sort_orders, orderings_satisfy
 
-__all__ = ["is_sorted_by", "sort_prefix", "sorted_columns"]
+__all__ = ["is_sorted_by", "sorted_columns"]
 
 
 def sorted_columns(facts: Facts) -> tuple[SortOrder, ...]:
@@ -45,19 +45,3 @@ def is_sorted_by(facts: Facts, columns: Sequence[SortOrder | str]) -> bool | Non
     if orderings_satisfy(facts.sorted_by, keys, non_nullable=non_nullable):
         return True
     return None
-
-
-def sort_prefix(facts: Facts, columns: Sequence[SortOrder | str]) -> int:
-    """How many leading `columns` the relation is already sorted by — the work a sort can skip.
-
-    Zero means the sort must do everything; `len(columns)` means it is a no-op. A partial
-    match is the interesting case: a relation already sorted by ``region`` needs only to sort
-    *within* each region to reach ``(region, day)``.
-    """
-    wanted = as_sort_orders(columns)
-    matched = 0
-    for want, have in zip(wanted, facts.sorted_by, strict=False):
-        if want != have:
-            break
-        matched += 1
-    return matched

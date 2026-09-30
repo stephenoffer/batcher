@@ -37,12 +37,27 @@ from batcher.kyber.optimizer import Optimizer
 from batcher.plan.expr_ir import Col, IsNotNull
 from batcher.plan.expr_rewrite import split_conjuncts
 from batcher.plan.logical import Filter, Join, Limit, Scan
+from batcher.plan.logical.join import JOIN_TYPES as _PLAN_JOIN_TYPES
 from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 from batcher.plan.visitor import walk
 
-JOIN_TYPES = ["inner", "left", "right", "full", "semi", "anti"]
+# Derived from the engine's own set, so a join type added there is exercised here by default.
+JOIN_TYPES = sorted(_PLAN_JOIN_TYPES)
+
+# Which side of each join gains an `IS NOT NULL` key filter when read from Parquet: a side is
+# reducible exactly when a NULL key on it can never reach the output. Keyed by every join type,
+# so a new one fails with a KeyError here until someone decides its answer, rather than
+# silently counting as "neither side".
+_NOT_NULL_SIDES = {
+    "inner": (True, True),
+    "left": (False, True),
+    "right": (True, False),
+    "full": (False, False),
+    "semi": (True, True),
+    "anti": (False, True),
+}
 
 # DuckDB spells the join types the SQL way; `semi`/`anti` are SEMI/ANTI JOIN.
 _SQL_JOIN = {
@@ -197,8 +212,7 @@ def test_is_not_null_fires_exactly_on_the_reducible_left(duck, tmp_path, how):
     _reg(duck, "fl", left)
     _reg(duck, "fr", right)
     ds = _stored(tmp_path, left).join(_stored(tmp_path, right), on="k", how=how)
-    expected_left = how in {"inner", "semi", "right"}
-    expected_right = how in {"anti", "inner", "left", "semi"}
+    expected_left, expected_right = _NOT_NULL_SIDES[how]
     assert _join_side_has_not_null(ds, "left") is expected_left
     assert _join_side_has_not_null(ds, "right") is expected_right
     cols = _cols_sql(how, "fl", "fr")

@@ -28,7 +28,9 @@ use crate::error::InterpError;
 use crate::ops;
 use crate::par::SpillOptions;
 
+pub(crate) mod asof_stream;
 pub(crate) mod probe_stream;
+pub(crate) mod range_blocked;
 pub mod sideways;
 use crate::spill_split::{
     drain_repartition, grace_bucket_count, split_salt, MAX_GRACE_SPLIT_DEPTH,

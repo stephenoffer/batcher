@@ -20,7 +20,6 @@ they live here as the single source of truth.
 from __future__ import annotations
 
 import collections
-import contextlib
 import functools
 import os
 import threading
@@ -29,6 +28,9 @@ from inspect import signature
 from batcher._internal.hardware.memory import machine_memory_bytes
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.config.env import env_float, env_int
+from batcher.io.source.readahead import native_read_depth, projected_rg_bytes
+from batcher.io.source.readahead import ordered_concurrent as _ordered_concurrent
 from batcher.io.splits import Split
 from batcher.plan.types import retained_bytes
 
@@ -40,14 +42,14 @@ from batcher.plan.types import retained_bytes
 # ~53s → ~31s (it plateaus past 32). Bounded: peak memory is ≤ `depth` in-flight splits.
 # Module-level (not `config`) so it applies on a worker without shipping the driver's
 # config_context; env-overridable for wider tables / tighter RAM.
-_SCAN_PREFETCH = max(1, int(os.environ.get("BATCHER_SCAN_PREFETCH", "32")))
+_SCAN_PREFETCH = env_int("BATCHER_SCAN_PREFETCH", 32, floor=1)
 
 # Target compressed bytes per scan split — coalesces a source's native chunks. Parquet
 # files with many small row-groups (sf100 lineitem: 49/file → 4,900 one-row-group splits)
 # make per-request latency the bottleneck; packing adjacent row-groups to this size turns
 # hundreds of tiny GETs per worker into a few dozen large reads. `_scan_splits` applies it
 # only while enough splits remain to keep the fan-out busy. Env-overridable.
-_SPLIT_TARGET_BYTES = max(1 << 20, int(os.environ.get("BATCHER_SPLIT_TARGET_BYTES", str(64 << 20))))
+_SPLIT_TARGET_BYTES = env_int("BATCHER_SPLIT_TARGET_BYTES", 64 << 20, floor=1 << 20)
 
 # Object-store read concurrency for the dataset scan. The scan is S3-LATENCY-bound, so
 # throughput tracks the number of in-flight range requests, which pyarrow caps at the
@@ -56,8 +58,8 @@ _SPLIT_TARGET_BYTES = max(1 << 20, int(os.environ.get("BATCHER_SPLIT_TARGET_BYTE
 # ~32 threads. The pool itself is lifted by `io.filesystem.ensure_io_threads` (shared with
 # the single-node read path); `fragment_readahead` is how many files a worker reads at once,
 # `batch_readahead` how far it reads into each. All env-overridable.
-_FRAGMENT_READAHEAD = max(2, int(os.environ.get("BATCHER_FRAGMENT_READAHEAD", "32")))
-_BATCH_READAHEAD = max(2, int(os.environ.get("BATCHER_BATCH_READAHEAD", "64")))
+_FRAGMENT_READAHEAD = env_int("BATCHER_FRAGMENT_READAHEAD", 32, floor=2)
+_BATCH_READAHEAD = env_int("BATCHER_BATCH_READAHEAD", 64, floor=2)
 
 
 # Native Rust parquet reader (bc-io via bc_py): decodes parquet over object_store
@@ -85,7 +87,7 @@ _NATIVE_READER = os.environ.get("BATCHER_NATIVE_READER", "1") not in ("0", "fals
 # the streaming partial-aggregate's bounded memory (and its read/compute overlap). Reading
 # in windows of this many row-groups bounds the in-flight memory to ~one window while
 # still fetching that window's row-groups concurrently. Env-overridable.
-_NATIVE_RG_WINDOW = max(1, int(os.environ.get("BATCHER_NATIVE_RG_WINDOW", "8")))
+_NATIVE_RG_WINDOW = env_int("BATCHER_NATIVE_RG_WINDOW", 8, floor=1)
 
 
 # --- Worker scan cache: decoded batches kept on the persistent worker between queries ---
@@ -94,6 +96,7 @@ _NATIVE_RG_WINDOW = max(1, int(os.environ.get("BATCHER_NATIVE_RG_WINDOW", "8")))
 # and run at compute speed. Bounded LRU by total cached bytes — defaults to a fraction of
 # the node's RAM so it never crowds out the working set; `BATCHER_SCAN_CACHE_BYTES=0`
 # disables it. Lives on the worker process, so it persists exactly as long as the fleet.
+@functools.lru_cache(maxsize=1)
 def _scan_cache_siblings() -> int:
     """How many worker processes share this node's RAM with us — never below 1.
 
@@ -124,7 +127,7 @@ def _scan_cache_siblings() -> int:
 
 
 def _default_scan_cache_cap() -> int:
-    frac = max(0.0, float(os.environ.get("BATCHER_SCAN_CACHE_FRACTION", "0.3")))
+    frac = env_float("BATCHER_SCAN_CACHE_FRACTION", 0.3, floor=0.0)
     # `machine_memory_bytes` rather than `psutil.virtual_memory().total`, which reports the
     # **host's** RAM. Under a container -- the ordinary way a Ray worker runs -- the cgroup
     # cap is the real ceiling, and a 4 GiB container on a 512 GiB node sized this cache
@@ -173,8 +176,9 @@ _SCAN_CACHE_LOCK = threading.Lock()
 
 # --- Broken-record tolerance (distributed.on_read_error="skip") --------------------
 # Count of splits (file / row-group group) a worker skipped because they failed to read.
-# Process-wide on the worker so a persistent-fleet worker's total is observable across a
-# query; `skipped_splits()` reads it. A skip is a silent data loss, so each one logs.
+# Process-wide on the worker, read by `skipped_splits()` and drained by
+# `drain_skipped_splits()`; it is not shipped to the driver. A skip is a data loss, so each
+# one also logs a warning, which is the record the driver sees.
 _SKIPPED_SPLITS = 0
 _SKIPPED_LOCK = threading.Lock()
 
@@ -195,8 +199,11 @@ def drain_skipped_splits() -> int:
 
     A fleet worker outlives the query that ran on it, so a cumulative counter cannot answer
     "did MY job lose data", the only question that matters when a petabyte-scale scan
-    quietly drops a corrupt shard. Draining per task lets the driver sum one number per
-    partition and report the job's true loss.
+    quietly drops a corrupt shard. Draining gives a per-query figure on the worker.
+
+    The count stays on the worker: no task returns it and the driver sums nothing. The
+    driver-visible record of a skip is the warning `_record_skipped` logs per split, which
+    Ray forwards from the worker's log.
     """
     global _SKIPPED_SPLITS
     with _SKIPPED_LOCK:
@@ -234,12 +241,11 @@ def _scannable_fragments(splits):
     That second case is the point. Sub-file splits read faster here (the scanner coalesces
     column-chunk ranges and reads fragments ahead in C++, and the result is cacheable), but
     knowing where the row-groups are costs the *driver* one footer read per file before any
-    worker starts — 18.3 s over 8,192 files, serial with the whole cluster idle. Whole-file
-    splits used to fall out of this fast path onto the per-split reader, so avoiding that
-    sweep meant giving up the reader too, and a 24 GB corpus measured 5.5 s read + 18.3 s
-    plan against 9.3 s read + 0.07 s plan — a choice between two bad halves. Accepting them
-    here removes the choice: the footer work moves off the driver and onto the workers that
-    were going to open the files anyway.
+    worker starts — 18.3 s over 8,192 files, serial with the whole cluster idle. If
+    whole-file splits fell out of this fast path onto the per-split reader, avoiding that
+    sweep would mean giving up the reader too: a 24 GB corpus measured 5.5 s read + 18.3 s
+    plan against 9.3 s read + 0.07 s plan. Accepting them here removes the choice: the
+    footer work moves off the driver and onto the workers that open the files anyway.
 
     Returns None — caller falls back — for any other split kind, and for a Parquet split
     carrying reader kwargs. Those kwargs are a bring-your-own filesystem, `storage_options`,
@@ -391,24 +397,15 @@ def _read_split_batches_uncached(splits, projection, predicate, on_read_error="e
         yield from _prefetch_split_reads(splits, projection, predicate, _SCAN_PREFETCH)
 
 
-def _native_read_depth(units: list[tuple[str, list[int]]]) -> int:
-    """How many native row-group windows to keep in flight, bounded by ROW-GROUPS.
+def _native_read_depth(units: list[tuple[str, list[int]]], splits=(), cols=None) -> int:
+    """Native row-group windows to keep in flight, budgeted in projected bytes.
 
-    The per-split reader holds at most `_SCAN_PREFETCH` splits — normally one row-group
-    each — so the same budget expressed in row-groups keeps this path's resident footprint
-    where the pyarrow path's already is, rather than multiplying it by the window size. A
-    partition of one-row-group-per-file (the balanced-assignment shape, and the one that was
-    slow) reads every file at once; a partition of few files x many row-groups reads fewer
-    windows concurrently, because each one already carries `_NATIVE_RG_WINDOW` of them.
-
-    Args:
-        units: The `(uri, row_groups)` windows the read was cut into.
-
-    Returns:
-        The concurrency to hand `_ordered_concurrent`, never below 1.
+    `io.source.read_budget.native_read_depth` over `splits`' projected row-group size (`cols`
+    the projection) and this node's process count, falling back to `_SCAN_PREFETCH` row
+    groups when the row groups are unsized.
     """
-    widest = max((len(window) for _uri, window in units), default=1)
-    return max(1, _SCAN_PREFETCH // max(1, widest))
+    rg_bytes = projected_rg_bytes(list(splits), cols)
+    return native_read_depth(units, rg_bytes, _SCAN_PREFETCH, _scan_cache_siblings())
 
 
 def _native_scan_batches(splits, projection, predicate=None):
@@ -444,8 +441,10 @@ def _native_scan_batches(splits, projection, predicate=None):
     # decoder working set per read, which is what OOM-killed a GPU inference actor holding a
     # node's worth of them; the byte cap is a no-op for an ordinary row. See
     # `_parquet_native.NATIVE_READ_TARGET_BYTES`.
-    with contextlib.suppress(Exception):
+    try:
         batch_rows = _parquet_native.native_read_batch(splits[0].schema(), cols, ceiling=batch_rows)
+    except Exception as exc:
+        note_suppressed("dist", "native parquet read batch sizing", exc)
 
     # Window the row-groups so the worker reads ~one window at a time (bounded memory +
     # read/compute overlap) instead of materializing its whole partition.
@@ -467,9 +466,9 @@ def _native_scan_batches(splits, projection, predicate=None):
         """The windows, read CONCURRENTLY and yielded in file order.
 
         Each native call already fetches its own window's column chunks concurrently, but
-        the calls themselves used to run one after another — so a partition spread over
-        many files paid a full object-store round trip per file, in series, with the task's
-        reserved cores idle throughout. That is the common shape, not a corner: the
+        run one after another the calls would make a partition spread over many files pay a
+        full object-store round trip per file, in series, with the task's reserved cores
+        idle throughout. That is the common shape, not a corner: the
         partitioner balances a source's splits across tasks, so a task's ten splits are
         typically ten *different* files.
 
@@ -489,7 +488,9 @@ def _native_scan_batches(splits, projection, predicate=None):
         entirely — which is why a warm best-of-N benchmark moves far less. See
         `benchmarks/BENCHMARK_RESULTS.md` for the cold/warm split.
         """
-        for batches in _ordered_concurrent(units, _read_window, _native_read_depth(units)):
+        for batches in _ordered_concurrent(
+            units, _read_window, _native_read_depth(units, splits, cols)
+        ):
             yield from batches
 
     # Probe the first read eagerly so a failure falls back to pyarrow instead of yielding
@@ -497,7 +498,8 @@ def _native_scan_batches(splits, projection, predicate=None):
     gen = _gen()
     try:
         first = next(gen, _SENTINEL)
-    except Exception:
+    except Exception as exc:
+        note_suppressed("dist", "native parquet read", exc)
         return None
     if first is _SENTINEL:
         return iter(())
@@ -639,77 +641,3 @@ def _prefetch_split_reads(splits, projection, predicate, depth: int, skip_errors
         splits, lambda s: _split_read(s, projection, predicate), depth, _on_error
     ):
         yield from batches
-
-
-def _ordered_concurrent(units, read_one, depth: int, on_error=None):
-    """Yield ``read_one(unit)`` for each of `units` **in order**, `depth` reads in flight.
-
-    The one definition of "read ahead on a thread pool without reordering" this module has,
-    shared by the per-split pyarrow reader and the native row-group reader. Both are
-    object-store-LATENCY-bound — a single connection sits far below a node's bandwidth and
-    each request waits tens of milliseconds — so what caps throughput is how many requests
-    are outstanding, not how fast any one of them is.
-
-    A FIFO of futures is what keeps the order: a unit is submitted early but only yielded
-    when the reader reaches it, so a caller that assumes file/split order is unaffected.
-    Memory is bounded to at most `depth` in-flight reads, and the next read is submitted
-    *before* the current one is drained so a skipped unit still advances the window.
-
-    `read_one` must release the GIL for the overlap to be real. Both callers do:
-    ``bc_py::read_parquet`` wraps its object-store fetch in ``py.allow_threads``, and
-    PyArrow's readers release it too.
-
-    Args:
-        units: The work items to read, in the order their results must be yielded.
-        read_one: Called on each unit; its return value is yielded.
-        depth: Reads to keep in flight; ``<= 1`` (or a single unit) runs plain sequentially.
-        on_error: Called as ``on_error(unit, exc)`` when a read raises. Returning True
-            skips that unit; returning False (the default when omitted) re-raises.
-
-    Yields:
-        Each unit's `read_one` result, in `units` order.
-    """
-    if depth <= 1 or len(units) <= 1:
-        for unit in units:
-            try:
-                out = read_one(unit)
-            except Exception as exc:
-                if on_error is not None and on_error(unit, exc):
-                    continue
-                raise
-            yield out
-        return
-
-    import collections
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=depth) as pool:
-        pending: collections.deque = collections.deque()
-        it = iter(units)
-        for unit in _take(it, depth):
-            pending.append((unit, pool.submit(read_one, unit)))
-        while pending:
-            unit, fut = pending.popleft()
-            # Submit the next read BEFORE draining this one so a failed unit still
-            # advances the prefetch window (keeps the pipeline full under skip).
-            nxt = next(it, None)
-            if nxt is not None:
-                pending.append((nxt, pool.submit(read_one, nxt)))
-            try:
-                out = fut.result()  # raises if the read failed
-            except Exception as exc:
-                if on_error is not None and on_error(unit, exc):
-                    continue
-                raise
-            yield out
-
-
-def _take(it, n: int):
-    """The next ≤`n` items of `it` (priming the prefetch window)."""
-    out = []
-    for _ in range(n):
-        x = next(it, None)
-        if x is None:
-            break
-        out.append(x)
-    return out

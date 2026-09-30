@@ -29,14 +29,22 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def corpus(tmp_path):
+def corpus(tmp_path, monkeypatch):
     """Seventy small Parquet files of six row-groups each.
 
     Seventy so the *coalesced* plan (one split per file at a 64 MB target) still clears
     `_scan_splits`' real floor of ``workers x _SCAN_PREFETCH`` at a two-worker fleet — 64.
     That is what lets this run against the production constants instead of monkeypatching
     them, which matters: the constants are the thing under test.
+
+    The one constant held still is the file count below which a read of small files is still
+    planned per row group (`_MIN_SPLITS`, eight per core). It is not under test, and it moves
+    with the machine: 384 on a 48-core box, where seventy files were planned per row group,
+    and 64 on an 8-core one, where they were planned whole and both reads came out the same.
     """
+    from batcher.io.base import source as base_source
+
+    monkeypatch.setattr(base_source, "_MIN_SPLITS", 1_000)
     for f in range(70):
         table = pa.table(
             {"i": pa.array(np.arange(f * 600, (f + 1) * 600)), "v": pa.array(np.random.rand(600))}

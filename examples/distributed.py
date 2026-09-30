@@ -11,7 +11,7 @@ rather than to every bit. Ray is
 used for scheduling only; bulk data moves over Arrow Flight, never the object store.
 
 This runs against a *local* Ray cluster (Ray spins one up in-process), so it works on a
-laptop. It no-ops cleanly when Ray is not installed (``pip install 'batcher[ray]'``).
+laptop. It no-ops cleanly when Ray is not installed (``pip install 'batcher-engine[ray]'``).
 
     python examples/distributed.py
 """
@@ -33,7 +33,7 @@ def _rowset(table: pa.Table) -> set:
 
 def main() -> None:
     if importlib.util.find_spec("ray") is None:
-        print("ray not installed — skipping (pip install 'batcher[ray]')")
+        print("ray not installed — skipping (pip install 'batcher-engine[ray]')")
         return
 
     rng = np.random.default_rng(0)

@@ -60,6 +60,29 @@ def test_selectivity_smoothing_across_runs():
     assert abs(hub.load_keyed_params(_NAMESPACE)[sig]["selectivity"] - 0.3) < 1e-6
 
 
+def test_selectivity_writes_advance_the_learned_generation_like_row_counts():
+    """The estimator reads the selectivity, so writing it must invalidate memoized plans.
+
+    `bump_generation`'s contract: every writer whose value the optimizer reads bumps, except the
+    converged drift of an already-known value.
+    """
+    from batcher.kyber.learning import generation
+
+    hub = _DictHub()
+    plan, sources = _filter_plan(1000)
+    before = generation()
+    kyber.record_selectivity(hub, plan, sources, 400)  # first write: nothing was known
+    assert generation() > before
+    for _ in range(40):  # let the smoothed value converge on 0.4
+        kyber.record_selectivity(hub, plan, sources, 400)
+    settled = generation()
+    kyber.record_selectivity(hub, plan, sources, 405)  # converged drift: no invalidation
+    assert generation() == settled
+    # 1.0 against ~0.4: even at the EWMA floor the stored value moves by more than 10%.
+    kyber.record_selectivity(hub, plan, sources, 1000)
+    assert generation() > settled
+
+
 def test_record_execution_preserves_selectivity():
     hub = _DictHub()
     plan, sources = _filter_plan(100)

@@ -44,6 +44,7 @@ import pyarrow as pa
 
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import (
+    SCHEMA_SAMPLE_ROWS,
     BulkSink,
     PartitionSpec,
     ScanSource,
@@ -110,8 +111,10 @@ class _CassandraSourceBase(ScanSource):
         port: int = 9042,
         auth: dict[str, str] | None = None,
         partition_spec: PartitionSpec | None = None,
+        schema: pa.Schema | None = None,
     ) -> None:
         super().__init__(
+            schema=schema,
             partition_spec=partition_spec or PartitionSpec(segments=64),
             contact_points=list(contact_points),
             keyspace=keyspace,
@@ -168,11 +171,11 @@ class _CassandraSourceBase(ScanSource):
         kw = self._conn_kwargs
         cluster, session = self._session()
         try:
-            stmt = f"SELECT * FROM {kw['table']} LIMIT 1"
+            stmt = f"SELECT * FROM {kw['table']} LIMIT {SCHEMA_SAMPLE_ROWS}"
             rows = list(session.execute(stmt))
         finally:
             cluster.shutdown()
-        return schema_from_rows([dict(rows[0]._asdict())] if rows else [])
+        return schema_from_rows([dict(row._asdict()) for row in rows])
 
     def _pk_columns(self) -> tuple[str, ...]:
         """The partition-key column names, whether declared as one name or a tuple."""

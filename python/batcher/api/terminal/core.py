@@ -210,6 +210,32 @@ def _collect(
         if gpu_result is not None:
             _shortcut(plan, "gpu", gpu_result.num_rows, started)
             return gpu_result
+    # `auto` promises the same answer on either route, so a plan the distributed route
+    # refuses (a shape with no distributed decomposition) is answered single-node rather
+    # than raised: TPC-H q22 at SF1 routed to the cluster by size and failed there, where an
+    # explicit `distributed=False` returned its seven rows. An explicit `True` still raises.
+    if distributed == "auto":
+        distributed = _resolve_distributed("auto", plan, sources)
+        if distributed:
+            try:
+                return _collect(
+                    plan,
+                    sources,
+                    columns,
+                    distributed=True,
+                    num_workers=num_workers,
+                    spill=spill,
+                    num_partitions=num_partitions,
+                    adaptive=adaptive,
+                    transport=transport,
+                    cache=cache,
+                    source_stats=source_stats,
+                )
+            except PlanError as exc:
+                from batcher._internal.logging import note_suppressed
+
+                note_suppressed("api", "run distributed=auto on the cluster", exc)
+                distributed = False
     # Opt-in: offload large-payload columns out of line around breakers (the blobs ride
     # through as tiny handles). Inserted before execution routing so the resulting
     # `map_batches` stages take the same mixed-executor path as an explicit offload.
@@ -258,7 +284,10 @@ def _collect(
 
         # Adaptive re-optimization now works distributed too: each breaker stage
         # fans out across workers and its measured cardinality re-plans the rest.
+        from batcher.kyber import plan_cache
+
         _t0 = time.perf_counter()
+        _misses = plan_cache.misses()
         table = execute_adaptive(
             plan,
             sources,
@@ -272,7 +301,9 @@ def _collect(
         # what the two routes differ in is precisely the work that is not inside a stage:
         # the per-stage materialize, re-plan, and the fusion and parallel width the pipeline
         # gives up by being cut at every breaker.
-        record_adaptive_route(core.default_hub(), plan, True, (time.perf_counter() - _t0) * 1000.0)
+        record_adaptive_route(
+            core.default_hub(), plan, True, (time.perf_counter() - _t0) * 1000.0, _misses
+        )
         return table
 
     if spill and not distributed:
@@ -372,7 +403,10 @@ def _collect(
         source_stats=source_stats,
         profile=event_log_collector(),
     )
+    from batcher.kyber import plan_cache
+
     t0 = time.perf_counter()
+    misses = plan_cache.misses()
     try:
         # Make the id ambient for the whole execution. The subsystems with the most to say
         # about a distributed query — `dist` deciding a fan-out, a placement, a transport —
@@ -402,7 +436,7 @@ def _collect(
     from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
 
     record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
-    record_adaptive_route(ctx.hub, plan, False, total_ms)  # the one-shot arm of the route bandit
+    record_adaptive_route(ctx.hub, plan, False, total_ms, misses)  # the route bandit's one-shot arm
     return table
 
 
@@ -813,7 +847,7 @@ def _report_write(manifest: WriteManifest, fmt: str) -> None:
             rows=manifest.total_rows,
             bytes=manifest.total_bytes,
         )
-    except Exception as exc:  # pragma: no cover - telemetry must never fail a commit
+    except Exception as exc:  # telemetry must never fail a commit
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("api", "report the write on the event bus", exc)
@@ -1092,22 +1126,15 @@ def _write(
             layout=layout,
             resume=resume,
         )
-        # The schema, asked for in the order that costs least, and **after** the write rather
-        # than before it. `_schema`'s last resort executes the plan under a zero-row limit,
-        # which for a `map_batches` stage builds the UDF here on the driver -- and this is the
-        # one write shape where that is a batch-inference model. Measured on a GPU-less head
-        # node: `map_batches(Model, num_gpus=1).write.parquet(...)` died in `cupy` with
-        # `cudaErrorInsufficientDriver` on a 1.9 GiB input, and on a 29 GiB one the driver was
-        # OOM-killed at 16.7 GB, both before a single row was written. Scoring a corpus and
-        # writing the scores is the canonical batch-inference job, so that was the shape it
-        # broke on.
-        #
-        # It is asked for at all only because a transactional sink creating a table cannot
-        # recover it from the data files (see `_commit`), and because an empty result still
-        # has to write one empty file with the right columns. The workers already attach the
-        # schema they wrote, which answers both -- except under `partition_by`, where the
-        # partition columns live in the path rather than in the file, so that case keeps the
-        # analysis it had.
+        # The schema is asked for after the write, cheapest source first. `_schema`'s last
+        # resort executes the plan under a zero-row limit, which for a `map_batches` stage builds
+        # the UDF on the driver: for a batch-inference write that loads the model there, which
+        # fails on a GPU-less head node or OOMs it on a large input before any row is written.
+        # The schema is needed only because a transactional sink creating a table cannot recover
+        # it from the data files (see `_commit`), and an empty result still writes one empty
+        # file with the right columns. The workers attach the schema they wrote, which answers
+        # both, except under `partition_by`, where the partition columns live in the path rather
+        # than in the file, so that case keeps the analysis.
         out_schema = _declared_schema(plan, sources)
         if out_schema is None and not partition_by:
             out_schema = manifest.schema

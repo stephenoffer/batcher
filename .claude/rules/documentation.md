@@ -73,8 +73,7 @@ that, and needing the preview usually means the page is too dense to be one page
   (`streaming-stateful-windows.md`) to dodge the limit, which is the docs version of the
   `expr_str_funcs.py` move `.claude/rules/maintainability.md` bans.
 - The page count includes files `conf.py` excludes from the build, because an excluded
-  working record is still a file a contributor scans past. The directory that first hit the
-  limit, `architecture/internals`, was 29 files of which 23 were excluded.
+  working record is still a file a contributor scans past.
 - Every directory has an `index.md` that introduces its children and carries their
   `{toctree}`. If a directory doesn't warrant an index, the content shouldn't be nested.
   A directory whose pages are *all* excluded is a shelf of contributor records rather than

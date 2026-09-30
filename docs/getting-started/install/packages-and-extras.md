@@ -2,21 +2,31 @@
 
 This page describes how to install Batcher, add the optional extras for clusters, cloud storage, table formats, and ML, and build the engine from source.
 
-Batcher installs from one wheel. The package on PyPI is `batcher-engine`, and it imports as `batcher`. The bare `batcher` name on PyPI belongs to an unrelated project, so install the full name. The wheel carries the Python control plane and the compiled Rust engine together, and its few dependencies include PyArrow and the SQL parser, so DataFrames, SQL, and Parquet work with nothing else installed.
+Batcher installs from one wheel. The distribution is named `batcher-engine`, and it imports as `batcher`. The bare `batcher` name on PyPI belongs to an unrelated project, so install the full name. The wheel carries the Python control plane and the compiled Rust engine together, and its few dependencies include PyArrow and the SQL parser, so DataFrames, SQL, and Parquet work with nothing else installed.
 
 Everything else is an optional extra layered on top of that wheel:
 
 ![A two-layer stack. The bottom layer is the core wheel, installed with pip install batcher-engine: the Python control plane with Dataset, SQL, and the optimizer, the precompiled Rust engine that needs no toolchain, and the required dependencies pyarrow, numpy, sqlglot, and psutil, on Python 3.11 or newer. An arrow labeled each plugs into the same API points up to the optional extras layer, grouped as clusters (ray), object stores (cloud), lakehouse (delta, iceberg, hudi), streaming (kafka, kinesis, pubsub, pulsar, eventhubs), media decode (image, audio, video), ML frameworks (torch, tensorflow, jax), LLMs and embeddings (st, vllm, sglang), and dataframes (pandas, polars), with the bundles lakehouse, streaming, multimodal, and all. A feature whose extra is missing raises MissingDependencyError.](/_static/diagrams/install_extras_stack.svg)
 
+:::{important}
+No `batcher-engine` release has been published to PyPI, and the GitHub repository has no tagged release. `pip install batcher-engine` therefore fails with "No matching distribution found". The container images under `ghcr.io/stephenoffer/batcher` are pushed by the same tagged release job, so they aren't available either. Install from the repository, as the next section shows. That compiles the engine on your machine and needs a Rust toolchain, 1.89 or newer (`rust-version` in `Cargo.toml`). The `pip install batcher-engine` commands elsewhere in these docs describe the package the release workflow publishes, and work once a release is tagged.
+:::
+
 ## Requirements
 
-You need Python 3.11 or newer on a 64-bit platform. Release wheels are built for Linux on x86_64 and aarch64, macOS on Intel and Apple silicon, and Windows. The engine ships precompiled, so you don't need a Rust toolchain to install a release.
+You need Python 3.11 or newer on a 64-bit platform. The release workflow, `.github/workflows/release.yml`, builds wheels for Linux on x86_64 and aarch64, macOS on Intel and Apple silicon, and Windows. A released wheel ships the engine precompiled, so installing a release needs no Rust toolchain. Installing from the repository does.
 
 {doc}`index` lists every supported platform, including musl-based Linux such as Alpine, and helps you choose between pip, uv, conda, containers, Ray clusters, and offline installs.
 
 ## Install the core engine
 
-Install the package with pip:
+Install from the repository with pip. This compiles the Rust engine, so install a [Rust toolchain](https://rustup.rs) first:
+
+```bash
+pip install "git+https://github.com/stephenoffer/batcher.git"
+```
+
+Once a release is published, the prebuilt wheel installs without a toolchain:
 
 ```bash
 pip install batcher-engine
@@ -70,6 +80,12 @@ Extras add integrations without changing the core API, so code you write doesn't
 
 ```bash
 pip install "batcher-engine[ray,cloud,delta]"
+```
+
+Before a release exists, name the repository as the source of the same extras:
+
+```bash
+pip install "batcher-engine[ray,cloud,delta] @ git+https://github.com/stephenoffer/batcher.git"
 ```
 
 The following table lists the extras most people reach for first, grouped by what they turn on. `pyproject.toml` declares the full set, including connectors for individual warehouses, databases, and message queues. Bundles such as `lakehouse`, `streaming`, `multimodal`, and `all` install a whole group at once.

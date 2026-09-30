@@ -133,6 +133,37 @@ fn window_bucket(
     if bucket.is_empty() {
         return Ok(());
     }
+    // Still over budget after every re-split: one hot partition. Rather than running the
+    // kernel over a bucket it has no room for, stream it over an out-of-core sort when the
+    // functions have an exact streamed form (`ops::window_stream`).
+    if bytes > ctx.budget_bytes
+        && ops::window_streamable(
+            &bucket,
+            ctx.partition_keys,
+            ctx.order_keys,
+            ctx.functions,
+            ctx.rank_limit,
+        )?
+    {
+        let spill = ops::StreamSpill {
+            chunk_bytes: (ctx.budget_bytes / 4).max(ops::MIN_CHUNK_BYTES),
+            dir: &ctx.dir.join(format!("window-stream-{depth}-{i}")),
+            fanin: bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+            run_target_bytes: ((ctx.budget_bytes / 4) as u64)
+                .clamp(1 << 20, ops::DEFAULT_RUN_TARGET_BYTES),
+            codec: ctx.codec,
+            cancel: None,
+        };
+        let (streamed, _) = ops::window_streaming(
+            bucket,
+            ctx.partition_keys,
+            ctx.order_keys,
+            ctx.functions,
+            &spill,
+        )?;
+        out.extend(streamed);
+        return Ok(());
+    }
     let combined = ops::materialize(&bucket)?;
     out.push(ops::window_batch(
         &combined,

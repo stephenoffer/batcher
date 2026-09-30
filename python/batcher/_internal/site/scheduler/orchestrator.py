@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from batcher._internal.site.scheduler.job import (
     SchedulerJob,
-    env_int,
+    env_count,
     env_str,
     first_env,
     launcher_ranks,
@@ -67,7 +67,7 @@ def kubernetes_job() -> SchedulerJob:
     ranks = launcher_ranks()
     # Volcano and the Kubeflow operators number their pods themselves; where they have, that
     # index is more trustworthy than a launcher variable a user may have set by hand.
-    rank = env_int("VC_TASK_INDEX") or env_int("VK_TASK_INDEX") or ranks.rank
+    rank = env_count("VC_TASK_INDEX") or env_count("VK_TASK_INDEX") or ranks.rank
     return SchedulerJob(
         kind="kubernetes",
         job_id=first_env(("POD_NAME", "JOB_NAME")),
@@ -123,7 +123,7 @@ def nomad_job() -> SchedulerJob:
         partition=env_str("NOMAD_NAMESPACE"),
         gpus_per_node=visible_device_count(),
         tasks=ranks.tasks,
-        rank=env_int("NOMAD_ALLOC_INDEX") or ranks.rank,
+        rank=env_count("NOMAD_ALLOC_INDEX") or ranks.rank,
         local_rank=ranks.local_rank,
         local_size=ranks.local_size,
         array_index=env_str("NOMAD_ALLOC_INDEX"),

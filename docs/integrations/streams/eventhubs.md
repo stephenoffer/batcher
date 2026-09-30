@@ -105,7 +105,7 @@ schema = pa.schema(
         ("value", pa.binary()),
         ("partition", pa.int64()),
         ("offset", pa.int64()),
-        ("timestamp", pa.int64()),
+        ("timestamp", pa.timestamp("ms")),
         ("topic", pa.string()),
     ]
 )
@@ -202,7 +202,7 @@ Azure allows five readers per consumer group per partition. Batcher's split assi
 
 Throughput units cap ingress and egress for the namespace, and exceeding egress returns `ServerBusyError` rather than a slower read.
 
-The native reader authenticates with a connection string only, and `connection_str` isn't resolved as a secret reference. The reader also calls a private method on `EventHubConsumerClient` to create per-partition consumers, so pin `azure-eventhub` and test before upgrading it.
+The native reader authenticates with a connection string only. Pass it as a secret reference, such as `connection_str="env:EVENTHUB_CONN"`, and it's resolved where the client is built, on the worker. The reader also calls a private method on `EventHubConsumerClient` to create per-partition consumers, so pin `azure-eventhub` and test before upgrading it.
 
 ## See also
 

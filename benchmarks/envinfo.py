@@ -21,6 +21,8 @@ harnesses needed the same gate; it is the same check, unchanged.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import os
 import platform
 import subprocess
@@ -28,8 +30,10 @@ import sys
 
 __all__ = [
     "QUIET_LOAD_PER_CORE",
+    "environment_digest",
     "load_per_core",
     "machine_fingerprint",
+    "package_versions",
     "require_quiet_box",
     "require_release_build",
 ]
@@ -185,6 +189,37 @@ def _cpu_model() -> str:
     return platform.processor() or "unknown"
 
 
+#: The engines and libraries a comparison's numbers depend on. Recorded at their exact
+#: installed version: `pyproject.toml` states lower bounds, so two runs of one commit can
+#: time different competitors without anything in the result saying so.
+_COMPARED_PACKAGES = ("duckdb", "polars", "pyarrow", "numpy", "daft", "pyspark", "ray", "pandas")
+
+
+def package_versions() -> dict[str, str | None]:
+    """The exact installed version of every compared engine, ``None`` where absent."""
+    out: dict[str, str | None] = {}
+    for name in _COMPARED_PACKAGES:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
+
+
+def environment_digest() -> str:
+    """A SHA-256 over every installed distribution's ``name==version``, sorted.
+
+    Two runs with the same digest ran against the same transitive dependency set; two with
+    different digests did not, whatever their direct versions say. It is a fingerprint, not
+    a lockfile: it detects drift, it does not reproduce the environment.
+    """
+    pins = sorted(
+        f"{(d.metadata['Name'] or '').lower()}=={d.version}"
+        for d in importlib.metadata.distributions()
+    )
+    return hashlib.sha256("\n".join(pins).encode()).hexdigest()
+
+
 def machine_fingerprint() -> dict[str, object]:
     """Everything needed to know whether two numbers are comparable.
 
@@ -217,6 +252,8 @@ def machine_fingerprint() -> dict[str, object]:
         "engine": vers["engine"],
         "engine_profile": vers["engine_profile"],
         "git_sha": _git_sha(),
+        "packages": package_versions(),
+        "environment_sha256": environment_digest(),
         "load_per_core_at_start": load_per_core(),
         "argv": sys.argv[1:],
     }

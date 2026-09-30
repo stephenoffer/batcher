@@ -1,7 +1,7 @@
 """Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate.
 
-Every concrete IR node used to hand-write the same three things: a ``__slots__``
-tuple, an ``__init__`` that copies args to attributes, and a ``to_ir()`` that emits
+Every concrete IR node needs the same three things: a ``__slots__`` tuple, an
+``__init__`` that copies args to attributes, and a ``to_ir()`` that emits
 ``{"e": <tag>, ...}`` while recursing into children, lifting literals, and omitting
 absent optionals. That is mechanical and identical across ~40 nodes, so it lives
 here once.
@@ -247,17 +247,16 @@ _CHILDREN_ATTR = "_ir_child_fields"
 def _wire_plan(cls: type) -> tuple[tuple[str, str, Any, bool, bool, Any], ...]:
     """`cls`'s plan: ``(attr, ir_key, encoder, omit_none, omit_falsy, types)`` per field.
 
-    `to_ir` used to re-derive this on every node it serialized: `dataclasses.fields`
-    materializes a fresh tuple per call, each field's metadata mapping is then probed for
-    the wire spec, and the encoder is chosen by a chain of enum comparisons — all of it a
-    pure function of the *class*, recomputed per *instance*. Expression trees are built and
-    lowered constantly (every `select`, every optimizer re-lowering), so this is one of the
-    hottest loops in the control plane.
+    Deriving it takes `dataclasses.fields` (a fresh tuple per call), a probe of each field's
+    metadata for the wire spec, and a chain of enum comparisons to pick the encoder — all a
+    pure function of the *class*. Expression trees are built and lowered constantly (every
+    `select`, every optimizer re-lowering), so `to_ir` is one of the hottest loops in the
+    control plane, and resolving the plan once per class turns the per-node work into a
+    walk over a flat tuple of pre-resolved values.
 
-    Resolving it once per class turns the per-node work into a walk over a flat tuple of
-    pre-resolved values. Stored on the class (not a module dict) so a class that is
-    garbage-collected takes its plan with it, and looked up through `cls.__dict__` so a
-    subclass never inherits its parent's plan.
+    Stored on the class (not a module dict) so a class that is garbage-collected takes its
+    plan with it, and looked up through `cls.__dict__` so a subclass never inherits its
+    parent's plan.
     """
     plan = cls.__dict__.get(_PLAN_ATTR)
     if plan is None:
@@ -299,10 +298,10 @@ class IRNode(Expr):
     vocab: ClassVar[frozenset[str] | None] = None
 
     def __post_init__(self) -> None:
-        if self.vocab is not None and self.fn not in self.vocab:  # type: ignore[attr-defined]
+        if self.vocab is not None and self.fn not in self.vocab:
             raise PlanError(
                 f"unknown {type(self).__name__} function "
-                f"{self.fn!r}; "  # type: ignore[attr-defined]
+                f"{self.fn!r}; "
                 "add it to the family vocabulary in plan/expr_ir/fn_names.py"
             )
 

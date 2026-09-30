@@ -22,6 +22,7 @@ Layer: `io`, neutral. A codec knows about bytes and Arrow types, never about pla
 
 from __future__ import annotations
 
+import importlib
 from typing import Any, Protocol, runtime_checkable
 
 import pyarrow as pa
@@ -72,18 +73,8 @@ CODECS: Registry[Any] = Registry(
 
 def _register_builtin_codecs() -> None:
     """Import the built-in codec modules so each registers itself."""
-    from batcher.io.formats.streaming.codecs import (  # noqa: F401
-        avro as _avro,
-    )
-    from batcher.io.formats.streaming.codecs import (
-        json as _json,  # noqa: F401
-    )
-    from batcher.io.formats.streaming.codecs import (
-        protobuf as _protobuf,  # noqa: F401
-    )
-    from batcher.io.formats.streaming.codecs import (
-        text as _text,  # noqa: F401
-    )
+    for name in ("avro", "json", "protobuf", "text"):
+        importlib.import_module(f"batcher.io.formats.streaming.codecs.{name}")
 
 
 @runtime_checkable

@@ -135,35 +135,25 @@ def union_streams_interleaved(plan, sources: list[Source]) -> bool:
 
 
 def interleave(streams: list) -> object:
-    """Yield from `streams` round-robin until every one is exhausted.
+    """Yield every branch's batches as each becomes ready, until every branch has ended.
 
-    One batch from each in turn, so a busy branch cannot starve a quiet one of its place
-    in the output and the driver never holds more than one branch's one batch.
-
-    **A branch parked on an idle source delays the others**, because pulling from it is a
-    blocking read — the same property the stream-stream join has, and for the same reason:
-    there is one driver thread and a source's `iter_batches` decides when it returns. A
-    stop signal reaches the sources themselves, so a query still stops promptly; what it
-    does not do is skip ahead past a quiet branch mid-poll.
+    Each branch is read on its own thread (`multiplex`), so a branch parked on an idle
+    source no longer holds the others behind its blocking read. Round-robin pulling did:
+    one quiet topic beside a busy one stopped the union emitting at all. The driver still
+    holds a bounded number of batches per branch, and a stop signal still reaches the
+    sources themselves.
 
     Args:
         streams: The per-branch iterators, already relabelled onto their own source.
 
     Returns:
-        A generator over every branch's batches, round-robin.
+        A generator over every branch's non-empty batches, in arrival order.
     """
+    from batcher.api.terminal.stream.multiplex import multiplex
 
     def gen():
-        live = list(streams)
-        while live:
-            still: list = []
-            for stream in live:
-                batch = next(stream, None)
-                if batch is None:
-                    continue  # this branch has ended; drop it from the rotation
-                still.append(stream)
-                if batch.num_rows:
-                    yield batch
-            live = still
+        for _, batch in multiplex(streams):
+            if batch.num_rows:
+                yield batch
 
     return gen()

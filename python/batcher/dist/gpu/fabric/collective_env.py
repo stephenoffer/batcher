@@ -162,7 +162,7 @@ def collective_env(
     Returns:
         Variable to value, containing only the variables a probe could answer. Empty on a node
         whose fabric is unreadable, which is the whole of the degradation path: the collective
-        library then probes for itself exactly as it did before this existed.
+        library then probes for itself, as it does with no environment set.
     """
     env: dict[str, str] = {}
     hca = ib_hca_list(assignment)

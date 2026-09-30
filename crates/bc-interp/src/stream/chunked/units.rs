@@ -13,6 +13,11 @@ use crate::InterpError;
 pub trait UnitSource: Sync {
     /// How many units the relation has.
     fn units(&self) -> usize;
+    /// The relation's total rows, if known without reading it. A Parquet footer records it;
+    /// a source that returns `None` only forgoes the runtime-filter sizing that needs it.
+    fn rows(&self) -> Option<usize> {
+        None
+    }
     /// The rows of unit `unit`, in order.
     ///
     /// # Errors

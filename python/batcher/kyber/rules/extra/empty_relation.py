@@ -40,6 +40,7 @@ from batcher.plan.logical import (
     LogicalPlan,
     Project,
     Window,
+    is_empty_relation,
 )
 
 __all__ = [
@@ -53,7 +54,7 @@ __all__ = [
 def _empty_input(node: LogicalPlan) -> LogicalPlan | None:
     """The relation under a canonical empty marker `Limit(_, 0)`, else None."""
     inner = node.input
-    if isinstance(inner, Limit) and inner.n == 0:
+    if is_empty_relation(inner):
         return inner.input
     return None
 

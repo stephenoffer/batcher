@@ -520,17 +520,22 @@ class TransactionalStreamSink:
     end-to-end exactly-once.
 
     `app_id` must be *stable across restarts* or the idempotency check would never find
-    the previous run's transactions. It is the query name when one was given, and
-    otherwise derived from the destination table — stable either way.
+    the previous run's transactions, and *unique to one stream* or it finds another
+    stream's. The conductor resolves it with `checkpoint.identity.stream_app_id` and passes
+    it as `query_name`. Constructed without one, the sink takes an id of its own: the old
+    default, derived from the destination table, was shared by every unnamed stream into
+    that table, and a transaction counts as committed once the recorded version reaches the
+    batch id, so a second stream's batches ``0..n`` were skipped as already written.
 
-    **A format without that log gets an ordinary append, and says so.** Iceberg and Hudi
-    have no ``(app_id, batch_id)`` marker here, so a replayed epoch appends its rows
-    again. That is at-least-once, and the sink warns once at `open()` rather than letting
-    a reader assume the exactly-once story above applies to every table format. What it
-    must never do is what this class replaced: `DeltaStreamSink` hard-coded
-    ``SINKS.get("delta")`` while the conductor routed *every* mode-aware format to it, so
-    ``write(path, format="iceberg", trigger=...)`` silently produced a Delta table — right
-    rows, right path, wrong format, no error anywhere.
+    **A format without that log gets an ordinary append, and says so.** Iceberg records the
+    marker in its snapshot summary (`IcebergSink.is_committed`); a format with no such
+    place, Hudi among them, appends a replayed epoch's rows again. That is at-least-once,
+    and the sink warns once at `open()` rather than letting a reader assume the exactly-once
+    story above applies to every table format. What it must never do is what this class
+    replaced: `DeltaStreamSink` hard-coded ``SINKS.get("delta")`` while the conductor routed
+    *every* mode-aware format to it, so ``write(path, format="iceberg", trigger=...)``
+    silently produced a Delta table — right rows, right path, wrong format, no error
+    anywhere.
 
     **A keyed write absorbs a replay without a log.** A database or operational-store sink
     running ``upsert``/``update``/``delete`` is idempotent by construction: replaying a
@@ -556,7 +561,11 @@ class TransactionalStreamSink:
         # from inside the constructor, naming an argument the caller never passed twice.
         self._uri = destination
         self._fmt = fmt
-        self._app_id = query_name or f"batcher-stream:{destination.rstrip('/')}"
+        if query_name is None:
+            from batcher.io.formats.streaming.checkpoint.identity import stream_app_id
+
+            query_name = stream_app_id(None, None, destination)
+        self._app_id = query_name
         opts.setdefault("mode", "append")
         self._opts = opts
 
@@ -596,7 +605,8 @@ class TransactionalStreamSink:
         warnings.warn(
             f"the {self._fmt!r} streaming sink has no per-batch transaction marker, so a "
             "micro-batch replayed after a failure appends its rows a second time "
-            "(at-least-once). Use format='delta' for exactly-once, or dedup downstream.",
+            "(at-least-once). Use format='delta' or 'iceberg' for exactly-once, or dedup "
+            "downstream.",
             stacklevel=2,
         )
 

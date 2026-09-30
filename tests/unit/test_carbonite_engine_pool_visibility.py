@@ -54,6 +54,20 @@ _needs_reader = pytest.mark.skipif(
 )
 
 
+def _engine_counts_over_release() -> bool:
+    """Whether the built extension carries the over-release counter (F083)."""
+    from batcher._internal.native import engine_or_none
+
+    mod = engine_or_none()
+    return mod is not None and hasattr(mod.MemoryPool(1), "over_released")
+
+
+_needs_over_release = pytest.mark.skipif(
+    not _engine_counts_over_release(),
+    reason="the built extension predates the over-release counter; rebuild with `just build`",
+)
+
+
 # --- the accessor degrades, always ---------------------------------------------
 
 
@@ -110,7 +124,7 @@ def test_the_engine_pool_reports_the_documented_shape() -> None:
         # fixes, and the pool is the only thing that knows which side it is on.
         "soft_limit_bytes",
         "pressure",
-    }
+    } | ({"over_released_bytes"} if _engine_counts_over_release() else set())
     assert stats["limit_bytes"] > 0
     # RAII reservations, so the pool drains between queries; the *peak* is what survives.
     assert stats["used_bytes"] == 0
@@ -119,6 +133,30 @@ def test_the_engine_pool_reports_the_documented_shape() -> None:
     # Drained, so the level has to be the quiet one. A pool that reported pressure while
     # holding nothing would make every idle process look like one about to spill.
     assert stats["pressure"] == "NOMINAL"
+
+
+@_needs_over_release
+def test_the_engine_pool_draws_its_soft_line_where_the_monitor_does() -> None:
+    """The pool's ELEVATED line is `memory.soft_limit` of its limit, not a fixed 80% (F066).
+
+    The monitor classifies this pool's `used / limit` against `memory.soft_limit`; with the
+    pool's own line at a different fraction the two reported different levels for one
+    counter. A non-default soft limit proves the line follows the config.
+    """
+    import batcher as bt
+
+    cfg = Config()
+    cfg = dataclasses.replace(
+        cfg, memory=dataclasses.replace(cfg.memory, max_memory_bytes=512 * _MIB, soft_limit=0.7)
+    )
+    with bt.config_context(cfg):
+        bt.from_pydict({"g": [1, 2, 3], "x": [1.0, 2.0, 3.0]}).group_by("g").agg(
+            s=bt.sum("x")
+        ).collect()
+    stats = engine_pool_stats()
+    assert stats is not None
+    assert stats["soft_limit_bytes"] == pytest.approx(0.7 * stats["limit_bytes"], abs=1)
+    assert stats["over_released_bytes"] == 0, "a balanced query released more than it held"
 
 
 @_needs_reader

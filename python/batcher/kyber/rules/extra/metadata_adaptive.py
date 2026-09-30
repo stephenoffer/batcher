@@ -32,6 +32,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.rules.zonemap_pruning import _float_order_is_ambiguous
+from batcher.kyber.stats.columns import has_exact_range
 from batcher.plan.expr_ir import Binary, Col
 from batcher.plan.ir_tags import COMPARISON_OPS
 from batcher.plan.logical import Distinct, Filter, Limit, LogicalPlan, Sort
@@ -62,11 +63,6 @@ def _is_constant_column(stat: ColumnStat) -> bool:
         and stat.null_count == 0
         and stat.min == stat.max
     )
-
-
-def _exact_bounds(stat: ColumnStat) -> bool:
-    """Whether `stat` carries an EXACT, fully-populated ``[min, max]`` range."""
-    return stat.provenance is Provenance.EXACT and stat.min is not None and stat.max is not None
 
 
 @rule(
@@ -261,7 +257,7 @@ def prune_filter_col_comparison(node: Filter, ctx: OptimizerContext) -> LogicalP
     stats = ctx.estimator.estimate(node.input)
     left = stats.column(pred.left.name)
     right = stats.column(pred.right.name)
-    if not (_exact_bounds(left) and _exact_bounds(right)):
+    if not (has_exact_range(left) and has_exact_range(right)):
         return None
     status = _decide_col_cmp(pred.op, left, right)
     if status is True:

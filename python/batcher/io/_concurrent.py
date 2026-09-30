@@ -10,10 +10,12 @@ matching the ``base.FileSource`` footer/read pool.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
+
+from batcher.config.env import env_int
+from batcher.io._backend import _scheme
 
 __all__ = ["is_local_path", "listed_sizes", "read_each_file", "total_file_bytes"]
 
@@ -21,7 +23,7 @@ T = TypeVar("T")
 
 # Metadata reads are latency-bound (network round trips), not CPU-bound, so the pool can
 # exceed the core count; shared with `base.FileSource` via the same env override.
-_CONCURRENCY = max(8, int(os.environ.get("BATCHER_FOOTER_CONCURRENCY", "64")))
+_CONCURRENCY = env_int("BATCHER_FOOTER_CONCURRENCY", 64, floor=8)
 
 
 def is_local_path(path: str) -> bool:
@@ -32,8 +34,7 @@ def is_local_path(path: str) -> bool:
     two were making the same decision from the same reasoning and only one of them had
     measured it.
     """
-    idx = path.find("://")
-    return idx <= 0 or path[:idx].lower() == "file"
+    return _scheme(path) in ("", "file")
 
 
 def read_each_file(fs: Any, files: list[str], read_one: Callable[[Any, str], T]) -> list[T]:

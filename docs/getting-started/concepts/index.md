@@ -4,7 +4,7 @@ Four ideas explain almost everything Batcher does, and each takes a few minutes 
 
 The two planes meet at one boundary, a JSON plan plus Arrow batches:
 
-![Two stacked layers. The top layer, the Python control plane, runs left to right from Dataset and SQL, which are lazy and immutable, to Kyber, which optimizes the plan, to Carbonite, which checks feasibility and allocates, to Core, which executes and measures. An arrow labeled JSON IR plus Arrow batches crosses down to the Rust data plane, which holds bc-py for the zero-copy FFI, bc-interp for the interpreter, parallel, and JIT paths, bc-runtime for mergeable operators, bc-codegen for the Cranelift JIT, bc-sketches for HLL, KLL, and Count-Min sketches, and bc-transport for Arrow Flight.](/_static/diagrams/two_planes.svg)
+![Two stacked layers. The top layer, the Python control plane, runs left to right from Dataset and SQL, which are lazy and immutable, to Kyber, which optimizes the plan, to Carbonite, which checks feasibility and allocates, to Core, which executes and measures. An arrow labeled JSON IR plus Arrow batches crosses down to the Rust data plane, which holds bc-py for the zero-copy FFI, bc-interp for the interpreter, parallel, and JIT paths, bc-runtime for mergeable operators, bc-codegen for the Cranelift JIT, bc-sketches for HLL, KLL, and Misra-Gries sketches, and bc-transport for Arrow Flight.](/_static/diagrams/two_planes.svg)
 
 That split is what lets the optimizer see your whole query before it runs, keeps Python out of the per-row loop, and lets the same plan run on a laptop or a cluster.
 

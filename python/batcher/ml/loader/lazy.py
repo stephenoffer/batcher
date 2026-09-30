@@ -564,31 +564,50 @@ def _shuffle_to_numpy(
 
 def _shuffled_blocks(batches: Any, buffer_rows: int, seed: int, columns: Any) -> Iterator[dict]:
     """Yield each accumulated block once, as whole permuted ``{column: ndarray}`` columns."""
+    from batcher.ml.converters import _column_to_numpy
+
+    for table, perm in permuted_blocks(batches, buffer_rows, seed):
+        names = list(table.column_names) if columns is None else list(columns)
+        yield {name: _column_to_numpy(table.column(name))[perm] for name in names}
+
+
+def permuted_blocks(batches: Iterable[Any], buffer_rows: int, seed: int) -> Iterator[tuple]:
+    """Group a batch stream into shuffle blocks, yielding each with the permutation to apply.
+
+    A block closes once it holds `buffer_rows` rows or `_SHUFFLE_BLOCK_MAX_BYTES` bytes,
+    whichever comes first, and each block's permutation is drawn from one
+    ``RandomState(seed)`` in block order, so a seed fixes the order. Zero-row batches are
+    skipped. The permutation is returned rather than applied so each caller gathers in its
+    own space: `Dataset.iter_batches` with an Arrow ``take``, the training loader in NumPy
+    after one conversion, which avoids the extra copies of a wide column a ``take`` costs.
+
+    Args:
+        batches: The `pyarrow.RecordBatch` stream.
+        buffer_rows: The row count that closes a block.
+        seed: The shuffle seed.
+
+    Returns:
+        An iterator of ``(block_table, permutation)`` pairs.
+    """
     import numpy as np
     import pyarrow as pa
 
-    from batcher.ml.converters import _column_to_numpy
-
     rng = np.random.RandomState(seed)
-
-    def _permute(chunks: list) -> dict:
-        table = pa.Table.from_batches(chunks)
-        names = list(table.column_names) if columns is None else list(columns)
-        perm = rng.permutation(table.num_rows)
-        return {name: _column_to_numpy(table.column(name))[perm] for name in names}
-
     block: list = []
-    rows = 0
-    nbytes = 0
-    for b in batches:
-        block.append(b)
-        rows += b.num_rows
-        nbytes += retained_bytes(b)
+    rows = nbytes = 0
+    for batch in batches:
+        if batch.num_rows == 0:
+            continue
+        block.append(batch)
+        rows += batch.num_rows
+        nbytes += retained_bytes(batch)
         if rows >= buffer_rows or nbytes >= _SHUFFLE_BLOCK_MAX_BYTES:
-            yield _permute(block)
+            table = pa.Table.from_batches(block)
+            yield table, rng.permutation(table.num_rows)
             block, rows, nbytes = [], 0, 0
     if block:
-        yield _permute(block)
+        table = pa.Table.from_batches(block)
+        yield table, rng.permutation(table.num_rows)
 
 
 def _rebatch(blocks: Iterator[dict], out_rows: int) -> Iterator[dict]:

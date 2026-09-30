@@ -9,22 +9,25 @@ stage boundary, driven by structure rather than by a measured cardinality.
 Keeping the two apart is the same split the adaptive loop uses: the decision stays pure and
 testable without a query running, and the execution stays in the layer allowed to execute.
 
-**Where it applies.** The single-node relational executor, which is `collect` and every
-terminal built on it. Deliberately not the other two routes, and neither is an oversight:
+**Where it applies.** The single-node and the distributed relational executors. Not the
+**adaptive** route, which already materializes at every breaker and splices by object
+identity, so a `Dataset` the caller reused is executed once there by construction; a
+second materializing pass in front of it would pay twice for the same thing.
 
-* The **adaptive** route already materializes at every breaker and splices by object
-  identity, so a `Dataset` the caller reused is executed once there by construction. Adding
-  a second materializing pass in front of it would pay twice for the same thing.
-* The **distributed** route would have to keep the shared intermediate partitioned on the
-  workers rather than collect it to the driver, which is `staging`'s `MaterializedSource`
-  machinery rather than this module's `InMemorySource`. That is a real gap and the reason
-  it is stated here rather than left to be discovered.
+On the distributed route this is a matter of correctness as well as speed. A float
+reduction is identical across partitionings only up to reassociation, so a subplan run twice
+over the cluster can return two different last bits -- and TPC-H q15, which keeps the
+supplier whose `sum` *equals* the `max` of the same `sum`, returned no rows at all. Run once,
+both appearances read the same values. The shared result is materialized by a distributed
+run, collected to the driver under the same `common_subplan_max_bytes` budget, and broadcast
+as an in-memory source; a subplan past that budget is still recomputed per appearance, and
+keeping it partitioned on the workers instead (`staging`'s `MaterializedSource`) is the gap
+that remains.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import logging
 import threading
 import weakref
@@ -34,8 +37,10 @@ import pyarrow as pa
 
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.io.source import InMemorySource, Source
-from batcher.plan.logical import LogicalPlan, Scan
+from batcher.plan.expr_ir import Expr
+from batcher.plan.logical import Filter, LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
+from batcher.plan.source_stats import derivation_key
 from batcher.plan.types import logical_bytes, retained_bytes
 from batcher.plan.visitor import children, transform_up, walk
 
@@ -43,47 +48,25 @@ __all__ = ["reuse_common_subplans"]
 
 _log = get_logger("api.subplan_reuse")
 
-#: The analysis's **verdict** for a plan already analyzed, so a re-issued query does not
-#: re-derive it. Bounded, and holding only the decision — never a materialized result, which
-#: would be a data cache and is `Dataset.cache()`'s job.
+#: The analysis's verdict for a plan already analyzed, so a re-issued query does not re-derive
+#: it. Bounded, and holding only the decision, never a materialized result (that is
+#: `Dataset.cache()`'s job). A verdict is the pre-order positions of each chosen subtree's
+#: appearances (empty for "nothing repeats"); the key carries `plan.content_key()`, so an entry
+#: is only served to an identical tree, where position `i` is the identical node. Both positive
+#: and negative verdicts are cached because the analysis is not cheap: a canonical rebuild, a
+#: `structural_key` per node and a `CostModel` pass (404 ms per collect on TPC-DS q80, whose
+#: query runs in 151 ms). The key uses Kyber's key builder with `learned=False`, so it follows
+#: the plan, config, hub and sources but not the generation counter, which every query in a
+#: mixed workload moves. The cost is that a verdict can outlive the estimates it was taken
+#: under: a slower query at worst, never a wrong one.
 #:
-#: A verdict is the pre-order **positions** of each chosen subtree's appearances, and the
-#: empty list is the (much commoner) "nothing repeats". Positions rather than nodes or keys
-#: because the key below carries `plan.content_key()` — the plan's whole lowered IR — so an
-#: entry can only be served to a plan with the identical tree, where position `i` of the
-#: pre-order walk is the identical node. That makes a hit cost one `walk`, against the
-#: canonical rebuild plus a `structural_key` per node plus a `CostModel` pass over the plan
-#: that deriving it costs: measured on TPC-DS q80, **404 ms per collect** (337 ms of analysis
-#: and 67 ms of canonicalization) against a whole query that runs in 151 ms.
-#:
-#: Caching the positive verdict is what makes that saving reachable at all. Only rejections
-#: were cached before, on the reasoning that a plan with something to reuse pays the analysis
-#: once and then the materialization dominates — true when the analysis was believed to be a
-#: walk, and false by two orders of magnitude on a snowflake query.
-#:
-#: The analysis is not the cheap walk its docstring claimed. `_one_id_per_source` rebuilds the
-#: plan whenever one source object is bound twice (every self-join, and TPC-H q8's two
-#: `nation` bindings), and the fresh nodes defeat `content_key`'s per-instance memo, so every
-#: `collect()` re-keyed every node. Measured warm at scale 1: **TPC-H q8 16.2 ms, q5 6.5 ms,
-#: q9 7.2 ms — 37%, 18% and 12% of those queries' entire wall time, to conclude "nothing
-#: repeats"** each time.
-#:
-#: The verdict is keyed with Kyber's own key builder but **without its learned fields**
-#: (`learned=False`), so it moves with the plan, the config, the hub and the sources and not
-#: with the generation counter or the calibration fingerprint. Carrying those was the obvious
-#: choice and it is measurably the wrong one: inside a mixed workload every query moves the
-#: generation for every other, so the key never repeated and the analysis ran in full on every
-#: execution forever. TPC-DS q80 in isolation is 97 ms with the verdict served and 848 ms
-#: inside the suite without it.
-#:
-#: What that trades away is small and stated plainly: a verdict taken under one set of
-#: estimates can outlive them, so a subtree that stops being worth materializing keeps being
-#: materialized until the plan, config or sources change. That costs a slower query, never a
-#: wrong one — and the decision is far less sensitive than a plan, since it asks only whether
-#: a subtree repeats and whether materializing it beats an engine round trip.
-_VERDICTS: OrderedDict[tuple, tuple[tuple[weakref.ref, ...], tuple[tuple[int, ...], ...]]] = (
-    OrderedDict()
-)
+#: Each entry also holds the row filter learned for each of its targets (see
+#: `_learn_row_filters`), keyed by the target's index in the verdict. It lives here rather than
+#: in its own map so the identity check that guards the verdict guards it too.
+_VERDICTS: OrderedDict[
+    tuple,
+    tuple[tuple[weakref.ref, ...], tuple[tuple[int, ...], ...], dict[int, Expr | None]],
+] = OrderedDict()
 _VERDICTS_MAX = 256
 _VERDICTS_LOCK = threading.Lock()
 
@@ -114,7 +97,7 @@ def _verdict_key(plan: LogicalPlan, sources: list[Source], ctx, config, cfg) -> 
             kind="subplan_reuse",
             learned=False,
         )
-    except Exception as exc:  # pragma: no cover - an unkeyable plan simply is not cached
+    except Exception as exc:  # an unkeyable plan simply is not cached
         note_suppressed("api", "key the common-subplan verdict", exc)
         return None
     if base is None:
@@ -134,10 +117,8 @@ def _known_verdict(key: tuple | None, sources: list[Source]):
         entry = _VERDICTS.get(key)
         if entry is None:
             return None
-        held, verdict = entry
-        if len(held) != len(sources) or any(
-            r() is not s for r, s in zip(held, sources, strict=True)
-        ):
+        verdict = entry[1]
+        if not _held_by(entry, sources):
             # A recycled `id()` landed on a different object: drop the entry rather than
             # serve one plan's verdict for another's.
             del _VERDICTS[key]
@@ -146,23 +127,33 @@ def _known_verdict(key: tuple | None, sources: list[Source]):
     return verdict
 
 
+def _held_by(entry: tuple, sources: list[Source]) -> bool:
+    """Whether a verdict entry was recorded over exactly these source objects.
+
+    A recycled `id()` can land on a different object under the same key, so the entry's weak
+    references are compared by identity before anything in it is served.
+    """
+    held = entry[0]
+    return len(held) == len(sources) and all(r() is s for r, s in zip(held, sources, strict=True))
+
+
 def _record_verdict(key: tuple | None, sources: list[Source], verdict) -> None:
     """Record this plan's reuse verdict. Best-effort."""
     if key is None:
         return
     try:
         held = tuple(weakref.ref(s) for s in sources)
-    except TypeError:  # pragma: no cover - a source that cannot be weakly referenced
+    except TypeError:  # a source that cannot be weakly referenced
         return
     with _VERDICTS_LOCK:
-        _VERDICTS[key] = (held, verdict)
+        _VERDICTS[key] = (held, verdict, {})
         _VERDICTS.move_to_end(key)
         while len(_VERDICTS) > _VERDICTS_MAX:
             _VERDICTS.popitem(last=False)
 
 
 def reuse_common_subplans(
-    plan: LogicalPlan, sources: list[Source], ctx
+    plan: LogicalPlan, sources: list[Source], ctx, *, distributed: bool = False
 ) -> tuple[LogicalPlan, list[Source]]:
     """Rewrite `plan` so each repeated subplan is executed once and scanned thereafter.
 
@@ -182,18 +173,22 @@ def reuse_common_subplans(
             was materialized.
         ctx: The `ExecutionContext` the caller will execute with, reused for the
             materializing runs so they see the same hub and source statistics.
+        distributed: Materialize each shared subplan with a distributed run, as the query
+            itself will run.
 
     Returns:
         The rewritten plan and the sources it is bound to.
     """
     try:
-        return _reuse(plan, sources, ctx)
-    except Exception as exc:  # pragma: no cover - an optimization must never break a query
+        return _reuse(plan, sources, ctx, distributed)
+    except Exception as exc:  # an optimization must never break a query
         note_suppressed("api", "reuse common subplans", exc)
         return plan, sources
 
 
-def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, list[Source]]:
+def _reuse(
+    plan: LogicalPlan, sources: list[Source], ctx, distributed: bool
+) -> tuple[LogicalPlan, list[Source]]:
     from batcher.config import active_config
     from batcher.io.source import is_bounded
 
@@ -228,9 +223,17 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
     # the query ends. Charged on the materialized size rather than the estimate, so a target
     # whose estimate was optimistic stops the ones after it instead of compounding.
     held = 0
-    for positions in verdict:
+    filters = _row_filters(key, sources)
+    unlearned: list[tuple[int, int]] = []
+    for index, positions in enumerate(verdict):
         appearances = [nodes[i] for i in positions]
-        table = _materialize(_narrowed(plan, appearances, len(srcs)), srcs, ctx)
+        target = _narrowed(plan, appearances, len(srcs))
+        if index in filters:
+            if filters[index] is not None:
+                target = Filter(target, filters[index])
+        else:
+            unlearned.append((index, len(srcs)))
+        table = _materialize(target, srcs, ctx, distributed)
         if table is None:
             continue
         # `retained_bytes`: a cached subplan is *held* for the query's lifetime, so the
@@ -258,7 +261,7 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
                 _batches(table),
                 zone_maps=False,
                 ephemeral=True,
-                derivation=_derivation(appearances[0], srcs),
+                derivation=derivation_key(appearances[0], srcs),
             )
         )
         plan = _replace_all(plan, appearances, Scan(sid, SchemaRef.from_arrow(table.schema)))
@@ -270,7 +273,59 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
             bytes=logical_bytes(table),
             op=type(appearances[0]).__name__,
         )
+    if unlearned:
+        _learn_row_filters(plan, srcs, ctx, key, sources, unlearned)
     return plan, srcs
+
+
+def _row_filters(key: tuple | None, sources: list[Source]) -> dict[int, Expr | None]:
+    """The row filters learned for this verdict's targets, by target index; empty if none."""
+    if key is None:
+        return {}
+    with _VERDICTS_LOCK:
+        entry = _VERDICTS.get(key)
+        return dict(entry[2]) if entry is not None and _held_by(entry, sources) else {}
+
+
+def _learn_row_filters(
+    plan: LogicalPlan,
+    srcs: list[Source],
+    ctx,
+    key: tuple | None,
+    sources: list[Source],
+    unlearned: list[tuple[int, int]],
+) -> None:
+    """Record, for each target materialized whole, the rows its consumers can read at all.
+
+    A shared subplan is materialized standalone, so nothing above it filters it: TPC-DS
+    q39 aggregates a year of inventory in its CTE and reads two months of it back, in two
+    scans, `d_moy = 1` and `d_moy = 2`. Kyber's pushdown already derives what every consumer of
+    the materialized source keeps, as the disjunction of their filters
+    (`kyber.rules.projections.scan_predicates`), so this asks it once, over the rewritten plan,
+    and the next run materializes `Filter(target, predicate)`. `None` records that some
+    consumer reads the target unfiltered, so there is nothing to learn.
+
+    Sound because it is keyed by the verdict: the same plan over the same source objects, so
+    the predicate is a superset of what every consumer of *this* query reads, including any
+    bound Kyber derived from another input. Best-effort: a failure learns nothing and the
+    target stays whole.
+    """
+    if key is None:
+        return
+    try:
+        from batcher import kyber
+        from batcher.kyber.rules.projections import scan_predicates
+
+        found = scan_predicates(kyber.optimize_logical(plan, sources=srcs, hub=ctx.hub))
+    except Exception as exc:  # learning a filter must never break a query
+        note_suppressed("api", "learn a common-subplan row filter", exc)
+        return
+    with _VERDICTS_LOCK:
+        entry = _VERDICTS.get(key)
+        if entry is None or not _held_by(entry, sources):
+            return
+        for index, sid in unlearned:
+            entry[2][index] = found.get(sid)
 
 
 def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> LogicalPlan:
@@ -327,7 +382,7 @@ def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> Lo
         if not keep or len(keep) >= len(carried):
             return target
         return Project(target, tuple(Projection(c, col(c)) for c in keep))
-    except Exception as exc:  # pragma: no cover - narrowing must never break a query
+    except Exception as exc:  # narrowing must never break a query
         note_suppressed("api", "narrow a common-subplan candidate", exc)
         return target
 
@@ -462,7 +517,9 @@ def _one_id_per_source(plan: LogicalPlan, sources: list[Source]) -> LogicalPlan:
     )
 
 
-def _materialize(target: LogicalPlan, sources: list[Source], ctx) -> pa.Table | None:
+def _materialize(
+    target: LogicalPlan, sources: list[Source], ctx, distributed: bool
+) -> pa.Table | None:
     """Run one shared subplan, or `None` if it cannot be run on this path.
 
     The subplan is executed with the caller's own context so it reads the same hub and
@@ -470,48 +527,36 @@ def _materialize(target: LogicalPlan, sources: list[Source], ctx) -> pa.Table | 
     `ctx.columns` names the root's, and with the result cache off: caching an intermediate
     the user never asked for would spend the cache's budget on something no later query
     asks for by name.
+
+    On the distributed route the subplan goes where ``distributed="auto"`` would send it:
+    all it needs is to be computed *once*, and a small one is faster on the driver than
+    through a ~1 s cluster round trip (TPC-H q15 at SF1, 1.9 s -> 0.6 s).
+
+    A distributed run that fails is retried single-node rather than given up. Declining
+    reuse is harmless on one node, but across the cluster it is not: the appearances would
+    each be recomputed, a float reduction can then differ in its last bits between them, and
+    TPC-H q15 returned no rows when a cold fleet made the first materialization time out.
     """
     from batcher.api.orchestration.run import run_relational
+    from batcher.api.terminal.routing import resolve_distributed
 
-    try:
-        table, _decisions = run_relational(
-            target,
-            sources,
-            dataclasses.replace(ctx, columns=target.available_columns(), cache=False),
-            distributed=False,
-        )
-    except Exception as exc:  # pragma: no cover - fall back to recomputing in place
-        note_suppressed("api", "materialize a shared subplan", exc)
-        return None
-    return table if isinstance(table, pa.Table) else None
-
-
-def _derivation(target: LogicalPlan, sources: list[Source]) -> str | None:
-    """A name for *how* this intermediate was derived, or `None` if it cannot be named.
-
-    The relation lives for one execution, so it is `ephemeral` — but the next execution of the
-    same query derives the identical relation from the identical inputs, and this string says
-    so: the subplan's own content key over the data-stable keys of the sources it reads. That
-    is what lets `kyber.plan_cache` memoize the plan built *over* the intermediate, which is
-    otherwise the one optimize a repeated query can never skip. On TPC-DS q77 it is the second
-    of two, and it ran in full on every execution forever.
-
-    `None` — no caching, exactly as before — when any input cannot key itself, because then
-    two different relations could produce the same name. The safe direction is the one that
-    re-plans.
-    """
-    from batcher.plan.source_stats import source_stats_key
-    from batcher.plan.visitor import scanned_source_ids
-
-    parts = [target.content_key()]
-    for sid in sorted(scanned_source_ids(target)):
-        if sid >= len(sources):
-            return None
-        key = source_stats_key(sources[sid])
-        if key is None:
-            return None
-        parts.append(f"{sid}={key}")
-    return hashlib.blake2b("|".join(parts).encode(), digest_size=16).hexdigest()
+    sub_ctx = dataclasses.replace(ctx, columns=target.available_columns(), cache=False)
+    cluster = distributed and resolve_distributed("auto", target, sources)
+    for on_cluster in (True, False) if cluster else (False,):
+        try:
+            table, _decisions = run_relational(target, sources, sub_ctx, distributed=on_cluster)
+        except Exception as exc:  # fall back to the next route, then to recomputing in place
+            if on_cluster:
+                _log.warning(
+                    "a shared subplan failed to materialize on the cluster (%s); "
+                    "materializing it on the driver instead",
+                    exc,
+                )
+            else:
+                note_suppressed("api", "materialize a shared subplan", exc)
+            continue
+        return table if isinstance(table, pa.Table) else None
+    return None
 
 
 def _batches(table: pa.Table) -> list[pa.RecordBatch]:

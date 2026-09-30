@@ -36,18 +36,14 @@ import pytest
 
 import batcher as bt
 from _engagement_shapes import _BUILDERS, _R, _T, EXPECTED_DISTRIBUTED
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 
 pytestmark = pytest.mark.integration
 
 pytest.importorskip("ray", reason="ray not installed")
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(4)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(4)
 
 
 #: The distributed executors each shape must reach, as `(attribute, modules binding the name)`.

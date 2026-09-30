@@ -14,16 +14,11 @@ from batcher.config import Config, DistributedConfig, config_context
 
 ray = pytest.importorskip("ray", reason="ray not installed")
 
-from _ray_cluster import init_test_ray, shutdown_test_ray  # noqa: E402  (after importorskip)
+from _ray_cluster import ray_session_fixture  # noqa: E402  (after importorskip)
 from batcher import dist  # noqa: E402  (after importorskip)
 from batcher.dist.executors.ray_runtime import scaling  # noqa: E402  (after importorskip)
 
-
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(2)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(2)
 
 
 @pytest.fixture

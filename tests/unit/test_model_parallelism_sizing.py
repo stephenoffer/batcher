@@ -14,7 +14,6 @@ from batcher._internal.errors import ResourceError
 from batcher.carbonite.accel.kv_cache import kv_bytes_per_token
 from batcher.carbonite.accel.parallelism import (
     MAX_TENSOR_DEGREE,
-    ParallelPlan,
     allreduce_bytes_per_token,
     minimum_tensor_degree,
     pipeline_bubble_fraction,
@@ -139,7 +138,6 @@ def test_plan_prefers_the_smallest_replica_then_replicates() -> None:
     assert plan.devices == 8
     assert plan.weight_bytes_per_device == 70 * GIB
     assert plan.allreduce_bytes_per_token > 0
-    assert plan.tensor_group_fits_node(8)
 
 
 def test_plan_never_books_a_group_wider_than_the_budget() -> None:
@@ -195,19 +193,6 @@ def test_plan_with_no_devices_is_a_refusal_not_a_crash() -> None:
     )
     assert plan.replicas == 0
     assert plan.devices == 0
-
-
-def test_group_fits_node_is_silent_when_the_node_width_is_unknown() -> None:
-    plan = ParallelPlan(
-        tensor_parallel=16,
-        pipeline_parallel=1,
-        replicas=1,
-        weight_bytes_per_device=0,
-        bytes_per_token_per_device=0,
-        allreduce_bytes_per_token=0,
-    )
-    assert plan.tensor_group_fits_node(0)
-    assert not plan.tensor_group_fits_node(8)
 
 
 def test_summary_is_flat_and_numeric() -> None:

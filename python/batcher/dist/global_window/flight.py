@@ -43,6 +43,7 @@ from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     buckets_for_envelope,
     engine_config_json,
+    kill_workers,
     map_barrier,
     shuffle_partitions,
 )
@@ -84,7 +85,6 @@ def execute_global_window_flight(
     `_fault_inject` / `_fault_inject_map` are test-only hooks: worker ids to kill after /
     before the map barrier, matching the sort and hash-window paths.
     """
-    import ray
 
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to worker actors
@@ -126,8 +126,7 @@ def execute_global_window_flight(
         )
 
         if _fault_inject_map:  # test hook: kill before the barrier, so nothing publishes
-            for i in _fault_inject_map:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject_map)
 
         # One ticket stage for THIS window's shuffle. A literal 0 would collide with any
         # other shuffle of the same query publishing byte-identical tickets, which is how a
@@ -189,11 +188,12 @@ def execute_global_window_flight(
 
         # Placed HERE, as soon as the buckets exist and before anything can take a worker
         # away — replicating after a loss would be probing a corpse.
-        replicas = replicate_shuffle_output(actors, mapper_addrs, n_buckets, workers, dead)
+        replicas = replicate_shuffle_output(
+            actors, mapper_addrs, n_buckets, workers, dead, stages=(stage_base,)
+        )
 
         if _fault_inject:
-            for i in _fault_inject:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject)
 
         results = _window_reduce_with_recovery(
             actors,

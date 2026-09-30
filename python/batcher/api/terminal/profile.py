@@ -213,9 +213,14 @@ def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
     """Record the optimized plan + its join decisions into the profile collector."""
     prof.optimized_ir = opt.ir
     prof.logical_ir = plan.to_ir()
+    prof.optimized_ir_json = opt.to_json()
+    prof.logical_ir_json = plan.ir_json()
     prof.physical_ops = opt.ops
-    prof.source_pushdown = pushdown_labels(opt)
-    prof.node_details = detail_labels(opt.ir)
+    # Both are pure functions of the (plan-cache-shared) physical plan, recomputed on every
+    # execution before this memo: ~0.9 ms profiled per TPC-H q8, for labels that never change.
+    # Copied out because the collector owns its dicts.
+    prof.source_pushdown = dict(opt.derived("pushdown_labels", pushdown_labels))
+    prof.node_details = dict(opt.derived("detail_labels", lambda o: detail_labels(o.ir)))
     prof.distributed = distributed
     prof.decisions.extend(build_side_decisions(decisions))
 
@@ -434,13 +439,13 @@ def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
     and `collect()` share one cache entry instead of planning the same query twice.
     """
     from batcher import core, kyber
-    from batcher.api.source_stats import collect_source_stats, column_bounds_needed
+    from batcher.api.source_stats import planning_source_stats
     from batcher.plan.profile import build_op_profiles
 
     hub = core.default_hub()
     if core.has_map_batches(plan):
         return _udf_planned_profile(plan, sources, hub)
-    source_stats = collect_source_stats(sources, hub, need_columns=column_bounds_needed(plan))
+    source_stats = planning_source_stats(sources, hub, plan)
     opt, decisions = kyber.optimize_traced(
         plan, sources=sources, hub=hub, source_stats=source_stats
     )

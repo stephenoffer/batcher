@@ -227,6 +227,13 @@ barely moves it.
 print(round(ds.ml.evaluate("y", y_pred="p", task="multiclass")["macro_f1"], 4))
 ```
 
+The averages take `by=` like every other metric. The per-class counts are `count_if` terms of one grouped aggregate, so a per-segment report is one pass that merges across partitions. Within a segment, a class enters the macro average only when it occurs there as a label or a prediction, which is what scoring that segment on its own with scikit-learn gives:
+
+```python
+seg = bt.from_pydict({"s": ["x", "x", "y", "y"], "y": ["a", "b", "a", "c"], "p": ["a", "b", "c", "c"]})
+print(seg.ml.evaluate("y", y_pred="p", task="multiclass", by="s").sort("s").to_pydict()["macro_f1"])
+```
+
 ## Choosing an operating point
 
 A classifier outputs a score, not a decision. Turning it into an action needs a cutoff, and
@@ -430,9 +437,8 @@ The `by=` forms return a lazy `Dataset`, so they also accept an explicit `collec
 
 A rank metric on a group containing only one class is undefined and returns NaN. Check the class balance of a segment before trusting a per-segment AUC.
 
-The classification metrics are binary, and none of the metrics take sample weights.
+The single-expression classification metrics are binary. The multi-class surface is `classification_report` and the macro and weighted averages of `evaluate(task="multiclass")`. None of the metrics take sample weights.
 
-The multi-class averages are computed from a per-class report rather than a single aggregate, so `by=` cannot partition them. Group the dataset and call `evaluate` per group when you need both.
 
 ## See also
 

@@ -22,7 +22,7 @@ from itertools import combinations
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.rules.joins import order_budget
-from batcher.kyber.rules.joins.order_residual import Residual, attach_residuals
+from batcher.kyber.rules.joins.order_residual import Residual, attach_residuals, residual_refs
 from batcher.plan.expr_ir import Col, Lit
 from batcher.plan.logical import Join, JoinOutputCol, LogicalPlan, Project, Projection
 
@@ -55,11 +55,6 @@ def _needed_cols(
 def _bits(mask: int) -> frozenset[int]:
     """The leaf indices a `_rebuild_dphyp` bitmask stands for."""
     return frozenset(i for i in range(mask.bit_length()) if mask >> i & 1)
-
-
-def _residual_refs(residuals: list[Residual]) -> set[ColRef]:
-    """Every logical column the residual predicates read (carried like a join key)."""
-    return {ref for r in residuals for ref in r.by_name.values()}
 
 
 def _base_leaf(
@@ -96,7 +91,7 @@ def _rebuild_greedy(
     # projection pushdown already pruned them from the scans, leaving the join
     # output referencing a column its (pruned) input no longer provides.
     residuals = residuals or []
-    needed = _needed_cols(required, edges) | _residual_refs(residuals)
+    needed = _needed_cols(required, edges) | residual_refs(residuals)
 
     # Start from the smallest leaf, then repeatedly add the connected leaf that
     # yields the smallest estimated intermediate result.
@@ -143,7 +138,7 @@ def _rebuild_greedy(
                 best = (score, j, with_res, cand_schema)
         if best is None:
             return None  # disconnected graph → would be a cross join; skip reorder
-        _, j, current, schema = best  # type: ignore[assignment]
+        _, j, current, schema = best
         joined.add(j)
 
     return _final_projection(current, schema, required)
@@ -194,7 +189,7 @@ def _rebuild_dp(
     if n > _MAX_EXHAUSTIVE_LEAVES:
         return None
     residuals = residuals or []
-    needed = _needed_cols(required, edges) | _residual_refs(residuals)
+    needed = _needed_cols(required, edges) | residual_refs(residuals)
     cost = ctx.costs()
 
     # best[subset] = (plan, schema, accumulated_cost). Base case: each singleton leaf.
@@ -265,7 +260,7 @@ def _rebuild_dphyp(
     if budget is None:
         budget = order_budget.max_pairs()
     residuals = residuals or []
-    needed = _needed_cols(required, edges) | _residual_refs(residuals)
+    needed = _needed_cols(required, edges) | residual_refs(residuals)
     cost = ctx.costs()
 
     # Adjacency between leaf indices as bitmasks (edge endpoints carry their leaf id).

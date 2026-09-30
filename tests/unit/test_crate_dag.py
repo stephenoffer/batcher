@@ -48,7 +48,6 @@ _LAYER: dict[str, int] = {
     "bc-sketches": 1,
     "bc-transport": 1,
     "bc-io": 1,
-    "bc-udf": 1,
     "bc-expr": 2,
     "bc-ir": 3,
     "bc-codegen": 3,

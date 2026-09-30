@@ -489,6 +489,27 @@ def test_without_dcgm_the_same_device_is_merely_compute_bound():
     assert verdict.actionable is False
 
 
+def test_a_verdict_names_the_signals_it_was_reached_without():
+    """Without DCGM a kernel limited by its own shape reads as compute bound, so the verdict has
+    to say occupancy was never measured rather than read as a complete diagnosis."""
+    verdict = bottleneck.classify_device(0, sm=_summary(0.9))
+    assert verdict.verdict == "compute_bound"
+    assert "occupancy" in verdict.unmeasured
+    assert "shared" in verdict.unmeasured
+    full = bottleneck.classify_device(
+        0,
+        sm=_summary(0.9),
+        memory=_summary(0.1),
+        pcie=_summary(0.1),
+        throttled=_summary(0.0),
+        codec=_summary(0.0),
+        occupancy=_summary(0.8),
+        shared=False,
+    )
+    assert full.verdict == "compute_bound"
+    assert full.unmeasured == ()
+
+
 def test_a_quiet_device_with_nothing_else_busy_is_starved():
     verdict = bottleneck.classify_device(0, sm=_summary(0.1), pcie=_summary(0.05))
     assert verdict.verdict == "starved"

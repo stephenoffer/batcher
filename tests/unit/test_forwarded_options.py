@@ -170,9 +170,23 @@ def test_a_misspelled_tenant_override_names_the_caller_and_the_settings():
 
 
 def test_a_real_tenant_override_still_applies():
-    with bt.tenant("analytics", max_concurrent_queries=4) as cfg:
+    with bt.tenant("analytics", max_concurrent_queries=0) as cfg:
         assert cfg.tenant.tenant_id == "analytics"
-        assert cfg.tenant.max_concurrent_queries == 4
+        assert cfg.tenant.max_concurrent_queries == 0
+
+
+@pytest.mark.parametrize(
+    ("override", "value"), [("max_concurrent_queries", 4), ("cache_share", 0.5)]
+)
+def test_an_unimplemented_tenant_limit_is_refused(override, value):
+    """Nothing reads the per-tenant limits, so a cap would silently bound nothing."""
+    from batcher._internal.errors import ConfigError
+
+    with (
+        pytest.raises(ConfigError, match=rf"tenant\.{override} is not implemented"),
+        bt.tenant("t", **{override: value}),
+    ):
+        pass
 
 
 def test_a_misspelled_config_section_names_the_sections():

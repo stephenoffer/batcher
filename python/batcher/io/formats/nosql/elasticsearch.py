@@ -27,11 +27,13 @@ import pyarrow as pa
 
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import (
+    SCHEMA_SAMPLE_ROWS,
     BulkSink,
     PartitionSpec,
     ScanSource,
     require_driver,
     rows_to_batches,
+    schema_from_rows,
 )
 from batcher.io.formats.sql._common import probe_is_typed
 from batcher.io.predicate import combine_conjunction
@@ -81,8 +83,10 @@ class ElasticsearchSource(ScanSource):
         esql: str | None = None,
         query: dict[str, Any] | None = None,
         partition_spec: PartitionSpec | None = None,
+        schema: pa.Schema | None = None,
     ) -> None:
         super().__init__(
+            schema=schema,
             partition_spec=partition_spec,
             hosts=hosts,
             index=index,
@@ -122,6 +126,7 @@ class ElasticsearchSource(ScanSource):
             esql=esql,
             query=query,
             partition_spec=self._partition_spec,
+            schema=self._conn_kwargs.get("schema"),
         )
 
     def _client(self) -> Any:
@@ -179,12 +184,10 @@ class ElasticsearchSource(ScanSource):
             resp = client.search(
                 index=self._conn_kwargs["index"],
                 query=self._conn_kwargs["query"],
-                size=1,
+                size=SCHEMA_SAMPLE_ROWS,
             )
         hits = resp["hits"]["hits"]
-        if not hits:
-            return pa.schema([])
-        return pa.RecordBatch.from_pylist([hits[0]["_source"]]).schema
+        return schema_from_rows([hit["_source"] for hit in hits])
 
     def _enumerate_partitions(self) -> list[_Slice]:
         if self._conn_kwargs["esql"]:

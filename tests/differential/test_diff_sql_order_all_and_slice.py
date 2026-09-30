@@ -11,11 +11,10 @@ covered the single-index form and returned None for a `Slice`, which surfaced as
 Ordering is the whole contract for the first group, so those use `assert_same_ordered`;
 `assert_same` is order-independent by design and would pass on an unsorted result.
 
-A *negative* slice bound is deliberately declined rather than translated:
-``list.slice`` clamps a negative offset to the start and returns the whole list, where
-DuckDB counts back from the end, so ``a[-2:]`` would answer the entire list instead of
-its last two elements. That is pinned below so the decline is not quietly turned into a
-wrong answer later.
+A *negative* slice bound counts back from each row's end. ``list.slice`` clamps a negative
+offset to the start, so handing it one answered the wrong elements; the translator now
+gathers the per-row positions instead (`sql_list_slice`), which is pinned below over lists
+of several lengths.
 """
 
 from __future__ import annotations
@@ -84,6 +83,41 @@ def test_list_slice_matches_duckdb(query, duck):
     assert_same(bt.sql(query).collect(), duck.sql(query))
 
 
-def test_negative_slice_bound_is_declined_not_answered_wrongly():
-    with pytest.raises(NotImplementedError, match="negative lower bound"):
-        bt.sql("SELECT [10, 20, 30][-2:] AS a").collect()
+#: Every bound shape against lists of length 4, 0, 1 and NULL, in both spellings. The row
+#: lengths matter because a negative bound is resolved per row.
+_SLICE_ROWS = pa.table(
+    {
+        "id": pa.array([1, 2, 3, 4, 5], pa.int64()),
+        "a": pa.array([[1, 2, 3, 4], [], None, [5], [None, 7, 8]], pa.list_(pa.int64())),
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "a[-2:]",
+        "a[-10:]",
+        "a[1:-1]",
+        "a[-3:-2]",
+        "a[:-3]",
+        "a[-1:1]",
+        "a[-3:2]",
+        "a[2:-10]",
+        "a[0:-1]",
+        "list_slice(a, -2, 4)",
+        "list_slice(a, -3, -2)",
+        "list_slice(a, 2, -1)",
+    ],
+)
+def test_negative_slice_bounds_count_from_the_end_like_duckdb(duck, form):
+    """A negative bound counts back from each row's end; `list_slice` follows the same rule.
+
+    Both used to be wrong or refused: the bracket form raised, and `list_slice(a, -2, 4)`
+    handed the negative offset to `list.slice`, which clamped it and returned `[2, 3, 4]`.
+    Compared positionally on `id`, so a list with the right elements in the wrong row fails.
+    """
+    duck.register("t", _SLICE_ROWS)
+    query = f"SELECT id, {form} AS r FROM t ORDER BY id"
+    got = bt.sql(query, t=_SLICE_ROWS).collect()
+    assert [tuple(r.values()) for r in got.to_pylist()] == duck.sql(query).fetchall()

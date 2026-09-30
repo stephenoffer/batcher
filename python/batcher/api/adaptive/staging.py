@@ -29,6 +29,7 @@ from batcher.api.adaptive.plan_surgery import (
 from batcher.io.source import InMemorySource, Source
 from batcher.plan.logical import LogicalPlan, Scan, empty_result_schema
 from batcher.plan.schema import SchemaRef
+from batcher.plan.source_stats import derivation_key
 
 _log = get_logger("api.adaptive")
 
@@ -102,9 +103,10 @@ def execute_adaptive(
 
     That is **the same mechanism and the same granularity as Spark AQE**, not a finer
     one: both re-plan the remainder of a query at a pipeline breaker, on the sizes the
-    completed part measured. What differs is where it is available — this loop runs
-    single-node too, where AQE needs shuffle stages — and what survives the query, which
-    is the cross-run learned statistics and the bandit in `kyber.learning`. Do not
+    completed part measured. AQE also runs on one machine, in Spark's local mode, so
+    what differs is where the loop runs — inside the Python process rather than in a JVM
+    beside it — and what survives the query, which is the cross-run learned statistics and
+    the bandit in `kyber.learning`. Do not
     restate this as re-planning *within* a stage; nothing here does that.
 
     Intermediate distributed stages keep their result *partitioned on disk* (a
@@ -376,7 +378,7 @@ def _staged_loop(
             # Splice a Scan over the breaker's result (exact-size) for the rest of the
             # plan. A `MaterializedSource` is scanned in place; a collected table is
             # re-wrapped as an in-memory source (the single-node / fallback path).
-            src, schema = _stage_source(result)
+            src, schema = _stage_source(result, derivation_key(target, srcs))
             # A partitioned intermediate (disk `MaterializedSource` or
             # `FlightMaterializedSource`) owns resources (files / worker actors) freed
             # after the final result; duck-type on `cleanup` so both are tracked.
@@ -441,7 +443,7 @@ def _release(what: str, release, *args) -> None:
     """
     try:
         release(*args)
-    except Exception as exc:  # pragma: no cover - a teardown must not mask the real error
+    except Exception as exc:  # a teardown must not mask the real error
         note_suppressed("api", what, exc)
 
 
@@ -501,7 +503,9 @@ def _as_table(result: pa.Table | Source, node: LogicalPlan) -> pa.Table:
     return _table(list(result.iter_batches()), node)
 
 
-def _stage_source(result: pa.Table | Source) -> tuple[Source, SchemaRef]:
+def _stage_source(
+    result: pa.Table | Source, derivation: str | None = None
+) -> tuple[Source, SchemaRef]:
     """A source + schema to splice in for the next stage's scan over `result`.
 
     A `MaterializedSource` is passed through (scanned in place, shared-nothing); a
@@ -517,11 +521,16 @@ def _stage_source(result: pa.Table | Source) -> tuple[Source, SchemaRef]:
     rather than its bounds, and it has to be said separately because the distinct-count
     sketch is keyed by identity rather than gated on `zone_maps`. See
     `api.terminal._metadata.seed_column_ndv`.
+
+    `derivation` (`plan.source_stats.derivation_key` of the stage's subplan) names the relation
+    by how it was computed, so the plan built over it by the next stage is memoized like any
+    other; without it that re-optimization missed the plan cache on every run of the query.
+    Every statistics path still skips the source, on `ephemeral` alone.
     """
     if isinstance(result, pa.Table):
         batches = result.to_batches() or [pa.RecordBatch.from_pylist([], schema=result.schema)]
         return (
-            InMemorySource(batches, zone_maps=False, ephemeral=True),
+            InMemorySource(batches, zone_maps=False, ephemeral=True, derivation=derivation),
             SchemaRef.from_arrow(result.schema),
         )
     return result, SchemaRef.from_arrow(result.schema())
@@ -575,7 +584,7 @@ def _worth_staging(srcs: list[Source], hub):
     # plan on every iteration of the stage loop.
     try:
         estimator = build_estimator(srcs, hub)
-    except Exception as exc:  # pragma: no cover - an estimate must never break staging
+    except Exception as exc:  # an estimate must never break staging
         note_suppressed("api", "build the estimator for staging", exc)
         estimator = None
 

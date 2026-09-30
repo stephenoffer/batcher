@@ -28,12 +28,13 @@ from .compare import (
     CompareResult,
     EngineResult,
     RowSet,
-    bench,
     column_classes,
     compare,
     results_match,
     rowsets_match,
+    timing_order,
     to_rowset,
+    type_differences,
 )
 from .divergences import KNOWN_DIVERGENCES, Divergence, explain
 from .names import canonical_column_name, canonical_names
@@ -48,6 +49,7 @@ from .summary import (
     geomean,
     summarize,
 )
+from .timing import Timing, bench, bench_samples
 
 __all__ = [
     "FLOAT_ATOL",
@@ -62,7 +64,9 @@ __all__ = [
     "OrderKey",
     "RowSet",
     "Summary",
+    "Timing",
     "bench",
+    "bench_samples",
     "canonical_column_name",
     "canonical_names",
     "case_ratios",
@@ -81,5 +85,7 @@ __all__ = [
     "rowsets_match",
     "run_isolated",
     "summarize",
+    "timing_order",
     "to_rowset",
+    "type_differences",
 ]

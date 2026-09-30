@@ -19,7 +19,7 @@ from batcher.plan.expr_ir.core import Expr, Lit
 from batcher.plan.expr_ir.func_nodes import SpatialFunc
 from batcher.plan.expr_ir.nodes import Col
 
-__all__ = ["Numeric", "Point", "Pose", "Quaternion", "spatial_call", "value"]
+__all__ = ["Matrix", "Numeric", "Point", "Pose", "Quaternion", "spatial_call", "value"]
 
 #: A single numeric argument: an expression, a column name, or a constant.
 Numeric = Expr | str | float | int
@@ -31,6 +31,9 @@ Quaternion = tuple[Numeric, Numeric, Numeric, Numeric]
 
 #: A position or displacement, as its three components in ``(x, y, z)`` order.
 Point = tuple[Numeric, Numeric, Numeric]
+
+#: A 3x3 matrix, as nine values in row-major order: ``m01`` is row 0, column 1.
+Matrix = tuple[Numeric, Numeric, Numeric, Numeric, Numeric, Numeric, Numeric, Numeric, Numeric]
 
 #: A rigid transform, as seven values: the translation ``(tx, ty, tz)`` first, then the
 #: rotation ``(qx, qy, qz, qw)``. Translation first because that is the order

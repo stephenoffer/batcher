@@ -31,6 +31,7 @@ import pyarrow as pa
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher._internal.native import engine
+from batcher.config.env import env_float, env_int
 from batcher.dist.executors.partition_io import (
     descriptor_rows,
     partition_descriptors,
@@ -55,7 +56,7 @@ from batcher.plan.visitor import scanned_source_ids
 # Smallest CPU share a task may request: a tiny partition gets a fraction of a core so
 # Ray packs many such tasks per core (high parallelism over many small files) instead of
 # each reserving a whole core. 1/8 core by default. Env-overridable.
-_MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125")))
+_MIN_TASK_CPU = env_float("BATCHER_MIN_TASK_CPU", 0.125, floor=0.01)
 # How much heavier a per-batch UDF / inference stage is per row than a plain scan/filter.
 # A `map_batches` partition gets this many times the CPU a same-sized scan would — the
 # plan-level compute-skew factor (data skew is handled per-partition by `descriptor_rows`).
@@ -65,7 +66,7 @@ _MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125"))
 # intra-task `num_workers` is derived from this same share, so the wider task runs the UDF
 # just as many ways, and it does so with a quarter of the per-task overhead. Measured 1.4-2.0x
 # slower the other way; see `_adaptive_partition_count`. Keep it out of the count.
-_MAP_COMPUTE_WEIGHT = max(1.0, float(os.environ.get("BATCHER_MAP_COMPUTE_WEIGHT", "4.0")))
+_MAP_COMPUTE_WEIGHT = env_float("BATCHER_MAP_COMPUTE_WEIGHT", 4.0, floor=1.0)
 # Hard ceiling on the per-actor submit-ahead depth (partitions an inference actor keeps in
 # flight). Single source in the neutral `_internal.hardware`, shared with the ML autobatcher
 # — `dist` cannot import `ml`, so the constant lives below both rather than being pasted twice.
@@ -81,7 +82,7 @@ _POOL_PROBE_TIMEOUT_S = 10.0
 # is constructed, and an actor is constructed only once the cluster hands it a device — so on
 # a busy fleet the probe waits for capacity, not for a measurement.
 #
-# It used to wait with a bare `ray.get` and no bound. Measured on a 6-GPU cluster, a
+# So the wait is bounded. Measured unbounded (a bare `ray.get`) on a 6-GPU cluster, a
 # `read.parquet(...).map_batches(cls, num_gpus=1).collect(distributed=True)` over four shards:
 # **251.5s of a 267.6s query** was this single call, with the actor pool itself doing the work
 # in 3.8s. The pool's own liveness probe 40 lines below is bounded for exactly this reason,
@@ -317,7 +318,7 @@ def release_foreign_agg_pools(plan0, needed_cpus: float) -> bool:
 
         if float(ray.available_resources().get("CPU", 0.0)) >= float(needed_cpus):
             return False
-    except Exception as exc:  # pragma: no cover - a scheduling courtesy, never a failure
+    except Exception as exc:  # a scheduling courtesy, never a failure
         note_suppressed("dist", "read free CPU before releasing a foreign pool", exc)
         return False
     _kill_pool_keys(foreign, _AGG_POOLS)
@@ -809,8 +810,8 @@ def _actor_inflight_depth() -> int:
 def _emptiest_actor(actors, slots: dict):
     """The actor with the most free in-flight slots, or `None` when the pool is full.
 
-    Both actor-pool drivers used to take "the first actor with a free slot", which fills
-    actor 0 to its submit depth before actor 1 receives anything. Whenever the partition
+    Taking "the first actor with a free slot" instead would fill actor 0 to its submit
+    depth before actor 1 receives anything. Whenever the partition
     count is at or below ``len(actors) x depth`` — the ordinary case for an inference stage,
     whose partitions are few and wide — the tail of the pool never runs at all.
 
@@ -1113,7 +1114,7 @@ def _placeable_scheduling(needed_cpus: float) -> dict:
                 needed_cpus=needed_cpus,
             )
         return opts
-    except Exception as exc:  # pragma: no cover - a scheduling courtesy, never a failure
+    except Exception as exc:  # a scheduling courtesy, never a failure
         note_suppressed("dist", "make room for a task stage beside the fleet", exc)
         return {}
 
@@ -1455,7 +1456,7 @@ def _shared_arg(value):
         import ray
 
         return ray.put(value)
-    except Exception as exc:  # pragma: no cover - an optimization, never a requirement
+    except Exception as exc:  # an optimization, never a requirement
         note_suppressed("dist", "share the map plan through the object store", exc)
         return value
 
@@ -1505,7 +1506,7 @@ def _record_source_rows(hub, source, plan: LogicalPlan, rows: int) -> None:
         from batcher.dist.adaptive_sizing import record_partition_rows
 
         record_partition_rows(_learning_hub(hub), source.identity(), rows)
-    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+    except Exception as exc:  # a learned write must never break a query
         note_suppressed("dist", "record measured source rows", exc)
 
 
@@ -1520,7 +1521,7 @@ def _record_actor_pool_reuse(hub, plan0, partitions: int) -> None:
         from batcher.dist.adaptive_sizing import record_actor_pool_reuse
 
         record_actor_pool_reuse(_learning_hub(hub), _pipeline_signature(plan0), partitions)
-    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+    except Exception as exc:  # a learned write must never break a query
         note_suppressed("dist", "record inference actor-pool reuse", exc)
 
 
@@ -1634,19 +1635,16 @@ def _cluster_cores() -> float:
 
 
 def _learning_hub(hub=None):
-    """The MetadataHub to read learned sizing from — the one threaded in, else the
-    process-wide default (the same store Core records feedback to). Best-effort: any
-    failure to reach a hub yields `None`, so a learned read simply falls back to the
-    plan default."""
+    """The MetadataHub to read learned sizing from: the one threaded in, else the
+    process-wide default (the same store Core records feedback to).
+
+    `default_hub` does not raise: a metadata backend that cannot be opened degrades to an
+    in-process store inside it, so there is nothing to catch here."""
     if hub is not None:
         return hub
-    try:
-        from batcher.core import default_hub
+    from batcher.core import default_hub
 
-        return default_hub()
-    except Exception as exc:  # pragma: no cover - learning is best-effort
-        note_suppressed("dist", "resolve the learning hub", exc)
-        return None
+    return default_hub()
 
 
 def _plan_family(plan: LogicalPlan) -> str:
@@ -1845,7 +1843,7 @@ def scan_clustering_for(plan: LogicalPlan, sources, workers: int, hub=None) -> t
 #: won at every UDF weight, i.e. cores/4), and it reproduces on this 1,024-core one: forcing
 #: 256 partitions (= 1,024/4) against the 301 the unclamped term asks for runs the sf100 heavy
 #: UDF pipeline in 1,345/1,382 ms against 1,662/1,758 ms.
-_TARGET_TASK_CPUS = max(1, int(os.environ.get("BATCHER_TARGET_TASK_CPUS", "4")))
+_TARGET_TASK_CPUS = env_int("BATCHER_TARGET_TASK_CPUS", 4, floor=1)
 
 
 def _widest_useful_fan_out(task_cpus: float | None = None) -> int:
@@ -1880,8 +1878,8 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None, task_cpus=N
       about `rows_per_cpu` rows. More tasks than cores buys nothing, so the clamp is right.
     * *Memory* — `_byte_partition_count`, the count that holds one task's input to
       `target_bytes_per_task`. This one is a **bound, not a preference**, and the core clamp
-      must not apply to it. It used to: `min(max(rows_term, bytes_term), cluster_cores)`
-      discarded the byte term for any source bigger than `cores x target_bytes_per_task`,
+      must not apply to it: `min(max(rows_term, bytes_term), cluster_cores)` would discard
+      the byte term for any source bigger than `cores x target_bytes_per_task`,
       which is precisely the range it exists for. A 1 TB scan on this 128-core cluster asked
       for 4,096 partitions and got 128 — **8 GiB per task against a 256 MiB budget, growing
       linearly with the data**. That is not a slow query; it is an OOM, and it arrives exactly
@@ -1929,7 +1927,7 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None, task_cpus=N
     if total is None:
         try:
             total = learned_partition_rows(_learning_hub(hub), source.identity())
-        except Exception as exc:  # pragma: no cover - a learned read must never break a query
+        except Exception as exc:  # a learned read must never break a query
             # The read half of the same loop. `None` here is "never measured", which is what a
             # broken read also produces — and the caller then takes the `fallback`, so a
             # persistently failing read looks exactly like a source nothing has learned about.
@@ -1982,7 +1980,7 @@ def _minus_pruned_columns(source, plan, total_rows: int, total_bytes: float) -> 
         return total_bytes
     try:
         schema = source.schema()
-    except Exception as exc:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # sizing must never break a query
         note_suppressed("dist", "read the source schema for byte sizing", exc)
         return total_bytes
     full = schema_row_bytes(schema)
@@ -2667,7 +2665,7 @@ class _MapActor:
         # ever reached is what the next run must fit. Utilization is a rate, so it is a mean.
         self._sample_gpu_vram(sample_gpu_vram_fraction)
         if not out or sum(b.num_rows for b in out) == 0:
-            return ([], None) if self._write_spec is not None else _udf_output(out)
+            return _empty_write(out) if self._write_spec is not None else _udf_output(out)
         # Writing stage: this actor writes its own inference output straight to the sink and
         # returns only `WrittenFile` locators. That is what keeps a batch-inference job whose
         # RESULT is larger than the driver (a 2B-row embedding write) from OOMing the driver
@@ -2684,7 +2682,6 @@ class _MapActor:
         `host_of(addr)` by construction — both are this node's advertised IP — so the two
         sides of that comparison cannot drift apart.
         """
-        import os
 
         import ray
 
@@ -2820,7 +2817,7 @@ class _MapActor:
 # fast GPU stage fed (the guides' 2-4:1 CPU:GPU ratio). GPU stages always stay at 1 (one CUDA
 # context). Modest so several fractional-GPU actors per node don't grossly oversubscribe the
 # cores; a decode/normalize `fn` releases the GIL (PIL/cv2/NumPy/torch) so threads scale.
-_INFERENCE_CPU_WORKERS = max(1, int(os.environ.get("BATCHER_INFERENCE_CPU_WORKERS", "4")))
+_INFERENCE_CPU_WORKERS = env_int("BATCHER_INFERENCE_CPU_WORKERS", 4, floor=1)
 
 # Seconds between an actor's VRAM readings (see `_MapActor._sample_gpu_vram`). The reading
 # feeds a running maximum used to pack the NEXT run's actors, and a model's footprint peaks in
@@ -2933,6 +2930,17 @@ def _write_udf_output(batches: list, write_spec: dict, idx: int) -> tuple[list, 
     return files, table.schema
 
 
+def _empty_write(out: list[pa.RecordBatch] | None) -> tuple[list, pa.Schema | None]:
+    """A writing shard that produced no rows: no locators, but the UDF's schema if it ran.
+
+    The write-side twin of `_udf_output`. A shard whose rows all filtered away writes no file,
+    and its zero-row output is then the only record of what the UDF emits -- which the driver
+    needs when *every* shard is empty, because a UDF-staged operand with no file and no schema
+    had nothing to scan and the whole breaker above it was refused (`_land_map_stage`).
+    """
+    return [], (out[0].schema if out else None)
+
+
 def _udf_output(out: list[pa.RecordBatch] | None) -> list[pa.RecordBatch] | None:
     """A task's empty result as one zero-row batch of the UDF's output schema, or None.
 
@@ -2963,7 +2971,7 @@ def _map_udf_task(
         _with_map_workers(plan0, workers), [InMemorySource(rows)], engine_config=cfg_json
     )
     if not out or sum(b.num_rows for b in out) == 0:
-        return ([], None) if write_spec is not None else _udf_output(out)
+        return _empty_write(out) if write_spec is not None else _udf_output(out)
     # Write in place so the post-UDF rows never travel back through the driver.
     if write_spec is not None:
         return _write_udf_output(out, write_spec, idx)
@@ -3286,8 +3294,8 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # summation order under the scheduler, so a sum can move in its last bits between two
     # runs over the same data. That is the reassociation the distributed contract already
     # allows (partition count moves it too, and `bc-runtime`'s Neumaier compensation is what
-    # bounds it either way) — but it was previously only *across* configurations, and here
-    # it is also within one. Integer and min/max/count aggregates are unaffected; a caller
+    # bounds it either way) — but elsewhere it varies only *across* configurations, and
+    # here it also varies within one. Integer and min/max/count aggregates are unaffected; a caller
     # needing bit-repeatable float sums has the same recourse it always had, which is to fix
     # the partition count.
     def _gather(launch):

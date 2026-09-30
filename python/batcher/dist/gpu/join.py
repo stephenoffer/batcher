@@ -135,8 +135,8 @@ def sharded_gpu_join(
 def _replicate_the_smaller_side(left, right, join_ir: dict) -> bool:
     """Whether to mirror this join so the *smaller* relation is the one every device copies.
 
-    The fan-out splits the probe side and gives every device the whole build side, and this
-    module used to take the build side to be whatever the plan put on the **right**. Nothing
+    The fan-out splits the probe side and gives every device the whole build side, so it
+    cannot take the build side to be whatever the plan put on the **right**. Nothing
     guarantees that. Kyber reorders a join's inputs for its own costing, and the CPU hash join
     it reorders for picks its build side at runtime, so the plan's left/right carries no promise
     about size — it just happened to hold on the plans this path was written against.
@@ -169,7 +169,7 @@ def _replicate_the_smaller_side(left, right, join_ir: dict) -> bool:
         return False
     try:
         return _relation_bytes(right) > _relation_bytes(left) > 0.0
-    except Exception as exc:  # pragma: no cover - sizing must never break the join
+    except Exception as exc:  # sizing must never break the join
         note_suppressed("dist", "size both join sides to pick the replicated one", exc)
         return False
 

@@ -63,6 +63,20 @@ Turning coordinate columns into geometries, and reducing a geometry to a simpler
    st_point_z
 ```
 
+## Polygon overlay
+
+The set operations on the area two shapes cover: {py:func}`st_intersection <batcher.st_intersection>` clips, {py:func}`st_difference <batcher.st_difference>` erases, and {py:func}`st_union <batcher.st_union>` merges. Both operands must be valid polygons or multipolygons. Any other operand gives null, and an empty result is `POLYGON EMPTY`.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   st_difference
+   st_intersection
+   st_union
+```
+
 ## Ordinates, bounds and counts
 
 The cheap functions. {py:func}`st_xmin <batcher.st_xmin>` and its three siblings are the ones to know: materialize them once beside the geometry and every later region filter becomes four Float64 comparisons that push down to the scan.

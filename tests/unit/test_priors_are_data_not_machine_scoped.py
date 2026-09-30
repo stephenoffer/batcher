@@ -5,8 +5,8 @@ machine-unit measurement, and never scope a statement about data, because scopin
 "would fragment the statistics that took the most work to collect, turning a well-calibrated
 fleet into N poorly-calibrated ones for no gain".
 
-All three priors here are on the data side of that line — a join's two input row counts, a
-breaker's shuffled row count, an aggregate's `groups / input_rows` ratio — and every one is
+Both priors here are on the data side of that line — a breaker's shuffled row count and an
+aggregate's `groups / input_rows` ratio — and each is
 recorded on the *driver* from the whole query's figures, never per shard. So the same query
 planned single-node and then distributed was writing two entries for identical data, and
 neither run could inform the other.
@@ -17,11 +17,9 @@ from __future__ import annotations
 import pytest
 
 from batcher.kyber.learned_tuning.priors import (
-    learned_build_sides,
     learned_partial_agg,
     learned_partition_count,
     record_group_reduction,
-    record_join_sides,
     record_partition_rows,
 )
 from batcher.metadata import MetadataHub
@@ -33,16 +31,6 @@ pytestmark = pytest.mark.unit
 
 def _hub() -> MetadataHub:
     return MetadataHub(InProcessBackend())
-
-
-def test_measured_join_sides_are_visible_from_another_machine_class() -> None:
-    hub = _hub()
-    record_join_sides(hub, "sig", 5_000_000.0, 400.0)
-    assert learned_build_sides(hub, "sig") == (5_000_000.0, 400.0)
-    with planning_for("worker-class"):
-        assert learned_build_sides(hub, "sig") == (5_000_000.0, 400.0), (
-            "a relation has the same number of rows whichever machine counts them"
-        )
 
 
 def test_measured_shuffle_rows_are_visible_from_another_machine_class() -> None:

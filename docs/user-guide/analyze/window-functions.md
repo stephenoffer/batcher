@@ -285,16 +285,17 @@ Most functions have such a shift:
 | How the global value is recovered | Functions |
 |---|---|
 | A running offset from earlier buckets | `row_number`, `rank`, `dense_rank`, running `sum`, `count`, `min`, `max`, `avg`, `var`, `stddev`, the bitwise and boolean folds, `first_value` |
-| The few rows just before the bucket | `lag` |
+| The few rows just before the bucket | `lag`, and `sum`, `count`, `min`, `max` and `avg` over a trailing `ROWS` frame such as `rolling_sum(n)` builds |
 | Closed out once every bucket has run | `percent_rank`, `cume_dist`, `ntile`, `last_value` |
 
 `lead`, `median`, a distinct count, the fills, and the EWM family have none, because each reads rows its bucket does not hold in a direction no bounded exchange recovers. A window with no `PARTITION BY`, no `ORDER BY` and an aggregate is simpler still: every row gets the same value, so it runs as an ordinary distributed aggregate and broadcasts the scalar back.
 
 ## Requirements and limitations
 
-- A global window distributes only when its leading `ORDER BY` key is a plain column of a type the range partitioner can cut. An expression key such as `order_by=[bt.col("a") + bt.col("b")]` has no distributed path.
-- An explicit frame on a global window has no distributed path. Frames on a `PARTITION BY` window are unaffected.
-- A top-N filter over a global ranking window, such as `.with_columns(r=bt.row_number().over(order_by="t")).filter(bt.col("r") <= 100)`, has no distributed path either. The filter fuses into the window as a rank bound, and a bucket knows only the rank within itself.
+- A global window distributes only when its leading `ORDER BY` key is of a type the range partitioner can cut. An expression key such as `order_by=[bt.col("a") + bt.col("b")]` is computed into a hidden column below the window first and dropped above it, the same way a computed sort key is.
+- A global window carries only some explicit frames. The running `ROWS` frame that `cum_sum` and its siblings build takes the same running offset as the default frame. The trailing `ROWS` frame that `rolling_sum(n)` builds, `n - 1` rows back to the current row, borrows the last `n - 1` rows of the earlier buckets, for `sum`, `count`, `min`, `max` and `avg`, over a numeric input except for `count`. A frame with a `FOLLOWING` edge, a value-based `RANGE` offset, or a trailing frame over a non-numeric input has no distributed path. Frames on a `PARTITION BY` window are unaffected.
+- A top-N filter over a global ranking window, such as `.with_columns(r=bt.row_number().over(order_by="t")).filter(bt.col("r") <= 100)`, fuses into the window as a rank bound. A `row_number` bound of up to 1,000,000 rows runs as the distributed top-N of `ORDER BY ... LIMIT k`, which exchanges no rows, and the window numbers those `k` rows afterwards. A `rank` or `dense_rank` bound, or a larger `row_number` one, is split back into the window and the filter, so every row is ranked across the cluster and the filter applies to the result.
+- The distributed global window corrects its buckets on the driver, in order, so the whole windowed relation passes through the driver process. A `PARTITION BY` window does not.
 - `row_number()` over an `ORDER BY` key with duplicate values gives tied rows an arbitrary order, so which of them gets which number can differ between a single-node and a distributed run. This is true of any window, partitioned or not. Order by a unique key, or add a tiebreaker column, when the exact numbers matter.
 - When a shape has no distributed path, `collect(distributed=True)` raises and names the functions at fault, rather than quietly running the whole relation on one node. Add a `PARTITION BY`, or pass `distributed=False` to run that stage on one node explicitly.
 - Out of core, a `PARTITION BY` window spills by grace-partitioning on its partition keys. A global window with running offsets streams bucket by bucket, so peak memory is one bucket rather than the whole relation. The functions closed out after the last bucket need every bucket assembled first, so they don't stream this way.

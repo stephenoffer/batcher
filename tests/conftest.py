@@ -141,8 +141,8 @@ def _docs_run_like_a_reader(request, monkeypatch):
     a reason that has nothing to do with the page.
 
     Scoped by path here rather than in a `tests/docs/conftest.py`, because a second
-    top-level module named `conftest` shadows `tests/differential/conftest.py` — and 174
-    differential tests import `assert_same` from it by bare name.
+    top-level module named `conftest` can shadow `tests/differential/conftest.py` for any
+    code that imports it by bare name.
     """
     if _DOCS_TESTS not in request.path.parents:
         return

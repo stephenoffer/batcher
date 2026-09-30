@@ -142,7 +142,7 @@ def auto_num_partitions(plan: LogicalPlan, sources: list[Source], hub: MetadataH
         width = est.row_width(plan, opt.row_bytes)
         byte_parts = math.ceil(rows * width / max(1, opt.target_bytes_per_task))
         return _clamp_partitions(max(row_parts, byte_parts))
-    except Exception as exc:  # pragma: no cover - sizing must never break a query
+    except Exception as exc:  # sizing must never break a query
         note_suppressed("api", "size partitions", exc)
         return DEFAULT_PARTITIONS
 
@@ -217,7 +217,7 @@ def distributed_grant(
     if derived is None:
         try:
             nodes = int(dist.cluster_topology().get("nodes", 0))
-        except Exception as exc:  # pragma: no cover - topology probe must never break a query
+        except Exception as exc:  # topology probe must never break a query
             note_suppressed("api", "read cluster topology for the distributed grant", exc)
             nodes = 0
         derived = learned_num_workers(ctx.hub, plan, sources, nodes)
@@ -249,7 +249,8 @@ def record_run_feedback(
     Closes three loops the read side already consumes: the breaker's shuffled volume
     (``learned_partition_count`` → spill/shuffle fan-out), a group-by's cardinality reduction
     (``learned_partial_agg``), and — for an unambiguous single-join plan — the join-strategy bandit
-    and its side sizes (``learned_join_strategy`` / ``learned_build_sides``). Every write is
+    and the hash-vs-sort-merge crossover (``learned_join_strategy`` /
+    ``learned_sort_merge_min_rows``). Every write is
     best-effort; each recorded signal only steers a later *performance* choice, never a result.
     """
     if hub is None:
@@ -275,20 +276,19 @@ def record_join_outcomes(
     *,
     distributed: bool = False,
 ) -> None:
-    """Record an executed join's strategy, side sizes and timing so the bandit learns.
+    """Record an executed join's strategy and timing so the bandit learns.
 
     Handled only for a plan with exactly one join (so the whole-query wall time is unambiguously
     that join's, and the single decision maps to the single join). The executed strategy (``None``
     → the engine's default hash) and the measured wall time feed the UCB1 strategy bandit and the
-    hash-vs-sort-merge crossover; the measured side sizes seed build-side selection. Each is a
-    choice among equivalent algorithms, so the learning changes throughput only.
+    hash-vs-sort-merge crossover. Each is a choice among equivalent algorithms, so the learning
+    changes throughput only.
     """
     if hub is None or wall_ms <= 0.0:
         return
     try:
         from batcher.kyber.learned_tuning import (
             record_broadcast_timing,
-            record_join_sides,
             record_join_strategy,
             record_sort_merge_timing,
         )
@@ -306,7 +306,6 @@ def record_join_outcomes(
         # keeps a decision from an older shape working.
         sig = dec.signature or plan_signature(join)
         strategy = join.strategy or "hash"
-        record_join_sides(hub, sig, float(dec.left_rows), float(dec.right_rows))
         # The bandit's reward must not depend on how much data this particular run saw: the
         # same signature runs over 1M rows today and 50M tomorrow, and a raw wall-time reward
         # would permanently condemn whichever arm drew the large input. Hand it the join's

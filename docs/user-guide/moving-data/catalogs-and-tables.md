@@ -237,7 +237,7 @@ The table below maps each engine's spelling onto Batcher's, alphabetically by th
 
 - A directory catalog stores Delta tables and needs the `delta` extra. It is not the Hive warehouse layout (`<db>.db/<table>`), so an existing Spark warehouse directory isn't read as a catalog.
 - A Delta table scopes `replace_where` to its partition columns, so an overwrite with a predicate needs a partitioned table there. The in-memory backend takes any predicate.
-- `mode="overwrite_partitions"` commits one scoped overwrite per partition the rows cover. Each commit is atomic and the set isn't, so a concurrent reader can see some partitions reloaded before others.
+- `mode="overwrite_partitions"` replaces every partition the rows cover in one commit, so a concurrent reader sees the old partitions or the new ones, never a mix. On Delta this needs each covered partition to be named by partition values that aren't null, because the removals are resolved from the log by equality.
 - An Iceberg catalog refuses `partition_by` on create, because Iceberg partitioning is a partition spec declared on the table. Create the table with pyiceberg, then write to it. Dropping an Iceberg table removes its catalog entry and leaves the data files.
 - `MERGE` acts on session tables only. For a catalog table, use `replace_where` or {py:meth}`ds.write.merge_into <batcher.api.io_namespace.writer.Writer.merge_into>` on the underlying format. `DELETE` and `UPDATE` on a catalog table rewrite the whole table.
 - `information_schema.tables` and `information_schema.columns` list session tables and views only. `SHOW TABLES` lists those and the current namespace's catalog tables, and `DESCRIBE` answers for either.

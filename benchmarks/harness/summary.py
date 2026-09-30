@@ -34,7 +34,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from .compare import CompareResult
+from .compare import CompareResult, EngineResult
+from .report import cell_status
 
 __all__ = [
     "Summary",
@@ -75,6 +76,24 @@ class Summary:
     value: float
     included: int
     excluded: dict[str, int] = field(default_factory=dict)
+    #: Summed best-of-N over the included cases, per side. A geomean weighs a 2 ms query
+    #: like a 20 s one, so many small wins can hide a severe loss on the expensive query a
+    #: user actually runs; the ratio of totals and the worst case put that loss back in view.
+    batcher_total_ms: float = 0.0
+    engine_total_ms: float = 0.0
+    worst: tuple[str, float] | None = None
+
+    def weight(self) -> str:
+        """Ratio of totals and the worst single case, or ``""`` with nothing included."""
+        if not self.included or not self.engine_total_ms:
+            return ""
+        out = (
+            f"total {self.batcher_total_ms / 1000:.2f}s vs {self.engine_total_ms / 1000:.2f}s "
+            f"(ratio of totals {self.batcher_total_ms / self.engine_total_ms:.2f}x)"
+        )
+        if self.worst is not None:
+            out += f"; worst {self.worst[0]} {self.worst[1]:.2f}x"
+        return out
 
     def provenance(self) -> str:
         """A one-line account of what the number is a mean *of*."""
@@ -89,7 +108,10 @@ def summarize(results: list[CompareResult], engines: list[str]) -> list[Summary]
 
     A case contributes only when both engines produced a timing *and* the row was not
     excluded by status. Every exclusion is counted rather than silently dropped, because a
-    geomean over an unstated denominator is not comparable to another one.
+    geomean over an unstated denominator is not comparable to another one — including a
+    case where either side has no timing at all (unsupported, errored, out of memory, or
+    not measured), which used to vanish from the count and let a fast score over a smaller
+    subset read like one over the whole suite.
 
     Args:
         results: Every case's comparison result.
@@ -104,19 +126,37 @@ def summarize(results: list[CompareResult], engines: list[str]) -> list[Summary]
     for engine in (e for e in engines if e != "batcher"):
         ratios: list[float] = []
         excluded: dict[str, int] = {}
+        totals = [0.0, 0.0]
+        worst: tuple[str, float] | None = None
         for r in results:
             b, c = r.engines.get("batcher"), r.engines.get(engine)
-            if b is None or c is None or not b.ms or not c.ms:
-                continue
             if r.status in _EXCLUDED:
                 excluded[r.status] = excluded.get(r.status, 0) + 1
+                continue
+            missing = _untimed(b, "batcher") or _untimed(c, engine)
+            if missing:
+                excluded[missing] = excluded.get(missing, 0) + 1
                 continue
             if b.correct is False or c.correct is False:
                 excluded["FAILED"] = excluded.get("FAILED", 0) + 1
                 continue
-            ratios.append(b.ms / c.ms)
-        out.append(Summary(engine, geomean(ratios), len(ratios), excluded))
+            ratio = b.ms / c.ms
+            ratios.append(ratio)
+            totals[0] += b.ms
+            totals[1] += c.ms
+            if worst is None or ratio > worst[1]:
+                worst = (r.name, ratio)
+        out.append(Summary(engine, geomean(ratios), len(ratios), excluded, *totals, worst=worst))
     return out
+
+
+def _untimed(er: EngineResult | None, engine: str) -> str | None:
+    """Why `engine` has no timing on a case (``"<engine> n/a"`` etc.), or ``None``."""
+    if er is None:
+        return f"{engine} not run"
+    if er.ms:
+        return None
+    return f"{engine} {cell_status(er)}"
 
 
 #: E[range] = d2(k) * sigma for k samples — the control-chart constant. A range under-states
@@ -205,6 +245,8 @@ def format_summary(summaries: list[Summary], runs: int, repeated: bool = False) 
         else:
             value = f"{s.value:.{3 if repeated else digits_for(s.value, None)}f}"
         lines.append(f"  b/{s.engine:<12} {value:>7}   {s.provenance()}")
+        if weight := s.weight():
+            lines.append(f"  {'':<14} {'':>7}   {weight}")
     if not repeated:
         lines.append(
             "  SINGLE RUN — quoted to two decimals, which is what one pass supports. Run\n"

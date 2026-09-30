@@ -1,9 +1,9 @@
 """The memory envelope's refusal is a *type*, not a message.
 
-Most stateful operators spill when they would exceed the envelope. A few cannot, because
-they need one global order over the whole relation: a window with no `PARTITION BY`, an
-ASOF join with no `by` keys, and the right side of a range join. Those raise rather than
-risking the process.
+Most stateful operators spill when they would exceed the envelope. A few cannot: a window
+with no `PARTITION BY` whose functions have no exact streamed form (a running float `sum`,
+an explicit frame -- see `bc-interp/src/ops/window_stream.rs`), and an ASOF join whose key
+types the out-of-core merge declines. Those raise rather than risking the process.
 
 That refusal is the one execution failure with an obvious programmatic answer -- raise the
 envelope, or re-plan so the non-spillable operator is not on the path -- and it only ever
@@ -29,7 +29,8 @@ from batcher._internal.errors import MemoryBudgetExceededError, ResourceError
 
 pytestmark = pytest.mark.unit
 
-#: A window with no `PARTITION BY` over one scan -- the operator that provably cannot spill,
+#: A running `sum` window with no `PARTITION BY` over one scan -- a shape that provably cannot
+#: spill (the streamed window declines `sum`, whose re-association would move float bits),
 #: written as IR rather than built through the optimizer, so the plan under test does not
 #: move with whatever the learning loop happens to have seen.
 _RANKING_PLAN = json.dumps(
@@ -40,12 +41,14 @@ _RANKING_PLAN = json.dumps(
         "order_keys": [
             {"expr": {"e": "col", "name": "v"}, "descending": False, "nulls_first": False}
         ],
-        "functions": [{"func": "rank", "alias": "r", "offset": 1}],
+        "functions": [
+            {"func": "sum", "input": {"e": "col", "name": "v"}, "alias": "r", "offset": 1}
+        ],
         "rank_limit": None,
     }
 )
 
-#: Enough rows that the ranking state is megabytes, so a 100 KB envelope is refused and a
+#: Enough rows that the window state is megabytes, so a 100 KB envelope is refused and a
 #: 512 MB one is not.
 _ROWS = 300_000
 

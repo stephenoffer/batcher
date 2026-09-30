@@ -16,6 +16,7 @@ from batcher.kyber.optimizer.driver import (
     _present,
     _run_phase,
 )
+from batcher.kyber.optimizer.plan_deps import dependencies_hold, dependency_snapshot
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, Rule
@@ -35,7 +36,6 @@ from batcher.plan.logical import LogicalPlan
 from batcher.plan.physical import PhysicalPlan
 from batcher.plan.resource import HardwareProfile
 from batcher.plan.source_stats import source_identity
-from batcher.plan.stats import RelStats
 from batcher.plan.visitor import children, walk
 
 __all__ = ["Optimizer", "optimize", "optimize_full", "optimize_logical", "optimize_traced"]
@@ -258,6 +258,9 @@ class Optimizer:
         """
         ctx = self._context()
         plan, ir = self._run(logical, ctx)
+        # What the plan's estimates were read from, for the plan cache to re-validate against
+        # (`plan_deps`): the measured values it consulted are not covered by the cache key.
+        self.consulted = ctx.estimator.consulted
         phys = PhysicalPlan(
             ir=ir if ir is not None else plan.to_ir(),
             output_schema=None,
@@ -286,27 +289,15 @@ class Optimizer:
 
         Named for what the caller wants (a rewritten `LogicalPlan`, not a `PhysicalPlan`),
         not for a subset of phases: `_run` iterates *all* of `Phase`, so JOIN_REORDER and
-        SELECTION execute here too. The previous "only the logical rewrite phases" wording
-        was wrong and contradicted `optimize_logical`, which memoizes this exact call —
-        worth knowing, because the metadata-answer layer calls this per `.count()` and so
-        pays for join-order search, not just the pruning it is after.
+        SELECTION execute here too (`optimize_logical` memoizes this exact call). Worth
+        knowing, because the metadata-answer layer calls this per `.count()` and so pays for
+        join-order search, not just the pruning it is after.
 
         The seam the metadata-answer layer uses to simplify a plan (combine limits, drop
         redundant distincts, zone-map pruning) before estimating it with an exact-first
         estimator of its own.
         """
         return self._run(logical, self._context())[0]
-
-    def logical_stats(self, logical: LogicalPlan) -> tuple[LogicalPlan, RelStats]:
-        """Run the logical rewrite phases and estimate the root's `RelStats`.
-
-        Returns the rewritten logical plan and its root statistics. The rewrites
-        run first so algebraic simplifications and zone-map pruning have sharpened
-        the plan before estimation.
-        """
-        ctx = self._context()
-        plan, _ir = self._run(logical, ctx)
-        return plan, ctx.estimator.estimate(plan)
 
     def explain(self, logical: LogicalPlan) -> str:
         """A human-readable view of the optimized plan and its cardinality decisions."""
@@ -374,13 +365,9 @@ def _format_plan(node: LogicalPlan, est: CardinalityEstimator, depth: int = 0) -
 #: The crossover sits between 3,000 and 4,000, and this is the first swept point on the far
 #: side of it — the conservative choice, since it leaves every measured near-tie where it was.
 #:
-#: It used to be 50,000, chosen as the midpoint of a 1e4..1e5 bracket whose interior had not
-#: been measured. What moved the crossover down an order of magnitude is
-#: `bc_interp::agg_par::chunked_partials`: the materializing aggregate used to build one hash
-#: table per 16,384-row morsel and hand the merge every one of them, which is ruinous in
-#: exactly the band where the group count fills a morsel's table without filling a worker's
-#: share. Building one table per worker instead took the 10,000-group case from 63.3 ms to
-#: 41.1, and with that the executor that was losing this band now wins it.
+#: The crossover is this low because the materializing aggregate builds one hash table per
+#: worker (`bc_interp::agg_par::chunked_partials`) rather than one per morsel, so it wins the
+#: band where the group count fills a morsel's table without filling a worker's share.
 MATERIALIZE_AGG_MIN_GROUPS = 4_000
 
 
@@ -447,15 +434,15 @@ def _prefers_materializing_aggregate(plan: LogicalPlan, ctx: OptimizerContext) -
 
 
 #: How many rows a build-side aggregate must read per row of the join's probe side before
-#: restricting it to the probe side's keys (`EngineConfig.prefer_sideways`) is worth routing
-#: the plan to the executor that can. Each probe row keeps at most the rows sharing its key, so
-#: the ratio bounds what the restriction removes; the engine's own run-time gate is 4x, and the
-#: route gives up the streaming executor for it, so this asks for a margin above that. Measured
-#: on TPC-H sf10 q21, whose learned plan settles at an 8.2x ratio: 16 left it streaming at
-#: ~1,030 ms, 8 routes it at ~660 ms. q18 (ratio ~1) and q2 keep streaming either way.
+#: restricting it to the probe side's keys (`EngineConfig.prefer_sideways`) is worth evaluating
+#: the probe side first. Each probe row keeps at most the rows sharing its key, so the ratio
+#: bounds what the restriction removes; the engine's own run-time gate is 4x, and evaluating
+#: the probe side first materializes it (`bc_interp::stream::builds`), or stages the query on
+#: the chunked path (`api.orchestration.chunked_sideways`), so this asks for a margin above
+#: that. TPC-H q21, whose learned plan settles at an 8.2x ratio, is the shape it is set for.
 SIDEWAYS_MIN_RATIO = 8
 
-#: The smallest aggregate input worth the route: the engine's own floor for restricting.
+#: The smallest aggregate input worth restricting: the engine's own floor for it.
 SIDEWAYS_MIN_ROWS = 262_144
 
 
@@ -596,15 +583,15 @@ def optimize_full(
     key = plan_cache.cache_key(
         logical.content_key(), sources, cfg, hub, source_stats=source_stats, hardware=hardware
     )
-    cached = plan_cache.lookup(key)
+    cached = plan_cache.lookup(key, lambda deps, rounds: dependencies_hold(hub, deps, rounds))
     if cached is not None:
         phys, plan, decisions = cached
         return phys, plan, list(decisions)  # decisions are telemetry; hand out a copy
 
-    result = Optimizer(
-        cfg, sources, hub, source_stats=source_stats, hardware=hardware
-    ).optimize_full(logical)
-    plan_cache.store(key, result, sources, max_entries)
+    optimizer = Optimizer(cfg, sources, hub, source_stats=source_stats, hardware=hardware)
+    result = optimizer.optimize_full(logical)
+    deps = dependency_snapshot(hub, getattr(optimizer, "consulted", set()))
+    plan_cache.store(key, result, sources, max_entries, deps)
     phys, plan, decisions = result
     return phys, plan, list(decisions)
 

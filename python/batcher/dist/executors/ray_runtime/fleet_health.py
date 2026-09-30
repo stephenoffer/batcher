@@ -15,6 +15,7 @@ The dependency points one way: this module reads `hardware_probe`'s probe plumbi
 from __future__ import annotations
 
 import time
+from typing import TypedDict
 
 from batcher._internal.logging import note_suppressed
 from batcher.dist.executors.ray_runtime.hardware_probe import (
@@ -156,7 +157,15 @@ def _scratch_status() -> str:
 #: costs one stage's placement, against a probe on every placement forever.
 _HEALTH_TTL_S = 30.0
 
-_HEALTH_SAMPLE: dict[str, object] = {"expires": 0.0, "value": ()}
+
+class _HealthSample(TypedDict):
+    """The one cached fleet-health reading and the monotonic time it goes stale."""
+
+    expires: float
+    value: tuple[dict, ...]
+
+
+_HEALTH_SAMPLE: _HealthSample = {"expires": 0.0, "value": ()}
 
 
 def reset_fleet_health() -> None:
@@ -185,8 +194,8 @@ def cluster_device_health() -> tuple[dict, ...]:
     """
 
     now = time.monotonic()
-    if now < float(_HEALTH_SAMPLE["expires"]):  # type: ignore[arg-type]
-        return _HEALTH_SAMPLE["value"]  # type: ignore[return-value]
+    if now < _HEALTH_SAMPLE["expires"]:
+        return _HEALTH_SAMPLE["value"]
     probed = _probe_fleet_health()
     # Only a successful probe is cached. An unreadable fleet is not a fact worth holding for
     # thirty seconds — the cluster may be seconds from coming up — and caching it would make
@@ -215,8 +224,8 @@ def sampled_device_health() -> tuple[dict, ...]:
         The current health records, or empty when none has been sampled recently.
     """
 
-    if time.monotonic() < float(_HEALTH_SAMPLE["expires"]):  # type: ignore[arg-type]
-        return _HEALTH_SAMPLE["value"]  # type: ignore[return-value]
+    if time.monotonic() < _HEALTH_SAMPLE["expires"]:
+        return _HEALTH_SAMPLE["value"]
     return ()
 
 

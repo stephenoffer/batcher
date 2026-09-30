@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher._internal.registry import MISSING, IdentityMemo
 from batcher.carbonite.memory.pressure import PressureLevel
 
 if TYPE_CHECKING:
@@ -119,7 +120,8 @@ def learned_row_cap(
 ) -> int | None:
     """Row cap that keeps a morsel's *measured* byte working set within the budget.
 
-    Uses the widest learned per-row footprint (``rows = morsel_bytes / max_bytes_per_row``),
+    Uses the widest learned *output* row (``rows = morsel_bytes / max_row_width``), not the
+    per-input-row footprint, which a fanning-out join inflates by its fan-out,
     restricted to `families` — this plan's operator kinds — when given, so a narrow plan is
     sized by its own data rather than throttled by an unrelated wide family measured in an
     earlier query.
@@ -138,7 +140,7 @@ def learned_row_cap(
     """
     if model is None:
         return None
-    return _cap_for_width(config, model.max_bytes_per_row(families), byte_target)
+    return _cap_for_width(config, model.max_row_width(families), byte_target)
 
 
 def _node_row_bytes(arrow: object, carried: frozenset[str] | None) -> float:
@@ -196,34 +198,54 @@ def planned_row_cap(
     return _cap_for_width(config, widest, byte_target) if widest > 0.0 else None
 
 
-#: `(id(plan), carried) -> (plan, widest)`, pinning the plan so a recycled id cannot answer for
-#: another. The widest per-row width is a property of an immutable plan and the carried column
-#: set alone, and a re-issued query hands back the same plan object: recomputing it walked every
-#: node's schema and rebuilt a filtered `pa.Schema` per node, which over ClickBench's 105-column
-#: `hits` was most of the ~580 us `recommended_config` charged a 4 ms query.
-_WIDEST_MEMO: dict[tuple[int, frozenset[str] | None], tuple[object, float]] = {}
-_WIDEST_MEMO_MAX = 256
+#: `(plan, carried) -> widest`. The widest per-row width is a property of an immutable plan and
+#: the carried column set alone, and a re-issued query hands back the same plan object:
+#: recomputing it walked every node's schema and rebuilt a filtered `pa.Schema` per node, which
+#: over ClickBench's 105-column `hits` was most of the ~580 us `recommended_config` charged a
+#: 4 ms query.
+_WIDEST_MEMO: IdentityMemo[float] = IdentityMemo(256)
 
 
 def _widest_row_bytes(plan: object, carried: frozenset[str] | None) -> float:
-    """The widest per-row width over `plan`'s node schemas, charging only `carried` columns."""
-    key = (id(plan), carried)
-    hit = _WIDEST_MEMO.get(key)
-    if hit is not None and hit[0] is plan:
-        return hit[1]
-    from batcher.plan.visitor import walk
+    """The widest per-row width any node *introduces*, charging only `carried` columns.
+
+    A node is charged for the columns it brings into the plan, not every column it emits: a
+    scan's columns, and whatever a projection or a UDF derives. A join or a union only
+    *combines* columns its inputs already carried, so it makes no morsel wider than its
+    inputs' were, and the engine bounds the combined batch itself (a morsel is 16,384 rows or
+    1 MiB, whichever trips first, on real bytes). Charging the combination instead cut every
+    scan's morsel by the width of the widest join output anywhere downstream: TPC-DS q59's
+    44-column union of two week-sales CTEs sized a plan of narrow scans at 173-1,297 rows.
+    A derived wide column (a decoded image tensor) is still charged in full, which is what
+    this cap exists for.
+    """
+    if (hit := _WIDEST_MEMO.get(plan, carried)) is not MISSING:
+        return hit
+    import pyarrow as pa
+
+    from batcher.plan.visitor import children, walk
 
     widest = 0.0
     for node in walk(plan):
-        schema = getattr(node, "available_schema", None)
-        resolved = schema() if callable(schema) else None
-        arrow = getattr(resolved, "arrow", None)
-        if arrow is not None:
-            widest = max(widest, _node_row_bytes(arrow, carried))
-    if len(_WIDEST_MEMO) >= _WIDEST_MEMO_MAX:
-        _WIDEST_MEMO.clear()
-    _WIDEST_MEMO[key] = (plan, widest)
-    return widest
+        arrow = _arrow_schema(node)
+        if arrow is None:
+            continue
+        inherited: set[str] = set()
+        for child in children(node):
+            child_arrow = _arrow_schema(child)
+            if child_arrow is not None:
+                inherited.update(child_arrow.names)
+        introduced = [f for f in arrow if f.name not in inherited]
+        if introduced:
+            widest = max(widest, _node_row_bytes(pa.schema(introduced), carried))
+    return _WIDEST_MEMO.put(plan, widest, carried)
+
+
+def _arrow_schema(node: object):
+    """`node`'s resolved Arrow schema, or None when it declares none."""
+    schema = getattr(node, "available_schema", None)
+    resolved = schema() if callable(schema) else None
+    return getattr(resolved, "arrow", None)
 
 
 def _planned(

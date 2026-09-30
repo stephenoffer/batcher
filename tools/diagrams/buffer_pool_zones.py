@@ -37,12 +37,12 @@ body = [
     f'<path d="M {X_LIMIT} {GAUGE_Y - 12} L {X_LIMIT} {GAUGE_Y + GAUGE_H + 12}" '
     f'stroke="{AMBER_DEEP}" stroke-width="4"/>',
     note(X0, 76, "0"),
-    note(X_SOFT, 76, "soft line: 80% of the limit", anchor="middle"),
+    note(X_SOFT, 76, "soft line: memory.soft_limit of the limit", anchor="middle"),
     note(X_LIMIT, 76, "limit", anchor="end"),
     label((X0 + X_SOFT) / 2, 108, "NOMINAL", anchor="middle"),
     note((X0 + X_SOFT) / 2, 126, "no throttling", anchor="middle"),
     label((X_SOFT + X_LIMIT) / 2, 108, "ELEVATED", anchor="middle"),
-    note((X_SOFT + X_LIMIT) / 2, 126, "spill early", anchor="middle"),
+    note((X_SOFT + X_LIMIT) / 2, 126, "reported only", anchor="middle"),
     note(
         X_LIMIT,
         158,

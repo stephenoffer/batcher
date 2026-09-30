@@ -213,7 +213,10 @@ _BROKER_FIELDS = [
     pa.field("value", pa.binary()),
     pa.field("partition", pa.int64()),
     pa.field("offset", pa.int64()),
-    pa.field("timestamp", pa.int64()),
+    # A typed timestamp, as Spark's Kafka source exposes it. Every broker reports epoch
+    # *milliseconds*, and as a bare int64 `window` and `with_watermark` read those ticks as
+    # the engine's microseconds: an hour of events fell into one 1970 window.
+    pa.field("timestamp", pa.timestamp("ms")),
     pa.field("topic", pa.string()),
 ]
 

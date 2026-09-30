@@ -34,8 +34,8 @@ if TYPE_CHECKING:
 
 __all__ = ["supported_window", "window"]
 
-# The engine's own window vocabulary, imported rather than restated. This module used to
-# carry its own three copies, and a copy is precisely how the device tier falls behind: a
+# The engine's own window vocabulary, imported rather than restated. A local copy is
+# precisely how the device tier falls behind: a
 # window function added to `plan.ir_tags` would be translated by no branch here while
 # `supported_window` kept claiming the shape, so the tier would produce a wrong column
 # instead of declining. `.claude/rules/device-tier.md`: derive a rule, never restate one.
@@ -129,7 +129,7 @@ def _rolling_width(frame: dict) -> int | None:
     """The row count of a `ROWS n PRECEDING → CURRENT ROW` frame, else `None`.
 
     This is the moving-window shape — a rolling sum, a moving average — which is most of what
-    a time series is ever asked for, and which the translator used to decline outright. Frames
+    a time series is ever asked for. Frames
     that look *forward* (`FOLLOWING`) are not covered: they are the same idea reflected, but
     each needs its own verification against the engine and an unverified window function is a
     wrong number rather than a slow one.

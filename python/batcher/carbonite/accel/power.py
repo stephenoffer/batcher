@@ -13,10 +13,10 @@ and a counter-offer rather than a refusal. The counter-offer is a device count, 
 may hold a device at once.
 
 The envelope itself is read in the neutral layer (`plan.energy.configured_power_envelope`), so
-the scheduling grant Kyber sizes against and the verdict Carbonite returns cannot disagree
-about what the budget allows. Two rules keep this safe to leave enabled:
-an unconfigured budget admits everything, and an unrecognized device model admits everything,
-because clamping a fleet against fabricated watts is worse than not clamping it at all.
+any other subsystem that needs the budget reads the same figure Carbonite admits against. Two
+rules keep this safe to leave enabled: an unconfigured budget admits everything, and an
+unrecognized device model admits everything, because clamping a fleet against fabricated watts
+is worse than not clamping it at all.
 """
 
 from __future__ import annotations

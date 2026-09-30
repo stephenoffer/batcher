@@ -33,8 +33,8 @@ def draining_workers(actors, workers: int) -> set[int]:
       is set when the autoscaler scales a node in, when KubeRay drains a pod, or when a
       node provider reports a reclamation. Consulted on every cluster, because none of
       those are spot-specific: an ordinary autoscaling cluster scaling in mid-query hits
-      exactly this, and it was previously invisible here, so the fleet only learned the
-      node was gone by failing to fetch from it. One GCS read, shared with the topology
+      exactly this, and without this signal the fleet would learn the node was gone only
+      by failing to fetch from it. One GCS read, shared with the topology
       snapshot, so a stable cluster pays approximately nothing.
     * **The worker's own preemption monitor** (`is_draining()`) — what the *node* knows. A
       cloud metadata reclamation notice or a `SIGTERM` reaches the node before the cluster

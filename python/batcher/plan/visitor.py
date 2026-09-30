@@ -23,7 +23,6 @@ __all__ = [
     "children",
     "reparent_unvalidated",
     "scanned_source_ids",
-    "transform_down",
     "transform_up",
     "walk",
     "walk_with_base_names",
@@ -234,13 +233,6 @@ def transform_up(node: LogicalPlan, fn: Callable[[LogicalPlan], LogicalPlan]) ->
         # else: an ambiguous slot currently `None` — no child to recurse into.
     rebuilt_node = node if changes is None else dataclasses.replace(node, **changes)
     return fn(rebuilt_node)
-
-
-def transform_down(node: LogicalPlan, fn: Callable[[LogicalPlan], LogicalPlan]) -> LogicalPlan:
-    """Top-down rewrite: apply `fn` to `node`, then recurse into the result's
-    children. Use when a rule reshapes a node before its children are visited."""
-    transformed = fn(node)
-    return with_children(transformed, [transform_down(c, fn) for c in children(transformed)])
 
 
 def walk(node: LogicalPlan):
