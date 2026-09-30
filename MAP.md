@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1554 Python modules across 220 packages and 316 Rust files across 14 crates.
+Covering 1554 Python modules across 220 packages and 317 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -950,7 +950,7 @@ Window-function translation for the SQL front-end.
 | `flight_join.py` | 561 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1907 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1914 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 532 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 312 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 383 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -1006,7 +1006,7 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 |---|---|---|
 | `_sources.py` | 703 | Shared partitioning + post-breaker helpers for the distributed operators. |
 | `assignment.py` | 413 | How a source's splits are divided among the workers — the three assignment strategies. |
-| `folds.py` | 208 | Streaming, byte-bounded folds of a shuffle map-side partition. |
+| `folds.py` | 280 | Streaming, byte-bounded folds of a shuffle map-side partition. |
 | `ranges.py` | 618 | Range partitioning: split rows by *value* into globally ordered buckets. |
 
 ### `batcher/dist/executors/ray_runtime/` — 4 · backend
@@ -3039,11 +3039,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `chunked.rs` | 227 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked.rs` | 325 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 798 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 737 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 165 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
@@ -3071,7 +3071,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join_par/probe_stream.rs` | 223 | Streaming a join's probe side past a build side that is already resident. |
 | `join_par/range_blocked.rs` | 169 | A range join whose right side does not fit: block-nested over chunks of both sides. |
 | `join_par/sideways.rs` | 243 | Restrict a join's build-side aggregate to the keys its (already materialized) probe side holds. |
-| `lib.rs` | 735 | `bc-interp` — the Tier-0 interpreter. |
+| `lib.rs` | 736 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 387 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/byte_sort.rs` | 644 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `ops/external_sort.rs` | 465 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
@@ -3096,8 +3096,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 631 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 667 | Preparing a hash join's build side once, for every worker that will probe it. |
-| `stream/chunked/mod.rs` | 674 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
+| `stream/chunked/mod.rs` | 713 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
+| `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/units.rs` | 34 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |

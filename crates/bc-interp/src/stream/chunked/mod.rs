@@ -28,6 +28,9 @@
 //! one the producer is decoding), independent of the driving relation's size.
 
 mod orient;
+mod partial;
+
+pub use partial::partial_aggregate_units;
 pub(crate) mod units;
 
 use arrow::array::RecordBatch;
@@ -342,6 +345,14 @@ fn node_at<'a>(plan: &'a mut RelOp, path: &[usize]) -> &'a mut RelOp {
     node
 }
 
+/// What [`Run::fold_units`] leaves: the partials, the driving rows they cover, and the compiled
+/// aggregate inputs, for the meter.
+struct Folded {
+    partials: Vec<agg::Partial>,
+    rows_in: u64,
+    jit: std::sync::OnceLock<ops::AggJit>,
+}
+
 /// One chunked execution's settings.
 struct Run<'o> {
     driving: usize,
@@ -552,6 +563,55 @@ impl Run<'_> {
     ) -> Result<Vec<RecordBatch>, InterpError> {
         let t = std::time::Instant::now();
         let RelOp::Aggregate {
+            group_keys,
+            aggregates,
+            ..
+        } = node
+        else {
+            unreachable!("Core::Aggregate holds an aggregate")
+        };
+        let folded = self.fold_units(node, srcs, src, ranges, meter)?;
+        let partials = folded.partials;
+        if partials.is_empty() {
+            return crate::execute(node, srcs);
+        }
+        let state = crate::column_bytes(
+            partials
+                .iter()
+                .flat_map(|p| p.group_columns.iter().chain(p.states.iter().flatten())),
+        ) as usize;
+        self.over_budget(state, "the chunked aggregate does not spill")?;
+        let out = self
+            .pool
+            .install(|| combine_and_finalize(&partials, group_keys, aggregates))?;
+        if let Some(m) = meter {
+            if let Some(compiled) = folded.jit.get() {
+                m.note_backend(m.id(node), compiled.backend_tag());
+            }
+            m.breaker(
+                m.id(node),
+                folded.rows_in,
+                0,
+                state as u64,
+                &out,
+                t.elapsed().as_nanos() as u64,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Fold each unit range through `node`'s input into one partial per non-empty range, on the
+    /// worker that reads the range. `meter` numbers the input's operators; `node` itself is not
+    /// looked up in it, so a caller may meter the input alone.
+    fn fold_units(
+        &self,
+        node: &RelOp,
+        srcs: &[Vec<RecordBatch>],
+        src: &dyn units::UnitSource,
+        ranges: &[std::ops::Range<usize>],
+        meter: Option<&super::Meter>,
+    ) -> Result<Folded, InterpError> {
+        let RelOp::Aggregate {
             input,
             group_keys,
             aggregates,
@@ -592,32 +652,11 @@ impl Run<'_> {
             .into_iter()
             .flatten()
             .collect();
-        if partials.is_empty() {
-            return crate::execute(node, srcs);
-        }
-        let state = crate::column_bytes(
-            partials
-                .iter()
-                .flat_map(|p| p.group_columns.iter().chain(p.states.iter().flatten())),
-        ) as usize;
-        self.over_budget(state, "the chunked aggregate does not spill")?;
-        let out = self
-            .pool
-            .install(|| combine_and_finalize(&partials, group_keys, aggregates))?;
-        if let Some(m) = meter {
-            if let Some(compiled) = jit.get() {
-                m.note_backend(m.id(node), compiled.backend_tag());
-            }
-            m.breaker(
-                m.id(node),
-                rows_in.into_inner(),
-                0,
-                state as u64,
-                &out,
-                t.elapsed().as_nanos() as u64,
-            );
-        }
-        Ok(out)
+        Ok(Folded {
+            partials,
+            rows_in: rows_in.into_inner(),
+            jit,
+        })
     }
 
     /// Run each unit range through the spine on the worker that reads it; keep the rows in order.

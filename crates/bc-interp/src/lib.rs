@@ -53,7 +53,8 @@ pub use par::{
     auto_width, execute_parallel, execute_parallel_with, execute_parallel_with_metrics, ExecOptions,
 };
 pub use stream::chunked::{
-    chunkable, execute_chunked, execute_units, execute_units_metered, NextChunk,
+    chunkable, execute_chunked, execute_units, execute_units_metered, partial_aggregate_units,
+    NextChunk,
 };
 pub use stream::UnitSource;
 pub use stream::{

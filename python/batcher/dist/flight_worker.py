@@ -726,6 +726,7 @@ try:
             nat = engine()
             from batcher.dist.executors.partition_io import (
                 iter_partition_descriptor,
+                native_partial_aggregate,
                 streaming_partial_aggregate,
             )
 
@@ -739,17 +740,23 @@ try:
             # a time, so the map side never materializes the whole partition or its whole
             # mapped output — the #1 distributed memory peak. Mergeable: the folded
             # per-chunk partials equal one partial over the whole partition.
-            partial = streaming_partial_aggregate(
-                nat,
-                map_ir,
-                gk,
-                aj,
-                iter_partition_descriptor(partition),
-                self._map_config,
-                # The buffer the driver drains after its barrier. Without it this map side
-                # measured every chunk and discarded all of it.
-                on_metrics=self._metrics.append,
+            # A Parquet partition is read and folded by the engine's own workers in one call;
+            # anything else, or a prefix the engine cannot stream, takes the chunked fold.
+            partial = native_partial_aggregate(
+                nat, map_ir, gk, aj, partition, self._map_config, on_metrics=self._metrics.append
             )
+            if partial is None:
+                partial = streaming_partial_aggregate(
+                    nat,
+                    map_ir,
+                    gk,
+                    aj,
+                    iter_partition_descriptor(partition),
+                    self._map_config,
+                    # The buffer the driver drains after its barrier. Without it this map side
+                    # measured every chunk and discarded all of it.
+                    on_metrics=self._metrics.append,
+                )
             if n_keys == 0:
                 buckets = [[partial]]
             else:

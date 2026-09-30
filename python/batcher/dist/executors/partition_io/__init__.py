@@ -51,6 +51,7 @@ from batcher.dist.executors.partition_io.assignment import (
     has_affinity,
 )
 from batcher.dist.executors.partition_io.folds import (
+    native_partial_aggregate,
     streaming_map_buckets,
     streaming_partial_aggregate,
     streaming_topn,
@@ -81,6 +82,7 @@ __all__ = [
     "iter_partition_descriptor",
     "materialize_reduce_output",
     "merge_boundaries",
+    "native_partial_aggregate",
     "partition_descriptors",
     "plan_hot_split",
     "range_partitionable",

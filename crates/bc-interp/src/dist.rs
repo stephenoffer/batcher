@@ -149,7 +149,7 @@ fn agg_widths(aggregates: &[AggregateItem]) -> Vec<usize> {
 /// unifies them, and fatal to anything that pools the batches this returns under one schema
 /// -- a shuffle file, a checkpoint that writes a spilled and a resident state as one IPC
 /// file. So the batch that crosses the process boundary is widened, once per group.
-fn partial_to_batch(
+pub(crate) fn partial_to_batch(
     group_keys: &[ProjectionItem],
     aggregates: &[AggregateItem],
     partial: &agg::Partial,

@@ -13,10 +13,82 @@ chunk-by-chunk, and combine-of-per-chunk-states equals one state over the whole 
 
 from __future__ import annotations
 
+import pyarrow as pa
+
 from batcher.config.env import env_int
 from batcher.plan.types import retained_bytes
 
 _FOLD_CHUNK_BYTES = env_int("BATCHER_FOLD_CHUNK_BYTES", 256 << 20, floor=1 << 20)
+
+
+def native_partial_aggregate(nat, map_ir, gk, aj, partition, engine_config, on_metrics=None):
+    """The map-side partial of a Parquet row-group partition, read and folded by the engine.
+
+    `streaming_partial_aggregate` below drives the fold from Python: each chunk is decoded,
+    handed back, mapped (every mapped row crossing the FFI), aggregated and combined in three
+    native calls, and reading overlaps computing only through a read-ahead queue. On TPC-H at
+    SF1000 that held a 16-core worker at 57% with its reads served from memory. Here the
+    engine's own workers read the row groups, run the map prefix and fold, all in one call
+    (`bc_interp::partial_aggregate_units`), and return the same partial-state batch.
+
+    Taken only for a split manifest of plain Parquet row groups, the shape the native reader
+    serves in `scan_read`; returns None for anything else, or when the engine cannot stream
+    the prefix, and the caller folds the partition the old way.
+
+    Args:
+        nat: The engine module.
+        map_ir: The map prefix's IR, scanning source 0.
+        gk: The group keys' JSON.
+        aj: The aggregates' JSON.
+        partition: The partition descriptor (`partition_descriptors`).
+        engine_config: The engine config JSON.
+        on_metrics: Receives the map prefix's metrics document, as the streaming fold's does.
+
+    Returns:
+        The partial-state batch, or None to fall back.
+    """
+    import json
+
+    from batcher._internal.logging import note_suppressed
+    from batcher.config import active_config
+    from batcher.dist.executors.scan_read import _native_uri
+    from batcher.io.formats.structured._parquet_native import native_read_batch
+    from batcher.io.predicate import to_native_predicate
+    from batcher.io.splits import RowGroupSplit
+
+    splits = partition.get("splits")
+    if not splits or not all(type(s) is RowGroupSplit for s in splits):
+        return None
+    if not hasattr(nat, "partial_aggregate_parquet"):
+        return None
+    projection = partition.get("projection")
+    cols = list(projection) if projection is not None else None
+    try:
+        schema = splits[0].schema()
+        if cols is not None:
+            schema = pa.schema([schema.field(c) for c in cols])
+        carrier = pa.RecordBatch.from_pylist([], schema=schema)
+        predicate = partition.get("predicate")
+        native = to_native_predicate(predicate) if predicate is not None else None
+        batch = native_read_batch(schema, None, ceiling=active_config().execution.morsel_rows)
+        units = [(_native_uri(s.path), rg) for s in splits for rg in s.row_groups]
+        partial, metrics = nat.partial_aggregate_parquet(
+            map_ir,
+            gk,
+            aj,
+            [carrier],
+            units,
+            cols,
+            json.dumps(native) if native is not None else None,
+            batch,
+            engine_config,
+        )
+    except Exception as exc:  # the streaming fold reads the partition instead
+        note_suppressed("dist", "fold a Parquet partition in the engine", exc)
+        return None
+    if on_metrics is not None and metrics:
+        on_metrics(metrics)
+    return partial
 
 
 def streaming_partial_aggregate(

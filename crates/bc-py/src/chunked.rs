@@ -225,3 +225,101 @@ pub(crate) fn execute_plan_parquet(
         metrics.to_json(),
     ))
 }
+
+/// The map side of a distributed aggregate over Parquet row groups, read by the engine's workers.
+///
+/// `units` are the partition's `(uri, row group)` pairs; `map_json` is the breaker-free map
+/// prefix over source 0, and `carrier` its zero-row schema batch. Each worker reads a contiguous
+/// range of the units one at a time, runs the prefix and folds the rows into its own partial
+/// (`bc_interp::partial_aggregate_units`), so decoding overlaps computing across the pool and
+/// no mapped row crosses into Python. Returns the partial-state batch `partial_aggregate`
+/// returns for the same rows -- the reducers cannot tell the paths apart -- and the map
+/// prefix's per-operator metrics document, numbered as the map plan is.
+///
+/// Raises the engine's not-chunkable error for a prefix the unit executor cannot stream; the
+/// caller then reads the partition itself.
+#[pyfunction]
+#[pyo3(signature = (map_json, group_keys_json, aggregates_json, carrier, units, columns=None, predicate=None, batch_size=65536, engine_config=""))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn partial_aggregate_parquet(
+    py: Python<'_>,
+    map_json: &str,
+    group_keys_json: &str,
+    aggregates_json: &str,
+    carrier: Vec<PyArrowType<RecordBatch>>,
+    units: Vec<(String, usize)>,
+    columns: Option<Vec<String>>,
+    predicate: Option<String>,
+    batch_size: usize,
+    engine_config: &str,
+) -> PyResult<(PyArrowType<RecordBatch>, String)> {
+    let group_keys = crate::normalize::parse_group_keys(group_keys_json)?;
+    let aggregates = crate::normalize::parse_aggregates(aggregates_json)?;
+    let ExecSetup {
+        plan,
+        sources,
+        opts,
+        ..
+    } = prepare_exec(map_json, vec![carrier], engine_config, None)?;
+    // As `execute_plan_parquet`: every usable core, since each worker mostly decodes.
+    let workers = if opts.parallelism > 0 {
+        opts.parallelism
+    } else {
+        bc_arrow::usable_cores().max(1)
+    };
+    // The files once each, in first-seen order, and each unit as (file index, row group).
+    let mut uris: Vec<String> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let pairs: Vec<(usize, usize)> = units
+        .into_iter()
+        .map(|(uri, rg)| {
+            let file = *index.entry(uri.clone()).or_insert_with(|| {
+                uris.push(uri);
+                uris.len() - 1
+            });
+            (file, rg)
+        })
+        .collect();
+    let out = py.detach(|| {
+        // Footer row counts (cached by the reader), for the fold's size hints.
+        let counts: std::collections::HashMap<(usize, usize), usize> =
+            bc_io::parquet_row_groups(&uris)
+                .map_err(|e| bc_interp::InterpError::ChunkSource(e.to_string()))?
+                .into_iter()
+                .map(|(file, rg, n)| ((file, rg), n))
+                .collect();
+        let rows = pairs.iter().filter_map(|u| counts.get(u)).sum();
+        let src = ParquetUnits {
+            uris: &uris,
+            columns: columns.as_deref(),
+            predicate: predicate.as_deref(),
+            batch_size: batch_size.max(1),
+            units: pairs,
+            rows,
+        };
+        bc_interp::partial_aggregate_units(
+            &plan,
+            &group_keys,
+            &aggregates,
+            &sources,
+            0,
+            &src,
+            workers,
+            &opts,
+        )
+    });
+    let (batch, metrics) = out.map_err(errors::interp_to_pyerr)?;
+    Ok((
+        PyArrowType(crate::normalize::rebase_batch(batch)),
+        metrics.to_json(),
+    ))
+}
+
+/// Register this module's entry points on the extension module.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(execute_plan_chunked, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_chunkable, m)?)?;
+    m.add_function(wrap_pyfunction!(execute_plan_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(partial_aggregate_parquet, m)?)?;
+    Ok(())
+}

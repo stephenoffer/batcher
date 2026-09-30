@@ -753,9 +753,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parquet_file_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_aggregated, m)?)?;
-    m.add_function(wrap_pyfunction!(chunked::execute_plan_chunked, m)?)?;
-    m.add_function(wrap_pyfunction!(chunked::plan_chunkable, m)?)?;
-    m.add_function(wrap_pyfunction!(chunked::execute_plan_parquet, m)?)?;
+    chunked::register(m)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
     // The shuffle surface registers itself, because it is the one family that grows a pair of
