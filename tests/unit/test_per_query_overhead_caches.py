@@ -78,6 +78,23 @@ def test_a_held_descriptor_that_fails_is_dropped_and_the_file_reopened(tmp_path,
     assert sysfs.read_live_text(str(path)) is None
 
 
+def test_a_replaced_open_is_honored_for_kernel_paths(monkeypatch):
+    """A fake `/sys` installed by replacing `open` must still be what the probes read."""
+    import builtins
+    import io
+
+    fake = {"/sys/fs/cgroup/memory.current": "12345\n"}
+
+    def opener(path, *args, **kwargs):
+        if path in fake:
+            return io.StringIO(fake[path])
+        raise OSError(path)
+
+    monkeypatch.setattr(builtins, "open", opener)
+    assert sysfs.read_live_text("/sys/fs/cgroup/memory.current") == "12345\n"
+    assert sysfs.read_live_text("/sys/fs/cgroup/no.such.file") is None
+
+
 @pytest.mark.skipif(not os.path.exists("/proc/self/statm"), reason="needs Linux /proc")
 def test_the_post_fork_hook_closes_and_forgets_every_held_descriptor():
     """`register_at_fork(after_in_child=...)` runs this in a child, which re-opens its own."""
