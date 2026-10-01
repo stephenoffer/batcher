@@ -69,6 +69,27 @@ pub(crate) fn fill<T: Copy>(values: &[T], test: impl Fn(T) -> bool) -> BooleanBu
     BooleanBuffer::new(words.into(), 0, n)
 }
 
+/// [`fill`] over the indices `0..n`, for a test that reads more than one value per row (a
+/// string's two offsets, say).
+#[inline(always)]
+pub(crate) fn fill_indexed(n: usize, test: impl Fn(usize) -> bool) -> BooleanBuffer {
+    let mut words = Vec::with_capacity(n.div_ceil(64));
+    let mut bytes = [0u8; 64];
+    let mut base = 0;
+    while base < n {
+        let take = (n - base).min(64);
+        if take < 64 {
+            bytes = [0u8; 64];
+        }
+        for (k, b) in bytes[..take].iter_mut().enumerate() {
+            *b = u8::from(test(base + k));
+        }
+        words.push(pack(&bytes));
+        base += 64;
+    }
+    BooleanBuffer::new(words.into(), 0, n)
+}
+
 /// Sixty-four 0/1 bytes as one word, byte `i` to bit `i` -- see [`fill`].
 #[inline(always)]
 fn pack(bytes: &[u8; 64]) -> u64 {

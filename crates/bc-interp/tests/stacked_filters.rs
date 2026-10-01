@@ -12,8 +12,8 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use bc_interp::{
-    execute, execute_parallel, execute_parallel_with_metrics, execute_streaming,
-    execute_streaming_metered, execute_streaming_parallel, ExecOptions,
+    execute, execute_parallel, execute_parallel_with, execute_parallel_with_metrics,
+    execute_streaming, execute_streaming_metered, execute_streaming_parallel, ExecOptions,
 };
 use bc_ir::RelOp;
 
@@ -76,6 +76,16 @@ fn filter(input: &str, predicate: &str) -> String {
 
 const SCAN: &str = r#"{"op":"scan","source_id":0}"#;
 
+/// The parallel executor as the control plane runs it: with linear-chain fusion on
+/// (`ExecutionConfig.fuse_linear` defaults to true), which is the path `run_chain` serves.
+/// `ExecOptions::default()` leaves it off, and a test using that never reaches the code.
+fn fused() -> ExecOptions {
+    ExecOptions {
+        fuse_linear: true,
+        ..ExecOptions::default()
+    }
+}
+
 /// Same rows in the same order as the oracle, from the parallel executor and both streaming
 /// executors (the sequential one, and the one that shards the scan across four workers).
 fn assert_matches_oracle(json: &str) {
@@ -84,6 +94,10 @@ fn assert_matches_oracle(json: &str) {
     let want = rows(&execute(&p, &src).expect("oracle"));
     let runs = [
         ("parallel", execute_parallel(&p, &src).expect("parallel")),
+        (
+            "parallel-fused",
+            execute_parallel_with(&p, &src, &fused()).expect("parallel-fused"),
+        ),
         (
             "streaming",
             execute_streaming(&p, &src, 0).expect("streaming"),
@@ -149,8 +163,8 @@ fn an_outer_predicate_that_can_fail_never_sees_a_removed_row() {
 #[test]
 fn each_stacked_filter_reports_its_own_row_count() {
     let json = filter(&filter(SCAN, &cmp("lt", "k", 50)), &cmp("ge", "v", 100_000));
-    let (_, par) = execute_parallel_with_metrics(&plan(&json), &[facts()], &ExecOptions::default())
-        .expect("parallel");
+    let (_, par) =
+        execute_parallel_with_metrics(&plan(&json), &[facts()], &fused()).expect("parallel");
     let (_, streamed) = execute_streaming_metered(&plan(&json), &[facts()], 0).expect("stream");
     let count = |json: &str| -> u64 {
         execute(&plan(json), &[facts()])
@@ -196,6 +210,7 @@ fn stacked_filters_under_an_aggregate_match_the_oracle() {
     assert!(!want.is_empty());
     for got in [
         execute_parallel(&p, &src).expect("parallel"),
+        execute_parallel_with(&p, &src, &fused()).expect("parallel-fused"),
         execute_streaming_parallel(&p, &src, 4, 0, None).expect("streaming-parallel"),
     ] {
         let mut got = rows(&got);

@@ -15,7 +15,7 @@ mod string;
 
 pub(crate) use nested::{eval_nested_cmp, is_nested};
 pub(crate) use prim::{
-    bool_scalar_cmp, fill, float_scalar_cmp, int_scalar_cmp, is_range_pair, mirror_cmp,
-    try_prim_range,
+    bool_scalar_cmp, fill, fill_indexed, float_scalar_cmp, int_scalar_cmp, is_range_pair,
+    mirror_cmp, try_prim_range,
 };
-pub(crate) use string::{string_scalar_cmp, try_string_range};
+pub(crate) use string::{starts_with_short, string_scalar_cmp, try_string_range};

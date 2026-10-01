@@ -3228,8 +3228,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/cast.rs` | 707 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/cmp/mod.rs` | 21 | Comparison kernels beside the generic one: typed fast paths, and the nested path. |
 | `eval/cmp/nested.rs` | 97 | `=`, `<>`, `<`, `<=`, `>`, `>=` over lists, structs and maps. |
-| `eval/cmp/prim.rs` | 501 | `<integer or temporal column> <cmp> <literal>`, and a two-sided range over one column, a word of mask bits at a time. |
-| `eval/cmp/string.rs` | 351 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
+| `eval/cmp/prim.rs` | 522 | `<integer or temporal column> <cmp> <literal>`, and a two-sided range over one column, a word of mask bits at a time. |
+| `eval/cmp/string.rs` | 409 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
 | `eval/dispatch.rs` | 525 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
@@ -3298,7 +3298,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/html.rs` | 171 | `strip_html`: recover the readable text of an HTML document. |
 | `eval/str/jaro.rs` | 82 | Jaro and Jaro-Winkler string similarity (the `.str.jaro`/`.str.jaro_winkler` funcs). |
 | `eval/str/json.rs` | 795 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
-| `eval/str/like.rs` | 274 | Fast SQL `LIKE` / substring matching. |
+| `eval/str/like.rs` | 277 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 137 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
 | `eval/str/mod.rs` | 1894 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/numfmt.rs` | 178 | String functions whose input is a **number**, not a string. |
