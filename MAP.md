@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1554 Python modules across 220 packages and 317 Rust files across 14 crates.
+Covering 1554 Python modules across 220 packages and 319 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -3078,7 +3078,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 578 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1792 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1843 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -3091,7 +3091,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 746 | Single-node parallel full sort by **sample-sort**. |
 | `ops/window_stream.rs` | 687 | Bounded-memory window execution for a partition that does not fit the envelope. |
-| `par.rs` | 3598 | The multi-core executor. |
+| `par.rs` | 3645 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 631 | The breakers: operators that must see all of their input before they can emit any output. |
@@ -3102,11 +3102,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/chunked/units.rs` | 34 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |
-| `stream/meter.rs` | 376 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 795 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/meter.rs` | 403 | Per-operator metrics for the streaming executor. |
+| `stream/mod.rs` | 780 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
 | `stream/parallel.rs` | 1604 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
-| `stream/pipeline.rs` | 181 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
+| `stream/pipeline.rs` | 280 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 510 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `stream/union_all.rs` | 114 | `UNION ALL` as a pipeline operator: yield each branch's morsels in turn, hold none of them. |
@@ -3217,18 +3217,19 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `analyze.rs` | 526 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
+| `analyze.rs` | 532 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 174 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 786 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
-| `eval/branch/case.rs` | 71 | `CASE`: the first branch whose condition holds supplies the row's value. |
-| `eval/branch/coalesce.rs` | 76 | `COALESCE`: the first argument with a value supplies the row's value. |
+| `eval/binary.rs` | 721 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/branch/case.rs` | 101 | `CASE`: the first branch whose condition holds supplies the row's value. |
+| `eval/branch/coalesce.rs` | 133 | `COALESCE`: the first argument with a value supplies the row's value. |
 | `eval/branch/literal_case.rs` | 181 | A `CASE` whose arms are all literals, built in one pass instead of one array per arm. |
 | `eval/branch/mod.rs` | 148 | Short-circuiting evaluation of the branch-selecting forms: `CASE` and `COALESCE`. |
-| `eval/branch/nullif.rs` | 33 | `NULLIF(left, right)`: `left`, except null wherever `left = right`. |
-| `eval/cast.rs` | 612 | `cast` evaluation with DuckDB float→int rounding semantics. |
-| `eval/cmp/mod.rs` | 16 | Comparison kernels beside the generic one: typed fast paths, and the nested path. |
+| `eval/branch/nullif.rs` | 54 | `NULLIF(left, right)`: `left`, except null wherever `left = right`. |
+| `eval/cast.rs` | 707 | `cast` evaluation with DuckDB float→int rounding semantics. |
+| `eval/cmp/mod.rs` | 21 | Comparison kernels beside the generic one: typed fast paths, and the nested path. |
 | `eval/cmp/nested.rs` | 97 | `=`, `<>`, `<`, `<=`, `>`, `>=` over lists, structs and maps. |
-| `eval/cmp/string.rs` | 318 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
+| `eval/cmp/prim.rs` | 501 | `<integer or temporal column> <cmp> <literal>`, and a two-sided range over one column, a word of mask bits at a time. |
+| `eval/cmp/string.rs` | 351 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
 | `eval/dispatch.rs` | 525 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
@@ -3240,7 +3241,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/geo/scalar.rs` | 328 | The scalar-returning geospatial functions: accessors, measures, predicates, codecs. |
 | `eval/hash/compat.rs` | 393 | Engine-compatible digests for `Expr::Hash` — Spark's `hash`, Iceberg's bucket hash, and Daft's default XXH3. |
 | `eval/hash/mod.rs` | 232 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
-| `eval/in_list.rs` | 271 | `x IN (lit, lit, …)` — hash-set membership. |
+| `eval/in_list.rs` | 408 | `x IN (lit, lit, …)` — hash-set membership. |
 | `eval/list.rs` | 791 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 161 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
 | `eval/list_ops/gather.rs` | 175 | `list.gather` — reorder or select from a list by a second list of indices. |
@@ -3288,6 +3289,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/seq/translate.rs` | 91 | Codon translation — DNA/RNA to protein, NCBI genetic code table 1 (the standard code). |
 | `eval/spatial/apply.rs` | 189 | One row of a rigid-body function: numbers in, one number out. |
 | `eval/spatial/mod.rs` | 162 | Evaluation of the `Expr::Spatial` variant — the array-level half of rigid-body support. |
+| `eval/str/ascii/mod.rs` | 112 | Whole-column string kernels for the case where every byte a column holds is ASCII. |
 | `eval/str/case.rs` | 272 | Case conversion for `StrFunc::ToCase`, and the SQuAD normalization every text metric runs first. |
 | `eval/str/chunk.rs` | 182 | `StrFunc::Chunk` — overlapping text windows (the RAG document splitter). |
 | `eval/str/compress.rs` | 144 | Byte-stream compression for `StrFunc::Compress`/`Decompress` — six codecs, one shape. |
@@ -3298,7 +3300,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/json.rs` | 795 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 274 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 137 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1895 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1894 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/numfmt.rs` | 178 | String functions whose input is a **number**, not a string. |
 | `eval/str/quality/builders.rs` | 27 | Shared column builders for the text-quality measures. |
 | `eval/str/quality/entropy.rs` | 49 | Character-distribution entropy — deliberately *not* one of Gopher's rules. |
@@ -3306,14 +3308,14 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/quality/mod.rs` | 33 | Per-document text-quality measures — the LLM pretraining-corpus filters. |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
-| `eval/temporal/civil.rs` | 193 | Calendar field extraction as integer arithmetic, for the date parts a query groups by. |
+| `eval/temporal/civil.rs` | 232 | Calendar field extraction as integer arithmetic, for the date parts a query groups by. |
 | `eval/temporal/date.rs` | 689 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 161 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 18 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/text.rs` | 232 | Text ↔ instant: `strftime` renders one, `strptime` reads one back. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
 | `lib.rs` | 2676 | `bc-expr` — scalar expression IR and its evaluation. |
-| `select.rs` | 299 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
+| `select.rs` | 430 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 | `subset.rs` | 186 | Evaluating an expression over a *subset* of a batch's rows, and putting the answer back where it came from. |
 | `supertype.rs` | 207 | The common-supertype lattice over Arrow types — one answer for every tier. |
 
