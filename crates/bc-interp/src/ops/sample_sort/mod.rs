@@ -400,6 +400,32 @@ fn gather_ranges(
                 .iter()
                 .map(|a| take(a.as_ref(), &take_idx, None))
                 .collect::<Result<_, _>>()?;
+            // The output is the keys alone, so the sorted keys *are* the range's answer: sort
+            // the values themselves and skip the permutation (`radix_sort::sorted_values`, and
+            // its multi-key twin `packed_multi_sorted_values`).
+            if reuse_all {
+                let sorted = match keys {
+                    [key] => super::radix_sort::sorted_values(
+                        &range_keys[0],
+                        arrow::compute::SortOptions {
+                            descending: key.descending,
+                            nulls_first: key.nulls_first,
+                        },
+                    )
+                    .map(|col| vec![col]),
+                    _ => super::radix_sort::packed_multi_sorted_values(
+                        &range_keys,
+                        &super::sort_options(keys),
+                    ),
+                };
+                if let Some(sorted) = sorted {
+                    let columns = reuse
+                        .iter()
+                        .map(|m| sorted[m.expect("all-or-nothing gate")].clone())
+                        .collect();
+                    return Ok(RecordBatch::try_new(batch.schema(), columns)?);
+                }
+            }
             let local = super::sort_indices_of(&range_keys, keys)?;
             if !reuse_all {
                 let global: Vec<u32> = local.values().iter().map(|&l| idx[l as usize]).collect();

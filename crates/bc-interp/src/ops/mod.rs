@@ -1040,6 +1040,7 @@ fn top_k_single_key(
     values: &ArrayRef,
     opts: SortOptions,
     k: usize,
+    bound: &RankBound,
 ) -> Option<arrow::array::UInt32Array> {
     use arrow::array::UInt32Array;
     if k == 0 {
@@ -1058,8 +1059,8 @@ fn top_k_single_key(
     let live: Vec<u32> = if live_k == 0 {
         Vec::new()
     } else {
-        radix_sort::top_k_live(values, opts.descending, live_k)
-            .or_else(|| byte_sort::top_k_live(values, opts.descending, live_k))?
+        radix_sort::top_k_live(values, opts.descending, live_k, bound)
+            .or_else(|| byte_sort::top_k_live(values, opts.descending, live_k, bound))?
     };
     if null_count == 0 {
         return Some(UInt32Array::from(live));
@@ -1088,6 +1089,42 @@ fn top_k_single_key(
     Some(UInt32Array::from(out))
 }
 
+/// A rank that at least `k` rows of a top-N are already known to reach, shared by the workers
+/// selecting its morsels.
+///
+/// The rank is the leading key's order-preserving `u64` as the selections compute it — the
+/// radix rank of a fixed-width key, or the packed 8-byte prefix of a byte key, inverted for
+/// `DESC`, with nulls placed by the caller. Both are monotone in the key: a strictly larger rank
+/// proves a strictly worse key. So once `k` rows rank at or below `v`, a row ranking strictly
+/// above `v` is worse on the leading key than each of them, and therefore worse overall whatever
+/// the later keys say; it cannot be in the answer, and every selection may skip it. Ties are never
+/// skipped (the test is strict), so the input-order tie-break is untouched.
+///
+/// The bound only tightens (`fetch_min`), so a stale read skips less and never wrongly: this
+/// needs no lock. Where `TopNBound` drops a whole morsel by its key range, which uniformly
+/// random data never allows, this works per row — and its main effect is downstream: a morsel
+/// selected after the bound is established contributes the handful of rows that can still win
+/// rather than its own `k`, which is what the serial merge of every morsel's candidates sorts.
+/// An unpublished bound is `u64::MAX`, which skips nothing.
+pub(crate) struct RankBound(std::sync::atomic::AtomicU64);
+
+impl RankBound {
+    /// A bound that excludes nothing yet.
+    pub(crate) fn unbounded() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(u64::MAX))
+    }
+
+    /// The tightest rank published so far.
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that at least `k` rows rank at or below `v`.
+    pub(crate) fn publish(&self, v: u64) {
+        self.0.fetch_min(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The `k` smallest-ranking live row indices, ordered by rank then by input position.
 ///
 /// `rank` maps a row to an order-preserving `u64` — smaller ranks come first, which is what the
@@ -1098,7 +1135,10 @@ fn top_k_single_key(
 /// against the current worst and nothing else. Ties break toward the earlier row because the scan
 /// runs in input order and only a *strictly* better entry displaces the worst — which is exactly
 /// the stable sort's tie order.
-fn heap_select_k<F>(n: usize, nulls: Option<&NullBuffer>, k: usize, rank: F) -> Vec<u32>
+///
+/// Rows ranking strictly above `limit` are skipped as if absent — the shared [`RankBound`], which
+/// proves no such row can reach the answer. `u64::MAX` skips nothing.
+fn heap_select_k<F>(n: usize, nulls: Option<&NullBuffer>, k: usize, limit: u64, rank: F) -> Vec<u32>
 where
     F: Fn(usize) -> u64,
 {
@@ -1107,7 +1147,9 @@ where
     macro_rules! consider {
         ($i:expr) => {{
             let entry = (rank($i), $i as u32);
-            if heap.len() < k {
+            if entry.0 > limit {
+                // Strictly worse than a rank `k` rows elsewhere already reach: see `RankBound`.
+            } else if heap.len() < k {
                 heap.push(entry);
             } else if entry < *heap.peek().expect("k >= 1, so the heap is non-empty") {
                 heap.pop();
@@ -1155,6 +1197,7 @@ fn top_k_indices_of(
     keys: &[SortKey],
     num_rows: usize,
     k: usize,
+    bound: &RankBound,
 ) -> Result<arrow::array::UInt32Array, InterpError> {
     use arrow::array::UInt32Array;
     // A single key first tries the bounded-heap **selection**, which reads each key once and
@@ -1181,10 +1224,10 @@ fn top_k_indices_of(
                 descending: keys[0].descending,
                 nulls_first: keys[0].nulls_first,
             };
-            if let Some(sel) = top_k_single_key(&key_arrays[0], opts, k) {
+            if let Some(sel) = top_k_single_key(&key_arrays[0], opts, k, bound) {
                 return Ok(sel);
             }
-        } else if let Some(sel) = top_k_by_leading_key(key_arrays, keys, num_rows, k)? {
+        } else if let Some(sel) = top_k_by_leading_key(key_arrays, keys, num_rows, k, bound)? {
             return Ok(sel);
         }
     }
@@ -1304,6 +1347,7 @@ fn top_k_by_leading_key(
     keys: &[SortKey],
     num_rows: usize,
     k: usize,
+    bound: &RankBound,
 ) -> Result<Option<arrow::array::UInt32Array>, InterpError> {
     use arrow::array::UInt32Array;
     let lead = &key_arrays[0];
@@ -1327,11 +1371,17 @@ fn top_k_by_leading_key(
             }
         }
     }
-    let seeds = heap_select_k(num_rows, None, k, |i| ranks[i]);
+    let seeds = heap_select_k(num_rows, None, k, bound.get(), |i| ranks[i]);
     let Some(&last) = seeds.last() else {
         return Ok(Some(UInt32Array::from(Vec::<u32>::new())));
     };
     let threshold = ranks[last as usize];
+    // Fewer than `k` seeds means the bound already excluded every other row, and the seeds —
+    // all at or below `threshold` — are then exactly the rows the scan below collects. A full
+    // heap is `k` rows at or below `threshold`, which is the claim the bound records.
+    if seeds.len() == k {
+        bound.publish(threshold);
+    }
     // The same budget the string prefix uses, and for the same reason: a leading key with heavy
     // ties at the threshold — a boolean, a status column, a `COUNT(*)` where most counts are 1 —
     // narrows nothing, and paying for the attempt *and* the quickselect is the one outcome worth
@@ -1431,6 +1481,10 @@ pub(crate) fn parallel_top_n(
     // `bc_runtime::topn` owns the soundness argument; the bound only ever tightens, so a stale
     // read costs a missed skip and never a wrong answer.
     let bound = bc_runtime::topn::TopNBound::new(keys[0].descending);
+    // The per-row twin of `bound`: a rank `k` rows are known to reach, so a later morsel's
+    // selection skips every row strictly worse — and, more to the point, hands the merge below
+    // only the rows that can still win instead of its own `k`. See `RankBound`.
+    let rank_bound = RankBound::unbounded();
     // Per morsel (parallel): its ≤k local top-k indices, and the key columns gathered to those
     // rows — narrow (only the ORDER BY expressions), never the payload. `None` for a morsel the
     // bound excluded.
@@ -1454,7 +1508,7 @@ pub(crate) fn parallel_top_n(
                 }
             }
 
-            let idx = top_k_indices_of(&key_arrays, keys, b.num_rows(), k)?;
+            let idx = top_k_indices_of(&key_arrays, keys, b.num_rows(), k, &rank_bound)?;
             let key_cols = key_arrays
                 .iter()
                 .map(|col| Ok(bc_runtime::gather::take_column(col.as_ref(), &idx)?))
@@ -2019,6 +2073,58 @@ mod sort_tests {
         }
     }
 
+    /// `SELECT k ORDER BY k`: every output column *is* the key, so each range sorts the values
+    /// themselves instead of a permutation (`radix_sort::sorted_values`). The output must be the
+    /// serial sort's column exactly — values, null positions and type — for a float and an
+    /// integer key, in every direction, including a key the canonicalization rewrites (`-0.0`),
+    /// which must keep the permutation path, and a key output twice.
+    #[test]
+    fn a_key_only_parallel_sort_matches_the_serial_sort_exactly() {
+        let n = 200_000usize;
+        let flt = |neg_zero: bool| -> ArrayRef {
+            Arc::new(Float64Array::from_iter((0..n).map(|i| {
+                (i % 101 != 0).then_some(if neg_zero && i % 7 == 0 {
+                    -0.0
+                } else {
+                    ((i * 7919) % 9_000) as f64 / 4.0 - 100.0
+                })
+            })))
+        };
+        let int: ArrayRef =
+            Arc::new(Int64Array::from_iter((0..n as i64).map(|i| {
+                (i % 89 != 0).then_some((i * 104_729) % 50_000 - 20_000)
+            })));
+        for (col, twice) in [(flt(false), false), (flt(true), false), (int, true)] {
+            let mut fields = vec![("k", col.clone())];
+            if twice {
+                fields.push(("k2", col.clone()));
+            }
+            let batch = RecordBatch::try_from_iter(fields).unwrap();
+            for descending in [false, true] {
+                for nulls_first in [false, true] {
+                    let keys = vec![SortKey {
+                        expr: Expr::Col { name: "k".into() },
+                        descending,
+                        nulls_first,
+                    }];
+                    let want = sort_batch(&batch, &keys, None).unwrap();
+                    let pieces = parallel_sort_batch(&batch, &keys, None)
+                        .unwrap()
+                        .expect("large enough to run in parallel");
+                    let got = materialize(&pieces).unwrap();
+                    for c in 0..batch.num_columns() {
+                        assert_eq!(
+                            got.column(c).to_data(),
+                            want.column(c).to_data(),
+                            "col {c} desc={descending} nf={nulls_first} {:?}",
+                            col.data_type()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Single integer key and a two-key (int leading) sort — the integer / multi-key
     /// generalization of the float sample-sort. Same invariant: identical key-column
     /// sequence and row multiset vs the serial sort.
@@ -2296,6 +2402,99 @@ mod sort_tests {
                             ea.value(r),
                             "row {r} k={k} desc={descending} nf={nulls_first}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The shared [`RankBound`] must never change which rows a top-N keeps, or their order.
+    ///
+    /// Many small parts, so that the bound is established after the first few and then prunes
+    /// the rest — run on **one** worker as well, where the parts are selected in order and every
+    /// later one is guaranteed to see a tight bound, so the pruning path is certain to run rather
+    /// than merely likely. Each leading key type the selections rank (byte prefix, integer radix,
+    /// float radix) is crossed with a second key, both directions and both null placements, and
+    /// the leading key ties heavily *at* the cut-off, which is where a non-strict skip would drop
+    /// a row the answer needs. The payload column names every row, so order is compared exactly.
+    #[test]
+    fn the_rank_bound_never_changes_the_answer() {
+        use arrow::array::StringArray;
+        let n = 24_000usize;
+        let s: Vec<Option<String>> = (0..n)
+            .map(|i| match i % 41 {
+                0 => None,
+                1 => Some("a-shared-prefix-1".to_string()),
+                2 => Some("a-shared-prefix-0".to_string()),
+                _ => Some(format!("v{:03}", (i * 7) % 300)),
+            })
+            .collect();
+        let int: Vec<Option<i64>> = (0..n)
+            .map(|i| (i % 37 != 0).then_some(((i * 11) % 500) as i64 - 250))
+            .collect();
+        let flt: Vec<Option<f64>> = (0..n)
+            .map(|i| match i % 53 {
+                0 => None,
+                1 => Some(-0.0),
+                2 => Some(f64::NAN),
+                _ => Some(((i * 3) % 400) as f64 / 4.0 - 50.0),
+            })
+            .collect();
+        let tie: Vec<i64> = (0..n as i64).map(|i| (i * 17) % 5).collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("s", Arc::new(StringArray::from(s)) as ArrayRef),
+            ("i", Arc::new(Int64Array::from(int)) as ArrayRef),
+            ("f", Arc::new(Float64Array::from(flt)) as ArrayRef),
+            ("t", Arc::new(Int64Array::from(tie)) as ArrayRef),
+            (
+                "p",
+                Arc::new(Int64Array::from_iter_values(0..n as i64)) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let parts: Vec<RecordBatch> = (0..n)
+            .step_by(500)
+            .map(|o| batch.slice(o, 500.min(n - o)))
+            .collect();
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let payload = |b: &RecordBatch| -> Vec<i64> {
+            let c = b.column(b.schema().index_of("p").unwrap());
+            c.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        let key = |name: &str, descending: bool, nulls_first: bool| SortKey {
+            expr: Expr::Col { name: name.into() },
+            descending,
+            nulls_first,
+        };
+        for lead in ["s", "i", "f"] {
+            for descending in [false, true] {
+                for nulls_first in [false, true] {
+                    for keys in [
+                        vec![key(lead, descending, nulls_first)],
+                        vec![
+                            key(lead, descending, nulls_first),
+                            key("t", !descending, false),
+                        ],
+                    ] {
+                        for k in [1usize, 7, 60] {
+                            let want = payload(&sort_batch(&batch, &keys, Some(k)).unwrap());
+                            let par = payload(&parallel_top_n(&parts, &keys, k).unwrap());
+                            let serial =
+                                payload(&one.install(|| parallel_top_n(&parts, &keys, k)).unwrap());
+                            let what = format!(
+                                "lead={lead} keys={} k={k} desc={descending} nf={nulls_first}",
+                                keys.len()
+                            );
+                            assert_eq!(par, want, "{what}");
+                            assert_eq!(serial, want, "one worker, {what}");
+                        }
                     }
                 }
             }
@@ -2691,7 +2890,10 @@ mod topn_bound_tests {
                 let mut range_ms = f64::MAX;
                 for _ in 0..20 {
                     let t = std::time::Instant::now();
-                    std::hint::black_box(top_k_indices_of(&key_arrays, &keys, ROWS, k).unwrap());
+                    std::hint::black_box(
+                        top_k_indices_of(&key_arrays, &keys, ROWS, k, &RankBound::unbounded())
+                            .unwrap(),
+                    );
                     select_ms = select_ms.min(t.elapsed().as_secs_f64() * 1e3);
                     let t = std::time::Instant::now();
                     std::hint::black_box(bc_runtime::topn::i64_key_range(&key_arrays[0]));
@@ -2713,7 +2915,9 @@ mod topn_bound_tests {
                             continue;
                         }
                     }
-                    let idx = top_k_indices_of(&ka, &keys, b.num_rows(), k).unwrap();
+                    let idx =
+                        top_k_indices_of(&ka, &keys, b.num_rows(), k, &RankBound::unbounded())
+                            .unwrap();
                     if idx.len() == k {
                         let cand = bc_runtime::gather::take_column(ka[0].as_ref(), &idx).unwrap();
                         if let Some(v) = bound.candidate_bound(&cand) {
@@ -2862,7 +3066,8 @@ mod top_k_selection_tests {
                 };
                 let full = stable_full_sort(&values, opts);
                 for k in 1..=n {
-                    let Some(sel) = top_k_single_key(&values, opts, k) else {
+                    let Some(sel) = top_k_single_key(&values, opts, k, &RankBound::unbounded())
+                    else {
                         continue;
                     };
                     assert_eq!(
@@ -2969,7 +3174,7 @@ mod top_k_selection_tests {
         ));
         let opts = SortOptions::default();
         for k in [1usize, 10, 100] {
-            let sel = top_k_single_key(&values, opts, k)
+            let sel = top_k_single_key(&values, opts, k, &RankBound::unbounded())
                 .expect("a prefix that settles nothing is selected on its bytes instead");
             assert_eq!(sel.values(), &stable_full_sort(&values, opts)[..k], "k={k}");
         }
@@ -2987,7 +3192,8 @@ mod top_k_selection_tests {
                 .collect::<Vec<_>>(),
         ));
         let opts = SortOptions::default();
-        let sel = top_k_single_key(&values, opts, 3).expect("inside the candidate budget");
+        let sel = top_k_single_key(&values, opts, 3, &RankBound::unbounded())
+            .expect("inside the candidate budget");
         assert_eq!(sel.values(), &stable_full_sort(&values, opts)[..3]);
     }
 
@@ -3036,9 +3242,10 @@ mod top_k_selection_tests {
                 let mut full: Vec<u32> = (0..n as u32).collect();
                 full.sort_by(&cmp);
                 for k in [1usize, 10, 137, 2_000] {
-                    let got = top_k_by_leading_key(&key_arrays, &keys, n, k)
-                        .unwrap()
-                        .expect("a 40-value leading key narrows inside the candidate budget");
+                    let got =
+                        top_k_by_leading_key(&key_arrays, &keys, n, k, &RankBound::unbounded())
+                            .unwrap()
+                            .expect("a 40-value leading key narrows inside the candidate budget");
                     assert_eq!(
                         got.values(),
                         &full[..k],
@@ -3070,7 +3277,7 @@ mod top_k_selection_tests {
             })
             .collect();
         assert!(
-            top_k_by_leading_key(&key_arrays, &keys, n, 10)
+            top_k_by_leading_key(&key_arrays, &keys, n, 10, &RankBound::unbounded())
                 .unwrap()
                 .is_none(),
             "a constant leading key must fall back rather than collect every row"
@@ -3090,7 +3297,8 @@ mod top_k_selection_tests {
             top_k_single_key(
                 &(Arc::new(Int64Array::from(vec![Some(1i64), Some(2)])) as ArrayRef),
                 SortOptions::default(),
-                0
+                0,
+                &RankBound::unbounded(),
             )
             .expect("zero rows is a valid selection")
             .len(),
