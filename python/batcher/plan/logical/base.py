@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 __all__ = [
     "LogicalPlan",
     "SortKeySpec",
+    "content_memo_key",
     "memoize_by_content",
     "validate_dedup_keys",
     "validate_key_domains",
@@ -447,3 +448,28 @@ def validate_dedup_keys(node: LogicalPlan, keys, *, operation: str) -> None:
 
     names = tuple(keys) or tuple(node.available_columns())
     validate_key_domains(node, [(_col(n), n) for n in names], operation=operation)
+
+
+def content_memo_key(plan: object) -> str | None:
+    """`plan`'s `content_key` when it is a sound key for a memo by *content*, else `None`.
+
+    An answer read off a plan's structure and schemas alone -- the columns it carries, the
+    widest row it introduces -- is a function of its lowered IR plus each scan's schema, which
+    is exactly what `content_key` hashes. Keying such an answer by content lets a query that is
+    rebuilt for every run (a DataFrame pipeline is a new object each time) hit where an
+    identity memo cannot. Anything the IR does not carry (a scan's `source_key`, which names
+    *which* relation) must not be read by such an answer.
+
+    `None` for an opaque plan (a `map_batches`, which has no IR): its `content_key` is built
+    from the object's address, which is only sound while something holds the object, and a
+    value-keyed memo does not.
+
+    Args:
+        plan: A logical plan, or anything else (which has no content key).
+
+    Returns:
+        The content key, or `None` when the plan cannot be keyed by content.
+    """
+    if not isinstance(plan, LogicalPlan) or plan.ir_json() is None:
+        return None
+    return plan.content_key()

@@ -17,7 +17,7 @@ import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.logging import note_suppressed
-from batcher._internal.registry import MISSING, IdentityMemo
+from batcher._internal.registry import MISSING, IdentityMemo, KeyedMemo
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -221,14 +221,29 @@ def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table 
 _CARRIED_MEMO: IdentityMemo[frozenset[str] | None] = IdentityMemo(256)
 
 
+#: The same answers by plan *content*: a query built afresh for every run (any DataFrame
+#: pipeline, and the plan a `Session.sql` misses its parse cache on) is a new object each time,
+#: so the identity memo above never hits for it. See `plan.logical.content_memo_key` for why
+#: the content key is a sound key for an answer read off the plan's structure and schemas.
+_CARRIED_BY_CONTENT: KeyedMemo[frozenset[str] | None] = KeyedMemo(256)
+
+
 def carried_columns(plan) -> frozenset[str] | None:
-    """Column names that can actually flow through `plan`, memoized per plan instance.
+    """Column names that can actually flow through `plan`, memoized per plan and by content.
 
     See `_carried_columns` for what they are. A plan is immutable, so its answer cannot change.
     """
     if (hit := _CARRIED_MEMO.get(plan)) is not MISSING:
         return hit
-    return _CARRIED_MEMO.put(plan, _carried_columns(plan))
+    from batcher.plan.logical import content_memo_key
+
+    key = content_memo_key(plan)
+    if key is not None and (hit := _CARRIED_BY_CONTENT.get(key)) is not MISSING:
+        return _CARRIED_MEMO.put(plan, hit)
+    value = _carried_columns(plan)
+    if key is not None:
+        _CARRIED_BY_CONTENT.put(key, value)
+    return _CARRIED_MEMO.put(plan, value)
 
 
 def _carried_columns(plan) -> frozenset[str] | None:

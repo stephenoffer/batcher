@@ -178,6 +178,46 @@ def test_the_scan_sizes_are_measured_once_per_key_and_follow_the_generation(monk
     assert set(first) == {s.source_id for s in scans}
 
 
+# --- content-keyed memos: a plan rebuilt for every run still hits ----------------------
+
+
+def test_a_rebuilt_plan_hits_the_content_memos_and_matches_a_fresh_derivation(monkeypatch):
+    from batcher.api.orchestration import sizing
+    from batcher.carbonite.policies import morsel
+
+    sizing._CARRIED_BY_CONTENT.clear()
+    morsel._WIDEST_BY_CONTENT.clear()
+    a = bt.from_pydict({"k": [1, 2, 3], "s": ["x", "y", "z"]})
+    first, second = a.filter(bt.col("k") > 1)._plan, a.filter(bt.col("k") > 1)._plan
+    assert first is not second
+    walks = []
+    real_carried, real_widest = sizing._carried_columns, morsel._widest_introduced
+    monkeypatch.setattr(sizing, "_carried_columns", lambda p: walks.append("c") or real_carried(p))
+    monkeypatch.setattr(
+        morsel, "_widest_introduced", lambda p, c: walks.append("w") or real_widest(p, c)
+    )
+    carried = sizing.carried_columns(first)
+    widest = morsel._widest_row_bytes(first, carried)
+    assert walks == ["c", "w"]
+    assert sizing.carried_columns(second) == carried == real_carried(second)
+    assert morsel._widest_row_bytes(second, carried) == widest == real_widest(second, carried)
+    assert walks == ["c", "w"]  # the rebuilt plan was answered by content
+    # A different plan is a different key.
+    other = a.select("s")._plan
+    sizing.carried_columns(other)
+    assert walks[-1] == "c"
+
+
+def test_an_opaque_plan_is_never_keyed_by_content():
+    from batcher.plan.logical import content_memo_key
+
+    ds = bt.from_pydict({"k": [1, 2]})
+    assert content_memo_key(ds._plan) == ds._plan.content_key()
+    udf = ds.map_batches(lambda b: b)._plan
+    assert content_memo_key(udf) is None
+    assert content_memo_key("not a plan") is None
+
+
 # --- learning.load_column_tables: the column slice of the bundle -----------------------
 
 

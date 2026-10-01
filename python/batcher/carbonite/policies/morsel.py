@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher._internal.registry import MISSING, IdentityMemo
+from batcher._internal.registry import MISSING, IdentityMemo, KeyedMemo
 from batcher.carbonite.memory.pressure import PressureLevel
 
 if TYPE_CHECKING:
@@ -221,6 +221,24 @@ def _widest_row_bytes(plan: object, carried: frozenset[str] | None) -> float:
     """
     if (hit := _WIDEST_MEMO.get(plan, carried)) is not MISSING:
         return hit
+    from batcher.plan.logical import content_memo_key
+
+    key = content_memo_key(plan)
+    if key is not None and (hit := _WIDEST_BY_CONTENT.get((key, carried))) is not MISSING:
+        return _WIDEST_MEMO.put(plan, hit, carried)
+    widest = _widest_introduced(plan, carried)
+    if key is not None:
+        _WIDEST_BY_CONTENT.put((key, carried), widest)
+    return _WIDEST_MEMO.put(plan, widest, carried)
+
+
+#: The same answers by plan *content* (`plan.logical.content_memo_key`), so a plan rebuilt for
+#: every run -- a new object each time -- still hits. The answer reads only node schemas.
+_WIDEST_BY_CONTENT: KeyedMemo[float] = KeyedMemo(256)
+
+
+def _widest_introduced(plan: object, carried: frozenset[str] | None) -> float:
+    """The uncached walk behind `_widest_row_bytes`."""
     import pyarrow as pa
 
     from batcher.plan.visitor import children, walk
@@ -238,7 +256,7 @@ def _widest_row_bytes(plan: object, carried: frozenset[str] | None) -> float:
         introduced = [f for f in arrow if f.name not in inherited]
         if introduced:
             widest = max(widest, _node_row_bytes(pa.schema(introduced), carried))
-    return _WIDEST_MEMO.put(plan, widest, carried)
+    return widest
 
 
 def _arrow_schema(node: object):

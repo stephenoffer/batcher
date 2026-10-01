@@ -353,7 +353,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 273 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
 | `run.py` | 676 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
-| `sizing.py` | 287 | What the conductor needs to know about a plan's size before it runs it. |
+| `sizing.py` | 302 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 592 | The three ways the conductor can execute an admitted plan, plus the source read. |
 | `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
 
@@ -1662,7 +1662,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `congestion.py` | 255 | What one round of a data channel actually observed, as a three-state congestion verdict. |
 | `cpu_budget.py` | 108 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 682 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
-| `morsel.py` | 372 | How big a morsel should be, given memory pressure and the rows' measured width. |
+| `morsel.py` | 390 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
 | `scheduling.py` | 288 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 469 | Whether a query goes out of core, and what shape its spilled state takes. |
@@ -2622,7 +2622,7 @@ String free functions, in two halves: building text and reading structure out of
 |---|---|---|
 | `_setops.py` | 84 | What makes two set-operation branches compatible. |
 | `aggregate.py` | 313 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
-| `base.py` | 449 | `LogicalPlan` — the base class for declarative plan nodes. |
+| `base.py` | 475 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 666 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
@@ -2782,7 +2782,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `optional.py` | 82 | The one optional-dependency import guard. |
 | `paths.py` | 130 | Filesystem locations of the installed package, and how to create things there safely. |
 | `prefetch.py` | 116 | Overlap a producer generator with its consumer on a background thread. |
-| `registry.py` | 257 | Keyed lookup tables: the generic extension-point registry and the identity memo. |
+| `registry.py` | 306 | Keyed lookup tables: the generic extension-point registry and the identity memo. |
 | `sql_errors.py` | 95 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
 
 ### `batcher/_internal/concurrency/` — 0 · utility

@@ -22,7 +22,7 @@ from batcher._internal.errors import BatcherError, unknown_value
 T = TypeVar("T")
 V = TypeVar("V")
 
-__all__ = ["MISSING", "IdentityMemo", "Registry"]
+__all__ = ["MISSING", "IdentityMemo", "KeyedMemo", "Registry"]
 
 
 class Registry(Generic[T]):
@@ -250,6 +250,55 @@ class IdentityMemo(Generic[V]):
         if len(self._entries) >= self._maxsize:
             self._entries.clear()
         self._entries[(id(obj), *extra)] = (obj, value)
+        return value
+
+    def clear(self) -> None:
+        """Drop every entry."""
+        self._entries.clear()
+
+
+class KeyedMemo(Generic[V]):
+    """A bounded memo keyed on a hashable *value*, for answers that are a pure function of it.
+
+    The companion to `IdentityMemo` for a key that names content rather than an object, such
+    as a plan's `content_key`: two plans built separately from the same query share it, so an
+    answer computed for the first serves the second, which an identity memo never can. Full,
+    the memo clears wholesale; a dropped entry costs one recomputation, never a wrong answer.
+
+    Args:
+        maxsize: Entries held before the memo clears.
+    """
+
+    __slots__ = ("_entries", "_maxsize")
+
+    def __init__(self, maxsize: int) -> None:
+        self._entries: dict[Hashable, V] = {}
+        self._maxsize = maxsize
+
+    def get(self, key: Hashable) -> V | Literal[_Missing.MISSING]:
+        """The answer memoized under `key`, or `MISSING`.
+
+        Args:
+            key: The value the answer is a function of.
+
+        Returns:
+            The memoized answer, or `MISSING` when there is none.
+        """
+        return self._entries.get(key, MISSING)
+
+    def put(self, key: Hashable, value: V) -> V:
+        """Memoize `value` under `key`.
+
+        Args:
+            key: The value the answer is a function of.
+            value: The answer.
+
+        Returns:
+            `value`, so a call site can `return memo.put(...)`.
+        """
+        if len(self._entries) >= self._maxsize:
+            self._entries.clear()
+        self._entries[key] = value
         return value
 
     def clear(self) -> None:
