@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1555 Python modules across 220 packages and 326 Rust files across 14 crates.
+Covering 1556 Python modules across 220 packages and 326 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -1274,12 +1274,13 @@ Kyber rule modules.
 | module | lines | what it is |
 |---|---|---|
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
+| `equi_expr_keys.py` | 202 | Equi-join keys over *expressions*: `a.x = b.y - 52` as a hash key, not a post-join filter. |
 | `fusion.py` | 396 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
 | `leaf_rewrite.py` | 318 | The shared machinery every leaf-level expression rule is built from. |
 | `literals.py` | 56 | Literal-value predicates shared by the expression rules: the i64 range and boolean literals. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 909 | Projection rewrites — collapse stacked projections and prune unread columns. |
-| `pushdown.py` | 692 | Predicate pushdown — evaluate filters as early as possible. |
+| `pushdown.py` | 711 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 574 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
 | `zonemap_pruning.py` | 580 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
@@ -2335,7 +2336,7 @@ The plan, in every shape the dashboard needs to show it.
 | module | lines | what it is |
 |---|---|---|
 | `build.py` | 269 | The executed plan as a laid-out graph — nodes, edges, and their measured stats. |
-| `describe.py` | 250 | Reading a plan IR node: what is a child, and what does this operator actually do. |
+| `describe.py` | 257 | Reading a plan IR node: what is a child, and what does this operator actually do. |
 | `diff.py` | 242 | What the optimizer actually did — the logical plan against the one that ran. |
 | `explain.py` | 146 | The plan as text — the EXPLAIN output every SQL engine's users already know how to read. |
 
@@ -2706,7 +2707,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 |---|---|---|
 | `arithmetic.py` | 364 | Output types for the arithmetic families: binary operators and the math functions. |
 | `collections.py` | 224 | Output types for the container accessors: `list`, `struct` and `map`. |
-| `dispatch.py` | 361 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
+| `dispatch.py` | 386 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `geospatial.py` | 107 | Output types for the `st_*` geometry and `quat_*`/`se3_*` rigid-body functions. |
 | `scalars.py` | 248 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
 

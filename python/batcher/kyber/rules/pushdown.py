@@ -21,7 +21,12 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
-from batcher.kyber.rules.equi_expr_keys import ExprKeyPair, attach_expr_keys, expr_key_pair
+from batcher.kyber.rules.equi_expr_keys import (
+    ExprKeyPair,
+    attach_expr_keys,
+    drop_cross_keys,
+    expr_key_pair,
+)
 from batcher.kyber.rules.zonemap_pruning import implied_by_bounds
 from batcher.kyber.stats.constants import constant_value
 from batcher.kyber.stats.selectivity import comparison_col_side
@@ -209,28 +214,8 @@ def derive_join_keys(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None
         keep.extend(conj for ek, conj in expr_pairs if id(ek) in refused_ids)
         if not derived and len(refused) == len(expr_pairs):
             return None
-        new_join = _drop_cross_keys(new_join)
+        new_join = drop_cross_keys(new_join)
     return new_join if not keep else Filter(new_join, combine_conjuncts(keep))
-
-
-def _drop_cross_keys(join: Join) -> Join:
-    """`join` without its cartesian pseudo-keys, when a real key remains to drive it."""
-    real = [
-        (lk, rk)
-        for lk, rk in zip(join.left_keys, join.right_keys, strict=True)
-        if not is_cartesian_key_pair(join.left, lk, join.right, rk)
-    ]
-    if not real or len(real) == len(join.left_keys):
-        return join
-    return Join(
-        join.left,
-        join.right,
-        tuple(lk for lk, _ in real),
-        tuple(rk for _, rk in real),
-        join.join_type,
-        join.output,
-        join.strategy,
-    )
 
 
 def _equi_key_pair(

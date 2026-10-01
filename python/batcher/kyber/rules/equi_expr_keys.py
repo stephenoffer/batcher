@@ -32,10 +32,10 @@ from dataclasses import dataclass
 import pyarrow as pa
 
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit, referenced_columns, remap_columns
-from batcher.plan.logical import Join, LogicalPlan, Project, Projection
+from batcher.plan.logical import Join, LogicalPlan, Project, Projection, is_cartesian_key_pair
 from batcher.plan.types import infer_type
 
-__all__ = ["ExprKeyPair", "attach_expr_keys", "expr_key_pair"]
+__all__ = ["ExprKeyPair", "attach_expr_keys", "drop_cross_keys", "expr_key_pair"]
 
 # Beyond this an `x + k` offset is no longer the calendar arithmetic the rule exists for, and
 # it starts to approach the range where an `Int64` add could overflow on a row the join
@@ -180,3 +180,23 @@ def attach_expr_keys(join: Join, pairs: list[ExprKeyPair]) -> tuple[Join, list[E
         join.strategy,
     )
     return keyed, refused
+
+
+def drop_cross_keys(join: Join) -> Join:
+    """`join` without its cartesian pseudo-keys, when a real key remains to drive it."""
+    real = [
+        (lk, rk)
+        for lk, rk in zip(join.left_keys, join.right_keys, strict=True)
+        if not is_cartesian_key_pair(join.left, lk, join.right, rk)
+    ]
+    if not real or len(real) == len(join.left_keys):
+        return join
+    return Join(
+        join.left,
+        join.right,
+        tuple(lk for lk, _ in real),
+        tuple(rk for _, rk in real),
+        join.join_type,
+        join.output,
+        join.strategy,
+    )

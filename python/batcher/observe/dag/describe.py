@@ -109,7 +109,14 @@ def describe(kind: str, node: dict[str, Any]) -> str:
 
 
 def _describe_join(node: dict[str, Any]) -> str:
-    keys = ", ".join(str(k) for k in node.get("left_keys", []))
+    # A pair whose sides share a name reads as that name; any other pair is named on both
+    # sides. Listing the left side alone hid the right one entirely, so `a.w = b.w - 52`,
+    # keyed through a computed right-side column, rendered as a join "on a_w".
+    left = [str(k) for k in node.get("left_keys", [])]
+    right = [str(k) for k in node.get("right_keys", [])]
+    if len(right) != len(left):
+        right = left
+    keys = ", ".join(lk if lk == rk else f"{lk} = {rk}" for lk, rk in zip(left, right, strict=True))
     join_type = str(node.get("join_type", "inner"))
     return f"{join_type} on {keys}" if keys else join_type
 
