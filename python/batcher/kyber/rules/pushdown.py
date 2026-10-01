@@ -572,12 +572,7 @@ def _add_inferred(
     current = split_conjuncts(target.predicate) if isinstance(target, Filter) else []
     # A set of canonical (memoized) keys, not a list of IR dicts: dicts are unhashable, so
     # the "already present?" test was a linear scan with a full dict comparison per step.
-    existing = {expr_key(c) for c in current}
-    # A constraint the target already proves further down -- under an aggregate's group key,
-    # say, where pushdown sank it last pass -- is present too. Without this the conjunct is
-    # re-added above, pushed down, deduplicated and re-added again for the whole PUSHDOWN
-    # iteration budget, which the bounds oracle below cannot see through an aggregate.
-    existing |= {expr_key(c) for c in _column_constraints(target, target_key)}
+    existing = {expr_key(c) for c in current} | _proven_below(target, target_key)
     fresh = [
         remapped
         for c in constraints
@@ -591,6 +586,18 @@ def _add_inferred(
         combined = combine_conjuncts(split_conjuncts(target.predicate) + fresh)
         return Filter(target.input, combined), True
     return Filter(target, combine_conjuncts(fresh)), True
+
+
+def _proven_below(target: LogicalPlan, target_key: str) -> set[str]:
+    """The keys of every constraint `target` already proves on `target_key`, at any depth.
+
+    A constraint sunk beneath an aggregate's group key by an earlier pass is present even
+    though no `Filter` at the top of `target` spells it, and the bounds oracle
+    `_add_inferred` also asks cannot see through an aggregate. Without this the conjunct is
+    re-added above, pushed down, deduplicated and re-added for the whole PUSHDOWN iteration
+    budget -- the cycle `infer_join_predicates` documents, one operator further down.
+    """
+    return {expr_key(c) for c in _column_constraints(target, target_key)}
 
 
 @rule(name="push_filter_through_aggregate", phase=Phase.PUSHDOWN, matches=(Filter,))
