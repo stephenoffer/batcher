@@ -21,6 +21,7 @@ import re
 import shutil
 import socket
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -429,7 +430,17 @@ def cluster_scratch(cluster_tmp_dir):
     def make(name: str) -> Path:
         scratch = cluster_tmp_dir / _safe_dirname(name)
         shutil.rmtree(scratch, ignore_errors=True)
-        scratch.mkdir(parents=True)
+        try:
+            scratch.mkdir(parents=True)
+        except FileExistsError:
+            # The old directory could not be emptied. On the NFS mounts these tests use, a
+            # file some process still holds open -- a long-lived Ray worker, or this driver,
+            # that read the previous corpus -- is renamed to `.nfsXXXX` instead of unlinked,
+            # and `rmtree` cannot remove the directory around it until that handle closes.
+            # Asking for the same name twice in one session (two tests sharing a `_write`
+            # helper) raised here. A fresh sibling is just as empty and leaves the held files
+            # alone; the session teardown, or a later run's `_prune_dead_owners`, removes both.
+            scratch = Path(tempfile.mkdtemp(prefix=f"{scratch.name}-", dir=cluster_tmp_dir))
         return scratch
 
     return make

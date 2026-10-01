@@ -19,15 +19,27 @@ was asked for to arrive.
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import queue
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import Future
+from typing import TypeVar
 
 from batcher._internal.errors import BackendError
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.config.deadline import remaining_budget
 
-__all__ = ["await_autoscale", "resolve_transport", "verify_disk_reach"]
+__all__ = [
+    "await_autoscale",
+    "bring_up_outliving_caller",
+    "resolve_transport",
+    "verify_disk_reach",
+]
+
+_T = TypeVar("_T")
 
 
 def _cluster_topology() -> dict:
@@ -45,6 +57,72 @@ def _cluster_topology() -> dict:
 
 
 # --- Connecting to a head that is still coming up -----------------------------------
+
+#: Bring-ups waiting for the lasting thread, as `(context, fn, future)`; None until first use.
+_bringup_calls: queue.SimpleQueue | None = None
+_bringup_thread: threading.Thread | None = None
+_bringup_guard = threading.Lock()
+
+
+def bring_up_outliving_caller(ray, lock: threading.Lock, fn: Callable[[], _T]) -> _T:
+    """Run the bring-up `fn` under `lock`, on a thread that outlives the caller if Ray is down.
+
+    A `ray.init` that starts a local cluster spawns the GCS and the raylet with Ray's kernel
+    fate-sharing, `PR_SET_PDEATHSIG = SIGKILL`, and Linux sends that signal when the parent
+    *thread* exits, not the process. So a pipeline run from a worker thread -- two
+    concurrent `collect(distributed=True)` calls, a web handler, an executor pool -- that
+    happened to bring Ray up took the cluster down when its thread finished: the driver lost
+    the GCS seconds after the job registered, every other query on it stalled, and 60 s
+    later Ray's watchdog terminated the whole driver with exit 1 and no traceback. Measured:
+    `test_two_real_pipelines_run_at_once_and_both_are_correct` died that way in 6 of 8 runs
+    and passes 8 of 8 through this function, and a bare `ray.init()` on a thread that then
+    exits leaves a driver that cannot run a task.
+
+    Only a cold bring-up starts processes, so with Ray already up `fn` runs here.
+    """
+
+    def guarded() -> _T:
+        with lock:
+            return fn()
+
+    return guarded() if ray.is_initialized() else _on_a_lasting_thread(guarded)
+
+
+def _on_a_lasting_thread(fn: Callable[[], _T]) -> _T:
+    """Run `fn` on a thread that lives as long as the process, and return what it returns.
+
+    The main thread already outlives everything Ray starts, so it runs `fn` directly, as
+    does the lasting thread itself. Every other caller hands `fn` over with its
+    `contextvars` (the active config and deadline are context-scoped) and waits.
+    """
+    global _bringup_calls, _bringup_thread
+    current = threading.current_thread()
+    if current is threading.main_thread() or current is _bringup_thread:
+        return fn()
+    with _bringup_guard:
+        if _bringup_calls is None:
+            _bringup_calls = queue.SimpleQueue()
+            _bringup_thread = threading.Thread(
+                target=_serve_bringups,
+                args=(_bringup_calls,),
+                name="batcher-ray-bringup",
+                daemon=True,  # never joined at exit: it must not die before Ray's own atexit
+            )
+            _bringup_thread.start()
+        calls = _bringup_calls
+    done: Future = Future()
+    calls.put((contextvars.copy_context(), fn, done))
+    return done.result()
+
+
+def _serve_bringups(calls: queue.SimpleQueue) -> None:
+    """The lasting thread's loop: run each bring-up in its caller's context, forever."""
+    while True:
+        context, fn, done = calls.get()
+        try:
+            done.set_result(context.run(fn))
+        except BaseException as exc:  # handed back to the waiting caller, who re-raises it
+            done.set_exception(exc)
 
 
 def _explicit_cluster_address() -> str | None:

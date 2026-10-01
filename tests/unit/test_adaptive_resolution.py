@@ -293,3 +293,27 @@ def test_staged_result_equals_one_shot_over_a_breaker_chain():
     assert norm(ds.collect(adaptive=True).to_pydict()) == norm(
         ds.collect(adaptive=False).to_pydict()
     )
+
+
+@pytest.mark.parametrize("how", ["anti", "semi", "inner"])
+def test_the_distributed_gate_answers_a_join_over_a_udf_operand(tmp_path, how):
+    # The distributed gate asks the aligned executor whether it claims the plan, and that
+    # question optimized the plan with its sources bound. Over a `map_batches` operand the
+    # self-join rules lowered the UDF to IR to compare the two sides, which raises, so
+    # `left.join(right.map_batches(f), how="anti").collect(distributed=True)` failed before
+    # any worker ran. The aligned executor cannot run a UDF plan, so the gate's answer is
+    # "not claimed", reached without optimizing. Ray-free: nothing here executes.
+    import pyarrow.parquet as pq
+
+    from batcher.api.adaptive.gating import aligned_claims
+
+    for side in ("left", "right"):
+        (tmp_path / side).mkdir()
+        for part in range(2):
+            keys = list(range(part, 40, 2))
+            pq.write_table(pa.table({"k": keys, "v": keys}), tmp_path / side / f"p{part}.parquet")
+    left = bt.read.parquet(str(tmp_path / "left"))
+    right = bt.read.parquet(str(tmp_path / "right"))
+    ds = left.join(right.map_batches(lambda b: b), on="k", how=how)
+    assert aligned_claims(ds._plan, ds._sources, _hub()) is False
+    resolve_adaptive("auto", ds._plan, ds._sources, _hub(), distributed=True)

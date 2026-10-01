@@ -1457,7 +1457,9 @@ def test_distributed_global_window_matches_single_node(cluster_tmp_path, transpo
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_ordered_global_window_matches_single_node(cluster_tmp_path, transport):
+def test_distributed_ordered_global_window_matches_single_node(
+    cluster_tmp_path, transport, monkeypatch
+):
     """`row_number() OVER (ORDER BY v)` and the running aggregates distribute by *order*.
 
     A global window has one partition over every row, so there is nothing to hash-shuffle on
@@ -1538,14 +1540,52 @@ def test_distributed_ordered_global_window_matches_single_node(cluster_tmp_path,
 
     # A `QUALIFY`-shaped filter is fused by Kyber into the window's `rank_limit`, which the
     # offsets refuse: `rank_limit` drops rows by rank, and a bucket only knows the rank
-    # *within itself*, so filtering per bucket would keep the wrong rows. Refusing is the
-    # correct answer today rather than a silently wrong one. Lifting it means keeping each
-    # bucket's local top-k (a global top-k row is always in its own bucket's top-k) and
-    # re-applying the bound on the driver after the offsets land.
-    with pytest.raises(PlanError):
-        bt.read.parquet(path).with_columns(r=row_number().over(order_by="u")).filter(
+    # *within itself*, so filtering per bucket would keep the wrong rows. This used to raise
+    # `PlanError`. It now distributes without filtering per bucket
+    # (`dist.executor._global_row_number_topn`): a `row_number` bound is the mergeable top-N
+    # `ORDER BY u LIMIT k`, re-numbered over the k survivors, and a `rank` bound is unfused
+    # so the ordered buckets compute the *global* rank and the filter re-applies over it. So
+    # the expectation is the stronger one: it runs on the fleet and equals single-node.
+    # `row_number` is bounded over the unique `u`, so which rows survive is defined; `rank`
+    # keeps every row tied at the cut on both paths, so it is asserted over the tied key.
+    fused = [
+        lambda d: d.with_columns(r=row_number().over(order_by="u")).filter(col("r") <= 100),
+        lambda d: d.with_columns(r=row_number().over(order_by=[("u", True)])).filter(
             col("r") <= 100
-        ).collect(distributed=True, num_workers=4, transport=transport)
+        ),
+        lambda d: d.with_columns(r=rank().over(order_by="tied")).filter(col("r") <= 100),
+    ]
+    # Agreeing with single-node is not enough on its own: a silent run on one node agrees
+    # too. So each shape must also reach a distributed driver, recorded by a pass-through spy
+    # on the defining modules and the packages that re-export them.
+    import importlib
+
+    fired: list[str] = []
+    for attr, modules in (
+        ("_distributed_topn", ("batcher.dist.executors.sort",)),
+        ("execute_topn_flight", ("batcher.dist.flight_sort",)),
+        ("execute_global_window_disk", ("batcher.dist.global_window.disk",)),
+        ("execute_global_window_flight", ("batcher.dist.global_window.flight",)),
+    ):
+        original = getattr(importlib.import_module(modules[0]), attr)
+
+        def spy(*args, _name=attr, _original=original, **kwargs):
+            fired.append(_name)
+            return _original(*args, **kwargs)
+
+        for module in (*modules, "batcher.dist.global_window"):
+            if hasattr(importlib.import_module(module), attr):
+                monkeypatch.setattr(importlib.import_module(module), attr, spy)
+    for build in fused:
+        single = build(bt.read.parquet(path)).collect(distributed=False)
+        fired.clear()
+        dist = build(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert fired, "the fused global ranking did not reach a distributed driver"
+        assert single.num_rows >= 100, "the bound must keep rows for the comparison to mean much"
+        assert single.schema == dist.schema
+        assert rowset(single) == rowset(dist)
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])

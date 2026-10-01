@@ -186,7 +186,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 
 | module | lines | what it is |
 |---|---|---|
-| `gating.py` | 517 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
+| `gating.py` | 524 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 88 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
 | `staging.py` | 608 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
@@ -1023,7 +1023,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `lifecycle.py` | 719 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
-| `readiness.py` | 424 | Bounded waits for a Ray cluster that is not ready yet. |
+| `readiness.py` | 502 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 292 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 796 | What the live cluster is, and what of it a query may use. |

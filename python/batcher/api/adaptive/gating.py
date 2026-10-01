@@ -31,8 +31,15 @@ def aligned_claims(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     they disagreed on TPC-H q22 and its decline raised instead of falling back to staging.
     """
     from batcher import kyber
+    from batcher.core.udf import has_map_batches
     from batcher.dist.executors.aligned import aligned_route
 
+    # The aligned executor declines a `map_batches` plan (it has no engine IR), so there is
+    # nothing to ask, and asking is not free: optimizing it here with its sources bound runs
+    # the self-join rules over a UDF operand, and `self_anti_join_to_null_keys` lowers that
+    # operand to IR to compare it, which raises. An anti join over a UDF failed that way.
+    if has_map_batches(plan):
+        return False
     return aligned_route(kyber.optimize_logical(plan, sources=sources, hub=hub), sources)
 
 

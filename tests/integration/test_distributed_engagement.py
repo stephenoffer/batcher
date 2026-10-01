@@ -90,6 +90,10 @@ _DIST_ENTRY_POINTS = {
     # can match across the cut. Asserting *which* ran is the point — routing a keyless ASOF
     # through the hash path would put every row in one bucket and still return the right rows.
     "asof_by": ("_distributed_asof", ("batcher.dist.executor",)),
+    # The key-range-aligned executor (`dist.executors.aligned`), which `_dispatch` tries
+    # before every other path: split the Parquet side by file (or by a key range its footers
+    # store in order), broadcast the small side, and join on each worker with no shuffle.
+    "aligned": ("_distributed_aligned", ("batcher.dist.executors.aligned.route",)),
     "asof_keyless": ("_distributed_asof_keyless", ("batcher.dist.executor",)),
 }
 

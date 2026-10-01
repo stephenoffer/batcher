@@ -59,7 +59,7 @@ _UDFS = {
 
 
 @pytest.mark.parametrize("udf", sorted(_UDFS))
-@pytest.mark.parametrize("how", ["inner", "left", "right", "anti"])
+@pytest.mark.parametrize("how", ["inner", "left", "right", "semi", "anti"])
 def test_a_join_over_a_udf_operand_matches_single_node(tables, udf, how):
     left, right = (bt.read.parquet(p) for p in tables)
     ds = left.join(right.map_batches(_UDFS[udf]), on="k", how=how)

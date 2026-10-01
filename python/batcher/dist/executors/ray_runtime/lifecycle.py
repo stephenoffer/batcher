@@ -458,10 +458,10 @@ def _import_ray():
 
 
 def _ensure_ray(workers: int) -> None:
-    ray = _import_ray()
+    from .readiness import bring_up_outliving_caller
 
-    with _RAY_INIT_LOCK:
-        _ensure_ray_locked(ray, workers)
+    ray = _import_ray()
+    bring_up_outliving_caller(ray, _RAY_INIT_LOCK, lambda: _ensure_ray_locked(ray, workers))
 
 
 def _ensure_ray_locked(ray, workers: int) -> None:
