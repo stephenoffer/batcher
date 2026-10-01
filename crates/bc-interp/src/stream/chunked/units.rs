@@ -23,7 +23,30 @@ pub trait UnitSource: Sync {
     /// # Errors
     /// Whatever reading the unit reports.
     fn read(&self, unit: usize) -> Result<Vec<RecordBatch>, InterpError>;
+
+    /// This relation reading only `columns`, in that order, with a [`LOCATOR`] column appended
+    /// that [`UnitSource::fetch`] resolves back to the row — or `None` when it cannot locate
+    /// its rows, or judges that reading `columns` first would save nothing.
+    ///
+    /// The narrowed view has the same units, and each unit the same rows in the same order.
+    fn narrowed(&self, columns: &[String]) -> Option<Box<dyn UnitSource + '_>> {
+        let _ = columns;
+        None
+    }
+
+    /// The rows a narrowed view reported under `locators`, every column, in `locators`' order.
+    ///
+    /// # Errors
+    /// Whatever reading them reports, and [`InterpError::NotChunkable`] from a source that
+    /// never narrows.
+    fn fetch(&self, locators: &[u64]) -> Result<Vec<RecordBatch>, InterpError> {
+        let _ = locators;
+        Err(InterpError::NotChunkable)
+    }
 }
+
+/// The column a [narrowed](UnitSource::narrowed) source appends: a `UInt64` naming each row.
+pub const LOCATOR: &str = "__bc_locator";
 
 /// The driving scan of one worker's pipeline, read lazily: `units` of `src` stand in for
 /// `sources[source_id]`.

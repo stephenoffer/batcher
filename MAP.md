@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1554 Python modules across 220 packages and 318 Rust files across 14 crates.
+Covering 1554 Python modules across 220 packages and 319 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -3039,7 +3039,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `chunked.rs` | 463 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked.rs` | 649 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
@@ -3096,10 +3096,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 631 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 667 | Preparing a hash join's build side once, for every worker that will probe it. |
-| `stream/chunked/mod.rs` | 731 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
+| `stream/chunked/mod.rs` | 738 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
-| `stream/chunked/units.rs` | 34 | The driving relation as a sequence of units read on demand by the workers that scan it. |
+| `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
+| `stream/chunked/units.rs` | 57 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 376 | Per-operator metrics for the streaming executor. |
@@ -3397,14 +3398,14 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
-| `late.rs` | 241 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
-| `lib.rs` | 792 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `late.rs` | 249 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
+| `lib.rs` | 781 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `mapped.rs` | 130 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
-| `projection.rs` | 67 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns. |
+| `projection.rs` | 109 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns, and put a decoded batch's columns back in the order they were requested. |
 | `row_filter.rs` | 524 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
-| `row_groups.rs` | 116 | Reading a Parquet relation one row group at a time, for a caller that schedules the row groups itself. |
+| `row_groups.rs` | 268 | Reading a Parquet relation one row group at a time, for a caller that schedules the row groups itself. |
 | `split_read/block_cache.rs` | 334 | A process-wide cache of remote object bytes, kept in fixed-size blocks: the warm path. |
 | `split_read/mod.rs` | 356 | Split an oversized object-store read into several concurrent range GETs. |
 | `store.rs` | 426 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |

@@ -1,4 +1,5 @@
-//! Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns.
+//! Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns, and put
+//! a decoded batch's columns back in the order they were requested.
 //!
 //! `ProjectionMask::columns` matches leaf paths with `starts_with`, which is right for the
 //! nested case it was written for — asking for `addr` should bring `addr.city` and `addr.zip`
@@ -22,6 +23,7 @@
 //! (`name.` as a prefix). That keeps the nested behaviour `ProjectionMask::columns` exists for
 //! and drops the accidental sibling matches.
 
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 
@@ -63,6 +65,46 @@ pub(crate) fn exact_columns<'a>(
         }
     }
     ProjectionMask::leaves(schema, leaves)
+}
+
+/// Reorder each batch's columns to the requested projection order (PyArrow parity).
+///
+/// The decoder emits columns in the file's schema order regardless of the order the
+/// caller asked for. When the requested names map one-to-one onto the batch's top-level
+/// fields, reorder to the requested order so the result is identical to PyArrow's
+/// `read_table(columns=[...])`. When they do not form a clean bijection (a nested/leaf
+/// projection, a duplicated or absent name), leave the batch untouched — the reorder is
+/// only defined for the flat top-level projections the engine actually issues, and
+/// touching the exotic cases would risk mangling them.
+pub(crate) fn reorder_to_projection(batches: &mut [RecordBatch], columns: &[String]) {
+    let Some(first) = batches.first() else {
+        return;
+    };
+    let schema = first.schema();
+    // A clean bijection: same count, and every requested name resolves to a distinct field.
+    if columns.len() != schema.fields().len() {
+        return;
+    }
+    let mut order = Vec::with_capacity(columns.len());
+    for name in columns {
+        match schema.index_of(name) {
+            Ok(idx) if !order.contains(&idx) => order.push(idx),
+            _ => return, // absent or duplicate name → not a clean reorder, leave as-is
+        }
+    }
+    if order.iter().enumerate().all(|(i, &idx)| i == idx) {
+        return; // already in requested order (the common case) — no work
+    }
+    for b in batches.iter_mut() {
+        let cols: Vec<_> = order.iter().map(|&i| b.column(i).clone()).collect();
+        let fields: Vec<_> = order.iter().map(|&i| b.schema().field(i).clone()).collect();
+        let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+        // Reindexing existing columns of a valid batch cannot fail; keep the original on
+        // the impossible error rather than dropping data.
+        if let Ok(nb) = RecordBatch::try_new(new_schema, cols) {
+            *b = nb;
+        }
+    }
 }
 
 #[cfg(test)]

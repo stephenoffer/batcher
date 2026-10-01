@@ -29,6 +29,7 @@ mod mapped;
 mod page_index;
 mod predicate;
 mod projection;
+pub(crate) use projection::reorder_to_projection;
 mod row_filter;
 mod row_groups;
 mod split_read;
@@ -58,8 +59,8 @@ pub use footer_stats::{
 };
 pub use late::{LateFilter, MaskFn, RowPredicate};
 pub use row_groups::{
-    parquet_row_groups, parquet_row_groups_surviving, read_parquet_row_group,
-    read_parquet_row_group_late,
+    parquet_column_bytes, parquet_row_groups, parquet_row_groups_surviving, read_parquet_row_group,
+    read_parquet_row_group_late, read_parquet_rows, ROW_NUMBER,
 };
 pub use split_read::block_cache::{stats as object_cache_stats, CacheStats};
 
@@ -79,7 +80,7 @@ pub use split_read::block_cache::{stats as object_cache_stats, CacheStats};
 /// regardless — so this caps the transient decode set, not the result. The floor of 16 keeps
 /// a small cgroup quota from serializing a *remote* read, where the concurrency hides latency
 /// rather than spreading CPU.
-fn rg_concurrency() -> usize {
+pub(crate) fn rg_concurrency() -> usize {
     static C: OnceLock<usize> = OnceLock::new();
     *C.get_or_init(|| {
         std::env::var("BATCHER_PARQUET_RG_CONCURRENCY")
@@ -419,7 +420,7 @@ impl parquet::arrow::async_reader::AsyncFileReader for PrefetchedFooter {
     }
 }
 
-async fn load_metadata_cached(
+pub(crate) async fn load_metadata_cached(
     uri: &str,
     resolved: &store::Resolved,
 ) -> Result<(u64, ArrowReaderMetadata), IoError> {
@@ -492,7 +493,26 @@ async fn read_parquet_async(
     batch_size: usize,
     predicate: Option<&str>,
 ) -> Result<Vec<RecordBatch>, IoError> {
-    read_parquet_inner(uri, row_groups, columns, batch_size, predicate, false, None).await
+    read_parquet_inner(
+        uri,
+        row_groups,
+        columns,
+        batch_size,
+        predicate,
+        &Unit::default(),
+    )
+    .await
+}
+
+/// How a read serves a caller scheduling its own units (`read_parquet_row_group_late`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Unit<'a> {
+    /// Decode on the polling thread rather than spawning onto the runtime's pool.
+    pub(crate) inline: bool,
+    /// The caller's own filter, decoded first.
+    pub(crate) late: Option<&'a Arc<late::LateFilter>>,
+    /// Append each row's position in its file as [`ROW_NUMBER`].
+    pub(crate) locate: bool,
 }
 
 /// [`read_parquet_async`], optionally decoding each row group on the polling thread (`inline`)
@@ -508,11 +528,20 @@ pub(crate) async fn read_parquet_inner(
     columns: Option<&[String]>,
     batch_size: usize,
     predicate: Option<&str>,
-    inline: bool,
-    late: Option<&Arc<late::LateFilter>>,
+    unit: &Unit<'_>,
 ) -> Result<Vec<RecordBatch>, IoError> {
+    let Unit {
+        inline,
+        late,
+        locate,
+    } = *unit;
     let resolved = store::resolve(uri)?;
     let (size, arrow_meta) = load_metadata_cached(uri, &resolved).await?;
+    let arrow_meta = if locate {
+        row_groups::with_row_numbers(&arrow_meta)?
+    } else {
+        arrow_meta
+    };
 
     // Which row-groups: the requested subset, else all of them.
     let all: Vec<usize> = (0..arrow_meta.metadata().num_row_groups()).collect();
@@ -748,46 +777,6 @@ fn coalesce_batches(
     }
     flush(&mut run, &mut out)?;
     Ok(out)
-}
-
-/// Reorder each batch's columns to the requested projection order (PyArrow parity).
-///
-/// The decoder emits columns in the file's schema order regardless of the order the
-/// caller asked for. When the requested names map one-to-one onto the batch's top-level
-/// fields, reorder to the requested order so the result is identical to PyArrow's
-/// `read_table(columns=[...])`. When they do not form a clean bijection (a nested/leaf
-/// projection, a duplicated or absent name), leave the batch untouched — the reorder is
-/// only defined for the flat top-level projections the engine actually issues, and
-/// touching the exotic cases would risk mangling them.
-fn reorder_to_projection(batches: &mut [RecordBatch], columns: &[String]) {
-    let Some(first) = batches.first() else {
-        return;
-    };
-    let schema = first.schema();
-    // A clean bijection: same count, and every requested name resolves to a distinct field.
-    if columns.len() != schema.fields().len() {
-        return;
-    }
-    let mut order = Vec::with_capacity(columns.len());
-    for name in columns {
-        match schema.index_of(name) {
-            Ok(idx) if !order.contains(&idx) => order.push(idx),
-            _ => return, // absent or duplicate name → not a clean reorder, leave as-is
-        }
-    }
-    if order.iter().enumerate().all(|(i, &idx)| i == idx) {
-        return; // already in requested order (the common case) — no work
-    }
-    for b in batches.iter_mut() {
-        let cols: Vec<_> = order.iter().map(|&i| b.column(i).clone()).collect();
-        let fields: Vec<_> = order.iter().map(|&i| b.schema().field(i).clone()).collect();
-        let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-        // Reindexing existing columns of a valid batch cannot fail; keep the original on
-        // the impossible error rather than dropping data.
-        if let Ok(nb) = RecordBatch::try_new(new_schema, cols) {
-            *b = nb;
-        }
-    }
 }
 
 #[cfg(test)]

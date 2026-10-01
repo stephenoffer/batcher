@@ -148,12 +148,198 @@ impl bc_interp::UnitSource for ParquetUnits<'_> {
             self.batch_size,
             self.predicate,
             self.late.as_ref(),
+            false,
         )
         .map_err(|e| source(e.to_string()))?
         .iter()
         .map(|b| normalize_batch(b).map_err(|e| source(e.to_string())))
         .collect()
     }
+
+    /// The relation as `columns` plus each row's locator, when the rest is worth deferring.
+    ///
+    /// Worth it when the columns left for the fetch are at least as large, uncompressed, as the
+    /// ones read now — the same yardstick `bc_io::LateFilter` defers by. A locator is the file's
+    /// index in the high 24 bits and the row's position in it in the low 40.
+    fn narrowed(&self, columns: &[String]) -> Option<Box<dyn bc_interp::UnitSource + '_>> {
+        if self.uris.len() >= 1 << LOCATOR_FILE_SHIFT_BITS {
+            return None;
+        }
+        let bytes = bc_io::parquet_column_bytes(self.uris).ok()?;
+        let projected = |name: &str| {
+            self.columns
+                .is_none_or(|cols| cols.iter().any(|c| c == name))
+        };
+        let (mut read, mut deferred) = (0u64, 0u64);
+        for (name, size) in &bytes {
+            if columns.iter().any(|c| c == name) {
+                read += size;
+            } else if projected(name) {
+                deferred += size;
+            }
+        }
+        (deferred > 0 && deferred >= read).then(|| {
+            Box::new(NarrowUnits {
+                base: self,
+                columns: columns.to_vec(),
+            }) as Box<dyn bc_interp::UnitSource + '_>
+        })
+    }
+
+    fn fetch(&self, locators: &[u64]) -> Result<Vec<RecordBatch>, bc_interp::InterpError> {
+        fetch_located(self, locators)
+    }
+}
+
+/// Bits of a locator holding the row's position in its file; the file index sits above them.
+const LOCATOR_ROW_BITS: u32 = 40;
+
+/// Bits left for the file index.
+const LOCATOR_FILE_SHIFT_BITS: u32 = 64 - LOCATOR_ROW_BITS;
+
+/// [`ParquetUnits`] reading only some columns, each row tagged with its locator.
+struct NarrowUnits<'s, 'a> {
+    base: &'s ParquetUnits<'a>,
+    columns: Vec<String>,
+}
+
+impl bc_interp::UnitSource for NarrowUnits<'_, '_> {
+    fn units(&self) -> usize {
+        self.base.units()
+    }
+
+    fn rows(&self) -> Option<usize> {
+        self.base.rows()
+    }
+
+    fn read(&self, unit: usize) -> Result<Vec<RecordBatch>, bc_interp::InterpError> {
+        let source = |e: String| bc_interp::InterpError::ChunkSource(e);
+        let (file, rg) = self.base.units[unit];
+        let out = bc_io::read_parquet_row_group_late(
+            &self.base.uris[file],
+            rg,
+            Some(&self.columns),
+            self.base.batch_size,
+            self.base.predicate,
+            self.base.late.as_ref(),
+            true,
+        )
+        .map_err(|e| source(e.to_string()))?;
+        out.iter()
+            .map(|b| {
+                located(
+                    &normalize_batch(b).map_err(|e| source(e.to_string()))?,
+                    &self.columns,
+                    file,
+                )
+            })
+            .collect()
+    }
+}
+
+/// `batch`'s `columns` in that order, then its locators, from the reader's row numbers.
+fn located(
+    batch: &RecordBatch,
+    columns: &[String],
+    file: usize,
+) -> Result<RecordBatch, bc_interp::InterpError> {
+    let source = |e: String| bc_interp::InterpError::ChunkSource(e);
+    let rows = batch
+        .column_by_name(bc_io::ROW_NUMBER)
+        .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
+        .ok_or_else(|| source("a locating read returned no row numbers".into()))?;
+    let high = (file as u64) << LOCATOR_ROW_BITS;
+    let mut locators = Vec::with_capacity(rows.len());
+    for row in rows.values() {
+        let row = u64::try_from(*row).map_err(|e| source(e.to_string()))?;
+        if row >> LOCATOR_ROW_BITS != 0 {
+            return Err(source(format!("row {row} is past the locator's range")));
+        }
+        locators.push(high | row);
+    }
+    let schema = batch.schema();
+    let mut fields = Vec::with_capacity(columns.len() + 1);
+    let mut arrays = Vec::with_capacity(columns.len() + 1);
+    for name in columns {
+        let i = schema.index_of(name).map_err(|e| source(e.to_string()))?;
+        fields.push(schema.field(i).clone());
+        arrays.push(batch.column(i).clone());
+    }
+    fields.push(arrow::datatypes::Field::new(
+        bc_interp::LOCATOR,
+        arrow::datatypes::DataType::UInt64,
+        false,
+    ));
+    arrays.push(Arc::new(arrow::array::UInt64Array::from(locators)));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|e| source(e.to_string()))
+}
+
+/// The rows `locators` name, every projected column, in `locators`' order.
+///
+/// Each file is asked once, for its rows in position order (`bc_io::read_parquet_rows`), and
+/// the answers are put back in the order asked for.
+fn fetch_located(
+    units: &ParquetUnits<'_>,
+    locators: &[u64],
+) -> Result<Vec<RecordBatch>, bc_interp::InterpError> {
+    let source = |e: String| bc_interp::InterpError::ChunkSource(e);
+    let mask = (1u64 << LOCATOR_ROW_BITS) - 1;
+    let mut by_file: std::collections::BTreeMap<usize, Vec<(u64, usize)>> =
+        std::collections::BTreeMap::new();
+    for (at, loc) in locators.iter().enumerate() {
+        let file = usize::try_from(loc >> LOCATOR_ROW_BITS).map_err(|e| source(e.to_string()))?;
+        by_file.entry(file).or_default().push((loc & mask, at));
+    }
+    let mut pieces: Vec<RecordBatch> = Vec::new();
+    // For each requested position, where its row landed in the concatenated pieces.
+    let mut slot = vec![0u32; locators.len()];
+    let mut base = 0usize;
+    for (file, mut rows) in by_file {
+        let uri = units
+            .uris
+            .get(file)
+            .ok_or_else(|| source(format!("no file {file} behind a locator")))?;
+        rows.sort_unstable();
+        rows.dedup_by_key(|(row, _)| *row);
+        let positions: Vec<u64> = rows.iter().map(|(row, _)| *row).collect();
+        let got = bc_io::read_parquet_rows(uri, &positions, units.columns, units.batch_size)
+            .map_err(|e| source(e.to_string()))?;
+        let got: Vec<RecordBatch> = got
+            .iter()
+            .map(|b| normalize_batch(b).map_err(|e| source(e.to_string())))
+            .collect::<Result<_, _>>()?;
+        let n: usize = got.iter().map(RecordBatch::num_rows).sum();
+        if n != positions.len() {
+            return Err(source(format!("fetched {n} rows of {}", positions.len())));
+        }
+        pieces.extend(got);
+        let index: std::collections::HashMap<u64, usize> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (*p, base + i))
+            .collect();
+        for (at, loc) in locators.iter().enumerate() {
+            if usize::try_from(loc >> LOCATOR_ROW_BITS).ok() == Some(file) {
+                slot[at] =
+                    u32::try_from(index[&(loc & mask)]).map_err(|e| source(e.to_string()))?;
+            }
+        }
+        base += n;
+    }
+    let Some(first) = pieces.first() else {
+        return Ok(Vec::new());
+    };
+    let all = arrow::compute::concat_batches(&first.schema(), &pieces)
+        .map_err(|e| source(e.to_string()))?;
+    let order = arrow::array::UInt32Array::from(slot);
+    let columns = all
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &order, None))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| source(e.to_string()))?;
+    let out = RecordBatch::try_new(all.schema(), columns).map_err(|e| source(e.to_string()))?;
+    Ok(vec![out])
 }
 
 /// Execute `plan_json` with `sources[driving]` read from Parquet `uris` by the engine's workers.
@@ -363,8 +549,8 @@ fn scan_filter(plan: &bc_ir::RelOp, driving: usize) -> Option<&bc_expr::Expr> {
 /// nothing would never see; so each conjunct is first evaluated over one all-null row of the
 /// scan's schema, and a conjunction any of whose conjuncts fails that is pushed whole.
 ///
-/// `None` when the first stage would decode every column the scan reads: there is then nothing
-/// left to defer, and the filter could only add its own evaluation to the read.
+/// `None` when the stages would decode every column the scan reads: there is then nothing left
+/// to defer, and the filter could only add its own evaluation to the read.
 fn late_filter(
     plan: &bc_ir::RelOp,
     driving: usize,
@@ -385,10 +571,10 @@ fn late_filter(
     } else {
         vec![stage(predicate)]
     };
-    let first = &stages.first()?.columns;
+    let staged = |name: &String| stages.iter().any(|s| s.columns.contains(name));
     let defers = match columns {
-        Some(cols) => cols.iter().any(|c| !first.contains(c)),
-        None => schema.fields().iter().any(|f| !first.contains(f.name())),
+        Some(cols) => cols.iter().any(|c| !staged(c)),
+        None => schema.fields().iter().any(|f| !staged(f.name())),
     };
     if !defers {
         return None;

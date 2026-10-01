@@ -128,6 +128,16 @@ _QUERIES = [
     "SELECT count(*) AS n, sum(dec) AS s, max(d) AS hi FROM t "
     "WHERE id >= 17000 AND d >= DATE '2020-07-01'",
     "SELECT id, ts FROM t WHERE d < DATE '2020-01-15' AND id > 700 ORDER BY id",
+    # A top-N over the scan: the narrow sort columns are read and sorted first, and only the
+    # winners are fetched whole -- descending keys, an offset, deferred nested and decimal
+    # columns, and a filter that keeps every row. (Ties the sort breaks by input order are
+    # left to the engine's own test, `stream::chunked::top_n`: DuckDB breaks them freely.)
+    "SELECT * FROM t WHERE cat = 'b' AND k = 3 ORDER BY ts DESC, id LIMIT 5",
+    "SELECT id, k, txt FROM t WHERE f = 0.25 ORDER BY k, d DESC, id LIMIT 8",
+    "SELECT id, st, lst, dec FROM t WHERE k = 2 ORDER BY dec DESC, id LIMIT 6",
+    "SELECT * FROM t WHERE dec <> 0.5 ORDER BY d DESC, id LIMIT 3",
+    "SELECT id, cat, ts, txt FROM t WHERE cat <> 'a' ORDER BY id DESC LIMIT 4 OFFSET 2",
+    "SELECT * FROM t WHERE dec = 0.005 ORDER BY id LIMIT 3",
     # Neither a negation nor a disjunction may be narrowed by the partial translation.
     "SELECT count(*) AS n FROM t WHERE NOT (id >= 17000 AND d >= DATE '2020-07-01')",
     "SELECT count(*) AS n FROM t WHERE id < 3000 OR d >= DATE '2020-08-01'",

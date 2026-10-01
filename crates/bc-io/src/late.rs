@@ -135,7 +135,10 @@ impl LateFilter {
         match self.state.load(Ordering::Relaxed) {
             ON => true,
             OFF => false,
-            _ => self.started.fetch_add(1, Ordering::Relaxed).is_multiple_of(2),
+            _ => self
+                .started
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(2),
         }
     }
 
@@ -175,24 +178,29 @@ impl LateFilter {
 
     /// Whether `rg` holds enough to defer for the filter to be worth installing on it at all.
     ///
-    /// The filter decodes its first stage's columns in full and saves only on the rest, so the
-    /// rest must be at least as large: deferring a narrow column behind a wide predicate (a
-    /// `LIKE` over two text columns, say, to save an integer key) can only cost. Measured in
-    /// the footer's uncompressed bytes, which is what the decode handles. `columns` is the
-    /// read's projection, `None` for every column.
+    /// What the filter can save is the columns no stage reads; what it costs is the columns the
+    /// stages do read, so the first must be at least as large as the second — deferring a narrow
+    /// column behind a wide predicate can only cost. A *later* stage's columns count as read,
+    /// not deferred: they are decoded under the earlier stages' selection, and a scattered
+    /// selection leaves a survivor in nearly every page, so the pages are decompressed whole.
+    /// ClickBench's `SearchPhrase <> '' AND Title LIKE '%Google%'` is the case: deferring
+    /// `Title` behind `SearchPhrase` measured slower per row (1,846 against 1,438 ns), and only
+    /// `URL` and `UserID` — a third of `Title`'s bytes — are left for the filter to skip.
+    /// Measured in the footer's uncompressed bytes, which is what the decode handles. `columns`
+    /// is the read's projection, `None` for every column.
     pub(crate) fn worth_deferring(
         &self,
         rg: &parquet::file::metadata::RowGroupMetaData,
         columns: Option<&[String]>,
     ) -> bool {
-        let first = &self.predicates[0].columns;
+        let staged = |root: &String| self.predicates.iter().any(|p| p.columns.contains(root));
         let (mut decoded, mut deferred) = (0i64, 0i64);
         for chunk in rg.columns() {
             let Some(root) = chunk.column_path().parts().first() else {
                 continue;
             };
             let size = chunk.uncompressed_size();
-            if first.iter().any(|c| c == root) {
+            if staged(root) {
                 decoded += size;
             } else if columns.is_none_or(|cols| cols.iter().any(|c| c == root)) {
                 deferred += size;
@@ -330,7 +338,10 @@ mod tests {
 
     fn read(path: &std::path::Path, rg: usize, late: &Arc<LateFilter>) -> RecordBatch {
         let uri = path.to_str().unwrap();
-        concat(&crate::read_parquet_row_group_late(uri, rg, None, 1024, None, Some(late)).unwrap())
+        concat(
+            &crate::read_parquet_row_group_late(uri, rg, None, 1024, None, Some(late), false)
+                .unwrap(),
+        )
     }
 
     /// With the filter installed, a row group comes back as exactly the rows the mask keeps —
@@ -396,6 +407,20 @@ mod tests {
         // A wide predicate column guarding a narrow deferred one is not worth it.
         let wide = filter_of(&["s"]);
         assert!(!wide.worth_deferring(rg, Some(&cols(&["s", "b"]))));
+        // Nor is a wide column read by a *later* stage: it is decoded, not deferred.
+        let staged = LateFilter::new(vec![
+            RowPredicate {
+                columns: cols(&["a"]),
+                mask: Arc::new(mask),
+            },
+            RowPredicate {
+                columns: cols(&["s"]),
+                mask: Arc::new(mask),
+            },
+        ])
+        .unwrap();
+        assert!(!staged.worth_deferring(rg, Some(&cols(&["a", "s", "b"]))));
+        assert!(late.worth_deferring(rg, Some(&cols(&["a", "s", "b"]))));
         std::fs::remove_dir_all(&dir).ok();
     }
 

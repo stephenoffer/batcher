@@ -29,6 +29,7 @@
 
 mod orient;
 mod partial;
+mod top_n;
 
 pub use partial::partial_aggregate_units;
 pub(crate) mod units;
@@ -322,6 +323,9 @@ fn units_with(
             crate::par::execute_parallel_with(&rest, &srcs, opts)
         }
         Core::Spine { depth, node } => {
+            if let Some(out) = run.top_n_late(plan, depth, node, &srcs, src, &ranges, meter)? {
+                return Ok(out);
+            }
             let result = run.collect_units(node, &srcs, src, &ranges, meter)?;
             if depth == 0 {
                 return Ok(result);
@@ -332,7 +336,10 @@ fn units_with(
             };
             srcs[driving] = Vec::new();
             srcs.push(result);
-            crate::execute(&post, &srcs)
+            // The parallel executor, not the sequential oracle: a top-N over a spine that kept
+            // a million rows (`SELECT s ... ORDER BY s LIMIT 10`) is the whole query's work, and
+            // sorting it on one core made it 3.9x slower than the resident read it replaced.
+            crate::par::execute_parallel_with(&post, &srcs, opts)
         }
     }
 }
