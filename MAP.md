@@ -1647,7 +1647,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | `ledger.py` | 72 | The memory ledger: reserved, resident, and unaccounted bytes as separate figures. |
 | `pool.py` | 422 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 466 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
-| `probe.py` | 389 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
+| `probe.py` | 387 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
 | `reclaim.py` | 273 | Handing the allocator's arena back when a query is about to go out of core. |
 
 ### `batcher/carbonite/policies/` — 3 · subsystem
@@ -1723,7 +1723,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 |---|---|---|
 | `base.py` | 87 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
 | `energy.py` | 328 | Measuring what a stage drew — Core's half of the energy loop. |
-| `executor.py` | 458 | The Core local executor. |
+| `executor.py` | 466 | The Core local executor. |
 | `gpu_transform.py` | 312 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 191 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 268 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
@@ -2821,7 +2821,7 @@ Effective hardware detection — what this process's machine really is and reall
 | module | lines | what it is |
 |---|---|---|
 | `cache.py` | 151 | The CPU cache hierarchy this process runs on — the sizes every blocking decision needs. |
-| `cgroup.py` | 376 | cgroup file-format mechanics — the container limits that override what the host reports. |
+| `cgroup.py` | 379 | cgroup file-format mechanics — the container limits that override what the host reports. |
 | `cpu.py` | 369 | The CPU budget this process really has, and how much of it something else is taking. |
 | `isa.py` | 215 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 212 | The memory ceiling and page geometry this process runs under. |
@@ -2830,7 +2830,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `probes.py` | 110 | The one hook that clears every memoized hardware reading. |
 | `profile.py` | 386 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 284 | The block device behind a directory — what spilling to it will actually cost. |
-| `sysfs.py` | 230 | Reading a kernel pseudo-file, where "absent" means "unknown" rather than "error". |
+| `sysfs.py` | 237 | Reading a kernel pseudo-file, where "absent" means "unknown" rather than "error". |
 | `topology.py` | 188 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
 ### `batcher/_internal/hardware/amd/` — 0 · utility

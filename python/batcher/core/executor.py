@@ -177,12 +177,20 @@ def _num(op: dict, key: str, default: float = 0.0) -> float:
     `or 0`; the ones feeding `cpu_utilization` and the elapsed time did not.
     """
     value = op.get(key)
+    # The common case first: the engine reports a plain int or float. `type(...) in` rather
+    # than `isinstance`, because `bool` subclasses `int` and must still read as `default`.
+    if type(value) in _PLAIN_NUMBERS:
+        return float(value)
     if value is None or isinstance(value, bool):
         return default
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+#: The types `_num` converts without the general path. Exactly these: `bool` is excluded.
+_PLAIN_NUMBERS = (int, float)
 
 
 def _record_one(

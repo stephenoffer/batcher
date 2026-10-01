@@ -148,15 +148,13 @@ def _read_cgroup_file_cache_bytes() -> int:
         ("/sys/fs/cgroup/memory.stat", "file"),
         ("/sys/fs/cgroup/memory/memory.stat", "total_cache"),
     ):
-        try:
-            with open(path) as f:
-                lines = f.read().splitlines()
-        except OSError:
+        text = read_live_text(path)
+        if text is None:
             # Not this cgroup version, or not in a cgroup at all. Both paths being absent
             # is the normal case off Linux, so trying the next one is the answer rather
             # than a reportable failure.
             continue
-        for line in lines:
+        for line in text.splitlines():
             field, _, raw = line.partition(" ")
             if field == key:
                 try:

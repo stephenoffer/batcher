@@ -206,14 +206,18 @@ def read_cgroup_stat(base: str, name: str) -> dict[str, int]:
     Returns:
         The parsed counters, empty when the file is absent or unreadable.
     """
+    # Through a held descriptor (`read_live_text`): the kernel's own `memory.stat` and
+    # `memory.events` behind the pressure snapshot, re-read on every sampling window.
+    text = read_live_text(os.path.join(base, name))
+    if text is None:
+        return {}
     try:
-        with open(os.path.join(base, name)) as f:
-            return {
-                parts[0]: int(parts[1])
-                for line in f
-                if len(parts := line.split()) == 2 and parts[1].isdigit()
-            }
-    except (OSError, ValueError):
+        return {
+            parts[0]: int(parts[1])
+            for line in text.splitlines()
+            if len(parts := line.split()) == 2 and parts[1].isdigit()
+        }
+    except ValueError:
         return {}
 
 
@@ -325,11 +329,10 @@ def read_psi(path: str) -> dict[str, float]:
         pressure" for a kernel that measured nothing.
     """
     out: dict[str, float] = {}
-    try:
-        with open(path) as f:
-            lines = f.read().splitlines()
-    except OSError:
+    text = read_live_text(path)
+    if text is None:
         return out
+    lines = text.splitlines()
     for line in lines:
         fields = line.split()
         if not fields or fields[0] not in ("some", "full"):

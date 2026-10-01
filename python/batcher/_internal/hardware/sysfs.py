@@ -31,7 +31,9 @@ here may use it without regard to the package's internal import order.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
+import io
 import os
 import threading
 
@@ -50,6 +52,9 @@ _LIVE_CHUNK = 65536
 #: Held descriptors, by path. Process-local: cleared in a forked child (see below).
 _LIVE_FDS: dict[str, int] = {}
 _LIVE_LOCK = threading.Lock()
+
+#: The interpreter's own `open`, to tell when something has replaced it.
+_REAL_OPEN = io.open
 
 
 def _forget_live_fds() -> None:
@@ -107,7 +112,9 @@ def read_live_text(path: str) -> str | None:
     Returns:
         The decoded contents, or `None` when the file is absent or unreadable.
     """
-    if not path.startswith(_LIVE_PREFIXES):
+    if not path.startswith(_LIVE_PREFIXES) or builtins.open is not _REAL_OPEN:
+        # A replaced `open` (a test faking `/sys`, an embedding that audits file access) is
+        # honored: the held-descriptor path goes to the OS directly and would bypass it.
         try:
             with open(path) as f:
                 return f.read()
