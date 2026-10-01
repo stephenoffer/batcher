@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1554 Python modules across 220 packages and 317 Rust files across 14 crates.
+Covering 1554 Python modules across 220 packages and 318 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -3128,15 +3128,16 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/distinct.rs` | 667 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/fused.rs` | 710 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
-| `agg/group/assign.rs` | 1788 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
+| `agg/group/assign.rs` | 1737 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
 | `agg/group/combine.rs` | 694 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 346 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
-| `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
+| `agg/group/mod.rs` | 35 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
+| `agg/group/short_key.rs` | 199 | Short byte-string keys (≤ 7 bytes) as one `u64` each, and the small table that groups them. |
 | `agg/inputs/mod.rs` | 194 | Bringing an aggregate call's inputs to a type the accumulator kernels read. |
 | `agg/int_sum/mod.rs` | 333 | The partial state of an integer `SUM`: an exact 128-bit total, range-checked only when it is finalized. |
-| `agg/median.rs` | 612 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
-| `agg/mod.rs` | 506 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
+| `agg/median.rs` | 687 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
+| `agg/mod.rs` | 503 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/ordered_list/mod.rs` | 184 | `array_agg(x ORDER BY k)`: a per-group list whose element order is a property of the rows. |
 | `agg/sketch.rs` | 196 | The sketch-backed aggregates: bounded memory in exchange for a bounded error. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
