@@ -35,6 +35,7 @@ from collections import OrderedDict
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.io.source import InMemorySource, Source
 from batcher.plan.expr_ir import Expr
@@ -254,9 +255,10 @@ def _reuse(
     held = 0
     filters = _row_filters(key, sources)
     unlearned: list[tuple[int, int]] = []
+    narrow: dict[int, SchemaRef] = {}
     for index, positions in enumerate(verdict):
         appearances = [nodes[i] for i in positions]
-        target = _narrowed(plan, appearances, len(srcs))
+        target, written = _narrowed(plan, appearances, len(srcs))
         if index in filters:
             if filters[index] is not None:
                 target = Filter(target, filters[index])
@@ -287,7 +289,13 @@ def _reuse(
                 derivation=derivation_key(appearances[0], srcs),
             )
         )
-        plan = _replace_all(plan, appearances, Scan(sid, SchemaRef.from_arrow(table.schema)))
+        held_schema = SchemaRef.from_arrow(table.schema)
+        # A narrowed result stands in under the subtree's full schema until every target is
+        # placed, because the plan as written still names the dropped columns; `_read_narrow`
+        # then prunes the plan and lets the scan carry only what was materialized.
+        plan = _replace_all(plan, appearances, Scan(sid, written or held_schema))
+        if written is not None:
+            narrow[sid] = held_schema
         log_kv(
             _log,
             logging.DEBUG,
@@ -296,9 +304,48 @@ def _reuse(
             bytes=logical_bytes(table),
             op=type(appearances[0]).__name__,
         )
+    if narrow:
+        plan = _read_narrow(plan, narrow)
     if unlearned:
         _learn_row_filters(plan, srcs, ctx, key, sources, unlearned)
     return plan, srcs
+
+
+def _read_narrow(plan: LogicalPlan, narrow: dict[int, SchemaRef]) -> LogicalPlan:
+    """`plan` pruned to the columns it uses, its narrowed scans given the schemas they hold.
+
+    Each materialized target in `narrow` was cut to what the *pruned* plan reads of it
+    (`_narrowed`), while the plan as written still names the columns that were dropped -- a
+    join declares its whole output whether or not anything above reads it. Pruning first
+    (`rewrite_projection`, the optimizer's own pass) removes those names, after which a scan
+    carrying only the materialized columns validates.
+
+    Checked rather than assumed: a narrowed scan whose pruned plan still reads a column it
+    does not hold raises, and `reuse_common_subplans` then returns the plan as it was.
+
+    Args:
+        plan: The rewritten plan, every narrowed scan still declaring its subtree's schema.
+        narrow: The schema each narrowed source actually holds, by source id.
+
+    Returns:
+        The pruned plan over the narrowed scans.
+    """
+    from batcher.kyber.rules.projections import required_columns_per_source, rewrite_projection
+
+    pruned = rewrite_projection(plan)
+    need = required_columns_per_source(pruned)
+    for sid, schema in narrow.items():
+        missing = set(need.get(sid, ())) - set(schema.names)
+        if missing:
+            raise PlanError(f"narrowed subplan {sid} is still read for {sorted(missing)}")
+    return transform_up(
+        pruned,
+        lambda n: (
+            dataclasses.replace(n, schema=narrow[n.source_id])
+            if isinstance(n, Scan) and n.source_id in narrow
+            else n
+        ),
+    )
 
 
 def _row_filters(key: tuple | None, sources: list[Source]) -> dict[int, Expr | None]:
@@ -351,7 +398,9 @@ def _learn_row_filters(
             entry[2][index] = found.get(sid)
 
 
-def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> LogicalPlan:
+def _narrowed(
+    plan: LogicalPlan, appearances: list[LogicalPlan], sid: int
+) -> tuple[LogicalPlan, SchemaRef | None]:
     """The chosen subtree cut down to the columns the rest of the plan still reads.
 
     Materializing forfeits the *fusion* each appearance had with its parent, and what that
@@ -364,10 +413,19 @@ def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> Lo
     of 78 ms on q14 and 41 on q70 — so the waste is the whole of the difference.
 
     The need is not recomputed here. The hypothetical rewrite is built (a `Scan` of the
-    subtree's own schema in place of every appearance) and the optimizer's own
-    need-propagation is asked what that scan must read, so the one definition of "which
-    columns does this plan require" stays in `kyber.rules.projections`. A subtree with no
-    static schema, or one the pass cannot narrow, is returned unchanged.
+    subtree's own schema in place of every appearance), pruned by the optimizer's own
+    projection pass, and the pass's need-propagation is asked what that scan must read, so
+    the one definition of "which columns does this plan require" stays in
+    `kyber.rules.projections`. A subtree with no static schema, or one the pass cannot
+    narrow, is returned unchanged.
+
+    The need is that of the **pruned** plan. The plan as written over-reports it whenever a
+    join sits above an appearance, because a join declares its whole output until pruning
+    narrows it: TPC-H q20's shared `partsupp ⋈ part` was materialized with `ps_comment`,
+    80 M strings no operator reads, and the materialization alone cost 3.2 s at sf100 against
+    0.6 s for the three columns the query uses. The plan as written still names such a
+    column, so the caller scans the result under the subtree's full schema (the second value
+    returned) until `_read_narrow` prunes the plan to match.
 
     Args:
         plan: The plan being rewritten, as it currently stands.
@@ -375,9 +433,10 @@ def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> Lo
         sid: The source id the materialized result will take.
 
     Returns:
-        The subtree, wrapped in a `Project` when that drops a column and unchanged otherwise.
+        The subtree, wrapped in a `Project` when that drops a column, and the subtree's full
+        schema in that case; the subtree unchanged and `None` otherwise.
     """
-    from batcher.kyber.rules.projections import required_columns_per_source
+    from batcher.kyber.rules.projections import required_columns_per_source, rewrite_projection
     from batcher.plan.expr_ir import col
     from batcher.plan.logical import Project, Projection
 
@@ -385,29 +444,19 @@ def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> Lo
     try:
         schema = target.available_schema()
         if schema is None:
-            return target
-        # Deliberately the need of the plan **as written**, not of its optimized form, which
-        # is the opposite of what the size gate wants and for a reason that is easy to walk
-        # into. Running projection pushdown first reports a *smaller* need -- a column a
-        # projection merely passes through stops counting -- but the plan being rewritten
-        # still names that column above the appearance, so a `Scan` without it does not
-        # validate. Measured: asking the pushed form for a shared SELECT carrying an unread
-        # column returned ['k', 'v'] against ['k', 'v', 'unused'], and the narrower scan
-        # raised, so `reuse_common_subplans` caught it and declined the reuse altogether --
-        # turning a saving into nothing at all. The need as written is exactly the set the
-        # surrounding plan references, which is the set that keeps it valid.
-        hypothetical = _replace_all(plan, appearances, Scan(sid, schema))
+            return target, None
+        hypothetical = rewrite_projection(_replace_all(plan, appearances, Scan(sid, schema)))
         wanted = required_columns_per_source(hypothetical).get(sid)
         carried = list(target.available_columns())
         if wanted is None or len(wanted) >= len(carried):
-            return target
+            return target, None
         keep = [c for c in carried if c in set(wanted)]
         if not keep or len(keep) >= len(carried):
-            return target
-        return Project(target, tuple(Projection(c, col(c)) for c in keep))
+            return target, None
+        return Project(target, tuple(Projection(c, col(c)) for c in keep)), schema
     except Exception as exc:  # narrowing must never break a query
         note_suppressed("api", "narrow a common-subplan candidate", exc)
-        return target
+        return target, None
 
 
 def _analyze(
