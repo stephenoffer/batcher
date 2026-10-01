@@ -175,7 +175,7 @@ The public, fluent, lazy, expression-first API surface.
 | `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 1159 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 259 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
-| `multi_group.py` | 408 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
+| `multi_group.py` | 431 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 737 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 | `subplan_reuse.py` | 669 | Compute a repeated subplan once and read it back (control plane, `api`). |

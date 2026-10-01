@@ -44,11 +44,13 @@ from batcher.plan.expr_ir.nodes import NullIf
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
+    Filter,
     Join,
     LogicalPlan,
     Project,
     Projection,
     Union,
+    Window,
     share_sources,
 )
 from batcher.plan.visitor import walk
@@ -57,6 +59,10 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["MultiLevelGroupBy", "cube_levels", "rollup_levels", "stack_levels"]
+
+# The single-input nodes a level may carry above its aggregate: each reads only the rows of
+# that level, so it is unchanged when the level's aggregate is computed from shared partials.
+_LEVEL_WRAPPERS = (Project, Filter, Window)
 
 
 def rollup_levels(keys: tuple[str, ...]) -> list[tuple[str, ...]]:
@@ -279,8 +285,18 @@ def _share_level_input(node: Union) -> LogicalPlan | None:
 
 
 def _level_aggregate(branch: LogicalPlan) -> Aggregate | None:
-    """The aggregate a union branch computes, directly or under one projection."""
-    if isinstance(branch, Project):
+    """The aggregate a union branch computes, under any chain of per-level nodes.
+
+    A level is its aggregate plus whatever the query computes *from* that level's rows: the
+    projection restoring its columns, a `HAVING` filter, and a window whose partition is the
+    level itself. TPC-DS q70 ranks each level (`rank() OVER (PARTITION BY
+    grouping(...)...)`), so its branches are `Project > Window > Project > Aggregate`, and
+    accepting only one projection above the aggregate left all three levels re-running the
+    whole three-table join. Those nodes read the level aggregate's rows and nothing else, so
+    they sit unchanged on the rolled-up aggregate, which produces the same rows under the
+    same names (`_roll_up`).
+    """
+    while isinstance(branch, _LEVEL_WRAPPERS):
         branch = branch.input
     return branch if isinstance(branch, Aggregate) and branch.watermark is None else None
 
@@ -403,6 +419,13 @@ def _roll_up(
     rolled: LogicalPlan = Project(
         Aggregate(finest, level.group_keys, tuple(merged)), (*keys, *finals)
     )
-    if isinstance(branch, Project):
-        rolled = dataclasses.replace(branch, input=rolled)
-    return rolled
+    return _rewrap(branch, level, rolled)
+
+
+def _rewrap(branch: LogicalPlan, level: Aggregate, rolled: LogicalPlan) -> LogicalPlan:
+    """`branch` with its level aggregate replaced by `rolled`, every node above it kept."""
+    if branch is level:
+        return rolled
+    if not isinstance(branch, _LEVEL_WRAPPERS):
+        raise PlanError(f"a grouping level holds a {type(branch).__name__} above its aggregate")
+    return dataclasses.replace(branch, input=_rewrap(branch.input, level, rolled))

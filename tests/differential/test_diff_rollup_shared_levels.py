@@ -47,6 +47,13 @@ _AGGS = (
     "avg(f.v) AS av, avg(f.f) AS af"
 )
 
+_RANKED = (
+    "SELECT d.region, d.city, sum(f.v) AS s, grouping(d.region) + grouping(d.city) AS lvl, "
+    "rank() OVER (PARTITION BY grouping(d.region) + grouping(d.city), "
+    "CASE WHEN grouping(d.city) = 0 THEN d.region END ORDER BY sum(f.v) DESC) AS rk "
+    f"{_JOIN} GROUP BY ROLLUP(d.region, d.city)"
+)
+
 _QUERIES = [
     f"SELECT d.region, d.city, {_AGGS} {_JOIN} GROUP BY ROLLUP(d.region, d.city)",
     f"SELECT d.region, d.city, {_AGGS} {_JOIN} GROUP BY CUBE(d.region, d.city)",
@@ -57,6 +64,12 @@ _QUERIES = [
     "GROUP BY ROLLUP(d.region, d.city)",
     # A decimal mean has no partial form here: the levels aggregate on their own.
     f"SELECT d.region, avg(f.m) AS am, sum(f.m) AS sm {_JOIN} GROUP BY ROLLUP(d.region)",
+    # A window over each level (TPC-DS q70's shape): every branch is a window above its
+    # aggregate, which the shared form must carry over unchanged.
+    _RANKED,
+    # A HAVING filter above each level's aggregate.
+    f"SELECT d.region, d.city, sum(f.v) AS s {_JOIN} GROUP BY ROLLUP(d.region, d.city) "
+    "HAVING count(*) > 1",
 ]
 
 
@@ -89,3 +102,21 @@ def test_the_levels_really_share_one_aggregate():
     ]
     assert len(shared) == 3, "ROLLUP(a, b) has three levels, each reading the shared aggregate"
     assert len({id(n) for n in shared}) == 1, "the levels must read one and the same aggregate"
+
+
+def test_windowed_levels_share_one_aggregate():
+    """The windowed levels read the shared aggregate too, not three copies of the join."""
+    from batcher.plan.logical import Aggregate, Join, Window
+    from batcher.plan.visitor import walk
+
+    plan = _session().sql(_RANKED)._plan
+    assert any(isinstance(n, Window) for n in walk(plan)), "the case must carry its window"
+    shared = [
+        n
+        for n in walk(plan)
+        if isinstance(n, Aggregate)
+        and any(re.fullmatch(r"__lvl_\d+", s.alias) for s in n.aggregates)
+    ]
+    assert len(shared) == 3 and len({id(n) for n in shared}) == 1
+    joins = {id(n) for n in walk(plan) if isinstance(n, Join)}
+    assert len(joins) == 1, "the join runs once, under the shared aggregate"
