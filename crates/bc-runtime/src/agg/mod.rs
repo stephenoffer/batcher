@@ -174,10 +174,7 @@ use accum::{
 };
 use argextreme::{arg_extreme_state, merge_arg_extreme};
 use counted::{counted_state, merge_counted};
-use distinct::{
-    bucket_values_into_list, distinct_state, finalize_count_distinct, flatten_list_state,
-    merge_distinct,
-};
+use distinct::{bucket_values_into_list, distinct_state, finalize_count_distinct, merge_distinct};
 pub use distinct::{distinct_dense, distinct_parts, distinct_prefix, DistinctPrefix};
 pub use distinct_on::{distinct_on, distinct_on_parts, OrderKey};
 pub(crate) use group::assign_groups;
