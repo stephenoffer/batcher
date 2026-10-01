@@ -16,12 +16,19 @@ registered via the `@rule` decorator (auto-discovered on import from
 from __future__ import annotations
 
 import dataclasses
+import json
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.agg_pushdown.conditional import (
+    CONDITIONAL_AGGS,
+    conditional_merge_input,
+    split_dimension_conditional,
+)
 from batcher.kyber.rules.agg_pushdown.gates import (
     _commuted,
+    _conditional_reduces,
     _global_aggregate_gains_nothing,
     _join_out_reduces_more,
     _measured_as_non_reducing,
@@ -296,17 +303,27 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
     # `(a - b) / 2` below the join gives each row the value it had above it. TPC-DS q4's
     # `sum(((ss_ext_list_price - ...) + ss_ext_sales_price) / 2)` is that shape.
     to_source = {a: out_map[a].name for a in left_aliases}
+    right_aliases = set(out_map) - left_aliases
     agg_inputs: list[Expr | None] = []
+    # Per aggregate, the right-side condition its merge re-applies (`conditional`), if any.
+    conditions: list[Expr | None] = []
     for spec in node.aggregates:
         agg = spec.agg
         if agg.func not in _PREAGG_MERGE or agg.input2 is not None:
             return None
+        conditions.append(None)
         if agg.func == "count_star":
             agg_inputs.append(None)  # counts rows, no input column
             continue
-        if agg.input is None or not referenced_columns(agg.input) <= left_aliases:
+        if agg.input is None:
             return None
-        src = remap_columns(agg.input, to_source)
+        value = agg.input
+        if not referenced_columns(value) <= left_aliases:
+            split = split_dimension_conditional(value, left_aliases, right_aliases)
+            if split is None or agg.func not in CONDITIONAL_AGGS:
+                return None
+            conditions[-1], value = split
+        src = remap_columns(value, to_source)
         if isinstance(src, Col) and src.name in left_group_sources:
             return None  # column both grouped and aggregated — leave it alone
         agg_inputs.append(src)
@@ -322,13 +339,7 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
     if _already_grouped_by(join.left, set(keep_sources)):
         return None
     partial_keys = tuple(Projection(s, Col(s)) for s in keep_sources)
-    partials = tuple(
-        AggregateSpec(
-            f"__pre_{i}",
-            AggExpr(spec.agg.func, src),
-        )
-        for i, (spec, src) in enumerate(zip(node.aggregates, agg_inputs, strict=True))
-    )
+    partials, slots = _shared_partials(node.aggregates, agg_inputs)
     pushed = Aggregate(join.left, partial_keys, partials)
 
     collapses = _outer_aggregate_collapses(node, join, out_map, keep_sources)
@@ -339,6 +350,7 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
         collapses
         or _reduces_enough(ctx, pushed, join.left)
         or _moves_string_keys(ctx, node, join, pushed)
+        or (any(c is not None for c in conditions) and _conditional_reduces(ctx, join, pushed))
     ):
         return None
     if _join_out_reduces_more(ctx, pushed, join):
@@ -367,14 +379,42 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
             new_join,
             tuple(Projection(k.alias, k.expr) for k in node.group_keys)
             + tuple(
-                Projection(spec.alias, Col(f"__pre_{i}")) for i, spec in enumerate(node.aggregates)
+                Projection(spec.alias, _merged_input(cond, slot))
+                for spec, cond, slot in zip(node.aggregates, conditions, slots, strict=True)
             ),
         )
     final_aggs = tuple(
-        AggregateSpec(spec.alias, AggExpr(_PREAGG_MERGE[spec.agg.func], Col(f"__pre_{i}")))
-        for i, spec in enumerate(node.aggregates)
+        AggregateSpec(spec.alias, AggExpr(_PREAGG_MERGE[spec.agg.func], _merged_input(cond, slot)))
+        for spec, cond, slot in zip(node.aggregates, conditions, slots, strict=True)
     )
     return dataclasses.replace(node, input=new_join, aggregates=final_aggs)
+
+
+def _shared_partials(
+    aggregates: tuple[AggregateSpec, ...], inputs: list[Expr | None]
+) -> tuple[tuple[AggregateSpec, ...], list[int]]:
+    """One partial per distinct `(function, input)`, and each aggregate's index into them.
+
+    Seven dimension-conditional sums over one measure (TPC-DS q2's weekday pivot) all
+    pre-aggregate `SUM(sales_price)`; each reads the shared partial through its own condition
+    (`conditional_merge_input`), so the pushed aggregate keeps one accumulator, not seven.
+    """
+    seen: dict[tuple[str, str], int] = {}
+    partials: list[AggregateSpec] = []
+    slots: list[int] = []
+    for spec, src in zip(aggregates, inputs, strict=True):
+        key = (spec.agg.func, "" if src is None else json.dumps(src.to_ir(), sort_keys=True))
+        if key not in seen:
+            seen[key] = len(partials)
+            partials.append(AggregateSpec(f"__pre_{len(partials)}", AggExpr(spec.agg.func, src)))
+        slots.append(seen[key])
+    return tuple(partials), slots
+
+
+def _merged_input(condition: Expr | None, i: int) -> Expr:
+    """Partial `i` as the merging aggregate reads it: re-gated by its condition, if it had one."""
+    partial = f"__pre_{i}"
+    return Col(partial) if condition is None else conditional_merge_input(condition, partial)
 
 
 @rule(name="pre_aggregation_through_reordered_join", phase=Phase.FUSION, matches=(Aggregate,))

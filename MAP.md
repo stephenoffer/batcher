@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1556 Python modules across 220 packages and 327 Rust files across 14 crates.
+Covering 1557 Python modules across 220 packages and 327 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -1291,9 +1291,10 @@ Aggregate-through-join pushdown: pre-aggregate a join side to shrink its input.
 
 | module | lines | what it is |
 |---|---|---|
-| `gates.py` | 240 | The cost gates the aggregate-through-join pushdown rules consult. |
+| `conditional.py` | 74 | A dimension-conditional aggregate input, split so its measure can be pre-aggregated. |
+| `gates.py` | 322 | The cost gates the aggregate-through-join pushdown rules consult. |
 | `reassociate.py` | 544 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
-| `rules.py` | 533 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
+| `rules.py` | 573 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
 

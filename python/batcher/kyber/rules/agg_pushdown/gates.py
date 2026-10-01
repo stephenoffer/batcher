@@ -12,7 +12,8 @@ import pyarrow as pa
 from batcher._internal.logging import note_suppressed
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.plan.expr_ir import Col
-from batcher.plan.logical import Aggregate, Join, JoinOutputCol, LogicalPlan
+from batcher.plan.logical import Aggregate, Join, JoinOutputCol, LogicalPlan, Project, Union
+from batcher.plan.stats import Provenance
 
 __all__: list[str] = []
 
@@ -85,6 +86,87 @@ def _moves_string_keys(
     # against DuckDB's 33). So the outer grouping must keep at least a quarter of the groups.
     outer = ctx.estimator.estimate(node).rows
     return outer * _OUTER_GROUP_SHARE >= groups
+
+
+#: The reduction `_conditional_reduces` requires: the measured bar `_reduces_enough` sets.
+_CONDITIONAL_MIN_REDUCTION = 8.0
+
+
+def _conditional_reduces(ctx: OptimizerContext, join: Join, pushed: Aggregate) -> bool:
+    """Whether a push carrying dimension-conditional aggregates reduces its side 8x or more.
+
+    `_reduces_enough` reads the pushed aggregate's own estimate and refuses a `DEFAULT` one,
+    and an aggregate's estimate is `DEFAULT` even when every key's distinct count was measured.
+    For TPC-DS q2 it estimates 1,830 groups over 2.16M rows -- the truth is 1,823 -- and the
+    gate cannot tell that from a guess. So this asks the keys instead -- a provable bound where
+    one exists (`_measured_ndv_bound`), else the estimator's count -- and requires their
+    *product* (which a correlation assumption cannot inflate; see `_moves_string_keys`) to
+    shrink the side by the bar `_reduces_enough` uses. The push it licenses saves a per-row
+    `CASE` and the gather of the dimension columns it reads, so a guess that over-reads the
+    reduction loses one aggregate pass rather than the query. Consulted only for the
+    conditional shape (`agg_pushdown.conditional`), so it licenses no push made before.
+    """
+    side = ctx.estimator.estimate(join.left)
+    groups = 1.0
+    for k in pushed.group_keys:
+        bound = _measured_ndv_bound(ctx, join.left, k.alias)
+        if bound is None:
+            # No provable bound (an in-memory source carries no footer range): the estimator's
+            # own count, which a wrong guess costs one extra aggregate pass on -- once, since
+            # `_measured_as_non_reducing` vetoes the push after a run measures no reduction.
+            col = side.columns.get(k.alias)
+            if col is None or col.ndv is None:
+                return False
+            bound = col.ndv
+        groups *= max(1.0, bound)
+    return groups * _CONDITIONAL_MIN_REDUCTION <= side.rows
+
+
+def _measured_ndv_bound(ctx: OptimizerContext, plan: LogicalPlan, col: str) -> float | None:
+    """An upper bound on `col`'s distinct count in `plan`, from measured counts only, or None.
+
+    At a leaf the bound is a measured distinct count, or an integer column's value range. A
+    `UNION ALL` cannot have more distinct values than its branches between them, so the sum
+    of the branches' bounds bounds it even though the union's own count is a
+    `DEFAULT`-tagged interpolation (`kyber.stats.columns._merge_union_column`): their overlap is
+    what is unmeasured, not the bound. Followed through plain renaming projections; anything
+    else, or a branch with no measured count, has no bound.
+    """
+    if isinstance(plan, Project):
+        item = next((p for p in plan.items if p.alias == col), None)
+        if item is None or not isinstance(item.expr, Col):
+            return None
+        return _measured_ndv_bound(ctx, plan.input, item.expr.name)
+    if isinstance(plan, Union) and not plan.distinct:
+        names = plan.available_schema()
+        if names is None or col not in names.names:
+            return None
+        pos = names.names.index(col)
+        total = 0.0
+        for branch in plan.inputs:
+            schema = branch.available_schema()
+            if schema is None or pos >= len(schema.names):
+                return None
+            bound = _measured_ndv_bound(ctx, branch, schema.names[pos])
+            if bound is None:
+                return None
+            total += bound
+        return total
+    stat = ctx.estimator.estimate(plan).columns.get(col)
+    if stat is None:
+        return None
+    if stat.ndv is not None and stat.provenance is not Provenance.DEFAULT:
+        return stat.ndv
+    # An integer column holds at most `max - min + 1` distinct values, and min/max stay valid
+    # *bounds* whatever the bundle's provenance (`plan.stats.ColumnStat`) -- a surrogate date
+    # key's footer range is what bounds TPC-DS's `ws_sold_date_sk` to 1,827 values.
+    if _is_int(stat.min) and _is_int(stat.max) and stat.max >= stat.min:
+        return float(stat.max - stat.min + 1)
+    return None
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _is_string(dtype: pa.DataType) -> bool:
