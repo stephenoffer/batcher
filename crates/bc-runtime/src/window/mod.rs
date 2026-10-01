@@ -27,6 +27,7 @@ pub mod frame;
 mod agg;
 mod coerce;
 mod fill;
+mod packed_order;
 mod parallel;
 mod partition_agg;
 mod running_par;
@@ -550,10 +551,16 @@ pub(crate) fn window_serial(
         None
     };
 
+    // A `ROWS` frame bounds by physical position and never consults peers (`frame_ctx` hands
+    // it no peer groups), so a window whose every framed call is a `ROWS` frame -- a moving
+    // average, a `ROWS UNBOUNDED PRECEDING` running total -- does not need the encoding.
     let needs_peers = funcs.iter().any(|c| {
         !matches!(c.func, WindowFn::RowNumber | WindowFn::Ntile)
             && !c.func.is_series()
             && !(c.func.is_value() && c.frame.is_none())
+            && !c
+                .frame
+                .is_some_and(|f| f.unit == crate::window::frame::FrameUnit::Rows)
     });
     let order_rows = if order_keys.is_empty() || !needs_peers {
         None
@@ -792,6 +799,18 @@ fn ordered_partitions_by_global_sort(
     // tuple compare instead of a random-access row-byte compare. Multi-column, nullable, or
     // non-numeric keys fall through to the general row-encoded path below.
     if let Some(out) = try_ordered_partitions_packed(partition_keys, order_keys, num_rows) {
+        return Ok(out);
+    }
+    // Every other key tuple whose measured ranges fit one `u64` -- `PARTITION BY s ORDER BY a,
+    // b` over integers or temporals, a nullable or narrow key, or any partition key the grouper
+    // can id -- sorts as one packed word, declining before it does any grouping work. See
+    // `packed_order` for why the order is this function's order. It is tried second, not first:
+    // on the one-numeric-partition, one-numeric-order shape the path above already covers, the
+    // narrower record did not pay for its range scans (measured a wash to 2.5% slower on 6M-row
+    // `lag`/`rank` windows).
+    if let Some(out) =
+        packed_order::ordered_partitions_range_packed(partition_keys, order_keys, num_rows)?
+    {
         return Ok(out);
     }
 
