@@ -1279,7 +1279,7 @@ Kyber rule modules.
 | `literals.py` | 56 | Literal-value predicates shared by the expression rules: the i64 range and boolean literals. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 909 | Projection rewrites — collapse stacked projections and prune unread columns. |
-| `pushdown.py` | 637 | Predicate pushdown — evaluate filters as early as possible. |
+| `pushdown.py` | 685 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 574 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
 | `zonemap_pruning.py` | 580 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
